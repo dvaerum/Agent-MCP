@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs for the same PR/branch when new commits land.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install package + dev deps
+        run: |
+          uv venv --python ${{ matrix.python-version }}
+          uv pip install -e ".[dev]"
+          uv pip install httpx starlette uvicorn
+
+      - name: Lint (tests/ only)
+        # Scope is tests/ for now; agent_mcp/ has 216 pre-existing ruff
+        # errors documented in CONTRIBUTING.md. PRs that touch agent_mcp/
+        # files clean them up incrementally.
+        run: uv run ruff check tests/
+
+      - name: Run pytest
+        run: uv run pytest -v
+
+  dashboard:
+    name: Dashboard build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent_mcp/dashboard
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: agent_mcp/dashboard/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build static export
+        run: npm run build
