@@ -1,224 +1,148 @@
-# Contributing to Agent-MCP
+# Contributing to dvaerum/Agent-MCP
 
-Thank you for your interest in contributing to Agent-MCP! This guide will help you get started with contributing to our multi-agent collaboration framework.
+This is a maintained fork of [`rinadelph/Agent-MCP`](https://github.com/rinadelph/Agent-MCP).
+Upstream has been effectively dormant since October 2025, so this fork
+hosts the active work — bug fixes, security hardening, and the
+deployment-related changes that previously lived as an out-of-tree
+patch series in [nixos-developer-system].
 
-## 🎯 Project Overview
+If you're here because something is broken, file an issue. If you're
+here to fix it, read on.
 
-Agent-MCP is a sophisticated multi-agent collaboration system built on the Model Context Protocol (MCP). Our goal is to enable multiple AI agents to work together efficiently on software development tasks through shared memory, coordinated task management, and real-time visualization.
+The original upstream `CONTRIBUTING.md` is preserved in git history at
+sha `13d98b2` if you want the generic OSS-onboarding view.
 
-## 🛠️ Development Setup
+[nixos-developer-system]: https://cms.best.aau.dk/dennis/nixos-developer-system
 
-### Prerequisites
-- **Python 3.10+** with pip or uv
-- **Node.js 18.0.0+** (recommended: 22.16.0)
-- **npm 9.0.0+** (recommended: 10.9.2)
-- **OpenAI API key** for embeddings and RAG
-- **Claude Code or Cursor** for AI-assisted development
+## Development setup
 
-### Setup Instructions
+Prerequisites:
 
-1. **Fork and Clone**
-   ```bash
-   git clone https://github.com/YOUR_USERNAME/Agent-MCP.git
-   cd Agent-MCP
-   ```
+- **Python 3.10+** with [uv](https://github.com/astral-sh/uv)
+- **Node.js 22.x** (for the dashboard build)
+- **Ollama** with a small embedding model (`qwen3-embedding:0.6b`
+  recommended; or any OpenAI-compatible embedding endpoint via
+  `OPENAI_BASE_URL` / `OPENAI_API_KEY`)
 
-2. **Install Dependencies**
-   ```bash
-   # Python dependencies
-   uv venv && uv pip install -e .
-   
-   # Dashboard dependencies
-   cd agent_mcp/dashboard
-   npm install
-   cd ../..
-   ```
+```sh
+git clone https://github.com/dvaerum/Agent-MCP.git
+cd Agent-MCP
 
-3. **Configure Environment**
-   ```bash
-   cp .env.example .env
-   # Add your OpenAI API key to .env
-   ```
+uv venv && uv pip install -e .[dev]
 
-4. **Setup Claude Code Hooks** (Important for multi-agent development)
-   ```bash
-   ./setup-claude-hooks.sh
-   ```
+# Dashboard (only needed if you're touching the dashboard)
+( cd agent_mcp/dashboard && npm ci )
 
-5. **Verify Setup**
-   ```bash
-   # Run tests
-   pytest
-   
-   # Start server
-   uv run -m agent_mcp.cli --project-dir .
-   
-   # Start dashboard (in new terminal)
-   cd agent_mcp/dashboard && npm run dev
-   ```
+# Run tests
+pytest
 
-## 🔄 Development Workflow
+# Lint
+ruff check .
 
-### Branch Strategy
-- `main` - Production-ready code
-- `feature/your-feature-name` - New features
-- `fix/issue-description` - Bug fixes
-- `docs/improvement-description` - Documentation updates
+# Dashboard build (CI does this)
+( cd agent_mcp/dashboard && npm run build )
+```
 
-### Making Changes
+OpenAI API key not required — local Ollama works fine. Set
+`OPENAI_BASE_URL=http://127.0.0.1:11434/v1` and any non-empty
+`OPENAI_API_KEY`.
 
-1. **Create a Feature Branch**
-   ```bash
-   git checkout -b feature/your-feature-name
-   ```
+## Branch layout
 
-2. **Development Guidelines**
-   - Follow existing code style and patterns
-   - Add tests for new functionality
-   - Update documentation as needed
-   - Use the multi-agent workflow when possible (see below)
+- **`main`** — production HEAD. The Nix deployment pins to a sha on
+  this branch. Every accepted change lands here via PR.
+- **`upstream-mirror`** — fast-forward only; mirrors
+  `rinadelph/Agent-MCP:main`. Useful for `git log upstream-mirror..main`
+  to see "what did we add", and as the base for cherry-picks intended
+  for upstream PRs.
+- **Topic branches** off `main`:
+  - `fix/<short-slug>` — bug fix
+  - `feat/<short-slug>` — new capability
+  - `chore/<short-slug>` — build, CI, docs, refactor
+  - `upstream/<short-slug>` — branch off `upstream-mirror`, used only
+    when we're preparing a PR to send back to upstream
 
-3. **Multi-Agent Development** (Recommended)
-   - Use Agent-MCP itself for development
-   - Create specialized agents for different tasks
-   - Follow the MCD (Main Context Document) approach
-   - Document your multi-agent workflow in commit messages
+Don't push directly to `main`. Don't push to `upstream-mirror` from
+your machine — it ff-syncs from upstream:
 
-### Code Style
+```sh
+git fetch upstream
+git checkout upstream-mirror
+git pull --ff-only        # pulls upstream/main into upstream-mirror
+git push origin upstream-mirror
+```
 
-**Python Code:**
-- Use `ruff` for linting and formatting
-- Follow PEP 8 guidelines
-- Run `rye run lint` and `rye run format` before committing
+(If `upstream` isn't a remote yet:
+`git remote add upstream https://github.com/rinadelph/Agent-MCP.git`.)
 
-**JavaScript/TypeScript:**
-- Use ESLint configuration provided
-- Follow existing patterns in the dashboard
-- Run `npm run lint` in the dashboard directory
+## TDD: red, green, ship
 
-**Testing:**
-- Write pytest tests with real objects (no mocking)
-- Use function-style tests instead of class-style
-- Ensure all tests pass before submitting PR
+Every PR with behavioral change must include:
 
-### Commit Guidelines
+1. A failing test that demonstrates the bug or missing capability
+   (the "red" commit).
+2. The minimum code change that makes it pass (the "green" commit).
+3. Optional refactor commits after green.
 
-- Use conventional commit format: `type(scope): description`
-- Types: `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`
-- Examples:
-  - `feat(tools): add new file locking mechanism`
-  - `fix(hooks): resolve Claude Code hook path issues`
-  - `docs(setup): add hook configuration instructions`
+Build-only PRs (Nix build hygiene, CI config, font/asset changes) are
+exempt — they just need to keep CI green.
 
-## 🐛 Reporting Issues
+Tests live in `tests/`. The default surface is **integration tests**:
+spin up agent-mcp as an in-process ASGI app via the httpx test client,
+hit it with real MCP-over-SSE / JSON-RPC, assert. Unit tests are fine
+for pure-logic bits (regex, schema generation). End-to-end tests
+against a real systemd + Ollama deployment live in
+[nixos-developer-system/users/dennis/agent-mcp/tests/] and are run
+manually as part of release verification — **not** part of CI here.
 
-### Bug Reports
-Please include:
-- **Environment details** (OS, Python version, Node.js version)
-- **Steps to reproduce** the issue
-- **Expected vs actual behavior**
-- **Error messages** and stack traces
-- **Configuration details** (hook setup, environment variables)
+[nixos-developer-system/users/dennis/agent-mcp/tests/]: https://cms.best.aau.dk/dennis/nixos-developer-system/src/branch/main/users/dennis/agent-mcp/tests
 
-### Feature Requests
-Please include:
-- **Use case description** and motivation
-- **Proposed solution** or approach
-- **Alternative solutions** considered
-- **Impact on existing functionality**
+## CI must pass
 
-## 🚀 Pull Request Process
+`.github/workflows/ci.yml` runs `pytest`, `ruff check .`, and
+`( cd agent_mcp/dashboard && npm ci && npm run build )` on every
+push and PR. Red CI blocks merge.
 
-1. **Pre-submission Checklist**
-   - [ ] All tests pass (`pytest`)
-   - [ ] Code is properly formatted (`rye run format`)
-   - [ ] No linting errors (`rye run lint`)
-   - [ ] Dashboard builds without errors (`npm run build`)
-   - [ ] Documentation is updated
-   - [ ] Hooks configuration works correctly
+## PR template
 
-2. **PR Description Template**
-   ```markdown
-   ## Summary
-   Brief description of changes
-   
-   ## Changes Made
-   - List of specific changes
-   - Include any breaking changes
-   
-   ## Testing
-   - How the changes were tested
-   - Any new test cases added
-   
-   ## Multi-Agent Workflow (if applicable)
-   - Description of agents used
-   - Task breakdown approach
-   - Coordination strategies employed
-   
-   ## Checklist
-   - [ ] Tests pass
-   - [ ] Documentation updated
-   - [ ] Hooks work correctly
-   - [ ] No breaking changes (or clearly documented)
-   ```
+`.github/PULL_REQUEST_TEMPLATE.md` is auto-populated on every new PR.
+Fill in every section that applies. "I'll add tests later" is a no.
 
-3. **Review Process**
-   - Maintainers will review within 1-2 weeks
-   - Address feedback promptly
-   - Ensure CI checks pass
-   - Squash commits if requested
+## Upstreaming a fix to rinadelph/Agent-MCP
 
-## 📚 Development Resources
+When a fix is general (i.e. anyone running upstream could use it,
+not just our deployment), open a PR against upstream too:
 
-### Key Architecture Components
-- **MCP Server** (`agent_mcp/app/`) - Core protocol implementation
-- **Tools Registry** (`agent_mcp/tools/`) - Modular tool system
-- **RAG System** (`agent_mcp/features/rag/`) - Context management
-- **Dashboard** (`agent_mcp/dashboard/`) - Real-time visualization
-- **Hooks** (`agent_mcp/hooks/`) - File locking and coordination
+```sh
+git fetch upstream
+git checkout -b upstream/<slug> upstream-mirror
+git cherry-pick -x <merged-fix-sha>     # -x records the cherry-pick source
+git push origin upstream/<slug>
+gh pr create -R rinadelph/Agent-MCP --base main \
+  --title "..." --body "..."
+```
 
-### Important Concepts
-- **Short-lived agents** with persistent shared memory
-- **Linear task decomposition** for predictable execution
-- **File-level locking** for conflict prevention
-- **RAG-based context** sharing between agents
+Expect months of latency on review (upstream is dormant). The point
+is that our patches are upstream-shaped if/when they wake up.
 
-### Testing Philosophy
-- Real objects over mocks for integration testing
-- Function-style tests for clarity
-- Test multi-agent scenarios when possible
-- Verify hook functionality in test environments
+## Tree layout reminder
 
-## 🤝 Community Guidelines
+This repo has **two parallel implementations**: `agent_mcp/` (Python,
+what the NixOS deployment runs) and `agent-mcp-node/` (TypeScript,
+upstream's newer rewrite). PRs in this fork target Python by default.
+CI builds + tests Python only. Don't delete the Node tree — keeping
+both keeps upstream PRs clean and leaves room to absorb Node work
+into Python later.
 
-### Code of Conduct
-- Be respectful and inclusive
-- Focus on constructive feedback
-- Help newcomers learn the system
-- Share knowledge about multi-agent development
+## Out of scope for this fork
 
-### Communication Channels
-- **GitHub Issues** - Bug reports and feature requests
-- **GitHub Discussions** - General questions and community sharing
-- **Discord** - Real-time community chat and support
+- Per-user dashboard authentication (the dashboard is admin-by-design
+  here; securing the URL is the deployer's job).
+- Migration to Postgres+pgvector (deliberate — SQLite per project
+  matches the deployment's per-project isolation model).
+- Single-process multi-tenant rewrite (the systemd-per-project +
+  router model stays — blast radius is the reason).
 
-### Recognition
-Contributors will be:
-- Added to the contributors list
-- Credited in release notes for significant contributions
-- Invited to join the core contributor team for sustained involvement
+See [ADRs] in the deployment repo for the trade-offs.
 
-## 📄 License
-
-By contributing to Agent-MCP, you agree that your contributions will be licensed under the AGPL-3.0 license. This ensures that all improvements benefit the open-source community, even in server/SaaS deployments.
-
-## 🆘 Getting Help
-
-- **Documentation**: Check `/docs` directory and README
-- **Setup Issues**: Try the `./setup-claude-hooks.sh` script
-- **Multi-Agent Questions**: Look at MCD examples in `/MCD-EXAMPLE`
-- **Technical Support**: Open a GitHub issue with detailed information
-
----
-
-**Thank you for contributing to Agent-MCP!** Your efforts help advance the future of multi-agent AI collaboration.
+[ADRs]: https://cms.best.aau.dk/dennis/nixos-developer-system/src/branch/main/users/dennis/agent-mcp/docs/adr
