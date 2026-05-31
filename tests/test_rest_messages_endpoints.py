@@ -1,0 +1,278 @@
+"""REST endpoints for agent_messages (Phase 6 PR #20).
+
+The dashboard's new Messages tab needs:
+- GET /api/messages with filters (from/to/between/type/priority/
+  read/since/until/q/limit/offset)
+- POST /api/messages — admin compose
+- PATCH /api/messages/<id> — flip read/delivered for admin housekeeping
+
+Token in JSON body, matching the Q6a.1 convention used by the
+existing memory + task endpoints.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import secrets
+
+
+def _admin(client) -> str:
+    return client.get("/api/tokens").json()["admin_token"]
+
+
+def _seed_worker(name: str) -> str:
+    """Insert a worker row + register in globals. Returns the token."""
+    from agent_mcp.core import globals as g
+    from agent_mcp.db.connection import get_db_connection
+
+    token = secrets.token_hex(16)
+    now = _dt.datetime.now().isoformat()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO agents (token, agent_id, capabilities, created_at, "
+        "status, working_directory, color, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (token, name, "[]", now, "active", "/tmp", "#888", now),
+    )
+    conn.commit()
+    conn.close()
+
+    g.active_agents[token] = {
+        "agent_id": name,
+        "status": "active",
+        "created_at": now,
+        "capabilities": [],
+    }
+    return token
+
+
+# ---------- POST /api/messages ----------------------------------
+
+
+def test_post_messages_creates_message_with_admin_token(client) -> None:
+    admin = _admin(client)
+    _seed_worker("alice")
+
+    r = client.post(
+        "/api/messages",
+        json={
+            "token": admin,
+            "recipient_id": "alice",
+            "message_content": "hello alice",
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body.get("success") is True, body
+    assert "message_id" in body, body
+
+
+def test_post_messages_rejects_bad_token(client) -> None:
+    _seed_worker("alice")
+    r = client.post(
+        "/api/messages",
+        json={
+            "token": "x" * 32,
+            "recipient_id": "alice",
+            "message_content": "hi",
+        },
+    )
+    assert r.status_code == 403, r.text
+
+
+def test_post_messages_rejects_missing_recipient(client) -> None:
+    admin = _admin(client)
+    r = client.post(
+        "/api/messages",
+        json={"token": admin, "message_content": "lonely"},
+    )
+    assert r.status_code == 400, r.text
+
+
+def test_post_messages_rejects_missing_content(client) -> None:
+    admin = _admin(client)
+    _seed_worker("alice")
+    r = client.post(
+        "/api/messages",
+        json={"token": admin, "recipient_id": "alice"},
+    )
+    assert r.status_code == 400, r.text
+
+
+# ---------- GET /api/messages ----------------------------------
+
+
+def test_get_messages_lists_seeded_messages(client) -> None:
+    admin = _admin(client)
+    _seed_worker("alice")
+
+    # Seed via POST.
+    posted = client.post(
+        "/api/messages",
+        json={
+            "token": admin,
+            "recipient_id": "alice",
+            "message_content": "findable",
+        },
+    ).json()
+    msg_id = posted["message_id"]
+
+    # GET requires admin token in query or body (admin in body for
+    # consistency with the convention).
+    r = client.request(
+        "GET",
+        "/api/messages",
+        json={"token": admin},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "messages" in body
+    ids = [m["message_id"] for m in body["messages"]]
+    assert msg_id in ids
+
+
+def test_get_messages_filter_from(client) -> None:
+    admin = _admin(client)
+    _seed_worker("alice")
+    _seed_worker("bob")
+
+    client.post("/api/messages", json={
+        "token": admin, "recipient_id": "alice", "message_content": "to alice from admin"
+    })
+
+    r = client.request("GET", "/api/messages", json={
+        "token": admin, "from": "admin"
+    })
+    assert r.status_code == 200, r.text
+    msgs = r.json()["messages"]
+    assert all(m["sender_id"] == "admin" for m in msgs), (
+        f"filter from=admin returned non-admin senders: {[m['sender_id'] for m in msgs]}"
+    )
+
+
+def test_get_messages_filter_to(client) -> None:
+    admin = _admin(client)
+    _seed_worker("alice")
+    _seed_worker("bob")
+
+    client.post("/api/messages", json={
+        "token": admin, "recipient_id": "alice", "message_content": "to alice"
+    })
+    client.post("/api/messages", json={
+        "token": admin, "recipient_id": "bob", "message_content": "to bob"
+    })
+
+    r = client.request("GET", "/api/messages", json={
+        "token": admin, "to": "alice"
+    })
+    msgs = r.json()["messages"]
+    assert all(m["recipient_id"] == "alice" for m in msgs), (
+        f"filter to=alice returned others: {[m['recipient_id'] for m in msgs]}"
+    )
+    assert len(msgs) >= 1
+
+
+def test_get_messages_filter_read(client) -> None:
+    admin = _admin(client)
+    _seed_worker("alice")
+
+    client.post("/api/messages", json={
+        "token": admin, "recipient_id": "alice", "message_content": "unread one"
+    })
+
+    # All seeded messages start with read=False.
+    r = client.request("GET", "/api/messages", json={
+        "token": admin, "read": False
+    })
+    assert r.status_code == 200, r.text
+    msgs = r.json()["messages"]
+    assert all(m["read"] == 0 or m["read"] is False for m in msgs)
+    assert len(msgs) >= 1
+
+
+def test_get_messages_filter_content_substring(client) -> None:
+    admin = _admin(client)
+    _seed_worker("alice")
+
+    client.post("/api/messages", json={
+        "token": admin, "recipient_id": "alice", "message_content": "pineapple pizza"
+    })
+    client.post("/api/messages", json={
+        "token": admin, "recipient_id": "alice", "message_content": "boring text"
+    })
+
+    r = client.request("GET", "/api/messages", json={
+        "token": admin, "q": "pineapple"
+    })
+    msgs = r.json()["messages"]
+    assert any("pineapple" in m["message_content"] for m in msgs)
+    assert all("boring" not in m["message_content"] for m in msgs)
+
+
+def test_get_messages_pagination(client) -> None:
+    admin = _admin(client)
+    _seed_worker("alice")
+    # Seed >2 messages.
+    for i in range(3):
+        client.post("/api/messages", json={
+            "token": admin, "recipient_id": "alice", "message_content": f"msg {i}"
+        })
+
+    r = client.request("GET", "/api/messages", json={
+        "token": admin, "limit": 2, "offset": 0
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["messages"]) <= 2
+
+
+def test_get_messages_rejects_bad_token(client) -> None:
+    r = client.request("GET", "/api/messages", json={"token": "x" * 32})
+    assert r.status_code == 403, r.text
+
+
+# ---------- PATCH /api/messages/<id> ----------------------------
+
+
+def test_patch_messages_marks_read(client) -> None:
+    admin = _admin(client)
+    _seed_worker("alice")
+    posted = client.post("/api/messages", json={
+        "token": admin, "recipient_id": "alice", "message_content": "to be read"
+    }).json()
+    msg_id = posted["message_id"]
+
+    r = client.request("PATCH", f"/api/messages/{msg_id}", json={
+        "token": admin, "read": True
+    })
+    assert r.status_code == 200, r.text
+    assert r.json().get("success") is True
+
+    # Verify via GET.
+    listing = client.request("GET", "/api/messages", json={
+        "token": admin
+    }).json()
+    msg = next(m for m in listing["messages"] if m["message_id"] == msg_id)
+    assert msg["read"] in (1, True)
+
+
+def test_patch_messages_404_on_unknown_id(client) -> None:
+    admin = _admin(client)
+    r = client.request("PATCH", "/api/messages/msg_doesnotexist", json={
+        "token": admin, "read": True
+    })
+    assert r.status_code == 404, r.text
+
+
+def test_patch_messages_rejects_bad_token(client) -> None:
+    admin = _admin(client)
+    _seed_worker("alice")
+    posted = client.post("/api/messages", json={
+        "token": admin, "recipient_id": "alice", "message_content": "hi"
+    }).json()
+    r = client.request("PATCH", f"/api/messages/{posted['message_id']}", json={
+        "token": "x" * 32, "read": True
+    })
+    assert r.status_code == 403, r.text
