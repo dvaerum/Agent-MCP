@@ -3612,7 +3612,7 @@ def register_task_tools():
             "properties": {
                 "token": {
                     "type": "string",
-                    "description": "Admin authentication token",
+                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
                 },
                 "agent_token": {
                     "type": "string",
@@ -3710,7 +3710,7 @@ def register_task_tools():
                     "description": "Reason for overriding RAG validation (required if override_rag is true)",
                 },
             },
-            "required": ["token"],
+            "required": [],
             "additionalProperties": False,
         },
         implementation=assign_task_tool_impl,
@@ -3724,7 +3724,7 @@ def register_task_tools():
             "properties": {
                 "token": {
                     "type": "string",
-                    "description": "Agent authentication token",
+                    "description": "Agent authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
                 },
                 "task_title": {"type": "string", "description": "Title of the task"},
                 "task_description": {
@@ -3747,7 +3747,7 @@ def register_task_tools():
                     "description": "ID of the parent task (defaults to agent's current task if not specified, but MUST have a parent)",
                 },
             },
-            "required": ["token", "task_title", "task_description"],
+            "required": ["task_title", "task_description"],
             "additionalProperties": False,
         },
         implementation=create_self_task_tool_impl,
@@ -3761,7 +3761,7 @@ def register_task_tools():
             "properties": {
                 "token": {
                     "type": "string",
-                    "description": "Authentication token (agent or admin)",
+                    "description": "Authentication token (agent or admin). Optional if Authorization: Bearer header is supplied (recommended).",
                 },
                 "task_id": {
                     "type": "string",
@@ -3827,7 +3827,7 @@ def register_task_tools():
                     "default": True,
                 },
             },
-            "required": ["token", "status"],
+            "required": ["status"],
             "additionalProperties": False,
         },
         implementation=update_task_status_tool_impl,
@@ -3839,7 +3839,7 @@ def register_task_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {"type": "string", "description": "Authentication token"},
+                "token": {"type": "string", "description": "Authentication token. Optional if Authorization: Bearer header is supplied (recommended)."},
                 "agent_id": {
                     "type": "string",
                     "description": "Filter tasks by agent ID (optional). If non-admin, can only be self.",
@@ -3900,7 +3900,7 @@ def register_task_tools():
                     "default": "created_at",
                 },
             },
-            "required": ["token"],
+            "required": [],
             "additionalProperties": False,
         },
         implementation=view_tasks_tool_impl,
@@ -3912,7 +3912,7 @@ def register_task_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {"type": "string", "description": "Authentication token"},
+                "token": {"type": "string", "description": "Authentication token. Optional if Authorization: Bearer header is supplied (recommended)."},
                 "search_query": {
                     "type": "string",
                     "description": "Search terms to find in tasks",
@@ -3939,7 +3939,7 @@ def register_task_tools():
                     "description": "Include notes content in search (default: true)",
                 },
             },
-            "required": ["token", "search_query"],
+            "required": ["search_query"],
             "additionalProperties": False,
         },
         implementation=search_tasks_tool_impl,
@@ -3953,7 +3953,7 @@ def register_task_tools():
             "properties": {
                 "token": {
                     "type": "string",
-                    "description": "Agent authentication token",
+                    "description": "Agent authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
                 },
                 "task_id": {
                     "type": "string",
@@ -3964,7 +3964,7 @@ def register_task_tools():
                     "description": "Description of the assistance required.",
                 },
             },
-            "required": ["token", "task_id", "description"],
+            "required": ["task_id", "description"],
             "additionalProperties": False,
         },
         implementation=request_assistance_tool_impl,
@@ -3978,7 +3978,7 @@ def register_task_tools():
             "properties": {
                 "token": {
                     "type": "string",
-                    "description": "Authentication token (agent or admin)",
+                    "description": "Authentication token (agent or admin). Optional if Authorization: Bearer header is supplied (recommended).",
                 },
                 "operations": {
                     "type": "array",
@@ -4035,7 +4035,7 @@ def register_task_tools():
                     "minItems": 1,
                 },
             },
-            "required": ["token", "operations"],
+            "required": ["operations"],
             "additionalProperties": False,
         },
         implementation=bulk_task_operations_tool_impl,
@@ -4049,7 +4049,7 @@ def register_task_tools():
             "properties": {
                 "token": {
                     "type": "string",
-                    "description": "Admin authentication token",
+                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
                 },
                 "task_id": {
                     "type": "string",
@@ -4061,7 +4061,7 @@ def register_task_tools():
                     "default": False,
                 },
             },
-            "required": ["token", "task_id"],
+            "required": ["task_id"],
             "additionalProperties": False,
         },
         implementation=delete_task_tool_impl,

@@ -52,9 +52,9 @@ def register_agent_tools():
         input_schema={ # From main.py:1774-1786
             "type": "object",
             "properties": {
-                "token": {"type": "string", "description": "Agent authentication token (the agent's own token)"}
+                "token": {"type": "string", "description": "Agent authentication token (the agent's own token). Optional if Authorization: Bearer header is supplied (recommended)."}
             },
-            "required": ["token"],
+            "required": [],
             "additionalProperties": False
         },
         implementation=get_system_prompt_tool_impl

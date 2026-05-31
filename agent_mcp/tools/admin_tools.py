@@ -1382,7 +1382,7 @@ def register_admin_tools():
             "properties": {
                 "token": {
                     "type": "string",
-                    "description": "Admin authentication token",
+                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
                 },
                 "agent_id": {
                     "type": "string",
@@ -1429,7 +1429,7 @@ def register_admin_tools():
                     "maximum": 30,
                 },
             },
-            "required": ["token", "agent_id", "task_ids"],
+            "required": ["agent_id", "task_ids"],
             "additionalProperties": False,
         },
         implementation=create_agent_tool_impl,
@@ -1441,9 +1441,9 @@ def register_admin_tools():
         input_schema={  # From main.py:1663-1674
             "type": "object",
             "properties": {
-                "token": {"type": "string", "description": "Admin authentication token"}
+                "token": {"type": "string", "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended)."}
             },
-            "required": ["token"],
+            "required": [],
             "additionalProperties": False,
         },
         implementation=view_status_tool_impl,
@@ -1457,14 +1457,14 @@ def register_admin_tools():
             "properties": {
                 "token": {
                     "type": "string",
-                    "description": "Admin authentication token",
+                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
                 },
                 "agent_id": {
                     "type": "string",
                     "description": "Unique identifier for the agent to terminate",
                 },
             },
-            "required": ["token", "agent_id"],
+            "required": ["agent_id"],
             "additionalProperties": False,
         },
         implementation=terminate_agent_tool_impl,
@@ -1478,7 +1478,7 @@ def register_admin_tools():
             "properties": {
                 "token": {
                     "type": "string",
-                    "description": "Admin authentication token",
+                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
                 },
                 "agent_id": {
                     "type": "string",
@@ -1496,7 +1496,7 @@ def register_admin_tools():
                     "maximum": 200,
                 },
             },
-            "required": ["token"],
+            "required": [],
             "additionalProperties": False,
         },
         implementation=view_audit_log_tool_impl,
@@ -1510,7 +1510,7 @@ def register_admin_tools():
             "properties": {
                 "token": {
                     "type": "string",
-                    "description": "Admin authentication token",
+                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
                 },
                 "filter_status": {
                     "type": "string",
@@ -1564,7 +1564,7 @@ def register_admin_tools():
                     "default": "DESC",
                 },
             },
-            "required": ["token"],
+            "required": [],
             "additionalProperties": False,
         },
         implementation=get_agent_tokens_tool_impl,
@@ -1578,7 +1578,7 @@ def register_admin_tools():
             "properties": {
                 "token": {
                     "type": "string",
-                    "description": "Admin authentication token",
+                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
                 },
                 "agent_id": {
                     "type": "string",
@@ -1599,7 +1599,7 @@ def register_admin_tools():
                     "default": "worker_with_rag",
                 },
             },
-            "required": ["token", "agent_id"],
+            "required": ["agent_id"],
             "additionalProperties": False,
         },
         implementation=relaunch_agent_tool_impl,
