@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-mcp"
-version = "2.5.2"
+version = "2.6.0"
 description = "AgentMCP v2.5 - Enhanced multi-agent system with tmux integration and worktree support"
 authors = [
     {name = "Luis Alejandro Rincon", email = "alejandro@rinconnect.com"},
@@ -28,6 +28,8 @@ dependencies = [
     "sqlite-vec",
     "httpx",
     "mcp>=1.8.1",
+    "sqlalchemy>=2.0",
+    "alembic",
 ]
 
 [project.optional-dependencies]
@@ -47,7 +49,15 @@ where = ["."]
 include = ["agent_mcp*"]
 
 [tool.setuptools.package-data]
-"agent_mcp" = ["py.typed", "templates/**/*", "static/**/*"]
+"agent_mcp" = [
+    "py.typed",
+    "templates/**/*",
+    "static/**/*",
+    "migrations/*.py",
+    "migrations/*.mako",
+    "migrations/README",
+    "migrations/versions/*.py",
+]
 
 [tool.rye]
 managed = true

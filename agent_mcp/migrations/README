@@ -1,0 +1,12 @@
+Alembic migration scripts for agent-mcp.
+
+See agent_mcp/db/README.md for the full workflow. Quick reference:
+
+    alembic revision -m "describe the change"
+    # edit migrations/versions/NNNN_describe_the_change.py
+    alembic upgrade head     # apply locally
+    git commit -a -m "feat: ..."
+
+`alembic upgrade head` also runs automatically on application
+startup, so users on existing DBs pick up new migrations the next
+time they boot agent-mcp.

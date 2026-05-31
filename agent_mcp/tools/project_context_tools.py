@@ -15,6 +15,8 @@ _SECRET_KEY_RE = re.compile(
 )
 
 import mcp.types as mcp_types
+from sqlalchemy import func, or_, select
+from sqlalchemy.exc import SQLAlchemyError
 
 from .registry import register_tool
 from ..core.config import logger
@@ -22,6 +24,8 @@ from ..core import globals as g  # Not directly used here, but auth uses it
 from ..core.auth import get_agent_id, verify_token
 from ..utils.audit_utils import log_audit
 from ..db.connection import get_db_connection, execute_db_write
+from ..db.engine import SessionLocal, get_session
+from ..db.models import ProjectContext
 from ..db.actions.agent_actions_db import log_agent_action_to_db
 
 
@@ -139,21 +143,36 @@ def _generate_context_recommendations(
     return recommendations
 
 
-def _create_context_backup(cursor, backup_name: str = None) -> Dict[str, Any]:
-    """Create a backup of all project context data"""
+def _row_to_dict(row: ProjectContext) -> Dict[str, Any]:
+    """Coerce a ProjectContext row into the same dict shape the old
+    `dict(sqlite3.Row)` produced. Several callers (backup, health
+    analysis, validation) lean on the dict surface; mirror it exactly."""
+    return {
+        "context_key": row.context_key,
+        "value": row.value,
+        "last_updated": row.last_updated,
+        "updated_by": row.updated_by,
+        "description": row.description,
+    }
+
+
+def _create_context_backup(session, backup_name: str = None) -> Dict[str, Any]:
+    """Create a backup of all project context data via the ORM."""
     if not backup_name:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_name = f"context_backup_{timestamp}"
 
-    # Fetch all context data
-    cursor.execute("SELECT * FROM project_context ORDER BY context_key")
-    all_entries = cursor.fetchall()
+    rows = (
+        session.query(ProjectContext)
+        .order_by(ProjectContext.context_key)
+        .all()
+    )
 
     backup_data = {
         "backup_name": backup_name,
         "created_at": datetime.datetime.now().isoformat(),
-        "total_entries": len(all_entries),
-        "entries": [dict(row) for row in all_entries],
+        "total_entries": len(rows),
+        "entries": [_row_to_dict(r) for r in rows],
     }
 
     return backup_data
@@ -196,73 +215,74 @@ async def view_project_context_tool_impl(
         {"context_key": context_key_filter, "search_query": search_query_filter},
     )
 
-    conn = None
     results_list: List[Dict[str, Any]] = []
     response_message: str = ""
 
+    session = SessionLocal()
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
         # Build smart query based on filters
-        where_conditions = []
-        query_params = []
+        stmt = select(
+            ProjectContext.context_key,
+            ProjectContext.value,
+            ProjectContext.description,
+            ProjectContext.updated_by,
+            ProjectContext.last_updated,
+            func.length(ProjectContext.value).label("value_size"),
+        )
 
+        conditions = []
         if context_key_filter:
-            where_conditions.append("context_key = ?")
-            query_params.append(context_key_filter)
+            conditions.append(ProjectContext.context_key == context_key_filter)
         elif search_query_filter:
             like_pattern = f"%{search_query_filter}%"
-            where_conditions.append(
-                "(context_key LIKE ? OR description LIKE ? OR value LIKE ?)"
+            conditions.append(
+                or_(
+                    ProjectContext.context_key.like(like_pattern),
+                    ProjectContext.description.like(like_pattern),
+                    ProjectContext.value.like(like_pattern),
+                )
             )
-            query_params.extend([like_pattern, like_pattern, like_pattern])
 
         if show_stale_entries:
             # Show entries older than 30 days
             thirty_days_ago = (
                 datetime.datetime.now() - datetime.timedelta(days=30)
             ).isoformat()
-            where_conditions.append("last_updated < ?")
-            query_params.append(thirty_days_ago)
+            conditions.append(ProjectContext.last_updated < thirty_days_ago)
 
-        # Build query with smart sorting
-        base_query = "SELECT context_key, value, description, updated_by, last_updated, LENGTH(value) as value_size FROM project_context"
-
-        if where_conditions:
-            base_query += " WHERE " + " AND ".join(where_conditions)
+        if conditions:
+            stmt = stmt.where(*conditions)
 
         # Smart sorting
         if sort_by == "size":
-            base_query += " ORDER BY LENGTH(value) DESC"
+            stmt = stmt.order_by(func.length(ProjectContext.value).desc())
         elif sort_by == "key":
-            base_query += " ORDER BY context_key ASC"
+            stmt = stmt.order_by(ProjectContext.context_key.asc())
         else:  # last_updated (default)
-            base_query += " ORDER BY last_updated DESC"
+            stmt = stmt.order_by(ProjectContext.last_updated.desc())
 
-        base_query += f" LIMIT {max_results}"
+        stmt = stmt.limit(max_results)
 
-        cursor.execute(base_query, query_params)
-        rows = cursor.fetchall()
+        rows = session.execute(stmt).all()
 
         # Redact secret-looking keys for non-admin callers (issue I).
         # Admins continue to see everything; workers see everything
         # EXCEPT keys matching _SECRET_KEY_RE.
         if not verify_token(agent_auth_token, "admin"):
-            rows = [r for r in rows if not _SECRET_KEY_RE.search(r["context_key"])]
+            rows = [r for r in rows if not _SECRET_KEY_RE.search(r.context_key)]
 
         # Process results with enhanced information
         for row_data in rows:
             try:
-                value_parsed = json.loads(row_data["value"])
+                value_parsed = json.loads(row_data.value)
                 json_valid = True
             except json.JSONDecodeError:
-                value_parsed = row_data["value"]
+                value_parsed = row_data.value
                 json_valid = False
 
             # Calculate additional metadata
-            entry_size = len(str(row_data["value"]))
-            last_updated = row_data["last_updated"]
+            entry_size = len(str(row_data.value))
+            last_updated = row_data.last_updated
             days_old = None
 
             if last_updated:
@@ -275,10 +295,10 @@ async def view_project_context_tool_impl(
                     pass
 
             entry_data = {
-                "key": row_data["context_key"],
+                "key": row_data.context_key,
                 "value": value_parsed,
-                "description": row_data["description"],
-                "updated_by": row_data["updated_by"],
+                "description": row_data.description,
+                "updated_by": row_data.updated_by,
                 "last_updated": last_updated,
                 "_metadata": {
                     "size_bytes": entry_size,
@@ -314,10 +334,21 @@ async def view_project_context_tool_impl(
             # Add health analysis if requested
             if show_health_analysis:
                 # Fetch all entries for comprehensive health analysis
-                cursor.execute(
-                    "SELECT context_key, value, last_updated FROM project_context"
-                )
-                all_entries = [dict(row) for row in cursor.fetchall()]
+                all_rows = session.execute(
+                    select(
+                        ProjectContext.context_key,
+                        ProjectContext.value,
+                        ProjectContext.last_updated,
+                    )
+                ).all()
+                all_entries = [
+                    {
+                        "context_key": r.context_key,
+                        "value": r.value,
+                        "last_updated": r.last_updated,
+                    }
+                    for r in all_rows
+                ]
                 health_analysis = _analyze_context_health(all_entries)
 
                 health_status = health_analysis["status"]
@@ -413,7 +444,7 @@ async def view_project_context_tool_impl(
 
             response_message = "\n".join(response_parts)
 
-    except sqlite3.Error as e_sql:
+    except SQLAlchemyError as e_sql:
         logger.error(
             f"Database error viewing project context: {e_sql}", exc_info=True
         )  # main.py:1462
@@ -430,8 +461,7 @@ async def view_project_context_tool_impl(
         logger.error(f"Unexpected error viewing project context: {e}", exc_info=True)
         response_message = f"An unexpected error occurred: {e}"
     finally:
-        if conn:
-            conn.close()
+        session.close()
 
     return [mcp_types.TextContent(type="text", text=response_message)]
 
@@ -456,7 +486,6 @@ async def _handle_single_context_update(
         },
     )
 
-    conn = None
     try:
         # Ensure value is JSON serializable before storing
         value_json_str = json.dumps(context_value_to_set)
@@ -473,60 +502,67 @@ async def _handle_single_context_update(
 
     # Define the write operation as an async function
     async def write_operation():
-        conn = None
+        session = SessionLocal()
         try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
             updated_at_iso = datetime.datetime.now().isoformat()
 
-            # Use INSERT OR REPLACE (UPSERT)
-            cursor.execute(
-                """
-                INSERT OR REPLACE INTO project_context (context_key, value, last_updated, updated_by, description)
-                VALUES (?, ?, ?, ?, ?)
-            """,
-                (
-                    context_key_to_update,
-                    value_json_str,
-                    updated_at_iso,
-                    requesting_agent_id,
-                    description_for_context,
-                ),
+            existing = (
+                session.query(ProjectContext)
+                .filter(ProjectContext.context_key == context_key_to_update)
+                .one_or_none()
             )
+            if existing is None:
+                session.add(
+                    ProjectContext(
+                        context_key=context_key_to_update,
+                        value=value_json_str,
+                        last_updated=updated_at_iso,
+                        updated_by=requesting_agent_id,
+                        description=description_for_context,
+                    )
+                )
+            else:
+                existing.value = value_json_str
+                existing.last_updated = updated_at_iso
+                existing.updated_by = requesting_agent_id
+                existing.description = description_for_context
 
-            # Log to agent_actions table
+            # Log to agent_actions table — still raw SQL for now
+            # (Phase 7j will migrate agent_actions). Reuse the existing
+            # ORM session's raw connection so the action lives in the
+            # same transaction as the project_context write.
+            raw_conn = session.connection().connection
+            cursor = raw_conn.cursor()
             log_agent_action_to_db(
                 cursor,
                 requesting_agent_id,
                 "updated_context",
                 details={"context_key": context_key_to_update, "action": "set/update"},
             )
-            conn.commit()
+
+            session.commit()
 
             logger.info(
                 f"Project context for key '{context_key_to_update}' updated by '{requesting_agent_id}'."
             )
             return "success"
 
-        except sqlite3.Error as e_sql:
-            if conn:
-                conn.rollback()
+        except SQLAlchemyError as e_sql:
+            session.rollback()
             logger.error(
                 f"Database error updating project context for key '{context_key_to_update}': {e_sql}",
                 exc_info=True,
             )
             raise e_sql
         except Exception as e:
-            if conn:
-                conn.rollback()
+            session.rollback()
             logger.error(
                 f"Unexpected error updating project context for key '{context_key_to_update}': {e}",
                 exc_info=True,
             )
             raise e
         finally:
-            if conn:
-                conn.close()
+            session.close()
 
     # Execute the write operation through the queue
     try:
@@ -537,7 +573,7 @@ async def _handle_single_context_update(
                 text=f"Project context updated successfully for key '{context_key_to_update}'.",
             )
         ]
-    except sqlite3.Error as e_sql:
+    except (sqlite3.Error, SQLAlchemyError) as e_sql:
         return [
             mcp_types.TextContent(
                 type="text", text=f"Database error updating project context: {e_sql}"
@@ -564,14 +600,14 @@ async def _handle_bulk_context_update(
 
     # Define the write operation as an async function
     async def write_operation():
-        conn = None
-        results = []
-        failed_updates = []
+        session = SessionLocal()
+        results: List[str] = []
+        failed_updates: List[str] = []
 
         try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
             updated_at_iso = datetime.datetime.now().isoformat()
+            raw_conn = session.connection().connection
+            cursor = raw_conn.cursor()
 
             # Process each update atomically
             for i, update in enumerate(updates_list):
@@ -585,20 +621,30 @@ async def _handle_bulk_context_update(
                     # Validate JSON serialization
                     value_json_str = json.dumps(context_value)
 
-                    # Execute update
-                    cursor.execute(
-                        """
-                        INSERT OR REPLACE INTO project_context (context_key, value, last_updated, updated_by, description)
-                        VALUES (?, ?, ?, ?, ?)
-                    """,
-                        (
-                            context_key,
-                            value_json_str,
-                            updated_at_iso,
-                            requesting_agent_id,
-                            description,
-                        ),
+                    existing = (
+                        session.query(ProjectContext)
+                        .filter(ProjectContext.context_key == context_key)
+                        .one_or_none()
                     )
+                    if existing is None:
+                        session.add(
+                            ProjectContext(
+                                context_key=context_key,
+                                value=value_json_str,
+                                last_updated=updated_at_iso,
+                                updated_by=requesting_agent_id,
+                                description=description,
+                            )
+                        )
+                    else:
+                        existing.value = value_json_str
+                        existing.last_updated = updated_at_iso
+                        existing.updated_by = requesting_agent_id
+                        existing.description = description
+
+                    # Flush so the row hits the connection before we
+                    # log the agent_actions row that references it.
+                    session.flush()
 
                     results.append(f"✓ Updated '{context_key}'")
 
@@ -622,7 +668,7 @@ async def _handle_bulk_context_update(
                         f"✗ Failed '{update.get('context_key', 'unknown')}': {str(e_update)}"
                     )
 
-            conn.commit()
+            session.commit()
 
             # Build response
             response_parts = [
@@ -642,27 +688,24 @@ async def _handle_bulk_context_update(
             )
             return response_parts
 
-        except sqlite3.Error as e_sql:
-            if conn:
-                conn.rollback()
+        except SQLAlchemyError as e_sql:
+            session.rollback()
             logger.error(
                 f"Database error in bulk context update: {e_sql}", exc_info=True
             )
             raise e_sql
         except Exception as e:
-            if conn:
-                conn.rollback()
+            session.rollback()
             logger.error(f"Unexpected error in bulk context update: {e}", exc_info=True)
             raise e
         finally:
-            if conn:
-                conn.close()
+            session.close()
 
     # Execute the write operation through the queue
     try:
         response_parts = await execute_db_write(write_operation)
         return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
-    except sqlite3.Error as e_sql:
+    except (sqlite3.Error, SQLAlchemyError) as e_sql:
         return [
             mcp_types.TextContent(
                 type="text", text=f"Database error in bulk update: {e_sql}"
@@ -774,14 +817,14 @@ async def bulk_update_project_context_tool_impl(
         {"update_count": len(updates)},
     )
 
-    conn = None
-    results = []
-    failed_updates = []
+    session = SessionLocal()
+    results: List[str] = []
+    failed_updates: List[str] = []
 
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
         updated_at_iso = datetime.datetime.now().isoformat()
+        raw_conn = session.connection().connection
+        cursor = raw_conn.cursor()
 
         # Process each update atomically
         for i, update in enumerate(updates):
@@ -793,20 +836,28 @@ async def bulk_update_project_context_tool_impl(
                 # Validate JSON serialization
                 value_json_str = json.dumps(context_value)
 
-                # Execute update
-                cursor.execute(
-                    """
-                    INSERT OR REPLACE INTO project_context (context_key, value, last_updated, updated_by, description)
-                    VALUES (?, ?, ?, ?, ?)
-                """,
-                    (
-                        context_key,
-                        value_json_str,
-                        updated_at_iso,
-                        requesting_agent_id,
-                        description,
-                    ),
+                existing = (
+                    session.query(ProjectContext)
+                    .filter(ProjectContext.context_key == context_key)
+                    .one_or_none()
                 )
+                if existing is None:
+                    session.add(
+                        ProjectContext(
+                            context_key=context_key,
+                            value=value_json_str,
+                            last_updated=updated_at_iso,
+                            updated_by=requesting_agent_id,
+                            description=description,
+                        )
+                    )
+                else:
+                    existing.value = value_json_str
+                    existing.last_updated = updated_at_iso
+                    existing.updated_by = requesting_agent_id
+                    existing.description = description
+
+                session.flush()
 
                 results.append(f"✓ Updated '{context_key}'")
 
@@ -830,7 +881,7 @@ async def bulk_update_project_context_tool_impl(
                     f"✗ Failed '{update.get('context_key', 'unknown')}': {str(e_update)}"
                 )
 
-        conn.commit()
+        session.commit()
 
         # Build response
         response_parts = [
@@ -850,9 +901,8 @@ async def bulk_update_project_context_tool_impl(
         )
         return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
 
-    except sqlite3.Error as e_sql:
-        if conn:
-            conn.rollback()
+    except SQLAlchemyError as e_sql:
+        session.rollback()
         logger.error(f"Database error in bulk context update: {e_sql}", exc_info=True)
         return [
             mcp_types.TextContent(
@@ -860,8 +910,7 @@ async def bulk_update_project_context_tool_impl(
             )
         ]
     except Exception as e:
-        if conn:
-            conn.rollback()
+        session.rollback()
         logger.error(f"Unexpected error in bulk context update: {e}", exc_info=True)
         return [
             mcp_types.TextContent(
@@ -869,8 +918,7 @@ async def bulk_update_project_context_tool_impl(
             )
         ]
     finally:
-        if conn:
-            conn.close()
+        session.close()
 
 
 # --- backup_project_context tool ---
@@ -904,13 +952,10 @@ async def backup_project_context_tool_impl(
         requesting_agent_id, "backup_project_context", {"backup_name": backup_name}
     )
 
-    conn = None
+    session = SessionLocal()
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
         # Create backup
-        backup_data = _create_context_backup(cursor, backup_name)
+        backup_data = _create_context_backup(session, backup_name)
 
         # Add health analysis if requested
         if include_health_report:
@@ -971,6 +1016,10 @@ async def backup_project_context_tool_impl(
             ]
         )
 
+        # log_agent_action_to_db expects a cursor; reuse the session's
+        # raw connection so the action lives in the same transaction.
+        raw_conn = session.connection().connection
+        cursor = raw_conn.cursor()
         log_agent_action_to_db(
             cursor,
             requesting_agent_id,
@@ -978,15 +1027,16 @@ async def backup_project_context_tool_impl(
             backup_name,
             {"total_entries": backup_data["total_entries"], "backup_path": backup_path},
         )
+        session.commit()
 
         return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
 
     except Exception as e:
+        session.rollback()
         logger.error(f"Error creating context backup: {e}", exc_info=True)
         return [mcp_types.TextContent(type="text", text=f"Error creating backup: {e}")]
     finally:
-        if conn:
-            conn.close()
+        session.close()
 
 
 # --- validate_context_consistency tool ---
@@ -1006,19 +1056,18 @@ async def validate_context_consistency_tool_impl(
     # Log audit
     log_audit(requesting_agent_id, "validate_context_consistency", {})
 
-    conn = None
+    session = SessionLocal()
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
         issues = []
         warnings = []
 
         # Get all context entries
-        cursor.execute(
-            "SELECT context_key, value, description, updated_by, last_updated FROM project_context ORDER BY context_key"
+        all_rows = (
+            session.query(ProjectContext)
+            .order_by(ProjectContext.context_key)
+            .all()
         )
-        all_entries = [dict(row) for row in cursor.fetchall()]
+        all_entries = [_row_to_dict(r) for r in all_rows]
 
         if not all_entries:
             return [
@@ -1117,7 +1166,7 @@ async def validate_context_consistency_tool_impl(
 
         return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
 
-    except sqlite3.Error as e_sql:
+    except SQLAlchemyError as e_sql:
         logger.error(
             f"Database error validating context consistency: {e_sql}", exc_info=True
         )
@@ -1136,8 +1185,7 @@ async def validate_context_consistency_tool_impl(
             )
         ]
     finally:
-        if conn:
-            conn.close()
+        session.close()
 
 
 # --- Register project context tools ---
@@ -1356,7 +1404,7 @@ async def delete_project_context_tool_impl(
     force_delete = arguments.get("force_delete", False)
 
     # Verify admin permissions
-    if not verify_token(admin_token, "admin"):
+    if not verify_token(admin_token, required_role="admin"):
         return [
             mcp_types.TextContent(
                 type="text", text="Unauthorized: Admin token required"
@@ -1405,21 +1453,17 @@ async def delete_project_context_tool_impl(
             )
         ]
 
-    conn = None
+    session = SessionLocal()
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        # Fetch existing rows up front so we know what's actually there.
+        existing_rows = (
+            session.query(ProjectContext)
+            .filter(ProjectContext.context_key.in_(keys_to_delete))
+            .all()
+        )
+        existing_map = {r.context_key: r for r in existing_rows}
 
-        # Check which keys exist
-        existing_keys = []
-        for key in keys_to_delete:
-            cursor.execute(
-                "SELECT context_key FROM project_context WHERE context_key = ?", (key,)
-            )
-            if cursor.fetchone():
-                existing_keys.append(key)
-
-        if not existing_keys:
+        if not existing_map:
             return [
                 mcp_types.TextContent(
                     type="text",
@@ -1431,31 +1475,23 @@ async def delete_project_context_tool_impl(
         deleted_count = 0
         deletion_details = []
 
-        for key in existing_keys:
-            # Get current value for logging
-            cursor.execute(
-                "SELECT value, description FROM project_context WHERE context_key = ?",
-                (key,),
+        for key, row in existing_map.items():
+            description = row.description if row.description else ""
+            session.delete(row)
+            deleted_count += 1
+            deletion_details.append(
+                {
+                    "key": key,
+                    "description": description,
+                    "was_critical": key in critical_keys_found,
+                }
             )
-            row = cursor.fetchone()
 
-            if row:
-                cursor.execute(
-                    "DELETE FROM project_context WHERE context_key = ?", (key,)
-                )
-                if cursor.rowcount > 0:
-                    deleted_count += 1
-                    deletion_details.append(
-                        {
-                            "key": key,
-                            "description": (
-                                row["description"] if row["description"] else ""
-                            ),
-                            "was_critical": key in critical_keys_found,
-                        }
-                    )
+        session.flush()
 
-        # Log the deletion action
+        # Log the deletion action via the shared connection.
+        raw_conn = session.connection().connection
+        cursor = raw_conn.cursor()
         log_agent_action_to_db(
             cursor=cursor,
             agent_id="admin",
@@ -1468,7 +1504,7 @@ async def delete_project_context_tool_impl(
             },
         )
 
-        conn.commit()
+        session.commit()
 
         # Prepare response
         response_parts = [
@@ -1498,8 +1534,7 @@ async def delete_project_context_tool_impl(
         return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
 
     except Exception as e:
-        if conn:
-            conn.rollback()
+        session.rollback()
         logger.error(f"Error in delete_project_context_tool_impl: {e}", exc_info=True)
         return [
             mcp_types.TextContent(
@@ -1507,8 +1542,7 @@ async def delete_project_context_tool_impl(
             )
         ]
     finally:
-        if conn:
-            conn.close()
+        session.close()
 
 
 # Call registration when this module is imported

@@ -17,6 +17,8 @@ from ..core import globals as g
 from ..core.auth import verify_token, get_agent_id as auth_get_agent_id
 from ..utils.json_utils import get_sanitized_json_body
 from ..db.connection import get_db_connection
+from ..db.engine import SessionLocal
+from ..db.models import ProjectContext
 from ..db.actions.agent_actions_db import log_agent_action_to_db
 
 from ..features.dashboard.api import (
@@ -984,10 +986,24 @@ async def all_data_api_route(request: Request) -> JSONResponse:
         cursor.execute("SELECT * FROM tasks ORDER BY created_at DESC")
         tasks_data = [dict(row) for row in cursor.fetchall()]
         
-        # Get all context entries
-        cursor.execute("SELECT * FROM project_context ORDER BY last_updated DESC")
-        context_data = [dict(row) for row in cursor.fetchall()]
-        
+        # Get all context entries via the ORM (Phase 7a).
+        with SessionLocal() as ctx_session:
+            ctx_rows = (
+                ctx_session.query(ProjectContext)
+                .order_by(ProjectContext.last_updated.desc())
+                .all()
+            )
+            context_data = [
+                {
+                    "context_key": r.context_key,
+                    "value": r.value,
+                    "last_updated": r.last_updated,
+                    "updated_by": r.updated_by,
+                    "description": r.description,
+                }
+                for r in ctx_rows
+            ]
+
         # Get recent agent actions (last 100)
         cursor.execute("""
             SELECT * FROM agent_actions 
@@ -1031,16 +1047,25 @@ async def context_data_api_route(request: Request) -> JSONResponse:
     """Get only context data"""
     if request.method == 'OPTIONS':
         return await handle_options(request)
-    
-    conn = None
+
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Get all context entries
-        cursor.execute("SELECT * FROM project_context ORDER BY last_updated DESC")
-        context_data = [dict(row) for row in cursor.fetchall()]
-        
+        with SessionLocal() as session:
+            rows = (
+                session.query(ProjectContext)
+                .order_by(ProjectContext.last_updated.desc())
+                .all()
+            )
+            context_data = [
+                {
+                    "context_key": r.context_key,
+                    "value": r.value,
+                    "last_updated": r.last_updated,
+                    "updated_by": r.updated_by,
+                    "description": r.description,
+                }
+                for r in rows
+            ]
+
         return JSONResponse(
             context_data,
             headers={
@@ -1049,13 +1074,10 @@ async def context_data_api_route(request: Request) -> JSONResponse:
                 'Access-Control-Allow-Headers': 'Content-Type'
             }
         )
-        
+
     except Exception as e:
         logger.error(f"Error fetching context data: {e}", exc_info=True)
         return JSONResponse({"error": f"Failed to fetch context data: {str(e)}"}, status_code=500)
-    finally:
-        if conn:
-            conn.close()
 
 # --- CORS Preflight Handler ---
 async def handle_options(request: Request) -> Response:
@@ -1104,12 +1126,9 @@ async def create_sample_memories_route(request: Request) -> JSONResponse:
     """Create sample memory entries for testing"""
     if request.method == 'OPTIONS':
         return await handle_options(request)
-    
-    conn = None
+
+    session = SessionLocal()
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
         # Sample memory entries
         sample_memories = [
             {
@@ -1141,238 +1160,257 @@ async def create_sample_memories_route(request: Request) -> JSONResponse:
                 'updated_by': 'admin'
             }
         ]
-        
+
         current_time = datetime.datetime.now().isoformat()
         created_count = 0
-        
+
         for memory in sample_memories:
-            cursor.execute("""
-                INSERT OR REPLACE INTO project_context (context_key, value, last_updated, updated_by, description)
-                VALUES (?, ?, ?, ?, ?)
-            """, (
-                memory['context_key'],
-                memory['value'],
-                current_time,
-                memory['updated_by'],
-                memory['description']
-            ))
+            existing = (
+                session.query(ProjectContext)
+                .filter(ProjectContext.context_key == memory['context_key'])
+                .one_or_none()
+            )
+            if existing is None:
+                session.add(
+                    ProjectContext(
+                        context_key=memory['context_key'],
+                        value=memory['value'],
+                        last_updated=current_time,
+                        updated_by=memory['updated_by'],
+                        description=memory['description'],
+                    )
+                )
+            else:
+                existing.value = memory['value']
+                existing.last_updated = current_time
+                existing.updated_by = memory['updated_by']
+                existing.description = memory['description']
             created_count += 1
-        
-        conn.commit()
-        
+
+        session.commit()
+
         return JSONResponse({
             "success": True,
             "message": f"Created {created_count} sample memory entries",
             "created_count": created_count
         })
-        
+
     except Exception as e:
-        if conn:
-            conn.rollback()
+        session.rollback()
         logger.error(f"Error creating sample memories: {e}", exc_info=True)
         return JSONResponse({
             "success": False,
             "error": str(e)
         }, status_code=500)
     finally:
-        if conn:
-            conn.close()
+        session.close()
 
 # Memory CRUD API endpoints
 async def create_memory_api_route(request: Request) -> JSONResponse:
     """Create a new memory entry"""
     if request.method == 'OPTIONS':
         return await handle_options(request)
-    
+
     if request.method != 'POST':
         return JSONResponse({"error": "Method not allowed"}, status_code=405)
-    
-    conn = None
+
+    session = None
     try:
         data = await get_sanitized_json_body(request)
         admin_token = data.get('token')
         context_key = data.get('context_key')
         context_value = data.get('context_value')
         description = data.get('description')
-        
+
         if not verify_token(admin_token, required_role='admin'):
             return JSONResponse({"error": "Invalid admin token"}, status_code=403)
-        
+
         if not context_key:
             return JSONResponse({"error": "context_key is required"}, status_code=400)
-        
+
         requesting_admin_id = auth_get_agent_id(admin_token)
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
+
+        session = SessionLocal()
+
         # Check if key already exists
-        cursor.execute("SELECT context_key FROM project_context WHERE context_key = ?", (context_key,))
-        if cursor.fetchone():
+        existing = (
+            session.query(ProjectContext)
+            .filter(ProjectContext.context_key == context_key)
+            .one_or_none()
+        )
+        if existing is not None:
             return JSONResponse({"error": "Memory with this key already exists"}, status_code=409)
-        
+
         current_time = datetime.datetime.now().isoformat()
-        
-        cursor.execute("""
-            INSERT INTO project_context (context_key, value, last_updated, updated_by, description)
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            context_key,
-            json.dumps(context_value),
-            current_time,
-            requesting_admin_id,
-            description
-        ))
-        
-        # Log the action
+
+        session.add(
+            ProjectContext(
+                context_key=context_key,
+                value=json.dumps(context_value),
+                last_updated=current_time,
+                updated_by=requesting_admin_id,
+                description=description,
+            )
+        )
+        session.flush()
+
+        # Log the action via the session's raw connection so it lands
+        # in the same transaction as the project_context insert.
+        raw_conn = session.connection().connection
+        cursor = raw_conn.cursor()
         log_agent_action_to_db(cursor, requesting_admin_id, "created_memory", details={"context_key": context_key})
-        conn.commit()
-        
+        session.commit()
+
         return JSONResponse({
             "success": True,
             "message": f"Memory '{context_key}' created successfully"
         })
-        
+
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:
-        if conn:
-            conn.rollback()
+        if session is not None:
+            session.rollback()
         logger.error(f"Error creating memory: {e}", exc_info=True)
         return JSONResponse({"error": f"Failed to create memory: {str(e)}"}, status_code=500)
     finally:
-        if conn:
-            conn.close()
+        if session is not None:
+            session.close()
 
 async def update_memory_api_route(request: Request) -> JSONResponse:
     """Update an existing memory entry"""
     if request.method == 'OPTIONS':
         return await handle_options(request)
-    
+
     if request.method != 'PUT':
         return JSONResponse({"error": "Method not allowed"}, status_code=405)
-    
+
     # Extract context_key from URL path
     path_parts = request.url.path.split('/')
     if len(path_parts) < 4 or not path_parts[-1]:
         return JSONResponse({"error": "context_key is required in URL"}, status_code=400)
-    
+
     context_key = path_parts[-1]
-    
-    conn = None
+
+    session = None
     try:
         data = await get_sanitized_json_body(request)
         admin_token = data.get('token')
         context_value = data.get('context_value')
         description = data.get('description')
-        
+
         if not verify_token(admin_token, required_role='admin'):
             return JSONResponse({"error": "Invalid admin token"}, status_code=403)
-        
+
         requesting_admin_id = auth_get_agent_id(admin_token)
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
+
+        session = SessionLocal()
+
         # Check if memory exists
-        cursor.execute("SELECT context_key FROM project_context WHERE context_key = ?", (context_key,))
-        if not cursor.fetchone():
+        row = (
+            session.query(ProjectContext)
+            .filter(ProjectContext.context_key == context_key)
+            .one_or_none()
+        )
+        if row is None:
             return JSONResponse({"error": "Memory not found"}, status_code=404)
-        
+
         current_time = datetime.datetime.now().isoformat()
-        
-        # Build update query dynamically
-        update_fields = ["last_updated = ?", "updated_by = ?"]
-        params = [current_time, requesting_admin_id]
-        
+
+        # Apply partial-update semantics: only overwrite the fields the
+        # caller actually supplied. Matches the legacy raw-SQL behavior.
+        row.last_updated = current_time
+        row.updated_by = requesting_admin_id
         if context_value is not None:
-            update_fields.append("value = ?")
-            params.append(json.dumps(context_value))
-        
+            row.value = json.dumps(context_value)
         if description is not None:
-            update_fields.append("description = ?")
-            params.append(description)
-        
-        params.append(context_key)
-        
-        query = f"UPDATE project_context SET {', '.join(update_fields)} WHERE context_key = ?"
-        cursor.execute(query, params)
-        
+            row.description = description
+
+        session.flush()
+
         # Log the action
+        raw_conn = session.connection().connection
+        cursor = raw_conn.cursor()
         log_agent_action_to_db(cursor, requesting_admin_id, "updated_memory", details={"context_key": context_key})
-        conn.commit()
-        
+        session.commit()
+
         return JSONResponse({
             "success": True,
             "message": f"Memory '{context_key}' updated successfully"
         })
-        
+
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:
-        if conn:
-            conn.rollback()
+        if session is not None:
+            session.rollback()
         logger.error(f"Error updating memory: {e}", exc_info=True)
         return JSONResponse({"error": f"Failed to update memory: {str(e)}"}, status_code=500)
     finally:
-        if conn:
-            conn.close()
+        if session is not None:
+            session.close()
 
 async def delete_memory_api_route(request: Request) -> JSONResponse:
     """Delete a memory entry"""
     if request.method == 'OPTIONS':
         return await handle_options(request)
-    
+
     if request.method != 'DELETE':
         return JSONResponse({"error": "Method not allowed"}, status_code=405)
-    
+
     # Extract context_key from URL path
     path_parts = request.url.path.split('/')
     if len(path_parts) < 4 or not path_parts[-1]:
         return JSONResponse({"error": "context_key is required in URL"}, status_code=400)
-    
+
     context_key = path_parts[-1]
-    
-    conn = None
+
+    session = None
     try:
         data = await get_sanitized_json_body(request)
         admin_token = data.get('token')
-        
+
         if not verify_token(admin_token, required_role='admin'):
             return JSONResponse({"error": "Invalid admin token"}, status_code=403)
-        
+
         requesting_admin_id = auth_get_agent_id(admin_token)
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
+
+        session = SessionLocal()
+
         # Check if memory exists
-        cursor.execute("SELECT context_key FROM project_context WHERE context_key = ?", (context_key,))
-        if not cursor.fetchone():
+        row = (
+            session.query(ProjectContext)
+            .filter(ProjectContext.context_key == context_key)
+            .one_or_none()
+        )
+        if row is None:
             return JSONResponse({"error": "Memory not found"}, status_code=404)
-        
+
         # Delete the memory
-        cursor.execute("DELETE FROM project_context WHERE context_key = ?", (context_key,))
-        
+        session.delete(row)
+        session.flush()
+
         # Log the action
+        raw_conn = session.connection().connection
+        cursor = raw_conn.cursor()
         log_agent_action_to_db(cursor, requesting_admin_id, "deleted_memory", details={"context_key": context_key})
-        conn.commit()
-        
+        session.commit()
+
         return JSONResponse({
             "success": True,
             "message": f"Memory '{context_key}' deleted successfully"
         })
-        
+
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:
-        if conn:
-            conn.rollback()
+        if session is not None:
+            session.rollback()
         logger.error(f"Error deleting memory: {e}", exc_info=True)
         return JSONResponse({"error": f"Failed to delete memory: {str(e)}"}, status_code=500)
     finally:
-        if conn:
-            conn.close()
+        if session is not None:
+            session.close()
 
 # --- Task CRUD endpoints (UPSTREAM_ISSUES.md issue C) ---
 # Tasks already have GET /api/tasks (list) and POST /api/update-task-dashboard
