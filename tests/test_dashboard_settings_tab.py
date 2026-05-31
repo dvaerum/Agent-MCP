@@ -40,6 +40,10 @@ def test_settings_dashboard_component_exists() -> None:
     assert "config_allow_worker_update_own_status" in src, (
         "expected the component to expose the config_allow_worker_update_own_status toggle"
     )
+    assert "config_allow_worker_create_unassigned" in src, (
+        "expected the component to expose the config_allow_worker_create_unassigned "
+        "toggle (Q6d — workers filing into the unassigned pool)"
+    )
     # Must reference the memory CRUD endpoint it's backed by.
     assert "/memories" in src, (
         "expected the component to PUT/POST to the /memories endpoint"

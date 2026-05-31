@@ -40,6 +40,37 @@ from ..utils.tmux_utils import (
 from ..utils.prompt_templates import build_agent_prompt
 
 
+def _get_config_bool(key: str, default: bool = False) -> bool:
+    """Read a boolean toggle from project_context. Defaults to `default`
+    when the key is absent or unparseable.
+
+    Mirrors the helper in `agent_communication_tools.py`. Kept local
+    here so callers in this module don't depend on cross-module
+    private helpers. If a third caller appears, promote both to
+    `agent_mcp/core/project_config.py`.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT value FROM project_context WHERE context_key = ?", (key,)
+        )
+        row = cursor.fetchone()
+        conn.close()
+    except Exception:
+        return default
+    if not row:
+        return default
+    raw = row["value"]
+    if isinstance(raw, str):
+        s = raw.strip().strip('"').lower()
+        if s in ("true", "1", "yes", "on"):
+            return True
+        if s in ("false", "0", "no", "off"):
+            return False
+    return default
+
+
 def estimate_tokens(text: str) -> int:
     """Accurate token estimation using tiktoken for GPT-4"""
     try:
@@ -1118,12 +1149,49 @@ async def assign_task_tool_impl(
     )  # Optional coordination context
     estimated_hours = arguments.get("estimated_hours")  # Optional workload estimation
 
-    if not verify_token(admin_auth_token, "admin"):  # main.py:1326
-        return [
-            mcp_types.TextContent(
-                type="text", text="Unauthorized: Admin token required"
-            )
-        ]
+    # Auth: admin can always call. Workers can call ONLY in Mode 0
+    # (unassigned task creation, no target_agent_token) when the
+    # per-project toggle config_allow_worker_create_unassigned is true
+    # (default allow). Workers cannot assign tasks to others — that
+    # capability is reserved for admin to avoid worker→worker task
+    # delegation.
+    is_admin = verify_token(admin_auth_token, "admin")
+    if not is_admin:
+        # Worker fallback: only allowed for Mode 0 (unassigned creation).
+        worker_id = get_agent_id(admin_auth_token)
+        if not worker_id:
+            return [
+                mcp_types.TextContent(
+                    type="text", text="Unauthorized: Admin token required"
+                )
+            ]
+        if target_agent_token:
+            return [
+                mcp_types.TextContent(
+                    type="text",
+                    text=(
+                        "Unauthorized: only admin may assign tasks to "
+                        "other agents. Workers may file unassigned "
+                        "tasks (omit agent_token) but cannot direct "
+                        "work to other workers."
+                    ),
+                )
+            ]
+        if not _get_config_bool("config_allow_worker_create_unassigned", default=True):
+            return [
+                mcp_types.TextContent(
+                    type="text",
+                    text=(
+                        "Unauthorized: worker self-filing of unassigned "
+                        "tasks is disabled by project policy "
+                        "(config_allow_worker_create_unassigned=false). "
+                        "Ask admin to enable it in dashboard Settings."
+                    ),
+                )
+            ]
+        # Tag the call so the unassigned-create path records the
+        # actual worker as creator, not "admin".
+        arguments["_worker_created_by"] = worker_id
 
     # Handle unassigned task creation (agent_token is optional)
     if not target_agent_token:
