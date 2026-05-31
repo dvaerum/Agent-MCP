@@ -931,7 +931,13 @@ _MESSAGE_PRIORITIES = ("low", "normal", "high", "urgent")
 
 
 async def list_messages_api_route(request: Request) -> JSONResponse:
-    """GET /api/messages with rich filters (admin token in JSON body).
+    """POST /api/messages/query with rich filters (admin token in JSON body).
+
+    Originally exposed as GET, but browsers strip request bodies from
+    GET (per the Fetch spec), which broke the dashboard's Messages tab.
+    We use POST + a dedicated /query suffix so that compose
+    (POST /api/messages) and listing (POST /api/messages/query) coexist
+    without method overloading.
 
     Body fields:
       token          (required, admin)
@@ -947,7 +953,7 @@ async def list_messages_api_route(request: Request) -> JSONResponse:
     """
     if request.method == 'OPTIONS':
         return await handle_options(request)
-    if request.method != 'GET':
+    if request.method != 'POST':
         return JSONResponse({"error": "Method not allowed"}, status_code=405)
 
     conn = None
@@ -1201,7 +1207,10 @@ routes.extend([
     Route('/api/tasks', endpoint=create_task_api_route, name="create_task_api", methods=['POST', 'OPTIONS']),
     Route('/api/tasks/{task_id}', endpoint=delete_task_api_route, name="delete_task_api", methods=['DELETE', 'OPTIONS']),
     # Messages CRUD (Phase 6 PR #20 / issue P).
-    Route('/api/messages', endpoint=list_messages_api_route, name="list_messages_api", methods=['GET', 'OPTIONS']),
+    # Listing uses POST /api/messages/query (not GET) because browsers
+    # strip GET bodies per the Fetch spec; declared before the
+    # compose route so the more specific path matches first.
+    Route('/api/messages/query', endpoint=list_messages_api_route, name="list_messages_api", methods=['POST', 'OPTIONS']),
     Route('/api/messages', endpoint=create_message_api_route, name="create_message_api", methods=['POST', 'OPTIONS']),
     Route('/api/messages/{message_id}', endpoint=patch_message_api_route, name="patch_message_api", methods=['PATCH', 'OPTIONS']),
 ])

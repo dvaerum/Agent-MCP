@@ -27,9 +27,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { apiClient } from "@/lib/api"
+import { apiClient, type Agent } from "@/lib/api"
 
-// Message row shape returned by GET /api/messages.
+// Message row shape returned by POST /api/messages/query.
 interface Message {
   message_id: string
   sender_id: string
@@ -67,13 +67,13 @@ async function adminToken(): Promise<string> {
   return tokens.admin_token
 }
 
-// Helper to call /api/messages with the JSON-body token convention.
-// httpx-style: GET with body is unusual but matches our convention
-// (Q6a.1) — other endpoints (memories, tasks) take the token in the
-// JSON body too. Fall back to query string if body-on-GET is stripped
-// by an intermediate proxy.
+// Helper to call /api/messages* with the JSON-body token convention.
+// Listing uses POST /api/messages/query because browsers strip bodies
+// from GET requests per the Fetch spec (this was the original bug).
+// Compose stays POST /api/messages; mark-read stays PATCH
+// /api/messages/<id>.
 async function callMessages(
-  method: "GET" | "POST" | "PATCH",
+  method: "POST" | "PATCH",
   pathSuffix: string,
   body: Record<string, unknown>
 ): Promise<any> {
@@ -111,6 +111,21 @@ export function MessagesDashboard() {
   const [composePriority, setComposePriority] = useState("normal")
   const [composing, setComposing] = useState(false)
 
+  // Recipient dropdown options: hardcoded admin first (admin always
+  // exists but /api/agents may not include it) + workers from
+  // /api/agents. Fetched once on mount.
+  const [agents, setAgents] = useState<Agent[]>([])
+  useEffect(() => {
+    apiClient.getAgents().then(setAgents).catch(() => setAgents([]))
+  }, [])
+  const recipientOptions = useMemo(() => {
+    const ids = new Set<string>(["admin"])
+    for (const a of agents) {
+      if (a.agent_id) ids.add(a.agent_id)
+    }
+    return Array.from(ids)
+  }, [agents])
+
   // Build a body matching the REST contract.
   const queryBody = useMemo(() => {
     return async () => {
@@ -131,7 +146,7 @@ export function MessagesDashboard() {
     setError(null)
     try {
       const body = await queryBody()
-      const data = await callMessages("GET", "", body)
+      const data = await callMessages("POST", "/query", body)
       setMessages(data.messages ?? [])
     } catch (e: any) {
       setError(e.message ?? String(e))
@@ -220,11 +235,19 @@ export function MessagesDashboard() {
             <div className="grid gap-3 md:grid-cols-3">
               <div>
                 <Label className="text-xs">Recipient agent_id</Label>
-                <Input
+                <Select
                   value={composeRecipient}
-                  onChange={(e) => setComposeRecipient(e.target.value)}
-                  placeholder="alice"
-                />
+                  onValueChange={setComposeRecipient}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="select agent" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {recipientOptions.map((id) => (
+                      <SelectItem key={id} value={id}>{id}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </div>
               <div>
                 <Label className="text-xs">Type</Label>

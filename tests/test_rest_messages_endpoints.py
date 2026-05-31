@@ -101,7 +101,22 @@ def test_post_messages_rejects_missing_content(client) -> None:
     assert r.status_code == 400, r.text
 
 
-# ---------- GET /api/messages ----------------------------------
+# ---------- POST /api/messages/query (filtered listing) -------------
+
+
+def test_list_uses_post_query_not_get_with_body(client) -> None:
+    """Regression: GET /api/messages returns 405. Filtered listing
+    must be POST /api/messages/query because the Fetch spec strips
+    bodies from GET requests in the browser.
+    """
+    admin = _admin(client)
+    r = client.request("GET", "/api/messages", json={"token": admin})
+    assert r.status_code in (404, 405), (
+        f"GET /api/messages should no longer be a route; got {r.status_code}"
+    )
+
+
+# ---------- POST /api/messages/query ---------------------------
 
 
 def test_get_messages_lists_seeded_messages(client) -> None:
@@ -121,9 +136,8 @@ def test_get_messages_lists_seeded_messages(client) -> None:
 
     # GET requires admin token in query or body (admin in body for
     # consistency with the convention).
-    r = client.request(
-        "GET",
-        "/api/messages",
+    r = client.post(
+        "/api/messages/query",
         json={"token": admin},
     )
     assert r.status_code == 200, r.text
@@ -142,7 +156,7 @@ def test_get_messages_filter_from(client) -> None:
         "token": admin, "recipient_id": "alice", "message_content": "to alice from admin"
     })
 
-    r = client.request("GET", "/api/messages", json={
+    r = client.post("/api/messages/query", json={
         "token": admin, "from": "admin"
     })
     assert r.status_code == 200, r.text
@@ -164,7 +178,7 @@ def test_get_messages_filter_to(client) -> None:
         "token": admin, "recipient_id": "bob", "message_content": "to bob"
     })
 
-    r = client.request("GET", "/api/messages", json={
+    r = client.post("/api/messages/query", json={
         "token": admin, "to": "alice"
     })
     msgs = r.json()["messages"]
@@ -183,7 +197,7 @@ def test_get_messages_filter_read(client) -> None:
     })
 
     # All seeded messages start with read=False.
-    r = client.request("GET", "/api/messages", json={
+    r = client.post("/api/messages/query", json={
         "token": admin, "read": False
     })
     assert r.status_code == 200, r.text
@@ -203,7 +217,7 @@ def test_get_messages_filter_content_substring(client) -> None:
         "token": admin, "recipient_id": "alice", "message_content": "boring text"
     })
 
-    r = client.request("GET", "/api/messages", json={
+    r = client.post("/api/messages/query", json={
         "token": admin, "q": "pineapple"
     })
     msgs = r.json()["messages"]
@@ -220,7 +234,7 @@ def test_get_messages_pagination(client) -> None:
             "token": admin, "recipient_id": "alice", "message_content": f"msg {i}"
         })
 
-    r = client.request("GET", "/api/messages", json={
+    r = client.post("/api/messages/query", json={
         "token": admin, "limit": 2, "offset": 0
     })
     assert r.status_code == 200, r.text
@@ -229,7 +243,7 @@ def test_get_messages_pagination(client) -> None:
 
 
 def test_get_messages_rejects_bad_token(client) -> None:
-    r = client.request("GET", "/api/messages", json={"token": "x" * 32})
+    r = client.post("/api/messages/query", json={"token": "x" * 32})
     assert r.status_code == 403, r.text
 
 
@@ -251,7 +265,7 @@ def test_patch_messages_marks_read(client) -> None:
     assert r.json().get("success") is True
 
     # Verify via GET.
-    listing = client.request("GET", "/api/messages", json={
+    listing = client.post("/api/messages/query", json={
         "token": admin
     }).json()
     msg = next(m for m in listing["messages"] if m["message_id"] == msg_id)
