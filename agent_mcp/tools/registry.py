@@ -32,6 +32,87 @@ async def placeholder_tool_logic(*args, **kwargs) -> List[mcp_types.TextContent]
 # For now, it's empty and will be filled as we create the tool modules.
 tool_implementations: Dict[str, Callable[..., Awaitable[List[mcp_types.TextContent]]]] = {}
 
+# Lazy import of jsonschema so the registry can be imported in
+# contexts where the dependency isn't installed (tests for the
+# registration invariant don't need to validate).
+try:
+    import jsonschema as _jsonschema  # type: ignore
+except ImportError:  # pragma: no cover
+    _jsonschema = None  # type: ignore
+
+# Top-level argument keys that real MCP clients leak into the
+# `arguments` object but that schemas (with `additionalProperties:
+# false`) will reject. These keys are reserved by the MCP spec at the
+# *params* level (CallToolRequestParams.meta / _meta) — when clients
+# put them in arguments instead, drop them silently so the call still
+# reaches the tool.
+_RESERVED_ARG_KEYS = frozenset({"_meta", "meta"})
+
+
+def _clean_arguments_for_schema(
+    arguments: Dict[str, Any], schema: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Make caller-supplied arguments tolerant of two real-world shapes
+    that LLM-driven MCP clients regularly produce and that
+    `jsonschema.validate(arguments, inputSchema)` would otherwise
+    reject:
+
+    1.  `{"token": null, ...}` — models serialize the optional
+        `token` field as JSON null when they decide "I don't have one
+        to send". Schemas declare `token` as a plain `{"type":
+        "string"}` (no `null` accepted), so validation fails with
+        `'None is not of type string'`. Strip any top-level key whose
+        value is `None`; the dispatcher's Q6e bearer-token fallback
+        will fill `token` back in from the Authorization header.
+
+    2.  `{"_meta": {...}, ...}` — some MCP client SDKs leak the
+        spec-defined `_meta` field (which belongs at the params
+        level) into the arguments object. Schemas use
+        `additionalProperties: false`, which rejects it. Drop the
+        reserved-name keys before validation.
+
+    Schema-driven cleanups go on top:
+
+    3.  If the property is `{"type": "integer"}` and the value is a
+        string of digits (or a Python bool, which jsonschema would
+        accept as integer but most tool impls treat as the bool),
+        coerce. Many LLM clients quote integer arguments.
+
+    Returns a NEW dict; never mutates the caller's input.
+    """
+    cleaned: Dict[str, Any] = {}
+    schema_props = (schema or {}).get("properties") or {}
+    for key, value in arguments.items():
+        if key in _RESERVED_ARG_KEYS:
+            continue
+        if value is None:
+            # Treat null as absent; schema-required keys with null
+            # values would also be wrong, but the dispatcher's other
+            # checks (and the tool's own arg parsing) catch those.
+            continue
+        # Integer-as-string coercion for properties declared as integers.
+        prop_schema = schema_props.get(key) or {}
+        if (
+            isinstance(value, str)
+            and prop_schema.get("type") == "integer"
+            and value.lstrip("-").isdigit()
+        ):
+            try:
+                cleaned[key] = int(value)
+                continue
+            except ValueError:  # pragma: no cover
+                pass
+        cleaned[key] = value
+    return cleaned
+
+
+def _find_schema_for(tool_name: str) -> Optional[Dict[str, Any]]:
+    for entry in tool_schemas:
+        if entry.get("name") == tool_name:
+            return entry.get("inputSchema")
+    return None
+
+
 # This list will hold the schema definitions for all tools.
 # It will be populated by defining each tool's schema.
 # Example entry:
@@ -142,6 +223,17 @@ class ToolAuthError(Exception):
     The MCP framework's call_tool wrapper catches exceptions and sets
     isError=True on the resulting CallToolResult, which is the correct
     signal for callers.
+    """
+
+
+class ToolInputValidationError(Exception):
+    """Raised when caller-supplied arguments fail jsonschema validation
+    after the dispatcher's pre-validation cleanup.
+
+    Mirrors the framework's behavior (mcp.server.lowlevel.server's
+    `call_tool` decorator) for callers: the message is prefixed
+    "Input validation error: …" and the wrapper converts the
+    exception into a CallToolResult with isError=True.
     """
 
 
@@ -262,10 +354,47 @@ async def dispatch_tool_call(
             #   return await create_agent_tool_impl(sanitized_arguments)
             # This is handled by the dict lookup now.
 
+            # -32602 regression fix: clean arguments before schema
+            # validation so real client shapes don't get rejected:
+            #
+            # - `token: null` from LLMs serializing the optional field
+            # - `_meta` leaked from params into arguments by some SDKs
+            # - integer-as-string for properties declared `"type":
+            #   "integer"`
+            #
+            # See `_clean_arguments_for_schema` for the full
+            # rationale; tests in
+            # `tests/test_call_tool_argument_tolerance.py` pin the
+            # invariant against the same handler real MCP clients hit.
+            input_schema = _find_schema_for(tool_name)
+            sanitized_arguments = _clean_arguments_for_schema(
+                sanitized_arguments, input_schema
+            )
+
+            # Run schema validation ourselves (the @call_tool decorator
+            # registers us with `validate_input=False` so it doesn't
+            # validate the *uncleaned* arguments first). Match the
+            # framework's error wording so clients with bespoke text
+            # matching keep working. Raising (instead of returning text)
+            # lets the framework's wrapper set isError=True via
+            # `_make_error_result`, same as it would have done if
+            # validation had run upstream of us.
+            if _jsonschema is not None and input_schema:
+                try:
+                    _jsonschema.validate(
+                        instance=sanitized_arguments, schema=input_schema
+                    )
+                except _jsonschema.ValidationError as e:
+                    raise ToolInputValidationError(
+                        f"Input validation error: {e.message}"
+                    )
+
             # Q6e: inject token from the Authorization-header contextvar
-            # when the caller didn't put one in arguments. Explicit
+            # when the caller didn't put one in arguments (or sent an
+            # empty / null one — `_clean_arguments_for_schema` strips
+            # nulls; we still guard against ""). Explicit non-empty
             # arguments.token always wins (no silent override).
-            if "token" not in sanitized_arguments or not sanitized_arguments.get("token"):
+            if not sanitized_arguments.get("token"):
                 header_token = request_auth_token.get()
                 if header_token:
                     sanitized_arguments = {**sanitized_arguments, "token": header_token}
@@ -283,6 +412,12 @@ async def dispatch_tool_call(
 
             return result
 
+        except ToolInputValidationError as e:
+            # Caller-error path; logged at info level (not a server
+            # bug) but still raised so isError=True reaches the
+            # client (mcp/server/lowlevel/server.py:541 → 542).
+            logger.info(f"Tool '{tool_name}' rejected arguments: {e}")
+            raise
         except Exception as e:
             logger.error(f"Error executing tool '{tool_name}': {e}", exc_info=True)
             # Re-raise so the MCP framework's `_make_error_result`
