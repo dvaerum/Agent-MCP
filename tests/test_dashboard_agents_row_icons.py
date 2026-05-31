@@ -135,6 +135,22 @@ def test_view_dialog_renders_agent_fields() -> None:
 # ---------- API client edit endpoint ------------------------------
 
 
+def test_capabilities_handling_is_defensive() -> None:
+    """Regression guard: agent.capabilities arrives as a JSON-encoded
+    string from some backend endpoints (raw column value) and as a
+    parsed array from others. The view + edit dialogs must not call
+    .join() directly on the raw value — that crashed the agents page
+    with `t.capabilities.join is not a function` during e2e."""
+    src = _read("components/dashboard/agents-dashboard.tsx")
+    # Either a dedicated helper or an inline Array.isArray guard.
+    assert ("normalizeCapabilities" in src) or ("Array.isArray" in src), (
+        "agents-dashboard.tsx must defensively normalize agent.capabilities "
+        "(use a helper named normalizeCapabilities or guard with Array.isArray) "
+        "before calling .join() — the raw column value can be a JSON-encoded "
+        "string and crashes the page otherwise"
+    )
+
+
 def test_api_client_has_edit_agent() -> None:
     """A new `editAgent` method must exist on the API client, hitting
     the upstream POST /api/agents/<id>/edit route added by this PR."""
