@@ -55,6 +55,13 @@ const POLICIES: PolicySpec[] = [
       "When on (default), workers may call update_task_status on tasks they are assigned to. When off, only the admin may transition task status.",
     default: true,
   },
+  {
+    key: "config_allow_worker_create_unassigned",
+    title: "Allow workers to file unassigned tasks",
+    description:
+      "When on (default), workers may call assign_task with no agent_token to file work into the unassigned pool for any peer to claim. When off, only the admin may create tasks.",
+    default: true,
+  },
 ]
 
 interface PolicyState {
