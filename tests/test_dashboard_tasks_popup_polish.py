@@ -81,15 +81,21 @@ def test_legacy_selected_task_state_removed() -> None:
 # ---------- Dialog widths follow shadcn idiom ---------------------
 
 
-def test_view_dialog_has_max_w_2xl() -> None:
+def test_view_dialog_has_explicit_width_override() -> None:
     src = _read_tasks()
-    # The ViewTaskDialog component's DialogContent must declare
-    # max-w-2xl so the View popup has consistent width.
+    # The ViewTaskDialog's DialogContent must declare a width override
+    # that beats the base DialogContent's `sm:max-w-lg` (which
+    # otherwise wins the cascade because both share specificity and
+    # base is declared later in the merged className string).
+    #
+    # Originally `max-w-2xl`; updated to `sm:!max-w-3xl` (Tailwind
+    # important) after the Firefox MCP audit found base `sm:max-w-lg`
+    # was squeezing every desktop dialog to 512px.
     assert re.search(
-        r"ViewTaskDialog.*?DialogContent[^>]*max-w-2xl",
+        r"ViewTaskDialog.*?DialogContent[^>]*sm:!max-w-3xl",
         src,
         re.DOTALL,
-    ), "View dialog DialogContent must use max-w-2xl"
+    ), "View dialog DialogContent must use sm:!max-w-3xl to override base sm:max-w-lg"
 
 
 def test_edit_dialog_has_max_w_xl() -> None:
