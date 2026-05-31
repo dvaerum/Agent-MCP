@@ -1,9 +1,9 @@
 "use client"
 
 import React, { useState, useEffect } from "react"
-import { 
+import {
   Users, PowerOff, Clock, AlertCircle, CheckCircle2, Shield, Cpu, Database, Network, Terminal,
-  Search, Plus, MoreVertical, Eye, RefreshCw, Copy
+  Search, Plus, MoreVertical, Eye, RefreshCw, Copy, RotateCcw, Trash2
 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -49,11 +49,13 @@ const AgentTypeIcon = React.memo(({ agentId }: { agentId: string }) => {
   return <Icon className="h-4 w-4 text-muted-foreground" />
 })
 
-const CompactAgentRow = React.memo(({ agent, onTerminate, onSelect, onTaskClick }: { 
-  agent: Agent, 
-  onTerminate: (id: string) => void, 
+const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, onSelect, onTaskClick }: {
+  agent: Agent,
+  onTerminate: (id: string) => void,
+  onRestore: (id: string) => void,
+  onPurge: (id: string) => void,
   onSelect: (agent: Agent) => void,
-  onTaskClick: (task: Task) => void 
+  onTaskClick: (task: Task) => void
 }) => {
   const { getAgentTasks } = useDataStore()
   
@@ -196,14 +198,39 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onSelect, onTaskClick 
             <Eye className="h-3.5 w-3.5" />
           </Button>
           {agent.status === 'running' && (
-            <Button 
-              variant="ghost" 
-              size="sm" 
+            <Button
+              variant="ghost"
+              size="sm"
               onClick={() => onTerminate(agent.agent_id)}
+              title="Terminate"
               className="h-7 w-7 p-0 text-destructive hover:text-destructive/80 hover:bg-destructive/10"
             >
               <PowerOff className="h-3.5 w-3.5" />
             </Button>
+          )}
+          {agent.status === 'terminated' && agent.agent_id !== 'Admin' && (
+            <>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => onRestore(agent.agent_id)}
+                title="Restore"
+                className="h-7 px-2 text-xs text-primary hover:text-primary/80 hover:bg-primary/10"
+              >
+                <RotateCcw className="h-3.5 w-3.5 mr-1" />
+                Restore
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => onPurge(agent.agent_id)}
+                title="Purge"
+                className="h-7 px-2 text-xs text-destructive hover:text-destructive/80 hover:bg-destructive/10"
+              >
+                <Trash2 className="h-3.5 w-3.5 mr-1" />
+                Purge
+              </Button>
+            </>
           )}
           <Button 
             variant="ghost" 
@@ -357,6 +384,146 @@ const onRender = (id: string, phase: "mount" | "update" | "nested-update", actua
   }
 }
 
+type PurgePreview = Awaited<ReturnType<typeof apiClient.getPurgePreview>>
+
+const PurgeAgentDialog = ({
+  agentId,
+  open,
+  onOpenChange,
+  onConfirmed,
+}: {
+  agentId: string | null
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  onConfirmed: () => void
+}) => {
+  const [preview, setPreview] = useState<PurgePreview | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [purging, setPurging] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!open || !agentId) {
+      setPreview(null)
+      setError(null)
+      return
+    }
+    let cancelled = false
+    setLoading(true)
+    setError(null)
+    apiClient
+      .getPurgePreview(agentId)
+      .then((p) => {
+        if (!cancelled) setPreview(p)
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) {
+          setError(e instanceof Error ? e.message : String(e))
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [open, agentId])
+
+  const handleConfirm = async () => {
+    if (!agentId) return
+    setPurging(true)
+    setError(null)
+    try {
+      await apiClient.purgeAgent(agentId)
+      onConfirmed()
+      onOpenChange(false)
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setPurging(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md bg-card border-border text-card-foreground">
+        <DialogHeader>
+          <DialogTitle className="text-lg">
+            Purge agent {agentId ?? ''}?
+          </DialogTitle>
+          <DialogDescription className="text-muted-foreground">
+            This deletes the agent row and tombstones every reference
+            to <code>{agentId}</code> as
+            <code className="ml-1">{preview?.tombstone ?? `[deleted-${agentId ?? ''}]`}</code>.
+            Task notes are preserved as an audit trail.
+          </DialogDescription>
+        </DialogHeader>
+        {loading && (
+          <div className="text-sm text-muted-foreground py-4">
+            Loading preview...
+          </div>
+        )}
+        {error && (
+          <div className="text-sm text-destructive py-2">{error}</div>
+        )}
+        {preview && (
+          <div className="space-y-2 text-sm">
+            <div className="font-medium">This will tombstone:</div>
+            <ul className="list-disc pl-5 space-y-1 text-muted-foreground">
+              <li>
+                {preview.counts.messages_sent} messages sent
+                {preview.samples.messages_sent[0] && (
+                  <span className="text-xs block">
+                    (last: &lsquo;{preview.samples.messages_sent[0].content}&rsquo;)
+                  </span>
+                )}
+              </li>
+              <li>{preview.counts.messages_received} messages received</li>
+              <li>
+                {preview.counts.tasks_created} tasks created
+                {preview.samples.tasks_created[0] && (
+                  <span className="text-xs block">
+                    (e.g. &lsquo;{preview.samples.tasks_created[0]}&rsquo;)
+                  </span>
+                )}
+              </li>
+              <li>
+                {preview.counts.tasks_assigned} tasks assigned
+                {preview.counts.tasks_assigned > 0 && (
+                  <span className="text-xs block">
+                    (will be set to unassigned)
+                  </span>
+                )}
+              </li>
+              <li>{preview.counts.agent_actions} agent_actions entries</li>
+            </ul>
+          </div>
+        )}
+        <DialogFooter className="gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => onOpenChange(false)}
+            size="sm"
+            disabled={purging}
+          >
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            onClick={handleConfirm}
+            size="sm"
+            disabled={purging || loading || !!error}
+            className="bg-destructive hover:bg-destructive/90 text-destructive-foreground"
+          >
+            {purging ? 'Purging...' : 'Confirm purge'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 export function AgentsDashboard() {
   const { servers, activeServerId } = useServerStore()
   const activeServer = servers.find(s => s.id === activeServerId)
@@ -366,10 +533,25 @@ export function AgentsDashboard() {
   const [selectedAgent, setSelectedAgent] = useState<Agent | null>(null)
   const [selectedTask, setSelectedTask] = useState<Task | null>(null)
   const [taskDialogOpen, setTaskDialogOpen] = useState(false)
-  
-  // Get filtered agents (only active or new agents)
+  const [purgeTargetId, setPurgeTargetId] = useState<string | null>(null)
+  const [purgeDialogOpen, setPurgeDialogOpen] = useState(false)
+
+  // Source list: include all agents (terminated rows need to surface so
+  // admins can hit Restore/Purge on them). getActiveAgents() is kept
+  // as the fallback for the "no terminated agents in this project"
+  // case but extended with any terminated rows from data.agents.
   const allAgents = data?.agents || []
-  const agents = getActiveAgents()
+  const activeAgents = getActiveAgents()
+  const terminatedAgents = allAgents.filter(
+    (a) => a.status === 'terminated'
+  )
+  // Concat + dedupe by agent_id (active first, then terminated).
+  const seen = new Set<string>()
+  const agents = [...activeAgents, ...terminatedAgents].filter((a) => {
+    if (seen.has(a.agent_id)) return false
+    seen.add(a.agent_id)
+    return true
+  })
   const isConnected = !!activeServerId && activeServer?.status === 'connected'
 
   // Fetch data on mount and when server changes
@@ -441,9 +623,24 @@ export function AgentsDashboard() {
   const handleTerminateAgent = async (agentId: string) => {
     try {
       await apiClient.terminateAgent(agentId)
+      await refreshData()
     } catch (error) {
       console.error('Failed to terminate agent:', error)
     }
+  }
+
+  const handleRestoreAgent = async (agentId: string) => {
+    try {
+      await apiClient.restoreAgent(agentId)
+      await refreshData()
+    } catch (error) {
+      console.error('Failed to restore agent:', error)
+    }
+  }
+
+  const handlePurgeAgent = (agentId: string) => {
+    setPurgeTargetId(agentId)
+    setPurgeDialogOpen(true)
   }
 
   if (!isConnected) {
@@ -601,6 +798,8 @@ export function AgentsDashboard() {
                 key={agent.agent_id}
                 agent={agent}
                 onTerminate={handleTerminateAgent}
+                onRestore={handleRestoreAgent}
+                onPurge={handlePurgeAgent}
                 onSelect={setSelectedAgent}
                 onTaskClick={handleTaskClick}
               />
@@ -633,6 +832,19 @@ export function AgentsDashboard() {
         onOpenChange={(open) => {
           setTaskDialogOpen(open)
           if (!open) setSelectedTask(null)
+        }}
+      />
+
+      {/* Purge confirmation dialog (cascade tombstone + DELETE) */}
+      <PurgeAgentDialog
+        agentId={purgeTargetId}
+        open={purgeDialogOpen}
+        onOpenChange={(open) => {
+          setPurgeDialogOpen(open)
+          if (!open) setPurgeTargetId(null)
+        }}
+        onConfirmed={() => {
+          void refreshData()
         }}
       />
       </div>

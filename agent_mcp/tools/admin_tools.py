@@ -96,6 +96,22 @@ async def create_agent_tool_impl(
             )
         ]
 
+    # Forbid `[` and `]` in agent_id. The purge cascade rewrites
+    # references to a deleted agent as the literal `[deleted-<id>]`;
+    # allowing brackets in real agent_ids would create unparseable /
+    # ambiguous tombstones.
+    if "[" in agent_id or "]" in agent_id:
+        return [
+            mcp_types.TextContent(
+                type="text",
+                text=(
+                    f"Error: invalid agent_id {agent_id!r}: `[` and `]` are "
+                    "reserved characters (used by the purge-cascade "
+                    "tombstone format `[deleted-<id>]`)."
+                ),
+            )
+        ]
+
     # Validate task_ids parameter
     if not task_ids:
         return [

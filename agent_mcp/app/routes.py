@@ -274,6 +274,17 @@ async def create_agent_dashboard_api_route(request: Request) -> JSONResponse:
         if not agent_id:
             return JSONResponse({"message": "Agent ID is required"}, status_code=400)
 
+        # Forbid `[` and `]` in agent_id — reserved for the purge
+        # cascade tombstone format `[deleted-<id>]`. Defense-in-depth:
+        # the underlying tool rejects too, but doing it here lets us
+        # respond with a clean 400 instead of bubbling a tool error.
+        if "[" in agent_id or "]" in agent_id:
+            return JSONResponse(
+                {"message": f"Invalid agent_id {agent_id!r}: `[` and `]` "
+                            "are reserved (purge-cascade tombstone format)."},
+                status_code=400,
+            )
+
         # Prepare arguments for the create_agent_tool_impl
         tool_args = {
             "token": admin_auth_token, # The tool_impl will verify this again
@@ -352,6 +363,397 @@ async def terminate_agent_dashboard_api_route(request: Request) -> JSONResponse:
     except Exception as e:
         logger.error(f"Error in terminate_agent_dashboard_api_route: {e}", exc_info=True)
         return JSONResponse({"message": f"Error terminating agent via dashboard API: {str(e)}"}, status_code=500)
+
+
+# --- Agent restore + purge endpoints (this PR) ---
+# `terminate_agent` is a soft-delete: it flips status='terminated' but
+# leaves the row + tokens + messages + tasks intact. Admins then either
+# Restore (reverse soft-delete) or Purge (hard delete + cascade
+# tombstone rewrite). Cascade table:
+#
+#   agents          → DELETE row (last in tx)
+#   agent_messages  → tombstone sender_id/recipient_id → [deleted-<id>]
+#   tasks           → tombstone created_by; SET NULL assigned_to + status=unassigned
+#   agent_actions   → tombstone agent_id
+#   tasks.notes JSON → UNTOUCHED — preserved as audit trail
+#
+# Tombstone format `[deleted-<id>]` depends on `[`/`]` being absent
+# from real agent_ids; see create_agent_tool_impl validation.
+
+
+def _purge_tombstone(agent_id: str) -> str:
+    """Tombstone literal used to rewrite references to a purged agent."""
+    return f"[deleted-{agent_id}]"
+
+
+async def restore_agent_api_route(request: Request) -> JSONResponse:
+    """POST /api/agents/<id>/restore — admin reverses a soft-delete.
+
+    Side effects of the original terminate (cleared current_task,
+    released held files, killed tmux session) are NOT undone. Admin
+    reassigns work explicitly. We only flip status back and re-add to
+    g.active_agents so the dashboard's active-list/token-list pick it
+    up again.
+    """
+    if request.method == 'OPTIONS':
+        return await handle_options(request)
+    if request.method != 'POST':
+        return JSONResponse({"error": "Method not allowed"}, status_code=405)
+
+    agent_id = request.path_params.get('agent_id')
+    if not agent_id:
+        return JSONResponse({"error": "agent_id required"}, status_code=400)
+
+    conn = None
+    try:
+        data = await get_sanitized_json_body(request)
+        admin_token = data.get('token')
+        if not verify_token(admin_token, required_role='admin'):
+            return JSONResponse(
+                {"error": "Unauthorized: admin token required"},
+                status_code=403,
+            )
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT token, status FROM agents WHERE agent_id = ?",
+            (agent_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return JSONResponse(
+                {"error": f"Agent '{agent_id}' not found"},
+                status_code=404,
+            )
+        if row["status"] != "terminated":
+            return JSONResponse(
+                {"error": f"Agent '{agent_id}' is not terminated "
+                          f"(status={row['status']!r}); nothing to restore"},
+                status_code=409,
+            )
+
+        agent_token = row["token"]
+        now = datetime.datetime.now().isoformat()
+        cursor.execute(
+            "UPDATE agents SET status = ?, terminated_at = NULL, "
+            "updated_at = ? WHERE agent_id = ?",
+            ("created", now, agent_id),
+        )
+        log_agent_action_to_db(
+            cursor, "admin", "restored_agent",
+            details={"agent_id": agent_id},
+        )
+        conn.commit()
+
+        # Re-add to in-memory active map so the dashboard sees them.
+        # We rebuild the entry from DB-known fields; capabilities/color
+        # are not surfaced through this re-add path (admin can fetch
+        # via /api/all-data if needed).
+        cursor.execute(
+            "SELECT agent_id, capabilities, created_at, status, color "
+            "FROM agents WHERE agent_id = ?",
+            (agent_id,),
+        )
+        full = cursor.fetchone()
+        if full is not None:
+            try:
+                caps = json.loads(full["capabilities"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                caps = []
+            g.active_agents[agent_token] = {
+                "agent_id": full["agent_id"],
+                "capabilities": caps,
+                "created_at": full["created_at"],
+                "status": full["status"],
+                "color": full["color"],
+            }
+
+        return JSONResponse({
+            "success": True,
+            "agent_id": agent_id,
+            "status": "created",
+            "message": f"Agent '{agent_id}' restored",
+        })
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error restoring agent {agent_id}: {e}", exc_info=True)
+        return JSONResponse(
+            {"error": f"Failed to restore agent: {str(e)}"}, status_code=500,
+        )
+    finally:
+        if conn:
+            conn.close()
+
+
+def _gather_purge_preview(cursor, agent_id: str) -> Dict[str, Any]:
+    """Compute the blast-radius counts + samples for a future purge."""
+    cursor.execute(
+        "SELECT COUNT(*) AS n FROM agent_messages WHERE sender_id = ?",
+        (agent_id,),
+    )
+    messages_sent = cursor.fetchone()["n"]
+    cursor.execute(
+        "SELECT COUNT(*) AS n FROM agent_messages WHERE recipient_id = ?",
+        (agent_id,),
+    )
+    messages_received = cursor.fetchone()["n"]
+    cursor.execute(
+        "SELECT COUNT(*) AS n FROM tasks WHERE created_by = ?",
+        (agent_id,),
+    )
+    tasks_created = cursor.fetchone()["n"]
+    cursor.execute(
+        "SELECT COUNT(*) AS n FROM tasks WHERE assigned_to = ?",
+        (agent_id,),
+    )
+    tasks_assigned = cursor.fetchone()["n"]
+    cursor.execute(
+        "SELECT COUNT(*) AS n FROM agent_actions WHERE agent_id = ?",
+        (agent_id,),
+    )
+    agent_actions = cursor.fetchone()["n"]
+
+    # Samples (most-recent first; small enough to inline in a modal).
+    def _trim(s: str | None, n: int = 80) -> str:
+        if not s:
+            return ""
+        return s if len(s) <= n else s[:n] + "..."
+
+    cursor.execute(
+        "SELECT message_content, timestamp FROM agent_messages "
+        "WHERE sender_id = ? ORDER BY timestamp DESC LIMIT 3",
+        (agent_id,),
+    )
+    sample_messages_sent = [
+        {"content": _trim(r["message_content"]), "timestamp": r["timestamp"]}
+        for r in cursor.fetchall()
+    ]
+    cursor.execute(
+        "SELECT title FROM tasks WHERE created_by = ? "
+        "ORDER BY created_at DESC LIMIT 3",
+        (agent_id,),
+    )
+    sample_tasks_created = [r["title"] for r in cursor.fetchall()]
+    cursor.execute(
+        "SELECT title FROM tasks WHERE assigned_to = ? "
+        "ORDER BY created_at DESC LIMIT 3",
+        (agent_id,),
+    )
+    sample_tasks_assigned = [r["title"] for r in cursor.fetchall()]
+
+    return {
+        "counts": {
+            "messages_sent": messages_sent,
+            "messages_received": messages_received,
+            "tasks_created": tasks_created,
+            "tasks_assigned": tasks_assigned,
+            "agent_actions": agent_actions,
+        },
+        "samples": {
+            "messages_sent": sample_messages_sent,
+            "tasks_created": sample_tasks_created,
+            "tasks_assigned": sample_tasks_assigned,
+        },
+    }
+
+
+async def purge_preview_api_route(request: Request) -> JSONResponse:
+    """GET /api/agents/<id>/purge-preview — blast-radius counts + samples.
+
+    Admin-only. Accepts the admin token via query parameter (so a plain
+    GET works without a body, which browsers strip per the Fetch spec).
+    """
+    if request.method == 'OPTIONS':
+        return await handle_options(request)
+    if request.method != 'GET':
+        return JSONResponse({"error": "Method not allowed"}, status_code=405)
+
+    agent_id = request.path_params.get('agent_id')
+    if not agent_id:
+        return JSONResponse({"error": "agent_id required"}, status_code=400)
+
+    admin_token = request.query_params.get('token')
+    if not verify_token(admin_token, required_role='admin'):
+        return JSONResponse(
+            {"error": "Unauthorized: admin token required"},
+            status_code=403,
+        )
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT status FROM agents WHERE agent_id = ?", (agent_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return JSONResponse(
+                {"error": f"Agent '{agent_id}' not found"},
+                status_code=404,
+            )
+
+        preview = _gather_purge_preview(cursor, agent_id)
+        preview["agent_id"] = agent_id
+        preview["status"] = row["status"]
+        preview["tombstone"] = _purge_tombstone(agent_id)
+        return JSONResponse(preview)
+    except Exception as e:
+        logger.error(
+            f"Error computing purge preview for {agent_id}: {e}", exc_info=True,
+        )
+        return JSONResponse(
+            {"error": f"Failed to compute purge preview: {str(e)}"},
+            status_code=500,
+        )
+    finally:
+        if conn:
+            conn.close()
+
+
+async def purge_agent_api_route(request: Request) -> JSONResponse:
+    """DELETE /api/agents/<id>?cascade=true — hard delete + cascade tombstone.
+
+    Admin-only. Wraps the cascade in a transaction (BEGIN/COMMIT) so a
+    half-purged state is impossible if any step fails. The DELETE on
+    agents runs LAST so logical references can be tombstoned while the
+    row is still present (no DB foreign keys, but this preserves
+    intent-readability).
+
+    Refuses without ?cascade=true so a bare DELETE doesn't silently
+    hard-delete data.
+    """
+    if request.method == 'OPTIONS':
+        return await handle_options(request)
+    if request.method != 'DELETE':
+        return JSONResponse({"error": "Method not allowed"}, status_code=405)
+
+    agent_id = request.path_params.get('agent_id')
+    if not agent_id:
+        return JSONResponse({"error": "agent_id required"}, status_code=400)
+
+    if request.query_params.get('cascade', '').lower() != 'true':
+        return JSONResponse(
+            {"error": "Refusing to hard-delete without cascade=true. "
+                      "Pass ?cascade=true to confirm tombstone cascade."},
+            status_code=400,
+        )
+
+    conn = None
+    try:
+        data = await get_sanitized_json_body(request)
+        admin_token = data.get('token')
+        if not verify_token(admin_token, required_role='admin'):
+            return JSONResponse(
+                {"error": "Unauthorized: admin token required"},
+                status_code=403,
+            )
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT token FROM agents WHERE agent_id = ?", (agent_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return JSONResponse(
+                {"error": f"Agent '{agent_id}' not found"},
+                status_code=404,
+            )
+        agent_token = row["token"]
+
+        # Snapshot counts before tombstoning so the response reflects
+        # what we actually rewrote.
+        preview = _gather_purge_preview(cursor, agent_id)
+        counts = preview["counts"]
+
+        tombstone = _purge_tombstone(agent_id)
+
+        # Cascade — wrapped in an explicit transaction. sqlite3's
+        # default isolation level already implicitly opens one on
+        # mutation, but we use BEGIN/COMMIT for self-documenting intent
+        # and to make rollback unambiguous.
+        cursor.execute("BEGIN")
+        try:
+            cursor.execute(
+                "UPDATE agent_messages SET sender_id = ? WHERE sender_id = ?",
+                (tombstone, agent_id),
+            )
+            cursor.execute(
+                "UPDATE agent_messages SET recipient_id = ? "
+                "WHERE recipient_id = ?",
+                (tombstone, agent_id),
+            )
+            cursor.execute(
+                "UPDATE tasks SET created_by = ? WHERE created_by = ?",
+                (tombstone, agent_id),
+            )
+            # Reassignment: anything assigned to this agent becomes
+            # unassigned (admin can pick it up + reassign).
+            cursor.execute(
+                "UPDATE tasks SET assigned_to = NULL, status = 'unassigned' "
+                "WHERE assigned_to = ?",
+                (agent_id,),
+            )
+            cursor.execute(
+                "UPDATE agent_actions SET agent_id = ? WHERE agent_id = ?",
+                (tombstone, agent_id),
+            )
+            # Audit the purge itself — written *before* the agent row
+            # disappears so the action log has a non-tombstoned
+            # 'purged_agent' entry attributable to admin.
+            log_agent_action_to_db(
+                cursor, "admin", "purged_agent",
+                details={
+                    "agent_id": agent_id,
+                    "tombstone": tombstone,
+                    "counts": counts,
+                },
+            )
+            # DELETE the agents row LAST.
+            cursor.execute("DELETE FROM agents WHERE agent_id = ?",
+                           (agent_id,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        # Drop in-memory references.
+        if agent_token in g.active_agents:
+            del g.active_agents[agent_token]
+        if agent_id in g.agent_working_dirs:
+            del g.agent_working_dirs[agent_id]
+        # Drop g.file_map entries held by this agent (cheap, idempotent).
+        for filepath, info in list(g.file_map.items()):
+            if info.get("agent_id") == agent_id:
+                del g.file_map[filepath]
+
+        return JSONResponse({
+            "success": True,
+            "agent_id": agent_id,
+            "tombstone": tombstone,
+            "counts": counts,
+            "message": f"Agent '{agent_id}' purged",
+        })
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        logger.error(f"Error purging agent {agent_id}: {e}", exc_info=True)
+        return JSONResponse(
+            {"error": f"Failed to purge agent: {str(e)}"}, status_code=500,
+        )
+    finally:
+        if conn:
+            conn.close()
 
 
 # --- Comprehensive Data Endpoint ---
@@ -498,7 +900,13 @@ routes = [
     # Added back for 1-to-1 dashboard compatibility
     Route('/api/create-agent', endpoint=create_agent_dashboard_api_route, name="create_agent_dashboard_api", methods=['POST', 'OPTIONS']),
     Route('/api/terminate-agent', endpoint=terminate_agent_dashboard_api_route, name="terminate_agent_dashboard_api", methods=['POST', 'OPTIONS']),
-    
+
+    # Restore + Purge (this PR). Path-style routes so the agent_id is
+    # part of the URL — matches the dashboard's `/agents/<id>/...` shape.
+    Route('/api/agents/{agent_id}/restore', endpoint=restore_agent_api_route, name="restore_agent_api", methods=['POST', 'OPTIONS']),
+    Route('/api/agents/{agent_id}/purge-preview', endpoint=purge_preview_api_route, name="purge_preview_api", methods=['GET', 'OPTIONS']),
+    Route('/api/agents/{agent_id}', endpoint=purge_agent_api_route, name="purge_agent_api", methods=['DELETE', 'OPTIONS']),
+
     # Catch-all OPTIONS handler for any API route
     Route('/api/{path:path}', endpoint=handle_options, methods=['OPTIONS']),
 ]
