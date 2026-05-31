@@ -187,25 +187,54 @@ class ApiClient {
     // Add timeout support
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), 10000) // 10 second timeout
-    
+
     try {
-      const response = await fetch(url, {
-        ...fetchOptions,
-        signal: controller.signal
-      })
-      
+      // Transparent cold-start retry. A lazily-spawned backend takes
+      // ~10-15s to create its Unix socket (Python import time +
+      // lifespan startup); during that window the router's proxy
+      // returns 502/503/504. Retrying on 5xx with exponential backoff
+      // (200ms, 400ms) lets the first request transparently wait for
+      // the backend instead of bubbling an error up to a boundary-
+      // level useEffect retry loop (the pattern this refactor
+      // replaces — Candidate C, architecture review 2026-06-01).
+      //
+      // Bounded at 3 attempts (200ms + 400ms = 600ms total backoff
+      // budget plus the original request's own timeout). 4xx and
+      // non-5xx are not retried.
+      let response: Response | null = null
+      for (let attempt = 0; attempt < 3; attempt++) {
+        response = await fetch(url, {
+          ...fetchOptions,
+          signal: controller.signal
+        })
+        if (
+          response.status >= 500 &&
+          response.status < 600 &&
+          attempt < 2
+        ) {
+          await new Promise(res => setTimeout(res, 200 * 2 ** attempt))
+          continue
+        }
+        break
+      }
+
       clearTimeout(timeoutId)
 
-      if (!response.ok) {
-        const errorText = await response.text().catch(() => 'Unknown error')
+      // Non-null after the loop: the loop body always assigns `response`
+      // on its first iteration, and we either continue (assigning again)
+      // or break.
+      const r = response as Response
+
+      if (!r.ok) {
+        const errorText = await r.text().catch(() => 'Unknown error')
         // Only log non-404 errors
-        if (response.status !== 404) {
-          console.error(`API Error [${response.status}]:`, errorText)
+        if (r.status !== 404) {
+          console.error(`API Error [${r.status}]:`, errorText)
         }
-        throw new Error(`API Error: ${response.status} ${response.statusText}`)
+        throw new Error(`API Error: ${r.status} ${r.statusText}`)
       }
-      
-      return await response.json()
+
+      return await r.json()
     } catch (error) {
       clearTimeout(timeoutId)
       

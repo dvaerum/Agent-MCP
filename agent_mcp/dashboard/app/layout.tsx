@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import { ThemeProvider } from "@/components/providers/theme-provider";
-import { ApiClientInitializer } from "@/components/providers/api-client-initializer";
+import { ProjectContextProvider } from "@/components/providers/project-context-provider";
 
 // Stub the font hooks so sandboxed / offline builds (Nix, Docker
 // without network egress, isolated CI) don't fail when next/font/google
@@ -32,6 +32,14 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  // The PathPrefix derivation lives in `lib/project-context.ts` as a
+  // module-level singleton computed at import time from
+  // `window.location.pathname` (Candidate C, architecture review
+  // 2026-06-01). `<ProjectContextProvider>` is a thin "use client"
+  // wrapper around `<ProjectContext.Provider value={projectContext}>`
+  // — required because this layout is a server component (exports
+  // `metadata` + `viewport`) and `createContext` is a client-only
+  // React API.
   return (
     <html lang="en" suppressHydrationWarning>
       <head>
@@ -42,8 +50,7 @@ export default function RootLayout({
         suppressHydrationWarning
       >
         <ThemeProvider>
-          <ApiClientInitializer />
-          {children}
+          <ProjectContextProvider>{children}</ProjectContextProvider>
         </ThemeProvider>
       </body>
     </html>
