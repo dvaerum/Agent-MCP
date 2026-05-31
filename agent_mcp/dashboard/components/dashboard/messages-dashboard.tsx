@@ -27,7 +27,38 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 import { apiClient, type Agent } from "@/lib/api"
+
+// Render a relative-time hint like "5 hours ago" / "in 3 minutes" so
+// admins don't have to do the timezone math themselves. Falls back to
+// the raw value if it can't be parsed.
+function relativeTime(iso: string): string {
+  const t = Date.parse(iso)
+  if (Number.isNaN(t)) return iso
+  const deltaMs = t - Date.now()
+  const abs = Math.abs(deltaMs)
+  const sec = Math.round(abs / 1000)
+  const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" })
+  const sign = deltaMs >= 0 ? 1 : -1
+  if (sec < 60) return rtf.format(sign * sec, "second")
+  const min = Math.round(sec / 60)
+  if (min < 60) return rtf.format(sign * min, "minute")
+  const hr = Math.round(min / 60)
+  if (hr < 24) return rtf.format(sign * hr, "hour")
+  const day = Math.round(hr / 24)
+  if (day < 30) return rtf.format(sign * day, "day")
+  const month = Math.round(day / 30)
+  if (month < 12) return rtf.format(sign * month, "month")
+  return rtf.format(sign * Math.round(month / 12), "year")
+}
 
 // Message row shape returned by POST /api/messages/query.
 interface Message {
@@ -112,6 +143,12 @@ export function MessagesDashboard() {
   // Per-row selection (message_id set). Cleared after every refresh
   // so we don't accidentally act on stale rows.
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+
+  // Detail modal — opened by clicking a row's content area (not the
+  // checkbox / per-row action cells, which stopPropagation). We keep
+  // the full row here rather than just the id so the modal can render
+  // without an extra fetch.
+  const [detailMessage, setDetailMessage] = useState<Message | null>(null)
 
   // Compose state.
   const [composeOpen, setComposeOpen] = useState(false)
@@ -208,10 +245,17 @@ export function MessagesDashboard() {
   const toggleRead = async (m: Message) => {
     try {
       const t = await adminToken()
+      const nextRead = !(m.read === 1 || m.read === true)
       await callMessages("PATCH", `/${m.message_id}`, {
         token: t,
-        read: !(m.read === 1 || m.read === true),
+        read: nextRead,
       })
+      // Keep the detail modal in sync when the toggle was triggered
+      // from within it — otherwise the footer label would lag the
+      // server until the next list refresh repopulates state.
+      if (detailMessage?.message_id === m.message_id) {
+        setDetailMessage({ ...detailMessage, read: nextRead })
+      }
       await refresh()
     } catch (e: any) {
       setError(e.message ?? String(e))
@@ -280,6 +324,11 @@ export function MessagesDashboard() {
     try {
       const t = await adminToken()
       await callMessages("DELETE", `/${m.message_id}`, { token: t })
+      // Close the detail modal if it was showing the deleted row, so
+      // we don't strand the user on a record that no longer exists.
+      if (detailMessage?.message_id === m.message_id) {
+        setDetailMessage(null)
+      }
       await refresh()
     } catch (e: any) {
       setError(e.message ?? String(e))
@@ -511,7 +560,11 @@ export function MessagesDashboard() {
               {messages.map((m) => {
                 const checked = selectedIds.has(m.message_id)
                 return (
-                  <TableRow key={m.message_id}>
+                  <TableRow
+                    key={m.message_id}
+                    className="cursor-pointer"
+                    onClick={() => setDetailMessage(m)}
+                  >
                     <TableCell onClick={(e) => e.stopPropagation()}>
                       <input
                         type="checkbox"
@@ -520,20 +573,14 @@ export function MessagesDashboard() {
                         onChange={() => toggleOne(m.message_id)}
                       />
                     </TableCell>
-                    <TableCell
-                      className="text-xs font-mono cursor-pointer"
-                      onClick={() => toggleRead(m)}
-                    >
+                    <TableCell className="text-xs font-mono">
                       {m.timestamp.slice(0, 19)}
                     </TableCell>
                     <TableCell><Badge variant="outline">{m.sender_id}</Badge></TableCell>
                     <TableCell><Badge variant="outline">{m.recipient_id}</Badge></TableCell>
                     <TableCell className="text-xs">{m.message_type}</TableCell>
                     <TableCell className="text-xs">{m.priority}</TableCell>
-                    <TableCell
-                      className="cursor-pointer"
-                      onClick={() => toggleRead(m)}
-                    >
+                    <TableCell>
                       {m.read === 1 || m.read === true ? "✓" : ""}
                     </TableCell>
                     <TableCell className="max-w-[400px] truncate text-xs">
@@ -556,6 +603,125 @@ export function MessagesDashboard() {
           </Table>
         </CardContent>
       </Card>
+
+      <Dialog
+        open={detailMessage !== null}
+        onOpenChange={(open) => {
+          if (!open) setDetailMessage(null)
+        }}
+      >
+        <DialogContent className="sm:max-w-2xl">
+          {detailMessage && (
+            <>
+              <DialogHeader>
+                <DialogTitle className="flex items-center gap-2">
+                  <MessageSquare className="h-5 w-5 text-primary" />
+                  Message detail
+                </DialogTitle>
+                <DialogDescription>
+                  {new Date(detailMessage.timestamp).toLocaleString()} ·{" "}
+                  {relativeTime(detailMessage.timestamp)}
+                </DialogDescription>
+              </DialogHeader>
+
+              <div className="grid grid-cols-2 gap-x-4 gap-y-3 text-sm">
+                <div>
+                  <div className="text-xs text-muted-foreground">Sender</div>
+                  <div className="font-mono break-all">
+                    {detailMessage.sender_id}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">Recipient</div>
+                  <div className="font-mono break-all">
+                    {detailMessage.recipient_id}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">Type</div>
+                  <div>
+                    <Badge variant="outline">{detailMessage.message_type}</Badge>
+                  </div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">Priority</div>
+                  <div>
+                    <Badge variant="outline">{detailMessage.priority}</Badge>
+                  </div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">Delivered</div>
+                  <div>
+                    {detailMessage.delivered === 1 ||
+                    detailMessage.delivered === true ? (
+                      <Badge variant="secondary">✓ delivered</Badge>
+                    ) : (
+                      <Badge variant="outline">✗ pending</Badge>
+                    )}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">Read</div>
+                  <div>
+                    {detailMessage.read === 1 ||
+                    detailMessage.read === true ? (
+                      <Badge variant="secondary">✓ read</Badge>
+                    ) : (
+                      <Badge variant="outline">✗ unread</Badge>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <div className="text-xs text-muted-foreground">Content</div>
+                <pre className="whitespace-pre-wrap break-words rounded-md border bg-muted/50 p-3 font-mono text-xs max-h-[40vh] overflow-auto">
+                  {detailMessage.message_content}
+                </pre>
+              </div>
+
+              <div className="text-[10px] font-mono text-muted-foreground break-all">
+                Message ID: {detailMessage.message_id}
+              </div>
+
+              <DialogFooter>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => toggleRead(detailMessage)}
+                >
+                  {detailMessage.read === 1 || detailMessage.read === true ? (
+                    <>
+                      <Mail className="h-4 w-4 mr-1" />
+                      Mark unread
+                    </>
+                  ) : (
+                    <>
+                      <MailOpen className="h-4 w-4 mr-1" />
+                      Mark read
+                    </>
+                  )}
+                </Button>
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  onClick={() => deleteOne(detailMessage)}
+                >
+                  <Trash2 className="h-4 w-4 mr-1" />
+                  Delete
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setDetailMessage(null)}
+                >
+                  Close
+                </Button>
+              </DialogFooter>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }
