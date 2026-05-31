@@ -1,21 +1,9 @@
 "use client"
 
 import React, { useState, useEffect } from "react"
-import { Plus, Server, Settings, Wifi, WifiOff, AlertCircle, Loader2 } from "lucide-react"
+import { Server, Settings, Wifi, Loader2, ExternalLink } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 import { Badge } from "@/components/ui/badge"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -24,60 +12,61 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import { useServerStore, MCPServer } from "@/lib/stores/server-store"
+
+// Patched for the NixOS deployment. Upstream's picker switches
+// between server-store entries (each = (host, port)). Our router
+// addresses projects by URL path: /agent-mcp/__dashboard/<name>/.
+// So the picker fetches the project list from the router and
+// picking an entry navigates the browser instead of swapping a
+// host:port pair.
+
+const DASHBOARD_PREFIX = "/agent-mcp/__dashboard/"
+const PROJECTS_ENDPOINT = "/agent-mcp/__projects"
+
+function readActiveProjectName(): string | null {
+  if (typeof window === "undefined") return null
+  const m = window.location.pathname.match(/\/agent-mcp\/__dashboard\/([^/]+)/)
+  return m ? m[1] : null
+}
 
 export function ProjectPicker() {
-  const {
-    servers,
-    activeServerId,
-    isConnecting,
-    connectionError,
-    setActiveServer,
-    refreshAllServers,
-    disconnectServer
-  } = useServerStore()
-
   const [isOpen, setIsOpen] = useState(false)
-  const activeServer = servers.find(s => s.id === activeServerId)
+  const [projects, setProjects] = useState<string[]>([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  // Deferred to a post-mount effect so SSG output ("Select
+  // Project") matches the first client paint, avoiding the React
+  // hydration mismatch (#418).
+  const [active, setActive] = useState<string | null>(null)
+  useEffect(() => {
+    setActive(readActiveProjectName())
+  }, [])
+
+  const fetchProjects = async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const r = await fetch(PROJECTS_ENDPOINT, { cache: "no-store" })
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      const body = await r.json()
+      setProjects(Array.isArray(body.projects) ? body.projects : [])
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLoading(false)
+    }
+  }
 
   useEffect(() => {
-    // Auto-refresh server status every 30 seconds
-    const interval = setInterval(() => {
-      refreshAllServers()
-    }, 30000)
+    fetchProjects()
+  }, [])
 
-    return () => clearInterval(interval)
-  }, [refreshAllServers])
-
-  const handleServerSelect = async (serverId: string) => {
-    await setActiveServer(serverId)
-    setIsOpen(false)
-  }
-
-  const getStatusIcon = (status: MCPServer['status']) => {
-    switch (status) {
-      case 'connected':
-        return <Wifi className="h-4 w-4 text-primary" />
-      case 'connecting':
-        return <Loader2 className="h-4 w-4 text-info animate-spin" />
-      case 'error':
-        return <AlertCircle className="h-4 w-4 text-destructive" />
-      default:
-        return <WifiOff className="h-4 w-4 text-muted-foreground" />
+  const handlePick = (name: string) => {
+    if (name === active) {
+      setIsOpen(false)
+      return
     }
-  }
-
-  const getStatusColor = (status: MCPServer['status']) => {
-    switch (status) {
-      case 'connected':
-        return 'bg-primary'
-      case 'connecting':
-        return 'bg-info'
-      case 'error':
-        return 'bg-destructive'
-      default:
-        return 'bg-muted-foreground'
-    }
+    window.location.href = `${DASHBOARD_PREFIX}${encodeURIComponent(name)}/`
   }
 
   return (
@@ -85,211 +74,82 @@ export function ProjectPicker() {
       <DropdownMenuTrigger asChild>
         <Button variant="outline" className="justify-between min-w-[200px]">
           <div className="flex items-center space-x-2">
-            {isConnecting ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <div className={`w-2 h-2 rounded-full ${activeServer ? getStatusColor(activeServer.status) : 'bg-muted-foreground'}`} />
-            )}
-            <span className="truncate">
-              {activeServer ? activeServer.name : 'Select Project'}
-            </span>
+            <div className="w-2 h-2 rounded-full bg-primary" />
+            <span className="truncate">{active ?? "Select Project"}</span>
           </div>
           <Settings className="h-4 w-4 ml-2 opacity-50" />
         </Button>
       </DropdownMenuTrigger>
-      
+
       <DropdownMenuContent className="w-80" align="start">
         <DropdownMenuLabel className="flex items-center justify-between">
           MCP Server Projects
           <Button
             variant="ghost"
             size="sm"
-            onClick={() => refreshAllServers()}
+            onClick={() => fetchProjects()}
             className="h-6 w-6 p-0"
+            disabled={loading}
           >
-            <Server className="h-3 w-3" />
+            {loading
+              ? <Loader2 className="h-3 w-3 animate-spin" />
+              : <Server className="h-3 w-3" />}
           </Button>
         </DropdownMenuLabel>
-        
+
         <DropdownMenuSeparator />
 
-        {connectionError && (
-          <div className="p-2">
-            <Card className="border-destructive/20 bg-destructive/10">
-              <CardContent className="p-3">
-                <div className="flex items-center space-x-2">
-                  <AlertCircle className="h-4 w-4 text-destructive" />
-                  <span className="text-sm text-destructive">
-                    {connectionError}
-                  </span>
-                </div>
-              </CardContent>
-            </Card>
+        {error && (
+          <div className="p-2 text-xs text-destructive">
+            Failed to load projects: {error}
           </div>
         )}
 
         <div className="max-h-[300px] overflow-y-auto">
-          {servers.map((server) => (
+          {projects.length === 0 && !loading && !error && (
+            <div className="p-3 text-xs text-muted-foreground">
+              No projects registered. Visit{" "}
+              <a href="/agent-mcp/" className="underline">
+                /agent-mcp/
+              </a>{" "}
+              to create one.
+            </div>
+          )}
+          {projects.map((name) => (
             <DropdownMenuItem
-              key={server.id}
-              onClick={() => handleServerSelect(server.id)}
+              key={name}
+              onClick={() => handlePick(name)}
               className="flex items-center justify-between p-3 cursor-pointer"
-              disabled={isConnecting}
             >
               <div className="flex items-center space-x-3">
-                {getStatusIcon(server.status)}
-                <div className="flex flex-col">
-                  <span className="font-medium">{server.name}</span>
-                  <span className="text-xs text-muted-foreground">
-                    {server.host}:{server.port}
-                  </span>
-                  {server.description && (
-                    <span className="text-xs text-muted-foreground">
-                      {server.description}
-                    </span>
-                  )}
-                </div>
+                <Wifi className="h-4 w-4 text-primary" />
+                <span className="font-medium">{name}</span>
               </div>
-              
-              <div className="flex items-center space-x-2">
-                {server.id === activeServerId && (
-                  <Badge variant="secondary" className="text-xs">
-                    Active
-                  </Badge>
-                )}
-                <Badge 
-                  variant={server.status === 'connected' ? 'default' : 'secondary'}
-                  className="text-xs"
-                >
-                  {server.status}
+              {name === active && (
+                <Badge variant="secondary" className="text-xs">
+                  Current
                 </Badge>
-              </div>
+              )}
             </DropdownMenuItem>
           ))}
         </div>
 
         <DropdownMenuSeparator />
-        
-        <div className="p-2 space-y-2">
-          <AddServerDialog />
-          
-          {activeServerId && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={disconnectServer}
-              className="w-full"
-            >
-              Disconnect
-            </Button>
-          )}
+
+        <div className="p-2">
+          <Button
+            variant="outline"
+            size="sm"
+            asChild
+            className="w-full"
+          >
+            <a href="/agent-mcp/">
+              <ExternalLink className="h-4 w-4 mr-2" />
+              Manage projects
+            </a>
+          </Button>
         </div>
       </DropdownMenuContent>
     </DropdownMenu>
-  )
-}
-
-function AddServerDialog() {
-  const { addServer } = useServerStore()
-  const [isOpen, setIsOpen] = useState(false)
-  const [formData, setFormData] = useState({
-    name: '',
-    host: 'localhost',
-    port: 8080,
-    description: ''
-  })
-
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault()
-    
-    if (!formData.name.trim()) return
-
-    addServer({
-      name: formData.name.trim(),
-      host: formData.host.trim() || 'localhost',
-      port: formData.port,
-      description: formData.description.trim()
-    })
-
-    setFormData({
-      name: '',
-      host: 'localhost',
-      port: 8080,
-      description: ''
-    })
-    
-    setIsOpen(false)
-  }
-
-  return (
-    <Dialog open={isOpen} onOpenChange={setIsOpen}>
-      <DialogTrigger asChild>
-        <Button variant="outline" size="sm" className="w-full">
-          <Plus className="h-4 w-4 mr-2" />
-          Add Server
-        </Button>
-      </DialogTrigger>
-      
-      <DialogContent className="sm:max-w-[425px]">
-        <DialogHeader>
-          <DialogTitle>Add MCP Server</DialogTitle>
-          <DialogDescription>
-            Add a new MCP server to connect to. This could be a local development server or a remote instance.
-          </DialogDescription>
-        </DialogHeader>
-        
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div className="grid gap-2">
-            <Label htmlFor="name">Project Name</Label>
-            <Input
-              id="name"
-              value={formData.name}
-              onChange={(e) => setFormData(prev => ({ ...prev, name: e.target.value }))}
-              placeholder="My Project"
-              required
-            />
-          </div>
-          
-          <div className="grid grid-cols-3 gap-2">
-            <div className="col-span-2">
-              <Label htmlFor="host">Host</Label>
-              <Input
-                id="host"
-                value={formData.host}
-                onChange={(e) => setFormData(prev => ({ ...prev, host: e.target.value }))}
-                placeholder="localhost"
-              />
-            </div>
-            <div>
-              <Label htmlFor="port">Port</Label>
-              <Input
-                id="port"
-                type="number"
-                value={formData.port}
-                onChange={(e) => setFormData(prev => ({ ...prev, port: parseInt(e.target.value) || 8080 }))}
-                placeholder="8080"
-              />
-            </div>
-          </div>
-          
-          <div className="grid gap-2">
-            <Label htmlFor="description">Description (Optional)</Label>
-            <Input
-              id="description"
-              value={formData.description}
-              onChange={(e) => setFormData(prev => ({ ...prev, description: e.target.value }))}
-              placeholder="Brief description of this server"
-            />
-          </div>
-          
-          <DialogFooter>
-            <Button type="button" variant="outline" onClick={() => setIsOpen(false)}>
-              Cancel
-            </Button>
-            <Button type="submit">Add Server</Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
   )
 }
