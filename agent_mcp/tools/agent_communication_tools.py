@@ -465,7 +465,7 @@ def register_agent_communication_tools():
             "properties": {
                 "token": {
                     "type": "string",
-                    "description": "Sender's authentication token"
+                    "description": "Sender's authentication token. Optional if Authorization: Bearer header is supplied (recommended)."
                 },
                 "recipient_id": {
                     "type": "string",
@@ -494,7 +494,7 @@ def register_agent_communication_tools():
                     "default": "tmux"
                 }
             },
-            "required": ["token", "recipient_id", "message"],
+            "required": ["recipient_id", "message"],
             "additionalProperties": False
         },
         implementation=send_agent_message_tool_impl
@@ -508,7 +508,7 @@ def register_agent_communication_tools():
             "properties": {
                 "token": {
                     "type": "string",
-                    "description": "Agent's authentication token"
+                    "description": "Agent's authentication token. Optional if Authorization: Bearer header is supplied (recommended)."
                 },
                 "include_sent": {
                     "type": "boolean",
@@ -543,7 +543,7 @@ def register_agent_communication_tools():
                     "default": False
                 }
             },
-            "required": ["token"],
+            "required": [],
             "additionalProperties": False
         },
         implementation=get_agent_messages_tool_impl
@@ -557,7 +557,7 @@ def register_agent_communication_tools():
             "properties": {
                 "token": {
                     "type": "string",
-                    "description": "Admin authentication token"
+                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended)."
                 },
                 "message": {
                     "type": "string",
@@ -576,7 +576,7 @@ def register_agent_communication_tools():
                     "default": "high"
                 }
             },
-            "required": ["token", "message"],
+            "required": ["message"],
             "additionalProperties": False
         },
         implementation=broadcast_admin_message_tool_impl

@@ -1148,7 +1148,7 @@ def register_project_context_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {"type": "string", "description": "Authentication token"},
+                "token": {"type": "string", "description": "Authentication token. Optional if Authorization: Bearer header is supplied (recommended)."},
                 "context_key": {
                     "type": "string",
                     "description": "Exact key to view (optional). If provided, search_query is ignored.",
@@ -1184,7 +1184,7 @@ def register_project_context_tools():
                     "default": "last_updated",
                 },
             },
-            "required": ["token"],
+            "required": [],
             "additionalProperties": False,
         },
         implementation=view_project_context_tool_impl,
@@ -1198,7 +1198,7 @@ def register_project_context_tools():
             "properties": {
                 "token": {
                     "type": "string",
-                    "description": "Authentication token (agent or admin)",
+                    "description": "Authentication token (agent or admin). Optional if Authorization: Bearer header is supplied (recommended).",
                 },
                 "context_key": {
                     "type": "string",
@@ -1220,7 +1220,7 @@ def register_project_context_tools():
                     "description": "Optional description of this context entry.",
                 },
             },
-            "required": ["token", "context_key", "context_value"],
+            "required": ["context_key", "context_value"],
             "additionalProperties": False,
         },
         implementation=update_project_context_tool_impl,
@@ -1232,7 +1232,7 @@ def register_project_context_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {"type": "string", "description": "Authentication token"},
+                "token": {"type": "string", "description": "Authentication token. Optional if Authorization: Bearer header is supplied (recommended)."},
                 "updates": {
                     "type": "array",
                     "description": "Array of update operations",
@@ -1264,7 +1264,7 @@ def register_project_context_tools():
                     },
                 },
             },
-            "required": ["token", "updates"],
+            "required": ["updates"],
             "additionalProperties": False,
         },
         implementation=bulk_update_project_context_tool_impl,
@@ -1278,7 +1278,7 @@ def register_project_context_tools():
             "properties": {
                 "token": {
                     "type": "string",
-                    "description": "Admin authentication token",
+                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
                 },
                 "backup_name": {
                     "type": "string",
@@ -1290,7 +1290,7 @@ def register_project_context_tools():
                     "default": True,
                 },
             },
-            "required": ["token"],
+            "required": [],
             "additionalProperties": False,
         },
         implementation=backup_project_context_tool_impl,
@@ -1302,9 +1302,9 @@ def register_project_context_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {"type": "string", "description": "Authentication token"}
+                "token": {"type": "string", "description": "Authentication token. Optional if Authorization: Bearer header is supplied (recommended)."}
             },
-            "required": ["token"],
+            "required": [],
             "additionalProperties": False,
         },
         implementation=validate_context_consistency_tool_impl,
@@ -1318,7 +1318,7 @@ def register_project_context_tools():
             "properties": {
                 "token": {
                     "type": "string",
-                    "description": "Admin authentication token",
+                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
                 },
                 "context_key": {
                     "type": "string",
@@ -1336,7 +1336,7 @@ def register_project_context_tools():
                     "default": False,
                 },
             },
-            "required": ["token"],
+            "required": [],
             "additionalProperties": False,
         },
         implementation=delete_project_context_tool_impl,

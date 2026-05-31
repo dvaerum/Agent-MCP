@@ -287,13 +287,13 @@ def register_file_metadata_tools():
         input_schema={  # From main.py:1842-1852
             "type": "object",
             "properties": {
-                "token": {"type": "string", "description": "Authentication token"},
+                "token": {"type": "string", "description": "Authentication token. Optional if Authorization: Bearer header is supplied (recommended)."},
                 "filepath": {
                     "type": "string",
                     "description": "Path to the file (can be relative to agent's CWD or absolute)",
                 },
             },
-            "required": ["token", "filepath"],
+            "required": ["filepath"],
             "additionalProperties": False,
         },
         implementation=view_file_metadata_tool_impl,
@@ -307,7 +307,7 @@ def register_file_metadata_tools():
             "properties": {
                 "token": {
                     "type": "string",
-                    "description": "Admin authentication token",
+                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
                 },
                 "filepath": {
                     "type": "string",
@@ -318,7 +318,7 @@ def register_file_metadata_tools():
                     "description": "A JSON object containing the metadata to set for the file.",
                 },
             },
-            "required": ["token", "filepath", "metadata"],
+            "required": ["filepath", "metadata"],
             "additionalProperties": False,
         },
         implementation=update_file_metadata_tool_impl,

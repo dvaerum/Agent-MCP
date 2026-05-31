@@ -145,10 +145,10 @@ def register_file_management_tools():
         input_schema={ # From main.py:1826-1839
             "type": "object",
             "properties": {
-                "token": {"type": "string", "description": "Agent authentication token"},
+                "token": {"type": "string", "description": "Agent authentication token. Optional if Authorization: Bearer header is supplied (recommended)."},
                 "filepath": {"type": "string", "description": "Path to the file to check (can be relative to agent's CWD or absolute)"}
             },
-            "required": ["token", "filepath"],
+            "required": ["filepath"],
             "additionalProperties": False
         },
         implementation=check_file_status_tool_impl
@@ -160,7 +160,7 @@ def register_file_management_tools():
         input_schema={ # From main.py:1842-1858
             "type": "object",
             "properties": {
-                "token": {"type": "string", "description": "Agent authentication token"},
+                "token": {"type": "string", "description": "Agent authentication token. Optional if Authorization: Bearer header is supplied (recommended)."},
                 "filepath": {"type": "string", "description": "Path to the file to update (can be relative or absolute)"},
                 "status": {
                     "type": "string",
@@ -168,7 +168,7 @@ def register_file_management_tools():
                     "enum": ["editing", "reading", "reviewing", "released"]
                 }
             },
-            "required": ["token", "filepath", "status"],
+            "required": ["filepath", "status"],
             "additionalProperties": False
         },
         implementation=update_file_status_tool_impl
