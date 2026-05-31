@@ -7,7 +7,7 @@ from typing import List, Optional # Added List and Optional
 import os # Added os import
 
 from starlette.applications import Starlette
-from starlette.routing import Mount, Route # Added Route
+from starlette.routing import Mount
 from starlette.middleware import Middleware # If any middleware is needed
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware # Example if CORS is needed
@@ -168,8 +168,29 @@ def create_app(project_dir: str, admin_token_cli: Optional[str] = None) -> Starl
             # Directly call the ASGI-compatible handle_post_message method
             await sse_transport.handle_post_message(scope, receive, send)
 
+    # ASGI app wrapper for sse_connection_handler. Must be a Mount, not
+    # a Route, because the handler streams via the raw ASGI `send`
+    # callable (through sse_transport.connect_sse) and returns None
+    # implicitly. Route's request_response wrapper would then do
+    # `await None(scope, receive, send)` → TypeError NoneType not
+    # callable, surfacing to clients as ServerDisconnectedError under
+    # multi-session load. UPSTREAM_ISSUES.md issue A.
+    class SseConnectApp:
+        """ASGI app wrapper for sse_connection_handler.
+
+        The handler expects a Starlette `Request`. We construct one
+        from the ASGI scope/receive and pass through, then return
+        without producing a `Response` — the handler has already
+        streamed its events via the send callable.
+        """
+        async def __call__(self, scope, receive, send):
+            from starlette.requests import Request
+
+            request = Request(scope, receive=receive, send=send)
+            await sse_connection_handler(request)
+
     # Add SSE routes (Original main.py:2113-2114)
-    all_routes.append(Route('/sse', endpoint=sse_connection_handler, name="sse_connect"))
+    all_routes.append(Mount('/sse', app=SseConnectApp(), name="sse_connect"))
     # Add the SseServerTransport's POST message handler as a Mount with ASGI app wrapper
     all_routes.append(Mount('/messages', app=MessageHandlerApp(), name="mcp_post_message"))
 
