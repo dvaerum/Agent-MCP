@@ -85,17 +85,21 @@ def _set_toggle(value: bool) -> None:
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    # project_context schema (key, value, description, updated_by, last_updated)
+    # project_context post-Phase-7b schema (key, value, description,
+    # created_at, created_by, updated_at, updated_by)
+    now_iso = _dt.datetime.now().isoformat()
     cursor.execute(
         "INSERT OR REPLACE INTO project_context "
-        "(context_key, value, description, updated_by, last_updated) "
-        "VALUES (?, ?, ?, ?, ?)",
+        "(context_key, value, description, created_at, created_by, updated_at, updated_by) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             "config_allow_worker_create_unassigned",
             "true" if value else "false",
             "test toggle",
+            now_iso,
             "test",
-            _dt.datetime.now().isoformat(),
+            now_iso,
+            "test",
         ),
     )
     conn.commit()

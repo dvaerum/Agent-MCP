@@ -221,15 +221,20 @@ def init_database() -> None:
         )
         logger.debug("Agent_actions table and indexes ensured.")
 
-        # Project Context Table (Original main.py lines 322-330)
+        # Project Context Table — post-Phase-7b shape with ownership
+        # columns. The Alembic migration `0002_project_context_ownership`
+        # upgrades legacy DBs (last_updated, no created_*) to this shape;
+        # for fresh DBs we land here directly so the migration is a no-op.
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS project_context (
                 context_key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,         -- Stored as JSON string
-                last_updated TEXT NOT NULL,
-                updated_by TEXT NOT NULL,    -- Agent ID or 'admin' or 'server_startup'
-                description TEXT
+                description TEXT,
+                created_at TEXT,             -- Stamped on first INSERT, never mutated after
+                created_by TEXT,             -- Agent ID or 'admin' (or 'server_startup' for legacy)
+                updated_at TEXT NOT NULL,    -- Refreshed on every UPDATE
+                updated_by TEXT NOT NULL     -- Agent ID or 'admin' or 'server_startup'
             )
         """
         )

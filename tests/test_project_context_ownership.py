@@ -11,17 +11,26 @@ batch rejects all in a single SQLAlchemy transaction.
 
 from __future__ import annotations
 
-import asyncio
-import datetime
 import json
 import secrets
 import sqlite3
 
-import pytest
+
+# The MCP-tool write paths post results through `execute_db_write`, whose
+# queue worker runs on the Starlette TestClient's lifespan event loop.
+# Calling those tools from a fresh `asyncio.run` loop would block forever
+# (the queue.put lands on a different loop than the worker's). We use
+# the TestClient's anyio BlockingPortal so each tool call runs on the
+# same loop that owns the write queue.
+def _portal_call(client, coro_func, *args, **kwargs):
+    return client.portal.call(coro_func, *args, **kwargs)
 
 
-def _run(coro):
-    return asyncio.run(coro)
+def _run_tool(client, tool_impl, arguments):
+    """Run an async MCP tool implementation on the lifespan event loop."""
+    async def _wrapped():
+        return await tool_impl(arguments)
+    return _portal_call(client, _wrapped)
 
 
 def _admin_token(client) -> str:
@@ -118,11 +127,7 @@ def test_1_admin_creates_key(client) -> None:
     from agent_mcp.tools.project_context_tools import update_project_context_tool_impl
 
     admin = _admin_token(client)
-    r = _run(
-        update_project_context_tool_impl(
-            {"token": admin, "context_key": "foo", "context_value": "v1"}
-        )
-    )
+    r = _run_tool(client, update_project_context_tool_impl, {"token": admin, "context_key": "foo", "context_value": "v1"})
     assert "successfully" in r[0].text.lower(), r[0].text
     row = _row("foo")
     assert row is not None
@@ -136,19 +141,11 @@ def test_2_admin_edits_own_key_preserves_creator(client) -> None:
     from agent_mcp.tools.project_context_tools import update_project_context_tool_impl
 
     admin = _admin_token(client)
-    _run(
-        update_project_context_tool_impl(
-            {"token": admin, "context_key": "foo", "context_value": "v1"}
-        )
-    )
+    _run_tool(client, update_project_context_tool_impl, {"token": admin, "context_key": "foo", "context_value": "v1"})
     row = _row("foo")
     created_at_before = row["created_at"]
 
-    _run(
-        update_project_context_tool_impl(
-            {"token": admin, "context_key": "foo", "context_value": "v2"}
-        )
-    )
+    _run_tool(client, update_project_context_tool_impl, {"token": admin, "context_key": "foo", "context_value": "v2"})
     row = _row("foo")
     assert row["updated_by"] == "admin"
     assert row["created_by"] == "admin"
@@ -162,11 +159,7 @@ def test_3_worker_creates_nonconfig_key(client) -> None:
 
     _admin_token(client)
     worker_a = _make_worker("worker-A")
-    r = _run(
-        update_project_context_tool_impl(
-            {"token": worker_a, "context_key": "bar", "context_value": "x"}
-        )
-    )
+    r = _run_tool(client, update_project_context_tool_impl, {"token": worker_a, "context_key": "bar", "context_value": "x"})
     assert "successfully" in r[0].text.lower(), r[0].text
     row = _row("bar")
     assert row is not None
@@ -179,16 +172,8 @@ def test_4_worker_edits_own_key(client) -> None:
 
     _admin_token(client)
     worker_a = _make_worker("worker-A")
-    _run(
-        update_project_context_tool_impl(
-            {"token": worker_a, "context_key": "bar", "context_value": "x"}
-        )
-    )
-    r = _run(
-        update_project_context_tool_impl(
-            {"token": worker_a, "context_key": "bar", "context_value": "y"}
-        )
-    )
+    _run_tool(client, update_project_context_tool_impl, {"token": worker_a, "context_key": "bar", "context_value": "x"})
+    r = _run_tool(client, update_project_context_tool_impl, {"token": worker_a, "context_key": "bar", "context_value": "y"})
     assert "successfully" in r[0].text.lower(), r[0].text
     row = _row("bar")
     assert json.loads(row["value"]) == "y"
@@ -201,16 +186,8 @@ def test_5_worker_b_cannot_edit_worker_a_key(client) -> None:
     _admin_token(client)
     worker_a = _make_worker("worker-A")
     worker_b = _make_worker("worker-B")
-    _run(
-        update_project_context_tool_impl(
-            {"token": worker_a, "context_key": "bar", "context_value": "x"}
-        )
-    )
-    r = _run(
-        update_project_context_tool_impl(
-            {"token": worker_b, "context_key": "bar", "context_value": "hacked"}
-        )
-    )
+    _run_tool(client, update_project_context_tool_impl, {"token": worker_a, "context_key": "bar", "context_value": "x"})
+    r = _run_tool(client, update_project_context_tool_impl, {"token": worker_b, "context_key": "bar", "context_value": "hacked"})
     msg = r[0].text
     assert "Unauthorized" in msg, msg
     assert "created by 'worker-A'" in msg, msg
@@ -224,11 +201,7 @@ def test_6_worker_cannot_create_config_key(client) -> None:
 
     _admin_token(client)
     worker_a = _make_worker("worker-A")
-    r = _run(
-        update_project_context_tool_impl(
-            {"token": worker_a, "context_key": "config_foo", "context_value": "v"}
-        )
-    )
+    r = _run_tool(client, update_project_context_tool_impl, {"token": worker_a, "context_key": "config_foo", "context_value": "v"})
     msg = r[0].text
     assert "Unauthorized" in msg, msg
     assert "config_* keys are admin-only" in msg, msg
@@ -239,11 +212,7 @@ def test_7_admin_can_create_config_key(client) -> None:
     from agent_mcp.tools.project_context_tools import update_project_context_tool_impl
 
     admin = _admin_token(client)
-    r = _run(
-        update_project_context_tool_impl(
-            {"token": admin, "context_key": "config_foo", "context_value": "v"}
-        )
-    )
+    r = _run_tool(client, update_project_context_tool_impl, {"token": admin, "context_key": "config_foo", "context_value": "v"})
     assert "successfully" in r[0].text.lower(), r[0].text
     row = _row("config_foo")
     assert row is not None
@@ -255,16 +224,8 @@ def test_8_worker_cannot_edit_admin_owned_config_key(client) -> None:
 
     admin = _admin_token(client)
     worker_a = _make_worker("worker-A")
-    _run(
-        update_project_context_tool_impl(
-            {"token": admin, "context_key": "config_foo", "context_value": "v"}
-        )
-    )
-    r = _run(
-        update_project_context_tool_impl(
-            {"token": worker_a, "context_key": "config_foo", "context_value": "hacked"}
-        )
-    )
+    _run_tool(client, update_project_context_tool_impl, {"token": admin, "context_key": "config_foo", "context_value": "v"})
+    r = _run_tool(client, update_project_context_tool_impl, {"token": worker_a, "context_key": "config_foo", "context_value": "hacked"})
     msg = r[0].text
     assert "Unauthorized" in msg, msg
     assert "config_* keys are admin-only" in msg, msg
@@ -278,16 +239,8 @@ def test_9_worker_deletes_own_key(client) -> None:
 
     _admin_token(client)
     worker_a = _make_worker("worker-A")
-    _run(
-        update_project_context_tool_impl(
-            {"token": worker_a, "context_key": "bar", "context_value": "x"}
-        )
-    )
-    r = _run(
-        delete_project_context_tool_impl(
-            {"token": worker_a, "context_key": "bar"}
-        )
-    )
+    _run_tool(client, update_project_context_tool_impl, {"token": worker_a, "context_key": "bar", "context_value": "x"})
+    r = _run_tool(client, delete_project_context_tool_impl, {"token": worker_a, "context_key": "bar"})
     text = r[0].text
     assert "Unauthorized" not in text, text
     assert "deleted" in text.lower() or "Deleted" in text, text
@@ -303,16 +256,8 @@ def test_10_worker_b_cannot_delete_worker_a_key(client) -> None:
     _admin_token(client)
     worker_a = _make_worker("worker-A")
     worker_b = _make_worker("worker-B")
-    _run(
-        update_project_context_tool_impl(
-            {"token": worker_a, "context_key": "bar", "context_value": "x"}
-        )
-    )
-    r = _run(
-        delete_project_context_tool_impl(
-            {"token": worker_b, "context_key": "bar"}
-        )
-    )
+    _run_tool(client, update_project_context_tool_impl, {"token": worker_a, "context_key": "bar", "context_value": "x"})
+    r = _run_tool(client, delete_project_context_tool_impl, {"token": worker_b, "context_key": "bar"})
     msg = r[0].text
     assert "Unauthorized" in msg, msg
     assert "created by 'worker-A'" in msg, msg
@@ -327,16 +272,8 @@ def test_11_admin_can_delete_any_key(client) -> None:
 
     admin = _admin_token(client)
     worker_a = _make_worker("worker-A")
-    _run(
-        update_project_context_tool_impl(
-            {"token": worker_a, "context_key": "bar", "context_value": "x"}
-        )
-    )
-    r = _run(
-        delete_project_context_tool_impl(
-            {"token": admin, "context_key": "bar"}
-        )
-    )
+    _run_tool(client, update_project_context_tool_impl, {"token": worker_a, "context_key": "bar", "context_value": "x"})
+    r = _run_tool(client, delete_project_context_tool_impl, {"token": admin, "context_key": "bar"})
     text = r[0].text
     assert "Unauthorized" not in text, text
     assert _row("bar") is None
@@ -353,22 +290,18 @@ def test_12_bulk_atomic_reject_on_unauthorized_entry(client) -> None:
     worker_b = _make_worker("worker-B")
 
     # B creates 'second'
-    _run(
-        update_project_context_tool_impl(
-            {"token": worker_b, "context_key": "second", "context_value": "B-val"}
-        )
-    )
+    _run_tool(client, update_project_context_tool_impl, {"token": worker_b, "context_key": "second", "context_value": "B-val"})
     # A submits a bulk update including a key (`second`) it doesn't own
-    r = _run(
-        bulk_update_project_context_tool_impl(
-            {
-                "token": worker_a,
-                "updates": [
-                    {"context_key": "first", "context_value": "A-val"},
-                    {"context_key": "second", "context_value": "A-overwrite"},
-                ],
-            }
-        )
+    r = _run_tool(
+        client,
+        bulk_update_project_context_tool_impl,
+        {
+            "token": worker_a,
+            "updates": [
+                {"context_key": "first", "context_value": "A-val"},
+                {"context_key": "second", "context_value": "A-overwrite"},
+            ],
+        },
     )
     msg = r[0].text
     assert "Unauthorized" in msg, msg
@@ -389,16 +322,16 @@ def test_13_bulk_all_authorized_succeeds(client) -> None:
 
     _admin_token(client)
     worker_a = _make_worker("worker-A")
-    r = _run(
-        bulk_update_project_context_tool_impl(
-            {
-                "token": worker_a,
-                "updates": [
-                    {"context_key": "k1", "context_value": "v1"},
-                    {"context_key": "k2", "context_value": "v2"},
-                ],
-            }
-        )
+    r = _run_tool(
+        client,
+        bulk_update_project_context_tool_impl,
+        {
+            "token": worker_a,
+            "updates": [
+                {"context_key": "k1", "context_value": "v1"},
+                {"context_key": "k2", "context_value": "v2"},
+            ],
+        },
     )
     text = r[0].text
     assert "Unauthorized" not in text, text
@@ -415,7 +348,7 @@ def test_14_validate_consistency_callable_by_worker(client) -> None:
 
     _admin_token(client)
     worker_a = _make_worker("worker-A")
-    r = _run(validate_context_consistency_tool_impl({"token": worker_a}))
+    r = _run_tool(client, validate_context_consistency_tool_impl, {"token": worker_a})
     assert "Unauthorized" not in r[0].text, r[0].text
 
 
@@ -424,7 +357,7 @@ def test_15_backup_admin_only(client) -> None:
 
     _admin_token(client)
     worker_a = _make_worker("worker-A")
-    r = _run(backup_project_context_tool_impl({"token": worker_a}))
+    r = _run_tool(client, backup_project_context_tool_impl, {"token": worker_a})
     assert "Unauthorized" in r[0].text, r[0].text
 
 
@@ -434,8 +367,6 @@ def test_16_legacy_db_migration_backfills_created_columns(
     """Mimic an existing DB on the OLD (pre-7b) schema: lifespan startup
     must add the new columns and backfill created_at/created_by from
     the legacy updated_at/updated_by data."""
-    from pathlib import Path
-
     # Build a legacy-shaped DB at the path the lifespan startup will see.
     agent_dir = project_dir / ".agent"
     agent_dir.mkdir(parents=True, exist_ok=True)

@@ -349,16 +349,16 @@ async def run_rag_indexing_periodically(
                 last_ctx_time_str  # Keep as ISO string for direct comparison
             )
 
-            # The original checked `last_updated > ?`. This is good.
+            # Phase 7b renamed last_updated -> updated_at on project_context.
             cursor.execute(
-                "SELECT context_key, value, description, last_updated FROM project_context WHERE last_updated > ?",
+                "SELECT context_key, value, description, updated_at FROM project_context WHERE updated_at > ?",
                 (last_ctx_time_str,),
             )
             for row in cursor.fetchall():
                 key = row["context_key"]
                 value_str = row["value"]  # Already a JSON string in DB
                 desc = row["description"] or ""
-                last_mod_iso = row["last_updated"]
+                last_mod_iso = row["updated_at"]
                 # Content for hashing and embedding (main.py:593-595)
                 content_for_embedding = (
                     f"Context Key: {key}\nDescription: {desc}\nValue: {value_str}"

@@ -77,16 +77,19 @@ def _set_toggle(key: str, value: bool) -> None:
 
     conn = get_db_connection()
     cursor = conn.cursor()
+    now_iso = _dt.datetime.now().isoformat()
     cursor.execute(
         "INSERT OR REPLACE INTO project_context "
-        "(context_key, value, description, updated_by, last_updated) "
-        "VALUES (?, ?, ?, ?, ?)",
+        "(context_key, value, description, created_at, created_by, updated_at, updated_by) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             key,
             "true" if value else "false",
             "test toggle",
+            now_iso,
             "test",
-            _dt.datetime.now().isoformat(),
+            now_iso,
+            "test",
         ),
     )
     conn.commit()

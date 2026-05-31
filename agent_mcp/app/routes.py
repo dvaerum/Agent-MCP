@@ -986,19 +986,21 @@ async def all_data_api_route(request: Request) -> JSONResponse:
         cursor.execute("SELECT * FROM tasks ORDER BY created_at DESC")
         tasks_data = [dict(row) for row in cursor.fetchall()]
         
-        # Get all context entries via the ORM (Phase 7a).
+        # Get all context entries via the ORM (Phase 7a; ownership cols 7b).
         with SessionLocal() as ctx_session:
             ctx_rows = (
                 ctx_session.query(ProjectContext)
-                .order_by(ProjectContext.last_updated.desc())
+                .order_by(ProjectContext.updated_at.desc())
                 .all()
             )
             context_data = [
                 {
                     "context_key": r.context_key,
                     "value": r.value,
-                    "last_updated": r.last_updated,
+                    "updated_at": r.updated_at,
                     "updated_by": r.updated_by,
+                    "created_at": r.created_at,
+                    "created_by": r.created_by,
                     "description": r.description,
                 }
                 for r in ctx_rows
@@ -1052,15 +1054,17 @@ async def context_data_api_route(request: Request) -> JSONResponse:
         with SessionLocal() as session:
             rows = (
                 session.query(ProjectContext)
-                .order_by(ProjectContext.last_updated.desc())
+                .order_by(ProjectContext.updated_at.desc())
                 .all()
             )
             context_data = [
                 {
                     "context_key": r.context_key,
                     "value": r.value,
-                    "last_updated": r.last_updated,
+                    "updated_at": r.updated_at,
                     "updated_by": r.updated_by,
+                    "created_at": r.created_at,
+                    "created_by": r.created_by,
                     "description": r.description,
                 }
                 for r in rows
@@ -1175,14 +1179,16 @@ async def create_sample_memories_route(request: Request) -> JSONResponse:
                     ProjectContext(
                         context_key=memory['context_key'],
                         value=memory['value'],
-                        last_updated=current_time,
+                        created_at=current_time,
+                        created_by=memory['updated_by'],
+                        updated_at=current_time,
                         updated_by=memory['updated_by'],
                         description=memory['description'],
                     )
                 )
             else:
                 existing.value = memory['value']
-                existing.last_updated = current_time
+                existing.updated_at = current_time
                 existing.updated_by = memory['updated_by']
                 existing.description = memory['description']
             created_count += 1
@@ -1247,7 +1253,9 @@ async def create_memory_api_route(request: Request) -> JSONResponse:
             ProjectContext(
                 context_key=context_key,
                 value=json.dumps(context_value),
-                last_updated=current_time,
+                created_at=current_time,
+                created_by=requesting_admin_id,
+                updated_at=current_time,
                 updated_by=requesting_admin_id,
                 description=description,
             )
@@ -1319,7 +1327,8 @@ async def update_memory_api_route(request: Request) -> JSONResponse:
 
         # Apply partial-update semantics: only overwrite the fields the
         # caller actually supplied. Matches the legacy raw-SQL behavior.
-        row.last_updated = current_time
+        # created_at / created_by stay untouched on an UPDATE.
+        row.updated_at = current_time
         row.updated_by = requesting_admin_id
         if context_value is not None:
             row.value = json.dumps(context_value)

@@ -174,7 +174,7 @@ const MemoryRow = ({ memory, onView, onEdit, onDelete }: {
       <TableCell className="py-2 px-2 hidden sm:table-cell">
         <div className="text-xs text-muted-foreground">
           <div className="truncate">{memory.updated_by}</div>
-          <div>{memory.last_updated ? new Date(memory.last_updated).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : 'Unknown'}</div>
+          <div>{memory.updated_at ? new Date(memory.updated_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : 'Unknown'}</div>
         </div>
       </TableCell>
       
@@ -350,7 +350,7 @@ export function MemoriesDashboard() {
   const activeServer = servers.find(s => s.id === activeServerId)
   const { data, loading, error, refreshData, getAdminToken } = useDataStore()
   const [searchTerm, setSearchTerm] = useState('')
-  const [sortBy, setSortBy] = useState<string>('last_updated')
+  const [sortBy, setSortBy] = useState<string>('updated_at')
   
   // Modal state management
   const [selectedMemory, setSelectedMemory] = useState<Memory | null>(null)
@@ -378,14 +378,16 @@ export function MemoriesDashboard() {
       context_key: ctx.context_key,
       value: ctx.value,
       description: ctx.description,
-      last_updated: ctx.last_updated,
+      updated_at: ctx.updated_at,
       updated_by: ctx.updated_by,
+      created_at: ctx.created_at,
+      created_by: ctx.created_by,
       _metadata: {
         size_bytes: JSON.stringify(ctx.value).length,
         size_kb: Math.round(JSON.stringify(ctx.value).length / 1024 * 100) / 100,
         json_valid: true,
-        days_old: ctx.last_updated ? Math.floor((Date.now() - new Date(ctx.last_updated).getTime()) / (1000 * 60 * 60 * 24)) : undefined,
-        is_stale: ctx.last_updated ? (Date.now() - new Date(ctx.last_updated).getTime()) > (30 * 24 * 60 * 60 * 1000) : false,
+        days_old: ctx.updated_at ? Math.floor((Date.now() - new Date(ctx.updated_at).getTime()) / (1000 * 60 * 60 * 24)) : undefined,
+        is_stale: ctx.updated_at ? (Date.now() - new Date(ctx.updated_at).getTime()) > (30 * 24 * 60 * 60 * 1000) : false,
         is_large: JSON.stringify(ctx.value).length > 10240
       }
     }))
@@ -413,9 +415,9 @@ export function MemoriesDashboard() {
           return a.context_key.localeCompare(b.context_key)
         case 'size':
           return (b._metadata?.size_bytes || 0) - (a._metadata?.size_bytes || 0)
-        case 'last_updated':
+        case 'updated_at':
         default:
-          return new Date(b.last_updated).getTime() - new Date(a.last_updated).getTime()
+          return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
       }
     })
 
@@ -635,7 +637,7 @@ export function MemoriesDashboard() {
             <SelectValue />
           </SelectTrigger>
           <SelectContent className="bg-background border-border">
-            <SelectItem value="last_updated">Latest First</SelectItem>
+            <SelectItem value="updated_at">Latest First</SelectItem>
             <SelectItem value="key">Alphabetical</SelectItem>
             <SelectItem value="size">Size (Large First)</SelectItem>
           </SelectContent>

@@ -3,7 +3,7 @@ import json
 import datetime
 import re
 import sqlite3
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 # Keys that hold project-level secrets. view_project_context filters
 # rows whose key matches when the caller isn't admin, so worker-tier
@@ -13,6 +13,26 @@ _SECRET_KEY_RE = re.compile(
     r"config_.*_(token|secret|password|api[_-]?key|priv(?:ate)?[_-]?key)",
     re.IGNORECASE,
 )
+
+# Keys reserved for admin-only writes/deletes (Phase 7b). Broader than
+# `_SECRET_KEY_RE`: any `config_*` is treated as policy or secret data,
+# regardless of suffix. Workers attempting to create or modify a
+# config_* entry are rejected at the tool boundary.
+_CONFIG_KEY_RE = re.compile(r"^config_", re.IGNORECASE)
+
+
+def _config_key_error() -> str:
+    return (
+        "Unauthorized: config_* keys are admin-only; "
+        "workers cannot create or modify policy/secret entries"
+    )
+
+
+def _creator_mismatch_error(context_key: str, creator: str) -> str:
+    return (
+        f"Unauthorized: key '{context_key}' was created by "
+        f"'{creator}'; only its creator or admin can modify it"
+    )
 
 import mcp.types as mcp_types
 from sqlalchemy import func, or_, select
@@ -45,7 +65,7 @@ def _analyze_context_health(context_entries: List[Dict[str, Any]]) -> Dict[str, 
     for entry in context_entries:
         context_key = entry.get("context_key", "unknown")
         value = entry.get("value", "")
-        last_updated = entry.get("last_updated")
+        updated_at = entry.get("updated_at")
 
         # Check for JSON parsing issues
         try:
@@ -56,10 +76,10 @@ def _analyze_context_health(context_entries: List[Dict[str, Any]]) -> Dict[str, 
             issues.append(f"JSON parse error in '{context_key}'")
 
         # Check for stale entries (30+ days old)
-        if last_updated:
+        if updated_at:
             try:
                 updated_time = datetime.datetime.fromisoformat(
-                    last_updated.replace("Z", "+00:00").replace("+00:00", "")
+                    updated_at.replace("Z", "+00:00").replace("+00:00", "")
                 )
                 days_old = (current_time - updated_time).days
                 if days_old > 30:
@@ -144,16 +164,61 @@ def _generate_context_recommendations(
 
 
 def _row_to_dict(row: ProjectContext) -> Dict[str, Any]:
-    """Coerce a ProjectContext row into the same dict shape the old
-    `dict(sqlite3.Row)` produced. Several callers (backup, health
-    analysis, validation) lean on the dict surface; mirror it exactly."""
+    """Coerce a ProjectContext row into a plain dict for backup / health
+    analysis / validation consumers. Post-Phase-7b shape: includes the
+    new `created_at` / `created_by` columns and renames `last_updated`
+    to `updated_at`."""
     return {
         "context_key": row.context_key,
         "value": row.value,
-        "last_updated": row.last_updated,
+        "updated_at": row.updated_at,
         "updated_by": row.updated_by,
+        "created_at": row.created_at,
+        "created_by": row.created_by,
         "description": row.description,
     }
+
+
+def _check_write_authorization(
+    session,
+    requesting_agent_id: str,
+    context_key: str,
+    *,
+    is_admin: bool,
+) -> Optional[str]:
+    """Return None if the caller may write/delete `context_key`, else
+    a specific human-readable error message.
+
+    Rules (Phase 7b):
+    - Admin: always authorized.
+    - Non-admin + config_* key: forbidden (admin-only safety invariant).
+    - Non-admin + existing key + creator != self: forbidden.
+    - Non-admin + new key (no row yet) + non-config: allowed.
+    - Non-admin + existing key + creator == self + non-config: allowed.
+
+    Reads `created_by` via the same SQLAlchemy session, so the check
+    sees pending changes inside an open transaction.
+    """
+    if is_admin:
+        return None
+    if _CONFIG_KEY_RE.match(context_key):
+        return _config_key_error()
+    existing = (
+        session.query(ProjectContext.created_by)
+        .filter(ProjectContext.context_key == context_key)
+        .one_or_none()
+    )
+    if existing is None:
+        return None
+    creator = existing[0]
+    # Legacy rows where created_by is NULL (pre-migration backfill edge
+    # case) cannot be safely attributed — treat as admin-only so workers
+    # can't claim them.
+    if creator is None:
+        return _creator_mismatch_error(context_key, "(unknown — legacy entry)")
+    if creator != requesting_agent_id:
+        return _creator_mismatch_error(context_key, creator)
+    return None
 
 
 def _create_context_backup(session, backup_name: str = None) -> Dict[str, Any]:
@@ -196,9 +261,12 @@ async def view_project_context_tool_impl(
         "include_backup_info", False
     )  # Include backup status
     max_results = arguments.get("max_results", 50)  # Limit results
-    sort_by = arguments.get(
-        "sort_by", "last_updated"
-    )  # Sort by: key, last_updated, size
+    # Sort by: key, updated_at, size. Accept `last_updated` as a
+    # backward-compatible alias for `updated_at` so existing dashboard
+    # builds + MCP clients don't break mid-deploy.
+    sort_by = arguments.get("sort_by", "updated_at")
+    if sort_by == "last_updated":
+        sort_by = "updated_at"
 
     requesting_agent_id = get_agent_id(agent_auth_token)  # main.py:1414
     if not requesting_agent_id:
@@ -226,7 +294,9 @@ async def view_project_context_tool_impl(
             ProjectContext.value,
             ProjectContext.description,
             ProjectContext.updated_by,
-            ProjectContext.last_updated,
+            ProjectContext.updated_at,
+            ProjectContext.created_by,
+            ProjectContext.created_at,
             func.length(ProjectContext.value).label("value_size"),
         )
 
@@ -248,7 +318,7 @@ async def view_project_context_tool_impl(
             thirty_days_ago = (
                 datetime.datetime.now() - datetime.timedelta(days=30)
             ).isoformat()
-            conditions.append(ProjectContext.last_updated < thirty_days_ago)
+            conditions.append(ProjectContext.updated_at < thirty_days_ago)
 
         if conditions:
             stmt = stmt.where(*conditions)
@@ -258,8 +328,8 @@ async def view_project_context_tool_impl(
             stmt = stmt.order_by(func.length(ProjectContext.value).desc())
         elif sort_by == "key":
             stmt = stmt.order_by(ProjectContext.context_key.asc())
-        else:  # last_updated (default)
-            stmt = stmt.order_by(ProjectContext.last_updated.desc())
+        else:  # updated_at (default)
+            stmt = stmt.order_by(ProjectContext.updated_at.desc())
 
         stmt = stmt.limit(max_results)
 
@@ -282,13 +352,13 @@ async def view_project_context_tool_impl(
 
             # Calculate additional metadata
             entry_size = len(str(row_data.value))
-            last_updated = row_data.last_updated
+            updated_at = row_data.updated_at
             days_old = None
 
-            if last_updated:
+            if updated_at:
                 try:
                     updated_time = datetime.datetime.fromisoformat(
-                        last_updated.replace("Z", "+00:00").replace("+00:00", "")
+                        updated_at.replace("Z", "+00:00").replace("+00:00", "")
                     )
                     days_old = (datetime.datetime.now() - updated_time).days
                 except:
@@ -299,7 +369,9 @@ async def view_project_context_tool_impl(
                 "value": value_parsed,
                 "description": row_data.description,
                 "updated_by": row_data.updated_by,
-                "last_updated": last_updated,
+                "updated_at": updated_at,
+                "created_by": row_data.created_by,
+                "created_at": row_data.created_at,
                 "_metadata": {
                     "size_bytes": entry_size,
                     "size_kb": round(entry_size / 1024, 2),
@@ -338,14 +410,14 @@ async def view_project_context_tool_impl(
                     select(
                         ProjectContext.context_key,
                         ProjectContext.value,
-                        ProjectContext.last_updated,
+                        ProjectContext.updated_at,
                     )
                 ).all()
                 all_entries = [
                     {
                         "context_key": r.context_key,
                         "value": r.value,
-                        "last_updated": r.last_updated,
+                        "updated_at": r.updated_at,
                     }
                     for r in all_rows
                 ]
@@ -405,8 +477,12 @@ async def view_project_context_tool_impl(
                     f"  Description: {entry.get('description', 'No description')}"
                 )
                 response_parts.append(
-                    f"  Updated: {entry.get('last_updated', 'Unknown')} by {entry.get('updated_by', 'Unknown')}"
+                    f"  Updated: {entry.get('updated_at', 'Unknown')} by {entry.get('updated_by', 'Unknown')}"
                 )
+                if entry.get("created_by"):
+                    response_parts.append(
+                        f"  Created: {entry.get('created_at', 'Unknown')} by {entry.get('created_by')}"
+                    )
 
                 # Show value preview (truncated for large values)
                 value_str = (
@@ -436,7 +512,7 @@ async def view_project_context_tool_impl(
                     "• Add show_stale_entries=true to see entries needing updates"
                 )
             response_parts.append(
-                "• Use sort_by=[key|size|last_updated] for different sorting"
+                "• Use sort_by=[key|size|updated_at] for different sorting"
             )
             response_parts.append(
                 "• Use validate_context_consistency to fix JSON errors"
@@ -468,13 +544,34 @@ async def view_project_context_tool_impl(
 
 # --- update_project_context tool ---
 # Original logic from main.py: lines 1468-1500 (update_project_context_tool function)
+class _UnauthorizedWrite(Exception):
+    """Raised inside a write_operation when the ownership check fails.
+
+    Carries the user-facing message so the outer caller can return it
+    verbatim. Using an exception rather than a sentinel return makes the
+    rollback flow in the SQLAlchemy try/except branch trivial.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.user_message = message
+
+
 async def _handle_single_context_update(
     requesting_agent_id: str,
     context_key_to_update: str,
     context_value_to_set: Any,
     description_for_context: Optional[str] = None,
+    *,
+    is_admin: bool,
 ) -> List[mcp_types.TextContent]:
-    """Handle single context update operation"""
+    """Handle single context update operation.
+
+    Phase 7b: authorizes the write per-key. Admins always pass; workers
+    pass only if the key is non-`config_*` and either new or self-owned.
+    On insert, stamps `created_at` / `created_by`; on update, leaves
+    those untouched and refreshes `updated_at` / `updated_by`.
+    """
     # Log audit
     log_audit(
         requesting_agent_id,
@@ -504,7 +601,16 @@ async def _handle_single_context_update(
     async def write_operation():
         session = SessionLocal()
         try:
-            updated_at_iso = datetime.datetime.now().isoformat()
+            err = _check_write_authorization(
+                session,
+                requesting_agent_id,
+                context_key_to_update,
+                is_admin=is_admin,
+            )
+            if err is not None:
+                raise _UnauthorizedWrite(err)
+
+            now_iso = datetime.datetime.now().isoformat()
 
             existing = (
                 session.query(ProjectContext)
@@ -516,16 +622,19 @@ async def _handle_single_context_update(
                     ProjectContext(
                         context_key=context_key_to_update,
                         value=value_json_str,
-                        last_updated=updated_at_iso,
-                        updated_by=requesting_agent_id,
                         description=description_for_context,
+                        created_at=now_iso,
+                        created_by=requesting_agent_id,
+                        updated_at=now_iso,
+                        updated_by=requesting_agent_id,
                     )
                 )
             else:
                 existing.value = value_json_str
-                existing.last_updated = updated_at_iso
+                existing.updated_at = now_iso
                 existing.updated_by = requesting_agent_id
                 existing.description = description_for_context
+                # created_at / created_by stay frozen on UPDATE
 
             # Log to agent_actions table — still raw SQL for now
             # (Phase 7j will migrate agent_actions). Reuse the existing
@@ -547,6 +656,9 @@ async def _handle_single_context_update(
             )
             return "success"
 
+        except _UnauthorizedWrite:
+            session.rollback()
+            raise
         except SQLAlchemyError as e_sql:
             session.rollback()
             logger.error(
@@ -573,6 +685,8 @@ async def _handle_single_context_update(
                 text=f"Project context updated successfully for key '{context_key_to_update}'.",
             )
         ]
+    except _UnauthorizedWrite as e_auth:
+        return [mcp_types.TextContent(type="text", text=e_auth.user_message)]
     except (sqlite3.Error, SQLAlchemyError) as e_sql:
         return [
             mcp_types.TextContent(
@@ -588,9 +702,17 @@ async def _handle_single_context_update(
 
 
 async def _handle_bulk_context_update(
-    requesting_agent_id: str, updates_list: List[Dict[str, Any]]
+    requesting_agent_id: str,
+    updates_list: List[Dict[str, Any]],
+    *,
+    is_admin: bool,
 ) -> List[mcp_types.TextContent]:
-    """Handle bulk context update operations"""
+    """Handle bulk context update operations atomically.
+
+    Phase 7b: every entry is authorized before any write lands. If a
+    single entry fails the ownership check, the whole batch rolls back
+    and the caller receives the specific error message.
+    """
     # Log audit
     log_audit(
         requesting_agent_id,
@@ -605,11 +727,27 @@ async def _handle_bulk_context_update(
         failed_updates: List[str] = []
 
         try:
-            updated_at_iso = datetime.datetime.now().isoformat()
+            # Phase 1 — authorize every key up front. Any failure here
+            # rolls back the open transaction (the session itself hasn't
+            # written yet, but a SELECT in _check_write_authorization
+            # has opened one).
+            for upd in updates_list:
+                key = upd.get("context_key")
+                if not key:
+                    continue
+                err = _check_write_authorization(
+                    session, requesting_agent_id, key, is_admin=is_admin
+                )
+                if err is not None:
+                    raise _UnauthorizedWrite(err)
+
+            now_iso = datetime.datetime.now().isoformat()
             raw_conn = session.connection().connection
             cursor = raw_conn.cursor()
 
-            # Process each update atomically
+            # Phase 2 — apply each update. JSON-encoding failures are
+            # per-entry soft errors (legacy behavior); ownership errors
+            # have already been excluded in phase 1 and would abort.
             for i, update in enumerate(updates_list):
                 try:
                     context_key = update["context_key"]
@@ -631,14 +769,16 @@ async def _handle_bulk_context_update(
                             ProjectContext(
                                 context_key=context_key,
                                 value=value_json_str,
-                                last_updated=updated_at_iso,
-                                updated_by=requesting_agent_id,
                                 description=description,
+                                created_at=now_iso,
+                                created_by=requesting_agent_id,
+                                updated_at=now_iso,
+                                updated_by=requesting_agent_id,
                             )
                         )
                     else:
                         existing.value = value_json_str
-                        existing.last_updated = updated_at_iso
+                        existing.updated_at = now_iso
                         existing.updated_by = requesting_agent_id
                         existing.description = description
 
@@ -688,6 +828,9 @@ async def _handle_bulk_context_update(
             )
             return response_parts
 
+        except _UnauthorizedWrite:
+            session.rollback()
+            raise
         except SQLAlchemyError as e_sql:
             session.rollback()
             logger.error(
@@ -705,6 +848,8 @@ async def _handle_bulk_context_update(
     try:
         response_parts = await execute_db_write(write_operation)
         return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
+    except _UnauthorizedWrite as e_auth:
+        return [mcp_types.TextContent(type="text", text=e_auth.user_message)]
     except (sqlite3.Error, SQLAlchemyError) as e_sql:
         return [
             mcp_types.TextContent(
@@ -738,6 +883,8 @@ async def update_project_context_tool_impl(
             )
         ]
 
+    is_admin = verify_token(auth_token, "admin")
+
     # Determine operation mode
     is_bulk_operation = updates_list is not None
 
@@ -749,7 +896,9 @@ async def update_project_context_tool_impl(
                     text="Error: updates must be a non-empty list for bulk operations.",
                 )
             ]
-        return await _handle_bulk_context_update(requesting_agent_id, updates_list)
+        return await _handle_bulk_context_update(
+            requesting_agent_id, updates_list, is_admin=is_admin
+        )
     else:
         # Single operation (backward compatibility)
         if not context_key_to_update or context_value_to_set is None:
@@ -764,6 +913,7 @@ async def update_project_context_tool_impl(
             context_key_to_update,
             context_value_to_set,
             description_for_context,
+            is_admin=is_admin,
         )
 
 
@@ -771,6 +921,15 @@ async def update_project_context_tool_impl(
 async def bulk_update_project_context_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
+    """Public-facing bulk-update entry point.
+
+    Delegates to the shared `_handle_bulk_context_update` so the
+    queue-aware code path and this surface stay in lockstep on ownership
+    rules + atomicity. Earlier versions of this file had a separate
+    inline implementation that drifted from the queued path; the Phase
+    7b ownership rules made that drift dangerous (it bypassed auth),
+    so we now route everything through one helper.
+    """
     auth_token = arguments.get("token")
     updates = arguments.get("updates", [])  # List of update operations
 
@@ -810,115 +969,10 @@ async def bulk_update_project_context_tool_impl(
                 )
             ]
 
-    # Log audit
-    log_audit(
-        requesting_agent_id,
-        "bulk_update_project_context",
-        {"update_count": len(updates)},
+    is_admin = verify_token(auth_token, "admin")
+    return await _handle_bulk_context_update(
+        requesting_agent_id, updates, is_admin=is_admin
     )
-
-    session = SessionLocal()
-    results: List[str] = []
-    failed_updates: List[str] = []
-
-    try:
-        updated_at_iso = datetime.datetime.now().isoformat()
-        raw_conn = session.connection().connection
-        cursor = raw_conn.cursor()
-
-        # Process each update atomically
-        for i, update in enumerate(updates):
-            try:
-                context_key = update["context_key"]
-                context_value = update["context_value"]
-                description = update.get("description", f"Bulk update operation {i+1}")
-
-                # Validate JSON serialization
-                value_json_str = json.dumps(context_value)
-
-                existing = (
-                    session.query(ProjectContext)
-                    .filter(ProjectContext.context_key == context_key)
-                    .one_or_none()
-                )
-                if existing is None:
-                    session.add(
-                        ProjectContext(
-                            context_key=context_key,
-                            value=value_json_str,
-                            last_updated=updated_at_iso,
-                            updated_by=requesting_agent_id,
-                            description=description,
-                        )
-                    )
-                else:
-                    existing.value = value_json_str
-                    existing.last_updated = updated_at_iso
-                    existing.updated_by = requesting_agent_id
-                    existing.description = description
-
-                session.flush()
-
-                results.append(f"✓ Updated '{context_key}'")
-
-                # Log individual action
-                log_agent_action_to_db(
-                    cursor,
-                    requesting_agent_id,
-                    "bulk_updated_context",
-                    details={
-                        "context_key": context_key,
-                        "operation": f"bulk_update_{i+1}",
-                    },
-                )
-
-            except (TypeError, json.JSONEncodeError) as e_json:
-                failed_updates.append(
-                    f"✗ Failed '{update.get('context_key', 'unknown')}': Invalid JSON - {e_json}"
-                )
-            except Exception as e_update:
-                failed_updates.append(
-                    f"✗ Failed '{update.get('context_key', 'unknown')}': {str(e_update)}"
-                )
-
-        session.commit()
-
-        # Build response
-        response_parts = [
-            f"Bulk update completed: {len(results)} successful, {len(failed_updates)} failed"
-        ]
-
-        if results:
-            response_parts.append("\nSuccessful updates:")
-            response_parts.extend(results)
-
-        if failed_updates:
-            response_parts.append("\nFailed updates:")
-            response_parts.extend(failed_updates)
-
-        logger.info(
-            f"Bulk context update by '{requesting_agent_id}': {len(results)} successful, {len(failed_updates)} failed."
-        )
-        return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
-
-    except SQLAlchemyError as e_sql:
-        session.rollback()
-        logger.error(f"Database error in bulk context update: {e_sql}", exc_info=True)
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Database error in bulk update: {e_sql}"
-            )
-        ]
-    except Exception as e:
-        session.rollback()
-        logger.error(f"Unexpected error in bulk context update: {e}", exc_info=True)
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Unexpected error in bulk update: {e}"
-            )
-        ]
-    finally:
-        session.close()
 
 
 # --- backup_project_context tool ---
@@ -1116,7 +1170,7 @@ async def validate_context_consistency_tool_impl(
         old_entries = [
             entry["context_key"]
             for entry in all_entries
-            if entry["last_updated"] < cutoff_date
+            if (entry.get("updated_at") or "") < cutoff_date
         ]
         if old_entries:
             warnings.extend(
@@ -1227,9 +1281,9 @@ def register_project_context_tools():
                 },
                 "sort_by": {
                     "type": "string",
-                    "description": "Sort entries by specified field (default: last_updated)",
-                    "enum": ["key", "last_updated", "size"],
-                    "default": "last_updated",
+                    "description": "Sort entries by specified field (default: updated_at). 'last_updated' is accepted as a deprecated alias.",
+                    "enum": ["key", "updated_at", "last_updated", "size"],
+                    "default": "updated_at",
                 },
             },
             "required": [],
@@ -1394,22 +1448,26 @@ def register_project_context_tools():
 async def delete_project_context_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
+    """Delete project context entries permanently.
+
+    Phase 7b: per-key creator-ownership check applies (admins can delete
+    anything; workers can delete only entries they themselves created
+    and which are not `config_*`). The `force_delete` safety net on
+    "critical" system keys is preserved as belt-and-suspenders.
     """
-    Delete project context entries permanently.
-    Admin-only operation with safety checks for critical system keys.
-    """
-    admin_token = arguments.get("token")
+    auth_token = arguments.get("token")
     context_keys = arguments.get("context_keys", [])
     context_key = arguments.get("context_key")
     force_delete = arguments.get("force_delete", False)
 
-    # Verify admin permissions
-    if not verify_token(admin_token, required_role="admin"):
+    requesting_agent_id = get_agent_id(auth_token)
+    if not requesting_agent_id:
         return [
             mcp_types.TextContent(
-                type="text", text="Unauthorized: Admin token required"
+                type="text", text="Unauthorized: Valid token required"
             )
         ]
+    is_admin = verify_token(auth_token, required_role="admin")
 
     # Prepare list of keys to delete
     keys_to_delete = []
@@ -1455,6 +1513,14 @@ async def delete_project_context_tool_impl(
 
     session = SessionLocal()
     try:
+        # Per-key ownership check before any deletion runs.
+        for key in keys_to_delete:
+            err = _check_write_authorization(
+                session, requesting_agent_id, key, is_admin=is_admin
+            )
+            if err is not None:
+                return [mcp_types.TextContent(type="text", text=err)]
+
         # Fetch existing rows up front so we know what's actually there.
         existing_rows = (
             session.query(ProjectContext)
@@ -1494,7 +1560,7 @@ async def delete_project_context_tool_impl(
         cursor = raw_conn.cursor()
         log_agent_action_to_db(
             cursor=cursor,
-            agent_id="admin",
+            agent_id=requesting_agent_id,
             action_type="deleted_context",
             details={
                 "deleted_keys": [d["key"] for d in deletion_details],

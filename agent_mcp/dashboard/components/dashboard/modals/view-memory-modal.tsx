@@ -79,7 +79,8 @@ export function ViewMemoryModal({ memory, open, onOpenChange }: ViewMemoryModalP
   }
 
   const metadata = memory._metadata
-  const dateInfo = formatDate(memory.last_updated)
+  const dateInfo = formatDate(memory.updated_at)
+  const createdDateInfo = memory.created_at ? formatDate(memory.created_at) : null
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -170,6 +171,33 @@ export function ViewMemoryModal({ memory, open, onOpenChange }: ViewMemoryModalP
                 </div>
                 <div className="text-sm text-foreground">{memory.updated_by}</div>
               </div>
+
+              {/* Created — Phase 7b: shown only when the backfilled
+                  created_at/created_by data is present. */}
+              {createdDateInfo && (
+                <div className="bg-muted/30 border border-border rounded-lg p-3">
+                  <div className="flex items-center gap-2 mb-2">
+                    <Clock className="h-4 w-4 text-muted-foreground" />
+                    <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+                      Created
+                    </span>
+                  </div>
+                  <div className="text-sm text-foreground">{createdDateInfo.relative}</div>
+                  <div className="text-xs text-muted-foreground">{createdDateInfo.absolute}</div>
+                </div>
+              )}
+
+              {memory.created_by && (
+                <div className="bg-muted/30 border border-border rounded-lg p-3">
+                  <div className="flex items-center gap-2 mb-2">
+                    <User className="h-4 w-4 text-muted-foreground" />
+                    <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+                      Created By
+                    </span>
+                  </div>
+                  <div className="text-sm text-foreground">{memory.created_by}</div>
+                </div>
+              )}
             </div>
 
             {/* Size Information */}
@@ -270,7 +298,9 @@ export function ViewMemoryModal({ memory, open, onOpenChange }: ViewMemoryModalP
                 value: memory.value,
                 description: memory.description,
                 updated_by: memory.updated_by,
-                last_updated: memory.last_updated
+                updated_at: memory.updated_at,
+                created_by: memory.created_by,
+                created_at: memory.created_at
               }, null, 2),
               'Full memory data'
             )}

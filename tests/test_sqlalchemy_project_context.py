@@ -1,16 +1,18 @@
-"""ORM model + Alembic infrastructure for project_context (Phase 7a).
+"""ORM model + Alembic infrastructure for project_context (Phase 7a/7b).
 
-The model must exactly mirror the current sqlite schema:
+Post-Phase-7b the model must mirror the migrated sqlite schema:
     context_key TEXT PRIMARY KEY
     value TEXT NOT NULL
-    last_updated TEXT NOT NULL
-    updated_by TEXT NOT NULL
     description TEXT
+    created_at TEXT
+    created_by TEXT
+    updated_at TEXT NOT NULL
+    updated_by TEXT NOT NULL
 
 This test confirms the SQLAlchemy model can read/write rows against
 the same DB that `init_database()` set up via raw SQL, and that
-`alembic upgrade head` is idempotent (the baseline migration is a no-op
-on an already-initialised schema).
+`alembic upgrade head` is idempotent (re-runs are no-ops on an
+already-migrated schema).
 """
 
 from __future__ import annotations
@@ -35,7 +37,9 @@ def test_project_context_model_round_trip(client, project_dir):
         row = ProjectContext(
             context_key="orm_round_trip",
             value=json.dumps({"hello": "world"}),
-            last_updated=now,
+            created_at=now,
+            created_by="test-suite",
+            updated_at=now,
             updated_by="test-suite",
             description="orm round-trip fixture",
         )
@@ -52,7 +56,9 @@ def test_project_context_model_round_trip(client, project_dir):
         assert json.loads(fetched.value) == {"hello": "world"}
         assert fetched.updated_by == "test-suite"
         assert fetched.description == "orm round-trip fixture"
-        assert fetched.last_updated == now
+        assert fetched.updated_at == now
+        assert fetched.created_at == now
+        assert fetched.created_by == "test-suite"
 
 
 def test_project_context_model_columns_match_raw_schema(client, project_dir):
@@ -66,9 +72,11 @@ def test_project_context_model_columns_match_raw_schema(client, project_dir):
     assert model_cols == {
         "context_key",
         "value",
-        "last_updated",
-        "updated_by",
         "description",
+        "created_at",
+        "created_by",
+        "updated_at",
+        "updated_by",
     }, f"ORM columns drifted from raw schema: {model_cols}"
 
     from agent_mcp.core.config import get_db_path
