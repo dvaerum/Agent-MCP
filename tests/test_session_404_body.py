@@ -39,14 +39,33 @@ def test_unknown_session_404_body_is_actionable(client) -> None:
     assert r.status_code == 404, r.status_code
     body = r.text.lower()
     # The original SDK body is just "could not find session". Demand
-    # something that points the user at the fix.
-    assert "restart" in body or "reconnect" in body or "re-open" in body, (
-        "expected the 404 body to instruct the caller to restart / "
-        "reconnect their MCP session — without that the error reads "
-        "as a configuration bug. Got:\n" + r.text
+    # the user-actionable phrase pointing at the fix.
+    assert "reconnect" in body, (
+        "expected the 404 body to tell the caller to reconnect their "
+        "MCP session. Got:\n" + r.text
     )
-    # And keep the original phrase so any client that grep'd for it
-    # still recognises the condition.
+    # Specifically the claude-code-flavoured example. The previous
+    # text suggested "restart claude-code" which is overkill — the
+    # right fix is just an MCP-level reconnect.
+    assert "/mcp reconnect" in body, (
+        "expected the 404 body to include the literal claude-code "
+        "command `/mcp reconnect <server>` as a concrete example so "
+        "the user can paste it directly. Without it the message reads "
+        "as vague advice. Got:\n" + r.text
+    )
+    # And no advice to restart / quit / relaunch the WHOLE client —
+    # that's heavier than necessary. (The word "restart" may appear
+    # describing what the backend did; we only object to suggesting
+    # the user restart the CLIENT.)
+    for bad in ("restart your", "restart claude", "restart the client",
+                "quit + relaunch", "relaunch claude"):
+        assert bad not in body, (
+            f"expected the 404 body NOT to suggest {bad!r} — that's "
+            f"heavier than necessary. An MCP-level reconnect is enough. "
+            f"Got:\n{r.text}"
+        )
+    # Keep the original phrase so clients matching on the SDK's text
+    # still trigger.
     assert "session" in body, (
         "expected the body to still mention 'session' so clients that "
         "match on the SDK's original phrase still trigger. Got:\n" + r.text
