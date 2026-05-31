@@ -1,8 +1,18 @@
 # Agent-MCP/mcp_template/mcp_server_src/tools/project_context_tools.py
 import json
 import datetime
+import re
 import sqlite3
 from typing import List, Dict, Any, Optional
+
+# Keys that hold project-level secrets. view_project_context filters
+# rows whose key matches when the caller isn't admin, so worker-tier
+# tokens can't read the admin credential (or other secrets) through
+# the tool surface. UPSTREAM_ISSUES.md issue I.
+_SECRET_KEY_RE = re.compile(
+    r"config_.*_(token|secret|password|api[_-]?key|priv(?:ate)?[_-]?key)",
+    re.IGNORECASE,
+)
 
 import mcp.types as mcp_types
 
@@ -234,6 +244,12 @@ async def view_project_context_tool_impl(
 
         cursor.execute(base_query, query_params)
         rows = cursor.fetchall()
+
+        # Redact secret-looking keys for non-admin callers (issue I).
+        # Admins continue to see everything; workers see everything
+        # EXCEPT keys matching _SECRET_KEY_RE.
+        if not verify_token(agent_auth_token, "admin"):
+            rows = [r for r in rows if not _SECRET_KEY_RE.search(r["context_key"])]
 
         # Process results with enhanced information
         for row_data in rows:
