@@ -323,6 +323,7 @@ uv.lock
 .mcp.json
 *.jsonl
 *.lock
+!flake.lock
 *.db
 
 # Backup files
@@ -376,4 +377,4 @@ agent_mcp/static/
 conversations/
 **/conversations/
 session-*/
-**/session-*/
+**/session-*/.playwright-mcp/
