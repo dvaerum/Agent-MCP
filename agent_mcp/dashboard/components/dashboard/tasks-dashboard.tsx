@@ -12,11 +12,11 @@ import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
+import { Label } from "@/components/ui/label"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { apiClient, Task, Agent } from "@/lib/api"
 import { useServerStore } from "@/lib/stores/server-store"
 import { cn } from "@/lib/utils"
-import { TaskDetailsPanel } from "./task-details-panel"
 
 // Status / priority colour helpers shared by the row + the View / Edit
 // modals. Keep these here so the styles match the rest of the page.
@@ -188,17 +188,16 @@ PriorityIcon.displayName = 'PriorityIcon'
 
 interface CompactTaskRowProps {
   task: Task
-  onTaskClick: (task: Task) => void
   // Three distinct row-action handlers. Each opens its own Dialog
-  // modal (View / Edit / Delete). The buttons stopPropagation so the
-  // row-level click handler (which still opens the legacy sidebar)
-  // doesn't fire when the icons are pressed.
+  // modal (View / Edit / Delete). The icon buttons stopPropagation so
+  // the row-level click handler (which now opens the same View
+  // dialog) doesn't fire twice when the icons are pressed.
   openView: (task: Task) => void
   openEdit: (task: Task) => void
   openDelete: (task: Task) => void
 }
 
-const CompactTaskRow = React.memo(({ task, onTaskClick, openView, openEdit, openDelete }: CompactTaskRowProps) => {
+const CompactTaskRow = React.memo(({ task, openView, openEdit, openDelete }: CompactTaskRowProps) => {
   const [mounted, setMounted] = useState(false)
 
   useEffect(() => {
@@ -216,7 +215,7 @@ const CompactTaskRow = React.memo(({ task, onTaskClick, openView, openEdit, open
   }, [mounted])
 
   return (
-    <TableRow className="border-teal-500/10 dark:border-teal-500/10 border-teal-600/20 hover:bg-teal-500/5 dark:hover:bg-teal-500/5 hover:bg-teal-600/10 group transition-all duration-200 cursor-pointer" onClick={() => onTaskClick(task)}>
+    <TableRow className="border-teal-500/10 dark:border-teal-500/10 border-teal-600/20 hover:bg-teal-500/5 dark:hover:bg-teal-500/5 hover:bg-teal-600/10 group transition-all duration-200 cursor-pointer" onClick={() => openView(task)}>
       <TableCell className="py-3">
         <div className="flex items-center gap-3">
           <StatusDot status={task.status} />
@@ -292,10 +291,11 @@ const CompactTaskRow = React.memo(({ task, onTaskClick, openView, openEdit, open
       
       <TableCell className="py-3">
         {/*
-          Three distinct row icons. Previously every icon eventually
-          opened the same sidebar (TaskDetailsPanel); now each one
-          opens its own Dialog modal. stopPropagation prevents the
-          row-level onClick from also firing.
+          Three distinct row icons. Each opens its own Dialog modal
+          (View / Edit / Delete). stopPropagation prevents the row-
+          level onClick (which opens the same View dialog) from
+          firing twice when the eye icon is pressed and from opening
+          the View dialog when Edit/Delete are pressed.
         */}
         <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
           <Button
@@ -501,10 +501,10 @@ const ViewTaskDialog = React.memo(({ task, onOpenChange }: RowDialogProps) => {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-2xl max-h-[85vh] overflow-y-auto bg-card border-border text-card-foreground">
+      <DialogContent className="max-w-2xl bg-card border-border text-card-foreground p-0 gap-0">
         {task && (
           <>
-            <DialogHeader>
+            <DialogHeader className="px-6 pt-6 pb-4 border-b border-border">
               <DialogTitle className="flex items-center justify-between pr-8 gap-2">
                 <span className="text-lg font-semibold truncate">{task.title}</span>
                 <div className="flex items-center gap-2 flex-shrink-0">
@@ -521,33 +521,36 @@ const ViewTaskDialog = React.memo(({ task, onOpenChange }: RowDialogProps) => {
               </DialogDescription>
             </DialogHeader>
 
-            <div className="space-y-4 text-sm">
+            {/* Scrollable body: only this section overflows, not the
+                whole modal (per shadcn idiom). */}
+            <div className="px-6 py-4 max-h-[80vh] overflow-y-auto space-y-4 text-sm">
+              {/* Group 1: core metadata in a 2-col grid */}
               <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <div className="text-xs uppercase tracking-wider text-muted-foreground mb-1">Title</div>
-                  <div className="font-medium">{task.title}</div>
+                <div className="space-y-2">
+                  <Label className="text-xs text-muted-foreground uppercase tracking-wider">Status</Label>
+                  <div>
+                    <Badge variant="outline" className={cn("text-xs", statusBadgeClass(task.status))}>
+                      {task.status.replace(/_/g, ' ')}
+                    </Badge>
+                  </div>
                 </div>
-                <div>
-                  <div className="text-xs uppercase tracking-wider text-muted-foreground mb-1">Status</div>
-                  <Badge variant="outline" className={cn("text-xs", statusBadgeClass(task.status))}>
-                    {task.status.replace(/_/g, ' ')}
-                  </Badge>
+                <div className="space-y-2">
+                  <Label className="text-xs text-muted-foreground uppercase tracking-wider">Priority</Label>
+                  <div>
+                    <Badge variant="outline" className={cn("text-xs", priorityBadgeClass(task.priority))}>
+                      {task.priority}
+                    </Badge>
+                  </div>
                 </div>
-                <div>
-                  <div className="text-xs uppercase tracking-wider text-muted-foreground mb-1">Priority</div>
-                  <Badge variant="outline" className={cn("text-xs", priorityBadgeClass(task.priority))}>
-                    {task.priority}
-                  </Badge>
-                </div>
-                <div>
-                  <div className="text-xs uppercase tracking-wider text-muted-foreground mb-1">Assigned to</div>
+                <div className="space-y-2">
+                  <Label className="text-xs text-muted-foreground uppercase tracking-wider">Assigned to</Label>
                   <div className={cn("text-sm", !task.assigned_to && "text-muted-foreground italic")}>
                     {task.assigned_to || '(unassigned)'}
                   </div>
                 </div>
                 {createdBy && (
-                  <div>
-                    <div className="text-xs uppercase tracking-wider text-muted-foreground mb-1">Created by</div>
+                  <div className="space-y-2">
+                    <Label className="text-xs text-muted-foreground uppercase tracking-wider">Created by</Label>
                     <div className={cn(
                       "text-sm",
                       isTombstone(createdBy) && "text-muted-foreground italic"
@@ -557,48 +560,56 @@ const ViewTaskDialog = React.memo(({ task, onOpenChange }: RowDialogProps) => {
                   </div>
                 )}
                 {task.parent_task && (
-                  <div>
-                    <div className="text-xs uppercase tracking-wider text-muted-foreground mb-1">Parent task</div>
-                    <Badge variant="outline" className="text-xs font-mono">
-                      <GitBranch className="h-3 w-3 mr-1" />
-                      {task.parent_task}
-                    </Badge>
+                  <div className="space-y-2 col-span-2">
+                    <Label className="text-xs text-muted-foreground uppercase tracking-wider">Parent task</Label>
+                    <div>
+                      <Badge variant="outline" className="text-xs font-mono">
+                        <GitBranch className="h-3 w-3 mr-1" />
+                        {task.parent_task}
+                      </Badge>
+                    </div>
                   </div>
                 )}
               </div>
 
-              <div>
-                <div className="text-xs uppercase tracking-wider text-muted-foreground mb-1">Description</div>
-                <p className="text-sm whitespace-pre-wrap break-words">
-                  {task.description || <span className="text-muted-foreground italic">(no description)</span>}
+              {/* Group 2: description — separated by a subtle divider */}
+              <div className="border-t border-border pt-4 space-y-2">
+                <Label className="text-xs text-muted-foreground uppercase tracking-wider">Description</Label>
+                <p className="text-sm whitespace-pre-wrap break-words font-mono text-xs bg-muted/40 rounded p-3">
+                  {task.description || <span className="text-muted-foreground italic font-sans">(no description)</span>}
                 </p>
               </div>
 
-              {dependencies.length > 0 && (
-                <div>
-                  <div className="text-xs uppercase tracking-wider text-muted-foreground mb-1">Depends on</div>
-                  <div className="flex flex-wrap gap-2">
-                    {dependencies.map((id: any, idx) => (
-                      <Badge key={idx} variant="outline" className="text-xs font-mono">{String(id)}</Badge>
-                    ))}
-                  </div>
+              {/* Group 3: relations (only renders if present) */}
+              {(dependencies.length > 0 || childTasks.length > 0) && (
+                <div className="border-t border-border pt-4 space-y-4">
+                  {dependencies.length > 0 && (
+                    <div className="space-y-2">
+                      <Label className="text-xs text-muted-foreground uppercase tracking-wider">Depends on</Label>
+                      <div className="flex flex-wrap gap-2">
+                        {dependencies.map((id: any, idx) => (
+                          <Badge key={idx} variant="outline" className="text-xs font-mono">{String(id)}</Badge>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {childTasks.length > 0 && (
+                    <div className="space-y-2">
+                      <Label className="text-xs text-muted-foreground uppercase tracking-wider">Subtasks</Label>
+                      <div className="flex flex-wrap gap-2">
+                        {childTasks.map((id: any, idx) => (
+                          <Badge key={idx} variant="outline" className="text-xs font-mono">{String(id)}</Badge>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
 
-              {childTasks.length > 0 && (
-                <div>
-                  <div className="text-xs uppercase tracking-wider text-muted-foreground mb-1">Subtasks</div>
-                  <div className="flex flex-wrap gap-2">
-                    {childTasks.map((id: any, idx) => (
-                      <Badge key={idx} variant="outline" className="text-xs font-mono">{String(id)}</Badge>
-                    ))}
-                  </div>
-                </div>
-              )}
-
+              {/* Group 4: notes (only renders if present) */}
               {notes.length > 0 && (
-                <div>
-                  <div className="text-xs uppercase tracking-wider text-muted-foreground mb-1">Notes ({notes.length})</div>
+                <div className="border-t border-border pt-4 space-y-2">
+                  <Label className="text-xs text-muted-foreground uppercase tracking-wider">Notes ({notes.length})</Label>
                   <div className="space-y-2">
                     {notes.map((note: any, idx) => (
                       <div key={idx} className="bg-muted/50 rounded-lg p-3">
@@ -620,27 +631,28 @@ const ViewTaskDialog = React.memo(({ task, onOpenChange }: RowDialogProps) => {
                 </div>
               )}
 
-              <div className="pt-3 border-t border-border space-y-1 text-xs text-muted-foreground">
-                <div className="flex justify-between">
+              {/* Group 5: tombstone metadata footer in monospace */}
+              <div className="border-t border-border pt-4 space-y-1 text-xs text-muted-foreground">
+                <div className="flex justify-between gap-2">
                   <span>Created</span>
-                  <span className="font-mono" title={task.created_at}>
+                  <span className="font-mono text-xs" title={task.created_at}>
                     {task.created_at} · {formatRelative(task.created_at)}
                   </span>
                 </div>
-                <div className="flex justify-between">
+                <div className="flex justify-between gap-2">
                   <span>Updated</span>
-                  <span className="font-mono" title={task.updated_at}>
+                  <span className="font-mono text-xs" title={task.updated_at}>
                     {task.updated_at} · {formatRelative(task.updated_at)}
                   </span>
                 </div>
-                <div className="flex justify-between">
+                <div className="flex justify-between gap-2">
                   <span>Task ID</span>
-                  <span className="font-mono break-all">{task.task_id}</span>
+                  <span className="font-mono text-xs break-all">{task.task_id}</span>
                 </div>
               </div>
             </div>
 
-            <DialogFooter>
+            <DialogFooter className="px-6 py-4 border-t border-border">
               <Button variant="outline" size="sm" onClick={() => onOpenChange(false)}>Close</Button>
             </DialogFooter>
           </>
@@ -716,87 +728,97 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-2xl max-h-[85vh] overflow-y-auto bg-card border-border text-card-foreground">
+      <DialogContent className="max-w-xl bg-card border-border text-card-foreground p-0 gap-0">
         {task && (
           <>
-            <DialogHeader>
+            <DialogHeader className="px-6 pt-6 pb-4 border-b border-border">
               <DialogTitle className="text-lg">Edit task</DialogTitle>
               <DialogDescription className="text-muted-foreground">
-                Changes are saved via POST /api/update-task-dashboard. <span className="font-mono">{task.task_id.slice(-8)}</span>
+                Changes are saved via POST /api/update-task-dashboard.
               </DialogDescription>
             </DialogHeader>
-            <form onSubmit={handleSave} className="space-y-4">
-              <div>
-                <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">Title</label>
-                <Input
-                  value={editTitle}
-                  onChange={(e) => setEditTitle(e.target.value)}
-                  required
-                  className="bg-background border-border text-foreground"
-                />
-              </div>
-              <div>
-                <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">Description</label>
-                <Textarea
-                  value={editDescription}
-                  onChange={(e) => setEditDescription(e.target.value)}
-                  className="bg-background border-border text-foreground min-h-[100px] whitespace-pre-wrap"
-                />
-              </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">Status</label>
-                  <Select value={editStatus} onValueChange={(v) => setEditStatus(v as Task['status'])}>
-                    <SelectTrigger className="bg-background border-border text-foreground">
+            <form onSubmit={handleSave}>
+              {/* Scrollable body — only this region overflows. */}
+              <div className="px-6 py-4 max-h-[80vh] overflow-y-auto space-y-4">
+                <div className="space-y-2">
+                  <Label htmlFor="edit-task-title" className="text-sm text-muted-foreground">Title</Label>
+                  <Input
+                    id="edit-task-title"
+                    value={editTitle}
+                    onChange={(e) => setEditTitle(e.target.value)}
+                    required
+                    className="w-full bg-background border-border text-foreground"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="edit-task-description" className="text-sm text-muted-foreground">Description</Label>
+                  <Textarea
+                    id="edit-task-description"
+                    value={editDescription}
+                    onChange={(e) => setEditDescription(e.target.value)}
+                    className="w-full bg-background border-border text-foreground min-h-[100px] whitespace-pre-wrap font-mono text-xs"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="edit-task-status" className="text-sm text-muted-foreground">Status</Label>
+                    <Select value={editStatus} onValueChange={(v) => setEditStatus(v as Task['status'])}>
+                      <SelectTrigger id="edit-task-status" className="w-full bg-background border-border text-foreground">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent className="bg-background border-border">
+                        <SelectItem value="pending">pending</SelectItem>
+                        <SelectItem value="in_progress">in_progress</SelectItem>
+                        <SelectItem value="completed">completed</SelectItem>
+                        <SelectItem value="cancelled">cancelled</SelectItem>
+                        <SelectItem value="failed">failed</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="edit-task-priority" className="text-sm text-muted-foreground">Priority</Label>
+                    <Select value={editPriority} onValueChange={(v) => setEditPriority(v as Task['priority'])}>
+                      <SelectTrigger id="edit-task-priority" className="w-full bg-background border-border text-foreground">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent className="bg-background border-border">
+                        <SelectItem value="low">low</SelectItem>
+                        <SelectItem value="medium">medium</SelectItem>
+                        <SelectItem value="high">high</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="edit-task-assigned" className="text-sm text-muted-foreground">Assigned to</Label>
+                  <Select value={editAssignedTo} onValueChange={setEditAssignedTo}>
+                    <SelectTrigger id="edit-task-assigned" className="w-full bg-background border-border text-foreground">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent className="bg-background border-border">
-                      <SelectItem value="pending">pending</SelectItem>
-                      <SelectItem value="in_progress">in_progress</SelectItem>
-                      <SelectItem value="completed">completed</SelectItem>
-                      <SelectItem value="cancelled">cancelled</SelectItem>
-                      <SelectItem value="failed">failed</SelectItem>
+                      <SelectItem value="__unassigned__">(unassigned)</SelectItem>
+                      {agents.map((a) => (
+                        <SelectItem key={a.agent_id} value={a.agent_id}>{a.agent_id}</SelectItem>
+                      ))}
+                      {/* If the current value isn't in the agent list, keep it as an explicit option. */}
+                      {editAssignedTo !== '__unassigned__' && !agents.find((a) => a.agent_id === editAssignedTo) && (
+                        <SelectItem value={editAssignedTo}>{editAssignedTo} (stale)</SelectItem>
+                      )}
                     </SelectContent>
                   </Select>
                 </div>
-                <div>
-                  <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">Priority</label>
-                  <Select value={editPriority} onValueChange={(v) => setEditPriority(v as Task['priority'])}>
-                    <SelectTrigger className="bg-background border-border text-foreground">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent className="bg-background border-border">
-                      <SelectItem value="low">low</SelectItem>
-                      <SelectItem value="medium">medium</SelectItem>
-                      <SelectItem value="high">high</SelectItem>
-                    </SelectContent>
-                  </Select>
+                {saveError && (
+                  <div className="text-xs text-destructive bg-destructive/10 border border-destructive/30 rounded p-2">
+                    {saveError}
+                  </div>
+                )}
+                {/* Monospace task_id footer — matches the View dialog idiom. */}
+                <div className="border-t border-border pt-3 flex justify-between gap-2 text-xs text-muted-foreground">
+                  <span>Task ID</span>
+                  <span className="font-mono text-xs break-all">{task.task_id}</span>
                 </div>
               </div>
-              <div>
-                <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">Assigned to</label>
-                <Select value={editAssignedTo} onValueChange={setEditAssignedTo}>
-                  <SelectTrigger className="bg-background border-border text-foreground">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent className="bg-background border-border">
-                    <SelectItem value="__unassigned__">(unassigned)</SelectItem>
-                    {agents.map((a) => (
-                      <SelectItem key={a.agent_id} value={a.agent_id}>{a.agent_id}</SelectItem>
-                    ))}
-                    {/* If the current value isn't in the agent list, keep it as an explicit option. */}
-                    {editAssignedTo !== '__unassigned__' && !agents.find((a) => a.agent_id === editAssignedTo) && (
-                      <SelectItem value={editAssignedTo}>{editAssignedTo} (stale)</SelectItem>
-                    )}
-                  </SelectContent>
-                </Select>
-              </div>
-              {saveError && (
-                <div className="text-xs text-destructive bg-destructive/10 border border-destructive/30 rounded p-2">
-                  {saveError}
-                </div>
-              )}
-              <DialogFooter className="gap-2">
+              <DialogFooter className="px-6 py-4 border-t border-border gap-2">
                 <Button type="button" variant="outline" size="sm" onClick={() => onOpenChange(false)} disabled={saving}>
                   Cancel
                 </Button>
@@ -845,24 +867,29 @@ const DeleteTaskDialog = React.memo(({ task, onOpenChange, onDeleted }: DeleteTa
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md bg-card border-border text-card-foreground">
+      <DialogContent className="max-w-md bg-card border-border text-card-foreground p-0 gap-0">
         {task && (
           <>
-            <DialogHeader>
+            <DialogHeader className="px-6 pt-6 pb-4">
               <DialogTitle className="text-lg">Delete task</DialogTitle>
               <DialogDescription className="text-muted-foreground">
                 Delete task &ldquo;{task.title}&rdquo;? This cannot be undone.
               </DialogDescription>
             </DialogHeader>
-            <div className="text-xs text-muted-foreground font-mono break-all border border-border rounded p-2 bg-muted/30">
-              {task.task_id}
-            </div>
-            {error && (
-              <div className="text-xs text-destructive bg-destructive/10 border border-destructive/30 rounded p-2">
-                {error}
+            <div className="px-6 pb-4 max-h-[80vh] overflow-y-auto space-y-3">
+              <div className="space-y-2">
+                <Label className="text-sm text-muted-foreground">Task ID</Label>
+                <div className="text-xs text-muted-foreground font-mono break-all border border-border rounded p-2 bg-muted/30">
+                  {task.task_id}
+                </div>
               </div>
-            )}
-            <DialogFooter className="gap-2">
+              {error && (
+                <div className="text-xs text-destructive bg-destructive/10 border border-destructive/30 rounded p-2">
+                  {error}
+                </div>
+              )}
+            </div>
+            <DialogFooter className="px-6 py-4 border-t border-border gap-2">
               <Button variant="outline" size="sm" onClick={() => onOpenChange(false)} disabled={busy}>
                 Cancel
               </Button>
@@ -891,9 +918,10 @@ export function TasksDashboard() {
   const [searchTerm, setSearchTerm] = useState('')
   const [statusFilter, setStatusFilter] = useState<string>('all')
   const [priorityFilter, setPriorityFilter] = useState<string>('all')
-  const [selectedTask, setSelectedTask] = useState<Task | null>(null)
   // Row-action dialog state. Each holds the task being viewed / edited
-  // / deleted, or null when the dialog is closed.
+  // / deleted, or null when the dialog is closed. The legacy
+  // TaskDetailsPanel sidebar has been retired — clicking a row body
+  // now opens the View dialog (same as the eye icon).
   const [viewTask, setViewTask] = useState<Task | null>(null)
   const [editTask, setEditTask] = useState<Task | null>(null)
   const [deleteTask, setDeleteTask] = useState<Task | null>(null)
@@ -928,17 +956,10 @@ export function TasksDashboard() {
     }
   }, [refresh])
 
-  const handleTaskClick = useCallback((task: Task) => {
-    setSelectedTask(task)
-  }, [])
-
-  const handleCloseTaskPanel = useCallback(() => {
-    setSelectedTask(null)
-  }, [])
-
-  // Row-action handlers. Each opens the matching Dialog (NOT the
-  // sidebar). The onOpenChange callback that the Dialog itself passes
-  // back uses null to mean "close".
+  // Row-action handlers. Each opens the matching Dialog. The
+  // onOpenChange callback that the Dialog itself passes back uses
+  // null to mean "close". openView is used by BOTH the eye icon and
+  // the row-body click — the sidebar (TaskDetailsPanel) is retired.
   const openView = useCallback((task: Task) => setViewTask(task), [])
   const openEdit = useCallback((task: Task) => setEditTask(task), [])
   const openDelete = useCallback((task: Task) => setDeleteTask(task), [])
@@ -985,10 +1006,7 @@ export function TasksDashboard() {
   }
 
   return (
-    <div className="relative w-full space-y-[var(--space-fluid-lg)]" style={{
-      paddingRight: selectedTask ? `calc(420px)` : '0px',
-      transition: 'padding-right 0.5s ease-in-out'
-    }}>
+    <div className="relative w-full space-y-[var(--space-fluid-lg)]">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
@@ -1114,7 +1132,6 @@ export function TasksDashboard() {
               <CompactTaskRow
                 key={task.task_id}
                 task={task}
-                onTaskClick={handleTaskClick}
                 openView={openView}
                 openEdit={openEdit}
                 openDelete={openDelete}
@@ -1151,15 +1168,6 @@ export function TasksDashboard() {
         task={deleteTask}
         onOpenChange={(open) => { if (!open) setDeleteTask(null) }}
         onDeleted={handleDeleted}
-      />
-
-      {/* Legacy Task Details Panel — still opened by clicking on the
-          row body (everything outside the action icons). Eventually
-          this can be retired entirely; for now it stays so existing
-          users with that muscle memory aren't broken. */}
-      <TaskDetailsPanel
-        task={selectedTask}
-        onClose={handleCloseTaskPanel}
       />
     </div>
   )
