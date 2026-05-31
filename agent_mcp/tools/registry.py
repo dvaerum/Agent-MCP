@@ -157,28 +157,73 @@ async def list_available_tools() -> List[mcp_types.Tool]:
     Returns a list of available tools with their schemas.
     This replaces the logic from `@app.list_tools()` in main.py (lines 1636-1858).
     It now reads from the `tool_schemas` list populated by `register_tool`.
+
+    The list is filtered by the calling bearer's role (admin / worker /
+    anonymous) per `agent_mcp.tools.access.is_visible_to_role`. The
+    bearer is taken from the `request_auth_token` ContextVar (set by
+    the HTTP middleware on each incoming request); in-process callers
+    that haven't set the ContextVar are treated as anonymous and see
+    only "any"-classified tools.
+
+    Phase 7g: previously this returned every registered tool to every
+    caller. That worked while the router's `_rewrite_tools_list_event`
+    hid admin-only tools, but Phase 7f removed that rewrite (per Q7.1:
+    no MCP-protocol manipulation in the router). Without backend-side
+    filtering, workers saw the full catalogue, attempted admin tools,
+    and got isError=true (PR #15) — wasting tokens and confusing the
+    model.
     """
-    # Convert the stored schema dictionaries to mcp_types.Tool objects
-    # The original code directly returned a list of mcp_types.Tool.
-    # We need to ensure the structure matches.
-    
-    # The `tool_schemas` list already contains dictionaries in the format
-    # that can be directly used to instantiate `mcp_types.Tool` if the keys match.
-    # Let's assume `mcp_types.Tool` can be constructed from a dictionary
-    # with 'name', 'description', and 'inputSchema'.
-    
+    # Resolve calling bearer to a role string. Imported lazily so the
+    # registry module stays importable in contexts where the access
+    # table or auth helpers haven't been wired (e.g. some unit tests).
+    role = "anonymous"
+    try:
+        bearer = request_auth_token.get()
+    except LookupError:
+        bearer = None
+
+    if bearer:
+        try:
+            from ..core.auth import verify_token, get_agent_id
+
+            if verify_token(bearer, "admin"):
+                role = "admin"
+            elif get_agent_id(bearer):
+                role = "worker"
+        except Exception as e:
+            # Don't fail the whole tools/list on an auth-resolver bug;
+            # fall back to anonymous (most conservative).
+            logger.warning(
+                "tools/list: failed to resolve bearer to role (%s); "
+                "treating as anonymous.",
+                e,
+            )
+
+    try:
+        from .access import is_visible_to_role
+    except Exception as e:
+        # If the access module itself fails to import (shouldn't
+        # happen in production), surface every tool — the previous
+        # behavior — and log loudly.
+        logger.error(
+            "tools/list: access module unavailable (%s); falling back "
+            "to unfiltered catalogue.",
+            e,
+        )
+
+        def is_visible_to_role(_name: str, _role: str) -> bool:
+            return True
+
     mcp_tool_list: List[mcp_types.Tool] = []
     for schema_dict in tool_schemas:
+        name = schema_dict.get("name", "")
+        if not is_visible_to_role(name, role):
+            continue
         try:
-            # Assuming mcp_types.Tool can be initialized like this:
-            # Tool(name="...", description="...", inputSchema={...})
-            # If it requires specific keyword arguments, adjust accordingly.
-            # The original `types.Tool` in main.py was directly instantiated.
             tool_instance = mcp_types.Tool(
                 name=schema_dict["name"],
                 description=schema_dict["description"],
                 inputSchema=schema_dict["inputSchema"]
-                # outputSchema=schema_dict.get("outputSchema") # If you add outputSchema
             )
             mcp_tool_list.append(tool_instance)
         except Exception as e:
@@ -186,6 +231,12 @@ async def list_available_tools() -> List[mcp_types.Tool]:
             # Optionally, skip this tool or add a placeholder error tool.
             # For now, skipping problematic ones.
 
+    logger.debug(
+        "tools/list returned %d / %d tools for role=%s",
+        len(mcp_tool_list),
+        len(tool_schemas),
+        role,
+    )
     return mcp_tool_list
 
 

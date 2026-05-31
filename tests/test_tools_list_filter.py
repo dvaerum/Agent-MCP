@@ -22,7 +22,6 @@ import asyncio
 import secrets
 
 import mcp.types as mcp_types
-import pytest
 
 
 def _admin_token(client) -> str:
