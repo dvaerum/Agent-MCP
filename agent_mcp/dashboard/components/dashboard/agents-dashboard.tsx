@@ -2,8 +2,8 @@
 
 import React, { useState, useEffect } from "react"
 import {
-  Users, PowerOff, Clock, AlertCircle, CheckCircle2, Shield, Cpu, Database, Network, Terminal,
-  Search, Plus, MoreVertical, Eye, RefreshCw, Copy, RotateCcw, Trash2
+  Users, Clock, AlertCircle, CheckCircle2, Shield, Cpu, Database, Network, Terminal,
+  Search, Plus, Eye, RefreshCw, Copy, RotateCcw, Trash2, Pencil
 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -16,7 +16,6 @@ import { apiClient, Agent, Task } from "@/lib/api"
 import { useServerStore } from "@/lib/stores/server-store"
 import { useDataStore } from "@/lib/stores/data-store"
 import { cn } from "@/lib/utils"
-import { AgentDetailsPanel } from "./agent-details-panel"
 import { TaskDetailsDialog } from "./task-details-dialog"
 
 
@@ -49,12 +48,13 @@ const AgentTypeIcon = React.memo(({ agentId }: { agentId: string }) => {
   return <Icon className="h-4 w-4 text-muted-foreground" />
 })
 
-const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, onSelect, onTaskClick }: {
+const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, onSelect, onEdit, onTaskClick }: {
   agent: Agent,
   onTerminate: (id: string) => void,
   onRestore: (id: string) => void,
   onPurge: (id: string) => void,
   onSelect: (agent: Agent) => void,
+  onEdit: (agent: Agent) => void,
   onTaskClick: (task: Task) => void
 }) => {
   const { getAgentTasks } = useDataStore()
@@ -189,23 +189,35 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, on
       
       <TableCell className="py-3">
         <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-          <Button 
-            variant="ghost" 
-            size="sm" 
+          <Button
+            variant="ghost"
+            size="sm"
             onClick={() => onSelect(agent)}
+            title="View details"
             className="h-7 w-7 p-0 text-muted-foreground hover:text-foreground hover:bg-muted"
           >
             <Eye className="h-3.5 w-3.5" />
           </Button>
+          {agent.agent_id !== 'Admin' && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => onEdit(agent)}
+              title="Edit agent"
+              className="h-7 w-7 p-0 text-muted-foreground hover:text-foreground hover:bg-muted"
+            >
+              <Pencil className="h-3.5 w-3.5" />
+            </Button>
+          )}
           {agent.status === 'running' && (
             <Button
               variant="ghost"
               size="sm"
               onClick={() => onTerminate(agent.agent_id)}
-              title="Terminate"
+              title="Terminate (soft-delete; can be restored or purged after)"
               className="h-7 w-7 p-0 text-destructive hover:text-destructive/80 hover:bg-destructive/10"
             >
-              <PowerOff className="h-3.5 w-3.5" />
+              <Trash2 className="h-3.5 w-3.5" />
             </Button>
           )}
           {agent.status === 'terminated' && agent.agent_id !== 'Admin' && (
@@ -232,13 +244,6 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, on
               </Button>
             </>
           )}
-          <Button 
-            variant="ghost" 
-            size="sm" 
-            className="h-7 w-7 p-0 text-muted-foreground hover:text-foreground hover:bg-muted"
-          >
-            <MoreVertical className="h-3.5 w-3.5" />
-          </Button>
         </div>
       </TableCell>
     </TableRow>
@@ -524,6 +529,415 @@ const PurgeAgentDialog = ({
   )
 }
 
+// Terminate confirmation. Soft-delete only — the row stays so the
+// admin can hit Restore / Purge after.
+const TerminateAgentDialog = ({
+  agentId,
+  open,
+  onOpenChange,
+  onConfirmed,
+}: {
+  agentId: string | null
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  onConfirmed: (agentId: string) => Promise<void> | void
+}) => {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const handleConfirm = async () => {
+    if (!agentId) return
+    setBusy(true)
+    setError(null)
+    try {
+      await onConfirmed(agentId)
+      onOpenChange(false)
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md bg-card border-border text-card-foreground">
+        <DialogHeader>
+          <DialogTitle className="text-lg">
+            Terminate agent {agentId ?? ''}?
+          </DialogTitle>
+          <DialogDescription className="text-muted-foreground">
+            This is a soft-delete. The agent&apos;s row, tasks, and messages
+            are preserved — you can Restore it or Purge it (hard delete +
+            tombstone) from the terminated-row actions after.
+          </DialogDescription>
+        </DialogHeader>
+        {error && <div className="text-sm text-destructive py-2">{error}</div>}
+        <DialogFooter className="gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => onOpenChange(false)}
+            disabled={busy}
+          >
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            onClick={handleConfirm}
+            disabled={busy}
+            className="bg-destructive hover:bg-destructive/90 text-destructive-foreground"
+          >
+            {busy ? 'Terminating...' : 'Terminate'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// Edit dialog — admin-editable agent fields. Backed by
+// POST /api/agents/<id>/edit (capabilities / color / working_directory).
+const EditAgentDialog = ({
+  agent,
+  open,
+  onOpenChange,
+  onSaved,
+}: {
+  agent: Agent | null
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  onSaved: () => void
+}) => {
+  const [capabilities, setCapabilities] = useState('')
+  const [color, setColor] = useState('')
+  const [workingDirectory, setWorkingDirectory] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!open || !agent) return
+    setCapabilities((agent.capabilities || []).join(', '))
+    setColor(agent.color || '')
+    setWorkingDirectory(agent.working_directory || '')
+    setError(null)
+  }, [open, agent])
+
+  const handleSave = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!agent) return
+    setBusy(true)
+    setError(null)
+    const updates: { capabilities?: string[]; color?: string; working_directory?: string } = {}
+    const parsedCaps = capabilities
+      .split(',')
+      .map((c) => c.trim())
+      .filter((c) => c.length > 0)
+    if (JSON.stringify(parsedCaps) !== JSON.stringify(agent.capabilities || [])) {
+      updates.capabilities = parsedCaps
+    }
+    if (color !== (agent.color || '')) {
+      updates.color = color
+    }
+    if (workingDirectory !== (agent.working_directory || '')) {
+      updates.working_directory = workingDirectory
+    }
+    if (Object.keys(updates).length === 0) {
+      onOpenChange(false)
+      setBusy(false)
+      return
+    }
+    try {
+      await apiClient.editAgent(agent.agent_id, updates)
+      onSaved()
+      onOpenChange(false)
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md bg-card border-border text-card-foreground">
+        <DialogHeader>
+          <DialogTitle className="text-lg">Edit agent {agent?.agent_id}</DialogTitle>
+          <DialogDescription className="text-muted-foreground">
+            Update the agent&apos;s capabilities, color, or working directory.
+            Status changes use Terminate / Restore / Purge.
+          </DialogDescription>
+        </DialogHeader>
+        <form onSubmit={handleSave} className="space-y-4">
+          <div>
+            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
+              Capabilities
+            </label>
+            <Textarea
+              value={capabilities}
+              onChange={(e) => setCapabilities(e.target.value)}
+              placeholder="code_edit, file_read, web_search"
+              className="bg-background border-border text-foreground h-20 resize-none"
+            />
+          </div>
+          <div>
+            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
+              Color
+            </label>
+            <div className="flex items-center gap-2">
+              <Input
+                type="color"
+                value={color || '#888888'}
+                onChange={(e) => setColor(e.target.value)}
+                className="h-9 w-12 p-1 bg-background border-border"
+              />
+              <Input
+                value={color}
+                onChange={(e) => setColor(e.target.value)}
+                placeholder="#888888"
+                className="bg-background border-border text-foreground font-mono"
+              />
+            </div>
+          </div>
+          <div>
+            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
+              Working Directory
+            </label>
+            <Input
+              value={workingDirectory}
+              onChange={(e) => setWorkingDirectory(e.target.value)}
+              placeholder="/workspace/agent"
+              className="bg-background border-border text-foreground font-mono text-sm"
+            />
+          </div>
+          {error && <div className="text-sm text-destructive">{error}</div>}
+          <DialogFooter className="gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => onOpenChange(false)}
+              disabled={busy}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              size="sm"
+              disabled={busy}
+              className="bg-primary hover:bg-primary/90"
+            >
+              {busy ? 'Saving...' : 'Save changes'}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// Read-only agent details modal — replaces the old sidebar drawer.
+// Uses the same Dialog primitive as the Messages row-detail popup
+// (PR #36).
+const AgentDetailDialog = ({
+  agent,
+  open,
+  onOpenChange,
+  onTaskClick,
+}: {
+  agent: Agent | null
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  onTaskClick: (task: Task) => void
+}) => {
+  const [revealToken, setRevealToken] = useState(false)
+  const [copied, setCopied] = useState(false)
+  const { getAgentTasks } = useDataStore()
+
+  useEffect(() => {
+    if (!open) {
+      setRevealToken(false)
+      setCopied(false)
+    }
+  }, [open])
+
+  if (!agent) return null
+
+  const currentTask = getAgentTasks(agent.agent_id).find(
+    (t) => t.task_id === agent.current_task,
+  )
+
+  const formatRelative = (iso: string) => {
+    if (!iso || iso === 'N/A') return 'unknown'
+    const d = new Date(iso)
+    const diff = Date.now() - d.getTime()
+    if (diff < 60_000) return 'just now'
+    if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`
+    if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`
+    return `${Math.floor(diff / 86_400_000)}d ago`
+  }
+
+  const copyAgentId = () => {
+    navigator.clipboard.writeText(agent.agent_id)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1500)
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-2xl bg-card border-border text-card-foreground">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            Agent details
+            <Badge variant="outline" className="text-xs">
+              {agent.status}
+            </Badge>
+          </DialogTitle>
+          <DialogDescription>
+            All fields for <code>{agent.agent_id}</code>.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-3 text-sm">
+          <div className="grid grid-cols-3 gap-2">
+            <div className="text-muted-foreground">Agent ID</div>
+            <div className="col-span-2 font-mono break-all flex items-center gap-2">
+              <span>{agent.agent_id}</span>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={copyAgentId}
+                className="h-6 w-6 p-0"
+                title="Copy agent id"
+              >
+                <Copy className="h-3 w-3" />
+              </Button>
+              {copied && <span className="text-xs text-primary">copied</span>}
+            </div>
+          </div>
+          <div className="grid grid-cols-3 gap-2">
+            <div className="text-muted-foreground">Status</div>
+            <div className="col-span-2">
+              <Badge variant="outline">{agent.status}</Badge>
+            </div>
+          </div>
+          <div className="grid grid-cols-3 gap-2">
+            <div className="text-muted-foreground">Created</div>
+            <div className="col-span-2">
+              {agent.created_at && agent.created_at !== 'N/A'
+                ? `${new Date(agent.created_at).toLocaleString()} (${formatRelative(agent.created_at)})`
+                : 'N/A'}
+            </div>
+          </div>
+          {agent.terminated_at && (
+            <div className="grid grid-cols-3 gap-2">
+              <div className="text-muted-foreground">Terminated</div>
+              <div className="col-span-2">
+                {new Date(agent.terminated_at).toLocaleString()} (
+                {formatRelative(agent.terminated_at)})
+              </div>
+            </div>
+          )}
+          <div className="grid grid-cols-3 gap-2">
+            <div className="text-muted-foreground">Capabilities</div>
+            <div className="col-span-2">
+              {agent.capabilities && agent.capabilities.length > 0
+                ? agent.capabilities.join(', ')
+                : <span className="text-muted-foreground">none</span>}
+            </div>
+          </div>
+          <div className="grid grid-cols-3 gap-2">
+            <div className="text-muted-foreground">Working Directory</div>
+            <div className="col-span-2 font-mono break-all">
+              {agent.working_directory || <span className="text-muted-foreground">unset</span>}
+            </div>
+          </div>
+          <div className="grid grid-cols-3 gap-2">
+            <div className="text-muted-foreground">Color</div>
+            <div className="col-span-2 flex items-center gap-2">
+              {agent.color ? (
+                <>
+                  <span
+                    className="inline-block w-4 h-4 rounded border border-border"
+                    style={{ backgroundColor: agent.color }}
+                  />
+                  <code className="font-mono">{agent.color}</code>
+                </>
+              ) : (
+                <span className="text-muted-foreground">unset</span>
+              )}
+            </div>
+          </div>
+          <div className="grid grid-cols-3 gap-2">
+            <div className="text-muted-foreground">Current Task</div>
+            <div className="col-span-2">
+              {currentTask ? (
+                <button
+                  className="text-primary hover:underline text-left"
+                  onClick={() => onTaskClick(currentTask)}
+                >
+                  {currentTask.title}{' '}
+                  <span className="text-xs text-muted-foreground font-mono">
+                    ({currentTask.task_id.slice(-8)})
+                  </span>
+                </button>
+              ) : (
+                <span className="text-muted-foreground">none</span>
+              )}
+            </div>
+          </div>
+          <div className="grid grid-cols-3 gap-2">
+            <div className="text-muted-foreground">Token</div>
+            <div className="col-span-2 flex items-center gap-2">
+              {agent.auth_token ? (
+                <>
+                  <code className="font-mono text-xs break-all">
+                    {revealToken
+                      ? agent.auth_token
+                      : `...${agent.auth_token.slice(-4)}`}
+                  </code>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setRevealToken((v) => !v)}
+                    className="h-6 px-2 text-xs"
+                  >
+                    {revealToken ? 'Hide' : 'Reveal'}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      navigator.clipboard.writeText(agent.auth_token || '')
+                    }}
+                    className="h-6 w-6 p-0"
+                    title="Copy token"
+                  >
+                    <Copy className="h-3 w-3" />
+                  </Button>
+                </>
+              ) : (
+                <span className="text-muted-foreground">none</span>
+              )}
+            </div>
+          </div>
+        </div>
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => onOpenChange(false)}
+          >
+            Close
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 export function AgentsDashboard() {
   const { servers, activeServerId } = useServerStore()
   const activeServer = servers.find(s => s.id === activeServerId)
@@ -535,6 +949,12 @@ export function AgentsDashboard() {
   const [taskDialogOpen, setTaskDialogOpen] = useState(false)
   const [purgeTargetId, setPurgeTargetId] = useState<string | null>(null)
   const [purgeDialogOpen, setPurgeDialogOpen] = useState(false)
+  const [terminateTargetId, setTerminateTargetId] = useState<string | null>(null)
+  const [terminateDialogOpen, setTerminateDialogOpen] = useState(false)
+  const [editAgent, setEditAgent] = useState<Agent | null>(null)
+  const [editDialogOpen, setEditDialogOpen] = useState(false)
+  const [detailAgent, setDetailAgent] = useState<Agent | null>(null)
+  const [detailDialogOpen, setDetailDialogOpen] = useState(false)
 
   // Source list: include all agents (terminated rows need to surface so
   // admins can hit Restore/Purge on them). getActiveAgents() is kept
@@ -643,6 +1063,25 @@ export function AgentsDashboard() {
     setPurgeDialogOpen(true)
   }
 
+  // Row-click handler. Opens a confirmation dialog before firing the
+  // actual terminate; the in-effect idle-cleanup path uses
+  // handleTerminateAgent directly so it stays bypass-confirm.
+  const handleTerminateConfirm = (agentId: string) => {
+    setTerminateTargetId(agentId)
+    setTerminateDialogOpen(true)
+  }
+
+  const handleEditAgent = (agent: Agent) => {
+    setEditAgent(agent)
+    setEditDialogOpen(true)
+  }
+
+  const handleSelectAgent = (agent: Agent) => {
+    setSelectedAgent(agent)
+    setDetailAgent(agent)
+    setDetailDialogOpen(true)
+  }
+
   if (!isConnected) {
     return (
       <div className="h-full flex items-center justify-center">
@@ -684,10 +1123,7 @@ export function AgentsDashboard() {
 
   return (
     <React.Profiler id="AgentsDashboard" onRender={onRender}>
-      <div className="w-full space-y-[var(--space-fluid-lg)] -mx-[var(--container-padding)] px-[var(--container-padding)] -my-[var(--space-fluid-lg)] py-[var(--space-fluid-lg)]" style={{
-        paddingRight: selectedAgent ? `calc(360px + var(--container-padding))` : 'var(--container-padding)',
-        transition: 'padding-right 0.5s ease-in-out'
-      }}>
+      <div className="w-full space-y-[var(--space-fluid-lg)] -mx-[var(--container-padding)] px-[var(--container-padding)] -my-[var(--space-fluid-lg)] py-[var(--space-fluid-lg)]">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
@@ -797,10 +1233,11 @@ export function AgentsDashboard() {
               <CompactAgentRow
                 key={agent.agent_id}
                 agent={agent}
-                onTerminate={handleTerminateAgent}
+                onTerminate={handleTerminateConfirm}
                 onRestore={handleRestoreAgent}
                 onPurge={handlePurgeAgent}
-                onSelect={setSelectedAgent}
+                onSelect={handleSelectAgent}
+                onEdit={handleEditAgent}
                 onTaskClick={handleTaskClick}
               />
             ))}
@@ -819,12 +1256,48 @@ export function AgentsDashboard() {
         )}
       </div>
 
-      {/* Agent Details Panel */}
-      <AgentDetailsPanel 
-        agent={selectedAgent} 
-        onClose={() => setSelectedAgent(null)} 
+      {/* Agent Detail Modal — replaces the old sidebar drawer */}
+      <AgentDetailDialog
+        agent={detailAgent}
+        open={detailDialogOpen}
+        onOpenChange={(open) => {
+          setDetailDialogOpen(open)
+          if (!open) {
+            setDetailAgent(null)
+            setSelectedAgent(null)
+          }
+        }}
+        onTaskClick={(task) => {
+          handleTaskClick(task)
+        }}
       />
-      
+
+      {/* Edit Agent Dialog */}
+      <EditAgentDialog
+        agent={editAgent}
+        open={editDialogOpen}
+        onOpenChange={(open) => {
+          setEditDialogOpen(open)
+          if (!open) setEditAgent(null)
+        }}
+        onSaved={() => {
+          void refreshData()
+        }}
+      />
+
+      {/* Terminate confirmation dialog */}
+      <TerminateAgentDialog
+        agentId={terminateTargetId}
+        open={terminateDialogOpen}
+        onOpenChange={(open) => {
+          setTerminateDialogOpen(open)
+          if (!open) setTerminateTargetId(null)
+        }}
+        onConfirmed={async (agentId) => {
+          await handleTerminateAgent(agentId)
+        }}
+      />
+
       {/* Task Details Dialog */}
       <TaskDetailsDialog
         task={selectedTask}

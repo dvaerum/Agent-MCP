@@ -9,6 +9,7 @@ export interface Agent {
   capabilities?: string[]
   created_at: string
   updated_at: string
+  terminated_at?: string | null
   auth_token?: string
 }
 
@@ -306,6 +307,23 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify({ token: tokens.admin_token }),
     })
+  }
+
+  // editAgent updates the editable agent fields (capabilities, color,
+  // working_directory). Admin-only; backed by POST /api/agents/<id>/edit
+  // added alongside the dashboard's per-row Edit icon.
+  async editAgent(
+    agentId: string,
+    updates: { capabilities?: string[]; color?: string; working_directory?: string },
+  ): Promise<{ success: boolean; agent_id: string; updated: Record<string, unknown>; message: string }> {
+    const tokens = await this.getTokens()
+    return this.request(
+      `/agents/${encodeURIComponent(agentId)}/edit`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ token: tokens.admin_token, ...updates }),
+      },
+    )
   }
 
   async getPurgePreview(agentId: string): Promise<{
