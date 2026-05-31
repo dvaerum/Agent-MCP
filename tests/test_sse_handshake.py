@@ -49,7 +49,7 @@ def test_sse_route_is_mount_not_route(app) -> None:
         f"SSE handler returns None (issue A)."
     )
     assert not isinstance(sse, Route), (
-        f"/sse must NOT be a Route — see issue A in UPSTREAM_ISSUES.md"
+        "/sse must NOT be a Route — see issue A in UPSTREAM_ISSUES.md"
     )
 
 
