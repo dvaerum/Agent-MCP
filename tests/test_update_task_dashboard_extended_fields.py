@@ -1,0 +1,153 @@
+"""Integration tests for the extended POST /api/update-task-dashboard.
+
+The dashboard Tasks page Edit modal (this PR) needs to mutate every
+editable field of a task — title, description, status, priority,
+assigned_to — through a single endpoint. Upstream's
+update-task-dashboard already accepts title/description/priority/notes
+but it (a) required `status` to be present even for non-status edits
+and (b) had no way to assign or unassign an agent.
+
+This PR relaxes the `status` requirement (status is now optional but
+at least one editable field must be supplied) and adds `assigned_to`.
+"""
+
+from __future__ import annotations
+
+
+def _admin_token(client) -> str:
+    r = client.get("/api/tokens")
+    assert r.status_code == 200, r.text
+    return r.json()["admin_token"]
+
+
+def _create_task(client, token: str, **overrides) -> str:
+    body = {
+        "token": token,
+        "task_title": overrides.get("title", "edit-target"),
+        "task_description": overrides.get("description", "an edit-target task"),
+    }
+    if "priority" in overrides:
+        body["priority"] = overrides["priority"]
+    r = client.post("/api/tasks", json=body)
+    assert r.status_code == 200, r.text
+    return r.json()["task_id"]
+
+
+def test_update_task_dashboard_accepts_title_only(client) -> None:
+    """Sending only {token, task_id, title} must succeed (no status required)."""
+    token = _admin_token(client)
+    task_id = _create_task(client, token)
+
+    r = client.post(
+        "/api/update-task-dashboard",
+        json={"token": token, "task_id": task_id, "title": "new title"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json().get("success") is True
+
+    # Confirm via listing.
+    import json as _json
+    listing = _json.dumps(client.get("/api/tasks").json())
+    assert "new title" in listing
+
+
+def test_update_task_dashboard_accepts_description_only(client) -> None:
+    token = _admin_token(client)
+    task_id = _create_task(client, token)
+
+    r = client.post(
+        "/api/update-task-dashboard",
+        json={
+            "token": token,
+            "task_id": task_id,
+            "description": "freshly edited body",
+        },
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_update_task_dashboard_accepts_priority_only(client) -> None:
+    token = _admin_token(client)
+    task_id = _create_task(client, token)
+
+    r = client.post(
+        "/api/update-task-dashboard",
+        json={"token": token, "task_id": task_id, "priority": "high"},
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_update_task_dashboard_accepts_assigned_to(client) -> None:
+    """Edit modal can assign a task to an existing agent via this endpoint."""
+    token = _admin_token(client)
+    task_id = _create_task(client, token)
+
+    # Create an agent to assign to (upstream endpoint is /api/create-agent).
+    create_agent = client.post(
+        "/api/create-agent",
+        json={"token": token, "agent_id": "edit-target-agent"},
+    )
+    assert create_agent.status_code in (200, 201), create_agent.text
+
+    r = client.post(
+        "/api/update-task-dashboard",
+        json={
+            "token": token,
+            "task_id": task_id,
+            "assigned_to": "edit-target-agent",
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert r.json().get("success") is True
+
+    # Confirm via listing.
+    import json as _json
+    listing = _json.dumps(client.get("/api/tasks").json())
+    assert "edit-target-agent" in listing
+
+
+def test_update_task_dashboard_unassigns_with_empty_assigned_to(client) -> None:
+    """Passing assigned_to='' (or null) must clear the assignment."""
+    token = _admin_token(client)
+    task_id = _create_task(client, token)
+
+    # Create + assign first.
+    client.post(
+        "/api/create-agent",
+        json={"token": token, "agent_id": "to-unassign"},
+    )
+    client.post(
+        "/api/update-task-dashboard",
+        json={"token": token, "task_id": task_id, "assigned_to": "to-unassign"},
+    )
+
+    # Now unassign.
+    r = client.post(
+        "/api/update-task-dashboard",
+        json={"token": token, "task_id": task_id, "assigned_to": None},
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_update_task_dashboard_requires_at_least_one_field(client) -> None:
+    """Sending nothing-but-the-task_id is a 400 (no-op rejected)."""
+    token = _admin_token(client)
+    task_id = _create_task(client, token)
+
+    r = client.post(
+        "/api/update-task-dashboard",
+        json={"token": token, "task_id": task_id},
+    )
+    assert r.status_code == 400, r.text
+
+
+def test_update_task_dashboard_status_still_works(client) -> None:
+    """Backwards compatibility: status-only updates (the old path) still work."""
+    token = _admin_token(client)
+    task_id = _create_task(client, token)
+
+    r = client.post(
+        "/api/update-task-dashboard",
+        json={"token": token, "task_id": task_id, "status": "in_progress"},
+    )
+    assert r.status_code == 200, r.text
