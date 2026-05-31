@@ -489,6 +489,112 @@ async def restore_agent_api_route(request: Request) -> JSONResponse:
             conn.close()
 
 
+async def edit_agent_api_route(request: Request) -> JSONResponse:
+    """POST /api/agents/<id>/edit — admin updates mutable agent fields.
+
+    Accepts an admin token in the JSON body alongside any combination of
+    the editable fields: `capabilities` (list[str]), `color` (str),
+    `working_directory` (str). Returns 400 if none of the editable
+    fields are supplied (avoids no-op writes), 404 if the agent does
+    not exist.
+
+    Non-whitelisted fields in the body are silently ignored — the
+    endpoint never touches status/agent_id/token; those have their own
+    dedicated flows (terminate/restore/purge for status; create for
+    agent_id+token; nothing for editing tokens).
+    """
+    if request.method == 'OPTIONS':
+        return await handle_options(request)
+    if request.method != 'POST':
+        return JSONResponse({"error": "Method not allowed"}, status_code=405)
+
+    agent_id = request.path_params.get('agent_id')
+    if not agent_id:
+        return JSONResponse({"error": "agent_id required"}, status_code=400)
+
+    conn = None
+    try:
+        data = await get_sanitized_json_body(request)
+        admin_token = data.get('token')
+        if not verify_token(admin_token, required_role='admin'):
+            return JSONResponse(
+                {"error": "Unauthorized: admin token required"},
+                status_code=403,
+            )
+
+        # Whitelisted editable fields. Anything else in `data` is ignored
+        # (defense in depth — status / agent_id / token must not flow
+        # through this endpoint).
+        editable = ('capabilities', 'color', 'working_directory')
+        updates = {k: data[k] for k in editable if k in data}
+        if not updates:
+            return JSONResponse(
+                {"error": "No editable fields supplied. Accepts any of: "
+                          + ", ".join(editable)},
+                status_code=400,
+            )
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT token, status FROM agents WHERE agent_id = ?",
+            (agent_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return JSONResponse(
+                {"error": f"Agent '{agent_id}' not found"},
+                status_code=404,
+            )
+
+        # Use the existing helper so JSON-serialisation of capabilities
+        # + updated_at bookkeeping stays consistent.
+        from agent_mcp.db.actions.agent_db import update_agent_db_field
+
+        applied: Dict[str, Any] = {}
+        for field, value in updates.items():
+            ok = update_agent_db_field(agent_id, field, value)
+            if not ok:
+                return JSONResponse(
+                    {"error": f"Failed to update field {field!r}"},
+                    status_code=500,
+                )
+            applied[field] = value
+
+        # Refresh the in-memory active agent entry so the dashboard sees
+        # the new color/capabilities without a server restart.
+        agent_token = row["token"]
+        if agent_token in g.active_agents:
+            for field, value in applied.items():
+                g.active_agents[agent_token][field] = value
+
+        log_agent_action_to_db(
+            cursor, "admin", "edited_agent",
+            details={"agent_id": agent_id, "fields": list(applied.keys())},
+        )
+        conn.commit()
+
+        return JSONResponse({
+            "success": True,
+            "agent_id": agent_id,
+            "updated": applied,
+            "message": f"Agent '{agent_id}' updated: "
+                       + ", ".join(applied.keys()),
+        })
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error editing agent {agent_id}: {e}", exc_info=True)
+        return JSONResponse(
+            {"error": f"Failed to edit agent: {str(e)}"}, status_code=500,
+        )
+    finally:
+        if conn:
+            conn.close()
+
+
 def _gather_purge_preview(cursor, agent_id: str) -> Dict[str, Any]:
     """Compute the blast-radius counts + samples for a future purge."""
     cursor.execute(
@@ -904,6 +1010,7 @@ routes = [
     # Restore + Purge (this PR). Path-style routes so the agent_id is
     # part of the URL — matches the dashboard's `/agents/<id>/...` shape.
     Route('/api/agents/{agent_id}/restore', endpoint=restore_agent_api_route, name="restore_agent_api", methods=['POST', 'OPTIONS']),
+    Route('/api/agents/{agent_id}/edit', endpoint=edit_agent_api_route, name="edit_agent_api", methods=['POST', 'OPTIONS']),
     Route('/api/agents/{agent_id}/purge-preview', endpoint=purge_preview_api_route, name="purge_preview_api", methods=['GET', 'OPTIONS']),
     Route('/api/agents/{agent_id}', endpoint=purge_agent_api_route, name="purge_agent_api", methods=['DELETE', 'OPTIONS']),
 
