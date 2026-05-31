@@ -15,6 +15,7 @@ from ..core.auth import generate_token  # For admin token generation
 from ..utils.project_utils import init_agent_directory
 from ..db.schema import init_database as initialize_database_schema
 from ..db.connection import get_db_connection, check_vss_loadability
+from ..db.migrations_runner import run_migrations_upgrade
 from ..external.openai_service import initialize_openai_client
 from ..features.rag.indexing import run_rag_indexing_periodically
 
@@ -94,6 +95,22 @@ async def application_startup(
         db_path_err = get_db_path_for_error()  # Get path for error message
         raise SystemExit(
             f"Error: Failed to initialize database at {db_path_err}. Check logs and permissions."
+        ) from e
+
+    # 3a. Apply Alembic migrations (Phase 7a). init_database() above
+    # still owns CREATE TABLE for fresh DBs; this picks up any model-
+    # level schema changes (column adds/renames, new tables created
+    # via ORM in later PRs). Idempotent — a re-run on an already-
+    # migrated DB is a no-op.
+    try:
+        run_migrations_upgrade()
+    except Exception as e:
+        logger.error(
+            f"CRITICAL: Failed to apply Alembic migrations: {e}. Exiting.",
+            exc_info=True,
+        )
+        raise SystemExit(
+            f"Error: Failed to apply Alembic migrations. Check logs."
         ) from e
 
     # 4. Handle Admin Token Persistence (Original main.py:1977-2012)

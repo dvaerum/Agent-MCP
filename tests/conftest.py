@@ -45,10 +45,14 @@ def reset_globals() -> Iterator[None]:
     """
     from agent_mcp.core import globals as g
     from agent_mcp.db import write_queue as _wq
+    from agent_mcp.db import engine as _engine
 
     # Force a fresh write queue for this test by clearing the singleton
     # cache before lifespan startup.
     _wq._global_write_queue = None
+    # And drop SQLAlchemy engines bound to a previous test's tmp DB
+    # path — each test gets its own project_dir + DB.
+    _engine.reset_engine_cache()
 
     snapshot = {
         "connections": dict(g.connections),
@@ -84,6 +88,7 @@ def reset_globals() -> Iterator[None]:
     g.global_vss_load_tested = snapshot["global_vss_load_tested"]
     g.global_vss_load_successful = snapshot["global_vss_load_successful"]
     _wq._global_write_queue = None
+    _engine.reset_engine_cache()
 
 
 @pytest.fixture

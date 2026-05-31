@@ -25,6 +25,7 @@ let
     dependencies = with python.pkgs; [
       anyio click openai starlette uvicorn jinja2
       python-dotenv sqlite-vec httpx mcp
+      sqlalchemy alembic
     ];
     # Upstream tests need a writable HOME, an OPENAI_API_KEY, and at
     # least one network-hitting fixture. Run them in CI, not here.

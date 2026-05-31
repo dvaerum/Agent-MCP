@@ -49,7 +49,15 @@ where = ["."]
 include = ["agent_mcp*"]
 
 [tool.setuptools.package-data]
-"agent_mcp" = ["py.typed", "templates/**/*", "static/**/*"]
+"agent_mcp" = [
+    "py.typed",
+    "templates/**/*",
+    "static/**/*",
+    "migrations/*.py",
+    "migrations/*.mako",
+    "migrations/README",
+    "migrations/versions/*.py",
+]
 
 [tool.rye]
 managed = true

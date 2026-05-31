@@ -19,10 +19,8 @@ import datetime as _dt
 import json
 import sqlite3
 
-import pytest
 
-
-def test_project_context_model_round_trip(app, project_dir):
+def test_project_context_model_round_trip(client, project_dir):
     """The ORM model can write a row and read it back identically.
 
     Uses the same DB file the lifespan-startup populated, so any
@@ -57,7 +55,7 @@ def test_project_context_model_round_trip(app, project_dir):
         assert fetched.last_updated == now
 
 
-def test_project_context_model_columns_match_raw_schema(app, project_dir):
+def test_project_context_model_columns_match_raw_schema(client, project_dir):
     """ORM model column names must match the raw SQL schema exactly.
 
     If init_database() ever drifts from the model, this catches it.
@@ -86,7 +84,7 @@ def test_project_context_model_columns_match_raw_schema(app, project_dir):
     )
 
 
-def test_alembic_upgrade_head_is_idempotent(app, project_dir):
+def test_alembic_upgrade_head_is_idempotent(client, project_dir):
     """Running `alembic upgrade head` a second time must be a no-op.
 
     Application startup already ran it once (via
@@ -134,7 +132,7 @@ def test_alembic_upgrade_head_is_idempotent(app, project_dir):
     assert after_version == before_version, "alembic version moved on re-upgrade"
 
 
-def test_alembic_version_table_present_after_startup(app, project_dir):
+def test_alembic_version_table_present_after_startup(client, project_dir):
     """Application startup creates the alembic_version row."""
     from agent_mcp.core.config import get_db_path
 
@@ -149,7 +147,7 @@ def test_alembic_version_table_present_after_startup(app, project_dir):
     assert rows, "alembic_version table missing after lifespan startup"
 
 
-def test_project_context_tool_uses_orm(app, client):
+def test_project_context_tool_uses_orm(client):
     """The view_project_context tool still works after ORM rewrite."""
     import asyncio
 
@@ -183,7 +181,7 @@ def test_project_context_tool_uses_orm(app, client):
     assert "from-tool" in text
 
 
-def test_all_data_endpoint_returns_project_context(app, client):
+def test_all_data_endpoint_returns_project_context(client):
     """/api/all-data still returns the project_context bit after rewrite."""
     r = client.get("/api/tokens")
     admin_token = r.json()["admin_token"]
@@ -205,7 +203,7 @@ def test_all_data_endpoint_returns_project_context(app, client):
     assert "all_data_orm_probe" in keys
 
 
-def test_context_data_endpoint_returns_project_context(app, client):
+def test_context_data_endpoint_returns_project_context(client):
     """/api/context-data still returns the project_context bit after rewrite."""
     r = client.get("/api/tokens")
     admin_token = r.json()["admin_token"]
