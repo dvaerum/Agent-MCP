@@ -72,3 +72,20 @@ def test_navigation_lists_settings_tab() -> None:
     assert "Settings" in src, (
         "expected a Settings icon import / NavItem title in navigation.tsx"
     )
+
+
+def test_settings_dashboard_exposes_message_retention_input() -> None:
+    """Phase 6 follow-up (issue Q): admins can configure how many days
+    of read agent_messages to keep before the background pruner deletes
+    them. The Settings tab must surface this knob alongside the
+    permission toggles. Stored as project_context["config_message_retention_days"].
+    """
+    src = _read("components/dashboard/settings-dashboard.tsx")
+    assert "config_message_retention_days" in src, (
+        "expected the component to expose the config_message_retention_days "
+        "input"
+    )
+    # Must be a numeric input (not a Switch) — retention is an integer count.
+    assert 'type="number"' in src or "type='number'" in src, (
+        "expected a numeric <input type=\"number\"> for retention days"
+    )
