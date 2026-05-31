@@ -919,6 +919,278 @@ async def delete_task_api_route(request: Request) -> JSONResponse:
             conn.close()
 
 
+# --- Messages CRUD endpoints (Phase 6 PR #20 / issue P) ---
+# agent_messages accumulates indefinitely; reading via get_agent_messages
+# marks `read=1` but never deletes. The dashboard's new Messages tab
+# needs list+filter+compose+mark-read access. Admin-only.
+
+
+_MESSAGE_TYPES = ("text", "system", "notification", "task_update",
+                  "assistance_request", "stop_command")
+_MESSAGE_PRIORITIES = ("low", "normal", "high", "urgent")
+
+
+async def list_messages_api_route(request: Request) -> JSONResponse:
+    """GET /api/messages with rich filters (admin token in JSON body).
+
+    Body fields:
+      token          (required, admin)
+      from           sender_id filter
+      to             recipient_id filter
+      between        [a, b] — messages either direction between two agents
+      type           message_type filter
+      priority       priority filter
+      read           bool — read flag filter
+      since/until    ISO timestamp window
+      q              content substring (LIKE %q%)
+      limit/offset   pagination (default 50 / 0)
+    """
+    if request.method == 'OPTIONS':
+        return await handle_options(request)
+    if request.method != 'GET':
+        return JSONResponse({"error": "Method not allowed"}, status_code=405)
+
+    conn = None
+    try:
+        data = await get_sanitized_json_body(request)
+        admin_token = data.get('token')
+        if not verify_token(admin_token, required_role='admin'):
+            return JSONResponse({"error": "Invalid admin token"}, status_code=403)
+
+        filter_from = data.get('from')
+        filter_to = data.get('to')
+        filter_between = data.get('between')  # list of two ids
+        filter_type = data.get('type')
+        filter_priority = data.get('priority')
+        filter_read = data.get('read')  # bool
+        filter_since = data.get('since')
+        filter_until = data.get('until')
+        filter_q = data.get('q')
+        limit = int(data.get('limit', 50))
+        offset = int(data.get('offset', 0))
+
+        if limit < 1 or limit > 500:
+            return JSONResponse(
+                {"error": "limit must be 1..500"}, status_code=400
+            )
+
+        where = []
+        params: list = []
+        if filter_from is not None:
+            where.append("sender_id = ?")
+            params.append(filter_from)
+        if filter_to is not None:
+            where.append("recipient_id = ?")
+            params.append(filter_to)
+        if (
+            isinstance(filter_between, list)
+            and len(filter_between) == 2
+            and all(isinstance(x, str) for x in filter_between)
+        ):
+            a, b = filter_between
+            where.append("((sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?))")
+            params.extend([a, b, b, a])
+        if filter_type is not None:
+            where.append("message_type = ?")
+            params.append(filter_type)
+        if filter_priority is not None:
+            where.append("priority = ?")
+            params.append(filter_priority)
+        if filter_read is not None:
+            where.append("read = ?")
+            params.append(1 if filter_read else 0)
+        if filter_since is not None:
+            where.append("timestamp >= ?")
+            params.append(filter_since)
+        if filter_until is not None:
+            where.append("timestamp <= ?")
+            params.append(filter_until)
+        if filter_q:
+            where.append("message_content LIKE ?")
+            params.append(f"%{filter_q}%")
+
+        sql = "SELECT * FROM agent_messages"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(sql, params)
+        rows = [dict(r) for r in cursor.fetchall()]
+
+        # total count for pagination UIs
+        count_sql = "SELECT COUNT(*) AS n FROM agent_messages"
+        if where:
+            count_sql += " WHERE " + " AND ".join(where)
+        cursor.execute(count_sql, params[:-2] if where else [])
+        total = cursor.fetchone()["n"]
+
+        return JSONResponse({"messages": rows, "total": total,
+                             "limit": limit, "offset": offset})
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        logger.error(f"Error listing messages: {e}", exc_info=True)
+        return JSONResponse(
+            {"error": f"Failed to list messages: {str(e)}"}, status_code=500
+        )
+    finally:
+        if conn:
+            conn.close()
+
+
+async def create_message_api_route(request: Request) -> JSONResponse:
+    """POST /api/messages — admin composes a message to a recipient.
+
+    Body: {token, recipient_id, message_content, message_type?, priority?}
+    Returns: {success, message_id, message}
+    """
+    if request.method == 'OPTIONS':
+        return await handle_options(request)
+    if request.method != 'POST':
+        return JSONResponse({"error": "Method not allowed"}, status_code=405)
+
+    conn = None
+    try:
+        data = await get_sanitized_json_body(request)
+        admin_token = data.get('token')
+        recipient_id = data.get('recipient_id')
+        content = data.get('message_content')
+        message_type = data.get('message_type', 'text')
+        priority = data.get('priority', 'normal')
+
+        if not verify_token(admin_token, required_role='admin'):
+            return JSONResponse({"error": "Invalid admin token"}, status_code=403)
+
+        if not recipient_id:
+            return JSONResponse(
+                {"error": "recipient_id is required"}, status_code=400
+            )
+        if not content:
+            return JSONResponse(
+                {"error": "message_content is required"}, status_code=400
+            )
+        if message_type not in _MESSAGE_TYPES:
+            return JSONResponse(
+                {"error": f"message_type must be one of {_MESSAGE_TYPES}"},
+                status_code=400,
+            )
+        if priority not in _MESSAGE_PRIORITIES:
+            return JSONResponse(
+                {"error": f"priority must be one of {_MESSAGE_PRIORITIES}"},
+                status_code=400,
+            )
+
+        import secrets as _secrets
+        message_id = f"msg_{_secrets.token_hex(8)}"
+        timestamp = datetime.datetime.now().isoformat()
+        sender_id = auth_get_agent_id(admin_token) or "admin"
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO agent_messages (
+                message_id, sender_id, recipient_id, message_content,
+                message_type, priority, timestamp, delivered, read
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (message_id, sender_id, recipient_id, content,
+             message_type, priority, timestamp, 0, 0),
+        )
+        log_agent_action_to_db(
+            cursor, sender_id, "sent_message_via_dashboard",
+            details={"message_id": message_id, "recipient": recipient_id},
+        )
+        conn.commit()
+
+        return JSONResponse({
+            "success": True,
+            "message_id": message_id,
+            "message": f"Message sent to {recipient_id}",
+        })
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error sending message: {e}", exc_info=True)
+        return JSONResponse(
+            {"error": f"Failed to send message: {str(e)}"}, status_code=500
+        )
+    finally:
+        if conn:
+            conn.close()
+
+
+async def patch_message_api_route(request: Request) -> JSONResponse:
+    """PATCH /api/messages/{message_id} — flip read/delivered."""
+    if request.method == 'OPTIONS':
+        return await handle_options(request)
+    if request.method != 'PATCH':
+        return JSONResponse({"error": "Method not allowed"}, status_code=405)
+
+    path_parts = request.url.path.split('/')
+    if len(path_parts) < 4 or not path_parts[-1]:
+        return JSONResponse({"error": "message_id is required in URL"}, status_code=400)
+    message_id = path_parts[-1]
+
+    conn = None
+    try:
+        data = await get_sanitized_json_body(request)
+        admin_token = data.get('token')
+        if not verify_token(admin_token, required_role='admin'):
+            return JSONResponse({"error": "Invalid admin token"}, status_code=403)
+
+        updates: list[tuple[str, object]] = []
+        if 'read' in data:
+            updates.append(("read", 1 if data['read'] else 0))
+        if 'delivered' in data:
+            updates.append(("delivered", 1 if data['delivered'] else 0))
+        if not updates:
+            return JSONResponse(
+                {"error": "no updatable field provided (read, delivered)"},
+                status_code=400,
+            )
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT message_id FROM agent_messages WHERE message_id = ?",
+            (message_id,),
+        )
+        if not cursor.fetchone():
+            return JSONResponse({"error": "Message not found"}, status_code=404)
+
+        set_clause = ", ".join(f"{col} = ?" for col, _ in updates)
+        params = [v for _, v in updates] + [message_id]
+        cursor.execute(
+            f"UPDATE agent_messages SET {set_clause} WHERE message_id = ?",
+            params,
+        )
+        log_agent_action_to_db(
+            cursor, auth_get_agent_id(admin_token) or "admin",
+            "updated_message", details={"message_id": message_id,
+                                        "fields": [c for c, _ in updates]},
+        )
+        conn.commit()
+        return JSONResponse({"success": True})
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error patching message: {e}", exc_info=True)
+        return JSONResponse(
+            {"error": f"Failed to patch message: {str(e)}"}, status_code=500
+        )
+    finally:
+        if conn:
+            conn.close()
+
+
 # Add the memory CRUD routes
 routes.extend([
     Route('/api/memories', endpoint=create_memory_api_route, name="create_memory_api", methods=['POST', 'OPTIONS']),
@@ -928,6 +1200,10 @@ routes.extend([
     # Task CRUD (issue C). GET /api/tasks (list) already exists earlier.
     Route('/api/tasks', endpoint=create_task_api_route, name="create_task_api", methods=['POST', 'OPTIONS']),
     Route('/api/tasks/{task_id}', endpoint=delete_task_api_route, name="delete_task_api", methods=['DELETE', 'OPTIONS']),
+    # Messages CRUD (Phase 6 PR #20 / issue P).
+    Route('/api/messages', endpoint=list_messages_api_route, name="list_messages_api", methods=['GET', 'OPTIONS']),
+    Route('/api/messages', endpoint=create_message_api_route, name="create_message_api", methods=['POST', 'OPTIONS']),
+    Route('/api/messages/{message_id}', endpoint=patch_message_api_route, name="patch_message_api", methods=['PATCH', 'OPTIONS']),
 ])
 
 # Add the sample data route
