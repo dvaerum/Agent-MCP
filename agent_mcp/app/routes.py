@@ -1090,12 +1090,53 @@ async def create_message_api_route(request: Request) -> JSONResponse:
             )
 
         import secrets as _secrets
-        message_id = f"msg_{_secrets.token_hex(8)}"
         timestamp = datetime.datetime.now().isoformat()
         sender_id = auth_get_agent_id(admin_token) or "admin"
 
         conn = get_db_connection()
         cursor = conn.cursor()
+
+        # Broadcast: recipient_id="*" fans out to every active worker
+        # (admin excluded), mirroring the broadcast_message MCP tool.
+        # One INSERT per recipient so the messages show up in the
+        # listing keyed by their real recipient_id.
+        if recipient_id == "*":
+            from agent_mcp.core import globals as _g
+            recipients: list[str] = []
+            for _tok, agent_data in _g.active_agents.items():
+                rid = agent_data.get("agent_id")
+                if rid and rid != "admin" and rid != sender_id:
+                    recipients.append(rid)
+
+            sent_ids: list[str] = []
+            for rid in recipients:
+                msg_id = f"msg_{_secrets.token_hex(8)}"
+                cursor.execute(
+                    """
+                    INSERT INTO agent_messages (
+                        message_id, sender_id, recipient_id, message_content,
+                        message_type, priority, timestamp, delivered, read
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (msg_id, sender_id, rid, content,
+                     message_type, priority, timestamp, 0, 0),
+                )
+                sent_ids.append(msg_id)
+            log_agent_action_to_db(
+                cursor, sender_id, "broadcast_message_via_dashboard",
+                details={"recipients": recipients,
+                         "sent_count": len(sent_ids)},
+            )
+            conn.commit()
+            return JSONResponse({
+                "success": True,
+                "broadcast": True,
+                "sent_count": len(sent_ids),
+                "message_ids": sent_ids,
+                "message": f"Broadcast sent to {len(sent_ids)} agents",
+            })
+
+        message_id = f"msg_{_secrets.token_hex(8)}"
         cursor.execute(
             """
             INSERT INTO agent_messages (
@@ -1132,10 +1173,14 @@ async def create_message_api_route(request: Request) -> JSONResponse:
 
 
 async def patch_message_api_route(request: Request) -> JSONResponse:
-    """PATCH /api/messages/{message_id} — flip read/delivered."""
+    """PATCH/DELETE /api/messages/{message_id}.
+
+    PATCH flips read/delivered. DELETE removes the row (used by the
+    dashboard's row-level + bulk delete actions). Admin-only.
+    """
     if request.method == 'OPTIONS':
         return await handle_options(request)
-    if request.method != 'PATCH':
+    if request.method not in ('PATCH', 'DELETE'):
         return JSONResponse({"error": "Method not allowed"}, status_code=405)
 
     path_parts = request.url.path.split('/')
@@ -1150,6 +1195,29 @@ async def patch_message_api_route(request: Request) -> JSONResponse:
         if not verify_token(admin_token, required_role='admin'):
             return JSONResponse({"error": "Invalid admin token"}, status_code=403)
 
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT message_id FROM agent_messages WHERE message_id = ?",
+            (message_id,),
+        )
+        if not cursor.fetchone():
+            return JSONResponse({"error": "Message not found"}, status_code=404)
+
+        if request.method == 'DELETE':
+            cursor.execute(
+                "DELETE FROM agent_messages WHERE message_id = ?",
+                (message_id,),
+            )
+            log_agent_action_to_db(
+                cursor, auth_get_agent_id(admin_token) or "admin",
+                "deleted_message_via_dashboard",
+                details={"message_id": message_id},
+            )
+            conn.commit()
+            return JSONResponse({"success": True, "deleted": message_id})
+
+        # PATCH
         updates: list[tuple[str, object]] = []
         if 'read' in data:
             updates.append(("read", 1 if data['read'] else 0))
@@ -1160,15 +1228,6 @@ async def patch_message_api_route(request: Request) -> JSONResponse:
                 {"error": "no updatable field provided (read, delivered)"},
                 status_code=400,
             )
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT message_id FROM agent_messages WHERE message_id = ?",
-            (message_id,),
-        )
-        if not cursor.fetchone():
-            return JSONResponse({"error": "Message not found"}, status_code=404)
 
         set_clause = ", ".join(f"{col} = ?" for col, _ in updates)
         params = [v for _, v in updates] + [message_id]
@@ -1212,7 +1271,7 @@ routes.extend([
     # compose route so the more specific path matches first.
     Route('/api/messages/query', endpoint=list_messages_api_route, name="list_messages_api", methods=['POST', 'OPTIONS']),
     Route('/api/messages', endpoint=create_message_api_route, name="create_message_api", methods=['POST', 'OPTIONS']),
-    Route('/api/messages/{message_id}', endpoint=patch_message_api_route, name="patch_message_api", methods=['PATCH', 'OPTIONS']),
+    Route('/api/messages/{message_id}', endpoint=patch_message_api_route, name="patch_message_api", methods=['PATCH', 'DELETE', 'OPTIONS']),
 ])
 
 # Add the sample data route
