@@ -42,6 +42,10 @@ jobs:
         run: uv run ruff check tests/
 
       - name: Run pytest
+        # `-n auto` (one worker per CPU) is configured in pyproject.toml
+        # under [tool.pytest.ini_options] addopts; pytest-xdist comes
+        # in via `.[dev]` above. GitHub ubuntu-latest runners give us
+        # ~4 cores, which is the sweet spot for this suite.
         run: uv run pytest -v
 
   dashboard:

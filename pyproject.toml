@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-mcp"
-version = "2.7.0"
+version = "2.7.1"
 description = "AgentMCP v2.5 - Enhanced multi-agent system with tmux integration and worktree support"
 authors = [
     {name = "Luis Alejandro Rincon", email = "alejandro@rinconnect.com"},
@@ -36,6 +36,13 @@ dependencies = [
 dev = [
     "pytest",
     "pytest-asyncio",
+    # Parallel test execution across CPU cores. The suite pays a
+    # ~4s lifespan-startup cost on the first test in each worker
+    # (sqlite-vec load + Alembic upgrade + RAG init), but per-test
+    # cost is tiny — so splitting across workers wins wall-clock
+    # time on multi-core machines. See [tool.pytest.ini_options]
+    # below for the default `-n auto` config and override notes.
+    "pytest-xdist>=3.0",
     "ruff",
     "black",
     "isort",
@@ -75,6 +82,18 @@ test = { cmd = "pytest" }
 lint = { cmd = "ruff check ." }
 format = { cmd = "ruff format ." }
 index = { cmd = "uv run -m agent-mcp.features.rag.indexing -- --project-dir ." }
+
+[tool.pytest.ini_options]
+# `-n auto` runs one worker per CPU. On CI runners (2-4 cores) this
+# gives a clean speedup; on big workstations xdist may over-subscribe
+# if your suite has heavy per-worker startup — see numbers in the
+# pytest-xdist PR description.
+#
+# Local override for interactive debugging of a single test:
+#   pytest -n 0 tests/test_foo.py::test_bar      # serial, no workers
+# Or set a fixed worker count:
+#   pytest -n 4 tests/                            # 4 workers
+addopts = "-n auto"
 
 [tool.black]
 line-length = 88
