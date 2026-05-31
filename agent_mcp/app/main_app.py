@@ -207,10 +207,10 @@ def create_app(project_dir: str, admin_token_cli: Optional[str] = None) -> Starl
                             "session is no longer registered on the backend. "
                             "This is usually because the backend restarted "
                             "(deploy, OOM, manual restart) and lost in-memory "
-                            "session state. Restart / reconnect your MCP "
-                            "client (e.g. quit + relaunch claude-code, or "
-                            "`/mcp` reload) so a new session_id is issued, "
-                            "then retry."
+                            "session state. Reconnect your MCP session so a "
+                            "new session_id is issued, then retry. In "
+                            "claude-code: `/mcp reconnect <server-name>` "
+                            "(e.g. `/mcp reconnect agent-mcp`)."
                         )
                         new_body = new_text.encode("utf-8")
                         # Rewrite Content-Length on the held start
