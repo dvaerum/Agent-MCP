@@ -134,7 +134,7 @@ export function DeleteMemoryModal({
 
               {/* Metadata */}
               <div className="flex items-center gap-4 text-xs text-muted-foreground pt-2 border-t border-border">
-                <span>Updated: {new Date(memory.last_updated).toLocaleDateString()}</span>
+                <span>Updated: {new Date(memory.updated_at).toLocaleDateString()}</span>
                 <span>By: {memory.updated_by}</span>
                 {memory._metadata && (
                   <span>Size: {memory._metadata.size_kb} KB</span>

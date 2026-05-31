@@ -28,6 +28,43 @@ from ..utils.signal_utils import register_signal_handlers  # For graceful shutdo
 from ..db.write_queue import get_write_queue
 
 
+def _upsert_admin_token_row(
+    cursor: sqlite3.Cursor,
+    context_key: str,
+    value_json: str,
+    description: str,
+) -> None:
+    """INSERT-or-UPDATE the admin-token row, preserving ownership columns.
+
+    Post-Phase-7b, project_context carries `created_at`/`created_by` that
+    must never be overwritten by an admin-token refresh. INSERT OR REPLACE
+    would clobber those columns; do an explicit existence check + branch.
+    """
+    now = datetime.datetime.now().isoformat()
+    cursor.execute(
+        "SELECT context_key FROM project_context WHERE context_key = ?",
+        (context_key,),
+    )
+    if cursor.fetchone() is None:
+        cursor.execute(
+            """
+            INSERT INTO project_context
+                (context_key, value, description, created_at, created_by, updated_at, updated_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (context_key, value_json, description, now, "server_startup", now, "server_startup"),
+        )
+    else:
+        cursor.execute(
+            """
+            UPDATE project_context
+            SET value = ?, description = ?, updated_at = ?, updated_by = ?
+            WHERE context_key = ?
+            """,
+            (value_json, description, now, "server_startup", context_key),
+        )
+
+
 # This function encapsulates the logic originally in main() before server run.
 async def application_startup(
     project_dir_path_str: str, admin_token_param: Optional[str] = None
@@ -126,18 +163,11 @@ async def application_startup(
         if admin_token_param:
             effective_admin_token = admin_token_param
             token_source_description = "command-line parameter"
-            cursor.execute(
-                """
-                INSERT OR REPLACE INTO project_context (context_key, value, last_updated, updated_by, description)
-                VALUES (?, ?, ?, ?, ?)
-            """,
-                (
-                    admin_token_key_in_db,
-                    json.dumps(effective_admin_token),
-                    datetime.datetime.now().isoformat(),
-                    "server_startup",
-                    "Persistent MCP Admin Token",
-                ),
+            _upsert_admin_token_row(
+                cursor,
+                admin_token_key_in_db,
+                json.dumps(effective_admin_token),
+                "Persistent MCP Admin Token",
             )
             conn_admin_token.commit()
             logger.info(f"Using admin token provided via {token_source_description}.")
@@ -168,18 +198,11 @@ async def application_startup(
             if not effective_admin_token:  # If not loaded or invalid
                 effective_admin_token = generate_token()
                 token_source_description = "newly generated"
-                cursor.execute(
-                    """
-                    INSERT OR REPLACE INTO project_context (context_key, value, last_updated, updated_by, description)
-                    VALUES (?, ?, ?, ?, ?)
-                """,
-                    (
-                        admin_token_key_in_db,
-                        json.dumps(effective_admin_token),
-                        datetime.datetime.now().isoformat(),
-                        "server_startup",
-                        "Persistent MCP Admin Token",
-                    ),
+                _upsert_admin_token_row(
+                    cursor,
+                    admin_token_key_in_db,
+                    json.dumps(effective_admin_token),
+                    "Persistent MCP Admin Token",
                 )
                 conn_admin_token.commit()
                 logger.info(f"Generated and stored new admin token.")

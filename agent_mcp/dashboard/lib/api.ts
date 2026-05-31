@@ -59,8 +59,12 @@ export interface Memory {
   context_key: string
   value: any
   description?: string
-  last_updated: string
+  updated_at: string
   updated_by: string
+  // Ownership columns (Phase 7b). Optional on the type because legacy
+  // rows pre-migration may still carry NULLs from the backfill window.
+  created_at?: string | null
+  created_by?: string | null
   _metadata?: {
     size_bytes: number
     size_kb: number
@@ -498,7 +502,7 @@ class ApiClient {
     show_health_analysis?: boolean
     show_stale_entries?: boolean
     max_results?: number
-    sort_by?: 'key' | 'last_updated' | 'size'
+    sort_by?: 'key' | 'updated_at' | 'size'
   }): Promise<Memory[]> {
     // Note: This would require implementing MCP tool calls via the backend
     // For now, we'll use the context data from getAllData
@@ -507,14 +511,16 @@ class ApiClient {
       context_key: ctx.context_key,
       value: ctx.value,
       description: ctx.description,
-      last_updated: ctx.last_updated,
+      updated_at: ctx.updated_at,
       updated_by: ctx.updated_by,
+      created_at: ctx.created_at,
+      created_by: ctx.created_by,
       _metadata: {
         size_bytes: JSON.stringify(ctx.value).length,
         size_kb: Math.round(JSON.stringify(ctx.value).length / 1024 * 100) / 100,
         json_valid: true,
-        days_old: ctx.last_updated ? Math.floor((Date.now() - new Date(ctx.last_updated).getTime()) / (1000 * 60 * 60 * 24)) : undefined,
-        is_stale: ctx.last_updated ? (Date.now() - new Date(ctx.last_updated).getTime()) > (30 * 24 * 60 * 60 * 1000) : false,
+        days_old: ctx.updated_at ? Math.floor((Date.now() - new Date(ctx.updated_at).getTime()) / (1000 * 60 * 60 * 24)) : undefined,
+        is_stale: ctx.updated_at ? (Date.now() - new Date(ctx.updated_at).getTime()) > (30 * 24 * 60 * 60 * 1000) : false,
         is_large: JSON.stringify(ctx.value).length > 10240
       }
     }))

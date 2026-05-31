@@ -57,10 +57,10 @@ def _set_retention_days(days: int) -> None:
     cursor = conn.cursor()
     cursor.execute(
         "INSERT OR REPLACE INTO project_context "
-        "(context_key, value, last_updated, updated_by, description) "
-        "VALUES (?, ?, ?, ?, ?)",
-        ("config_message_retention_days", json.dumps(days), now,
-         "test", "retention test"),
+        "(context_key, value, description, created_at, created_by, updated_at, updated_by) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("config_message_retention_days", json.dumps(days), "retention test",
+         now, "test", now, "test"),
     )
     conn.commit()
     conn.close()
@@ -163,10 +163,10 @@ def test_prune_ignores_bad_config_value(client) -> None:
     cursor = conn.cursor()
     cursor.execute(
         "INSERT OR REPLACE INTO project_context "
-        "(context_key, value, last_updated, updated_by, description) "
-        "VALUES (?, ?, ?, ?, ?)",
+        "(context_key, value, description, created_at, created_by, updated_at, updated_by) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         ("config_message_retention_days", json.dumps("not a number"),
-         now, "test", "bad value"),
+         "bad value", now, "test", now, "test"),
     )
     conn.commit()
     conn.close()
