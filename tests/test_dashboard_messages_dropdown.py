@@ -40,11 +40,19 @@ def test_recipient_field_uses_select_not_input() -> None:
     )
 
 
-def test_recipient_dropdown_populated_from_get_agents() -> None:
+def test_recipient_dropdown_populated_from_participants_endpoint() -> None:
+    """Originally asserted apiClient.getAgents() was the dropdown source.
+
+    Dennis flagged ghost agents — /api/agents returns every row
+    including status='terminated' — so the source changed to
+    /api/messages/participants, which returns {live, tombstones}
+    (terminated agents excluded). The Compose recipient renders the
+    `live` list only; the From/To filters render live + tombstones.
+    """
     src = _read("components/dashboard/messages-dashboard.tsx")
-    assert "apiClient.getAgents()" in src, (
+    assert "/participants" in src or "/messages/participants" in src, (
         "expected the Compose form to populate recipient options from "
-        "apiClient.getAgents()"
+        "the /api/messages/participants endpoint (live agents only)"
     )
 
 

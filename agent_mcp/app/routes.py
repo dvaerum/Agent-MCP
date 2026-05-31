@@ -1455,6 +1455,87 @@ async def list_messages_api_route(request: Request) -> JSONResponse:
             conn.close()
 
 
+async def list_participants_api_route(request: Request) -> JSONResponse:
+    """POST /api/messages/participants — agents available as filter values.
+
+    Returns the set of agent identifiers that should populate the
+    Messages tab's From/To filter dropdowns. /api/agents was the
+    previous source but returns every row including
+    ``status='terminated'``, leaking ghost agents that no longer appear
+    on the Agents page.
+
+    Response shape::
+
+        {
+          "live": [{"agent_id": "...", "status": "..."}, ...],
+          "tombstones": ["[deleted-old-worker-1]", ...]
+        }
+
+    ``live`` excludes terminated agents and prepends a synthetic
+    ``admin`` entry (the agents table has no admin row, but admin is a
+    valid sender/recipient).
+
+    ``tombstones`` are DISTINCT sender_id / recipient_id values that
+    begin with ``[deleted-`` — the marker the PR C agent-purge cascade
+    writes when an agent is permanently removed. Sorted lexicographically
+    so the dropdown order is stable. Empty list until PR C lands.
+    """
+    if request.method == 'OPTIONS':
+        return await handle_options(request)
+    if request.method != 'POST':
+        return JSONResponse({"error": "Method not allowed"}, status_code=405)
+
+    conn = None
+    try:
+        data = await get_sanitized_json_body(request)
+        admin_token = data.get('token')
+        if not verify_token(admin_token, required_role='admin'):
+            return JSONResponse({"error": "Invalid admin token"}, status_code=403)
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Live agents: anything that hasn't been terminated. We keep
+        # 'pending'/'failed'/etc. visible so historical messages from
+        # those agents stay filterable — only 'terminated' is the ghost
+        # state Dennis flagged.
+        cursor.execute(
+            "SELECT agent_id, status FROM agents "
+            "WHERE status IS NULL OR status != 'terminated' "
+            "ORDER BY agent_id ASC"
+        )
+        live = [dict(row) for row in cursor.fetchall()]
+
+        # Always-present admin participant. Prepended so it sorts to the
+        # top of the dropdown regardless of agent_id ordering.
+        if not any(a.get('agent_id', '').lower() == 'admin' for a in live):
+            live.insert(0, {"agent_id": "admin", "status": "system"})
+
+        # Tombstones: DISTINCT sender_id UNION recipient_id values
+        # beginning with the literal '[deleted-' marker. UNION
+        # deduplicates across the two columns.
+        cursor.execute(
+            "SELECT sender_id AS id FROM agent_messages "
+            "WHERE sender_id LIKE '[deleted-%' "
+            "UNION "
+            "SELECT recipient_id AS id FROM agent_messages "
+            "WHERE recipient_id LIKE '[deleted-%' "
+            "ORDER BY id ASC"
+        )
+        tombstones = [row["id"] for row in cursor.fetchall()]
+
+        return JSONResponse({"live": live, "tombstones": tombstones})
+    except Exception as e:
+        logger.error(f"Error listing participants: {e}", exc_info=True)
+        return JSONResponse(
+            {"error": f"Failed to list participants: {str(e)}"},
+            status_code=500,
+        )
+    finally:
+        if conn:
+            conn.close()
+
+
 async def create_message_api_route(request: Request) -> JSONResponse:
     """POST /api/messages — admin composes a message to a recipient.
 
@@ -1678,6 +1759,10 @@ routes.extend([
     # strip GET bodies per the Fetch spec; declared before the
     # compose route so the more specific path matches first.
     Route('/api/messages/query', endpoint=list_messages_api_route, name="list_messages_api", methods=['POST', 'OPTIONS']),
+    # Participants endpoint: live agents (status != terminated) + tombstones
+    # for purged agents (PR C cascade). Sources the Sender/Recipient
+    # filter dropdowns so terminated agents don't ghost the UI.
+    Route('/api/messages/participants', endpoint=list_participants_api_route, name="list_participants_api", methods=['POST', 'OPTIONS']),
     Route('/api/messages', endpoint=create_message_api_route, name="create_message_api", methods=['POST', 'OPTIONS']),
     Route('/api/messages/{message_id}', endpoint=patch_message_api_route, name="patch_message_api", methods=['PATCH', 'DELETE', 'OPTIONS']),
 ])
