@@ -163,10 +163,81 @@ def create_app(project_dir: str, admin_token_cli: Optional[str] = None) -> Starl
     # The sse_transport.handle_post_message is already a proper ASGI callable
     # We just need to wrap it as an ASGI app class for Mount to work
     class MessageHandlerApp:
-        """ASGI app wrapper for SseServerTransport.handle_post_message"""
+        """ASGI app wrapper for SseServerTransport.handle_post_message.
+
+        Intercepts the bare `Could not find session` 404 that MCP's SDK
+        returns (`mcp/server/sse.py:226-227`) when a POST arrives for a
+        session_id the backend has no record of — typically because the
+        backend restarted and the client kept POSTing with its old
+        session_id. The SDK's body is one line and gives the caller no
+        hint what to do; we rewrite it to spell out the fix
+        (reconnect) and echo the offending session_id so operators can
+        correlate with the backend log.
+        """
         async def __call__(self, scope, receive, send):
-            # Directly call the ASGI-compatible handle_post_message method
-            await sse_transport.handle_post_message(scope, receive, send)
+            sid = ""
+            qs = scope.get("query_string", b"")
+            if isinstance(qs, (bytes, bytearray)):
+                # Cheap query-string parse; avoid pulling urllib for
+                # a single key.
+                for part in qs.split(b"&"):
+                    if part.startswith(b"session_id="):
+                        sid = part[len(b"session_id="):].decode(errors="replace")
+                        break
+
+            captured_start: dict[str, object] = {}
+            replace_body = False
+
+            async def _send_wrapper(message):
+                nonlocal replace_body
+                if message["type"] == "http.response.start":
+                    captured_start.update(message)
+                    if message.get("status") == 404:
+                        replace_body = True
+                        # Hold the start until the body is known — we
+                        # may need to rewrite Content-Length.
+                        return
+                    await send(message)
+                    return
+                if message["type"] == "http.response.body" and replace_body:
+                    body = message.get("body", b"") or b""
+                    if b"Could not find session" in body:
+                        new_text = (
+                            f"Could not find session {sid or '<unknown>'} — your MCP "
+                            "session is no longer registered on the backend. "
+                            "This is usually because the backend restarted "
+                            "(deploy, OOM, manual restart) and lost in-memory "
+                            "session state. Restart / reconnect your MCP "
+                            "client (e.g. quit + relaunch claude-code, or "
+                            "`/mcp` reload) so a new session_id is issued, "
+                            "then retry."
+                        )
+                        new_body = new_text.encode("utf-8")
+                        # Rewrite Content-Length on the held start
+                        # frame; ASGI lowercases header names by spec.
+                        headers = [
+                            (k, v) for (k, v) in captured_start.get("headers", [])
+                            if k.lower() != b"content-length"
+                        ]
+                        headers.append((b"content-length", str(len(new_body)).encode()))
+                        captured_start["headers"] = headers
+                        await send(captured_start)
+                        await send({
+                            "type": "http.response.body",
+                            "body": new_body,
+                            "more_body": message.get("more_body", False),
+                        })
+                        replace_body = False
+                        return
+                    # 404 but not the one we care about; flush the
+                    # held start and the original body untouched.
+                    await send(captured_start)
+                    await send(message)
+                    replace_body = False
+                    return
+                await send(message)
+
+            await sse_transport.handle_post_message(scope, receive, _send_wrapper)
 
     # ASGI app wrapper for sse_connection_handler. Must be a Mount, not
     # a Route, because the handler streams via the raw ASGI `send`
