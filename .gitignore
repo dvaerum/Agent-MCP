@@ -14,7 +14,12 @@ dist/
 downloads/
 eggs/
 .eggs/
+# Python build directory — ignored everywhere except inside the dashboard,
+# whose TypeScript source lives under agent_mcp/dashboard/lib/. Without
+# the negation, every PR touching dashboard/lib/ needs `git add -f`.
 lib/
+!agent_mcp/dashboard/lib/
+!agent_mcp/dashboard/lib/**
 lib64/
 parts/
 sdist/
