@@ -3,6 +3,7 @@
 import React, { useEffect, useState } from "react"
 import { Settings, RefreshCw } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import { Switch } from "@/components/ui/switch"
 import {
   Card,
@@ -11,6 +12,12 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import { apiClient } from "@/lib/api"
+
+// Per-project agent_messages retention. Stored as an integer count of
+// days in project_context["config_message_retention_days"]; absent or 0
+// means "keep forever" (upstream behavior). The background pruner in
+// features.message_retention enforces it.
+const MESSAGE_RETENTION_KEY = "config_message_retention_days"
 
 // Per-project worker-permission policies. Each lives in the
 // project_context store under a `config_*` key. The dashboard runs as
@@ -84,6 +91,36 @@ function coerceBool(raw: unknown, fallback: boolean): boolean {
   return fallback
 }
 
+// project_context stores retention as a JSON-encoded integer. Tolerate
+// quoted strings and floats; clamp to >= 0.
+function coerceNonNegInt(raw: unknown): number {
+  let n: number
+  if (typeof raw === "number") {
+    n = raw
+  } else if (typeof raw === "string") {
+    const s = raw.trim().replace(/^"|"$/g, "")
+    try {
+      const parsed = JSON.parse(s)
+      n = typeof parsed === "number" ? parsed : Number(s)
+    } catch {
+      n = Number(s)
+    }
+  } else {
+    n = NaN
+  }
+  if (!Number.isFinite(n) || n < 0) return 0
+  return Math.floor(n)
+}
+
+interface RetentionState {
+  // Current saved value (last seen from server). 0 means disabled.
+  saved: number
+  // What the user has typed into the input (string for free editing).
+  draft: string
+  exists: boolean
+  pending: boolean
+}
+
 export function SettingsDashboard() {
   const [state, setState] = useState<Record<string, PolicyState>>(() => {
     const initial: Record<string, PolicyState> = {}
@@ -91,6 +128,12 @@ export function SettingsDashboard() {
       initial[p.key] = { value: p.default, exists: false, pending: false }
     }
     return initial
+  })
+  const [retention, setRetention] = useState<RetentionState>({
+    saved: 0,
+    draft: "0",
+    exists: false,
+    pending: false,
   })
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -117,10 +160,50 @@ export function SettingsDashboard() {
         }
         return next
       })
+      const retRow = contexts.find(
+        (c: any) => c.context_key === MESSAGE_RETENTION_KEY,
+      )
+      if (retRow) {
+        const days = coerceNonNegInt(retRow.value)
+        setRetention({ saved: days, draft: String(days), exists: true, pending: false })
+      } else {
+        setRetention({ saved: 0, draft: "0", exists: false, pending: false })
+      }
     } catch (e: any) {
       setError(e.message ?? String(e))
     } finally {
       setLoading(false)
+    }
+  }
+
+  const saveRetention = async () => {
+    const next = coerceNonNegInt(retention.draft)
+    if (next === retention.saved && retention.exists) {
+      // No change — nothing to do.
+      return
+    }
+    setRetention((s) => ({ ...s, pending: true }))
+    setError(null)
+    try {
+      const token = await adminToken()
+      if (retention.exists) {
+        await apiClient.updateMemory(MESSAGE_RETENTION_KEY, {
+          context_value: next,
+          token,
+        })
+      } else {
+        await apiClient.createMemory({
+          context_key: MESSAGE_RETENTION_KEY,
+          context_value: next,
+          description:
+            "Days of read agent_messages to keep before background pruner deletes them. 0 = disabled.",
+          token,
+        })
+      }
+      setRetention({ saved: next, draft: String(next), exists: true, pending: false })
+    } catch (e: any) {
+      setRetention((s) => ({ ...s, pending: false }))
+      setError(e.message ?? String(e))
     }
   }
 
@@ -225,6 +308,63 @@ export function SettingsDashboard() {
               </div>
             )
           })}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Message retention</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex items-start justify-between gap-4 py-2">
+            <div className="flex-1 min-w-0">
+              <div className="font-medium text-sm">
+                Auto-delete read messages older than
+              </div>
+              <div className="text-xs text-muted-foreground mt-1">
+                The background pruner runs once every 24 hours and deletes
+                rows from agent_messages where read=1 and timestamp is older
+                than the configured window. Unread messages are never
+                pruned. Set to 0 to disable (keep forever).
+              </div>
+              <div className="text-[10px] text-muted-foreground mt-1 font-mono">
+                {MESSAGE_RETENTION_KEY}
+                {!retention.exists && (
+                  <span className="ml-2 italic">
+                    (using default: keep forever)
+                  </span>
+                )}
+              </div>
+            </div>
+            <div className="flex-shrink-0 pt-1 flex items-center gap-2">
+              <Input
+                type="number"
+                min={0}
+                step={1}
+                inputMode="numeric"
+                value={retention.draft}
+                disabled={retention.pending}
+                onChange={(e) =>
+                  setRetention((s) => ({ ...s, draft: e.target.value }))
+                }
+                className="w-24"
+                aria-label="Message retention days"
+              />
+              <span className="text-xs text-muted-foreground">days</span>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={saveRetention}
+                disabled={
+                  retention.pending ||
+                  (retention.exists &&
+                    coerceNonNegInt(retention.draft) === retention.saved)
+                }
+              >
+                Save
+              </Button>
+            </div>
+          </div>
         </CardContent>
       </Card>
     </div>

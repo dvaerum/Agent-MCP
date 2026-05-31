@@ -19,6 +19,10 @@ from ..external.openai_service import initialize_openai_client
 from ..features.rag.indexing import run_rag_indexing_periodically
 
 from ..features.claude_session_monitor import run_claude_session_monitoring
+from ..features.message_retention import (
+    DEFAULT_INTERVAL_SECONDS as MESSAGE_RETENTION_INTERVAL_DEFAULT,
+    run_message_retention_periodically,
+)
 from ..utils.signal_utils import register_signal_handlers  # For graceful shutdown
 from ..db.write_queue import get_write_queue
 
@@ -320,6 +324,23 @@ async def start_background_tasks(task_group: anyio.abc.TaskGroup):
         f"Claude Code session monitor started with interval {claude_session_interval}s."
     )
 
+    # Start agent_messages retention pruner (Phase 6 follow-up, issue Q).
+    # The interval is long (24h default) — pruning is bookkeeping, not
+    # latency-sensitive. Override via MCP_MESSAGE_RETENTION_INTERVAL_SECONDS
+    # for tests / ops.
+    retention_interval = int(
+        os.environ.get(
+            "MCP_MESSAGE_RETENTION_INTERVAL_SECONDS",
+            str(MESSAGE_RETENTION_INTERVAL_DEFAULT),
+        )
+    )
+    g.message_retention_task_scope = await task_group.start(
+        run_message_retention_periodically, retention_interval
+    )
+    logger.info(
+        f"Message retention pruner started with interval {retention_interval}s."
+    )
+
 
 async def application_shutdown():
     """Handles graceful shutdown of application resources and tasks."""
@@ -335,6 +356,13 @@ async def application_shutdown():
         logger.info("Attempting to cancel Claude session monitoring task...")
         g.claude_session_task_scope.cancel()
         # Note: Actual waiting for task completion is usually handled by the AnyIO TaskGroup context manager.
+
+    if (
+        g.message_retention_task_scope
+        and not g.message_retention_task_scope.cancel_called
+    ):
+        logger.info("Attempting to cancel message retention pruner task...")
+        g.message_retention_task_scope.cancel()
 
     # Stop database write queue
     write_queue = get_write_queue()
