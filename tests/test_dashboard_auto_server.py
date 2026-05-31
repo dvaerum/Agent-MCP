@@ -1,61 +1,56 @@
-"""Regression guards for the dashboard path-prefix auto-seed + cold-start retry.
+"""Regression guards for the dashboard path-prefix derivation.
 
-These verify that ApiClientInitializer contains the auto-seed and
-retry logic that path-prefixed deployments depend on. Regression
-guards (parse .tsx as text) — not behavioral tests. Behavior is
-verified by `npm run build` + manual click-through documented in
-the PR body.
+Originally these guarded the 3-useEffect bootstrap in
+`api-client-initializer.tsx` (auto-seed + cold-start retry +
+hydration-gate). Candidate C from the 2026-06-01 architecture review
+collapsed that into:
+
+  - A module-level singleton in `lib/project-context.ts` that derives
+    `{projectName, baseUrl, apiPrefix}` synchronously from
+    `window.location.pathname` at import time (no useEffect, no
+    zustand-persist hydration race).
+  - Transparent retry inside `ApiClient.request()` on 502/503/504
+    (no boundary-level setInterval poll).
+
+These guards now check the new module. The "cold-start retry" guard
+moved to `test_dashboard_path_prefix_adapter.py` (asserting the retry
+loop in `lib/api.ts`), and the "hydration-gate" guard is gone — the
+new derivation is synchronous and cannot race the persisted state.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-INIT_TSX = Path(
-    "agent_mcp/dashboard/components/providers/api-client-initializer.tsx"
-)
+PROJECT_CONTEXT = Path("agent_mcp/dashboard/lib/project-context.ts")
 
 
 def _src() -> str:
-    return INIT_TSX.read_text()
+    return PROJECT_CONTEXT.read_text()
 
 
-def test_auto_seed_uses_dashboard_path_regex() -> None:
-    """ApiClientInitializer must inspect window.location.pathname for
-    the deployment URL pattern so the dashboard self-bootstraps when
-    mounted under /agent-mcp/__dashboard/<name>/."""
+def test_path_prefix_derivation_uses_dashboard_path_regex() -> None:
+    """The PathPrefix singleton must inspect window.location.pathname
+    for the deployment URL pattern so the dashboard self-bootstraps
+    when mounted under /agent-mcp/__dashboard/<name>/."""
     src = _src()
     assert "/agent-mcp/__dashboard" in src, (
         "expected the path-prefix regex `/agent-mcp/__dashboard` in "
-        "api-client-initializer.tsx; auto-seed only works when the "
+        "lib/project-context.ts; derivation only works when the "
         "deployment URL pattern is detected"
     )
     assert "window.location.pathname" in src, (
-        "expected ApiClientInitializer to read window.location.pathname"
+        "expected the singleton to read window.location.pathname "
+        "(synchronous derivation at module import)"
     )
 
 
-def test_auto_seed_waits_for_persist_hydration() -> None:
-    """Seeding must wait until zustand-persist hydrates, else the
-    first render seeds a duplicate entry every reload."""
+def test_path_prefix_derivation_has_ssr_guard() -> None:
+    """Next.js prerenders the module at build time where `window` is
+    undefined. The singleton must guard with `typeof window` to fall
+    through to defaults during SSR."""
     src = _src()
-    assert (
-        "onFinishHydration" in src or "hasHydrated" in src
-    ), (
-        "expected the auto-seed effect to gate on persist hydration "
-        "(`onFinishHydration` or `hasHydrated`); without it, the first "
-        "render seeds before the persisted state arrives and creates "
-        "a duplicate entry on every reload"
-    )
-
-
-def test_cold_start_retry_loop_present() -> None:
-    """Cold-start retry: backend's lazy spawn takes 10-15s; without
-    a retry the first health check fails and the user sees the
-    'Connect to MCP Server' screen even though the URL identifies
-    the project."""
-    src = _src()
-    assert "setInterval" in src, (
-        "expected setInterval-based retry loop for the cold-start "
-        "race against lazy backend spawn"
+    assert "typeof window" in src, (
+        "expected `typeof window !== 'undefined'` SSR guard so the "
+        "module imports cleanly during Next.js prerender"
     )

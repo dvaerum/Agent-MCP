@@ -40,7 +40,12 @@ from __future__ import annotations
 from pathlib import Path
 
 STORE = Path("agent_mcp/dashboard/lib/stores/server-store.ts")
-INIT = Path("agent_mcp/dashboard/components/providers/api-client-initializer.tsx")
+# Candidate C refactor moved the auto-seed side effect out of the
+# old `api-client-initializer.tsx` and into the module-load body of
+# `lib/project-context.ts`. The seed still happens — just synchronously
+# at module import (gated on `persist.onFinishHydration` as before)
+# instead of via a React effect.
+INIT = Path("agent_mcp/dashboard/lib/project-context.ts")
 CONN = Path("agent_mcp/dashboard/components/server/server-connection.tsx")
 MODAL = Path("agent_mcp/dashboard/components/server/server-management-modal.tsx")
 OVERVIEW = Path("agent_mcp/dashboard/components/dashboard/overview-dashboard.tsx")
@@ -92,7 +97,7 @@ def test_check_server_health_respects_explicit_baseurl() -> None:
 
 
 def test_auto_seed_passes_baseurl_to_add_server() -> None:
-    """`ApiClientInitializer`'s auto-seed must pass the router-proxied
+    """The PathPrefix singleton's auto-seed must pass the router-proxied
     API root as `baseUrl` so subsequent setActiveServer/health checks
     keep using it instead of `proxy:0`."""
     src = INIT.read_text()
@@ -101,7 +106,7 @@ def test_auto_seed_passes_baseurl_to_add_server() -> None:
     # in the addServer call). Both end up persisting the field.
     assert "/agent-mcp/__api/" in src, (
         "expected the path-prefix API root literal in "
-        "api-client-initializer.tsx — needed so the persisted server "
+        "lib/project-context.ts — needed so the persisted server "
         "entry knows where to fetch via the router proxy."
     )
     assert "baseUrl" in src and "addServer" in src, (

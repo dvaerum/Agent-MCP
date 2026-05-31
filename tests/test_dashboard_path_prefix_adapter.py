@@ -40,6 +40,7 @@ from pathlib import Path
 DASHBOARD = Path("agent_mcp/dashboard")
 PROJECT_CONTEXT = DASHBOARD / "lib" / "project-context.ts"
 LAYOUT = DASHBOARD / "app" / "layout.tsx"
+PROVIDER = DASHBOARD / "components" / "providers" / "project-context-provider.tsx"
 API = DASHBOARD / "lib" / "api.ts"
 OLD_INIT = DASHBOARD / "components" / "providers" / "api-client-initializer.tsx"
 
@@ -104,20 +105,43 @@ def test_project_context_derives_from_pathname_synchronously() -> None:
 
 
 def test_layout_wraps_children_in_project_context_provider() -> None:
-    """The Provider lives in `app/layout.tsx` so every dashboard
-    route sees the resolved values."""
-    src = _read(LAYOUT)
-    assert "ProjectContext" in src, (
-        "expected `ProjectContext` import in app/layout.tsx"
+    """The Provider is wired into `app/layout.tsx` so every dashboard
+    route sees the resolved values.
+
+    Next.js Server/Client boundary requires the actual
+    `<ProjectContext.Provider value={projectContext}>` to live in a
+    "use client" module — `app/layout.tsx` is a server component
+    (exports `metadata` + `viewport`). The Provider is therefore
+    extracted into a thin client wrapper
+    (`components/providers/project-context-provider.tsx`) that
+    layout.tsx renders. We accept either pattern: the Provider
+    rendered directly in layout, or via the wrapper component.
+    """
+    layout_src = _read(LAYOUT)
+    direct = (
+        "ProjectContext.Provider" in layout_src
+        and "projectContext" in layout_src
     )
-    assert "ProjectContext.Provider" in src, (
+    wrapper_in_layout = "ProjectContextProvider" in layout_src
+    assert direct or wrapper_in_layout, (
         "expected `<ProjectContext.Provider value={projectContext}>` "
-        "in app/layout.tsx wrapping the children"
+        "in app/layout.tsx OR a `<ProjectContextProvider>` client "
+        "wrapper rendered from app/layout.tsx"
     )
-    assert "projectContext" in src, (
-        "expected `projectContext` (the singleton value) to be passed "
-        "to the Provider"
-    )
+    if wrapper_in_layout:
+        assert PROVIDER.exists(), (
+            "layout.tsx references ProjectContextProvider but the "
+            "wrapper module is missing"
+        )
+        provider_src = _read(PROVIDER)
+        assert "ProjectContext.Provider" in provider_src, (
+            "expected `<ProjectContext.Provider>` inside the client "
+            f"wrapper at {PROVIDER}"
+        )
+        assert "projectContext" in provider_src, (
+            "expected the singleton `projectContext` to be passed as "
+            "the Provider value in the wrapper"
+        )
 
 
 # -- ApiClient transparent retry ------------------------------------------

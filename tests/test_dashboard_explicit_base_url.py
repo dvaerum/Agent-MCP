@@ -39,16 +39,20 @@ def test_api_client_has_set_base_url_method() -> None:
     )
 
 
-def test_api_client_initializer_uses_set_base_url_for_path_prefix() -> None:
-    src = _read("components/providers/api-client-initializer.tsx")
-    # When path-prefix matches, the initializer must call setBaseUrl
-    # with the derived /agent-mcp/__api/<name> URL.
+def test_path_prefix_singleton_uses_set_base_url() -> None:
+    """Candidate C refactor (2026-06-01) moved this side effect from
+    the old api-client-initializer.tsx useEffect into the module-load
+    body of `lib/project-context.ts`. When the path-prefix matches,
+    the singleton must call `apiClient.setBaseUrl` with the derived
+    `/agent-mcp/__api/<name>` URL so the very first fetch already
+    routes through the proxy."""
+    src = _read("lib/project-context.ts")
     assert "setBaseUrl" in src, (
-        "expected ApiClientInitializer to call apiClient.setBaseUrl "
+        "expected lib/project-context.ts to call apiClient.setBaseUrl "
         "with the derived URL when the dashboard URL matches "
         "/agent-mcp/__dashboard/<name>/"
     )
     assert "/agent-mcp/__api/" in src, (
-        "expected the path-derived URL (/agent-mcp/__api/...) in the "
-        "ApiClientInitializer"
+        "expected the path-derived URL (/agent-mcp/__api/...) in "
+        "lib/project-context.ts"
     )
