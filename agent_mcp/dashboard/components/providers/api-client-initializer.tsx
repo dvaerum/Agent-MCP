@@ -25,15 +25,21 @@ export function ApiClientInitializer() {
   // a tick later. Seeding before hydration creates a duplicate entry
   // every reload.
   //
-  // (host, port) are placeholders — apiClient.setServer detects
-  // path-prefix mode (when URL matches DASHBOARD_PATH_RE) and uses
-  // the URL-derived baseUrl regardless of these values.
+  // (host, port) are placeholders — the activeServerId effect below
+  // would otherwise call setServer(host, port) and produce a broken
+  // `http://proxy:0/api` URL. We pre-empt that by calling
+  // apiClient.setBaseUrl with the URL-derived API root
+  // (`/agent-mcp/__api/<name>`) BEFORE the seed runs, so even the
+  // cold-start retry fetches via the router's proxy. The subsequent
+  // setServer call still happens (the synthetic entry satisfies the
+  // store gate) but the explicit baseUrl overrides what it produces.
   useEffect(() => {
     const trySeed = () => {
       if (typeof window === 'undefined') return
-      const m = window.location.pathname.match(DASHBOARD_PATH_RE)
+      const m = DASHBOARD_PATH_RE.exec(window.location.pathname)
       if (!m) return
       const name = m[1]
+      apiClient.setBaseUrl('/agent-mcp/__api/' + name)
       const store = useServerStore.getState()
       let existing = store.servers.find(s => s.name === name)
       if (!existing) {
@@ -59,6 +65,16 @@ export function ApiClientInitializer() {
       if (activeServer) {
         console.debug(`ApiClientInitializer: Setting API server to ${activeServer.host}:${activeServer.port}`)
         apiClient.setServer(activeServer.host, activeServer.port)
+        // Path-prefix deployments: override the host:port baseUrl
+        // with the URL-derived API root. setServer above is still
+        // useful because some external code reads the server entry,
+        // but the actual fetches must go through the router proxy.
+        if (typeof window !== 'undefined') {
+          const m = DASHBOARD_PATH_RE.exec(window.location.pathname)
+          if (m) {
+            apiClient.setBaseUrl('/agent-mcp/__api/' + m[1])
+          }
+        }
       }
     }
   }, [activeServerId, servers])

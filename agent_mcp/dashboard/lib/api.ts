@@ -128,6 +128,24 @@ class ApiClient {
   }
 
   /**
+   * Set the API root URL directly.
+   *
+   * Use this instead of `setServer(host, port)` when the caller
+   * already knows the absolute or relative URL of the API root
+   * (for example, path-prefixed deployments mounted behind a
+   * reverse-proxy router where the dashboard fetches resolve via
+   * `/agent-mcp/__api/<name>` rather than a `http://host:port/api`
+   * origin).
+   *
+   * The provided URL should be the API root including any `/api`
+   * segment, matching the same convention as `setServer`. Endpoint
+   * paths are concatenated to this value directly.
+   */
+  setBaseUrl(url: string) {
+    this.baseUrl = url
+  }
+
+  /**
    * Returns the API root URL (includes `/api`, not just the server
    * origin). Callers that build URLs from this should concatenate
    * the endpoint directly without adding `/api/` themselves.
