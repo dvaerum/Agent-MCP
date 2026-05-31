@@ -99,9 +99,16 @@ manually as part of release verification — **not** part of CI here.
 
 ## CI must pass
 
-`.github/workflows/ci.yml` runs `pytest`, `ruff check .`, and
-`( cd agent_mcp/dashboard && npm ci && npm run build )` on every
-push and PR. Red CI blocks merge.
+`.github/workflows/ci.yml` runs:
+
+- `pytest` (everything under `tests/`)
+- `ruff check tests/` (scope is `tests/` only for now — legacy
+  `agent_mcp/` has 216 existing ruff errors that we don't gate CI on;
+  PRs that touch `agent_mcp/` files should manually `ruff check <file>`
+  and clean them up incrementally)
+- `( cd agent_mcp/dashboard && npm ci && npm run build )`
+
+Red CI blocks merge.
 
 ## PR template
 
