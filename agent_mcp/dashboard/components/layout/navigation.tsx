@@ -7,7 +7,8 @@ import {
   CheckSquare,
   Brain,
   BookOpen,
-  MessageSquare
+  MessageSquare,
+  Settings
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -17,7 +18,7 @@ import { useDashboard, useSidebar } from "@/lib/store"
 interface NavItem {
   title: string
   icon: React.ComponentType<{ className?: string }>
-  view: 'overview' | 'agents' | 'tasks' | 'memories' | 'messages' | 'prompts'
+  view: 'overview' | 'agents' | 'tasks' | 'memories' | 'messages' | 'settings' | 'prompts'
   description?: string
   badge?: string
 }
@@ -52,6 +53,12 @@ const navigationItems: NavItem[] = [
     icon: MessageSquare,
     view: "messages",
     description: "Inter-agent messaging — compose, read, history"
+  },
+  {
+    title: "Settings",
+    icon: Settings,
+    view: "settings",
+    description: "Per-project worker-permission policy toggles"
   },
   {
     title: "Prompt Book",
