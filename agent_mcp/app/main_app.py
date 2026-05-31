@@ -51,10 +51,19 @@ async def mcp_list_tools_handler() -> List[mcp_types.Tool]:
     """MCP endpoint to list available tools."""
     return await list_available_tools() # Calls the function from tools.registry
 
-@mcp_app_instance.call_tool()
+@mcp_app_instance.call_tool(validate_input=False)
 async def mcp_call_tool_handler(name: str, arguments: dict) -> List[mcp_types.TextContent]:
-    """MCP endpoint to call a specific tool."""
-    # `dispatch_tool_call` from tools.registry handles sanitization and routing
+    """MCP endpoint to call a specific tool.
+
+    `validate_input=False` disables the framework's automatic
+    `jsonschema.validate(arguments, tool.inputSchema)` step
+    (mcp/server/lowlevel/server.py:497). We re-run validation inside
+    `dispatch_tool_call` *after* cleaning arguments for the real-world
+    shapes LLM clients produce (`token: null`, leaked `_meta`,
+    integer-as-string). See `_clean_arguments_for_schema` in
+    `tools/registry.py` and the tolerance suite in
+    `tests/test_call_tool_argument_tolerance.py`.
+    """
     return await dispatch_tool_call(name, arguments)
 
 
