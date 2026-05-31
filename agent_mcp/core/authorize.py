@@ -116,10 +116,10 @@ def requires(role: str) -> Callable[[ToolImpl], ToolImpl]:
             token = _extract_token(arguments)
             if role == "admin":
                 if not verify_token(token, "admin"):
-                    raise AuthRejected("Admin token required")
+                    raise AuthRejected("Unauthorized: Admin token required")
             else:  # role == "any"
                 if not get_agent_id(token):
-                    raise AuthRejected("Valid token required")
+                    raise AuthRejected("Unauthorized: Valid token required")
             return await func(arguments)
 
         return wrapper
@@ -165,7 +165,7 @@ def requires_policy(
 
             # Worker path: must resolve to an active agent first.
             if not get_agent_id(token):
-                raise AuthRejected("Valid token required")
+                raise AuthRejected("Unauthorized: Valid token required")
 
             # Lazy import: the access module pulls in DB helpers we
             # don't want to load at module-import time (keeps
@@ -179,7 +179,7 @@ def requires_policy(
 
             joined = ", ".join(config_keys)
             raise AuthRejected(
-                f"worker access disabled by project policy "
+                f"Unauthorized: worker access denied by project policy "
                 f"(all of: {joined} are off). Ask admin to enable "
                 "one in dashboard Settings."
             )
