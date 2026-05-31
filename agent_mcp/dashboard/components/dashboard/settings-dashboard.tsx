@@ -62,6 +62,13 @@ const POLICIES: PolicySpec[] = [
       "When on (default), workers may call assign_task with no agent_token to file work into the unassigned pool for any peer to claim. When off, only the admin may create tasks.",
     default: true,
   },
+  {
+    key: "config_aoe_notify_enabled",
+    title: "Notify Agents-of-Empires on new messages",
+    description:
+      "When on, send_agent_message also POSTs a tmux-pane wake-up to a local Agents-of-Empires (AoE) instance so the recipient notices the message even between polls. Disabled by default. Configure config_aoe_base_url, config_aoe_bearer_token (secret), and config_aoe_notify_template via the Memories tab. The message body itself is never forwarded — only {sender}, {recipient}, {message_id} are interpolated.",
+    default: false,
+  },
 ]
 
 interface PolicyState {

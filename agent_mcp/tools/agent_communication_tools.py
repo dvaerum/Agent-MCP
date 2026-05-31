@@ -1,4 +1,5 @@
 # Agent-MCP/agent_mcp/tools/agent_communication_tools.py
+import asyncio
 import json
 import datetime
 import secrets
@@ -15,6 +16,7 @@ from ..core.config import logger
 from ..core import globals as g
 from ..core.auth import verify_token, get_agent_id
 from ..core.authorize import requires, requires_policy
+from ..features.aoe_notify import notify_aoe as _aoe_notify
 from ..utils.audit_utils import log_audit
 from ..db.connection import get_db_connection
 from ..db.actions.agent_actions_db import log_agent_action_to_db
@@ -214,7 +216,21 @@ async def send_agent_message_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
                                })
         
         conn.commit()
-        
+
+        # AoE notification side-channel (best-effort, fire-and-forget).
+        # Disabled by default; admins opt in via
+        # project_context[config_aoe_notify_enabled]. Never blocks or
+        # raises — the message is already persisted, and AoE is just
+        # a tmux-pane wake-up call.
+        try:
+            asyncio.create_task(
+                _aoe_notify(recipient_id, sender_id, message_id)
+            )
+        except RuntimeError:
+            # No running event loop (e.g. unit tests calling the impl
+            # synchronously). Run inline; still swallows errors.
+            await _aoe_notify(recipient_id, sender_id, message_id)
+
         # Audit log
         log_audit(sender_id, "send_agent_message", {
             "recipient": recipient_id,
