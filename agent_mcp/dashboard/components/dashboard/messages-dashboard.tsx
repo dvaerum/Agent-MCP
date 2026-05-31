@@ -1,7 +1,7 @@
 "use client"
 
 import React, { useEffect, useMemo, useState } from "react"
-import { MessageSquare, Send, RefreshCw, X } from "lucide-react"
+import { MessageSquare, Send, RefreshCw, X, Trash2, MailOpen, Mail } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -60,6 +60,12 @@ const MESSAGE_TYPES = [
 ]
 const PRIORITIES = ["low", "normal", "high", "urgent"]
 
+// Sentinel values for Select dropdowns (Radix Select cannot use ""
+// as an item value). "__all" clears the filter, "__broadcast" picks
+// the broadcast recipient.
+const ALL = "__all"
+const BROADCAST = "__broadcast"
+
 // The admin token is fetched once and reused; the dashboard runs as
 // admin per ADR-0003. We don't display it.
 async function adminToken(): Promise<string> {
@@ -71,9 +77,9 @@ async function adminToken(): Promise<string> {
 // Listing uses POST /api/messages/query because browsers strip bodies
 // from GET requests per the Fetch spec (this was the original bug).
 // Compose stays POST /api/messages; mark-read stays PATCH
-// /api/messages/<id>.
+// /api/messages/<id>; delete is DELETE /api/messages/<id>.
 async function callMessages(
-  method: "POST" | "PATCH",
+  method: "POST" | "PATCH" | "DELETE",
   pathSuffix: string,
   body: Record<string, unknown>
 ): Promise<any> {
@@ -103,6 +109,10 @@ export function MessagesDashboard() {
     q: "",
   })
 
+  // Per-row selection (message_id set). Cleared after every refresh
+  // so we don't accidentally act on stale rows.
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+
   // Compose state.
   const [composeOpen, setComposeOpen] = useState(false)
   const [composeRecipient, setComposeRecipient] = useState("")
@@ -113,7 +123,8 @@ export function MessagesDashboard() {
 
   // Recipient dropdown options: hardcoded admin first (admin always
   // exists but /api/agents may not include it) + workers from
-  // /api/agents. Fetched once on mount.
+  // /api/agents. Fetched once on mount; reused by the from/to filter
+  // dropdowns as well.
   const [agents, setAgents] = useState<Agent[]>([])
   useEffect(() => {
     apiClient.getAgents().then(setAgents).catch(() => setAgents([]))
@@ -148,6 +159,9 @@ export function MessagesDashboard() {
       const body = await queryBody()
       const data = await callMessages("POST", "/query", body)
       setMessages(data.messages ?? [])
+      // Clear selection — IDs that survive filter changes would
+      // silently act on rows the user can no longer see.
+      setSelectedIds(new Set())
     } catch (e: any) {
       setError(e.message ?? String(e))
     } finally {
@@ -171,9 +185,12 @@ export function MessagesDashboard() {
     setError(null)
     try {
       const t = await adminToken()
+      // BROADCAST sentinel maps to recipient_id="*" on the backend.
+      const recipient =
+        composeRecipient === BROADCAST ? "*" : composeRecipient
       await callMessages("POST", "", {
         token: t,
-        recipient_id: composeRecipient,
+        recipient_id: recipient,
         message_content: composeContent,
         message_type: composeType,
         priority: composePriority,
@@ -195,6 +212,74 @@ export function MessagesDashboard() {
         token: t,
         read: !(m.read === 1 || m.read === true),
       })
+      await refresh()
+    } catch (e: any) {
+      setError(e.message ?? String(e))
+    }
+  }
+
+  // ----- bulk selection helpers ----------------------------------
+
+  const toggleOne = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const allVisibleSelected =
+    messages.length > 0 && selectedIds.size === messages.length
+
+  const toggleAllVisible = () => {
+    // selectAllVisible: toggle every row currently rendered (the rows
+    // that pass the active filter, since the table renders the full
+    // filtered list — no pagination is applied client-side).
+    if (allVisibleSelected) {
+      setSelectedIds(new Set())
+    } else {
+      setSelectedIds(new Set(messages.map((m) => m.message_id)))
+    }
+  }
+
+  const bulkMark = async (read: boolean) => {
+    if (selectedIds.size === 0) return
+    setError(null)
+    try {
+      const t = await adminToken()
+      await Promise.all(
+        Array.from(selectedIds).map((id) =>
+          callMessages("PATCH", `/${id}`, { token: t, read })
+        )
+      )
+      await refresh()
+    } catch (e: any) {
+      setError(e.message ?? String(e))
+    }
+  }
+
+  const bulkDelete = async () => {
+    if (selectedIds.size === 0) return
+    setError(null)
+    try {
+      const t = await adminToken()
+      await Promise.all(
+        Array.from(selectedIds).map((id) =>
+          callMessages("DELETE", `/${id}`, { token: t })
+        )
+      )
+      await refresh()
+    } catch (e: any) {
+      setError(e.message ?? String(e))
+    }
+  }
+
+  const deleteOne = async (m: Message) => {
+    setError(null)
+    try {
+      const t = await adminToken()
+      await callMessages("DELETE", `/${m.message_id}`, { token: t })
       await refresh()
     } catch (e: any) {
       setError(e.message ?? String(e))
@@ -243,6 +328,9 @@ export function MessagesDashboard() {
                     <SelectValue placeholder="select agent" />
                   </SelectTrigger>
                   <SelectContent>
+                    <SelectItem value={BROADCAST}>
+                      (broadcast to all workers)
+                    </SelectItem>
                     {recipientOptions.map((id) => (
                       <SelectItem key={id} value={id}>{id}</SelectItem>
                     ))}
@@ -296,43 +384,61 @@ export function MessagesDashboard() {
         </CardHeader>
         <CardContent>
           <div className="grid gap-3 md:grid-cols-6">
-            <Input
-              placeholder="from (sender_id)"
-              value={filters.from}
-              onChange={(e) => setFilters((f) => ({ ...f, from: e.target.value }))}
-            />
-            <Input
-              placeholder="to (recipient_id)"
-              value={filters.to}
-              onChange={(e) => setFilters((f) => ({ ...f, to: e.target.value }))}
-            />
             <Select
-              value={filters.type || "__all"}
-              onValueChange={(v) => setFilters((f) => ({ ...f, type: v === "__all" ? "" : v }))}
+              value={filters.from || ALL}
+              onValueChange={(v) =>
+                setFilters((f) => ({ ...f, from: v === ALL ? "" : v }))
+              }
+            >
+              <SelectTrigger><SelectValue placeholder="from" /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value={ALL}>any sender</SelectItem>
+                {recipientOptions.map((id) => (
+                  <SelectItem key={`from-${id}`} value={id}>{id}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select
+              value={filters.to || ALL}
+              onValueChange={(v) =>
+                setFilters((f) => ({ ...f, to: v === ALL ? "" : v }))
+              }
+            >
+              <SelectTrigger><SelectValue placeholder="to" /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value={ALL}>any recipient</SelectItem>
+                {recipientOptions.map((id) => (
+                  <SelectItem key={`to-${id}`} value={id}>{id}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select
+              value={filters.type || ALL}
+              onValueChange={(v) => setFilters((f) => ({ ...f, type: v === ALL ? "" : v }))}
             >
               <SelectTrigger><SelectValue placeholder="type" /></SelectTrigger>
               <SelectContent>
-                <SelectItem value="__all">all types</SelectItem>
+                <SelectItem value={ALL}>all types</SelectItem>
                 {MESSAGE_TYPES.map((t) => (<SelectItem key={t} value={t}>{t}</SelectItem>))}
               </SelectContent>
             </Select>
             <Select
-              value={filters.priority || "__all"}
-              onValueChange={(v) => setFilters((f) => ({ ...f, priority: v === "__all" ? "" : v }))}
+              value={filters.priority || ALL}
+              onValueChange={(v) => setFilters((f) => ({ ...f, priority: v === ALL ? "" : v }))}
             >
               <SelectTrigger><SelectValue placeholder="priority" /></SelectTrigger>
               <SelectContent>
-                <SelectItem value="__all">any priority</SelectItem>
+                <SelectItem value={ALL}>any priority</SelectItem>
                 {PRIORITIES.map((p) => (<SelectItem key={p} value={p}>{p}</SelectItem>))}
               </SelectContent>
             </Select>
             <Select
-              value={filters.read || "__all"}
-              onValueChange={(v) => setFilters((f) => ({ ...f, read: v === "__all" ? "" : (v as "true" | "false") }))}
+              value={filters.read || ALL}
+              onValueChange={(v) => setFilters((f) => ({ ...f, read: v === ALL ? "" : (v as "true" | "false") }))}
             >
               <SelectTrigger><SelectValue placeholder="read?" /></SelectTrigger>
               <SelectContent>
-                <SelectItem value="__all">any</SelectItem>
+                <SelectItem value={ALL}>any</SelectItem>
                 <SelectItem value="false">unread</SelectItem>
                 <SelectItem value="true">read</SelectItem>
               </SelectContent>
@@ -353,15 +459,44 @@ export function MessagesDashboard() {
       </Card>
 
       <Card>
-        <CardHeader>
+        <CardHeader className="flex flex-row items-center justify-between space-y-0">
           <CardTitle className="text-base">
             {messages.length} {messages.length === 1 ? "message" : "messages"}
+            {selectedIds.size > 0 && (
+              <span className="ml-2 text-sm text-muted-foreground">
+                ({selectedIds.size} selected)
+              </span>
+            )}
           </CardTitle>
+          {selectedIds.size > 0 && (
+            <div className="flex gap-2">
+              <Button variant="outline" size="sm" onClick={() => bulkMark(true)}>
+                <MailOpen className="h-4 w-4 mr-1" />
+                Mark read
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => bulkMark(false)}>
+                <Mail className="h-4 w-4 mr-1" />
+                Mark unread
+              </Button>
+              <Button variant="destructive" size="sm" onClick={bulkDelete}>
+                <Trash2 className="h-4 w-4 mr-1" />
+                Delete
+              </Button>
+            </div>
+          )}
         </CardHeader>
         <CardContent>
           <Table>
             <TableHeader>
               <TableRow>
+                <TableHead className="w-8">
+                  <input
+                    type="checkbox"
+                    aria-label="select all visible"
+                    checked={allVisibleSelected}
+                    onChange={toggleAllVisible}
+                  />
+                </TableHead>
                 <TableHead>Time</TableHead>
                 <TableHead>From</TableHead>
                 <TableHead>To</TableHead>
@@ -369,26 +504,54 @@ export function MessagesDashboard() {
                 <TableHead>Pri</TableHead>
                 <TableHead>R</TableHead>
                 <TableHead>Content</TableHead>
+                <TableHead className="w-8"></TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {messages.map((m) => (
-                <TableRow
-                  key={m.message_id}
-                  className="cursor-pointer"
-                  onClick={() => toggleRead(m)}
-                >
-                  <TableCell className="text-xs font-mono">{m.timestamp.slice(0, 19)}</TableCell>
-                  <TableCell><Badge variant="outline">{m.sender_id}</Badge></TableCell>
-                  <TableCell><Badge variant="outline">{m.recipient_id}</Badge></TableCell>
-                  <TableCell className="text-xs">{m.message_type}</TableCell>
-                  <TableCell className="text-xs">{m.priority}</TableCell>
-                  <TableCell>{m.read === 1 || m.read === true ? "✓" : ""}</TableCell>
-                  <TableCell className="max-w-[400px] truncate text-xs">
-                    {m.message_content}
-                  </TableCell>
-                </TableRow>
-              ))}
+              {messages.map((m) => {
+                const checked = selectedIds.has(m.message_id)
+                return (
+                  <TableRow key={m.message_id}>
+                    <TableCell onClick={(e) => e.stopPropagation()}>
+                      <input
+                        type="checkbox"
+                        aria-label={`select message ${m.message_id}`}
+                        checked={checked}
+                        onChange={() => toggleOne(m.message_id)}
+                      />
+                    </TableCell>
+                    <TableCell
+                      className="text-xs font-mono cursor-pointer"
+                      onClick={() => toggleRead(m)}
+                    >
+                      {m.timestamp.slice(0, 19)}
+                    </TableCell>
+                    <TableCell><Badge variant="outline">{m.sender_id}</Badge></TableCell>
+                    <TableCell><Badge variant="outline">{m.recipient_id}</Badge></TableCell>
+                    <TableCell className="text-xs">{m.message_type}</TableCell>
+                    <TableCell className="text-xs">{m.priority}</TableCell>
+                    <TableCell
+                      className="cursor-pointer"
+                      onClick={() => toggleRead(m)}
+                    >
+                      {m.read === 1 || m.read === true ? "✓" : ""}
+                    </TableCell>
+                    <TableCell className="max-w-[400px] truncate text-xs">
+                      {m.message_content}
+                    </TableCell>
+                    <TableCell onClick={(e) => e.stopPropagation()}>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        aria-label="delete message"
+                        onClick={() => deleteOne(m)}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                )
+              })}
             </TableBody>
           </Table>
         </CardContent>
