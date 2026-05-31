@@ -186,6 +186,24 @@ def create_app(project_dir: str, admin_token_cli: Optional[str] = None) -> Starl
         async def __call__(self, scope, receive, send):
             from starlette.requests import Request
 
+            # Starlette's Mount sets scope['root_path']='/sse' on the
+            # inner app. MCP's SseServerTransport.connect_sse then
+            # computes the follow-up POST URL it tells the client to use
+            # as `root_path.rstrip('/') + self._endpoint`
+            # (mcp/server/sse.py:152), which produces
+            # `/sse/messages/?session_id=...` instead of the canonical
+            # `/messages/?session_id=...`. Any reverse-proxy / router
+            # rewriting `data: /messages/` on the SSE byte stream
+            # (multi-tenant deployments) then stops matching, and
+            # clients POST to a 404. Strip root_path so the transport
+            # advertises the canonical URL — the Mount still routes
+            # /sse → here either way.
+            if scope.get("root_path"):
+                scope = {
+                    **scope,
+                    "path": scope.get("root_path", "") + scope.get("path", ""),
+                    "root_path": "",
+                }
             request = Request(scope, receive=receive, send=send)
             await sse_connection_handler(request)
 
