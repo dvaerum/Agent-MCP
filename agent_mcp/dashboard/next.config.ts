@@ -9,22 +9,31 @@ const nextConfig: NextConfig = {
   // Enable static export for serving through Python backend (only in production)
   output: process.env.NODE_ENV === 'production' ? 'export' : undefined,
   
-  // Configure output directory to be the static folder (only for production builds)
-  distDir: process.env.NODE_ENV === 'production' ? '../static' : '.next',
-  
+  // Output directory for the production static export. Keep the build
+  // artifact INSIDE the dashboard tree (Next.js default convention) so
+  // downstream packagers (Nix, Docker, etc.) don't have to chase a
+  // sibling-relative path. Prior value `../static` wrote outside the
+  // dashboard directory and broke sandboxed builds.
+  distDir: process.env.NODE_ENV === 'production' ? 'out' : '.next',
+
   // Disable image optimization for static export
   images: {
     unoptimized: true
   },
-  
+
   // Configure trailing slash for better static serving
   trailingSlash: true,
-  
+
   // Base path configuration (can be updated if needed)
   basePath: '',
-  
-  // Asset prefix for CDN support if needed later
-  assetPrefix: '',
+
+  // Asset prefix for deployments behind a path-prefixed reverse proxy.
+  // Driven by the ASSET_PREFIX env var at build time. Default empty
+  // preserves upstream behavior (assets served at site root). Path-
+  // prefixed deployments set ASSET_PREFIX (e.g. ASSET_PREFIX=/agent-mcp/__dashboard)
+  // so the webpack runtime's public path matches where the proxy
+  // serves the static tree.
+  assetPrefix: process.env.ASSET_PREFIX || '',
 
   eslint: {
     ignoreDuringBuilds: true,
