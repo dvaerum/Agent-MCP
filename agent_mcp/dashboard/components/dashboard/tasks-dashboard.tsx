@@ -501,13 +501,25 @@ const ViewTaskDialog = React.memo(({ task, onOpenChange }: RowDialogProps) => {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-2xl bg-card border-border text-card-foreground p-0 gap-0">
+      {/*
+        Width: sm:!max-w-3xl overrides the base DialogContent's `sm:max-w-lg`
+        (32rem = 512px) which otherwise wins the cascade and squeezes the
+        dialog to a phone-narrow 512px on desktop. The `!` (Tailwind important)
+        is required because both classes share the same specificity and the
+        base class is declared later in the merged className string.
+      */}
+      <DialogContent className="sm:!max-w-3xl w-[calc(100vw-2rem)] bg-card border-border text-card-foreground p-0 gap-0 max-h-[90vh] flex flex-col">
         {task && (
           <>
-            <DialogHeader className="px-6 pt-6 pb-4 border-b border-border">
-              <DialogTitle className="flex items-center justify-between pr-8 gap-2">
-                <span className="text-lg font-semibold truncate">{task.title}</span>
-                <div className="flex items-center gap-2 flex-shrink-0">
+            <DialogHeader className="px-6 pt-6 pb-4 border-b border-border flex-shrink-0">
+              <DialogTitle className="flex items-start justify-between pr-8 gap-3">
+                {/*
+                  Title wraps onto multiple lines (max 3) rather than being
+                  silently truncated. `break-words` so a long unbroken
+                  task_1780… style id still wraps instead of overflowing.
+                */}
+                <span className="text-lg font-semibold break-words line-clamp-3 leading-snug">{task.title}</span>
+                <div className="flex items-center gap-2 flex-shrink-0 pt-0.5">
                   <Badge variant="outline" className={cn("text-xs", statusBadgeClass(task.status))}>
                     {task.status.replace(/_/g, ' ')}
                   </Badge>
@@ -521,9 +533,15 @@ const ViewTaskDialog = React.memo(({ task, onOpenChange }: RowDialogProps) => {
               </DialogDescription>
             </DialogHeader>
 
-            {/* Scrollable body: only this section overflows, not the
-                whole modal (per shadcn idiom). */}
-            <div className="px-6 py-4 max-h-[80vh] overflow-y-auto space-y-4 text-sm">
+            {/*
+              Scrollable body: parent is now `flex-col` with the header +
+              footer marked flex-shrink-0, so this `flex-1 min-h-0 overflow-y-auto`
+              expands to fill remaining space and is the single scroll region.
+              Previously `max-h-[80vh]` on the body alone could push the dialog
+              past the viewport (we observed h=984 on a 1000px viewport for a
+              65k-char description), so the dialog now caps at 90vh total.
+            */}
+            <div className="px-6 py-4 flex-1 min-h-0 overflow-y-auto space-y-4 text-sm">
               {/* Group 1: core metadata in a 2-col grid */}
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
@@ -572,12 +590,28 @@ const ViewTaskDialog = React.memo(({ task, onOpenChange }: RowDialogProps) => {
                 )}
               </div>
 
-              {/* Group 2: description — separated by a subtle divider */}
+              {/*
+                Group 2: description.
+                - `[overflow-wrap:anywhere]` so a 65k-char unbroken string
+                  (we have one in the wild — `XXX…XXX`) wraps inside the
+                  block instead of forcing the body to a giant scroll-X.
+                - `max-h-[40vh] overflow-y-auto` so monster descriptions
+                  scroll *inside* the description block rather than ballooning
+                  the whole dialog body. Outer body still scrolls for the
+                  rest of the fields.
+                - `font-sans` by default; only the `(no description)`
+                  placeholder stays italic. Most descriptions are prose,
+                  not code — forcing mono everywhere made them hard to read.
+              */}
               <div className="border-t border-border pt-4 space-y-2">
                 <Label className="text-xs text-muted-foreground uppercase tracking-wider">Description</Label>
-                <p className="text-sm whitespace-pre-wrap break-words font-mono text-xs bg-muted/40 rounded p-3">
-                  {task.description || <span className="text-muted-foreground italic font-sans">(no description)</span>}
-                </p>
+                {task.description ? (
+                  <pre className="text-sm whitespace-pre-wrap break-words [overflow-wrap:anywhere] font-mono text-xs leading-relaxed bg-muted/40 rounded p-3 max-h-[40vh] overflow-y-auto">
+                    {task.description}
+                  </pre>
+                ) : (
+                  <p className="text-sm text-muted-foreground italic">(no description)</p>
+                )}
               </div>
 
               {/* Group 3: relations (only renders if present) */}
@@ -631,28 +665,35 @@ const ViewTaskDialog = React.memo(({ task, onOpenChange }: RowDialogProps) => {
                 </div>
               )}
 
-              {/* Group 5: tombstone metadata footer in monospace */}
+              {/*
+                Group 5: tombstone metadata footer.
+                Each row is a 2-col grid (label / value) so the value is
+                always right-aligned with `text-right` and `break-all`
+                allows long ISO timestamps + " · 3h ago" or a long
+                task_id to wrap cleanly instead of overflowing the modal
+                at narrow widths.
+              */}
               <div className="border-t border-border pt-4 space-y-1 text-xs text-muted-foreground">
-                <div className="flex justify-between gap-2">
+                <div className="grid grid-cols-[6rem_1fr] gap-2">
                   <span>Created</span>
-                  <span className="font-mono text-xs" title={task.created_at}>
+                  <span className="font-mono text-xs break-all text-right" title={task.created_at}>
                     {task.created_at} · {formatRelative(task.created_at)}
                   </span>
                 </div>
-                <div className="flex justify-between gap-2">
+                <div className="grid grid-cols-[6rem_1fr] gap-2">
                   <span>Updated</span>
-                  <span className="font-mono text-xs" title={task.updated_at}>
+                  <span className="font-mono text-xs break-all text-right" title={task.updated_at}>
                     {task.updated_at} · {formatRelative(task.updated_at)}
                   </span>
                 </div>
-                <div className="flex justify-between gap-2">
+                <div className="grid grid-cols-[6rem_1fr] gap-2">
                   <span>Task ID</span>
-                  <span className="font-mono text-xs break-all">{task.task_id}</span>
+                  <span className="font-mono text-xs break-all text-right">{task.task_id}</span>
                 </div>
               </div>
             </div>
 
-            <DialogFooter className="px-6 py-4 border-t border-border">
+            <DialogFooter className="px-6 py-4 border-t border-border flex-shrink-0">
               <Button variant="outline" size="sm" onClick={() => onOpenChange(false)}>Close</Button>
             </DialogFooter>
           </>
