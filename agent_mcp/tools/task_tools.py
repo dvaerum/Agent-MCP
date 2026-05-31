@@ -71,6 +71,98 @@ def _get_config_bool(key: str, default: bool = False) -> bool:
     return default
 
 
+def _authorize_assign_task(
+    *,
+    admin_auth_token: Optional[str],
+    target_agent_token: Optional[str],
+    task_ids: Optional[List[str]],
+    arguments: Dict[str, Any],
+) -> Optional[str]:
+    """Authorize a call to `assign_task_tool_impl`.
+
+    Returns `None` if the call is permitted; otherwise returns the
+    error message string to surface to the caller (the caller wraps
+    it in a `TextContent` so this helper stays unit-testable).
+
+    Permission matrix:
+
+    - admin token → always permitted (no further checks).
+    - worker token + no `target_agent_token` (Mode 0, file
+      unassigned) → gated by `config_allow_worker_create_unassigned`
+      (default true). Tags `arguments["_worker_created_by"]` so the
+      creator field records the worker, not "admin".
+    - worker token + `target_agent_token == own token` + non-empty
+      `task_ids` (Mode 3, self-claim existing unassigned task) →
+      gated by `config_allow_worker_self_assign` (default true).
+    - worker token + `target_agent_token == own token` + no
+      `task_ids` (would be Mode 1/2 = create-and-assign-to-self) →
+      rejected; the supported worker self-claim flow is Mode 3.
+    - worker token + `target_agent_token != own token` → always
+      rejected. Worker→worker delegation is admin-only.
+
+    Kept as a free function so the matrix is testable in isolation
+    and so the diff against the call site stays one line; this also
+    minimises merge conflict surface with sibling PR 7d which edits
+    the admin-side `agent_id` alternative path below.
+    """
+    if verify_token(admin_auth_token, "admin"):
+        return None
+
+    worker_id = get_agent_id(admin_auth_token)
+    if not worker_id:
+        return "Unauthorized: Admin token required"
+
+    # Mode 0: worker files an unassigned task.
+    if not target_agent_token:
+        if not _get_config_bool(
+            "config_allow_worker_create_unassigned", default=True
+        ):
+            return (
+                "Unauthorized: worker self-filing of unassigned tasks "
+                "is disabled by project policy "
+                "(config_allow_worker_create_unassigned=false). Ask "
+                "admin to enable it in dashboard Settings."
+            )
+        arguments["_worker_created_by"] = worker_id
+        return None
+
+    # `target_agent_token` is set. Identify whether the worker is
+    # targeting themselves.
+    target_agent_id = get_agent_id(target_agent_token)
+    targeting_self = (
+        target_agent_id is not None and target_agent_id == worker_id
+    )
+
+    if not targeting_self:
+        return (
+            "Unauthorized: workers can only assign tasks to themselves "
+            "(use config_allow_worker_self_assign + "
+            "agent_token=<your own>)"
+        )
+
+    # Self-targeted. We only support the self-claim flow (Mode 3
+    # with `task_ids`) — create-and-assign-to-self isn't a supported
+    # worker path today; tell the caller why.
+    if not task_ids:
+        return (
+            "Unauthorized: workers may only self-claim existing "
+            "unassigned tasks (pass task_ids=[...]); create-and-"
+            "assign-to-self is not supported. File the task with no "
+            "agent_token and then claim it."
+        )
+
+    if not _get_config_bool(
+        "config_allow_worker_self_assign", default=True
+    ):
+        return (
+            "Unauthorized: worker self-assignment is disabled "
+            "(config_allow_worker_self_assign=false). Ask admin to "
+            "enable it in dashboard Settings."
+        )
+
+    return None
+
+
 def estimate_tokens(text: str) -> int:
     """Accurate token estimation using tiktoken for GPT-4"""
     try:
@@ -1149,49 +1241,17 @@ async def assign_task_tool_impl(
     )  # Optional coordination context
     estimated_hours = arguments.get("estimated_hours")  # Optional workload estimation
 
-    # Auth: admin can always call. Workers can call ONLY in Mode 0
-    # (unassigned task creation, no target_agent_token) when the
-    # per-project toggle config_allow_worker_create_unassigned is true
-    # (default allow). Workers cannot assign tasks to others — that
-    # capability is reserved for admin to avoid worker→worker task
-    # delegation.
-    is_admin = verify_token(admin_auth_token, "admin")
-    if not is_admin:
-        # Worker fallback: only allowed for Mode 0 (unassigned creation).
-        worker_id = get_agent_id(admin_auth_token)
-        if not worker_id:
-            return [
-                mcp_types.TextContent(
-                    type="text", text="Unauthorized: Admin token required"
-                )
-            ]
-        if target_agent_token:
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text=(
-                        "Unauthorized: only admin may assign tasks to "
-                        "other agents. Workers may file unassigned "
-                        "tasks (omit agent_token) but cannot direct "
-                        "work to other workers."
-                    ),
-                )
-            ]
-        if not _get_config_bool("config_allow_worker_create_unassigned", default=True):
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text=(
-                        "Unauthorized: worker self-filing of unassigned "
-                        "tasks is disabled by project policy "
-                        "(config_allow_worker_create_unassigned=false). "
-                        "Ask admin to enable it in dashboard Settings."
-                    ),
-                )
-            ]
-        # Tag the call so the unassigned-create path records the
-        # actual worker as creator, not "admin".
-        arguments["_worker_created_by"] = worker_id
+    # Auth: admin can always call. Workers may call in a narrow set
+    # of modes, each gated by its own per-project toggle. See
+    # `_authorize_assign_task` for the full matrix.
+    auth_error = _authorize_assign_task(
+        admin_auth_token=admin_auth_token,
+        target_agent_token=target_agent_token,
+        task_ids=task_ids,
+        arguments=arguments,
+    )
+    if auth_error is not None:
+        return [mcp_types.TextContent(type="text", text=auth_error)]
 
     # Handle unassigned task creation (agent_token is optional)
     if not target_agent_token:
