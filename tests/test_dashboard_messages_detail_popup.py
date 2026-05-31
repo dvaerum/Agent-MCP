@@ -131,7 +131,10 @@ def test_detail_popup_has_delete_button() -> None:
 def test_detail_popup_has_close_button() -> None:
     src = _read("components/dashboard/messages-dashboard.tsx")
     # "Close" footer button is explicit (in addition to the Dialog's
-    # built-in X close affordance).
-    assert ">Close<" in src or "Close</Button>" in src, (
+    # built-in X close affordance). Tolerate whitespace between the
+    # opening Button tag and the literal text.
+    import re
+
+    assert re.search(r"\bClose\b\s*</Button>", src), (
         "expected an explicit Close button in the modal footer"
     )
