@@ -209,7 +209,7 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, on
               <Pencil className="h-3.5 w-3.5" />
             </Button>
           )}
-          {agent.status === 'running' && (
+          {agent.status !== 'terminated' && agent.agent_id !== 'Admin' && (
             <Button
               variant="ghost"
               size="sm"
@@ -529,6 +529,27 @@ const PurgeAgentDialog = ({
   )
 }
 
+// Defensive normalisation. The backend column is JSON-encoded text but
+// some endpoints (e.g. /api/all-data) return it parsed and others return
+// the raw string. Without this guard, calling .join() on a string blows
+// the whole agents page up with a TypeError.
+const normalizeCapabilities = (caps: unknown): string[] => {
+  if (Array.isArray(caps)) return caps.map((c) => String(c))
+  if (typeof caps === 'string') {
+    try {
+      const parsed = JSON.parse(caps)
+      if (Array.isArray(parsed)) return parsed.map((c) => String(c))
+    } catch {
+      // Fall through — treat as comma-separated.
+    }
+    return caps
+      .split(',')
+      .map((c) => c.trim())
+      .filter((c) => c.length > 0)
+  }
+  return []
+}
+
 // Terminate confirmation. Soft-delete only — the row stays so the
 // admin can hit Restore / Purge after.
 const TerminateAgentDialog = ({
@@ -619,7 +640,7 @@ const EditAgentDialog = ({
 
   useEffect(() => {
     if (!open || !agent) return
-    setCapabilities((agent.capabilities || []).join(', '))
+    setCapabilities(normalizeCapabilities(agent.capabilities).join(', '))
     setColor(agent.color || '')
     setWorkingDirectory(agent.working_directory || '')
     setError(null)
@@ -635,7 +656,8 @@ const EditAgentDialog = ({
       .split(',')
       .map((c) => c.trim())
       .filter((c) => c.length > 0)
-    if (JSON.stringify(parsedCaps) !== JSON.stringify(agent.capabilities || [])) {
+    const currentCaps = normalizeCapabilities(agent.capabilities)
+    if (JSON.stringify(parsedCaps) !== JSON.stringify(currentCaps)) {
       updates.capabilities = parsedCaps
     }
     if (color !== (agent.color || '')) {
@@ -842,9 +864,12 @@ const AgentDetailDialog = ({
           <div className="grid grid-cols-3 gap-2">
             <div className="text-muted-foreground">Capabilities</div>
             <div className="col-span-2">
-              {agent.capabilities && agent.capabilities.length > 0
-                ? agent.capabilities.join(', ')
-                : <span className="text-muted-foreground">none</span>}
+              {(() => {
+                const caps = normalizeCapabilities(agent.capabilities)
+                return caps.length > 0
+                  ? caps.join(', ')
+                  : <span className="text-muted-foreground">none</span>
+              })()}
             </div>
           </div>
           <div className="grid grid-cols-3 gap-2">
