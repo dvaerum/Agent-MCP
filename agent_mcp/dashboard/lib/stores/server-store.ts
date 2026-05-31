@@ -11,6 +11,12 @@ export interface MCPServer {
   status: 'connected' | 'disconnected' | 'connecting' | 'error'
   lastConnected?: string
   description?: string
+  // When set, the entry represents a path-prefix-mounted backend
+  // reachable at this API root (e.g. `/agent-mcp/__api/<name>`)
+  // instead of `http://host:port/api`. setActiveServer /
+  // checkServerHealth honor this via apiClient.setBaseUrl, and the
+  // UI hides the host:port row.
+  baseUrl?: string
 }
 
 interface ServerStore {
@@ -73,9 +79,16 @@ export const useServerStore = create<ServerStore>()(
         set({ isConnecting: true, connectionError: null })
 
         try {
-          // Update API client to use this server
-          apiClient.setServer(server.host, server.port)
-          
+          // Update API client to use this server. Path-prefix entries
+          // carry an explicit baseUrl; using setServer(host, port) on
+          // those would produce `http://proxy:0/api` and break the
+          // router-proxied fetch path.
+          if (server.baseUrl) {
+            apiClient.setBaseUrl(server.baseUrl)
+          } else {
+            apiClient.setServer(server.host, server.port)
+          }
+
           // Test connection
           const isHealthy = await get().checkServerHealth(id)
           
@@ -109,17 +122,27 @@ export const useServerStore = create<ServerStore>()(
           const server = get().servers.find(s => s.id === id)
           if (!server) return false
 
-          // Temporarily set API client to test this server
+          // Temporarily set API client to test this server.
+          // Path-prefix entries use the explicit baseUrl rather than
+          // the host:port pair.
           const originalUrl = apiClient.getServerUrl()
-          apiClient.setServer(server.host, server.port)
-          
+          if (server.baseUrl) {
+            apiClient.setBaseUrl(server.baseUrl)
+          } else {
+            apiClient.setServer(server.host, server.port)
+          }
+
           const response = await apiClient.getSystemStatus()
-          
+
           // Restore original URL if this was just a test
           if (get().activeServerId !== id) {
             const activeServer = get().servers.find(s => s.id === get().activeServerId)
             if (activeServer) {
-              apiClient.setServer(activeServer.host, activeServer.port)
+              if (activeServer.baseUrl) {
+                apiClient.setBaseUrl(activeServer.baseUrl)
+              } else {
+                apiClient.setServer(activeServer.host, activeServer.port)
+              }
             }
           }
           

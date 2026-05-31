@@ -39,11 +39,21 @@ export function ApiClientInitializer() {
       const m = DASHBOARD_PATH_RE.exec(window.location.pathname)
       if (!m) return
       const name = m[1]
-      apiClient.setBaseUrl('/agent-mcp/__api/' + name)
+      const baseUrl = '/agent-mcp/__api/' + name
+      apiClient.setBaseUrl(baseUrl)
       const store = useServerStore.getState()
       let existing = store.servers.find(s => s.name === name)
       if (!existing) {
-        store.addServer({ name, host: 'proxy', port: 0 })
+        // baseUrl is the load-bearing field for path-prefix entries;
+        // host/port are kept only to satisfy the legacy MCPServer
+        // shape and are hidden in the UI when baseUrl is present.
+        store.addServer({ name, host: 'proxy', port: 0, baseUrl })
+        existing = useServerStore.getState().servers.find(s => s.name === name)
+      } else if (!existing.baseUrl) {
+        // Backfill baseUrl on entries persisted before this field
+        // existed — otherwise setActiveServer would still overwrite
+        // the API client with the stale `proxy:0` host/port.
+        store.updateServer(existing.id, { baseUrl })
         existing = useServerStore.getState().servers.find(s => s.name === name)
       }
       if (existing && useServerStore.getState().activeServerId !== existing.id) {

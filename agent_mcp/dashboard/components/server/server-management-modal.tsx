@@ -136,7 +136,7 @@ export function ServerManagementModal() {
                           <div>
                             <h4 className="font-medium text-sm">{server.name}</h4>
                             <p className="text-xs text-muted-foreground">
-                              {server.host}:{server.port}
+                              {server.baseUrl ?? `${server.host}:${server.port}`}
                             </p>
                           </div>
                         </div>
@@ -192,7 +192,7 @@ export function ServerManagementModal() {
                           <div>
                             <h4 className="font-medium text-sm">{server.name}</h4>
                             <p className="text-xs text-muted-foreground">
-                              {server.host}:{server.port}
+                              {server.baseUrl ?? `${server.host}:${server.port}`}
                             </p>
                           </div>
                         </div>

@@ -44,7 +44,7 @@ export function OverviewDashboard() {
             </p>
             {activeServer && activeServer.status === 'error' && (
               <div className="text-sm text-destructive mt-4">
-                Failed to connect to {activeServer.name} ({activeServer.host}:{activeServer.port})
+                Failed to connect to {activeServer.name} ({activeServer.baseUrl ?? `${activeServer.host}:${activeServer.port}`})
                 <div className="mt-4">
                   <CORSDiagnostic />
                 </div>
