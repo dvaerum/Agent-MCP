@@ -9,6 +9,7 @@ import os # Added os import
 from starlette.applications import Starlette
 from starlette.routing import Mount, Route # Added Route
 from starlette.middleware import Middleware # If any middleware is needed
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware # Example if CORS is needed
 
 # MCP Server specific imports
@@ -21,7 +22,24 @@ from ..core.config import logger
 from ..core import globals as g # For g.connections (if still used for SSE tracking)
 from .routes import routes as http_routes # Import defined HTTP routes
 from .server_lifecycle import application_startup, application_shutdown, start_background_tasks
-from ..tools.registry import list_available_tools, dispatch_tool_call
+from ..tools.registry import list_available_tools, dispatch_tool_call, request_auth_token
+
+
+class AuthHeaderMiddleware(BaseHTTPMiddleware):
+    """Q6e: capture Authorization: Bearer into request_auth_token.
+
+    Tool dispatch reads request_auth_token as a fallback when the
+    JSON-RPC arguments don't contain `token`. This lets MCP clients
+    that speak standard HTTP bearer auth (e.g. Claude Code via
+    `claude mcp add --header`) authenticate without the body-rewriting
+    workaround the router currently maintains.
+    """
+
+    async def dispatch(self, request, call_next):
+        auth = request.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            request_auth_token.set(auth[7:].strip())
+        return await call_next(request)
 
 # --- MCP Server Setup (mimicking original main.py:2055) ---
 mcp_app_instance = MCPLowLevelServer("mcp-server") # Name from original main.py:2055
@@ -112,7 +130,10 @@ def create_app(project_dir: str, admin_token_cli: Optional[str] = None) -> Starl
 
     # Define middleware (if any)
     # Enable CORS for dashboard integration - comprehensive CORS config
+    # AuthHeaderMiddleware runs first so the ContextVar is set before
+    # any downstream handler (including the MCP message dispatcher).
     middleware_stack = [
+        Middleware(AuthHeaderMiddleware),
         Middleware(
             CORSMiddleware,
             allow_origins=[
