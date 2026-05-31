@@ -173,11 +173,19 @@ ADVANCED_EMBEDDINGS: bool = False  # Default to simple mode
 # Auto-indexing control - set by CLI
 DISABLE_AUTO_INDEXING: bool = False  # Default to automatic indexing
 
-# Original/Simple mode configuration (default) - restored to original values
-SIMPLE_EMBEDDING_MODEL: str = (
-    "text-embedding-3-large"  # Original embedding model (unchanged)
+# Original/Simple mode configuration (default).
+#
+# Both values are overridable at process start via env vars; defaults
+# preserve upstream behavior (text-embedding-3-large + 1536). Deployments
+# using a different provider (e.g. local Ollama with a small model)
+# set AGENT_MCP_EMBEDDING_MODEL + AGENT_MCP_EMBEDDING_DIMENSION; no
+# code change required.
+SIMPLE_EMBEDDING_MODEL: str = os.environ.get(
+    "AGENT_MCP_EMBEDDING_MODEL", "text-embedding-3-large"
 )
-SIMPLE_EMBEDDING_DIMENSION: int = 1536  # Increased from 1024 for better performance
+SIMPLE_EMBEDDING_DIMENSION: int = int(
+    os.environ.get("AGENT_MCP_EMBEDDING_DIMENSION", "1536")
+)
 
 # Advanced mode configuration - new enhanced mode
 ADVANCED_EMBEDDING_MODEL: str = "text-embedding-3-large"  # From main.py:178
