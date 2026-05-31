@@ -209,7 +209,7 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, on
               <Pencil className="h-3.5 w-3.5" />
             </Button>
           )}
-          {agent.status === 'running' && (
+          {agent.status !== 'terminated' && agent.agent_id !== 'Admin' && (
             <Button
               variant="ghost"
               size="sm"
