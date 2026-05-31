@@ -157,6 +157,24 @@ async def agents_list_api_route(request: Request) -> JSONResponse:
 async def tokens_api_route(request: Request) -> JSONResponse:
     # // ... (implementation from previous response)
     try:
+        # Guard: if the caller presents an Authorization: Bearer header
+        # that resolves to a non-admin agent, refuse. This blocks the
+        # worker→admin HTTP-side escalation path (issue O — sibling
+        # of issue I via the REST surface).
+        #
+        # Unauthenticated callers still get the full response — that's
+        # consistent with the dashboard-as-admin design (anyone reaching
+        # the URL is implicitly admin; securing the URL is the
+        # deployer's job).
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            bearer = auth_header[7:].strip()
+            if bearer and not verify_token(bearer, "admin"):
+                return JSONResponse(
+                    {"error": "Unauthorized: admin token required"},
+                    status_code=403,
+                )
+
         agent_tokens_list = []
         for token, data in g.active_agents.items():
             if data.get("status") != "terminated":
