@@ -24,39 +24,81 @@ def _generate_message_id() -> str:
     return f"msg_{secrets.token_hex(8)}"
 
 
+def _get_config_bool(key: str, default: bool = False) -> bool:
+    """Read a boolean toggle from project_context. Defaults to `default`
+    when the key is absent or unparseable.
+
+    Used for the per-project policy toggles (e.g.
+    config_allow_worker_to_worker). Keep this lookup cheap — called on
+    every send_agent_message.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT value FROM project_context WHERE context_key = ?", (key,)
+        )
+        row = cursor.fetchone()
+        conn.close()
+    except Exception:
+        return default
+    if not row:
+        return default
+    raw = row["value"]
+    if isinstance(raw, str):
+        s = raw.strip().strip('"').lower()
+        if s in ("true", "1", "yes", "on"):
+            return True
+        if s in ("false", "0", "no", "off"):
+            return False
+    return default
+
+
+def _agents_active_by_id() -> set[str]:
+    """Set of agent_ids currently registered in g.active_agents.
+
+    `g.active_agents` is keyed by TOKEN, so checking `agent_id in
+    g.active_agents` always fails. This helper iterates the values
+    once to get the right set.
+    """
+    return {data.get("agent_id") for data in g.active_agents.values()}
+
+
 def _can_agents_communicate(sender_id: str, recipient_id: str, is_admin: bool) -> tuple[bool, str]:
     """
     Check if two agents are allowed to communicate.
-    
+
     Args:
         sender_id: ID of the sending agent
-        recipient_id: ID of the receiving agent  
+        recipient_id: ID of the receiving agent
         is_admin: Whether the sender has admin privileges
-    
+
     Returns:
         Tuple of (allowed: bool, reason: str)
     """
     # Admin can always communicate with anyone
     if is_admin:
         return True, "Admin privileges"
-    
+
     # Self-communication not allowed (use internal methods)
     if sender_id == recipient_id:
         return False, "Self-communication not allowed"
-    
+
     # Admin agent can always be contacted
     if recipient_id == "admin" or recipient_id.lower().startswith("admin"):
         return True, "Admin agent always contactable"
-    
-    # Check if recipient allows communication from sender
-    # This could be extended with a permission system in the database
-    # For now, we'll use a simple rule: agents can communicate if they're both active
-    if sender_id in g.active_agents and recipient_id in g.active_agents:
+
+    # Worker→worker: gated by per-project toggle (issue K).
+    # Default-deny preserves upstream behavior; admin opts in via
+    # project_context[config_allow_worker_to_worker].
+    if not _get_config_bool("config_allow_worker_to_worker", default=False):
+        return False, "Worker-to-worker messaging disabled by policy"
+
+    # Toggle is on. Permit when both sides are currently active agents.
+    active_ids = _agents_active_by_id()
+    if sender_id in active_ids and recipient_id in active_ids:
         return True, "Both agents are active"
-    
-    # Check if either agent is in the same task context
-    # (This would require additional task relationship checking)
-    
+
     return False, "Communication not permitted between these agents"
 
 
