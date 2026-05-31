@@ -78,16 +78,11 @@ def test_update_task_dashboard_accepts_priority_only(client) -> None:
 
 
 def test_update_task_dashboard_accepts_assigned_to(client) -> None:
-    """Edit modal can assign a task to an existing agent via this endpoint."""
+    """Edit modal can assign a task to an arbitrary agent_id string via
+    this endpoint. The endpoint stores assigned_to verbatim; agent
+    existence is enforced (or not) by upstream consumers."""
     token = _admin_token(client)
     task_id = _create_task(client, token)
-
-    # Create an agent to assign to (upstream endpoint is /api/create-agent).
-    create_agent = client.post(
-        "/api/create-agent",
-        json={"token": token, "agent_id": "edit-target-agent"},
-    )
-    assert create_agent.status_code in (200, 201), create_agent.text
 
     r = client.post(
         "/api/update-task-dashboard",
@@ -111,11 +106,7 @@ def test_update_task_dashboard_unassigns_with_empty_assigned_to(client) -> None:
     token = _admin_token(client)
     task_id = _create_task(client, token)
 
-    # Create + assign first.
-    client.post(
-        "/api/create-agent",
-        json={"token": token, "agent_id": "to-unassign"},
-    )
+    # Assign first.
     client.post(
         "/api/update-task-dashboard",
         json={"token": token, "task_id": task_id, "assigned_to": "to-unassign"},
@@ -127,6 +118,12 @@ def test_update_task_dashboard_unassigns_with_empty_assigned_to(client) -> None:
         json={"token": token, "task_id": task_id, "assigned_to": None},
     )
     assert r.status_code == 200, r.text
+
+    # And the listing no longer mentions the agent.
+    import json as _json
+    listing = _json.dumps(client.get("/api/tasks").json())
+    # The task itself is in the listing but assigned_to should now be null.
+    assert "to-unassign" not in listing
 
 
 def test_update_task_dashboard_requires_at_least_one_field(client) -> None:
