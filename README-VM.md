@@ -189,5 +189,9 @@ The module covers the systemd shape only — TLS termination
   units via systemd, so the router doesn't need root.
 - Ollama runs in-VM with `qwen3-embedding:0.6b` (1024-dim).
   The model (~620 MB) is downloaded on first boot, not baked
-  into the image — so the qcow2 only fills up once. Persistent
-  runs reuse the downloaded blob.
+  into the image, and lives at `/var/lib/ollama/` inside the
+  guest — which means it's on the qcow2 disk in your persist
+  dir. Subsequent runs reuse the downloaded blob; no re-download
+  unless you delete `./vm-persistent-data/disk.qcow2` (or use
+  `--ephemeral`, which always starts fresh). Verified: first
+  boot ~62 s (cold-includes Ollama pull), second boot ~28 s.
