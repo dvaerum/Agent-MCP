@@ -16,6 +16,7 @@ import { apiClient, Agent, Task } from "@/lib/api"
 import { useServerStore } from "@/lib/stores/server-store"
 import { useDataStore } from "@/lib/stores/data-store"
 import { cn } from "@/lib/utils"
+import { useDialog } from "@/hooks/use-dialog"
 import { TaskDetailsDialog } from "./task-details-dialog"
 
 
@@ -969,17 +970,21 @@ export function AgentsDashboard() {
   const { data, loading, error, fetchAllData, refreshData, getActiveAgents, getIdleAgentsForCleanup } = useDataStore()
   const [searchTerm, setSearchTerm] = useState('')
   const [statusFilter, setStatusFilter] = useState<string>('all')
+  // selectedAgent is the "current selection" marker the header chip
+  // and the detail dialog both observe; the detail dialog's
+  // open/close drives it via useDialog (see handleSelectAgent / the
+  // dialog's onOpenChange below).
   const [selectedAgent, setSelectedAgent] = useState<Agent | null>(null)
-  const [selectedTask, setSelectedTask] = useState<Task | null>(null)
-  const [taskDialogOpen, setTaskDialogOpen] = useState(false)
-  const [purgeTargetId, setPurgeTargetId] = useState<string | null>(null)
-  const [purgeDialogOpen, setPurgeDialogOpen] = useState(false)
-  const [terminateTargetId, setTerminateTargetId] = useState<string | null>(null)
-  const [terminateDialogOpen, setTerminateDialogOpen] = useState(false)
-  const [editAgent, setEditAgent] = useState<Agent | null>(null)
-  const [editDialogOpen, setEditDialogOpen] = useState(false)
-  const [detailAgent, setDetailAgent] = useState<Agent | null>(null)
-  const [detailDialogOpen, setDetailDialogOpen] = useState(false)
+  // Five row-action dialogs migrated to the generic useDialog<T>()
+  // hook (Candidate F1, architecture review 2026-06-01). Each one
+  // used to own a useState<boolean>(false) + useState<T | null>(null)
+  // pair; useDialog folds the pair into a single piece of state and
+  // returns {isOpen, data, open, close}.
+  const taskDialog = useDialog<Task>()
+  const purgeDialog = useDialog<string>()       // holds purge-target agent_id
+  const terminateDialog = useDialog<string>()   // holds terminate-target agent_id
+  const editDialog = useDialog<Agent>()
+  const detailDialog = useDialog<Agent>()
 
   // Source list: include all agents (terminated rows need to surface so
   // admins can hit Restore/Purge on them). getActiveAgents() is kept
@@ -1036,8 +1041,7 @@ export function AgentsDashboard() {
   
   
   const handleTaskClick = (task: Task) => {
-    setSelectedTask(task)
-    setTaskDialogOpen(true)
+    taskDialog.open(task)
   }
 
   const filteredAgents = agents.filter(agent => {
@@ -1084,27 +1088,23 @@ export function AgentsDashboard() {
   }
 
   const handlePurgeAgent = (agentId: string) => {
-    setPurgeTargetId(agentId)
-    setPurgeDialogOpen(true)
+    purgeDialog.open(agentId)
   }
 
   // Row-click handler. Opens a confirmation dialog before firing the
   // actual terminate; the in-effect idle-cleanup path uses
   // handleTerminateAgent directly so it stays bypass-confirm.
   const handleTerminateConfirm = (agentId: string) => {
-    setTerminateTargetId(agentId)
-    setTerminateDialogOpen(true)
+    terminateDialog.open(agentId)
   }
 
   const handleEditAgent = (agent: Agent) => {
-    setEditAgent(agent)
-    setEditDialogOpen(true)
+    editDialog.open(agent)
   }
 
   const handleSelectAgent = (agent: Agent) => {
     setSelectedAgent(agent)
-    setDetailAgent(agent)
-    setDetailDialogOpen(true)
+    detailDialog.open(agent)
   }
 
   if (!isConnected) {
@@ -1283,12 +1283,11 @@ export function AgentsDashboard() {
 
       {/* Agent Detail Modal — replaces the old sidebar drawer */}
       <AgentDetailDialog
-        agent={detailAgent}
-        open={detailDialogOpen}
+        agent={detailDialog.data}
+        open={detailDialog.isOpen}
         onOpenChange={(open) => {
-          setDetailDialogOpen(open)
           if (!open) {
-            setDetailAgent(null)
+            detailDialog.close()
             setSelectedAgent(null)
           }
         }}
@@ -1299,11 +1298,10 @@ export function AgentsDashboard() {
 
       {/* Edit Agent Dialog */}
       <EditAgentDialog
-        agent={editAgent}
-        open={editDialogOpen}
+        agent={editDialog.data}
+        open={editDialog.isOpen}
         onOpenChange={(open) => {
-          setEditDialogOpen(open)
-          if (!open) setEditAgent(null)
+          if (!open) editDialog.close()
         }}
         onSaved={() => {
           void refreshData()
@@ -1312,11 +1310,10 @@ export function AgentsDashboard() {
 
       {/* Terminate confirmation dialog */}
       <TerminateAgentDialog
-        agentId={terminateTargetId}
-        open={terminateDialogOpen}
+        agentId={terminateDialog.data}
+        open={terminateDialog.isOpen}
         onOpenChange={(open) => {
-          setTerminateDialogOpen(open)
-          if (!open) setTerminateTargetId(null)
+          if (!open) terminateDialog.close()
         }}
         onConfirmed={async (agentId) => {
           await handleTerminateAgent(agentId)
@@ -1325,21 +1322,19 @@ export function AgentsDashboard() {
 
       {/* Task Details Dialog */}
       <TaskDetailsDialog
-        task={selectedTask}
-        open={taskDialogOpen}
+        task={taskDialog.data}
+        open={taskDialog.isOpen}
         onOpenChange={(open) => {
-          setTaskDialogOpen(open)
-          if (!open) setSelectedTask(null)
+          if (!open) taskDialog.close()
         }}
       />
 
       {/* Purge confirmation dialog (cascade tombstone + DELETE) */}
       <PurgeAgentDialog
-        agentId={purgeTargetId}
-        open={purgeDialogOpen}
+        agentId={purgeDialog.data}
+        open={purgeDialog.isOpen}
         onOpenChange={(open) => {
-          setPurgeDialogOpen(open)
-          if (!open) setPurgeTargetId(null)
+          if (!open) purgeDialog.close()
         }}
         onConfirmed={() => {
           void refreshData()
