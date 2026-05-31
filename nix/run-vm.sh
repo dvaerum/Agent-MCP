@@ -85,12 +85,17 @@ else
   state_dir="$(readlink -f -- "$persist_dir")"
 fi
 
-# All VM state lives on a qcow2 image inside `state_dir`. SQLite WAL
-# requires real fcntl locks, which qemu's 9p host-share can't fake —
-# so we don't use 9p at all and let the qcow2 disk be the only
-# substrate. Persistent mode = same qcow2 across runs; ephemeral =
-# tmpdir scrubbed on exit.
+# The VM uses two substrates side-by-side inside `state_dir`:
+#   disk.qcow2  — agent-mcp state. SQLite WAL needs real fcntl
+#                 locks, so this has to be a real block device.
+#   ollama/     — Ollama's model dir, bind-mounted into the guest
+#                 at /var/lib/ollama via 9p. Ollama stores blobs
+#                 as plain files (no SQLite) so 9p is fine, and
+#                 the user can wipe disk.qcow2 without forcing
+#                 a ~620 MB embedding-model redownload.
 export NIX_DISK_IMAGE="$state_dir/disk.qcow2"
+export AGENT_MCP_OLLAMA_DIR="$state_dir/ollama"
+mkdir -p -- "$AGENT_MCP_OLLAMA_DIR"
 export TMPDIR="$state_dir"
 export USE_TMPDIR=1
 

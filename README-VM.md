@@ -98,28 +98,33 @@ API itself.
 
 ## State layout
 
-The persist directory holds a single qcow2 disk image — that
-image is the VM's writable filesystem, and `/var/lib/agent-mcp/`
-inside the VM is what agent-mcp persists to:
+Two independent persistence substrates side-by-side in the persist
+directory:
 
 ```
 ./vm-persistent-data/
-└── disk.qcow2                       # 8 GB sparse, qcow2
+├── disk.qcow2                       # 8 GB sparse — agent-mcp state
+└── ollama/                          # 9p host share — Ollama models
+    └── models/blobs/sha256-…        # ~610 MB qwen3-embedding blob
 
 # Inside the VM:
-/var/lib/agent-mcp/
+/var/lib/agent-mcp/                  # on disk.qcow2
 ├── projects.local.json              # {<name>: <path>} registry
 ├── projects/<name>/                 # workspace (SQLite DB in .agent/)
 └── .bootstrap-<name>                # marker
+/var/lib/ollama/                     # 9p bind to ./vm-persistent-data/ollama/
+└── models/                          # blobs/, manifests/
 ```
 
-We deliberately avoid qemu's 9p host-share for state because
-SQLite's WAL mode needs real `fcntl` locks, which 9p can't fake.
-Putting state on the qcow2 disk dodges that entirely.
+agent-mcp state goes on the qcow2 because SQLite's WAL mode needs
+real `fcntl` locks that 9p can't fake. Ollama state goes on 9p
+because its blobs are plain files — that way, deleting
+`disk.qcow2` to wipe agent-mcp state doesn't force a ~610 MB
+redownload of the embedding model. The two substrates are
+independent: nuke either without disturbing the other.
 
-Delete the dir (or just the `disk.qcow2`) to nuke state. With
-`--ephemeral` the wrapper mktemp's a temporary dir and removes it
-on exit.
+With `--ephemeral` the wrapper mktemp's a fresh dir containing both
+substrates and `rm -rf`s it on exit.
 
 ## Running the e2e tests against the VM
 
@@ -187,11 +192,16 @@ The module covers the systemd shape only — TLS termination
 - A polkit rule (in `nix/module.nix`) grants the unprivileged
   `agent-mcp` user permission to start/stop `agent-mcp@*.service`
   units via systemd, so the router doesn't need root.
-- Ollama runs in-VM with `qwen3-embedding:0.6b` (1024-dim).
-  The model (~620 MB) is downloaded on first boot, not baked
-  into the image, and lives at `/var/lib/ollama/` inside the
-  guest — which means it's on the qcow2 disk in your persist
-  dir. Subsequent runs reuse the downloaded blob; no re-download
-  unless you delete `./vm-persistent-data/disk.qcow2` (or use
-  `--ephemeral`, which always starts fresh). Verified: first
-  boot ~62 s (cold-includes Ollama pull), second boot ~28 s.
+- Ollama runs in-VM with `qwen3-embedding:0.6b` (1024-dim). The
+  model (~610 MB) is downloaded on first boot to
+  `./vm-persistent-data/ollama/` on the host (9p bind-mounted
+  into the VM at `/var/lib/ollama`). Subsequent runs — including
+  ones where you've deleted `disk.qcow2` — reuse the downloaded
+  blob; no re-download unless you also wipe the `ollama/`
+  subdir or use `--ephemeral`.
+- `services.ollama` is run with `User=root` + selectively
+  re-granted capabilities. The hardening NixOS normally applies
+  (DynamicUser, bind-mounted private state dirs, `ProtectSystem`,
+  empty `CapabilityBoundingSet`) collides with our 9p mountpoint;
+  see `nix/vm.nix` for the override. Fine for an e2e-sandbox VM;
+  not what you'd ship as a public-facing module.
