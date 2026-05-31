@@ -1,12 +1,13 @@
 "use client"
 
 import React from "react"
-import { 
-  LayoutDashboard, 
-  Users, 
+import {
+  LayoutDashboard,
+  Users,
   CheckSquare,
   Brain,
-  BookOpen
+  BookOpen,
+  MessageSquare
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -16,7 +17,7 @@ import { useDashboard, useSidebar } from "@/lib/store"
 interface NavItem {
   title: string
   icon: React.ComponentType<{ className?: string }>
-  view: 'overview' | 'agents' | 'tasks' | 'memories' | 'prompts'
+  view: 'overview' | 'agents' | 'tasks' | 'memories' | 'messages' | 'prompts'
   description?: string
   badge?: string
 }
@@ -45,6 +46,12 @@ const navigationItems: NavItem[] = [
     icon: Brain,
     view: "memories",
     description: "Memory bank and context management"
+  },
+  {
+    title: "Messages",
+    icon: MessageSquare,
+    view: "messages",
+    description: "Inter-agent messaging — compose, read, history"
   },
   {
     title: "Prompt Book",
