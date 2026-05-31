@@ -34,7 +34,6 @@ jobs:
         run: |
           uv venv --python ${{ matrix.python-version }}
           uv pip install -e ".[dev]"
-          uv pip install httpx starlette uvicorn
 
       - name: Lint (tests/ only)
         # Scope is tests/ for now; agent_mcp/ has 216 pre-existing ruff
