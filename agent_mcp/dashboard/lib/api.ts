@@ -379,8 +379,16 @@ class ApiClient {
   // Update an existing task. Upstream exposes this as
   // POST /api/update-task-dashboard which takes the admin token + the
   // task_id + the fields to change in the JSON body. Supported keys:
-  // - status: pending | in_progress | completed | cancelled | failed
-  // - notes:  free text — appended as a new note entry by the backend
+  // - status:       pending | in_progress | completed | cancelled | failed
+  // - title:        string
+  // - description:  string
+  // - priority:     low | medium | high
+  // - assigned_to:  agent_id string, or null/'' to clear assignment
+  // - notes:        free text — appended as a new note entry by the backend
+  //
+  // At least one editable field must be provided (otherwise the
+  // backend returns 400 — a no-op write is rejected).
+  //
   // Older versions of this client posted to PUT /tasks/<id> which
   // doesn't exist upstream and 405'd; fixed here.
   //
@@ -389,7 +397,14 @@ class ApiClient {
   // Task.notes which is the stored list of note entries.
   async updateTask(
     taskId: string,
-    data: { status?: Task['status']; notes?: string }
+    data: {
+      status?: Task['status']
+      title?: string
+      description?: string
+      priority?: Task['priority']
+      assigned_to?: string | null
+      notes?: string
+    }
   ): Promise<{ success: boolean; message: string }> {
     const tokens = await this.getTokens()
     const body: Record<string, unknown> = {
@@ -397,6 +412,11 @@ class ApiClient {
       task_id: taskId,
     }
     if (data.status) body.status = data.status
+    if (data.title !== undefined) body.title = data.title
+    if (data.description !== undefined) body.description = data.description
+    if (data.priority) body.priority = data.priority
+    // assigned_to=null is meaningful (unassign); pass it through.
+    if (data.assigned_to !== undefined) body.assigned_to = data.assigned_to
     if (data.notes) body.notes = data.notes
     return this.request('/update-task-dashboard', {
       method: 'POST',

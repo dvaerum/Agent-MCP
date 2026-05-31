@@ -4,7 +4,7 @@ import json
 import datetime
 import sqlite3
 from pathlib import Path
-from typing import Callable, List, Dict, Any # Added List, Dict, Any
+from typing import Callable, List, Dict, Any, Optional # Added List, Dict, Any, Optional
 
 from starlette.routing import Route, Mount
 from starlette.staticfiles import StaticFiles
@@ -200,25 +200,59 @@ async def all_tasks_api_route(request: Request) -> JSONResponse:
         if conn: conn.close()
 
 async def update_task_details_api_route(request: Request) -> JSONResponse:
-    # // ... (implementation from previous response)
+    # Dashboard task edit endpoint.
+    #
+    # Originally required (task_id, status) and used `status` as the
+    # only mandatory field. The dashboard's Edit modal needs to mutate
+    # individual fields independently (title-only, priority-only, …)
+    # and to manage assignment, so the rules are:
+    #   - task_id + admin token still required.
+    #   - status is now OPTIONAL (status-only updates still supported).
+    #   - At least one editable field must be supplied (otherwise the
+    #     UPDATE is a no-op and 400 is clearer than success).
+    #   - assigned_to: new field. <agent_id> assigns; null/empty
+    #     string clears the assignment (NULL in DB).
     if request.method != 'POST': return JSONResponse({"error": "Method not allowed"}, status_code=405)
     conn = None
     try:
         data = await get_sanitized_json_body(request)
         admin_auth_token = data.get('token'); task_id_to_update = data.get('task_id'); new_status = data.get('status')
-        if not task_id_to_update or not new_status: return JSONResponse({"error": "task_id and status are required fields."}, status_code=400)
+        if not task_id_to_update:
+            return JSONResponse({"error": "task_id is a required field."}, status_code=400)
         if not verify_token(admin_auth_token, required_role='admin'): return JSONResponse({"error": "Invalid admin token"}, status_code=403)
+        # The set of recognised editable fields. At least one must be
+        # supplied; otherwise the request is a no-op and rejected.
+        EDITABLE_KEYS = {"status", "title", "description", "priority", "notes", "assigned_to"}
+        supplied_editable = [k for k in EDITABLE_KEYS if k in data]
+        if not supplied_editable:
+            return JSONResponse(
+                {"error": "at least one editable field is required (status, title, description, priority, notes, assigned_to)."},
+                status_code=400,
+            )
         requesting_admin_id = auth_get_agent_id(admin_auth_token)
         conn = get_db_connection(); cursor = conn.cursor()
         cursor.execute("SELECT notes FROM tasks WHERE task_id = ?", (task_id_to_update,)); task_row = cursor.fetchone()
         if not task_row: return JSONResponse({"error": "Task not found"}, status_code=404)
         existing_notes_str = task_row["notes"]
-        update_fields: List[str] = []; params: List[Any] = []; log_details: Dict[str, Any] = {"status_updated_to": new_status}
-        update_fields.append("status = ?"); params.append(new_status)
+        update_fields: List[str] = []; params: List[Any] = []; log_details: Dict[str, Any] = {}
+        if new_status:
+            update_fields.append("status = ?"); params.append(new_status)
+            log_details["status_updated_to"] = new_status
         update_fields.append("updated_at = ?"); params.append(datetime.datetime.now().isoformat())
         if 'title' in data and data['title'] is not None: update_fields.append("title = ?"); params.append(data['title']); log_details["title_changed"] = True
         if 'description' in data and data['description'] is not None: update_fields.append("description = ?"); params.append(data['description']); log_details["description_changed"] = True
         if 'priority' in data and data['priority']: update_fields.append("priority = ?"); params.append(data['priority']); log_details["priority_changed"] = True
+        if 'assigned_to' in data:
+            # null / '' / 'unassigned' clears the assignment; any other
+            # value is stored verbatim as the agent_id.
+            raw_assigned = data['assigned_to']
+            new_assigned: Optional[str]
+            if raw_assigned is None or (isinstance(raw_assigned, str) and raw_assigned.strip() in ('', 'unassigned')):
+                new_assigned = None
+            else:
+                new_assigned = str(raw_assigned).strip()
+            update_fields.append("assigned_to = ?"); params.append(new_assigned)
+            log_details["assigned_to_changed"] = new_assigned
         if 'notes' in data and data['notes'] and isinstance(data['notes'], str) and data['notes'].strip():
             try: current_notes_list = json.loads(existing_notes_str or "[]")
             except json.JSONDecodeError: current_notes_list = []

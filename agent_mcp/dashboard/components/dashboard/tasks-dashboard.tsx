@@ -1,9 +1,9 @@
 "use client"
 
 import React, { useState, useEffect, useCallback, useMemo } from "react"
-import { 
+import {
   CheckSquare, Clock, AlertCircle, Users,
-  Search, Plus, MoreVertical, Eye, Play, Pause,
+  Search, Plus, Eye, Pencil, Trash2,
   ArrowUp, ArrowDown, Minus, CheckCircle2, Target, Zap, GitBranch, RefreshCw
 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
@@ -13,10 +13,62 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Textarea } from "@/components/ui/textarea"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { apiClient, Task } from "@/lib/api"
+import { apiClient, Task, Agent } from "@/lib/api"
 import { useServerStore } from "@/lib/stores/server-store"
 import { cn } from "@/lib/utils"
 import { TaskDetailsPanel } from "./task-details-panel"
+
+// Status / priority colour helpers shared by the row + the View / Edit
+// modals. Keep these here so the styles match the rest of the page.
+const statusBadgeClass = (status: Task['status']): string => {
+  const map: Record<string, string> = {
+    in_progress: "bg-teal-500/15 text-teal-400 dark:text-teal-300 ring-1 ring-teal-500/20",
+    pending: "bg-amber-500/15 text-amber-500 dark:text-amber-300 ring-1 ring-amber-500/20",
+    completed: "bg-emerald-500/15 text-emerald-500 dark:text-emerald-300 ring-1 ring-emerald-500/20",
+    cancelled: "bg-slate-500/15 text-slate-500 dark:text-slate-300 ring-1 ring-slate-500/20",
+    failed: "bg-orange-500/15 text-orange-500 dark:text-orange-300 ring-1 ring-orange-500/20",
+  }
+  return map[status] || map.pending
+}
+
+const priorityBadgeClass = (priority: Task['priority']): string => {
+  const map: Record<string, string> = {
+    high: "bg-orange-500/10 text-orange-500 dark:text-orange-300 border-orange-500/20",
+    medium: "bg-amber-500/10 text-amber-500 dark:text-amber-300 border-amber-500/20",
+    low: "bg-slate-500/10 text-slate-500 dark:text-slate-300 border-slate-500/20",
+  }
+  return map[priority] || map.medium
+}
+
+// Same author tombstone rendering used by the Agents page: a deleted
+// agent id like `[deleted-foo]` renders grey + italic so admins can
+// spot it without clicking through.
+const isTombstone = (value: string | undefined | null): boolean =>
+  typeof value === 'string' && /^\[deleted-.+\]$/.test(value)
+
+const parseJsonField = (field: unknown): unknown[] => {
+  if (Array.isArray(field)) return field
+  if (typeof field === 'string') {
+    try {
+      const parsed = JSON.parse(field)
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      return []
+    }
+  }
+  return []
+}
+
+const formatRelative = (iso: string | undefined): string => {
+  if (!iso) return '—'
+  const t = new Date(iso).getTime()
+  if (Number.isNaN(t)) return iso
+  const diff = Date.now() - t
+  if (diff < 60_000) return 'just now'
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`
+  return `${Math.floor(diff / 86_400_000)}d ago`
+}
 
 // Cache for tasks data
 const tasksCache = new Map<string, { data: Task[], timestamp: number }>()
@@ -134,17 +186,29 @@ const PriorityIcon = React.memo(({ priority }: { priority: Task['priority'] }) =
 })
 PriorityIcon.displayName = 'PriorityIcon'
 
-const CompactTaskRow = React.memo(({ task, onTaskClick }: { task: Task, onTaskClick: (task: Task) => void }) => {
+interface CompactTaskRowProps {
+  task: Task
+  onTaskClick: (task: Task) => void
+  // Three distinct row-action handlers. Each opens its own Dialog
+  // modal (View / Edit / Delete). The buttons stopPropagation so the
+  // row-level click handler (which still opens the legacy sidebar)
+  // doesn't fire when the icons are pressed.
+  openView: (task: Task) => void
+  openEdit: (task: Task) => void
+  openDelete: (task: Task) => void
+}
+
+const CompactTaskRow = React.memo(({ task, onTaskClick, openView, openEdit, openDelete }: CompactTaskRowProps) => {
   const [mounted, setMounted] = useState(false)
-  
+
   useEffect(() => {
     setMounted(true)
   }, [])
 
   const formatDate = useCallback((dateString: string) => {
     if (!mounted) return "..."
-    return new Date(dateString).toLocaleDateString('en-US', { 
-      month: 'short', 
+    return new Date(dateString).toLocaleDateString('en-US', {
+      month: 'short',
       day: 'numeric',
       hour: '2-digit',
       minute: '2-digit'
@@ -227,38 +291,42 @@ const CompactTaskRow = React.memo(({ task, onTaskClick }: { task: Task, onTaskCl
       </TableCell>
       
       <TableCell className="py-3">
+        {/*
+          Three distinct row icons. Previously every icon eventually
+          opened the same sidebar (TaskDetailsPanel); now each one
+          opens its own Dialog modal. stopPropagation prevents the
+          row-level onClick from also firing.
+        */}
         <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-          <Button 
-            variant="ghost" 
-            size="sm" 
+          <Button
+            variant="ghost"
+            size="sm"
+            title="View task"
+            aria-label="View task"
             className="h-7 w-7 p-0 text-muted-foreground hover:text-foreground hover:bg-muted"
+            onClick={(e) => { e.stopPropagation(); openView(task) }}
           >
             <Eye className="h-3.5 w-3.5" />
           </Button>
-          {task.status === 'pending' && (
-            <Button 
-              variant="ghost" 
-              size="sm" 
-              className="h-7 w-7 p-0 text-teal-400 hover:text-teal-300 hover:bg-teal-500/10"
-            >
-              <Play className="h-3.5 w-3.5" />
-            </Button>
-          )}
-          {task.status === 'in_progress' && (
-            <Button 
-              variant="ghost" 
-              size="sm" 
-              className="h-7 w-7 p-0 text-amber-400 hover:text-amber-300 hover:bg-amber-500/10"
-            >
-              <Pause className="h-3.5 w-3.5" />
-            </Button>
-          )}
-          <Button 
-            variant="ghost" 
-            size="sm" 
-            className="h-7 w-7 p-0 text-muted-foreground hover:text-foreground hover:bg-muted"
+          <Button
+            variant="ghost"
+            size="sm"
+            title="Edit task"
+            aria-label="Edit task"
+            className="h-7 w-7 p-0 text-teal-400 hover:text-teal-300 hover:bg-teal-500/10"
+            onClick={(e) => { e.stopPropagation(); openEdit(task) }}
           >
-            <MoreVertical className="h-3.5 w-3.5" />
+            <Pencil className="h-3.5 w-3.5" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            title="Delete task"
+            aria-label="Delete task"
+            className="h-7 w-7 p-0 text-destructive hover:text-destructive hover:bg-destructive/10"
+            onClick={(e) => { e.stopPropagation(); openDelete(task) }}
+          >
+            <Trash2 className="h-3.5 w-3.5" />
           </Button>
         </div>
       </TableCell>
@@ -407,6 +475,415 @@ const CreateTaskModal = React.memo(({ onCreateTask }: { onCreateTask: (data: any
 })
 CreateTaskModal.displayName = 'CreateTaskModal'
 
+// =========================================================================
+// Row-action dialogs: View / Edit / Delete
+//
+// Each opens a shadcn Dialog (NOT a sidebar Sheet). They mirror the
+// Messages-page detail popup pattern from PR #36 and the in-flight
+// agents-page UI fix.
+// =========================================================================
+
+interface RowDialogProps {
+  task: Task | null
+  onOpenChange: (open: boolean) => void
+}
+
+// ---------- View dialog (read-only) -------------------------------
+
+const ViewTaskDialog = React.memo(({ task, onOpenChange }: RowDialogProps) => {
+  const open = task !== null
+
+  // Parse JSON-shaped optional fields safely.
+  const dependencies = task ? parseJsonField(task.depends_on_tasks) : []
+  const childTasks = task ? parseJsonField(task.child_tasks) : []
+  const notes = task ? parseJsonField(task.notes) : []
+  const createdBy: string | undefined = task ? (task as unknown as { created_by?: string }).created_by : undefined
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-2xl max-h-[85vh] overflow-y-auto bg-card border-border text-card-foreground">
+        {task && (
+          <>
+            <DialogHeader>
+              <DialogTitle className="flex items-center justify-between pr-8 gap-2">
+                <span className="text-lg font-semibold truncate">{task.title}</span>
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  <Badge variant="outline" className={cn("text-xs", statusBadgeClass(task.status))}>
+                    {task.status.replace(/_/g, ' ')}
+                  </Badge>
+                  <Badge variant="outline" className={cn("text-xs", priorityBadgeClass(task.priority))}>
+                    {task.priority}
+                  </Badge>
+                </div>
+              </DialogTitle>
+              <DialogDescription className="text-muted-foreground">
+                Read-only view of every task field. Use the pencil icon on the row to edit.
+              </DialogDescription>
+            </DialogHeader>
+
+            <div className="space-y-4 text-sm">
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <div className="text-xs uppercase tracking-wider text-muted-foreground mb-1">Title</div>
+                  <div className="font-medium">{task.title}</div>
+                </div>
+                <div>
+                  <div className="text-xs uppercase tracking-wider text-muted-foreground mb-1">Status</div>
+                  <Badge variant="outline" className={cn("text-xs", statusBadgeClass(task.status))}>
+                    {task.status.replace(/_/g, ' ')}
+                  </Badge>
+                </div>
+                <div>
+                  <div className="text-xs uppercase tracking-wider text-muted-foreground mb-1">Priority</div>
+                  <Badge variant="outline" className={cn("text-xs", priorityBadgeClass(task.priority))}>
+                    {task.priority}
+                  </Badge>
+                </div>
+                <div>
+                  <div className="text-xs uppercase tracking-wider text-muted-foreground mb-1">Assigned to</div>
+                  <div className={cn("text-sm", !task.assigned_to && "text-muted-foreground italic")}>
+                    {task.assigned_to || '(unassigned)'}
+                  </div>
+                </div>
+                {createdBy && (
+                  <div>
+                    <div className="text-xs uppercase tracking-wider text-muted-foreground mb-1">Created by</div>
+                    <div className={cn(
+                      "text-sm",
+                      isTombstone(createdBy) && "text-muted-foreground italic"
+                    )}>
+                      {createdBy}
+                    </div>
+                  </div>
+                )}
+                {task.parent_task && (
+                  <div>
+                    <div className="text-xs uppercase tracking-wider text-muted-foreground mb-1">Parent task</div>
+                    <Badge variant="outline" className="text-xs font-mono">
+                      <GitBranch className="h-3 w-3 mr-1" />
+                      {task.parent_task}
+                    </Badge>
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <div className="text-xs uppercase tracking-wider text-muted-foreground mb-1">Description</div>
+                <p className="text-sm whitespace-pre-wrap break-words">
+                  {task.description || <span className="text-muted-foreground italic">(no description)</span>}
+                </p>
+              </div>
+
+              {dependencies.length > 0 && (
+                <div>
+                  <div className="text-xs uppercase tracking-wider text-muted-foreground mb-1">Depends on</div>
+                  <div className="flex flex-wrap gap-2">
+                    {dependencies.map((id: any, idx) => (
+                      <Badge key={idx} variant="outline" className="text-xs font-mono">{String(id)}</Badge>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {childTasks.length > 0 && (
+                <div>
+                  <div className="text-xs uppercase tracking-wider text-muted-foreground mb-1">Subtasks</div>
+                  <div className="flex flex-wrap gap-2">
+                    {childTasks.map((id: any, idx) => (
+                      <Badge key={idx} variant="outline" className="text-xs font-mono">{String(id)}</Badge>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {notes.length > 0 && (
+                <div>
+                  <div className="text-xs uppercase tracking-wider text-muted-foreground mb-1">Notes ({notes.length})</div>
+                  <div className="space-y-2">
+                    {notes.map((note: any, idx) => (
+                      <div key={idx} className="bg-muted/50 rounded-lg p-3">
+                        <div className="flex items-center justify-between mb-1 text-xs">
+                          <span className={cn(
+                            "font-medium",
+                            isTombstone(note.author) && "text-muted-foreground italic"
+                          )}>
+                            {note.author || 'unknown'}
+                          </span>
+                          <span className="text-muted-foreground" title={note.timestamp}>
+                            {formatRelative(note.timestamp)}
+                          </span>
+                        </div>
+                        <p className="text-sm whitespace-pre-wrap">{note.content}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="pt-3 border-t border-border space-y-1 text-xs text-muted-foreground">
+                <div className="flex justify-between">
+                  <span>Created</span>
+                  <span className="font-mono" title={task.created_at}>
+                    {task.created_at} · {formatRelative(task.created_at)}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Updated</span>
+                  <span className="font-mono" title={task.updated_at}>
+                    {task.updated_at} · {formatRelative(task.updated_at)}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Task ID</span>
+                  <span className="font-mono break-all">{task.task_id}</span>
+                </div>
+              </div>
+            </div>
+
+            <DialogFooter>
+              <Button variant="outline" size="sm" onClick={() => onOpenChange(false)}>Close</Button>
+            </DialogFooter>
+          </>
+        )}
+      </DialogContent>
+    </Dialog>
+  )
+})
+ViewTaskDialog.displayName = 'ViewTaskDialog'
+
+// ---------- Edit dialog -------------------------------------------
+
+interface EditTaskDialogProps extends RowDialogProps {
+  onSaved: () => void
+}
+
+const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDialogProps) => {
+  const open = task !== null
+
+  const [editTitle, setEditTitle] = useState('')
+  const [editDescription, setEditDescription] = useState('')
+  const [editStatus, setEditStatus] = useState<Task['status'] | 'unassigned'>('pending')
+  const [editPriority, setEditPriority] = useState<Task['priority']>('medium')
+  // Sentinel '__unassigned__' so the shadcn Select can represent NULL.
+  const [editAssignedTo, setEditAssignedTo] = useState<string>('__unassigned__')
+  const [agents, setAgents] = useState<Agent[]>([])
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
+
+  // Re-seed form whenever the dialog opens for a new task.
+  useEffect(() => {
+    if (!task) return
+    setEditTitle(task.title || '')
+    setEditDescription(task.description || '')
+    setEditStatus(task.status || 'pending')
+    setEditPriority(task.priority || 'medium')
+    setEditAssignedTo(task.assigned_to || '__unassigned__')
+    setSaveError(null)
+  }, [task])
+
+  // Fetch agents for the Assigned-to dropdown. Best-effort: if it
+  // fails, the dropdown is empty (admin can still unassign).
+  useEffect(() => {
+    if (!open) return
+    apiClient.getAgents().then(setAgents).catch(() => setAgents([]))
+  }, [open])
+
+  const handleSave = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!task) return
+    setSaving(true)
+    setSaveError(null)
+    try {
+      // Build the patch: include every editable field so the admin
+      // can blanket-overwrite, but normalise assigned_to so the
+      // sentinel becomes a real null.
+      const patch: Record<string, unknown> = {
+        title: editTitle,
+        description: editDescription,
+        status: editStatus as Task['status'],
+        priority: editPriority,
+        assigned_to: editAssignedTo === '__unassigned__' ? null : editAssignedTo,
+      }
+      await apiClient.updateTask(task.task_id, patch)
+      onSaved()
+      onOpenChange(false)
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-2xl max-h-[85vh] overflow-y-auto bg-card border-border text-card-foreground">
+        {task && (
+          <>
+            <DialogHeader>
+              <DialogTitle className="text-lg">Edit task</DialogTitle>
+              <DialogDescription className="text-muted-foreground">
+                Changes are saved via POST /api/update-task-dashboard. <span className="font-mono">{task.task_id.slice(-8)}</span>
+              </DialogDescription>
+            </DialogHeader>
+            <form onSubmit={handleSave} className="space-y-4">
+              <div>
+                <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">Title</label>
+                <Input
+                  value={editTitle}
+                  onChange={(e) => setEditTitle(e.target.value)}
+                  required
+                  className="bg-background border-border text-foreground"
+                />
+              </div>
+              <div>
+                <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">Description</label>
+                <Textarea
+                  value={editDescription}
+                  onChange={(e) => setEditDescription(e.target.value)}
+                  className="bg-background border-border text-foreground min-h-[100px] whitespace-pre-wrap"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">Status</label>
+                  <Select value={editStatus} onValueChange={(v) => setEditStatus(v as Task['status'])}>
+                    <SelectTrigger className="bg-background border-border text-foreground">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent className="bg-background border-border">
+                      <SelectItem value="pending">pending</SelectItem>
+                      <SelectItem value="in_progress">in_progress</SelectItem>
+                      <SelectItem value="completed">completed</SelectItem>
+                      <SelectItem value="cancelled">cancelled</SelectItem>
+                      <SelectItem value="failed">failed</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">Priority</label>
+                  <Select value={editPriority} onValueChange={(v) => setEditPriority(v as Task['priority'])}>
+                    <SelectTrigger className="bg-background border-border text-foreground">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent className="bg-background border-border">
+                      <SelectItem value="low">low</SelectItem>
+                      <SelectItem value="medium">medium</SelectItem>
+                      <SelectItem value="high">high</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+              <div>
+                <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">Assigned to</label>
+                <Select value={editAssignedTo} onValueChange={setEditAssignedTo}>
+                  <SelectTrigger className="bg-background border-border text-foreground">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent className="bg-background border-border">
+                    <SelectItem value="__unassigned__">(unassigned)</SelectItem>
+                    {agents.map((a) => (
+                      <SelectItem key={a.agent_id} value={a.agent_id}>{a.agent_id}</SelectItem>
+                    ))}
+                    {/* If the current value isn't in the agent list, keep it as an explicit option. */}
+                    {editAssignedTo !== '__unassigned__' && !agents.find((a) => a.agent_id === editAssignedTo) && (
+                      <SelectItem value={editAssignedTo}>{editAssignedTo} (stale)</SelectItem>
+                    )}
+                  </SelectContent>
+                </Select>
+              </div>
+              {saveError && (
+                <div className="text-xs text-destructive bg-destructive/10 border border-destructive/30 rounded p-2">
+                  {saveError}
+                </div>
+              )}
+              <DialogFooter className="gap-2">
+                <Button type="button" variant="outline" size="sm" onClick={() => onOpenChange(false)} disabled={saving}>
+                  Cancel
+                </Button>
+                <Button type="submit" size="sm" className="bg-teal-600 hover:bg-teal-700" disabled={saving}>
+                  {saving ? 'Saving…' : 'Save'}
+                </Button>
+              </DialogFooter>
+            </form>
+          </>
+        )}
+      </DialogContent>
+    </Dialog>
+  )
+})
+EditTaskDialog.displayName = 'EditTaskDialog'
+
+// ---------- Delete confirm dialog ---------------------------------
+
+interface DeleteTaskDialogProps extends RowDialogProps {
+  onDeleted: () => void
+}
+
+const DeleteTaskDialog = React.memo(({ task, onOpenChange, onDeleted }: DeleteTaskDialogProps) => {
+  const open = task !== null
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (open) setError(null)
+  }, [open])
+
+  const handleConfirm = async () => {
+    if (!task) return
+    setBusy(true)
+    setError(null)
+    try {
+      await apiClient.deleteTask(task.task_id)
+      onDeleted()
+      onOpenChange(false)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md bg-card border-border text-card-foreground">
+        {task && (
+          <>
+            <DialogHeader>
+              <DialogTitle className="text-lg">Delete task</DialogTitle>
+              <DialogDescription className="text-muted-foreground">
+                Delete task &ldquo;{task.title}&rdquo;? This cannot be undone.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="text-xs text-muted-foreground font-mono break-all border border-border rounded p-2 bg-muted/30">
+              {task.task_id}
+            </div>
+            {error && (
+              <div className="text-xs text-destructive bg-destructive/10 border border-destructive/30 rounded p-2">
+                {error}
+              </div>
+            )}
+            <DialogFooter className="gap-2">
+              <Button variant="outline" size="sm" onClick={() => onOpenChange(false)} disabled={busy}>
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                size="sm"
+                onClick={handleConfirm}
+                disabled={busy}
+              >
+                <Trash2 className="h-3.5 w-3.5 mr-1.5" />
+                {busy ? 'Deleting…' : 'Delete'}
+              </Button>
+            </DialogFooter>
+          </>
+        )}
+      </DialogContent>
+    </Dialog>
+  )
+})
+DeleteTaskDialog.displayName = 'DeleteTaskDialog'
+
 export function TasksDashboard() {
   const { tasks, loading, error, refresh, lastFetch, isConnected } = useTasksData()
   const { servers, activeServerId } = useServerStore()
@@ -415,6 +892,11 @@ export function TasksDashboard() {
   const [statusFilter, setStatusFilter] = useState<string>('all')
   const [priorityFilter, setPriorityFilter] = useState<string>('all')
   const [selectedTask, setSelectedTask] = useState<Task | null>(null)
+  // Row-action dialog state. Each holds the task being viewed / edited
+  // / deleted, or null when the dialog is closed.
+  const [viewTask, setViewTask] = useState<Task | null>(null)
+  const [editTask, setEditTask] = useState<Task | null>(null)
+  const [deleteTask, setDeleteTask] = useState<Task | null>(null)
 
   // Memoize filtered tasks to prevent unnecessary recalculations
   const filteredTasks = useMemo(() => {
@@ -453,6 +935,15 @@ export function TasksDashboard() {
   const handleCloseTaskPanel = useCallback(() => {
     setSelectedTask(null)
   }, [])
+
+  // Row-action handlers. Each opens the matching Dialog (NOT the
+  // sidebar). The onOpenChange callback that the Dialog itself passes
+  // back uses null to mean "close".
+  const openView = useCallback((task: Task) => setViewTask(task), [])
+  const openEdit = useCallback((task: Task) => setEditTask(task), [])
+  const openDelete = useCallback((task: Task) => setDeleteTask(task), [])
+  const handleEditSaved = useCallback(() => { refresh() }, [refresh])
+  const handleDeleted = useCallback(() => { refresh() }, [refresh])
 
   if (!isConnected) {
     return (
@@ -624,11 +1115,14 @@ export function TasksDashboard() {
                 key={task.task_id}
                 task={task}
                 onTaskClick={handleTaskClick}
+                openView={openView}
+                openEdit={openEdit}
+                openDelete={openDelete}
               />
             ))}
           </TableBody>
         </Table>
-        
+
         {filteredTasks.length === 0 && (
           <div className="p-12 text-center">
             <CheckSquare className="h-12 w-12 text-teal-400/50 dark:text-teal-400/50 text-teal-600/50 mx-auto mb-4" />
@@ -640,11 +1134,32 @@ export function TasksDashboard() {
           </div>
         )}
       </div>
-      
-      {/* Task Details Panel */}
-      <TaskDetailsPanel 
-        task={selectedTask} 
-        onClose={handleCloseTaskPanel} 
+
+      {/* Row-action dialogs (View / Edit / Delete) — Dialog modals,
+          NOT the sidebar Sheet. Mirrors the messages-tab popup
+          pattern from PR #36. */}
+      <ViewTaskDialog
+        task={viewTask}
+        onOpenChange={(open) => { if (!open) setViewTask(null) }}
+      />
+      <EditTaskDialog
+        task={editTask}
+        onOpenChange={(open) => { if (!open) setEditTask(null) }}
+        onSaved={handleEditSaved}
+      />
+      <DeleteTaskDialog
+        task={deleteTask}
+        onOpenChange={(open) => { if (!open) setDeleteTask(null) }}
+        onDeleted={handleDeleted}
+      />
+
+      {/* Legacy Task Details Panel — still opened by clicking on the
+          row body (everything outside the action icons). Eventually
+          this can be retired entirely; for now it stays so existing
+          users with that muscle memory aren't broken. */}
+      <TaskDetailsPanel
+        task={selectedTask}
+        onClose={handleCloseTaskPanel}
       />
     </div>
   )
