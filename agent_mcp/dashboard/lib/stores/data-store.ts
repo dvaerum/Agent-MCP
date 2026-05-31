@@ -115,24 +115,16 @@ export const useDataStore = create<DataStore>((set, get) => ({
       // Try the new all-data endpoint first
       let data
       try {
-        const response = await fetch(`${apiClient.getServerUrl()}/api/all-data`, {
-          method: 'GET',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          mode: 'cors'
-        })
-        if (!response.ok) throw new Error(`Failed to fetch: ${response.statusText}`)
-        data = await response.json()
+        data = await apiClient.getAllData()
       } catch (err) {
         // Fallback to fetching data from individual endpoints
         console.debug('All-data endpoint not available, using fallback...')
-        
+
         const [agents, tasks, tokens, contextData] = await Promise.all([
           apiClient.getAgents(),
           apiClient.getTasks(),
           apiClient.getTokens(),
-          fetch(`${apiClient.getServerUrl()}/api/context-data`).then(res => res.ok ? res.json() : [])
+          apiClient.getContextData()
         ])
         
         // Merge tokens into agents
