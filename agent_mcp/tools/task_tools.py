@@ -2403,6 +2403,21 @@ async def view_tasks_tool_impl(
     summary_mode = arguments.get(
         "summary_mode", False
     )  # If True, show only summary info
+    # `summary` is the canonical knob (added for callers that want a
+    # tiny per-task projection — task_id, title, status, priority,
+    # assigned_to). `summary_mode` is the older alias and still works.
+    # If either is true, summary projection wins.
+    if arguments.get("summary", False):
+        summary_mode = True
+
+    # Page-based pagination (added alongside the legacy token-based
+    # `start_after` knob). `limit` caps the number of tasks returned;
+    # `offset` skips the first N (applied AFTER all filters + sort,
+    # BEFORE summary projection / serialization). When `limit` is set,
+    # a `Total: <N>` line is added to the response so the caller knows
+    # whether there is a next page.
+    limit = arguments.get("limit")  # None = unbounded, preserves shape
+    offset = arguments.get("offset", 0) or 0
 
     # Smart filtering and analysis options
     show_dependencies = arguments.get(
@@ -2530,6 +2545,16 @@ async def view_tasks_tool_impl(
                 break
         tasks_to_display = tasks_to_display[start_index:]
 
+    # Page-based pagination: capture the total matching count BEFORE
+    # slicing so we can report "Total: N" to the caller. Only emit the
+    # Total line when `limit` is explicitly set — older callers that
+    # don't pass `limit` must see the exact same response shape.
+    total_matching = len(tasks_to_display)
+    if offset:
+        tasks_to_display = tasks_to_display[offset:]
+    if limit is not None:
+        tasks_to_display = tasks_to_display[:limit]
+
     if not tasks_to_display:
         response_text = "No tasks found matching the criteria."
     else:
@@ -2630,6 +2655,15 @@ async def view_tasks_tool_impl(
                 response_parts.append(f"Overview: view_tasks(summary_mode=true)")
         else:
             response_parts.append(f"--- All {tasks_included} matching tasks shown ---")
+
+        # When the caller is paginating with `limit`, expose the total
+        # matching count + the current window so they know whether to
+        # ask for the next page. Only emitted on the new API surface;
+        # legacy callers (no `limit`) see the existing shape verbatim.
+        if limit is not None:
+            response_parts.append(
+                f"Total: {total_matching} (showing offset={offset}, limit={limit})"
+            )
 
         # Add smart usage tips
         response_parts.append("\n💡 Smart Tips:")
@@ -3895,7 +3929,12 @@ def register_task_tools():
 
     register_tool(
         name="view_tasks",
-        description="Smart task viewer with dependency analysis, health metrics, and advanced filtering. Provides comprehensive task insights with intelligent pagination.",
+        description=(
+            "Smart task viewer with dependency analysis, health metrics, "
+            "and advanced filtering. For an overview against a project "
+            "with many tasks, prefer summary=true (and limit=50) to keep "
+            "the response well under the per-call token cap."
+        ),
         input_schema={
             "type": "object",
             "properties": {
@@ -3928,6 +3967,39 @@ def register_task_tools():
                 "summary_mode": {
                     "type": "boolean",
                     "description": "If true, show only summary info to fit more tasks (default: false)",
+                },
+                "summary": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, return only task_id, title, status, "
+                        "priority, and assigned_to per task (omits "
+                        "description, notes, child_tasks, depends_on_tasks, "
+                        "and other large fields). Recommended default "
+                        "for any 'give me an overview' call — a project "
+                        "with 40 tasks fits comfortably under the "
+                        "per-call token cap. Alias of summary_mode."
+                    ),
+                    "default": False,
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Max number of tasks to return after filters + "
+                        "sort. When set, response includes a Total: "
+                        "<N> line so the caller knows if more pages "
+                        "exist. Suggested: 50 for overview calls."
+                    ),
+                    "minimum": 1,
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": (
+                        "Pagination offset — skip the first N tasks "
+                        "(applied after filters + sort). Pairs with "
+                        "limit. Default: 0."
+                    ),
+                    "minimum": 0,
+                    "default": 0,
                 },
                 # Smart filtering options
                 "filter_priority": {
