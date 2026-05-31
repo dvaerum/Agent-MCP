@@ -108,6 +108,43 @@ async def list_available_tools() -> List[mcp_types.Tool]:
     return mcp_tool_list
 
 
+# Auth-failure detection (issue H). Tools return text content like
+# "Unauthorized: Admin token required" / "Unauthorized: Valid token
+# required" / "Invalid token" instead of raising; the MCP framework
+# then sets isError=False, hiding the failure from naive clients.
+# This regex catches the common shapes used across the codebase.
+import re as _re
+
+_AUTH_FAILURE_RE = _re.compile(
+    r"^\s*(unauthor(?:ized|ised)|invalid (?:admin |agent |auth |worker )?token)",
+    _re.IGNORECASE,
+)
+
+
+class ToolAuthError(Exception):
+    """Raised when a tool short-circuits on authentication failure.
+
+    The MCP framework's call_tool wrapper catches exceptions and sets
+    isError=True on the resulting CallToolResult, which is the correct
+    signal for callers.
+    """
+
+
+def _raise_if_auth_failure(
+    tool_name: str, result: List[mcp_types.TextContent]
+) -> None:
+    if not result:
+        return
+    first = result[0]
+    text = getattr(first, "text", None)
+    if not isinstance(text, str):
+        return
+    if _AUTH_FAILURE_RE.match(text):
+        # Use the tool's own text as the exception message so the
+        # framework propagates it intact to the client.
+        raise ToolAuthError(text.strip())
+
+
 async def dispatch_tool_call(
     tool_name: str,
     raw_arguments: Union[Dict[str, Any], List[Dict[str, Any]]] # Original accepted list or dict
@@ -210,11 +247,25 @@ async def dispatch_tool_call(
             #   return await create_agent_tool_impl(sanitized_arguments)
             # This is handled by the dict lookup now.
 
-            return await implementation_func(sanitized_arguments)
+            result = await implementation_func(sanitized_arguments)
+
+            # Issue H: tools that short-circuit on auth currently return
+            # a TextContent with "Unauthorized..." text and the MCP
+            # framework wraps that as isError=False — so clients that
+            # key off isError think the call succeeded. Detect the
+            # auth-failure shape and raise so the framework's
+            # exception path sets isError=True (and JSON-RPC clients
+            # can see the failure at the protocol level).
+            _raise_if_auth_failure(tool_name, result)
+
+            return result
 
         except Exception as e:
             logger.error(f"Error executing tool '{tool_name}': {e}", exc_info=True)
-            return [mcp_types.TextContent(type="text", text=f"Internal error executing tool '{tool_name}': {str(e)}")]
+            # Re-raise so the MCP framework's `_make_error_result`
+            # sets isError=True. Previously we swallowed and returned
+            # text, which kept isError=False for any exception.
+            raise
     else:
         logger.warning(f"Unknown tool called: {tool_name}")
         # Original main.py:1930 (raise ValueError(f"Unknown tool: {name}"))
