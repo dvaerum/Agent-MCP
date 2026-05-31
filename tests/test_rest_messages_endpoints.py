@@ -20,8 +20,13 @@ def _admin(client) -> str:
     return client.get("/api/tokens").json()["admin_token"]
 
 
-def _seed_worker(name: str) -> str:
-    """Insert a worker row + register in globals. Returns the token."""
+def _seed_worker(name: str, status: str = "active") -> str:
+    """Insert a worker row + register in globals. Returns the token.
+
+    ``status`` defaults to ``active``; pass ``terminated`` to simulate a
+    worker that has been ended (used by the participants endpoint tests
+    to assert ghost agents are filtered out of the dashboard dropdowns).
+    """
     from agent_mcp.core import globals as g
     from agent_mcp.db.connection import get_db_connection
 
@@ -34,18 +39,43 @@ def _seed_worker(name: str) -> str:
         "INSERT INTO agents (token, agent_id, capabilities, created_at, "
         "status, working_directory, color, updated_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (token, name, "[]", now, "active", "/tmp", "#888", now),
+        (token, name, "[]", now, status, "/tmp", "#888", now),
     )
     conn.commit()
     conn.close()
 
     g.active_agents[token] = {
         "agent_id": name,
-        "status": "active",
+        "status": status,
         "created_at": now,
         "capabilities": [],
     }
     return token
+
+
+def _seed_message_with_sender(sender_id: str, recipient_id: str = "alice",
+                              content: str = "x") -> str:
+    """Insert an agent_messages row directly with an arbitrary sender.
+
+    Used by the participants endpoint tests to plant tombstone rows
+    (sender_id / recipient_id beginning with ``[deleted-``) that the
+    REST compose path would otherwise refuse to create.
+    """
+    from agent_mcp.db.connection import get_db_connection
+
+    now = _dt.datetime.now().isoformat()
+    msg_id = f"msg_{secrets.token_hex(6)}"
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO agent_messages (message_id, sender_id, recipient_id, "
+        "message_content, message_type, priority, timestamp, delivered, read) "
+        "VALUES (?, ?, ?, ?, 'text', 'normal', ?, 0, 0)",
+        (msg_id, sender_id, recipient_id, content, now),
+    )
+    conn.commit()
+    conn.close()
+    return msg_id
 
 
 # ---------- POST /api/messages ----------------------------------
@@ -378,4 +408,106 @@ def test_post_messages_broadcast_rejects_bad_token(client) -> None:
         "recipient_id": "*",
         "message_content": "nope",
     })
+    assert r.status_code == 403, r.text
+
+
+# ---------- POST /api/messages/participants --------------------
+# The Messages tab's From/To filter dropdowns originally sourced from
+# /api/agents, which returns EVERY agent row including status='terminated'.
+# Dennis flagged ghost agents in the dropdown that no longer existed in the
+# Agents page. The fix introduces a dedicated /participants endpoint that
+# returns (a) live agents (status != 'terminated') and (b) DISTINCT
+# tombstone strings (sender_id / recipient_id beginning with
+# ``[deleted-``) so admins can still grep history for purged agents
+# (PR C cascade).
+
+
+def test_participants_lists_live_agents_only(client) -> None:
+    admin = _admin(client)
+    _seed_worker("alice", status="active")
+    _seed_worker("bob", status="terminated")
+
+    r = client.post("/api/messages/participants", json={"token": admin})
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    assert "live" in body, body
+    assert "tombstones" in body, body
+
+    live_ids = [a["agent_id"] for a in body["live"]]
+    assert "alice" in live_ids, live_ids
+    assert "bob" not in live_ids, (
+        f"terminated agent leaked into participants.live: {live_ids}"
+    )
+
+
+def test_participants_includes_admin_in_live(client) -> None:
+    # admin is a synthetic always-present sender; the agents table does
+    # not contain an "admin" row, so the endpoint must inject it so
+    # admins can filter for messages they themselves sent.
+    admin = _admin(client)
+    r = client.post("/api/messages/participants", json={"token": admin})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    live_ids = [a["agent_id"] for a in body["live"]]
+    assert "admin" in live_ids or "Admin" in live_ids, (
+        f"expected 'admin' (or 'Admin') to be injected as a live "
+        f"participant; got {live_ids}"
+    )
+
+
+def test_participants_lists_tombstones(client) -> None:
+    admin = _admin(client)
+    _seed_worker("alice", status="active")
+    # PR C tombstone marker on a sender_id and a recipient_id.
+    _seed_message_with_sender(
+        "[deleted-old-worker-1]", recipient_id="alice", content="legacy"
+    )
+    _seed_message_with_sender(
+        "admin", recipient_id="[deleted-old-worker-2]", content="legacy2"
+    )
+
+    r = client.post("/api/messages/participants", json={"token": admin})
+    assert r.status_code == 200, r.text
+    tombstones = r.json().get("tombstones", [])
+    assert "[deleted-old-worker-1]" in tombstones, tombstones
+    assert "[deleted-old-worker-2]" in tombstones, tombstones
+
+
+def test_participants_tombstones_distinct_and_sorted(client) -> None:
+    admin = _admin(client)
+    _seed_worker("alice", status="active")
+    # Duplicate the same tombstone across multiple messages; the endpoint
+    # must DISTINCT them.
+    for _ in range(3):
+        _seed_message_with_sender("[deleted-zzz]", recipient_id="alice")
+    _seed_message_with_sender("[deleted-aaa]", recipient_id="alice")
+
+    r = client.post("/api/messages/participants", json={"token": admin})
+    tombstones = r.json().get("tombstones", [])
+    # Distinct: each appears exactly once.
+    assert tombstones.count("[deleted-zzz]") == 1, tombstones
+    assert tombstones.count("[deleted-aaa]") == 1, tombstones
+    # Sorted lexicographically (aaa before zzz).
+    assert tombstones.index("[deleted-aaa]") < tombstones.index("[deleted-zzz]"), (
+        f"tombstones should be sorted lexicographically: {tombstones}"
+    )
+
+
+def test_participants_empty_tombstones_when_none(client) -> None:
+    # PR C has not landed yet; today the message table contains no
+    # tombstone rows. The endpoint must return an empty list, not error.
+    admin = _admin(client)
+    _seed_worker("alice", status="active")
+
+    r = client.post("/api/messages/participants", json={"token": admin})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["tombstones"] == [], body
+
+
+def test_participants_rejects_bad_token(client) -> None:
+    r = client.post(
+        "/api/messages/participants", json={"token": "x" * 32}
+    )
     assert r.status_code == 403, r.text

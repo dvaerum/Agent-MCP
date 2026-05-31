@@ -158,21 +158,60 @@ export function MessagesDashboard() {
   const [composePriority, setComposePriority] = useState("normal")
   const [composing, setComposing] = useState(false)
 
-  // Recipient dropdown options: hardcoded admin first (admin always
-  // exists but /api/agents may not include it) + workers from
-  // /api/agents. Fetched once on mount; reused by the from/to filter
-  // dropdowns as well.
-  const [agents, setAgents] = useState<Agent[]>([])
+  // Participants drive the dropdowns. The old code sourced from
+  // apiClient.getAgents(), which returns EVERY row including
+  // status='terminated' — leaking ghost agents into the From/To
+  // filters that no longer appear on the Agents page. The new
+  // /api/messages/participants endpoint returns {live, tombstones}:
+  //   - live: agents whose status != 'terminated' (admin synthesised)
+  //   - tombstones: DISTINCT sender_id/recipient_id values starting
+  //     with '[deleted-' (PR C agent-purge cascade marker; empty list
+  //     until that PR lands).
+  // Compose recipient renders live agents only (you cannot message a
+  // deleted agent). The From/To filters render live + tombstones so
+  // admins can still grep history for purged agents.
+  const [liveParticipants, setLiveParticipants] = useState<
+    { agent_id: string; status?: string }[]
+  >([])
+  const [tombstones, setTombstones] = useState<string[]>([])
+
+  const loadParticipants = async () => {
+    try {
+      const t = await adminToken()
+      const data = await callMessages("POST", "/participants", { token: t })
+      const live = Array.isArray(data?.live) ? data.live : []
+      const tomb = Array.isArray(data?.tombstones) ? data.tombstones : []
+      setLiveParticipants(live)
+      setTombstones(tomb)
+    } catch {
+      // Soft-fail: dropdown just shows the hardcoded admin entry.
+      setLiveParticipants([])
+      setTombstones([])
+    }
+  }
   useEffect(() => {
-    apiClient.getAgents().then(setAgents).catch(() => setAgents([]))
+    loadParticipants()
   }, [])
+
+  // Compose recipient list (live-only — admin pinned, then workers).
   const recipientOptions = useMemo(() => {
     const ids = new Set<string>(["admin"])
-    for (const a of agents) {
+    for (const a of liveParticipants) {
       if (a.agent_id) ids.add(a.agent_id)
     }
     return Array.from(ids)
-  }, [agents])
+  }, [liveParticipants])
+
+  // Filter dropdown list (From / To). Live agents first, then
+  // tombstone strings appended at the bottom so the live agents are
+  // the primary affordance and historical purged ids are still
+  // selectable.
+  const filterOptions = useMemo(() => {
+    const live = recipientOptions
+    // Tombstones are already DISTINCT + lexicographically sorted on
+    // the server; preserve that order.
+    return [...live, ...tombstones]
+  }, [recipientOptions, tombstones])
 
   // Build a body matching the REST contract.
   const queryBody = useMemo(() => {
@@ -199,6 +238,10 @@ export function MessagesDashboard() {
       // Clear selection — IDs that survive filter changes would
       // silently act on rows the user can no longer see.
       setSelectedIds(new Set())
+      // Re-pull participants so tombstone strings introduced by deletes
+      // (or live agents created/terminated mid-session) stay in sync.
+      // Fire-and-forget; soft-fails in loadParticipants.
+      void loadParticipants()
     } catch (e: any) {
       setError(e.message ?? String(e))
     } finally {
@@ -442,7 +485,7 @@ export function MessagesDashboard() {
               <SelectTrigger><SelectValue placeholder="from" /></SelectTrigger>
               <SelectContent>
                 <SelectItem value={ALL}>any sender</SelectItem>
-                {recipientOptions.map((id) => (
+                {filterOptions.map((id) => (
                   <SelectItem key={`from-${id}`} value={id}>{id}</SelectItem>
                 ))}
               </SelectContent>
@@ -456,7 +499,7 @@ export function MessagesDashboard() {
               <SelectTrigger><SelectValue placeholder="to" /></SelectTrigger>
               <SelectContent>
                 <SelectItem value={ALL}>any recipient</SelectItem>
-                {recipientOptions.map((id) => (
+                {filterOptions.map((id) => (
                   <SelectItem key={`to-${id}`} value={id}>{id}</SelectItem>
                 ))}
               </SelectContent>

@@ -40,11 +40,19 @@ def test_recipient_field_uses_select_not_input() -> None:
     )
 
 
-def test_recipient_dropdown_populated_from_get_agents() -> None:
+def test_recipient_dropdown_populated_from_participants_endpoint() -> None:
+    """Originally asserted apiClient.getAgents() was the dropdown source.
+
+    Dennis flagged ghost agents — /api/agents returns every row
+    including status='terminated' — so the source changed to
+    /api/messages/participants, which returns {live, tombstones}
+    (terminated agents excluded). The Compose recipient renders the
+    `live` list only; the From/To filters render live + tombstones.
+    """
     src = _read("components/dashboard/messages-dashboard.tsx")
-    assert "apiClient.getAgents()" in src, (
+    assert "/participants" in src or "/messages/participants" in src, (
         "expected the Compose form to populate recipient options from "
-        "apiClient.getAgents()"
+        "the /api/messages/participants endpoint (live agents only)"
     )
 
 
@@ -167,4 +175,70 @@ def test_row_has_inline_delete_button() -> None:
     # dashboard for delete affordances.
     assert "Trash2" in src or "Trash " in src or 'icon="trash"' in src, (
         "expected a Trash2 icon import for the per-row delete button"
+    )
+
+
+# ---------- Filter dropdown participant source ------------------
+# Original bug: From/To dropdowns sourced from apiClient.getAgents(),
+# which returns EVERY agent including status='terminated'. The
+# replacement is a new /api/messages/participants endpoint that returns
+# live agents only + DISTINCT tombstone strings (sender_id /
+# recipient_id beginning with ``[deleted-``). The Compose recipient
+# stays live-only (you cannot message a deleted agent).
+
+
+def test_filter_dropdowns_call_participants_endpoint() -> None:
+    src = _read("components/dashboard/messages-dashboard.tsx")
+    # The filter dropdowns must be populated from /messages/participants
+    # (admin-token POST), not from apiClient.getAgents(), so terminated
+    # agents are excluded.
+    assert "/messages/participants" in src or "/participants" in src, (
+        "expected the Messages tab to call the new "
+        "/api/messages/participants endpoint to populate the "
+        "Sender/Recipient filter dropdowns (live agents + tombstones)"
+    )
+
+
+def test_filter_dropdowns_exclude_terminated_agents() -> None:
+    src = _read("components/dashboard/messages-dashboard.tsx")
+    # Defensive client-side filter even if a stale getAgents() call
+    # remains; the symbolic check is that the terminated status is
+    # explicitly excluded somewhere in the participant pipeline.
+    # The new flow drops getAgents() entirely from the *filter* dropdown
+    # source, so the only call to apiClient.getAgents() that may remain
+    # is the Compose recipient list. Either path must not include
+    # terminated agents in the From/To dropdowns.
+    if "apiClient.getAgents()" in src:
+        # If getAgents is still used (e.g., to feed the Compose
+        # recipient), there must be an explicit terminated filter.
+        assert "terminated" in src, (
+            "Compose recipient still uses apiClient.getAgents(); must "
+            "filter status='terminated' out before rendering options"
+        )
+
+
+def test_filter_dropdowns_render_tombstone_values() -> None:
+    src = _read("components/dashboard/messages-dashboard.tsx")
+    # The participants endpoint returns {live, tombstones}. The From/To
+    # dropdowns must render BOTH so admins can grep history for purged
+    # agents. Look for evidence of the tombstones key being read.
+    assert "tombstones" in src, (
+        "expected the Messages tab to read the `tombstones` array from "
+        "the participants endpoint and render those values in the "
+        "Sender/Recipient filter dropdowns"
+    )
+
+
+def test_compose_recipient_excludes_tombstones() -> None:
+    src = _read("components/dashboard/messages-dashboard.tsx")
+    # Compose recipient must remain live-only — you cannot message a
+    # deleted agent. The simplest evidence is that the compose flow
+    # does not iterate `tombstones` into its <SelectItem>s.
+    # Find the Recipient label and inspect ~1200 chars after.
+    idx = src.find("Recipient agent_id")
+    assert idx > 0, "Recipient label not found"
+    block = src[idx : idx + 1200]
+    assert "tombstones" not in block, (
+        "Compose recipient block should not render tombstone agent ids "
+        "(you cannot message a deleted agent); render live agents only"
     )
