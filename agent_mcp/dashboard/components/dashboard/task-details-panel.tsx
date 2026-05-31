@@ -1,12 +1,12 @@
 "use client"
 
 import React, { useState } from 'react'
-import { X, Clock, User, Hash, AlertCircle, CheckCircle2, Activity, MessageSquare, GitBranch, Target, Zap, ChevronRight } from 'lucide-react'
+import { X, Clock, User, Hash, AlertCircle, CheckCircle2, Activity, MessageSquare, GitBranch, Target, Zap, ChevronRight, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { cn } from '@/lib/utils'
-import { Task } from '@/lib/api'
+import { Task, apiClient } from '@/lib/api'
 import { useDataStore } from '@/lib/stores/data-store'
 
 interface TaskDetailsPanelProps {
@@ -15,8 +15,47 @@ interface TaskDetailsPanelProps {
 }
 
 export function TaskDetailsPanel({ task, onClose }: TaskDetailsPanelProps) {
-  const { data } = useDataStore()
+  const { data, refreshData } = useDataStore()
   const [activeTab, setActiveTab] = useState<'details' | 'history'>('details')
+  const [busy, setBusy] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+
+  // Wire the previously-inert action buttons to upstream REST endpoints.
+  // updateTask hits POST /api/update-task-dashboard for status + notes;
+  // deleteTask hits DELETE /api/tasks/<id> (added in dvaerum#12).
+  const runAction = async (label: string, run: () => Promise<unknown>) => {
+    setBusy(label)
+    setActionError(null)
+    try {
+      await run()
+      try {
+        await refreshData?.()
+      } catch {
+        /* refresh is best-effort */
+      }
+      onClose()
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const handleStart = () =>
+    task && runAction('start', () => apiClient.updateTask(task.task_id, { status: 'in_progress' }))
+  const handleComplete = () =>
+    task && runAction('complete', () => apiClient.updateTask(task.task_id, { status: 'completed' }))
+  const handleAddNote = () => {
+    if (!task) return
+    const note = window.prompt('Add a note for this task:')
+    if (!note) return
+    runAction('note', () => apiClient.updateTask(task.task_id, { notes: note }))
+  }
+  const handleDelete = () => {
+    if (!task) return
+    if (!window.confirm(`Delete task ${task.task_id}? This cannot be undone.`)) return
+    runAction('delete', () => apiClient.deleteTask(task.task_id))
+  }
 
   // Get task history and related actions
   const taskHistory = task ? (data?.actions || []).filter(action => 
@@ -293,21 +332,36 @@ export function TaskDetailsPanel({ task, onClose }: TaskDetailsPanelProps) {
 
           {/* Action Buttons */}
           <div className="border-t p-4 space-y-2">
+            {actionError && (
+              <div className="text-xs text-destructive bg-destructive/10 border border-destructive/30 rounded p-2">
+                {actionError}
+              </div>
+            )}
             {task.status === 'pending' && (
-              <Button className="w-full" size="sm">
+              <Button className="w-full" size="sm" onClick={handleStart} disabled={busy !== null}>
                 <Activity className="h-3.5 w-3.5 mr-2" />
-                Start Task
+                {busy === 'start' ? 'Starting…' : 'Start Task'}
               </Button>
             )}
             {task.status === 'in_progress' && (
-              <Button className="w-full" variant="secondary" size="sm">
+              <Button className="w-full" variant="secondary" size="sm" onClick={handleComplete} disabled={busy !== null}>
                 <CheckCircle2 className="h-3.5 w-3.5 mr-2" />
-                Mark Complete
+                {busy === 'complete' ? 'Marking…' : 'Mark Complete'}
               </Button>
             )}
-            <Button variant="outline" className="w-full" size="sm">
+            <Button variant="outline" className="w-full" size="sm" onClick={handleAddNote} disabled={busy !== null}>
               <MessageSquare className="h-3.5 w-3.5 mr-2" />
-              Add Note
+              {busy === 'note' ? 'Adding…' : 'Add Note'}
+            </Button>
+            <Button
+              variant="ghost"
+              className="w-full text-destructive hover:text-destructive hover:bg-destructive/10"
+              size="sm"
+              onClick={handleDelete}
+              disabled={busy !== null}
+            >
+              <Trash2 className="h-3.5 w-3.5 mr-2" />
+              {busy === 'delete' ? 'Deleting…' : 'Delete Task'}
             </Button>
           </div>
 
