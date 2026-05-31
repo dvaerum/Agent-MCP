@@ -282,13 +282,38 @@ class ApiClient {
     return this.request<Task>(`/tasks/${taskId}`)
   }
 
-  async updateTask(taskId: string, data: Partial<Task>): Promise<{ success: boolean; message: string }> {
-    return this.request(`/tasks/${taskId}`, {
-      method: 'PUT',
-      body: JSON.stringify(data)
+  // Update an existing task. Upstream exposes this as
+  // POST /api/update-task-dashboard which takes the admin token + the
+  // task_id + the fields to change in the JSON body. Supported keys:
+  // - status: pending | in_progress | completed | cancelled | failed
+  // - notes:  free text — appended as a new note entry by the backend
+  // Older versions of this client posted to PUT /tasks/<id> which
+  // doesn't exist upstream and 405'd; fixed here.
+  //
+  // The `notes` parameter is a string (server appends a structured
+  // note entry with author=admin + timestamp). Distinct from
+  // Task.notes which is the stored list of note entries.
+  async updateTask(
+    taskId: string,
+    data: { status?: Task['status']; notes?: string }
+  ): Promise<{ success: boolean; message: string }> {
+    const tokens = await this.getTokens()
+    const body: Record<string, unknown> = {
+      token: tokens.admin_token,
+      task_id: taskId,
+    }
+    if (data.status) body.status = data.status
+    if (data.notes) body.notes = data.notes
+    return this.request('/update-task-dashboard', {
+      method: 'POST',
+      body: JSON.stringify(body),
     })
   }
 
+  // Create a new task via POST /api/tasks (added upstream in dvaerum#12).
+  // The dashboard's Create Task button uses this; takes title +
+  // optional description / priority / assigned_to / parent_task.
+  // The fork's endpoint maps title→task_title and description→task_description.
   async createTask(data: {
     title: string
     description?: string
@@ -296,9 +321,26 @@ class ApiClient {
     assigned_to?: string
     parent_task?: string
   }): Promise<{ success: boolean; message: string; task_id?: string }> {
+    const tokens = await this.getTokens()
     return this.request('/tasks', {
       method: 'POST',
-      body: JSON.stringify(data)
+      body: JSON.stringify({
+        token: tokens.admin_token,
+        task_title: data.title,
+        task_description: data.description ?? '',
+        priority: data.priority,
+        assigned_to: data.assigned_to,
+        parent_task: data.parent_task,
+      }),
+    })
+  }
+
+  // Delete a task via DELETE /api/tasks/<id> (added upstream in dvaerum#12).
+  async deleteTask(taskId: string): Promise<{ success: boolean; message: string }> {
+    const tokens = await this.getTokens()
+    return this.request(`/tasks/${taskId}`, {
+      method: 'DELETE',
+      body: JSON.stringify({ token: tokens.admin_token }),
     })
   }
 
