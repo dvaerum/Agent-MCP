@@ -760,12 +760,156 @@ async def delete_memory_api_route(request: Request) -> JSONResponse:
         if conn:
             conn.close()
 
+# --- Task CRUD endpoints (UPSTREAM_ISSUES.md issue C) ---
+# Tasks already have GET /api/tasks (list) and POST /api/update-task-dashboard
+# (mutate). The dashboard's "Create Task" and per-row delete buttons need
+# POST /api/tasks and DELETE /api/tasks/<id>; without these the dashboard
+# routes through a per-request MCP-tools/call bridge in reverse-proxy
+# deployments, which is heavyweight and admin-bypassing.
+
+import uuid as _uuid
+
+
+async def create_task_api_route(request: Request) -> JSONResponse:
+    """Create a new task. Admin token in JSON body (Q6a.1 convention).
+
+    Body: {"token", "task_title", "task_description", "priority"?,
+           "assigned_to"?, "parent_task"?}
+    Returns: {"success": true, "task_id": "...", "message": "..."}
+    """
+    if request.method == 'OPTIONS':
+        return await handle_options(request)
+    if request.method != 'POST':
+        return JSONResponse({"error": "Method not allowed"}, status_code=405)
+
+    conn = None
+    try:
+        data = await get_sanitized_json_body(request)
+        admin_token = data.get('token')
+        title = data.get('task_title')
+        description = data.get('task_description', '')
+        priority = data.get('priority', 'medium')
+        assigned_to = data.get('assigned_to')  # nullable
+        parent_task = data.get('parent_task')  # nullable
+
+        if not verify_token(admin_token, required_role='admin'):
+            return JSONResponse({"error": "Invalid admin token"}, status_code=403)
+
+        if not title:
+            return JSONResponse(
+                {"error": "task_title is required"}, status_code=400
+            )
+
+        requesting_admin_id = auth_get_agent_id(admin_token)
+        task_id = f"task_{_uuid.uuid4().hex[:12]}"
+        now = datetime.datetime.now().isoformat()
+        status = 'pending' if assigned_to else 'unassigned'
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO tasks (
+                task_id, title, description, assigned_to, created_by,
+                status, priority, created_at, updated_at,
+                parent_task, child_tasks, depends_on_tasks, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id, title, description, assigned_to, requesting_admin_id,
+                status, priority, now, now,
+                parent_task, '[]', '[]', '[]',
+            ),
+        )
+        log_agent_action_to_db(
+            cursor, requesting_admin_id, "created_task",
+            task_id=task_id, details={"title": title, "assigned_to": assigned_to},
+        )
+        conn.commit()
+
+        return JSONResponse({
+            "success": True,
+            "task_id": task_id,
+            "message": f"Task '{title}' created successfully",
+        })
+
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error creating task: {e}", exc_info=True)
+        return JSONResponse(
+            {"error": f"Failed to create task: {str(e)}"}, status_code=500
+        )
+    finally:
+        if conn:
+            conn.close()
+
+
+async def delete_task_api_route(request: Request) -> JSONResponse:
+    """Delete a task by ID. Admin token in JSON body."""
+    if request.method == 'OPTIONS':
+        return await handle_options(request)
+    if request.method != 'DELETE':
+        return JSONResponse({"error": "Method not allowed"}, status_code=405)
+
+    # Extract task_id from URL path (last segment).
+    path_parts = request.url.path.split('/')
+    if len(path_parts) < 4 or not path_parts[-1]:
+        return JSONResponse({"error": "task_id is required in URL"}, status_code=400)
+    task_id = path_parts[-1]
+
+    conn = None
+    try:
+        data = await get_sanitized_json_body(request)
+        admin_token = data.get('token')
+
+        if not verify_token(admin_token, required_role='admin'):
+            return JSONResponse({"error": "Invalid admin token"}, status_code=403)
+
+        requesting_admin_id = auth_get_agent_id(admin_token)
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT task_id FROM tasks WHERE task_id = ?", (task_id,))
+        if not cursor.fetchone():
+            return JSONResponse({"error": "Task not found"}, status_code=404)
+
+        cursor.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
+        log_agent_action_to_db(
+            cursor, requesting_admin_id, "deleted_task", task_id=task_id,
+        )
+        conn.commit()
+
+        return JSONResponse({
+            "success": True,
+            "message": f"Task '{task_id}' deleted successfully",
+        })
+
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error deleting task: {e}", exc_info=True)
+        return JSONResponse(
+            {"error": f"Failed to delete task: {str(e)}"}, status_code=500
+        )
+    finally:
+        if conn:
+            conn.close()
+
+
 # Add the memory CRUD routes
 routes.extend([
     Route('/api/memories', endpoint=create_memory_api_route, name="create_memory_api", methods=['POST', 'OPTIONS']),
     Route('/api/memories/{context_key}', endpoint=update_memory_api_route, name="update_memory_api", methods=['PUT', 'OPTIONS']),
     Route('/api/memories/{context_key}', endpoint=delete_memory_api_route, name="delete_memory_api", methods=['DELETE', 'OPTIONS']),
     Route('/api/context-data', endpoint=context_data_api_route, name="context_data_api", methods=['GET', 'OPTIONS']),
+    # Task CRUD (issue C). GET /api/tasks (list) already exists earlier.
+    Route('/api/tasks', endpoint=create_task_api_route, name="create_task_api", methods=['POST', 'OPTIONS']),
+    Route('/api/tasks/{task_id}', endpoint=delete_task_api_route, name="delete_task_api", methods=['DELETE', 'OPTIONS']),
 ])
 
 # Add the sample data route
