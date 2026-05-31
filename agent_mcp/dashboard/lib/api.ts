@@ -117,25 +117,35 @@ class ApiClient {
     this.suppressErrors = suppress
   }
 
-  // Dynamic server connection
+  // Dynamic server connection.
+  //
+  // Convention: `baseUrl` IS the API root, including the `/api`
+  // path segment when present. setServer appends `/api` so every
+  // other method can just concatenate the endpoint without
+  // worrying about where the prefix lives.
   setServer(host: string, port: number) {
-    this.baseUrl = `http://${host}:${port}`
+    this.baseUrl = `http://${host}:${port}/api`
   }
 
+  /**
+   * Returns the API root URL (includes `/api`, not just the server
+   * origin). Callers that build URLs from this should concatenate
+   * the endpoint directly without adding `/api/` themselves.
+   */
   getServerUrl(): string {
     return this.baseUrl
   }
 
   private async request<T>(
-    endpoint: string, 
+    endpoint: string,
     options: RequestInit = {}
   ): Promise<T> {
     // Check if a server is connected
     if (!this.baseUrl) {
       throw new Error('NO_SERVER_CONNECTED')
     }
-    
-    const url = `${this.baseUrl}/api${endpoint}`
+
+    const url = `${this.baseUrl}${endpoint}`
     
     // Enhanced CORS configuration
     const fetchOptions: RequestInit = {
@@ -397,7 +407,14 @@ class ApiClient {
 
   // Real-time updates via Server-Sent Events
   createEventSource(endpoint: string): EventSource {
-    return new EventSource(`${this.baseUrl}/api${endpoint}`)
+    return new EventSource(`${this.baseUrl}${endpoint}`)
+  }
+
+  // Fetch the project context store (a.k.a. "memories"). Pairs with
+  // getAllData() above, which already covers it but may 404 on
+  // backends that don't implement the bulk endpoint.
+  async getContextData(): Promise<any[]> {
+    return this.request<any[]>('/context-data').catch(() => [])
   }
 
   // Utility methods
@@ -411,7 +428,7 @@ class ApiClient {
       console.log(`Testing CORS connection to: ${this.baseUrl}`)
       
       // Try a simple OPTIONS request first
-      const optionsResponse = await fetch(`${this.baseUrl}/api/health`, {
+      const optionsResponse = await fetch(`${this.baseUrl}/health`, {
         method: 'OPTIONS',
         headers: {
           'Access-Control-Request-Method': 'GET',
