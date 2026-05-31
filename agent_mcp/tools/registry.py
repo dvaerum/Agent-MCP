@@ -6,6 +6,9 @@ import mcp.types as mcp_types # Assuming this is the correct import for your mcp
 from ..utils.json_utils import sanitize_json_input, get_sanitized_json_body
 # Import the central logger
 from ..core.config import logger
+# Typed auth-failure exception from the decorator surface; the
+# dispatcher catches it explicitly so the audit log line is uniform.
+from ..core.authorize import AuthRejected
 
 # Tool implementations will be imported here once they are created.
 # For now, we'll define placeholders for the functions they will call.
@@ -459,9 +462,31 @@ async def dispatch_tool_call(
             # auth-failure shape and raise so the framework's
             # exception path sets isError=True (and JSON-RPC clients
             # can see the failure at the protocol level).
+            #
+            # Remaining call-sites that still return text on auth
+            # failure are migrating to `@requires` / `@requires_policy`
+            # decorators (which raise `AuthRejected` directly); this
+            # shim stays until the last legacy tool is converted, then
+            # gets deleted in the cleanup commit.
             _raise_if_auth_failure(tool_name, result)
 
             return result
+
+        except AuthRejected as e:
+            # Decorator-raised auth failure (architecture review
+            # 2026-06-01 candidate A). Re-raise so the MCP framework's
+            # `_make_error_result` (`mcp/server/lowlevel/server.py:584`)
+            # turns it into a `CallToolResult` with `isError=True` and
+            # `text="Unauthorized: <reason>"`. We don't catch + return
+            # here because the framework already does the right thing
+            # with exceptions; this stanza exists for the type to be
+            # visible at the dispatch boundary and to give us a clean
+            # hook if we ever need to log/audit auth failures
+            # uniformly.
+            logger.info(
+                f"Tool '{tool_name}' auth-rejected: {e.reason}"
+            )
+            raise
 
         except ToolInputValidationError as e:
             # Caller-error path; logged at info level (not a server
