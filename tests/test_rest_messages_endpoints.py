@@ -290,3 +290,92 @@ def test_patch_messages_rejects_bad_token(client) -> None:
         "token": "x" * 32, "read": True
     })
     assert r.status_code == 403, r.text
+
+
+# ---------- DELETE /api/messages/<id> ---------------------------
+# The Messages tab needs row-level delete + bulk delete from a
+# selection toolbar. We expose a thin DELETE endpoint that wraps the
+# existing admin-only message housekeeping path.
+
+
+def test_delete_messages_removes_row(client) -> None:
+    admin = _admin(client)
+    _seed_worker("alice")
+    posted = client.post("/api/messages", json={
+        "token": admin, "recipient_id": "alice", "message_content": "delete me"
+    }).json()
+    msg_id = posted["message_id"]
+
+    r = client.request("DELETE", f"/api/messages/{msg_id}", json={
+        "token": admin,
+    })
+    assert r.status_code == 200, r.text
+    assert r.json().get("success") is True
+
+    listing = client.post("/api/messages/query", json={"token": admin}).json()
+    ids = [m["message_id"] for m in listing["messages"]]
+    assert msg_id not in ids, (
+        "deleted message_id should no longer appear in /api/messages/query"
+    )
+
+
+def test_delete_messages_404_on_unknown_id(client) -> None:
+    admin = _admin(client)
+    r = client.request("DELETE", "/api/messages/msg_doesnotexist", json={
+        "token": admin,
+    })
+    assert r.status_code == 404, r.text
+
+
+def test_delete_messages_rejects_bad_token(client) -> None:
+    admin = _admin(client)
+    _seed_worker("alice")
+    posted = client.post("/api/messages", json={
+        "token": admin, "recipient_id": "alice", "message_content": "hi"
+    }).json()
+    r = client.request("DELETE", f"/api/messages/{posted['message_id']}", json={
+        "token": "x" * 32,
+    })
+    assert r.status_code == 403, r.text
+
+
+# ---------- Broadcast via POST /api/messages -------------------
+# The dashboard Compose form needs a "(broadcast to all workers)" option.
+# We extend POST /api/messages to accept recipient_id="*" and fan out to
+# every active worker (admin excluded), mirroring the broadcast_message
+# admin MCP tool. Returns sent_count instead of a single message_id.
+
+
+def test_post_messages_broadcast_fans_out_to_workers(client) -> None:
+    admin = _admin(client)
+    _seed_worker("alice")
+    _seed_worker("bob")
+
+    r = client.post("/api/messages", json={
+        "token": admin,
+        "recipient_id": "*",
+        "message_content": "hello everyone",
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body.get("success") is True, body
+    assert body.get("broadcast") is True, body
+    assert body.get("sent_count", 0) >= 2, body
+
+    listing = client.post("/api/messages/query", json={"token": admin}).json()
+    recipients = {m["recipient_id"] for m in listing["messages"]
+                  if m["message_content"] == "hello everyone"}
+    assert "alice" in recipients, recipients
+    assert "bob" in recipients, recipients
+    # Admin must not receive its own broadcast.
+    assert "admin" not in recipients, recipients
+
+
+def test_post_messages_broadcast_rejects_bad_token(client) -> None:
+    _seed_worker("alice")
+    r = client.post("/api/messages", json={
+        "token": "x" * 32,
+        "recipient_id": "*",
+        "message_content": "nope",
+    })
+    assert r.status_code == 403, r.text

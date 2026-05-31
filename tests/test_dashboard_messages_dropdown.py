@@ -70,3 +70,101 @@ def test_listing_uses_post_query_not_get() -> None:
         "expected the GET-with-empty-suffix call to be removed; it was "
         "the original bug (browsers strip GET bodies)"
     )
+
+
+# ---------- Filter dropdowns (from / to) -----------------------
+# The original Filters card used <Input> text boxes for "from" and "to".
+# Dennis asked for dropdowns populated from /api/agents so admins can
+# pick known sender/recipient ids without typing.
+
+
+def test_from_filter_uses_select_not_input() -> None:
+    src = _read("components/dashboard/messages-dashboard.tsx")
+    # Free-text Input for from/to must be gone.
+    assert 'placeholder="from (sender_id)"' not in src, (
+        "from-filter still uses an <Input> with the old placeholder"
+    )
+    # The replacement Select must reference the filters.from state.
+    assert "filters.from" in src and "filters.to" in src, (
+        "expected the from/to filter state names to remain"
+    )
+
+
+def test_to_filter_uses_select_not_input() -> None:
+    src = _read("components/dashboard/messages-dashboard.tsx")
+    assert 'placeholder="to (recipient_id)"' not in src, (
+        "to-filter still uses an <Input> with the old placeholder"
+    )
+
+
+def test_filter_dropdowns_have_any_sender_recipient_options() -> None:
+    src = _read("components/dashboard/messages-dashboard.tsx")
+    # Must include an "any sender" / "any recipient" sentinel option so
+    # the dropdowns can clear the filter — same __all pattern used for
+    # type/priority/read filters.
+    assert "any sender" in src.lower(), (
+        "expected from filter to expose an 'any sender' option"
+    )
+    assert "any recipient" in src.lower(), (
+        "expected to filter to expose an 'any recipient' option"
+    )
+
+
+# ---------- Compose: broadcast option --------------------------
+
+
+def test_compose_recipient_includes_broadcast_option() -> None:
+    src = _read("components/dashboard/messages-dashboard.tsx")
+    # Broadcast is wired via recipient_id="*" — the API sentinel.
+    assert '"*"' in src or "'*'" in src, (
+        "expected a recipient_id='*' broadcast option in Compose"
+    )
+    assert "broadcast" in src.lower(), (
+        "expected the Compose recipient dropdown to mention broadcast"
+    )
+
+
+# ---------- Bulk selection toolbar -----------------------------
+
+
+def test_table_has_select_all_checkbox() -> None:
+    src = _read("components/dashboard/messages-dashboard.tsx")
+    # Header checkbox toggles every currently-rendered (filtered) row.
+    # We're text-parsing, so look for the structural marker rather than
+    # the visual one.
+    assert "selectAllVisible" in src or "toggleAllVisible" in src, (
+        "expected a select-all-visible handler in the table header"
+    )
+
+
+def test_table_has_per_row_checkbox() -> None:
+    src = _read("components/dashboard/messages-dashboard.tsx")
+    assert "selectedIds" in src, (
+        "expected selectedIds state to track per-row checkbox selection"
+    )
+
+
+def test_bulk_actions_toolbar_present_when_selected() -> None:
+    src = _read("components/dashboard/messages-dashboard.tsx")
+    # Toolbar buttons: mark read / mark unread / delete.
+    assert "Mark read" in src, "missing 'Mark read' bulk action button"
+    assert "Mark unread" in src, "missing 'Mark unread' bulk action button"
+    assert "Delete" in src, "missing 'Delete' bulk action button"
+
+
+def test_bulk_delete_calls_delete_endpoint() -> None:
+    src = _read("components/dashboard/messages-dashboard.tsx")
+    # callMessages must support the new DELETE verb.
+    assert '"DELETE"' in src or "'DELETE'" in src, (
+        "expected the component to issue DELETE /api/messages/<id> for "
+        "bulk + row-level delete"
+    )
+
+
+def test_row_has_inline_delete_button() -> None:
+    src = _read("components/dashboard/messages-dashboard.tsx")
+    # Lucide Trash2 icon is the convention used elsewhere in the
+    # dashboard for delete affordances.
+    assert "Trash2" in src or "Trash " in src or 'icon="trash"' in src, (
+        "expected a Trash2 icon import for the per-row delete button"
+    )
