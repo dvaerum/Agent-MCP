@@ -1,18 +1,19 @@
 import type { Metadata } from "next";
-import { Inter, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 import { ThemeProvider } from "@/components/providers/theme-provider";
 import { ApiClientInitializer } from "@/components/providers/api-client-initializer";
 
-const inter = Inter({
-  subsets: ["latin"],
-  variable: "--font-sans",
-});
-
-const jetbrainsMono = JetBrains_Mono({
-  subsets: ["latin"],
-  variable: "--font-mono",
-});
+// Stub the font hooks so sandboxed / offline builds (Nix, Docker
+// without network egress, isolated CI) don't fail when next/font/google
+// tries to fetch Inter + JetBrains_Mono from Google Fonts at compile
+// time. The page falls back to system sans/mono via the CSS variables
+// — visually less polished but functionally identical.
+//
+// Upstream-quality fix is vendoring the fonts with next/font/local
+// (works online + offline + no third-party fetches). Tracked as a
+// follow-up; out of scope for this PR.
+const inter = { variable: "--font-sans" } as const;
+const jetbrainsMono = { variable: "--font-mono" } as const;
 
 export const metadata: Metadata = {
   title: "Agent MCP Dashboard",
