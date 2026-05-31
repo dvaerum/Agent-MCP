@@ -92,7 +92,7 @@ export function ServerConnection() {
                         <div>
                           <h4 className="font-medium text-foreground">{server.name}</h4>
                           <p className="text-sm text-muted-foreground">
-                            {server.host}:{server.port}
+                            {server.baseUrl ?? `${server.host}:${server.port}`}
                           </p>
                         </div>
                       </div>
@@ -148,7 +148,7 @@ export function ServerConnection() {
                         <div>
                           <h4 className="font-medium text-foreground">{server.name}</h4>
                           <p className="text-sm text-muted-foreground">
-                            {server.host}:{server.port}
+                            {server.baseUrl ?? `${server.host}:${server.port}`}
                           </p>
                         </div>
                       </div>
