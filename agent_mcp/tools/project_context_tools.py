@@ -43,7 +43,7 @@ from ..core.config import logger
 from ..core import globals as g  # Not directly used here, but auth uses it
 from ..core.auth import get_agent_id, verify_token
 from ..utils.audit_utils import log_audit
-from ..db.connection import get_db_connection, execute_db_write
+from ..db.connection import get_db_connection
 from ..db.engine import SessionLocal, get_session
 from ..db.models import ProjectContext
 from ..db.actions.agent_actions_db import log_agent_action_to_db
@@ -543,18 +543,75 @@ async def view_project_context_tool_impl(
 
 
 # --- update_project_context tool ---
-# Original logic from main.py: lines 1468-1500 (update_project_context_tool function)
-class _UnauthorizedWrite(Exception):
-    """Raised inside a write_operation when the ownership check fails.
+def _single_update_inline(
+    requesting_agent_id: str,
+    context_key_to_update: str,
+    value_json_str: str,
+    description_for_context: Optional[str],
+    *,
+    is_admin: bool,
+) -> Optional[str]:
+    """Sync single-update body — returns an error message or None.
 
-    Carries the user-facing message so the outer caller can return it
-    verbatim. Using an exception rather than a sentinel return makes the
-    rollback flow in the SQLAlchemy try/except branch trivial.
+    Inline (not queued) for the same reason as the bulk path: tests +
+    test-style entry points run tools on ad-hoc asyncio loops and
+    deadlock when the body posts into the lifespan write queue.
+    SQLAlchemy + SQLite WAL handles the actual write serialization.
     """
+    session = SessionLocal()
+    try:
+        err = _check_write_authorization(
+            session,
+            requesting_agent_id,
+            context_key_to_update,
+            is_admin=is_admin,
+        )
+        if err is not None:
+            session.rollback()
+            return err
 
-    def __init__(self, message: str) -> None:
-        super().__init__(message)
-        self.user_message = message
+        now_iso = datetime.datetime.now().isoformat()
+
+        existing = (
+            session.query(ProjectContext)
+            .filter(ProjectContext.context_key == context_key_to_update)
+            .one_or_none()
+        )
+        if existing is None:
+            session.add(
+                ProjectContext(
+                    context_key=context_key_to_update,
+                    value=value_json_str,
+                    description=description_for_context,
+                    created_at=now_iso,
+                    created_by=requesting_agent_id,
+                    updated_at=now_iso,
+                    updated_by=requesting_agent_id,
+                )
+            )
+        else:
+            existing.value = value_json_str
+            existing.updated_at = now_iso
+            existing.updated_by = requesting_agent_id
+            existing.description = description_for_context
+            # created_at / created_by stay frozen on UPDATE
+
+        raw_conn = session.connection().connection
+        cursor = raw_conn.cursor()
+        log_agent_action_to_db(
+            cursor,
+            requesting_agent_id,
+            "updated_context",
+            details={"context_key": context_key_to_update, "action": "set/update"},
+        )
+
+        session.commit()
+        logger.info(
+            f"Project context for key '{context_key_to_update}' updated by '{requesting_agent_id}'."
+        )
+        return None
+    finally:
+        session.close()
 
 
 async def _handle_single_context_update(
@@ -572,7 +629,6 @@ async def _handle_single_context_update(
     On insert, stamps `created_at` / `created_by`; on update, leaves
     those untouched and refreshes `updated_at` / `updated_by`.
     """
-    # Log audit
     log_audit(
         requesting_agent_id,
         "update_project_context",
@@ -584,7 +640,6 @@ async def _handle_single_context_update(
     )
 
     try:
-        # Ensure value is JSON serializable before storing
         value_json_str = json.dumps(context_value_to_set)
     except TypeError as e_type:
         logger.error(
@@ -597,108 +652,43 @@ async def _handle_single_context_update(
             )
         ]
 
-    # Define the write operation as an async function
-    async def write_operation():
-        session = SessionLocal()
-        try:
-            err = _check_write_authorization(
-                session,
-                requesting_agent_id,
-                context_key_to_update,
-                is_admin=is_admin,
-            )
-            if err is not None:
-                raise _UnauthorizedWrite(err)
-
-            now_iso = datetime.datetime.now().isoformat()
-
-            existing = (
-                session.query(ProjectContext)
-                .filter(ProjectContext.context_key == context_key_to_update)
-                .one_or_none()
-            )
-            if existing is None:
-                session.add(
-                    ProjectContext(
-                        context_key=context_key_to_update,
-                        value=value_json_str,
-                        description=description_for_context,
-                        created_at=now_iso,
-                        created_by=requesting_agent_id,
-                        updated_at=now_iso,
-                        updated_by=requesting_agent_id,
-                    )
-                )
-            else:
-                existing.value = value_json_str
-                existing.updated_at = now_iso
-                existing.updated_by = requesting_agent_id
-                existing.description = description_for_context
-                # created_at / created_by stay frozen on UPDATE
-
-            # Log to agent_actions table — still raw SQL for now
-            # (Phase 7j will migrate agent_actions). Reuse the existing
-            # ORM session's raw connection so the action lives in the
-            # same transaction as the project_context write.
-            raw_conn = session.connection().connection
-            cursor = raw_conn.cursor()
-            log_agent_action_to_db(
-                cursor,
-                requesting_agent_id,
-                "updated_context",
-                details={"context_key": context_key_to_update, "action": "set/update"},
-            )
-
-            session.commit()
-
-            logger.info(
-                f"Project context for key '{context_key_to_update}' updated by '{requesting_agent_id}'."
-            )
-            return "success"
-
-        except _UnauthorizedWrite:
-            session.rollback()
-            raise
-        except SQLAlchemyError as e_sql:
-            session.rollback()
-            logger.error(
-                f"Database error updating project context for key '{context_key_to_update}': {e_sql}",
-                exc_info=True,
-            )
-            raise e_sql
-        except Exception as e:
-            session.rollback()
-            logger.error(
-                f"Unexpected error updating project context for key '{context_key_to_update}': {e}",
-                exc_info=True,
-            )
-            raise e
-        finally:
-            session.close()
-
-    # Execute the write operation through the queue
     try:
-        await execute_db_write(write_operation)
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text=f"Project context updated successfully for key '{context_key_to_update}'.",
-            )
-        ]
-    except _UnauthorizedWrite as e_auth:
-        return [mcp_types.TextContent(type="text", text=e_auth.user_message)]
+        err = _single_update_inline(
+            requesting_agent_id,
+            context_key_to_update,
+            value_json_str,
+            description_for_context,
+            is_admin=is_admin,
+        )
     except (sqlite3.Error, SQLAlchemyError) as e_sql:
+        logger.error(
+            f"Database error updating project context for key '{context_key_to_update}': {e_sql}",
+            exc_info=True,
+        )
         return [
             mcp_types.TextContent(
                 type="text", text=f"Database error updating project context: {e_sql}"
             )
         ]
     except Exception as e:
+        logger.error(
+            f"Unexpected error updating project context for key '{context_key_to_update}': {e}",
+            exc_info=True,
+        )
         return [
             mcp_types.TextContent(
                 type="text", text=f"Unexpected error updating project context: {e}"
             )
         ]
+
+    if err is not None:
+        return [mcp_types.TextContent(type="text", text=err)]
+    return [
+        mcp_types.TextContent(
+            type="text",
+            text=f"Project context updated successfully for key '{context_key_to_update}'.",
+        )
+    ]
 
 
 async def _handle_bulk_context_update(
@@ -712,156 +702,37 @@ async def _handle_bulk_context_update(
     Phase 7b: every entry is authorized before any write lands. If a
     single entry fails the ownership check, the whole batch rolls back
     and the caller receives the specific error message.
+
+    Routes through the shared inline helper for the same loop-affinity
+    reason described in `bulk_update_project_context_tool_impl`.
     """
-    # Log audit
     log_audit(
         requesting_agent_id,
         "bulk_update_project_context",
         {"update_count": len(updates_list)},
     )
 
-    # Define the write operation as an async function
-    async def write_operation():
-        session = SessionLocal()
-        results: List[str] = []
-        failed_updates: List[str] = []
-
-        try:
-            # Phase 1 — authorize every key up front. Any failure here
-            # rolls back the open transaction (the session itself hasn't
-            # written yet, but a SELECT in _check_write_authorization
-            # has opened one).
-            for upd in updates_list:
-                key = upd.get("context_key")
-                if not key:
-                    continue
-                err = _check_write_authorization(
-                    session, requesting_agent_id, key, is_admin=is_admin
-                )
-                if err is not None:
-                    raise _UnauthorizedWrite(err)
-
-            now_iso = datetime.datetime.now().isoformat()
-            raw_conn = session.connection().connection
-            cursor = raw_conn.cursor()
-
-            # Phase 2 — apply each update. JSON-encoding failures are
-            # per-entry soft errors (legacy behavior); ownership errors
-            # have already been excluded in phase 1 and would abort.
-            for i, update in enumerate(updates_list):
-                try:
-                    context_key = update["context_key"]
-                    context_value = update["context_value"]
-                    description = update.get(
-                        "description", f"Bulk update operation {i+1}"
-                    )
-
-                    # Validate JSON serialization
-                    value_json_str = json.dumps(context_value)
-
-                    existing = (
-                        session.query(ProjectContext)
-                        .filter(ProjectContext.context_key == context_key)
-                        .one_or_none()
-                    )
-                    if existing is None:
-                        session.add(
-                            ProjectContext(
-                                context_key=context_key,
-                                value=value_json_str,
-                                description=description,
-                                created_at=now_iso,
-                                created_by=requesting_agent_id,
-                                updated_at=now_iso,
-                                updated_by=requesting_agent_id,
-                            )
-                        )
-                    else:
-                        existing.value = value_json_str
-                        existing.updated_at = now_iso
-                        existing.updated_by = requesting_agent_id
-                        existing.description = description
-
-                    # Flush so the row hits the connection before we
-                    # log the agent_actions row that references it.
-                    session.flush()
-
-                    results.append(f"✓ Updated '{context_key}'")
-
-                    # Log individual action
-                    log_agent_action_to_db(
-                        cursor,
-                        requesting_agent_id,
-                        "bulk_updated_context",
-                        details={
-                            "context_key": context_key,
-                            "operation": f"bulk_update_{i+1}",
-                        },
-                    )
-
-                except (TypeError, json.JSONEncodeError) as e_json:
-                    failed_updates.append(
-                        f"✗ Failed '{update.get('context_key', 'unknown')}': Invalid JSON - {e_json}"
-                    )
-                except Exception as e_update:
-                    failed_updates.append(
-                        f"✗ Failed '{update.get('context_key', 'unknown')}': {str(e_update)}"
-                    )
-
-            session.commit()
-
-            # Build response
-            response_parts = [
-                f"Bulk update completed: {len(results)} successful, {len(failed_updates)} failed"
-            ]
-
-            if results:
-                response_parts.append("\nSuccessful updates:")
-                response_parts.extend(results)
-
-            if failed_updates:
-                response_parts.append("\nFailed updates:")
-                response_parts.extend(failed_updates)
-
-            logger.info(
-                f"Bulk context update by '{requesting_agent_id}': {len(results)} successful, {len(failed_updates)} failed."
-            )
-            return response_parts
-
-        except _UnauthorizedWrite:
-            session.rollback()
-            raise
-        except SQLAlchemyError as e_sql:
-            session.rollback()
-            logger.error(
-                f"Database error in bulk context update: {e_sql}", exc_info=True
-            )
-            raise e_sql
-        except Exception as e:
-            session.rollback()
-            logger.error(f"Unexpected error in bulk context update: {e}", exc_info=True)
-            raise e
-        finally:
-            session.close()
-
-    # Execute the write operation through the queue
     try:
-        response_parts = await execute_db_write(write_operation)
-        return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
-    except _UnauthorizedWrite as e_auth:
-        return [mcp_types.TextContent(type="text", text=e_auth.user_message)]
+        err, response_parts = _bulk_update_inline(
+            requesting_agent_id, updates_list, is_admin=is_admin
+        )
     except (sqlite3.Error, SQLAlchemyError) as e_sql:
+        logger.error(f"Database error in bulk context update: {e_sql}", exc_info=True)
         return [
             mcp_types.TextContent(
                 type="text", text=f"Database error in bulk update: {e_sql}"
             )
         ]
     except Exception as e:
+        logger.error(f"Unexpected error in bulk context update: {e}", exc_info=True)
         return [
             mcp_types.TextContent(
                 type="text", text=f"Unexpected error in bulk update: {e}"
             )
         ]
+    if err is not None:
+        return [mcp_types.TextContent(type="text", text=err)]
+    return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
 
 
 async def update_project_context_tool_impl(
@@ -918,17 +789,130 @@ async def update_project_context_tool_impl(
 
 
 # --- bulk_update_project_context tool ---
+def _bulk_update_inline(
+    requesting_agent_id: str,
+    updates_list: List[Dict[str, Any]],
+    *,
+    is_admin: bool,
+) -> Tuple[Optional[str], List[str]]:
+    """Sync bulk-update body shared by the queued + inline entry points.
+
+    Returns (error_message, response_parts). On the unauthorized path
+    the error_message is non-None and response_parts is empty. On the
+    success path error_message is None and response_parts is the
+    rendered per-entry summary.
+
+    Both `_handle_bulk_context_update` (queued) and the standalone
+    `bulk_update_project_context_tool_impl` (inline) call this so the
+    ownership rules + atomicity can't drift between the two surfaces.
+    """
+    session = SessionLocal()
+    results: List[str] = []
+    failed_updates: List[str] = []
+    try:
+        # Phase 1 — authorize every key up front.
+        for upd in updates_list:
+            key = upd.get("context_key")
+            if not key:
+                continue
+            err = _check_write_authorization(
+                session, requesting_agent_id, key, is_admin=is_admin
+            )
+            if err is not None:
+                session.rollback()
+                return err, []
+
+        now_iso = datetime.datetime.now().isoformat()
+        raw_conn = session.connection().connection
+        cursor = raw_conn.cursor()
+
+        # Phase 2 — apply each update.
+        for i, update in enumerate(updates_list):
+            try:
+                context_key = update["context_key"]
+                context_value = update["context_value"]
+                description = update.get(
+                    "description", f"Bulk update operation {i+1}"
+                )
+
+                value_json_str = json.dumps(context_value)
+
+                existing = (
+                    session.query(ProjectContext)
+                    .filter(ProjectContext.context_key == context_key)
+                    .one_or_none()
+                )
+                if existing is None:
+                    session.add(
+                        ProjectContext(
+                            context_key=context_key,
+                            value=value_json_str,
+                            description=description,
+                            created_at=now_iso,
+                            created_by=requesting_agent_id,
+                            updated_at=now_iso,
+                            updated_by=requesting_agent_id,
+                        )
+                    )
+                else:
+                    existing.value = value_json_str
+                    existing.updated_at = now_iso
+                    existing.updated_by = requesting_agent_id
+                    existing.description = description
+
+                session.flush()
+                results.append(f"✓ Updated '{context_key}'")
+
+                log_agent_action_to_db(
+                    cursor,
+                    requesting_agent_id,
+                    "bulk_updated_context",
+                    details={
+                        "context_key": context_key,
+                        "operation": f"bulk_update_{i+1}",
+                    },
+                )
+
+            except (TypeError, json.JSONEncodeError) as e_json:
+                failed_updates.append(
+                    f"✗ Failed '{update.get('context_key', 'unknown')}': Invalid JSON - {e_json}"
+                )
+            except Exception as e_update:
+                failed_updates.append(
+                    f"✗ Failed '{update.get('context_key', 'unknown')}': {str(e_update)}"
+                )
+
+        session.commit()
+
+        response_parts = [
+            f"Bulk update completed: {len(results)} successful, {len(failed_updates)} failed"
+        ]
+        if results:
+            response_parts.append("\nSuccessful updates:")
+            response_parts.extend(results)
+        if failed_updates:
+            response_parts.append("\nFailed updates:")
+            response_parts.extend(failed_updates)
+        logger.info(
+            f"Bulk context update by '{requesting_agent_id}': {len(results)} successful, {len(failed_updates)} failed."
+        )
+        return None, response_parts
+    finally:
+        session.close()
+
+
 async def bulk_update_project_context_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
-    """Public-facing bulk-update entry point.
+    """Public-facing bulk-update entry point (inline, no write queue).
 
-    Delegates to the shared `_handle_bulk_context_update` so the
-    queue-aware code path and this surface stay in lockstep on ownership
-    rules + atomicity. Earlier versions of this file had a separate
-    inline implementation that drifted from the queued path; the Phase
-    7b ownership rules made that drift dangerous (it bypassed auth),
-    so we now route everything through one helper.
+    The MCP framework dispatcher runs tools on arbitrary asyncio loops
+    (including ad-hoc loops created by `asyncio.run` in test/CLI
+    contexts). Routing through the lifespan write queue from a
+    different loop deadlocks — so this surface does its writes inline
+    via a SQLAlchemy session, sharing the ownership + atomicity logic
+    with the queued surface (`_handle_bulk_context_update`) through
+    `_bulk_update_inline`.
     """
     auth_token = arguments.get("token")
     updates = arguments.get("updates", [])  # List of update operations
@@ -969,10 +953,32 @@ async def bulk_update_project_context_tool_impl(
                 )
             ]
 
-    is_admin = verify_token(auth_token, "admin")
-    return await _handle_bulk_context_update(
-        requesting_agent_id, updates, is_admin=is_admin
+    log_audit(
+        requesting_agent_id,
+        "bulk_update_project_context",
+        {"update_count": len(updates)},
     )
+
+    is_admin = verify_token(auth_token, "admin")
+    try:
+        err, response_parts = _bulk_update_inline(
+            requesting_agent_id, updates, is_admin=is_admin
+        )
+    except (sqlite3.Error, SQLAlchemyError) as e_sql:
+        return [
+            mcp_types.TextContent(
+                type="text", text=f"Database error in bulk update: {e_sql}"
+            )
+        ]
+    except Exception as e:
+        return [
+            mcp_types.TextContent(
+                type="text", text=f"Unexpected error in bulk update: {e}"
+            )
+        ]
+    if err is not None:
+        return [mcp_types.TextContent(type="text", text=err)]
+    return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
 
 
 # --- backup_project_context tool ---
