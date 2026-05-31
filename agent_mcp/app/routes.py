@@ -134,18 +134,35 @@ async def node_details_api_route(request: Request) -> JSONResponse:
     return JSONResponse(details)
 
 async def agents_list_api_route(request: Request) -> JSONResponse:
-    # // ... (implementation from previous response)
+    # GET /api/agents[?status=<status>]
+    #
+    # Without a `status` query param, returns every agent row plus the
+    # synthetic "Admin" row used by the dashboard graph (back-compat).
+    #
+    # With `status=<value>`, returns only agent rows whose status
+    # matches exactly. The synthetic Admin row (status='system') is
+    # also filtered out — only rows whose status equals the filter
+    # value survive. This shape replaces the router's `list_agents`
+    # synthetic tool (Phase 7c, Q7.2 in plan).
+    status_filter: Optional[str] = request.query_params.get('status')
     agents_list_data: List[Dict[str, Any]] = []
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        admin_style = get_node_style('admin')
-        agents_list_data.append({
-            'agent_id': 'Admin', 'status': 'system', 'color': admin_style.get('color', '#607D8B'),
-            'created_at': 'N/A', 'current_task': 'N/A'
-        })
-        cursor.execute("SELECT agent_id, status, color, created_at, current_task FROM agents ORDER BY created_at DESC")
+        if status_filter is None:
+            admin_style = get_node_style('admin')
+            agents_list_data.append({
+                'agent_id': 'Admin', 'status': 'system', 'color': admin_style.get('color', '#607D8B'),
+                'created_at': 'N/A', 'current_task': 'N/A'
+            })
+            cursor.execute("SELECT agent_id, status, color, created_at, current_task FROM agents ORDER BY created_at DESC")
+        else:
+            cursor.execute(
+                "SELECT agent_id, status, color, created_at, current_task "
+                "FROM agents WHERE status = ? ORDER BY created_at DESC",
+                (status_filter,),
+            )
         for row in cursor.fetchall(): agents_list_data.append(dict(row))
     except Exception as e:
         logger.error(f"Error fetching agents list: {e}", exc_info=True)
@@ -185,12 +202,42 @@ async def tokens_api_route(request: Request) -> JSONResponse:
         return JSONResponse({"error": f"Error retrieving tokens: {str(e)}"}, status_code=500)
 
 async def all_tasks_api_route(request: Request) -> JSONResponse:
-    # // ... (implementation from previous response)
+    # GET /api/tasks[?assigned_to=<agent_id>][?unassigned=true]
+    #
+    # Default (no query params): returns every task row (back-compat
+    # with the existing dashboard listing).
+    #
+    # `?assigned_to=<agent_id>` filters to tasks whose assigned_to
+    # column matches exactly. Replaces the router's `list_tasks_for`
+    # synthetic.
+    #
+    # `?unassigned=true` filters to tasks with assigned_to IS NULL.
+    # Replaces the router's `list_unassigned_tasks` synthetic. If both
+    # params are supplied, `unassigned=true` wins (mutually exclusive
+    # by nature — IS NULL never matches a literal agent_id).
+    #
+    # Phase 7c, Q7.2 in plan.
+    assigned_to_filter: Optional[str] = request.query_params.get('assigned_to')
+    unassigned_raw = request.query_params.get('unassigned', '')
+    unassigned_filter: bool = unassigned_raw.lower() in ('true', '1', 'yes')
+
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM tasks ORDER BY created_at DESC")
+        if unassigned_filter:
+            cursor.execute(
+                "SELECT * FROM tasks WHERE assigned_to IS NULL "
+                "ORDER BY created_at DESC"
+            )
+        elif assigned_to_filter is not None:
+            cursor.execute(
+                "SELECT * FROM tasks WHERE assigned_to = ? "
+                "ORDER BY created_at DESC",
+                (assigned_to_filter,),
+            )
+        else:
+            cursor.execute("SELECT * FROM tasks ORDER BY created_at DESC")
         tasks_data = [dict(row) for row in cursor.fetchall()]
         return JSONResponse(tasks_data)
     except Exception as e:
