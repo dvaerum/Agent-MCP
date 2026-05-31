@@ -125,6 +125,16 @@ def get_admin_token_from_db(project_dir: str) -> Optional[str]:
     help="Port to listen on for SSE and HTTP dashboard.",
 )
 @click.option(
+    "--uds",
+    type=str,
+    default=None,
+    help=(
+        "Unix domain socket path. When set, the server listens on this "
+        "socket instead of host:port (SSE transport only). Useful for "
+        "reverse-proxy deployments that want to avoid exposing TCP."
+    ),
+)
+@click.option(
     "--transport",
     type=click.Choice(["stdio", "sse"], case_sensitive=False),
     default="sse",
@@ -178,6 +188,7 @@ def get_admin_token_from_db(project_dir: str) -> Optional[str]:
 )
 def main_cli(
     port: int,
+    uds: Optional[str],
     transport: str,
     project_dir: str,
     admin_token_cli: Optional[str],
@@ -490,14 +501,21 @@ def main_cli(
         # Uvicorn configuration
         # log_config=None prevents Uvicorn from overriding our logging setup from config.py
         # (Original main.py:2630)
-        uvicorn_config = uvicorn.Config(
-            starlette_app,
-            host="0.0.0.0",  # Listen on all available interfaces
-            port=port,
+        # When --uds is set, bind a Unix domain socket instead of a TCP
+        # host:port. Useful for reverse-proxy deployments where the
+        # proxy speaks to the backend over a UDS and never exposes it
+        # to the network.
+        _uvicorn_kwargs: dict = dict(
             log_config=None,  # Use our custom logging setup
             access_log=False,  # Disable access logs
             lifespan="on",  # Ensure Starlette's on_startup/on_shutdown are used
         )
+        if uds:
+            _uvicorn_kwargs["uds"] = uds
+        else:
+            _uvicorn_kwargs["host"] = "0.0.0.0"
+            _uvicorn_kwargs["port"] = port
+        uvicorn_config = uvicorn.Config(starlette_app, **_uvicorn_kwargs)
         server = uvicorn.Server(uvicorn_config)
 
         # Run Uvicorn server with background tasks managed by an AnyIO task group
