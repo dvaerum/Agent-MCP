@@ -113,7 +113,22 @@ async def list_available_tools() -> List[mcp_types.Tool]:
 # required" / "Invalid token" instead of raising; the MCP framework
 # then sets isError=False, hiding the failure from naive clients.
 # This regex catches the common shapes used across the codebase.
+import contextvars as _cv
 import re as _re
+
+# Q6e: Authorization: Bearer header fallback. A Starlette middleware
+# (registered in main_app.py) captures the bearer from the HTTP
+# request into this contextvar; dispatch_tool_call reads from it
+# when `arguments.token` is missing. Lets HTTP MCP clients
+# (e.g. Claude Code with `claude mcp add --header`) authenticate via
+# standard bearer auth without the router needing to byte-rewrite
+# the JSON-RPC body.
+#
+# Default None means "no header was sent on this request"; an empty
+# string would also be treated as missing.
+request_auth_token: _cv.ContextVar = _cv.ContextVar(
+    "request_auth_token", default=None
+)
 
 _AUTH_FAILURE_RE = _re.compile(
     r"^\s*(unauthor(?:ized|ised)|invalid (?:admin |agent |auth |worker )?token)",
@@ -246,6 +261,14 @@ async def dispatch_tool_call(
             # Example: if tool_name == "create_agent":
             #   return await create_agent_tool_impl(sanitized_arguments)
             # This is handled by the dict lookup now.
+
+            # Q6e: inject token from the Authorization-header contextvar
+            # when the caller didn't put one in arguments. Explicit
+            # arguments.token always wins (no silent override).
+            if "token" not in sanitized_arguments or not sanitized_arguments.get("token"):
+                header_token = request_auth_token.get()
+                if header_token:
+                    sanitized_arguments = {**sanitized_arguments, "token": header_token}
 
             result = await implementation_func(sanitized_arguments)
 
