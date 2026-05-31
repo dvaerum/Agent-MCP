@@ -110,12 +110,11 @@ def test_worker_cannot_update_someone_elses_task(client) -> None:
     task_id = r.json()["task_id"]
 
     # Bob tries to update — must fail.
-    result = _call_update({
+    _call_update({
         "token": bob_token,
         "task_id": task_id,
         "status": "completed",
     })
-    text = result[0].text
     # Per-task error wrapping varies; either a top-level Unauthorized
     # or a per-task error message is acceptable. Just assert the
     # update did NOT take effect.
@@ -125,6 +124,6 @@ def test_worker_cannot_update_someone_elses_task(client) -> None:
     row = next((r for r in listing if r["task_id"] == task_id), None)
     assert row is not None
     assert row["status"] != "completed", (
-        f"bob (not assigned) successfully completed alice's task — "
-        "permission boundary broken: {text}"
+        "bob (not assigned) successfully completed alice's task — "
+        "permission boundary broken"
     )
