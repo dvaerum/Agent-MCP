@@ -1212,6 +1212,49 @@ async def assign_task_tool_impl(
 ) -> List[mcp_types.TextContent]:
     admin_auth_token = arguments.get("token")
     target_agent_token = arguments.get("agent_token")
+    target_agent_id_alias = arguments.get("agent_id")
+
+    # Admin-only `agent_id` alternative (Phase 7d). Resolves to the
+    # agent's token server-side so admins can target an agent by their
+    # human-readable name in a single call, retiring the need for the
+    # old `create_task_for` router synthetic.
+    #
+    # Precedence: if both `agent_id` and `agent_token` are supplied,
+    # `agent_token` wins and `agent_id` is silently ignored — keeps
+    # mixed-bearer setups (e.g. a worker happens to know their own
+    # agent_id) from erroring noisily.
+    #
+    # Worker bearers may NOT use `agent_id` at all; they must pass
+    # their own `agent_token`. Otherwise a worker could pass an
+    # arbitrary agent_id and impersonate the admin-side resolution
+    # path.
+    if target_agent_id_alias and not target_agent_token:
+        if not verify_token(admin_auth_token, "admin"):
+            return [
+                mcp_types.TextContent(
+                    type="text",
+                    text=(
+                        "Unauthorized: agent_id parameter is admin-only; "
+                        "workers must pass agent_token (their own token)"
+                    ),
+                )
+            ]
+        conn = get_db_connection()
+        try:
+            row = conn.execute(
+                "SELECT token FROM agents WHERE agent_id = ?",
+                (target_agent_id_alias,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return [
+                mcp_types.TextContent(
+                    type="text",
+                    text=f"Unknown agent_id: '{target_agent_id_alias}'",
+                )
+            ]
+        target_agent_token = row["token"]
 
     # Mode 1: Single task creation (existing behavior)
     task_title = arguments.get("task_title")
@@ -3677,6 +3720,15 @@ def register_task_tools():
                 "agent_token": {
                     "type": "string",
                     "description": "Agent token to assign the task(s) to (optional - if not provided, creates unassigned tasks)",
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": (
+                        "Admin-only alternative to `agent_token` — resolves "
+                        "to the agent's token server-side by name. Workers "
+                        "must use `agent_token`. Ignored (no error) when "
+                        "`agent_token` is also provided."
+                    ),
                 },
                 # Mode 1: Single task creation (existing behavior)
                 "task_title": {
