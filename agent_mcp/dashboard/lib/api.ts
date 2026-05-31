@@ -286,9 +286,67 @@ class ApiClient {
   }
 
   async terminateAgent(agentId: string): Promise<{ success: boolean; message: string }> {
-    return this.request(`/agents/${agentId}/terminate`, {
-      method: 'POST'
+    // Routes to the dashboard shim that wraps the terminate_agent admin tool.
+    const tokens = await this.getTokens()
+    return this.request('/terminate-agent', {
+      method: 'POST',
+      body: JSON.stringify({ token: tokens.admin_token, agent_id: agentId }),
     })
+  }
+
+  // Restore + Purge for terminated agents. `restoreAgent` flips the
+  // soft-delete back; `getPurgePreview` returns blast-radius counts
+  // and samples for the confirmation modal; `purgeAgent` runs the
+  // cascade tombstone + DELETE. All admin-only.
+  async restoreAgent(
+    agentId: string,
+  ): Promise<{ success: boolean; agent_id: string; status: string; message: string }> {
+    const tokens = await this.getTokens()
+    return this.request(`/agents/${encodeURIComponent(agentId)}/restore`, {
+      method: 'POST',
+      body: JSON.stringify({ token: tokens.admin_token }),
+    })
+  }
+
+  async getPurgePreview(agentId: string): Promise<{
+    agent_id: string
+    status: string
+    tombstone: string
+    counts: {
+      messages_sent: number
+      messages_received: number
+      tasks_created: number
+      tasks_assigned: number
+      agent_actions: number
+    }
+    samples: {
+      messages_sent: Array<{ content: string; timestamp: string }>
+      tasks_created: string[]
+      tasks_assigned: string[]
+    }
+  }> {
+    const tokens = await this.getTokens()
+    const qs = new URLSearchParams({ token: tokens.admin_token }).toString()
+    return this.request(
+      `/agents/${encodeURIComponent(agentId)}/purge-preview?${qs}`,
+    )
+  }
+
+  async purgeAgent(agentId: string): Promise<{
+    success: boolean
+    agent_id: string
+    tombstone: string
+    counts: Record<string, number>
+    message: string
+  }> {
+    const tokens = await this.getTokens()
+    return this.request(
+      `/agents/${encodeURIComponent(agentId)}?cascade=true`,
+      {
+        method: 'DELETE',
+        body: JSON.stringify({ token: tokens.admin_token }),
+      },
+    )
   }
 
   // Task endpoints
