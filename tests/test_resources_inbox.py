@@ -151,7 +151,7 @@ async def test_worker_cannot_read_anothers_inbox(tmp_path: Path) -> None:
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
-        bob = await admin.create_worker("bob")
+        await admin.create_worker("bob")  # registered as a recipient
 
         # admin sends a message to bob.
         await send_agent_message_tool_impl(

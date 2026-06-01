@@ -145,6 +145,89 @@ async def mcp_list_tools_handler() -> List[mcp_types.Tool]:
     return await list_available_tools()
 
 
+@mcp_app_instance.list_resources()
+async def mcp_list_resources_handler() -> List[mcp_types.Resource]:
+    """Return the per-caller inbox + status resource URIs (plan Phase 3).
+
+    Resources are scoped to the calling bearer's agent_id (admin
+    sees their own admin-scoped pair; workers see their own).
+    Cross-agent reads are rejected at `resources/read` time.
+    """
+    from ..core.auth import get_agent_id
+    from ..resources import INBOX_URI_PREFIX, STATUS_URI_PREFIX
+    from pydantic_core import Url
+
+    token = request_auth_token.get()
+    agent_id = get_agent_id(token) if token else None
+    if not agent_id:
+        # Unauthenticated callers see an empty list rather than an
+        # error — the MCP framework's `resources/list` doesn't have
+        # an "unauthorized" shape and bouncing the request hurts
+        # the client's UX more than returning a credible-but-empty
+        # catalogue. Tools/list does the same when role resolves
+        # to "anonymous".
+        return []
+    return [
+        mcp_types.Resource(
+            uri=Url(f"{INBOX_URI_PREFIX}{agent_id}"),
+            name=f"inbox/{agent_id}",
+            description=(
+                "Event timeline for this agent — pending messages, "
+                "broadcasts, and task assignments / changes. JSON "
+                "envelope: {events: [...], next_cursor: \"<iso-ts>\"}."
+            ),
+            mimeType="application/json",
+        ),
+        mcp_types.Resource(
+            uri=Url(f"{STATUS_URI_PREFIX}{agent_id}"),
+            name=f"status/{agent_id}",
+            description=(
+                "Ambient counters for this agent: "
+                "{unread_messages, unfinished_tasks, ...}."
+            ),
+            mimeType="application/json",
+        ),
+    ]
+
+
+@mcp_app_instance.read_resource()
+async def mcp_read_resource_handler(uri):
+    """Read inbox / status resources (plan Phase 3).
+
+    Routes by URI prefix:
+
+    * ``agent-mcp://inbox/<agent_id>`` → events envelope via
+      `agent_mcp.resources.inbox.render_inbox`.
+    * ``agent-mcp://status/<agent_id>`` → counters via
+      `agent_mcp.resources.status.render_status`.
+
+    Cross-agent reads are rejected; admin can read any agent's
+    resources (operational visibility).
+    """
+    from ..resources import (
+        INBOX_URI_PREFIX,
+        STATUS_URI_PREFIX,
+        resolve_agent_id_for_uri,
+    )
+    from ..resources.inbox import render_inbox
+    from ..resources.status import render_status
+    from mcp.server.lowlevel.helper_types import ReadResourceContents
+
+    uri_str = str(uri)
+    token = request_auth_token.get()
+    # Raises ValueError on auth mismatch — the framework will surface
+    # the message verbatim as a JSON-RPC error.
+    agent_id = resolve_agent_id_for_uri(uri_str, token)
+
+    if uri_str.startswith(INBOX_URI_PREFIX):
+        text = render_inbox(agent_id)
+    elif uri_str.startswith(STATUS_URI_PREFIX):
+        text = render_status(agent_id)
+    else:
+        raise ValueError(f"Unknown resource URI: {uri_str}")
+    return [ReadResourceContents(content=text, mime_type="application/json")]
+
+
 @mcp_app_instance.call_tool(validate_input=False)
 async def mcp_call_tool_handler(name: str, arguments: dict) -> List[mcp_types.TextContent]:
     """MCP endpoint to call a specific tool.
