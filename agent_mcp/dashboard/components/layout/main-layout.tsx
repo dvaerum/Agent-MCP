@@ -57,7 +57,12 @@ export function MainLayout({ children }: MainLayoutProps) {
           
           {/* Main Content */}
           <main className="flex-1 overflow-auto min-h-0">
-            <div className="fluid-container h-full animate-fade-in">
+            {/* CC-15 audit 2026-06-02: dropped the layout-level
+                page-fade animation. Combined with shadcn dialog enters
+                + sidebar tooltip animations it read as busy motion
+                against the modern-minimal target. Component-level
+                150ms hover/focus transitions own the motion budget. */}
+            <div className="fluid-container h-full">
               {children}
             </div>
           </main>
