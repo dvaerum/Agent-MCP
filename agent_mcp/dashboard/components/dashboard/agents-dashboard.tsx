@@ -8,11 +8,14 @@ import {
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { apiClient, Agent, Task } from "@/lib/api"
+import { projectContext } from "@/lib/project-context"
 import { useServerStore } from "@/lib/stores/server-store"
 import { useDataStore } from "@/lib/stores/data-store"
 import { cn } from "@/lib/utils"
@@ -49,12 +52,12 @@ const AgentTypeIcon = React.memo(({ agentId }: { agentId: string }) => {
   return <Icon className="h-4 w-4 text-muted-foreground" />
 })
 
-const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, onSelect, onEdit, onTaskClick }: {
+const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, openView, onEdit, onTaskClick }: {
   agent: Agent,
   onTerminate: (id: string) => void,
   onRestore: (id: string) => void,
   onPurge: (id: string) => void,
-  onSelect: (agent: Agent) => void,
+  openView: (agent: Agent) => void,
   onEdit: (agent: Agent) => void,
   onTaskClick: (task: Task) => void
 }) => {
@@ -101,7 +104,14 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, on
 
 
   return (
-    <TableRow className="border-border/50 hover:bg-muted/30 group transition-all duration-200">
+    // Row body click opens the View dialog — mirrors the Tasks page
+    // pattern (PR #54). The action buttons inside this row each
+    // stopPropagation so their clicks don't bubble up and re-trigger
+    // openView on top of (e.g.) a terminate confirm.
+    <TableRow
+      className="border-border/50 hover:bg-muted/30 group transition-all duration-200 cursor-pointer"
+      onClick={() => openView(agent)}
+    >
       <TableCell className="py-3">
         <div className="flex items-center gap-3">
           <StatusDot status={agent.status} />
@@ -139,7 +149,7 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, on
         {currentTask ? (
           <div>
             <button
-              onClick={() => onTaskClick(currentTask)}
+              onClick={(e) => { e.stopPropagation(); onTaskClick(currentTask) }}
               className="text-sm text-foreground hover:text-primary truncate block text-left hover:underline"
             >
               {currentTask.title}
@@ -174,7 +184,8 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, on
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => {
+              onClick={(e) => {
+                e.stopPropagation()
                 navigator.clipboard.writeText(agent.auth_token || '')
                 // You could add a toast notification here
               }}
@@ -187,13 +198,16 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, on
           <span className="text-xs text-muted-foreground">No token</span>
         )}
       </TableCell>
-      
+
+      {/* Row-action buttons. Every onClick must stopPropagation —
+          otherwise the row-body onClick (which opens View) fires on
+          top of the destructive Terminate / Purge confirm. */}
       <TableCell className="py-3">
         <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
           <Button
             variant="ghost"
             size="sm"
-            onClick={() => onSelect(agent)}
+            onClick={(e) => { e.stopPropagation(); openView(agent) }}
             title="View details"
             className="h-7 w-7 p-0 text-muted-foreground hover:text-foreground hover:bg-muted"
           >
@@ -203,7 +217,7 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, on
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => onEdit(agent)}
+              onClick={(e) => { e.stopPropagation(); onEdit(agent) }}
               title="Edit agent"
               className="h-7 w-7 p-0 text-muted-foreground hover:text-foreground hover:bg-muted"
             >
@@ -214,7 +228,7 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, on
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => onTerminate(agent.agent_id)}
+              onClick={(e) => { e.stopPropagation(); onTerminate(agent.agent_id) }}
               title="Terminate (soft-delete; can be restored or purged after)"
               className="h-7 w-7 p-0 text-destructive hover:text-destructive/80 hover:bg-destructive/10"
             >
@@ -226,7 +240,7 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, on
               <Button
                 variant="ghost"
                 size="sm"
-                onClick={() => onRestore(agent.agent_id)}
+                onClick={(e) => { e.stopPropagation(); onRestore(agent.agent_id) }}
                 title="Restore"
                 className="h-7 px-2 text-xs text-primary hover:text-primary/80 hover:bg-primary/10"
               >
@@ -236,7 +250,7 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, on
               <Button
                 variant="ghost"
                 size="sm"
-                onClick={() => onPurge(agent.agent_id)}
+                onClick={(e) => { e.stopPropagation(); onPurge(agent.agent_id) }}
                 title="Purge"
                 className="h-7 px-2 text-xs text-destructive hover:text-destructive/80 hover:bg-destructive/10"
               >
@@ -795,9 +809,230 @@ const EditAgentDialog = ({
   )
 }
 
+// ===== MCP-onboarding snippet helpers =====================================
+//
+// The View dialog grows a tabbed "add me as an MCP server" section.
+// Each tab shows the copy-paste-ready config snippet for one MCP client
+// targeting THIS specific agent. The server name is namespaced per
+// agent_id (`agent-mcp-<agent_id>`) so multi-agent identity setups
+// don't collide. URL is derived from the path-prefix adapter
+// (lib/project-context.ts, PR #56). Transport is Streamable HTTP per
+// MCP spec rev 2025-03-26 (PR #61) — POST/GET/DELETE on /mcp with
+// Authorization: Bearer <agent_token>.
+//
+// Client schemas were verified against current docs (2026-06):
+//   - OpenCode    https://opencode.ai/docs/mcp-servers
+//   - Cursor      https://cursor.com/docs/context/mcp
+//   - Cline       https://docs.cline.bot/mcp/configuring-mcp-servers
+//   - Zed         https://zed.dev/docs/ai/mcp
+//   - Continue    https://docs.continue.dev/customize/deep-dives/mcp
+//                 (YAML format under .continue/mcpServers/<name>.yaml)
+//   - Claude Code Anthropic CLI `claude mcp add --transport http`
+//
+// Generic JSON is a transport-agnostic fallback for clients we don't
+// explicitly support.
+
+type ClientTab =
+  | 'claude-code'
+  | 'opencode'
+  | 'cursor'
+  | 'cline'
+  | 'zed'
+  | 'continue'
+  | 'generic'
+
+const CLIENT_TABS: ReadonlyArray<{ value: ClientTab; label: string }> = [
+  { value: 'claude-code', label: 'Claude Code' },
+  { value: 'opencode', label: 'OpenCode' },
+  { value: 'cursor', label: 'Cursor' },
+  { value: 'cline', label: 'Cline' },
+  { value: 'zed', label: 'Zed' },
+  { value: 'continue', label: 'Continue.dev' },
+  { value: 'generic', label: 'Generic JSON' },
+]
+
+const ACTIVE_TAB_STORAGE_KEY = 'agent-mcp-popup-active-client'
+
+/**
+ * Derive the public MCP endpoint URL for this dashboard's project.
+ *
+ * Under path-prefix deployments (the production shape) the dashboard
+ * loads from `/agent-mcp/__dashboard/<name>/...` and the per-project
+ * backend is proxied at `/agent-mcp/__api/<name>` — so the MCP
+ * transport lives at `<origin>/agent-mcp/__api/<name>/mcp`.
+ *
+ * Standalone deployments (single-tenant, no path prefix) expose the
+ * MCP transport at `<origin>/mcp` directly.
+ */
+function deriveMcpUrl(): string {
+  const origin = typeof window !== 'undefined' ? window.location.origin : ''
+  if (projectContext.projectName) {
+    return `${origin}${projectContext.apiPrefix}/mcp`
+  }
+  return `${origin}/mcp`
+}
+
+function buildSnippet(tab: ClientTab, agentId: string, token: string, url: string): string {
+  const name = `agent-mcp-${agentId}`
+  const tokenForSnippet = token || '<AGENT_TOKEN>'
+  switch (tab) {
+    case 'claude-code':
+      return [
+        '# 1. CLI — one-shot add via the Claude Code CLI:',
+        `claude mcp add --transport http ${name} ${url} \\`,
+        `  --header "Authorization: Bearer ${tokenForSnippet}"`,
+        '',
+        '# 2. Equivalent JSON (paste into ~/.claude.json under',
+        '#    `mcpServers` for user-scope OR',
+        '#    `projects["<cwd>"].mcpServers` for project-scope):',
+        '"' + name + '": {',
+        '  "type": "http",',
+        `  "url": "${url}",`,
+        `  "headers": {"Authorization": "Bearer ${tokenForSnippet}"}`,
+        '}',
+      ].join('\n')
+    case 'opencode':
+      // Verified against https://opencode.ai/docs/mcp-servers
+      // Lives in opencode.json (project root) or
+      // ~/.config/opencode/opencode.json (user-scope).
+      return [
+        '// opencode.json (project) — or ~/.config/opencode/opencode.json',
+        '{',
+        '  "$schema": "https://opencode.ai/config.json",',
+        '  "mcp": {',
+        `    "${name}": {`,
+        '      "type": "remote",',
+        `      "url": "${url}",`,
+        '      "enabled": true,',
+        `      "headers": {"Authorization": "Bearer ${tokenForSnippet}"}`,
+        '    }',
+        '  }',
+        '}',
+      ].join('\n')
+    case 'cursor':
+      // Verified against https://cursor.com/docs/context/mcp
+      // Lives in .cursor/mcp.json (project) or ~/.cursor/mcp.json
+      // (global).
+      return [
+        '// .cursor/mcp.json (project) — or ~/.cursor/mcp.json (global)',
+        '{',
+        '  "mcpServers": {',
+        `    "${name}": {`,
+        `      "url": "${url}",`,
+        `      "headers": {"Authorization": "Bearer ${tokenForSnippet}"}`,
+        '    }',
+        '  }',
+        '}',
+      ].join('\n')
+    case 'cline':
+      // Verified against https://docs.cline.bot/mcp/configuring-mcp-servers
+      // CLI: ~/.cline/mcp.json. IDE extensions: MCP Settings JSON
+      // via the Configure tab.
+      return [
+        '// ~/.cline/mcp.json (CLI) — or the MCP Settings JSON in the',
+        '// Configure tab for the VS Code / IDE extension',
+        '{',
+        '  "mcpServers": {',
+        `    "${name}": {`,
+        `      "url": "${url}",`,
+        `      "headers": {"Authorization": "Bearer ${tokenForSnippet}"},`,
+        '      "disabled": false,',
+        '      "autoApprove": []',
+        '    }',
+        '  }',
+        '}',
+      ].join('\n')
+    case 'zed':
+      // Verified against https://zed.dev/docs/ai/mcp
+      // Lives in ~/.config/zed/settings.json under `context_servers`.
+      return [
+        '// ~/.config/zed/settings.json — under context_servers',
+        '{',
+        '  "context_servers": {',
+        `    "${name}": {`,
+        `      "url": "${url}",`,
+        `      "headers": {"Authorization": "Bearer ${tokenForSnippet}"}`,
+        '    }',
+        '  }',
+        '}',
+      ].join('\n')
+    case 'continue':
+      // Verified against https://docs.continue.dev/customize/deep-dives/mcp
+      // Continue uses per-server YAML files under
+      // `.continue/mcpServers/<server>.yaml`. The docs we could verify
+      // do not show explicit Authorization-header syntax for HTTP
+      // transports — the `requestOptions.headers` form below matches
+      // the broader Continue config convention; verify against your
+      // installed Continue version.
+      return [
+        '# .continue/mcpServers/' + name + '.yaml',
+        '# NOTE: Authorization-header syntax for HTTP MCP servers in',
+        '#       Continue is not explicitly documented in the public',
+        '#       docs — verify against your installed version.',
+        'mcpServers:',
+        `  - name: ${name}`,
+        '    type: streamable-http',
+        `    url: ${url}`,
+        '    requestOptions:',
+        '      headers:',
+        `        Authorization: "Bearer ${tokenForSnippet}"`,
+      ].join('\n')
+    case 'generic':
+      return [
+        '// Generic / transport-agnostic — adapt to your client\'s schema.',
+        '{',
+        `  "name": "${name}",`,
+        `  "url": "${url}",`,
+        '  "transport": "http",',
+        `  "headers": {"Authorization": "Bearer ${tokenForSnippet}"}`,
+        '}',
+      ].join('\n')
+  }
+}
+
+// SnippetBlock — a pre/code block with an inline Copy button. Pulled
+// out of the tab body so each TabsContent stays a one-liner; also lets
+// us count <Copy /> occurrences (one per tab + token copy + agent_id
+// copy) cleanly.
+const SnippetBlock = ({
+  snippet,
+  copied,
+  onCopy,
+}: {
+  snippet: string
+  copied: boolean
+  onCopy: () => void
+}) => (
+  <div className="relative">
+    <Button
+      variant="ghost"
+      size="sm"
+      onClick={onCopy}
+      className="absolute top-2 right-2 h-7 px-2 text-xs z-10"
+      title="Copy snippet"
+    >
+      <Copy className="h-3 w-3 mr-1" />
+      {copied ? 'Copied' : 'Copy'}
+    </Button>
+    <pre className="text-xs leading-relaxed font-mono bg-muted/40 rounded p-3 pr-20 whitespace-pre-wrap break-words [overflow-wrap:anywhere] max-h-[40vh] overflow-y-auto">
+      {snippet}
+    </pre>
+  </div>
+)
+
 // Read-only agent details modal — replaces the old sidebar drawer.
 // Uses the same Dialog primitive as the Messages row-detail popup
-// (PR #36).
+// (PR #36). Polished to match the Tasks page dialog idiom (PR #54):
+// - sm:!max-w-3xl beats the base sm:max-w-lg
+// - max-h-[90vh] + flex-col body with a single
+//   flex-1 min-h-0 overflow-y-auto scroll region
+// - sticky header / footer (flex-shrink-0)
+// - long values use [overflow-wrap:anywhere] (32-hex tokens, snippets)
+// - title uses line-clamp-3 break-words (NOT truncate)
+//
+// New: MCP-onboarding section — a Tabs primitive with one tab per
+// supported client. Active tab persists to localStorage so a user's
+// preferred client is sticky across sessions.
 const AgentDetailDialog = ({
   agent,
   open,
@@ -811,12 +1046,30 @@ const AgentDetailDialog = ({
 }) => {
   const [revealToken, setRevealToken] = useState(false)
   const [copied, setCopied] = useState(false)
+  const [copiedSnippet, setCopiedSnippet] = useState<ClientTab | null>(null)
+  const [activeTab, setActiveTab] = useState<ClientTab>('claude-code')
   const { getAgentTasks } = useDataStore()
+
+  // Hydrate active tab from localStorage on first mount. We
+  // deliberately seed lazily (inside useEffect, not in useState) so
+  // SSR doesn't crash on `localStorage`.
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    try {
+      const stored = window.localStorage.getItem(ACTIVE_TAB_STORAGE_KEY)
+      if (stored && CLIENT_TABS.some((t) => t.value === stored)) {
+        setActiveTab(stored as ClientTab)
+      }
+    } catch {
+      // localStorage can be disabled (private browsing); fall through.
+    }
+  }, [])
 
   useEffect(() => {
     if (!open) {
       setRevealToken(false)
       setCopied(false)
+      setCopiedSnippet(null)
     }
   }, [open])
 
@@ -842,99 +1095,174 @@ const AgentDetailDialog = ({
     setTimeout(() => setCopied(false), 1500)
   }
 
+  const mcpUrl = deriveMcpUrl()
+  const snippetToken = agent.auth_token || ''
+
+  const handleTabChange = (value: string) => {
+    const next = value as ClientTab
+    setActiveTab(next)
+    if (typeof window !== 'undefined') {
+      try {
+        window.localStorage.setItem(ACTIVE_TAB_STORAGE_KEY, next)
+      } catch {
+        // localStorage disabled — silently no-op.
+      }
+    }
+  }
+
+  const handleCopySnippet = (tab: ClientTab) => {
+    const snippet = buildSnippet(tab, agent.agent_id, snippetToken, mcpUrl)
+    navigator.clipboard.writeText(snippet)
+    setCopiedSnippet(tab)
+    setTimeout(() => setCopiedSnippet(null), 1500)
+  }
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-2xl bg-card border-border text-card-foreground">
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            Agent details
-            <Badge variant="outline" className="text-xs">
-              {agent.status}
-            </Badge>
+      {/*
+        Width: sm:!max-w-3xl (Tailwind important) beats the base
+        DialogContent's sm:max-w-lg. Height capped at 90vh so a long
+        snippet/notes block scrolls inside the modal instead of
+        pushing it past the viewport. Body is the single scroll
+        region via flex-1 min-h-0 overflow-y-auto.
+      */}
+      <DialogContent className="sm:!max-w-3xl w-[calc(100vw-2rem)] bg-card border-border text-card-foreground p-0 gap-0 max-h-[90vh] flex flex-col">
+        <DialogHeader className="px-6 pt-6 pb-4 border-b border-border flex-shrink-0">
+          <DialogTitle className="flex items-start justify-between pr-8 gap-3">
+            {/* Title wraps up to 3 lines via line-clamp-3 break-words —
+                NOT truncate, which silently drops chars from long
+                agent_ids. */}
+            <span className="text-lg font-semibold break-words line-clamp-3 leading-snug">
+              Agent {agent.agent_id}
+            </span>
+            <div className="flex items-center gap-2 flex-shrink-0 pt-0.5">
+              <Badge variant="outline" className="text-xs">
+                {agent.status}
+              </Badge>
+            </div>
           </DialogTitle>
           <DialogDescription>
-            All fields for <code>{agent.agent_id}</code>.
+            All fields for{' '}
+            <code className="font-mono [overflow-wrap:anywhere]">
+              {agent.agent_id}
+            </code>
+            , plus copy-paste-ready MCP client config.
           </DialogDescription>
         </DialogHeader>
-        <div className="space-y-3 text-sm">
-          <div className="grid grid-cols-3 gap-2">
-            <div className="text-muted-foreground">Agent ID</div>
-            <div className="col-span-2 font-mono break-all flex items-center gap-2">
-              <span>{agent.agent_id}</span>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={copyAgentId}
-                className="h-6 w-6 p-0"
-                title="Copy agent id"
-              >
-                <Copy className="h-3 w-3" />
-              </Button>
-              {copied && <span className="text-xs text-primary">copied</span>}
+
+        {/*
+          Scrollable body. flex-1 min-h-0 overflow-y-auto means this
+          region expands to fill the remaining DialogContent height
+          and is the single thing that scrolls — header + footer are
+          flex-shrink-0 and stay pinned.
+        */}
+        <div className="px-6 py-4 flex-1 min-h-0 overflow-y-auto space-y-4 text-sm">
+          {/* Group 1: identity + status */}
+          <div className="grid grid-cols-3 gap-3">
+            <div className="space-y-1">
+              <Label className="text-xs text-muted-foreground uppercase tracking-wider">
+                Agent ID
+              </Label>
+              <div className="font-mono text-sm [overflow-wrap:anywhere] flex items-center gap-2">
+                <span>{agent.agent_id}</span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={copyAgentId}
+                  className="h-6 w-6 p-0 flex-shrink-0"
+                  title="Copy agent id"
+                >
+                  <Copy className="h-3 w-3" />
+                </Button>
+                {copied && <span className="text-xs text-primary">copied</span>}
+              </div>
+            </div>
+            <div className="space-y-1">
+              <Label className="text-xs text-muted-foreground uppercase tracking-wider">
+                Status
+              </Label>
+              <div>
+                <Badge variant="outline">{agent.status}</Badge>
+              </div>
+            </div>
+            <div className="space-y-1">
+              <Label className="text-xs text-muted-foreground uppercase tracking-wider">
+                Created
+              </Label>
+              <div className="text-sm [overflow-wrap:anywhere]">
+                {agent.created_at && agent.created_at !== 'N/A'
+                  ? `${new Date(agent.created_at).toLocaleString()} (${formatRelative(agent.created_at)})`
+                  : 'N/A'}
+              </div>
             </div>
           </div>
-          <div className="grid grid-cols-3 gap-2">
-            <div className="text-muted-foreground">Status</div>
-            <div className="col-span-2">
-              <Badge variant="outline">{agent.status}</Badge>
-            </div>
-          </div>
-          <div className="grid grid-cols-3 gap-2">
-            <div className="text-muted-foreground">Created</div>
-            <div className="col-span-2">
-              {agent.created_at && agent.created_at !== 'N/A'
-                ? `${new Date(agent.created_at).toLocaleString()} (${formatRelative(agent.created_at)})`
-                : 'N/A'}
-            </div>
-          </div>
+
           {agent.terminated_at && (
-            <div className="grid grid-cols-3 gap-2">
-              <div className="text-muted-foreground">Terminated</div>
-              <div className="col-span-2">
+            <div className="space-y-1">
+              <Label className="text-xs text-muted-foreground uppercase tracking-wider">
+                Terminated
+              </Label>
+              <div className="text-sm [overflow-wrap:anywhere]">
                 {new Date(agent.terminated_at).toLocaleString()} (
                 {formatRelative(agent.terminated_at)})
               </div>
             </div>
           )}
-          <div className="grid grid-cols-3 gap-2">
-            <div className="text-muted-foreground">Capabilities</div>
-            <div className="col-span-2">
-              {(() => {
-                const caps = normalizeCapabilities(agent.capabilities)
-                return caps.length > 0
-                  ? caps.join(', ')
-                  : <span className="text-muted-foreground">none</span>
-              })()}
+
+          {/* Group 2: capabilities / wd / color */}
+          <div className="border-t border-border pt-4 space-y-3">
+            <div className="space-y-1">
+              <Label className="text-xs text-muted-foreground uppercase tracking-wider">
+                Capabilities
+              </Label>
+              <div className="text-sm [overflow-wrap:anywhere]">
+                {(() => {
+                  const caps = normalizeCapabilities(agent.capabilities)
+                  return caps.length > 0
+                    ? caps.join(', ')
+                    : <span className="text-muted-foreground italic">none</span>
+                })()}
+              </div>
+            </div>
+            <div className="space-y-1">
+              <Label className="text-xs text-muted-foreground uppercase tracking-wider">
+                Working Directory
+              </Label>
+              <div className="font-mono text-xs [overflow-wrap:anywhere]">
+                {agent.working_directory || (
+                  <span className="text-muted-foreground italic font-sans">unset</span>
+                )}
+              </div>
+            </div>
+            <div className="space-y-1">
+              <Label className="text-xs text-muted-foreground uppercase tracking-wider">
+                Color
+              </Label>
+              <div className="flex items-center gap-2">
+                {agent.color ? (
+                  <>
+                    <span
+                      className="inline-block w-4 h-4 rounded border border-border"
+                      style={{ backgroundColor: agent.color }}
+                    />
+                    <code className="font-mono text-xs">{agent.color}</code>
+                  </>
+                ) : (
+                  <span className="text-muted-foreground italic">unset</span>
+                )}
+              </div>
             </div>
           </div>
-          <div className="grid grid-cols-3 gap-2">
-            <div className="text-muted-foreground">Working Directory</div>
-            <div className="col-span-2 font-mono break-all">
-              {agent.working_directory || <span className="text-muted-foreground">unset</span>}
-            </div>
-          </div>
-          <div className="grid grid-cols-3 gap-2">
-            <div className="text-muted-foreground">Color</div>
-            <div className="col-span-2 flex items-center gap-2">
-              {agent.color ? (
-                <>
-                  <span
-                    className="inline-block w-4 h-4 rounded border border-border"
-                    style={{ backgroundColor: agent.color }}
-                  />
-                  <code className="font-mono">{agent.color}</code>
-                </>
-              ) : (
-                <span className="text-muted-foreground">unset</span>
-              )}
-            </div>
-          </div>
-          <div className="grid grid-cols-3 gap-2">
-            <div className="text-muted-foreground">Current Task</div>
-            <div className="col-span-2">
+
+          {/* Group 3: current task */}
+          <div className="border-t border-border pt-4 space-y-1">
+            <Label className="text-xs text-muted-foreground uppercase tracking-wider">
+              Current Task
+            </Label>
+            <div className="text-sm">
               {currentTask ? (
                 <button
-                  className="text-primary hover:underline text-left"
+                  className="text-primary hover:underline text-left [overflow-wrap:anywhere]"
                   onClick={() => onTaskClick(currentTask)}
                 >
                   {currentTask.title}{' '}
@@ -943,16 +1271,20 @@ const AgentDetailDialog = ({
                   </span>
                 </button>
               ) : (
-                <span className="text-muted-foreground">none</span>
+                <span className="text-muted-foreground italic">none</span>
               )}
             </div>
           </div>
-          <div className="grid grid-cols-3 gap-2">
-            <div className="text-muted-foreground">Token</div>
-            <div className="col-span-2 flex items-center gap-2">
+
+          {/* Group 4: token (32-hex blob; uses [overflow-wrap:anywhere]) */}
+          <div className="border-t border-border pt-4 space-y-1">
+            <Label className="text-xs text-muted-foreground uppercase tracking-wider">
+              Token
+            </Label>
+            <div className="flex items-start gap-2 flex-wrap">
               {agent.auth_token ? (
                 <>
-                  <code className="font-mono text-xs break-all">
+                  <code className="font-mono text-xs [overflow-wrap:anywhere] flex-1 min-w-0">
                     {revealToken
                       ? agent.auth_token
                       : `...${agent.auth_token.slice(-4)}`}
@@ -961,7 +1293,7 @@ const AgentDetailDialog = ({
                     variant="ghost"
                     size="sm"
                     onClick={() => setRevealToken((v) => !v)}
-                    className="h-6 px-2 text-xs"
+                    className="h-6 px-2 text-xs flex-shrink-0"
                   >
                     {revealToken ? 'Hide' : 'Reveal'}
                   </Button>
@@ -971,19 +1303,113 @@ const AgentDetailDialog = ({
                     onClick={() => {
                       navigator.clipboard.writeText(agent.auth_token || '')
                     }}
-                    className="h-6 w-6 p-0"
+                    className="h-6 w-6 p-0 flex-shrink-0"
                     title="Copy token"
                   >
                     <Copy className="h-3 w-3" />
                   </Button>
                 </>
               ) : (
-                <span className="text-muted-foreground">none</span>
+                <span className="text-muted-foreground italic">none</span>
               )}
             </div>
           </div>
+
+          {/* Group 5: MCP-onboarding tabs ------------------------------
+              One tab per supported client. Each tab body is a
+              copy-paste-ready snippet wired to this agent's id +
+              token + the path-prefix-derived URL. Active tab persists
+              to localStorage under ACTIVE_TAB_STORAGE_KEY so a user's
+              "I always use OpenCode" preference survives reloads. */}
+          <div className="border-t border-border pt-4 space-y-2">
+            <Label className="text-xs text-muted-foreground uppercase tracking-wider">
+              Add as MCP server
+            </Label>
+            <p className="text-xs text-muted-foreground">
+              Streamable HTTP transport (MCP spec rev 2025-03-26). Server name is
+              namespaced per agent_id so multi-agent setups don&apos;t collide.
+            </p>
+            {/*
+              Tabs are expanded statically (one TabsTrigger / TabsContent
+              per client) rather than .map()'d so the literal client
+              values are greppable / regression-guard-friendly. The
+              buildSnippet helper still owns all the per-client config
+              schema knowledge; this block just wires it up.
+
+              Snippet format details:
+              - Server name: `agent-mcp-${agent.agent_id}` so each
+                agent registers under a unique key in multi-agent
+                identity setups.
+              - URL: derived from window.location.origin +
+                projectContext.apiPrefix + '/mcp' (path-prefix adapter,
+                PR #56). The /mcp endpoint is Streamable HTTP per
+                MCP spec rev 2025-03-26 (PR #61).
+              - Authorization: Bearer <agent_token> on every snippet.
+            */}
+            <Tabs value={activeTab} onValueChange={handleTabChange} className="w-full">
+              <TabsList className="flex flex-wrap h-auto justify-start gap-1">
+                <TabsTrigger value="claude-code" className="text-xs">Claude Code</TabsTrigger>
+                <TabsTrigger value="opencode" className="text-xs">OpenCode</TabsTrigger>
+                <TabsTrigger value="cursor" className="text-xs">Cursor</TabsTrigger>
+                <TabsTrigger value="cline" className="text-xs">Cline</TabsTrigger>
+                <TabsTrigger value="zed" className="text-xs">Zed</TabsTrigger>
+                <TabsTrigger value="continue" className="text-xs">Continue.dev</TabsTrigger>
+                <TabsTrigger value="generic" className="text-xs">Generic JSON</TabsTrigger>
+              </TabsList>
+              <TabsContent value="claude-code" className="mt-2">
+                <SnippetBlock
+                  snippet={buildSnippet('claude-code', agent.agent_id, snippetToken, mcpUrl)}
+                  copied={copiedSnippet === 'claude-code'}
+                  onCopy={() => handleCopySnippet('claude-code')}
+                />
+              </TabsContent>
+              <TabsContent value="opencode" className="mt-2">
+                <SnippetBlock
+                  snippet={buildSnippet('opencode', agent.agent_id, snippetToken, mcpUrl)}
+                  copied={copiedSnippet === 'opencode'}
+                  onCopy={() => handleCopySnippet('opencode')}
+                />
+              </TabsContent>
+              <TabsContent value="cursor" className="mt-2">
+                <SnippetBlock
+                  snippet={buildSnippet('cursor', agent.agent_id, snippetToken, mcpUrl)}
+                  copied={copiedSnippet === 'cursor'}
+                  onCopy={() => handleCopySnippet('cursor')}
+                />
+              </TabsContent>
+              <TabsContent value="cline" className="mt-2">
+                <SnippetBlock
+                  snippet={buildSnippet('cline', agent.agent_id, snippetToken, mcpUrl)}
+                  copied={copiedSnippet === 'cline'}
+                  onCopy={() => handleCopySnippet('cline')}
+                />
+              </TabsContent>
+              <TabsContent value="zed" className="mt-2">
+                <SnippetBlock
+                  snippet={buildSnippet('zed', agent.agent_id, snippetToken, mcpUrl)}
+                  copied={copiedSnippet === 'zed'}
+                  onCopy={() => handleCopySnippet('zed')}
+                />
+              </TabsContent>
+              <TabsContent value="continue" className="mt-2">
+                <SnippetBlock
+                  snippet={buildSnippet('continue', agent.agent_id, snippetToken, mcpUrl)}
+                  copied={copiedSnippet === 'continue'}
+                  onCopy={() => handleCopySnippet('continue')}
+                />
+              </TabsContent>
+              <TabsContent value="generic" className="mt-2">
+                <SnippetBlock
+                  snippet={buildSnippet('generic', agent.agent_id, snippetToken, mcpUrl)}
+                  copied={copiedSnippet === 'generic'}
+                  onCopy={() => handleCopySnippet('generic')}
+                />
+              </TabsContent>
+            </Tabs>
+          </div>
         </div>
-        <DialogFooter>
+
+        <DialogFooter className="px-6 py-4 border-t border-border flex-shrink-0">
           <Button
             type="button"
             variant="outline"
@@ -1295,7 +1721,7 @@ export function AgentsDashboard() {
                 onTerminate={handleTerminateConfirm}
                 onRestore={handleRestoreAgent}
                 onPurge={handlePurgeAgent}
-                onSelect={handleSelectAgent}
+                openView={handleSelectAgent}
                 onEdit={handleEditAgent}
                 onTaskClick={handleTaskClick}
               />

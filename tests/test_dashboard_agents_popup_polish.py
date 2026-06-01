@@ -357,17 +357,12 @@ def test_server_name_includes_agent_id() -> None:
 def test_snippet_uses_streamable_http_transport() -> None:
     """The snippets must declare Streamable HTTP transport — the
     backend gates ``/mcp`` to POST/GET/DELETE per MCP spec rev
-    2025-03-26 (PR #61)."""
+    2025-03-26 (PR #61). The Claude Code CLI snippet uses
+    ``--transport http``; the JSON snippets use ``"type": "http"``."""
     src = _read_agents()
-    body_block = re.search(
-        r"AgentDetailDialog[\s\S]*?</DialogFooter>",
-        src,
-    )
-    assert body_block, "could not locate AgentDetailDialog body"
-    body = body_block.group(0)
-    # The Claude Code snippet uses --transport http; the JSON
-    # snippets use "type": "http". Both encode the http transport.
-    assert ("--transport http" in body) or ('"type": "http"' in body) or ('type: "http"' in body), (
+    # File-level check: snippet templates live in a sibling helper
+    # (buildSnippet) so we don't constrain them to the dialog body.
+    assert ("--transport http" in src) or ('"type": "http"' in src), (
         "MCP snippets must declare http transport (--transport http "
         "for the CLI or \"type\": \"http\" in JSON configs)"
     )
