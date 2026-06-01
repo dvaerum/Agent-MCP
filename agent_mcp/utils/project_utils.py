@@ -211,10 +211,11 @@ Agent Type: {agent_type}
     # (Original main.py lines 1229-1237 for connection code structure)
     # The MCP_SERVER_URL should come from a config or be dynamically determined.
     # The original used os.environ.get('PORT', '8080') which implies it's for the SSE server.
-    # The client connection example in the prompt should use the /messages/ endpoint for tool calls if that's the design.
-    # Let's assume the agent's env var MCP_SERVER_URL points to the correct base for /messages/
+    # The agent's connection example should use the Streamable HTTP /mcp
+    # endpoint (spec rev 2025-03-26). Old /messages/ paired-endpoint
+    # transport was removed; see main_app.py:_MIGRATION_BODY.
     mcp_server_url_for_client = os.environ.get(
-        "MCP_SERVER_URL", f"http://localhost:{os.environ.get('PORT', '8080')}/messages/"
+        "MCP_SERVER_URL", f"http://localhost:{os.environ.get('PORT', '8080')}/mcp"
     )
 
     # The original connection code snippet in main.py was quite extensive and specific.
