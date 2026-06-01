@@ -8,6 +8,7 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { cn } from '@/lib/utils'
 import { Agent, Task } from '@/lib/api'
 import { useDataStore } from '@/lib/stores/data-store'
+import { useDialog } from '@/hooks/use-dialog'
 import { TaskDetailsDialog } from './task-details-dialog'
 
 interface AgentDetailsPanelProps {
@@ -17,8 +18,8 @@ interface AgentDetailsPanelProps {
 
 export function AgentDetailsPanel({ agent, onClose }: AgentDetailsPanelProps) {
   const [copiedToken, setCopiedToken] = useState(false)
-  const [selectedTask, setSelectedTask] = useState<Task | null>(null)
-  const [taskDialogOpen, setTaskDialogOpen] = useState(false)
+  // Task-details popup. Migrated to useDialog<Task>() — Candidate F1.
+  const taskDialog = useDialog<Task>()
   const { getAgentTasks, getAgentActions } = useDataStore()
   
   // Get agent's tasks and actions from cached data
@@ -29,8 +30,7 @@ export function AgentDetailsPanel({ agent, onClose }: AgentDetailsPanelProps) {
   const currentTask = agentTasks.find(t => t.task_id === agent?.current_task)
   
   const handleTaskClick = (task: Task) => {
-    setSelectedTask(task)
-    setTaskDialogOpen(true)
+    taskDialog.open(task)
   }
 
   const copyToken = () => {
@@ -219,11 +219,10 @@ export function AgentDetailsPanel({ agent, onClose }: AgentDetailsPanelProps) {
       
       {/* Task Details Dialog */}
       <TaskDetailsDialog
-        task={selectedTask}
-        open={taskDialogOpen}
+        task={taskDialog.data}
+        open={taskDialog.isOpen}
         onOpenChange={(open) => {
-          setTaskDialogOpen(open)
-          if (!open) setSelectedTask(null)
+          if (!open) taskDialog.close()
         }}
       />
     </div>

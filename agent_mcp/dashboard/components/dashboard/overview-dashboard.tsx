@@ -1,26 +1,35 @@
 "use client"
 
-import React, { useState, useEffect } from "react"
+import React, { useEffect } from "react"
 import { RefreshCw, Server } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { useServerStore } from "@/lib/stores/server-store"
 import { useDataStore } from "@/lib/stores/data-store"
+import { useDialog } from "@/hooks/use-dialog"
 import { VisGraph } from "./vis-graph-simple"
 import { NodeDetailPanel } from "./node-detail-panel"
 import { CORSDiagnostic } from "../debug/cors-diagnostic"
+
+type SelectedNode = {
+  id: string
+  type: 'agent' | 'task' | 'context' | 'file' | 'admin'
+  data: unknown
+}
 
 export function OverviewDashboard() {
   const { servers, activeServerId } = useServerStore()
   const activeServer = servers.find(s => s.id === activeServerId)
   const { data, loading, fetchAllData, isRefreshing } = useDataStore()
   
-  // Selected node state for detail panel
-  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
-  const [selectedNodeType, setSelectedNodeType] = useState<'agent' | 'task' | 'context' | 'file' | 'admin' | null>(null)
-  const [selectedNodeData, setSelectedNodeData] = useState<unknown>(null)
-  const [isPanelOpen, setIsPanelOpen] = useState(false)
+  // Node-detail panel state. Migrated to useDialog<SelectedNode>()
+  // (Candidate F1, architecture review 2026-06-01) — replaces three
+  // nullable useStates (id / type / data) plus a parallel boolean
+  // (isPanelOpen) with a single piece of state. The three values
+  // are read together as a tuple anyway, so packing them into one
+  // record removes the "are they in sync?" question.
+  const nodeDialog = useDialog<SelectedNode>()
   
   useEffect(() => {
     // Fetch data on mount
@@ -57,10 +66,7 @@ export function OverviewDashboard() {
   }
 
   const handleClosePanel = () => {
-    setIsPanelOpen(false)
-    setSelectedNodeId(null)
-    setSelectedNodeType(null)
-    setSelectedNodeData(null)
+    nodeDialog.close()
   }
 
   return (
@@ -96,23 +102,20 @@ export function OverviewDashboard() {
 
       {/* Graph Container - taking full available space like tasks table */}
       <div className="bg-card/30 border border-border/50 rounded-lg backdrop-blur-sm overflow-hidden" style={{ height: 'calc(100vh - 280px)' }}>
-        <VisGraph 
-          fullscreen 
+        <VisGraph
+          fullscreen
           onNodeSelect={(nodeId, nodeType, nodeData) => {
-            setSelectedNodeId(nodeId)
-            setSelectedNodeType(nodeType)
-            setSelectedNodeData(nodeData)
-            setIsPanelOpen(true)
+            nodeDialog.open({ id: nodeId, type: nodeType, data: nodeData })
           }}
         />
       </div>
       
       {/* Node Detail Panel - Fixed positioned */}
       <NodeDetailPanel
-        nodeId={selectedNodeId}
-        nodeType={selectedNodeType}
-        nodeData={selectedNodeData as any}
-        isOpen={isPanelOpen}
+        nodeId={nodeDialog.data?.id ?? null}
+        nodeType={nodeDialog.data?.type ?? null}
+        nodeData={(nodeDialog.data?.data ?? null) as any}
+        isOpen={nodeDialog.isOpen}
         onClose={handleClosePanel}
       />
     </div>

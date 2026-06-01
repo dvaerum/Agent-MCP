@@ -36,6 +36,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { apiClient, type Agent } from "@/lib/api"
+import { useDialog } from "@/hooks/use-dialog"
 
 // Render a relative-time hint like "5 hours ago" / "in 3 minutes" so
 // admins don't have to do the timezone math themselves. Falls back to
@@ -148,7 +149,10 @@ export function MessagesDashboard() {
   // checkbox / per-row action cells, which stopPropagation). We keep
   // the full row here rather than just the id so the modal can render
   // without an extra fetch.
-  const [detailMessage, setDetailMessage] = useState<Message | null>(null)
+  // Row-click detail popup. Migrated to useDialog<Message>()
+  // (Candidate F1, architecture review 2026-06-01); the dialog
+  // open-state is derived from detailDialog.data !== null.
+  const detailDialog = useDialog<Message>()
 
   // Compose state.
   const [composeOpen, setComposeOpen] = useState(false)
@@ -296,8 +300,8 @@ export function MessagesDashboard() {
       // Keep the detail modal in sync when the toggle was triggered
       // from within it — otherwise the footer label would lag the
       // server until the next list refresh repopulates state.
-      if (detailMessage?.message_id === m.message_id) {
-        setDetailMessage({ ...detailMessage, read: nextRead })
+      if (detailDialog.data?.message_id === m.message_id) {
+        detailDialog.open({ ...detailDialog.data, read: nextRead })
       }
       await refresh()
     } catch (e: any) {
@@ -369,8 +373,8 @@ export function MessagesDashboard() {
       await callMessages("DELETE", `/${m.message_id}`, { token: t })
       // Close the detail modal if it was showing the deleted row, so
       // we don't strand the user on a record that no longer exists.
-      if (detailMessage?.message_id === m.message_id) {
-        setDetailMessage(null)
+      if (detailDialog.data?.message_id === m.message_id) {
+        detailDialog.close()
       }
       await refresh()
     } catch (e: any) {
@@ -606,7 +610,7 @@ export function MessagesDashboard() {
                   <TableRow
                     key={m.message_id}
                     className="cursor-pointer"
-                    onClick={() => setDetailMessage(m)}
+                    onClick={() => detailDialog.open(m)}
                   >
                     <TableCell onClick={(e) => e.stopPropagation()}>
                       <input
@@ -648,13 +652,15 @@ export function MessagesDashboard() {
       </Card>
 
       <Dialog
-        open={detailMessage !== null}
+        open={detailDialog.isOpen}
         onOpenChange={(open) => {
-          if (!open) setDetailMessage(null)
+          if (!open) detailDialog.close()
         }}
       >
         <DialogContent className="sm:max-w-2xl">
-          {detailMessage && (
+          {/* Local alias keeps the rest of the JSX untouched — every
+              reference to `detailMessage` below reads the hook's data. */}
+          {detailDialog.data && (() => { const detailMessage = detailDialog.data; return (
             <>
               <DialogHeader>
                 <DialogTitle className="flex items-center gap-2">
@@ -756,13 +762,13 @@ export function MessagesDashboard() {
                 <Button
                   variant="ghost"
                   size="sm"
-                  onClick={() => setDetailMessage(null)}
+                  onClick={() => detailDialog.close()}
                 >
                   Close
                 </Button>
               </DialogFooter>
             </>
-          )}
+          ); })()}
         </DialogContent>
       </Dialog>
     </div>

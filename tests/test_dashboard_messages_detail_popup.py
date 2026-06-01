@@ -47,18 +47,20 @@ def test_detail_popup_imports_dialog_primitives() -> None:
 
 def test_row_has_click_handler_opening_detail() -> None:
     src = _read("components/dashboard/messages-dashboard.tsx")
-    # State that drives the detail modal.
-    assert "detailMessage" in src or "detail" in src, (
-        "expected a piece of state (e.g. detailMessage) holding the row "
-        "the modal is opened for"
+    # State that drives the detail modal. After the useDialog<T>()
+    # migration (Candidate F1) the state lives on a hook named
+    # detailDialog rather than a useState pair, but the substring
+    # "detail" is still present as the hook name.
+    assert "detailDialog" in src, (
+        "expected detailDialog (useDialog<Message>()) to back the modal"
     )
-    # The TableRow itself must carry an onClick that sets the detail
-    # message — that's how clicking on the row content area opens the
-    # modal.
+    # The TableRow itself must carry an onClick that opens the modal
+    # — that's how clicking on the row content area opens it.
     assert "<TableRow" in src
-    # The handler must reference a setter for the detail state.
-    assert "setDetailMessage" in src, (
-        "expected setDetailMessage to be wired onto the row's onClick"
+    # The handler must reference the hook's .open(...) method (the
+    # post-migration replacement for setDetailMessage).
+    assert "detailDialog.open" in src, (
+        "expected detailDialog.open(m) to be wired onto the row's onClick"
     )
 
 

@@ -38,6 +38,7 @@ import {
 import { cn } from '@/lib/utils'
 import { useDataStore } from '@/lib/stores/data-store'
 import { useServerStore } from '@/lib/stores/server-store'
+import { useDialog } from '@/hooks/use-dialog'
 import { apiClient, type Memory } from '@/lib/api'
 import { CreateMemoryModal } from './modals/create-memory-modal'
 import { ViewMemoryModal } from './modals/view-memory-modal'
@@ -352,11 +353,13 @@ export function MemoriesDashboard() {
   const [searchTerm, setSearchTerm] = useState('')
   const [sortBy, setSortBy] = useState<string>('updated_at')
   
-  // Modal state management
-  const [selectedMemory, setSelectedMemory] = useState<Memory | null>(null)
-  const [viewModalOpen, setViewModalOpen] = useState(false)
-  const [editModalOpen, setEditModalOpen] = useState(false)
-  const [deleteModalOpen, setDeleteModalOpen] = useState(false)
+  // Modal state management. View and Edit migrated to useDialog<T>()
+  // (Candidate F1, architecture review 2026-06-01) — each one used
+  // to own a useState<boolean>(false) + share the same
+  // setSelectedMemory pair. deleteModalOpen was declared but unused
+  // (delete uses window.confirm — see handleDelete) and is dropped.
+  const viewDialog = useDialog<Memory>()
+  const editDialog = useDialog<Memory>()
   const [isOperationLoading, setIsOperationLoading] = useState(false)
   const [operationError, setOperationError] = useState<string | null>(null)
   
@@ -440,13 +443,11 @@ export function MemoriesDashboard() {
   }, [memories])
 
   const handleView = (memory: Memory) => {
-    setSelectedMemory(memory)
-    setViewModalOpen(true)
+    viewDialog.open(memory)
   }
 
   const handleEdit = (memory: Memory) => {
-    setSelectedMemory(memory)
-    setEditModalOpen(true)
+    editDialog.open(memory)
   }
 
   const handleDelete = async (memory: Memory) => {
@@ -513,8 +514,7 @@ export function MemoriesDashboard() {
     })
     
     await refreshData() // Refresh data after successful update
-    setEditModalOpen(false)
-    setSelectedMemory(null)
+    editDialog.close()
     console.log('Memory updated successfully:', data.context_key)
   }
 
@@ -720,18 +720,18 @@ export function MemoriesDashboard() {
       )}
 
       {/* View Memory Modal */}
-      <ViewMemoryModal 
-        memory={selectedMemory}
-        open={viewModalOpen}
-        onOpenChange={setViewModalOpen}
+      <ViewMemoryModal
+        memory={viewDialog.data}
+        open={viewDialog.isOpen}
+        onOpenChange={(open) => { if (!open) viewDialog.close() }}
       />
 
       {/* Edit Memory Modal - Using CreateMemoryModal with default values */}
-      {selectedMemory && editModalOpen && (
+      {editDialog.isOpen && editDialog.data && (
         <EditMemoryModal
-          memory={selectedMemory}
-          open={editModalOpen}
-          onOpenChange={setEditModalOpen}
+          memory={editDialog.data}
+          open={editDialog.isOpen}
+          onOpenChange={(open) => { if (!open) editDialog.close() }}
           onUpdateMemory={handleUpdateMemory}
         />
       )}
