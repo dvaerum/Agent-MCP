@@ -155,6 +155,12 @@ def _snapshot_and_reset_globals(stack: ExitStack) -> None:
 
     _wq._global_write_queue = None
     _engine.reset_engine_cache()
+    # `agent_event_signals` holds asyncio.Event objects bound to
+    # whatever loop created them. Pytest-asyncio gives each test its
+    # own loop; an Event leftover from a prior test cannot be awaited
+    # in a new loop ("Event is bound to a different event loop").
+    # Clear unconditionally — `signal_for(agent_id)` recreates lazily.
+    g.agent_event_signals.clear()
 
     snapshot = {
         "connections": dict(g.connections),
@@ -191,6 +197,9 @@ def _snapshot_and_reset_globals(stack: ExitStack) -> None:
         g.global_vss_load_successful = snapshot["global_vss_load_successful"]
         _wq._global_write_queue = None
         _engine.reset_engine_cache()
+        # Drop any signals created during this test so the next test
+        # (different event loop) starts with a fresh registry.
+        g.agent_event_signals.clear()
 
     stack.callback(_restore)
 

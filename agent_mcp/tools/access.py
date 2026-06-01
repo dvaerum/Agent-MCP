@@ -63,6 +63,11 @@ TOOL_ACCESS: Dict[str, str] = {
     "broadcast_admin_message": "admin",
     # Workers can read their own inbox unconditionally.
     "get_agent_messages": "any",
+    # Long-poll for new events (messages, broadcasts, task changes)
+    # addressed to the caller. Any active agent waits on their own
+    # agent_id; no spoofing because the bearer resolves to the
+    # caller's agent_id server-side.
+    "wait_for_events": "any",
     # Worker→worker delivery gated on config_allow_worker_to_worker
     # (default deny per PR #16 / Q6b.1). Admin always permitted.
     "send_agent_message": "worker-if-toggled:config_allow_worker_to_worker",

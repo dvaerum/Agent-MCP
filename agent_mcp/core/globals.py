@@ -5,6 +5,7 @@ To use:
 from mcp_server_src.core import globals as g
 g.admin_token = "new_token"
 """
+import asyncio
 import anyio  # For rag_index_task type hint
 from typing import Dict, List, Optional, Any
 
@@ -86,6 +87,43 @@ claude_session_task_scope: Optional[anyio.abc.CancelScope] = None
 # Configured per-project via project_context["config_message_retention_days"].
 # Absent or 0 => no pruning. See features.message_retention.
 message_retention_task_scope: Optional[anyio.abc.CancelScope] = None
+
+# --- wait_for_events long-poll signals (plan Phase 2) ---
+# Per-agent asyncio.Event signals used by the `wait_for_events` tool to
+# block until the agent has new activity (direct messages, broadcasts,
+# task assignments / changes). The tool clears its agent's signal,
+# waits, and then re-queries the source tables when the signal fires.
+#
+# Writers `.set()` the signal AFTER their DB commit so any pending
+# waiter wakes and re-queries with consistent state:
+#
+#   * `send_agent_message_tool_impl`     → recipient
+#   * `broadcast_admin_message_tool_impl` → each per-recipient row
+#   * `assign_task_tool_impl` (all modes) → newly-assigned agent
+#   * `update_task_status_tool_impl`     → currently-assigned agent
+#
+# Use `signal_for(agent_id)` to lazily create / fetch the Event.
+# In-process by design: the project backend is single-process, so we
+# don't need Redis pubsub or Postgres LISTEN.
+agent_event_signals: Dict[str, asyncio.Event] = {}
+
+
+def signal_for(agent_id: str) -> asyncio.Event:
+    """Lazily fetch (or create) the asyncio.Event for `agent_id`.
+
+    Returning an Event means callers can `.set()` (writer side) or
+    `.wait()` (waiter side) without further state coordination.
+
+    Note: the dict is shared across the process; one Event per agent
+    is fine because we only ever drop edges when the signal flips
+    cleared→set, and waiters re-query the DB after waking (so the
+    actual data is the source of truth, not the edge count).
+    """
+    sig = agent_event_signals.get(agent_id)
+    if sig is None:
+        sig = asyncio.Event()
+        agent_event_signals[agent_id] = sig
+    return sig
 
 # Note: The original `main.py` also had `openai_client = None` at line 185.
 # I've named it `openai_client_instance` here to avoid confusion with the module name
