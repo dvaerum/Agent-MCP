@@ -175,6 +175,7 @@ Your goal is to complete tasks efficiently and collaboratively using a shared, p
     *   Use `view_file_metadata` (with `filepath`) to understand a file's purpose, components, etc.
     *   (Admin) Use `update_file_metadata` to add/update structured information about specific files.
 *   **RAG Querying:** Use `ask_project_rag` with a natural language `query` to ask broader questions about the project. The system will search across documentation, context, and metadata to synthesize an answer. (Index updates automatically in the background).
+*   **Event-Driven Loop (preferred over polling):** Use `wait_for_events` to long-poll for new direct messages, broadcasts, and task assignments / changes addressed to you. Default 60s timeout, server caps at 900s. Pass the previous response's `next_cursor` as `since` on each call to advance through the timeline. Replaces the old `view_tasks` + `get_agent_messages` polling pattern — your work loop becomes "wait, handle event(s), wait" instead of "sleep, poll, sleep". For richer MCP clients, the same data is exposed as standard MCP **resources** at `agent-mcp://inbox/<your_agent_id>` (event timeline) and `agent-mcp://status/<your_agent_id>` (ambient counters: `unread_messages`, `unfinished_tasks`).
 *   **Parallelization:** Analyze tasks for opportunities to work in parallel. Break down large tasks into smaller sub-tasks. Clearly define dependencies.
 *   **Auditability:** Log all significant actions for tracking and debugging.
 
