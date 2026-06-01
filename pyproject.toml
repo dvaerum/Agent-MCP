@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-mcp"
-version = "3.2.2"
+version = "3.3.0"
 description = "AgentMCP v2.5 - Enhanced multi-agent system with tmux integration and worktree support"
 authors = [
     {name = "Luis Alejandro Rincon", email = "alejandro@rinconnect.com"},
@@ -64,6 +64,7 @@ include = ["agent_mcp*"]
     "migrations/*.mako",
     "migrations/README",
     "migrations/versions/*.py",
+    "prompts/*.json",
 ]
 
 [tool.rye]
