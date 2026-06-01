@@ -16,6 +16,7 @@ import { Label } from "@/components/ui/label"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { apiClient, Task, Agent } from "@/lib/api"
 import { useServerStore } from "@/lib/stores/server-store"
+import { useDialog } from "@/hooks/use-dialog"
 import { cn } from "@/lib/utils"
 
 // Status / priority colour helpers shared by the row + the View / Edit
@@ -959,13 +960,14 @@ export function TasksDashboard() {
   const [searchTerm, setSearchTerm] = useState('')
   const [statusFilter, setStatusFilter] = useState<string>('all')
   const [priorityFilter, setPriorityFilter] = useState<string>('all')
-  // Row-action dialog state. Each holds the task being viewed / edited
-  // / deleted, or null when the dialog is closed. The legacy
-  // TaskDetailsPanel sidebar has been retired — clicking a row body
-  // now opens the View dialog (same as the eye icon).
-  const [viewTask, setViewTask] = useState<Task | null>(null)
-  const [editTask, setEditTask] = useState<Task | null>(null)
-  const [deleteTask, setDeleteTask] = useState<Task | null>(null)
+  // Row-action dialog state. Each holds the task being viewed /
+  // edited / deleted via the generic useDialog<T>() hook
+  // (Candidate F1, architecture review 2026-06-01). The legacy
+  // TaskDetailsPanel sidebar has been retired — clicking a row
+  // body now opens the View dialog (same as the eye icon).
+  const viewDialog = useDialog<Task>()
+  const editDialog = useDialog<Task>()
+  const deleteDialog = useDialog<Task>()
 
   // Memoize filtered tasks to prevent unnecessary recalculations
   const filteredTasks = useMemo(() => {
@@ -997,13 +999,14 @@ export function TasksDashboard() {
     }
   }, [refresh])
 
-  // Row-action handlers. Each opens the matching Dialog. The
-  // onOpenChange callback that the Dialog itself passes back uses
-  // null to mean "close". openView is used by BOTH the eye icon and
-  // the row-body click — the sidebar (TaskDetailsPanel) is retired.
-  const openView = useCallback((task: Task) => setViewTask(task), [])
-  const openEdit = useCallback((task: Task) => setEditTask(task), [])
-  const openDelete = useCallback((task: Task) => setDeleteTask(task), [])
+  // Row-action handlers. Each opens the matching Dialog. openView
+  // is used by BOTH the eye icon and the row-body click — the
+  // sidebar (TaskDetailsPanel) is retired. We forward the stable
+  // hook .open methods directly; CompactTaskRow is memoised so the
+  // referential identity matters.
+  const openView = viewDialog.open
+  const openEdit = editDialog.open
+  const openDelete = deleteDialog.open
   const handleEditSaved = useCallback(() => { refresh() }, [refresh])
   const handleDeleted = useCallback(() => { refresh() }, [refresh])
 
@@ -1197,17 +1200,17 @@ export function TasksDashboard() {
           NOT the sidebar Sheet. Mirrors the messages-tab popup
           pattern from PR #36. */}
       <ViewTaskDialog
-        task={viewTask}
-        onOpenChange={(open) => { if (!open) setViewTask(null) }}
+        task={viewDialog.data}
+        onOpenChange={(open) => { if (!open) viewDialog.close() }}
       />
       <EditTaskDialog
-        task={editTask}
-        onOpenChange={(open) => { if (!open) setEditTask(null) }}
+        task={editDialog.data}
+        onOpenChange={(open) => { if (!open) editDialog.close() }}
         onSaved={handleEditSaved}
       />
       <DeleteTaskDialog
-        task={deleteTask}
-        onOpenChange={(open) => { if (!open) setDeleteTask(null) }}
+        task={deleteDialog.data}
+        onOpenChange={(open) => { if (!open) deleteDialog.close() }}
         onDeleted={handleDeleted}
       />
     </div>
