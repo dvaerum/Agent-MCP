@@ -375,7 +375,7 @@ async def _launch_testing_agent_for_completed_task(
 
             # Get server port for MCP registration
             server_port = os.environ.get("PORT", "8080")
-            mcp_server_url = f"http://localhost:{server_port}/sse"
+            mcp_server_url = f"http://localhost:{server_port}/mcp"
 
             # Log MCP server info
             mcp_info_command = f"echo 'MCP Server URL: {mcp_server_url}'"
