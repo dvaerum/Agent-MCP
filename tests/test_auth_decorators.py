@@ -158,7 +158,6 @@ async def test_requires_policy_worker_rejected_when_toggle_off(
     project_dir, reset_globals, monkeypatch
 ) -> None:
     """Worker is rejected when all listed policy keys evaluate false."""
-    import os
     from agent_mcp.core import globals as g
 
     monkeypatch.setenv("MCP_PROJECT_DIR", str(project_dir))
