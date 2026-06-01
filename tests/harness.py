@@ -77,7 +77,7 @@ import secrets
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, List
+from typing import Any, AsyncIterator, List, Optional
 
 import httpx
 import mcp.types as mcp_types
@@ -321,6 +321,86 @@ class WorkerSession:
                 f"{tool_name}({arguments!r}) returned Unauthorized: {text}"
             )
         return result
+
+    # --- Event-driven helpers (plan Phase 5) ---
+
+    async def wait_for_event(
+        self,
+        since: Optional[str] = None,
+        timeout: int = 5,
+    ) -> dict[str, Any]:
+        """Call the `wait_for_events` MCP tool for this session and
+        return the parsed envelope dict.
+
+        Thin wrapper that hides the JSON-text decode + content-block
+        unwrap; tests can write::
+
+            env = await alice.wait_for_event(since=ts, timeout=2)
+            assert env["events"][0]["type"] == "message"
+
+        rather than re-implementing the unwrap on every call site.
+        """
+        import json as _json
+
+        args: dict[str, Any] = {"timeout_seconds": int(timeout)}
+        if since is not None:
+            args["since"] = since
+        result = await self.call("wait_for_events", args)
+        if not result:
+            return {"events": [], "next_cursor": since or ""}
+        text = getattr(result[0], "text", "") or ""
+        try:
+            return _json.loads(text)
+        except _json.JSONDecodeError:
+            # Unexpected non-JSON response — surface the raw text so the
+            # caller's assertion has something to grip.
+            return {"events": [], "next_cursor": since or "", "raw": text}
+
+    async def _read_resource(self, uri: str) -> str:
+        """Hit `resources/read` for `uri` through the registered MCP
+        handler with this session's bearer; return the first text
+        block, empty string if none."""
+        from agent_mcp.tools.registry import request_auth_token
+        from pydantic_core import Url
+
+        handler = self._admin._mcp_app_instance().request_handlers[
+            mcp_types.ReadResourceRequest
+        ]
+        req = mcp_types.ReadResourceRequest(
+            method="resources/read",
+            params=mcp_types.ReadResourceRequestParams(uri=Url(uri)),
+        )
+        tok = request_auth_token.set(self.token)
+        try:
+            result = await handler(req)
+        finally:
+            request_auth_token.reset(tok)
+        inner = result.root if hasattr(result, "root") else result
+        for content in getattr(inner, "contents", []) or []:
+            text = getattr(content, "text", None)
+            if isinstance(text, str):
+                return text
+        return ""
+
+    async def read_inbox(self) -> dict[str, Any]:
+        """`resources/read` on `agent-mcp://inbox/<agent_id>` →
+        parsed JSON envelope (same shape as `wait_for_event`)."""
+        import json as _json
+        text = await self._read_resource(
+            f"agent-mcp://inbox/{self.agent_id}"
+        )
+        return _json.loads(text) if text else {
+            "events": [], "next_cursor": ""
+        }
+
+    async def read_status(self) -> dict[str, Any]:
+        """`resources/read` on `agent-mcp://status/<agent_id>` →
+        parsed counter dict."""
+        import json as _json
+        text = await self._read_resource(
+            f"agent-mcp://status/{self.agent_id}"
+        )
+        return _json.loads(text) if text else {}
 
     async def assert_unauthorized(
         self, tool_name: str, arguments: dict[str, Any]
