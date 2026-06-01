@@ -353,12 +353,21 @@ def test_14_validate_consistency_callable_by_worker(client) -> None:
 
 
 def test_15_backup_admin_only(client) -> None:
+    """Workers cannot call backup_project_context.
+
+    Post auth-decorators (architecture review 2026-06-01 candidate A):
+    @requires("admin") raises AuthRejected before the impl runs; the
+    dispatcher translates that to isError=True over the wire. Here we
+    exercise the impl directly so we assert the raise.
+    """
+    import pytest
+    from agent_mcp.core.authorize import AuthRejected
     from agent_mcp.tools.project_context_tools import backup_project_context_tool_impl
 
     _admin_token(client)
     worker_a = _make_worker("worker-A")
-    r = _run_tool(client, backup_project_context_tool_impl, {"token": worker_a})
-    assert "Unauthorized" in r[0].text, r[0].text
+    with pytest.raises(AuthRejected):
+        _run_tool(client, backup_project_context_tool_impl, {"token": worker_a})
 
 
 def test_16_legacy_db_migration_backfills_created_columns(

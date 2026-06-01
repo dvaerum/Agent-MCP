@@ -11,10 +11,8 @@ import mcp.types as mcp_types  # Assuming this is your mcp.types path
 from .registry import register_tool
 from ..core.config import logger, AGENT_COLORS  # AGENT_COLORS for create_agent
 from ..core import globals as g
-from ..core.auth import (
-    verify_token,
-    generate_token,
-)  # For create_agent, terminate_agent
+from ..core.auth import generate_token  # For create_agent, terminate_agent
+from ..core.authorize import requires  # @requires(\"admin\") gates entry
 from ..utils.audit_utils import log_audit
 from ..utils.project_utils import generate_system_prompt  # For create_agent
 from ..utils.tmux_utils import (
@@ -66,6 +64,7 @@ def create_agent_session_name(agent_id: str, admin_token: str) -> str:
 
 # --- create_agent tool ---
 # Original logic from main.py: lines 1060-1203 (create_agent_tool function)
+@requires("admin")
 async def create_agent_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -81,13 +80,6 @@ async def create_agent_tool_impl(
     custom_prompt = arguments.get("custom_prompt")  # Custom prompt text
     send_prompt = arguments.get("send_prompt", True)  # Default to auto-send prompt
     prompt_delay = arguments.get("prompt_delay", 5)  # Default 5 second delay
-
-    if not verify_token(token, "admin"):  # main.py:1066
-        return [
-            mcp_types.TextContent(
-                type="text", text="Unauthorized: Admin token required"
-            )
-        ]
 
     if not agent_id or not isinstance(agent_id, str):
         return [
@@ -605,18 +597,10 @@ async def create_agent_tool_impl(
 
 # --- view_status tool ---
 # Original logic from main.py: lines 1242-1268 (view_status_tool function)
+@requires("admin")
 async def view_status_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
-    token = arguments.get("token")
-
-    if not verify_token(token, "admin"):  # main.py:1244
-        return [
-            mcp_types.TextContent(
-                type="text", text="Unauthorized: Admin token required"
-            )
-        ]
-
     log_audit("admin", "view_status", {})  # main.py:1249
 
     # Build agent status from g.active_agents and g.agent_working_dirs (main.py:1251-1259)
@@ -700,18 +684,11 @@ async def view_status_tool_impl(
 
 # --- terminate_agent tool ---
 # Original logic from main.py: lines 1270-1316 (terminate_agent_tool function)
+@requires("admin")
 async def terminate_agent_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
-    token = arguments.get("token")
     agent_id_to_terminate = arguments.get("agent_id")
-
-    if not verify_token(token, "admin"):  # main.py:1274
-        return [
-            mcp_types.TextContent(
-                type="text", text="Unauthorized: Admin token required"
-            )
-        ]
 
     if not agent_id_to_terminate or not isinstance(agent_id_to_terminate, str):
         return [
@@ -876,20 +853,13 @@ async def terminate_agent_tool_impl(
 
 # --- view_audit_log tool ---
 # Original logic from main.py: lines 1387-1408 (view_audit_log_tool function)
+@requires("admin")
 async def view_audit_log_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
-    token = arguments.get("token")
     filter_agent_id = arguments.get("agent_id")  # Optional filter
     filter_action = arguments.get("action")  # Optional filter
     limit = arguments.get("limit", 50)  # Default limit 50
-
-    if not verify_token(token, "admin"):  # main.py:1389
-        return [
-            mcp_types.TextContent(
-                type="text", text="Unauthorized: Admin token required"
-            )
-        ]
 
     # Validate limit
     try:
@@ -954,6 +924,7 @@ async def view_audit_log_tool_impl(
 
 
 # --- get_agent_tokens tool ---
+@requires("admin")
 async def get_agent_tokens_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -961,16 +932,6 @@ async def get_agent_tokens_tool_impl(
     Retrieve agent tokens with advanced filtering capabilities.
     Supports filtering by status, agent_id pattern, creation date range, and more.
     """
-    token = arguments.get("token")
-
-    # Authentication
-    if not verify_token(token, "admin"):
-        return [
-            mcp_types.TextContent(
-                type="text", text="Unauthorized: Admin token required"
-            )
-        ]
-
     # Extract and validate filter parameters
     filter_status = arguments.get(
         "filter_status"
@@ -1169,6 +1130,7 @@ async def get_agent_tokens_tool_impl(
 
 
 # --- relaunch_agent tool ---
+@requires("admin")
 async def relaunch_agent_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -1182,14 +1144,6 @@ async def relaunch_agent_tool_impl(
     generate_new_token = arguments.get("generate_new_token", False)
     custom_prompt = arguments.get("custom_prompt")
     prompt_template = arguments.get("prompt_template", "worker_with_rag")
-
-    # Admin authentication
-    if not verify_token(admin_token, "admin"):
-        return [
-            mcp_types.TextContent(
-                type="text", text="Unauthorized: Admin token required"
-            )
-        ]
 
     if not agent_id:
         return [mcp_types.TextContent(type="text", text="Error: agent_id is required")]

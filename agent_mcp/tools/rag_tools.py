@@ -7,6 +7,7 @@ from .registry import register_tool
 from ..core.config import logger
 # No direct use of g (globals) here, auth and RAG core logic handle that.
 from ..core.auth import get_agent_id # Corrected
+from ..core.authorize import requires
 from ..utils.audit_utils import log_audit # Corrected
 # Import the core RAG querying logic
 from ..features.rag.query import query_rag_system # Corrected
@@ -14,13 +15,13 @@ from ..features.rag.query import query_rag_system # Corrected
 # --- ask_project_rag tool ---
 # Original logic for the tool part from main.py: lines 1572-1578 (ask_project_rag_tool function shell)
 # The core RAG execution is in features/rag/query.py's query_rag_system.
+@requires("any")
 async def ask_project_rag_tool_impl(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
     agent_auth_token = arguments.get("token")
     query_text = arguments.get("query")
 
-    requesting_agent_id = get_agent_id(agent_auth_token) # main.py:1575
-    if not requesting_agent_id:
-        return [mcp_types.TextContent(type="text", text="Unauthorized: Valid agent token required")]
+    # @requires("any") guaranteed entry; resolve id for audit.
+    requesting_agent_id = get_agent_id(agent_auth_token)
 
     if not query_text or not isinstance(query_text, str):
         return [mcp_types.TextContent(type="text", text="Error: query text is required and must be a string.")]

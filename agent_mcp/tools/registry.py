@@ -6,6 +6,9 @@ import mcp.types as mcp_types # Assuming this is the correct import for your mcp
 from ..utils.json_utils import sanitize_json_input, get_sanitized_json_body
 # Import the central logger
 from ..core.config import logger
+# Typed auth-failure exception from the decorator surface; the
+# dispatcher catches it explicitly so the audit log line is uniform.
+from ..core.authorize import AuthRejected
 
 # Tool implementations will be imported here once they are created.
 # For now, we'll define placeholders for the functions they will call.
@@ -240,13 +243,7 @@ async def list_available_tools() -> List[mcp_types.Tool]:
     return mcp_tool_list
 
 
-# Auth-failure detection (issue H). Tools return text content like
-# "Unauthorized: Admin token required" / "Unauthorized: Valid token
-# required" / "Invalid token" instead of raising; the MCP framework
-# then sets isError=False, hiding the failure from naive clients.
-# This regex catches the common shapes used across the codebase.
 import contextvars as _cv
-import re as _re
 
 # Q6e: Authorization: Bearer header fallback. A Starlette middleware
 # (registered in main_app.py) captures the bearer from the HTTP
@@ -262,20 +259,6 @@ request_auth_token: _cv.ContextVar = _cv.ContextVar(
     "request_auth_token", default=None
 )
 
-_AUTH_FAILURE_RE = _re.compile(
-    r"^\s*(unauthor(?:ized|ised)|invalid (?:admin |agent |auth |worker )?token)",
-    _re.IGNORECASE,
-)
-
-
-class ToolAuthError(Exception):
-    """Raised when a tool short-circuits on authentication failure.
-
-    The MCP framework's call_tool wrapper catches exceptions and sets
-    isError=True on the resulting CallToolResult, which is the correct
-    signal for callers.
-    """
-
 
 class ToolInputValidationError(Exception):
     """Raised when caller-supplied arguments fail jsonschema validation
@@ -286,21 +269,6 @@ class ToolInputValidationError(Exception):
     "Input validation error: …" and the wrapper converts the
     exception into a CallToolResult with isError=True.
     """
-
-
-def _raise_if_auth_failure(
-    tool_name: str, result: List[mcp_types.TextContent]
-) -> None:
-    if not result:
-        return
-    first = result[0]
-    text = getattr(first, "text", None)
-    if not isinstance(text, str):
-        return
-    if _AUTH_FAILURE_RE.match(text):
-        # Use the tool's own text as the exception message so the
-        # framework propagates it intact to the client.
-        raise ToolAuthError(text.strip())
 
 
 async def dispatch_tool_call(
@@ -452,16 +420,33 @@ async def dispatch_tool_call(
 
             result = await implementation_func(sanitized_arguments)
 
-            # Issue H: tools that short-circuit on auth currently return
-            # a TextContent with "Unauthorized..." text and the MCP
-            # framework wraps that as isError=False — so clients that
-            # key off isError think the call succeeded. Detect the
-            # auth-failure shape and raise so the framework's
-            # exception path sets isError=True (and JSON-RPC clients
-            # can see the failure at the protocol level).
-            _raise_if_auth_failure(tool_name, result)
-
+            # Issue H is now handled by the @requires / @requires_policy
+            # decorators in agent_mcp/core/authorize.py: they raise
+            # AuthRejected directly, which the `except AuthRejected`
+            # arm below catches. The legacy text-matching shim
+            # (_AUTH_FAILURE_RE / ToolAuthError / _raise_if_auth_failure)
+            # was deleted in the consolidation cleanup commit; if any
+            # future tool re-introduces a hand-rolled "Unauthorized:"
+            # text response, it will silently regress to isError=False
+            # and tests/test_auth_decorators.py will catch the
+            # _AUTH_FAILURE_RE re-introduction.
             return result
+
+        except AuthRejected as e:
+            # Decorator-raised auth failure (architecture review
+            # 2026-06-01 candidate A). Re-raise so the MCP framework's
+            # `_make_error_result` (`mcp/server/lowlevel/server.py:584`)
+            # turns it into a `CallToolResult` with `isError=True` and
+            # `text="Unauthorized: <reason>"`. We don't catch + return
+            # here because the framework already does the right thing
+            # with exceptions; this stanza exists for the type to be
+            # visible at the dispatch boundary and to give us a clean
+            # hook if we ever need to log/audit auth failures
+            # uniformly.
+            logger.info(
+                f"Tool '{tool_name}' auth-rejected: {e.reason}"
+            )
+            raise
 
         except ToolInputValidationError as e:
             # Caller-error path; logged at info level (not a server

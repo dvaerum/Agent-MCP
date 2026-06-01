@@ -10,9 +10,11 @@ import os
 import mcp.types as mcp_types
 
 from .registry import register_tool
+from . import access as _access  # Canonical home for _get_config_bool
 from ..core.config import logger
 from ..core import globals as g
 from ..core.auth import verify_token, get_agent_id
+from ..core.authorize import requires, requires_policy
 from ..utils.audit_utils import log_audit
 from ..db.connection import get_db_connection
 from ..db.actions.agent_actions_db import log_agent_action_to_db
@@ -22,36 +24,6 @@ from ..utils.tmux_utils import send_prompt_async, session_exists, sanitize_sessi
 def _generate_message_id() -> str:
     """Generate a unique message ID."""
     return f"msg_{secrets.token_hex(8)}"
-
-
-def _get_config_bool(key: str, default: bool = False) -> bool:
-    """Read a boolean toggle from project_context. Defaults to `default`
-    when the key is absent or unparseable.
-
-    Used for the per-project policy toggles (e.g.
-    config_allow_worker_to_worker). Keep this lookup cheap — called on
-    every send_agent_message.
-    """
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT value FROM project_context WHERE context_key = ?", (key,)
-        )
-        row = cursor.fetchone()
-        conn.close()
-    except Exception:
-        return default
-    if not row:
-        return default
-    raw = row["value"]
-    if isinstance(raw, str):
-        s = raw.strip().strip('"').lower()
-        if s in ("true", "1", "yes", "on"):
-            return True
-        if s in ("false", "0", "no", "off"):
-            return False
-    return default
 
 
 def _agents_active_by_id() -> set[str]:
@@ -91,7 +63,7 @@ def _can_agents_communicate(sender_id: str, recipient_id: str, is_admin: bool) -
     # Worker→worker: gated by per-project toggle (issue K).
     # Default-deny preserves upstream behavior; admin opts in via
     # project_context[config_allow_worker_to_worker].
-    if not _get_config_bool("config_allow_worker_to_worker", default=False):
+    if not _access._get_config_bool("config_allow_worker_to_worker", default=False):
         return False, "Worker-to-worker messaging disabled by policy"
 
     # Toggle is on. Permit when both sides are currently active agents.
@@ -102,6 +74,7 @@ def _can_agents_communicate(sender_id: str, recipient_id: str, is_admin: bool) -
     return False, "Communication not permitted between these agents"
 
 
+@requires_policy("config_allow_worker_to_worker", default=False)
 async def send_agent_message_tool_impl(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
     """
     Send a message from one agent to another with permission checks.
@@ -113,12 +86,14 @@ async def send_agent_message_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
     message_type = arguments.get("message_type", "text")  # text, assistance_request, task_update
     priority = arguments.get("priority", "normal")  # low, normal, high, urgent
     deliver_method = arguments.get("deliver_method", "tmux")  # tmux, store, both
-    
-    # Authentication
+
+    # The @requires_policy decorator already guaranteed `sender_token`
+    # resolves to either admin or a worker permitted under
+    # config_allow_worker_to_worker. We still need `sender_id` (and
+    # `is_admin` below) for the message metadata and the per-pair
+    # delivery rules in `_can_agents_communicate`.
     sender_id = get_agent_id(sender_token)
-    if not sender_id:
-        return [mcp_types.TextContent(type="text", text="Unauthorized: Valid token required")]
-    
+
     # Validation
     if not recipient_id or not message_content:
         return [mcp_types.TextContent(type="text", text="Error: recipient_id and message are required")]
@@ -280,6 +255,7 @@ async def send_agent_message_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
             conn.close()
 
 
+@requires("any")
 async def get_agent_messages_tool_impl(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
     """
     Retrieve messages for an agent.
@@ -291,12 +267,11 @@ async def get_agent_messages_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
     limit = arguments.get("limit", 20)
     message_type_filter = arguments.get("message_type")
     unread_only = arguments.get("unread_only", False)
-    
-    # Authentication
+
+    # @requires("any") guaranteed agent_token resolves; we still need
+    # the id for filtering & audit.
     agent_id = get_agent_id(agent_token)
-    if not agent_id:
-        return [mcp_types.TextContent(type="text", text="Unauthorized: Valid token required")]
-    
+
     # Validation
     try:
         limit = int(limit)
@@ -396,6 +371,7 @@ async def get_agent_messages_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
             conn.close()
 
 
+@requires("admin")
 async def broadcast_admin_message_tool_impl(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
     """
     Admin-only tool to broadcast a message to all active agents.
@@ -404,11 +380,7 @@ async def broadcast_admin_message_tool_impl(arguments: Dict[str, Any]) -> List[m
     message_content = arguments.get("message")
     message_type = arguments.get("message_type", "broadcast")
     priority = arguments.get("priority", "high")
-    
-    # Authentication (admin only)
-    if not verify_token(admin_token, "admin"):
-        return [mcp_types.TextContent(type="text", text="Unauthorized: Admin token required")]
-    
+
     if not message_content:
         return [mcp_types.TextContent(type="text", text="Error: message is required")]
     

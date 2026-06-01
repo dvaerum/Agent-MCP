@@ -10,9 +10,11 @@ from typing import List, Dict, Any, Optional
 import mcp.types as mcp_types
 
 from .registry import register_tool
+from . import access as _access  # Canonical home for _get_config_bool
 from ..core.config import logger, ENABLE_TASK_PLACEMENT_RAG, ALLOW_RAG_OVERRIDE
 from ..core import globals as g
 from ..core.auth import verify_token, get_agent_id
+from ..core.authorize import requires, requires_policy
 from ..utils.audit_utils import log_audit
 from ..db.connection import get_db_connection, execute_db_write
 from ..db.actions.agent_actions_db import log_agent_action_to_db
@@ -38,37 +40,6 @@ from ..utils.tmux_utils import (
     sanitize_session_name,
 )
 from ..utils.prompt_templates import build_agent_prompt
-
-
-def _get_config_bool(key: str, default: bool = False) -> bool:
-    """Read a boolean toggle from project_context. Defaults to `default`
-    when the key is absent or unparseable.
-
-    Mirrors the helper in `agent_communication_tools.py`. Kept local
-    here so callers in this module don't depend on cross-module
-    private helpers. If a third caller appears, promote both to
-    `agent_mcp/core/project_config.py`.
-    """
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT value FROM project_context WHERE context_key = ?", (key,)
-        )
-        row = cursor.fetchone()
-        conn.close()
-    except Exception:
-        return default
-    if not row:
-        return default
-    raw = row["value"]
-    if isinstance(raw, str):
-        s = raw.strip().strip('"').lower()
-        if s in ("true", "1", "yes", "on"):
-            return True
-        if s in ("false", "0", "no", "off"):
-            return False
-    return default
 
 
 def _authorize_assign_task(
@@ -114,7 +85,7 @@ def _authorize_assign_task(
 
     # Mode 0: worker files an unassigned task.
     if not target_agent_token:
-        if not _get_config_bool(
+        if not _access._get_config_bool(
             "config_allow_worker_create_unassigned", default=True
         ):
             return (
@@ -151,7 +122,7 @@ def _authorize_assign_task(
             "agent_token and then claim it."
         )
 
-    if not _get_config_bool(
+    if not _access._get_config_bool(
         "config_allow_worker_self_assign", default=True
     ):
         return (
@@ -1207,6 +1178,16 @@ async def _create_and_assign_multiple_tasks(
 
 # --- assign_task tool ---
 # Original logic from main.py: lines 1319-1384 (assign_task_tool function)
+# assign_task: admin always; worker iff at least one of the two
+# worker-paths-policy toggles is on (self-claim via Mode 3, or
+# file-unassigned via Mode 0). The per-mode arbitration stays in
+# `_authorize_assign_task` below; the decorator only ensures we don't
+# let an anonymous caller in.
+@requires_policy(
+    "config_allow_worker_self_assign",
+    "config_allow_worker_create_unassigned",
+    default=True,
+)
 async def assign_task_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -1850,6 +1831,7 @@ async def assign_task_tool_impl(
 
 # --- create_self_task tool ---
 # Original logic from main.py: lines 1409-1474 (create_self_task_tool function)
+@requires("any")
 async def create_self_task_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -1860,13 +1842,8 @@ async def create_self_task_tool_impl(
     depends_on_tasks_list = arguments.get("depends_on_tasks")
     parent_task_id_arg = arguments.get("parent_task_id")
 
-    requesting_agent_id = get_agent_id(agent_auth_token)  # main.py:1415
-    if not requesting_agent_id:
-        return [
-            mcp_types.TextContent(
-                type="text", text="Unauthorized: Valid token required"
-            )
-        ]
+    # @requires("any") guarantees a valid token; resolve to id for use below.
+    requesting_agent_id = get_agent_id(agent_auth_token)
 
     if not all([task_title, task_description]):
         return [
@@ -2124,6 +2101,7 @@ async def create_self_task_tool_impl(
 
 # --- update_task_status tool ---
 # Original logic from main.py: lines 1477-1583 (update_task_status_tool function)
+@requires_policy("config_allow_worker_update_own_status", default=True)
 async def update_task_status_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -2153,13 +2131,9 @@ async def update_task_status_tool_impl(
         "validate_dependencies", True
     )  # Validate dependency constraints
 
+    # @requires_policy guaranteed entry; resolve id for per-task ownership
+    # checks below (workers can only update their OWN tasks; admins anyone).
     requesting_agent_id = get_agent_id(agent_auth_token)
-    if not requesting_agent_id:
-        return [
-            mcp_types.TextContent(
-                type="text", text="Unauthorized: Valid token required"
-            )
-        ]
 
     # Determine if this is bulk or single operation
     task_ids_to_process = []
@@ -2431,6 +2405,7 @@ async def update_task_status_tool_impl(
 
 # --- view_tasks tool ---
 # Original logic from main.py: lines 1586-1655 (view_tasks_tool function)
+@requires("any")
 async def view_tasks_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -2478,14 +2453,10 @@ async def view_tasks_tool_impl(
         "sort_by", "created_at"
     )  # Sort by: created_at, updated_at, priority, status
 
+    # @requires("any") guarantees a valid token; resolve id + admin flag
+    # for the per-row filtering below (workers see only their own tasks
+    # unless filter_agent_id matches their id; admins see anyone's).
     requesting_agent_id = get_agent_id(agent_auth_token)
-    if not requesting_agent_id:
-        return [
-            mcp_types.TextContent(
-                type="text", text="Unauthorized: Valid token required"
-            )
-        ]
-
     is_admin_request = verify_token(agent_auth_token, "admin")
 
     # Permission check
@@ -3031,6 +3002,7 @@ def _suggest_optimal_parent_task(
 # --- request_assistance tool ---
 # Original logic from main.py: lines 1658-1763 (request_assistance_tool function)
 # This tool had file-based notification system. We'll replicate that for 1-to-1.
+@requires("any")
 async def request_assistance_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -3038,13 +3010,8 @@ async def request_assistance_tool_impl(
     parent_task_id = arguments.get("task_id")  # Task ID needing assistance
     assistance_description = arguments.get("description")
 
-    requesting_agent_id = get_agent_id(agent_auth_token)  # main.py:1666
-    if not requesting_agent_id:
-        return [
-            mcp_types.TextContent(
-                type="text", text="Unauthorized: Valid token required"
-            )
-        ]
+    # @requires("any") guaranteed a valid token; resolve id for ownership.
+    requesting_agent_id = get_agent_id(agent_auth_token)
 
     if not parent_task_id or not assistance_description:
         return [
@@ -3292,19 +3259,19 @@ async def request_assistance_tool_impl(
 
 
 # --- bulk_task_operations tool ---
+@requires("any")
 async def bulk_task_operations_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
     agent_auth_token = arguments.get("token")
     operations = arguments.get("operations", [])  # List of operation objects
 
+    # @requires("any") guaranteed entry; admin gets full control, workers
+    # are restricted per-op (own-task only) by the in-loop ownership
+    # check below. tools/list classifies this as admin (access.py) so
+    # workers don't see it in their catalogue; direct callers still get
+    # the per-op gate.
     requesting_agent_id = get_agent_id(agent_auth_token)
-    if not requesting_agent_id:
-        return [
-            mcp_types.TextContent(
-                type="text", text="Unauthorized: Valid token required"
-            )
-        ]
 
     if not operations or not isinstance(operations, list):
         return [
@@ -3565,6 +3532,7 @@ async def bulk_task_operations_tool_impl(
 
 
 # --- search_tasks tool ---
+@requires("any")
 async def search_tasks_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -3574,13 +3542,9 @@ async def search_tasks_tool_impl(
     max_results = arguments.get("max_results", 20)
     include_notes = arguments.get("include_notes", True)
 
+    # @requires("any") guaranteed entry; admin sees all tasks, workers
+    # only see their own (per-row filter below).
     requesting_agent_id = get_agent_id(agent_auth_token)
-    if not requesting_agent_id:
-        return [
-            mcp_types.TextContent(
-                type="text", text="Unauthorized: Valid token required"
-            )
-        ]
 
     if not search_query or not search_query.strip():
         return [
@@ -4252,6 +4216,7 @@ def register_task_tools():
     )
 
 
+@requires("admin")
 async def delete_task_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -4259,17 +4224,8 @@ async def delete_task_tool_impl(
     Delete a task permanently with cascade handling for related tasks.
     Admin-only operation with comprehensive safety checks.
     """
-    admin_token = arguments.get("token")
     task_id = arguments.get("task_id")
     force_delete = arguments.get("force_delete", False)
-
-    # Verify admin permissions
-    if not verify_token(admin_token, "admin"):
-        return [
-            mcp_types.TextContent(
-                type="text", text="Unauthorized: Admin token required"
-            )
-        ]
 
     if not task_id:
         return [mcp_types.TextContent(type="text", text="Error: task_id is required")]
