@@ -39,6 +39,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from .registry import register_tool
+from ..core.authorize import requires
 from ..core.config import logger
 from ..core import globals as g  # Not directly used here, but auth uses it
 from ..core.auth import get_agent_id, verify_token
@@ -245,6 +246,7 @@ def _create_context_backup(session, backup_name: str = None) -> Dict[str, Any]:
 
 # --- view_project_context tool ---
 # Original logic from main.py: lines 1411-1465 (view_project_context_tool function)
+@requires("any")
 async def view_project_context_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -268,13 +270,9 @@ async def view_project_context_tool_impl(
     if sort_by == "last_updated":
         sort_by = "updated_at"
 
-    requesting_agent_id = get_agent_id(agent_auth_token)  # main.py:1414
-    if not requesting_agent_id:
-        return [
-            mcp_types.TextContent(
-                type="text", text="Unauthorized: Valid token required"
-            )
-        ]
+    # @requires("any") guaranteed entry; resolve id for audit + the
+    # admin-vs-worker secret-key redaction below (issue I).
+    requesting_agent_id = get_agent_id(agent_auth_token)
 
     # Log audit (main.py:1417)
     log_audit(
@@ -735,6 +733,7 @@ async def _handle_bulk_context_update(
     return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
 
 
+@requires("any")
 async def update_project_context_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -746,14 +745,10 @@ async def update_project_context_tool_impl(
     description_for_context = arguments.get("description")
     updates_list = arguments.get("updates")  # For bulk operations
 
+    # @requires("any") guaranteed entry; resolve id + admin flag for the
+    # per-key creator-ownership matrix (PR #52 — admins write anything,
+    # workers only their own non-`config_*` keys).
     requesting_agent_id = get_agent_id(auth_token)
-    if not requesting_agent_id:
-        return [
-            mcp_types.TextContent(
-                type="text", text="Unauthorized: Valid token required"
-            )
-        ]
-
     is_admin = verify_token(auth_token, "admin")
 
     # Determine operation mode
@@ -901,6 +896,7 @@ def _bulk_update_inline(
         session.close()
 
 
+@requires("any")
 async def bulk_update_project_context_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -917,13 +913,9 @@ async def bulk_update_project_context_tool_impl(
     auth_token = arguments.get("token")
     updates = arguments.get("updates", [])  # List of update operations
 
+    # @requires("any") guaranteed entry; resolve id for the per-key
+    # ownership matrix below.
     requesting_agent_id = get_agent_id(auth_token)
-    if not requesting_agent_id:
-        return [
-            mcp_types.TextContent(
-                type="text", text="Unauthorized: Valid token required"
-            )
-        ]
 
     if not updates or not isinstance(updates, list):
         return [
@@ -982,6 +974,7 @@ async def bulk_update_project_context_tool_impl(
 
 
 # --- backup_project_context tool ---
+@requires("admin")
 async def backup_project_context_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -991,22 +984,8 @@ async def backup_project_context_tool_impl(
         "include_health_report", True
     )  # Include health analysis in backup
 
+    # @requires("admin") guaranteed entry; admin id is always "admin".
     requesting_agent_id = get_agent_id(auth_token)
-    if not requesting_agent_id:
-        return [
-            mcp_types.TextContent(
-                type="text", text="Unauthorized: Valid token required"
-            )
-        ]
-
-    # Admin only for security
-    if not verify_token(auth_token, "admin"):
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text="Unauthorized: Admin token required for backup operations",
-            )
-        ]
 
     log_audit(
         requesting_agent_id, "backup_project_context", {"backup_name": backup_name}
@@ -1100,18 +1079,14 @@ async def backup_project_context_tool_impl(
 
 
 # --- validate_context_consistency tool ---
+@requires("any")
 async def validate_context_consistency_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
     auth_token = arguments.get("token")
 
+    # @requires("any") guaranteed entry; resolve id for audit only.
     requesting_agent_id = get_agent_id(auth_token)
-    if not requesting_agent_id:
-        return [
-            mcp_types.TextContent(
-                type="text", text="Unauthorized: Valid token required"
-            )
-        ]
 
     # Log audit
     log_audit(requesting_agent_id, "validate_context_consistency", {})
@@ -1451,6 +1426,7 @@ def register_project_context_tools():
     )
 
 
+@requires("any")
 async def delete_project_context_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -1466,13 +1442,9 @@ async def delete_project_context_tool_impl(
     context_key = arguments.get("context_key")
     force_delete = arguments.get("force_delete", False)
 
+    # @requires("any") guaranteed entry; resolve id + admin flag for the
+    # per-key creator-ownership matrix in _check_write_authorization.
     requesting_agent_id = get_agent_id(auth_token)
-    if not requesting_agent_id:
-        return [
-            mcp_types.TextContent(
-                type="text", text="Unauthorized: Valid token required"
-            )
-        ]
     is_admin = verify_token(auth_token, required_role="admin")
 
     # Prepare list of keys to delete
