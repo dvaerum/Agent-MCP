@@ -217,6 +217,18 @@ async def send_agent_message_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
         
         conn.commit()
 
+        # Wake any `wait_for_events` waiter for the recipient. Set
+        # AFTER commit so the waiter's re-query sees the new row.
+        # Per-recipient wake covers broadcasts too — they call this
+        # impl in a loop, one set() per recipient row.
+        try:
+            g.signal_for(recipient_id).set()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "wait_for_events signal_for(%s) raised after send_agent_message: %s",
+                recipient_id, e,
+            )
+
         # AoE notification side-channel (best-effort, fire-and-forget).
         # Disabled by default; admins opt in via
         # project_context[config_aoe_notify_enabled]. Never blocks or
@@ -442,6 +454,216 @@ async def broadcast_admin_message_tool_impl(arguments: Dict[str, Any]) -> List[m
     )]
 
 
+# ---------------------------------------------------------------------------
+# wait_for_events long-poll tool (plan Phase 2)
+# ---------------------------------------------------------------------------
+
+# Default and cap per locked grilling decision #3: 60s default keeps
+# round-trips brisk and stays under typical HTTP intermediary
+# idle-timeouts; 900s ceiling for advanced low-traffic callers.
+WAIT_FOR_EVENTS_DEFAULT_TIMEOUT = 60
+WAIT_FOR_EVENTS_MAX_TIMEOUT = 900
+
+
+_BROADCAST_MESSAGE_TYPES = ("broadcast", "announcement", "system_alert")
+
+
+def _collect_events_for(
+    agent_id: str, since: Optional[str]
+) -> List[Dict[str, Any]]:
+    """Collect new events for `agent_id` strictly after the ISO-UTC
+    timestamp `since`.
+
+    Returns a chronologically-ordered (ASC) list of dicts:
+    ``{"type": "<event_type>", "timestamp": "<iso>", "data": {...}}``.
+
+    Event types:
+
+    * ``message`` — direct message from `agent_messages` where
+      `recipient_id = agent_id` AND `message_type` is NOT a broadcast
+      variant.
+    * ``broadcast`` — same source, but `message_type` is one of
+      ``broadcast`` / ``announcement`` / ``system_alert`` (per the
+      `broadcast_admin_message` enum).
+    * ``task_assigned`` — task row whose `assigned_to` transitioned
+      INTO `agent_id` since `since` (heuristic: `created_at > since`
+      AND `assigned_to == agent_id`, OR `updated_at > since` AND
+      `created_at <= since` if the row was reassigned — v1 keeps it
+      simple by treating any change with `created_at > since` as a
+      fresh assignment).
+    * ``task_changed`` — any other touched task (`updated_at > since`)
+      where `assigned_to == agent_id` and `created_at <= since`.
+
+    The helper is also reused by the Phase 3 inbox resource (the plan
+    explicitly factors this out so both surfaces stay in sync).
+    """
+    # No cursor → "what's there right now" doesn't really make sense
+    # for an event stream. Treat absence as "since the epoch" so the
+    # first call returns the latest backlog; in practice callers
+    # always pass `since` after the first call.
+    since_iso = since if since else "0000-01-01T00:00:00"
+
+    events: List[Dict[str, Any]] = []
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # --- agent_messages -------------------------------------------------
+        cursor.execute(
+            """
+            SELECT message_id, sender_id, recipient_id, message_content,
+                   message_type, priority, timestamp, delivered, read
+            FROM agent_messages
+            WHERE recipient_id = ? AND timestamp > ?
+            ORDER BY timestamp ASC
+            """,
+            (agent_id, since_iso),
+        )
+        for row in cursor.fetchall():
+            data = {
+                "message_id": row["message_id"],
+                "sender_id": row["sender_id"],
+                "recipient_id": row["recipient_id"],
+                "message_content": row["message_content"],
+                "message_type": row["message_type"],
+                "priority": row["priority"],
+                "timestamp": row["timestamp"],
+                "delivered": bool(row["delivered"]),
+                "read": bool(row["read"]),
+            }
+            evt_type = (
+                "broadcast"
+                if (row["message_type"] or "") in _BROADCAST_MESSAGE_TYPES
+                else "message"
+            )
+            events.append({
+                "type": evt_type,
+                "timestamp": row["timestamp"],
+                "data": data,
+            })
+
+        # --- tasks ----------------------------------------------------------
+        cursor.execute(
+            """
+            SELECT task_id, title, description, assigned_to, created_by,
+                   status, priority, created_at, updated_at, parent_task
+            FROM tasks
+            WHERE assigned_to = ? AND updated_at > ?
+            ORDER BY updated_at ASC
+            """,
+            (agent_id, since_iso),
+        )
+        for row in cursor.fetchall():
+            data = {
+                "task_id": row["task_id"],
+                "title": row["title"],
+                "description": row["description"],
+                "assigned_to": row["assigned_to"],
+                "created_by": row["created_by"],
+                "status": row["status"],
+                "priority": row["priority"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "parent_task": row["parent_task"],
+            }
+            # v1 heuristic per the plan: rows created since the
+            # cursor are treated as fresh assignments; older rows
+            # touched since the cursor are mutations.
+            created_at = row["created_at"] or ""
+            if created_at > since_iso:
+                evt_type = "task_assigned"
+            else:
+                evt_type = "task_changed"
+            events.append({
+                "type": evt_type,
+                "timestamp": row["updated_at"],
+                "data": data,
+            })
+    finally:
+        if conn:
+            conn.close()
+
+    # Merge-sort by timestamp ASC. Stable sort preserves the per-source
+    # arrival order on ties (which only happen at sub-millisecond
+    # resolution if at all, but be defensive).
+    events.sort(key=lambda e: e["timestamp"])
+    return events
+
+
+def _envelope(
+    events: List[Dict[str, Any]], since: Optional[str]
+) -> List[mcp_types.TextContent]:
+    """Wrap collected events into the standard response envelope.
+
+    `next_cursor` advances to the max timestamp seen, or stays at
+    `since` if the call timed out with no activity (preserving the
+    caller's progress through the timeline).
+    """
+    if events:
+        next_cursor = max(e["timestamp"] for e in events)
+    else:
+        next_cursor = since or ""
+    payload = {"events": events, "next_cursor": next_cursor}
+    return [mcp_types.TextContent(
+        type="text", text=json.dumps(payload, ensure_ascii=False)
+    )]
+
+
+@requires("any")
+async def wait_for_events_tool_impl(
+    arguments: Dict[str, Any],
+) -> List[mcp_types.TextContent]:
+    """Long-poll for new events for the calling agent.
+
+    Returns immediately with any events newer than `since`; otherwise
+    blocks until `signal_for(agent_id).set()` fires or
+    `timeout_seconds` (default 60, max 900) elapses.
+    """
+    token = arguments.get("token")
+    agent_id = get_agent_id(token)
+    if not agent_id:
+        # `@requires("any")` should have caught this, but be defensive
+        # against contextvar-bridged invocations.
+        return [mcp_types.TextContent(
+            type="text",
+            text="Unauthorized: token does not resolve to an agent",
+        )]
+
+    since = arguments.get("since")
+    if since is not None and not isinstance(since, str):
+        return [mcp_types.TextContent(
+            type="text",
+            text="Error: since must be an ISO-UTC timestamp string",
+        )]
+
+    raw_timeout = arguments.get(
+        "timeout_seconds", WAIT_FOR_EVENTS_DEFAULT_TIMEOUT
+    )
+    try:
+        timeout = int(raw_timeout)
+    except (TypeError, ValueError):
+        timeout = WAIT_FOR_EVENTS_DEFAULT_TIMEOUT
+    if timeout <= 0:
+        timeout = WAIT_FOR_EVENTS_DEFAULT_TIMEOUT
+    if timeout > WAIT_FOR_EVENTS_MAX_TIMEOUT:
+        timeout = WAIT_FOR_EVENTS_MAX_TIMEOUT
+
+    # Fast path — return immediately if backlog is non-empty.
+    events = _collect_events_for(agent_id, since)
+    if events:
+        return _envelope(events, since)
+
+    # Slow path — clear the signal, wait for `.set()` or timeout, re-query.
+    sig = g.signal_for(agent_id)
+    sig.clear()
+    try:
+        await asyncio.wait_for(sig.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        return _envelope([], since)
+    return _envelope(_collect_events_for(agent_id, since), since)
+
+
 def register_agent_communication_tools():
     """Register agent communication tools."""
     
@@ -568,6 +790,55 @@ def register_agent_communication_tools():
             "additionalProperties": False
         },
         implementation=broadcast_admin_message_tool_impl
+    )
+
+    register_tool(
+        name="wait_for_events",
+        description=(
+            "Long-poll for new events addressed to the calling agent "
+            "(direct messages, broadcasts, task assignments / changes). "
+            "Returns immediately if events are already pending; otherwise "
+            "blocks server-side until something arrives or the timeout "
+            "elapses. Response is a JSON envelope "
+            "{\"events\": [{type, timestamp, data}, ...], \"next_cursor\": "
+            "\"<iso-ts>\"} — pass `next_cursor` as `since` on the next "
+            "call to advance through the timeline."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "token": {
+                    "type": "string",
+                    "description": (
+                        "Calling agent's token. Optional if "
+                        "Authorization: Bearer header is supplied "
+                        "(recommended)."
+                    ),
+                },
+                "since": {
+                    "type": "string",
+                    "description": (
+                        "ISO-UTC timestamp; only events with "
+                        "timestamp > since are returned. Pass the "
+                        "previous response's `next_cursor` to advance."
+                    ),
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "description": (
+                        "Max seconds to wait for new activity before "
+                        "returning an empty envelope. Default 60. "
+                        "Values above 900 are silently clamped "
+                        "server-side (no validation error)."
+                    ),
+                    "default": WAIT_FOR_EVENTS_DEFAULT_TIMEOUT,
+                    "minimum": 1,
+                },
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+        implementation=wait_for_events_tool_impl,
     )
 
 

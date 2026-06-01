@@ -1023,6 +1023,15 @@ async def _assign_to_existing_tasks(
 
         conn.commit()
 
+        # Phase 2: wake the newly-assigned agent's wait_for_events waiter.
+        try:
+            g.signal_for(target_agent_id).set()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "wait_for_events signal_for(%s) raised after _assign_to_existing_tasks: %s",
+                target_agent_id, e,
+            )
+
         # Build response
         task_titles = [task["title"] for task in found_tasks]
         response_parts = [
@@ -1143,6 +1152,15 @@ async def _create_and_assign_multiple_tasks(
             )
 
         conn.commit()
+
+        # Phase 2: wake the newly-assigned agent's wait_for_events waiter.
+        try:
+            g.signal_for(target_agent_id).set()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "wait_for_events signal_for(%s) raised after _create_and_assign_multiple_tasks: %s",
+                target_agent_id, e,
+            )
 
         # Build response
         response_parts = [
@@ -1706,6 +1724,16 @@ async def assign_task_tool_impl(
             details={"agent_id": target_agent_id, "title": task_title},
         )
         conn.commit()
+
+        # Phase 2: wake the new assignee's `wait_for_events` waiter.
+        # Done AFTER commit so the re-query sees the row.
+        try:
+            g.signal_for(target_agent_id).set()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "wait_for_events signal_for(%s) raised after assign_task: %s",
+                target_agent_id, e,
+            )
 
         # Update agent's current task in memory if needed (main.py:1390-1391)
         if (
@@ -2309,6 +2337,42 @@ async def update_task_status_tool_impl(
 
         # Commit all changes
         conn.commit()
+
+        # Phase 2: wake `wait_for_events` waiters for every touched
+        # task's current assignee. Done AFTER commit so re-queries
+        # see the new state. We dedupe via a set to avoid waking the
+        # same agent multiple times when bulk-updating their tasks.
+        try:
+            woken: set = set()
+            for r in results + cascade_results + dependency_updates:
+                if not r.get("success"):
+                    continue
+                tid = r.get("task_id")
+                if not tid:
+                    continue
+                # Prefer the in-memory cache (updated by
+                # `_update_single_task`); fall back to the DB row
+                # if the task isn't cached for some reason.
+                assignee = None
+                if tid in g.tasks:
+                    assignee = g.tasks[tid].get("assigned_to")
+                if not assignee:
+                    cursor.execute(
+                        "SELECT assigned_to FROM tasks WHERE task_id = ?",
+                        (tid,),
+                    )
+                    row = cursor.fetchone()
+                    if row:
+                        assignee = row["assigned_to"]
+                if assignee and assignee not in woken:
+                    g.signal_for(assignee).set()
+                    woken.add(assignee)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "wait_for_events signal fan-out raised after "
+                "update_task_status: %s",
+                e,
+            )
 
         # Phase 4: Re-index updated tasks
         import asyncio

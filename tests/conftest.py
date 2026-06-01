@@ -53,6 +53,10 @@ def reset_globals() -> Iterator[None]:
     # And drop SQLAlchemy engines bound to a previous test's tmp DB
     # path — each test gets its own project_dir + DB.
     _engine.reset_engine_cache()
+    # wait_for_events Phase 2: drop signals bound to a prior test's
+    # event loop. asyncio.Event instances cannot be awaited across
+    # loops; signal_for() lazily recreates as needed.
+    g.agent_event_signals.clear()
 
     snapshot = {
         "connections": dict(g.connections),
@@ -89,6 +93,7 @@ def reset_globals() -> Iterator[None]:
     g.global_vss_load_successful = snapshot["global_vss_load_successful"]
     _wq._global_write_queue = None
     _engine.reset_engine_cache()
+    g.agent_event_signals.clear()
 
 
 @pytest.fixture

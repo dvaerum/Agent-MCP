@@ -26,7 +26,6 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import json
-import secrets
 from pathlib import Path
 
 import pytest
@@ -358,12 +357,16 @@ async def test_timeout_clamp_to_900_seconds(tmp_path: Path) -> None:
     import agent_mcp.tools.agent_communication_tools as acm
 
     captured_timeouts: list[float] = []
-    original_wait_for = asyncio.wait_for
 
     async def spy_wait_for(awaitable, timeout):
         captured_timeouts.append(float(timeout))
-        # Don't actually wait the clamped value; raise so the impl
-        # returns the empty envelope quickly.
+        # Close the un-awaited Event.wait() coroutine to avoid
+        # pytest's "coroutine was never awaited" warning, then raise
+        # TimeoutError so the impl returns its empty envelope quickly.
+        try:
+            awaitable.close()
+        except Exception:
+            pass
         raise asyncio.TimeoutError()
 
     async with mcp_session(tmp_path) as admin:
