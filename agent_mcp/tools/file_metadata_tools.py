@@ -12,6 +12,7 @@ from .registry import register_tool
 from ..core.config import logger
 from ..core import globals as g  # For agent_working_dirs
 from ..core.auth import get_agent_id, verify_token
+from ..core.authorize import requires
 from ..utils.audit_utils import log_audit
 from ..db.connection import get_db_connection
 from ..db.actions.agent_actions_db import log_agent_action_to_db
@@ -42,19 +43,15 @@ def _normalize_filepath(filepath_arg: str, agent_id_for_wd: Optional[str]) -> st
 
 # --- view_file_metadata tool ---
 # Original logic from main.py: lines 1503-1533 (view_file_metadata_tool function)
+@requires("any")
 async def view_file_metadata_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
     agent_auth_token = arguments.get("token")
     filepath_arg = arguments.get("filepath")
 
-    requesting_agent_id = get_agent_id(agent_auth_token)  # main.py:1506
-    if not requesting_agent_id:
-        return [
-            mcp_types.TextContent(
-                type="text", text="Unauthorized: Valid token required"
-            )
-        ]
+    # @requires("any") guaranteed entry; resolve id for working-dir lookup + audit.
+    requesting_agent_id = get_agent_id(agent_auth_token)
 
     if not filepath_arg or not isinstance(filepath_arg, str):
         return [
@@ -140,22 +137,19 @@ async def view_file_metadata_tool_impl(
 
 # --- update_file_metadata tool ---
 # Original logic from main.py: lines 1536-1569 (update_file_metadata_tool function)
+#
+# Note: access.py classifies this as "any" (workers see it in tools/list)
+# but the impl gates admin-only. We preserve current enforcement and decorate
+# with @requires("admin") — workers calling it directly get AuthRejected.
+# (The access.py mismatch is a pre-existing visibility quirk; tightening
+# tools/list would be a separate behavior-change PR.)
+@requires("admin")
 async def update_file_metadata_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
     admin_auth_token = arguments.get("token")
     filepath_arg = arguments.get("filepath")
     metadata_to_set = arguments.get("metadata")  # This is a Dict[str, Any]
-
-    if not verify_token(
-        admin_auth_token, "admin"
-    ):  # main.py:1539 (Restricted to admin)
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text="Unauthorized: Admin token required for updating file metadata.",
-            )
-        ]
 
     requesting_admin_id = get_agent_id(admin_auth_token)  # main.py:1542
     if not requesting_admin_id:  # Should be "admin"

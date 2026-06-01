@@ -9,18 +9,19 @@ from .registry import register_tool
 from ..core.config import logger
 from ..core import globals as g
 from ..core.auth import get_agent_id # verify_token not strictly needed here if get_agent_id implies valid token
+from ..core.authorize import requires
 from ..utils.audit_utils import log_audit
 # No DB interactions for these specific tools as they manage in-memory state (g.file_map)
 
 # --- check_file_status tool ---
 # Original logic from main.py: lines 1774-1801 (check_file_status_tool function)
+@requires("any")
 async def check_file_status_tool_impl(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
     agent_auth_token = arguments.get("token")
     filepath_arg = arguments.get("filepath")
 
-    requesting_agent_id = get_agent_id(agent_auth_token) # main.py:1777
-    if not requesting_agent_id:
-        return [mcp_types.TextContent(type="text", text="Unauthorized: Valid token required")]
+    # @requires("any") guaranteed entry; resolve id for working-dir lookup.
+    requesting_agent_id = get_agent_id(agent_auth_token)
 
     if not filepath_arg or not isinstance(filepath_arg, str):
         return [mcp_types.TextContent(type="text", text="Error: filepath is required and must be a string.")]
@@ -65,14 +66,14 @@ async def check_file_status_tool_impl(arguments: Dict[str, Any]) -> List[mcp_typ
 
 # --- update_file_status tool ---
 # Original logic from main.py: lines 1804-1849 (update_file_status_tool function)
+@requires("any")
 async def update_file_status_tool_impl(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
     agent_auth_token = arguments.get("token")
     filepath_arg = arguments.get("filepath")
     new_status = arguments.get("status") # e.g., "editing", "reading", "released"
 
-    requesting_agent_id = get_agent_id(agent_auth_token) # main.py:1808
-    if not requesting_agent_id:
-        return [mcp_types.TextContent(type="text", text="Unauthorized: Valid token required")]
+    # @requires("any") guaranteed entry; resolve id for working-dir lookup.
+    requesting_agent_id = get_agent_id(agent_auth_token)
 
     if not filepath_arg or not isinstance(filepath_arg, str) or \
        not new_status or not isinstance(new_status, str):

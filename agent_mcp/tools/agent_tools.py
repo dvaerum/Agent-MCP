@@ -7,17 +7,18 @@ from .registry import register_tool
 from ..core.config import logger
 from ..core import globals as g
 from ..core.auth import get_agent_id # verify_token not strictly needed here
+from ..core.authorize import requires
 from ..utils.audit_utils import log_audit
 from ..utils.project_utils import generate_system_prompt # The core logic
 
 # --- get_system_prompt tool ---
 # Original logic from main.py: lines 1352-1384 (get_system_prompt_tool function)
+@requires("any")
 async def get_system_prompt_tool_impl(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
     agent_auth_token = arguments.get("token") # This is the agent's own token
 
-    requesting_agent_id = get_agent_id(agent_auth_token) # main.py:1355
-    if not requesting_agent_id:
-        return [mcp_types.TextContent(type="text", text="Unauthorized: Valid agent token required")]
+    # @requires("any") guaranteed entry; resolve id for prompt generation.
+    requesting_agent_id = get_agent_id(agent_auth_token)
 
     # The original code (main.py:1359-1365) tried to find the agent_token again from active_agents
     # if it wasn't the admin token. This is redundant if `agent_auth_token` is already the agent's token.
