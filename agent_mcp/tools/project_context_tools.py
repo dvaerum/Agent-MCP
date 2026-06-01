@@ -20,6 +20,69 @@ _SECRET_KEY_RE = re.compile(
 # config_* entry are rejected at the tool boundary.
 _CONFIG_KEY_RE = re.compile(r"^config_", re.IGNORECASE)
 
+# Worker-policy toggle keys (Phase 4). Writing one of these flips the
+# tools/list visibility for worker bearers (PR #55 reads the toggle
+# live in `tools/access.py::is_visible_to_role`), so any subscribed
+# MCP client should re-fetch `tools/list`. We emit
+# `notifications/tools/list_changed` on the current request's session
+# (best-effort: in stateless StreamableHTTP mode there is no
+# enumeration of OTHER sessions to fan out to — clients still see the
+# new visibility on their next periodic `tools/list` call).
+_WORKER_POLICY_TOGGLE_RE = re.compile(r"^config_allow_worker_", re.IGNORECASE)
+
+
+def _is_worker_policy_toggle(context_key: str) -> bool:
+    """True if `context_key` controls worker tool visibility per
+    `agent_mcp/tools/access.py::TOOL_ACCESS`. Source-of-truth here is
+    intentionally pattern-based (any `config_allow_worker_*`) so a
+    future toggle added to TOOL_ACCESS picks up the notification
+    automatically."""
+    return bool(_WORKER_POLICY_TOGGLE_RE.match(context_key or ""))
+
+
+async def _emit_tools_list_changed(context_key: str) -> None:
+    """Best-effort emit `notifications/tools/list_changed` on the
+    current MCP request's session.
+
+    Safe to call from ANY context — when no `request_ctx` is bound
+    (e.g. REST endpoints, unit tests, background tasks) the helper
+    silently no-ops. The toggle-write itself is the source of truth;
+    `tools/list` reads it live, so clients converge on the next
+    refresh even without the push.
+
+    Cross-request fan-out (notifying workers' open GET /mcp streams
+    when an admin makes the change) requires the session registry
+    not yet built in stateless mode. Tracked separately.
+    """
+    try:
+        from mcp.server.lowlevel.server import request_ctx
+    except Exception:  # pragma: no cover - defensive
+        return
+
+    try:
+        ctx = request_ctx.get()
+    except LookupError:
+        return
+    if ctx is None:
+        return
+
+    session = getattr(ctx, "session", None)
+    if session is None:
+        return
+
+    sender = getattr(session, "send_tool_list_changed", None)
+    if sender is None:
+        return
+
+    try:
+        await sender()
+    except Exception as e:  # pragma: no cover - defensive
+        from ..core.config import logger
+        logger.debug(
+            "tools/list_changed emit failed (key=%s): %s",
+            context_key, e,
+        )
+
 
 def _config_key_error() -> str:
     return (
@@ -681,6 +744,12 @@ async def _handle_single_context_update(
 
     if err is not None:
         return [mcp_types.TextContent(type="text", text=err)]
+
+    # Phase 4: notify subscribers when a worker-policy toggle flips.
+    # The helper is best-effort and safe outside a request context.
+    if _is_worker_policy_toggle(context_key_to_update):
+        await _emit_tools_list_changed(context_key_to_update)
+
     return [
         mcp_types.TextContent(
             type="text",
@@ -730,6 +799,17 @@ async def _handle_bulk_context_update(
         ]
     if err is not None:
         return [mcp_types.TextContent(type="text", text=err)]
+
+    # Phase 4: if the bulk write touched any worker-policy toggle,
+    # emit a single tools/list_changed notification — workers care
+    # whether the set of visible tools changed, not which key
+    # flipped it.
+    if any(
+        _is_worker_policy_toggle(u.get("context_key", ""))
+        for u in updates_list
+    ):
+        await _emit_tools_list_changed("__bulk__")
+
     return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
 
 
@@ -970,6 +1050,15 @@ async def bulk_update_project_context_tool_impl(
         ]
     if err is not None:
         return [mcp_types.TextContent(type="text", text=err)]
+
+    # Phase 4: emit tools/list_changed once if any update was a
+    # worker-policy toggle.
+    if any(
+        _is_worker_policy_toggle(u.get("context_key", ""))
+        for u in updates
+    ):
+        await _emit_tools_list_changed("__bulk__")
+
     return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
 
 
