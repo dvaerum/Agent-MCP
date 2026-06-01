@@ -33,6 +33,7 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog'
 import { Separator } from '@/components/ui/separator'
+import { useDialog } from '@/hooks/use-dialog'
 import { 
   promptCategories, 
   promptTemplates, 
@@ -307,8 +308,11 @@ const PromptBuilder = ({ prompt, onClose }: {
 export function PromptBookDashboard() {
   const [searchTerm, setSearchTerm] = useState('')
   const [selectedCategory, setSelectedCategory] = useState<string>('all')
-  const [selectedPrompt, setSelectedPrompt] = useState<PromptTemplate | null>(null)
-  const [builderOpen, setBuilderOpen] = useState(false)
+  // Prompt builder dialog. Migrated to useDialog<PromptTemplate>()
+  // (Candidate F1, architecture review 2026-06-01) — collapses the
+  // legacy useState<PromptTemplate | null>(null) +
+  // useState<boolean>(false) pair into one piece of state.
+  const builderDialog = useDialog<PromptTemplate>()
   const [customPrompts, setCustomPrompts] = useState<PromptTemplate[]>([])
   const [createModalOpen, setCreateModalOpen] = useState(false)
   const { showTutorial, setShowTutorial } = usePromptBookTutorial()
@@ -368,8 +372,7 @@ export function PromptBookDashboard() {
   }, [filteredPrompts])
 
   const handleSelectPrompt = (prompt: PromptTemplate) => {
-    setSelectedPrompt(prompt)
-    setBuilderOpen(true)
+    builderDialog.open(prompt)
   }
 
   const handleCreatePrompt = (promptData: any) => {
@@ -594,7 +597,10 @@ export function PromptBookDashboard() {
       )}
 
       {/* Prompt Builder Dialog */}
-      <Dialog open={builderOpen} onOpenChange={setBuilderOpen}>
+      <Dialog
+        open={builderDialog.isOpen}
+        onOpenChange={(open) => { if (!open) builderDialog.close() }}
+      >
         <DialogContent className="max-w-4xl max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Prompt Builder</DialogTitle>
@@ -602,11 +608,11 @@ export function PromptBookDashboard() {
               Customize and generate your prompt with the required variables
             </DialogDescription>
           </DialogHeader>
-          
-          {selectedPrompt && (
+
+          {builderDialog.data && (
             <PromptBuilder
-              prompt={selectedPrompt}
-              onClose={() => setBuilderOpen(false)}
+              prompt={builderDialog.data}
+              onClose={() => builderDialog.close()}
             />
           )}
         </DialogContent>
