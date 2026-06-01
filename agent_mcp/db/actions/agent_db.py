@@ -120,7 +120,7 @@ def update_agent_db_field(agent_id: str, field_name: str, new_value: Any) -> boo
     Handles JSON serialization for fields like 'capabilities'.
     Returns True on success, False on failure.
     """
-    if field_name not in ['status', 'current_task', 'working_directory', 'color', 'capabilities', 'updated_at']:
+    if field_name not in ['status', 'current_task', 'working_directory', 'color', 'capabilities', 'updated_at', 'aoe_session_id']:
         logger.error(f"Attempted to update an invalid or unsupported agent field: {field_name}")
         return False
 
@@ -139,11 +139,12 @@ def update_agent_db_field(agent_id: str, field_name: str, new_value: Any) -> boo
         # Use safe field mapping to prevent SQL injection
         allowed_fields = {
             'status': 'status',
-            'current_task': 'current_task', 
+            'current_task': 'current_task',
             'working_directory': 'working_directory',
             'color': 'color',
             'capabilities': 'capabilities',
-            'updated_at': 'updated_at'
+            'updated_at': 'updated_at',
+            'aoe_session_id': 'aoe_session_id',
         }
         safe_field_name = allowed_fields[field_name]  # This will raise KeyError if invalid
         sql = f"UPDATE agents SET {safe_field_name} = ?, updated_at = ? WHERE agent_id = ?"

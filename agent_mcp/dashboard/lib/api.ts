@@ -11,6 +11,11 @@ export interface Agent {
   updated_at: string
   terminated_at?: string | null
   auth_token?: string
+  // 16-char lowercase hex string identifying the matching tmux
+  // session inside Agents-of-Empires for the notification side-
+  // channel. Empty/missing = no AoE binding (notifier will fall back
+  // to title-match resolution).
+  aoe_session_id?: string | null
 }
 
 export interface Task {
@@ -343,11 +348,19 @@ class ApiClient {
   }
 
   // editAgent updates the editable agent fields (capabilities, color,
-  // working_directory). Admin-only; backed by POST /api/agents/<id>/edit
-  // added alongside the dashboard's per-row Edit icon.
+  // working_directory, aoe_session_id). Admin-only; backed by
+  // POST /api/agents/<id>/edit added alongside the dashboard's
+  // per-row Edit icon. aoe_session_id is a 16-char lowercase hex
+  // string (or empty to clear) used by the AoE notification side-
+  // channel — see features/aoe_notify.py.
   async editAgent(
     agentId: string,
-    updates: { capabilities?: string[]; color?: string; working_directory?: string },
+    updates: {
+      capabilities?: string[]
+      color?: string
+      working_directory?: string
+      aoe_session_id?: string
+    },
   ): Promise<{ success: boolean; agent_id: string; updated: Record<string, unknown>; message: string }> {
     const tokens = await this.getTokens()
     return this.request(
@@ -357,6 +370,20 @@ class ApiClient {
         body: JSON.stringify({ token: tokens.admin_token, ...updates }),
       },
     )
+  }
+
+  // aoeHealth probes the configured Agents-of-Empires instance with
+  // the current bearer token. Settings panel uses it to warn when the
+  // token has gone stale (AoE rotates the file-sourced token on a
+  // schedule). Admin-only.
+  async aoeHealth(): Promise<{
+    status: 'ok' | 'disabled' | 'unauthorized' | 'unreachable' | 'misconfigured'
+    message?: string
+    session_count?: number
+    base_url?: string
+  }> {
+    const tokens = await this.getTokens()
+    return this.request(`/aoe/health?token=${encodeURIComponent(tokens.admin_token)}`)
   }
 
   async getPurgePreview(agentId: string): Promise<{

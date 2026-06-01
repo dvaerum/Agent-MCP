@@ -62,6 +62,13 @@ const POLICIES: PolicySpec[] = [
       "When on (default), workers may call assign_task with no agent_token to file work into the unassigned pool for any peer to claim. When off, only the admin may create tasks.",
     default: true,
   },
+  {
+    key: "config_aoe_notify_enabled",
+    title: "Notify Agents-of-Empires on new messages",
+    description:
+      "When on, send_agent_message also POSTs a tmux-pane wake-up to a local Agents-of-Empires (AoE) instance so the recipient notices the message even between polls. Disabled by default. Configure config_aoe_base_url, config_aoe_bearer_token (secret), and config_aoe_notify_template via the Memories tab. The message body itself is never forwarded — only {sender}, {recipient}, {message_id} are interpolated.",
+    default: false,
+  },
 ]
 
 interface PolicyState {
@@ -374,6 +381,92 @@ export function SettingsDashboard() {
           </div>
         </CardContent>
       </Card>
+
+      <AoeHealthCard />
     </div>
+  )
+}
+
+// AoeHealthCard: shows the live status of the configured Agents-of-
+// Empires instance. AoE rotates its bearer token on a schedule (it
+// writes a fresh value to ~/.config/agent-of-empires/serve.token);
+// admins using config_aoe_bearer_token_file get free rotation, but
+// inline tokens go stale silently. This card lets the admin check
+// without sending a real test message.
+function AoeHealthCard() {
+  type Health = Awaited<ReturnType<typeof apiClient.aoeHealth>>
+  const [health, setHealth] = useState<Health | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const probe = async () => {
+    setBusy(true)
+    setError(null)
+    try {
+      const r = await apiClient.aoeHealth()
+      setHealth(r)
+    } catch (e: any) {
+      setError(e?.message ?? String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  useEffect(() => {
+    probe()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const statusColor =
+    health?.status === 'ok'
+      ? 'text-emerald-500'
+      : health?.status === 'disabled'
+      ? 'text-muted-foreground'
+      : 'text-destructive'
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">Agents-of-Empires status</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <p className="text-xs text-muted-foreground">
+          Probes the configured AoE instance with the current bearer token
+          (resolved live, including file-sourced rotations). Use this to
+          confirm the token in <span className="font-mono">
+          config_aoe_bearer_token</span> / <span className="font-mono">
+          config_aoe_bearer_token_file</span> still works.
+        </p>
+        <div className="flex items-center justify-between gap-4">
+          <div className="text-sm">
+            {busy && <span className="text-muted-foreground">Probing…</span>}
+            {!busy && error && (
+              <span className="text-destructive">probe error: {error}</span>
+            )}
+            {!busy && !error && health && (
+              <>
+                <span className={`font-medium ${statusColor}`}>
+                  {health.status}
+                </span>
+                {health.status === 'ok' && health.session_count !== undefined && (
+                  <span className="ml-2 text-muted-foreground">
+                    {health.session_count} sessions @ {health.base_url}
+                  </span>
+                )}
+                {health.message && (
+                  <span className="ml-2 text-muted-foreground">
+                    — {health.message}
+                  </span>
+                )}
+              </>
+            )}
+          </div>
+          <Button variant="outline" size="sm" onClick={probe} disabled={busy}>
+            <RefreshCw className={`h-4 w-4 mr-1 ${busy ? 'animate-spin' : ''}`} />
+            Re-check
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
   )
 }
