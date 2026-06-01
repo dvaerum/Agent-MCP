@@ -44,7 +44,6 @@ The integration site is ``send_agent_message_tool_impl`` in
 
 from __future__ import annotations
 
-import asyncio
 import re
 from dataclasses import dataclass
 from typing import Optional
@@ -125,6 +124,83 @@ class AoeConfig:
     bearer_token: Optional[str]
     template: str
     timeout_ms: int
+    bearer_token_file: Optional[str] = None
+
+
+def _resolve_bearer_token(cfg: AoeConfig) -> Optional[str]:
+    """Pick the active bearer token.
+
+    Priority (highest first):
+      1. ``config_aoe_bearer_token``  (inline, "explicit wins")
+      2. ``config_aoe_bearer_token_file`` → read first line of file
+
+    AoE rotates ``~/.config/agent-of-empires/serve.token`` on a
+    schedule, so admins who want zero-touch operation point the
+    file-key at that path; admins who want pinned credentials use the
+    inline key. Reads happen on every send — cheap (single open of a
+    64-byte file) and means rotations are picked up live.
+    """
+    if cfg.bearer_token:
+        return cfg.bearer_token
+    if cfg.bearer_token_file:
+        try:
+            with open(cfg.bearer_token_file, "r") as f:
+                # AoE writes a single token with a trailing newline;
+                # be lenient about either.
+                first = f.readline().strip()
+            if not first:
+                logger.warning(
+                    "aoe_notify: token file %s is empty",
+                    cfg.bearer_token_file,
+                )
+                return None
+            return first
+        except FileNotFoundError:
+            logger.warning(
+                "aoe_notify: token file %s not found",
+                cfg.bearer_token_file,
+            )
+            return None
+        except PermissionError:
+            logger.warning(
+                "aoe_notify: token file %s not readable (check 0600 + ownership)",
+                cfg.bearer_token_file,
+            )
+            return None
+        except OSError as e:
+            logger.warning(
+                "aoe_notify: token file %s read failed: %s",
+                cfg.bearer_token_file, e,
+            )
+            return None
+    return None
+
+
+def _get_stored_aoe_session_id(agent_id: str) -> Optional[str]:
+    """Return ``agents.aoe_session_id`` for ``agent_id`` (None if unset/missing).
+
+    Tolerates the column being absent (legacy DB pre-migration) by
+    returning None — the caller will then fall back to title-match
+    resolution against /api/sessions.
+    """
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT aoe_session_id FROM agents WHERE agent_id = ?",
+            (agent_id,),
+        )
+        row = cur.fetchone()
+        conn.close()
+    except Exception as e:
+        logger.debug("aoe_notify: agents.aoe_session_id lookup failed: %s", e)
+        return None
+    if not row:
+        return None
+    val = row["aoe_session_id"]
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    return None
 
 
 def _read_ctx(key: str) -> Optional[str]:
@@ -178,6 +254,7 @@ def load_config() -> AoeConfig:
         enabled=_read_bool("config_aoe_notify_enabled", False),
         base_url=(_read_ctx("config_aoe_base_url") or DEFAULT_BASE_URL).rstrip("/"),
         bearer_token=_read_ctx("config_aoe_bearer_token"),
+        bearer_token_file=_read_ctx("config_aoe_bearer_token_file"),
         template=_read_ctx("config_aoe_notify_template") or DEFAULT_TEMPLATE,
         timeout_ms=_read_int("config_aoe_timeout_ms", DEFAULT_TIMEOUT_MS),
     )
@@ -192,14 +269,20 @@ def _build_client(cfg: AoeConfig) -> httpx.AsyncClient:
 
     Tests set ``_TRANSPORT_FOR_TESTS`` so this returns a client backed
     by an ``httpx.MockTransport``; production goes over the network.
+
+    The bearer token is resolved at client-build time via
+    ``_resolve_bearer_token`` so a file-sourced token rotation is
+    picked up on the next ``_build_client`` call without a server
+    restart.
     """
     timeout = httpx.Timeout(cfg.timeout_ms / 1000.0)
     kwargs: dict = {"base_url": cfg.base_url, "timeout": timeout}
     if _TRANSPORT_FOR_TESTS is not None:
         kwargs["transport"] = _TRANSPORT_FOR_TESTS
     headers: dict[str, str] = {}
-    if cfg.bearer_token:
-        headers["Authorization"] = f"Bearer {cfg.bearer_token}"
+    token = _resolve_bearer_token(cfg)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     if headers:
         kwargs["headers"] = headers
     return httpx.AsyncClient(**kwargs)
@@ -278,10 +361,28 @@ async def notify_aoe(recipient_id: str, sender_id: str, message_id: str) -> None
             recipient=recipient_id,
             message_id=message_id,
         )
+
+        # Token sanity: if the admin configured a token-file path but
+        # the file isn't usable, give up early — there's no point in
+        # talking to AoE without auth, and most AoE deployments require
+        # the bearer (read-only mode is the exception).
+        if (
+            cfg.bearer_token_file
+            and not cfg.bearer_token
+            and _resolve_bearer_token(cfg) is None
+        ):
+            return
+
         async with _build_client(cfg) as client:
+            # Per-agent stored binding takes precedence over title-match
+            # resolution. Cache holds the most-recent successful id;
+            # stored value is consulted on cache miss before falling
+            # back to /api/sessions.
             aoe_id = _SESSION_ID_CACHE.get(recipient_id)
             if aoe_id is None:
-                aoe_id = await _resolve_aoe_id(client, recipient_id)
+                aoe_id = _get_stored_aoe_session_id(recipient_id)
+                if aoe_id is None:
+                    aoe_id = await _resolve_aoe_id(client, recipient_id)
                 if aoe_id is None:
                     return
                 _SESSION_ID_CACHE[recipient_id] = aoe_id
@@ -315,3 +416,87 @@ async def notify_aoe(recipient_id: str, sender_id: str, message_id: str) -> None
         # uncaught exception inside an ``asyncio.create_task`` would
         # spam the logs with "Task exception was never retrieved".
         logger.warning("aoe_notify: unexpected error: %s", e, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Health check (admin-facing)
+# ---------------------------------------------------------------------------
+
+async def check_health() -> dict:
+    """Probe AoE with the current credentials and report status.
+
+    Returns a small dict shaped for the dashboard:
+
+      {"status": "ok",            "session_count": N, ...}
+      {"status": "disabled",      "message": "..."}
+      {"status": "unauthorized",  "message": "AoE returned 401 ..."}
+      {"status": "unreachable",   "message": "..."}
+      {"status": "misconfigured", "message": "no bearer token resolved"}
+
+    The endpoint (`/api/aoe/health`) is admin-only — see routes.py.
+    """
+    cfg = load_config()
+    if not cfg.enabled:
+        return {
+            "status": "disabled",
+            "message": "config_aoe_notify_enabled is off",
+        }
+
+    # If a token source is configured, make sure we can actually use
+    # it before we pester AoE.
+    if cfg.bearer_token or cfg.bearer_token_file:
+        token = _resolve_bearer_token(cfg)
+        if token is None:
+            return {
+                "status": "misconfigured",
+                "message": (
+                    "config_aoe_bearer_token_file is set but the file "
+                    "could not be read (see server log)"
+                ),
+            }
+
+    try:
+        async with _build_client(cfg) as client:
+            try:
+                resp = await client.get("/api/sessions")
+            except httpx.TimeoutException:
+                return {
+                    "status": "unreachable",
+                    "message": f"AoE timed out at {cfg.base_url}",
+                }
+            except Exception as e:
+                return {
+                    "status": "unreachable",
+                    "message": f"AoE at {cfg.base_url} unreachable: {e}",
+                }
+
+            if resp.status_code == 401 or resp.status_code == 403:
+                return {
+                    "status": "unauthorized",
+                    "message": (
+                        f"AoE returned {resp.status_code} — bearer token "
+                        "is missing, stale, or rejected"
+                    ),
+                }
+            if resp.status_code != 200:
+                return {
+                    "status": "unreachable",
+                    "message": f"AoE returned {resp.status_code}",
+                }
+            try:
+                sessions = resp.json().get("sessions") or []
+            except Exception as e:
+                return {
+                    "status": "unreachable",
+                    "message": f"AoE /api/sessions body unparseable: {e}",
+                }
+            return {
+                "status": "ok",
+                "session_count": len(sessions),
+                "base_url": cfg.base_url,
+            }
+    except Exception as e:
+        return {
+            "status": "unreachable",
+            "message": f"AoE health check failed: {e}",
+        }

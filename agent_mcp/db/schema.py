@@ -171,7 +171,8 @@ def init_database() -> None:
                 working_directory TEXT NOT NULL,
                 color TEXT,           -- For dashboard visualization
                 terminated_at TEXT,   -- Timestamp of termination
-                updated_at TEXT       -- Timestamp of last update
+                updated_at TEXT,      -- Timestamp of last update
+                aoe_session_id TEXT   -- 16-hex AoE session id for notification side-channel (nullable)
             )
         """
         )

@@ -608,7 +608,7 @@ async def edit_agent_api_route(request: Request) -> JSONResponse:
         # Whitelisted editable fields. Anything else in `data` is ignored
         # (defense in depth — status / agent_id / token must not flow
         # through this endpoint).
-        editable = ('capabilities', 'color', 'working_directory')
+        editable = ('capabilities', 'color', 'working_directory', 'aoe_session_id')
         updates = {k: data[k] for k in editable if k in data}
         if not updates:
             return JSONResponse(
@@ -616,6 +616,24 @@ async def edit_agent_api_route(request: Request) -> JSONResponse:
                           + ", ".join(editable)},
                 status_code=400,
             )
+
+        # aoe_session_id: AoE generates 16-char lowercase hex ids.
+        # Accept that exact shape or empty string (clears the binding,
+        # stored as NULL in the column). Anything else → 400.
+        if 'aoe_session_id' in updates:
+            raw = updates['aoe_session_id']
+            if raw is None or raw == '':
+                updates['aoe_session_id'] = None
+            elif (
+                not isinstance(raw, str)
+                or len(raw) != 16
+                or any(c not in '0123456789abcdef' for c in raw)
+            ):
+                return JSONResponse(
+                    {"error": "aoe_session_id must be 16 lowercase hex chars "
+                              "or empty (got " + repr(raw) + ")"},
+                    status_code=400,
+                )
 
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -1096,8 +1114,56 @@ async def handle_options(request: Request) -> Response:
         }
     )
 
+async def aoe_health_api_route(request: Request) -> JSONResponse:
+    """GET /api/aoe/health — admin-only AoE-reachability probe.
+
+    Pings the configured AoE instance with the current bearer token
+    (resolved live, including file-sourced rotations) and reports back:
+
+      {"status": "ok",            "session_count": N, "base_url": "..."}
+      {"status": "disabled",      "message": "config_aoe_notify_enabled is off"}
+      {"status": "unauthorized",  "message": "AoE returned 401 ..."}
+      {"status": "unreachable",   "message": "..."}
+      {"status": "misconfigured", "message": "no bearer token resolved"}
+
+    Used by the Settings tab to surface a "your AoE token has gone
+    stale" warning without requiring the admin to attempt a real send.
+    """
+    if request.method == 'OPTIONS':
+        return await handle_options(request)
+    if request.method != 'GET':
+        return JSONResponse({"error": "Method not allowed"}, status_code=405)
+
+    # Auth: admin only. Accept token via Authorization: Bearer header
+    # OR ?token=<>.
+    auth_header = request.headers.get("Authorization", "")
+    token: Optional[str] = None
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header[7:].strip() or None
+    if token is None:
+        token = request.query_params.get("token")
+    if not token or not verify_token(token, "admin"):
+        return JSONResponse(
+            {"error": "Unauthorized: admin token required"},
+            status_code=401,
+        )
+
+    from agent_mcp.features.aoe_notify import check_health
+
+    try:
+        result = await check_health()
+    except Exception as e:
+        logger.error("AoE health probe crashed: %s", e, exc_info=True)
+        return JSONResponse(
+            {"status": "unreachable", "message": f"probe crashed: {e}"},
+            status_code=200,
+        )
+    return JSONResponse(result)
+
+
 # --- Route Definitions List ---
 routes = [
+    Route('/api/aoe/health', endpoint=aoe_health_api_route, name="aoe_health_api", methods=['GET', 'OPTIONS']),
     Route('/api/all-data', endpoint=all_data_api_route, name="all_data_api", methods=['GET', 'OPTIONS']),
     Route('/api/status', endpoint=simple_status_api_route, name="simple_status_api", methods=['GET', 'OPTIONS']),
     Route('/api/graph-data', endpoint=graph_data_api_route, name="graph_data_api", methods=['GET', 'OPTIONS']),

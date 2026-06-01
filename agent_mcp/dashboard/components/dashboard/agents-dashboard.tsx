@@ -636,6 +636,7 @@ const EditAgentDialog = ({
   const [capabilities, setCapabilities] = useState('')
   const [color, setColor] = useState('')
   const [workingDirectory, setWorkingDirectory] = useState('')
+  const [aoeSessionId, setAoeSessionId] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -644,6 +645,7 @@ const EditAgentDialog = ({
     setCapabilities(normalizeCapabilities(agent.capabilities).join(', '))
     setColor(agent.color || '')
     setWorkingDirectory(agent.working_directory || '')
+    setAoeSessionId(agent.aoe_session_id || '')
     setError(null)
   }, [open, agent])
 
@@ -652,7 +654,12 @@ const EditAgentDialog = ({
     if (!agent) return
     setBusy(true)
     setError(null)
-    const updates: { capabilities?: string[]; color?: string; working_directory?: string } = {}
+    const updates: {
+      capabilities?: string[]
+      color?: string
+      working_directory?: string
+      aoe_session_id?: string
+    } = {}
     const parsedCaps = capabilities
       .split(',')
       .map((c) => c.trim())
@@ -666,6 +673,16 @@ const EditAgentDialog = ({
     }
     if (workingDirectory !== (agent.working_directory || '')) {
       updates.working_directory = workingDirectory
+    }
+    const aoeTrimmed = aoeSessionId.trim().toLowerCase()
+    if (aoeTrimmed !== (agent.aoe_session_id || '')) {
+      // Client-side hint — the backend re-validates and 400s on bad input.
+      if (aoeTrimmed && !/^[0-9a-f]{16}$/.test(aoeTrimmed)) {
+        setError('AoE session id must be 16 lowercase hex chars (or empty to clear).')
+        setBusy(false)
+        return
+      }
+      updates.aoe_session_id = aoeTrimmed
     }
     if (Object.keys(updates).length === 0) {
       onOpenChange(false)
@@ -734,6 +751,23 @@ const EditAgentDialog = ({
               placeholder="/workspace/agent"
               className="bg-background border-border text-foreground font-mono text-sm"
             />
+          </div>
+          <div>
+            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
+              AoE Session ID
+            </label>
+            <Input
+              value={aoeSessionId}
+              onChange={(e) => setAoeSessionId(e.target.value)}
+              placeholder="16-char lowercase hex, e.g. 551e7a79d11f435b"
+              className="bg-background border-border text-foreground font-mono text-sm"
+              maxLength={16}
+              pattern="[0-9a-f]{16}"
+            />
+            <p className="text-[10px] text-muted-foreground mt-1">
+              Binds this agent to a specific Agents-of-Empires tmux session for the
+              notification side-channel. Leave empty to fall back to title-match.
+            </p>
           </div>
           {error && <div className="text-sm text-destructive">{error}</div>}
           <DialogFooter className="gap-2">
