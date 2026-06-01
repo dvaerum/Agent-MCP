@@ -9,16 +9,23 @@ Behavior:
 - Admin + unknown agent_id: clear "Unknown agent_id: '<id>'" error.
 - Worker + agent_id: rejected as admin-only (workers must pass their own token).
 - Admin + BOTH agent_id and agent_token: agent_token wins, agent_id ignored.
+
+Migrated to use `tests/harness.py::mcp_session` (Candidate E from
+architecture review 2026-06-01). The `_inline_write_queue` shim is
+preserved (same Mode-0 deadlock applies under the harness's
+asyncio.run flow — the underlying execute_db_write queue is per-loop).
 """
 
 from __future__ import annotations
 
-import asyncio
-import datetime as _dt
 import re
-import secrets
 
 import pytest
+
+from tests.harness import mcp_session
+
+
+pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture(autouse=True)
@@ -41,130 +48,95 @@ def _inline_write_queue(monkeypatch):
     )
 
 
-def _seed_worker(name: str = "alice"):
-    from agent_mcp.core import globals as g
-    from agent_mcp.db.connection import get_db_connection
-
-    worker_token = secrets.token_hex(16)
-    now = _dt.datetime.now().isoformat()
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO agents (token, agent_id, capabilities, created_at, "
-        "status, working_directory, color, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (worker_token, name, "[]", now, "active", "/tmp", "#888", now),
-    )
-    conn.commit()
-    conn.close()
-
-    g.active_agents[worker_token] = {
-        "agent_id": name,
-        "status": "active",
-        "created_at": now,
-        "capabilities": [],
-    }
-    return worker_token, name
-
-
-def _admin(client) -> str:
-    return client.get("/api/tokens").json()["admin_token"]
-
-
-def _call_assign(arguments: dict):
-    from agent_mcp.tools.task_tools import assign_task_tool_impl
-
-    return asyncio.run(assign_task_tool_impl(arguments))
-
-
-def _row(client, task_id: str):
-    listing = client.get("/api/tasks").json()
-    if isinstance(listing, dict):
-        listing = listing.get("tasks", [])
-    for entry in listing:
-        if entry.get("task_id") == task_id:
-            return entry
-    return None
-
-
-def test_admin_can_use_agent_id_instead_of_agent_token(client) -> None:
+async def test_admin_can_use_agent_id_instead_of_agent_token(tmp_path) -> None:
     """Admin passes agent_id='alice' → server resolves to alice's token,
     creates and assigns the task in one call."""
-    admin = _admin(client)
-    _worker_token, worker_id = _seed_worker("alice")
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
 
-    result = _call_assign({
-        "token": admin,
-        "agent_id": worker_id,
-        "task_title": "do the thing",
-        "task_description": "all of it",
-    })
-    text = result[0].text
-    assert "Error" not in text and "error" not in text, text
+        result = await admin.assert_tool_succeeds(
+            "assign_task",
+            {
+                "agent_id": alice.agent_id,
+                "task_title": "do the thing",
+                "task_description": "all of it",
+            },
+        )
+        text = result[0].text
+        assert "Error" not in text and "error" not in text, text
 
-    m = re.search(r"task_[a-f0-9]+", text)
-    assert m, f"no task_id in result: {text}"
-    task_id = m.group(0)
+        m = re.search(r"task_[a-f0-9]+", text)
+        assert m, f"no task_id in result: {text}"
+        task_id = m.group(0)
 
-    row = _row(client, task_id)
-    assert row is not None, f"task {task_id} not in /api/tasks listing"
-    assert row.get("assigned_to") == worker_id, (
-        f"expected assigned_to=={worker_id}, got {row.get('assigned_to')!r}"
-    )
+        row = admin.task_row(task_id)
+        assert row is not None, f"task {task_id} not in /api/tasks listing"
+        assert row.get("assigned_to") == alice.agent_id, (
+            f"expected assigned_to=={alice.agent_id}, "
+            f"got {row.get('assigned_to')!r}"
+        )
 
 
-def test_admin_unknown_agent_id_returns_clear_error(client) -> None:
+async def test_admin_unknown_agent_id_returns_clear_error(tmp_path) -> None:
     """Admin passes an agent_id that doesn't exist → clear error message
     naming the bad id."""
-    admin = _admin(client)
+    async with mcp_session(tmp_path) as admin:
+        # Not using assert_tool_succeeds — we expect an Error TextContent.
+        result = await admin.call(
+            "assign_task",
+            {
+                "agent_id": "ghost-agent",
+                "task_title": "x",
+                "task_description": "y",
+            },
+        )
+        text = result[0].text
+        assert "Unknown agent_id" in text and "ghost-agent" in text, text
 
-    result = _call_assign({
-        "token": admin,
-        "agent_id": "ghost-agent",
-        "task_title": "x",
-        "task_description": "y",
-    })
-    text = result[0].text
-    assert "Unknown agent_id" in text and "ghost-agent" in text, text
 
-
-def test_worker_cannot_use_agent_id_admin_only(client) -> None:
+async def test_worker_cannot_use_agent_id_admin_only(tmp_path) -> None:
     """Workers may not pass agent_id (it's an admin-only parameter)."""
-    _admin(client)  # ensure admin token initialized
-    worker_token, worker_id = _seed_worker("bob")
+    async with mcp_session(tmp_path) as admin:
+        bob = await admin.create_worker("bob")
+        # We assert against the wire-level Unauthorized + admin-only
+        # hint shape; the helper handles the Unauthorized check, the
+        # extra "admin-only" word is asserted manually for specificity.
+        result = await bob.call(
+            "assign_task",
+            {
+                "agent_id": bob.agent_id,
+                "task_title": "x",
+                "task_description": "y",
+            },
+        )
+        text = result[0].text
+        assert "Unauthorized" in text and "admin-only" in text, text
 
-    result = _call_assign({
-        "token": worker_token,
-        "agent_id": worker_id,
-        "task_title": "x",
-        "task_description": "y",
-    })
-    text = result[0].text
-    assert "Unauthorized" in text and "admin-only" in text, text
 
-
-def test_admin_both_agent_id_and_agent_token_prefers_token(client) -> None:
+async def test_admin_both_agent_id_and_agent_token_prefers_token(tmp_path) -> None:
     """When both are provided, agent_token wins. agent_id is ignored
     silently (no error). The task ends up assigned to the agent_token's
     owner, not the agent_id's owner."""
-    admin = _admin(client)
-    alice_token, alice_id = _seed_worker("alice")
-    _bob_token, bob_id = _seed_worker("bob")
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        bob = await admin.create_worker("bob")
 
-    result = _call_assign({
-        "token": admin,
-        "agent_id": bob_id,  # decoy — should be ignored
-        "agent_token": alice_token,  # this wins
-        "task_title": "do the thing",
-        "task_description": "all of it",
-    })
-    text = result[0].text
-    assert "Error" not in text and "error" not in text, text
+        result = await admin.assert_tool_succeeds(
+            "assign_task",
+            {
+                "agent_id": bob.agent_id,  # decoy — should be ignored
+                "agent_token": alice.token,  # this wins
+                "task_title": "do the thing",
+                "task_description": "all of it",
+            },
+        )
+        text = result[0].text
+        assert "Error" not in text and "error" not in text, text
 
-    task_id = re.search(r"task_[a-f0-9]+", text).group(0)
-    row = _row(client, task_id)
-    assert row is not None
-    assert row.get("assigned_to") == alice_id, (
-        f"agent_token must win when both provided; got {row.get('assigned_to')!r}"
-    )
+        task_id = re.search(r"task_[a-f0-9]+", text).group(0)
+        row = admin.task_row(task_id)
+        assert row is not None
+        assert row.get("assigned_to") == alice.agent_id, (
+            f"agent_token must win when both provided; "
+            f"got {row.get('assigned_to')!r}"
+        )

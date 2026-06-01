@@ -15,83 +15,34 @@ These tests pin the filter against the full registered catalogue so a
 new admin-gated tool registered without an access classification is
 caught (defaults to "any" today, but the test makes the policy explicit
 per tool).
+
+Migrated to use `tests/harness.py::mcp_session` (Candidate E from
+architecture review 2026-06-01). The `_list_tools_via_framework`
+helper and the ContextVar-juggling around `request_auth_token`
+collapse into `session.list_tools()`. The structural classification
+test that doesn't need a running app stays as a plain function.
 """
+
 from __future__ import annotations
 
-import asyncio
-import secrets
+import pytest
 
-import mcp.types as mcp_types
-
-
-def _admin_token(client) -> str:
-    return client.get("/api/tokens").json()["admin_token"]
+from tests.harness import mcp_session
 
 
-def _seed_worker(name: str = "alice") -> tuple[str, str]:
-    """Register a worker; returns (token, agent_id)."""
-    import datetime as _dt
-    from agent_mcp.core import globals as g
-    from agent_mcp.db.connection import get_db_connection
-
-    worker_token = secrets.token_hex(16)
-    now = _dt.datetime.now().isoformat()
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO agents (token, agent_id, capabilities, created_at, "
-        "status, working_directory, color, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (worker_token, name, "[]", now, "active", "/tmp", "#888", now),
-    )
-    conn.commit()
-    conn.close()
-    g.active_agents[worker_token] = {
-        "agent_id": name,
-        "status": "active",
-        "created_at": now,
-        "capabilities": [],
-    }
-    return worker_token, name
+# Note: tests in this module mix one sync structural test
+# (`test_every_registered_tool_has_access_classification`) with async
+# harness-driven tests. We mark the async ones individually rather
+# than at module level so pytest-asyncio doesn't warn about the sync
+# function carrying an asyncio mark.
 
 
-def _set_toggle(client, key: str, value: str, admin_token: str) -> None:
-    """Seed/update a project_context toggle via the REST API."""
-    r = client.post(
-        "/api/memories",
-        json={"token": admin_token, "context_key": key, "context_value": value},
-    )
-    if r.status_code == 409:
-        r = client.request(
-            "PUT",
-            f"/api/memories/{key}",
-            json={"token": admin_token, "context_value": value},
-        )
-    assert r.status_code == 200, r.text
-
-
-async def _list_tools_via_framework() -> list[mcp_types.Tool]:
-    """Drive the MCP server's registered ListToolsRequest handler.
-
-    Mirrors what an SSE/JSON-RPC client gets when it sends `tools/list`.
-    The handler reads the bearer from the `request_auth_token`
-    ContextVar (set by the HTTP middleware in real traffic; set
-    directly here).
-    """
-    from agent_mcp.app.main_app import mcp_app_instance
-
-    handler = mcp_app_instance.request_handlers[mcp_types.ListToolsRequest]
-    req = mcp_types.ListToolsRequest(method="tools/list")
-    result = await handler(req)
-    inner = result.root if hasattr(result, "root") else result
-    return list(getattr(inner, "tools", []) or [])
-
-
-def _names(tools: list[mcp_types.Tool]) -> set[str]:
+def _names(tools) -> set[str]:
     return {t.name for t in tools}
 
 
 # --- Access classification: the registry must classify every tool ---
+
 
 def test_every_registered_tool_has_access_classification() -> None:
     """Every name in `tool_schemas` must have an entry in
@@ -99,6 +50,8 @@ def test_every_registered_tool_has_access_classification() -> None:
     decision). New tools without a classification would default to
     "any", which is the most permissive — making the classification
     mandatory catches that omission.
+
+    Pure structural assertion: no app, no harness needed.
     """
     import agent_mcp.tools  # noqa: F401 — registers tools
     from agent_mcp.tools.access import TOOL_ACCESS
@@ -129,213 +82,173 @@ ADMIN_ONLY = {
 }
 
 
-def test_admin_bearer_sees_every_registered_tool(client) -> None:
+@pytest.mark.asyncio
+async def test_admin_bearer_sees_every_registered_tool(tmp_path) -> None:
     """Admin role → no filter; tools/list returns the full catalogue."""
-    from agent_mcp.tools.registry import request_auth_token, tool_schemas
+    from agent_mcp.tools.registry import tool_schemas
 
-    admin = _admin_token(client)
-    token = request_auth_token.set(admin)
-    try:
-        tools = asyncio.run(_list_tools_via_framework())
-    finally:
-        request_auth_token.reset(token)
-
-    names = _names(tools)
-    registered = {e["name"] for e in tool_schemas}
-    assert names == registered, (
-        f"admin should see every registered tool; missing="
-        f"{sorted(registered - names)}, extra={sorted(names - registered)}"
-    )
+    async with mcp_session(tmp_path) as admin:
+        tools = await admin.list_tools()
+        names = _names(tools)
+        registered = {e["name"] for e in tool_schemas}
+        assert names == registered, (
+            f"admin should see every registered tool; missing="
+            f"{sorted(registered - names)}, extra={sorted(names - registered)}"
+        )
 
 
-def test_worker_bearer_does_not_see_admin_only_tools(client) -> None:
+@pytest.mark.asyncio
+async def test_worker_bearer_does_not_see_admin_only_tools(tmp_path) -> None:
     """Worker role → all "admin"-classified tools are filtered out."""
-    from agent_mcp.tools.registry import request_auth_token
-
-    _admin_token(client)  # trigger lazy init
-    worker_tok, _ = _seed_worker("alice-filter")
-
-    token = request_auth_token.set(worker_tok)
-    try:
-        tools = asyncio.run(_list_tools_via_framework())
-    finally:
-        request_auth_token.reset(token)
-
-    names = _names(tools)
-    leaked = names & ADMIN_ONLY
-    assert not leaked, (
-        f"worker tools/list leaked admin-only tools: {sorted(leaked)}"
-    )
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice-filter")
+        tools = await alice.list_tools()
+        names = _names(tools)
+        leaked = names & ADMIN_ONLY
+        assert not leaked, (
+            f"worker tools/list leaked admin-only tools: {sorted(leaked)}"
+        )
 
 
-def test_worker_bearer_sees_any_tools(client) -> None:
+@pytest.mark.asyncio
+async def test_worker_bearer_sees_any_tools(tmp_path) -> None:
     """Worker role → "any"-classified tools remain visible."""
-    from agent_mcp.tools.registry import request_auth_token
-
-    _admin_token(client)
-    worker_tok, _ = _seed_worker("alice-any")
-
-    token = request_auth_token.set(worker_tok)
-    try:
-        tools = asyncio.run(_list_tools_via_framework())
-    finally:
-        request_auth_token.reset(token)
-
-    names = _names(tools)
-    expected_visible = {
-        "view_project_context",
-        "view_tasks",
-        "view_file_metadata",
-        "get_agent_messages",
-        "request_assistance",
-        "ask_project_rag",
-        "test",
-        "get_system_prompt",
-    }
-    missing = expected_visible - names
-    assert not missing, (
-        f"worker tools/list dropped expected 'any' tools: {sorted(missing)}"
-    )
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice-any")
+        tools = await alice.list_tools()
+        names = _names(tools)
+        expected_visible = {
+            "view_project_context",
+            "view_tasks",
+            "view_file_metadata",
+            "get_agent_messages",
+            "request_assistance",
+            "ask_project_rag",
+            "test",
+            "get_system_prompt",
+        }
+        missing = expected_visible - names
+        assert not missing, (
+            f"worker tools/list dropped expected 'any' tools: "
+            f"{sorted(missing)}"
+        )
 
 
-def test_worker_send_agent_message_hidden_by_default(client) -> None:
+@pytest.mark.asyncio
+async def test_worker_send_agent_message_hidden_by_default(tmp_path) -> None:
     """`send_agent_message` is gated on `config_allow_worker_to_worker`
     (default False per PR #16). Worker should NOT see it until the
     toggle is on.
     """
-    from agent_mcp.tools.registry import request_auth_token
-
-    _admin_token(client)
-    worker_tok, _ = _seed_worker("alice-w2w")
-
-    token = request_auth_token.set(worker_tok)
-    try:
-        tools = asyncio.run(_list_tools_via_framework())
-    finally:
-        request_auth_token.reset(token)
-
-    assert "send_agent_message" not in _names(tools), (
-        "worker should not see send_agent_message when "
-        "config_allow_worker_to_worker is unset (default False)"
-    )
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice-w2w")
+        tools = await alice.list_tools()
+        assert "send_agent_message" not in _names(tools), (
+            "worker should not see send_agent_message when "
+            "config_allow_worker_to_worker is unset (default False)"
+        )
 
 
-def test_worker_send_agent_message_visible_when_toggle_on(client) -> None:
+@pytest.mark.asyncio
+async def test_worker_send_agent_message_visible_when_toggle_on(
+    tmp_path,
+) -> None:
     """Flip `config_allow_worker_to_worker=true` and the tool appears."""
-    from agent_mcp.tools.registry import request_auth_token
-
-    admin = _admin_token(client)
-    _set_toggle(client, "config_allow_worker_to_worker", "true", admin)
-    worker_tok, _ = _seed_worker("alice-w2w-on")
-
-    token = request_auth_token.set(worker_tok)
-    try:
-        tools = asyncio.run(_list_tools_via_framework())
-    finally:
-        request_auth_token.reset(token)
-
-    assert "send_agent_message" in _names(tools), (
-        "worker should see send_agent_message when "
-        "config_allow_worker_to_worker=true"
-    )
+    async with mcp_session(tmp_path) as admin:
+        admin.set_toggle("config_allow_worker_to_worker", "true")
+        alice = await admin.create_worker("alice-w2w-on")
+        tools = await alice.list_tools()
+        assert "send_agent_message" in _names(tools), (
+            "worker should see send_agent_message when "
+            "config_allow_worker_to_worker=true"
+        )
 
 
-def test_worker_update_task_status_visible_by_default(client) -> None:
+@pytest.mark.asyncio
+async def test_worker_update_task_status_visible_by_default(tmp_path) -> None:
     """`update_task_status` is toggle-gated but defaults to True
     (PR #18) — worker should see it without any explicit toggle.
     """
-    from agent_mcp.tools.registry import request_auth_token
-
-    _admin_token(client)
-    worker_tok, _ = _seed_worker("alice-uts")
-
-    token = request_auth_token.set(worker_tok)
-    try:
-        tools = asyncio.run(_list_tools_via_framework())
-    finally:
-        request_auth_token.reset(token)
-
-    assert "update_task_status" in _names(tools)
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice-uts")
+        tools = await alice.list_tools()
+        assert "update_task_status" in _names(tools)
 
 
-def test_worker_update_task_status_hidden_when_toggle_off(client) -> None:
+@pytest.mark.asyncio
+async def test_worker_update_task_status_hidden_when_toggle_off(
+    tmp_path,
+) -> None:
     """Flip `config_allow_worker_update_own_status=false` → hidden."""
-    from agent_mcp.tools.registry import request_auth_token
-
-    admin = _admin_token(client)
-    _set_toggle(
-        client, "config_allow_worker_update_own_status", "false", admin
-    )
-    worker_tok, _ = _seed_worker("alice-uts-off")
-
-    token = request_auth_token.set(worker_tok)
-    try:
-        tools = asyncio.run(_list_tools_via_framework())
-    finally:
-        request_auth_token.reset(token)
-
-    assert "update_task_status" not in _names(tools)
+    async with mcp_session(tmp_path) as admin:
+        admin.set_toggle(
+            "config_allow_worker_update_own_status", "false"
+        )
+        alice = await admin.create_worker("alice-uts-off")
+        tools = await alice.list_tools()
+        assert "update_task_status" not in _names(tools)
 
 
-def test_worker_assign_task_visible_by_default(client) -> None:
+@pytest.mark.asyncio
+async def test_worker_assign_task_visible_by_default(tmp_path) -> None:
     """`assign_task` defaults — both `self_assign` and
     `create_unassigned` default True. With either toggle truthy the
     tool is visible to workers.
     """
-    from agent_mcp.tools.registry import request_auth_token
-
-    _admin_token(client)
-    worker_tok, _ = _seed_worker("alice-assign")
-
-    token = request_auth_token.set(worker_tok)
-    try:
-        tools = asyncio.run(_list_tools_via_framework())
-    finally:
-        request_auth_token.reset(token)
-
-    assert "assign_task" in _names(tools)
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice-assign")
+        tools = await alice.list_tools()
+        assert "assign_task" in _names(tools)
 
 
-def test_worker_assign_task_hidden_when_both_toggles_off(client) -> None:
+@pytest.mark.asyncio
+async def test_worker_assign_task_hidden_when_both_toggles_off(
+    tmp_path,
+) -> None:
     """When BOTH `config_allow_worker_self_assign` and
     `config_allow_worker_create_unassigned` are false, the worker
     can't usefully call `assign_task` — hide it.
     """
-    from agent_mcp.tools.registry import request_auth_token
-
-    admin = _admin_token(client)
-    _set_toggle(client, "config_allow_worker_self_assign", "false", admin)
-    _set_toggle(
-        client, "config_allow_worker_create_unassigned", "false", admin
-    )
-    worker_tok, _ = _seed_worker("alice-assign-off")
-
-    token = request_auth_token.set(worker_tok)
-    try:
-        tools = asyncio.run(_list_tools_via_framework())
-    finally:
-        request_auth_token.reset(token)
-
-    assert "assign_task" not in _names(tools)
+    async with mcp_session(tmp_path) as admin:
+        admin.set_toggle("config_allow_worker_self_assign", "false")
+        admin.set_toggle(
+            "config_allow_worker_create_unassigned", "false"
+        )
+        alice = await admin.create_worker("alice-assign-off")
+        tools = await alice.list_tools()
+        assert "assign_task" not in _names(tools)
 
 
-def test_unauthenticated_sees_only_any_tools(client) -> None:
+@pytest.mark.asyncio
+async def test_unauthenticated_sees_only_any_tools(tmp_path) -> None:
     """No bearer set → conservative: show only "any" tools."""
-    from agent_mcp.tools.registry import request_auth_token
     from agent_mcp.tools.access import TOOL_ACCESS
+    from agent_mcp.tools.registry import request_auth_token
 
-    _admin_token(client)  # trigger lazy init, but don't set ContextVar
+    async with mcp_session(tmp_path) as admin:
+        # The harness's WorkerSession always binds *some* bearer in
+        # request_auth_token. To exercise the "unauthenticated" path
+        # we explicitly clear the contextvar around list_tools by
+        # going through the framework handler with a None token
+        # bound. The admin.list_tools() flow would bind admin_token,
+        # so we drive the handler directly here using admin's lazy
+        # accessor.
+        import mcp.types as mcp_types
 
-    token = request_auth_token.set(None)
-    try:
-        tools = asyncio.run(_list_tools_via_framework())
-    finally:
-        request_auth_token.reset(token)
+        handler = admin._list_tools_handler()
+        req = mcp_types.ListToolsRequest(method="tools/list")
+        cv_token = request_auth_token.set(None)
+        try:
+            result = await handler(req)
+        finally:
+            request_auth_token.reset(cv_token)
+        inner = result.root if hasattr(result, "root") else result
+        tools = list(getattr(inner, "tools", []) or [])
 
-    names = _names(tools)
-    expected_any = {n for n, lvl in TOOL_ACCESS.items() if lvl == "any"}
-    assert names == expected_any, (
-        f"unauthenticated should see exactly 'any' tools; "
-        f"missing={sorted(expected_any - names)}, "
-        f"extra={sorted(names - expected_any)}"
-    )
+        names = _names(tools)
+        expected_any = {n for n, lvl in TOOL_ACCESS.items() if lvl == "any"}
+        assert names == expected_any, (
+            f"unauthenticated should see exactly 'any' tools; "
+            f"missing={sorted(expected_any - names)}, "
+            f"extra={sorted(names - expected_any)}"
+        )

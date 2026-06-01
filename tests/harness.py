@@ -1,0 +1,558 @@
+"""Full E2E test harness for agent-mcp integration tests.
+
+Candidate E from the 2026-06-01 architecture review. Replaces the
+~40 lines of boilerplate every integration test today re-implements
+(build ASGI app, mount mock_ollama transport, run lifespan,
+extract admin token, register worker via raw SQL, bind bearer to
+`request_auth_token`, wire jsonschema-validating dispatcher) with a
+single async context manager:
+
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        await alice.assert_unauthorized("view_status", {})
+        await admin.assert_tool_succeeds("view_status", {})
+
+What you get
+------------
+* `mcp_session(tmp_path)` — async context manager. Builds the
+  Starlette app with `create_app(project_dir=str(tmp_path / "project"))`,
+  installs the same httpx mock transport the `mock_ollama` fixture
+  uses (so RAG/embeddings calls don't reach the network), runs the
+  lifespan via `starlette.testclient.TestClient`, and yields an
+  `AdminClient`. On exit it tears the TestClient down and resets the
+  process-wide singletons (`g.*`, write queue, engine cache) the same
+  way the `reset_globals` fixture in `conftest.py` does.
+
+* `AdminClient` — `.admin_token`, `.client` (httpx TestClient), and
+  the MCP-call helpers `.call`, `.list_tools`,
+  `.assert_tool_succeeds`, `.assert_unauthorized`,
+  `.create_worker(agent_id)`, `.create_admin_agent(agent_id)`.
+
+* `WorkerSession` — same MCP-call helpers, bound to a specific
+  bearer (worker token, or the admin token for `create_admin_agent`).
+  Tool calls go through the registered framework handler
+  (`mcp_app_instance.request_handlers[CallToolRequest]`), which is
+  what real SSE/JSON-RPC clients hit — so `tools/list` filtering
+  (PR #55), jsonschema validation (PR #43), and the issue-H auth
+  error path all run for every call.
+
+What you don't get
+------------------
+* No real SSE transport / JSON-RPC framing. The harness drives the
+  registered request handlers directly with the bearer bound on the
+  `request_auth_token` ContextVar — that's the same path the HTTP
+  middleware ends at, so behavior is wire-equivalent for everything
+  except the streaming-protocol bits (which the existing
+  `test_sse_handshake.py` covers structurally).
+
+* No live tmux, no real Ollama. The `mock_ollama`-equivalent
+  transport returns deterministic zero-vector embeddings; tools that
+  shell out to tmux (`send_agent_message` with deliver_method="tmux")
+  should pass `deliver_method="store"` per the existing test
+  convention.
+
+Concurrency note
+----------------
+Because `mcp_session` mutates module-level singletons
+(`agent_mcp.core.globals`, the write queue, the SQLAlchemy engine
+cache), tests using it must not run concurrently in the same process.
+pytest-xdist runs each worker in its own process — that's fine. Inside
+a worker, the harness's exit hook snapshots/restores per the same
+convention as `conftest.py::reset_globals`.
+
+Co-existence with the older pattern
+-----------------------------------
+This harness is opt-in. The pre-existing `client` and `app` fixtures
+in `tests/conftest.py` still work; ~27 tests continue to use them.
+Only the 4 example tests migrated in the same PR (per the architecture
+review's "proof-of-life" mandate) use `mcp_session`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import datetime as _dt
+import secrets
+from contextlib import ExitStack
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, AsyncIterator, List
+
+import httpx
+import mcp.types as mcp_types
+import pytest
+
+
+# --- Internal helpers (mirroring the patterns scattered across tests/) ---
+
+
+def _install_mock_ollama_transport(monkeypatch_or_stack: ExitStack) -> None:
+    """Install the same in-process httpx mock transport that
+    `conftest.py::mock_ollama` installs. Implemented against an
+    AsyncExitStack so the harness can roll it back on exit without
+    requiring callers to depend on the pytest `monkeypatch` fixture.
+    """
+    DIM = 1024
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/embeddings"):
+            body = request.read()
+            import json as _json
+
+            data = _json.loads(body) if body else {}
+            inputs = data.get("input", "")
+            if isinstance(inputs, str):
+                inputs = [inputs]
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "object": "embedding",
+                            "embedding": [0.0] * DIM,
+                            "index": i,
+                        }
+                        for i in range(len(inputs))
+                    ],
+                    "model": data.get("model", "mock-embed"),
+                    "usage": {"prompt_tokens": 0, "total_tokens": 0},
+                },
+            )
+        return httpx.Response(404, json={"error": "not found"})
+
+    transport = httpx.MockTransport(_handler)
+    original_client_init = httpx.Client.__init__
+    original_async_init = httpx.AsyncClient.__init__
+
+    def _patched_client_init(self, *args, **kwargs):
+        kwargs.setdefault("transport", transport)
+        original_client_init(self, *args, **kwargs)
+
+    def _patched_async_init(self, *args, **kwargs):
+        kwargs.setdefault("transport", transport)
+        original_async_init(self, *args, **kwargs)
+
+    httpx.Client.__init__ = _patched_client_init  # type: ignore[assignment]
+    httpx.AsyncClient.__init__ = _patched_async_init  # type: ignore[assignment]
+
+    def _restore() -> None:
+        httpx.Client.__init__ = original_client_init  # type: ignore[assignment]
+        httpx.AsyncClient.__init__ = original_async_init  # type: ignore[assignment]
+
+    monkeypatch_or_stack.callback(_restore)
+
+
+def _snapshot_and_reset_globals(stack: ExitStack) -> None:
+    """Mirror of `conftest.py::reset_globals`. Snapshots the
+    module-level singletons agent-mcp relies on so the harness's
+    teardown restores them — keeps mcp_session safe to use multiple
+    times per test process (across consecutive `async with`)."""
+    from agent_mcp.core import globals as g
+    from agent_mcp.db import engine as _engine
+    from agent_mcp.db import write_queue as _wq
+
+    _wq._global_write_queue = None
+    _engine.reset_engine_cache()
+
+    snapshot = {
+        "connections": dict(g.connections),
+        "active_agents": dict(g.active_agents),
+        "admin_token": g.admin_token,
+        "tasks": dict(g.tasks),
+        "file_map": dict(g.file_map),
+        "agent_working_dirs": dict(g.agent_working_dirs),
+        "agent_tmux_sessions": dict(g.agent_tmux_sessions),
+        "audit_log": list(g.audit_log),
+        "openai_client_instance": g.openai_client_instance,
+        "global_vss_load_tested": g.global_vss_load_tested,
+        "global_vss_load_successful": g.global_vss_load_successful,
+    }
+
+    def _restore() -> None:
+        g.connections.clear()
+        g.connections.update(snapshot["connections"])
+        g.active_agents.clear()
+        g.active_agents.update(snapshot["active_agents"])
+        g.admin_token = snapshot["admin_token"]
+        g.tasks.clear()
+        g.tasks.update(snapshot["tasks"])
+        g.file_map.clear()
+        g.file_map.update(snapshot["file_map"])
+        g.agent_working_dirs.clear()
+        g.agent_working_dirs.update(snapshot["agent_working_dirs"])
+        g.agent_tmux_sessions.clear()
+        g.agent_tmux_sessions.update(snapshot["agent_tmux_sessions"])
+        g.audit_log.clear()
+        g.audit_log.extend(snapshot["audit_log"])
+        g.openai_client_instance = snapshot["openai_client_instance"]
+        g.global_vss_load_tested = snapshot["global_vss_load_tested"]
+        g.global_vss_load_successful = snapshot["global_vss_load_successful"]
+        _wq._global_write_queue = None
+        _engine.reset_engine_cache()
+
+    stack.callback(_restore)
+
+
+# --- Session classes ---
+
+
+def _result_text(result: List[mcp_types.TextContent]) -> str:
+    """Concatenate text blocks from a tool-call result."""
+    if not result:
+        return ""
+    parts: list[str] = []
+    for block in result:
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def _first_text(result: List[mcp_types.TextContent]) -> str:
+    if not result:
+        return ""
+    return getattr(result[0], "text", "") or ""
+
+
+def _is_unauthorized(text: str) -> bool:
+    if not text:
+        return False
+    head = text.strip().lower()
+    return head.startswith("unauthorized") or head.startswith("invalid") and (
+        "token" in head
+    )
+
+
+@dataclass
+class WorkerSession:
+    """A bearer-bound MCP session.
+
+    Holds a token, the parent AdminClient (for shared TestClient
+    access), and the agent_id this bearer authenticates as. All MCP
+    calls go through the registered framework handlers with
+    `request_auth_token` set to this session's token — mirroring the
+    contextvar an HTTP request would set via the Authorization-header
+    middleware in production.
+    """
+
+    token: str
+    agent_id: str
+    _admin: "AdminClient"
+
+    # --- Low-level call surface ---
+
+    async def call(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> List[mcp_types.TextContent]:
+        """Invoke a tool through the registered CallToolRequest handler.
+
+        Same path real SSE/JSON-RPC clients take. Bearer is bound via
+        `request_auth_token` so the dispatcher's Q6e fallback fills
+        `arguments.token` if absent. Returns the raw content blocks;
+        use the `assert_*` helpers for wire-isError semantics.
+        """
+        from agent_mcp.tools.registry import request_auth_token
+
+        handler = self._admin._call_tool_handler()
+        req = mcp_types.CallToolRequest(
+            method="tools/call",
+            params=mcp_types.CallToolRequestParams(
+                name=tool_name, arguments=arguments
+            ),
+        )
+        cv_token = request_auth_token.set(self.token)
+        try:
+            server_result = await handler(req)
+        finally:
+            request_auth_token.reset(cv_token)
+
+        inner = (
+            server_result.root
+            if hasattr(server_result, "root")
+            else server_result
+        )
+        # Stash isError for assert_tool_succeeds.
+        self._last_is_error = bool(getattr(inner, "isError", False))
+        return list(getattr(inner, "content", None) or [])
+
+    async def list_tools(self) -> List[mcp_types.Tool]:
+        """`tools/list` as this bearer sees it (admin or worker filter
+        per PR #55)."""
+        from agent_mcp.tools.registry import request_auth_token
+
+        handler = self._admin._list_tools_handler()
+        req = mcp_types.ListToolsRequest(method="tools/list")
+        cv_token = request_auth_token.set(self.token)
+        try:
+            result = await handler(req)
+        finally:
+            request_auth_token.reset(cv_token)
+        inner = result.root if hasattr(result, "root") else result
+        return list(getattr(inner, "tools", []) or [])
+
+    # --- Assertion helpers ---
+
+    async def assert_tool_succeeds(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> List[mcp_types.TextContent]:
+        """Call `tool_name`; pytest.fail if isError or the response
+        text matches the Unauthorized shape. Returns the content blocks
+        on success so callers can assert on the result text.
+        """
+        result = await self.call(tool_name, arguments)
+        text = _first_text(result)
+        if getattr(self, "_last_is_error", False):
+            pytest.fail(
+                f"{tool_name}({arguments!r}) returned isError=true: {text}"
+            )
+        if _is_unauthorized(text):
+            pytest.fail(
+                f"{tool_name}({arguments!r}) returned Unauthorized: {text}"
+            )
+        return result
+
+    async def assert_unauthorized(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> None:
+        """Call `tool_name`; pytest.fail unless the wire response is an
+        Unauthorized text block (either via the issue-H isError path or
+        a plain TextContent starting with 'Unauthorized'/'Invalid …
+        token').
+
+        Note: asserts on the *wire response*, not on a Python exception.
+        That keeps the helper robust if auth-decorator refactors (the
+        parallel A-agent work) change the internal exception type while
+        keeping the wire shape (`isError=true` + 'Unauthorized: …' text)
+        identical.
+        """
+        result = await self.call(tool_name, arguments)
+        text = _first_text(result)
+        is_error = getattr(self, "_last_is_error", False)
+        if is_error and _is_unauthorized(text):
+            return
+        # Issue-H may surface as isError=true with the exception's
+        # message verbatim; the text-prefix check covers that.
+        if _is_unauthorized(text):
+            return
+        pytest.fail(
+            f"{tool_name}({arguments!r}) was expected to be Unauthorized; "
+            f"got isError={is_error} text={text!r}"
+        )
+
+
+class AdminClient(WorkerSession):
+    """The session yielded by `mcp_session`. Adds factory methods
+    for spawning worker / admin-agent sessions and exposes the
+    underlying TestClient for REST assertions.
+    """
+
+    def __init__(self, admin_token: str, test_client: Any) -> None:
+        super().__init__(token=admin_token, agent_id="admin", _admin=self)
+        self.admin_token = admin_token
+        self.client = test_client
+        self._mcp_app = None
+
+    # --- Lazy handler accessors (avoid importing main_app at module load) ---
+
+    def _mcp_app_instance(self):
+        if self._mcp_app is None:
+            from agent_mcp.app.main_app import mcp_app_instance
+
+            self._mcp_app = mcp_app_instance
+        return self._mcp_app
+
+    def _call_tool_handler(self):
+        return self._mcp_app_instance().request_handlers[
+            mcp_types.CallToolRequest
+        ]
+
+    def _list_tools_handler(self):
+        return self._mcp_app_instance().request_handlers[
+            mcp_types.ListToolsRequest
+        ]
+
+    # --- Agent registration ---
+
+    async def create_worker(self, agent_id: str) -> WorkerSession:
+        """Register a worker via the same raw-SQL insert the existing
+        tests use (`tests/test_worker_peer_messaging.py` and
+        siblings). Returns a `WorkerSession` bound to a fresh
+        per-agent token; subsequent `.call`/`.list_tools` on the
+        returned session run with the worker role.
+        """
+        from agent_mcp.core import globals as g
+        from agent_mcp.db.connection import get_db_connection
+
+        worker_token = secrets.token_hex(16)
+        now = _dt.datetime.now().isoformat()
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO agents (token, agent_id, capabilities, "
+            "created_at, status, working_directory, color, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                worker_token,
+                agent_id,
+                "[]",
+                now,
+                "active",
+                "/tmp",
+                "#888",
+                now,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        g.active_agents[worker_token] = {
+            "agent_id": agent_id,
+            "status": "active",
+            "created_at": now,
+            "capabilities": [],
+        }
+        return WorkerSession(
+            token=worker_token, agent_id=agent_id, _admin=self
+        )
+
+    async def create_admin_agent(self, agent_id: str) -> WorkerSession:
+        """Register an agent record bound to the admin token. Useful
+        for tests that want to simulate an admin-driven MCP caller
+        distinct from the AdminClient itself (e.g. populating
+        `active_agents` with a named admin entry while still using the
+        admin bearer for auth)."""
+        from agent_mcp.core import globals as g
+
+        g.active_agents[self.admin_token] = {
+            "agent_id": agent_id,
+            "status": "active",
+            "created_at": _dt.datetime.now().isoformat(),
+            "capabilities": ["admin"],
+        }
+        return WorkerSession(
+            token=self.admin_token, agent_id=agent_id, _admin=self
+        )
+
+    # --- Builder helpers for common project_context shapes ---
+
+    def set_toggle(self, key: str, value: str) -> None:
+        """Seed or update a `config_*` toggle via the REST memory API
+        (same pattern existing tests use)."""
+        r = self.client.post(
+            "/api/memories",
+            json={
+                "token": self.admin_token,
+                "context_key": key,
+                "context_value": value,
+            },
+        )
+        if r.status_code == 409:
+            r = self.client.request(
+                "PUT",
+                f"/api/memories/{key}",
+                json={
+                    "token": self.admin_token,
+                    "context_value": value,
+                },
+            )
+        assert r.status_code == 200, r.text
+
+    def task_row(self, task_id: str) -> dict | None:
+        """Look up a task row in `/api/tasks` by task_id. Returns None
+        if absent."""
+        listing = self.client.get("/api/tasks").json()
+        if isinstance(listing, dict):
+            listing = listing.get("tasks", [])
+        for entry in listing:
+            if entry.get("task_id") == task_id:
+                return entry
+        return None
+
+
+# --- Public entry point ---
+
+
+@contextlib.asynccontextmanager
+async def mcp_session(tmp_path: Path) -> AsyncIterator[AdminClient]:
+    """Build the app, run lifespan, yield an AdminClient.
+
+    Usage:
+        async with mcp_session(tmp_path) as admin:
+            alice = await admin.create_worker("alice")
+            ...
+
+    Implementation notes:
+      * Runs the Starlette TestClient lifespan in a worker thread so
+        it doesn't block the running asyncio loop.
+      * Installs the same mock-ollama httpx transport on entry; rolls
+        back on exit so subsequent tests with a real `httpx.Client`
+        don't get the mock.
+      * Snapshots and restores process-wide singletons (mirrors
+        `conftest.py::reset_globals`).
+    """
+    # Env isolation — match `conftest.py::_isolate_env` so the harness
+    # works equally well from tests that don't use the autouse fixture
+    # (e.g. callers that supply their own `tmp_path` without
+    # `conftest.py`'s injection).
+    import os
+
+    env_snapshot = {
+        "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY"),
+        "DOTENV_PATH": os.environ.get("DOTENV_PATH"),
+        "MCP_PROJECT_DIR": os.environ.get("MCP_PROJECT_DIR"),
+    }
+    os.environ["OPENAI_API_KEY"] = ""
+    os.environ["DOTENV_PATH"] = "/dev/null"
+    os.environ.pop("MCP_PROJECT_DIR", None)
+
+    stack = ExitStack()
+    try:
+        # Reset and snapshot globals so the harness is safe to nest
+        # under tests that don't use conftest's reset_globals fixture.
+        _snapshot_and_reset_globals(stack)
+        _install_mock_ollama_transport(stack)
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir(exist_ok=True)
+
+        from agent_mcp.app.main_app import create_app
+        from starlette.testclient import TestClient
+
+        app = create_app(project_dir=str(project_dir))
+
+        # TestClient.__enter__ runs the lifespan synchronously
+        # (blocking the event loop) — push it onto a worker thread so
+        # we don't deadlock under pytest-asyncio.
+        def _start() -> TestClient:
+            tc = TestClient(app)
+            tc.__enter__()
+            return tc
+
+        test_client = await asyncio.to_thread(_start)
+
+        def _close() -> None:
+            test_client.__exit__(None, None, None)
+
+        # TestClient teardown also blocks the loop on lifespan shutdown;
+        # the stack runs callbacks synchronously, so wrap with to_thread
+        # via a helper closure executed in the outer finally block.
+        stack.callback(_close)
+
+        admin_token = test_client.get("/api/tokens").json()["admin_token"]
+
+        admin = AdminClient(admin_token=admin_token, test_client=test_client)
+        yield admin
+    finally:
+        # Restore env vars first; teardown of app comes via the stack.
+        for k, v in env_snapshot.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        await asyncio.to_thread(stack.close)
+        # ExitStack.close drains callbacks in LIFO order. Running it
+        # via to_thread keeps the synchronous TestClient teardown
+        # (which blocks on lifespan shutdown) off the event loop.
