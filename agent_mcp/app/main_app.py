@@ -145,6 +145,73 @@ async def mcp_list_tools_handler() -> List[mcp_types.Tool]:
     return await list_available_tools()
 
 
+@mcp_app_instance.list_prompts()
+async def mcp_list_prompts_handler() -> List[mcp_types.Prompt]:
+    """Return the Prompt Book catalogue (plan Phase 6).
+
+    Sourced from `agent_mcp/prompts/catalog.json` so the dashboard
+    and the MCP surface stay in sync (the dashboard inlines the
+    same data today; a follow-up migrates it to fetch from
+    `GET /api/prompts/catalog`).
+
+    Returned `name` is the catalogue id (stable, kebab-case).
+    `description` is the catalogue description. `arguments` lists
+    each variable so MCP clients can prompt the user for them.
+    """
+    from ..prompts import load_catalog
+
+    catalog = load_catalog()
+    prompts: List[mcp_types.Prompt] = []
+    for entry in catalog.get("prompts", []):
+        args = []
+        for v in entry.get("variables", []):
+            args.append(
+                mcp_types.PromptArgument(
+                    name=v["name"],
+                    description=v.get("description", ""),
+                    required=bool(v.get("required", False)),
+                )
+            )
+        prompts.append(
+            mcp_types.Prompt(
+                name=entry["id"],
+                title=entry.get("title", entry["id"]),
+                description=entry.get("description", ""),
+                arguments=args,
+            )
+        )
+    return prompts
+
+
+@mcp_app_instance.get_prompt()
+async def mcp_get_prompt_handler(
+    name: str, arguments: Optional[dict] = None
+) -> mcp_types.GetPromptResult:
+    """Render a Prompt Book entry with the supplied arguments
+    substituted into its `{{VARIABLE}}` placeholders.
+
+    Returns the rendered text as a single user-role message.
+    Missing optional variables substitute as empty (no
+    `{{VAR}}` leaks through).
+    """
+    from ..prompts import get_prompt as _get_catalog_entry
+    from ..prompts import render_prompt
+
+    entry = _get_catalog_entry(name)
+    if entry is None:
+        raise ValueError(f"Unknown prompt: {name}")
+    rendered = render_prompt(name, arguments or {})
+    return mcp_types.GetPromptResult(
+        description=entry.get("description", ""),
+        messages=[
+            mcp_types.PromptMessage(
+                role="user",
+                content=mcp_types.TextContent(type="text", text=rendered),
+            )
+        ],
+    )
+
+
 @mcp_app_instance.list_resources()
 async def mcp_list_resources_handler() -> List[mcp_types.Resource]:
     """Return the per-caller inbox + status resource URIs (plan Phase 3).

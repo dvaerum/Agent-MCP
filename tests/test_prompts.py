@@ -17,13 +17,10 @@ a follow-up.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import mcp.types as mcp_types
 import pytest
-
-pytestmark = pytest.mark.asyncio
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +134,7 @@ async def _get_prompt(
     return inner
 
 
+@pytest.mark.asyncio
 async def test_prompts_list_returns_catalog_entries(tmp_path: Path) -> None:
     """`prompts/list` returns every catalogue entry as an
     `mcp_types.Prompt`. Names are stable (prompt id from the
@@ -154,6 +152,7 @@ async def test_prompts_list_returns_catalog_entries(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.asyncio
 async def test_prompts_get_renders_template_with_variables(
     tmp_path: Path,
 ) -> None:
@@ -189,6 +188,7 @@ async def test_prompts_get_renders_template_with_variables(
         )
 
 
+@pytest.mark.asyncio
 async def test_prompts_get_leaves_unsupplied_variables_blank(
     tmp_path: Path,
 ) -> None:
@@ -215,6 +215,7 @@ async def test_prompts_get_leaves_unsupplied_variables_blank(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 async def test_rest_catalog_endpoint_returns_json(tmp_path: Path) -> None:
     """`GET /api/prompts/catalog` returns the same JSON
     `load_catalog()` returns."""

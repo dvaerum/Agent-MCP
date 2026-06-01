@@ -1161,8 +1161,21 @@ async def aoe_health_api_route(request: Request) -> JSONResponse:
     return JSONResponse(result)
 
 
+# --- Prompt Book catalog (plan Phase 6) ---
+async def prompts_catalog_api_route(request):
+    """`GET /api/prompts/catalog` — the single source of truth
+    for the Prompt Book catalogue.
+
+    Sourced from `agent_mcp/prompts/catalog.json` so MCP
+    `prompts/list` and the dashboard read the same data.
+    """
+    from ..prompts import load_catalog
+    return JSONResponse(load_catalog())
+
+
 # --- Route Definitions List ---
 routes = [
+    Route('/api/prompts/catalog', endpoint=prompts_catalog_api_route, name="prompts_catalog_api", methods=['GET', 'OPTIONS']),
     Route('/api/aoe/health', endpoint=aoe_health_api_route, name="aoe_health_api", methods=['GET', 'OPTIONS']),
     Route('/api/all-data', endpoint=all_data_api_route, name="all_data_api", methods=['GET', 'OPTIONS']),
     Route('/api/status', endpoint=simple_status_api_route, name="simple_status_api", methods=['GET', 'OPTIONS']),
