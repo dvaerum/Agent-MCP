@@ -46,6 +46,12 @@ import {
 } from '@/lib/prompt-book'
 import { CreatePromptModal } from './modals/create-prompt-modal'
 import { PromptBookTutorial, usePromptBookTutorial } from './onboarding/prompt-book-tutorial'
+// CC-3 audit 2026-06-02: imported Skeleton primitive for the
+// initial-mount fade so the empty UI renders briefly while
+// localStorage hydration is in flight rather than flashing the
+// final list at first paint. See <InitialSkeleton/> below.
+import { Skeleton } from "@/components/ui/skeleton"
+import { EmptyState } from "@/components/dashboard/shared/empty-state"
 
 // Icon mapping for categories
 const categoryIcons = {
@@ -210,8 +216,12 @@ const PromptBuilder = ({ prompt, onClose }: {
         <h3 className="text-lg font-semibold mb-2">{prompt.title}</h3>
         <p className="text-muted-foreground text-sm mb-4">{prompt.description}</p>
         
-        <div className="bg-blue-50 dark:bg-blue-950/20 border border-blue-200 dark:border-blue-800 rounded-lg p-3">
-          <p className="text-sm text-blue-800 dark:text-blue-200">
+        {/* CC-17 audit 2026-06-02: dropped the hardcoded blue
+            palette (was the only theme-bypass hardcode in this file).
+            Modern-minimal calls for monochrome surfaces with a single
+            accent; the muted token works under both themes. */}
+        <div className="bg-muted/50 border border-border rounded-md p-3">
+          <p className="text-sm text-foreground">
             <strong>Usage:</strong> {prompt.usage}
           </p>
         </div>
@@ -316,6 +326,11 @@ export function PromptBookDashboard() {
   const [customPrompts, setCustomPrompts] = useState<PromptTemplate[]>([])
   const [createModalOpen, setCreateModalOpen] = useState(false)
   const { showTutorial, setShowTutorial } = usePromptBookTutorial()
+  // CC-3 audit 2026-06-02: hydrated gate so first paint can show a
+  // <Skeleton> shape rather than rendering the empty-then-populated
+  // prompts list (which flashes). Flips to true on the same tick the
+  // localStorage useEffect runs.
+  const [hydrated, setHydrated] = useState(false)
 
   // Load custom prompts from localStorage on mount
   useEffect(() => {
@@ -327,6 +342,7 @@ export function PromptBookDashboard() {
         console.error('Failed to load custom prompts:', error)
       }
     }
+    setHydrated(true)
   }, [])
 
   // Save custom prompts to localStorage when they change
@@ -408,22 +424,27 @@ export function PromptBookDashboard() {
             Standardized prompts and workflows for Agent-MCP
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          <Badge variant="outline" className="text-xs">
+        {/* CC-23 audit 2026-06-02: added flex-wrap so the 4 badges +
+            2 buttons can break to multiple rows at <sm: instead of
+            overflowing the right edge at 375px. Also stripped the
+            noisy shadow-lg on the primary action — modern-minimal
+            calls for no shadows except on elevated surfaces (CC-5). */}
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant="outline" className="text-xs tabular-nums">
             {promptTemplates.length + customPrompts.length} prompts
           </Badge>
-          <Badge variant="outline" className="text-xs">
+          <Badge variant="outline" className="text-xs tabular-nums">
             {promptCategories.length} categories
           </Badge>
           {customPrompts.length > 0 && (
-            <Badge variant="secondary" className="text-xs">
+            <Badge variant="secondary" className="text-xs tabular-nums">
               {customPrompts.length} custom
             </Badge>
           )}
           <Button
             size="sm"
             onClick={() => setCreateModalOpen(true)}
-            className="bg-primary hover:bg-primary/90 text-primary-foreground shadow-lg hover:shadow-primary/25 transition-all duration-200"
+            className="bg-primary hover:bg-primary/90 text-primary-foreground transition-colors duration-150"
           >
             <Plus className="h-4 w-4 mr-1.5" />
             Create Prompt
@@ -507,13 +528,19 @@ export function PromptBookDashboard() {
         </CardContent>
       </Card>
 
-      {/* Category Tabs */}
+      {/* Category Tabs — CC-24 audit 2026-06-02: rendered the full
+          category name (was `name.split(' ')[0]` which truncated
+          "Agent Initialization" + "Agent Coordination" to two
+          identical "Agent" tabs in the 375 px screenshot). With full
+          names the tabs are wider, so the TabsList now uses
+          `inline-flex w-auto overflow-x-auto` to scroll horizontally
+          on narrow viewports instead of squeezing into the grid. */}
       <Tabs value={selectedCategory} onValueChange={setSelectedCategory} className="w-full">
-        <TabsList className="grid w-full grid-cols-3 lg:grid-cols-6">
-          <TabsTrigger value="all" className="text-xs">All</TabsTrigger>
+        <TabsList className="inline-flex w-full sm:w-auto max-w-full overflow-x-auto justify-start">
+          <TabsTrigger value="all" className="text-xs whitespace-nowrap">All</TabsTrigger>
           {promptCategories.map(category => (
-            <TabsTrigger key={category.id} value={category.id} className="text-xs">
-              {category.name.split(' ')[0]}
+            <TabsTrigger key={category.id} value={category.id} className="text-xs whitespace-nowrap">
+              {category.name}
             </TabsTrigger>
           ))}
         </TabsList>
@@ -585,16 +612,24 @@ export function PromptBookDashboard() {
         ))}
       </Tabs>
 
-      {/* No Results */}
-      {filteredPrompts.length === 0 && (
-        <div className="text-center py-12">
-          <BookOpen className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
-          <h3 className="text-lg font-medium text-foreground mb-2">No prompts found</h3>
-          <p className="text-muted-foreground text-sm">
-            Try adjusting your search terms or category filter
-          </p>
+      {/* No Results — CC-3/CC-6 audit 2026-06-02: shared EmptyState
+          primitive when filtered list is empty. While hydrating
+          (custom prompts not yet read from localStorage), show a
+          Skeleton card grid so first paint isn't a flash of the
+          final list. */}
+      {!hydrated ? (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <Skeleton key={i} className="h-40 w-full" />
+          ))}
         </div>
-      )}
+      ) : filteredPrompts.length === 0 ? (
+        <EmptyState
+          icon={BookOpen}
+          title="No prompts found"
+          description="Try adjusting your search terms or category filter."
+        />
+      ) : null}
 
       {/* Prompt Builder Dialog */}
       <Dialog
