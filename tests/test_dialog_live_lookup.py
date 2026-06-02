@@ -75,13 +75,17 @@ def test_use_dialog_hook_stores_key_not_snapshot() -> None:
     null.
     """
     src = HOOK.read_text()
+    # Strip block / line comments so docstring prose about the old
+    # snapshot shape doesn't trip the heuristic.
+    code = re.sub(r"/\*.*?\*/", "", src, flags=re.DOTALL)
+    code = re.sub(r"^\s*//.*$", "", code, flags=re.MULTILINE)
     # The state must be typed as a key (string | null is the standard
     # case; we accept any narrower union via "K | null").
-    assert re.search(r"useState\s*<\s*[\w\s|]*\bnull\s*>\s*\(\s*null\s*\)", src), (
+    assert re.search(r"useState\s*<\s*[\w\s|]*\bnull\s*>\s*\(\s*null\s*\)", code), (
         "expected the hook to store a key with useState<K | null>(null)"
     )
-    # Negative: the hook must NOT store the row itself.
-    assert "useState<T" not in src.replace(" ", ""), (
+    # Negative: the hook implementation must NOT store the row itself.
+    assert "useState<T" not in code.replace(" ", ""), (
         "useDialog must not store useState<T | null>; storing the row "
         "is the snapshot bug we are fixing"
     )

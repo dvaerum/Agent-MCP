@@ -53,9 +53,11 @@ function formatRelative(iso: string | undefined): string {
 
 interface TasksMobileListProps {
   tasks: Task[]
-  openView: (task: Task) => void
-  openEdit: (task: Task) => void
-  openDelete: (task: Task) => void
+  // Live-lookup useDialog (Candidate D, 2026-06-02): handlers take
+  // the task_id; the dialog reads the row live from the source.
+  openView: (taskId: string) => void
+  openEdit: (taskId: string) => void
+  openDelete: (taskId: string) => void
 }
 
 export function TasksMobileList({
@@ -69,7 +71,7 @@ export function TasksMobileList({
       {tasks.map((task) => (
         <li
           key={task.task_id}
-          onClick={() => openView(task)}
+          onClick={() => openView(task.task_id)}
           className="p-4 hover:bg-muted/30 active:bg-muted/50 transition-colors duration-150 cursor-pointer"
         >
           <div className="flex items-start justify-between gap-3">
@@ -143,7 +145,7 @@ export function TasksMobileList({
               title="View task"
               aria-label="View task"
               className="h-9 w-9 p-0 text-muted-foreground hover:text-foreground"
-              onClick={(e) => { e.stopPropagation(); openView(task) }}
+              onClick={(e) => { e.stopPropagation(); openView(task.task_id) }}
             >
               <Eye className="h-4 w-4" />
             </Button>
@@ -153,7 +155,7 @@ export function TasksMobileList({
               title="Edit task"
               aria-label="Edit task"
               className="h-9 w-9 p-0 text-primary hover:text-primary hover:bg-primary/10"
-              onClick={(e) => { e.stopPropagation(); openEdit(task) }}
+              onClick={(e) => { e.stopPropagation(); openEdit(task.task_id) }}
             >
               <Pencil className="h-4 w-4" />
             </Button>
@@ -163,7 +165,7 @@ export function TasksMobileList({
               title="Delete task"
               aria-label="Delete task"
               className="h-9 w-9 p-0 text-destructive hover:text-destructive hover:bg-destructive/10"
-              onClick={(e) => { e.stopPropagation(); openDelete(task) }}
+              onClick={(e) => { e.stopPropagation(); openDelete(task.task_id) }}
             >
               <Trash2 className="h-4 w-4" />
             </Button>
