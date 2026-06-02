@@ -15,11 +15,16 @@ import { Button } from "@/components/ui/button"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { useSidebar as useSidebarUI } from "@/components/ui/sidebar"
 import { useServerStore } from "@/lib/stores/server-store"
-import { useDashboard, useSidebar } from "@/lib/store"
+import { useSidebar } from "@/lib/store"
+import { useSectionRoute } from "@/lib/use-section-route"
 
 interface NavItem {
   title: string
   icon: React.ComponentType<{ className?: string }>
+  // Mirrors `DashboardSection` from lib/use-section-route.ts — kept
+  // as a literal union here so a grep for the enum values lands on
+  // this file too (the sidebar is where contributors reason about
+  // "which menu items exist").
   view: 'overview' | 'agents' | 'tasks' | 'memories' | 'messages' | 'settings' | 'prompts'
   description?: string
   badge?: string
@@ -72,7 +77,12 @@ const navigationItems: NavItem[] = [
 
 
 export function Navigation() {
-  const { currentView, setCurrentView } = useDashboard()
+  // URL-driven section routing — clicking a nav item writes `?page=…`
+  // into the URL so reload + share-links land back on the same
+  // section. The hook keeps the legacy `useDashboard.currentView`
+  // zustand slice in sync as a write-through so consumers like
+  // <Header>'s page-title crumb keep working unchanged.
+  const { currentSection, setSection } = useSectionRoute()
   const { isCollapsed } = useSidebar()
   // CC-25 (audit 2026-06-02): on mobile, the sidebar is rendered as
   // a Sheet over the content. Without this, clicking a nav item just
@@ -94,7 +104,7 @@ export function Navigation() {
           isActive && "bg-secondary text-secondary-foreground font-medium"
         )}
         onClick={() => {
-          setCurrentView(item.view)
+          setSection(item.view)
           if (isMobile) setOpenMobile(false)
         }}
       >
@@ -143,7 +153,7 @@ export function Navigation() {
             <NavButton
               key={item.view}
               item={item}
-              isActive={currentView === item.view}
+              isActive={currentSection === item.view}
             />
           ))}
         </div>
