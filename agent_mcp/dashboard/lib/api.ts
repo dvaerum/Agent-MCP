@@ -526,6 +526,33 @@ class ApiClient {
     return this.request('/tokens')
   }
 
+  // Prompt-book catalog endpoint (PR #67). Source of truth is
+  // `agent_mcp/prompts/catalog.json`; the dashboard reads via the
+  // zustand `promptsCatalog` slice in lib/stores/data-store.ts which
+  // calls this method on app boot and after notifications/prompts/
+  // list_changed.
+  //
+  // Shape mirrors the JSON envelope exactly so callers don't have to
+  // re-massage fields. `PromptTemplate` and `PromptCategory` live in
+  // @/lib/prompt-book — those are the shared types; only the inlined
+  // data was removed when this migration shipped.
+  async getPromptsCatalog(): Promise<{
+    categories: Array<{ id: string; name: string; description: string; icon: string }>
+    prompts: Array<{
+      id: string
+      title: string
+      description: string
+      category: string
+      template: string
+      variables: Array<{ name: string; description: string; placeholder: string; required: boolean }>
+      usage: string
+      examples?: string[]
+      tags: string[]
+    }>
+  }> {
+    return this.request('/prompts/catalog')
+  }
+
   // All data endpoint for caching
   async getAllData(): Promise<{
     agents: Agent[]
