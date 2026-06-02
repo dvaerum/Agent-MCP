@@ -100,7 +100,7 @@ export function AppSidebar() {
                   Dashboard" tagline — read as leftover beta-marketing
                   copy. Show product + version only. */}
               <div className="font-medium text-foreground">Agent-MCP</div>
-              <div className="text-muted-foreground tabular-nums">v3.3.0</div>
+              <div className="text-muted-foreground tabular-nums">v3.4.0</div>
             </div>
           )}
           <ServerManagementModal />
