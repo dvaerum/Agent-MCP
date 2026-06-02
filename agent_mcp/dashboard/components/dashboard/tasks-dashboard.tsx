@@ -18,15 +18,18 @@ import { apiClient, Task, Agent } from "@/lib/api"
 import { useServerStore } from "@/lib/stores/server-store"
 import { useDialog } from "@/hooks/use-dialog"
 import { cn } from "@/lib/utils"
+import { Skeleton } from "@/components/ui/skeleton"
+import { EmptyState } from "@/components/dashboard/shared/empty-state"
+import { TasksMobileList } from "@/components/dashboard/tasks-mobile-list"
 
 // Status / priority colour helpers shared by the row + the View / Edit
 // modals. Keep these here so the styles match the rest of the page.
 const statusBadgeClass = (status: Task['status']): string => {
   const map: Record<string, string> = {
-    in_progress: "bg-teal-500/15 text-teal-400 dark:text-teal-300 ring-1 ring-teal-500/20",
+    in_progress: "bg-primary/15 text-primary ring-1 ring-primary/20",
     pending: "bg-amber-500/15 text-amber-500 dark:text-amber-300 ring-1 ring-amber-500/20",
     completed: "bg-emerald-500/15 text-emerald-500 dark:text-emerald-300 ring-1 ring-emerald-500/20",
-    cancelled: "bg-slate-500/15 text-slate-500 dark:text-slate-300 ring-1 ring-slate-500/20",
+    cancelled: "bg-muted text-muted-foreground ring-1 ring-border",
     failed: "bg-orange-500/15 text-orange-500 dark:text-orange-300 ring-1 ring-orange-500/20",
   }
   return map[status] || map.pending
@@ -36,7 +39,7 @@ const priorityBadgeClass = (priority: Task['priority']): string => {
   const map: Record<string, string> = {
     high: "bg-orange-500/10 text-orange-500 dark:text-orange-300 border-orange-500/20",
     medium: "bg-amber-500/10 text-amber-500 dark:text-amber-300 border-amber-500/20",
-    low: "bg-slate-500/10 text-slate-500 dark:text-slate-300 border-slate-500/20",
+    low: "bg-muted text-muted-foreground border-border",
   }
   return map[priority] || map.medium
 }
@@ -158,11 +161,16 @@ const useTasksData = () => {
 
 const StatusDot = React.memo(({ status }: { status: Task['status'] }) => {
   const config = {
-    in_progress: "bg-teal-400 shadow-teal-400/50 shadow-md animate-pulse",
-    pending: "bg-amber-400 shadow-amber-400/50 shadow-md",
-    completed: "bg-emerald-400 shadow-emerald-400/50 shadow-md",
-    cancelled: "bg-slate-500 shadow-slate-500/50 shadow-md",
-    failed: "bg-orange-400 shadow-orange-400/50 shadow-md animate-pulse",
+    // CC-2 audit 2026-06-02: dropped the teal accent + colored
+    // shadows; status uses the existing primary token for in-progress
+    // and shadcn semantic tokens for the muted "cancelled" state.
+    // animate-pulse kept ONLY on `in_progress` and `failed` where
+    // it semantically conveys "live state" — see CC-19.
+    in_progress: "bg-primary animate-pulse",
+    pending: "bg-amber-500",
+    completed: "bg-emerald-500",
+    cancelled: "bg-muted-foreground/40",
+    failed: "bg-destructive animate-pulse",
   }
   
   return (
@@ -176,9 +184,9 @@ StatusDot.displayName = 'StatusDot'
 
 const PriorityIcon = React.memo(({ priority }: { priority: Task['priority'] }) => {
   const config = {
-    high: { icon: ArrowUp, className: "text-orange-400" },
-    medium: { icon: Minus, className: "text-amber-400" },
-    low: { icon: ArrowDown, className: "text-slate-400" },
+    high: { icon: ArrowUp, className: "text-orange-500" },
+    medium: { icon: Minus, className: "text-amber-500" },
+    low: { icon: ArrowDown, className: "text-muted-foreground" },
   }
   
   const configItem = config[priority] || config.medium // fallback to medium if priority is undefined
@@ -216,7 +224,7 @@ const CompactTaskRow = React.memo(({ task, openView, openEdit, openDelete }: Com
   }, [mounted])
 
   return (
-    <TableRow className="border-teal-500/10 dark:border-teal-500/10 border-teal-600/20 hover:bg-teal-500/5 dark:hover:bg-teal-500/5 hover:bg-teal-600/10 group transition-all duration-200 cursor-pointer" onClick={() => openView(task)}>
+    <TableRow className="border-border hover:bg-muted/50 group transition-colors duration-150 cursor-pointer" onClick={() => openView(task)}>
       <TableCell className="py-3">
         <div className="flex items-center gap-3">
           <StatusDot status={task.status} />
@@ -233,10 +241,10 @@ const CompactTaskRow = React.memo(({ task, openView, openEdit, openDelete }: Com
           variant="outline" 
           className={cn(
             "text-xs font-semibold border-0 px-3 py-1.5 rounded-md",
-            task.status === 'in_progress' && "bg-teal-500/15 text-teal-400 dark:text-teal-300 ring-1 ring-teal-500/20",
+            task.status === 'in_progress' && "bg-primary/15 text-primary ring-1 ring-primary/20",
             task.status === 'pending' && "bg-amber-500/15 text-amber-500 dark:text-amber-300 ring-1 ring-amber-500/20",
             task.status === 'completed' && "bg-emerald-500/15 text-emerald-500 dark:text-emerald-300 ring-1 ring-emerald-500/20",
-            task.status === 'cancelled' && "bg-slate-500/15 text-slate-500 dark:text-slate-300 ring-1 ring-slate-500/20",
+            task.status === 'cancelled' && "bg-muted text-muted-foreground ring-1 ring-border",
             task.status === 'failed' && "bg-orange-500/15 text-orange-500 dark:text-orange-300 ring-1 ring-orange-500/20"
           )}
         >
@@ -263,7 +271,7 @@ const CompactTaskRow = React.memo(({ task, openView, openEdit, openDelete }: Com
             "text-xs font-medium px-2 py-0.5",
             task.priority === 'high' && "bg-orange-500/10 text-orange-500 dark:text-orange-300 border-orange-500/20",
             task.priority === 'medium' && "bg-amber-500/10 text-amber-500 dark:text-amber-300 border-amber-500/20",
-            task.priority === 'low' && "bg-slate-500/10 text-slate-500 dark:text-slate-300 border-slate-500/20"
+            task.priority === 'low' && "bg-muted text-muted-foreground border-border"
           )}
         >
           {task.priority.toUpperCase()}
@@ -314,7 +322,7 @@ const CompactTaskRow = React.memo(({ task, openView, openEdit, openDelete }: Com
             size="sm"
             title="Edit task"
             aria-label="Edit task"
-            className="h-7 w-7 p-0 text-teal-400 hover:text-teal-300 hover:bg-teal-500/10"
+            className="h-9 w-9 sm:h-7 sm:w-7 p-0 text-primary hover:text-primary hover:bg-primary/10"
             onClick={(e) => { e.stopPropagation(); openEdit(task) }}
           >
             <Pencil className="h-3.5 w-3.5" />
@@ -346,20 +354,25 @@ const StatsCard = React.memo(({ icon: Icon, label, value, change, trend }: {
   change?: string
   trend?: 'up' | 'down' | 'neutral'
 }) => (
-  <div className="bg-slate-900/60 dark:bg-slate-900/60 bg-white/80 border border-slate-800/60 dark:border-slate-800/60 border-slate-200 rounded-xl p-[var(--space-fluid-md)] backdrop-blur-sm hover:bg-slate-900/80 dark:hover:bg-slate-900/80 hover:bg-white/90 transition-all duration-200 group">
+  // CC-1/CC-2/CC-4/CC-5/CC-8 audit 2026-06-02: migrated to semantic
+  // tokens (bg-card / border-border / text-foreground /
+  // text-muted-foreground / text-primary). Drop the inconsistent
+  // rounded-xl + backdrop-blur + slate/teal palette. Added
+  // tabular-nums on the value so digits don't shift width.
+  <div className="bg-card border border-border rounded-lg p-3 sm:p-5 hover:bg-muted/30 transition-colors duration-150 group">
     <div className="flex items-center justify-between">
       <div>
         <div className="flex items-center gap-2 mb-2">
-          <Icon className="h-4 w-4 text-slate-400 dark:text-slate-400 text-slate-600 group-hover:text-slate-300 dark:group-hover:text-slate-300 group-hover:text-slate-700 transition-colors" />
-          <span className="text-fluid-xs font-semibold text-slate-400 dark:text-slate-400 text-slate-600 uppercase tracking-wider">{label}</span>
+          <Icon className="h-4 w-4 text-muted-foreground transition-colors" />
+          <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">{label}</span>
         </div>
-        <div className="text-fluid-2xl font-bold text-white dark:text-white text-slate-900 mb-1">{value}</div>
+        <div className="text-2xl sm:text-3xl font-semibold text-foreground tabular-nums mb-1">{value}</div>
         {change && (
           <div className={cn(
-            "text-fluid-xs font-medium",
-            trend === 'up' && "text-teal-400",
-            trend === 'down' && "text-orange-400",
-            trend === 'neutral' && "text-slate-400"
+            "text-xs font-medium tabular-nums",
+            trend === 'up' && "text-emerald-500",
+            trend === 'down' && "text-orange-500",
+            trend === 'neutral' && "text-muted-foreground"
           )}>
             {change}
           </div>
@@ -397,7 +410,7 @@ const CreateTaskModal = React.memo(({ onCreateTask }: { onCreateTask: (data: any
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
-        <Button size="sm" className="bg-teal-600 hover:bg-teal-700 text-white shadow-lg hover:shadow-teal-500/25 transition-all duration-200">
+        <Button size="sm" className="bg-primary hover:bg-primary/90 text-primary-foreground transition-colors duration-150">
           <Plus className="h-4 w-4 mr-1.5" />
           Create Task
         </Button>
@@ -465,7 +478,7 @@ const CreateTaskModal = React.memo(({ onCreateTask }: { onCreateTask: (data: any
             <Button type="button" variant="outline" onClick={() => setOpen(false)} size="sm">
               Cancel
             </Button>
-            <Button type="submit" size="sm" className="bg-teal-600 hover:bg-teal-700 shadow-lg hover:shadow-teal-500/25 transition-all">
+            <Button type="submit" size="sm" className="bg-primary hover:bg-primary/90 text-primary-foreground transition-colors duration-150">
               Create Task
             </Button>
           </DialogFooter>
@@ -864,7 +877,7 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
                 <Button type="button" variant="outline" size="sm" onClick={() => onOpenChange(false)} disabled={saving}>
                   Cancel
                 </Button>
-                <Button type="submit" size="sm" className="bg-teal-600 hover:bg-teal-700" disabled={saving}>
+                <Button type="submit" size="sm" className="bg-primary hover:bg-primary/90 text-primary-foreground" disabled={saving}>
                   {saving ? 'Saving…' : 'Save'}
                 </Button>
               </DialogFooter>
@@ -1050,16 +1063,26 @@ export function TasksDashboard() {
   }
 
   return (
-    <div className="relative w-full space-y-[var(--space-fluid-lg)]">
+    <div className="relative w-full p-4 sm:p-6 space-y-4 sm:space-y-6">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
-          <h1 className="text-fluid-2xl font-bold text-white dark:text-white text-slate-900">Task Operations</h1>
-          <p className="text-slate-400 dark:text-slate-400 text-slate-600 text-fluid-base mt-1">Orchestrate and monitor autonomous tasks</p>
+          {/* CC-1/CC-8/CC-21 audit 2026-06-02: H1 was hard-coded with
+              a three-way light/dark palette triplet that Tailwind v4
+              ordered alphabetically — the always-on white utility won
+              over the always-on slate-900 on light-mode white
+              backgrounds, so the title vanished. Switched to
+              text-foreground semantic token. Same fix for the
+              subtitle paragraph below. */}
+          <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight text-foreground">Task Operations</h1>
+          <p className="text-muted-foreground text-sm sm:text-base mt-1">Orchestrate and monitor autonomous tasks</p>
         </div>
         <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-          <Badge variant="outline" className="text-xs bg-teal-500/15 text-teal-300 border-teal-500/30 font-medium">
-            <div className="w-2 h-2 bg-teal-400 rounded-full mr-2 animate-pulse" />
+          {/* CC-19: dropped the animate-pulse on the server-online dot —
+              constant motion in the chrome reads as busy. Switched the
+              palette to bg-emerald-500 for "alive" semantics. */}
+          <Badge variant="outline" className="text-xs bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30 font-medium">
+            <span aria-hidden className="w-2 h-2 bg-emerald-500 rounded-full mr-2" />
             {activeServer?.name}
           </Badge>
           {lastFetch > 0 && (
@@ -1081,8 +1104,9 @@ export function TasksDashboard() {
         </div>
       </div>
 
-      {/* Stats */}
-      <div className="grid gap-[var(--space-fluid-md)] grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
+      {/* Stats — CC-16: plain Tailwind spacing replaces the
+          --space-fluid-md var for predictable scaling. */}
+      <div className="grid gap-3 sm:gap-4 grid-cols-2 sm:grid-cols-3 lg:grid-cols-5">
         <StatsCard 
           icon={Target} 
           label="Total" 
@@ -1120,22 +1144,27 @@ export function TasksDashboard() {
         />
       </div>
 
-      {/* Controls */}
-      <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-[var(--space-fluid-sm)]">
+      {/* Controls — CC-16: plain Tailwind gap. */}
+      <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 sm:gap-3">
         <div className="relative flex-1 sm:max-w-sm">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-teal-400 dark:text-teal-400 text-teal-600" />
+          {/* CC-1/CC-13 audit 2026-06-02: Search + Select migrated to
+              shadcn semantic tokens. Dropped hand-rolled focus:ring-
+              teal-* (different color + uses :focus not :focus-visible).
+              Now relies on the Input/Select primitives' built-in
+              focus-visible:ring-ring/50 styles. */}
+          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
             placeholder="Search tasks..."
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
-            className="pl-10 bg-slate-900/60 dark:bg-slate-900/60 bg-white/80 border-slate-700/60 dark:border-slate-700/60 border-slate-300 text-white dark:text-white text-slate-900 placeholder:text-slate-400 focus:border-teal-500/50 focus:ring-teal-500/20 transition-all"
+            className="pl-10"
           />
         </div>
         <Select value={statusFilter} onValueChange={setStatusFilter}>
-          <SelectTrigger className="w-full sm:w-36 bg-slate-900/60 dark:bg-slate-900/60 bg-white/80 border-slate-700/60 dark:border-slate-700/60 border-slate-300 text-white dark:text-white text-slate-900">
+          <SelectTrigger className="w-full sm:w-36">
             <SelectValue />
           </SelectTrigger>
-          <SelectContent className="bg-slate-900 dark:bg-slate-900 bg-white border-slate-800 dark:border-slate-800 border-slate-200">
+          <SelectContent>
             <SelectItem value="all">All Status</SelectItem>
             <SelectItem value="pending">Pending</SelectItem>
             <SelectItem value="in_progress">In Progress</SelectItem>
@@ -1145,10 +1174,10 @@ export function TasksDashboard() {
           </SelectContent>
         </Select>
         <Select value={priorityFilter} onValueChange={setPriorityFilter}>
-          <SelectTrigger className="w-full sm:w-32 bg-slate-900/60 dark:bg-slate-900/60 bg-white/80 border-slate-700/60 dark:border-slate-700/60 border-slate-300 text-white dark:text-white text-slate-900">
+          <SelectTrigger className="w-full sm:w-32">
             <SelectValue />
           </SelectTrigger>
-          <SelectContent className="bg-slate-900 dark:bg-slate-900 bg-white border-slate-800 dark:border-slate-800 border-slate-200">
+          <SelectContent>
             <SelectItem value="all">All Priority</SelectItem>
             <SelectItem value="high">High</SelectItem>
             <SelectItem value="medium">Medium</SelectItem>
@@ -1157,42 +1186,75 @@ export function TasksDashboard() {
         </Select>
       </div>
 
-      {/* Tasks Table */}
-      <div className="bg-slate-900/50 dark:bg-slate-900/50 bg-white/90 border border-teal-500/20 dark:border-teal-500/20 border-teal-600/30 rounded-xl overflow-x-auto backdrop-blur-md shadow-xl shadow-teal-500/10">
-        <Table>
-          <TableHeader>
-            <TableRow className="border-teal-500/10 dark:border-teal-500/10 border-teal-600/20 hover:bg-transparent">
-              <TableHead className="text-white/70 dark:text-white/70 text-slate-700 font-medium text-xs uppercase tracking-wider">Task</TableHead>
-              <TableHead className="text-white/70 dark:text-white/70 text-slate-700 font-medium text-xs uppercase tracking-wider">Status</TableHead>
-              <TableHead className="text-white/70 dark:text-white/70 text-slate-700 font-medium text-xs uppercase tracking-wider">Details</TableHead>
-              <TableHead className="text-white/70 dark:text-white/70 text-slate-700 font-medium text-xs uppercase tracking-wider">Priority</TableHead>
-              <TableHead className="text-white/70 dark:text-white/70 text-slate-700 font-medium text-xs uppercase tracking-wider">Relations</TableHead>
-              <TableHead className="text-white/70 dark:text-white/70 text-slate-700 font-medium text-xs uppercase tracking-wider">Updated</TableHead>
-              <TableHead className="text-white/70 dark:text-white/70 text-slate-700 font-medium text-xs uppercase tracking-wider w-24">Actions</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {filteredTasks.map((task) => (
-              <CompactTaskRow
-                key={task.task_id}
-                task={task}
+      {/* Tasks Table — token-clean shadcn card. CC-1/CC-2/CC-4/CC-5
+          audit 2026-06-02: dropped slate/teal palette + rounded-xl +
+          shadow-teal in favour of bg-card / border-border / rounded-lg
+          (no shadow — cards don't need elevation, the border carries
+          the surface). Desktop renders <Table>, mobile renders
+          <TasksMobileList> (CC-7). Loading shows <Skeleton> rows
+          instead of the previous blank pane (CC-3). Empty state uses
+          the shared <EmptyState> primitive (CC-6). */}
+      <div className="bg-card border border-border rounded-lg overflow-hidden">
+        {loading && tasks.length === 0 ? (
+          <div className="p-4 space-y-3">
+            {Array.from({ length: 6 }).map((_, i) => (
+              <Skeleton key={i} className="h-14 w-full" />
+            ))}
+          </div>
+        ) : filteredTasks.length === 0 ? (
+          <EmptyState
+            icon={CheckSquare}
+            title="No tasks found"
+            description={
+              tasks.length === 0
+                ? "Create your first task to get started."
+                : "No tasks match your current filters."
+            }
+            action={
+              tasks.length === 0
+                ? <CreateTaskModal onCreateTask={handleCreateTask} />
+                : undefined
+            }
+          />
+        ) : (
+          <>
+            {/* Desktop table */}
+            <div className="hidden sm:block overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow className="border-border hover:bg-transparent">
+                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Task</TableHead>
+                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Status</TableHead>
+                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Details</TableHead>
+                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Priority</TableHead>
+                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Relations</TableHead>
+                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Updated</TableHead>
+                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider w-24">Actions</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {filteredTasks.map((task) => (
+                    <CompactTaskRow
+                      key={task.task_id}
+                      task={task}
+                      openView={openView}
+                      openEdit={openEdit}
+                      openDelete={openDelete}
+                    />
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+            {/* Mobile card-list (CC-7) */}
+            <div className="block sm:hidden">
+              <TasksMobileList
+                tasks={filteredTasks}
                 openView={openView}
                 openEdit={openEdit}
                 openDelete={openDelete}
               />
-            ))}
-          </TableBody>
-        </Table>
-
-        {filteredTasks.length === 0 && (
-          <div className="p-12 text-center">
-            <CheckSquare className="h-12 w-12 text-teal-400/50 dark:text-teal-400/50 text-teal-600/50 mx-auto mb-4" />
-            <h3 className="text-lg font-medium text-white dark:text-white text-slate-900 mb-2">No tasks found</h3>
-            <p className="text-white/60 dark:text-white/60 text-slate-600 text-sm mb-4">
-              {tasks.length === 0 ? "Create your first task to get started" : "No tasks match your current filters"}
-            </p>
-            {tasks.length === 0 && <CreateTaskModal onCreateTask={handleCreateTask} />}
-          </div>
+            </div>
+          </>
         )}
       </div>
 
