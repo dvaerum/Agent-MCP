@@ -1,9 +1,9 @@
 "use client"
 
 import * as React from "react"
-import { PanelLeftClose, PanelLeftOpen } from "lucide-react"
+import { PanelLeftClose, PanelLeftOpen, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { 
+import {
   Sidebar,
   SidebarContent,
   SidebarFooter,
@@ -22,9 +22,8 @@ export function AppSidebar() {
 
   // SidebarProvider context (controls actual sidebar behaviour)
   const {
-    state, // "expanded" | "collapsed"
+    state, // "expanded" | "collapsed" — desktop state machine only
     toggleSidebar,
-    openMobile,
     setOpenMobile,
     isMobile,
   } = useSidebarUI()
@@ -34,12 +33,18 @@ export function AppSidebar() {
     setCollapsed(state === "collapsed")
   }, [state, setCollapsed])
 
-  // Ensure the sheet (mobile) opens when we navigate to mobile view while expanded.
-  React.useEffect(() => {
-    if (isMobile && state === "expanded") {
-      setOpenMobile(true)
-    }
-  }, [isMobile, state, setOpenMobile])
+  // CC-32 (audit 2026-06-02): the previous auto-open effect watched
+  // `[isMobile, state, setOpenMobile]` and called setOpenMobile(true)
+  // whenever `state === 'expanded'`. `state` is the *desktop* expanded/
+  // collapsed flag — it is NOT cleared when the user dismisses the
+  // mobile sheet (the sheet uses the separate `openMobile` flag), so
+  // the effect would re-fire on every subsequent render and re-open
+  // the sheet, trapping the user behind an overlay with no visible
+  // dismiss affordance (see below for the in-sheet close button that
+  // closes the other half of this bug). Removed entirely — the
+  // SidebarProvider's `defaultOpen` + the sheet's intrinsic
+  // open/close state already give the right initial UX on mobile
+  // (sheet starts closed; user opens via the header hamburger).
 
   const handleToggle = () => {
     toggleSidebar()
@@ -81,6 +86,27 @@ export function AppSidebar() {
                 <PanelLeftClose className="h-4 w-4" />
               )}
               <span className="sr-only">Toggle sidebar</span>
+            </Button>
+          )}
+          {/* CC-32 (audit 2026-06-02): in-sheet close button for the
+              mobile sheet variant. The header's hamburger trigger sits
+              behind the SheetContent overlay's z-index once the sheet
+              is open, and the shadcn <Sheet>'s built-in close X is
+              hidden by the `[&>button]:hidden` selector applied in
+              components/ui/sidebar.tsx (line 190). Without this button
+              there is NO visible way to dismiss the sidebar on mobile.
+              Sized 44x44 (h-11 w-11) to clear the 44 px touch-target
+              floor — matches the in-content interactive elements. */}
+          {isMobile && (
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => setOpenMobile(false)}
+              className="h-11 w-11 shrink-0"
+              aria-label="Close sidebar"
+            >
+              <X className="h-5 w-5" />
+              <span className="sr-only">Close sidebar</span>
             </Button>
           )}
         </div>
