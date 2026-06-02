@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 import { ThemeProvider } from "@/components/providers/theme-provider";
 import { ProjectContextProvider } from "@/components/providers/project-context-provider";
+import { McpNotificationsProvider } from "@/components/providers/mcp-notifications-provider";
 
 // Stub the font hooks so sandboxed / offline builds (Nix, Docker
 // without network egress, isolated CI) don't fail when next/font/google
@@ -50,7 +51,9 @@ export default function RootLayout({
         suppressHydrationWarning
       >
         <ThemeProvider>
-          <ProjectContextProvider>{children}</ProjectContextProvider>
+          <ProjectContextProvider>
+            <McpNotificationsProvider>{children}</McpNotificationsProvider>
+          </ProjectContextProvider>
         </ThemeProvider>
       </body>
     </html>
