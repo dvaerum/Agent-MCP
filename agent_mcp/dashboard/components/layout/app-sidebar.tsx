@@ -96,8 +96,11 @@ export function AppSidebar() {
         <div className="flex items-center justify-between">
           {!collapsed && (
             <div className="text-xs text-muted-foreground">
-              <div className="font-medium text-foreground">AgentMCP Dashboard</div>
-              <div className="text-muted-foreground">v2.2 • Improved Dashboard</div>
+              {/* CC-10 (audit 2026-06-02): dropped the "Improved
+                  Dashboard" tagline — read as leftover beta-marketing
+                  copy. Show product + version only. */}
+              <div className="font-medium text-foreground">Agent-MCP</div>
+              <div className="text-muted-foreground tabular-nums">v3.4.0</div>
             </div>
           )}
           <ServerManagementModal />

@@ -70,26 +70,28 @@ export function OverviewDashboard() {
   }
 
   return (
-    <div className="w-full space-y-[var(--space-fluid-lg)]">
-      {/* Header - following tasks dashboard pattern */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+    /* CC-8/CC-16/CC-19/CC-26 audit 2026-06-02: plain Tailwind spacing,
+       h1 sizing, drop animate-pulse, shorten H1 wrap. */
+    <div className="w-full p-4 sm:p-6 space-y-4 sm:space-y-6 flex flex-col h-full">
+      {/* Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 shrink-0">
         <div>
-          <h1 className="text-fluid-2xl font-bold text-foreground">Multi-Agent Collaboration Network</h1>
-          <p className="text-muted-foreground text-fluid-base mt-1">Real-time visualization of agent-task relationships</p>
+          <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight text-foreground">Collaboration Network</h1>
+          <p className="text-muted-foreground text-sm sm:text-base mt-1">Real-time visualization of agent-task relationships</p>
         </div>
         <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-          <Badge variant="outline" className="text-xs bg-green-500/15 text-green-600 border-green-500/30 font-medium">
-            <div className="w-2 h-2 bg-green-500 rounded-full mr-2 animate-pulse" />
+          <Badge variant="outline" className="text-xs bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30 font-medium">
+            <span aria-hidden className="w-2 h-2 bg-emerald-500 rounded-full mr-2" />
             {activeServer?.name}
           </Badge>
           {data?.timestamp && (
-            <span className="text-xs text-muted-foreground">
+            <span className="text-xs text-muted-foreground tabular-nums">
               Last updated: {new Date(data.timestamp).toLocaleTimeString()}
             </span>
           )}
-          <Button 
-            variant="outline" 
-            size="sm" 
+          <Button
+            variant="outline"
+            size="sm"
             onClick={() => fetchAllData(true)}
             disabled={loading || isRefreshing}
             className="text-xs"
@@ -100,8 +102,12 @@ export function OverviewDashboard() {
         </div>
       </div>
 
-      {/* Graph Container - taking full available space like tasks table */}
-      <div className="bg-card/30 border border-border/50 rounded-lg backdrop-blur-sm overflow-hidden" style={{ height: 'calc(100vh - 280px)' }}>
+      {/* Graph Container — CC-9 partial / overview-specific fix: was
+          `style={{ height: 'calc(100vh - 280px)' }}` (magic px offset
+          that broke when the header wrapped to multiple rows at narrow
+          viewports). Now uses `flex-1 min-h-[400px]` so it expands to
+          fill whatever space remains inside the page flex column. */}
+      <div className="bg-card border border-border rounded-lg overflow-hidden flex-1 min-h-[400px]">
         <VisGraph
           fullscreen
           onNodeSelect={(nodeId, nodeType, nodeData) => {
@@ -109,6 +115,7 @@ export function OverviewDashboard() {
           }}
         />
       </div>
+
       
       {/* Node Detail Panel - Fixed positioned */}
       <NodeDetailPanel

@@ -295,14 +295,19 @@ export function SettingsDashboard() {
             return (
               <div
                 key={p.key}
-                className="flex items-start justify-between gap-4 py-2 border-b last:border-b-0"
+                /* CC-18 audit 2026-06-02: stacked at <sm:, row at sm+.
+                   The Switch drops below the description on mobile so
+                   it doesn't squash the policy-description column.
+                   `sm:items-start` keeps the Switch top-aligned with
+                   the title on desktop. */
+                className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3 py-3 border-b last:border-b-0"
               >
                 <div className="flex-1 min-w-0">
                   <div className="font-medium text-sm">{p.title}</div>
                   <div className="text-xs text-muted-foreground mt-1">
                     {p.description}
                   </div>
-                  <div className="text-[10px] text-muted-foreground mt-1 font-mono">
+                  <div className="text-[10px] text-muted-foreground mt-1 font-mono break-all">
                     {p.key}
                     {!s.exists && (
                       <span className="ml-2 italic">
@@ -311,7 +316,7 @@ export function SettingsDashboard() {
                     )}
                   </div>
                 </div>
-                <div className="flex-shrink-0 pt-1">
+                <div className="flex-shrink-0 sm:pt-1 self-end sm:self-auto">
                   <Switch
                     checked={s.value}
                     disabled={s.pending}
@@ -330,7 +335,7 @@ export function SettingsDashboard() {
           <CardTitle className="text-base">Message retention</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="flex items-start justify-between gap-4 py-2">
+          <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3 py-2">
             <div className="flex-1 min-w-0">
               <div className="font-medium text-sm">
                 Auto-delete read messages older than
@@ -341,7 +346,7 @@ export function SettingsDashboard() {
                 than the configured window. Unread messages are never
                 pruned. Set to 0 to disable (keep forever).
               </div>
-              <div className="text-[10px] text-muted-foreground mt-1 font-mono">
+              <div className="text-[10px] text-muted-foreground mt-1 font-mono break-all">
                 {MESSAGE_RETENTION_KEY}
                 {!retention.exists && (
                   <span className="ml-2 italic">
@@ -350,7 +355,7 @@ export function SettingsDashboard() {
                 )}
               </div>
             </div>
-            <div className="flex-shrink-0 pt-1 flex items-center gap-2">
+            <div className="flex-shrink-0 sm:pt-1 flex items-center gap-2 self-end sm:self-auto">
               <Input
                 type="number"
                 min={0}

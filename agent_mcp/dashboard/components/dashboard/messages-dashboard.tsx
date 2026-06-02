@@ -37,6 +37,9 @@ import {
 } from "@/components/ui/dialog"
 import { apiClient, type Agent } from "@/lib/api"
 import { useDialog } from "@/hooks/use-dialog"
+import { Skeleton } from "@/components/ui/skeleton"
+import { EmptyState } from "@/components/dashboard/shared/empty-state"
+import { MessagesMobileList } from "@/components/dashboard/messages-mobile-list"
 
 // Render a relative-time hint like "5 hours ago" / "in 3 minutes" so
 // admins don't have to do the timezone math themselves. Falls back to
@@ -479,7 +482,12 @@ export function MessagesDashboard() {
           <CardTitle className="text-base">Filters</CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="grid gap-3 md:grid-cols-6">
+          {/* CC-22 audit 2026-06-02: filter grid stepping was
+              `grid-cols-1 md:grid-cols-6` — 6 cols on tablet (768)
+              squished SelectTriggers to where the value text
+              ("priority", "any sender") didn't fit. Now stepped
+              1 → 2 → 3 → 6 so each step keeps comfortable widths. */}
+          <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-6">
             <Select
               value={filters.from || ALL}
               onValueChange={(v) =>
@@ -582,72 +590,115 @@ export function MessagesDashboard() {
           )}
         </CardHeader>
         <CardContent>
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="w-8">
-                  <input
-                    type="checkbox"
-                    aria-label="select all visible"
-                    checked={allVisibleSelected}
-                    onChange={toggleAllVisible}
-                  />
-                </TableHead>
-                <TableHead>Time</TableHead>
-                <TableHead>From</TableHead>
-                <TableHead>To</TableHead>
-                <TableHead>Type</TableHead>
-                <TableHead>Pri</TableHead>
-                <TableHead>R</TableHead>
-                <TableHead>Content</TableHead>
-                <TableHead className="w-8"></TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {messages.map((m) => {
-                const checked = selectedIds.has(m.message_id)
-                return (
-                  <TableRow
-                    key={m.message_id}
-                    className="cursor-pointer"
-                    onClick={() => detailDialog.open(m)}
-                  >
-                    <TableCell onClick={(e) => e.stopPropagation()}>
-                      <input
-                        type="checkbox"
-                        aria-label={`select message ${m.message_id}`}
-                        checked={checked}
-                        onChange={() => toggleOne(m.message_id)}
-                      />
-                    </TableCell>
-                    <TableCell className="text-xs font-mono">
-                      {m.timestamp.slice(0, 19)}
-                    </TableCell>
-                    <TableCell><Badge variant="outline">{m.sender_id}</Badge></TableCell>
-                    <TableCell><Badge variant="outline">{m.recipient_id}</Badge></TableCell>
-                    <TableCell className="text-xs">{m.message_type}</TableCell>
-                    <TableCell className="text-xs">{m.priority}</TableCell>
-                    <TableCell>
-                      {m.read === 1 || m.read === true ? "✓" : ""}
-                    </TableCell>
-                    <TableCell className="max-w-[400px] truncate text-xs">
-                      {m.message_content}
-                    </TableCell>
-                    <TableCell onClick={(e) => e.stopPropagation()}>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        aria-label="delete message"
-                        onClick={() => deleteOne(m)}
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </Button>
-                    </TableCell>
-                  </TableRow>
-                )
-              })}
-            </TableBody>
-          </Table>
+          {/* CC-3/CC-6/CC-7/CC-20 audit 2026-06-02: Skeleton during
+              the initial load, shared EmptyState body when empty (was
+              just a blank table region under "0 messages"), and a
+              mobile <MessagesMobileList> sibling for narrow viewports
+              where the 9-column table overflows horizontally. Also
+              fixed the desktop column labels — "Pri" / "R" were
+              truncated abbreviations; now full "Priority" / "Read?"
+              at sm:+ and the columns dropped from the mobile view. */}
+          {loading && messages.length === 0 ? (
+            <div className="space-y-2">
+              {Array.from({ length: 6 }).map((_, i) => (
+                <Skeleton key={i} className="h-12 w-full" />
+              ))}
+            </div>
+          ) : messages.length === 0 ? (
+            <EmptyState
+              icon={MessageSquare}
+              title="No messages"
+              description="No messages match the current filters."
+              action={
+                <Button variant="outline" size="sm" onClick={clearFilters}>
+                  <X className="h-4 w-4 mr-1" />
+                  Clear filters
+                </Button>
+              }
+            />
+          ) : (
+            <>
+              {/* Desktop table */}
+              <div className="hidden sm:block overflow-x-auto">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="w-8">
+                        <input
+                          type="checkbox"
+                          aria-label="select all visible"
+                          checked={allVisibleSelected}
+                          onChange={toggleAllVisible}
+                        />
+                      </TableHead>
+                      <TableHead>Time</TableHead>
+                      <TableHead>From</TableHead>
+                      <TableHead>To</TableHead>
+                      <TableHead>Type</TableHead>
+                      <TableHead>Priority</TableHead>
+                      <TableHead>Read?</TableHead>
+                      <TableHead>Content</TableHead>
+                      <TableHead className="w-8"></TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {messages.map((m) => {
+                      const checked = selectedIds.has(m.message_id)
+                      return (
+                        <TableRow
+                          key={m.message_id}
+                          className="cursor-pointer"
+                          onClick={() => detailDialog.open(m)}
+                        >
+                          <TableCell onClick={(e) => e.stopPropagation()}>
+                            <input
+                              type="checkbox"
+                              aria-label={`select message ${m.message_id}`}
+                              checked={checked}
+                              onChange={() => toggleOne(m.message_id)}
+                            />
+                          </TableCell>
+                          <TableCell className="text-xs font-mono tabular-nums">
+                            {m.timestamp.slice(0, 19)}
+                          </TableCell>
+                          <TableCell><Badge variant="outline">{m.sender_id}</Badge></TableCell>
+                          <TableCell><Badge variant="outline">{m.recipient_id}</Badge></TableCell>
+                          <TableCell className="text-xs">{m.message_type}</TableCell>
+                          <TableCell className="text-xs">{m.priority}</TableCell>
+                          <TableCell>
+                            {m.read === 1 || m.read === true ? "✓" : ""}
+                          </TableCell>
+                          <TableCell className="max-w-[400px] truncate text-xs">
+                            {m.message_content}
+                          </TableCell>
+                          <TableCell onClick={(e) => e.stopPropagation()}>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              aria-label="delete message"
+                              onClick={() => deleteOne(m)}
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          </TableCell>
+                        </TableRow>
+                      )
+                    })}
+                  </TableBody>
+                </Table>
+              </div>
+              {/* Mobile card-list (CC-7) */}
+              <div className="block sm:hidden -m-6">
+                <MessagesMobileList
+                  messages={messages}
+                  selectedIds={selectedIds}
+                  toggleOne={toggleOne}
+                  openDetail={(m) => detailDialog.open(m)}
+                  deleteOne={deleteOne}
+                />
+              </div>
+            </>
+          )}
         </CardContent>
       </Card>
 
@@ -657,7 +708,7 @@ export function MessagesDashboard() {
           if (!open) detailDialog.close()
         }}
       >
-        <DialogContent className="sm:max-w-2xl">
+        <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-2xl">
           {/* Local alias keeps the rest of the JSX untouched — every
               reference to `detailMessage` below reads the hook's data. */}
           {detailDialog.data && (() => { const detailMessage = detailDialog.data; return (

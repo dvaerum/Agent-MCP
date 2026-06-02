@@ -54,7 +54,7 @@ export function TaskDetailsDialog({ task, open, onOpenChange }: TaskDetailsDialo
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-2xl max-h-[80vh]">
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-2xl max-h-[80vh]">
         <DialogHeader>
           <DialogTitle className="flex items-center justify-between pr-8">
             <span className="text-lg font-semibold">{task.title}</span>

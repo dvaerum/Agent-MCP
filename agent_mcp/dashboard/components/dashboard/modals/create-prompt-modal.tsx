@@ -157,7 +157,7 @@ export function CreatePromptModal({ open, onOpenChange, onCreatePrompt }: Create
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto bg-card border-border text-card-foreground">
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-2xl max-h-[90vh] overflow-y-auto bg-card border-border text-card-foreground">
         <DialogHeader>
           <DialogTitle className="text-lg flex items-center gap-2">
             <Sparkles className="h-5 w-5 text-primary" />

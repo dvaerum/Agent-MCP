@@ -43,6 +43,9 @@ import { apiClient, type Memory } from '@/lib/api'
 import { CreateMemoryModal } from './modals/create-memory-modal'
 import { ViewMemoryModal } from './modals/view-memory-modal'
 import { SmartValueEditor } from './modals/smart-value-editor'
+import { Skeleton } from "@/components/ui/skeleton"
+import { EmptyState } from "@/components/dashboard/shared/empty-state"
+import { MemoriesMobileList } from "@/components/dashboard/memories-mobile-list"
 import {
   Dialog,
   DialogContent,
@@ -262,7 +265,7 @@ const EditMemoryModal = ({ memory, open, onOpenChange, onUpdateMemory }: {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg bg-card border-border text-card-foreground max-h-[90vh] overflow-y-auto">
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-lg bg-card border-border text-card-foreground max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle className="text-lg">Edit Memory</DialogTitle>
           <DialogDescription className="text-muted-foreground">
@@ -644,50 +647,76 @@ export function MemoriesDashboard() {
         </Select>
       </div>
 
-      {/* Memories Table */}
-      <div className="bg-card/30 border border-border/50 rounded-lg backdrop-blur-sm overflow-x-auto">
-        <Table>
-          <TableHeader>
-            <TableRow className="border-border/50 hover:bg-transparent">
-              <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Memory Key</TableHead>
-              <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Value</TableHead>
-              <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Status</TableHead>
-              <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Updated</TableHead>
-              <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider w-24">Actions</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {filteredMemories.map((memory) => (
-              <MemoryRow
-                key={memory.context_key}
-                memory={memory}
+      {/* Memories list — CC-4/CC-6/CC-7 audit 2026-06-02: dropped
+          bg-card/30 + backdrop-blur, Skeleton during initial load,
+          shared EmptyState, mobile <MemoriesMobileList>. */}
+      <div className="bg-card border border-border rounded-lg overflow-hidden">
+        {loading && memories.length === 0 ? (
+          <div className="p-4 space-y-2">
+            {Array.from({ length: 5 }).map((_, i) => (
+              <Skeleton key={i} className="h-12 w-full" />
+            ))}
+          </div>
+        ) : filteredMemories.length === 0 ? (
+          <EmptyState
+            icon={Brain}
+            title="No memories found"
+            description={
+              memories.length === 0
+                ? "Create your first memory to get started."
+                : "No memories match your current filters."
+            }
+            action={
+              memories.length === 0 ? (
+                <CreateMemoryModal
+                  onCreateMemory={handleCreateMemory}
+                  trigger={
+                    <Button>
+                      <Plus className="h-4 w-4 mr-2" />
+                      Create first memory
+                    </Button>
+                  }
+                />
+              ) : undefined
+            }
+          />
+        ) : (
+          <>
+            {/* Desktop table */}
+            <div className="hidden sm:block overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow className="border-border hover:bg-transparent">
+                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Memory Key</TableHead>
+                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Value</TableHead>
+                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Status</TableHead>
+                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Updated</TableHead>
+                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider w-24">Actions</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {filteredMemories.map((memory) => (
+                    <MemoryRow
+                      key={memory.context_key}
+                      memory={memory}
+                      onView={handleView}
+                      onEdit={handleEdit}
+                      onDelete={handleDelete}
+                    />
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+            {/* Mobile card-list (CC-7) */}
+            <div className="block sm:hidden">
+              <MemoriesMobileList
+                memories={filteredMemories}
                 onView={handleView}
                 onEdit={handleEdit}
                 onDelete={handleDelete}
               />
-            ))}
-          </TableBody>
-        </Table>
-        
-        {filteredMemories.length === 0 && (
-          <div className="p-12 text-center">
-            <Brain className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
-            <h3 className="text-lg font-medium text-foreground mb-2">No memories found</h3>
-            <p className="text-muted-foreground text-sm mb-4">
-              {memories.length === 0 ? "Create your first memory to get started" : "No memories match your current filters"}
-            </p>
-            {memories.length === 0 && (
-              <CreateMemoryModal 
-                onCreateMemory={handleCreateMemory}
-                trigger={
-                  <Button>
-                    <Plus className="h-4 w-4 mr-2" />
-                    Create First Memory
-                  </Button>
-                }
-              />
-            )}
-          </div>
+            </div>
+          </>
         )}
       </div>
 

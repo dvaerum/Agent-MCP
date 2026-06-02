@@ -21,6 +21,9 @@ import { useDataStore } from "@/lib/stores/data-store"
 import { cn } from "@/lib/utils"
 import { useDialog } from "@/hooks/use-dialog"
 import { TaskDetailsDialog } from "./task-details-dialog"
+import { Skeleton } from "@/components/ui/skeleton"
+import { EmptyState } from "@/components/dashboard/shared/empty-state"
+import { AgentsMobileList } from "@/components/dashboard/agents-mobile-list"
 
 
 const StatusDot = React.memo(({ status }: { status: Agent['status'] }) => {
@@ -272,18 +275,20 @@ const StatsCard = ({ icon: Icon, label, value, change, trend }: {
   change?: string
   trend?: 'up' | 'down' | 'neutral'
 }) => (
-  <div className="bg-card/80 border border-border/60 rounded-xl p-[var(--space-fluid-md)] backdrop-blur-sm hover:bg-card transition-all duration-200 group">
+  // CC-4/CC-8/CC-16 audit 2026-06-02: rounded-lg + plain Tailwind
+  // sizing + tabular-nums on numerals.
+  <div className="bg-card border border-border rounded-lg p-3 sm:p-5 hover:bg-muted/30 transition-colors duration-150 group">
     <div className="flex items-center justify-between">
       <div>
         <div className="flex items-center gap-2 mb-2">
-          <Icon className="h-4 w-4 text-muted-foreground group-hover:text-foreground transition-colors" />
-          <span className="text-fluid-xs font-semibold text-muted-foreground uppercase tracking-wider">{label}</span>
+          <Icon className="h-4 w-4 text-muted-foreground transition-colors" />
+          <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">{label}</span>
         </div>
-        <div className="text-fluid-2xl font-bold text-foreground mb-1">{value}</div>
+        <div className="text-2xl sm:text-3xl font-semibold text-foreground tabular-nums mb-1">{value}</div>
         {change && (
           <div className={cn(
-            "text-fluid-xs font-medium",
-            trend === 'up' && "text-primary",
+            "text-xs font-medium tabular-nums",
+            trend === 'up' && "text-emerald-500",
             trend === 'down' && "text-destructive",
             trend === 'neutral' && "text-muted-foreground"
           )}>
@@ -336,7 +341,7 @@ const CreateAgentModal = ({ onCreateAgent }: { onCreateAgent: (data: CreateAgent
           Deploy
         </Button>
       </DialogTrigger>
-      <DialogContent className="sm:max-w-md bg-card border-border text-card-foreground">
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground">
         <DialogHeader>
           <DialogTitle className="text-lg">Deploy Agent</DialogTitle>
           <DialogDescription className="text-muted-foreground">
@@ -466,7 +471,7 @@ const PurgeAgentDialog = ({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md bg-card border-border text-card-foreground">
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground">
         <DialogHeader>
           <DialogTitle className="text-lg">
             Purge agent {agentId ?? ''}?
@@ -597,7 +602,7 @@ const TerminateAgentDialog = ({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md bg-card border-border text-card-foreground">
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground">
         <DialogHeader>
           <DialogTitle className="text-lg">
             Terminate agent {agentId ?? ''}?
@@ -716,7 +721,7 @@ const EditAgentDialog = ({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md bg-card border-border text-card-foreground">
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground">
         <DialogHeader>
           <DialogTitle className="text-lg">Edit agent {agent?.agent_id}</DialogTitle>
           <DialogDescription className="text-muted-foreground">
@@ -1581,12 +1586,23 @@ export function AgentsDashboard() {
     )
   }
 
-  if (loading) {
+  if (loading && agents.length === 0) {
+    // CC-3 audit 2026-06-02: replaced the spinner+"Loading agents..."
+    // placeholder with a Skeleton shape that mirrors the stats + table
+    // layout. Reads as the page populating in place rather than the
+    // dashboard being broken.
     return (
-      <div className="h-full flex items-center justify-center">
-        <div className="text-center space-y-4">
-          <div className="animate-spin h-8 w-8 border-2 border-primary border-t-transparent rounded-full mx-auto" />
-          <p className="text-muted-foreground text-sm">Loading agents...</p>
+      <div className="w-full p-4 sm:p-6 space-y-4 sm:space-y-6">
+        <div className="grid gap-3 sm:gap-4 grid-cols-2 sm:grid-cols-4">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <Skeleton key={i} className="h-24" />
+          ))}
+        </div>
+        <Skeleton className="h-10 w-full sm:max-w-md" />
+        <div className="bg-card border border-border rounded-lg p-4 space-y-3">
+          {Array.from({ length: 5 }).map((_, i) => (
+            <Skeleton key={i} className="h-14 w-full" />
+          ))}
         </div>
       </div>
     )
@@ -1608,16 +1624,19 @@ export function AgentsDashboard() {
 
   return (
     <React.Profiler id="AgentsDashboard" onRender={onRender}>
-      <div className="w-full space-y-[var(--space-fluid-lg)] -mx-[var(--container-padding)] px-[var(--container-padding)] -my-[var(--space-fluid-lg)] py-[var(--space-fluid-lg)]">
+      <div className="w-full p-4 sm:p-6 space-y-4 sm:space-y-6">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
-          <h1 className="text-fluid-2xl font-bold text-foreground">Agent Fleet</h1>
-          <p className="text-muted-foreground text-fluid-base mt-1">Monitor and manage autonomous agents</p>
+          {/* CC-8 audit 2026-06-02: plain Tailwind h1 sizing. */}
+          <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight text-foreground">Agent Fleet</h1>
+          <p className="text-muted-foreground text-sm sm:text-base mt-1">Monitor and manage autonomous agents</p>
         </div>
         <div className="flex flex-wrap items-center gap-2 sm:gap-3">
+          {/* CC-19 audit 2026-06-02: dropped animate-pulse on the
+              server-online dot. */}
           <Badge variant="outline" className="text-xs bg-primary/15 text-primary border-primary/30 font-medium">
-            <div className="w-2 h-2 bg-primary rounded-full mr-2 animate-pulse" />
+            <span aria-hidden className="w-2 h-2 bg-primary rounded-full mr-2" />
             {activeServer?.name}
           </Badge>
           {data?.timestamp && (
@@ -1645,7 +1664,7 @@ export function AgentsDashboard() {
       </div>
 
       {/* Stats */}
-      <div className="grid gap-[var(--space-fluid-md)] grid-cols-1 sm:grid-cols-2 xl:grid-cols-4">
+      <div className="grid gap-3 sm:gap-4 grid-cols-2 sm:grid-cols-4">
         <StatsCard 
           icon={Users} 
           label="Total" 
@@ -1677,7 +1696,7 @@ export function AgentsDashboard() {
       </div>
 
       {/* Controls */}
-      <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-[var(--space-fluid-sm)]">
+      <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 sm:gap-3">
         <div className="relative flex-1 sm:max-w-sm">
           <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
@@ -1701,43 +1720,69 @@ export function AgentsDashboard() {
         </Select>
       </div>
 
-      {/* Agents Table */}
-      <div className="bg-card/30 border border-border/50 rounded-lg backdrop-blur-sm overflow-x-auto">
-        <Table>
-          <TableHeader>
-            <TableRow className="border-border/50 hover:bg-transparent">
-              <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Agent</TableHead>
-              <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Status</TableHead>
-              <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Tasks</TableHead>
-              <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Token</TableHead>
-              <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider w-24">Actions</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {filteredAgents.map((agent) => (
-              <CompactAgentRow
-                key={agent.agent_id}
-                agent={agent}
+      {/* Agents list — CC-4/CC-6/CC-7 audit 2026-06-02: dropped
+          bg-card/30 + backdrop-blur (modern-minimal calls for no
+          ambient depth), desktop renders <Table>, mobile renders
+          <AgentsMobileList> (card-list), empty state uses shared
+          <EmptyState>. */}
+      <div className="bg-card border border-border rounded-lg overflow-hidden">
+        {filteredAgents.length === 0 ? (
+          <EmptyState
+            icon={Users}
+            title="No agents found"
+            description={
+              agents.length === 0
+                ? "Deploy your first agent to get started."
+                : "No agents match your current filters."
+            }
+            action={
+              agents.length === 0
+                ? <CreateAgentModal onCreateAgent={handleCreateAgent} />
+                : undefined
+            }
+          />
+        ) : (
+          <>
+            {/* Desktop table */}
+            <div className="hidden sm:block overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow className="border-border hover:bg-transparent">
+                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Agent</TableHead>
+                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Status</TableHead>
+                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Tasks</TableHead>
+                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Token</TableHead>
+                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider w-24">Actions</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {filteredAgents.map((agent) => (
+                    <CompactAgentRow
+                      key={agent.agent_id}
+                      agent={agent}
+                      onTerminate={handleTerminateConfirm}
+                      onRestore={handleRestoreAgent}
+                      onPurge={handlePurgeAgent}
+                      openView={handleSelectAgent}
+                      onEdit={handleEditAgent}
+                      onTaskClick={handleTaskClick}
+                    />
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+            {/* Mobile card-list (CC-7) */}
+            <div className="block sm:hidden">
+              <AgentsMobileList
+                agents={filteredAgents}
+                openView={handleSelectAgent}
+                onEdit={handleEditAgent}
                 onTerminate={handleTerminateConfirm}
                 onRestore={handleRestoreAgent}
                 onPurge={handlePurgeAgent}
-                openView={handleSelectAgent}
-                onEdit={handleEditAgent}
-                onTaskClick={handleTaskClick}
               />
-            ))}
-          </TableBody>
-        </Table>
-        
-        {filteredAgents.length === 0 && (
-          <div className="p-12 text-center">
-            <Users className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
-            <h3 className="text-lg font-medium text-foreground mb-2">No agents found</h3>
-            <p className="text-muted-foreground text-sm mb-4">
-              {agents.length === 0 ? "Deploy your first agent to get started" : "No agents match your current filters"}
-            </p>
-            {agents.length === 0 && <CreateAgentModal onCreateAgent={handleCreateAgent} />}
-          </div>
+            </div>
+          </>
         )}
       </div>
 
