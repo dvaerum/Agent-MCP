@@ -145,26 +145,53 @@ async def mcp_list_tools_handler() -> List[mcp_types.Tool]:
     return await list_available_tools()
 
 
+def _caller_role() -> str:
+    """Resolve the calling bearer's role for visibility filtering.
+
+    Mirrors the resolver in `tools.registry.list_available_tools` —
+    extracted here so the prompts + tools handlers stay in lockstep
+    on what "admin" vs "worker" vs "anonymous" mean. Failures fall
+    back to "anonymous" (most conservative).
+    """
+    try:
+        bearer = request_auth_token.get()
+    except LookupError:
+        bearer = None
+    if not bearer:
+        return "anonymous"
+    try:
+        from ..core.auth import verify_token, get_agent_id
+
+        if verify_token(bearer, "admin"):
+            return "admin"
+        if get_agent_id(bearer):
+            return "worker"
+    except Exception as e:
+        logger.warning(
+            "prompts/list: failed to resolve bearer to role (%s); "
+            "treating as anonymous.",
+            e,
+        )
+    return "anonymous"
+
+
 @mcp_app_instance.list_prompts()
 async def mcp_list_prompts_handler() -> List[mcp_types.Prompt]:
-    """Return the Prompt Book catalogue (plan Phase 6).
+    """Return the Prompt Book catalogue (plan Phase 6, filtered by
+    role per Candidate B / G).
 
-    Sourced from `agent_mcp/prompts/catalog.json` so the dashboard
-    and the MCP surface stay in sync (the dashboard inlines the
-    same data today; a follow-up migrates it to fetch from
-    `GET /api/prompts/catalog`).
-
-    Returned `name` is the catalogue id (stable, kebab-case).
-    `description` is the catalogue description. `arguments` lists
-    each variable so MCP clients can prompt the user for them.
+    Sourced from `agent_mcp/prompts/catalog.json` via the shared
+    `prompt_registry`. Entries with `"visibility": "admin"` are
+    hidden from worker + anonymous callers; default is `"any"` so
+    the on-the-wire behavior is unchanged for the current catalog.
     """
-    from ..prompts import load_catalog
+    from ..prompts import prompt_registry
 
-    catalog = load_catalog()
+    role = _caller_role()
     prompts: List[mcp_types.Prompt] = []
-    for entry in catalog.get("prompts", []):
+    for entry in prompt_registry.list_visible(role):
         args = []
-        for v in entry.get("variables", []):
+        for v in entry.meta.variables:
             args.append(
                 mcp_types.PromptArgument(
                     name=v["name"],
@@ -174,9 +201,9 @@ async def mcp_list_prompts_handler() -> List[mcp_types.Prompt]:
             )
         prompts.append(
             mcp_types.Prompt(
-                name=entry["id"],
-                title=entry.get("title", entry["id"]),
-                description=entry.get("description", ""),
+                name=entry.name,
+                title=entry.meta.title,
+                description=entry.meta.description,
                 arguments=args,
             )
         )
@@ -192,17 +219,22 @@ async def mcp_get_prompt_handler(
 
     Returns the rendered text as a single user-role message.
     Missing optional variables substitute as empty (no
-    `{{VAR}}` leaks through).
+    `{{VAR}}` leaks through). Admin-only prompts (per the catalog's
+    `"visibility": "admin"` field) raise PermissionError for
+    non-admin callers — defense in depth on top of `prompts/list`
+    filtering, since a worker could otherwise guess the id.
     """
-    from ..prompts import get_prompt as _get_catalog_entry
-    from ..prompts import render_prompt
+    from ..prompts import prompt_registry
 
-    entry = _get_catalog_entry(name)
+    role = _caller_role()
+    entry = prompt_registry.get(name)
     if entry is None:
         raise ValueError(f"Unknown prompt: {name}")
-    rendered = render_prompt(name, arguments or {})
+    # `render()` enforces visibility; PermissionError propagates as a
+    # JSON-RPC error via the framework wrapper.
+    rendered = prompt_registry.render(name, arguments or {}, role=role)
     return mcp_types.GetPromptResult(
-        description=entry.get("description", ""),
+        description=entry.meta.description,
         messages=[
             mcp_types.PromptMessage(
                 role="user",
@@ -214,85 +246,62 @@ async def mcp_get_prompt_handler(
 
 @mcp_app_instance.list_resources()
 async def mcp_list_resources_handler() -> List[mcp_types.Resource]:
-    """Return the per-caller inbox + status resource URIs (plan Phase 3).
+    """Return the per-caller resource URIs for every registered
+    resource (plan Phase 3, refactored to Registry[T] in Candidate B).
 
-    Resources are scoped to the calling bearer's agent_id (admin
-    sees their own admin-scoped pair; workers see their own).
-    Cross-agent reads are rejected at `resources/read` time.
+    Each entry in `resource_registry` is scoped to the calling
+    bearer's agent_id (admin sees their own admin-scoped pair;
+    workers see their own). Cross-agent reads are rejected at
+    `resources/read` time. Unauthenticated callers see an empty
+    list — same UX choice as `tools/list` for anonymous role.
     """
     from ..core.auth import get_agent_id
-    from ..resources import INBOX_URI_PREFIX, STATUS_URI_PREFIX
+    from ..resources import resource_registry
     from pydantic_core import Url
 
     token = request_auth_token.get()
     agent_id = get_agent_id(token) if token else None
     if not agent_id:
-        # Unauthenticated callers see an empty list rather than an
-        # error — the MCP framework's `resources/list` doesn't have
-        # an "unauthorized" shape and bouncing the request hurts
-        # the client's UX more than returning a credible-but-empty
-        # catalogue. Tools/list does the same when role resolves
-        # to "anonymous".
         return []
-    return [
-        mcp_types.Resource(
-            uri=Url(f"{INBOX_URI_PREFIX}{agent_id}"),
-            name=f"inbox/{agent_id}",
-            description=(
-                "Event timeline for this agent — pending messages, "
-                "broadcasts, and task assignments / changes. JSON "
-                "envelope: {events: [...], next_cursor: \"<iso-ts>\"}."
-            ),
-            mimeType="application/json",
-        ),
-        mcp_types.Resource(
-            uri=Url(f"{STATUS_URI_PREFIX}{agent_id}"),
-            name=f"status/{agent_id}",
-            description=(
-                "Ambient counters for this agent: "
-                "{unread_messages, unfinished_tasks, ...}."
-            ),
-            mimeType="application/json",
-        ),
-    ]
+
+    role = "admin" if agent_id == "admin" else "worker"
+    resources: List[mcp_types.Resource] = []
+    for entry in resource_registry.list_visible(role):
+        resources.append(
+            mcp_types.Resource(
+                uri=Url(f"{entry.meta.uri_prefix}{agent_id}"),
+                name=f"{entry.name}/{agent_id}",
+                description=entry.meta.description,
+                mimeType=entry.meta.mime_type,
+            )
+        )
+    return resources
 
 
 @mcp_app_instance.read_resource()
 async def mcp_read_resource_handler(uri):
-    """Read inbox / status resources (plan Phase 3).
+    """Read a resource by URI (plan Phase 3, refactored to
+    Registry[T] in Candidate B).
 
-    Routes by URI prefix:
-
-    * ``agent-mcp://inbox/<agent_id>`` → events envelope via
-      `agent_mcp.resources.inbox.render_inbox`.
-    * ``agent-mcp://status/<agent_id>`` → counters via
-      `agent_mcp.resources.status.render_status`.
+    Dispatch walks `resource_registry` for the URI prefix that
+    matches — adding a new resource means registering it, no
+    if/elif chain to update here.
 
     Cross-agent reads are rejected; admin can read any agent's
     resources (operational visibility).
     """
-    from ..resources import (
-        INBOX_URI_PREFIX,
-        STATUS_URI_PREFIX,
-        resolve_agent_id_for_uri,
-    )
-    from ..resources.inbox import render_inbox
-    from ..resources.status import render_status
+    from ..resources import resource_registry
     from mcp.server.lowlevel.helper_types import ReadResourceContents
 
     uri_str = str(uri)
     token = request_auth_token.get()
-    # Raises ValueError on auth mismatch — the framework will surface
-    # the message verbatim as a JSON-RPC error.
-    agent_id = resolve_agent_id_for_uri(uri_str, token)
+    # `read()` raises ValueError on auth mismatch / unknown URI —
+    # the framework surfaces the message verbatim as a JSON-RPC error.
+    text = resource_registry.read(uri_str, token)
 
-    if uri_str.startswith(INBOX_URI_PREFIX):
-        text = render_inbox(agent_id)
-    elif uri_str.startswith(STATUS_URI_PREFIX):
-        text = render_status(agent_id)
-    else:
-        raise ValueError(f"Unknown resource URI: {uri_str}")
-    return [ReadResourceContents(content=text, mime_type="application/json")]
+    entry = resource_registry.find_by_uri(uri_str)
+    mime = entry.meta.mime_type if entry else "application/json"
+    return [ReadResourceContents(content=text, mime_type=mime)]
 
 
 @mcp_app_instance.call_tool(validate_input=False)

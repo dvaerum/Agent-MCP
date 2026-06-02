@@ -6,34 +6,115 @@ Single source of truth for the Prompt Book catalogue is
 and the dashboard's REST consumer
 (`GET /api/prompts/catalog`) read from this file.
 
+Candidate B + G (architecture review 2026-06-02): prompts now live
+in a `prompt_registry: PromptRegistry` that subclasses the shared
+`Registry[T]`. The catalog gains an optional `"visibility"` field
+(default `"any"`) so admin-only prompts hide from worker
+`prompts/list` and `prompts/get` calls — the same role-based gating
+tools have had since Phase 7g.
+
 The dashboard's TypeScript copy at
-`agent_mcp/dashboard/lib/prompt-book.ts` currently inlines the
-data; a sync test
-(`tests/test_prompts.py::test_typescript_and_json_catalogs_in_sync`)
-catches drift. Migrating the dashboard to fetch from the REST
-endpoint at runtime is a follow-up.
+`agent_mcp/dashboard/lib/prompt-book.ts` used to inline the data;
+it now fetches from `GET /api/prompts/catalog` (the sync test that
+caught drift was retired in the dashboard-prompts-from-rest
+migration — see test_dashboard_prompts_from_rest.py).
 """
 
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+
+from ..core.registry import Registry, RegistryEntry, Visibility
 
 
 _CATALOG_PATH = Path(__file__).resolve().parent / "catalog.json"
 
+# Test-only override for the catalog path. When set, `load_catalog`
+# returns the override instead of the shipped `catalog.json`. Used by
+# tests that need to register a temporary admin-only prompt without
+# mutating the on-disk catalog.
+_CATALOG_OVERRIDE: Optional[Path] = None
 
-@lru_cache(maxsize=1)
+
+@dataclass
+class PromptEntry:
+    """Per-prompt payload stored in the shared registry."""
+
+    title: str
+    description: str
+    template: str
+    variables: list
+    category: str
+    raw: Dict[str, Any]  # full catalog entry for back-compat consumers
+
+
+class PromptRegistry(Registry[PromptEntry]):
+    """Prompts subsystem adapter for the shared Registry.
+
+    Adds `render(name, arguments)` as the prompts' verb. Visibility
+    is honored — `render` raises PermissionError if the calling role
+    cannot see the prompt (defense in depth; `prompts/list` filtering
+    alone is not enough if a worker guesses an admin-only id).
+    """
+
+    def render(
+        self,
+        name: str,
+        arguments: Dict[str, str],
+        role: str = "admin",
+    ) -> str:
+        """Render the named prompt's template with `arguments`.
+
+        Raises KeyError if the prompt is unknown or PermissionError
+        if `role` may not see it. Missing variables substitute as
+        the empty string (so no `{{VAR}}` leaks through).
+        """
+        from ..core.registry import resolve_visibility
+
+        entry = self.get(name)
+        if entry is None:
+            raise KeyError(f"Unknown prompt id: {name}")
+        if not resolve_visibility(entry.visibility, role):
+            raise PermissionError(
+                f"Prompt {name!r} is not visible to role {role!r}"
+            )
+        template = entry.meta.template
+        declared = {v["name"] for v in entry.meta.variables}
+        rendered = template
+        for var_name in sorted(declared):
+            value = str(arguments.get(var_name, ""))
+            rendered = rendered.replace("{{" + var_name + "}}", value)
+        return rendered
+
+
+#: Singleton PromptRegistry consumed by the MCP handlers in
+#: `app/main_app.py`. Populated lazily on first access from
+#: `catalog.json`.
+prompt_registry: PromptRegistry = PromptRegistry()
+
+
 def load_catalog() -> Dict[str, Any]:
-    """Load and cache the prompt catalogue from disk.
+    """Load the prompt catalogue from disk.
 
     Returns the raw dict (not a deep copy) — callers MUST treat
     the structure as read-only. Wrap your access through
     `render_prompt` if you need a defensive copy.
+
+    Test-only `_reload_catalog_for_tests(path)` swaps the active
+    catalog file; the cache is cleared accordingly so the registry
+    rebuild picks the new contents up.
     """
-    with _CATALOG_PATH.open("r", encoding="utf-8") as fh:
+    path = _CATALOG_OVERRIDE or _CATALOG_PATH
+    return _load_catalog_cached(path)
+
+
+@lru_cache(maxsize=4)
+def _load_catalog_cached(path: Path) -> Dict[str, Any]:
+    with path.open("r", encoding="utf-8") as fh:
         return json.load(fh)
 
 
@@ -56,19 +137,58 @@ def render_prompt(prompt_id: str, arguments: Dict[str, str]) -> str:
     UPPER_SNAKE_CASE by convention.
 
     Raises KeyError if the prompt_id is unknown.
+
+    Backwards-compat shim — new callers should use
+    `prompt_registry.render(prompt_id, arguments, role=...)` to
+    get visibility enforcement.
     """
-    entry = get_prompt(prompt_id)
-    if entry is None:
-        raise KeyError(f"Unknown prompt id: {prompt_id}")
+    return prompt_registry.render(prompt_id, arguments)
 
-    template = entry.get("template", "")
-    declared = {v["name"] for v in entry.get("variables", [])}
-    rendered = template
 
-    # Substitute declared variables in a stable order so the
-    # output is deterministic.
-    for var_name in sorted(declared):
-        value = str(arguments.get(var_name, ""))
-        rendered = rendered.replace("{{" + var_name + "}}", value)
+def _build_registry_from_catalog() -> None:
+    """Populate `prompt_registry` from the active catalog. Idempotent —
+    safe to call after `_reload_catalog_for_tests` swaps the source.
+    """
+    prompt_registry.clear()
+    for raw in load_catalog().get("prompts", []):
+        visibility: Visibility = raw.get("visibility", "any")
+        if visibility not in ("any", "admin"):
+            # Be conservative on an unknown sentinel — log via the
+            # core resolver's warning path at filter time.
+            visibility = "admin"
+        prompt_registry.register(
+            RegistryEntry(
+                name=raw["id"],
+                visibility=visibility,
+                meta=PromptEntry(
+                    title=raw.get("title", raw["id"]),
+                    description=raw.get("description", ""),
+                    template=raw.get("template", ""),
+                    variables=list(raw.get("variables", []) or []),
+                    category=raw.get("category", ""),
+                    raw=raw,
+                ),
+            )
+        )
 
-    return rendered
+
+def _reload_catalog_for_tests(path: Optional[Path]) -> None:
+    """Test helper: point `load_catalog()` at `path` (or restore the
+    shipped catalog when None) and rebuild the registry.
+
+    Production code MUST NOT call this — it exists so the unification
+    tests in `tests/test_registry_unification.py` can verify
+    visibility filtering with a temp catalog without touching the
+    on-disk one.
+    """
+    global _CATALOG_OVERRIDE
+    _CATALOG_OVERRIDE = path
+    # The lru_cache is keyed on path so the new path will miss
+    # naturally, but a previous override might have cached stale
+    # contents — clear unconditionally.
+    _load_catalog_cached.cache_clear()
+    _build_registry_from_catalog()
+
+
+# Build the registry once at import time from the shipped catalog.
+_build_registry_from_catalog()
