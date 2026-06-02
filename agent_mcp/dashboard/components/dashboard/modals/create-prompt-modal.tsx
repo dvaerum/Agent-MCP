@@ -23,7 +23,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { promptCategories, type PromptTemplate } from '@/lib/prompt-book'
+import { type PromptTemplate } from '@/lib/prompt-book'
+import { useDataStore } from '@/lib/stores/data-store'
 
 interface CreatePromptData {
   title: string
@@ -48,6 +49,11 @@ interface CreatePromptModalProps {
 
 export function CreatePromptModal({ open, onOpenChange, onCreatePrompt }: CreatePromptModalProps) {
   const [loading, setLoading] = useState(false)
+  // Categories come from the REST-backed promptsCatalog slice now —
+  // see lib/stores/data-store.ts. Fall back to an empty list while
+  // the catalogue is still loading; the <Select> stays valid (the
+  // submit handler rejects empty form anyway).
+  const promptCategories = useDataStore(s => s.promptsCategories) ?? []
   const [formData, setFormData] = useState<CreatePromptData>({
     title: '',
     description: '',

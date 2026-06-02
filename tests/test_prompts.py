@@ -52,42 +52,12 @@ def test_catalog_json_is_valid_and_non_empty() -> None:
         assert in_cat, f"category {cat_id} has no prompts"
 
 
-def test_typescript_and_json_catalogs_in_sync() -> None:
-    """The TS catalogue in
-    `agent_mcp/dashboard/lib/prompt-book.ts` MUST match the JSON
-    on prompt IDs and category IDs.
-
-    Until the dashboard fetches from `/api/prompts/catalog`
-    instead of inlining the data, this test catches drift. When
-    the migration lands, this test (and the TS data) can go
-    away."""
-    from agent_mcp.prompts import load_catalog
-
-    catalog = load_catalog()
-    ts_path = (
-        Path(__file__).resolve().parents[1]
-        / "agent_mcp"
-        / "dashboard"
-        / "lib"
-        / "prompt-book.ts"
-    )
-    ts_src = ts_path.read_text()
-
-    # Every JSON prompt id must appear in the TS file as `id: '<id>'`
-    # or `id: "<id>"`. The TS file uses single quotes, but accept
-    # either for resilience.
-    import re
-    ts_ids = set(re.findall(r"id:\s*[\"']([\w-]+)[\"']", ts_src))
-    json_ids = {p["id"] for p in catalog["prompts"]}
-    missing = json_ids - ts_ids
-    extra = ts_ids - json_ids
-    # extra is allowed during the transition (TS may have additions
-    # not yet ported into JSON), but JSON additions MUST be present
-    # in TS until the runtime fetch lands.
-    assert not missing, (
-        f"prompt ids in catalog.json missing from prompt-book.ts: "
-        f"{sorted(missing)}; extra in TS (allowed): {sorted(extra)}"
-    )
+# `test_typescript_and_json_catalogs_in_sync` retired in the
+# dashboard-prompts-from-rest migration — `prompt-book.ts` no longer
+# inlines the catalogue, so there's nothing to drift. The replacement
+# regression guard lives in tests/test_dashboard_prompts_from_rest.py
+# and asserts the dashboard reads via the zustand promptsCatalog
+# slice instead.
 
 
 # ---------------------------------------------------------------------------

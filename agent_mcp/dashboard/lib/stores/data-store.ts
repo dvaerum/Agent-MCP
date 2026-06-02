@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { Agent, Task, apiClient } from '../api'
+import type { PromptTemplate, PromptCategory } from '../prompt-book'
 
 // Memoization cache for expensive computations
 const memoCache = new Map<string, { data: any, timestamp: number }>()
@@ -59,8 +60,21 @@ interface DataStore {
   lastFetch: number
   isRefreshing: boolean
 
+  // Prompt-book catalogue (PR #67 + dashboard-prompts-from-rest
+  // migration). Source of truth lives in agent_mcp/prompts/catalog.json
+  // and is served via GET /api/prompts/catalog. The slice is its own
+  // shape — not folded into the AllData blob — because the catalogue
+  // changes on a different cadence (admin create / update / delete)
+  // and the rest of the dashboard's hot data shouldn't churn when a
+  // prompt edit lands.
+  promptsCatalog: PromptTemplate[] | null
+  promptsCategories: PromptCategory[] | null
+  promptsCatalogLoading: boolean
+
   // Actions
   fetchAllData: (force?: boolean) => Promise<void>
+  fetchPromptsCatalog: (force?: boolean) => Promise<void>
+  invalidatePromptsCatalog: () => void
   getAgent: (agentId: string) => Agent | undefined
   getAgentTasks: (agentId: string) => Task[]
   getAgentActions: (agentId: string) => any[]
@@ -93,6 +107,44 @@ export const useDataStore = create<DataStore>((set, get) => ({
   error: null,
   lastFetch: 0,
   isRefreshing: false,
+  promptsCatalog: null,
+  promptsCategories: null,
+  promptsCatalogLoading: false,
+
+  // Fetch the prompt-book catalogue from GET /api/prompts/catalog.
+  // Skips when a fetch is already in flight or when the catalogue is
+  // already loaded (unless force=true). Populates both
+  // `promptsCatalog` (the prompts array) and `promptsCategories`
+  // (the categories array) since the REST envelope returns them
+  // together.
+  fetchPromptsCatalog: async (force = false) => {
+    const state = get()
+    if (state.promptsCatalogLoading) return
+    if (!force && state.promptsCatalog !== null) return
+    set({ promptsCatalogLoading: true })
+    try {
+      const envelope = await apiClient.getPromptsCatalog()
+      set({
+        promptsCatalog: envelope.prompts as PromptTemplate[],
+        promptsCategories: envelope.categories as PromptCategory[],
+        promptsCatalogLoading: false,
+      })
+    } catch (err) {
+      console.debug('Failed to fetch prompts catalog:', err)
+      set({ promptsCatalogLoading: false })
+    }
+  },
+
+  // Invalidate the cached catalogue + refetch immediately. Wired
+  // from the MCP notification listener (see notifyPromptsListChanged
+  // export below) so admin create/update/delete reaches other
+  // dashboard tabs within seconds rather than on the next manual
+  // reload. Setting `promptsCatalog: null` forces fetchPromptsCatalog
+  // to actually hit the network even though the cached value exists.
+  invalidatePromptsCatalog: () => {
+    set({ promptsCatalog: null, promptsCategories: null })
+    void get().fetchPromptsCatalog(true)
+  },
 
   fetchAllData: async (force = false) => {
     const state = get()
@@ -435,5 +487,24 @@ if (typeof window !== 'undefined') {
       store.refreshData()
     }
   }, 60000)
+}
+
+/**
+ * Handler for MCP `notifications/prompts/list_changed`.
+ *
+ * Wire this from wherever the dashboard consumes its `GET /mcp` SSE
+ * stream — when a `notifications/prompts/list_changed` payload
+ * arrives, call this function. It invalidates the cached prompt
+ * catalogue and triggers an immediate refetch, so a prompt created
+ * or edited in one dashboard tab (or via the MCP `prompts/list`
+ * surface) is visible in other open tabs within seconds rather
+ * than on the next manual reload.
+ *
+ * Exported separately from the store so the consumer site (a
+ * notification dispatcher in lib/api.ts or a sibling) can import
+ * without taking a React render dependency on the store.
+ */
+export function notifyPromptsListChanged(): void {
+  useDataStore.getState().invalidatePromptsCatalog()
 }
 

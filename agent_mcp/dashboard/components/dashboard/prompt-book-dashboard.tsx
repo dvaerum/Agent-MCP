@@ -34,16 +34,14 @@ import {
 } from '@/components/ui/dialog'
 import { Separator } from '@/components/ui/separator'
 import { useDialog } from '@/hooks/use-dialog'
-import { 
-  promptCategories, 
-  promptTemplates, 
-  getPromptsByCategory, 
-  searchPrompts, 
+import {
+  searchPrompts,
   fillPromptTemplate,
   validatePromptVariables,
   type PromptTemplate,
   type PromptCategory
 } from '@/lib/prompt-book'
+import { useDataStore } from '@/lib/stores/data-store'
 import { CreatePromptModal } from './modals/create-prompt-modal'
 import { PromptBookTutorial, usePromptBookTutorial } from './onboarding/prompt-book-tutorial'
 // CC-3 audit 2026-06-02: imported Skeleton primitive for the
@@ -332,6 +330,21 @@ export function PromptBookDashboard() {
   // localStorage useEffect runs.
   const [hydrated, setHydrated] = useState(false)
 
+  // Prompts catalogue from the REST-backed zustand slice. The store
+  // fetches on mount via fetchPromptsCatalog() below; until the
+  // response lands `promptsCatalog` is null and the skeleton renders.
+  const promptsCatalog = useDataStore(s => s.promptsCatalog)
+  const promptsCategories = useDataStore(s => s.promptsCategories)
+  const promptsCatalogLoading = useDataStore(s => s.promptsCatalogLoading)
+  const fetchPromptsCatalog = useDataStore(s => s.fetchPromptsCatalog)
+  const promptTemplates: PromptTemplate[] = promptsCatalog ?? []
+  const promptCategories: PromptCategory[] = promptsCategories ?? []
+
+  // Boot the catalogue fetch on first mount.
+  useEffect(() => {
+    void fetchPromptsCatalog()
+  }, [fetchPromptsCatalog])
+
   // Load custom prompts from localStorage on mount
   useEffect(() => {
     const stored = localStorage.getItem('custom-prompts')
@@ -357,8 +370,8 @@ export function PromptBookDashboard() {
 
     if (searchTerm) {
       // Use the search function for standard prompts, then filter custom prompts
-      const standardResults = searchPrompts(searchTerm)
-      const customResults = customPrompts.filter(p => 
+      const standardResults = searchPrompts(promptTemplates, searchTerm)
+      const customResults = customPrompts.filter(p =>
         p.title.toLowerCase().includes(searchTerm.toLowerCase()) ||
         p.description.toLowerCase().includes(searchTerm.toLowerCase()) ||
         p.tags.some(tag => tag.toLowerCase().includes(searchTerm.toLowerCase()))
@@ -371,7 +384,7 @@ export function PromptBookDashboard() {
     }
 
     return prompts
-  }, [searchTerm, selectedCategory, customPrompts])
+  }, [searchTerm, selectedCategory, customPrompts, promptTemplates])
 
   // Group prompts by category for display
   const promptsByCategory = useMemo(() => {
