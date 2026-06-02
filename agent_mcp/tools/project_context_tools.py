@@ -83,6 +83,30 @@ async def _emit_tools_list_changed(context_key: str) -> None:
             context_key, e,
         )
 
+    # Cross-request fan-out: tools/list visibility is bearer-role
+    # dependent (PR #55), so every subscribed worker needs to refetch
+    # after a worker-policy toggle. Enqueue the notification on every
+    # registered session's runtime queue; the GET /mcp drain loop
+    # (Phase: transport-wiring) ships these to the wire. Until that
+    # wiring lands, the queue accumulates and clients still converge
+    # on the next periodic tools/list refresh — same fallback as
+    # before this hook.
+    try:
+        from ..core import session_registry
+
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed",
+            "params": {},
+        }
+        session_registry.fanout_to_all(payload)
+    except Exception as e:  # pragma: no cover - defensive
+        from ..core.config import logger
+        logger.debug(
+            "tools/list_changed fanout failed (key=%s): %s",
+            context_key, e,
+        )
+
 
 def _config_key_error() -> str:
     return (

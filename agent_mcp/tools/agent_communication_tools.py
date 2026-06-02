@@ -217,15 +217,17 @@ async def send_agent_message_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
         
         conn.commit()
 
-        # Wake any `wait_for_events` waiter for the recipient. Set
-        # AFTER commit so the waiter's re-query sees the new row.
-        # Per-recipient wake covers broadcasts too — they call this
-        # impl in a loop, one set() per recipient row.
+        # Wake any `wait_for_events` waiter for the recipient AND fan
+        # out `notifications/resources/updated` on every registered
+        # GET /mcp stream for them. Single helper so both sinks fire
+        # in lockstep (per-recipient wake covers broadcasts too — they
+        # call this impl in a loop, one notify per recipient row).
+        # Called AFTER commit so the waiter's re-query sees the new row.
         try:
-            g.signal_for(recipient_id).set()
+            g.notify_agent_inbox(recipient_id)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning(
-                "wait_for_events signal_for(%s) raised after send_agent_message: %s",
+                "notify_agent_inbox(%s) raised after send_agent_message: %s",
                 recipient_id, e,
             )
 
