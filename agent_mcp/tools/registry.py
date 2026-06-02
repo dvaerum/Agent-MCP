@@ -9,6 +9,12 @@ from ..core.config import logger
 # Typed auth-failure exception from the decorator surface; the
 # dispatcher catches it explicitly so the audit log line is uniform.
 from ..core.authorize import AuthRejected
+# Shared Registry[T] core (Candidate B, 2026-06-02 architecture
+# review). Tools live in `tool_registry` alongside resources +
+# prompts; the legacy `tool_schemas` / `tool_implementations` dicts
+# below are kept as backwards-compatible mirrors so the dozens of
+# tests + downstream consumers that import them keep working.
+from ..core.registry import Registry, RegistryEntry
 
 # Tool implementations will be imported here once they are created.
 # For now, we'll define placeholders for the functions they will call.
@@ -127,6 +133,78 @@ def _find_schema_for(tool_name: str) -> Optional[Dict[str, Any]]:
 tool_schemas: List[Dict[str, Any]] = []
 
 
+# --- Shared Registry[T] adapter (Candidate B) ---------------------
+#
+# `ToolImpl` is the payload type each entry carries: the schema dict
+# + the async implementation function. Mirrors what `tool_schemas`
+# and `tool_implementations` carry today, but routed through the
+# shared `Registry[T]` container so resources / prompts can use the
+# same role-based visibility filtering.
+from dataclasses import dataclass as _dataclass
+
+
+@_dataclass
+class ToolImpl:
+    """Per-tool payload stored in the shared registry."""
+
+    description: str
+    input_schema: Dict[str, Any]
+    implementation: Callable[..., Awaitable[List[mcp_types.TextContent]]]
+
+
+class ToolRegistry(Registry[ToolImpl]):
+    """Tool subsystem adapter for the shared Registry.
+
+    Adds `dispatch(name, arguments)` as the tools' verb. The schema
+    + impl live in `entry.meta`; visibility is a callable that
+    consults `tools.access.is_visible_to_role` so every existing
+    classification (admin / any / worker-if-toggled:<key>) continues
+    to govern `tools/list` filtering.
+    """
+
+    async def dispatch(
+        self, name: str, arguments: Dict[str, Any]
+    ) -> List[mcp_types.TextContent]:
+        """Look up the tool by name and invoke its implementation
+        with the (already-cleaned) arguments dict. Re-raises every
+        framework-relevant exception (AuthRejected, validation
+        errors) so the MCP framework's `_make_error_result` builds
+        the correct `isError=True` response.
+        """
+        entry = self.get(name)
+        if entry is None:
+            raise ValueError(f"Unknown tool: {name}")
+        return await entry.meta.implementation(arguments)
+
+
+#: The single tool registry consumed by `mcp_call_tool_handler` +
+#: `mcp_list_tools_handler` in `app/main_app.py`. Populated lazily
+#: by `register_tool` as each tool module is imported.
+tool_registry: ToolRegistry = ToolRegistry()
+
+
+def _tool_visibility_policy(tool_name: str) -> Callable[[str], bool]:
+    """Build a visibility callable that defers to the access table.
+
+    Captured at registration time so the entry doesn't need to know
+    its own name; the closure carries it through to `list_visible`.
+    The lookup is intentionally lazy (imported inside the callable)
+    so this module stays importable in tests that don't load the
+    access table.
+    """
+
+    def _policy(role: str) -> bool:
+        try:
+            from .access import is_visible_to_role
+        except Exception:
+            # Fail-open like `list_available_tools` does — surface
+            # the tool rather than silently hide it on a config bug.
+            return True
+        return is_visible_to_role(tool_name, role)
+
+    return _policy
+
+
 # --- Core Tool Registry Functions ---
 
 def register_tool(
@@ -152,6 +230,24 @@ def register_tool(
         # mcp.types.Tool in the original also had an outputSchema, which can be added if needed.
     })
     tool_implementations[name] = implementation
+
+    # Mirror the registration into the shared Registry[T]. Visibility
+    # is delegated to `tools.access.is_visible_to_role` (lazy-loaded
+    # inside the policy callable) so adding a new tool keeps the
+    # single source of truth for classification at access.py — no
+    # duplication.
+    tool_registry.register(
+        RegistryEntry(
+            name=name,
+            visibility=_tool_visibility_policy(name),
+            meta=ToolImpl(
+                description=description,
+                input_schema=input_schema,
+                implementation=implementation,
+            ),
+        )
+    )
+
     logger.info(f"Registered tool: {name}")
 
 
@@ -202,37 +298,28 @@ async def list_available_tools() -> List[mcp_types.Tool]:
                 e,
             )
 
-    try:
-        from .access import is_visible_to_role
-    except Exception as e:
-        # If the access module itself fails to import (shouldn't
-        # happen in production), surface every tool — the previous
-        # behavior — and log loudly.
-        logger.error(
-            "tools/list: access module unavailable (%s); falling back "
-            "to unfiltered catalogue.",
-            e,
-        )
-
-        def is_visible_to_role(_name: str, _role: str) -> bool:
-            return True
+    # Route through the shared Registry[T] — visibility is encoded
+    # in each entry's policy callable (which itself reads
+    # `tools/access.py`). The dispatch from `tool_schemas` is kept
+    # only for legacy import surface; the source of truth for what
+    # the wire sees is the registry.
+    visible_entries = tool_registry.list_visible(role)
 
     mcp_tool_list: List[mcp_types.Tool] = []
-    for schema_dict in tool_schemas:
-        name = schema_dict.get("name", "")
-        if not is_visible_to_role(name, role):
-            continue
+    for entry in visible_entries:
         try:
             tool_instance = mcp_types.Tool(
-                name=schema_dict["name"],
-                description=schema_dict["description"],
-                inputSchema=schema_dict["inputSchema"]
+                name=entry.name,
+                description=entry.meta.description,
+                inputSchema=entry.meta.input_schema,
             )
             mcp_tool_list.append(tool_instance)
         except Exception as e:
-            logger.error(f"Failed to create mcp_types.Tool instance for '{schema_dict.get('name', 'Unknown')}': {e}", exc_info=True)
-            # Optionally, skip this tool or add a placeholder error tool.
-            # For now, skipping problematic ones.
+            logger.error(
+                f"Failed to create mcp_types.Tool instance for "
+                f"'{entry.name}': {e}",
+                exc_info=True,
+            )
 
     logger.debug(
         "tools/list returned %d / %d tools for role=%s",
