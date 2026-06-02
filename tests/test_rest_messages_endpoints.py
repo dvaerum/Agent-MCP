@@ -8,6 +8,11 @@ The dashboard's new Messages tab needs:
 
 Token in JSON body, matching the Q6a.1 convention used by the
 existing memory + task endpoints.
+
+Migrated to `tests/harness.py::mcp_session` (Candidate F from
+architecture review 2026-06-02). _seed_worker is replaced by
+admin.create_worker (with a terminated-state helper for the
+participants tests that need ghost agents).
 """
 
 from __future__ import annotations
@@ -15,19 +20,18 @@ from __future__ import annotations
 import datetime as _dt
 import secrets
 
+import pytest
 
-def _admin(client) -> str:
-    return client.get("/api/tokens").json()["admin_token"]
+from tests.harness import mcp_session
 
 
-def _seed_worker(name: str, status: str = "active") -> str:
-    """Insert a worker row + register in globals. Returns the token.
+pytestmark = pytest.mark.asyncio
 
-    ``status`` defaults to ``active``; pass ``terminated`` to simulate a
-    worker that has been ended (used by the participants endpoint tests
-    to assert ghost agents are filtered out of the dashboard dropdowns).
-    """
-    from agent_mcp.core import globals as g
+
+async def _seed_terminated_worker(admin, name: str) -> None:
+    """Insert a worker row in the terminated state. The harness's
+    create_worker only knows about active workers; the participants
+    endpoint tests need ghosts to assert they're filtered."""
     from agent_mcp.db.connection import get_db_connection
 
     token = secrets.token_hex(16)
@@ -39,22 +43,16 @@ def _seed_worker(name: str, status: str = "active") -> str:
         "INSERT INTO agents (token, agent_id, capabilities, created_at, "
         "status, working_directory, color, updated_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (token, name, "[]", now, status, "/tmp", "#888", now),
+        (token, name, "[]", now, "terminated", "/tmp", "#888", now),
     )
     conn.commit()
     conn.close()
-
-    g.active_agents[token] = {
-        "agent_id": name,
-        "status": status,
-        "created_at": now,
-        "capabilities": [],
-    }
-    return token
+    # Do NOT register in g.active_agents — terminated workers aren't active.
 
 
-def _seed_message_with_sender(sender_id: str, recipient_id: str = "alice",
-                              content: str = "x") -> str:
+def _seed_message_with_sender(
+    sender_id: str, recipient_id: str = "alice", content: str = "x",
+) -> str:
     """Insert an agent_messages row directly with an arbitrary sender.
 
     Used by the participants endpoint tests to plant tombstone rows
@@ -69,7 +67,8 @@ def _seed_message_with_sender(sender_id: str, recipient_id: str = "alice",
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO agent_messages (message_id, sender_id, recipient_id, "
-        "message_content, message_type, priority, timestamp, delivered, read) "
+        "message_content, message_type, priority, timestamp, "
+        "delivered, read) "
         "VALUES (?, ?, ?, ?, 'text', 'normal', ?, 0, 0)",
         (msg_id, sender_id, recipient_id, content, now),
     )
@@ -81,433 +80,535 @@ def _seed_message_with_sender(sender_id: str, recipient_id: str = "alice",
 # ---------- POST /api/messages ----------------------------------
 
 
-def test_post_messages_creates_message_with_admin_token(client) -> None:
-    admin = _admin(client)
-    _seed_worker("alice")
+async def test_post_messages_creates_message_with_admin_token(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
 
-    r = client.post(
-        "/api/messages",
-        json={
-            "token": admin,
-            "recipient_id": "alice",
-            "message_content": "hello alice",
-        },
-    )
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body.get("success") is True, body
-    assert "message_id" in body, body
-
-
-def test_post_messages_rejects_bad_token(client) -> None:
-    _seed_worker("alice")
-    r = client.post(
-        "/api/messages",
-        json={
-            "token": "x" * 32,
-            "recipient_id": "alice",
-            "message_content": "hi",
-        },
-    )
-    assert r.status_code == 403, r.text
+        r = admin.client.post(
+            "/api/messages",
+            json={
+                "token": admin.admin_token,
+                "recipient_id": "alice",
+                "message_content": "hello alice",
+            },
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body.get("success") is True, body
+        assert "message_id" in body, body
 
 
-def test_post_messages_rejects_missing_recipient(client) -> None:
-    admin = _admin(client)
-    r = client.post(
-        "/api/messages",
-        json={"token": admin, "message_content": "lonely"},
-    )
-    assert r.status_code == 400, r.text
+async def test_post_messages_rejects_bad_token(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        r = admin.client.post(
+            "/api/messages",
+            json={
+                "token": "x" * 32,
+                "recipient_id": "alice",
+                "message_content": "hi",
+            },
+        )
+        assert r.status_code == 403, r.text
 
 
-def test_post_messages_rejects_missing_content(client) -> None:
-    admin = _admin(client)
-    _seed_worker("alice")
-    r = client.post(
-        "/api/messages",
-        json={"token": admin, "recipient_id": "alice"},
-    )
-    assert r.status_code == 400, r.text
+async def test_post_messages_rejects_missing_recipient(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        r = admin.client.post(
+            "/api/messages",
+            json={"token": admin.admin_token, "message_content": "lonely"},
+        )
+        assert r.status_code == 400, r.text
+
+
+async def test_post_messages_rejects_missing_content(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        r = admin.client.post(
+            "/api/messages",
+            json={"token": admin.admin_token, "recipient_id": "alice"},
+        )
+        assert r.status_code == 400, r.text
 
 
 # ---------- POST /api/messages/query (filtered listing) -------------
 
 
-def test_list_uses_post_query_not_get_with_body(client) -> None:
+async def test_list_uses_post_query_not_get_with_body(tmp_path) -> None:
     """Regression: GET /api/messages returns 405. Filtered listing
     must be POST /api/messages/query because the Fetch spec strips
     bodies from GET requests in the browser.
     """
-    admin = _admin(client)
-    r = client.request("GET", "/api/messages", json={"token": admin})
-    assert r.status_code in (404, 405), (
-        f"GET /api/messages should no longer be a route; got {r.status_code}"
-    )
+    async with mcp_session(tmp_path) as admin:
+        r = admin.client.request(
+            "GET", "/api/messages", json={"token": admin.admin_token}
+        )
+        assert r.status_code in (404, 405), (
+            f"GET /api/messages should no longer be a route; "
+            f"got {r.status_code}"
+        )
 
 
 # ---------- POST /api/messages/query ---------------------------
 
 
-def test_get_messages_lists_seeded_messages(client) -> None:
-    admin = _admin(client)
-    _seed_worker("alice")
+async def test_get_messages_lists_seeded_messages(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
 
-    # Seed via POST.
-    posted = client.post(
-        "/api/messages",
-        json={
-            "token": admin,
-            "recipient_id": "alice",
-            "message_content": "findable",
-        },
-    ).json()
-    msg_id = posted["message_id"]
+        # Seed via POST.
+        posted = admin.client.post(
+            "/api/messages",
+            json={
+                "token": admin.admin_token,
+                "recipient_id": "alice",
+                "message_content": "findable",
+            },
+        ).json()
+        msg_id = posted["message_id"]
 
-    # GET requires admin token in query or body (admin in body for
-    # consistency with the convention).
-    r = client.post(
-        "/api/messages/query",
-        json={"token": admin},
-    )
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert "messages" in body
-    ids = [m["message_id"] for m in body["messages"]]
-    assert msg_id in ids
+        r = admin.client.post(
+            "/api/messages/query",
+            json={"token": admin.admin_token},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert "messages" in body
+        ids = [m["message_id"] for m in body["messages"]]
+        assert msg_id in ids
 
 
-def test_get_messages_filter_from(client) -> None:
-    admin = _admin(client)
-    _seed_worker("alice")
-    _seed_worker("bob")
+async def test_get_messages_filter_from(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        await admin.create_worker("bob")
 
-    client.post("/api/messages", json={
-        "token": admin, "recipient_id": "alice", "message_content": "to alice from admin"
-    })
+        admin.client.post(
+            "/api/messages",
+            json={
+                "token": admin.admin_token,
+                "recipient_id": "alice",
+                "message_content": "to alice from admin",
+            },
+        )
 
-    r = client.post("/api/messages/query", json={
-        "token": admin, "from": "admin"
-    })
-    assert r.status_code == 200, r.text
-    msgs = r.json()["messages"]
-    assert all(m["sender_id"] == "admin" for m in msgs), (
-        f"filter from=admin returned non-admin senders: {[m['sender_id'] for m in msgs]}"
-    )
-
-
-def test_get_messages_filter_to(client) -> None:
-    admin = _admin(client)
-    _seed_worker("alice")
-    _seed_worker("bob")
-
-    client.post("/api/messages", json={
-        "token": admin, "recipient_id": "alice", "message_content": "to alice"
-    })
-    client.post("/api/messages", json={
-        "token": admin, "recipient_id": "bob", "message_content": "to bob"
-    })
-
-    r = client.post("/api/messages/query", json={
-        "token": admin, "to": "alice"
-    })
-    msgs = r.json()["messages"]
-    assert all(m["recipient_id"] == "alice" for m in msgs), (
-        f"filter to=alice returned others: {[m['recipient_id'] for m in msgs]}"
-    )
-    assert len(msgs) >= 1
+        r = admin.client.post(
+            "/api/messages/query",
+            json={"token": admin.admin_token, "from": "admin"},
+        )
+        assert r.status_code == 200, r.text
+        msgs = r.json()["messages"]
+        assert all(m["sender_id"] == "admin" for m in msgs), (
+            f"filter from=admin returned non-admin senders: "
+            f"{[m['sender_id'] for m in msgs]}"
+        )
 
 
-def test_get_messages_filter_read(client) -> None:
-    admin = _admin(client)
-    _seed_worker("alice")
+async def test_get_messages_filter_to(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        await admin.create_worker("bob")
 
-    client.post("/api/messages", json={
-        "token": admin, "recipient_id": "alice", "message_content": "unread one"
-    })
+        admin.client.post(
+            "/api/messages",
+            json={
+                "token": admin.admin_token,
+                "recipient_id": "alice",
+                "message_content": "to alice",
+            },
+        )
+        admin.client.post(
+            "/api/messages",
+            json={
+                "token": admin.admin_token,
+                "recipient_id": "bob",
+                "message_content": "to bob",
+            },
+        )
 
-    # All seeded messages start with read=False.
-    r = client.post("/api/messages/query", json={
-        "token": admin, "read": False
-    })
-    assert r.status_code == 200, r.text
-    msgs = r.json()["messages"]
-    assert all(m["read"] == 0 or m["read"] is False for m in msgs)
-    assert len(msgs) >= 1
-
-
-def test_get_messages_filter_content_substring(client) -> None:
-    admin = _admin(client)
-    _seed_worker("alice")
-
-    client.post("/api/messages", json={
-        "token": admin, "recipient_id": "alice", "message_content": "pineapple pizza"
-    })
-    client.post("/api/messages", json={
-        "token": admin, "recipient_id": "alice", "message_content": "boring text"
-    })
-
-    r = client.post("/api/messages/query", json={
-        "token": admin, "q": "pineapple"
-    })
-    msgs = r.json()["messages"]
-    assert any("pineapple" in m["message_content"] for m in msgs)
-    assert all("boring" not in m["message_content"] for m in msgs)
+        r = admin.client.post(
+            "/api/messages/query",
+            json={"token": admin.admin_token, "to": "alice"},
+        )
+        msgs = r.json()["messages"]
+        assert all(m["recipient_id"] == "alice" for m in msgs), (
+            f"filter to=alice returned others: "
+            f"{[m['recipient_id'] for m in msgs]}"
+        )
+        assert len(msgs) >= 1
 
 
-def test_get_messages_pagination(client) -> None:
-    admin = _admin(client)
-    _seed_worker("alice")
-    # Seed >2 messages.
-    for i in range(3):
-        client.post("/api/messages", json={
-            "token": admin, "recipient_id": "alice", "message_content": f"msg {i}"
-        })
+async def test_get_messages_filter_read(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
 
-    r = client.post("/api/messages/query", json={
-        "token": admin, "limit": 2, "offset": 0
-    })
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert len(body["messages"]) <= 2
+        admin.client.post(
+            "/api/messages",
+            json={
+                "token": admin.admin_token,
+                "recipient_id": "alice",
+                "message_content": "unread one",
+            },
+        )
+
+        # All seeded messages start with read=False.
+        r = admin.client.post(
+            "/api/messages/query",
+            json={"token": admin.admin_token, "read": False},
+        )
+        assert r.status_code == 200, r.text
+        msgs = r.json()["messages"]
+        assert all(m["read"] == 0 or m["read"] is False for m in msgs)
+        assert len(msgs) >= 1
 
 
-def test_get_messages_rejects_bad_token(client) -> None:
-    r = client.post("/api/messages/query", json={"token": "x" * 32})
-    assert r.status_code == 403, r.text
+async def test_get_messages_filter_content_substring(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+
+        admin.client.post(
+            "/api/messages",
+            json={
+                "token": admin.admin_token,
+                "recipient_id": "alice",
+                "message_content": "pineapple pizza",
+            },
+        )
+        admin.client.post(
+            "/api/messages",
+            json={
+                "token": admin.admin_token,
+                "recipient_id": "alice",
+                "message_content": "boring text",
+            },
+        )
+
+        r = admin.client.post(
+            "/api/messages/query",
+            json={"token": admin.admin_token, "q": "pineapple"},
+        )
+        msgs = r.json()["messages"]
+        assert any("pineapple" in m["message_content"] for m in msgs)
+        assert all("boring" not in m["message_content"] for m in msgs)
+
+
+async def test_get_messages_pagination(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        # Seed >2 messages.
+        for i in range(3):
+            admin.client.post(
+                "/api/messages",
+                json={
+                    "token": admin.admin_token,
+                    "recipient_id": "alice",
+                    "message_content": f"msg {i}",
+                },
+            )
+
+        r = admin.client.post(
+            "/api/messages/query",
+            json={"token": admin.admin_token, "limit": 2, "offset": 0},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert len(body["messages"]) <= 2
+
+
+async def test_get_messages_rejects_bad_token(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        r = admin.client.post(
+            "/api/messages/query", json={"token": "x" * 32}
+        )
+        assert r.status_code == 403, r.text
 
 
 # ---------- PATCH /api/messages/<id> ----------------------------
 
 
-def test_patch_messages_marks_read(client) -> None:
-    admin = _admin(client)
-    _seed_worker("alice")
-    posted = client.post("/api/messages", json={
-        "token": admin, "recipient_id": "alice", "message_content": "to be read"
-    }).json()
-    msg_id = posted["message_id"]
+async def test_patch_messages_marks_read(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        posted = admin.client.post(
+            "/api/messages",
+            json={
+                "token": admin.admin_token,
+                "recipient_id": "alice",
+                "message_content": "to be read",
+            },
+        ).json()
+        msg_id = posted["message_id"]
 
-    r = client.request("PATCH", f"/api/messages/{msg_id}", json={
-        "token": admin, "read": True
-    })
-    assert r.status_code == 200, r.text
-    assert r.json().get("success") is True
+        r = admin.client.request(
+            "PATCH",
+            f"/api/messages/{msg_id}",
+            json={"token": admin.admin_token, "read": True},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json().get("success") is True
 
-    # Verify via GET.
-    listing = client.post("/api/messages/query", json={
-        "token": admin
-    }).json()
-    msg = next(m for m in listing["messages"] if m["message_id"] == msg_id)
-    assert msg["read"] in (1, True)
-
-
-def test_patch_messages_404_on_unknown_id(client) -> None:
-    admin = _admin(client)
-    r = client.request("PATCH", "/api/messages/msg_doesnotexist", json={
-        "token": admin, "read": True
-    })
-    assert r.status_code == 404, r.text
+        # Verify via GET.
+        listing = admin.client.post(
+            "/api/messages/query",
+            json={"token": admin.admin_token},
+        ).json()
+        msg = next(
+            m for m in listing["messages"] if m["message_id"] == msg_id
+        )
+        assert msg["read"] in (1, True)
 
 
-def test_patch_messages_rejects_bad_token(client) -> None:
-    admin = _admin(client)
-    _seed_worker("alice")
-    posted = client.post("/api/messages", json={
-        "token": admin, "recipient_id": "alice", "message_content": "hi"
-    }).json()
-    r = client.request("PATCH", f"/api/messages/{posted['message_id']}", json={
-        "token": "x" * 32, "read": True
-    })
-    assert r.status_code == 403, r.text
+async def test_patch_messages_404_on_unknown_id(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        r = admin.client.request(
+            "PATCH",
+            "/api/messages/msg_doesnotexist",
+            json={"token": admin.admin_token, "read": True},
+        )
+        assert r.status_code == 404, r.text
+
+
+async def test_patch_messages_rejects_bad_token(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        posted = admin.client.post(
+            "/api/messages",
+            json={
+                "token": admin.admin_token,
+                "recipient_id": "alice",
+                "message_content": "hi",
+            },
+        ).json()
+        r = admin.client.request(
+            "PATCH",
+            f"/api/messages/{posted['message_id']}",
+            json={"token": "x" * 32, "read": True},
+        )
+        assert r.status_code == 403, r.text
 
 
 # ---------- DELETE /api/messages/<id> ---------------------------
-# The Messages tab needs row-level delete + bulk delete from a
-# selection toolbar. We expose a thin DELETE endpoint that wraps the
-# existing admin-only message housekeeping path.
 
 
-def test_delete_messages_removes_row(client) -> None:
-    admin = _admin(client)
-    _seed_worker("alice")
-    posted = client.post("/api/messages", json={
-        "token": admin, "recipient_id": "alice", "message_content": "delete me"
-    }).json()
-    msg_id = posted["message_id"]
+async def test_delete_messages_removes_row(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        posted = admin.client.post(
+            "/api/messages",
+            json={
+                "token": admin.admin_token,
+                "recipient_id": "alice",
+                "message_content": "delete me",
+            },
+        ).json()
+        msg_id = posted["message_id"]
 
-    r = client.request("DELETE", f"/api/messages/{msg_id}", json={
-        "token": admin,
-    })
-    assert r.status_code == 200, r.text
-    assert r.json().get("success") is True
+        r = admin.client.request(
+            "DELETE",
+            f"/api/messages/{msg_id}",
+            json={"token": admin.admin_token},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json().get("success") is True
 
-    listing = client.post("/api/messages/query", json={"token": admin}).json()
-    ids = [m["message_id"] for m in listing["messages"]]
-    assert msg_id not in ids, (
-        "deleted message_id should no longer appear in /api/messages/query"
-    )
-
-
-def test_delete_messages_404_on_unknown_id(client) -> None:
-    admin = _admin(client)
-    r = client.request("DELETE", "/api/messages/msg_doesnotexist", json={
-        "token": admin,
-    })
-    assert r.status_code == 404, r.text
+        listing = admin.client.post(
+            "/api/messages/query", json={"token": admin.admin_token}
+        ).json()
+        ids = [m["message_id"] for m in listing["messages"]]
+        assert msg_id not in ids, (
+            "deleted message_id should no longer appear in "
+            "/api/messages/query"
+        )
 
 
-def test_delete_messages_rejects_bad_token(client) -> None:
-    admin = _admin(client)
-    _seed_worker("alice")
-    posted = client.post("/api/messages", json={
-        "token": admin, "recipient_id": "alice", "message_content": "hi"
-    }).json()
-    r = client.request("DELETE", f"/api/messages/{posted['message_id']}", json={
-        "token": "x" * 32,
-    })
-    assert r.status_code == 403, r.text
+async def test_delete_messages_404_on_unknown_id(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        r = admin.client.request(
+            "DELETE",
+            "/api/messages/msg_doesnotexist",
+            json={"token": admin.admin_token},
+        )
+        assert r.status_code == 404, r.text
+
+
+async def test_delete_messages_rejects_bad_token(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        posted = admin.client.post(
+            "/api/messages",
+            json={
+                "token": admin.admin_token,
+                "recipient_id": "alice",
+                "message_content": "hi",
+            },
+        ).json()
+        r = admin.client.request(
+            "DELETE",
+            f"/api/messages/{posted['message_id']}",
+            json={"token": "x" * 32},
+        )
+        assert r.status_code == 403, r.text
 
 
 # ---------- Broadcast via POST /api/messages -------------------
-# The dashboard Compose form needs a "(broadcast to all workers)" option.
-# We extend POST /api/messages to accept recipient_id="*" and fan out to
-# every active worker (admin excluded), mirroring the broadcast_message
-# admin MCP tool. Returns sent_count instead of a single message_id.
 
 
-def test_post_messages_broadcast_fans_out_to_workers(client) -> None:
-    admin = _admin(client)
-    _seed_worker("alice")
-    _seed_worker("bob")
+async def test_post_messages_broadcast_fans_out_to_workers(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        await admin.create_worker("bob")
 
-    r = client.post("/api/messages", json={
-        "token": admin,
-        "recipient_id": "*",
-        "message_content": "hello everyone",
-    })
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body.get("success") is True, body
-    assert body.get("broadcast") is True, body
-    assert body.get("sent_count", 0) >= 2, body
+        r = admin.client.post(
+            "/api/messages",
+            json={
+                "token": admin.admin_token,
+                "recipient_id": "*",
+                "message_content": "hello everyone",
+            },
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body.get("success") is True, body
+        assert body.get("broadcast") is True, body
+        assert body.get("sent_count", 0) >= 2, body
 
-    listing = client.post("/api/messages/query", json={"token": admin}).json()
-    recipients = {m["recipient_id"] for m in listing["messages"]
-                  if m["message_content"] == "hello everyone"}
-    assert "alice" in recipients, recipients
-    assert "bob" in recipients, recipients
-    # Admin must not receive its own broadcast.
-    assert "admin" not in recipients, recipients
+        listing = admin.client.post(
+            "/api/messages/query", json={"token": admin.admin_token},
+        ).json()
+        recipients = {
+            m["recipient_id"]
+            for m in listing["messages"]
+            if m["message_content"] == "hello everyone"
+        }
+        assert "alice" in recipients, recipients
+        assert "bob" in recipients, recipients
+        # Admin must not receive its own broadcast.
+        assert "admin" not in recipients, recipients
 
 
-def test_post_messages_broadcast_rejects_bad_token(client) -> None:
-    _seed_worker("alice")
-    r = client.post("/api/messages", json={
-        "token": "x" * 32,
-        "recipient_id": "*",
-        "message_content": "nope",
-    })
-    assert r.status_code == 403, r.text
+async def test_post_messages_broadcast_rejects_bad_token(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        r = admin.client.post(
+            "/api/messages",
+            json={
+                "token": "x" * 32,
+                "recipient_id": "*",
+                "message_content": "nope",
+            },
+        )
+        assert r.status_code == 403, r.text
 
 
 # ---------- POST /api/messages/participants --------------------
-# The Messages tab's From/To filter dropdowns originally sourced from
-# /api/agents, which returns EVERY agent row including status='terminated'.
-# Dennis flagged ghost agents in the dropdown that no longer existed in the
-# Agents page. The fix introduces a dedicated /participants endpoint that
-# returns (a) live agents (status != 'terminated') and (b) DISTINCT
-# tombstone strings (sender_id / recipient_id beginning with
-# ``[deleted-``) so admins can still grep history for purged agents
-# (PR C cascade).
 
 
-def test_participants_lists_live_agents_only(client) -> None:
-    admin = _admin(client)
-    _seed_worker("alice", status="active")
-    _seed_worker("bob", status="terminated")
+async def test_participants_lists_live_agents_only(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        await _seed_terminated_worker(admin, "bob")
 
-    r = client.post("/api/messages/participants", json={"token": admin})
-    assert r.status_code == 200, r.text
-    body = r.json()
+        r = admin.client.post(
+            "/api/messages/participants",
+            json={"token": admin.admin_token},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
 
-    assert "live" in body, body
-    assert "tombstones" in body, body
+        assert "live" in body, body
+        assert "tombstones" in body, body
 
-    live_ids = [a["agent_id"] for a in body["live"]]
-    assert "alice" in live_ids, live_ids
-    assert "bob" not in live_ids, (
-        f"terminated agent leaked into participants.live: {live_ids}"
-    )
+        live_ids = [a["agent_id"] for a in body["live"]]
+        assert "alice" in live_ids, live_ids
+        assert "bob" not in live_ids, (
+            f"terminated agent leaked into participants.live: {live_ids}"
+        )
 
 
-def test_participants_includes_admin_in_live(client) -> None:
+async def test_participants_includes_admin_in_live(tmp_path) -> None:
     # admin is a synthetic always-present sender; the agents table does
     # not contain an "admin" row, so the endpoint must inject it so
     # admins can filter for messages they themselves sent.
-    admin = _admin(client)
-    r = client.post("/api/messages/participants", json={"token": admin})
-    assert r.status_code == 200, r.text
-    body = r.json()
-    live_ids = [a["agent_id"] for a in body["live"]]
-    assert "admin" in live_ids or "Admin" in live_ids, (
-        f"expected 'admin' (or 'Admin') to be injected as a live "
-        f"participant; got {live_ids}"
-    )
+    async with mcp_session(tmp_path) as admin:
+        r = admin.client.post(
+            "/api/messages/participants",
+            json={"token": admin.admin_token},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        live_ids = [a["agent_id"] for a in body["live"]]
+        assert "admin" in live_ids or "Admin" in live_ids, (
+            f"expected 'admin' (or 'Admin') to be injected as a live "
+            f"participant; got {live_ids}"
+        )
 
 
-def test_participants_lists_tombstones(client) -> None:
-    admin = _admin(client)
-    _seed_worker("alice", status="active")
-    # PR C tombstone marker on a sender_id and a recipient_id.
-    _seed_message_with_sender(
-        "[deleted-old-worker-1]", recipient_id="alice", content="legacy"
-    )
-    _seed_message_with_sender(
-        "admin", recipient_id="[deleted-old-worker-2]", content="legacy2"
-    )
+async def test_participants_lists_tombstones(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        # PR C tombstone marker on a sender_id and a recipient_id.
+        _seed_message_with_sender(
+            "[deleted-old-worker-1]", recipient_id="alice", content="legacy",
+        )
+        _seed_message_with_sender(
+            "admin",
+            recipient_id="[deleted-old-worker-2]",
+            content="legacy2",
+        )
 
-    r = client.post("/api/messages/participants", json={"token": admin})
-    assert r.status_code == 200, r.text
-    tombstones = r.json().get("tombstones", [])
-    assert "[deleted-old-worker-1]" in tombstones, tombstones
-    assert "[deleted-old-worker-2]" in tombstones, tombstones
-
-
-def test_participants_tombstones_distinct_and_sorted(client) -> None:
-    admin = _admin(client)
-    _seed_worker("alice", status="active")
-    # Duplicate the same tombstone across multiple messages; the endpoint
-    # must DISTINCT them.
-    for _ in range(3):
-        _seed_message_with_sender("[deleted-zzz]", recipient_id="alice")
-    _seed_message_with_sender("[deleted-aaa]", recipient_id="alice")
-
-    r = client.post("/api/messages/participants", json={"token": admin})
-    tombstones = r.json().get("tombstones", [])
-    # Distinct: each appears exactly once.
-    assert tombstones.count("[deleted-zzz]") == 1, tombstones
-    assert tombstones.count("[deleted-aaa]") == 1, tombstones
-    # Sorted lexicographically (aaa before zzz).
-    assert tombstones.index("[deleted-aaa]") < tombstones.index("[deleted-zzz]"), (
-        f"tombstones should be sorted lexicographically: {tombstones}"
-    )
+        r = admin.client.post(
+            "/api/messages/participants",
+            json={"token": admin.admin_token},
+        )
+        assert r.status_code == 200, r.text
+        tombstones = r.json().get("tombstones", [])
+        assert "[deleted-old-worker-1]" in tombstones, tombstones
+        assert "[deleted-old-worker-2]" in tombstones, tombstones
 
 
-def test_participants_empty_tombstones_when_none(client) -> None:
+async def test_participants_tombstones_distinct_and_sorted(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        # Duplicate the same tombstone across multiple messages; the
+        # endpoint must DISTINCT them.
+        for _ in range(3):
+            _seed_message_with_sender("[deleted-zzz]", recipient_id="alice")
+        _seed_message_with_sender("[deleted-aaa]", recipient_id="alice")
+
+        r = admin.client.post(
+            "/api/messages/participants",
+            json={"token": admin.admin_token},
+        )
+        tombstones = r.json().get("tombstones", [])
+        # Distinct: each appears exactly once.
+        assert tombstones.count("[deleted-zzz]") == 1, tombstones
+        assert tombstones.count("[deleted-aaa]") == 1, tombstones
+        # Sorted lexicographically (aaa before zzz).
+        assert tombstones.index("[deleted-aaa]") < tombstones.index(
+            "[deleted-zzz]"
+        ), (
+            f"tombstones should be sorted lexicographically: {tombstones}"
+        )
+
+
+async def test_participants_empty_tombstones_when_none(tmp_path) -> None:
     # PR C has not landed yet; today the message table contains no
     # tombstone rows. The endpoint must return an empty list, not error.
-    admin = _admin(client)
-    _seed_worker("alice", status="active")
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
 
-    r = client.post("/api/messages/participants", json={"token": admin})
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["tombstones"] == [], body
+        r = admin.client.post(
+            "/api/messages/participants",
+            json={"token": admin.admin_token},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["tombstones"] == [], body
 
 
-def test_participants_rejects_bad_token(client) -> None:
-    r = client.post(
-        "/api/messages/participants", json={"token": "x" * 32}
-    )
-    assert r.status_code == 403, r.text
+async def test_participants_rejects_bad_token(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        r = admin.client.post(
+            "/api/messages/participants", json={"token": "x" * 32}
+        )
+        assert r.status_code == 403, r.text
