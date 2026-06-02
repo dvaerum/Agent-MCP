@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useState, useEffect } from "react"
+import React, { useState, useEffect, useCallback } from "react"
 import {
   Users, Clock, AlertCircle, CheckCircle2, Shield, Cpu, Database, Network, Terminal,
   Search, Plus, Eye, RefreshCw, Copy, RotateCcw, Trash2, Pencil
@@ -659,6 +659,12 @@ const EditAgentDialog = ({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  // Re-seed form whenever the dialog opens for a *different* agent.
+  // With live-lookup useDialog (Candidate D, 2026-06-02) the agent
+  // prop reference can change on every background refresh; keying the
+  // effect on agent_id keeps the admin's in-progress field edits
+  // alive instead of being clobbered by the latest store snapshot.
+  const agentId = agent?.agent_id
   useEffect(() => {
     if (!open || !agent) return
     setCapabilities(normalizeCapabilities(agent.capabilities).join(', '))
@@ -666,7 +672,9 @@ const EditAgentDialog = ({
     setWorkingDirectory(agent.working_directory || '')
     setAoeSessionId(agent.aoe_session_id || '')
     setError(null)
-  }, [open, agent])
+    // Intentionally key on agentId, not the agent object — see above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, agentId])
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -1440,16 +1448,50 @@ export function AgentsDashboard() {
   // open/close drives it via useDialog (see handleSelectAgent / the
   // dialog's onOpenChange below).
   const [selectedAgent, setSelectedAgent] = useState<Agent | null>(null)
-  // Five row-action dialogs migrated to the generic useDialog<T>()
-  // hook (Candidate F1, architecture review 2026-06-01). Each one
-  // used to own a useState<boolean>(false) + useState<T | null>(null)
-  // pair; useDialog folds the pair into a single piece of state and
-  // returns {isOpen, data, open, close}.
-  const taskDialog = useDialog<Task>()
-  const purgeDialog = useDialog<string>()       // holds purge-target agent_id
-  const terminateDialog = useDialog<string>()   // holds terminate-target agent_id
-  const editDialog = useDialog<Agent>()
-  const detailDialog = useDialog<Agent>()
+  // Five row-action dialogs use the live-lookup useDialog<T> hook
+  // (Candidate D, architecture review 2026-06-02). Each dialog stores
+  // a key (agent_id / task_id) and asks the matching selector for the
+  // current row on every render — background refresh, edits, and
+  // terminations all flow into the open dialog automatically.
+  //
+  // For purge/terminate the "row" is just the agent_id string itself
+  // (those dialogs only need the id, not the row); the selector is
+  // therefore an identity function that surfaces the stored key as
+  // data so the dialog body stays uniform with the others.
+  const agentSelector = useCallback(
+    (id: string | null) =>
+      id ? data?.agents?.find((a) => a.agent_id === id) ?? null : null,
+    [data?.agents],
+  )
+  const taskByIdSelector = useCallback(
+    (id: string | null) =>
+      id ? data?.tasks?.find((t) => t.task_id === id) ?? null : null,
+    [data?.tasks],
+  )
+  const identitySelector = useCallback(
+    (id: string | null) => id,
+    [],
+  )
+  const taskDialog = useDialog<Task>(taskByIdSelector)
+  const purgeDialog = useDialog<string>(identitySelector)       // holds purge-target agent_id
+  const terminateDialog = useDialog<string>(identitySelector)   // holds terminate-target agent_id
+  const editDialog = useDialog<Agent>(agentSelector)
+  const detailDialog = useDialog<Agent>(agentSelector)
+
+  // Deleted-while-open: if the agent or task vanishes from the source
+  // (terminate from another tab, etc.), the live selector returns
+  // null. Auto-close so the user isn't staring at an empty modal.
+  // purge/terminate dialogs are skipped — their "row" is the id itself
+  // and is never null while open.
+  useEffect(() => {
+    if (taskDialog.isOpen && taskDialog.data === null) taskDialog.close()
+  }, [taskDialog.isOpen, taskDialog.data, taskDialog.close])
+  useEffect(() => {
+    if (editDialog.isOpen && editDialog.data === null) editDialog.close()
+  }, [editDialog.isOpen, editDialog.data, editDialog.close])
+  useEffect(() => {
+    if (detailDialog.isOpen && detailDialog.data === null) detailDialog.close()
+  }, [detailDialog.isOpen, detailDialog.data, detailDialog.close])
 
   // Source list: include all agents (terminated rows need to surface so
   // admins can hit Restore/Purge on them). getActiveAgents() is kept
@@ -1506,7 +1548,7 @@ export function AgentsDashboard() {
   
   
   const handleTaskClick = (task: Task) => {
-    taskDialog.open(task)
+    taskDialog.open(task.task_id)
   }
 
   const filteredAgents = agents.filter(agent => {
@@ -1564,12 +1606,12 @@ export function AgentsDashboard() {
   }
 
   const handleEditAgent = (agent: Agent) => {
-    editDialog.open(agent)
+    editDialog.open(agent.agent_id)
   }
 
   const handleSelectAgent = (agent: Agent) => {
     setSelectedAgent(agent)
-    detailDialog.open(agent)
+    detailDialog.open(agent.agent_id)
   }
 
   if (!isConnected) {

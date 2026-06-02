@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useState } from 'react'
+import React, { useCallback, useEffect, useState } from 'react'
 import { X, Copy, CheckCircle2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -18,19 +18,32 @@ interface AgentDetailsPanelProps {
 
 export function AgentDetailsPanel({ agent, onClose }: AgentDetailsPanelProps) {
   const [copiedToken, setCopiedToken] = useState(false)
-  // Task-details popup. Migrated to useDialog<Task>() — Candidate F1.
-  const taskDialog = useDialog<Task>()
-  const { getAgentTasks, getAgentActions } = useDataStore()
-  
+  // Task-details popup. Live-lookup useDialog (Candidate D,
+  // 2026-06-02) reads the task row live from the global store on
+  // every render, so background refresh / sibling edits flow into the
+  // open dialog automatically — no more snapshot of the pre-edit row.
+  const { getAgentTasks, getAgentActions, getTask } = useDataStore()
+  const taskByIdSelector = useCallback(
+    (id: string | null) => (id ? getTask(id) ?? null : null),
+    [getTask],
+  )
+  const taskDialog = useDialog<Task>(taskByIdSelector)
+
+  // Auto-close if the task is deleted from the store while the
+  // dialog is open.
+  useEffect(() => {
+    if (taskDialog.isOpen && taskDialog.data === null) taskDialog.close()
+  }, [taskDialog.isOpen, taskDialog.data, taskDialog.close])
+
   // Get agent's tasks and actions from cached data
   const agentTasks = agent ? getAgentTasks(agent.agent_id) : []
   const agentActions = agent ? getAgentActions(agent.agent_id) : []
-  
+
   // Get current task details
   const currentTask = agentTasks.find(t => t.task_id === agent?.current_task)
-  
+
   const handleTaskClick = (task: Task) => {
-    taskDialog.open(task)
+    taskDialog.open(task.task_id)
   }
 
   const copyToken = () => {

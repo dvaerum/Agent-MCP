@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useEffect, useMemo, useState } from "react"
+import React, { useCallback, useEffect, useMemo, useState } from "react"
 import { MessageSquare, Send, RefreshCw, X, Trash2, MailOpen, Mail } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -149,13 +149,27 @@ export function MessagesDashboard() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
 
   // Detail modal — opened by clicking a row's content area (not the
-  // checkbox / per-row action cells, which stopPropagation). We keep
-  // the full row here rather than just the id so the modal can render
-  // without an extra fetch.
-  // Row-click detail popup. Migrated to useDialog<Message>()
-  // (Candidate F1, architecture review 2026-06-01); the dialog
-  // open-state is derived from detailDialog.data !== null.
-  const detailDialog = useDialog<Message>()
+  // checkbox / per-row action cells, which stopPropagation). Live-
+  // lookup useDialog (Candidate D, 2026-06-02) stores only the
+  // message_id and asks the selector for the current row on every
+  // render — so when the local messages list is reloaded (e.g. after
+  // a mark-read PATCH) the open dialog re-renders with the fresh
+  // row instead of a snapshot from when it was opened.
+  const messageSelector = useCallback(
+    (id: string | null) =>
+      id ? messages.find((m) => m.message_id === id) ?? null : null,
+    [messages],
+  )
+  const detailDialog = useDialog<Message>(messageSelector)
+
+  // Deleted-while-open: if the row is removed from the list (delete
+  // from any source — this tab, another tab, server-side cleanup),
+  // the selector returns null. Auto-close so the user isn't stuck
+  // on an empty modal. Explicit detailDialog.close() in deleteOne is
+  // redundant but kept for code clarity.
+  useEffect(() => {
+    if (detailDialog.isOpen && detailDialog.data === null) detailDialog.close()
+  }, [detailDialog.isOpen, detailDialog.data, detailDialog.close])
 
   // Compose state.
   const [composeOpen, setComposeOpen] = useState(false)
@@ -300,12 +314,10 @@ export function MessagesDashboard() {
         token: t,
         read: nextRead,
       })
-      // Keep the detail modal in sync when the toggle was triggered
-      // from within it — otherwise the footer label would lag the
-      // server until the next list refresh repopulates state.
-      if (detailDialog.data?.message_id === m.message_id) {
-        detailDialog.open({ ...detailDialog.data, read: nextRead })
-      }
+      // Live-lookup useDialog (Candidate D, 2026-06-02): no explicit
+      // dialog-sync hack needed. The dialog reads the row live from
+      // `messages`; refreshing the list propagates the new read state
+      // into the open modal automatically.
       await refresh()
     } catch (e: any) {
       setError(e.message ?? String(e))
@@ -648,7 +660,7 @@ export function MessagesDashboard() {
                         <TableRow
                           key={m.message_id}
                           className="cursor-pointer"
-                          onClick={() => detailDialog.open(m)}
+                          onClick={() => detailDialog.open(m.message_id)}
                         >
                           <TableCell onClick={(e) => e.stopPropagation()}>
                             <input
@@ -693,7 +705,7 @@ export function MessagesDashboard() {
                   messages={messages}
                   selectedIds={selectedIds}
                   toggleOne={toggleOne}
-                  openDetail={(m) => detailDialog.open(m)}
+                  openDetail={(m) => detailDialog.open(m.message_id)}
                   deleteOne={deleteOne}
                 />
               </div>
