@@ -601,7 +601,7 @@ export function PromptBookDashboard() {
         open={builderDialog.isOpen}
         onOpenChange={(open) => { if (!open) builderDialog.close() }}
       >
-        <DialogContent className="max-w-4xl max-h-[90vh] overflow-y-auto">
+        <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-4xl max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Prompt Builder</DialogTitle>
             <DialogDescription>

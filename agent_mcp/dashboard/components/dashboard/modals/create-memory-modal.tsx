@@ -93,7 +93,7 @@ export function CreateMemoryModal({ onCreateMemory, trigger }: CreateMemoryModal
       <DialogTrigger asChild>
         {trigger || defaultTrigger}
       </DialogTrigger>
-      <DialogContent className="sm:max-w-lg bg-card border-border text-card-foreground max-h-[90vh] overflow-y-auto">
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-lg bg-card border-border text-card-foreground max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle className="text-lg">Create New Memory</DialogTitle>
           <DialogDescription className="text-muted-foreground">

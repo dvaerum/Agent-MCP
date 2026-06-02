@@ -336,7 +336,7 @@ const CreateAgentModal = ({ onCreateAgent }: { onCreateAgent: (data: CreateAgent
           Deploy
         </Button>
       </DialogTrigger>
-      <DialogContent className="sm:max-w-md bg-card border-border text-card-foreground">
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground">
         <DialogHeader>
           <DialogTitle className="text-lg">Deploy Agent</DialogTitle>
           <DialogDescription className="text-muted-foreground">
@@ -466,7 +466,7 @@ const PurgeAgentDialog = ({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md bg-card border-border text-card-foreground">
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground">
         <DialogHeader>
           <DialogTitle className="text-lg">
             Purge agent {agentId ?? ''}?
@@ -597,7 +597,7 @@ const TerminateAgentDialog = ({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md bg-card border-border text-card-foreground">
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground">
         <DialogHeader>
           <DialogTitle className="text-lg">
             Terminate agent {agentId ?? ''}?
@@ -716,7 +716,7 @@ const EditAgentDialog = ({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md bg-card border-border text-card-foreground">
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground">
         <DialogHeader>
           <DialogTitle className="text-lg">Edit agent {agent?.agent_id}</DialogTitle>
           <DialogDescription className="text-muted-foreground">

@@ -657,7 +657,7 @@ export function MessagesDashboard() {
           if (!open) detailDialog.close()
         }}
       >
-        <DialogContent className="sm:max-w-2xl">
+        <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-2xl">
           {/* Local alias keeps the rest of the JSX untouched — every
               reference to `detailMessage` below reads the hook's data. */}
           {detailDialog.data && (() => { const detailMessage = detailDialog.data; return (

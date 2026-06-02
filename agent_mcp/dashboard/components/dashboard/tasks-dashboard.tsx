@@ -402,7 +402,7 @@ const CreateTaskModal = React.memo(({ onCreateTask }: { onCreateTask: (data: any
           Create Task
         </Button>
       </DialogTrigger>
-      <DialogContent className="sm:max-w-md bg-card border-border text-card-foreground">
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground">
         <DialogHeader>
           <DialogTitle className="text-lg">Create Task</DialogTitle>
           <DialogDescription className="text-muted-foreground">
@@ -770,7 +770,7 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-xl bg-card border-border text-card-foreground p-0 gap-0">
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-xl bg-card border-border text-card-foreground p-0 gap-0">
         {task && (
           <>
             <DialogHeader className="px-6 pt-6 pb-4 border-b border-border">
@@ -909,7 +909,7 @@ const DeleteTaskDialog = React.memo(({ task, onOpenChange, onDeleted }: DeleteTa
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-md bg-card border-border text-card-foreground p-0 gap-0">
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground p-0 gap-0">
         {task && (
           <>
             <DialogHeader className="px-6 pt-6 pb-4">
