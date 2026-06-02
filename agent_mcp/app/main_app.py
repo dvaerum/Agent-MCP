@@ -145,26 +145,53 @@ async def mcp_list_tools_handler() -> List[mcp_types.Tool]:
     return await list_available_tools()
 
 
+def _caller_role() -> str:
+    """Resolve the calling bearer's role for visibility filtering.
+
+    Mirrors the resolver in `tools.registry.list_available_tools` —
+    extracted here so the prompts + tools handlers stay in lockstep
+    on what "admin" vs "worker" vs "anonymous" mean. Failures fall
+    back to "anonymous" (most conservative).
+    """
+    try:
+        bearer = request_auth_token.get()
+    except LookupError:
+        bearer = None
+    if not bearer:
+        return "anonymous"
+    try:
+        from ..core.auth import verify_token, get_agent_id
+
+        if verify_token(bearer, "admin"):
+            return "admin"
+        if get_agent_id(bearer):
+            return "worker"
+    except Exception as e:
+        logger.warning(
+            "prompts/list: failed to resolve bearer to role (%s); "
+            "treating as anonymous.",
+            e,
+        )
+    return "anonymous"
+
+
 @mcp_app_instance.list_prompts()
 async def mcp_list_prompts_handler() -> List[mcp_types.Prompt]:
-    """Return the Prompt Book catalogue (plan Phase 6).
+    """Return the Prompt Book catalogue (plan Phase 6, filtered by
+    role per Candidate B / G).
 
-    Sourced from `agent_mcp/prompts/catalog.json` so the dashboard
-    and the MCP surface stay in sync (the dashboard inlines the
-    same data today; a follow-up migrates it to fetch from
-    `GET /api/prompts/catalog`).
-
-    Returned `name` is the catalogue id (stable, kebab-case).
-    `description` is the catalogue description. `arguments` lists
-    each variable so MCP clients can prompt the user for them.
+    Sourced from `agent_mcp/prompts/catalog.json` via the shared
+    `prompt_registry`. Entries with `"visibility": "admin"` are
+    hidden from worker + anonymous callers; default is `"any"` so
+    the on-the-wire behavior is unchanged for the current catalog.
     """
-    from ..prompts import load_catalog
+    from ..prompts import prompt_registry
 
-    catalog = load_catalog()
+    role = _caller_role()
     prompts: List[mcp_types.Prompt] = []
-    for entry in catalog.get("prompts", []):
+    for entry in prompt_registry.list_visible(role):
         args = []
-        for v in entry.get("variables", []):
+        for v in entry.meta.variables:
             args.append(
                 mcp_types.PromptArgument(
                     name=v["name"],
@@ -174,9 +201,9 @@ async def mcp_list_prompts_handler() -> List[mcp_types.Prompt]:
             )
         prompts.append(
             mcp_types.Prompt(
-                name=entry["id"],
-                title=entry.get("title", entry["id"]),
-                description=entry.get("description", ""),
+                name=entry.name,
+                title=entry.meta.title,
+                description=entry.meta.description,
                 arguments=args,
             )
         )
@@ -192,17 +219,22 @@ async def mcp_get_prompt_handler(
 
     Returns the rendered text as a single user-role message.
     Missing optional variables substitute as empty (no
-    `{{VAR}}` leaks through).
+    `{{VAR}}` leaks through). Admin-only prompts (per the catalog's
+    `"visibility": "admin"` field) raise PermissionError for
+    non-admin callers — defense in depth on top of `prompts/list`
+    filtering, since a worker could otherwise guess the id.
     """
-    from ..prompts import get_prompt as _get_catalog_entry
-    from ..prompts import render_prompt
+    from ..prompts import prompt_registry
 
-    entry = _get_catalog_entry(name)
+    role = _caller_role()
+    entry = prompt_registry.get(name)
     if entry is None:
         raise ValueError(f"Unknown prompt: {name}")
-    rendered = render_prompt(name, arguments or {})
+    # `render()` enforces visibility; PermissionError propagates as a
+    # JSON-RPC error via the framework wrapper.
+    rendered = prompt_registry.render(name, arguments or {}, role=role)
     return mcp_types.GetPromptResult(
-        description=entry.get("description", ""),
+        description=entry.meta.description,
         messages=[
             mcp_types.PromptMessage(
                 role="user",
