@@ -24,6 +24,11 @@ from ..features.message_retention import (
     DEFAULT_INTERVAL_SECONDS as MESSAGE_RETENTION_INTERVAL_DEFAULT,
     run_message_retention_periodically,
 )
+from ..features.session_registry_pruner import (
+    DEFAULT_INTERVAL_SECONDS as SESSION_REGISTRY_INTERVAL_DEFAULT,
+    DEFAULT_THRESHOLD_SECONDS as SESSION_REGISTRY_THRESHOLD_DEFAULT,
+    run_session_registry_pruner,
+)
 from ..utils.signal_utils import register_signal_handlers  # For graceful shutdown
 from ..db.write_queue import get_write_queue
 
@@ -381,6 +386,33 @@ async def start_background_tasks(task_group: anyio.abc.TaskGroup):
         f"Message retention pruner started with interval {retention_interval}s."
     )
 
+    # Start session registry pruner (cross-request notification fan-out
+    # plumbing — Phase: session-registry). Sweeps mcp_sessions for rows
+    # whose `last_seen_at` is older than threshold so a crashed /
+    # disconnected GET /mcp stream doesn't keep getting fanned out to.
+    session_registry_interval = int(
+        os.environ.get(
+            "MCP_SESSION_REGISTRY_INTERVAL_SECONDS",
+            str(SESSION_REGISTRY_INTERVAL_DEFAULT),
+        )
+    )
+    session_registry_threshold = int(
+        os.environ.get(
+            "MCP_SESSION_REGISTRY_THRESHOLD_SECONDS",
+            str(SESSION_REGISTRY_THRESHOLD_DEFAULT),
+        )
+    )
+    g.session_registry_pruner_task_scope = await task_group.start(
+        run_session_registry_pruner,
+        session_registry_interval,
+        session_registry_threshold,
+    )
+    logger.info(
+        "Session registry pruner started "
+        f"(interval={session_registry_interval}s, "
+        f"threshold={session_registry_threshold}s)."
+    )
+
 
 async def application_shutdown():
     """Handles graceful shutdown of application resources and tasks."""
@@ -403,6 +435,13 @@ async def application_shutdown():
     ):
         logger.info("Attempting to cancel message retention pruner task...")
         g.message_retention_task_scope.cancel()
+
+    if (
+        getattr(g, "session_registry_pruner_task_scope", None)
+        and not g.session_registry_pruner_task_scope.cancel_called
+    ):
+        logger.info("Attempting to cancel session registry pruner task...")
+        g.session_registry_pruner_task_scope.cancel()
 
     # Stop database write queue
     write_queue = get_write_queue()

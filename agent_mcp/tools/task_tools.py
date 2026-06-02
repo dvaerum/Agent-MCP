@@ -1023,12 +1023,13 @@ async def _assign_to_existing_tasks(
 
         conn.commit()
 
-        # Phase 2: wake the newly-assigned agent's wait_for_events waiter.
+        # Wake wait_for_events waiter + fan out resources/updated to
+        # every registered GET /mcp stream for the newly-assigned agent.
         try:
-            g.signal_for(target_agent_id).set()
+            g.notify_agent_inbox(target_agent_id)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning(
-                "wait_for_events signal_for(%s) raised after _assign_to_existing_tasks: %s",
+                "notify_agent_inbox(%s) raised after _assign_to_existing_tasks: %s",
                 target_agent_id, e,
             )
 
@@ -1153,12 +1154,13 @@ async def _create_and_assign_multiple_tasks(
 
         conn.commit()
 
-        # Phase 2: wake the newly-assigned agent's wait_for_events waiter.
+        # Wake wait_for_events waiter + fan out resources/updated to
+        # every registered GET /mcp stream for the newly-assigned agent.
         try:
-            g.signal_for(target_agent_id).set()
+            g.notify_agent_inbox(target_agent_id)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning(
-                "wait_for_events signal_for(%s) raised after _create_and_assign_multiple_tasks: %s",
+                "notify_agent_inbox(%s) raised after _create_and_assign_multiple_tasks: %s",
                 target_agent_id, e,
             )
 
@@ -1725,13 +1727,14 @@ async def assign_task_tool_impl(
         )
         conn.commit()
 
-        # Phase 2: wake the new assignee's `wait_for_events` waiter.
-        # Done AFTER commit so the re-query sees the row.
+        # Wake wait_for_events waiter + fan out resources/updated to
+        # every registered GET /mcp stream for the new assignee. Done
+        # AFTER commit so the re-query sees the row.
         try:
-            g.signal_for(target_agent_id).set()
+            g.notify_agent_inbox(target_agent_id)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning(
-                "wait_for_events signal_for(%s) raised after assign_task: %s",
+                "notify_agent_inbox(%s) raised after assign_task: %s",
                 target_agent_id, e,
             )
 
@@ -2365,11 +2368,11 @@ async def update_task_status_tool_impl(
                     if row:
                         assignee = row["assigned_to"]
                 if assignee and assignee not in woken:
-                    g.signal_for(assignee).set()
+                    g.notify_agent_inbox(assignee)
                     woken.add(assignee)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning(
-                "wait_for_events signal fan-out raised after "
+                "notify_agent_inbox fan-out raised after "
                 "update_task_status: %s",
                 e,
             )

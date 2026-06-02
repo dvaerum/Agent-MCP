@@ -114,16 +114,6 @@ def test_touch_session_updates_last_seen(client) -> None:
     from agent_mcp.db.connection import get_db_connection
 
     sid = reg.register_session(agent_id="carol", bearer_token="t")
-    conn = get_db_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT last_seen_at FROM mcp_sessions WHERE session_id = ?", (sid,),
-        )
-        before = cur.fetchone()["last_seen_at"]
-    finally:
-        conn.close()
-
     # Force a different timestamp by reaching past the registry's
     # internal clock — the simplest reliable way is to overwrite the
     # row to an ancient value and confirm touch_session moves it forward.

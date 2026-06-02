@@ -88,6 +88,12 @@ claude_session_task_scope: Optional[anyio.abc.CancelScope] = None
 # Absent or 0 => no pruning. See features.message_retention.
 message_retention_task_scope: Optional[anyio.abc.CancelScope] = None
 
+# Handle for the mcp_sessions registry pruner background task. Sweeps
+# rows whose `last_seen_at` is older than the configured threshold so a
+# crashed / disconnected GET /mcp stream's row gets reaped before
+# emitters keep fanning out to it. See features.session_registry_pruner.
+session_registry_pruner_task_scope: Optional[anyio.abc.CancelScope] = None
+
 # --- wait_for_events long-poll signals (plan Phase 2) ---
 # Per-agent asyncio.Event signals used by the `wait_for_events` tool to
 # block until the agent has new activity (direct messages, broadcasts,
@@ -124,6 +130,52 @@ def signal_for(agent_id: str) -> asyncio.Event:
         sig = asyncio.Event()
         agent_event_signals[agent_id] = sig
     return sig
+
+
+def notify_agent_inbox(agent_id: str) -> None:
+    """Wake waiters AND fan out resources/updated to subscribed sessions.
+
+    Single call site for the "new event for this agent" trigger. Two
+    sinks:
+
+    1. ``signal_for(agent_id).set()`` — wakes any in-process
+       ``wait_for_events`` tool call (POST /mcp blocking on the Event).
+       This is the long-poll path workers rely on today.
+
+    2. ``session_registry.fanout_to_agent`` — enqueues
+       ``notifications/resources/updated`` on every GET /mcp stream
+       registered for the agent. The stream-side draining loop ships
+       these to the wire (Phase: transport-wiring); until that lands
+       the queue accumulates and the in-process signal still works,
+       so worker UX is unchanged.
+
+    Writers (`send_agent_message_tool_impl`, broadcast,
+    `assign_task_*`, `update_task_status`) call this exactly once,
+    AFTER commit, so the waiter / subscriber's re-query sees the new
+    row.
+
+    Wrapped in broad try/except because notification side-effects must
+    never crash the tool that called the writer — the source-of-truth
+    write is already committed.
+    """
+    try:
+        signal_for(agent_id).set()
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+    try:
+        # Lazy import to avoid a circular dependency at module load
+        # (session_registry → db.connection → core.config).
+        from . import session_registry
+
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "notifications/resources/updated",
+            "params": {"uri": f"agent-mcp://inbox/{agent_id}"},
+        }
+        session_registry.fanout_to_agent(agent_id, payload)
+    except Exception:  # pragma: no cover - defensive
+        pass
 
 # Note: The original `main.py` also had `openai_client = None` at line 185.
 # I've named it `openai_client_instance` here to avoid confusion with the module name
