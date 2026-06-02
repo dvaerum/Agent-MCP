@@ -98,18 +98,42 @@ def test_view_dialog_title_wraps_instead_of_truncating() -> None:
     )
 
 
-def test_view_dialog_description_caps_height_inside_body() -> None:
-    """Within the already-scrollable body, a huge description should
-    scroll *inside* its own block (`max-h-[40vh] overflow-y-auto`)
-    rather than ballooning the body. Otherwise the metadata footer
-    falls off the bottom of the visible scroll region."""
+def test_view_dialog_description_no_inner_scroll() -> None:
+    """The description block in the View dialog must NOT have its own
+    scroll container — only the parent dialog body (`flex-1 min-h-0
+    overflow-y-auto`) should scroll. Previously the description had
+    `max-h-[40vh] overflow-y-auto` which created a nested scroll inside
+    the dialog body — bad UX: users had to scroll two regions to read
+    a long description plus metadata footer.
+
+    The fix is to drop `max-h-[Nvh]` and `overflow-y-auto` from the
+    description block so the description flows naturally and the whole
+    dialog body scrolls as one. `[overflow-wrap:anywhere]` is kept so
+    long unbreakable strings still wrap mid-token.
+    """
     src = _src()
-    # Look near the description region for the inner-scroll markers.
     description_block_idx = src.find("Description</Label>")
     assert description_block_idx >= 0, "couldn't locate description block"
-    region = src[description_block_idx:description_block_idx + 600]
-    assert "max-h-[40vh]" in region, (
-        "expected `max-h-[40vh]` on the description block so monster "
-        "descriptions scroll inside the description rather than "
-        "balloon the dialog body and push other fields off-screen."
+    # Look only at the description's wrapping element + the <pre> body
+    # (~400 chars after the label is plenty).
+    region = src[description_block_idx:description_block_idx + 500]
+    import re as _re
+    assert not _re.search(r"max-h-\[\d+vh\]", region), (
+        "expected NO `max-h-[Nvh]` constraint on the description block — "
+        "the parent dialog body already scrolls (`max-h-[90vh]` + "
+        "`flex-1 min-h-0 overflow-y-auto`), and nesting another scroll "
+        "region inside it forces users to scroll twice. Drop the cap."
+    )
+    assert "overflow-y-auto" not in region, (
+        "expected NO `overflow-y-auto` on the description block — only "
+        "the parent dialog body should scroll. A nested scroll here was "
+        "a UX regression (PR #54 polish over-corrected for long bodies)."
+    )
+    # Positive: the wrap helper must stay so 65k-char unbreakable tokens
+    # still wrap mid-string instead of overflowing horizontally.
+    assert "[overflow-wrap:anywhere]" in region, (
+        "expected `[overflow-wrap:anywhere]` to be retained on the "
+        "description block so long unbroken strings wrap mid-token "
+        "(the dialog body's vertical scroll doesn't help horizontal "
+        "overflow)."
     )
