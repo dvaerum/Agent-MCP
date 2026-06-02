@@ -609,18 +609,18 @@ const ViewTaskDialog = React.memo(({ task, onOpenChange }: RowDialogProps) => {
                 - `[overflow-wrap:anywhere]` so a 65k-char unbroken string
                   (we have one in the wild — `XXX…XXX`) wraps inside the
                   block instead of forcing the body to a giant scroll-X.
-                - `max-h-[40vh] overflow-y-auto` so monster descriptions
-                  scroll *inside* the description block rather than ballooning
-                  the whole dialog body. Outer body still scrolls for the
-                  rest of the fields.
-                - `font-sans` by default; only the `(no description)`
-                  placeholder stays italic. Most descriptions are prose,
-                  not code — forcing mono everywhere made them hard to read.
+                - NO inner `max-h-[Nvh] overflow-y-auto`. The dialog body
+                  (`max-h-[90vh]` + `flex-1 min-h-0 overflow-y-auto`) is
+                  the single vertical scroll region; nesting another one
+                  here forced users to scroll twice (PR #54's polish
+                  over-corrected for monster bodies). Long descriptions
+                  now flow naturally into the body scroll alongside the
+                  metadata footer.
               */}
               <div className="border-t border-border pt-4 space-y-2">
                 <Label className="text-xs text-muted-foreground uppercase tracking-wider">Description</Label>
                 {task.description ? (
-                  <pre className="text-sm whitespace-pre-wrap break-words [overflow-wrap:anywhere] font-mono text-xs leading-relaxed bg-muted/40 rounded p-3 max-h-[40vh] overflow-y-auto">
+                  <pre className="text-sm whitespace-pre-wrap break-words [overflow-wrap:anywhere] font-mono text-xs leading-relaxed bg-muted/40 rounded p-3">
                     {task.description}
                   </pre>
                 ) : (
