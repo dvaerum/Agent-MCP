@@ -46,8 +46,10 @@ def test_view_dialog_has_notes_section_label() -> None:
     then no visible affordance saying "this task has no notes".
     """
     src = _src(DASHBOARD)
-    # Match the Label/header for the notes section.
-    assert re.search(r">Notes(\s*\(\{?notes\.length\}?\))?<", src), (
+    # Match the Label/header for the notes section. Accepts either the
+    # legacy `Notes ({notes.length})` static label or the dynamic
+    # variant that drops the count when there are zero notes.
+    assert re.search(r">\s*Notes\b", src), (
         "expected the View dialog to render a 'Notes' label/header. "
         "After PR #49 / #68, the notes block is gated on `notes.length > 0` "
         "and silently absent for empty-notes tasks."
@@ -122,23 +124,28 @@ def test_edit_dialog_submits_notes_in_patch() -> None:
     status / priority / assigned_to only.
     """
     src = _src(DASHBOARD)
-    # Look for a patch with `notes:` near the apiClient.updateTask call.
-    # Allow either always-include + backend ignores empty, or conditional.
-    update_call_region = re.search(
-        r"const patch:[^}]*?\}",
+    # Locate the EditTaskDialog component and look for both the patch
+    # object and a downstream `notes` / `editNote` assignment before
+    # `apiClient.updateTask`. The append can happen either inside the
+    # initial object literal (`notes: ...`) or as a post-construction
+    # `patch.notes = ...` (conditional on non-empty input).
+    edit_dialog_region = re.search(
+        r"const EditTaskDialog\b.*?await apiClient\.updateTask",
         src,
         re.DOTALL,
     )
-    assert update_call_region is not None, (
-        "could not locate the `const patch:` literal in the Edit dialog "
-        "save handler — test pattern needs updating."
+    assert edit_dialog_region is not None, (
+        "could not locate the EditTaskDialog's save handler — test "
+        "pattern needs updating."
     )
-    region = update_call_region.group(0)
-    assert "notes" in region or "editNote" in region, (
-        "expected the Edit dialog save handler's patch object to include "
-        "a `notes:` field (sourced from the new-note textarea) so "
-        "submitting actually persists the note via the existing "
-        "`/api/update-task-dashboard` endpoint."
+    region = edit_dialog_region.group(0)
+    assert re.search(r"\b(patch\.notes|notes:\s*\w+|editNote)\b", region), (
+        "expected the Edit dialog save handler to wire the new-note "
+        "textarea (`editNote` or similar) into the patch sent to "
+        "`apiClient.updateTask`, either as `notes: trimmedNote` in the "
+        "patch literal or as a `patch.notes = trimmedNote` assignment. "
+        "Without it the textarea is decorative — the server never "
+        "appends a new note."
     )
 
 

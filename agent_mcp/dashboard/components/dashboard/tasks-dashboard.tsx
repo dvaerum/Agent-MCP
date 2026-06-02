@@ -654,10 +654,19 @@ const ViewTaskDialog = React.memo(({ task, onOpenChange }: RowDialogProps) => {
                 </div>
               )}
 
-              {/* Group 4: notes (only renders if present) */}
-              {notes.length > 0 && (
-                <div className="border-t border-border pt-4 space-y-2">
-                  <Label className="text-xs text-muted-foreground uppercase tracking-wider">Notes ({notes.length})</Label>
+              {/*
+                Group 4: notes — always renders, with an empty state
+                when the task has none. Gating on `notes.length > 0`
+                hid the section completely for empty tasks (no
+                affordance, no hint the feature exists). The Add-note
+                affordance lives in the Edit dialog (`apiClient.updateTask`
+                with `notes: string` appends a new entry).
+              */}
+              <div className="border-t border-border pt-4 space-y-2">
+                <Label className="text-xs text-muted-foreground uppercase tracking-wider">
+                  Notes{notes.length > 0 ? ` (${notes.length})` : ''}
+                </Label>
+                {notes.length > 0 ? (
                   <div className="space-y-2">
                     {notes.map((note: any, idx) => (
                       <div key={idx} className="bg-muted/50 rounded-lg p-3">
@@ -676,8 +685,12 @@ const ViewTaskDialog = React.memo(({ task, onOpenChange }: RowDialogProps) => {
                       </div>
                     ))}
                   </div>
-                </div>
-              )}
+                ) : (
+                  <p className="text-sm text-muted-foreground italic">
+                    No notes yet. Use the Edit dialog to add one.
+                  </p>
+                )}
+              </div>
 
               {/*
                 Group 5: tombstone metadata footer.
@@ -733,9 +746,18 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
   const [editPriority, setEditPriority] = useState<Task['priority']>('medium')
   // Sentinel '__unassigned__' so the shadcn Select can represent NULL.
   const [editAssignedTo, setEditAssignedTo] = useState<string>('__unassigned__')
+  // New-note textarea is append-only: the backend stores notes as a
+  // JSON array and `/api/update-task-dashboard` appends a single
+  // entry per request. Empty string = no note added. Cleared on save.
+  const [editNote, setEditNote] = useState<string>('')
   const [agents, setAgents] = useState<Agent[]>([])
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
+
+  // Existing notes for the "Existing notes" preview block at the
+  // bottom of the Edit dialog. Read-only here — to edit historical
+  // notes you'd need per-note IDs which don't exist in the schema.
+  const existingNotes = task ? parseJsonField(task.notes) : []
 
   // Re-seed form whenever the dialog opens for a new task.
   useEffect(() => {
@@ -745,6 +767,7 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
     setEditStatus(task.status || 'pending')
     setEditPriority(task.priority || 'medium')
     setEditAssignedTo(task.assigned_to || '__unassigned__')
+    setEditNote('')
     setSaveError(null)
   }, [task])
 
@@ -771,6 +794,12 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
         priority: editPriority,
         assigned_to: editAssignedTo === '__unassigned__' ? null : editAssignedTo,
       }
+      // Append-only: only include `notes` in the patch when the new-note
+      // textarea has content. The backend treats `notes: str` as "append
+      // a new entry with author=admin + timestamp"; passing empty would
+      // be a no-op but we omit it to keep the request body minimal.
+      const trimmedNote = editNote.trim()
+      if (trimmedNote) patch.notes = trimmedNote
       await apiClient.updateTask(task.task_id, patch)
       onSaved()
       onOpenChange(false)
@@ -861,6 +890,52 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
                       )}
                     </SelectContent>
                   </Select>
+                </div>
+                {/*
+                  Add-note section. Append-only — the backend appends a
+                  new {timestamp, author, content} entry to the JSON
+                  notes array; we cannot edit/delete historical notes
+                  per-id (no PK in the schema). Leaving the textarea
+                  empty skips the notes field in the patch. The
+                  existing-notes preview below is read-only and gives
+                  the admin context for the new note they're typing.
+                */}
+                <div className="border-t border-border pt-4 space-y-2">
+                  <Label htmlFor="edit-task-note" className="text-sm text-muted-foreground">
+                    Add note
+                  </Label>
+                  <Textarea
+                    id="edit-task-note"
+                    value={editNote}
+                    onChange={(e) => setEditNote(e.target.value)}
+                    placeholder="Optional. Appended to the task notes log with your admin id and a timestamp."
+                    className="w-full bg-background border-border text-foreground min-h-[60px] whitespace-pre-wrap text-sm"
+                  />
+                  {existingNotes.length > 0 && (
+                    <details className="text-xs text-muted-foreground">
+                      <summary className="cursor-pointer hover:text-foreground">
+                        Existing notes ({existingNotes.length})
+                      </summary>
+                      <div className="mt-2 space-y-2 max-h-[20vh] overflow-y-auto">
+                        {existingNotes.map((note: any, idx: number) => (
+                          <div key={idx} className="bg-muted/40 rounded p-2">
+                            <div className="flex items-center justify-between mb-1">
+                              <span className={cn(
+                                "font-medium",
+                                isTombstone(note.author) && "italic"
+                              )}>
+                                {note.author || 'unknown'}
+                              </span>
+                              <span title={note.timestamp}>
+                                {formatRelative(note.timestamp)}
+                              </span>
+                            </div>
+                            <p className="whitespace-pre-wrap text-foreground">{note.content}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </details>
+                  )}
                 </div>
                 {saveError && (
                   <div className="text-xs text-destructive bg-destructive/10 border border-destructive/30 rounded p-2">
