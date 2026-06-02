@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useState, useEffect } from 'react'
+import React, { useCallback, useEffect, useState } from 'react'
 import { 
   Brain, 
   Search, 
@@ -232,6 +232,11 @@ const EditMemoryModal = ({ memory, open, onOpenChange, onUpdateMemory }: {
     description: memory.description || ''
   })
 
+  // Re-seed on a *different* memory only (key change), not on every
+  // background-refresh-driven prop reference change — otherwise the
+  // admin's in-progress edits would be clobbered. Live-lookup
+  // useDialog (Candidate D, 2026-06-02).
+  const memoryKey = memory?.context_key
   React.useEffect(() => {
     if (open && memory) {
       setFormData({
@@ -240,7 +245,9 @@ const EditMemoryModal = ({ memory, open, onOpenChange, onUpdateMemory }: {
         description: memory.description || ''
       })
     }
-  }, [open, memory])
+    // Deliberately keyed on memoryKey, not memory — see comment above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, memoryKey])
 
   const handleValueChange = (value: any) => {
     setFormData(prev => ({ ...prev, context_value: value }))
@@ -356,13 +363,16 @@ export function MemoriesDashboard() {
   const [searchTerm, setSearchTerm] = useState('')
   const [sortBy, setSortBy] = useState<string>('updated_at')
   
-  // Modal state management. View and Edit migrated to useDialog<T>()
-  // (Candidate F1, architecture review 2026-06-01) — each one used
-  // to own a useState<boolean>(false) + share the same
-  // setSelectedMemory pair. deleteModalOpen was declared but unused
-  // (delete uses window.confirm — see handleDelete) and is dropped.
-  const viewDialog = useDialog<Memory>()
-  const editDialog = useDialog<Memory>()
+  // Modal state management. Live-lookup useDialog (Candidate D,
+  // 2026-06-02) stores the context_key and asks the selector for the
+  // current memory row on every render — so background refresh and
+  // sibling Edit saves flow into the open View dialog automatically.
+  // deleteModalOpen was declared but unused (delete uses window.confirm
+  // — see handleDelete) and is dropped.
+  // NB: the memories array is recomputed from data.context above; it
+  // is therefore stable across renders only when context is stable,
+  // which is the right granularity for the selector deps.
+  // Forward-declare a stable selector — see memorySelector below.
   const [isOperationLoading, setIsOperationLoading] = useState(false)
   const [operationError, setOperationError] = useState<string | null>(null)
   
@@ -398,6 +408,28 @@ export function MemoriesDashboard() {
       }
     }))
   }, [data?.context])
+
+  // Live-lookup selector for the View/Edit dialogs. Re-computes
+  // when `memories` changes (i.e. when the underlying context slice
+  // refreshes from the store) so the open dialog re-renders against
+  // the current row.
+  const memorySelector = useCallback(
+    (key: string | null) =>
+      key ? memories.find((m) => m.context_key === key) ?? null : null,
+    [memories],
+  )
+  const viewDialog = useDialog<Memory>(memorySelector)
+  const editDialog = useDialog<Memory>(memorySelector)
+
+  // Deleted-while-open: if the row is purged from the store, the
+  // selector returns null. Auto-close so the user isn't stuck on an
+  // empty modal.
+  useEffect(() => {
+    if (viewDialog.isOpen && viewDialog.data === null) viewDialog.close()
+  }, [viewDialog.isOpen, viewDialog.data, viewDialog.close])
+  useEffect(() => {
+    if (editDialog.isOpen && editDialog.data === null) editDialog.close()
+  }, [editDialog.isOpen, editDialog.data, editDialog.close])
 
   // Fetch data on mount and when server changes
   useEffect(() => {
@@ -446,11 +478,11 @@ export function MemoriesDashboard() {
   }, [memories])
 
   const handleView = (memory: Memory) => {
-    viewDialog.open(memory)
+    viewDialog.open(memory.context_key)
   }
 
   const handleEdit = (memory: Memory) => {
-    editDialog.open(memory)
+    editDialog.open(memory.context_key)
   }
 
   const handleDelete = async (memory: Memory) => {

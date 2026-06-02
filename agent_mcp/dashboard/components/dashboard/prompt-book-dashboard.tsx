@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useState, useMemo, useEffect } from 'react'
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { 
   BookOpen, Search, Copy, CheckCircle2, Filter, Tag, ChevronDown, ChevronRight,
   UserPlus, CheckSquare, Database, Bug, Users, Sparkles, ExternalLink, Plus, HelpCircle, Edit3, X
@@ -316,11 +316,6 @@ const PromptBuilder = ({ prompt, onClose }: {
 export function PromptBookDashboard() {
   const [searchTerm, setSearchTerm] = useState('')
   const [selectedCategory, setSelectedCategory] = useState<string>('all')
-  // Prompt builder dialog. Migrated to useDialog<PromptTemplate>()
-  // (Candidate F1, architecture review 2026-06-01) — collapses the
-  // legacy useState<PromptTemplate | null>(null) +
-  // useState<boolean>(false) pair into one piece of state.
-  const builderDialog = useDialog<PromptTemplate>()
   const [customPrompts, setCustomPrompts] = useState<PromptTemplate[]>([])
   const [createModalOpen, setCreateModalOpen] = useState(false)
   const { showTutorial, setShowTutorial } = usePromptBookTutorial()
@@ -339,6 +334,27 @@ export function PromptBookDashboard() {
   const fetchPromptsCatalog = useDataStore(s => s.fetchPromptsCatalog)
   const promptTemplates: PromptTemplate[] = promptsCatalog ?? []
   const promptCategories: PromptCategory[] = promptsCategories ?? []
+
+  // Prompt builder dialog. Live-lookup useDialog (Candidate D,
+  // 2026-06-02) stores the prompt id and asks the selector for the
+  // current row on every render — so a catalog refresh or a
+  // localStorage write to customPrompts flows into the open builder
+  // automatically.
+  const promptSelector = useCallback(
+    (id: string | null) => {
+      if (!id) return null
+      const all = [...promptTemplates, ...customPrompts]
+      return all.find((p) => p.id === id) ?? null
+    },
+    [promptTemplates, customPrompts],
+  )
+  const builderDialog = useDialog<PromptTemplate>(promptSelector)
+
+  // Auto-close if the prompt is removed from both catalog and
+  // localStorage while the dialog is open.
+  useEffect(() => {
+    if (builderDialog.isOpen && builderDialog.data === null) builderDialog.close()
+  }, [builderDialog.isOpen, builderDialog.data, builderDialog.close])
 
   // Boot the catalogue fetch on first mount.
   useEffect(() => {
@@ -401,7 +417,7 @@ export function PromptBookDashboard() {
   }, [filteredPrompts])
 
   const handleSelectPrompt = (prompt: PromptTemplate) => {
-    builderDialog.open(prompt)
+    builderDialog.open(prompt.id)
   }
 
   const handleCreatePrompt = (promptData: any) => {

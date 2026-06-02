@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useEffect } from "react"
+import React, { useCallback, useEffect } from "react"
 import { RefreshCw, Server } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -23,13 +23,18 @@ export function OverviewDashboard() {
   const activeServer = servers.find(s => s.id === activeServerId)
   const { data, loading, fetchAllData, isRefreshing } = useDataStore()
   
-  // Node-detail panel state. Migrated to useDialog<SelectedNode>()
-  // (Candidate F1, architecture review 2026-06-01) — replaces three
-  // nullable useStates (id / type / data) plus a parallel boolean
-  // (isPanelOpen) with a single piece of state. The three values
-  // are read together as a tuple anyway, so packing them into one
-  // record removes the "are they in sync?" question.
-  const nodeDialog = useDialog<SelectedNode>()
+  // Node-detail panel state. The "key" here is the SelectedNode
+  // itself — the graph's onNodeSelect callback already passes the
+  // full {id, type, data} tuple and there is no separate live source
+  // to look it up from (the data is computed by vis.js on click, not
+  // stored in zustand). So the selector is identity. Live-lookup
+  // useDialog (Candidate D, 2026-06-02) requires a selector argument
+  // even when the source has no separate row store.
+  const nodeIdentitySelector = useCallback(
+    (node: SelectedNode | null) => node,
+    [],
+  )
+  const nodeDialog = useDialog<SelectedNode, SelectedNode>(nodeIdentitySelector)
   
   useEffect(() => {
     // Fetch data on mount

@@ -201,9 +201,12 @@ interface CompactTaskRowProps {
   // modal (View / Edit / Delete). The icon buttons stopPropagation so
   // the row-level click handler (which now opens the same View
   // dialog) doesn't fire twice when the icons are pressed.
-  openView: (task: Task) => void
-  openEdit: (task: Task) => void
-  openDelete: (task: Task) => void
+  // Live-lookup useDialog (Candidate D, 2026-06-02) takes the key
+  // (task_id) rather than the row — the dialog reads the row live
+  // from the source on every render.
+  openView: (taskId: string) => void
+  openEdit: (taskId: string) => void
+  openDelete: (taskId: string) => void
 }
 
 const CompactTaskRow = React.memo(({ task, openView, openEdit, openDelete }: CompactTaskRowProps) => {
@@ -224,7 +227,7 @@ const CompactTaskRow = React.memo(({ task, openView, openEdit, openDelete }: Com
   }, [mounted])
 
   return (
-    <TableRow className="border-border hover:bg-muted/50 group transition-colors duration-150 cursor-pointer" onClick={() => openView(task)}>
+    <TableRow className="border-border hover:bg-muted/50 group transition-colors duration-150 cursor-pointer" onClick={() => openView(task.task_id)}>
       <TableCell className="py-3">
         <div className="flex items-center gap-3">
           <StatusDot status={task.status} />
@@ -313,7 +316,7 @@ const CompactTaskRow = React.memo(({ task, openView, openEdit, openDelete }: Com
             title="View task"
             aria-label="View task"
             className="h-7 w-7 p-0 text-muted-foreground hover:text-foreground hover:bg-muted"
-            onClick={(e) => { e.stopPropagation(); openView(task) }}
+            onClick={(e) => { e.stopPropagation(); openView(task.task_id) }}
           >
             <Eye className="h-3.5 w-3.5" />
           </Button>
@@ -323,7 +326,7 @@ const CompactTaskRow = React.memo(({ task, openView, openEdit, openDelete }: Com
             title="Edit task"
             aria-label="Edit task"
             className="h-9 w-9 sm:h-7 sm:w-7 p-0 text-primary hover:text-primary hover:bg-primary/10"
-            onClick={(e) => { e.stopPropagation(); openEdit(task) }}
+            onClick={(e) => { e.stopPropagation(); openEdit(task.task_id) }}
           >
             <Pencil className="h-3.5 w-3.5" />
           </Button>
@@ -333,7 +336,7 @@ const CompactTaskRow = React.memo(({ task, openView, openEdit, openDelete }: Com
             title="Delete task"
             aria-label="Delete task"
             className="h-7 w-7 p-0 text-destructive hover:text-destructive hover:bg-destructive/10"
-            onClick={(e) => { e.stopPropagation(); openDelete(task) }}
+            onClick={(e) => { e.stopPropagation(); openDelete(task.task_id) }}
           >
             <Trash2 className="h-3.5 w-3.5" />
           </Button>
@@ -759,7 +762,14 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
   // notes you'd need per-note IDs which don't exist in the schema.
   const existingNotes = task ? parseJsonField(task.notes) : []
 
-  // Re-seed form whenever the dialog opens for a new task.
+  // Re-seed form whenever the dialog opens for a *different* task.
+  // Note: with live-lookup useDialog (Candidate D, 2026-06-02) the
+  // `task` prop reference can change on every background refresh
+  // even when the underlying fields are unchanged — keying the effect
+  // on task identity prevents the refresh from blowing away the
+  // admin's in-progress edits. Only the New-note textarea + save
+  // error are reset between opens; existing field edits survive.
+  const taskId = task?.task_id
   useEffect(() => {
     if (!task) return
     setEditTitle(task.title || '')
@@ -769,7 +779,10 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
     setEditAssignedTo(task.assigned_to || '__unassigned__')
     setEditNote('')
     setSaveError(null)
-  }, [task])
+    // We deliberately depend on taskId, not the whole task object —
+    // see the comment above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [taskId])
 
   // Fetch agents for the Assigned-to dropdown. Best-effort: if it
   // fails, the dropdown is empty (admin can still unassign).
@@ -884,10 +897,18 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
                       {agents.map((a) => (
                         <SelectItem key={a.agent_id} value={a.agent_id}>{a.agent_id}</SelectItem>
                       ))}
-                      {/* If the current value isn't in the agent list, keep it as an explicit option. */}
-                      {editAssignedTo !== '__unassigned__' && !agents.find((a) => a.agent_id === editAssignedTo) && (
-                        <SelectItem value={editAssignedTo}>{editAssignedTo} (stale)</SelectItem>
-                      )}
+                      {/*
+                        Live-lookup useDialog (Candidate D, 2026-06-02)
+                        retired the previous fallback SelectItem hack
+                        that re-injected a non-roster assignee with a
+                        sentinel label. editAssignedTo is initialised
+                        from the task row that the dialog reads live
+                        from the store, so it is always in lock-step
+                        with the live agent roster — when an agent is
+                        terminated, the row update flows in and the
+                        value snaps to either a present agent_id or
+                        __unassigned__.
+                      */}
                     </SelectContent>
                   </Select>
                 </div>
@@ -1048,14 +1069,38 @@ export function TasksDashboard() {
   const [searchTerm, setSearchTerm] = useState('')
   const [statusFilter, setStatusFilter] = useState<string>('all')
   const [priorityFilter, setPriorityFilter] = useState<string>('all')
-  // Row-action dialog state. Each holds the task being viewed /
-  // edited / deleted via the generic useDialog<T>() hook
-  // (Candidate F1, architecture review 2026-06-01). The legacy
-  // TaskDetailsPanel sidebar has been retired — clicking a row
-  // body now opens the View dialog (same as the eye icon).
-  const viewDialog = useDialog<Task>()
-  const editDialog = useDialog<Task>()
-  const deleteDialog = useDialog<Task>()
+  // Row-action dialog state. Each holds the **task_id** of the task
+  // being viewed / edited / deleted via the live-lookup useDialog<T>
+  // hook (Candidate D, architecture review 2026-06-02). The dialog
+  // body reads `dialog.data` which is recomputed on every render by
+  // the selector below — so background refresh, edits saved from the
+  // sibling Edit dialog, and tombstoning the row all flow through
+  // immediately. PR #74's Add-Note "saved note disappears" symptom
+  // was the snapshot-mode bug this replaces. The legacy
+  // TaskDetailsPanel sidebar has been retired — clicking a row body
+  // now opens the View dialog (same as the eye icon).
+  const taskSelector = useCallback(
+    (id: string | null) => (id ? tasks.find(t => t.task_id === id) ?? null : null),
+    [tasks],
+  )
+  const viewDialog = useDialog<Task>(taskSelector)
+  const editDialog = useDialog<Task>(taskSelector)
+  const deleteDialog = useDialog<Task>(taskSelector)
+
+  // Deleted-while-open: if the row vanishes from the source under us
+  // (background refresh sees a delete from another tab, or a sibling
+  // dialog deletes the same task), the live selector returns null.
+  // Auto-close the dialog so the user isn't stuck staring at an
+  // empty modal; the row's gone, no point keeping the modal up.
+  useEffect(() => {
+    if (viewDialog.isOpen && viewDialog.data === null) viewDialog.close()
+  }, [viewDialog.isOpen, viewDialog.data, viewDialog.close])
+  useEffect(() => {
+    if (editDialog.isOpen && editDialog.data === null) editDialog.close()
+  }, [editDialog.isOpen, editDialog.data, editDialog.close])
+  useEffect(() => {
+    if (deleteDialog.isOpen && deleteDialog.data === null) deleteDialog.close()
+  }, [deleteDialog.isOpen, deleteDialog.data, deleteDialog.close])
 
   // Memoize filtered tasks to prevent unnecessary recalculations
   const filteredTasks = useMemo(() => {
