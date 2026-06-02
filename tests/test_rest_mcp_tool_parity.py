@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
-import secrets
 
 import pytest
 
@@ -49,8 +48,11 @@ async def test_terminate_agent_rest_matches_mcp_tool(tmp_path) -> None:
     and a non-NULL terminated_at.
     """
     async with mcp_session(tmp_path) as admin:
-        alice = await admin.create_worker("alice")
-        bob = await admin.create_worker("bob")
+        # Register alice + bob in g.active_agents (the value is bound
+        # to the per-test session globals; we don't need the returned
+        # WorkerSession objects since both terminations are admin-driven).
+        await admin.create_worker("alice")
+        await admin.create_worker("bob")
 
         # --- REST path ---
         r = admin.client.post(

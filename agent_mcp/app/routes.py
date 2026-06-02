@@ -27,12 +27,138 @@ from ..features.dashboard.api import (
 )
 from ..features.dashboard.styles import get_node_style
 
-# Import tool implementations that these dashboard APIs will call
-from ..tools.admin_tools import (
-    create_agent_tool_impl,
-    terminate_agent_tool_impl
-)
+# Import tool implementations that the dashboard APIs which still
+# call directly (vs. dispatch through MCP) need. `create_agent` stays
+# direct because the MCP tool requires `task_ids` (purposeful for
+# tool-driven agent creation), but the dashboard's "Create Agent"
+# modal creates agents without preassigned tasks — going through the
+# dispatcher would surface as a 400 instead of the current 200.
+from ..tools.admin_tools import create_agent_tool_impl
 import mcp.types as mcp_types # For handling the result from tool_impl
+
+# Thin-adapter plumbing (Candidate C, 2026-06-02 architecture review).
+# Mutating REST endpoints that have a 1:1 MCP-tool match dispatch
+# through `dispatch_tool_call` so validation, auth, and audit logging
+# live once — in the tool's inputSchema + @requires decorator + impl
+# — rather than being re-implemented per surface.
+from ..tools.registry import dispatch_tool_call, request_auth_token
+from ..core.authorize import AuthRejected
+from ..tools.registry import ToolInputValidationError
+
+
+def _result_text(result: List[mcp_types.TextContent]) -> str:
+    """Concatenate text blocks from a tool-call result."""
+    if not result:
+        return ""
+    parts: List[str] = []
+    for block in result:
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            parts.append(text)
+    return "\n".join(parts)
+
+
+async def _dispatch_through_tool(
+    tool_name: str,
+    arguments: Dict[str, Any],
+    *,
+    bearer_token: Optional[str],
+    success_message: Optional[str] = None,
+    extra_response: Optional[Dict[str, Any]] = None,
+) -> JSONResponse:
+    """Run an MCP tool from a REST handler and translate the
+    `list[TextContent]` result back into a dashboard-friendly JSON
+    response.
+
+    Auth: the dashboard sends the admin token in the JSON body, not as
+    an Authorization header. We bind it on the `request_auth_token`
+    ContextVar so `dispatch_tool_call`'s Q6e fallback injects it into
+    `arguments.token` if not already there — same path an HTTP middleware
+    would take.
+
+    Error mapping (HTTP-shaped):
+      * AuthRejected            → 403
+      * ToolInputValidationError → 400
+      * Tool result starting with "Error: ... not found" / "not found" → 404
+      * Other tool-error text   → 400 (caller-error semantics)
+      * Unexpected exception    → 500
+
+    Success payload mirrors the legacy REST endpoints'
+    ``{"success": true, "message": "...", ...extras}`` shape so the
+    dashboard's ApiClient doesn't have to change.
+    """
+    cv_token = None
+    if bearer_token:
+        cv_token = request_auth_token.set(bearer_token)
+    try:
+        result = await dispatch_tool_call(tool_name, arguments)
+    except AuthRejected as e:
+        return JSONResponse(
+            {"success": False, "error": e.reason, "message": e.reason},
+            status_code=403,
+        )
+    except ToolInputValidationError as e:
+        return JSONResponse(
+            {"success": False, "error": str(e), "message": str(e)},
+            status_code=400,
+        )
+    except Exception as e:
+        logger.error(
+            f"Unexpected error dispatching tool {tool_name!r}: {e}",
+            exc_info=True,
+        )
+        return JSONResponse(
+            {
+                "success": False,
+                "error": f"Tool dispatch failed: {e}",
+                "message": f"Tool dispatch failed: {e}",
+            },
+            status_code=500,
+        )
+    finally:
+        if cv_token is not None:
+            request_auth_token.reset(cv_token)
+
+    text = _result_text(result)
+    # Tool impls report errors as plain-text "Error: ..." blocks. Map
+    # those onto HTTP status codes so the dashboard sees the same shape
+    # the legacy direct-DB handlers produced. We also catch the
+    # without-"Error:"-prefix wording some tool impls use
+    # (`terminate_agent` says "Agent 'x' not found or already
+    # terminated."; `delete_project_context` says "None of the
+    # specified keys exist..."). Treating any "not found" / "does not
+    # exist" / "Cannot delete" sentence as a non-2xx keeps the
+    # adapter's HTTP shape identical to the legacy REST endpoints.
+    lower = text.lower().lstrip()
+    is_error_prefix = (
+        lower.startswith("error:") or lower.startswith("unauthorized")
+    )
+    is_not_found_phrase = (
+        " not found" in lower
+        or lower.startswith("not found")
+        or "does not exist" in lower
+        or "none of the specified keys exist" in lower
+    )
+    is_refusal_phrase = lower.startswith("cannot ")
+    if is_error_prefix or is_not_found_phrase or is_refusal_phrase:
+        status = 400
+        if is_not_found_phrase:
+            status = 404
+        if "unauthorized" in lower:
+            status = 403
+        return JSONResponse(
+            {"success": False, "error": text, "message": text},
+            status_code=status,
+        )
+
+    payload: Dict[str, Any] = {
+        "success": True,
+        "message": success_message or text,
+    }
+    if extra_response:
+        payload.update(extra_response)
+    return JSONResponse(payload)
+
 
 # --- Dashboard and API Endpoints ---
 
@@ -409,43 +535,39 @@ async def create_agent_dashboard_api_route(request: Request) -> JSONResponse:
         logger.error(f"Error in create_agent_dashboard_api_route: {e}", exc_info=True)
         return JSONResponse({"message": f"Error creating agent via dashboard API: {str(e)}"}, status_code=500)
 
-# Original: main.py lines 2061-2099 (terminate_agent_api function)
+# Thin adapter (Candidate C, 2026-06-02 architecture review): dispatch
+# through the `terminate_agent` MCP tool so validation +
+# auth-rejection wording cannot drift between the dashboard surface
+# and the MCP surface. Wire-shape parity is pinned by
+# tests/test_rest_mcp_tool_parity.py.
 async def terminate_agent_dashboard_api_route(request: Request) -> JSONResponse:
-    """Dashboard API endpoint to terminate an agent. Calls the admin tool internally."""
+    """POST /api/terminate-agent — admin terminates an agent.
+
+    Thin adapter over the ``terminate_agent`` MCP tool. The tool's
+    ``inputSchema`` enforces ``agent_id`` required + admin-only role
+    (via ``@requires("admin")``); this handler just translates the
+    HTTP request → tool call → JSON response.
+    """
+    if request.method == 'OPTIONS':
+        return await handle_options(request)
     if request.method != 'POST':
         return JSONResponse({"error": "Method not allowed"}, status_code=405)
     try:
         data = await get_sanitized_json_body(request)
-        admin_auth_token = data.get("token")
-        agent_id_to_terminate = data.get("agent_id")
-
-        if not verify_token(admin_auth_token, "admin"):
-            return JSONResponse({"message": "Unauthorized: Invalid admin token for API call"}, status_code=401)
-
-        if not agent_id_to_terminate:
-            return JSONResponse({"message": "Agent ID to terminate is required"}, status_code=400)
-
-        tool_args = {
-            "token": admin_auth_token, # Tool impl will verify again
-            "agent_id": agent_id_to_terminate
-        }
-
-        result_list: List[mcp_types.TextContent] = await terminate_agent_tool_impl(tool_args)
-
-        if result_list and result_list[0].text.startswith(f"Agent '{agent_id_to_terminate}' terminated"):
-            return JSONResponse({"message": f"Agent '{agent_id_to_terminate}' terminated successfully via dashboard API."})
-        else:
-            error_message = result_list[0].text if result_list else "Unknown error terminating agent."
-            status_code = 400
-            if "Unauthorized" in error_message: status_code = 401
-            if "not found" in error_message: status_code = 404
-            return JSONResponse({"message": error_message}, status_code=status_code)
-            
-    except ValueError as e_val: # From get_sanitized_json_body
+    except ValueError as e_val:
         return JSONResponse({"message": str(e_val)}, status_code=400)
-    except Exception as e:
-        logger.error(f"Error in terminate_agent_dashboard_api_route: {e}", exc_info=True)
-        return JSONResponse({"message": f"Error terminating agent via dashboard API: {str(e)}"}, status_code=500)
+
+    admin_token = data.get("token")
+    agent_id = data.get("agent_id")
+    return await _dispatch_through_tool(
+        "terminate_agent",
+        {"agent_id": agent_id} if agent_id else {},
+        bearer_token=admin_token,
+        success_message=(
+            f"Agent '{agent_id}' terminated successfully via dashboard API."
+            if agent_id else None
+        ),
+    )
 
 
 # --- Agent restore + purge endpoints (this PR) ---
@@ -1439,7 +1561,22 @@ async def update_memory_api_route(request: Request) -> JSONResponse:
             session.close()
 
 async def delete_memory_api_route(request: Request) -> JSONResponse:
-    """Delete a memory entry"""
+    """DELETE /api/memories/<context_key> — admin deletes a memory.
+
+    Thin adapter over the ``delete_project_context`` MCP tool
+    (Candidate C, 2026-06-02 architecture review). The tool's
+    ``inputSchema`` requires ``context_key`` (or ``context_keys``),
+    auth is gated by the tool's own per-key creator-ownership matrix
+    (``@requires("any")``; admins pass through unconditionally).
+
+    The MCP tool refuses to delete "critical" keys (``config_*``,
+    ``server_*``, ``mcp_*``, ``database_*``, ``system_*``) without
+    ``force_delete=true``. The legacy REST handler had no such guard,
+    so we pass ``force_delete=true`` to preserve wire compatibility —
+    the dashboard never sent this flag and would otherwise start
+    seeing 400s on system keys it could delete before. Wire-shape
+    parity is pinned by tests/test_rest_mcp_tool_parity.py.
+    """
     if request.method == 'OPTIONS':
         return await handle_options(request)
 
@@ -1453,52 +1590,18 @@ async def delete_memory_api_route(request: Request) -> JSONResponse:
 
     context_key = path_parts[-1]
 
-    session = None
     try:
         data = await get_sanitized_json_body(request)
-        admin_token = data.get('token')
-
-        if not verify_token(admin_token, required_role='admin'):
-            return JSONResponse({"error": "Invalid admin token"}, status_code=403)
-
-        requesting_admin_id = auth_get_agent_id(admin_token)
-
-        session = SessionLocal()
-
-        # Check if memory exists
-        row = (
-            session.query(ProjectContext)
-            .filter(ProjectContext.context_key == context_key)
-            .one_or_none()
-        )
-        if row is None:
-            return JSONResponse({"error": "Memory not found"}, status_code=404)
-
-        # Delete the memory
-        session.delete(row)
-        session.flush()
-
-        # Log the action
-        raw_conn = session.connection().connection
-        cursor = raw_conn.cursor()
-        log_agent_action_to_db(cursor, requesting_admin_id, "deleted_memory", details={"context_key": context_key})
-        session.commit()
-
-        return JSONResponse({
-            "success": True,
-            "message": f"Memory '{context_key}' deleted successfully"
-        })
-
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
-    except Exception as e:
-        if session is not None:
-            session.rollback()
-        logger.error(f"Error deleting memory: {e}", exc_info=True)
-        return JSONResponse({"error": f"Failed to delete memory: {str(e)}"}, status_code=500)
-    finally:
-        if session is not None:
-            session.close()
+
+    admin_token = data.get('token')
+    return await _dispatch_through_tool(
+        "delete_project_context",
+        {"context_key": context_key, "force_delete": True},
+        bearer_token=admin_token,
+        success_message=f"Memory '{context_key}' deleted successfully",
+    )
 
 # --- Task CRUD endpoints (UPSTREAM_ISSUES.md issue C) ---
 # Tasks already have GET /api/tasks (list) and POST /api/update-task-dashboard
@@ -1588,7 +1691,15 @@ async def create_task_api_route(request: Request) -> JSONResponse:
 
 
 async def delete_task_api_route(request: Request) -> JSONResponse:
-    """Delete a task by ID. Admin token in JSON body."""
+    """DELETE /api/tasks/<task_id> — admin deletes a task.
+
+    Thin adapter over the ``delete_task`` MCP tool (Candidate C,
+    2026-06-02 architecture review). Validation
+    (``task_id`` required) and admin-only auth live in the tool's
+    ``inputSchema`` + ``@requires("admin")``. Cascade safety (children
+    / dependents) is handled by the tool impl. Wire-shape parity is
+    pinned by tests/test_rest_mcp_tool_parity.py.
+    """
     if request.method == 'OPTIONS':
         return await handle_options(request)
     if request.method != 'DELETE':
@@ -1600,45 +1711,23 @@ async def delete_task_api_route(request: Request) -> JSONResponse:
         return JSONResponse({"error": "task_id is required in URL"}, status_code=400)
     task_id = path_parts[-1]
 
-    conn = None
     try:
         data = await get_sanitized_json_body(request)
-        admin_token = data.get('token')
-
-        if not verify_token(admin_token, required_role='admin'):
-            return JSONResponse({"error": "Invalid admin token"}, status_code=403)
-
-        requesting_admin_id = auth_get_agent_id(admin_token)
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT task_id FROM tasks WHERE task_id = ?", (task_id,))
-        if not cursor.fetchone():
-            return JSONResponse({"error": "Task not found"}, status_code=404)
-
-        cursor.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
-        log_agent_action_to_db(
-            cursor, requesting_admin_id, "deleted_task", task_id=task_id,
-        )
-        conn.commit()
-
-        return JSONResponse({
-            "success": True,
-            "message": f"Task '{task_id}' deleted successfully",
-        })
-
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        logger.error(f"Error deleting task: {e}", exc_info=True)
-        return JSONResponse(
-            {"error": f"Failed to delete task: {str(e)}"}, status_code=500
-        )
-    finally:
-        if conn:
-            conn.close()
+
+    admin_token = data.get('token')
+    # ``force_delete=True`` matches the legacy REST behavior (the
+    # direct-DB handler had no cascade safety check). The MCP tool's
+    # default is False; passing True here preserves wire compatibility
+    # — the dashboard never sent force_delete, and silently failing on
+    # tasks with children would break existing flows.
+    return await _dispatch_through_tool(
+        "delete_task",
+        {"task_id": task_id, "force_delete": True},
+        bearer_token=admin_token,
+        success_message=f"Task '{task_id}' deleted successfully",
+    )
 
 
 # --- Messages CRUD endpoints (Phase 6 PR #20 / issue P) ---
