@@ -1,4 +1,5 @@
 # Agent-MCP/mcp_template/mcp_server_src/tools/registry.py
+from dataclasses import dataclass as _dataclass
 from typing import List, Dict, Any, Callable, Awaitable, Optional, Union
 import mcp.types as mcp_types # Assuming this is the correct import for your mcp.types
 
@@ -140,7 +141,6 @@ tool_schemas: List[Dict[str, Any]] = []
 # and `tool_implementations` carry today, but routed through the
 # shared `Registry[T]` container so resources / prompts can use the
 # same role-based visibility filtering.
-from dataclasses import dataclass as _dataclass
 
 
 @_dataclass

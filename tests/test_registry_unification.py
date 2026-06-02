@@ -219,8 +219,6 @@ def test_prompt_registry_respects_explicit_admin_visibility(
     This is Candidate G in disguise: prompts gain admin-only gating
     for free now that they ride on the shared registry.
     """
-    import importlib
-
     # Build a temporary catalog with one admin-only and one any prompt.
     import agent_mcp.prompts as prompts_mod
 
