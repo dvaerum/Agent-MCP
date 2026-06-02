@@ -31,48 +31,35 @@ escape hatch — so callers who follow the JSON-RPC spec (and the
 
 These tests pin the tolerance invariant via the same framework
 handler real MCP clients hit (CallToolRequest → registered handler).
+
+Migrated to `tests/harness.py::mcp_session` (Candidate F from
+architecture review 2026-06-02). Uses `admin.call(...)` which drives
+the same registered CallToolRequest handler via
+`request_auth_token`, identical wire path.
 """
 
 from __future__ import annotations
 
-import asyncio
-
-import mcp.types as mcp_types
 import pytest
 
-
-async def _call_tool_via_framework(tool_name: str, arguments: dict):
-    """Invoke the registered MCP CallToolRequest handler — same path
-    a real SSE/JSON-RPC client takes (including the framework's
-    `jsonschema.validate(arguments, tool.inputSchema)` step)."""
-    from agent_mcp.app.main_app import mcp_app_instance
-
-    handler = mcp_app_instance.request_handlers[mcp_types.CallToolRequest]
-    req = mcp_types.CallToolRequest(
-        method="tools/call",
-        params=mcp_types.CallToolRequestParams(
-            name=tool_name, arguments=arguments
-        ),
-    )
-    return await handler(req)
+from tests.harness import mcp_session
 
 
-def _result_text(server_result) -> str:
-    inner = server_result.root if hasattr(server_result, "root") else server_result
-    blocks = getattr(inner, "content", None) or []
-    parts = [getattr(b, "text", "") for b in blocks]
+pytestmark = pytest.mark.asyncio
+
+
+def _result_text(result_blocks) -> str:
+    parts = [getattr(b, "text", "") for b in result_blocks]
     return "\n".join(p for p in parts if p)
 
 
-def _is_validation_error(server_result) -> bool:
-    inner = server_result.root if hasattr(server_result, "root") else server_result
-    if not getattr(inner, "isError", False):
+def _is_validation_error(admin, result_blocks) -> bool:
+    """The harness stashes the last server isError on the session.
+    A "validation error" is isError=True with the framework's
+    'Input validation error' text."""
+    if not getattr(admin, "_last_is_error", False):
         return False
-    return "Input validation error" in _result_text(server_result)
-
-
-def _admin_token(client) -> str:
-    return client.get("/api/tokens").json()["admin_token"]
+    return "Input validation error" in _result_text(result_blocks)
 
 
 # --- Class 1: explicit `token: null` from LLM-driven clients ---
@@ -91,8 +78,8 @@ def _admin_token(client) -> str:
         ("view_tasks", {}),
     ],
 )
-def test_token_null_does_not_break_validation(
-    client, tool_name: str, extra_args: dict
+async def test_token_null_does_not_break_validation(
+    tmp_path, tool_name: str, extra_args: dict
 ) -> None:
     """`{"token": null, ...}` is what LLMs serialize when they decide
     to "explicitly pass the optional token as absent". Schema says
@@ -100,18 +87,14 @@ def test_token_null_does_not_break_validation(
     null. The dispatcher must strip null-valued keys before the
     framework's validator sees them.
     """
-    from agent_mcp.tools.registry import request_auth_token
+    async with mcp_session(tmp_path) as admin:
+        args = {"token": None, **extra_args}
+        result = await admin.call(tool_name, args)
 
-    admin = _admin_token(client)
-    request_auth_token.set(admin)
-
-    args = {"token": None, **extra_args}
-    result = asyncio.run(_call_tool_via_framework(tool_name, args))
-
-    assert not _is_validation_error(result), (
-        f"{tool_name}: framework rejected `token: null` at schema "
-        f"validation: {_result_text(result)}"
-    )
+        assert not _is_validation_error(admin, result), (
+            f"{tool_name}: framework rejected `token: null` at schema "
+            f"validation: {_result_text(result)}"
+        )
 
 
 # --- Class 2: `_meta` escape hatch leaked into arguments ---
@@ -124,71 +107,59 @@ def test_token_null_does_not_break_validation(
         ("view_tasks", {}),
     ],
 )
-def test_meta_escape_hatch_does_not_break_validation(
-    client, tool_name: str, extra_args: dict
+async def test_meta_escape_hatch_does_not_break_validation(
+    tmp_path, tool_name: str, extra_args: dict
 ) -> None:
     """Some MCP client SDKs put the spec-defined `_meta` field on the
     arguments object (instead of at the params level). Schemas use
     `additionalProperties: false`, so this trips validation. The
     dispatcher must drop `_meta` before validation."""
-    from agent_mcp.tools.registry import request_auth_token
+    async with mcp_session(tmp_path) as admin:
+        args = {"_meta": {"progressToken": "p-1"}, **extra_args}
+        result = await admin.call(tool_name, args)
 
-    admin = _admin_token(client)
-    request_auth_token.set(admin)
-
-    args = {"_meta": {"progressToken": "p-1"}, **extra_args}
-    result = asyncio.run(_call_tool_via_framework(tool_name, args))
-
-    assert not _is_validation_error(result), (
-        f"{tool_name}: framework rejected leaked `_meta` at schema "
-        f"validation: {_result_text(result)}"
-    )
+        assert not _is_validation_error(admin, result), (
+            f"{tool_name}: framework rejected leaked `_meta` at schema "
+            f"validation: {_result_text(result)}"
+        )
 
 
 # --- Class 3: combined — both null-token AND _meta ---
 
-def test_token_null_and_meta_combined(client) -> None:
+async def test_token_null_and_meta_combined(tmp_path) -> None:
     """A real-world Claude Code call: both `token: null` (model
     serializing the optional field as null) and `_meta` (SDK leaking
     progress token into arguments)."""
-    from agent_mcp.tools.registry import request_auth_token
+    async with mcp_session(tmp_path) as admin:
+        args = {
+            "token": None,
+            "_meta": {"progressToken": "abc"},
+            "recipient_id": "admin",
+            "message": "combined-probe",
+        }
+        result = await admin.call("send_agent_message", args)
 
-    admin = _admin_token(client)
-    request_auth_token.set(admin)
-
-    args = {
-        "token": None,
-        "_meta": {"progressToken": "abc"},
-        "recipient_id": "admin",
-        "message": "combined-probe",
-    }
-    result = asyncio.run(_call_tool_via_framework("send_agent_message", args))
-
-    assert not _is_validation_error(result), (
-        f"framework rejected combined null-token + _meta: "
-        f"{_result_text(result)}"
-    )
+        assert not _is_validation_error(admin, result), (
+            f"framework rejected combined null-token + _meta: "
+            f"{_result_text(result)}"
+        )
 
 
 # --- Negative: real validation errors (wrong types, bad enum) still surface ---
 
-def test_real_schema_violations_still_rejected(client) -> None:
+async def test_real_schema_violations_still_rejected(tmp_path) -> None:
     """Tolerance must not become permissiveness. A truly wrong value
     (e.g. wrong enum) must still be reported so the model can fix it."""
-    from agent_mcp.tools.registry import request_auth_token
+    async with mcp_session(tmp_path) as admin:
+        # `priority` enum doesn't include "urgent-X"
+        args = {
+            "recipient_id": "admin",
+            "message": "ping",
+            "priority": "urgent-X",
+        }
+        result = await admin.call("send_agent_message", args)
 
-    admin = _admin_token(client)
-    request_auth_token.set(admin)
-
-    # `priority` enum doesn't include "urgent-X"
-    args = {
-        "recipient_id": "admin",
-        "message": "ping",
-        "priority": "urgent-X",
-    }
-    result = asyncio.run(_call_tool_via_framework("send_agent_message", args))
-
-    assert _is_validation_error(result), (
-        f"a real schema violation should still surface as a validation "
-        f"error so the caller can correct it: {_result_text(result)}"
-    )
+        assert _is_validation_error(admin, result), (
+            f"a real schema violation should still surface as a validation "
+            f"error so the caller can correct it: {_result_text(result)}"
+        )
