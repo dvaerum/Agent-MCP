@@ -217,3 +217,156 @@ def test_update_task_dashboard_endpoint_accepts_notes() -> None:
         "that turns the `notes: str` body field into a new "
         "{timestamp, author, content} entry appended to the JSON array."
     )
+
+
+# ---------- Integration: full dashboard Edit-payload round-trip --------
+#
+# bg-agent #61 wired the Add-note textarea into the patch sent by
+# `EditTaskDialog.handleSave`. That fix is guarded statically above
+# (`test_edit_dialog_submits_notes_in_patch`). Dennis reported the
+# end-to-end flow still doesn't display notes after save, so we add a
+# real integration test that simulates the EXACT payload the dashboard
+# Edit dialog sends — full patch including title/description/status/
+# priority/assigned_to AND `notes` — and asserts the notes appear in
+# `GET /api/tasks` afterwards.
+#
+# This catches: dropped fields in sanitize_json_input, payload-shape
+# mismatches (e.g. `notes` getting clobbered by an `assigned_to: null`
+# branch), and the historical case where the route required `status`
+# even for notes-only edits.
+
+
+def test_dashboard_edit_payload_with_notes_round_trips(client) -> None:
+    """Send the FULL Edit-dialog patch (title, description, status,
+    priority, assigned_to, notes) and assert the note is persisted and
+    shows up in `GET /api/tasks` with the expected
+    {timestamp, author, content} shape.
+    """
+    import json as _json
+
+    r = client.get("/api/tokens")
+    assert r.status_code == 200, r.text
+    token = r.json()["admin_token"]
+
+    r = client.post(
+        "/api/tasks",
+        json={
+            "token": token,
+            "task_title": "round-trip note target",
+            "task_description": "create + edit + verify",
+        },
+    )
+    assert r.status_code == 200, r.text
+    task_id = r.json()["task_id"]
+
+    # The exact payload `EditTaskDialog.handleSave` builds when the
+    # admin types a note and clicks Save.
+    payload = {
+        "token": token,
+        "task_id": task_id,
+        "title": "round-trip note target",
+        "description": "create + edit + verify",
+        "status": "pending",
+        "priority": "medium",
+        "assigned_to": None,
+        "notes": "first dashboard note",
+    }
+    r = client.post("/api/update-task-dashboard", json=payload)
+    assert r.status_code == 200, r.text
+    assert r.json().get("success") is True
+
+    # Round-trip: fetch the tasks list and pull the note back out.
+    r = client.get("/api/tasks")
+    assert r.status_code == 200, r.text
+    tasks = r.json()
+    [task] = [t for t in tasks if t["task_id"] == task_id]
+    notes_raw = task.get("notes")
+    notes = _json.loads(notes_raw) if isinstance(notes_raw, str) else notes_raw
+    assert isinstance(notes, list), f"notes must be a list, got {type(notes)}: {notes_raw!r}"
+    assert len(notes) == 1, (
+        f"expected exactly 1 note after one Save, got {len(notes)}: {notes}"
+    )
+    entry = notes[0]
+    assert entry.get("content") == "first dashboard note", (
+        f"note content did not round-trip; got {entry!r}"
+    )
+    assert "timestamp" in entry and "author" in entry, (
+        f"note entry missing timestamp/author keys: {entry!r}"
+    )
+
+
+def test_dashboard_edit_payload_appends_multiple_notes(client) -> None:
+    """Successive Saves with the notes textarea filled must APPEND
+    entries to the array (not overwrite). The View dialog renders all
+    historical notes; if a Save overwrites prior notes the audit trail
+    is destroyed.
+    """
+    import json as _json
+
+    token = client.get("/api/tokens").json()["admin_token"]
+    task_id = client.post(
+        "/api/tasks",
+        json={"token": token, "task_title": "multi-note target"},
+    ).json()["task_id"]
+
+    base_payload = {
+        "token": token,
+        "task_id": task_id,
+        "title": "multi-note target",
+        "status": "pending",
+        "priority": "medium",
+        "assigned_to": None,
+    }
+    for content in ("note one", "note two", "note three"):
+        r = client.post(
+            "/api/update-task-dashboard",
+            json={**base_payload, "notes": content},
+        )
+        assert r.status_code == 200, r.text
+
+    tasks = client.get("/api/tasks").json()
+    [task] = [t for t in tasks if t["task_id"] == task_id]
+    notes_raw = task.get("notes")
+    notes = _json.loads(notes_raw) if isinstance(notes_raw, str) else notes_raw
+    contents = [n["content"] for n in notes]
+    assert contents == ["note one", "note two", "note three"], (
+        f"expected three notes appended in order, got {contents!r}"
+    )
+
+
+def test_dashboard_edit_payload_empty_notes_does_not_append(client) -> None:
+    """When the Add-note textarea is empty, the dashboard omits `notes`
+    from the patch (`apiClient.updateTask` skips `notes` when falsy).
+    A Save that doesn't include `notes` must NOT append a phantom
+    empty entry — otherwise every Save spams the notes log.
+    """
+    import json as _json
+
+    token = client.get("/api/tokens").json()["admin_token"]
+    task_id = client.post(
+        "/api/tasks",
+        json={"token": token, "task_title": "no-spam target"},
+    ).json()["task_id"]
+
+    # Save without the `notes` key — title-only edit.
+    r = client.post(
+        "/api/update-task-dashboard",
+        json={
+            "token": token,
+            "task_id": task_id,
+            "title": "no-spam target (edited)",
+            "description": "",
+            "status": "pending",
+            "priority": "medium",
+            "assigned_to": None,
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    tasks = client.get("/api/tasks").json()
+    [task] = [t for t in tasks if t["task_id"] == task_id]
+    notes_raw = task.get("notes")
+    notes = _json.loads(notes_raw) if isinstance(notes_raw, str) else (notes_raw or [])
+    assert notes == [], (
+        f"expected no notes appended for a notes-less Save, got {notes!r}"
+    )
