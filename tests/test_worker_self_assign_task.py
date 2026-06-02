@@ -17,15 +17,23 @@ This file pins the corrected permission matrix:
   → rejected regardless of toggle (workers may only self-claim)
 - admin bearer + any combination → unchanged, still allowed
 - Mode 0 worker-creates-unassigned (PR #32) → unchanged
+
+Migrated to `tests/harness.py::mcp_session` (Candidate F from
+architecture review 2026-06-02).
 """
 
 from __future__ import annotations
 
-import asyncio
 import datetime as _dt
+import re
 import secrets
 
 import pytest
+
+from tests.harness import mcp_session
+
+
+pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture(autouse=True)
@@ -45,33 +53,6 @@ def _inline_write_queue(monkeypatch):
     )
 
 
-def _seed_worker(name: str = "alice"):
-    from agent_mcp.core import globals as g
-    from agent_mcp.db.connection import get_db_connection
-
-    worker_token = secrets.token_hex(16)
-    now = _dt.datetime.now().isoformat()
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO agents (token, agent_id, capabilities, created_at, "
-        "status, working_directory, color, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (worker_token, name, "[]", now, "active", "/tmp", "#888", now),
-    )
-    conn.commit()
-    conn.close()
-
-    g.active_agents[worker_token] = {
-        "agent_id": name,
-        "status": "active",
-        "created_at": now,
-        "capabilities": [],
-    }
-    return worker_token, name
-
-
 def _set_toggle(key: str, value: bool) -> None:
     from agent_mcp.db.connection import get_db_connection
 
@@ -80,7 +61,8 @@ def _set_toggle(key: str, value: bool) -> None:
     now_iso = _dt.datetime.now().isoformat()
     cursor.execute(
         "INSERT OR REPLACE INTO project_context "
-        "(context_key, value, description, created_at, created_by, updated_at, updated_by) "
+        "(context_key, value, description, created_at, created_by, "
+        "updated_at, updated_by) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             key,
@@ -127,172 +109,176 @@ def _seed_unassigned_task(title: str = "needs an owner") -> str:
     return task_id
 
 
-def _call_assign(arguments: dict):
-    from agent_mcp.tools.task_tools import assign_task_tool_impl
-
-    return asyncio.run(assign_task_tool_impl(arguments))
-
-
-def test_worker_self_claim_allowed_by_default(client) -> None:
+async def test_worker_self_claim_allowed_by_default(tmp_path) -> None:
     """Default (toggle absent → allow): a worker may call
     `assign_task` with their own `agent_token` and a list of existing
     unassigned task ids to claim them."""
-    worker_token, worker_name = _seed_worker("alice")
-    task_id = _seed_unassigned_task("alice should pick this up")
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        task_id = _seed_unassigned_task("alice should pick this up")
 
-    result = _call_assign(
-        {
-            "token": worker_token,
-            "agent_token": worker_token,
-            "task_ids": [task_id],
-        }
-    )
-    text = result[0].text
-    assert "Unauthorized" not in text, (
-        f"worker self-claim should be permitted by default; got {text!r}"
-    )
-    assert "Assigned" in text or task_id in text, (
-        f"expected success response mentioning the task; got {text!r}"
-    )
+        result = await alice.call(
+            "assign_task",
+            {
+                "agent_token": alice.token,
+                "task_ids": [task_id],
+            },
+        )
+        text = result[0].text
+        assert "Unauthorized" not in text, (
+            f"worker self-claim should be permitted by default; got {text!r}"
+        )
+        assert "Assigned" in text or task_id in text, (
+            f"expected success response mentioning the task; got {text!r}"
+        )
 
-    # Verify in DB: task is now assigned to alice.
-    from agent_mcp.db.connection import get_db_connection
+        # Verify in DB: task is now assigned to alice.
+        from agent_mcp.db.connection import get_db_connection
 
-    conn = get_db_connection()
-    row = conn.execute(
-        "SELECT assigned_to FROM tasks WHERE task_id = ?", (task_id,)
-    ).fetchone()
-    conn.close()
-    assert row is not None and row["assigned_to"] == worker_name, (
-        f"task should be assigned to {worker_name!r}; got {row and row['assigned_to']!r}"
-    )
+        conn = get_db_connection()
+        row = conn.execute(
+            "SELECT assigned_to FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        conn.close()
+        assert row is not None and row["assigned_to"] == alice.agent_id, (
+            f"task should be assigned to {alice.agent_id!r}; "
+            f"got {row and row['assigned_to']!r}"
+        )
 
 
-def test_worker_self_claim_rejected_when_toggle_off(client) -> None:
+async def test_worker_self_claim_rejected_when_toggle_off(tmp_path) -> None:
     """Toggle off: worker self-claim must be rejected with a clear
     error message that names the policy key."""
-    _set_toggle("config_allow_worker_self_assign", False)
-    worker_token, _ = _seed_worker("alice")
-    task_id = _seed_unassigned_task()
+    async with mcp_session(tmp_path) as admin:
+        _set_toggle("config_allow_worker_self_assign", False)
+        alice = await admin.create_worker("alice")
+        task_id = _seed_unassigned_task()
 
-    result = _call_assign(
-        {
-            "token": worker_token,
-            "agent_token": worker_token,
-            "task_ids": [task_id],
-        }
-    )
-    text = result[0].text
-    assert "Unauthorized" in text, (
-        f"toggle=off must reject worker self-claim; got {text!r}"
-    )
-    assert "config_allow_worker_self_assign" in text, (
-        f"error should reference the policy key for discoverability; "
-        f"got {text!r}"
-    )
+        result = await alice.call(
+            "assign_task",
+            {
+                "agent_token": alice.token,
+                "task_ids": [task_id],
+            },
+        )
+        text = result[0].text
+        assert "Unauthorized" in text, (
+            f"toggle=off must reject worker self-claim; got {text!r}"
+        )
+        assert "config_allow_worker_self_assign" in text, (
+            f"error should reference the policy key for discoverability; "
+            f"got {text!r}"
+        )
 
 
-def test_worker_cannot_assign_to_other_worker_with_task_ids(client) -> None:
+async def test_worker_cannot_assign_to_other_worker_with_task_ids(
+    tmp_path,
+) -> None:
     """A worker may NOT use Mode 3 to pin an existing task on a
     different worker, regardless of toggle state. The self-assign
     toggle gates self-claim only — never proxy-assignment."""
-    _set_toggle("config_allow_worker_self_assign", True)
-    alice_token, _ = _seed_worker("alice")
-    bob_token, _ = _seed_worker("bob")
-    task_id = _seed_unassigned_task()
+    async with mcp_session(tmp_path) as admin:
+        _set_toggle("config_allow_worker_self_assign", True)
+        alice = await admin.create_worker("alice")
+        bob = await admin.create_worker("bob")
+        task_id = _seed_unassigned_task()
 
-    result = _call_assign(
-        {
-            "token": alice_token,
-            "agent_token": bob_token,
-            "task_ids": [task_id],
-        }
-    )
-    text = result[0].text
-    assert "Unauthorized" in text, (
-        f"worker must not be able to assign tasks to other workers; "
-        f"got {text!r}"
-    )
+        result = await alice.call(
+            "assign_task",
+            {
+                "agent_token": bob.token,
+                "task_ids": [task_id],
+            },
+        )
+        text = result[0].text
+        assert "Unauthorized" in text, (
+            f"worker must not be able to assign tasks to other workers; "
+            f"got {text!r}"
+        )
 
-    # Task must still be unassigned.
-    from agent_mcp.db.connection import get_db_connection
+        # Task must still be unassigned.
+        from agent_mcp.db.connection import get_db_connection
 
-    conn = get_db_connection()
-    row = conn.execute(
-        "SELECT assigned_to FROM tasks WHERE task_id = ?", (task_id,)
-    ).fetchone()
-    conn.close()
-    assert row is not None and row["assigned_to"] is None, (
-        f"task must remain unassigned after rejected proxy-assign; "
-        f"got assigned_to={row and row['assigned_to']!r}"
-    )
+        conn = get_db_connection()
+        row = conn.execute(
+            "SELECT assigned_to FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        conn.close()
+        assert row is not None and row["assigned_to"] is None, (
+            f"task must remain unassigned after rejected proxy-assign; "
+            f"got assigned_to={row and row['assigned_to']!r}"
+        )
 
 
-def test_worker_cannot_create_and_assign_to_other_via_task_title(client) -> None:
+async def test_worker_cannot_create_and_assign_to_other_via_task_title(
+    tmp_path,
+) -> None:
     """Mode 1 path (no `task_ids`, but `agent_token` to someone else
     + `task_title`/`task_description`) must remain rejected — workers
     cannot create-and-assign-to-others."""
-    _set_toggle("config_allow_worker_self_assign", True)
-    alice_token, _ = _seed_worker("alice")
-    bob_token, _ = _seed_worker("bob")
+    async with mcp_session(tmp_path) as admin:
+        _set_toggle("config_allow_worker_self_assign", True)
+        alice = await admin.create_worker("alice")
+        bob = await admin.create_worker("bob")
 
-    result = _call_assign(
-        {
-            "token": alice_token,
-            "agent_token": bob_token,
-            "task_title": "alice trying to assign-on-create to bob",
-            "task_description": "should fail",
-        }
-    )
-    text = result[0].text
-    assert "Unauthorized" in text, (
-        f"worker create-and-assign-to-other must be rejected; got {text!r}"
-    )
+        result = await alice.call(
+            "assign_task",
+            {
+                "agent_token": bob.token,
+                "task_title": "alice trying to assign-on-create to bob",
+                "task_description": "should fail",
+            },
+        )
+        text = result[0].text
+        assert "Unauthorized" in text, (
+            f"worker create-and-assign-to-other must be rejected; "
+            f"got {text!r}"
+        )
 
 
-def test_admin_self_claim_via_agent_token_unchanged(client) -> None:
+async def test_admin_self_claim_via_agent_token_unchanged(tmp_path) -> None:
     """No regression: admin token can still use Mode 3 with any
     agent_token (including a worker's) to assign existing tasks."""
-    admin = client.get("/api/tokens").json()["admin_token"]
-    worker_token, worker_name = _seed_worker("alice")
-    task_id = _seed_unassigned_task("admin assigns to alice")
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        task_id = _seed_unassigned_task("admin assigns to alice")
 
-    result = _call_assign(
-        {
-            "token": admin,
-            "agent_token": worker_token,
-            "task_ids": [task_id],
-        }
-    )
-    text = result[0].text
-    assert "Unauthorized" not in text, text
+        result = await admin.call(
+            "assign_task",
+            {
+                "agent_token": alice.token,
+                "task_ids": [task_id],
+            },
+        )
+        text = result[0].text
+        assert "Unauthorized" not in text, text
 
-    from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.db.connection import get_db_connection
 
-    conn = get_db_connection()
-    row = conn.execute(
-        "SELECT assigned_to FROM tasks WHERE task_id = ?", (task_id,)
-    ).fetchone()
-    conn.close()
-    assert row is not None and row["assigned_to"] == worker_name
+        conn = get_db_connection()
+        row = conn.execute(
+            "SELECT assigned_to FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        conn.close()
+        assert row is not None and row["assigned_to"] == alice.agent_id
 
 
-def test_worker_create_unassigned_still_works(client) -> None:
+async def test_worker_create_unassigned_still_works(tmp_path) -> None:
     """Regression guard for PR #32: worker Mode 0 (no agent_token)
     creates an unassigned task — must remain unaffected by this PR."""
-    worker_token, _ = _seed_worker("alice")
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
 
-    result = _call_assign(
-        {
-            "token": worker_token,
-            "task_title": "found a bug",
-            "task_description": "needs triage",
-        }
-    )
-    text = result[0].text
-    assert "Unauthorized" not in text, (
-        f"worker Mode 0 (PR #32) must still succeed; got {text!r}"
-    )
-    import re
+        result = await alice.call(
+            "assign_task",
+            {
+                "task_title": "found a bug",
+                "task_description": "needs triage",
+            },
+        )
+        text = result[0].text
+        assert "Unauthorized" not in text, (
+            f"worker Mode 0 (PR #32) must still succeed; got {text!r}"
+        )
 
-    assert re.search(r"task_[a-f0-9]+", text), f"no task_id in: {text}"
+        assert re.search(r"task_[a-f0-9]+", text), f"no task_id in: {text}"

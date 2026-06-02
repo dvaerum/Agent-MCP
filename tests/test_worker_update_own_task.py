@@ -13,117 +13,83 @@ permission check is:
 so an assignee SHOULD be allowed. This test verifies — if it passes
 without code change, issue N is also already fixed (like L + M);
 the test then locks in the behavior as a regression guard.
+
+Migrated to `tests/harness.py::mcp_session` (Candidate F from
+architecture review 2026-06-02).
 """
 
 from __future__ import annotations
 
-import asyncio
-import datetime as _dt
-import secrets
+import pytest
+
+from tests.harness import mcp_session
 
 
-def _seed_worker(name: str = "alice"):
-    from agent_mcp.core import globals as g
-    from agent_mcp.db.connection import get_db_connection
-
-    worker_token = secrets.token_hex(16)
-    now = _dt.datetime.now().isoformat()
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO agents (token, agent_id, capabilities, created_at, "
-        "status, working_directory, color, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (worker_token, name, "[]", now, "active", "/tmp", "#888", now),
-    )
-    conn.commit()
-    conn.close()
-
-    g.active_agents[worker_token] = {
-        "agent_id": name,
-        "status": "active",
-        "created_at": now,
-        "capabilities": [],
-    }
-    return worker_token, name
+pytestmark = pytest.mark.asyncio
 
 
-def _admin(client) -> str:
-    return client.get("/api/tokens").json()["admin_token"]
-
-
-def _call_update(arguments: dict):
-    from agent_mcp.tools.task_tools import update_task_status_tool_impl
-
-    return asyncio.run(update_task_status_tool_impl(arguments))
-
-
-def test_worker_can_update_own_task_status(client) -> None:
+async def test_worker_can_update_own_task_status(tmp_path) -> None:
     """The assignee of a task can call update_task_status (issue N)."""
-    admin = _admin(client)
-    worker_token, worker_id = _seed_worker("alice")
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
 
-    # Admin creates + assigns a task to the worker.
-    r = client.post(
-        "/api/tasks",
-        json={
-            "token": admin,
-            "task_title": "do thing",
-            "task_description": "...",
-            "assigned_to": worker_id,
-        },
-    )
-    assert r.status_code == 200, r.text
-    task_id = r.json()["task_id"]
+        # Admin creates + assigns a task to the worker via REST (same
+        # endpoint legacy fixtures hit).
+        r = admin.client.post(
+            "/api/tasks",
+            json={
+                "token": admin.admin_token,
+                "task_title": "do thing",
+                "task_description": "...",
+                "assigned_to": alice.agent_id,
+            },
+        )
+        assert r.status_code == 200, r.text
+        task_id = r.json()["task_id"]
 
-    # Worker updates their own task status.
-    result = _call_update({
-        "token": worker_token,
-        "task_id": task_id,
-        "status": "in_progress",
-    })
-    text = result[0].text
-    assert "Unauthorized" not in text, (
-        f"worker can't update own task (issue N would manifest here): {text}"
-    )
+        # Worker updates their own task status via the MCP tool surface.
+        result = await alice.call(
+            "update_task_status",
+            {"task_id": task_id, "status": "in_progress"},
+        )
+        text = result[0].text
+        assert "Unauthorized" not in text, (
+            f"worker can't update own task (issue N would manifest here): "
+            f"{text}"
+        )
 
 
-def test_worker_cannot_update_someone_elses_task(client) -> None:
+async def test_worker_cannot_update_someone_elses_task(tmp_path) -> None:
     """A worker NOT assigned to a task can't update it — even with the
     issue N fix, the permission boundary stays at 'you can update
     what you own'."""
-    admin = _admin(client)
-    alice_token, alice_id = _seed_worker("alice")
-    bob_token, _ = _seed_worker("bob")
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        bob = await admin.create_worker("bob")
 
-    # Task assigned to alice.
-    r = client.post(
-        "/api/tasks",
-        json={
-            "token": admin,
-            "task_title": "alice's task",
-            "task_description": "...",
-            "assigned_to": alice_id,
-        },
-    )
-    task_id = r.json()["task_id"]
+        # Task assigned to alice.
+        r = admin.client.post(
+            "/api/tasks",
+            json={
+                "token": admin.admin_token,
+                "task_title": "alice's task",
+                "task_description": "...",
+                "assigned_to": alice.agent_id,
+            },
+        )
+        task_id = r.json()["task_id"]
 
-    # Bob tries to update — must fail.
-    _call_update({
-        "token": bob_token,
-        "task_id": task_id,
-        "status": "completed",
-    })
-    # Per-task error wrapping varies; either a top-level Unauthorized
-    # or a per-task error message is acceptable. Just assert the
-    # update did NOT take effect.
-    listing = client.get("/api/tasks").json()
-    if isinstance(listing, dict):
-        listing = listing.get("tasks", [])
-    row = next((r for r in listing if r["task_id"] == task_id), None)
-    assert row is not None
-    assert row["status"] != "completed", (
-        "bob (not assigned) successfully completed alice's task — "
-        "permission boundary broken"
-    )
+        # Bob tries to update — must fail.
+        await bob.call(
+            "update_task_status",
+            {"task_id": task_id, "status": "completed"},
+        )
+        # Per-task error wrapping varies; either a top-level Unauthorized
+        # or a per-task error message is acceptable. Just assert the
+        # update did NOT take effect.
+        row = admin.task_row(task_id)
+        assert row is not None
+        assert row["status"] != "completed", (
+            "bob (not assigned) successfully completed alice's task — "
+            "permission boundary broken"
+        )

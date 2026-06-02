@@ -16,17 +16,22 @@ callers see the existing response shape):
 
 Backward-compat regression: with no new params, the response shape is
 identical to today's (no `Total:` line injected, no behavioral change).
+
+Migrated to `tests/harness.py::mcp_session` (Candidate F from
+architecture review 2026-06-02).
 """
 
 from __future__ import annotations
 
-import asyncio
 import datetime as _dt
 import secrets
 
+import pytest
 
-def _admin(client) -> str:
-    return client.get("/api/tokens").json()["admin_token"]
+from tests.harness import mcp_session
+
+
+pytestmark = pytest.mark.asyncio
 
 
 def _seed_tasks(admin_id: str, count: int = 5) -> list[str]:
@@ -73,10 +78,8 @@ def _seed_tasks(admin_id: str, count: int = 5) -> list[str]:
     return ids
 
 
-def _call_view(arguments: dict) -> str:
-    from agent_mcp.tools.task_tools import view_tasks_tool_impl
-
-    result = asyncio.run(view_tasks_tool_impl(arguments))
+async def _view(admin, arguments: dict) -> str:
+    result = await admin.call("view_tasks", arguments)
     return result[0].text
 
 
@@ -89,131 +92,121 @@ def _count_task_blocks(text: str) -> int:
 # --- 1. summary=true produces dramatically smaller per-task blocks ---
 
 
-def test_summary_true_shrinks_per_task_payload(client) -> None:
+async def test_summary_true_shrinks_per_task_payload(tmp_path) -> None:
     """summary=true -> each task block is the minimal projection.
 
     With ~1.5 KB descriptions in detailed mode, the difference per
     task is large (~2 KB detailed vs ~150 B summary)."""
-    admin = _admin(client)
-    _seed_tasks("admin", count=5)
+    async with mcp_session(tmp_path) as admin:
+        _seed_tasks("admin", count=5)
 
-    full = _call_view({"token": admin})
-    short = _call_view({"token": admin, "summary": True})
+        full = await _view(admin, {})
+        short = await _view(admin, {"summary": True})
 
-    # Both responses must include all 5 task blocks.
-    assert _count_task_blocks(full) == 5, full
-    assert _count_task_blocks(short) == 5, short
+        # Both responses must include all 5 task blocks.
+        assert _count_task_blocks(full) == 5, full
+        assert _count_task_blocks(short) == 5, short
 
-    # The summary payload must be at least 5x smaller than detailed.
-    # (Detailed includes full description + Created/Updated/Created-by
-    # lines; summary only carries id/title/status/priority/assignee +
-    # 100-char truncated description.)
-    assert len(short) * 5 < len(full), (
-        f"summary mode didn't shrink the response enough: "
-        f"summary={len(short)} chars, detailed={len(full)} chars"
-    )
+        # The summary payload must be at least 5x smaller than detailed.
+        assert len(short) * 5 < len(full), (
+            f"summary mode didn't shrink the response enough: "
+            f"summary={len(short)} chars, detailed={len(full)} chars"
+        )
 
-    # And the absolute per-task budget in summary mode is tight: with
-    # 5 tasks the whole summary response should fit comfortably under
-    # 5 * 600 chars (per-task block <~200 chars; rest is header/tips).
-    assert len(short) < 5 * 600, (
-        f"summary response too large: {len(short)} chars (expected "
-        f"<3000 for 5 tiny task blocks): {short[:400]}"
-    )
+        # And the absolute per-task budget in summary mode is tight.
+        assert len(short) < 5 * 600, (
+            f"summary response too large: {len(short)} chars (expected "
+            f"<3000 for 5 tiny task blocks): {short[:400]}"
+        )
 
 
 # --- 2. limit caps the result list and exposes the total ---
 
 
-def test_limit_caps_results_and_reports_total(client) -> None:
-    admin = _admin(client)
-    _seed_tasks("admin", count=5)
+async def test_limit_caps_results_and_reports_total(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        _seed_tasks("admin", count=5)
 
-    out = _call_view({"token": admin, "summary": True, "limit": 2})
+        out = await _view(admin, {"summary": True, "limit": 2})
 
-    assert _count_task_blocks(out) == 2, (
-        f"limit=2 must return exactly 2 task blocks; got "
-        f"{_count_task_blocks(out)}:\n{out}"
-    )
-    # The caller needs to know there are more pages.
-    assert "Total: 5" in out, (
-        f"limit must surface the total matching count so the caller "
-        f"knows more pages exist:\n{out}"
-    )
+        assert _count_task_blocks(out) == 2, (
+            f"limit=2 must return exactly 2 task blocks; got "
+            f"{_count_task_blocks(out)}:\n{out}"
+        )
+        assert "Total: 5" in out, (
+            f"limit must surface the total matching count so the caller "
+            f"knows more pages exist:\n{out}"
+        )
 
 
 # --- 3. offset advances the window ---
 
 
-def test_offset_advances_pagination_window(client) -> None:
-    admin = _admin(client)
-    _seed_tasks("admin", count=5)
+async def test_offset_advances_pagination_window(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        _seed_tasks("admin", count=5)
 
-    page1 = _call_view(
-        {"token": admin, "summary": True, "limit": 2, "offset": 0}
-    )
-    page2 = _call_view(
-        {"token": admin, "summary": True, "limit": 2, "offset": 2}
-    )
+        page1 = await _view(
+            admin, {"summary": True, "limit": 2, "offset": 0}
+        )
+        page2 = await _view(
+            admin, {"summary": True, "limit": 2, "offset": 2}
+        )
 
-    assert _count_task_blocks(page1) == 2
-    assert _count_task_blocks(page2) == 2
+        assert _count_task_blocks(page1) == 2
+        assert _count_task_blocks(page2) == 2
 
-    # Pages must be disjoint: no task ID appears in both.
-    def _ids(text: str) -> set[str]:
-        return {
-            line.removeprefix("ID: ").strip()
-            for line in text.splitlines()
-            if line.startswith("ID: task_")
-        }
+        # Pages must be disjoint: no task ID appears in both.
+        def _ids(text: str) -> set[str]:
+            return {
+                line.removeprefix("ID: ").strip()
+                for line in text.splitlines()
+                if line.startswith("ID: task_")
+            }
 
-    overlap = _ids(page1) & _ids(page2)
-    assert not overlap, (
-        f"offset must produce a disjoint page; overlap={overlap}\n"
-        f"--- page1 ---\n{page1}\n--- page2 ---\n{page2}"
-    )
+        overlap = _ids(page1) & _ids(page2)
+        assert not overlap, (
+            f"offset must produce a disjoint page; overlap={overlap}\n"
+            f"--- page1 ---\n{page1}\n--- page2 ---\n{page2}"
+        )
 
-    # And the total is still reported correctly on both pages.
-    assert "Total: 5" in page1
-    assert "Total: 5" in page2
+        assert "Total: 5" in page1
+        assert "Total: 5" in page2
 
 
 # --- 4. summary + limit combine cleanly ---
 
 
-def test_summary_with_limit_combined(client) -> None:
-    admin = _admin(client)
-    _seed_tasks("admin", count=5)
+async def test_summary_with_limit_combined(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        _seed_tasks("admin", count=5)
 
-    out = _call_view({"token": admin, "summary": True, "limit": 3})
+        out = await _view(admin, {"summary": True, "limit": 3})
 
-    assert _count_task_blocks(out) == 3
-    assert "Total: 5" in out
-    # Still small — 3 summary blocks + header should be well under 2 KB.
-    assert len(out) < 3 * 600, (
-        f"summary+limit response unexpectedly large: {len(out)} chars"
-    )
+        assert _count_task_blocks(out) == 3
+        assert "Total: 5" in out
+        assert len(out) < 3 * 600, (
+            f"summary+limit response unexpectedly large: {len(out)} chars"
+        )
 
 
 # --- 5. Backward-compat regression: no new params -> existing shape ---
 
 
-def test_no_new_params_response_shape_unchanged(client) -> None:
+async def test_no_new_params_response_shape_unchanged(tmp_path) -> None:
     """A caller that passes none of the new params must see the exact
     same response shape as before:
-      - All matching tasks are rendered (no silent truncation by
-        limit).
+      - All matching tasks are rendered (no silent truncation by limit).
       - No `Total:` line injected (that's a new-API-only field).
     """
-    admin = _admin(client)
-    _seed_tasks("admin", count=5)
+    async with mcp_session(tmp_path) as admin:
+        _seed_tasks("admin", count=5)
 
-    out = _call_view({"token": admin})
+        out = await _view(admin, {})
 
-    assert _count_task_blocks(out) == 5
-    assert "Total:" not in out, (
-        f"existing callers must not see a new `Total:` field "
-        f"injected — that would change the response shape:\n{out}"
-    )
-    # And the existing closing line must still be present.
-    assert "matching tasks shown" in out
+        assert _count_task_blocks(out) == 5
+        assert "Total:" not in out, (
+            f"existing callers must not see a new `Total:` field "
+            f"injected — that would change the response shape:\n{out}"
+        )
+        assert "matching tasks shown" in out

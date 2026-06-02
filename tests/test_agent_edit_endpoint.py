@@ -15,43 +15,21 @@ Contract:
   - 404 when the agent_id doesn't exist
   - 200 + updated row echoed back on success
   - Omitting all editable fields → 400 (nothing to update)
+
+Migrated to `tests/harness.py::mcp_session` (Candidate F from
+architecture review 2026-06-02).
 """
 
 from __future__ import annotations
 
-import datetime as _dt
 import json
-import secrets
+
+import pytest
+
+from tests.harness import mcp_session
 
 
-def _admin(client) -> str:
-    return client.get("/api/tokens").json()["admin_token"]
-
-
-def _seed_worker(name: str = "alice") -> tuple[str, str]:
-    from agent_mcp.core import globals as g
-    from agent_mcp.db.connection import get_db_connection
-
-    worker_token = secrets.token_hex(16)
-    now = _dt.datetime.now().isoformat()
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO agents (token, agent_id, capabilities, created_at, "
-        "status, working_directory, color, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (worker_token, name, "[]", now, "active", "/tmp", "#888", now),
-    )
-    conn.commit()
-    conn.close()
-    g.active_agents[worker_token] = {
-        "agent_id": name,
-        "status": "active",
-        "created_at": now,
-        "capabilities": [],
-        "color": "#888",
-    }
-    return worker_token, name
+pytestmark = pytest.mark.asyncio
 
 
 def _row(table: str, where_sql: str, params: tuple) -> dict | None:
@@ -70,120 +48,129 @@ def _row(table: str, where_sql: str, params: tuple) -> dict | None:
 # -------------------- happy path -------------------------------------
 
 
-def test_edit_updates_capabilities(client) -> None:
-    _seed_worker("alice")
-    admin = _admin(client)
-    resp = client.post(
-        "/api/agents/alice/edit",
-        json={"token": admin, "capabilities": ["code_edit", "file_read"]},
-    )
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body.get("success") is True, body
+async def test_edit_updates_capabilities(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        resp = admin.client.post(
+            "/api/agents/alice/edit",
+            json={
+                "token": admin.admin_token,
+                "capabilities": ["code_edit", "file_read"],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body.get("success") is True, body
 
-    row = _row("agents", "agent_id = ?", ("alice",))
-    assert row is not None
-    assert json.loads(row["capabilities"]) == ["code_edit", "file_read"]
-
-
-def test_edit_updates_color(client) -> None:
-    _seed_worker("alice")
-    admin = _admin(client)
-    resp = client.post(
-        "/api/agents/alice/edit",
-        json={"token": admin, "color": "#abcdef"},
-    )
-    assert resp.status_code == 200, resp.text
-
-    row = _row("agents", "agent_id = ?", ("alice",))
-    assert row is not None
-    assert row["color"] == "#abcdef"
+        row = _row("agents", "agent_id = ?", ("alice",))
+        assert row is not None
+        assert json.loads(row["capabilities"]) == ["code_edit", "file_read"]
 
 
-def test_edit_updates_working_directory(client) -> None:
-    _seed_worker("alice")
-    admin = _admin(client)
-    resp = client.post(
-        "/api/agents/alice/edit",
-        json={"token": admin, "working_directory": "/workspace/alice"},
-    )
-    assert resp.status_code == 200, resp.text
+async def test_edit_updates_color(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        resp = admin.client.post(
+            "/api/agents/alice/edit",
+            json={"token": admin.admin_token, "color": "#abcdef"},
+        )
+        assert resp.status_code == 200, resp.text
 
-    row = _row("agents", "agent_id = ?", ("alice",))
-    assert row is not None
-    assert row["working_directory"] == "/workspace/alice"
+        row = _row("agents", "agent_id = ?", ("alice",))
+        assert row is not None
+        assert row["color"] == "#abcdef"
 
 
-def test_edit_updates_multiple_fields_at_once(client) -> None:
-    _seed_worker("alice")
-    admin = _admin(client)
-    resp = client.post(
-        "/api/agents/alice/edit",
-        json={
-            "token": admin,
-            "capabilities": ["one", "two"],
-            "color": "#deadbe",
-            "working_directory": "/home/alice",
-        },
-    )
-    assert resp.status_code == 200, resp.text
+async def test_edit_updates_working_directory(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        resp = admin.client.post(
+            "/api/agents/alice/edit",
+            json={
+                "token": admin.admin_token,
+                "working_directory": "/workspace/alice",
+            },
+        )
+        assert resp.status_code == 200, resp.text
 
-    row = _row("agents", "agent_id = ?", ("alice",))
-    assert row is not None
-    assert json.loads(row["capabilities"]) == ["one", "two"]
-    assert row["color"] == "#deadbe"
-    assert row["working_directory"] == "/home/alice"
+        row = _row("agents", "agent_id = ?", ("alice",))
+        assert row is not None
+        assert row["working_directory"] == "/workspace/alice"
+
+
+async def test_edit_updates_multiple_fields_at_once(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        resp = admin.client.post(
+            "/api/agents/alice/edit",
+            json={
+                "token": admin.admin_token,
+                "capabilities": ["one", "two"],
+                "color": "#deadbe",
+                "working_directory": "/home/alice",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        row = _row("agents", "agent_id = ?", ("alice",))
+        assert row is not None
+        assert json.loads(row["capabilities"]) == ["one", "two"]
+        assert row["color"] == "#deadbe"
+        assert row["working_directory"] == "/home/alice"
 
 
 # -------------------- auth + validation ------------------------------
 
 
-def test_edit_rejects_worker_token(client) -> None:
-    _seed_worker("alice")
-    worker_token, _ = _seed_worker("bob")
-    resp = client.post(
-        "/api/agents/alice/edit",
-        json={"token": worker_token, "color": "#000000"},
-    )
-    assert resp.status_code in (401, 403), resp.text
+async def test_edit_rejects_worker_token(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        bob = await admin.create_worker("bob")
+        resp = admin.client.post(
+            "/api/agents/alice/edit",
+            json={"token": bob.token, "color": "#000000"},
+        )
+        assert resp.status_code in (401, 403), resp.text
 
 
-def test_edit_404_when_agent_missing(client) -> None:
-    admin = _admin(client)
-    resp = client.post(
-        "/api/agents/nonexistent/edit",
-        json={"token": admin, "color": "#000000"},
-    )
-    assert resp.status_code == 404, resp.text
+async def test_edit_404_when_agent_missing(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        resp = admin.client.post(
+            "/api/agents/nonexistent/edit",
+            json={"token": admin.admin_token, "color": "#000000"},
+        )
+        assert resp.status_code == 404, resp.text
 
 
-def test_edit_400_when_no_editable_fields(client) -> None:
-    _seed_worker("alice")
-    admin = _admin(client)
-    resp = client.post(
-        "/api/agents/alice/edit",
-        json={"token": admin},
-    )
-    assert resp.status_code == 400, resp.text
+async def test_edit_400_when_no_editable_fields(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        resp = admin.client.post(
+            "/api/agents/alice/edit",
+            json={"token": admin.admin_token},
+        )
+        assert resp.status_code == 400, resp.text
 
 
-def test_edit_rejects_non_whitelisted_fields(client) -> None:
+async def test_edit_rejects_non_whitelisted_fields(tmp_path) -> None:
     """Sending `status` or `agent_id` (not in the whitelist) must not
     touch the row — only capabilities/color/working_directory are
     editable through this endpoint."""
-    _seed_worker("alice")
-    admin = _admin(client)
-    resp = client.post(
-        "/api/agents/alice/edit",
-        json={
-            "token": admin,
-            "status": "terminated",
-            "agent_id": "renamed",
-        },
-    )
-    # Either 400 (no editable fields supplied) or 200 (silently ignored).
-    # Either way, the agents row must NOT have been mutated.
-    assert resp.status_code in (200, 400), resp.text
-    row = _row("agents", "agent_id = ?", ("alice",))
-    assert row is not None, "alice row must still exist with the original agent_id"
-    assert row["status"] == "active"
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        resp = admin.client.post(
+            "/api/agents/alice/edit",
+            json={
+                "token": admin.admin_token,
+                "status": "terminated",
+                "agent_id": "renamed",
+            },
+        )
+        # Either 400 (no editable fields supplied) or 200 (silently ignored).
+        # Either way, the agents row must NOT have been mutated.
+        assert resp.status_code in (200, 400), resp.text
+        row = _row("agents", "agent_id = ?", ("alice",))
+        assert row is not None, (
+            "alice row must still exist with the original agent_id"
+        )
+        assert row["status"] == "active"

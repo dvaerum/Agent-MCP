@@ -19,92 +19,79 @@ This iteration:
 * New ``GET /api/aoe/health`` endpoint pings AoE with the current
   credentials and reports back so the dashboard can warn when the
   token is stale.
+
+Migrated to `tests/harness.py::mcp_session` (Candidate F from
+architecture review 2026-06-02).
 """
 
 from __future__ import annotations
 
 import asyncio
-import datetime as _dt
 import json
-import secrets
 from typing import Any
 
 import httpx
 import pytest
 
+from tests.harness import mcp_session
+
+
+pytestmark = pytest.mark.asyncio
+
 
 # ---------------------------------------------------------------------------
-# Shared helpers (copied from test_aoe_notification.py to keep the two
-# test files independently runnable)
+# Shared helpers
 # ---------------------------------------------------------------------------
 
-def _admin_token(client) -> str:
-    return client.get("/api/tokens").json()["admin_token"]
 
+async def _make_worker(
+    admin, name: str = "alice", *, aoe_session_id: str | None = None
+):
+    """Register a worker via the harness, then optionally backfill
+    aoe_session_id on the row (the harness's create_worker doesn't take
+    that column)."""
+    worker = await admin.create_worker(name)
+    if aoe_session_id is not None:
+        from agent_mcp.db.connection import get_db_connection
 
-def _seed_worker(name: str = "alice", *, aoe_session_id: str | None = None):
-    """Register a worker. Returns (token, agent_id). Tries to write
-    the new aoe_session_id column too — falls back gracefully if the
-    migration hasn't run yet (so the red phase can still load).
-    """
-    from agent_mcp.core import globals as g
-    from agent_mcp.db.connection import get_db_connection
-
-    worker_token = secrets.token_hex(16)
-    now = _dt.datetime.now().isoformat()
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            "INSERT INTO agents (token, agent_id, capabilities, created_at, "
-            "status, working_directory, color, updated_at, aoe_session_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (worker_token, name, "[]", now, "active", "/tmp", "#888", now,
-             aoe_session_id),
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE agents SET aoe_session_id = ? WHERE agent_id = ?",
+            (aoe_session_id, name),
         )
-    except Exception:
-        cursor.execute(
-            "INSERT INTO agents (token, agent_id, capabilities, created_at, "
-            "status, working_directory, color, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (worker_token, name, "[]", now, "active", "/tmp", "#888", now),
-        )
-    conn.commit()
-    conn.close()
-
-    g.active_agents[worker_token] = {
-        "agent_id": name,
-        "status": "active",
-        "created_at": now,
-        "capabilities": [],
-    }
-    return worker_token, name
+        conn.commit()
+        conn.close()
+    return worker
 
 
-def _set_ctx(client, key: str, value: Any, admin_token: str) -> None:
-    r = client.post(
+def _set_ctx(admin, key: str, value: Any) -> None:
+    r = admin.client.post(
         "/api/memories",
-        json={"token": admin_token, "context_key": key, "context_value": value},
+        json={
+            "token": admin.admin_token,
+            "context_key": key,
+            "context_value": value,
+        },
     )
     if r.status_code == 409:
-        r = client.request(
+        r = admin.client.request(
             "PUT",
             f"/api/memories/{key}",
-            json={"token": admin_token, "context_value": value},
+            json={"token": admin.admin_token, "context_value": value},
         )
     assert r.status_code == 200, r.text
 
 
-async def _send_and_wait(sender_token: str, recipient_id: str, body: str = "hi"):
-    from agent_mcp.tools.agent_communication_tools import send_agent_message_tool_impl
-
-    result = await send_agent_message_tool_impl({
-        "token": sender_token,
-        "recipient_id": recipient_id,
-        "message": body,
-        "deliver_method": "store",
-    })
+async def _send_and_wait(admin, recipient_id: str, body: str = "hi"):
+    result = await admin.call(
+        "send_agent_message",
+        {
+            "recipient_id": recipient_id,
+            "message": body,
+            "deliver_method": "store",
+        },
+    )
     for _ in range(20):
         await asyncio.sleep(0)
     return result
@@ -137,7 +124,11 @@ class _AoeServer:
                 return httpx.Response(401, json={"error": "unauthorized"})
             return httpx.Response(200, json={"sessions": list(self.sessions)})
 
-        if request.method == "POST" and path.startswith("/api/sessions/") and path.endswith("/send"):
+        if (
+            request.method == "POST"
+            and path.startswith("/api/sessions/")
+            and path.endswith("/send")
+        ):
             aoe_id = path[len("/api/sessions/"):-len("/send")]
             body = json.loads(request.read() or b"{}")
             self.sends.append((aoe_id, body, auth))
@@ -162,7 +153,9 @@ def aoe_mock(monkeypatch):
     from agent_mcp.features import aoe_notify
 
     aoe_notify.clear_session_cache()
-    monkeypatch.setattr(aoe_notify, "_TRANSPORT_FOR_TESTS", transport, raising=False)
+    monkeypatch.setattr(
+        aoe_notify, "_TRANSPORT_FOR_TESTS", transport, raising=False
+    )
     yield server
     aoe_notify.clear_session_cache()
 
@@ -171,265 +164,294 @@ def aoe_mock(monkeypatch):
 # 1. Schema: aoe_session_id column on agents
 # ---------------------------------------------------------------------------
 
-def test_agents_table_has_aoe_session_id_column(client) -> None:
+
+async def test_agents_table_has_aoe_session_id_column(tmp_path) -> None:
     """Migration 0003 must add aoe_session_id (nullable TEXT) to agents."""
     from agent_mcp.db.connection import get_db_connection
 
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("PRAGMA table_info(agents)")
-    cols = {row["name"] for row in cur.fetchall()}
-    conn.close()
-    assert "aoe_session_id" in cols, (
-        "agents table is missing the aoe_session_id column "
-        "(migration 0003 not applied or revision mis-chained)"
-    )
+    async with mcp_session(tmp_path):
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(agents)")
+        cols = {row["name"] for row in cur.fetchall()}
+        conn.close()
+        assert "aoe_session_id" in cols, (
+            "agents table is missing the aoe_session_id column "
+            "(migration 0003 not applied or revision mis-chained)"
+        )
 
 
 # ---------------------------------------------------------------------------
 # 2. Per-agent id wins over title-match resolution
 # ---------------------------------------------------------------------------
 
-def test_notifier_uses_stored_aoe_session_id(client, aoe_mock) -> None:
+
+async def test_notifier_uses_stored_aoe_session_id(tmp_path, aoe_mock) -> None:
     """When the agent has aoe_session_id set, the notifier POSTs to
     THAT id and skips the /api/sessions lookup entirely.
     """
-    admin = _admin_token(client)
-    _set_ctx(client, "config_aoe_notify_enabled", "true", admin)
-    _set_ctx(client, "config_aoe_base_url", "http://aoe.test", admin)
-    # Title says "someone_else" but the stored id wins.
-    aoe_mock.sessions = [
-        {"id": "ffffffffffffffff", "title": "someone_else", "status": "Running"},
-    ]
-    _seed_worker("alice", aoe_session_id="abc123def456cafe")
+    async with mcp_session(tmp_path) as admin:
+        _set_ctx(admin, "config_aoe_notify_enabled", "true")
+        _set_ctx(admin, "config_aoe_base_url", "http://aoe.test")
+        # Title says "someone_else" but the stored id wins.
+        aoe_mock.sessions = [
+            {"id": "ffffffffffffffff", "title": "someone_else", "status": "Running"},
+        ]
+        await _make_worker(admin, "alice", aoe_session_id="abc123def456cafe")
 
-    asyncio.run(_send_and_wait(admin, "alice"))
+        await _send_and_wait(admin, "alice")
 
-    assert len(aoe_mock.sends) == 1
-    aoe_id, _, _ = aoe_mock.sends[0]
-    assert aoe_id == "abc123def456cafe"
-    # Fast-path: no /api/sessions probe needed.
-    assert aoe_mock.sessions_list_calls == 0
+        assert len(aoe_mock.sends) == 1
+        aoe_id, _, _ = aoe_mock.sends[0]
+        assert aoe_id == "abc123def456cafe"
+        # Fast-path: no /api/sessions probe needed.
+        assert aoe_mock.sessions_list_calls == 0
 
 
-def test_notifier_falls_back_to_title_match(client, aoe_mock) -> None:
+async def test_notifier_falls_back_to_title_match(tmp_path, aoe_mock) -> None:
     """When aoe_session_id is empty, the old title-match resolution
     still kicks in (backwards-compat)."""
-    admin = _admin_token(client)
-    _set_ctx(client, "config_aoe_notify_enabled", "true", admin)
-    _set_ctx(client, "config_aoe_base_url", "http://aoe.test", admin)
-    aoe_mock.sessions = [
-        {"id": "deadbeefcafe0000", "title": "alice", "status": "Running"},
-    ]
-    _seed_worker("alice", aoe_session_id=None)
+    async with mcp_session(tmp_path) as admin:
+        _set_ctx(admin, "config_aoe_notify_enabled", "true")
+        _set_ctx(admin, "config_aoe_base_url", "http://aoe.test")
+        aoe_mock.sessions = [
+            {"id": "deadbeefcafe0000", "title": "alice", "status": "Running"},
+        ]
+        await _make_worker(admin, "alice", aoe_session_id=None)
 
-    asyncio.run(_send_and_wait(admin, "alice"))
+        await _send_and_wait(admin, "alice")
 
-    assert len(aoe_mock.sends) == 1
-    aoe_id, _, _ = aoe_mock.sends[0]
-    assert aoe_id == "deadbeefcafe0000"
-    assert aoe_mock.sessions_list_calls == 1
+        assert len(aoe_mock.sends) == 1
+        aoe_id, _, _ = aoe_mock.sends[0]
+        assert aoe_id == "deadbeefcafe0000"
+        assert aoe_mock.sessions_list_calls == 1
 
 
 # ---------------------------------------------------------------------------
 # 3. Dashboard edit endpoint accepts aoe_session_id
 # ---------------------------------------------------------------------------
 
-def test_edit_endpoint_sets_aoe_session_id(client) -> None:
+
+async def test_edit_endpoint_sets_aoe_session_id(tmp_path) -> None:
     """POST /api/agents/<id>/edit must accept aoe_session_id."""
-    _seed_worker("alice")
-    admin = _admin_token(client)
-    r = client.post(
-        "/api/agents/alice/edit",
-        json={"token": admin, "aoe_session_id": "1234567890abcdef"},
-    )
-    assert r.status_code == 200, r.text
-
-    from agent_mcp.db.connection import get_db_connection
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT aoe_session_id FROM agents WHERE agent_id = ?", ("alice",))
-    row = cur.fetchone()
-    conn.close()
-    assert row is not None
-    assert row["aoe_session_id"] == "1234567890abcdef"
-
-
-def test_edit_endpoint_clears_aoe_session_id_with_empty_string(client) -> None:
-    """Sending an empty string must NULL out the column (clears the binding)."""
-    _seed_worker("alice", aoe_session_id="cafebabecafebabe")
-    admin = _admin_token(client)
-
-    r = client.post(
-        "/api/agents/alice/edit",
-        json={"token": admin, "aoe_session_id": ""},
-    )
-    assert r.status_code == 200, r.text
-
-    from agent_mcp.db.connection import get_db_connection
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT aoe_session_id FROM agents WHERE agent_id = ?", ("alice",))
-    row = cur.fetchone()
-    conn.close()
-    assert row["aoe_session_id"] in (None, "")
-
-
-def test_edit_endpoint_validates_aoe_session_id_format(client) -> None:
-    """AoE ids are 16 lowercase hex chars. Anything else → 400."""
-    _seed_worker("alice")
-    admin = _admin_token(client)
-
-    for bad in (
-        "not-hex",
-        "tooshort",
-        "1234567890abcdef1",  # too long
-        "GHIJKLMNOPQRSTUV",   # not hex
-        "abcdefghij123456",   # invalid hex chars
-    ):
-        r = client.post(
+    async with mcp_session(tmp_path) as admin:
+        await _make_worker(admin, "alice")
+        r = admin.client.post(
             "/api/agents/alice/edit",
-            json={"token": admin, "aoe_session_id": bad},
+            json={
+                "token": admin.admin_token,
+                "aoe_session_id": "1234567890abcdef",
+            },
         )
-        assert r.status_code == 400, f"{bad!r} should be rejected: {r.text}"
+        assert r.status_code == 200, r.text
+
+        from agent_mcp.db.connection import get_db_connection
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT aoe_session_id FROM agents WHERE agent_id = ?",
+            ("alice",),
+        )
+        row = cur.fetchone()
+        conn.close()
+        assert row is not None
+        assert row["aoe_session_id"] == "1234567890abcdef"
+
+
+async def test_edit_endpoint_clears_aoe_session_id_with_empty_string(
+    tmp_path,
+) -> None:
+    """Sending an empty string must NULL out the column (clears the
+    binding)."""
+    async with mcp_session(tmp_path) as admin:
+        await _make_worker(admin, "alice", aoe_session_id="cafebabecafebabe")
+
+        r = admin.client.post(
+            "/api/agents/alice/edit",
+            json={"token": admin.admin_token, "aoe_session_id": ""},
+        )
+        assert r.status_code == 200, r.text
+
+        from agent_mcp.db.connection import get_db_connection
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT aoe_session_id FROM agents WHERE agent_id = ?",
+            ("alice",),
+        )
+        row = cur.fetchone()
+        conn.close()
+        assert row["aoe_session_id"] in (None, "")
+
+
+async def test_edit_endpoint_validates_aoe_session_id_format(tmp_path) -> None:
+    """AoE ids are 16 lowercase hex chars. Anything else → 400."""
+    async with mcp_session(tmp_path) as admin:
+        await _make_worker(admin, "alice")
+
+        for bad in (
+            "not-hex",
+            "tooshort",
+            "1234567890abcdef1",  # too long
+            "GHIJKLMNOPQRSTUV",   # not hex
+            "abcdefghij123456",   # invalid hex chars
+        ):
+            r = admin.client.post(
+                "/api/agents/alice/edit",
+                json={"token": admin.admin_token, "aoe_session_id": bad},
+            )
+            assert r.status_code == 400, (
+                f"{bad!r} should be rejected: {r.text}"
+            )
 
 
 # ---------------------------------------------------------------------------
 # 4. Bearer token can be sourced from a file
 # ---------------------------------------------------------------------------
 
-def test_token_loaded_from_file(client, aoe_mock, tmp_path) -> None:
+
+async def test_token_loaded_from_file(tmp_path, aoe_mock) -> None:
     """config_aoe_bearer_token_file → read token from disk on each call.
 
     AoE rotates ~/.config/agent-of-empires/serve.token on a schedule;
     keeping the file path in config (and re-reading on use) means we
     survive a rotation without an admin restart.
     """
-    admin = _admin_token(client)
-    token_path = tmp_path / "serve.token"
-    token_path.write_text("file-sourced-token-123\n")
-    _set_ctx(client, "config_aoe_notify_enabled", "true", admin)
-    _set_ctx(client, "config_aoe_base_url", "http://aoe.test", admin)
-    _set_ctx(client, "config_aoe_bearer_token_file", str(token_path), admin)
-    aoe_mock.accepted_tokens = {"file-sourced-token-123"}
-    _seed_worker("alice", aoe_session_id="a" * 16)
+    async with mcp_session(tmp_path) as admin:
+        token_path = tmp_path / "serve.token"
+        token_path.write_text("file-sourced-token-123\n")
+        _set_ctx(admin, "config_aoe_notify_enabled", "true")
+        _set_ctx(admin, "config_aoe_base_url", "http://aoe.test")
+        _set_ctx(admin, "config_aoe_bearer_token_file", str(token_path))
+        aoe_mock.accepted_tokens = {"file-sourced-token-123"}
+        await _make_worker(admin, "alice", aoe_session_id="a" * 16)
 
-    asyncio.run(_send_and_wait(admin, "alice"))
+        await _send_and_wait(admin, "alice")
 
-    assert len(aoe_mock.sends) == 1
-    _, _, auth = aoe_mock.sends[0]
-    assert auth == "Bearer file-sourced-token-123"
+        assert len(aoe_mock.sends) == 1
+        _, _, auth = aoe_mock.sends[0]
+        assert auth == "Bearer file-sourced-token-123"
 
 
-def test_token_file_rotation_picked_up_without_restart(client, aoe_mock, tmp_path) -> None:
+async def test_token_file_rotation_picked_up_without_restart(
+    tmp_path, aoe_mock,
+) -> None:
     """Writing a new token to the same file → subsequent sends use it."""
-    admin = _admin_token(client)
-    token_path = tmp_path / "serve.token"
-    token_path.write_text("rev1\n")
-    _set_ctx(client, "config_aoe_notify_enabled", "true", admin)
-    _set_ctx(client, "config_aoe_base_url", "http://aoe.test", admin)
-    _set_ctx(client, "config_aoe_bearer_token_file", str(token_path), admin)
-    aoe_mock.accepted_tokens = {"rev1"}
-    _seed_worker("alice", aoe_session_id="b" * 16)
+    async with mcp_session(tmp_path) as admin:
+        token_path = tmp_path / "serve.token"
+        token_path.write_text("rev1\n")
+        _set_ctx(admin, "config_aoe_notify_enabled", "true")
+        _set_ctx(admin, "config_aoe_base_url", "http://aoe.test")
+        _set_ctx(admin, "config_aoe_bearer_token_file", str(token_path))
+        aoe_mock.accepted_tokens = {"rev1"}
+        await _make_worker(admin, "alice", aoe_session_id="b" * 16)
 
-    asyncio.run(_send_and_wait(admin, "alice"))
-    token_path.write_text("rev2\n")
-    aoe_mock.accepted_tokens = {"rev2"}
-    asyncio.run(_send_and_wait(admin, "alice"))
+        await _send_and_wait(admin, "alice")
+        token_path.write_text("rev2\n")
+        aoe_mock.accepted_tokens = {"rev2"}
+        await _send_and_wait(admin, "alice")
 
-    assert len(aoe_mock.sends) == 2
-    assert aoe_mock.sends[0][2] == "Bearer rev1"
-    assert aoe_mock.sends[1][2] == "Bearer rev2"
+        assert len(aoe_mock.sends) == 2
+        assert aoe_mock.sends[0][2] == "Bearer rev1"
+        assert aoe_mock.sends[1][2] == "Bearer rev2"
 
 
-def test_inline_token_takes_precedence_over_file(client, aoe_mock, tmp_path) -> None:
+async def test_inline_token_takes_precedence_over_file(
+    tmp_path, aoe_mock,
+) -> None:
     """If both config_aoe_bearer_token AND ..._file are set, the
     inline value wins (explicit-over-implicit). Keeps the existing
     one-secret-key workflow unchanged.
     """
-    admin = _admin_token(client)
-    token_path = tmp_path / "serve.token"
-    token_path.write_text("from-file\n")
-    _set_ctx(client, "config_aoe_notify_enabled", "true", admin)
-    _set_ctx(client, "config_aoe_base_url", "http://aoe.test", admin)
-    _set_ctx(client, "config_aoe_bearer_token", "from-inline", admin)
-    _set_ctx(client, "config_aoe_bearer_token_file", str(token_path), admin)
-    aoe_mock.accepted_tokens = {"from-inline"}
-    _seed_worker("alice", aoe_session_id="c" * 16)
+    async with mcp_session(tmp_path) as admin:
+        token_path = tmp_path / "serve.token"
+        token_path.write_text("from-file\n")
+        _set_ctx(admin, "config_aoe_notify_enabled", "true")
+        _set_ctx(admin, "config_aoe_base_url", "http://aoe.test")
+        _set_ctx(admin, "config_aoe_bearer_token", "from-inline")
+        _set_ctx(admin, "config_aoe_bearer_token_file", str(token_path))
+        aoe_mock.accepted_tokens = {"from-inline"}
+        await _make_worker(admin, "alice", aoe_session_id="c" * 16)
 
-    asyncio.run(_send_and_wait(admin, "alice"))
-    assert aoe_mock.sends[-1][2] == "Bearer from-inline"
+        await _send_and_wait(admin, "alice")
+        assert aoe_mock.sends[-1][2] == "Bearer from-inline"
 
 
-def test_missing_token_file_does_not_crash(client, aoe_mock, tmp_path) -> None:
+async def test_missing_token_file_does_not_crash(tmp_path, aoe_mock) -> None:
     """Path points at a non-existent file → log + skip the send, no
     exception bubbles."""
-    admin = _admin_token(client)
-    _set_ctx(client, "config_aoe_notify_enabled", "true", admin)
-    _set_ctx(client, "config_aoe_base_url", "http://aoe.test", admin)
-    _set_ctx(client, "config_aoe_bearer_token_file", str(tmp_path / "nope"), admin)
-    _seed_worker("alice", aoe_session_id="d" * 16)
+    async with mcp_session(tmp_path) as admin:
+        _set_ctx(admin, "config_aoe_notify_enabled", "true")
+        _set_ctx(admin, "config_aoe_base_url", "http://aoe.test")
+        _set_ctx(
+            admin,
+            "config_aoe_bearer_token_file",
+            str(tmp_path / "nope"),
+        )
+        await _make_worker(admin, "alice", aoe_session_id="d" * 16)
 
-    res = asyncio.run(_send_and_wait(admin, "alice"))
-    assert "denied" not in res[0].text.lower()
-    # We didn't have a usable token → no POST attempted.
-    assert aoe_mock.sends == []
+        res = await _send_and_wait(admin, "alice")
+        assert "denied" not in res[0].text.lower()
+        # We didn't have a usable token → no POST attempted.
+        assert aoe_mock.sends == []
 
 
 # ---------------------------------------------------------------------------
 # 5. Health check endpoint
 # ---------------------------------------------------------------------------
 
-def test_aoe_health_ok(client, aoe_mock) -> None:
+
+async def test_aoe_health_ok(tmp_path, aoe_mock) -> None:
     """GET /api/aoe/health hits AoE, reports ok + session count."""
-    admin = _admin_token(client)
-    _set_ctx(client, "config_aoe_notify_enabled", "true", admin)
-    _set_ctx(client, "config_aoe_base_url", "http://aoe.test", admin)
-    _set_ctx(client, "config_aoe_bearer_token", "good-token", admin)
-    aoe_mock.accepted_tokens = {"good-token"}
-    aoe_mock.sessions = [
-        {"id": "0" * 16, "title": "alice", "status": "Running"},
-        {"id": "1" * 16, "title": "bob", "status": "Idle"},
-    ]
+    async with mcp_session(tmp_path) as admin:
+        _set_ctx(admin, "config_aoe_notify_enabled", "true")
+        _set_ctx(admin, "config_aoe_base_url", "http://aoe.test")
+        _set_ctx(admin, "config_aoe_bearer_token", "good-token")
+        aoe_mock.accepted_tokens = {"good-token"}
+        aoe_mock.sessions = [
+            {"id": "0" * 16, "title": "alice", "status": "Running"},
+            {"id": "1" * 16, "title": "bob", "status": "Idle"},
+        ]
 
-    r = client.get(f"/api/aoe/health?token={admin}")
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["status"] == "ok"
-    assert body["session_count"] == 2
+        r = admin.client.get(f"/api/aoe/health?token={admin.admin_token}")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["status"] == "ok"
+        assert body["session_count"] == 2
 
 
-def test_aoe_health_bad_token(client, aoe_mock) -> None:
+async def test_aoe_health_bad_token(tmp_path, aoe_mock) -> None:
     """If AoE rejects the configured token, health reports unauthorized."""
-    admin = _admin_token(client)
-    _set_ctx(client, "config_aoe_notify_enabled", "true", admin)
-    _set_ctx(client, "config_aoe_base_url", "http://aoe.test", admin)
-    _set_ctx(client, "config_aoe_bearer_token", "stale-token", admin)
-    aoe_mock.accepted_tokens = {"the-current-token"}  # NOT "stale-token"
+    async with mcp_session(tmp_path) as admin:
+        _set_ctx(admin, "config_aoe_notify_enabled", "true")
+        _set_ctx(admin, "config_aoe_base_url", "http://aoe.test")
+        _set_ctx(admin, "config_aoe_bearer_token", "stale-token")
+        aoe_mock.accepted_tokens = {"the-current-token"}  # NOT "stale-token"
 
-    r = client.get(f"/api/aoe/health?token={admin}")
-    assert r.status_code == 200, r.text  # endpoint itself succeeds
-    body = r.json()
-    assert body["status"] == "unauthorized", body
-    assert "401" in body.get("message", "")
+        r = admin.client.get(f"/api/aoe/health?token={admin.admin_token}")
+        assert r.status_code == 200, r.text  # endpoint itself succeeds
+        body = r.json()
+        assert body["status"] == "unauthorized", body
+        assert "401" in body.get("message", "")
 
 
-def test_aoe_health_requires_admin(client) -> None:
+async def test_aoe_health_requires_admin(tmp_path) -> None:
     """No token / worker token → 401/403."""
-    r = client.get("/api/aoe/health")
-    assert r.status_code in (401, 403)
+    async with mcp_session(tmp_path) as admin:
+        r = admin.client.get("/api/aoe/health")
+        assert r.status_code in (401, 403)
 
 
-def test_aoe_health_disabled_status(client, aoe_mock) -> None:
+async def test_aoe_health_disabled_status(tmp_path, aoe_mock) -> None:
     """When the master toggle is off, health says 'disabled' (don't
     probe AoE at all)."""
-    admin = _admin_token(client)
-    # No config_aoe_notify_enabled set (defaults to off).
-    r = client.get(f"/api/aoe/health?token={admin}")
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["status"] == "disabled", body
-    # No HTTP traffic happened.
-    assert aoe_mock.sessions_list_calls == 0
+    async with mcp_session(tmp_path) as admin:
+        # No config_aoe_notify_enabled set (defaults to off).
+        r = admin.client.get(f"/api/aoe/health?token={admin.admin_token}")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["status"] == "disabled", body
+        # No HTTP traffic happened.
+        assert aoe_mock.sessions_list_calls == 0
