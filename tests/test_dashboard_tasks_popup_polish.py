@@ -55,13 +55,21 @@ def test_task_details_panel_jsx_removed() -> None:
 def test_row_body_click_opens_view_dialog() -> None:
     """The row-body ``onClick`` must route to the same ``openView``
     handler used by the eye icon — clicking anywhere on the row body
-    opens the View dialog now."""
+    opens the View dialog now.
+
+    After the 2026-06-02 live-lookup refactor (Candidate D), the
+    handler takes the row's identity field (``task.task_id``) rather
+    than the row itself so the dialog can read the row live from the
+    source.
+    """
     src = _read_tasks()
-    # The TableRow onClick should call openView(task) — not the
+    # The TableRow onClick should call openView(task.task_id) — not the
     # legacy handleTaskClick / setSelectedTask path.
-    assert re.search(r"onClick=\{\(\)\s*=>\s*openView\(task\)\}", src), (
-        "TableRow onClick must call openView(task) so the row body "
-        "opens the View dialog (same as the eye icon)"
+    assert re.search(r"onClick=\{\(\)\s*=>\s*openView\(task\.task_id\)\}", src), (
+        "TableRow onClick must call openView(task.task_id) so the row "
+        "body opens the View dialog (same as the eye icon) and the "
+        "live-lookup useDialog reads the row from the store on every "
+        "render"
     )
 
 
