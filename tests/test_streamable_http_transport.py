@@ -21,18 +21,26 @@ What this test pins:
   410 Gone with a JSON body pointing operators at the new endpoint.
 * Restart safety: tear down all SessionManager state mid-process and
   the next POST still succeeds with no handshake.
+
+Migrated to `tests/harness.py::mcp_session` (Candidate F from
+architecture review 2026-06-02). Where the legacy fixture exposed an
+`app` Starlette instance for route inspection, the harness exposes
+the same instance via `admin.client.app`.
 """
 
 from __future__ import annotations
 
 import json
 
+import pytest
+
+from tests.harness import mcp_session
+
+
+pytestmark = pytest.mark.asyncio
+
 
 # ---------- helpers --------------------------------------------------
-
-
-def _admin_token(client) -> str:
-    return client.get("/api/tokens").json()["admin_token"]
 
 
 def _post_mcp(client, body: dict, headers: dict | None = None):
@@ -69,48 +77,50 @@ def _extract_jsonrpc_result(response) -> dict:
 # ---------- POST /mcp ------------------------------------------------
 
 
-def test_post_mcp_with_admin_bearer_returns_tools_list(client) -> None:
+async def test_post_mcp_with_admin_bearer_returns_tools_list(tmp_path) -> None:
     """The new transport must accept POST /mcp with a JSON-RPC body and
     return tools/list inline."""
-    admin = _admin_token(client)
-    r = _post_mcp(
-        client,
-        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
-        headers={"Authorization": f"Bearer {admin}"},
-    )
-    assert r.status_code == 200, r.text
-    payload = _extract_jsonrpc_result(r)
-    assert payload.get("jsonrpc") == "2.0", payload
-    assert payload.get("id") == 1, payload
-    assert "result" in payload, payload
-    tools = payload["result"].get("tools")
-    assert isinstance(tools, list) and len(tools) > 0, payload
+    async with mcp_session(tmp_path) as admin:
+        r = _post_mcp(
+            admin.client,
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
+        assert r.status_code == 200, r.text
+        payload = _extract_jsonrpc_result(r)
+        assert payload.get("jsonrpc") == "2.0", payload
+        assert payload.get("id") == 1, payload
+        assert "result" in payload, payload
+        tools = payload["result"].get("tools")
+        assert isinstance(tools, list) and len(tools) > 0, payload
 
 
-def test_post_mcp_with_bad_bearer_returns_401(client) -> None:
+async def test_post_mcp_with_bad_bearer_returns_401(tmp_path) -> None:
     """Bad token at the HTTP layer → 401 from the auth middleware
     before tool dispatch runs."""
-    r = _post_mcp(
-        client,
-        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
-        headers={"Authorization": "Bearer " + ("x" * 32)},
-    )
-    assert r.status_code == 401, r.text
+    async with mcp_session(tmp_path) as admin:
+        r = _post_mcp(
+            admin.client,
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            headers={"Authorization": "Bearer " + ("x" * 32)},
+        )
+        assert r.status_code == 401, r.text
 
 
-def test_post_mcp_without_authorization_returns_401(client) -> None:
+async def test_post_mcp_without_authorization_returns_401(tmp_path) -> None:
     """No Authorization header → 401."""
-    r = _post_mcp(
-        client,
-        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
-    )
-    assert r.status_code == 401, r.text
+    async with mcp_session(tmp_path) as admin:
+        r = _post_mcp(
+            admin.client,
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+        )
+        assert r.status_code == 401, r.text
 
 
 # ---------- GET /mcp -------------------------------------------------
 
 
-def test_get_mcp_is_routed_to_streamable_http_manager(app) -> None:
+async def test_get_mcp_is_routed_to_streamable_http_manager(tmp_path) -> None:
     """GET /mcp must reach the StreamableHTTP session manager.
 
     We can't easily exercise the live SSE stream with Starlette's
@@ -130,44 +140,46 @@ def test_get_mcp_is_routed_to_streamable_http_manager(app) -> None:
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
     from agent_mcp.app.main_app import _McpAsgiApp
 
-    mcp_mount = next(
-        (r for r in app.routes if isinstance(r, Mount) and r.path == "/mcp"),
-        None,
-    )
-    assert mcp_mount is not None, (
-        "expected a Mount('/mcp', ...) for the Streamable HTTP transport"
-    )
-    inner = mcp_mount.app
-    assert isinstance(inner, _McpAsgiApp), (
-        f"/mcp Mount should be an _McpAsgiApp; got {type(inner).__name__}"
-    )
-    assert isinstance(inner._manager, StreamableHTTPSessionManager), (
-        f"/mcp ASGI wrapper must hold a StreamableHTTPSessionManager; "
-        f"got {type(inner._manager).__name__}"
-    )
-    # Stateless mode is the whole point of the rewrite — assert it
-    # explicitly so a future regression that flips to stateful mode
-    # (and thus reintroduces the lost-session-on-restart bug) fails
-    # loudly here.
-    assert inner._manager.stateless is True, (
-        "Streamable HTTP transport must be in stateless mode so backend "
-        "restarts don't lose session state"
-    )
+    async with mcp_session(tmp_path) as admin:
+        app = admin.client.app
+        mcp_mount = next(
+            (r for r in app.routes if isinstance(r, Mount) and r.path == "/mcp"),
+            None,
+        )
+        assert mcp_mount is not None, (
+            "expected a Mount('/mcp', ...) for the Streamable HTTP transport"
+        )
+        inner = mcp_mount.app
+        assert isinstance(inner, _McpAsgiApp), (
+            f"/mcp Mount should be an _McpAsgiApp; got {type(inner).__name__}"
+        )
+        assert isinstance(inner._manager, StreamableHTTPSessionManager), (
+            f"/mcp ASGI wrapper must hold a StreamableHTTPSessionManager; "
+            f"got {type(inner._manager).__name__}"
+        )
+        # Stateless mode is the whole point of the rewrite — assert it
+        # explicitly so a future regression that flips to stateful mode
+        # (and thus reintroduces the lost-session-on-restart bug) fails
+        # loudly here.
+        assert inner._manager.stateless is True, (
+            "Streamable HTTP transport must be in stateless mode so backend "
+            "restarts don't lose session state"
+        )
 
 
 # ---------- DELETE /mcp ---------------------------------------------
 
 
-def test_delete_mcp_returns_405_in_stateless_mode(client) -> None:
+async def test_delete_mcp_returns_405_in_stateless_mode(tmp_path) -> None:
     """In stateless mode there is no session to terminate, so DELETE
     /mcp must return 405 Method Not Allowed per the spec."""
-    admin = _admin_token(client)
-    r = client.request(
-        "DELETE",
-        "/mcp",
-        headers={"Authorization": f"Bearer {admin}"},
-    )
-    assert r.status_code == 405, r.text
+    async with mcp_session(tmp_path) as admin:
+        r = admin.client.request(
+            "DELETE",
+            "/mcp",
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
+        assert r.status_code == 405, r.text
 
 
 # ---------- Legacy endpoints return 410 -----------------------------
@@ -181,61 +193,62 @@ def _assert_migration_body(body_text: str) -> None:
     assert "hint" in data, data
 
 
-def test_legacy_sse_endpoint_returns_410(client) -> None:
-    r = client.get("/sse")
-    assert r.status_code == 410, r.text
-    _assert_migration_body(r.text)
+async def test_legacy_sse_endpoint_returns_410(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        r = admin.client.get("/sse")
+        assert r.status_code == 410, r.text
+        _assert_migration_body(r.text)
 
 
-def test_legacy_messages_endpoint_returns_410(client) -> None:
-    r = client.post(
-        "/messages/?session_id=00000000000000000000000000000000",
-        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
-    )
-    assert r.status_code == 410, r.text
-    _assert_migration_body(r.text)
+async def test_legacy_messages_endpoint_returns_410(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        r = admin.client.post(
+            "/messages/?session_id=00000000000000000000000000000000",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+        )
+        assert r.status_code == 410, r.text
+        _assert_migration_body(r.text)
 
 
 # ---------- Restart safety -------------------------------------------
 
 
-def test_post_mcp_works_after_session_state_cleared(client) -> None:
+async def test_post_mcp_works_after_session_state_cleared(tmp_path) -> None:
     """The point of going stateless: nuking whatever the
     SessionManager has cached mid-process must not break the next POST.
     No handshake re-required."""
-    admin = _admin_token(client)
+    async with mcp_session(tmp_path) as admin:
+        # Warm up with one successful POST so any per-request internals get
+        # exercised first.
+        r1 = _post_mcp(
+            admin.client,
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
+        assert r1.status_code == 200, r1.text
 
-    # Warm up with one successful POST so any per-request internals get
-    # exercised first.
-    r1 = _post_mcp(
-        client,
-        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
-        headers={"Authorization": f"Bearer {admin}"},
-    )
-    assert r1.status_code == 200, r1.text
+        # Reach into the StreamableHTTPSessionManager and clear whatever
+        # session-ish bookkeeping it has. In stateless mode the
+        # `_server_instances` dict is unused but we clear it anyway to make
+        # the invariant explicit and resilient if upstream ever populates it.
+        from agent_mcp.app import main_app
 
-    # Reach into the StreamableHTTPSessionManager and clear whatever
-    # session-ish bookkeeping it has. In stateless mode the
-    # `_server_instances` dict is unused but we clear it anyway to make
-    # the invariant explicit and resilient if upstream ever populates it.
-    from agent_mcp.app import main_app
+        sm = getattr(main_app, "session_manager", None)
+        assert sm is not None, (
+            "expected agent_mcp.app.main_app.session_manager to be a "
+            "StreamableHTTPSessionManager instance"
+        )
+        if hasattr(sm, "_server_instances"):
+            sm._server_instances.clear()
+        if hasattr(sm, "_session_owners"):
+            sm._session_owners.clear()
 
-    sm = getattr(main_app, "session_manager", None)
-    assert sm is not None, (
-        "expected agent_mcp.app.main_app.session_manager to be a "
-        "StreamableHTTPSessionManager instance"
-    )
-    if hasattr(sm, "_server_instances"):
-        sm._server_instances.clear()
-    if hasattr(sm, "_session_owners"):
-        sm._session_owners.clear()
-
-    r2 = _post_mcp(
-        client,
-        {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
-        headers={"Authorization": f"Bearer {admin}"},
-    )
-    assert r2.status_code == 200, r2.text
-    payload = _extract_jsonrpc_result(r2)
-    assert payload.get("id") == 2, payload
-    assert "result" in payload, payload
+        r2 = _post_mcp(
+            admin.client,
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
+        assert r2.status_code == 200, r2.text
+        payload = _extract_jsonrpc_result(r2)
+        assert payload.get("id") == 2, payload
+        assert "result" in payload, payload
