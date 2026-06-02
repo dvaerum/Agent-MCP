@@ -298,8 +298,12 @@ async def test_get_mcp_registers_session_and_runtime_queue(live_server) -> None:
     base_url, _ = live_server
     alice_token = _seed_worker("alice")
 
+    # Snapshot baseline: _runtime_queues is process-global state shared by
+    # any concurrent test in the same xdist worker, so we measure deltas
+    # rather than absolute counts. The mcp_sessions count is per-agent
+    # and isolated to this test's "alice".
+    baseline_queues = _runtime_queues_size()
     assert _mcp_sessions_count_for("alice") == 0
-    assert _runtime_queues_size() == 0
 
     async with httpx.AsyncClient(base_url=base_url, timeout=10.0, follow_redirects=True) as client:
         async with client.stream(
@@ -319,20 +323,23 @@ async def test_get_mcp_registers_session_and_runtime_queue(live_server) -> None:
             assert _mcp_sessions_count_for("alice") == 1, (
                 "GET /mcp must register a session row for the bearer's agent_id"
             )
-            assert _runtime_queues_size() >= 1, (
+            assert _runtime_queues_size() >= baseline_queues + 1, (
                 "GET /mcp must attach an asyncio queue for runtime fan-out"
             )
 
     # After the stream closes, the row + queue must be cleaned up.
     for _ in range(60):
-        if _mcp_sessions_count_for("alice") == 0 and _runtime_queues_size() == 0:
+        if (
+            _mcp_sessions_count_for("alice") == 0
+            and _runtime_queues_size() <= baseline_queues
+        ):
             break
         await asyncio.sleep(0.05)
     assert _mcp_sessions_count_for("alice") == 0, (
         "Closing GET /mcp must delete the mcp_sessions row"
     )
-    assert _runtime_queues_size() == 0, (
-        "Closing GET /mcp must detach the runtime queue"
+    assert _runtime_queues_size() <= baseline_queues, (
+        "Closing GET /mcp must detach the runtime queue (delta vs baseline)"
     )
 
 
