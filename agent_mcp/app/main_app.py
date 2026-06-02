@@ -1,4 +1,5 @@
 # Agent-MCP/mcp_template/mcp_server_src/app/main_app.py
+import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
@@ -17,7 +18,8 @@ import mcp.types as mcp_types
 
 # Project-specific imports
 from ..core.config import logger
-from ..core.auth import verify_token
+from ..core.auth import verify_token, get_agent_id
+from ..core import session_registry
 from .routes import routes as http_routes
 from .server_lifecycle import application_startup, application_shutdown
 from ..tools.registry import list_available_tools, dispatch_tool_call, request_auth_token
@@ -349,13 +351,230 @@ class _McpAsgiApp:
     the module-global `session_manager` on every request) so tests
     that build multiple `create_app` instances in the same process
     don't accidentally hit each other's stale managers.
+
+    GET /mcp is handled IN-HOUSE rather than passed through to the
+    SDK's manager because in stateless mode the SDK creates a fresh
+    transport per request — its GET stream is local to that one
+    transport, dies with the request, and is therefore useless for
+    cross-request notification fan-out. Our handler:
+
+      1. Registers an ``mcp_sessions`` row via ``session_registry``
+         (bearer hashed, agent_id derived from the bearer-resolved
+         active_agents entry).
+      2. Attaches an ``asyncio.Queue`` to the session_id.
+      3. Streams SSE to the wire, draining the queue → one
+         ``data: <json-rpc envelope>`` frame per payload.
+      4. On disconnect / error: detaches the queue + unregisters the
+         row in a try/finally so a crash mid-pump still cleans up.
+
+    POST and DELETE still pass through to the manager: POST handles
+    the JSON-RPC request/response shape (inline JSON or SSE body
+    when a tool emits progress); DELETE returns 405 in stateless mode.
     """
+
+    # Heartbeat cadence for the GET stream. Sent as SSE comment lines
+    # (`: ping`) which clients ignore. Two purposes:
+    #
+    # 1. Detect dead TCP peers: a write to a closed socket will raise
+    #    inside `send`, which is how the cleanup `finally` learns the
+    #    client is gone (ASGI's `http.disconnect` event arrives via
+    #    `receive` but only when nothing else is awaiting receive,
+    #    which our pump loop isn't).
+    # 2. Keep intermediaries (corporate proxies, load balancers) from
+    #    reaping the long-lived connection as idle.
+    _HEARTBEAT_INTERVAL_SECONDS = 15.0
 
     def __init__(self, manager: StreamableHTTPSessionManager) -> None:
         self._manager = manager
 
     async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and scope.get("method") == "GET":
+            await self._handle_get(scope, receive, send)
+            return
         await self._manager.handle_request(scope, receive, send)
+
+    async def _handle_get(self, scope, receive, send) -> None:
+        """Open an SSE stream + drain `session_registry` queue at it.
+
+        Pre-condition: ``AuthHeaderMiddleware`` has already verified
+        the bearer (any /mcp request without a valid bearer is
+        rejected with 401 before reaching here), so we trust the
+        Authorization header value in `scope.headers` here for
+        identity-resolution purposes (`get_agent_id`).
+        """
+        bearer = _bearer_from_scope(scope)
+        agent_id = get_agent_id(bearer) if bearer else None
+        if not agent_id:
+            # Defence in depth — middleware should have already
+            # rejected this. Return 500 rather than 401 because a
+            # mismatch here is a backend bug (the middleware's gate
+            # passed but agent resolution failed), not a client
+            # auth problem we want clients to retry.
+            await _send_simple_response(
+                send, 500, b'{"error":"session_registry_no_agent"}'
+            )
+            return
+
+        session_id = session_registry.register_session(
+            agent_id=agent_id, bearer_token=bearer
+        )
+        # The queue size is intentionally bounded — if a client's
+        # consumption falls behind by more than this many notifications
+        # we drop oldest and log. 256 fits a worker that's been
+        # disconnected for ~minutes at typical notification rates.
+        queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=256)
+        session_registry.attach_runtime_queue(session_id, queue)
+        logger.info(
+            "session_registry: opened GET /mcp stream session=%s agent=%s",
+            session_id, agent_id,
+        )
+
+        try:
+            await send({
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"text/event-stream"),
+                    (b"cache-control", b"no-cache, no-transform"),
+                    (b"connection", b"keep-alive"),
+                ],
+            })
+            # Initial comment frame so headers flush immediately — let
+            # the client know the connection is live without having to
+            # wait for the first real notification.
+            await send({
+                "type": "http.response.body",
+                "body": b": connected\n\n",
+                "more_body": True,
+            })
+
+            # Concurrent watchers: drain the queue while also watching
+            # the client-disconnect signal. Whichever finishes first
+            # ends the request; the other is cancelled in the finally.
+            disconnect_task = asyncio.create_task(
+                _await_disconnect(receive),
+                name=f"mcp-get-disconnect-{session_id}",
+            )
+            pump_task = asyncio.create_task(
+                self._pump(session_id, queue, send),
+                name=f"mcp-get-pump-{session_id}",
+            )
+            try:
+                done, pending = await asyncio.wait(
+                    {disconnect_task, pump_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for t in pending:
+                    t.cancel()
+                # Surface pump errors (disconnect is expected to
+                # finish first under normal usage).
+                for t in done:
+                    if t is pump_task and not t.cancelled():
+                        exc = t.exception()
+                        if exc is not None:
+                            raise exc
+            finally:
+                disconnect_task.cancel()
+                pump_task.cancel()
+
+            try:
+                await send({"type": "http.response.body", "body": b"", "more_body": False})
+            except Exception:  # pragma: no cover - peer already gone
+                pass
+        finally:
+            session_registry.detach_runtime_queue(session_id)
+            session_registry.unregister_session(session_id)
+            logger.info(
+                "session_registry: closed GET /mcp stream session=%s agent=%s",
+                session_id, agent_id,
+            )
+
+    async def _pump(self, session_id: str, queue: asyncio.Queue, send) -> None:
+        """Drain `queue` onto the SSE wire forever (until cancelled).
+
+        One SSE `data:` frame per queue payload. Heartbeat comments
+        are emitted whenever the queue stays empty past
+        `_HEARTBEAT_INTERVAL_SECONDS` — they double as the dead-peer
+        detector (a write to a closed socket raises here, which
+        bubbles up and ends the request via the surrounding `wait`).
+
+        We also call `session_registry.touch_session` on every
+        successful payload + heartbeat so the periodic pruner doesn't
+        evict still-live sessions.
+        """
+        while True:
+            try:
+                payload = await asyncio.wait_for(
+                    queue.get(), timeout=self._HEARTBEAT_INTERVAL_SECONDS
+                )
+            except asyncio.TimeoutError:
+                await send({
+                    "type": "http.response.body",
+                    "body": b": heartbeat\n\n",
+                    "more_body": True,
+                })
+                try:
+                    session_registry.touch_session(session_id)
+                except Exception:  # pragma: no cover - defensive
+                    pass
+                continue
+
+            data = json.dumps(payload).encode("utf-8")
+            await send({
+                "type": "http.response.body",
+                "body": b"data: " + data + b"\n\n",
+                "more_body": True,
+            })
+            try:
+                session_registry.touch_session(session_id)
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+
+def _bearer_from_scope(scope) -> str:
+    """Extract the bearer value from an ASGI HTTP scope's headers.
+
+    Returns "" if absent or malformed. We re-parse here (rather than
+    reading from `request_auth_token`) because the ContextVar is set
+    by ``AuthHeaderMiddleware`` on the incoming request task — the
+    pump task that lives past the middleware return runs in a
+    different context where the var may have been reset.
+    """
+    for name, value in scope.get("headers", []):
+        if name.lower() == b"authorization":
+            try:
+                decoded = value.decode("ascii")
+            except UnicodeDecodeError:
+                return ""
+            if decoded.lower().startswith("bearer "):
+                return decoded[7:].strip()
+            return ""
+    return ""
+
+
+async def _await_disconnect(receive) -> None:
+    """Block until the ASGI `http.disconnect` event arrives.
+
+    ASGI delivers `http.disconnect` when the client (or upstream proxy)
+    closes the TCP connection. Returning from this coroutine signals
+    to `_handle_get` that it should tear down the SSE stream.
+    """
+    while True:
+        message = await receive()
+        if message.get("type") == "http.disconnect":
+            return
+
+
+async def _send_simple_response(send, status: int, body: bytes) -> None:
+    await send({
+        "type": "http.response.start",
+        "status": status,
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+        ],
+    })
+    await send({"type": "http.response.body", "body": body, "more_body": False})
 
 
 # --- Starlette Application Creation --------------------------------

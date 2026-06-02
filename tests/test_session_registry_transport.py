@@ -377,7 +377,9 @@ async def test_notification_reaches_both_concurrent_get_streams(live_server) -> 
             )
 
             # Trigger a notification by POSTing send_agent_message via /mcp.
-            async with httpx.AsyncClient(base_url=base_url, timeout=10.0) as poster:
+            async with httpx.AsyncClient(
+                base_url=base_url, timeout=10.0, follow_redirects=True
+            ) as poster:
                 rpc = {
                     "jsonrpc": "2.0",
                     "id": 1,
