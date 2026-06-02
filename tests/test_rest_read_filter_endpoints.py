@@ -15,12 +15,22 @@ returned as `[]`, not 404.
 
 Backward compat: calling the endpoints with no query params returns the
 same shape as before this PR.
+
+Migrated to `tests/harness.py::mcp_session` (Candidate F from
+architecture review 2026-06-02).
 """
 
 from __future__ import annotations
 
 import datetime as _dt
 import secrets
+
+import pytest
+
+from tests.harness import mcp_session
+
+
+pytestmark = pytest.mark.asyncio
 
 
 def _seed_agent(agent_id: str, status: str = "active") -> str:
@@ -42,7 +52,8 @@ def _seed_agent(agent_id: str, status: str = "active") -> str:
         "INSERT INTO agents (token, agent_id, capabilities, created_at, "
         "status, working_directory, color, terminated_at, updated_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (token, agent_id, "[]", now, status, "/tmp", "#888", terminated_at, now),
+        (token, agent_id, "[]", now, status, "/tmp", "#888",
+         terminated_at, now),
     )
     conn.commit()
     conn.close()
@@ -57,7 +68,8 @@ def _seed_agent(agent_id: str, status: str = "active") -> str:
     return token
 
 
-def _seed_task(task_id: str, *, assigned_to: str | None, status: str = "pending") -> None:
+def _seed_task(task_id: str, *, assigned_to: str | None,
+               status: str = "pending") -> None:
     """Insert a task row directly with a given assignment + status."""
     from agent_mcp.db.connection import get_db_connection
 
@@ -80,55 +92,57 @@ def _seed_task(task_id: str, *, assigned_to: str | None, status: str = "pending"
 # ---------------------------------------------------------------------------
 
 
-def test_agents_filter_status_active_excludes_terminated(client) -> None:
+async def test_agents_filter_status_active_excludes_terminated(tmp_path) -> None:
     """`?status=active` returns only active agents (no terminated rows)."""
-    _seed_agent("alice", status="active")
-    _seed_agent("bob", status="active")
-    _seed_agent("zombie", status="terminated")
+    async with mcp_session(tmp_path) as admin:
+        _seed_agent("alice", status="active")
+        _seed_agent("bob", status="active")
+        _seed_agent("zombie", status="terminated")
 
-    r = client.get("/api/agents?status=active")
-    assert r.status_code == 200, r.text
-    rows = r.json()
-    # The existing handler prepends a synthetic "Admin" row with
-    # status='system'; the status filter must drop it too (only rows
-    # whose status matches the filter survive).
-    ids = [row.get("agent_id") for row in rows]
-    statuses = [row.get("status") for row in rows]
-    assert "alice" in ids, ids
-    assert "bob" in ids, ids
-    assert "zombie" not in ids, ids
-    assert set(statuses) == {"active"}, statuses
+        r = admin.client.get("/api/agents?status=active")
+        assert r.status_code == 200, r.text
+        rows = r.json()
+        # The existing handler prepends a synthetic "Admin" row with
+        # status='system'; the status filter must drop it too (only rows
+        # whose status matches the filter survive).
+        ids = [row.get("agent_id") for row in rows]
+        statuses = [row.get("status") for row in rows]
+        assert "alice" in ids, ids
+        assert "bob" in ids, ids
+        assert "zombie" not in ids, ids
+        assert set(statuses) == {"active"}, statuses
 
 
-def test_agents_filter_status_terminated_only(client) -> None:
+async def test_agents_filter_status_terminated_only(tmp_path) -> None:
     """`?status=terminated` returns only terminated agents."""
-    _seed_agent("alice", status="active")
-    _seed_agent("zombie", status="terminated")
-    _seed_agent("ghost", status="terminated")
+    async with mcp_session(tmp_path) as admin:
+        _seed_agent("alice", status="active")
+        _seed_agent("zombie", status="terminated")
+        _seed_agent("ghost", status="terminated")
 
-    r = client.get("/api/agents?status=terminated")
-    assert r.status_code == 200, r.text
-    rows = r.json()
-    ids = [row.get("agent_id") for row in rows]
-    assert ids and set(ids) == {"zombie", "ghost"}, ids
-    assert all(row.get("status") == "terminated" for row in rows)
+        r = admin.client.get("/api/agents?status=terminated")
+        assert r.status_code == 200, r.text
+        rows = r.json()
+        ids = [row.get("agent_id") for row in rows]
+        assert ids and set(ids) == {"zombie", "ghost"}, ids
+        assert all(row.get("status") == "terminated" for row in rows)
 
 
-def test_agents_no_filter_returns_all(client) -> None:
+async def test_agents_no_filter_returns_all(tmp_path) -> None:
     """No query params → backward-compatible behavior (everything, plus
     the synthetic Admin row)."""
-    _seed_agent("alice", status="active")
-    _seed_agent("zombie", status="terminated")
+    async with mcp_session(tmp_path) as admin:
+        _seed_agent("alice", status="active")
+        _seed_agent("zombie", status="terminated")
 
-    r = client.get("/api/agents")
-    assert r.status_code == 200, r.text
-    rows = r.json()
-    ids = [row.get("agent_id") for row in rows]
-    # Both real agents present.
-    assert "alice" in ids, ids
-    assert "zombie" in ids, ids
-    # Synthetic Admin row preserved for back-compat with dashboard.
-    assert "Admin" in ids, ids
+        r = admin.client.get("/api/agents")
+        assert r.status_code == 200, r.text
+        rows = r.json()
+        ids = [row.get("agent_id") for row in rows]
+        assert "alice" in ids, ids
+        assert "zombie" in ids, ids
+        # Synthetic Admin row preserved for back-compat with dashboard.
+        assert "Admin" in ids, ids
 
 
 # ---------------------------------------------------------------------------
@@ -136,36 +150,40 @@ def test_agents_no_filter_returns_all(client) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_tasks_filter_assigned_to_existing_agent(client) -> None:
+async def test_tasks_filter_assigned_to_existing_agent(tmp_path) -> None:
     """`?assigned_to=alice` returns only tasks whose assigned_to=='alice'."""
-    _seed_agent("alice", status="active")
-    _seed_agent("bob", status="active")
-    _seed_task("task_a1", assigned_to="alice")
-    _seed_task("task_a2", assigned_to="alice")
-    _seed_task("task_b1", assigned_to="bob")
-    _seed_task("task_u1", assigned_to=None)
+    async with mcp_session(tmp_path) as admin:
+        _seed_agent("alice", status="active")
+        _seed_agent("bob", status="active")
+        _seed_task("task_a1", assigned_to="alice")
+        _seed_task("task_a2", assigned_to="alice")
+        _seed_task("task_b1", assigned_to="bob")
+        _seed_task("task_u1", assigned_to=None)
 
-    r = client.get("/api/tasks?assigned_to=alice")
-    assert r.status_code == 200, r.text
-    rows = r.json()
-    if isinstance(rows, dict):
-        rows = rows.get("tasks", [])
-    ids = sorted(row.get("task_id") for row in rows)
-    assert ids == ["task_a1", "task_a2"], ids
-    assert all(row.get("assigned_to") == "alice" for row in rows)
+        r = admin.client.get("/api/tasks?assigned_to=alice")
+        assert r.status_code == 200, r.text
+        rows = r.json()
+        if isinstance(rows, dict):
+            rows = rows.get("tasks", [])
+        ids = sorted(row.get("task_id") for row in rows)
+        assert ids == ["task_a1", "task_a2"], ids
+        assert all(row.get("assigned_to") == "alice" for row in rows)
 
 
-def test_tasks_filter_assigned_to_nonexistent_agent_is_empty(client) -> None:
+async def test_tasks_filter_assigned_to_nonexistent_agent_is_empty(
+    tmp_path,
+) -> None:
     """`?assigned_to=ghost` (no such agent) returns []; not 404."""
-    _seed_agent("alice", status="active")
-    _seed_task("task_a1", assigned_to="alice")
+    async with mcp_session(tmp_path) as admin:
+        _seed_agent("alice", status="active")
+        _seed_task("task_a1", assigned_to="alice")
 
-    r = client.get("/api/tasks?assigned_to=ghost-does-not-exist")
-    assert r.status_code == 200, r.text
-    rows = r.json()
-    if isinstance(rows, dict):
-        rows = rows.get("tasks", [])
-    assert rows == [], rows
+        r = admin.client.get("/api/tasks?assigned_to=ghost-does-not-exist")
+        assert r.status_code == 200, r.text
+        rows = r.json()
+        if isinstance(rows, dict):
+            rows = rows.get("tasks", [])
+        assert rows == [], rows
 
 
 # ---------------------------------------------------------------------------
@@ -173,33 +191,35 @@ def test_tasks_filter_assigned_to_nonexistent_agent_is_empty(client) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_tasks_filter_unassigned(client) -> None:
+async def test_tasks_filter_unassigned(tmp_path) -> None:
     """`?unassigned=true` returns only tasks with assigned_to IS NULL."""
-    _seed_agent("alice", status="active")
-    _seed_task("task_assigned", assigned_to="alice")
-    _seed_task("task_unassigned_1", assigned_to=None)
-    _seed_task("task_unassigned_2", assigned_to=None)
+    async with mcp_session(tmp_path) as admin:
+        _seed_agent("alice", status="active")
+        _seed_task("task_assigned", assigned_to="alice")
+        _seed_task("task_unassigned_1", assigned_to=None)
+        _seed_task("task_unassigned_2", assigned_to=None)
 
-    r = client.get("/api/tasks?unassigned=true")
-    assert r.status_code == 200, r.text
-    rows = r.json()
-    if isinstance(rows, dict):
-        rows = rows.get("tasks", [])
-    ids = sorted(row.get("task_id") for row in rows)
-    assert ids == ["task_unassigned_1", "task_unassigned_2"], ids
-    assert all(row.get("assigned_to") is None for row in rows)
+        r = admin.client.get("/api/tasks?unassigned=true")
+        assert r.status_code == 200, r.text
+        rows = r.json()
+        if isinstance(rows, dict):
+            rows = rows.get("tasks", [])
+        ids = sorted(row.get("task_id") for row in rows)
+        assert ids == ["task_unassigned_1", "task_unassigned_2"], ids
+        assert all(row.get("assigned_to") is None for row in rows)
 
 
-def test_tasks_no_filter_returns_all(client) -> None:
+async def test_tasks_no_filter_returns_all(tmp_path) -> None:
     """No query params → backward-compatible (every task row, no filter)."""
-    _seed_agent("alice", status="active")
-    _seed_task("task_assigned", assigned_to="alice")
-    _seed_task("task_unassigned", assigned_to=None)
+    async with mcp_session(tmp_path) as admin:
+        _seed_agent("alice", status="active")
+        _seed_task("task_assigned", assigned_to="alice")
+        _seed_task("task_unassigned", assigned_to=None)
 
-    r = client.get("/api/tasks")
-    assert r.status_code == 200, r.text
-    rows = r.json()
-    if isinstance(rows, dict):
-        rows = rows.get("tasks", [])
-    ids = sorted(row.get("task_id") for row in rows)
-    assert ids == ["task_assigned", "task_unassigned"], ids
+        r = admin.client.get("/api/tasks")
+        assert r.status_code == 200, r.text
+        rows = r.json()
+        if isinstance(rows, dict):
+            rows = rows.get("tasks", [])
+        ids = sorted(row.get("task_id") for row in rows)
+        assert ids == ["task_assigned", "task_unassigned"], ids
