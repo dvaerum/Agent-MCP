@@ -76,6 +76,12 @@ def _make_engine(url: str) -> Engine:
         finally:
             cursor.close()
 
+    # Attach the slow-query listener (db review item 6). Imported
+    # locally to keep `slow_query` from importing engine internals at
+    # module load.
+    from . import slow_query as _slow_query
+    _slow_query.install(engine)
+
     return engine
 
 

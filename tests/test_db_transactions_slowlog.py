@@ -18,9 +18,8 @@ Covers items 5 and 6 from the 2026-06-02 review:
 
 from __future__ import annotations
 
+import contextlib
 import logging
-import sqlite3
-import time
 from unittest import mock
 
 import pytest
@@ -68,26 +67,45 @@ async def test_assign_existing_tasks_commits_once(tmp_path) -> None:
             task_ids.append(r.json()["task_id"])
 
         # Spy on Connection.commit so we can count the calls during
-        # the assign tool invocation.
+        # the assign tool invocation. `task_tools.py` does
+        # `from ..db.connection import get_db_connection`, which
+        # binds the name at the tool-module level — patching
+        # `db.connection.get_db_connection` wouldn't affect the
+        # already-bound reference, so we patch the tool module too.
+        from agent_mcp.tools import task_tools as task_tools_mod
+
         commit_count = {"n": 0}
         real_get_conn = conn_mod.get_db_connection
 
-        def spy_get_conn(*a, **kw):
-            c = real_get_conn(*a, **kw)
-            real_commit = c.commit
+        class _CountingConn:
+            """Proxy around sqlite3.Connection that increments
+            `commit_count` on each `.commit()` call. We use a proxy
+            because `sqlite3.Connection.commit` is a read-only
+            attribute on the actual instance.
+            """
 
-            def counted_commit(*ca, **ckw):
+            def __init__(self, inner):
+                self._inner = inner
+
+            def commit(self):
                 commit_count["n"] += 1
-                return real_commit(*ca, **ckw)
+                return self._inner.commit()
 
-            c.commit = counted_commit  # type: ignore[method-assign]
-            return c
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def __enter__(self):
+                return self._inner.__enter__()
+
+            def __exit__(self, *a):
+                return self._inner.__exit__(*a)
+
+        def spy_get_conn(*a, **kw):
+            return _CountingConn(real_get_conn(*a, **kw))
 
         with mock.patch.object(
-            conn_mod, "get_db_connection", side_effect=spy_get_conn
+            task_tools_mod, "get_db_connection", side_effect=spy_get_conn
         ):
-            # Drive the assign tool. We re-import inside the patch so
-            # the tool implementation picks up the spy.
             from agent_mcp.tools.task_tools import assign_task_tool_impl
 
             commit_count["n"] = 0  # reset after seeding's own commits
@@ -200,9 +218,6 @@ async def test_slow_query_logger_truncates_sql(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-import contextlib
 
 
 @contextlib.contextmanager
