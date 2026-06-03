@@ -279,9 +279,9 @@ async def test_descriptor_advertises_new_endpoint_urls(
     assert eps["api"] == "/agent-mcp/api"
     assert eps["app"] == "/agent-mcp/app"
     assert eps["assets"] == "/agent-mcp/assets"
-    # PR-D will move this to /agent-mcp/mcp/<name>; PR-B keeps the
-    # current per-project shape but the descriptor still names it.
-    assert eps["mcp"] == "/agent-mcp"
+    # PR-D moved the MCP transport to /agent-mcp/mcp/<name>; the
+    # descriptor advertises the parent prefix.
+    assert eps["mcp"] == "/agent-mcp/mcp"
 
 
 # ── Reserved-name validator (audit §2.6) ────────────────────────────

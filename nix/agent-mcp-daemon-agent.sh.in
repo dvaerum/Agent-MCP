@@ -72,7 +72,11 @@ bearer="${bearer//$'\r'/}"
 # Loopback router endpoint. The dashboard-facing tailnet URL works
 # too, but loopback avoids the TLS round-trip and keeps daemon
 # traffic off the wire.
-export AGENT_MCP_MCP_URL="http://127.0.0.1:@router_port@/agent-mcp/${project}/mcp"
+# PR-D Shape-3 MCP URL move: /agent-mcp/<name>/mcp → /agent-mcp/mcp/<name>.
+# The router 308-redirects the old shape for ~30 days; this daemon
+# wrapper uses the new canonical URL directly so daemon-spawned
+# agents never depend on the redirect.
+export AGENT_MCP_MCP_URL="http://127.0.0.1:@router_port@/agent-mcp/mcp/${project}"
 export AGENT_MCP_PROJECT="$project"
 export AGENT_MCP_AGENT_ID="$agent_id"
 export AGENT_MCP_BEARER="$bearer"
