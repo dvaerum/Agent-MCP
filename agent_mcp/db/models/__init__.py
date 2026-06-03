@@ -19,5 +19,13 @@ from .agent_message import AgentMessage
 from .mcp_session import McpSession
 from .project_context import ProjectContext
 from .task import Task
+from .task_note import TaskNote
 
-__all__ = ["Agent", "AgentMessage", "McpSession", "ProjectContext", "Task"]
+__all__ = [
+    "Agent",
+    "AgentMessage",
+    "McpSession",
+    "ProjectContext",
+    "Task",
+    "TaskNote",
+]
