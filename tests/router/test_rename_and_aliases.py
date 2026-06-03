@@ -1,5 +1,5 @@
-"""Tests for the router's __rename endpoint and alias-in-proxy
-plumbing (Phase 1b).
+"""Tests for the router's __rename endpoint, alias-in-proxy
+plumbing, and the alias reaper background task (Phase 1b).
 
 The registry data-model tests live next door in
 ``test_project_registry.py`` — this file is for the router-layer
@@ -8,7 +8,9 @@ plumbing that consumes the new registry primitives.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import logging
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -207,3 +209,36 @@ async def test_unknown_name_with_no_matching_alias_rejects(
     # Either 401 (token rejected first) or 404 (unknown project) is
     # acceptable — what matters is that the request does NOT succeed.
     assert resp.status in (401, 404)
+
+
+# ── Alias reaper ────────────────────────────────────────────────────
+
+
+async def test_alias_reaper_removes_expired_entries(
+    router_module, tmp_path: Path, caplog, monkeypatch,
+) -> None:
+    """Single tick of the reaper drops past-due aliases and logs."""
+    from agent_mcp.router import project_registry
+
+    # Repoint the registry at a tmp file so we don't share state with
+    # other tests in the same worker.
+    monkeypatch.setattr(
+        project_registry, "REGISTRY_PATH", tmp_path / "projects.local.json",
+    )
+    reg = project_registry.ProjectRegistry()
+    reg.register("alpha", "/tmp/alpha")
+    past = _iso(datetime.now(timezone.utc) - timedelta(seconds=1))
+    future = _iso(datetime.now(timezone.utc) + timedelta(days=10))
+    reg.add_alias("alpha", "expired-one", expires_at=past)
+    reg.add_alias("alpha", "alive-one", expires_at=future)
+
+    caplog.set_level(logging.INFO, logger="agent_mcp.router.app")
+    await router_module._alias_reaper_tick(reg)
+
+    row = reg.get("alpha")
+    alias_names = {a["name"] for a in row["aliases"]}
+    assert alias_names == {"alive-one"}
+    assert any(
+        "expired-one" in r.message and "alpha" in r.message
+        for r in caplog.records
+    ), [r.message for r in caplog.records]
