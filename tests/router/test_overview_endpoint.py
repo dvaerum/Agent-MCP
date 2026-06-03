@@ -35,7 +35,6 @@ see ADR-0009 + Phase 3.5c for the wiring-snippets port).
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from pathlib import Path
 
