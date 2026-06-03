@@ -100,13 +100,27 @@ def _hash_bearer(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def register_session(*, agent_id: str, bearer_token: str) -> str:
+def register_session(
+    *,
+    agent_id: str,
+    bearer_token: str,
+    alias_used: Optional[str] = None,
+) -> str:
     """Insert a row for a new GET /mcp stream, return the minted session_id.
 
     `session_id` is a fresh UUID4 — independent of any client-provided
     identifier so a misbehaving client can't collide with someone
     else's stream. `bearer_token` is hashed before persisting; the raw
     value never lands on disk.
+
+    `alias_used` (Phase 1c): when the upstream router proxied this
+    request from an alias URL it forwards
+    `X-Agent-MCP-Alias: <alias_name>,<expires_at>` and the transport
+    layer threads `alias_name` through here. The row's `alias_used`
+    column then lets operators answer "which alias is still receiving
+    traffic" without re-joining against the router-side registry.
+    NULL (the default) means the stream was opened on the canonical
+    project URL — the common case.
     """
     session_id = uuid.uuid4().hex
     now = _now_utc_iso()
@@ -115,9 +129,13 @@ def register_session(*, agent_id: str, bearer_token: str) -> str:
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO mcp_sessions "
-            "(session_id, agent_id, opened_at, last_seen_at, bearer_token_hash) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (session_id, agent_id, now, now, _hash_bearer(bearer_token)),
+            "(session_id, agent_id, opened_at, last_seen_at, "
+            "bearer_token_hash, alias_used) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                session_id, agent_id, now, now,
+                _hash_bearer(bearer_token), alias_used,
+            ),
         )
         conn.commit()
     finally:
