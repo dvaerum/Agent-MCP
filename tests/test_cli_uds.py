@@ -5,8 +5,11 @@ dispatch (uvicorn receives `uds=<path>` instead of `host`/`port` when
 the option is set) is exercised end-to-end by the deployment tests in
 `nixos-developer-system/users/dennis/agent-mcp/tests/` (where the
 deployed binary really binds a UDS). Adding an in-process dispatch
-test would require refactoring `main_cli` to extract a pure
+test would require refactoring `server_cmd` to extract a pure
 `_build_uvicorn_kwargs(port, uds)` helper — out of scope for this PR.
+
+Phase 1a renamed `main_cli` → `server_cmd` (now a subcommand of the
+top-level `cli` click group); the underlying option set is unchanged.
 """
 
 from __future__ import annotations
@@ -16,10 +19,10 @@ from click.testing import CliRunner
 
 def test_cli_help_mentions_uds_option() -> None:
     """`agent_mcp --help` lists --uds as an available flag."""
-    from agent_mcp.cli import main_cli
+    from agent_mcp.cli import server_cmd
 
     runner = CliRunner()
-    result = runner.invoke(main_cli, ["--help"])
+    result = runner.invoke(server_cmd, ["--help"])
 
     assert result.exit_code == 0, result.output
     assert "--uds" in result.output, (
@@ -29,10 +32,10 @@ def test_cli_help_mentions_uds_option() -> None:
 
 def test_cli_uds_help_text_mentions_unix_socket() -> None:
     """The help text for --uds explains what it does."""
-    from agent_mcp.cli import main_cli
+    from agent_mcp.cli import server_cmd
 
     runner = CliRunner()
-    result = runner.invoke(main_cli, ["--help"])
+    result = runner.invoke(server_cmd, ["--help"])
 
     assert result.exit_code == 0, result.output
     # Find the --uds line + its description.

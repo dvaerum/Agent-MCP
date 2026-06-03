@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-# ── ONE-TIME VENDORED COPY ───────────────────────────────────────────
-# This file is a verbatim snapshot of
-# /home/dennis/nixos-developer-system/users/dennis/agent-mcp/router.py
-# (deploy repo), pulled in at Phase 0 of the router-upstream plan
-# (prancy-napping-pie). Its sole purpose is to give the pytest suite
-# something concrete to assert against while the source still lives in
-# the deploy repo. It is INTENTIONALLY identical to the source — do
-# NOT edit. If the deploy file changes, this snapshot stays stale until
-# Phase 1, which deletes this entire `_fixtures/` directory and moves
-# router.py + project_registry.py to their permanent in-tree home.
-# ─────────────────────────────────────────────────────────────────────
+# ── MOVED-UPSTREAM SOURCE ───────────────────────────────────────────
+# Was: nixos-developer-system/users/dennis/agent-mcp/router.py
+# Now: agent_mcp/router/app.py — moved upstream in Phase 1a of the
+# router-upstream plan (prancy-napping-pie). The deploy repo now
+# invokes this via `python -m agent_mcp.cli router …` (the new CLI
+# subcommand added in the same PR) instead of carrying its own copy.
+#
+# Behaviour changes folded into the move:
+#   * Removed the stale `<p>SSE URL: <code>{escape(sse)}</code></p>`
+#     fragment in `_wiring_help_panel` — it referenced an undefined
+#     `sse` variable and raised `NameError` on every render
+#     (production 500s visible in journalctl). Streamable HTTP is
+#     the only supported transport now, so the line was dead.
+#   * `import project_registry` → `from . import project_registry`
+#     so the registry resolves as a sibling module inside the
+#     `agent_mcp.router` package.
+# ────────────────────────────────────────────────────────────────────
 """
 agent-mcp-router
 
@@ -101,7 +107,7 @@ from urllib.parse import quote, urlencode
 
 from aiohttp import ClientSession, ClientTimeout, UnixConnector, web
 
-import project_registry  # local module, see ./project_registry.py
+from . import project_registry  # sibling module — see ./project_registry.py
 
 # ── Configuration ────────────────────────────────────────────────────
 
@@ -129,8 +135,20 @@ DEFAULT_WORKSPACE_PARENT = Path(
     )
 ).expanduser()
 README_HTML_PATH = os.environ.get("AGENT_MCP_README_HTML", "")
-INSTALLER_TEMPLATE_PATH = Path(os.environ["AGENT_MCP_INSTALLER_TEMPLATE"])
-_INSTALLER_TEMPLATE = INSTALLER_TEMPLATE_PATH.read_text()
+# Installer template: env var overrides (deploy repo still sets this
+# explicitly for now); the default falls back to the packaged
+# installer.sh.in shipped alongside this module. Resolving via
+# importlib.resources keeps the package re-locatable (wheel install,
+# nix store path, etc.).
+_INSTALLER_TEMPLATE_ENV = os.environ.get("AGENT_MCP_INSTALLER_TEMPLATE")
+if _INSTALLER_TEMPLATE_ENV:
+    INSTALLER_TEMPLATE_PATH = Path(_INSTALLER_TEMPLATE_ENV)
+    _INSTALLER_TEMPLATE = INSTALLER_TEMPLATE_PATH.read_text()
+else:
+    from importlib.resources import files as _pkg_files
+    _packaged_installer = _pkg_files("agent_mcp.router").joinpath("installer.sh.in")
+    INSTALLER_TEMPLATE_PATH = Path(str(_packaged_installer))
+    _INSTALLER_TEMPLATE = _packaged_installer.read_text()
 
 # Slug regex used to validate project names. Single-letter names
 # are allowed (`^[a-z]$`); longer names must start with a letter and
@@ -1229,7 +1247,6 @@ async def _wiring_help_panel(
     return f"""
 <details class=wiring{open_attr}>
   <summary>Wiring help for <code>{escape(name)}</code></summary>
-  <p><strong>SSE URL:</strong> <code>{escape(sse)}</code></p>
   {missing_agent_warning}
   {picker}
   {create_form}
