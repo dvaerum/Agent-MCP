@@ -14,6 +14,7 @@ Adding a new model:
 4. Generate an Alembic revision under `migrations/versions/`.
 """
 
+from .agent import Agent
 from .project_context import ProjectContext
 
-__all__ = ["ProjectContext"]
+__all__ = ["Agent", "ProjectContext"]

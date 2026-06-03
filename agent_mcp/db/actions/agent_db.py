@@ -1,173 +1,207 @@
-# Agent-MCP/mcp_template/mcp_server_src/db/actions/agent_db.py
-import sqlite3
+# Agent-MCP/agent_mcp/db/actions/agent_db.py
+"""Reusable DB operations for the `agents` table.
+
+Cutover to SQLAlchemy in db-review PR-G2 — the model lives in
+`agent_mcp.db.models.agent::Agent`. The function signatures + return
+shapes (Optional[Dict[str, Any]] / List[Dict[str, Any]] keyed by
+column name) are preserved 1:1 so consumers (tool authorisation,
+lifespan startup, dashboard API) don't need to change.
+
+The raw-SQL update path in `update_agent_db_field` keeps its
+allowlist of mutable fields — that allowlist doubles as anti-injection
+protection. The ORM cutover replaces the `f"UPDATE ... SET {field} = ?"`
+template with `setattr(row, field, value)` on the Agent instance, but
+the allowlist guard stays.
+"""
+
+from __future__ import annotations
+
+import datetime
 import json
-from typing import Optional, Dict, List, Any
-import datetime # Added because it's used in update_agent_db_field
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy.exc import SQLAlchemyError
 
 from ...core.config import logger
-from ..connection import get_db_connection
+from ..engine import get_session
+from ..models import Agent
 
-# This module provides reusable database operations specifically for the 'agents' table.
+
+# Columns the caller is allowed to mutate via `update_agent_db_field`.
+# Used both as an allowlist (anti-injection / anti-typo) and to
+# centralise the JSON-serialisation rule for `capabilities`.
+_MUTABLE_FIELDS: set[str] = {
+    "status",
+    "current_task",
+    "working_directory",
+    "color",
+    "capabilities",
+    "updated_at",
+    "aoe_session_id",
+}
+
+
+def _agent_to_dict(row: Agent) -> Dict[str, Any]:
+    """Project an `Agent` ORM row into the dict shape consumers expect.
+
+    Mirrors the pre-cutover `dict(sqlite_row)` projection: every column
+    is exposed by name, and `capabilities` is JSON-decoded (the column
+    stores a JSON-encoded list).
+    """
+    data: Dict[str, Any] = {
+        "token": row.token,
+        "agent_id": row.agent_id,
+        "capabilities": row.capabilities,
+        "created_at": row.created_at,
+        "status": row.status,
+        "current_task": row.current_task,
+        "working_directory": row.working_directory,
+        "color": row.color,
+        "terminated_at": row.terminated_at,
+        "updated_at": row.updated_at,
+        "aoe_session_id": row.aoe_session_id,
+    }
+    raw_caps = data.get("capabilities")
+    if isinstance(raw_caps, str):
+        try:
+            data["capabilities"] = json.loads(raw_caps or "[]")
+        except json.JSONDecodeError:
+            logger.warning(
+                f"Failed to parse capabilities JSON for agent "
+                f"{row.agent_id!r}. Raw: {raw_caps!r}"
+            )
+            data["capabilities"] = []
+    return data
+
 
 def get_agent_by_id(agent_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Fetches a single agent's details from the database by agent_id.
-    Returns None if the agent is not found.
-    """
-    conn = None
+    """Fetch a single agent by agent_id. Returns None if not found."""
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM agents WHERE agent_id = ?", (agent_id,))
-        row = cursor.fetchone()
-        if row:
-            agent_data = dict(row)
-            # Parse JSON fields if necessary (e.g., capabilities)
-            if 'capabilities' in agent_data and isinstance(agent_data['capabilities'], str):
-                try:
-                    agent_data['capabilities'] = json.loads(agent_data['capabilities'])
-                except json.JSONDecodeError:
-                    logger.warning(f"Failed to parse capabilities JSON for agent {agent_id}. Raw: {agent_data['capabilities']}")
-                    agent_data['capabilities'] = [] # Default to empty list on parse error
-            return agent_data
-        return None
-    except sqlite3.Error as e:
-        logger.error(f"Database error fetching agent by ID '{agent_id}': {e}", exc_info=True)
+        with get_session() as session:
+            row = (
+                session.query(Agent)
+                .filter(Agent.agent_id == agent_id)
+                .one_or_none()
+            )
+            return _agent_to_dict(row) if row is not None else None
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error fetching agent by ID '{agent_id}': {e}",
+            exc_info=True,
+        )
         return None
     except Exception as e:
-        logger.error(f"Unexpected error fetching agent by ID '{agent_id}': {e}", exc_info=True)
+        logger.error(
+            f"Unexpected error fetching agent by ID '{agent_id}': {e}",
+            exc_info=True,
+        )
         return None
-    finally:
-        if conn:
-            conn.close()
+
 
 def get_agent_by_token(token: str) -> Optional[Dict[str, Any]]:
-    """
-    Fetches a single agent's details from the database by their token.
-    Returns None if the agent is not found.
-    """
-    conn = None
+    """Fetch a single agent by bearer token. Returns None if not found."""
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM agents WHERE token = ?", (token,))
-        row = cursor.fetchone()
-        if row:
-            agent_data = dict(row)
-            if 'capabilities' in agent_data and isinstance(agent_data['capabilities'], str):
-                try:
-                    agent_data['capabilities'] = json.loads(agent_data['capabilities'])
-                except json.JSONDecodeError:
-                    logger.warning(f"Failed to parse capabilities JSON for agent with token. Raw: {agent_data['capabilities']}")
-                    agent_data['capabilities'] = []
-            return agent_data
-        return None
-    except sqlite3.Error as e:
-        logger.error(f"Database error fetching agent by token: {e}", exc_info=True)
+        with get_session() as session:
+            row = (
+                session.query(Agent)
+                .filter(Agent.token == token)
+                .one_or_none()
+            )
+            return _agent_to_dict(row) if row is not None else None
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error fetching agent by token: {e}", exc_info=True,
+        )
         return None
     except Exception as e:
-        logger.error(f"Unexpected error fetching agent by token: {e}", exc_info=True)
+        logger.error(
+            f"Unexpected error fetching agent by token: {e}", exc_info=True,
+        )
         return None
-    finally:
-        if conn:
-            conn.close()
+
 
 def get_all_active_agents_from_db() -> List[Dict[str, Any]]:
+    """Fetch every agent whose status is not 'terminated'.
+
+    Used by `application_startup` to populate `g.active_agents`.
     """
-    Fetches all agents from the database that are not 'terminated'.
-    This is used for populating g.active_agents at startup.
-    """
-    agents_list: List[Dict[str, Any]] = []
-    conn = None
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        # Query matches the one in server_lifecycle.application_startup
-        cursor.execute("""
-            SELECT token, agent_id, capabilities, created_at, status, current_task, working_directory, color 
-            FROM agents WHERE status != ?
-        """, ("terminated",))
-        for row in cursor.fetchall():
-            agent_data = dict(row)
-            if 'capabilities' in agent_data and isinstance(agent_data['capabilities'], str):
-                try:
-                    agent_data['capabilities'] = json.loads(agent_data['capabilities'] or '[]')
-                except json.JSONDecodeError:
-                    agent_data['capabilities'] = []
-            agents_list.append(agent_data)
-        return agents_list
-    except sqlite3.Error as e:
-        logger.error(f"Database error fetching all active agents: {e}", exc_info=True)
-        return [] # Return empty list on error
-    except Exception as e:
-        logger.error(f"Unexpected error fetching all active agents: {e}", exc_info=True)
+        with get_session() as session:
+            rows = (
+                session.query(Agent)
+                .filter(Agent.status != "terminated")
+                .all()
+            )
+            return [_agent_to_dict(r) for r in rows]
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error fetching all active agents: {e}", exc_info=True,
+        )
         return []
-    finally:
-        if conn:
-            conn.close()
+    except Exception as e:
+        logger.error(
+            f"Unexpected error fetching all active agents: {e}",
+            exc_info=True,
+        )
+        return []
 
-# Add other agent-specific DB operations here if needed, e.g.:
-# - update_agent_status(agent_id, new_status, new_current_task=None)
-# - update_agent_capabilities(agent_id, new_capabilities)
-# These are currently handled within the tool implementations (admin_tools.py, task_tools.py)
-# For a strict 1-to-1 of original main.py, these more granular functions weren't separate.
-# However, having them here improves modularity if these operations become more complex or reused.
 
-# Example: A more specific update function (not directly from original main.py as a separate function)
-def update_agent_db_field(agent_id: str, field_name: str, new_value: Any) -> bool:
+def update_agent_db_field(
+    agent_id: str, field_name: str, new_value: Any,
+) -> bool:
+    """Update a single field on an agent row + bump `updated_at`.
+
+    Returns True on success, False on any failure (unknown field,
+    no matching agent, or DB error). The allowlist is non-negotiable —
+    callers must not be able to mutate `token`, `agent_id`, or
+    `created_at` via this surface.
     """
-    Updates a specific field for an agent in the database.
-    Handles JSON serialization for fields like 'capabilities'.
-    Returns True on success, False on failure.
-    """
-    if field_name not in ['status', 'current_task', 'working_directory', 'color', 'capabilities', 'updated_at', 'aoe_session_id']:
-        logger.error(f"Attempted to update an invalid or unsupported agent field: {field_name}")
+    if field_name not in _MUTABLE_FIELDS:
+        logger.error(
+            f"Attempted to update an invalid or unsupported agent "
+            f"field: {field_name}"
+        )
         return False
 
-    conn = None
+    value_to_set = new_value
+    if field_name == "capabilities":
+        value_to_set = json.dumps(new_value or [])
+    elif field_name == "updated_at" and new_value is None:
+        value_to_set = datetime.datetime.now().isoformat()
+
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        value_to_set = new_value
-        if field_name == 'capabilities':
-            value_to_set = json.dumps(new_value or [])
-        elif field_name == 'updated_at' and new_value is None: # Auto-set updated_at if not provided
-            value_to_set = datetime.datetime.now().isoformat()
-        
-        # Always update 'updated_at' timestamp
-        # Use safe field mapping to prevent SQL injection
-        allowed_fields = {
-            'status': 'status',
-            'current_task': 'current_task',
-            'working_directory': 'working_directory',
-            'color': 'color',
-            'capabilities': 'capabilities',
-            'updated_at': 'updated_at',
-            'aoe_session_id': 'aoe_session_id',
-        }
-        safe_field_name = allowed_fields[field_name]  # This will raise KeyError if invalid
-        sql = f"UPDATE agents SET {safe_field_name} = ?, updated_at = ? WHERE agent_id = ?"
-        current_time = datetime.datetime.now().isoformat()
-        
-        cursor.execute(sql, (value_to_set, current_time, agent_id))
-        conn.commit()
-        
-        if cursor.rowcount > 0:
-            logger.info(f"Agent '{agent_id}' field '{field_name}' updated in DB.")
+        with get_session() as session:
+            row = (
+                session.query(Agent)
+                .filter(Agent.agent_id == agent_id)
+                .one_or_none()
+            )
+            if row is None:
+                logger.warning(
+                    f"Agent '{agent_id}' not found; "
+                    f"field '{field_name}' update is a no-op."
+                )
+                return False
+            setattr(row, field_name, value_to_set)
+            # Always bump updated_at, even if the caller's field IS
+            # updated_at (the value above already accounts for that).
+            row.updated_at = datetime.datetime.now().isoformat()
+            session.commit()
+            logger.info(
+                f"Agent '{agent_id}' field '{field_name}' updated in DB."
+            )
             return True
-        else:
-            logger.warning(f"Agent '{agent_id}' not found or field '{field_name}' update had no effect in DB.")
-            return False
-            
-    except sqlite3.Error as e:
-        if conn: conn.rollback()
-        logger.error(f"Database error updating agent '{agent_id}' field '{field_name}': {e}", exc_info=True)
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error updating agent '{agent_id}' field "
+            f"'{field_name}': {e}",
+            exc_info=True,
+        )
         return False
     except Exception as e:
-        if conn: conn.rollback()
-        logger.error(f"Unexpected error updating agent '{agent_id}' field '{field_name}': {e}", exc_info=True)
+        logger.error(
+            f"Unexpected error updating agent '{agent_id}' field "
+            f"'{field_name}': {e}",
+            exc_info=True,
+        )
         return False
-    finally:
-        if conn:
-            conn.close()
