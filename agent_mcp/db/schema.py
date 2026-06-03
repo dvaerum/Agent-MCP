@@ -198,7 +198,22 @@ def init_database() -> None:
             )
         """
         )
-        logger.debug("Tasks table ensured.")
+        # Indexes for tasks (added per 2026-06-02 database review).
+        # The composite index is the critical one for wait_for_events
+        # (`assigned_to = ? ORDER BY updated_at DESC`); the
+        # single-column indexes cover hot status/priority filters in
+        # the dashboard's /api/all-data and tool implementations.
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_assigned_to_updated_at "
+            "ON tasks (assigned_to, updated_at DESC)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks (priority)"
+        )
+        logger.debug("Tasks table and indexes ensured.")
 
         # Agent Actions Table (Original main.py lines 306-317)
         cursor.execute(
@@ -328,6 +343,12 @@ def init_database() -> None:
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_agent_messages_unread ON agent_messages (recipient_id, read, timestamp DESC)"
         )
+        # Added per 2026-06-02 database review: speeds up the "purge
+        # delivered messages" cleanup path so it no longer scans the
+        # whole table.
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_messages_delivered ON agent_messages (delivered)"
+        )
         logger.debug("Agent_messages table and indexes ensured.")
 
         # Claude Code Sessions Table (for git-agentmcp hook integration)
@@ -357,7 +378,42 @@ def init_database() -> None:
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_claude_sessions_agent ON claude_code_sessions (agent_id)"
         )
+        # Added per 2026-06-02 database review: status is filtered
+        # alongside last_activity in admin views.
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_claude_sessions_status ON claude_code_sessions (status)"
+        )
         logger.debug("Claude_code_sessions table and indexes ensured.")
+
+        # MCP Sessions Table (mirrors Alembic migration 0004_mcp_sessions
+        # + 0005_mcp_sessions_alias_used). Declared here for fresh-DB
+        # parity per the 2026-06-02 database review (item 15): a brand-new
+        # database should have the table even if Alembic hasn't run yet,
+        # so the canonical Alembic migration remains source-of-truth but
+        # bootstrap is defensive.
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mcp_sessions (
+                session_id TEXT PRIMARY KEY NOT NULL,
+                agent_id TEXT NOT NULL,
+                opened_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                bearer_token_hash TEXT NOT NULL,
+                alias_used TEXT
+            )
+        """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mcp_sessions_agent ON mcp_sessions (agent_id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mcp_sessions_last_seen ON mcp_sessions (last_seen_at)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mcp_sessions_alias_used "
+            "ON mcp_sessions (alias_used, last_seen_at)"
+        )
+        logger.debug("Mcp_sessions table and indexes ensured.")
 
         # RAG Embeddings Table (Virtual Table using sqlite-vec)
         # (Original main.py lines 365-379)
