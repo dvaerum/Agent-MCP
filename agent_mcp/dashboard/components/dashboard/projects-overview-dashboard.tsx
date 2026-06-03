@@ -18,19 +18,32 @@
 //   │  Workspace: /home/dennis/.local/share/agent-mcp/projects/x │
 //   └────────────────────────────────────────────────────────────┘
 //
-// Add/Remove/Rename modal buttons ship in PR-B (Phase 3.5b). Alias
+// Add/Remove/Rename modal buttons wired in PR-B (Phase 3.5b). Alias
 // chip expansion + wiring snippets ship in PR-C (Phase 3.5c).
 
 import React, { useEffect, useState } from "react"
-import { RefreshCw, Folder, Loader2, AlertCircle, ChevronDown, ChevronUp } from "lucide-react"
+import {
+  RefreshCw, Folder, Loader2, AlertCircle, ChevronDown, ChevronUp,
+  Plus, Pencil, Trash2, MoreHorizontal,
+} from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import {
   useProjectsStore,
   type ProjectOverviewRow,
   type ProjectStatus,
 } from "@/lib/stores/projects-store"
+import { AddProjectModal } from "./add-project-modal"
+import { RemoveProjectModal } from "./remove-project-modal"
+import { RenameProjectModal } from "./rename-project-modal"
 
 const STATUS_VARIANT: Record<ProjectStatus, "default" | "secondary" | "destructive" | "outline"> = {
   active: "default",
@@ -59,8 +72,16 @@ function formatRelative(ts: number | null): string {
   return `${Math.floor(ageSec / 86400)}d ago`
 }
 
-function ProjectCard({ row }: { row: ProjectOverviewRow }): React.ReactElement {
+function ProjectCard({
+  row,
+  multiTenant,
+}: {
+  row: ProjectOverviewRow
+  multiTenant: boolean
+}): React.ReactElement {
   const [showDetails, setShowDetails] = useState(false)
+  const [renameOpen, setRenameOpen] = useState(false)
+  const [removeOpen, setRemoveOpen] = useState(false)
   const dashboardHref = `/agent-mcp/__dashboard/${encodeURIComponent(row.name)}/`
   return (
     <Card className="overflow-hidden">
@@ -78,9 +99,39 @@ function ProjectCard({ row }: { row: ProjectOverviewRow }): React.ReactElement {
             </a>
           </CardTitle>
         </div>
-        <Badge variant={STATUS_VARIANT[row.status]} className="text-xs capitalize">
-          {row.status}
-        </Badge>
+        <div className="flex items-center gap-1">
+          <Badge variant={STATUS_VARIANT[row.status]} className="text-xs capitalize">
+            {row.status}
+          </Badge>
+          {multiTenant && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7"
+                  aria-label={`Project ${row.name} actions`}
+                >
+                  <MoreHorizontal className="h-4 w-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onClick={() => setRenameOpen(true)}>
+                  <Pencil className="h-4 w-4 mr-2" />
+                  Rename
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onClick={() => setRemoveOpen(true)}
+                  className="text-destructive focus:text-destructive"
+                >
+                  <Trash2 className="h-4 w-4 mr-2" />
+                  Remove
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+        </div>
       </CardHeader>
       <CardContent className="pb-3 space-y-2">
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
@@ -148,12 +199,24 @@ function ProjectCard({ row }: { row: ProjectOverviewRow }): React.ReactElement {
           </div>
         )}
       </CardContent>
+      <RenameProjectModal
+        projectName={row.name}
+        open={renameOpen}
+        onOpenChange={setRenameOpen}
+      />
+      <RemoveProjectModal
+        projectName={row.name}
+        open={removeOpen}
+        onOpenChange={setRemoveOpen}
+      />
     </Card>
   )
 }
 
 export function ProjectsOverviewDashboard(): React.ReactElement {
   const { envelope, loading, error, fetchOverview } = useProjectsStore()
+  const [addOpen, setAddOpen] = useState(false)
+  const multiTenant = envelope?.multi_tenant !== false
 
   useEffect(() => {
     fetchOverview()
@@ -186,20 +249,34 @@ export function ProjectsOverviewDashboard(): React.ReactElement {
                 : "All registered projects on this router."}
             </p>
           </div>
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={loading}
-            onClick={() => fetchOverview()}
-          >
-            {loading ? (
-              <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-            ) : (
-              <RefreshCw className="h-4 w-4 mr-2" />
+          <div className="flex items-center gap-2">
+            {multiTenant && (
+              <Button
+                variant="default"
+                size="sm"
+                onClick={() => setAddOpen(true)}
+              >
+                <Plus className="h-4 w-4 mr-2" />
+                Add project
+              </Button>
             )}
-            Refresh
-          </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={loading}
+              onClick={() => fetchOverview()}
+            >
+              {loading ? (
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              ) : (
+                <RefreshCw className="h-4 w-4 mr-2" />
+              )}
+              Refresh
+            </Button>
+          </div>
         </div>
+
+        <AddProjectModal open={addOpen} onOpenChange={setAddOpen} />
 
         {error && (
           <Card>
@@ -221,7 +298,11 @@ export function ProjectsOverviewDashboard(): React.ReactElement {
         {envelope && envelope.projects.length > 0 && (
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
             {envelope.projects.map((row) => (
-              <ProjectCard key={row.name} row={row} />
+              <ProjectCard
+                key={row.name}
+                row={row}
+                multiTenant={multiTenant}
+              />
             ))}
           </div>
         )}

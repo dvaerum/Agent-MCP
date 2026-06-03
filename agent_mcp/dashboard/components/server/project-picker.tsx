@@ -1,7 +1,7 @@
 "use client"
 
 import React, { useState, useEffect } from "react"
-import { Server, Settings, Wifi, Loader2, ExternalLink } from "lucide-react"
+import { Server, Settings, Wifi, Loader2, ArrowLeft, Lock } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import {
@@ -12,6 +12,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
+import { useProjectsStore } from "@/lib/stores/projects-store"
 
 // Patched for the NixOS deployment. Upstream's picker switches
 // between server-store entries (each = (host, port)). Our router
@@ -19,9 +20,19 @@ import {
 // So the picker fetches the project list from the router and
 // picking an entry navigates the browser instead of swapping a
 // host:port pair.
+//
+// Phase 3.5b (prancy-napping-pie decision #10): the picker now reads
+// from the new useProjectsStore (backed by /__overview) so it can
+// learn the router's tenancy mode in the same payload. Behaviour:
+//
+//   * Multi-tenant: prepend an "← All projects" entry that navigates
+//     to /agent-mcp/__dashboard/ (the cross-project overview).
+//   * Single-tenant: the dropdown is disabled, showing only the
+//     configured project name with a small "single-tenant" badge.
+//     There's nowhere else for the operator to go.
 
 const DASHBOARD_PREFIX = "/agent-mcp/__dashboard/"
-const PROJECTS_ENDPOINT = "/agent-mcp/__projects"
+const OVERVIEW_PATH = "/agent-mcp/__dashboard/"
 
 function readActiveProjectName(): string | null {
   if (typeof window === "undefined") return null
@@ -31,9 +42,8 @@ function readActiveProjectName(): string | null {
 
 export function ProjectPicker() {
   const [isOpen, setIsOpen] = useState(false)
-  const [projects, setProjects] = useState<string[]>([])
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const { envelope, loading, error, fetchOverview } = useProjectsStore()
+
   // Deferred to a post-mount effect so SSG output ("Select
   // Project") matches the first client paint, avoiding the React
   // hydration mismatch (#418).
@@ -42,24 +52,16 @@ export function ProjectPicker() {
     setActive(readActiveProjectName())
   }, [])
 
-  const fetchProjects = async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      const r = await fetch(PROJECTS_ENDPOINT, { cache: "no-store" })
-      if (!r.ok) throw new Error(`HTTP ${r.status}`)
-      const body = await r.json()
-      setProjects(Array.isArray(body.projects) ? body.projects : [])
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setLoading(false)
-    }
-  }
-
   useEffect(() => {
-    fetchProjects()
-  }, [])
+    if (!envelope && !loading) {
+      void fetchOverview()
+    }
+  }, [envelope, loading, fetchOverview])
+
+  const multiTenant = envelope?.multi_tenant !== false
+  const singleName = envelope?.single_tenant_name ?? null
+  const projects = envelope?.projects.map((p) => p.name) ?? []
+  const displayName = active ?? singleName ?? "Select Project"
 
   const handlePick = (name: string) => {
     if (name === active) {
@@ -69,13 +71,36 @@ export function ProjectPicker() {
     window.location.href = `${DASHBOARD_PREFIX}${encodeURIComponent(name)}/`
   }
 
+  // Single-tenant: render a disabled button that only shows the
+  // project name. No dropdown, no actions — there's exactly one
+  // project, statically configured by the operator's home-manager
+  // profile.
+  if (envelope && !multiTenant) {
+    return (
+      <Button
+        variant="outline"
+        className="justify-between min-w-[200px] cursor-not-allowed opacity-80"
+        disabled
+        aria-label="Project picker disabled in single-tenant mode"
+      >
+        <div className="flex items-center space-x-2">
+          <Lock className="h-3 w-3 text-muted-foreground" />
+          <span className="truncate">{displayName}</span>
+        </div>
+        <Badge variant="outline" className="text-[10px] ml-2">
+          single-tenant
+        </Badge>
+      </Button>
+    )
+  }
+
   return (
     <DropdownMenu open={isOpen} onOpenChange={setIsOpen}>
       <DropdownMenuTrigger asChild>
         <Button variant="outline" className="justify-between min-w-[200px]">
           <div className="flex items-center space-x-2">
             <div className="w-2 h-2 rounded-full bg-primary" />
-            <span className="truncate">{active ?? "Select Project"}</span>
+            <span className="truncate">{displayName}</span>
           </div>
           <Settings className="h-4 w-4 ml-2 opacity-50" />
         </Button>
@@ -87,7 +112,7 @@ export function ProjectPicker() {
           <Button
             variant="ghost"
             size="sm"
-            onClick={() => fetchProjects()}
+            onClick={() => fetchOverview()}
             className="h-6 w-6 p-0"
             disabled={loading}
           >
@@ -96,6 +121,17 @@ export function ProjectPicker() {
               : <Server className="h-3 w-3" />}
           </Button>
         </DropdownMenuLabel>
+
+        <DropdownMenuSeparator />
+
+        {/* "← All projects" entry — only in multi-tenant mode (decision #10). */}
+        <DropdownMenuItem
+          onClick={() => (window.location.href = OVERVIEW_PATH)}
+          className="flex items-center p-3 cursor-pointer"
+        >
+          <ArrowLeft className="h-4 w-4 mr-3 text-muted-foreground" />
+          <span className="font-medium">All projects</span>
+        </DropdownMenuItem>
 
         <DropdownMenuSeparator />
 
@@ -108,11 +144,11 @@ export function ProjectPicker() {
         <div className="max-h-[300px] overflow-y-auto">
           {projects.length === 0 && !loading && !error && (
             <div className="p-3 text-xs text-muted-foreground">
-              No projects registered. Visit{" "}
-              <a href="/agent-mcp/" className="underline">
-                /agent-mcp/
+              No projects registered. Use the{" "}
+              <a href={OVERVIEW_PATH} className="underline">
+                overview
               </a>{" "}
-              to create one.
+              to add one.
             </div>
           )}
           {projects.map((name) => (
@@ -132,22 +168,6 @@ export function ProjectPicker() {
               )}
             </DropdownMenuItem>
           ))}
-        </div>
-
-        <DropdownMenuSeparator />
-
-        <div className="p-2">
-          <Button
-            variant="outline"
-            size="sm"
-            asChild
-            className="w-full"
-          >
-            <a href="/agent-mcp/">
-              <ExternalLink className="h-4 w-4 mr-2" />
-              Manage projects
-            </a>
-          </Button>
         </div>
       </DropdownMenuContent>
     </DropdownMenu>

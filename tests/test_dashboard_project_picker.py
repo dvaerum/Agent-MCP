@@ -14,10 +14,18 @@ PICKER = Path("agent_mcp/dashboard/components/server/project-picker.tsx")
 
 
 def test_picker_fetches_router_projects_endpoint() -> None:
+    """As of Phase 3.5b the picker reads the project list from the
+    cross-project useProjectsStore (backed by /agent-mcp/__overview)
+    instead of fetching /agent-mcp/__projects directly. The store
+    indirection lets the picker consume the same envelope the
+    overview cards do — one network round-trip per tab, and the
+    tenancy mode (multi vs single) is available in the same payload.
+    """
     src = PICKER.read_text()
-    assert "/agent-mcp/__projects" in src, (
-        "expected picker to fetch project list from "
-        "/agent-mcp/__projects (router endpoint)"
+    assert "useProjectsStore" in src, (
+        "expected picker to consume useProjectsStore (the cross-"
+        "project store backed by /agent-mcp/__overview) instead of "
+        "fetching /__projects directly"
     )
 
 

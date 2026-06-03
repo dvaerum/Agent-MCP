@@ -1490,12 +1490,53 @@ async def rename_handler(req: web.Request) -> web.StreamResponse:
     )
 
 
+_DELETE_WORKSPACE_TRUTHY = {"true", "1", "yes", "on"}
+
+
+def _form_truthy(form, key: str) -> bool:
+    raw = (form.get(key) or "").strip().lower()
+    return raw in _DELETE_WORKSPACE_TRUTHY
+
+
+def _is_within_default_workspace(workspace_path: Path) -> bool:
+    """Defence in depth for the D4 two-tier remove (Phase 3.5b):
+    only allow a hard rm when the workspace path is rooted inside
+    ``DEFAULT_WORKSPACE_PARENT``. A malicious projects.local.json edit
+    listing ``/`` or ``/home/dennis`` would otherwise turn the
+    dashboard's 'Also delete workspace files' checkbox into a wipe
+    button. We compare on resolved paths so symlink traversal still
+    hits the bound.
+    """
+    try:
+        workspace_resolved = workspace_path.resolve()
+        parent_resolved = DEFAULT_WORKSPACE_PARENT.resolve()
+    except OSError:
+        return False
+    try:
+        workspace_resolved.relative_to(parent_resolved)
+    except ValueError:
+        return False
+    return True
+
+
 async def unregister_handler(req: web.Request) -> web.StreamResponse:
     """POST /agent-mcp/__unregister — drop a project.
 
-    Stops the systemd unit; does NOT touch the workspace directory
-    (the user's SQLite state lives there) nor any .mcp.json on any
-    host (the router didn't create those).
+    Stops the systemd unit. By default does NOT touch the workspace
+    directory (the user's SQLite state lives there) nor any .mcp.json
+    on any host (the router didn't create those).
+
+    Phase 3.5b: the dashboard's two-tier safe-default remove modal
+    (D4) can request a hard ``rm -rf`` of the workspace files by
+    sending ``delete_workspace=true`` in the form body. The router
+    only honours this when the workspace path resolves inside
+    ``DEFAULT_WORKSPACE_PARENT`` (defence in depth — see
+    ``_is_within_default_workspace`` for why).
+
+    Phase 3.5b: refuse with 409 + a structured body listing active
+    connection count when the project has any in-flight router-
+    tracked sessions. The dashboard surfaces this list and asks the
+    operator to disconnect agents before retrying.
 
     In single-tenant mode (Phase 3) this endpoint returns 410 — the
     project is fixed at module-config time, can't be unregistered
@@ -1512,11 +1553,89 @@ async def unregister_handler(req: web.Request) -> web.StreamResponse:
     # for a missing name rather than silently no-op'ing.
     # `_REGISTRY.unregister()` itself is idempotent-on-missing, which
     # is the right semantics for the registry but the wrong UX here.
-    if name not in _projects_dict():
+    projects = _projects_dict()
+    if name not in projects:
         raise web.HTTPNotFound(reason=f"unknown project: {name!r}")
-    _REGISTRY.unregister(name)
 
+    # Active-session refusal — mirrors the same guard on __rename
+    # (Phase 1b). The dashboard's remove modal pre-fetches the active
+    # agent list and asks the operator to terminate them first, but
+    # we double-check here in case a session opened between modal-open
+    # and confirm-click.
+    conns = active_conns.get(name, 0)
+    if conns > 0:
+        raise web.HTTPConflict(
+            reason=(
+                f"{name!r} has {conns} active connection(s); "
+                f"refusing to unregister"
+            ),
+            text=json.dumps(
+                {
+                    "error": "active_sessions",
+                    "active_connections": conns,
+                    "agents": [],
+                    "reason": (
+                        f"{name!r} has {conns} active connection(s); "
+                        f"disconnect them and retry"
+                    ),
+                }
+            ),
+            content_type="application/json",
+        )
+
+    workspace_path = Path(projects[name])
+    want_delete = _form_truthy(form, "delete_workspace")
+
+    workspace_deleted = False
+    workspace_delete_skipped_reason: str | None = None
+    if want_delete:
+        if not _is_within_default_workspace(workspace_path):
+            workspace_delete_skipped_reason = (
+                f"workspace {workspace_path} resolves outside the "
+                f"default workspace parent; refusing recursive delete"
+            )
+            log.warning(
+                "unregister: %s — %s", name, workspace_delete_skipped_reason
+            )
+        elif workspace_path.exists():
+            import shutil
+            try:
+                shutil.rmtree(workspace_path)
+                workspace_deleted = True
+            except OSError as e:
+                workspace_delete_skipped_reason = (
+                    f"rmtree({workspace_path}) failed: {e.strerror}"
+                )
+                log.warning(
+                    "unregister: %s — %s",
+                    name, workspace_delete_skipped_reason,
+                )
+        else:
+            workspace_delete_skipped_reason = (
+                f"workspace {workspace_path} did not exist on disk"
+            )
+            # Treat as success — the operator's desired end-state is
+            # "no workspace dir", and they have it.
+            workspace_deleted = True
+
+    _REGISTRY.unregister(name)
     _systemctl("stop", _unit_name(name, "backend"))
+
+    wants_json = "application/json" in req.headers.get("Accept", "")
+    if wants_json or want_delete:
+        # The delete-workspace flow always wants the structured body
+        # so the dashboard can surface partial-success (project gone
+        # but workspace skipped). Pure unregister callers without an
+        # explicit Accept header still get the legacy 303 redirect.
+        body = {
+            "unregistered": name,
+            "workspace_deleted": workspace_deleted,
+        }
+        if workspace_delete_skipped_reason is not None:
+            body["workspace_delete_skipped_reason"] = (
+                workspace_delete_skipped_reason
+            )
+        return web.json_response(body, headers={"Cache-Control": "no-store"})
 
     raise web.HTTPSeeOther(location="/agent-mcp/")
 
