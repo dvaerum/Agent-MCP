@@ -101,13 +101,19 @@ def test_auto_seed_passes_baseurl_to_add_server() -> None:
     API root as `baseUrl` so subsequent setActiveServer/health checks
     keep using it instead of `proxy:0`."""
     src = INIT.read_text()
-    # Accept either explicit (`baseUrl: '/agent-mcp/__api/' + name`) or
-    # the shorthand-object form (a `const baseUrl = ...` + `, baseUrl }`
-    # in the addServer call). Both end up persisting the field.
-    assert "/agent-mcp/__api/" in src, (
-        "expected the path-prefix API root literal in "
-        "lib/project-context.ts — needed so the persisted server "
-        "entry knows where to fetch via the router proxy."
+    # PR-B centralised the API URL build in lib/urls.ts; the singleton
+    # now goes through `apiUrl()` instead of templating the URL inline.
+    # The literal lives in lib/urls.ts, the import lives here.
+    assert "apiUrl" in src, (
+        "expected lib/project-context.ts to import the apiUrl() helper "
+        "from lib/urls.ts (PR-B centralisation)"
+    )
+    from pathlib import Path as _P
+    urls_src = _P("agent_mcp/dashboard/lib/urls.ts").read_text()
+    assert "/agent-mcp/api" in urls_src, (
+        "expected the path-prefix API root literal /agent-mcp/api in "
+        "lib/urls.ts — needed so the persisted server entry knows "
+        "where to fetch via the router proxy."
     )
     assert "baseUrl" in src and "addServer" in src, (
         "expected the auto-seed `addServer(...)` call to include a "

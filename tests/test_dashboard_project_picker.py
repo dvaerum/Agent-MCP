@@ -33,11 +33,14 @@ def test_picker_navigates_via_window_location() -> None:
     src = PICKER.read_text()
     assert "window.location.href" in src, (
         "expected picker to navigate via window.location.href = "
-        "'/agent-mcp/__dashboard/<name>/' rather than switching "
-        "server-store entries"
+        "appUrl(<name>) rather than switching server-store entries "
+        "(PR-B routes through lib/urls.ts helpers)"
     )
-    assert "/agent-mcp/__dashboard" in src, (
-        "expected the dashboard URL pattern in navigation"
+    # PR-B centralised URLs in lib/urls.ts; picker now imports
+    # `appUrl()` instead of templating the URL inline.
+    assert "appUrl" in src, (
+        "expected the picker to import appUrl() from lib/urls.ts "
+        "(PR-B centralisation)"
     )
 
 

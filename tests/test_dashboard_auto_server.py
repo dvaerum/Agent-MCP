@@ -32,12 +32,18 @@ def _src() -> str:
 def test_path_prefix_derivation_uses_dashboard_path_regex() -> None:
     """The PathPrefix singleton must inspect window.location.pathname
     for the deployment URL pattern so the dashboard self-bootstraps
-    when mounted under /agent-mcp/__dashboard/<name>/."""
+    when mounted under /agent-mcp/app/<name>/ (PR-B renamed from
+    /__dashboard/). The regex literal moved to lib/urls.ts (PR-B
+    centralisation); project-context.ts imports the matcher."""
     src = _src()
-    assert "/agent-mcp/__dashboard" in src, (
-        "expected the path-prefix regex `/agent-mcp/__dashboard` in "
-        "lib/project-context.ts; derivation only works when the "
-        "deployment URL pattern is detected"
+    assert "APP_PROJECT_PATH_RE" in src, (
+        "expected project-context.ts to import APP_PROJECT_PATH_RE "
+        "from lib/urls.ts (PR-B centralisation)"
+    )
+    urls_src = Path("agent_mcp/dashboard/lib/urls.ts").read_text()
+    assert "/agent-mcp/app" in urls_src, (
+        "expected the path-prefix regex `/agent-mcp/app` in lib/urls.ts; "
+        "derivation only works when the deployment URL pattern is detected"
     )
     assert "window.location.pathname" in src, (
         "expected the singleton to read window.location.pathname "
