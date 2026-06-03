@@ -16,5 +16,6 @@ Adding a new model:
 
 from .agent import Agent
 from .project_context import ProjectContext
+from .task import Task
 
-__all__ = ["Agent", "ProjectContext"]
+__all__ = ["Agent", "ProjectContext", "Task"]
