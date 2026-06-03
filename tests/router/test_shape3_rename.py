@@ -29,7 +29,6 @@ Other PR-B changes pinned by these tests:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Awaitable, Callable
 
 import pytest
 import pytest_asyncio
