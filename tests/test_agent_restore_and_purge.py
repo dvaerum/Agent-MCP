@@ -32,7 +32,7 @@ import secrets
 
 import pytest
 
-from tests.harness import mcp_session
+from tests.harness import mcp_session, seed_agent_rows
 
 
 pytestmark = pytest.mark.asyncio
@@ -248,6 +248,11 @@ async def test_purge_preview_returns_counts(tmp_path) -> None:
     the cascade would tombstone."""
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
+        # bob is referenced via raw _insert_message but never created
+        # as a real worker; seed the agents row so the
+        # agent_messages.{sender_id, recipient_id} FK (PR-G1) accepts
+        # the insert.
+        seed_agent_rows("bob")
         await _terminate(admin, "alice")
 
         # Seed cascade data.
@@ -301,6 +306,7 @@ async def test_purge_cascade_full(tmp_path) -> None:
     """
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
+        seed_agent_rows("bob")  # PR-G1 FK requires the row
         await _terminate(admin, "alice")
 
         # Messages: alice sent some + received some.
@@ -389,6 +395,7 @@ async def test_purge_atomic_on_failure(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         # Bootstrap a different agent + its message that must not be touched.
         await admin.create_worker("alice")
+        seed_agent_rows("bob")  # PR-G1 FK requires the row
         msg = _insert_message("alice", "bob", "untouched")
 
         resp = admin.client.request(

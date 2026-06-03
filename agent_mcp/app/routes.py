@@ -1008,6 +1008,25 @@ async def purge_agent_api_route(request: Request) -> JSONResponse:
         # and to make rollback unambiguous.
         cursor.execute("BEGIN")
         try:
+            # PR-G1: agent_messages.{sender_id, recipient_id} now FK to
+            # agents.agent_id. The tombstone string `[deleted-<id>]`
+            # must therefore exist as an `agents` row before any UPDATE
+            # can rewrite a sender_id/recipient_id to it. INSERT OR
+            # IGNORE so a re-purge (same agent_id, already tombstoned)
+            # is a no-op. The token PK is namespaced under
+            # `__tombstone_` so it can't collide with a real bearer.
+            cursor.execute(
+                "INSERT OR IGNORE INTO agents "
+                "(token, agent_id, capabilities, created_at, status, "
+                " working_directory, color, updated_at) "
+                "VALUES (?, ?, '[]', ?, 'tombstone', '', '#000000', ?)",
+                (
+                    f"__tombstone_{agent_id}",
+                    tombstone,
+                    datetime.datetime.now().isoformat(),
+                    datetime.datetime.now().isoformat(),
+                ),
+            )
             cursor.execute(
                 "UPDATE agent_messages SET sender_id = ? WHERE sender_id = ?",
                 (tombstone, agent_id),

@@ -22,7 +22,7 @@ import secrets
 
 import pytest
 
-from tests.harness import mcp_session
+from tests.harness import mcp_session, seed_agent_rows
 
 
 pytestmark = pytest.mark.asyncio
@@ -546,6 +546,13 @@ async def test_participants_includes_admin_in_live(tmp_path) -> None:
 async def test_participants_lists_tombstones(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
+        # PR-G1 added FK constraints on agent_messages.{sender_id,
+        # recipient_id} -> agents.agent_id. Tombstone strings live in
+        # those columns once an agent is purged; tests that
+        # pre-populate tombstones must seed the agents row too. In
+        # production the cascade in routes.py inserts these rows
+        # automatically before the UPDATE.
+        seed_agent_rows("[deleted-old-worker-1]", "[deleted-old-worker-2]")
         # PR C tombstone marker on a sender_id and a recipient_id.
         _seed_message_with_sender(
             "[deleted-old-worker-1]", recipient_id="alice", content="legacy",
@@ -569,6 +576,8 @@ async def test_participants_lists_tombstones(tmp_path) -> None:
 async def test_participants_tombstones_distinct_and_sorted(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
+        # See test_participants_lists_tombstones for FK seeding rationale.
+        seed_agent_rows("[deleted-zzz]", "[deleted-aaa]")
         # Duplicate the same tombstone across multiple messages; the
         # endpoint must DISTINCT them.
         for _ in range(3):

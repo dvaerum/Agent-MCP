@@ -225,6 +225,52 @@ def _first_text(result: List[mcp_types.TextContent]) -> str:
     return getattr(result[0], "text", "") or ""
 
 
+def seed_agent_rows(*agent_ids: str) -> None:
+    """INSERT OR IGNORE a minimal `agents` row for each id.
+
+    Tests that bypass the public tool surface and write directly to
+    tables that FK -> agents (`agent_messages`, `mcp_sessions`,
+    `claude_code_sessions`, `tasks.assigned_to`) need the referenced
+    `agents.agent_id` to exist or the insert raises
+    `FOREIGN KEY constraint failed`.
+
+    `admin` is pre-seeded by lifespan startup; only worker agents
+    need this helper. The synthetic rows mirror what `create_worker`
+    does, minus the per-token bookkeeping — `token` here is generated
+    deterministically from the agent_id so re-calling the helper for
+    the same id is a no-op (INSERT OR IGNORE on the `agent_id` UNIQUE
+    constraint, but the PK on `token` also needs to be unique per
+    distinct id).
+    """
+    from agent_mcp.db.connection import get_db_connection
+
+    if not agent_ids:
+        return
+    now = _dt.datetime.now().isoformat()
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        for agent_id in agent_ids:
+            cursor.execute(
+                "INSERT OR IGNORE INTO agents (token, agent_id, "
+                "capabilities, created_at, status, working_directory, "
+                "color, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    f"__test_seed_{agent_id}",
+                    agent_id,
+                    "[]",
+                    now,
+                    "active",
+                    "/tmp",
+                    "#888",
+                    now,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _is_unauthorized(text: str) -> bool:
     if not text:
         return False

@@ -45,7 +45,7 @@ import hashlib
 
 import pytest
 
-from tests.harness import mcp_session
+from tests.harness import mcp_session, seed_agent_rows
 
 
 pytestmark = pytest.mark.asyncio
@@ -66,6 +66,7 @@ async def test_register_returns_session_id_and_persists_row(tmp_path) -> None:
     from agent_mcp.db.connection import get_db_connection
 
     async with mcp_session(tmp_path):
+        seed_agent_rows("alice")
         sid1 = reg.register_session(agent_id="alice", bearer_token="raw-token-1")
         sid2 = reg.register_session(agent_id="alice", bearer_token="raw-token-2")
         assert isinstance(sid1, str) and sid1
@@ -96,6 +97,7 @@ async def test_unregister_removes_row(tmp_path) -> None:
     from agent_mcp.db.connection import get_db_connection
 
     async with mcp_session(tmp_path):
+        seed_agent_rows("bob")
         sid = reg.register_session(agent_id="bob", bearer_token="tok-bob")
         reg.unregister_session(sid)
         conn = get_db_connection()
@@ -128,6 +130,7 @@ async def test_touch_session_updates_last_seen(tmp_path) -> None:
     from agent_mcp.db.connection import get_db_connection
 
     async with mcp_session(tmp_path):
+        seed_agent_rows("carol")
         sid = reg.register_session(agent_id="carol", bearer_token="t")
         # Force a different timestamp by reaching past the registry's
         # internal clock — the simplest reliable way is to overwrite the
@@ -166,6 +169,7 @@ async def test_sessions_for_agent_returns_only_matching(tmp_path) -> None:
     from agent_mcp.core import session_registry as reg
 
     async with mcp_session(tmp_path):
+        seed_agent_rows("alice", "bob")
         a1 = reg.register_session(agent_id="alice", bearer_token="t-a1")
         a2 = reg.register_session(agent_id="alice", bearer_token="t-a2")
         reg.register_session(agent_id="bob", bearer_token="t-b1")
@@ -181,6 +185,7 @@ async def test_all_sessions_returns_every_row(tmp_path) -> None:
     from agent_mcp.core import session_registry as reg
 
     async with mcp_session(tmp_path):
+        seed_agent_rows("alice", "bob", "carol")
         a = reg.register_session(agent_id="alice", bearer_token="t-a")
         b = reg.register_session(agent_id="bob", bearer_token="t-b")
         c = reg.register_session(agent_id="carol", bearer_token="t-c")
@@ -194,6 +199,7 @@ async def test_expire_stale_removes_old_sessions(tmp_path) -> None:
     from agent_mcp.db.connection import get_db_connection
 
     async with mcp_session(tmp_path):
+        seed_agent_rows("alice")
         fresh = reg.register_session(agent_id="alice", bearer_token="t-fresh")
         stale = reg.register_session(agent_id="alice", bearer_token="t-stale")
 
@@ -245,6 +251,7 @@ async def test_runtime_queue_attaches_and_detaches(tmp_path) -> None:
     from agent_mcp.core import session_registry as reg
 
     async with mcp_session(tmp_path):
+        seed_agent_rows("alice")
         sid = reg.register_session(agent_id="alice", bearer_token="t")
         q = asyncio.Queue()
         reg.attach_runtime_queue(sid, q)
@@ -267,6 +274,7 @@ async def test_fanout_enqueues_to_every_attached_session_for_agent(
     from agent_mcp.core import session_registry as reg
 
     async with mcp_session(tmp_path):
+        seed_agent_rows("alice", "bob")
         sid_a = reg.register_session(agent_id="alice", bearer_token="t-a")
         sid_b = reg.register_session(agent_id="alice", bearer_token="t-b")
         sid_c = reg.register_session(agent_id="bob", bearer_token="t-c")
@@ -292,6 +300,7 @@ async def test_fanout_to_all_enqueues_to_every_attached_session(
     from agent_mcp.core import session_registry as reg
 
     async with mcp_session(tmp_path):
+        seed_agent_rows("alice", "bob")
         sid_a = reg.register_session(agent_id="alice", bearer_token="t-a")
         sid_b = reg.register_session(agent_id="bob", bearer_token="t-b")
         qa = asyncio.Queue()
