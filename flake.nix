@@ -1,8 +1,8 @@
 {
-  description = "Agent-MCP — multi-agent coordination MCP server (NixOS VM for e2e tests)";
+  description = "Agent-MCP — multi-agent coordination MCP server (packages, home-manager module, and NixOS VM for e2e tests)";
 
   # Pinning to nixos-unstable keeps the dashboard's Next.js 15 + Node
-  # 22 toolchain available; the 24.11 / 25.05 releases also work.
+  # 22 toolchain available; the 25.05 / 25.11 releases also work.
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs = { self, nixpkgs, ... }:
@@ -11,15 +11,25 @@
       pkgs = import nixpkgs { inherit system; };
       lib = nixpkgs.lib;
 
+      # ── Production package set (Phase 2) ─────────────────────────
+      # The home-manager module's default package set. Mirrors the
+      # nixos-developer-system deployment derivations 1:1; see
+      # nix/packages.nix for the per-derivation rationale.
+      productionPkgs = import ./nix/packages.nix {
+        inherit pkgs lib;
+        src = self;
+      };
+
+      # ── VM package set (older NixOS-module flake, kept for tests) ──
       # Re-usable builders for the Python package, the dashboard, the
       # router wrapper, etc. The two modes differ only in
       # assetPrefix; the dashboard derivation hard-bakes that prefix.
-      mkPkgs = assetPrefix: import ./nix/package.nix {
+      mkVmPkgs = assetPrefix: import ./nix/package.nix {
         inherit pkgs lib assetPrefix;
         src = self;
       };
-      pkgsMulti = mkPkgs "/agent-mcp/__dashboard";
-      pkgsSingle = mkPkgs "";
+      vmPkgsMulti = mkVmPkgs "/agent-mcp/__dashboard";
+      vmPkgsSingle = mkVmPkgs "";
 
       # NixOS VM builder. `mode` selects the systemd shape via
       # services.agent-mcp.mode in nix/vm.nix.
@@ -54,15 +64,26 @@
           --prefix PATH : ${lib.makeBinPath [ pkgs.qemu pkgs.coreutils pkgs.bash ]}
       '';
     in {
+      # ── packages ────────────────────────────────────────────────
+      # The three top-level packages the home-manager module consumes
+      # (agent-mcp, agent-mcp-dashboard, agent-mcp-router-wrapper) plus
+      # the legacy VM-flavoured packages and the qemu run script.
       packages.${system} = {
-        agent-mcp = pkgsMulti.agentMcpPy;
-        agent-mcp-dashboard = pkgsMulti.agentMcpDashboard;
-        agent-mcp-dashboard-single = pkgsSingle.agentMcpDashboard;
-        agent-mcp-router = pkgsMulti.agentMcpRouter;
+        # Phase 2 production set (consumed by the home-manager module).
+        agent-mcp = productionPkgs.agentMcpPy;
+        agent-mcp-dashboard = productionPkgs.agentMcpDashboard;
+        agent-mcp-router-wrapper = productionPkgs.agentMcpRouterWrapper;
+        default = productionPkgs.agentMcpPy;
+
+        # Legacy VM/test packages. The dashboard variant with empty
+        # assetPrefix supports the WIP single-tenant URL surface
+        # (Phase 3 owns the toggle that selects between the two).
+        agent-mcp-dashboard-single = vmPkgsSingle.agentMcpDashboard;
+        agent-mcp-router = vmPkgsMulti.agentMcpRouter;
         vm = vmMulti;
         vm-multi = vmMulti;
         vm-single = vmSingle;
-        default = runScript;
+        vm-run = runScript;
       };
 
       apps.${system}.default = {
@@ -70,14 +91,31 @@
         program = "${runScript}/bin/agent-mcp";
       };
 
+      # ── home-manager module (Phase 2) ───────────────────────────
+      # User-scope module exposing `services.agent-mcp.*` options.
+      # See nix/README.md for the worked example.
+      #
+      # We wrap the bare module so that its `source` option defaults
+      # to `self` — operators who import this flake's
+      # `homeManagerModules.default` don't have to repeat the fork's
+      # repo path themselves.
+      homeManagerModules.default = { ... }: {
+        imports = [ ./nix/home-manager-module.nix ];
+        services.agent-mcp.source = lib.mkDefault self;
+      };
+      homeManagerModules.agent-mcp = self.homeManagerModules.default;
+
+      # ── NixOS module (legacy, used by VM tests only) ────────────
       nixosModules.default = ./nix/module.nix;
       nixosModules.agent-mcp = ./nix/module.nix;
 
-      # `nix flake check` smoke test: just build the python package
-      # and the dashboard. Building the full VM is too heavy for CI.
+      # `nix flake check` smoke test: build the python package + the
+      # dashboard + the router wrapper. Building the full VM is too
+      # heavy for CI.
       checks.${system} = {
-        agent-mcp = pkgsMulti.agentMcpPy;
-        agent-mcp-dashboard = pkgsMulti.agentMcpDashboard;
+        agent-mcp = productionPkgs.agentMcpPy;
+        agent-mcp-dashboard = productionPkgs.agentMcpDashboard;
+        agent-mcp-router-wrapper = productionPkgs.agentMcpRouterWrapper;
       };
     };
 }
