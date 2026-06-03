@@ -1,14 +1,9 @@
-# ── ONE-TIME VENDORED COPY ───────────────────────────────────────────
-# This file is a verbatim snapshot of
-# /home/dennis/nixos-developer-system/users/dennis/agent-mcp/project_registry.py
-# (deploy repo), pulled in at Phase 0 of the router-upstream plan
-# (prancy-napping-pie). Its sole purpose is to give the pytest suite
-# something concrete to assert against while the source still lives in
-# the deploy repo. It is INTENTIONALLY identical to the source — do
-# NOT edit. If the deploy file changes, this snapshot stays stale until
-# Phase 1, which deletes this entire `_fixtures/` directory and moves
-# router.py + project_registry.py to their permanent in-tree home.
-# ─────────────────────────────────────────────────────────────────────
+# ── MOVED-UPSTREAM SOURCE ───────────────────────────────────────────
+# Was: nixos-developer-system/users/dennis/agent-mcp/project_registry.py
+# Now: agent_mcp/router/project_registry.py — moved upstream in Phase
+# 1a of the router-upstream plan (prancy-napping-pie). Imported as a
+# sibling module from agent_mcp.router.app.
+# ────────────────────────────────────────────────────────────────────
 """Pure JSON project registry — the locking store backing the file
 `~/.config/agent-mcp/projects.local.json` that the router consults on
 every request and the dashboard mutates via __create / __unregister.

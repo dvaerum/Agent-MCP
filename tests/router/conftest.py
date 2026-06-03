@@ -1,9 +1,9 @@
-"""Test fixtures for the vendored router.py + project_registry.py.
+"""Test fixtures for ``agent_mcp.router.app`` + ``…project_registry``.
 
 The router module reads a fistful of environment variables at import
 time (``AGENT_MCP_PROJECTS_FILE``, ``AGENT_MCP_SOCK_DIR``, …) and also
-``read_text()``s the installer template — so we can't just ``import
-router`` from anywhere; we have to set those env vars first and we
+``read_text()``s the installer template — so we can't just import the
+module from anywhere; we have to set those env vars first and we
 have to make the import side-effects test-scoped.
 
 The pattern below: every test that touches the router goes through
@@ -13,10 +13,10 @@ fixture:
 1.  Builds a fresh tmp directory tree (projects file, sock dir,
     dashboard dir, installer template).
 2.  Sets all the env vars the router expects.
-3.  Drops ``router`` + ``project_registry`` out of ``sys.modules``
-    so the next ``import router`` re-executes module-level code
+3.  Drops ``agent_mcp.router.app`` + ``…project_registry`` out of
+    ``sys.modules`` so the next import re-executes module-level code
     against the new env.
-4.  Imports both modules and patches ``router._systemctl`` to a
+4.  Imports both modules and patches ``app._systemctl`` to a
     recording stub — the real ``systemctl --user`` call would either
     no-op (returncode 4) or actually start backend systemd units in a
     test environment, neither of which is what we want.
@@ -26,11 +26,10 @@ The ``aiohttp_client`` fixture (from pytest-aiohttp, declared in
 ``pyproject.toml``'s dev deps) wraps this app in a ``TestClient`` /
 ``TestServer`` pair on demand.
 
-The ``_fixtures/`` directory next to this file holds verbatim copies
-of the router + registry source (see header comments there). The
-``sys.path`` insertion below makes them importable as top-level
-``router`` and ``project_registry`` modules, exactly as they are in
-the deploy repo.
+Phase 0 used a ``_fixtures/`` directory next to this file holding
+verbatim copies of the source. Phase 1a (this commit) moved the
+source upstream to ``agent_mcp/router/`` — the fixtures directory
+and ``sys.path`` shim are gone.
 """
 
 from __future__ import annotations
@@ -44,14 +43,6 @@ from pathlib import Path
 from typing import Callable
 
 import pytest
-
-# Make the vendored router + project_registry importable. This MUST run
-# before any `import router` anywhere in the suite — keeping the path
-# munging in conftest.py (which pytest imports before any test module)
-# is the cleanest way.
-_FIXTURES = Path(__file__).parent / "_fixtures"
-if str(_FIXTURES) not in sys.path:
-    sys.path.insert(0, str(_FIXTURES))
 
 
 # ── Env scaffolding ─────────────────────────────────────────────────
@@ -166,16 +157,20 @@ def router_module(
     systemctl_stub: _SystemctlRecorder,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Import the vendored router with all side-effects test-scoped.
+    """Import ``agent_mcp.router.app`` with all side-effects test-scoped.
 
     Each test that requests this fixture gets a freshly re-imported
     module — module-level state (token cache, last_active, ensure
     locks, the global registry handle) is reset by definition.
     """
     # Drop any prior copy so module-level env reads run again.
-    for mod_name in ("router", "project_registry"):
+    for mod_name in (
+        "agent_mcp.router",
+        "agent_mcp.router.app",
+        "agent_mcp.router.project_registry",
+    ):
         sys.modules.pop(mod_name, None)
-    router = importlib.import_module("router")
+    router = importlib.import_module("agent_mcp.router.app")
     monkeypatch.setattr(router, "_systemctl", systemctl_stub)
     # The reaper/reconcile hooks call _systemctl too; stub already
     # handles that, but the reaper itself never runs in unit tests

@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# agent-mcp client installer.
+# Merge `agent-mcp` into an existing .mcp.json, or create one if
+# missing. Idempotent: re-running replaces only the `agent-mcp`
+# entry, leaving other servers untouched.
+#
+# Usage:
+#   curl -fsSL '.../agent-mcp/__client-installer/<name>.sh?agent=<id>' | bash
+#   # or save to a specific file:
+#   curl -fsSL '.../agent-mcp/__client-installer/<name>.sh?agent=<id>' \
+#     | bash -s -- ./.mcp.json
+#
+# The /mcp URL and the chosen agent's token are substituted into the
+# template by the router at request time. The router refuses if the
+# project / agent doesn't exist, so by the time this script runs
+# you've already verified that.
+#
+# Transport: Streamable HTTP (MCP spec rev 2025-03-26). The legacy
+# SSE+messages pair (type=sse) was retired in dvaerum/Agent-MCP 3.0.0.
+set -euo pipefail
+
+TARGET="${1:-.mcp.json}"
+TOKEN="__AGENT_MCP_AGENT_TOKEN__"
+URL="__AGENT_MCP_MCP_URL__"
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "agent-mcp installer: jq is required" >&2
+  exit 1
+fi
+
+ENTRY="$(jq -nc \
+  --arg url "$URL" \
+  --arg auth "Bearer $TOKEN" \
+  '{type:"http", url:$url, headers:{Authorization:$auth}}')"
+
+if [[ -f "$TARGET" ]]; then
+  TMP="$(mktemp "$(dirname "$TARGET")/.mcp.json.XXXXXX")"
+  trap 'rm -f "$TMP"' EXIT
+  jq --argjson new "$ENTRY" '
+    .mcpServers = ((.mcpServers // {}) | .["agent-mcp"] = $new)
+  ' "$TARGET" > "$TMP"
+  mv "$TMP" "$TARGET"
+  trap - EXIT
+  echo "agent-mcp installer: merged into $TARGET"
+else
+  jq -n --argjson new "$ENTRY" '{mcpServers: {"agent-mcp": $new}}' > "$TARGET"
+  echo "agent-mcp installer: created $TARGET"
+fi

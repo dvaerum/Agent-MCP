@@ -34,7 +34,7 @@ import pytest
 @pytest.fixture
 def registry_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Repoint the registry's global REGISTRY_PATH at a tmp file."""
-    import project_registry
+    from agent_mcp.router import project_registry
 
     path = tmp_path / "projects.local.json"
     monkeypatch.setattr(project_registry, "REGISTRY_PATH", path)
@@ -43,7 +43,7 @@ def registry_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.fixture
 def reg(registry_path: Path):
-    import project_registry
+    from agent_mcp.router import project_registry
 
     return project_registry.ProjectRegistry()
 

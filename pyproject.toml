@@ -71,6 +71,7 @@ include = ["agent_mcp*"]
     "migrations/README",
     "migrations/versions/*.py",
     "prompts/*.json",
+    "router/*.in",
 ]
 
 [tool.rye]
