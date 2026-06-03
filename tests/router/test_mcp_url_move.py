@@ -110,6 +110,9 @@ async def test_descriptor_advertises_new_mcp_prefix(
 # ── Internal MCP URL helper ─────────────────────────────────────────
 
 
+# Bypass the module-level asyncio mark for this sync test by checking
+# the helper directly. pytest-asyncio will warn on the mark mismatch
+# but the test still runs fine; the warning is filtered in CI.
 def test_mcp_url_for_helper_returns_new_shape(router_module) -> None:
     """The router's internal ``_mcp_url_for`` helper builds the URL
     embedded in .mcp.json client configs (via /__client-config). It

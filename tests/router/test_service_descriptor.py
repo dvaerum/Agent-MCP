@@ -118,7 +118,9 @@ async def test_index_returns_service_descriptor_for_json_client(
     assert eps["api"] == "/agent-mcp/api"
     assert eps["app"] == "/agent-mcp/app"
     assert eps["assets"] == "/agent-mcp/assets"
-    assert eps["mcp"] == "/agent-mcp"
+    # PR-D moved the MCP transport to /agent-mcp/mcp/<name>; the
+    # descriptor advertises the parent prefix.
+    assert eps["mcp"] == "/agent-mcp/mcp"
     # Discovery links the dashboard's two READ entry points so a plain
     # HTTP client can iterate projects without scraping HTML.
     assert body["projects_url"] == "/agent-mcp/__projects"

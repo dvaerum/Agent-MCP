@@ -16,7 +16,7 @@
  *   /agent-mcp/app/<name>/<sec>  — section deep-link (e.g. /tasks, /agents)
  *   /agent-mcp/api/<name>/<rest> — REST surface (strict Accept gate, PR-A)
  *   /agent-mcp/assets/<rest>     — Next.js static bundle (sentinel-substituted)
- *   /agent-mcp/<name>/mcp        — MCP transport (PR-D moves to /mcp/<name>)
+ *   /agent-mcp/mcp/<name>        — MCP transport (PR-D Shape-3 move)
  *
  * Direct router endpoints (NOT yet renamed in PR-B — PR-C folds them
  * into POST /api/projects):
@@ -74,12 +74,11 @@ export function assetsUrl(path?: string): string {
   return `${ASSETS}/${path.replace(/^\/+/, "")}`
 }
 
-/** MCP transport URL for a project. PR-B keeps the per-project shape
- *  /agent-mcp/<name>/mcp; PR-D will rewrite this to /agent-mcp/mcp/<name>.
- *  Callers that build MCP-client config strings MUST go through this
- *  helper so the PR-D move is a one-line change. */
+/** MCP transport URL for a project (PR-D Shape-3:
+ *  /agent-mcp/mcp/<name>). Callers that build MCP-client config
+ *  strings go through this helper so the URL shape is centralised. */
 export function mcpUrl(projectName: string, origin: string = ""): string {
-  return `${origin}${ROOT}/${encodeURIComponent(projectName)}/mcp`
+  return `${origin}${ROOT}/mcp/${encodeURIComponent(projectName)}`
 }
 
 /** Direct router-internal endpoints (not yet under /api/). PR-C will

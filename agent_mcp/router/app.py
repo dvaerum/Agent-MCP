@@ -2318,8 +2318,15 @@ async def unregister_handler(req: web.Request) -> web.StreamResponse:
 
 
 def _mcp_url_for(name: str) -> str:
-    """Public URL of the project's Streamable HTTP /mcp endpoint."""
-    return f"{EXTERNAL_URL}/agent-mcp/{name}/mcp"
+    """Public URL of the project's Streamable HTTP /mcp endpoint.
+
+    PR-D Shape-3 move: from /agent-mcp/<name>/mcp to /agent-mcp/mcp/<name>.
+    This URL is what /__client-config and /__client-installer bake into
+    the .mcp.json file operators download — so this helper is the
+    one-line change that propagates the new shape to every wiring
+    surface.
+    """
+    return f"{EXTERNAL_URL}/agent-mcp/mcp/{name}"
 
 
 def _mcp_json_for(name: str, *, token: str | None = None) -> dict:
@@ -2518,15 +2525,38 @@ def _service_descriptor() -> dict:
             "api": "/agent-mcp/api",
             "app": "/agent-mcp/app",
             "assets": "/agent-mcp/assets",
-            # PR-D will fold this into /agent-mcp/mcp/<name>; today the
-            # MCP transport is at /agent-mcp/<name>/mcp so the parent
-            # prefix is just /agent-mcp.
-            "mcp": "/agent-mcp",
+            # PR-D folded the MCP transport into a top-level /mcp/
+            # prefix; clients append /<name> to reach a given project's
+            # transport.
+            "mcp": "/agent-mcp/mcp",
         },
         "projects_url": "/agent-mcp/__projects",
         "overview_url": "/agent-mcp/__overview",
         "single_tenant_project": SINGLE_TENANT_NAME,
     }
+
+
+def _make_mcp_url_redirect():
+    """Return an aiohttp handler that 308-redirects the legacy MCP URL
+    ``/agent-mcp/<name>/mcp`` to the PR-D Shape-3 location
+    ``/agent-mcp/mcp/<name>``.
+
+    The path components shuffle (the project name moves from a
+    middle segment to a trailing one), so this is a different shape
+    transformation than ``_make_rename_redirect`` — that one rewrites
+    a leading prefix, this one peels a trailing literal off and
+    reorders.
+    """
+    async def handler(req: web.Request) -> web.Response:
+        name = req.match_info["name"]
+        # Drop any URL query string back onto the new location so it
+        # rides through the redirect.
+        qs = req.rel_url.raw_query_string
+        target = f"/agent-mcp/mcp/{name}"
+        if qs:
+            target = f"{target}?{qs}"
+        raise web.HTTPPermanentRedirect(location=target)
+    return handler
 
 
 def _make_rename_redirect(old_prefix: str, new_prefix: str):
@@ -2725,15 +2755,22 @@ def make_app(
 
     # Backend operations.
     #
-    # /agent-mcp/<name>/mcp is the Streamable HTTP transport
-    # (dvaerum/Agent-MCP 3.0.0; MCP spec rev 2025-03-26). PR-D will move
-    # this to /agent-mcp/mcp/<name>; PR-B keeps the per-project shape so
-    # the dashboard + REST rename can land without the MCP client-config
-    # rewrite churn that PR-D will carry. The four reserved names (api,
-    # app, assets, mcp) ensure no project shadows a top-level segment;
-    # see ``_validate_name``.
+    # PR-D moved the MCP Streamable HTTP transport (dvaerum/Agent-MCP
+    # 3.0.0; MCP spec rev 2025-03-26) from /agent-mcp/<name>/mcp to
+    # the Shape-3 /agent-mcp/mcp/<name> top-level prefix. The four
+    # reserved names (api, app, assets, mcp) — declared in
+    # ``_validate_name`` — ensure no project shadows the top-level
+    # segments now that `mcp` is one of them.
     app.router.add_route(
-        "*", "/agent-mcp/{name}/mcp", backend_mcp_handler
+        "*", "/agent-mcp/mcp/{name}", backend_mcp_handler
+    )
+    # Old path 308-redirects for ~30 days so MCP clients on the
+    # pre-PR-D shape keep working until operators rotate their
+    # .mcp.json files. 308 preserves method + body so the POST that
+    # carries an initialize body survives the redirect.
+    app.router.add_route(
+        "*", "/agent-mcp/{name}/mcp",
+        _make_mcp_url_redirect(),
     )
     # PR-C: REST resource shape for project lifecycle.
     #

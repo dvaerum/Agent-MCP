@@ -151,19 +151,21 @@ async def test_single_tenant_dashboard_bare_wrong_name_redirects(
 async def test_single_tenant_mcp_wrong_name_redirects(
     aiohttp_client, single_tenant_app,
 ) -> None:
-    """Wrong-project MCP URL → 302 to the configured project's /mcp.
+    """Wrong-project MCP URL → W1 redirect to the configured project's
+    MCP URL.
 
-    We don't follow the redirect (the backend isn't real in unit
-    tests); the assertion is on the redirect target itself.
-    """
+    PR-D moved the MCP path from /agent-mcp/<name>/mcp to
+    /agent-mcp/mcp/<name>; this test uses the new shape. The W1
+    single-tenant substitution swaps the project name segment, which
+    in the new shape is the last segment."""
     client = await aiohttp_client(single_tenant_app)
     resp = await client.post(
-        "/agent-mcp/some-other-project/mcp",
+        "/agent-mcp/mcp/some-other-project",
         headers={"Authorization": "Bearer dummy-token"},
         allow_redirects=False,
     )
     assert resp.status == 302
-    assert resp.headers["Location"] == "/agent-mcp/only-project/mcp"
+    assert resp.headers["Location"] == "/agent-mcp/mcp/only-project"
 
 
 async def test_single_tenant_api_wrong_name_redirects(
