@@ -220,14 +220,18 @@ async def test_new_assets_path_serves_next_static_bundle(
     aiohttp_client, router_app, write_dashboard_file,
 ) -> None:
     """Assets move from /agent-mcp/__dashboard/_next/<rest> to
-    /agent-mcp/assets/<rest> — a top-level prefix, decoupled from the
-    /app/ pages path. Tested via a JS file under _next/static/ (the
-    on-disk layout Next.js emits) since that's what asset_prefix
-    substitution actually rewrites references to."""
+    /agent-mcp/assets/_next/<rest> — the parent prefix is renamed
+    to a top-level segment, but Next.js's own ``_next/`` artifact
+    stays in the URL because that's what the dashboard's webpack
+    runtime emits in chunk-resolution code (the sentinel substitution
+    replaces only the prefix, not the ``_next`` suffix Next.js
+    appends in its own runtime). New default ASSET_PREFIX is
+    /agent-mcp/assets, so the substituted HTML/JS emits this URL
+    shape."""
     write_dashboard_file("_next/static/chunks/main.js", "console.log('asset')")
     client = await aiohttp_client(router_app)
 
-    resp = await client.get("/agent-mcp/assets/static/chunks/main.js")
+    resp = await client.get("/agent-mcp/assets/_next/static/chunks/main.js")
 
     assert resp.status == 200
     assert "console.log" in await resp.text()
@@ -248,9 +252,12 @@ async def test_old_assets_path_redirects_to_new(
     )
 
     assert resp.status == 308
+    # The _next/ tail under __dashboard/ redirects to /assets/_next/
+    # rather than /app/_next/ — the assets bundle is top-level after
+    # PR-B, decoupled from the dashboard pages path.
     assert (
         resp.headers["Location"]
-        == "/agent-mcp/assets/static/chunks/main.js"
+        == "/agent-mcp/assets/_next/static/chunks/main.js"
     )
 
 

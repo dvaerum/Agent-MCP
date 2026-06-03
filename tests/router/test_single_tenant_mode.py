@@ -117,31 +117,31 @@ async def test_single_tenant_dashboard_wrong_name_redirects(
     # single-tenant project. Disable client-side redirect-follow so we
     # observe the 302 itself rather than its target.
     resp = await client.get(
-        "/agent-mcp/__dashboard/some-other-project/tasks/",
+        "/agent-mcp/app/some-other-project/tasks/",
         allow_redirects=False,
     )
     assert resp.status == 302
     assert (
         resp.headers["Location"]
-        == "/agent-mcp/__dashboard/only-project/tasks/"
+        == "/agent-mcp/app/only-project/tasks/"
     )
 
 
 async def test_single_tenant_dashboard_bare_wrong_name_redirects(
     aiohttp_client, single_tenant_app,
 ) -> None:
-    """The bare ``/__dashboard/<name>`` (no trailing slash) form is a
+    """The bare ``/app/<name>`` (no trailing slash) form is a
     real route too — make sure W1 redirect catches it before the
     bare→trailing-slash 301 fires."""
     client = await aiohttp_client(single_tenant_app)
     resp = await client.get(
-        "/agent-mcp/__dashboard/some-other-project/",
+        "/agent-mcp/app/some-other-project/",
         allow_redirects=False,
     )
     assert resp.status == 302
     assert (
         resp.headers["Location"]
-        == "/agent-mcp/__dashboard/only-project/"
+        == "/agent-mcp/app/only-project/"
     )
 
 
@@ -174,14 +174,14 @@ async def test_single_tenant_api_wrong_name_redirects(
     test must opt in to the gate to reach the redirect path."""
     client = await aiohttp_client(single_tenant_app)
     resp = await client.get(
-        "/agent-mcp/__api/some-other-project/agents",
+        "/agent-mcp/api/some-other-project/agents",
         headers={"Accept": "application/vnd.agent-mcp.v1+json"},
         allow_redirects=False,
     )
     assert resp.status == 302
     assert (
         resp.headers["Location"]
-        == "/agent-mcp/__api/only-project/agents"
+        == "/agent-mcp/api/only-project/agents"
     )
 
 
@@ -197,7 +197,7 @@ async def test_single_tenant_configured_name_no_redirect(
     write_dashboard_file("index.html", "<html>only</html>")
     client = await aiohttp_client(single_tenant_app)
     resp = await client.get(
-        "/agent-mcp/__dashboard/only-project/",
+        "/agent-mcp/app/only-project/",
         allow_redirects=False,
     )
     assert resp.status == 200

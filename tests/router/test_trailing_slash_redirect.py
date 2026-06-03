@@ -3,18 +3,18 @@ dashboard URL to canonical trailing-slash form).
 
 Why this matters: the dashboard's index.html embeds asset URLs
 relative to the request path. Without a trailing slash on
-``/agent-mcp/__dashboard/<name>``, the browser resolves
-``<script src="_next/static/...">`` against ``/agent-mcp/__dashboard``
-(the bare segment) instead of ``/agent-mcp/__dashboard/<name>/``,
+``/agent-mcp/app/<name>``, the browser resolves
+``<script src="_next/static/...">`` against ``/agent-mcp/app``
+(the bare segment) instead of ``/agent-mcp/app/<name>/``,
 fetches give 404, the page renders blank.
 
 aiohttp's own automatic trailing-slash matching was off the table —
 it only kicks in for paths without dynamic segments. The fix was an
 explicit redirect route. This test pins both arms:
 
-  1. ``GET /agent-mcp/__dashboard/<name>`` returns 301 to
-     ``/agent-mcp/__dashboard/<name>/`` (with the slash).
-  2. ``GET /agent-mcp/__dashboard/<name>/<section>`` (no trailing
+  1. ``GET /agent-mcp/app/<name>`` returns 301 to
+     ``/agent-mcp/app/<name>/`` (with the slash).
+  2. ``GET /agent-mcp/app/<name>/<section>`` (no trailing
      slash on the section) is handled by the dashboard handler /
      SPA fallback — NOT by the redirect. Pinning this arm is what
      would have caught a botched fix that scoped the redirect too
@@ -38,7 +38,7 @@ async def test_bare_dashboard_name_redirects_to_trailing_slash(
     client = await aiohttp_client(router_app)
 
     resp = await client.get(
-        "/agent-mcp/__dashboard/myproj", allow_redirects=False,
+        "/agent-mcp/app/myproj", allow_redirects=False,
     )
 
     assert resp.status == 301, (
@@ -46,13 +46,13 @@ async def test_bare_dashboard_name_redirects_to_trailing_slash(
         "must redirect to the canonical trailing-slash form so the "
         "embedded relative asset URLs in index.html resolve correctly"
     )
-    assert resp.headers["Location"] == "/agent-mcp/__dashboard/myproj/"
+    assert resp.headers["Location"] == "/agent-mcp/app/myproj/"
 
 
 async def test_bare_dashboard_section_does_not_redirect(
     aiohttp_client, router_app, write_dashboard_file,
 ) -> None:
-    """``/agent-mcp/__dashboard/myproj/tasks`` (one segment past the
+    """``/agent-mcp/app/myproj/tasks`` (one segment past the
     project name, no trailing slash) must NOT 301 — it's a routing
     target handled by the dashboard handler's SPA fallback. A 301
     here would mean the redirect is scoped too widely and is eating
@@ -62,7 +62,7 @@ async def test_bare_dashboard_section_does_not_redirect(
     client = await aiohttp_client(router_app)
 
     resp = await client.get(
-        "/agent-mcp/__dashboard/myproj/tasks", allow_redirects=False,
+        "/agent-mcp/app/myproj/tasks", allow_redirects=False,
     )
 
     assert resp.status == 200, (
@@ -83,7 +83,7 @@ async def test_bare_dashboard_redirect_uses_match_info_name(
 
     for name in ("alpha", "b", "long-hyphenated-name"):
         resp = await client.get(
-            f"/agent-mcp/__dashboard/{name}", allow_redirects=False,
+            f"/agent-mcp/app/{name}", allow_redirects=False,
         )
         assert resp.status == 301
-        assert resp.headers["Location"] == f"/agent-mcp/__dashboard/{name}/"
+        assert resp.headers["Location"] == f"/agent-mcp/app/{name}/"

@@ -13,30 +13,28 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { useProjectsStore } from "@/lib/stores/projects-store"
+import { APP_PROJECT_PATH_RE, appUrl, overviewAppUrl } from "@/lib/urls"
 
 // Patched for the NixOS deployment. Upstream's picker switches
 // between server-store entries (each = (host, port)). Our router
-// addresses projects by URL path: /agent-mcp/__dashboard/<name>/.
-// So the picker fetches the project list from the router and
-// picking an entry navigates the browser instead of swapping a
-// host:port pair.
+// addresses projects by URL path: /agent-mcp/app/<name>/ (PR-B
+// renamed from /__dashboard/<name>/). So the picker fetches the
+// project list from the router and picking an entry navigates the
+// browser instead of swapping a host:port pair.
 //
 // Phase 3.5b (prancy-napping-pie decision #10): the picker now reads
 // from the new useProjectsStore (backed by /__overview) so it can
 // learn the router's tenancy mode in the same payload. Behaviour:
 //
 //   * Multi-tenant: prepend an "← All projects" entry that navigates
-//     to /agent-mcp/__dashboard/ (the cross-project overview).
+//     to /agent-mcp/app/ (the cross-project overview).
 //   * Single-tenant: the dropdown is disabled, showing only the
 //     configured project name with a small "single-tenant" badge.
 //     There's nowhere else for the operator to go.
 
-const DASHBOARD_PREFIX = "/agent-mcp/__dashboard/"
-const OVERVIEW_PATH = "/agent-mcp/__dashboard/"
-
 function readActiveProjectName(): string | null {
   if (typeof window === "undefined") return null
-  const m = window.location.pathname.match(/\/agent-mcp\/__dashboard\/([^/]+)/)
+  const m = window.location.pathname.match(APP_PROJECT_PATH_RE)
   return m ? m[1] : null
 }
 
@@ -68,7 +66,7 @@ export function ProjectPicker() {
       setIsOpen(false)
       return
     }
-    window.location.href = `${DASHBOARD_PREFIX}${encodeURIComponent(name)}/`
+    window.location.href = appUrl(name)
   }
 
   // Single-tenant: render a disabled button that only shows the
@@ -126,7 +124,7 @@ export function ProjectPicker() {
 
         {/* "← All projects" entry — only in multi-tenant mode (decision #10). */}
         <DropdownMenuItem
-          onClick={() => (window.location.href = OVERVIEW_PATH)}
+          onClick={() => (window.location.href = overviewAppUrl())}
           className="flex items-center p-3 cursor-pointer"
         >
           <ArrowLeft className="h-4 w-4 mr-3 text-muted-foreground" />
@@ -145,7 +143,7 @@ export function ProjectPicker() {
           {projects.length === 0 && !loading && !error && (
             <div className="p-3 text-xs text-muted-foreground">
               No projects registered. Use the{" "}
-              <a href={OVERVIEW_PATH} className="underline">
+              <a href={overviewAppUrl()} className="underline">
                 overview
               </a>{" "}
               to add one.

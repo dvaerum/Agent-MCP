@@ -18,6 +18,7 @@
 //   * 400 (anything else)   — show the router's reason text verbatim.
 
 import React, { useState } from "react"
+import { appUrl } from "@/lib/urls"
 import { Loader2, Pencil } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import {
@@ -108,8 +109,8 @@ export function RenameProjectModal({
       // dashboard's project-context is keyed on path, so without this
       // the next page-load would render the old name.
       if (typeof window !== "undefined") {
-        const newPath = `/agent-mcp/__dashboard/${encodeURIComponent(newName)}/`
-        window.location.href = newPath
+        // appUrl already encodeURIComponent's the project name.
+        window.location.href = appUrl(newName)
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))

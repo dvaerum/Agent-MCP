@@ -10,13 +10,13 @@
  *   - share-links could not deep-link into a specific section.
  *
  * This hook makes the URL the source of truth via `?page=<section>`,
- * e.g. `/agent-mcp/__dashboard/<project>/?page=tasks`.
+ * e.g. `/agent-mcp/app/<project>/?page=tasks`.
  *
  * Why query-param vs proper route segments. The dashboard is a single
  * client page that swaps a `currentView` enum — route segments would
  * require restructuring app/ into `app/[section]/page.tsx` files and
  * coordinating with the path-prefix adapter (PR #56) that mounts the
- * dashboard at `/agent-mcp/__dashboard/<project>/`. Query-param is a
+ * dashboard at `/agent-mcp/app/<project>/`. Query-param is a
  * one-file change and works with the existing mount unchanged.
  *
  * Why a dedicated hook vs inlining useSearchParams in page.tsx. So

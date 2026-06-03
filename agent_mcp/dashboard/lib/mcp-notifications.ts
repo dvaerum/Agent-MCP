@@ -20,11 +20,11 @@
  *
  * URL plumbing
  * ------------
- * The dashboard mounts at `/agent-mcp/__dashboard/<name>/...` and the
- * REST API at `/agent-mcp/__api/<name>` (Candidate C path-prefix
- * adapter, lib/project-context.ts). The MCP Streamable HTTP endpoint
- * for the same project is at `/agent-mcp/<name>/mcp` — NOT the
- * `__api` prefix; that's the REST proxy. The dashboard's
+ * The dashboard mounts at `/agent-mcp/app/<name>/...` and the REST
+ * API at `/agent-mcp/api/<name>` (PR-B renamed both from /__dashboard/
+ * and /__api/ respectively). The MCP Streamable HTTP endpoint for the
+ * same project is at `/agent-mcp/<name>/mcp` — NOT the /api/ prefix;
+ * that's the REST proxy. The dashboard's
  * `apiClient.createEventSource('/mcp')` would concatenate '/mcp'
  * onto baseUrl and hit the REST proxy prefix (a 404 — the router
  * doesn't expose /mcp under the REST root). We therefore build the
@@ -73,6 +73,7 @@
 
 import { useDataStore, notifyPromptsListChanged } from "./stores/data-store"
 import { projectContext } from "./project-context"
+import { mcpUrl } from "./urls"
 
 // -- URL construction -----------------------------------------------------
 
@@ -89,7 +90,10 @@ import { projectContext } from "./project-context"
  */
 export function mcpUrlForProject(): string {
   if (projectContext.projectName) {
-    return `/agent-mcp/${projectContext.projectName}/mcp`
+    // PR-B: route through the shared URL helper. PR-D will move the
+    // MCP path to /agent-mcp/mcp/<name>; that change becomes a
+    // one-line edit in lib/urls.ts.
+    return mcpUrl(projectContext.projectName)
   }
   // Standalone: prefer the apiClient baseUrl's origin if it's an
   // absolute URL (the `setServer(host, port)` path). Otherwise fall

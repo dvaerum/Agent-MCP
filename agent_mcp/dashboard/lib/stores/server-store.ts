@@ -12,8 +12,9 @@ export interface MCPServer {
   lastConnected?: string
   description?: string
   // When set, the entry represents a path-prefix-mounted backend
-  // reachable at this API root (e.g. `/agent-mcp/__api/<name>`)
-  // instead of `http://host:port/api`. setActiveServer /
+  // reachable at this API root (e.g. `/agent-mcp/api/<name>`, PR-B
+  // renamed from /__api/) instead of `http://host:port/api`.
+  // setActiveServer /
   // checkServerHealth honor this via apiClient.setBaseUrl, and the
   // UI hides the host:port row.
   baseUrl?: string
