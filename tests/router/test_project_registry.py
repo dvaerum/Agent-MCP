@@ -23,12 +23,19 @@ Coverage matches the original Candidate B contract pinned on
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+
+
+def _iso(dt: datetime) -> str:
+    """ISO-8601 UTC with a trailing Z — the storage format aliases use."""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @pytest.fixture
@@ -249,3 +256,149 @@ def test_lockfile_inode_stable_across_rewrites(reg, registry_path: Path) -> None
         "registry file inode unchanged after a write — register() "
         "may be truncating in place instead of using os.replace"
     )
+
+
+# ── 7. Nested-shape data model + aliases (Phase 1b) ─────────────────
+
+
+def test_legacy_flat_shape_reads_with_empty_aliases(
+    reg, registry_path: Path,
+) -> None:
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text(
+        json.dumps({"alpha": "/tmp/alpha", "beta": "/tmp/beta"})
+    )
+    rows = reg.list()
+    assert {r["name"] for r in rows} == {"alpha", "beta"}
+    for row in rows:
+        assert row["aliases"] == []
+
+
+def test_nested_shape_reads_with_populated_aliases(
+    reg, registry_path: Path,
+) -> None:
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    future = _iso(datetime.now(timezone.utc) + timedelta(days=10))
+    registry_path.write_text(
+        json.dumps(
+            {
+                "alpha": {
+                    "workspace": "/tmp/alpha",
+                    "aliases": [{"name": "older", "expires_at": future}],
+                }
+            }
+        )
+    )
+    row = reg.get("alpha")
+    assert row["workspace"] == "/tmp/alpha"
+    assert row["aliases"] == [{"name": "older", "expires_at": future}]
+
+
+def test_read_only_does_not_rewrite_legacy_file(
+    reg, registry_path: Path,
+) -> None:
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    original = json.dumps({"alpha": "/tmp/alpha"})
+    registry_path.write_text(original)
+
+    reg.list()
+    reg.get("alpha")
+    reg.resolve_alias("nope")
+
+    # File contents must be byte-identical (no auto-upgrade on read).
+    assert registry_path.read_text() == original
+
+
+def test_write_upgrades_legacy_file_to_nested_shape(
+    reg, registry_path: Path,
+) -> None:
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text(json.dumps({"alpha": "/tmp/alpha"}))
+
+    reg.register("beta", "/tmp/beta")  # any write triggers upgrade
+
+    data = json.loads(registry_path.read_text())
+    assert data["alpha"] == {"workspace": "/tmp/alpha", "aliases": []}
+    assert data["beta"] == {"workspace": "/tmp/beta", "aliases": []}
+
+
+def test_add_alias_default_expiry_is_30_days(reg) -> None:
+    reg.register("alpha", "/tmp/alpha")
+    before = datetime.now(timezone.utc)
+    reg.add_alias("alpha", "ancient")
+    after = datetime.now(timezone.utc)
+    row = reg.get("alpha")
+    assert len(row["aliases"]) == 1
+    expires = datetime.fromisoformat(
+        row["aliases"][0]["expires_at"].replace("Z", "+00:00")
+    )
+    assert before + timedelta(days=30) - timedelta(minutes=1) <= expires
+    assert expires <= after + timedelta(days=30) + timedelta(minutes=1)
+
+
+def test_add_alias_rejects_collision_with_real_name(reg) -> None:
+    reg.register("alpha", "/tmp/alpha")
+    reg.register("beta", "/tmp/beta")
+    with pytest.raises(ValueError):
+        reg.add_alias("alpha", "beta")
+
+
+def test_add_alias_rejects_collision_with_active_alias(reg) -> None:
+    reg.register("alpha", "/tmp/alpha")
+    reg.register("beta", "/tmp/beta")
+    reg.add_alias("alpha", "shared")
+    with pytest.raises(ValueError):
+        reg.add_alias("beta", "shared")
+
+
+def test_add_alias_rejects_bad_slug(reg) -> None:
+    reg.register("alpha", "/tmp/alpha")
+    with pytest.raises(ValueError):
+        reg.add_alias("alpha", "Bad_Slug")
+
+
+def test_resolve_alias_returns_name_for_matching_alias(reg) -> None:
+    reg.register("real", "/tmp/real")
+    reg.add_alias("real", "old")
+    assert reg.resolve_alias("old") == "real"
+    assert reg.resolve_alias("not-an-alias") is None
+
+
+def test_resolve_alias_skips_expired(reg) -> None:
+    reg.register("real", "/tmp/real")
+    past = _iso(datetime.now(timezone.utc) - timedelta(seconds=1))
+    reg.add_alias("real", "stale", expires_at=past)
+    assert reg.resolve_alias("stale") is None
+
+
+def test_expire_alias_removes_entry(reg) -> None:
+    reg.register("real", "/tmp/real")
+    reg.add_alias("real", "old")
+    reg.expire_alias("real", "old")
+    assert reg.get("real")["aliases"] == []
+
+
+def test_rename_keeps_old_name_as_alias(reg) -> None:
+    reg.register("old", "/tmp/work")
+    reg.rename("old", "new", grace_days=14)
+
+    assert reg.get("old") is None
+    row = reg.get("new")
+    # Workspace path is NOT touched by the data-model layer — the
+    # caller (router endpoint) is responsible for the dir rename.
+    assert row["workspace"] == "/tmp/work"
+    assert len(row["aliases"]) == 1
+    assert row["aliases"][0]["name"] == "old"
+    assert reg.resolve_alias("old") == "new"
+
+
+def test_rename_rejects_when_new_name_exists(reg) -> None:
+    reg.register("alpha", "/tmp/alpha")
+    reg.register("beta", "/tmp/beta")
+    with pytest.raises(ValueError):
+        reg.rename("alpha", "beta")
+
+
+def test_rename_rejects_unknown_old_name(reg) -> None:
+    with pytest.raises(KeyError):
+        reg.rename("nope", "yep")

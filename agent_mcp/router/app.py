@@ -96,6 +96,7 @@ Configuration (all via environment variables):
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -108,6 +109,9 @@ from urllib.parse import quote, urlencode
 from aiohttp import ClientSession, ClientTimeout, UnixConnector, web
 
 from . import project_registry  # sibling module — see ./project_registry.py
+
+
+log = logging.getLogger(__name__)
 
 # ── Configuration ────────────────────────────────────────────────────
 
@@ -364,8 +368,43 @@ async def _ensure(name: str, role: str) -> Path:
 # ── Backend proxy ────────────────────────────────────────────────────
 
 
+def _resolve_project_or_alias(name: str) -> tuple[str, dict | None]:
+    """Return (real_name, alias_entry) for the URL segment `name`.
+
+    `alias_entry` is None if `name` is itself a real project, or the
+    matching ``{"name", "expires_at"}`` alias entry if `name` is a
+    grace-period alias of some other project. Raises ``HTTPNotFound``
+    if neither resolution succeeds.
+
+    Used by the backend MCP + REST proxy handlers to support the
+    Phase 1b alias-with-grace-period decision (#4 in the plan):
+    requests to an alias URL are transparently re-pointed at the
+    backend for the real project, with a sentinel header injected so
+    the backend can later surface the deprecation warning to clients
+    (Phase 1c — `serverInfo.instructions`).
+    """
+    row = _REGISTRY.get(name)
+    if row is not None:
+        return name, None
+    real_name = _REGISTRY.resolve_alias(name)
+    if real_name is None:
+        raise web.HTTPNotFound(reason=f"unknown project: {name!r}")
+    # Re-read the real project's row to find the alias entry's
+    # expires_at — `resolve_alias` only returns the name, so we look
+    # it up here to populate the X-Agent-MCP-Alias header.
+    real_row = _REGISTRY.get(real_name)
+    alias_entry: dict | None = None
+    if real_row is not None:
+        for entry in real_row.get("aliases", []):
+            if entry.get("name") == name:
+                alias_entry = entry
+                break
+    return real_name, alias_entry
+
+
 async def _proxy_to_backend(
     req: web.Request, name: str, backend_path: str,
+    *, alias_info: tuple[str, str] | None = None,
 ) -> web.StreamResponse:
     """Proxy `req` to the backend for `name`, asking it for `backend_path`.
 
@@ -391,6 +430,13 @@ async def _proxy_to_backend(
         k: v for k, v in req.headers.items()
         if k.lower() not in ("host", "content-length")
     }
+    # Phase 1b: if this request arrived on an alias URL, tell the
+    # backend so it can later (Phase 1c) inject a deprecation warning
+    # into the MCP `serverInfo.instructions` field. The header shape
+    # is "<alias_name>,<expires_at>" so the backend gets both halves
+    # in a single header read.
+    if alias_info is not None:
+        headers["X-Agent-MCP-Alias"] = f"{alias_info[0]},{alias_info[1]}"
     timeout = ClientTimeout(total=None, sock_read=None)
     connector = UnixConnector(path=str(sock))
 
@@ -495,10 +541,23 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
     bearer = _extract_bearer(req)
     if bearer is None:
         raise _unauthorized()
-    tokens = await _agent_token_map(name)
+    # Resolve alias → real project. The token map is fetched against
+    # the *real* project because alias resolution is transparent;
+    # tokens are not per-alias.
+    real_name, alias_entry = _resolve_project_or_alias(name)
+    tokens = await _agent_token_map(real_name)
     if bearer not in tokens:
         raise _unauthorized()
-    return await _proxy_to_backend(req, name, "/mcp")
+    alias_info: tuple[str, str] | None = None
+    if alias_entry is not None:
+        # Stash on the request too so downstream observers (Phase 1c
+        # telemetry, future audit log) can pick it up.
+        req["resolved_via_alias"] = name
+        req["resolved_project"] = real_name
+        alias_info = (name, alias_entry.get("expires_at", ""))
+    return await _proxy_to_backend(
+        req, real_name, "/mcp", alias_info=alias_info,
+    )
 
 
 async def legacy_sse_gone_handler(req: web.Request) -> web.Response:
@@ -522,8 +581,15 @@ async def legacy_messages_gone_handler(req: web.Request) -> web.Response:
 async def backend_api_handler(req: web.Request) -> web.StreamResponse:
     """/agent-mcp/__api/<name>/{rest} → backend /api/{rest}"""
     rest = req.match_info.get("rest", "")
+    name = req.match_info["name"]
+    real_name, alias_entry = _resolve_project_or_alias(name)
+    alias_info: tuple[str, str] | None = None
+    if alias_entry is not None:
+        req["resolved_via_alias"] = name
+        req["resolved_project"] = real_name
+        alias_info = (name, alias_entry.get("expires_at", ""))
     return await _proxy_to_backend(
-        req, req.match_info["name"], f"/api/{rest}"
+        req, real_name, f"/api/{rest}", alias_info=alias_info,
     )
 
 
@@ -776,6 +842,64 @@ async def reaper(app: web.Application) -> None:
                 last_active.pop(key, None)
 
 
+# ── Alias reaper ────────────────────────────────────────────────────
+
+
+# Cadence between alias-reaper ticks. The grace period for aliases is
+# measured in days (default 30), so a 60 s tick gives near-instant
+# cleanup of past-due aliases without paying for a tighter loop. Held
+# at module scope so tests can monkeypatch to a smaller value.
+_ALIAS_REAPER_INTERVAL_SEC = 60
+
+
+async def _alias_reaper_tick(registry: project_registry.ProjectRegistry) -> None:
+    """Single pass over the registry, removing any alias whose
+    `expires_at` is in the past. Emits one INFO log line per removal.
+
+    Extracted from the loop so tests can call it directly with a
+    deterministic registry instance — the loop wrapper just wakes up,
+    calls this, and goes back to sleep.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    for row in registry.list():
+        name = row["name"]
+        for entry in list(row.get("aliases", []) or []):
+            alias_name = entry.get("name")
+            expires_at = entry.get("expires_at", "")
+            if not alias_name or not expires_at:
+                continue
+            try:
+                exp = project_registry._parse_iso(expires_at)
+            except (TypeError, ValueError):
+                # Malformed entry — leave it; the operator can clean
+                # up by hand and we don't want to silently drop data
+                # we can't reason about.
+                continue
+            if exp <= now:
+                registry.expire_alias(name, alias_name)
+                log.info(
+                    "Alias %r for project %r expired and was removed.",
+                    alias_name, name,
+                )
+
+
+async def alias_reaper(app: web.Application) -> None:
+    """Long-running background task: every
+    ``_ALIAS_REAPER_INTERVAL_SEC`` seconds, sweep the registry for
+    aliases whose grace period has lapsed. Idempotent w.r.t.
+    concurrent rename/add_alias — `expire_alias` is a write-locked
+    operation.
+    """
+    while True:
+        await asyncio.sleep(_ALIAS_REAPER_INTERVAL_SEC)
+        try:
+            await _alias_reaper_tick(_REGISTRY)
+        except Exception:
+            log.exception("alias reaper tick failed; will retry next pass")
+
+
 async def reconcile_on_startup(app: web.Application) -> None:
     """Adopt already-running backend units after a router restart."""
     r = _systemctl(
@@ -907,6 +1031,190 @@ async def stop_handler(req: web.Request) -> web.StreamResponse:
         )
     raise web.HTTPSeeOther(
         location="/agent-mcp/?" + urlencode({"stopped": name})
+    )
+
+
+async def rename_handler(req: web.Request) -> web.StreamResponse:
+    """POST /agent-mcp/__rename — rename a project with a grace-period alias.
+
+    Form-encoded body: ``old_name``, ``new_name``, optional
+    ``grace_days`` (default 30). Plan decision #4 (locked) makes this
+    a *full* rename: the workspace dir is moved on disk, the systemd
+    unit name follows the new project name, per-agent token files
+    are moved, and the old name is parked as an alias of the new
+    name for ``grace_days`` days.
+
+    The order of operations matters: side-effects (stop unit + move
+    dir + move tokens) happen BEFORE the registry write so a partial
+    failure leaves the on-disk state in a recoverable place. If the
+    workspace path doesn't end in ``/<old_name>`` (operator-customised
+    layout), we skip the directory rename — the caller can rename
+    by hand.
+
+    Refusals:
+
+      * 400 if either name fails the slug regex.
+      * 409 if ``new_name`` is already a project or active alias.
+      * 409 if ``old_name`` has any in-flight MCP/REST connections,
+        with the active-connection count surfaced in the body so the
+        operator knows what's blocking them.
+      * 404 if ``old_name`` isn't registered.
+    """
+    form = await req.post()
+    old_name = (form.get("old_name") or "").strip()
+    new_name = (form.get("new_name") or "").strip()
+    grace_raw = (form.get("grace_days") or "").strip()
+    try:
+        grace_days = int(grace_raw) if grace_raw else 30
+    except ValueError:
+        raise web.HTTPBadRequest(reason=f"grace_days must be an integer; got {grace_raw!r}")
+
+    if not _SLUG_RE.match(old_name):
+        raise web.HTTPBadRequest(
+            reason=f"old_name must match {_SLUG_RE.pattern}"
+        )
+    if not _SLUG_RE.match(new_name):
+        raise web.HTTPBadRequest(
+            reason=f"new_name must match {_SLUG_RE.pattern}"
+        )
+    if old_name == new_name:
+        raise web.HTTPBadRequest(reason="old_name and new_name are identical")
+
+    old_row = _REGISTRY.get(old_name)
+    if old_row is None:
+        raise web.HTTPNotFound(reason=f"unknown project: {old_name!r}")
+
+    # Conflict check before doing any side-effects. The registry's
+    # own `rename()` would catch this too, but doing it here keeps
+    # the error a 409 instead of a 500-out-of-ValueError.
+    if _REGISTRY.get(new_name) is not None:
+        raise web.HTTPConflict(
+            reason=f"project {new_name!r} is already registered",
+            text=json.dumps(
+                {
+                    "error": "name_taken",
+                    "reason": f"project {new_name!r} is already registered",
+                }
+            ),
+            content_type="application/json",
+        )
+    # Active alias collision check — `_REGISTRY.rename()` does this
+    # too, but again, we want a 409 not a 500.
+    if _REGISTRY.resolve_alias(new_name) is not None:
+        raise web.HTTPConflict(
+            reason=f"name {new_name!r} is an active alias",
+            text=json.dumps(
+                {
+                    "error": "alias_collision",
+                    "reason": f"name {new_name!r} is an active alias",
+                }
+            ),
+            content_type="application/json",
+        )
+
+    # In-flight session refusal. `active_conns` is the router's
+    # in-process per-(name) counter, incremented by `_track_connection`
+    # at proxy entry and decremented on exit. Note this does NOT
+    # cover sessions opened against the backend directly (bypassing
+    # the router), but for the deploy-shape the deployed router is
+    # the only ingress, so this counter is exhaustive.
+    conns = active_conns.get(old_name, 0)
+    if conns > 0:
+        raise web.HTTPConflict(
+            reason=(
+                f"{old_name!r} has {conns} active connection(s); "
+                f"refusing to rename"
+            ),
+            text=json.dumps(
+                {
+                    "error": "active_sessions",
+                    "active_connections": conns,
+                    "agents": [],  # per-agent attribution arrives in 1c
+                    "reason": (
+                        f"{old_name!r} has {conns} active connection(s); "
+                        f"disconnect them and retry"
+                    ),
+                }
+            ),
+            content_type="application/json",
+        )
+
+    # Side-effects, in order.
+    #
+    # 1) Stop the systemd unit for the old name. Idempotent: a
+    #    project that was never started just no-ops.
+    _systemctl("stop", _unit_name(old_name, "backend"))
+
+    # 2) Move the workspace dir if the path looks like .../<old_name>.
+    #    Custom layouts (operators who pointed a project at a path
+    #    that doesn't end in <old_name>) are left alone — they can
+    #    rename by hand.
+    workspace = Path(old_row.get("workspace", ""))
+    new_workspace: Path | None = None
+    if workspace.name == old_name and workspace.exists():
+        new_workspace = workspace.with_name(new_name)
+        try:
+            os.rename(workspace, new_workspace)
+        except OSError as e:
+            raise web.HTTPInternalServerError(
+                reason=f"could not rename workspace dir: {e.strerror}"
+            )
+
+    # 3) Move the per-agent token files. The on-disk naming follows
+    #    `<project>--<agent>.token`; we glob for the old prefix and
+    #    rename in place. Token dir lives at
+    #    ~/.config/agent-mcp/tokens; missing dir is fine (no agents).
+    token_dir = (
+        Path(os.environ.get("AGENT_MCP_TOKENS_DIR", ""))
+        or (Path.home() / ".config" / "agent-mcp" / "tokens")
+    )
+    if token_dir.is_dir():
+        for tok in token_dir.glob(f"{old_name}--*.token"):
+            suffix = tok.name[len(old_name) + len("--"):]
+            try:
+                tok.rename(token_dir / f"{new_name}--{suffix}")
+            except OSError as e:
+                log.warning(
+                    "rename: token rename %s → %s--%s failed: %s",
+                    tok, new_name, suffix, e.strerror,
+                )
+
+    # 4) Registry write last — if anything above raised, the on-disk
+    #    state still has the old registry entry pointing at a missing
+    #    workspace, which is a clear "rollback by hand" situation
+    #    rather than the silently-broken alternative.
+    try:
+        _REGISTRY.rename(old_name, new_name, grace_days=grace_days)
+    except (ValueError, KeyError) as e:
+        # Best-effort rollback: put the workspace dir back. We don't
+        # try to undo the unit stop (systemd will start on next
+        # request) or token renames (those are idempotent on retry).
+        if new_workspace is not None and new_workspace.exists():
+            try:
+                os.rename(new_workspace, workspace)
+            except OSError:
+                pass
+        raise web.HTTPInternalServerError(
+            reason=f"registry rename failed: {e}"
+        )
+
+    # Final response — the operator gets the alias's expiry so they
+    # know when to expect the alias to disappear.
+    new_row = _REGISTRY.get(new_name)
+    alias_expires_at = ""
+    for entry in (new_row or {}).get("aliases", []) or []:
+        if entry.get("name") == old_name:
+            alias_expires_at = entry.get("expires_at", "")
+            break
+
+    return web.json_response(
+        {
+            "renamed": True,
+            "old": old_name,
+            "new": new_name,
+            "alias_expires_at": alias_expires_at,
+        },
+        headers={"Cache-Control": "no-store"},
     )
 
 
@@ -1414,10 +1722,17 @@ async def _start_reaper_task(app: web.Application) -> None:
     asyncio.create_task(reaper(app))
 
 
+async def _start_alias_reaper_task(app: web.Application) -> None:
+    """Spawn the alias reaper coroutine on app startup. Mirrors the
+    pattern used by `_start_reaper_task` for the idle-backend reaper."""
+    asyncio.create_task(alias_reaper(app))
+
+
 def make_app() -> web.Application:
     app = web.Application()
     app.on_startup.append(reconcile_on_startup)
     app.on_startup.append(_start_reaper_task)
+    app.on_startup.append(_start_alias_reaper_task)
     app.on_cleanup.append(shutdown)
 
     # Index + project lifecycle.
@@ -1431,6 +1746,7 @@ def make_app() -> web.Application:
     app.router.add_post("/agent-mcp/__create-agent", create_agent_handler)
     app.router.add_post("/agent-mcp/__stop", stop_handler)
     app.router.add_post("/agent-mcp/__unregister", unregister_handler)
+    app.router.add_post("/agent-mcp/__rename", rename_handler)
 
     # Client wiring helpers.
     app.router.add_get(

@@ -32,12 +32,29 @@ possible — but the alternative (refusing to start, or silently
 returning whatever subset parses) leaves the dashboard wedged with
 no recovery path.
 
-File-on-disk shape: the historical `{name: "<workspace-string>"}`
-flat mapping. We preserve this shape on disk because the bash
-launcher (`users/dennis/agent-mcp/default.nix`'s `agentMcpLauncher`)
-reads it via `jq -er '.[$n]'` and expects a plain string back; a
-nested `{workspace: ...}` shape would break the launcher silently
-and the systemd template would refuse to start any project.
+On-disk shape (Phase 1b update). Two shapes are accepted on READ:
+
+  Legacy (pre-Phase-1b)::
+
+      {"<name>": "<workspace-string>", ...}
+
+  Nested (current)::
+
+      {"<name>": {"workspace": "<path>",
+                  "aliases": [{"name": "<old>", "expires_at": "<iso>"}],
+                  **extra},
+       ...}
+
+The legacy shape is upgraded lazily: a read returns synthesised
+records (`aliases: []`) without touching the file, and any write
+rewrites the whole file in the nested shape. This keeps a router
+that boots-and-idles from mutating the operator's file out from
+under them, while ensuring any registration / alias / rename touch
+upgrades on the way out. The bash launcher
+(`users/dennis/agent-mcp/default.nix`'s `agentMcpLauncher`) used
+the legacy shape via `jq -er '.[$n]'`, expecting a plain string back;
+since the launcher reads via the same Python registry now (the
+router shells out to nothing), the nested shape is the steady state.
 
 Any `extra` kwargs passed to `register()` are accepted at the API
 boundary but are NOT persisted today — there's no in-tree consumer
@@ -47,8 +64,10 @@ own commit + deploy + rollback story.
 
 Public surface — see class docstrings for the contract:
 
-    Project          : TypedDict {"name", "workspace", **extra}
+    Project          : TypedDict {"name", "workspace", "aliases", **extra}
+    Alias            : TypedDict {"name": str, "expires_at": str}
     ProjectRegistry  : list / get / register / unregister
+                      add_alias / expire_alias / resolve_alias / rename
     REGISTRY_PATH    : module-level Path, overridable in tests
 """
 
@@ -58,12 +77,13 @@ import fcntl
 import json
 import logging
 import os
+import re
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, TypedDict
 
-__all__ = ["Project", "ProjectRegistry", "REGISTRY_PATH"]
+__all__ = ["Alias", "Project", "ProjectRegistry", "REGISTRY_PATH"]
 
 
 log = logging.getLogger(__name__)
@@ -81,13 +101,52 @@ REGISTRY_PATH: Path = Path(
 )
 
 
+# Slug regex used to validate project names AND alias names. Kept in
+# sync with the router-side `_SLUG_RE` in agent_mcp/router/app.py —
+# duplicated here so the registry can validate aliases without a
+# circular import.
+_SLUG_RE = re.compile(r"^[a-z](?:[a-z0-9-]*[a-z0-9])?$")
+
+# Default grace period for `add_alias` when the caller doesn't pass
+# `expires_at`. The plan (decision #4) locks this at 30 days; we
+# expose it as a module constant so tests / operators can tune.
+DEFAULT_ALIAS_GRACE_DAYS: int = 30
+
+
+class Alias(TypedDict):
+    """One alias entry — a name that resolves to the parent project
+    until `expires_at` passes. Stored ISO-8601 UTC with a trailing Z."""
+
+    name: str
+    expires_at: str
+
+
 class Project(TypedDict, total=False):
-    """One project record. `name` and `workspace` are required; any
-    other keys are passed through opaque so the dashboard can stash
-    e.g. `created_at` without this module needing a schema bump."""
+    """One project record. `name`, `workspace`, and `aliases` are
+    always populated by the registry's reader; any other keys are
+    passed through opaque so the dashboard can stash e.g. `created_at`
+    without this module needing a schema bump."""
 
     name: str
     workspace: str
+    aliases: list[Alias]
+
+
+def _now_iso() -> str:
+    """ISO-8601 UTC seconds-precision, with a trailing Z. The format
+    aliases are stored in on disk."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_iso(s: str) -> datetime:
+    """Parse the format produced by `_now_iso()` plus any tz-aware
+    ISO string Python accepts. Used by `resolve_alias` to filter out
+    past-due aliases."""
+    # `datetime.fromisoformat` understands a trailing `+00:00` on
+    # 3.10+, but the `Z` shorthand requires 3.11. Strip it.
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s)
 
 
 class ProjectRegistry:
@@ -179,11 +238,9 @@ class ProjectRegistry:
                 # rather than rewriting the file.
                 return existing_row
 
-            # Flat string shape: matches the legacy on-disk format
-            # the bash launcher's `jq -er '.[$n]'` expects.
-            data[name] = workspace
-            self._write_locked(fd, data)
-            return self._materialise(name, workspace)
+            data[name] = self._make_record(workspace, aliases=[])
+            self._write_locked(fd, self._normalise_for_write(data))
+            return self._materialise(name, data[name])
 
     def unregister(self, name: str) -> None:
         """Drop `name` from the registry. No-op if not present."""
@@ -191,7 +248,175 @@ class ProjectRegistry:
             if name not in data:
                 return
             data.pop(name)
-            self._write_locked(fd, data)
+            self._write_locked(fd, self._normalise_for_write(data))
+
+    # ── Alias API (Phase 1b) ───────────────────────────────────────
+
+    def add_alias(
+        self,
+        name: str,
+        alias: str,
+        expires_at: str | None = None,
+    ) -> None:
+        """Append `alias` to `name`'s alias list with the given expiry.
+
+        Default expiry is `now + DEFAULT_ALIAS_GRACE_DAYS` (30 days).
+        Validation under LOCK_EX:
+
+          * `alias` must match the project-name slug regex.
+          * `alias` must not collide with any existing project name.
+          * `alias` must not collide with any *currently active*
+            alias for some other project. (Expired aliases are
+            allowed to be reclaimed — `resolve_alias` would never
+            return them anyway, so reclamation is safe and useful
+            after a long-overdue cleanup.)
+
+        Raises:
+            ValueError: on any validation failure.
+            KeyError: if `name` is not a registered project.
+        """
+        if not _SLUG_RE.match(alias):
+            raise ValueError(
+                f"alias {alias!r} is not a valid slug — must match "
+                f"{_SLUG_RE.pattern}"
+            )
+
+        if expires_at is None:
+            expires_at = (
+                datetime.now(timezone.utc)
+                + timedelta(days=DEFAULT_ALIAS_GRACE_DAYS)
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        with self._lock_for_write() as (fd, data):
+            if name not in data:
+                raise KeyError(name)
+
+            if alias in data:
+                raise ValueError(
+                    f"alias {alias!r} collides with a real project name"
+                )
+
+            now = datetime.now(timezone.utc)
+            for other_name, payload in data.items():
+                if other_name == name:
+                    continue
+                for entry in self._aliases_of(payload):
+                    if entry["name"] != alias:
+                        continue
+                    try:
+                        entry_exp = _parse_iso(entry["expires_at"])
+                    except (KeyError, ValueError):
+                        # Malformed entry — treat as expired.
+                        continue
+                    if entry_exp > now:
+                        raise ValueError(
+                            f"alias {alias!r} is already an active alias "
+                            f"for project {other_name!r}"
+                        )
+
+            record = self._coerce_to_record(data[name])
+            record["aliases"].append(
+                {"name": alias, "expires_at": expires_at}
+            )
+            data[name] = record
+            self._write_locked(fd, self._normalise_for_write(data))
+
+    def expire_alias(self, name: str, alias: str) -> None:
+        """Remove `alias` from `name`'s alias list. No-op if absent."""
+        with self._lock_for_write() as (fd, data):
+            if name not in data:
+                return
+            record = self._coerce_to_record(data[name])
+            record["aliases"] = [
+                a for a in record["aliases"] if a.get("name") != alias
+            ]
+            data[name] = record
+            self._write_locked(fd, self._normalise_for_write(data))
+
+    def resolve_alias(self, maybe_alias: str) -> str | None:
+        """If `maybe_alias` matches a non-expired alias of some
+        project, return that project's real name. Otherwise None.
+
+        O(N) over registered projects — N is small (per-host single-
+        digit to low-double-digit), and the read happens behind the
+        existing per-request snapshot the router already does, so
+        the cost is invisible.
+        """
+        data = self._read_locked()
+        now = datetime.now(timezone.utc)
+        for real_name, payload in data.items():
+            for entry in self._aliases_of(payload):
+                if entry.get("name") != maybe_alias:
+                    continue
+                try:
+                    exp = _parse_iso(entry["expires_at"])
+                except (KeyError, ValueError):
+                    continue
+                if exp > now:
+                    return real_name
+        return None
+
+    def rename(
+        self,
+        old_name: str,
+        new_name: str,
+        grace_days: int = DEFAULT_ALIAS_GRACE_DAYS,
+    ) -> None:
+        """Atomically rename `old_name` to `new_name`, parking
+        `old_name` as a grace-period alias on the new record.
+
+        Does **not** move the workspace directory on disk nor restart
+        any systemd unit — that's the calling endpoint's job
+        (`agent_mcp.router.app.rename_handler`). This method only
+        rewrites the registry file.
+
+        Raises:
+            KeyError: if `old_name` isn't registered.
+            ValueError: if `new_name` is invalid or already taken
+                (project or active alias).
+        """
+        if not _SLUG_RE.match(new_name):
+            raise ValueError(
+                f"new name {new_name!r} is not a valid slug — must match "
+                f"{_SLUG_RE.pattern}"
+            )
+
+        expires_at = (
+            datetime.now(timezone.utc) + timedelta(days=grace_days)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        with self._lock_for_write() as (fd, data):
+            if old_name not in data:
+                raise KeyError(old_name)
+            if new_name in data:
+                raise ValueError(
+                    f"project {new_name!r} is already registered"
+                )
+
+            now = datetime.now(timezone.utc)
+            for other_name, payload in data.items():
+                if other_name == old_name:
+                    continue
+                for entry in self._aliases_of(payload):
+                    if entry.get("name") != new_name:
+                        continue
+                    try:
+                        exp = _parse_iso(entry["expires_at"])
+                    except (KeyError, ValueError):
+                        continue
+                    if exp > now:
+                        raise ValueError(
+                            f"name {new_name!r} is already an active "
+                            f"alias for project {other_name!r}"
+                        )
+
+            record = self._coerce_to_record(data[old_name])
+            record["aliases"].append(
+                {"name": old_name, "expires_at": expires_at}
+            )
+            data[new_name] = record
+            del data[old_name]
+            self._write_locked(fd, self._normalise_for_write(data))
 
     # ── Internals: locking, parsing, corrupt-recovery ──────────────
 
@@ -319,25 +544,96 @@ class ProjectRegistry:
             tmp_path.unlink(missing_ok=True)
             raise
 
+    # ── Shape normalisation ────────────────────────────────────────
+
+    @staticmethod
+    def _make_record(workspace: str, *, aliases: list[Alias]) -> dict[str, Any]:
+        """Build a fresh nested-shape record for `register()`."""
+        return {"workspace": workspace, "aliases": list(aliases)}
+
+    @staticmethod
+    def _coerce_to_record(payload: Any) -> dict[str, Any]:
+        """Return a mutable nested-shape record for `payload`.
+
+        Accepts either a legacy string payload OR an existing nested
+        dict; returns a copy with `workspace` and `aliases` guaranteed
+        present, ready for mutation.
+        """
+        if isinstance(payload, str):
+            return {"workspace": payload, "aliases": []}
+        if isinstance(payload, dict):
+            workspace = payload.get("workspace", "")
+            aliases = payload.get("aliases") or []
+            if not isinstance(aliases, list):
+                aliases = []
+            # Shallow copy keeps any opaque extras the caller stuffed
+            # in the dict, while presenting a tidy `aliases` list.
+            out: dict[str, Any] = {
+                k: v for k, v in payload.items()
+                if k not in ("workspace", "aliases")
+            }
+            out["workspace"] = workspace
+            out["aliases"] = list(aliases)
+            return out
+        return {"workspace": "", "aliases": []}
+
+    @staticmethod
+    def _aliases_of(payload: Any) -> list[dict[str, Any]]:
+        """Best-effort: return the aliases list embedded in `payload`,
+        accepting either the legacy string shape (→ no aliases) or
+        the nested shape."""
+        if isinstance(payload, dict):
+            aliases = payload.get("aliases") or []
+            if isinstance(aliases, list):
+                return [a for a in aliases if isinstance(a, dict)]
+        return []
+
+    @classmethod
+    def _normalise_for_write(cls, data: dict[str, Any]) -> dict[str, Any]:
+        """Coerce every value in `data` to the nested-shape record so
+        any in-memory legacy-string entries get upgraded on write."""
+        return {
+            name: cls._coerce_to_record(payload)
+            for name, payload in data.items()
+        }
+
     # ── Internals: row materialisation ─────────────────────────────
 
     @staticmethod
     def _materialise(name: str, payload: Any) -> Project:
         """Coerce a raw row into the Project TypedDict shape.
 
-        Accepts both the new shape (`{"workspace": ..., **extra}`)
-        and the legacy shape (`"<workspace-string>"`). Always
-        returns a dict carrying `name` so callers don't have to
-        round-trip through the registry dict's keys.
+        Accepts both the new shape (`{"workspace": ..., "aliases":
+        [...]}, **extra}`) and the legacy shape (`"<workspace-string>"`).
+        Always returns a dict carrying `name` AND `aliases` so callers
+        don't need to handle the legacy-flat case downstream.
         """
         if isinstance(payload, str):
-            row: dict[str, Any] = {"name": name, "workspace": payload}
+            row: dict[str, Any] = {
+                "name": name,
+                "workspace": payload,
+                "aliases": [],
+            }
             return row  # type: ignore[return-value]
         if isinstance(payload, dict):
-            row = {"name": name, **payload}
-            row.setdefault("workspace", "")
+            aliases = payload.get("aliases") or []
+            if not isinstance(aliases, list):
+                aliases = []
+            row = {
+                k: v for k, v in payload.items()
+                if k not in ("workspace", "aliases")
+            }
+            row["name"] = name
+            row["workspace"] = payload.get("workspace", "")
+            row["aliases"] = [
+                {"name": a.get("name", ""), "expires_at": a.get("expires_at", "")}
+                for a in aliases
+                if isinstance(a, dict)
+            ]
             return row  # type: ignore[return-value]
         # Defensive: unexpected payload type → treat as empty workspace.
         # Don't raise: the registry is read on hot paths and we'd rather
         # the operator see a broken-looking row than a 500.
-        return {"name": name, "workspace": ""}  # type: ignore[return-value]
+        return {  # type: ignore[return-value]
+            "name": name, "workspace": "", "aliases": [],
+        }

@@ -182,6 +182,7 @@ def router_module(
         return None
 
     monkeypatch.setattr(router, "_start_reaper_task", _noop)
+    monkeypatch.setattr(router, "_start_alias_reaper_task", _noop)
     monkeypatch.setattr(router, "reconcile_on_startup", _noop)
     return router
 
