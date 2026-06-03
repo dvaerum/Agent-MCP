@@ -3,7 +3,7 @@
 These tests are deliberately shallow: they prove each declared route
 is reachable and dispatched to the right handler. Handler behaviour
 is asserted in the targeted ``test_*`` modules (SPA fallback, proxy
-passthrough, 410 migration, etc.).
+passthrough, etc.).
 
 We exercise routes via ``aiohttp_client`` so the full aiohttp router
 + middleware stack is in the loop — introspecting ``app.router``
@@ -100,21 +100,37 @@ async def test_create_accepts_form_encoded_name(
     assert "created=newproj" in location
 
 
-async def test_legacy_sse_returns_410(
+async def test_legacy_sse_returns_404(
     aiohttp_client, router_app,
 ) -> None:
-    """``GET /agent-mcp/__sse/<name>`` was retired in Agent-MCP 3.0.0.
-    The router replies 410 with a structured JSON migration body so
-    any client/config still pointed at it gets a parseable hint."""
+    """``GET /agent-mcp/__sse/<name>`` was retired in Agent-MCP 3.0.0
+    and ran as a 410-Gone handler with a JSON migration body through
+    Phase 5 of the router-upstream plan. Phase 6 deleted the handler;
+    the URL now 404s via aiohttp's default behaviour. The intent is
+    that any client still configured for SSE fails hard rather than
+    receiving a structured migration hint indefinitely."""
     client = await aiohttp_client(router_app)
 
     resp = await client.get("/agent-mcp/__sse/foo")
 
-    assert resp.status == 410
-    assert resp.headers["Content-Type"].startswith("application/json")
-    body = await resp.json()
-    assert body["error"] == "endpoint_removed"
-    assert body["migrated_to"] == "/mcp"
+    assert resp.status == 404
+
+
+async def test_legacy_messages_returns_404(
+    aiohttp_client, router_app,
+) -> None:
+    """Same retirement story as `__sse`: the paired
+    ``/agent-mcp/__messages/<name>/<rest>`` POST endpoint also 404s
+    after Phase 6 cleanup."""
+    client = await aiohttp_client(router_app)
+
+    resp = await client.post(
+        "/agent-mcp/__messages/foo/some/path",
+        data=b'{"jsonrpc":"2.0","id":1,"method":"x"}',
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert resp.status == 404
 
 
 async def test_unknown_route_returns_404(

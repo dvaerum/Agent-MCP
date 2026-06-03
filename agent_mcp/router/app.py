@@ -46,16 +46,13 @@ collide.
   *    /agent-mcp/__api/<name>/{rest}         proxy → backend /api/{rest}
   GET  /agent-mcp/__dashboard/<name>/{rest}   static Next.js export
 
-Retired endpoints (return 410 Gone with a JSON migration body
-pointing at /agent-mcp/<name>/mcp):
-
-  *    /agent-mcp/__sse/<name>                old SSE handshake
-  *    /agent-mcp/__messages/<name>/{rest}    old paired POST endpoint
-
 dvaerum/Agent-MCP 3.0.0 dropped the SSE+messages pair in favour of
 a single stateless Streamable HTTP /mcp endpoint. Sessions are no
 longer issued or required; backend restarts are invisible to
-clients beyond the in-flight request itself.
+clients beyond the in-flight request itself. Phase 6 (router-
+upstream plan) removed the transitional 410-Gone handlers for the
+old `/agent-mcp/__sse/<name>` and `/agent-mcp/__messages/<name>/...`
+URLs — those shapes now 404 via aiohttp's default behaviour.
 
 Backend instances are systemd template units (agent-mcp@<name>.service)
 listening on Unix domain sockets at
@@ -82,9 +79,6 @@ Configuration (all via environment variables):
   AGENT_MCP_DEFAULT_WORKSPACE    parent dir for workspaces when the
                                  user doesn't provide one (typically
                                  ~/.local/share/agent-mcp/projects).
-  AGENT_MCP_README_HTML          optional rendered README fragment
-                                 shown in the index page's
-                                 "How to use" details block.
   AGENT_MCP_INSTALLER_TEMPLATE   path to the bash installer template
                                  (./installer.sh.in in the source
                                  tree). `__AGENT_MCP_MCP_URL__`
@@ -139,7 +133,11 @@ DEFAULT_WORKSPACE_PARENT = Path(
         str(Path.home() / ".local" / "share" / "agent-mcp" / "projects"),
     )
 ).expanduser()
-README_HTML_PATH = os.environ.get("AGENT_MCP_README_HTML", "")
+# AGENT_MCP_README_HTML used to be read here and embedded in the legacy
+# server-rendered HTML index page. The index page was deleted in Phase
+# 6 (see ``index_redirect_handler`` further down); the env var is still
+# accepted by the CLI / module for back-compat but the router no longer
+# reads it.
 
 # ── Runtime asset prefix (Phase 4) ──────────────────────────────────
 # The dashboard build emits a literal sentinel
@@ -560,26 +558,14 @@ async def _proxy_to_backend(
                 )
 
 
-# ── Streamable HTTP migration ────────────────────────────────────
+# ── Streamable HTTP transport ────────────────────────────────────
 # dvaerum/Agent-MCP 3.0.0 dropped the SSE+messages pair in favour of
 # a single `POST/GET/DELETE /mcp` endpoint. The router exposes it
-# at `/agent-mcp/<name>/mcp` and 410s the old `/agent-mcp/__sse/`
-# and `/agent-mcp/__messages/` shapes so any client/config still
-# pointed at them gets a structured, parseable hint pointing at the
-# new URL. See the backend's `_MIGRATION_BODY` in main_app.py.
-
-_MIGRATION_BODY = json.dumps(
-    {
-        "error": "endpoint_removed",
-        "migrated_to": "/mcp",
-        "spec_revision": "2025-03-26",
-        "hint": (
-            "Use POST /agent-mcp/<name>/mcp with "
-            "Authorization: Bearer <token>. "
-            "Sessions are no longer required."
-        ),
-    },
-).encode("utf-8")
+# at `/agent-mcp/<name>/mcp`. Phase 6 (this file) removed the
+# transitional 410-Gone handlers for `/agent-mcp/__sse/<name>` and
+# `/agent-mcp/__messages/<name>/{rest}`: the old shapes now 404 via
+# aiohttp's default behaviour, which is the intent — old configs
+# should see a hard failure indicating the endpoint is gone.
 
 
 def _w1_redirect(new_path: str) -> web.Response:
@@ -658,24 +644,6 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
         alias_info = (name, alias_entry.get("expires_at", ""))
     return await _proxy_to_backend(
         req, real_name, "/mcp", alias_info=alias_info,
-    )
-
-
-async def legacy_sse_gone_handler(req: web.Request) -> web.Response:
-    """/agent-mcp/__sse/<name> → 410 with migration body."""
-    return web.Response(
-        status=410,
-        body=_MIGRATION_BODY,
-        content_type="application/json",
-    )
-
-
-async def legacy_messages_gone_handler(req: web.Request) -> web.Response:
-    """/agent-mcp/__messages/<name>/{rest} → 410 with migration body."""
-    return web.Response(
-        status=410,
-        body=_MIGRATION_BODY,
-        content_type="application/json",
     )
 
 
@@ -1976,182 +1944,15 @@ async def create_agent_handler(req: web.Request) -> web.StreamResponse:
     )
 
 
-# ── Index page ───────────────────────────────────────────────────────
-
-
-def _list_view() -> list[dict]:
-    rows: list[dict] = []
-    now = time.time()
-    for name, path in sorted(_projects_dict().items()):
-        running = _is_active(_unit_name(name, "backend"))
-        ts = last_active.get((name, "backend"))
-        idle_for = (now - ts) if (running and ts is not None) else None
-        rows.append(
-            dict(name=name, path=path, running=running, idle_for=idle_for)
-        )
-    return rows
-
-
-_INDEX_STYLE = """\
-<style>
-body { font-family: system-ui, sans-serif; max-width: 60em; margin: 2em auto; padding: 0 1em; }
-h1 { margin-bottom: 0.2em; }
-h2 { margin-top: 1.5em; }
-table { border-collapse: collapse; width: 100%; margin-top: 1em; }
-td, th { padding: 0.4em 0.8em; border-bottom: 1px solid #ddd; text-align: left; vertical-align: top; }
-code { background: #f4f4f4; padding: 0 0.3em; border-radius: 3px; }
-pre { background: #f4f4f4; padding: 0.7em 0.9em; border-radius: 4px; overflow-x: auto; }
-pre code { background: none; padding: 0; }
-.running { color: #2a8; }
-.stopped { color: #999; }
-details { margin: 1em 0; padding: 0.7em 0.9em; background: #f7f7f7; border-radius: 4px; }
-summary { cursor: pointer; font-weight: 600; }
-form { display: inline; margin: 0; }
-button { font: inherit; cursor: pointer; }
-fieldset { margin: 1em 0; padding: 0.8em 1.2em; border: 1px solid #ddd; border-radius: 4px; }
-fieldset legend { padding: 0 0.4em; font-weight: 600; }
-fieldset label { display: block; margin: 0.4em 0; }
-fieldset input[type=text] { width: 100%; max-width: 32em; padding: 0.3em 0.4em; font: inherit; }
-fieldset .hint { color: #888; font-size: 0.85em; margin-left: 0.5em; }
-fieldset button { margin-top: 0.5em; padding: 0.3em 0.9em; }
-.created { background: #ecfdf5; border: 1px solid #6ee7b7; padding: 0.8em 1.2em; border-radius: 4px; margin: 1em 0; }
-.created h3 { margin-top: 0; }
-.agent-picker, .agent-create { margin: 0.4em 0; }
-.agent-picker select, .agent-create input { font: inherit; padding: 0.2em 0.4em; }
-.agent-picker label, .agent-create label { font-weight: 600; }
-.hint { color: #666; font-size: 0.92em; }
-.warn { color: #b45309; font-size: 0.92em; }
-</style>
-"""
-
-
-async def _wiring_help_panel(
-    name: str, *, opened: bool, selected_agent: str = "Admin"
-) -> str:
-    """Render the wiring panel for project `name`, scoped to one agent.
-
-    Lists every agent on the project as a dropdown; the four
-    copy-paste blocks below are pre-filled with the selected
-    agent's token so the user can copy-paste straight into
-    `.mcp.json` / `claude mcp add`. A "Create new agent" mini-form
-    lets the user spin up a fresh worker without leaving the page.
-    """
-    tokens = await _agent_token_map(name)
-    # Stable order: Admin first, then alphabetical.
-    agent_ids = ["Admin"] + sorted(a for a in tokens.values() if a != "Admin")
-    # Deduplicate while preserving order.
-    seen: set[str] = set()
-    agent_ids = [a for a in agent_ids if not (a in seen or seen.add(a))]
-    missing_agent_warning = ""
-    if selected_agent not in agent_ids:
-        missing_agent_warning = (
-            f'<p class=warn>No agent <code>{escape(selected_agent)}</code> '
-            f"on this project — falling back to the default.</p>"
-        )
-        selected_agent = "Admin" if "Admin" in agent_ids else (agent_ids[0] if agent_ids else "Admin")
-    token_for: dict[str, str] = {a: t for t, a in tokens.items()}
-    sel_token = token_for.get(selected_agent, "")
-
-    mcp_url = _mcp_url_for(name)
-    auth_flag = (
-        f' --header "Authorization: Bearer {sel_token}"' if sel_token else ""
-    )
-    cli_cmd = f"claude mcp add --transport http agent-mcp {mcp_url}{auth_flag}"
-    json_snippet = json.dumps(
-        _mcp_json_for(name, token=sel_token if sel_token else None), indent=2,
-    )
-    qs = urlencode({"agent": selected_agent})
-    cfg_url = (
-        f"{EXTERNAL_URL}/agent-mcp/__client-config/{name}.mcp.json?{qs}"
-    )
-    inst_url = (
-        f"{EXTERNAL_URL}/agent-mcp/__client-installer/{name}.sh?{qs}"
-    )
-    installer = _installer_script_for(
-        name, token=sel_token if sel_token else None
-    )
-    open_attr = " open" if opened else ""
-
-    # Agent picker: a tiny GET form that reloads the same page with
-    # ?wiring=<name>&agent=<id>.
-    options = "".join(
-        f'<option value="{escape(a)}"{" selected" if a == selected_agent else ""}>{escape(a)}</option>'
-        for a in agent_ids
-    )
-    picker = (
-        f'<form method=get action="/agent-mcp/" class="agent-picker">'
-        f'<input type=hidden name=wiring value="{escape(name)}">'
-        f'<label>Show wiring for: '
-        f'<select name=agent onchange="this.form.submit()">{options}</select>'
-        f'</label>'
-        f'<noscript> <button type=submit>Switch</button></noscript>'
-        f'</form>'
-    )
-    create_form = (
-        f'<form method=post action="/agent-mcp/__create-agent" class="agent-create">'
-        f'<input type=hidden name=name value="{escape(name)}">'
-        f'<label>Create new agent: '
-        f'<input type=text name=agent_id required '
-        f'pattern="[a-z][a-z0-9-]*[a-z0-9]|[a-z]" placeholder="e.g. backend-dev">'
-        f'</label> <button type=submit>Create</button>'
-        f'</form>'
-    )
-
-    if not sel_token:
-        identity_note = (
-            "<p class=warn><strong>Heads up:</strong> the backend isn't "
-            "running, so we couldn't fetch agent tokens. The blocks below "
-            "show the URL only; they'll fill in once a backend request "
-            "(e.g. opening the dashboard) starts the project.</p>"
-        )
-    elif selected_agent == "Admin":
-        identity_note = (
-            "<p class=hint><strong>Admin scope.</strong> Use this for "
-            "yourself or for the orchestrator. For each developer machine, "
-            "create a per-machine agent below so revocation is granular.</p>"
-        )
-    else:
-        identity_note = (
-            f'<p class=hint>Wiring shown is scoped to agent '
-            f'<code>{escape(selected_agent)}</code>.</p>'
-        )
-
-    return f"""
-<details class=wiring{open_attr}>
-  <summary>Wiring help for <code>{escape(name)}</code></summary>
-  {missing_agent_warning}
-  {picker}
-  {create_form}
-  {identity_note}
-
-  <h4>1. <code>claude mcp add</code> (writes to user-global ~/.claude.json)</h4>
-<pre><code>{escape(cli_cmd)}</code></pre>
-
-  <h4>2. JSON snippet to drop into a project's <code>.mcp.json</code></h4>
-<pre><code>{escape(json_snippet)}</code></pre>
-
-  <h4>3. One-liner — download <code>.mcp.json</code> to cwd</h4>
-<pre><code>curl -fsSL '{escape(cfg_url)}' -o .mcp.json</code></pre>
-
-  <h4>4. One-liner — merge into existing <code>.mcp.json</code> (or create)</h4>
-<pre><code>curl -fsSL '{escape(inst_url)}' | bash</code></pre>
-  <details>
-    <summary>What does the installer script do? (audit before piping to bash)</summary>
-<pre><code>{escape(installer)}</code></pre>
-  </details>
-</details>"""
-
-
-def _create_form() -> str:
-    return f"""
-<fieldset>
-  <legend>Create a new project</legend>
-  <form method=post action="/agent-mcp/__create" style="display:block">
-    <label>Name <input type=text name=name required pattern="[a-z][a-z0-9-]*[a-z0-9]|[a-z]" maxlength={_NAME_MAX}></label>
-    <button type=submit>Create</button>
-  </form>
-</fieldset>"""
-
+# ── Index redirect ───────────────────────────────────────────────────
+# The legacy server-rendered HTML index page (`index_handler` and its
+# `_list_view` / `_INDEX_STYLE` / `_wiring_help_panel` / `_create_form`
+# helpers) was deleted in Phase 6 of the router-upstream plan
+# (prancy-napping-pie). The bare `/agent-mcp/` URL has been a 302 to
+# the React dashboard since Phase 3.5a (ADR-0009); the HTML page was
+# only retained "for reference" while we shipped the React equivalents
+# of its wiring + create-project surfaces. Those equivalents shipped in
+# Phase 3.5b/c, so the legacy HTML is now dead code.
 
 async def index_redirect_handler(req: web.Request) -> web.Response:
     """GET /agent-mcp/ — 302 to the dashboard overview.
@@ -2168,132 +1969,6 @@ async def index_redirect_handler(req: web.Request) -> web.Response:
     else:
         target = "/agent-mcp/__dashboard/"
     raise web.HTTPFound(location=target)
-
-
-async def index_handler(req: web.Request) -> web.Response:
-    rows = _list_view()
-    readme_html = ""
-    if README_HTML_PATH and Path(README_HTML_PATH).is_file():
-        try:
-            readme_html = Path(README_HTML_PATH).read_text()
-        except OSError:
-            readme_html = ""
-
-    created = req.rel_url.query.get("created", "")
-    projects = _projects_dict()
-    # Which project's wiring panel (if any) should open by default,
-    # and on which agent. Set when the user just created a project
-    # (?created=…), just created an agent (?wiring=…&agent=…), or
-    # clicked a wiring link (?wiring=…).
-    wiring_focus_name = (
-        req.rel_url.query.get("wiring") or created or ""
-    )
-    wiring_focus_agent = (
-        req.rel_url.query.get("agent") or "Admin"
-    )
-    created_panel = ""
-    if created and created in projects:
-        wiring = await _wiring_help_panel(
-            created, opened=True, selected_agent=wiring_focus_agent
-        )
-        created_panel = (
-            f'<div class=created><h3>✓ Project <code>{escape(created)}</code> created</h3>'
-            f'<p>Workspace: <code>{escape(projects[created])}</code></p>'
-            f'{wiring}'
-            "</div>"
-        )
-
-    stopped = req.rel_url.query.get("stopped", "")
-    stopped_panel = ""
-    if stopped and stopped in projects:
-        stopped_panel = (
-            f'<div class=created><h3>■ Project <code>{escape(stopped)}</code> stopped</h3>'
-            "<p>The backend systemd unit was stopped cleanly. Any new "
-            "request to its dashboard or SSE URL will spin it back up.</p>"
-            "</div>"
-        )
-
-    parts: list[str] = [
-        "<!doctype html><meta charset=utf-8><title>agent-mcp</title>",
-        _INDEX_STYLE,
-        "<h1>agent-mcp</h1>",
-        "<details><summary>How to use</summary>",
-        readme_html or "<p><em>README not bundled.</em></p>",
-        "</details>",
-        _create_form(),
-        created_panel,
-        stopped_panel,
-        "<h2>projects</h2>",
-    ]
-    if not rows:
-        parts.append(
-            "<p><em>No projects registered yet.</em> Use the "
-            "<strong>Create a new project</strong> form above.</p>"
-        )
-    else:
-        parts.append(
-            "<table><tr><th>name<th>path<th>state<th>actions</tr>"
-        )
-        for r in rows:
-            if r["running"] and r["idle_for"] is not None:
-                state = (
-                    f'<span class=running>running '
-                    f'({int(r["idle_for"])}s idle)</span>'
-                )
-            elif r["running"]:
-                state = '<span class=running>running</span>'
-            else:
-                state = '<span class=stopped>stopped</span>'
-            n = r["name"]
-            dashboard_link = (
-                f'<a href="/agent-mcp/__dashboard/{quote(n)}/">dashboard</a>'
-            )
-            help_link = (
-                f'<a href="#wiring-{quote(n)}">wiring</a>'
-            )
-            stop_form = ""
-            if r["running"]:
-                conn_count = active_conns.get(n, 0)
-                conn_note = (
-                    f" Will be refused: {conn_count} active connection(s)."
-                    if conn_count else ""
-                )
-                stop_form = (
-                    '<form method=post action="/agent-mcp/__stop"'
-                    f' onsubmit="return confirm(\'Stop {escape(n)}?{escape(conn_note)}\')">'
-                    f'<input type=hidden name=name value="{escape(n)}">'
-                    '<button type=submit>stop</button></form>'
-                )
-            unreg_form = (
-                '<form method=post action="/agent-mcp/__unregister"'
-                f' onsubmit="return confirm(\'unregister {escape(n)}?\')">'
-                f'<input type=hidden name=name value="{escape(n)}">'
-                '<button type=submit>unregister</button></form>'
-            )
-            parts.append(
-                f"<tr><td>{escape(n)}<td><code>{escape(r['path'])}</code>"
-                f"<td>{state}<td>{dashboard_link} {help_link} "
-                f"{stop_form} {unreg_form}</tr>"
-            )
-        parts.append("</table>")
-        # Per-project wiring panels (collapsed, anchored). The
-        # ?wiring=<name>[&agent=<id>] focus opens its panel and
-        # selects the right agent in its dropdown.
-        for r in rows:
-            n = r["name"]
-            opened = (n == wiring_focus_name and not created)
-            agent = wiring_focus_agent if opened else "Admin"
-            wiring = await _wiring_help_panel(
-                n, opened=opened, selected_agent=agent
-            )
-            parts.append(f'<div id="wiring-{escape(n)}">')
-            parts.append(wiring)
-            parts.append("</div>")
-    return web.Response(
-        text="".join(parts),
-        content_type="text/html",
-        headers={"Cache-Control": "no-store"},
-    )
 
 
 # ── Wire-up ──────────────────────────────────────────────────────────
@@ -2344,9 +2019,8 @@ def make_app(
     # an HTML index page; it 302-redirects to the React overview at
     # `/agent-mcp/__dashboard/` (multi-tenant) or to the configured
     # single project's dashboard (single-tenant). The legacy
-    # `index_handler` is still exported for now but only reachable via
-    # the deprecated `?legacy=1` query for one release while operators
-    # migrate.
+    # `index_handler` and its private HTML-render helpers were deleted
+    # in Phase 6 — see the comment above ``index_redirect_handler``.
     app.router.add_get("/agent-mcp/", index_redirect_handler)
     app.router.add_get(
         "/agent-mcp",
@@ -2421,16 +2095,12 @@ def make_app(
     app.router.add_route(
         "*", "/agent-mcp/{name}/mcp", backend_mcp_handler
     )
-    # Legacy 410s — kept so any client/config still pointed at the
-    # old shape gets the structured migration hint instead of a
-    # bare 404.
-    app.router.add_route(
-        "*", "/agent-mcp/__sse/{name}", legacy_sse_gone_handler
-    )
-    app.router.add_route(
-        "*", "/agent-mcp/__messages/{name}/{rest:.*}",
-        legacy_messages_gone_handler,
-    )
+    # Phase 6 removed the transitional 410-Gone handlers for the
+    # `/agent-mcp/__sse/<name>` and `/agent-mcp/__messages/<name>/...`
+    # URLs (the SSE+messages transport from dvaerum/Agent-MCP <3.0.0).
+    # Those URLs now hit aiohttp's default 404, which is the intent:
+    # any client still configured for SSE should fail hard rather than
+    # receive a structured migration hint indefinitely.
     app.router.add_route(
         "*", "/agent-mcp/__api/{name}/{rest:.*}", backend_api_handler
     )
