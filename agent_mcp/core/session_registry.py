@@ -56,8 +56,11 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Optional
 
+from sqlalchemy import delete as _sa_delete, select as _sa_select
+
 from .config import logger
-from ..db.connection import get_db_connection
+from ..db.engine import get_session
+from ..db.models import McpSession as _McpSession
 
 
 @dataclass(frozen=True)
@@ -124,22 +127,20 @@ def register_session(
     """
     session_id = uuid.uuid4().hex
     now = _now_utc_iso()
-    conn = get_db_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO mcp_sessions "
-            "(session_id, agent_id, opened_at, last_seen_at, "
-            "bearer_token_hash, alias_used) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                session_id, agent_id, now, now,
-                _hash_bearer(bearer_token), alias_used,
-            ),
+    # PR-G5 cutover: write via the ORM. The DDL-level FK (PR-G1)
+    # still rejects rows whose agent_id has no parent in `agents`.
+    with get_session() as session:
+        session.add(
+            _McpSession(
+                session_id=session_id,
+                agent_id=agent_id,
+                opened_at=now,
+                last_seen_at=now,
+                bearer_token_hash=_hash_bearer(bearer_token),
+                alias_used=alias_used,
+            )
         )
-        conn.commit()
-    finally:
-        conn.close()
+        session.commit()
     return session_id
 
 
@@ -152,15 +153,11 @@ def unregister_session(session_id: str) -> None:
     safer contract here — the row is GONE either way, and the
     in-memory queue gets dropped by `detach_runtime_queue` regardless.
     """
-    conn = get_db_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "DELETE FROM mcp_sessions WHERE session_id = ?", (session_id,),
+    with get_session() as session:
+        session.execute(
+            _sa_delete(_McpSession).where(_McpSession.session_id == session_id)
         )
-        conn.commit()
-    finally:
-        conn.close()
+        session.commit()
     # Drop the runtime queue too — keeps the two layers in lockstep.
     _runtime_queues.pop(session_id, None)
 
@@ -173,26 +170,25 @@ def touch_session(session_id: str) -> None:
     `expire_stale` uses the column to evict zombie rows whose
     associated stream went away without a clean disconnect.
     """
-    conn = get_db_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE mcp_sessions SET last_seen_at = ? WHERE session_id = ?",
-            (_now_utc_iso(), session_id),
+    with get_session() as session:
+        row = (
+            session.query(_McpSession)
+            .filter(_McpSession.session_id == session_id)
+            .one_or_none()
         )
-        conn.commit()
-    finally:
-        conn.close()
+        if row is not None:
+            row.last_seen_at = _now_utc_iso()
+            session.commit()
 
 
-def _rows_to_handles(rows: Iterable[Any]) -> List[SessionHandle]:
+def _orm_rows_to_handles(rows: Iterable[Any]) -> List[SessionHandle]:
     return [
         SessionHandle(
-            session_id=r["session_id"],
-            agent_id=r["agent_id"],
-            opened_at=r["opened_at"],
-            last_seen_at=r["last_seen_at"],
-            bearer_token_hash=r["bearer_token_hash"],
+            session_id=r.session_id,
+            agent_id=r.agent_id,
+            opened_at=r.opened_at,
+            last_seen_at=r.last_seen_at,
+            bearer_token_hash=r.bearer_token_hash,
         )
         for r in rows
     ]
@@ -200,18 +196,13 @@ def _rows_to_handles(rows: Iterable[Any]) -> List[SessionHandle]:
 
 def sessions_for_agent(agent_id: str) -> List[SessionHandle]:
     """Every registered session for `agent_id` (zero or more)."""
-    conn = get_db_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT session_id, agent_id, opened_at, last_seen_at, "
-            "bearer_token_hash FROM mcp_sessions WHERE agent_id = ?",
-            (agent_id,),
+    with get_session() as session:
+        rows = (
+            session.query(_McpSession)
+            .filter(_McpSession.agent_id == agent_id)
+            .all()
         )
-        rows = cur.fetchall()
-    finally:
-        conn.close()
-    return _rows_to_handles(rows)
+        return _orm_rows_to_handles(rows)
 
 
 def all_sessions() -> List[SessionHandle]:
@@ -220,17 +211,9 @@ def all_sessions() -> List[SessionHandle]:
     Used by emitters whose semantics affect every subscriber (e.g.
     `notifications/tools/list_changed` after a worker-policy toggle).
     """
-    conn = get_db_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT session_id, agent_id, opened_at, last_seen_at, "
-            "bearer_token_hash FROM mcp_sessions",
-        )
-        rows = cur.fetchall()
-    finally:
-        conn.close()
-    return _rows_to_handles(rows)
+    with get_session() as session:
+        rows = session.query(_McpSession).all()
+        return _orm_rows_to_handles(rows)
 
 
 def expire_stale(threshold_seconds: int = 300) -> List[str]:
@@ -250,23 +233,20 @@ def expire_stale(threshold_seconds: int = 300) -> List[str]:
         _dt.datetime.now(_dt.timezone.utc)
         - _dt.timedelta(seconds=threshold_seconds)
     ).isoformat()
-    conn = get_db_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT session_id FROM mcp_sessions WHERE last_seen_at < ?",
-            (cutoff,),
-        )
-        expired = [r["session_id"] for r in cur.fetchall()]
-        if expired:
-            placeholders = ",".join("?" for _ in expired)
-            cur.execute(
-                f"DELETE FROM mcp_sessions WHERE session_id IN ({placeholders})",
-                tuple(expired),
+    with get_session() as session:
+        rows = session.execute(
+            _sa_select(_McpSession.session_id).where(
+                _McpSession.last_seen_at < cutoff
             )
-            conn.commit()
-    finally:
-        conn.close()
+        ).all()
+        expired = [r[0] for r in rows]
+        if expired:
+            session.execute(
+                _sa_delete(_McpSession).where(
+                    _McpSession.session_id.in_(expired)
+                )
+            )
+            session.commit()
     for sid in expired:
         _runtime_queues.pop(sid, None)
     return expired
