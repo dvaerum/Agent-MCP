@@ -33,8 +33,6 @@ StreamableHTTP transport does at the wire.
 
 from __future__ import annotations
 
-import asyncio
-import datetime as _dt
 import sqlite3
 from pathlib import Path
 
