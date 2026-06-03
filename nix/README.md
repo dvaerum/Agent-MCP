@@ -157,6 +157,38 @@ Tailnet exposure (`externalUrl`) is configured outside this module
 — e.g. via `services.tailscale.serve` at NixOS scope. See the
 [deployment example](https://github.com/dvaerum/nixos-developer-system).
 
+## Asset prefix
+
+The dashboard's static export embeds a literal sentinel string
+(`__AGENT_MCP_ASSET_PREFIX__`) wherever Next.js would normally bake
+in `assetPrefix`. The router substitutes the configured runtime
+prefix into served HTML / JS / CSS bodies on the fly so a single
+build artifact serves any deployment URL.
+
+* **Default** prefix: `/agent-mcp/__dashboard`. Operators who deploy
+  the router straight onto loopback (the documented path) need no
+  configuration — the default matches the router's own route table.
+* **Custom mount**: deploying the dashboard behind a reverse proxy
+  mounted at a different prefix (e.g. `/tools/`) is a one-line
+  change. Set `AGENT_MCP_ASSET_PREFIX=/tools` in the router unit's
+  `environment`, or pass `--asset-prefix /tools` on the
+  `agent-mcp-router` command line. No rebuild required.
+
+Substitution is Content-Type-gated: only `text/html`,
+`text/css`, and `application/javascript` responses are eligible.
+JSON API responses, fonts, images, and other binary assets pass
+through verbatim, so substitution can never corrupt their bytes
+even if a chance sequence happens to match the sentinel.
+
+**Important — single-tenant requires a router-fronted serve.** Per
+decision #1 of the [prancy-napping-pie
+plan](https://github.com/dvaerum/Agent-MCP/blob/main/.claude/plans/prancy-napping-pie.md)
+and [ADR-0008](../docs/adr/0008-single-tenant-url-parity.md), the
+router runs in both single-tenant and multi-tenant modes. Substitution
+happens at the router, so deploying the dashboard without the router
+(e.g. serving the static export directly from nginx) would leak the
+sentinel into served bytes and render the dashboard blank. Don't.
+
 ## Multi-tenant only (for now)
 
 Phase 2 ships the multi-tenant deployment only — the router always

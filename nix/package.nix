@@ -1,9 +1,12 @@
 { pkgs
 , lib
 , src
-  # Dashboard ASSET_PREFIX. Multi-tenant deployments serve the
-  # dashboard under /agent-mcp/__dashboard so the webpack runtime has
-  # to know about that prefix at build time. Single-tenant doesn't.
+  # Dashboard ASSET_PREFIX kept for callers that still pass it, but
+  # ignored by the build itself since Phase 4 of prancy-napping-pie:
+  # the dashboard's `next.config.ts` now defaults the assetPrefix to
+  # a literal sentinel string and the router substitutes the runtime
+  # prefix on serve. Keeping the parameter argument-shaped (rather
+  # than removing it) avoids breaking external callers in-flight.
 , assetPrefix ? "/agent-mcp/__dashboard"
 }:
 
@@ -55,7 +58,9 @@ let
     pname = "agent-mcp-dashboard";
     version = "0.1.0";
     src = "${src}/agent_mcp/dashboard";
-    ASSET_PREFIX = assetPrefix;
+    # Intentionally no ASSET_PREFIX env (Phase 4): the build emits a
+    # sentinel, the router substitutes at serve time. See nix/README.md
+    # § "Asset prefix".
     # Re-set on package-lock.json drift. Nix prints the correct value
     # on hash mismatch; paste it back here. Lockfile shipped with the
     # repo as of 2026-05-31 hashes to:

@@ -94,16 +94,21 @@ let
 
   # ── Dashboard static export ──────────────────────────────────────
   # Next.js 15 project with `output: 'export'`. The router serves the
-  # `out/` directory at /agent-mcp/__dashboard/. ASSET_PREFIX tells
-  # webpack the runtime URL prefix for chunks; default empty would
-  # resolve assets to site root and 404.
+  # `out/` directory at /agent-mcp/__dashboard/.
+  #
+  # Phase 4 (prancy-napping-pie): we deliberately do NOT set
+  # `ASSET_PREFIX` here. The dashboard's `next.config.ts` now defaults
+  # the assetPrefix to a literal sentinel string
+  # (`__AGENT_MCP_ASSET_PREFIX__`); the router substitutes the
+  # configured runtime prefix on serve. One build artifact serves
+  # every deployment URL — no rebuild needed when the operator points
+  # the router at a different prefix.
   agentMcpDashboard = pkgs.buildNpmPackage {
     pname = "agent-mcp-dashboard";
     # Version mirrors the Python package; bumping pyproject also
     # bumps the dashboard derivation in lockstep.
     version = agentMcpPy.version;
     src = "${src}/agent_mcp/dashboard";
-    ASSET_PREFIX = "/agent-mcp/__dashboard";
     # Re-set whenever the dashboard's package-lock.json changes
     # upstream (rare). On hash mismatch, nix prints the correct
     # value; paste it here.
