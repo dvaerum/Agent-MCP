@@ -215,6 +215,28 @@ def init_database() -> None:
         )
         logger.debug("Tasks table and indexes ensured.")
 
+        # Task notes side table (db-review PR-H / Alembic 0009).
+        # Replaces the JSON-list-in-TEXT pattern of `tasks.notes`
+        # with one row per note so individual notes can be
+        # edited/deleted. The legacy `tasks.notes` column is kept
+        # in place for one release for the deprecation window.
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS task_notes (
+                note_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,  -- logical FK -> tasks(task_id)
+                author TEXT,
+                timestamp TEXT NOT NULL,
+                text TEXT NOT NULL
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_notes_task "
+            "ON task_notes (task_id)"
+        )
+        logger.debug("Task_notes table and index ensured.")
+
         # Agent Actions Table (Original main.py lines 306-317)
         cursor.execute(
             """

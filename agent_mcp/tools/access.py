@@ -96,6 +96,12 @@ TOOL_ACCESS: Dict[str, str] = {
         "worker-if-toggled:config_allow_worker_self_assign,"
         "config_allow_worker_create_unassigned"
     ),
+    # --- task_notes_tools.py (PR-H) ---
+    # Any agent can add notes; the impl scopes ownership for
+    # edit/delete (only the author or admin may mutate).
+    "add_task_note": "any",
+    "edit_task_note": "any",
+    "delete_task_note": "any",
     # --- project_context_tools.py ---
     # Admin-only backup tool (write to backup_name).
     "backup_project_context": "admin",

@@ -23,6 +23,7 @@ logger.info("Initializing and registering MCP tools...")
 
 from . import admin_tools
 from . import task_tools
+from . import task_notes_tools  # PR-H — side-table notes tools
 from . import file_management_tools
 from . import project_context_tools
 from . import file_metadata_tools
