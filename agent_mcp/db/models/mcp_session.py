@@ -9,7 +9,7 @@ column) — and `agent_id` has a NOT NULL FK to `agents.agent_id`
 landed by migration 0008 (PR-G1).
 
 The model declares a `relationship('Agent')` so callers can navigate
-\`session.agent\` to inspect the parent row without a separate query.
+`session.agent` to inspect the parent row without a separate query.
 The FK constraint itself lives in the DDL (init_database + Alembic)
 — we do NOT add `ForeignKey()` to the column annotation because that
 would cause SQLAlchemy to emit FK DDL inside `create_all()`, which
