@@ -56,19 +56,35 @@ import { apiClient } from './api'
 import { useServerStore } from './stores/server-store'
 
 const DASHBOARD_PATH_RE = /\/agent-mcp\/__dashboard\/([^/]+)/
+// Phase 3.5a — bare `/agent-mcp/__dashboard/` (or no trailing slash)
+// is the cross-project overview route. Detect it separately from the
+// per-project pattern so the dashboard can render `<ProjectsOverview/>`
+// instead of `<DashboardWrapper>`.
+const DASHBOARD_OVERVIEW_PATH_RE = /\/agent-mcp\/__dashboard\/?$/
 
 function derive(): {
   projectName: string | null
+  isOverview: boolean
   baseUrl: string
   apiPrefix: string
 } {
   const pathname =
     typeof window !== 'undefined' ? window.location.pathname : ''
+  if (DASHBOARD_OVERVIEW_PATH_RE.test(pathname)) {
+    // Cross-project overview route — no per-project API root.
+    return {
+      projectName: null,
+      isOverview: true,
+      baseUrl: '',
+      apiPrefix: '',
+    }
+  }
   const match = pathname.match(DASHBOARD_PATH_RE)
   if (match) {
     const apiRoot = `/agent-mcp/__api/${match[1]}`
     return {
       projectName: match[1],
+      isOverview: false,
       baseUrl: apiRoot,
       apiPrefix: apiRoot,
     }
@@ -77,6 +93,7 @@ function derive(): {
   // deployment fetches from /api on the same origin.
   return {
     projectName: null,
+    isOverview: false,
     baseUrl: '/api',
     apiPrefix: '',
   }
@@ -88,10 +105,14 @@ export const ProjectContext = createContext(projectContext)
 
 // Module-load side effects. Only fire on the client AND only when the
 // URL identifies a path-prefix-mounted project. Standalone deploys
-// keep their existing connect-via-modal flow.
+// keep their existing connect-via-modal flow. Overview mode (no
+// project segment) skips both side effects — the overview component
+// hits the router's `/__overview` endpoint directly and doesn't need
+// the per-project API client/server-store entry.
 if (
   typeof window !== 'undefined' &&
-  projectContext.projectName !== null
+  projectContext.projectName !== null &&
+  !projectContext.isOverview
 ) {
   // 1. Point the ApiClient at the router-proxied API root before any
   //    fetch can land. This is the only thing the cold-start retry

@@ -4,6 +4,7 @@ import { Suspense } from "react"
 import { MainLayout } from "@/components/layout/main-layout"
 import { DashboardWrapper } from "@/components/dashboard/dashboard-wrapper"
 import { OverviewDashboard } from "@/components/dashboard/overview-dashboard"
+import { ProjectsOverviewDashboard } from "@/components/dashboard/projects-overview-dashboard"
 import { AgentsDashboard } from "@/components/dashboard/agents-dashboard"
 import { TasksDashboard } from "@/components/dashboard/tasks-dashboard"
 import { MemoriesDashboard } from "@/components/dashboard/memories-dashboard"
@@ -12,12 +13,24 @@ import { SettingsDashboard } from "@/components/dashboard/settings-dashboard"
 import { PromptBookDashboard } from "@/components/dashboard/prompt-book-dashboard"
 import { SystemDashboard } from "@/components/dashboard/system-dashboard"
 import { useSectionRoute } from "@/lib/use-section-route"
+import { projectContext } from "@/lib/project-context"
 
 function DashboardPage() {
   // URL-driven section routing — `?page=<section>` is the source of
   // truth. Reload + share-links land on the same section the user was
   // last looking at. Missing/unknown values fall back to 'overview'.
+  // (Hook must be called unconditionally; the overview branch below
+  // simply ignores its value.)
   const { currentSection } = useSectionRoute()
+
+  // Phase 3.5a — when the URL is `/agent-mcp/__dashboard/` (no project
+  // segment), render the cross-project overview instead of the
+  // per-project dashboard. The MainLayout is skipped because the
+  // overview has its own header (no sidebar nav, no project picker
+  // for self — picker enhancements ship in PR-B for per-project pages).
+  if (projectContext.isOverview) {
+    return <ProjectsOverviewDashboard />
+  }
 
   const renderCurrentView = () => {
     switch (currentSection) {

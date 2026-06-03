@@ -176,6 +176,16 @@ export function dispatchNotification(payload: JsonRpcNotification): void {
       console.debug("[mcp-notifications] unknown resource uri:", uri)
     }
     void useDataStore.getState().refreshData()
+    // Phase 3.5a — also fan out a window event so the cross-project
+    // overview store can refresh without importing the per-project
+    // data store (the overview route doesn't load the data-store
+    // module at all). The event is best-effort: missing window means
+    // SSR, in which case there's no listener to call.
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(
+        new CustomEvent("mcp:resources-updated", { detail: { uri } }),
+      )
+    }
     return
   }
 

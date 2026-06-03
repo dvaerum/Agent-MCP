@@ -845,6 +845,26 @@ def _safe_dashboard_path(rest: str) -> Path | None:
     return candidate
 
 
+async def overview_dashboard_handler(req: web.Request) -> web.StreamResponse:
+    """Serve the Next.js overview page at /agent-mcp/__dashboard/.
+
+    Phase 3.5a: the React overview lives at the bare path; the
+    dashboard JS detects the missing project segment in
+    `window.location.pathname` and renders the cross-project cards
+    instead of the per-project dashboard.
+
+    Implementation-wise this is a one-shot serve of the static
+    export's `index.html`; routing inside the SPA owns the rest.
+    """
+    candidate = _safe_dashboard_path("index.html")
+    if candidate is None or not candidate.is_file():
+        raise web.HTTPNotFound()
+    return web.FileResponse(
+        path=candidate,
+        headers={"Content-Type": "text/html", "Cache-Control": "no-store"},
+    )
+
+
 async def dashboard_handler(req: web.Request) -> web.StreamResponse:
     """Serve the Next.js page HTML at /agent-mcp/__dashboard/<name>/.
 
@@ -1030,6 +1050,157 @@ async def projects_handler(req: web.Request) -> web.Response:
         {"projects": sorted(_projects_dict().keys())},
         headers={"Cache-Control": "no-store"},
     )
+
+
+# ── Overview endpoint (Phase 3.5a) ──────────────────────────────────
+#
+# Backs the new React route `/__dashboard/` (the dashboard overview).
+# One JSON envelope per request — three small COUNTs per project on a
+# warm SQLite + one `systemctl is-active` per project. We cache the
+# envelope for `_OVERVIEW_CACHE_TTL_SEC` so the dashboard's fan-out of
+# parallel API calls during first paint doesn't hammer systemd-userd
+# or stat() the SQLite file dozens of times. Cache invalidation on
+# project mutation happens organically — the TTL is short enough
+# (3s) that the staleness window is invisible to a human eye.
+
+
+_OVERVIEW_CACHE_TTL_SEC: float = 3.0
+_overview_cache: tuple[float, dict] | None = None
+
+
+def _project_db_path(workspace: str) -> Path:
+    """Per-project SQLite lives at ``<workspace>/.agent/mcp_state.db``."""
+    return Path(workspace) / ".agent" / "mcp_state.db"
+
+
+def _project_counts(workspace: str) -> dict[str, int]:
+    """Three COUNT queries against the project's SQLite. Returns
+    zeros (and never raises) when the DB file or any table is missing
+    — a freshly-registered project that hasn't been touched yet has
+    no DB, and we'd rather render `0` than blank a card."""
+    db = _project_db_path(workspace)
+    out = {"agents": 0, "tasks": 0, "open_messages": 0}
+    if not db.is_file():
+        return out
+    try:
+        # `mode=ro` + `uri=True` prevents accidental writes (and lets
+        # us open a DB that's currently held by the backend without
+        # contention beyond the lock the backend holds at write time).
+        import sqlite3
+
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1.0)
+        try:
+            cur = con.cursor()
+            for table, key in (
+                ("agents", "agents"),
+                ("tasks", "tasks"),
+            ):
+                try:
+                    row = cur.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+                    out[key] = int(row[0]) if row and row[0] is not None else 0
+                except sqlite3.Error:
+                    # Table missing in a half-migrated DB — keep 0.
+                    pass
+            try:
+                row = cur.execute(
+                    "SELECT COUNT(*) FROM agent_messages WHERE read = 0"
+                ).fetchone()
+                out["open_messages"] = (
+                    int(row[0]) if row and row[0] is not None else 0
+                )
+            except sqlite3.Error:
+                pass
+        finally:
+            con.close()
+    except Exception:
+        # Any unexpected DB error → render zeros, don't 500 the card.
+        log.exception("overview: COUNT query failed for %s", db)
+    return out
+
+
+def _derive_status(
+    name: str, *, running: bool, last_activity_ts: float | None, now: float,
+) -> str:
+    """S2: collapse (systemd state, last-activity bucket) to a
+    dashboard chip enum: active/idle/sleeping/stopped/starting/failed.
+
+    Mirrors the cutoffs the idle reaper uses (5 min for "fresh",
+    4 h for "sleeping → reaped"):
+
+      * not running                          → ``stopped``
+      * running, no activity timestamp yet   → ``starting``
+      * running, activity ≤ 5 min ago        → ``active``
+      * running, activity ≤ 4 h ago          → ``idle``
+      * running, activity > 4 h ago          → ``sleeping``
+
+    ``failed`` is reserved for a future enhancement (systemd-side
+    failure detection); we don't synthesize it from any input today.
+    """
+    if not running:
+        return "stopped"
+    if last_activity_ts is None:
+        return "starting"
+    age = now - last_activity_ts
+    if age <= 5 * 60:
+        return "active"
+    if age <= 4 * 60 * 60:
+        return "idle"
+    return "sleeping"
+
+
+def _build_overview_envelope() -> dict:
+    """Assemble the overview JSON envelope from registry + systemd +
+    per-project SQLite. Cheap-ish; cached in `_overview_cache`."""
+    now = time.time()
+    projects_out: list[dict] = []
+    for row in _REGISTRY.list():
+        name = row["name"]
+        workspace = row["workspace"]
+        unit = _unit_name(name, "backend")
+        running = _is_active(unit)
+        ts = last_active.get((name, "backend"))
+        counts = _project_counts(workspace)
+        projects_out.append(
+            {
+                "name": name,
+                "workspace": workspace,
+                "status": _derive_status(
+                    name,
+                    running=running,
+                    last_activity_ts=ts,
+                    now=now,
+                ),
+                "last_activity_ts": ts,
+                "agents": counts["agents"],
+                "tasks": counts["tasks"],
+                "open_messages": counts["open_messages"],
+                "alias": list(row.get("aliases", []) or []),
+            }
+        )
+    envelope: dict = {
+        "projects": projects_out,
+        "multi_tenant": SINGLE_TENANT_NAME is None,
+    }
+    if SINGLE_TENANT_NAME is not None:
+        envelope["single_tenant_name"] = SINGLE_TENANT_NAME
+    return envelope
+
+
+async def overview_handler(req: web.Request) -> web.Response:
+    """GET /agent-mcp/__overview — JSON envelope for the dashboard
+    overview cards (R2 + S2 + multi-line per Phase 3.5).
+
+    Cached for ``_OVERVIEW_CACHE_TTL_SEC`` to avoid hammering
+    systemctl + SQLite on the dashboard's first-paint fan-out. The
+    cache is process-local; one router process = one cache."""
+    global _overview_cache
+    now = time.time()
+    if _overview_cache is not None and _overview_cache[0] > now:
+        envelope = _overview_cache[1]
+    else:
+        envelope = _build_overview_envelope()
+        _overview_cache = (now + _OVERVIEW_CACHE_TTL_SEC, envelope)
+    return web.json_response(envelope, headers={"Cache-Control": "no-store"})
 
 
 async def create_handler(req: web.Request) -> web.StreamResponse:
@@ -1696,6 +1867,23 @@ def _create_form() -> str:
 </fieldset>"""
 
 
+async def index_redirect_handler(req: web.Request) -> web.Response:
+    """GET /agent-mcp/ — 302 to the dashboard overview.
+
+    The HTML index page is gone (decision #3 / ADR-0009). In
+    multi-tenant mode this redirects to the React overview at
+    `/agent-mcp/__dashboard/`. In single-tenant mode it goes straight
+    to the configured project's per-project dashboard so the operator
+    isn't bounced through an "All projects" page that lists exactly
+    one entry.
+    """
+    if SINGLE_TENANT_NAME is not None:
+        target = f"/agent-mcp/__dashboard/{quote(SINGLE_TENANT_NAME)}/"
+    else:
+        target = "/agent-mcp/__dashboard/"
+    raise web.HTTPFound(location=target)
+
+
 async def index_handler(req: web.Request) -> web.Response:
     rows = _list_view()
     readme_html = ""
@@ -1865,12 +2053,21 @@ def make_app(
     app.on_cleanup.append(shutdown)
 
     # Index + project lifecycle.
-    app.router.add_get("/agent-mcp/", index_handler)
+    #
+    # Phase 3.5a (ADR-0009): the bare `/agent-mcp/` URL no longer renders
+    # an HTML index page; it 302-redirects to the React overview at
+    # `/agent-mcp/__dashboard/` (multi-tenant) or to the configured
+    # single project's dashboard (single-tenant). The legacy
+    # `index_handler` is still exported for now but only reachable via
+    # the deprecated `?legacy=1` query for one release while operators
+    # migrate.
+    app.router.add_get("/agent-mcp/", index_redirect_handler)
     app.router.add_get(
         "/agent-mcp",
         lambda r: web.HTTPMovedPermanently(location="/agent-mcp/"),
     )
     app.router.add_get("/agent-mcp/__projects", projects_handler)
+    app.router.add_get("/agent-mcp/__overview", overview_handler)
     app.router.add_post("/agent-mcp/__create", create_handler)
     app.router.add_post("/agent-mcp/__create-agent", create_agent_handler)
     app.router.add_post("/agent-mcp/__stop", stop_handler)
@@ -1896,6 +2093,17 @@ def make_app(
     #     project from window.location.pathname for its API calls).
     app.router.add_get(
         "/agent-mcp/__dashboard/_next/{rest:.*}", dashboard_assets_handler
+    )
+    # Phase 3.5a — bare `/agent-mcp/__dashboard/` (no project segment)
+    # serves the React overview page (cross-project cards). Must be
+    # registered BEFORE the `{name}` routes so the more-specific
+    # zero-segment match wins.
+    app.router.add_get("/agent-mcp/__dashboard/", overview_dashboard_handler)
+    app.router.add_get(
+        "/agent-mcp/__dashboard",
+        lambda r: web.HTTPMovedPermanently(
+            location="/agent-mcp/__dashboard/"
+        ),
     )
     # Bare /agent-mcp/__dashboard/<name> (no trailing slash) is a common
     # typed/bookmarked URL; redirect to the canonical trailing-slash form
