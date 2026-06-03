@@ -207,6 +207,9 @@ def upgrade() -> None:
     _cleanup_orphans(bind)
 
     # Step 3 — group FKs by table so each table is rebuilt at most once.
+    # See env.py for the FK pragma policy (hotfix 2026-06-03): FKs
+    # are OFF during migration, then re-enabled with foreign_key_check
+    # as the safety net.
     tables: list[str] = []
     for fk in _FKS:
         if fk[0] not in tables:
