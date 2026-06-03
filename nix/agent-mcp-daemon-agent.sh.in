@@ -1,0 +1,83 @@
+#!@bash@/bin/bash
+# agent-mcp-daemon-agent — wrapper invoked by the systemd template
+# agent-mcp-daemon-agent@<project>-<agent_id>.service.
+#
+# Responsibilities:
+#   1. Parse %i (passed as $1) into <project> + <agent_id> by
+#      splitting on the literal `--` (double-hyphen) separator.
+#      Both project slugs and agent_id slugs allow single hyphens
+#      (e.g. `washing-brothers` / `backend-dev`), so any single-
+#      hyphen split is ambiguous. The doc's instance convention
+#      is `<project>--<agent_id>` — example
+#      `washing-brothers--backend-dev`.
+#   2. Resolve the bearer token from
+#      ~/.config/agent-mcp/tokens/<project>-<agent_id>.token. The
+#      file is operator-provisioned; for production hosts wire it
+#      through sops (see docs/EVENT_DRIVEN_AGENT_LOOP.md). For
+#      first-day setup a chmod-0600 plaintext file is fine.
+#   3. Compute the MCP endpoint URL for the project (loopback router
+#      port; the same URL the dashboard hands out for tailnet clients
+#      works locally too).
+#   4. exec the Python event-loop runner, passing the resolved
+#      project / agent / token / URL via env vars. The runner is
+#      ~80 lines, lives alongside this script in the same store
+#      path, and is what the systemd unit's logs actually show.
+#      The runner's body is a long-poll loop on the `wait_for_events`
+#      MCP tool (agent-mcp PR #62): each iteration calls the tool
+#      with the last `since` cursor and 60s timeout, then logs any
+#      returned events before re-arming.
+#
+# Nix substitutions:
+#   @bash@    — pkgs.bash
+#   @python@  — pkgs.python312
+#   @runner@  — absolute path to the runner script (Python source
+#               file installed by the same Nix derivation that
+#               substituted this wrapper)
+#   @router_port@ — router's loopback port (1337 today)
+
+set -euo pipefail
+
+instance="${1:?usage: agent-mcp-daemon-agent <project>--<agent_id>}"
+
+# Split on the literal `--` separator. ${var%--*} strips the shortest
+# match of `--*` from the END = everything from the `--` rightward,
+# leaving the project. ${var##*--} strips the longest match of `*--`
+# from the START = everything up to and including the `--`, leaving
+# the agent id.
+project="${instance%--*}"
+agent_id="${instance##*--}"
+
+if [[ -z "$project" || -z "$agent_id" || "$project" == "$instance" ]]; then
+  echo "agent-mcp-daemon-agent: instance '$instance' does not split into <project>--<agent_id>" >&2
+  echo "  expected double-hyphen separator, e.g. 'washing-brothers--backend-dev'" >&2
+  exit 2
+fi
+
+cfg_dir="${XDG_CONFIG_HOME:-$HOME/.config}/agent-mcp"
+# Token filename uses the same `--` separator as the instance.
+token_file="$cfg_dir/tokens/${project}--${agent_id}.token"
+
+if [[ ! -r "$token_file" ]]; then
+  echo "agent-mcp-daemon-agent: missing bearer token at $token_file" >&2
+  echo "  Provision it manually for first-day setup:" >&2
+  echo "    install -m 600 /dev/stdin '$token_file' <<<'<bearer-token>'" >&2
+  echo "  Or via sops once integrated — see docs/EVENT_DRIVEN_AGENT_LOOP.md." >&2
+  exit 3
+fi
+
+bearer="$(< "$token_file")"
+bearer="${bearer//$'\n'/}"
+bearer="${bearer//$'\r'/}"
+
+# Loopback router endpoint. The dashboard-facing tailnet URL works
+# too, but loopback avoids the TLS round-trip and keeps daemon
+# traffic off the wire.
+export AGENT_MCP_MCP_URL="http://127.0.0.1:@router_port@/agent-mcp/${project}/mcp"
+export AGENT_MCP_PROJECT="$project"
+export AGENT_MCP_AGENT_ID="$agent_id"
+export AGENT_MCP_BEARER="$bearer"
+# Cursor lives under XDG_STATE_HOME so restarts don't replay the
+# entire event backlog. The runner mkdir -p's the parent.
+export AGENT_MCP_CURSOR_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/agent-mcp-daemons/${project}--${agent_id}.cursor"
+
+exec @python@/bin/python3 @runner@

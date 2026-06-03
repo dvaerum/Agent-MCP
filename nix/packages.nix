@@ -1,0 +1,236 @@
+{ pkgs, lib, src }:
+
+# Production package set for the agent-mcp home-manager module
+# (Phase 2 of the router-upstream plan, prancy-napping-pie).
+#
+# Three top-level derivations:
+#
+#   agentMcpPy            — the Python application (buildPythonApplication).
+#   agentMcpDashboard     — the Next.js static export, served by the router.
+#   agentMcpRouterWrapper — thin writeShellScriptBin invoking
+#                           `python -m agent_mcp.cli router`. The router
+#                           source moved upstream in Phase 1a, so this
+#                           is now a one-liner wrapper rather than a
+#                           vendored script.
+#
+# Plus the supporting wrappers the home-manager module needs:
+#
+#   agentMcpBackendWrapper        — invokes `python -m agent_mcp.cli` for
+#                                   the per-project backend (SSE transport).
+#   agentMcpLauncher              — bash launcher invoked by the
+#                                   agent-mcp@<name>.service template; resolves
+#                                   <name> → workspace path via the router's
+#                                   projects.local.json, then exec's the
+#                                   backend with --uds.
+#   agentMcpDaemonAgentRunner     — Python event-loop body (long-poll
+#                                   wait_for_events, log each event,
+#                                   persist cursor).
+#   agentMcpDaemonAgentWrapper    — bash wrapper invoked by the
+#                                   agent-mcp-daemon-agent@<instance>.service
+#                                   template. Splits %i into
+#                                   <project>--<agent_id>, reads bearer
+#                                   from ~/.config/agent-mcp/tokens/,
+#                                   exec's the Python runner.
+#   agentMcpDaemonAgentPrecompactHook — Claude Code PreCompact hook for
+#                                       daemon agents.
+#   readmeHtml                    — CommonMark-rendered README used by the
+#                                   router's index page.
+#   installerTemplate             — path to the .mcp.json merge installer
+#                                   template (installer.sh.in moved upstream
+#                                   to agent_mcp/router/ in Phase 1a).
+#
+# Ports the derivations from
+# nixos-developer-system/users/dennis/agent-mcp/default.nix verbatim,
+# adjusting paths so the source comes from `src` (the fork) instead of
+# the `agent-mcp` flake input.
+
+let
+  python = pkgs.python312;
+
+  agentMcpPy = python.pkgs.buildPythonApplication {
+    pname = "agent-mcp";
+    # Read the version from pyproject.toml at evaluation time so a
+    # version bump in pyproject doesn't need to be mirrored here.
+    # The version field lives on a single `version = "X.Y.Z"` line.
+    version =
+      let
+        py = builtins.readFile "${src}/pyproject.toml";
+        m = builtins.match ".*\nversion = \"([^\"]+)\".*" py;
+      in
+        if m == null then "0.0.0-unknown" else builtins.head m;
+    pyproject = true;
+    inherit src;
+    build-system = [ python.pkgs.setuptools ];
+    dependencies = with python.pkgs; [
+      anyio click openai starlette uvicorn jinja2
+      python-dotenv sqlite-vec httpx mcp
+      sqlalchemy alembic aiohttp
+    ];
+    # Upstream tests need a writable HOME, an OPENAI_API_KEY, and at
+    # least one network-hitting fixture. Run them in CI, not here.
+    doCheck = false;
+  };
+
+  # buildPythonApplication does not put the app's site-packages on
+  # PYTHONPATH for subprocesses, so we splice it in manually.
+  agentMcpPyPath =
+    "${agentMcpPy}/${python.sitePackages}:"
+    + "${python.pkgs.makePythonPath agentMcpPy.dependencies}";
+
+  # ── Backend launcher ─────────────────────────────────────────────
+  # Sets the Ollama-shaped OpenAI-compatible endpoint defaults and
+  # exec's `python -m agent_mcp.cli server` via the fork's CLI group.
+  # Callers can override OPENAI_BASE_URL / OPENAI_API_KEY /
+  # AGENT_MCP_EMBEDDING_MODEL / AGENT_MCP_EMBEDDING_DIMENSION via the
+  # systemd unit's Environment list.
+  agentMcpBackendWrapper = pkgs.writeShellScriptBin "agent-mcp-backend" ''
+    export OPENAI_BASE_URL="''${OPENAI_BASE_URL:-http://127.0.0.1:11434/v1}"
+    export OPENAI_API_KEY="''${OPENAI_API_KEY:-ollama}"
+    export AGENT_MCP_EMBEDDING_MODEL="''${AGENT_MCP_EMBEDDING_MODEL:-qwen3-embedding:0.6b}"
+    export AGENT_MCP_EMBEDDING_DIMENSION="''${AGENT_MCP_EMBEDDING_DIMENSION:-1024}"
+    export PYTHONPATH="${agentMcpPyPath}''${PYTHONPATH:+:$PYTHONPATH}"
+    exec ${python}/bin/python -m agent_mcp.cli server --transport sse "$@"
+  '';
+
+  # ── Dashboard static export ──────────────────────────────────────
+  # Next.js 15 project with `output: 'export'`. The router serves the
+  # `out/` directory at /agent-mcp/__dashboard/. ASSET_PREFIX tells
+  # webpack the runtime URL prefix for chunks; default empty would
+  # resolve assets to site root and 404.
+  agentMcpDashboard = pkgs.buildNpmPackage {
+    pname = "agent-mcp-dashboard";
+    # Version mirrors the Python package; bumping pyproject also
+    # bumps the dashboard derivation in lockstep.
+    version = agentMcpPy.version;
+    src = "${src}/agent_mcp/dashboard";
+    ASSET_PREFIX = "/agent-mcp/__dashboard";
+    # Re-set whenever the dashboard's package-lock.json changes
+    # upstream (rare). On hash mismatch, nix prints the correct
+    # value; paste it here.
+    npmDepsHash = "sha256-VDyDHd90VNMIKLqSy/goQ7uj7d+2LkyS7cmYHGy8ojU=";
+    NEXT_PUBLIC_AUTO_CONNECT = "false";
+    NEXT_PUBLIC_DEFAULT_SERVER_HOST = "";
+    NEXT_PUBLIC_DEFAULT_SERVER_PORT = "";
+    installPhase = ''
+      runHook preInstall
+      mkdir -p $out/share
+      cp -r out $out/share/agent-mcp-dashboard
+      runHook postInstall
+    '';
+    dontFixup = true;
+  };
+
+  # ── Router wrapper ────────────────────────────────────────────────
+  # The router source moved upstream in Phase 1a (PR #84): it's now
+  # at agent_mcp/router/ inside the Python package, invoked via the
+  # `router` subcommand on the fork's CLI group. This wrapper just
+  # sets PYTHONPATH and exec's it; the aiohttp runtime dep is pulled
+  # in by agentMcpPy above.
+  agentMcpRouterWrapper = pkgs.writeShellScriptBin "agent-mcp-router" ''
+    export PYTHONPATH="${agentMcpPyPath}''${PYTHONPATH:+:$PYTHONPATH}"
+    exec ${python}/bin/python -m agent_mcp.cli router "$@"
+  '';
+
+  # ── systemd template launcher ─────────────────────────────────────
+  # The agent-mcp@<name>.service template invokes this with %i. The
+  # launcher resolves <name> → project path by reading the single
+  # CLI-managed JSON file, then exec's the backend wrapper with
+  # `--uds <path>/.../backend.sock`.
+  agentMcpLauncher = pkgs.writeShellScriptBin "agent-mcp-launcher" ''
+    set -euo pipefail
+    name="''${1:?usage: agent-mcp-launcher <instance>}"
+    cfg_dir="''${XDG_CONFIG_HOME:-$HOME/.config}/agent-mcp"
+    loc_file="$cfg_dir/projects.local.json"
+
+    path=""
+    if [[ -r "$loc_file" ]]; then
+      path="$(${pkgs.jq}/bin/jq -er --arg n "$name" '.[$n] // empty' "$loc_file" 2>/dev/null || true)"
+    fi
+
+    if [[ -z "$path" ]]; then
+      echo "agent-mcp-launcher: unknown project '$name'" >&2
+      echo "  searched: $loc_file" >&2
+      exit 1
+    fi
+    if [[ ! -d "$path" ]]; then
+      echo "agent-mcp-launcher: '$name' resolves to '$path' but that dir does not exist" >&2
+      exit 1
+    fi
+
+    sock="''${XDG_RUNTIME_DIR}/agent-mcp/$name/backend.sock"
+    mkdir -p "$(dirname "$sock")"
+    exec ${agentMcpBackendWrapper}/bin/agent-mcp-backend \
+      --uds "$sock" \
+      --project-dir "$path" \
+      --no-tui
+  '';
+
+  # ── Daemon-agent reference wiring ─────────────────────────────────
+  # Per-agent always-on event loop. See docs/EVENT_DRIVEN_AGENT_LOOP.md
+  # for the operator-facing story. Two scripts get substituted into
+  # the store:
+  #
+  #   agentMcpDaemonAgentRunner   — Python event-loop body.
+  #   agentMcpDaemonAgentWrapper  — Bash wrapper invoked by the systemd
+  #                                 template.
+  #
+  # The Nix-substituted `.sh.in` files use `@var@` markers so the
+  # store-path locations of pkgs.bash / pkgs.python312 / the runner
+  # script / pkgs.curl / pkgs.jq are baked in at build time.
+
+  agentMcpDaemonAgentRunner = pkgs.runCommand "agent-mcp-daemon-agent-runner.py" {} ''
+    cp ${./agent-mcp-daemon-agent-runner.py} $out
+    chmod +x $out
+  '';
+
+  agentMcpDaemonAgentWrapper = routerPort: pkgs.runCommand "agent-mcp-daemon-agent" {
+    nativeBuildInputs = [ pkgs.makeWrapper ];
+  } ''
+    mkdir -p $out/bin
+    substitute ${./agent-mcp-daemon-agent.sh.in} $out/bin/agent-mcp-daemon-agent \
+      --replace-fail @bash@ ${pkgs.bash} \
+      --replace-fail @python@ ${python} \
+      --replace-fail @runner@ ${agentMcpDaemonAgentRunner} \
+      --replace-fail @router_port@ ${toString routerPort}
+    chmod +x $out/bin/agent-mcp-daemon-agent
+  '';
+
+  agentMcpDaemonAgentPrecompactHook = pkgs.runCommand "agent-mcp-daemon-agent-precompact-hook" {} ''
+    mkdir -p $out/bin
+    substitute ${./agent-mcp-daemon-agent-precompact-hook.sh.in} \
+      $out/bin/agent-mcp-daemon-agent-precompact-hook \
+      --replace-fail @bash@ ${pkgs.bash} \
+      --replace-fail @curl@ ${pkgs.curl} \
+      --replace-fail @jq@ ${pkgs.jq}
+    chmod +x $out/bin/agent-mcp-daemon-agent-precompact-hook
+  '';
+
+  # ── README, rendered to HTML at build time ───────────────────────
+  # Used by the router as the body of the index page's "How to use"
+  # <details> block. cmark is a small CommonMark renderer; the
+  # produced file is a fragment (no <html>/<body>), which is what
+  # the router's _INDEX_STYLE block expects.
+  readmeHtml = pkgs.runCommand "agent-mcp-readme.html" {
+    nativeBuildInputs = [ pkgs.cmark ];
+  } ''
+    cmark --safe ${./README.md} > $out
+  '';
+
+  # installer.sh.in moved upstream to agent_mcp/router/ in Phase 1a
+  # (PR #84). The router reads its path from
+  # AGENT_MCP_INSTALLER_TEMPLATE; we point it at the upstreamed copy.
+  installerTemplate = "${src}/agent_mcp/router/installer.sh.in";
+
+in {
+  inherit
+    agentMcpPy
+    agentMcpDashboard
+    agentMcpRouterWrapper
+    agentMcpBackendWrapper
+    agentMcpLauncher
+    agentMcpDaemonAgentRunner
+    agentMcpDaemonAgentWrapper
+    agentMcpDaemonAgentPrecompactHook
+    readmeHtml
+    installerTemplate;
+}
