@@ -7,8 +7,9 @@
 #   2. GET __projects lists both names.
 #   3. Deep-link into one project's dashboard returns 200 (the
 #      handler serves index.html for any /__dashboard/<name>/ path).
-#   4. The retired SSE handshake URL returns 410 with the migration
-#      hint body (regression guard for the Streamable-HTTP migration).
+#   4. The retired SSE handshake URL returns 404 (Phase 6 deleted
+#      the transitional 410-Gone handlers; the URL now falls through
+#      to aiohttp's default 404, which is the new contract).
 #
 # The backend isn't actually exercised here — booting the full
 # embedding pipeline against ollama would balloon the test runtime.
@@ -166,19 +167,13 @@ pkgs.testers.nixosTest {
     )
     assert code == "200", f"expected 200 from dashboard handler; got {code}"
 
-    # 3. Legacy SSE handshake URL → 410 with migration body.
-    body = machine.succeed(
-        "curl -fsS -o - -w '\\n%{http_code}' "
-        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__sse/alpha "
-        "|| true"
-    )
-    # curl -f exits non-zero on 4xx, suppressed by `|| true`; the
-    # body still streams. We assert on body content + status code.
-    out_410 = machine.succeed(
+    # 3. Legacy SSE handshake URL → 404 (Phase 6: deleted the 410-
+    # Gone handler; aiohttp's default 404 is now the contract).
+    out_404 = machine.succeed(
         "curl -s -o /dev/null -w '%{http_code}' "
         "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__sse/alpha"
     )
-    assert out_410 == "410", f"expected 410 on legacy SSE; got {out_410}"
+    assert out_404 == "404", f"expected 404 on legacy SSE; got {out_404}"
 
     # 4. __create / __unregister / __rename are NOT 410 in multi-tenant
     # mode — they're the documented multi-tenant write surface.
