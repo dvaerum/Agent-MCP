@@ -23,12 +23,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 
 # Synchronous tests (no harness): the CLI subcommand runs against a
 # pre-built sqlite file; the helper runs against any connection.
-# Marking individual tests `pytest.mark.asyncio` where needed.
+# No pytest-asyncio markers needed.
 
 
 # ---------------------------------------------------------------------------

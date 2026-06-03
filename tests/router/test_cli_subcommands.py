@@ -25,8 +25,9 @@ from agent_mcp.cli import (
 )
 
 
-def test_cli_is_a_group_with_two_subcommands() -> None:
-    assert set(cli.commands) == {"server", "router"}
+def test_cli_is_a_group_with_expected_subcommands() -> None:
+    # `backup` was added in the 2026-06-02 db-review PR-5 (item 12).
+    assert set(cli.commands) == {"server", "router", "backup"}
 
 
 def test_server_command_exists_and_keeps_legacy_options() -> None:

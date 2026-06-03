@@ -989,6 +989,72 @@ def _looks_like_legacy_top_level_invocation(argv: list[str]) -> bool:
     return head in _TOP_LEVEL_FLAGS_THAT_NOW_BELONG_TO_SERVER
 
 
+# --- `backup` subcommand ---
+# Per item 12 of the 2026-06-02 database review. The previous
+# project_context-only JSON dump was the only backup surface; this
+# is a full-DB online backup via sqlite3.Connection.backup(), which
+# is safe under WAL (doesn't block writers).
+@cli.command("backup", context_settings=dict(help_option_names=["-h", "--help"]))
+@click.argument(
+    "project_dir",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+)
+@click.argument("output_path", type=click.Path(dir_okay=False))
+@click.option(
+    "--force/--no-force",
+    default=False,
+    help=(
+        "Overwrite OUTPUT_PATH if it already exists. Without this "
+        "flag, the command refuses to clobber an existing file."
+    ),
+)
+def backup_cmd(project_dir: str, output_path: str, force: bool) -> None:
+    """Back up a project's SQLite database to OUTPUT_PATH.
+
+    Uses sqlite3.Connection.backup() — the canonical online backup
+    API. Safe to run while the server is live; readers and writers
+    keep going.
+
+    PROJECT_DIR is the directory containing `.agent/mcp_state.db`
+    (the same path you'd pass to `agent-mcp server --project-dir`).
+    """
+    src_path = Path(project_dir).resolve() / ".agent" / "mcp_state.db"
+    dst_path = Path(output_path)
+
+    if not src_path.exists():
+        click.echo(
+            f"Error: database not found at {src_path}",
+            err=True,
+        )
+        sys.exit(1)
+
+    if dst_path.exists() and not force:
+        click.echo(
+            f"Error: output file {dst_path} already exists; "
+            f"pass --force to overwrite",
+            err=True,
+        )
+        sys.exit(1)
+
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    # If --force, remove the existing target so the backup writes a
+    # fresh DB rather than appending to an unrelated sqlite file.
+    if dst_path.exists() and force:
+        dst_path.unlink()
+
+    src = sqlite3.connect(str(src_path))
+    dst = sqlite3.connect(str(dst_path))
+    try:
+        # progress callback gets (status, remaining, total); we don't
+        # need to surface it interactively for now but the API leaves
+        # the hook available for a future --progress flag.
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    click.echo(f"Backup complete: {dst_path}")
+
+
 def main() -> None:
     """Public entry point.
 
