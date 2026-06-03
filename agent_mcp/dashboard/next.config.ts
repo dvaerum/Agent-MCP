@@ -28,12 +28,26 @@ const nextConfig: NextConfig = {
   basePath: '',
 
   // Asset prefix for deployments behind a path-prefixed reverse proxy.
-  // Driven by the ASSET_PREFIX env var at build time. Default empty
-  // preserves upstream behavior (assets served at site root). Path-
-  // prefixed deployments set ASSET_PREFIX (e.g. ASSET_PREFIX=/agent-mcp/__dashboard)
-  // so the webpack runtime's public path matches where the proxy
-  // serves the static tree.
-  assetPrefix: process.env.ASSET_PREFIX || '',
+  //
+  // Phase 4 (prancy-napping-pie): the default is now a literal
+  // *sentinel* string (`__AGENT_MCP_ASSET_PREFIX__`) instead of an
+  // empty string or a baked-in path. Next.js embeds whatever this
+  // resolves to in HTML, JS chunks, and CSS files at build time; the
+  // sentinel is then substituted at *serve* time by
+  // `agent_mcp/router/asset_prefix.py` with the operator's configured
+  // runtime prefix.
+  //
+  // This inversion (prefix-agnostic build + runtime substitution)
+  // means one build artifact serves every deployment URL — operators
+  // wanting `/tools/` instead of `/agent-mcp/__dashboard/` just point
+  // the router at the new prefix; no rebuild.
+  //
+  // The ASSET_PREFIX env var is still honoured as an escape hatch (a
+  // local dev workflow that wants real Next-baked URLs can set it
+  // before `npm run build`). Nix / CI / production builds MUST NOT
+  // set the env var — let the sentinel default fire so the router
+  // can do its job.
+  assetPrefix: process.env.ASSET_PREFIX || '__AGENT_MCP_ASSET_PREFIX__',
 
   eslint: {
     ignoreDuringBuilds: true,
