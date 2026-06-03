@@ -30,6 +30,9 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import {
+  Tabs, TabsContent, TabsList, TabsTrigger,
+} from "@/components/ui/tabs"
+import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -44,6 +47,8 @@ import {
 import { AddProjectModal } from "./add-project-modal"
 import { RemoveProjectModal } from "./remove-project-modal"
 import { RenameProjectModal } from "./rename-project-modal"
+import { AliasChipPanel } from "./alias-chip-panel"
+import { WiringSnippetsTab } from "./wiring-snippets-tab"
 
 const STATUS_VARIANT: Record<ProjectStatus, "default" | "secondary" | "destructive" | "outline"> = {
   active: "default",
@@ -82,6 +87,7 @@ function ProjectCard({
   const [showDetails, setShowDetails] = useState(false)
   const [renameOpen, setRenameOpen] = useState(false)
   const [removeOpen, setRemoveOpen] = useState(false)
+  const [openAlias, setOpenAlias] = useState<string | null>(null)
   const dashboardHref = `/agent-mcp/__dashboard/${encodeURIComponent(row.name)}/`
   return (
     <Card className="overflow-hidden">
@@ -153,13 +159,39 @@ function ProjectCard({
         </div>
 
         {row.alias.length > 0 && (
-          <div className="flex flex-wrap gap-1">
-            {row.alias.map((a) => (
-              <Badge key={a.name} variant="outline" className="text-[10px]">
-                alias <code className="px-1">{a.name}</code> → expires{" "}
-                {a.expires_at.slice(0, 10)}
-              </Badge>
-            ))}
+          <div className="space-y-1">
+            <div className="flex flex-wrap gap-1">
+              {row.alias.map((a) => (
+                <button
+                  key={a.name}
+                  type="button"
+                  onClick={() =>
+                    setOpenAlias((cur) => (cur === a.name ? null : a.name))
+                  }
+                  className="inline-flex"
+                  aria-label={`Show usage of alias ${a.name}`}
+                >
+                  <Badge
+                    variant={openAlias === a.name ? "default" : "outline"}
+                    className="text-[10px] cursor-pointer hover:bg-accent"
+                  >
+                    alias <code className="px-1">{a.name}</code> → expires{" "}
+                    {a.expires_at.slice(0, 10)}
+                  </Badge>
+                </button>
+              ))}
+            </div>
+            {row.alias.map((a) =>
+              openAlias === a.name ? (
+                <AliasChipPanel
+                  key={a.name}
+                  projectName={row.name}
+                  alias={a}
+                  open={true}
+                  onClose={() => setOpenAlias(null)}
+                />
+              ) : null,
+            )}
           </div>
         )}
 
@@ -278,34 +310,47 @@ export function ProjectsOverviewDashboard(): React.ReactElement {
 
         <AddProjectModal open={addOpen} onOpenChange={setAddOpen} />
 
-        {error && (
-          <Card>
-            <CardContent className="flex items-center gap-2 py-4 text-sm text-destructive">
-              <AlertCircle className="h-4 w-4" />
-              Failed to load projects: {error}
-            </CardContent>
-          </Card>
-        )}
+        <Tabs defaultValue="projects" className="w-full">
+          <TabsList>
+            <TabsTrigger value="projects">Projects</TabsTrigger>
+            <TabsTrigger value="setup">Setup</TabsTrigger>
+          </TabsList>
 
-        {envelope && envelope.projects.length === 0 && !loading && !error && (
-          <Card>
-            <CardContent className="py-12 text-center text-sm text-muted-foreground">
-              No projects registered yet.
-            </CardContent>
-          </Card>
-        )}
+          <TabsContent value="projects" className="space-y-4">
+            {error && (
+              <Card>
+                <CardContent className="flex items-center gap-2 py-4 text-sm text-destructive">
+                  <AlertCircle className="h-4 w-4" />
+                  Failed to load projects: {error}
+                </CardContent>
+              </Card>
+            )}
 
-        {envelope && envelope.projects.length > 0 && (
-          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-            {envelope.projects.map((row) => (
-              <ProjectCard
-                key={row.name}
-                row={row}
-                multiTenant={multiTenant}
-              />
-            ))}
-          </div>
-        )}
+            {envelope && envelope.projects.length === 0 && !loading && !error && (
+              <Card>
+                <CardContent className="py-12 text-center text-sm text-muted-foreground">
+                  No projects registered yet.
+                </CardContent>
+              </Card>
+            )}
+
+            {envelope && envelope.projects.length > 0 && (
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                {envelope.projects.map((row) => (
+                  <ProjectCard
+                    key={row.name}
+                    row={row}
+                    multiTenant={multiTenant}
+                  />
+                ))}
+              </div>
+            )}
+          </TabsContent>
+
+          <TabsContent value="setup">
+            <WiringSnippetsTab />
+          </TabsContent>
+        </Tabs>
       </div>
     </div>
   )

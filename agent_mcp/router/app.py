@@ -1186,6 +1186,115 @@ def _build_overview_envelope() -> dict:
     return envelope
 
 
+async def alias_usage_handler(req: web.Request) -> web.Response:
+    """GET /agent-mcp/__alias-usage?alias=<name>
+
+    Backs the dashboard's alias-chip expansion panel (Phase 3.5c).
+    Resolves the alias to its real project, then queries the
+    project's SQLite `mcp_sessions.alias_used` column (added in
+    Phase 1c migration 0005) for the distinct agent_ids that have
+    used the alias. The dashboard shows this list so the operator
+    can see "who's still on the old name" before deciding to expire
+    the alias early.
+
+    Returns 404 if the alias isn't currently active on any project.
+    Returns ``{alias, project, expires_at, agents}`` on success.
+    """
+    alias = (req.rel_url.query.get("alias") or "").strip()
+    if not alias:
+        raise web.HTTPBadRequest(reason="missing 'alias' query parameter")
+
+    real_name = _REGISTRY.resolve_alias(alias)
+    if real_name is None:
+        raise web.HTTPNotFound(
+            reason=f"alias {alias!r} is not active on any project"
+        )
+
+    row = _REGISTRY.get(real_name)
+    if row is None:
+        # Race: resolve_alias hit a row that was unregistered between
+        # the two reads. Treat as 404.
+        raise web.HTTPNotFound(reason=f"alias {alias!r} no longer resolves")
+
+    # Find the alias's expires_at on the project's record.
+    expires_at = ""
+    for entry in row.get("aliases", []) or []:
+        if entry.get("name") == alias:
+            expires_at = entry.get("expires_at", "")
+            break
+
+    # Pull distinct agent_ids from the project's SQLite (best-effort —
+    # missing DB or missing column → empty list, never raises).
+    agents: list[str] = []
+    db = _project_db_path(row["workspace"])
+    if db.is_file():
+        try:
+            import sqlite3
+
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1.0)
+            try:
+                cur = con.cursor()
+                rows = cur.execute(
+                    "SELECT DISTINCT agent_id FROM mcp_sessions "
+                    "WHERE alias_used = ? AND agent_id IS NOT NULL",
+                    (alias,),
+                ).fetchall()
+                agents = [r[0] for r in rows if r[0]]
+            finally:
+                con.close()
+        except Exception:
+            # Table missing in a half-migrated DB, or unexpected DB
+            # error — return [] rather than 500 the panel.
+            log.exception("alias-usage: query failed for %s", db)
+
+    return web.json_response(
+        {
+            "alias": alias,
+            "project": real_name,
+            "expires_at": expires_at,
+            "agents": agents,
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def remove_alias_handler(req: web.Request) -> web.Response:
+    """POST /agent-mcp/__remove-alias
+
+    Form fields: ``name`` (the real project), ``alias`` (the alias
+    to drop). Removes the alias immediately, skipping the grace
+    reaper. Surface on the dashboard via the alias-chip expansion's
+    "Remove alias now" button (Phase 3.5c).
+
+    Disabled in single-tenant mode (Phase 3) — there's no rename
+    surface in N=1 mode, so there's no alias surface either.
+    """
+    if SINGLE_TENANT_NAME is not None:
+        return _single_tenant_disabled_response()
+    form = await req.post()
+    name = (form.get("name") or "").strip()
+    alias = (form.get("alias") or "").strip()
+    if not name or not alias:
+        raise web.HTTPBadRequest(reason="missing 'name' or 'alias'")
+
+    row = _REGISTRY.get(name)
+    if row is None:
+        raise web.HTTPNotFound(reason=f"unknown project: {name!r}")
+
+    _REGISTRY.expire_alias(name, alias)
+
+    updated = _REGISTRY.get(name)
+    remaining = list((updated or {}).get("aliases", []) or [])
+    return web.json_response(
+        {
+            "removed": alias,
+            "project": name,
+            "remaining_aliases": remaining,
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 async def overview_handler(req: web.Request) -> web.Response:
     """GET /agent-mcp/__overview — JSON envelope for the dashboard
     overview cards (R2 + S2 + multi-line per Phase 3.5).
@@ -2192,6 +2301,9 @@ def make_app(
     app.router.add_post("/agent-mcp/__stop", stop_handler)
     app.router.add_post("/agent-mcp/__unregister", unregister_handler)
     app.router.add_post("/agent-mcp/__rename", rename_handler)
+    # Alias management (Phase 3.5c).
+    app.router.add_get("/agent-mcp/__alias-usage", alias_usage_handler)
+    app.router.add_post("/agent-mcp/__remove-alias", remove_alias_handler)
 
     # Client wiring helpers.
     app.router.add_get(
