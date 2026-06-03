@@ -1086,6 +1086,15 @@ async def purge_agent_api_route(request: Request) -> JSONResponse:
 
 
 # --- Comprehensive Data Endpoint ---
+# Default per-section LIMIT for /api/all-data; bounded by the 2026-06-02
+# database review (item 2) so a project with thousands of rows no longer
+# materialises an unbounded payload on every dashboard refresh. Callers
+# that want more can pass `?limit=N`, but `_ALL_DATA_MAX_LIMIT` clamps
+# the upper bound to keep the JSON shape sane.
+_ALL_DATA_DEFAULT_LIMIT = 500
+_ALL_DATA_MAX_LIMIT = 5000
+
+
 async def all_data_api_route(request: Request) -> JSONResponse:
     """Get all data in one call for caching on frontend"""
     if request.method == 'OPTIONS':
@@ -1096,23 +1105,40 @@ async def all_data_api_route(request: Request) -> JSONResponse:
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Get all agents with their tokens
-        cursor.execute("SELECT * FROM agents ORDER BY created_at DESC")
+        # Bound the per-section response so a project with thousands
+        # of agents/tasks/file_metadata rows no longer ships an
+        # unbounded blob on every dashboard refresh (db review item 2).
+        # Default to `_ALL_DATA_DEFAULT_LIMIT`; allow `?limit=` to
+        # override within `[1, _ALL_DATA_MAX_LIMIT]`.
+        try:
+            requested_limit = int(request.query_params.get("limit", _ALL_DATA_DEFAULT_LIMIT))
+        except (TypeError, ValueError):
+            requested_limit = _ALL_DATA_DEFAULT_LIMIT
+        section_limit = max(1, min(requested_limit, _ALL_DATA_MAX_LIMIT))
+
+        # Build a single agent_id -> active-token map up front so the
+        # per-agent token lookup below is O(1) instead of O(n²)
+        # (db review item 9).
+        active_token_by_agent: dict[str, str] = {}
+        for token, data in g.active_agents.items():
+            if data.get("status") == "terminated":
+                continue
+            ag_id = data.get("agent_id")
+            if ag_id and ag_id not in active_token_by_agent:
+                active_token_by_agent[ag_id] = token
+
+        cursor.execute(
+            "SELECT * FROM agents ORDER BY created_at DESC LIMIT ?",
+            (section_limit,),
+        )
         agents_data = []
         for row in cursor.fetchall():
             agent_dict = dict(row)
-            agent_id = agent_dict['agent_id']
-            
-            # Find token for this agent from active_agents
-            agent_token = None
-            for token, data in g.active_agents.items():
-                if data.get("agent_id") == agent_id and data.get("status") != "terminated":
-                    agent_token = token
-                    break
-            
-            agent_dict['auth_token'] = agent_token
+            agent_dict['auth_token'] = active_token_by_agent.get(
+                agent_dict['agent_id']
+            )
             agents_data.append(agent_dict)
-        
+
         # Add admin as special agent
         agents_data.insert(0, {
             'agent_id': 'Admin',
@@ -1121,16 +1147,19 @@ async def all_data_api_route(request: Request) -> JSONResponse:
             'created_at': 'N/A',
             'current_task': 'N/A'
         })
-        
-        # Get all tasks
-        cursor.execute("SELECT * FROM tasks ORDER BY created_at DESC")
+
+        cursor.execute(
+            "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?",
+            (section_limit,),
+        )
         tasks_data = [dict(row) for row in cursor.fetchall()]
         
-        # Get all context entries via the ORM (Phase 7a; ownership cols 7b).
+        # Get bounded context entries via the ORM (Phase 7a; ownership cols 7b).
         with SessionLocal() as ctx_session:
             ctx_rows = (
                 ctx_session.query(ProjectContext)
                 .order_by(ProjectContext.updated_at.desc())
+                .limit(section_limit)
                 .all()
             )
             context_data = [
@@ -1146,16 +1175,21 @@ async def all_data_api_route(request: Request) -> JSONResponse:
                 for r in ctx_rows
             ]
 
-        # Get recent agent actions (last 100)
-        cursor.execute("""
-            SELECT * FROM agent_actions 
-            ORDER BY timestamp DESC 
-            LIMIT 100
-        """)
+        # Recent agent actions: capped at min(100, section_limit). Keeps
+        # the pre-existing "last 100" behavior when no `?limit=` is
+        # supplied; lets `?limit=N<100` shrink it further.
+        actions_cap = min(100, section_limit)
+        cursor.execute(
+            "SELECT * FROM agent_actions ORDER BY timestamp DESC LIMIT ?",
+            (actions_cap,),
+        )
         actions_data = [dict(row) for row in cursor.fetchall()]
-        
-        # Get file metadata
-        cursor.execute("SELECT * FROM file_metadata")
+
+        # Get bounded file metadata (db review item 2 — was unbounded).
+        cursor.execute(
+            "SELECT * FROM file_metadata LIMIT ?",
+            (section_limit,),
+        )
         file_metadata = [dict(row) for row in cursor.fetchall()]
         
         response_data = {
