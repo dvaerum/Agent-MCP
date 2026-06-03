@@ -842,6 +842,64 @@ async def reaper(app: web.Application) -> None:
                 last_active.pop(key, None)
 
 
+# ── Alias reaper ────────────────────────────────────────────────────
+
+
+# Cadence between alias-reaper ticks. The grace period for aliases is
+# measured in days (default 30), so a 60 s tick gives near-instant
+# cleanup of past-due aliases without paying for a tighter loop. Held
+# at module scope so tests can monkeypatch to a smaller value.
+_ALIAS_REAPER_INTERVAL_SEC = 60
+
+
+async def _alias_reaper_tick(registry: project_registry.ProjectRegistry) -> None:
+    """Single pass over the registry, removing any alias whose
+    `expires_at` is in the past. Emits one INFO log line per removal.
+
+    Extracted from the loop so tests can call it directly with a
+    deterministic registry instance — the loop wrapper just wakes up,
+    calls this, and goes back to sleep.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    for row in registry.list():
+        name = row["name"]
+        for entry in list(row.get("aliases", []) or []):
+            alias_name = entry.get("name")
+            expires_at = entry.get("expires_at", "")
+            if not alias_name or not expires_at:
+                continue
+            try:
+                exp = project_registry._parse_iso(expires_at)
+            except (TypeError, ValueError):
+                # Malformed entry — leave it; the operator can clean
+                # up by hand and we don't want to silently drop data
+                # we can't reason about.
+                continue
+            if exp <= now:
+                registry.expire_alias(name, alias_name)
+                log.info(
+                    "Alias %r for project %r expired and was removed.",
+                    alias_name, name,
+                )
+
+
+async def alias_reaper(app: web.Application) -> None:
+    """Long-running background task: every
+    ``_ALIAS_REAPER_INTERVAL_SEC`` seconds, sweep the registry for
+    aliases whose grace period has lapsed. Idempotent w.r.t.
+    concurrent rename/add_alias — `expire_alias` is a write-locked
+    operation.
+    """
+    while True:
+        await asyncio.sleep(_ALIAS_REAPER_INTERVAL_SEC)
+        try:
+            await _alias_reaper_tick(_REGISTRY)
+        except Exception:
+            log.exception("alias reaper tick failed; will retry next pass")
+
+
 async def reconcile_on_startup(app: web.Application) -> None:
     """Adopt already-running backend units after a router restart."""
     r = _systemctl(
@@ -1664,10 +1722,17 @@ async def _start_reaper_task(app: web.Application) -> None:
     asyncio.create_task(reaper(app))
 
 
+async def _start_alias_reaper_task(app: web.Application) -> None:
+    """Spawn the alias reaper coroutine on app startup. Mirrors the
+    pattern used by `_start_reaper_task` for the idle-backend reaper."""
+    asyncio.create_task(alias_reaper(app))
+
+
 def make_app() -> web.Application:
     app = web.Application()
     app.on_startup.append(reconcile_on_startup)
     app.on_startup.append(_start_reaper_task)
+    app.on_startup.append(_start_alias_reaper_task)
     app.on_cleanup.append(shutdown)
 
     # Index + project lifecycle.
