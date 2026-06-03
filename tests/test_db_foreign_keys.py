@@ -6,10 +6,11 @@ CREATE TABLE** — so the pragma is a no-op. This PR ships **four of
 the seven** implicit FKs via Alembic migration 0007.
 
 The other three (agent_messages.sender_id, agent_messages.recipient_id,
-mcp_sessions.agent_id) are deferred to a follow-up PR — production
-data shows all their orphans have agent_id='admin', the admin
-pseudo-agent identity that lives in `g.admin_token` but has no row
-in the agents table. Seeding that row is a separate change.
+mcp_sessions.agent_id) were initially deferred — production data
+showed all their orphans had agent_id='admin', the admin pseudo-agent
+identity that lives in `g.admin_token` but had no row in the agents
+table. PR-G1 (migration 0008) seeds that row and ships the deferred
+FKs; coverage for those moved to `test_db_admin_pseudo_agent.py`.
 
 Tests cover:
 - All 4 FK constraints visible via `PRAGMA foreign_key_list(<table>)`
@@ -85,12 +86,18 @@ async def test_shipped_fk_constraints_declared(tmp_path) -> None:
             conn.close()
 
 
-async def test_deferred_fks_explicitly_absent(tmp_path) -> None:
-    """The three admin-implicated FKs are intentionally NOT shipped.
+async def test_previously_deferred_fks_now_shipped(tmp_path) -> None:
+    """The three admin-implicated FKs are now declared (PR-G1, migration 0008).
 
-    Pins the deferral decision so a future "let's just add all the
-    review's FKs" PR has to confront the docstring rationale and
-    either ship the admin-seed change first or update this pin.
+    Originally PR-2 (0007) deferred these three FKs because the
+    application treated `admin` as a pseudo-agent with no row in
+    `agents`. PR-G1 (0008) seeded that row and shipped the deferred
+    FKs. This test guards against accidental regression that would
+    re-remove them.
+
+    Detailed coverage (FK violation rejection + admin-row seeding +
+    `PRAGMA foreign_key_check` clean) lives in
+    `test_db_admin_pseudo_agent.py`.
     """
     from agent_mcp.core.config import get_db_path
 
@@ -99,9 +106,9 @@ async def test_deferred_fks_explicitly_absent(tmp_path) -> None:
         try:
             for table, col, ref_table, ref_col in _DEFERRED_FKS:
                 fks = _fk_list(conn, table)
-                assert (col, ref_table, ref_col) not in fks, (
+                assert (col, ref_table, ref_col) in fks, (
                     f"deferred FK {table}.{col} -> {ref_table}.{ref_col} "
-                    f"was added unexpectedly; see migration 0007 docstring"
+                    f"should now be present after PR-G1; have {fks}"
                 )
         finally:
             conn.close()
@@ -393,19 +400,28 @@ async def test_migration_cleans_up_orphans_by_default(tmp_path) -> None:
         assert ccs is not None
         assert ccs[0] is None
 
-        # Deferred-FK orphan rows untouched (the migration doesn't
-        # know about them; the deferred FK column is still arbitrary
-        # text).
+        # Previously-deferred FK orphan rows are now DELETEd by
+        # migration 0008 (PR-G1). The agent_messages and mcp_sessions
+        # orphans seeded above reference 'bogus-sender' /
+        # 'bogus-recipient' / 'bogus-agent' — none of those are
+        # 'admin', so they don't survive the NOT NULL FK cleanup.
         assert (
             conn.execute(
                 "SELECT COUNT(*) FROM agent_messages "
                 "WHERE message_id IN ('m-orph-snd', 'm-orph-rcp')"
             ).fetchone()[0]
-            == 2
+            == 0
         )
         assert (
             conn.execute(
                 "SELECT COUNT(*) FROM mcp_sessions WHERE session_id='mcps-orph'"
+            ).fetchone()[0]
+            == 0
+        )
+        # The synthetic admin row is seeded by migration 0008.
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM agents WHERE agent_id='admin'"
             ).fetchone()[0]
             == 1
         )

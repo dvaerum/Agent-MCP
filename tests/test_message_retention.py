@@ -26,7 +26,7 @@ import secrets
 
 import pytest
 
-from tests.harness import mcp_session
+from tests.harness import mcp_session, seed_agent_rows
 
 
 # ---------- pruner SQL ----------------------------------------------
@@ -82,6 +82,7 @@ async def test_prune_deletes_old_read_messages(tmp_path) -> None:
     from agent_mcp.features.message_retention import prune_old_messages
 
     async with mcp_session(tmp_path):
+        seed_agent_rows("alice")
         now = _dt.datetime.now()
         old_ts = (now - _dt.timedelta(days=5)).isoformat()
         new_ts = now.isoformat()
@@ -113,6 +114,7 @@ async def test_prune_keeps_unread_messages_even_if_old(tmp_path) -> None:
     from agent_mcp.features.message_retention import prune_old_messages
 
     async with mcp_session(tmp_path):
+        seed_agent_rows("alice")
         old_ts = (_dt.datetime.now() - _dt.timedelta(days=30)).isoformat()
         unread = _seed_message("admin", "alice", "old unread", read=0,
                                timestamp=old_ts)
@@ -138,6 +140,7 @@ async def test_prune_no_op_when_retention_unset(tmp_path) -> None:
     from agent_mcp.features.message_retention import prune_old_messages
 
     async with mcp_session(tmp_path):
+        seed_agent_rows("alice")
         old_ts = (_dt.datetime.now() - _dt.timedelta(days=365)).isoformat()
         _seed_message("admin", "alice", "ancient read", read=1, timestamp=old_ts)
 
@@ -154,6 +157,7 @@ async def test_prune_no_op_when_retention_zero(tmp_path) -> None:
     from agent_mcp.features.message_retention import prune_old_messages
 
     async with mcp_session(tmp_path):
+        seed_agent_rows("alice")
         old_ts = (_dt.datetime.now() - _dt.timedelta(days=365)).isoformat()
         _seed_message("admin", "alice", "ancient read", read=1, timestamp=old_ts)
 
@@ -170,6 +174,7 @@ async def test_prune_ignores_bad_config_value(tmp_path) -> None:
     from agent_mcp.features.message_retention import prune_old_messages
 
     async with mcp_session(tmp_path):
+        seed_agent_rows("alice")
         old_ts = (_dt.datetime.now() - _dt.timedelta(days=365)).isoformat()
         _seed_message("admin", "alice", "ancient read", read=1, timestamp=old_ts)
 
