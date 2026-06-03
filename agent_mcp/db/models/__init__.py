@@ -16,7 +16,8 @@ Adding a new model:
 
 from .agent import Agent
 from .agent_message import AgentMessage
+from .mcp_session import McpSession
 from .project_context import ProjectContext
 from .task import Task
 
-__all__ = ["Agent", "AgentMessage", "ProjectContext", "Task"]
+__all__ = ["Agent", "AgentMessage", "McpSession", "ProjectContext", "Task"]
