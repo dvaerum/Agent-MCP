@@ -198,11 +198,19 @@ async def test_overview_alias_rows_surface(
 async def test_multi_tenant_index_redirects_to_dashboard_overview(
     aiohttp_client, router_app,
 ) -> None:
-    """``GET /agent-mcp/`` in multi-tenant mode is now a 302 to
-    ``/agent-mcp/__dashboard/`` (decision #2 / ADR-0009)."""
+    """``GET /agent-mcp/`` with a browser Accept (text/html) 302s to
+    ``/agent-mcp/__dashboard/`` (decision #2 / ADR-0009).
+
+    PR-A added Accept-header negotiation: non-browser clients get the
+    JSON service descriptor instead — covered in
+    ``test_service_descriptor.py``. This test pins the browser path."""
     client = await aiohttp_client(router_app)
 
-    resp = await client.get("/agent-mcp/", allow_redirects=False)
+    resp = await client.get(
+        "/agent-mcp/",
+        headers={"Accept": "text/html"},
+        allow_redirects=False,
+    )
 
     assert resp.status == 302
     assert resp.headers["Location"] == "/agent-mcp/__dashboard/"
@@ -214,13 +222,18 @@ async def test_multi_tenant_index_redirects_to_dashboard_overview(
 async def test_single_tenant_index_redirects_to_single_project_dashboard(
     aiohttp_client, router_module, register_project,
 ) -> None:
-    """``GET /agent-mcp/`` in single-tenant mode goes straight to the
-    configured project's dashboard (decision #2)."""
+    """``GET /agent-mcp/`` with a browser Accept in single-tenant mode
+    goes straight to the configured project's dashboard (decision #2).
+    PR-A: explicit Accept: text/html required to get the redirect."""
     register_project("only")
     app = router_module.make_app(single_tenant_name="only")
     client = await aiohttp_client(app)
 
-    resp = await client.get("/agent-mcp/", allow_redirects=False)
+    resp = await client.get(
+        "/agent-mcp/",
+        headers={"Accept": "text/html"},
+        allow_redirects=False,
+    )
 
     assert resp.status == 302
     assert resp.headers["Location"] == "/agent-mcp/__dashboard/only/"
