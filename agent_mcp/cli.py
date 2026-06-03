@@ -833,6 +833,21 @@ def server_cmd(
     help="Optional README rendered to HTML, embedded in the index page.",
 )
 @click.option(
+    "--asset-prefix",
+    "asset_prefix",
+    type=str,
+    default=lambda: os.environ.get("AGENT_MCP_ASSET_PREFIX") or None,
+    show_default="$AGENT_MCP_ASSET_PREFIX (default: /agent-mcp/__dashboard)",
+    help=(
+        "Runtime URL prefix substituted into the dashboard's "
+        "sentinel-marked asset URLs on serve (Phase 4). Set this to "
+        "match the path the dashboard is mounted at by your reverse "
+        "proxy. Default ``/agent-mcp/__dashboard`` matches the "
+        "router's own dashboard route table. One build artifact "
+        "serves any prefix — no rebuild needed."
+    ),
+)
+@click.option(
     "--single-tenant",
     "single_tenant_name",
     type=str,
@@ -867,6 +882,7 @@ def router_cmd(
     idle_sec: int,
     installer_template: Optional[str],
     readme_html: str,
+    asset_prefix: Optional[str],
     single_tenant_name: Optional[str],
     single_tenant_workspace: Optional[str],
 ) -> None:
@@ -892,6 +908,8 @@ def router_cmd(
         os.environ["AGENT_MCP_INSTALLER_TEMPLATE"] = installer_template
     if readme_html:
         os.environ["AGENT_MCP_README_HTML"] = readme_html
+    if asset_prefix is not None:
+        os.environ["AGENT_MCP_ASSET_PREFIX"] = asset_prefix
 
     # Required env vars without defaults: surface a clean error
     # rather than a KeyError stack trace deep inside the app.

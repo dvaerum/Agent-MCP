@@ -109,6 +109,7 @@ from urllib.parse import quote, urlencode
 from aiohttp import ClientSession, ClientTimeout, UnixConnector, web
 
 from . import project_registry  # sibling module — see ./project_registry.py
+from . import asset_prefix as _asset_prefix  # Phase 4: runtime sentinel sub
 
 
 log = logging.getLogger(__name__)
@@ -139,6 +140,26 @@ DEFAULT_WORKSPACE_PARENT = Path(
     )
 ).expanduser()
 README_HTML_PATH = os.environ.get("AGENT_MCP_README_HTML", "")
+
+# ── Runtime asset prefix (Phase 4) ──────────────────────────────────
+# The dashboard build emits a literal sentinel
+# (``__AGENT_MCP_ASSET_PREFIX__``) wherever Next.js would normally bake
+# ``assetPrefix`` into HTML / JS / CSS bytes. The router substitutes
+# this value in at serve time so one build artifact can be deployed at
+# any URL prefix without a rebuild.
+#
+# Default ``/agent-mcp/__dashboard`` preserves the historic URL shape
+# the deploy repo already serves under — operators who don't set the
+# env var see zero behavior change. Operators deploying behind a
+# reverse proxy mounted at a different path override the env var (or
+# pass ``--asset-prefix`` to the CLI) to a matching value; no rebuild.
+#
+# See ADR-0008 + the Phase 4 entry of the plan
+# ``prancy-napping-pie.md`` for the design rationale (single build,
+# runtime substitution, sentinel-as-self-documenting marker).
+ASSET_PREFIX: str = os.environ.get(
+    "AGENT_MCP_ASSET_PREFIX", "/agent-mcp/__dashboard"
+)
 
 # ── Single-tenant mode (Phase 3) ────────────────────────────────────
 # When set, the router runs in N=1 mode (services.agent-mcp.multiTenant
@@ -845,6 +866,43 @@ def _safe_dashboard_path(rest: str) -> Path | None:
     return candidate
 
 
+def _serve_dashboard_file(
+    candidate: Path, *, cache_control: str,
+) -> web.Response:
+    """Serve a file from the dashboard tree, running it through the
+    Phase 4 sentinel substitution if the Content-Type is one of the
+    eligible text types (HTML/JS/CSS).
+
+    Binary files (images, fonts, JSON manifests) skip substitution and
+    are read straight from disk — substitution could corrupt their
+    bytes if a chance sequence happened to match the sentinel.
+
+    Reads the configured prefix from module-level ``ASSET_PREFIX`` on
+    each call rather than capturing it at startup, so tests
+    monkey-patching ``ASSET_PREFIX`` after import see their override
+    reflected immediately.
+    """
+    ctype = _MIME.get(candidate.suffix.lower(), "application/octet-stream")
+    if _asset_prefix.content_type_needs_substitution(ctype):
+        body = _asset_prefix.substitute_file_bytes(candidate, ASSET_PREFIX)
+        return web.Response(
+            body=body,
+            headers={
+                "Content-Type": ctype,
+                "Cache-Control": cache_control,
+            },
+        )
+    # Binary / structured-data file → pass through verbatim.
+    raw = candidate.read_bytes()
+    return web.Response(
+        body=raw,
+        headers={
+            "Content-Type": ctype,
+            "Cache-Control": cache_control,
+        },
+    )
+
+
 async def overview_dashboard_handler(req: web.Request) -> web.StreamResponse:
     """Serve the Next.js overview page at /agent-mcp/__dashboard/.
 
@@ -855,25 +913,26 @@ async def overview_dashboard_handler(req: web.Request) -> web.StreamResponse:
 
     Implementation-wise this is a one-shot serve of the static
     export's `index.html`; routing inside the SPA owns the rest.
+
+    Phase 4: HTML body is run through the asset-prefix sentinel
+    substitution so embedded ``__AGENT_MCP_ASSET_PREFIX__/_next/…``
+    URLs are rewritten to the configured runtime prefix.
     """
     candidate = _safe_dashboard_path("index.html")
     if candidate is None or not candidate.is_file():
         raise web.HTTPNotFound()
-    return web.FileResponse(
-        path=candidate,
-        headers={"Content-Type": "text/html", "Cache-Control": "no-store"},
-    )
+    return _serve_dashboard_file(candidate, cache_control="no-store")
 
 
 async def dashboard_handler(req: web.Request) -> web.StreamResponse:
     """Serve the Next.js page HTML at /agent-mcp/__dashboard/<name>/.
 
-    The HTML's embedded `<script src=…>` URLs come pre-prefixed by
-    Next.js's `assetPrefix` (set in the build-time patch to
-    `/agent-mcp/__dashboard`), so they get served by
-    dashboard_assets_handler below, NOT by this handler. This one
-    only deals with the page itself (index.html or any nested
-    page route from the static export).
+    The HTML's embedded `<script src=…>` URLs come pre-prefixed with
+    the build-time sentinel ``__AGENT_MCP_ASSET_PREFIX__``; Phase 4's
+    `_serve_dashboard_file` substitutes the configured runtime prefix
+    (default ``/agent-mcp/__dashboard``) before the bytes go on the
+    wire. Assets themselves are served by
+    `dashboard_assets_handler` below.
     """
     name = req.match_info.get("name", "")
     if name:
@@ -900,40 +959,39 @@ async def dashboard_handler(req: web.Request) -> web.StreamResponse:
                     raise web.HTTPNotFound()
         else:
             raise web.HTTPNotFound()
-    ctype = _MIME.get(candidate.suffix.lower(), "application/octet-stream")
     # HTML may change between rebuilds (different chunk hashes embedded
     # in <script> tags). Force fresh fetches so a redeploy doesn't get
     # masked by the browser disk cache.
-    return web.FileResponse(
-        path=candidate,
-        headers={"Content-Type": ctype, "Cache-Control": "no-store"},
-    )
+    return _serve_dashboard_file(candidate, cache_control="no-store")
 
 
 async def dashboard_assets_handler(req: web.Request) -> web.StreamResponse:
     """Serve Next.js static assets at /agent-mcp/__dashboard/_next/…
 
-    The dashboard's `assetPrefix` patch makes Next emit asset URLs as
-    `/agent-mcp/__dashboard/_next/static/…` — no project name segment
-    (assetPrefix is fixed at build time, can't include a runtime
-    project name). All projects share the same on-disk dist tree
-    anyway, so a single route serving from DASHBOARD_DIR/_next/...
-    is the right thing.
+    The dashboard's webpack chunks bake the sentinel into
+    ``__webpack_public_path__`` at build time; Phase 4's
+    `_serve_dashboard_file` substitutes the configured runtime prefix
+    in JS / CSS responses so chunks resolve under the correct URL no
+    matter where the dashboard is mounted. Binary files (fonts,
+    images) pass through unchanged.
+
+    All projects share the same on-disk dist tree (assetPrefix is
+    project-agnostic; it's only the URL prefix that varies), so a
+    single route serving from DASHBOARD_DIR/_next/... is the right
+    thing.
     """
     rest = req.match_info.get("rest", "")
     candidate = _safe_dashboard_path(f"_next/{rest}")
     if candidate is None or not candidate.is_file():
         raise web.HTTPNotFound()
-    ctype = _MIME.get(candidate.suffix.lower(), "application/octet-stream")
     # Next.js content-hashes every chunk filename; the same URL is
-    # guaranteed to map to the same bytes forever. Mark immutable so
-    # the browser skips even conditional revalidation on reload.
-    return web.FileResponse(
-        path=candidate,
-        headers={
-            "Content-Type": ctype,
-            "Cache-Control": "public, max-age=31536000, immutable",
-        },
+    # guaranteed to map to the same bytes forever (a different prefix
+    # → different bytes, but content hashes never re-hit so cache
+    # poisoning across prefixes is impossible). Mark immutable so the
+    # browser skips conditional revalidation on reload.
+    return _serve_dashboard_file(
+        candidate,
+        cache_control="public, max-age=31536000, immutable",
     )
 
 

@@ -190,5 +190,31 @@ pkgs.testers.nixosTest {
     assert code_create != "410", (
         f"__create must not 410 in multi-tenant mode; got {code_create}"
     )
+
+    # 5. Phase 4 runtime asset-prefix substitution: the dashboard build
+    # emits `__AGENT_MCP_ASSET_PREFIX__` everywhere Next.js would have
+    # baked in a build-time assetPrefix; the router must substitute the
+    # default `/agent-mcp/__dashboard` on serve. A leak here = a broken
+    # white dashboard in the browser.
+    sentinel_count = machine.succeed(
+        "curl -fsS http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__dashboard/alpha/"
+        " | grep -c '__AGENT_MCP_ASSET_PREFIX__' || true"
+    ).strip()
+    assert sentinel_count == "0", (
+        "Phase 4 regression: the asset-prefix sentinel leaked into "
+        f"served HTML (count={sentinel_count!r}). The router's "
+        "substitution must replace every occurrence before bytes go "
+        "on the wire — a leaked sentinel renders the dashboard blank."
+    )
+
+    # Asset URLs in the served HTML must now reference the configured
+    # runtime prefix (default /agent-mcp/__dashboard).
+    served = machine.succeed(
+        "curl -fsS http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__dashboard/alpha/"
+    )
+    assert "/agent-mcp/__dashboard/_next/" in served, (
+        "Phase 4: expected substituted asset URLs in served HTML; "
+        f"first 400 bytes: {served[:400]!r}"
+    )
   '';
 }

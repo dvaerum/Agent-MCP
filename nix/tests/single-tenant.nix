@@ -195,5 +195,22 @@ pkgs.testers.nixosTest {
         "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__dashboard/${singleName}/"
     )
     assert code == "200", f"configured project dashboard should 200; got {code}"
+
+    # 5. Phase 4 runtime asset-prefix substitution: same regression
+    # guard as multi-tenant.nix. The dashboard build emits the
+    # sentinel `__AGENT_MCP_ASSET_PREFIX__`; the router substitutes
+    # the configured prefix on serve. Leak = blank dashboard.
+    sentinel_count = machine.succeed(
+        "curl -fsS http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__dashboard/${singleName}/"
+        " | grep -c '__AGENT_MCP_ASSET_PREFIX__' || true"
+    ).strip()
+    assert sentinel_count == "0", (
+        "Phase 4 regression: the asset-prefix sentinel leaked into "
+        f"served HTML (count={sentinel_count!r}) in single-tenant "
+        "mode. Both modes share the same dashboard handler, so a "
+        "leak here would also fail the multi-tenant test — but pin "
+        "it explicitly so the failure surface tells the operator "
+        "exactly which mode broke."
+    )
   '';
 }
