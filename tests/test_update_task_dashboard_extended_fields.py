@@ -90,10 +90,16 @@ async def test_update_task_dashboard_accepts_priority_only(tmp_path) -> None:
 
 
 async def test_update_task_dashboard_accepts_assigned_to(tmp_path) -> None:
-    """Edit modal can assign a task to an arbitrary agent_id string via
-    this endpoint. The endpoint stores assigned_to verbatim; agent
-    existence is enforced (or not) by upstream consumers."""
+    """Edit modal can assign a task to an existing agent via this endpoint.
+
+    The endpoint stores `assigned_to` verbatim, but per the
+    `tasks.assigned_to -> agents.agent_id` FK declared in Alembic
+    migration 0007 the target must exist in the agents table.
+    Previously this test used an unknown agent_id string ("edit-target
+    -agent") and relied on the absence of FK enforcement.
+    """
     async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("edit-target-agent")
         task_id = _create_task(admin)
 
         r = admin.client.post(
@@ -114,8 +120,14 @@ async def test_update_task_dashboard_accepts_assigned_to(tmp_path) -> None:
 async def test_update_task_dashboard_unassigns_with_empty_assigned_to(
     tmp_path,
 ) -> None:
-    """Passing assigned_to='' (or null) must clear the assignment."""
+    """Passing assigned_to='' (or null) must clear the assignment.
+
+    The agent_id used here is also a real agent created via
+    `create_worker` so the assign step lands cleanly under the
+    `tasks.assigned_to -> agents.agent_id` FK (migration 0007).
+    """
     async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("to-unassign")
         task_id = _create_task(admin)
 
         # Assign first.
@@ -139,9 +151,18 @@ async def test_update_task_dashboard_unassigns_with_empty_assigned_to(
         )
         assert r.status_code == 200, r.text
 
-        # And the listing no longer mentions the agent.
-        listing = _json.dumps(admin.client.get("/api/tasks").json())
-        assert "to-unassign" not in listing
+        # And the listing no longer mentions the agent's assignment.
+        # (The agent still exists in the agents table; we just check
+        # the task no longer carries the assignment.)
+        tasks = admin.client.get("/api/tasks").json()
+        assigned_to_field = None
+        for t in tasks if isinstance(tasks, list) else []:
+            if t.get("task_id") == task_id:
+                assigned_to_field = t.get("assigned_to")
+                break
+        assert assigned_to_field in (None, "", "Unassigned"), (
+            f"task {task_id} still assigned to {assigned_to_field!r}"
+        )
 
 
 async def test_update_task_dashboard_requires_at_least_one_field(
