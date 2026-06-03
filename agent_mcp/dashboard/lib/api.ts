@@ -175,11 +175,17 @@ class ApiClient {
 
     const url = `${this.baseUrl}${endpoint}`
     
-    // Enhanced CORS configuration
+    // Enhanced CORS configuration.
+    //
+    // PR-A: the strict, version-pinned API media type is required by
+    // the router's Accept-header gate (/agent-mcp/__api/<name>/*). A
+    // plain `application/json` Accept value is rejected with 406. The
+    // dashboard is a first-class consumer of the v1 surface, so the
+    // gate header is part of every request.
     const fetchOptions: RequestInit = {
       headers: {
         'Content-Type': 'application/json',
-        'Accept': 'application/json',
+        'Accept': 'application/vnd.agent-mcp.v1+json',
         // Don't set Origin header - let browser handle it automatically
         ...options.headers,
       },

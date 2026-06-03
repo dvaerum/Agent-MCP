@@ -169,9 +169,13 @@ async def test_single_tenant_mcp_wrong_name_redirects(
 async def test_single_tenant_api_wrong_name_redirects(
     aiohttp_client, single_tenant_app,
 ) -> None:
+    """PR-A: the REST surface now requires the strict Accept header.
+    The single-tenant W1 redirect runs after the Accept gate, so the
+    test must opt in to the gate to reach the redirect path."""
     client = await aiohttp_client(single_tenant_app)
     resp = await client.get(
         "/agent-mcp/__api/some-other-project/agents",
+        headers={"Accept": "application/vnd.agent-mcp.v1+json"},
         allow_redirects=False,
     )
     assert resp.status == 302
