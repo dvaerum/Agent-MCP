@@ -1,5 +1,6 @@
 # Agent-MCP/mcp_template/mcp_server_src/app/main_app.py
 import asyncio
+import contextvars
 import json
 import os
 from contextlib import asynccontextmanager
@@ -49,6 +50,27 @@ _MIGRATION_BODY = json.dumps(
 ).encode("utf-8")
 
 
+# Phase 1c — request-scoped alias telemetry.
+#
+# Set by ``AuthHeaderMiddleware`` when the upstream router (Phase 1b)
+# proxied a request from an alias URL and forwarded the
+# ``X-Agent-MCP-Alias: <name>,<expires_at>`` header. Read by the
+# overridden ``create_initialization_options`` so the MCP initialize
+# response's ``instructions`` field can append a deprecation warning,
+# and by the GET /mcp opener so the new ``mcp_sessions.alias_used``
+# column records which alias routed the stream.
+#
+# ContextVar (rather than ``request.scope``) is required for the
+# initialize-response path because the SDK calls
+# ``create_initialization_options`` from a server-task spawned by
+# ``StreamableHTTPSessionManager`` — that task inherits the request's
+# Context (so the ContextVar carries over) but has no direct handle on
+# the originating Request object.
+request_alias_info: "contextvars.ContextVar[Optional[tuple[str, str]]]" = (
+    contextvars.ContextVar("request_alias_info", default=None)
+)
+
+
 class _GoneApp:
     """ASGI app that always responds 410 Gone with the migration body.
 
@@ -80,10 +102,36 @@ class _GoneApp:
         )
 
 
+def _parse_alias_header(value: Optional[str]) -> Optional[tuple[str, str]]:
+    """Parse the `X-Agent-MCP-Alias: <name>,<expires_at>` header value.
+
+    Returns `(alias_name, expires_at_iso)` on success, `None` if the
+    header is absent or malformed. The router (Phase 1b) is the only
+    legitimate producer of this header; if a client sets it directly
+    the worst case is a cosmetic warning in the initialize response,
+    so we don't try to authenticate the header itself.
+
+    Both halves are required — a value missing the comma means the
+    router shape changed and we should not silently inject half-data
+    into the response. Returning None there leaves the wire response
+    unchanged (the no-alias path).
+    """
+    if not value:
+        return None
+    parts = value.split(",", 1)
+    if len(parts) != 2:
+        return None
+    alias_name = parts[0].strip()
+    expires_at = parts[1].strip()
+    if not alias_name or not expires_at:
+        return None
+    return alias_name, expires_at
+
+
 class AuthHeaderMiddleware(BaseHTTPMiddleware):
     """Capture Authorization: Bearer into request_auth_token + gate /mcp.
 
-    Two responsibilities:
+    Three responsibilities:
 
     1. Bind any incoming `Authorization: Bearer <tok>` value to the
        `request_auth_token` ContextVar so tool dispatch can fall back
@@ -102,6 +150,15 @@ class AuthHeaderMiddleware(BaseHTTPMiddleware):
        Note: per-tool role checks (admin vs worker) still happen
        inside the tool layer via `@requires`/`@requires_policy`. This
        middleware only enforces "is this *any* valid token?".
+
+    3. Phase 1c: parse `X-Agent-MCP-Alias` if present and stash the
+       `(alias_name, expires_at)` tuple on `request.scope` plus the
+       `request_alias_info` ContextVar. The ContextVar is what the
+       MCP server's `create_initialization_options` override reads to
+       decide whether to append the deprecation warning to
+       `instructions`; the scope copy is kept around for downstream
+       handlers (e.g. the GET /mcp opener that writes
+       `mcp_sessions.alias_used`).
     """
 
     async def dispatch(self, request, call_next):
@@ -110,6 +167,18 @@ class AuthHeaderMiddleware(BaseHTTPMiddleware):
         if auth.lower().startswith("bearer "):
             token = auth[7:].strip()
             request_auth_token.set(token)
+
+        # Phase 1c — alias telemetry. Parse here even for non-/mcp
+        # requests because dashboard/REST aliasing may come later and
+        # this keeps the contract uniform: the header always lands on
+        # the scope if present, and consumers downstream check scope
+        # without re-parsing.
+        alias_info = _parse_alias_header(
+            request.headers.get("X-Agent-MCP-Alias")
+        )
+        if alias_info is not None:
+            request.scope["agent_mcp_alias"] = alias_info
+            request_alias_info.set(alias_info)
 
         path = request.url.path
         # Gate the MCP transport endpoint. We match exact `/mcp` and
@@ -415,8 +484,18 @@ class _McpAsgiApp:
             )
             return
 
+        # Phase 1c — surface the alias name (if any) on the persisted
+        # session row. The middleware stashes the parsed tuple on
+        # `scope["agent_mcp_alias"]`; we pull `alias_name` here. The
+        # `expires_at` half is not stored on the session row — it's
+        # purely a router-side fact used to build the instructions
+        # warning.
+        alias_tuple = scope.get("agent_mcp_alias")
+        alias_name = alias_tuple[0] if alias_tuple else None
         session_id = session_registry.register_session(
-            agent_id=agent_id, bearer_token=bearer
+            agent_id=agent_id,
+            bearer_token=bearer,
+            alias_used=alias_name,
         )
         # The queue size is intentionally bounded — if a client's
         # consumption falls behind by more than this many notifications
