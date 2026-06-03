@@ -990,15 +990,22 @@ async def _assign_to_existing_tasks(
                 )
             ]
 
-        # Assign all tasks to the agent
+        # Assign all tasks to the agent. Both the UPDATEs and the
+        # audit-log INSERTs are wrapped in a single transaction via
+        # the connection's default isolation; using `executemany`
+        # for the UPDATE avoids round-trips through the SQLite
+        # statement preparation step on each row (db review item 5).
+        # The audit log keeps its per-row call because
+        # `log_agent_action_to_db` constructs a fresh `details` JSON
+        # blob per row — batching that requires inlining the helper,
+        # which is out of scope here.
         updated_at = datetime.datetime.now().isoformat()
+        cursor.executemany(
+            "UPDATE tasks SET assigned_to = ?, updated_at = ? "
+            "WHERE task_id = ?",
+            [(target_agent_id, updated_at, tid) for tid in task_ids],
+        )
         for task_id in task_ids:
-            cursor.execute(
-                "UPDATE tasks SET assigned_to = ?, updated_at = ? WHERE task_id = ?",
-                (target_agent_id, updated_at, task_id),
-            )
-
-            # Log the assignment
             log_agent_action_to_db(
                 cursor,
                 "admin",
