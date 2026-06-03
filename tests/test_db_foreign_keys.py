@@ -2,18 +2,25 @@
 
 The 2026-06-02 database review flagged that `PRAGMA foreign_keys=ON`
 is set per connection but **no FK constraints are declared in any
-CREATE TABLE** — so the pragma is a no-op. This PR declares the
-seven implicit FK relationships in DDL via Alembic migration 0007.
+CREATE TABLE** — so the pragma is a no-op. This PR ships **four of
+the seven** implicit FKs via Alembic migration 0007.
+
+The other three (agent_messages.sender_id, agent_messages.recipient_id,
+mcp_sessions.agent_id) are deferred to a follow-up PR — production
+data shows all their orphans have agent_id='admin', the admin
+pseudo-agent identity that lives in `g.admin_token` but has no row
+in the agents table. Seeding that row is a separate change.
 
 Tests cover:
-- All 7 FK constraints visible via `PRAGMA foreign_key_list(<table>)`
+- All 4 FK constraints visible via `PRAGMA foreign_key_list(<table>)`
   after lifespan startup.
-- Insert that violates an FK is rejected when `foreign_keys=ON`.
-- Pre-existing orphans are cleaned up by the migration (the only
-  destructive operation in the migration).
+- Insert that violates a shipped FK is rejected when `foreign_keys=ON`.
+- Pre-existing orphans on nullable FK columns are NULL-cleaned by the
+  migration.
 - The cleanup can be bypassed via
   `AGENT_MCP_FK_BYPASS_ORPHAN_CLEANUP=1` env var (safety hatch for
-  operators who want to inspect orphans first).
+  operators who want to inspect orphans first); follow-on FK
+  creation then fails loudly so the operator notices.
 """
 
 from __future__ import annotations
@@ -34,15 +41,21 @@ from tests.harness import mcp_session
 pytestmark = pytest.mark.asyncio
 
 
-# (table, column, referenced_table, referenced_column) — every FK the
-# review identified.
+# (table, column, referenced_table, referenced_column) — the four
+# FKs this migration ships (subset of the seven in the review; see
+# module docstring for why the other three are deferred).
 _REQUIRED_FKS = [
     ("agents", "current_task", "tasks", "task_id"),
     ("tasks", "parent_task", "tasks", "task_id"),
     ("tasks", "assigned_to", "agents", "agent_id"),
+    ("claude_code_sessions", "agent_id", "agents", "agent_id"),
+]
+
+# The three FKs explicitly deferred to a follow-up PR — proven not
+# present here so the deferral remains documented.
+_DEFERRED_FKS = [
     ("agent_messages", "sender_id", "agents", "agent_id"),
     ("agent_messages", "recipient_id", "agents", "agent_id"),
-    ("claude_code_sessions", "agent_id", "agents", "agent_id"),
     ("mcp_sessions", "agent_id", "agents", "agent_id"),
 ]
 
@@ -55,8 +68,8 @@ def _fk_list(conn: sqlite3.Connection, table: str) -> list[tuple]:
     return [(r[3], r[2], r[4]) for r in rows]
 
 
-async def test_all_seven_fk_constraints_declared(tmp_path) -> None:
-    """Every FK from the 2026-06-02 review must be present in DDL."""
+async def test_shipped_fk_constraints_declared(tmp_path) -> None:
+    """Each shipped FK must be present in DDL after lifespan startup."""
     from agent_mcp.core.config import get_db_path
 
     async with mcp_session(tmp_path):
@@ -72,22 +85,46 @@ async def test_all_seven_fk_constraints_declared(tmp_path) -> None:
             conn.close()
 
 
+async def test_deferred_fks_explicitly_absent(tmp_path) -> None:
+    """The three admin-implicated FKs are intentionally NOT shipped.
+
+    Pins the deferral decision so a future "let's just add all the
+    review's FKs" PR has to confront the docstring rationale and
+    either ship the admin-seed change first or update this pin.
+    """
+    from agent_mcp.core.config import get_db_path
+
+    async with mcp_session(tmp_path):
+        conn = sqlite3.connect(str(get_db_path()))
+        try:
+            for table, col, ref_table, ref_col in _DEFERRED_FKS:
+                fks = _fk_list(conn, table)
+                assert (col, ref_table, ref_col) not in fks, (
+                    f"deferred FK {table}.{col} -> {ref_table}.{ref_col} "
+                    f"was added unexpectedly; see migration 0007 docstring"
+                )
+        finally:
+            conn.close()
+
+
 async def test_fk_violation_is_rejected(tmp_path) -> None:
-    """With `foreign_keys=ON`, an orphan insert must fail."""
+    """With `foreign_keys=ON`, an orphan insert must fail.
+
+    Uses `claude_code_sessions.agent_id` because the brand-new DB has
+    zero rows in `agents`, so any agent_id we invent is an orphan and
+    the FK should reject the insert.
+    """
     from agent_mcp.db.connection import get_db_connection
 
     async with mcp_session(tmp_path):
         conn = get_db_connection()
         try:
-            # mcp_sessions.agent_id is the cleanest FK to probe: brand-new
-            # DB has zero rows in agents, so any agent_id we invent is an
-            # orphan.
             with pytest.raises(sqlite3.IntegrityError):
                 conn.execute(
-                    "INSERT INTO mcp_sessions "
-                    "(session_id, agent_id, opened_at, last_seen_at, "
-                    " bearer_token_hash) "
-                    "VALUES ('s', 'no-such-agent', 't', 't', 'h')"
+                    "INSERT INTO claude_code_sessions "
+                    "(session_id, pid, parent_pid, first_detected, "
+                    " last_activity, agent_id) "
+                    "VALUES ('s', 100, 1, 't', 't', 'no-such-agent')"
                 )
         finally:
             conn.close()
@@ -326,10 +363,12 @@ async def test_migration_cleans_up_orphans_by_default(tmp_path) -> None:
             "SELECT 1 FROM tasks WHERE task_id='task-real'"
         ).fetchone()
 
-        # Orphans cleaned up — note that agents.current_task is nullable,
-        # so the orphan agent itself is kept; only the dangling pointer
-        # is nulled. Same for tasks.parent_task and tasks.assigned_to
-        # (both nullable). Message + session rows are deleted outright.
+        # Orphans on the 4 shipped FKs: all four columns are nullable,
+        # so the migration NULLs the dangling pointer and keeps the
+        # row. The deferred FKs' orphan rows (agent_messages,
+        # mcp_sessions with bogus admin-ish agent_ids) are intentionally
+        # left untouched — they'll be addressed in the follow-up that
+        # seeds the admin pseudo-agent.
         orph_agent = conn.execute(
             "SELECT current_task FROM agents WHERE agent_id='orph'"
         ).fetchone()
@@ -348,28 +387,27 @@ async def test_migration_cleans_up_orphans_by_default(tmp_path) -> None:
         assert orph_assign is not None
         assert orph_assign[0] is None
 
-        # Messages have NOT NULL on sender_id / recipient_id so we delete
-        # them rather than NULL them.
-        assert (
-            conn.execute(
-                "SELECT COUNT(*) FROM agent_messages "
-                "WHERE message_id IN ('m-orph-snd', 'm-orph-rcp')"
-            ).fetchone()[0]
-            == 0
-        )
-        # claude_code_sessions.agent_id is nullable.
         ccs = conn.execute(
             "SELECT agent_id FROM claude_code_sessions WHERE session_id='ccs-orph'"
         ).fetchone()
         assert ccs is not None
         assert ccs[0] is None
 
-        # mcp_sessions.agent_id is NOT NULL — orphan rows are deleted.
+        # Deferred-FK orphan rows untouched (the migration doesn't
+        # know about them; the deferred FK column is still arbitrary
+        # text).
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM agent_messages "
+                "WHERE message_id IN ('m-orph-snd', 'm-orph-rcp')"
+            ).fetchone()[0]
+            == 2
+        )
         assert (
             conn.execute(
                 "SELECT COUNT(*) FROM mcp_sessions WHERE session_id='mcps-orph'"
             ).fetchone()[0]
-            == 0
+            == 1
         )
     finally:
         conn.close()

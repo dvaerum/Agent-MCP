@@ -16,7 +16,7 @@ import os
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import engine_from_config, event, pool
 
 # Make the agent_mcp package importable when alembic is invoked from
 # the repo root. env.py lives at agent_mcp/migrations/env.py, so the
@@ -81,6 +81,22 @@ def run_migrations_online() -> None:
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
+
+    # Mirror the runtime `agent_mcp.db.engine` PRAGMA block — most
+    # critically `foreign_keys=ON`. Without it, a migration that
+    # rebuilds a table via `batch_alter_table` can silently copy rows
+    # that violate the new FKs; the violation only surfaces when the
+    # next request-time connection checks the schema. Turning the
+    # pragma on here makes the migration itself fail loudly, which is
+    # the only point at which an operator is watching for it.
+    @event.listens_for(connectable, "connect")
+    def _set_pragmas(dbapi_connection, _record):  # noqa: ARG001
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA foreign_keys=ON")
+        finally:
+            cursor.close()
+
     with connectable.connect() as connection:
         context.configure(
             connection=connection,
