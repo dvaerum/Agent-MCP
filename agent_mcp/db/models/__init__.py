@@ -15,7 +15,8 @@ Adding a new model:
 """
 
 from .agent import Agent
+from .agent_message import AgentMessage
 from .project_context import ProjectContext
 from .task import Task
 
-__all__ = ["Agent", "ProjectContext", "Task"]
+__all__ = ["Agent", "AgentMessage", "ProjectContext", "Task"]
