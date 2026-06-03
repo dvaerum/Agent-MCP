@@ -354,14 +354,31 @@ async def get_agent_messages_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
         cursor.execute(query, query_params)
         messages = cursor.fetchall()
         
-        # Mark received messages as read if requested
+        # Mark received messages as read if requested.
+        #
+        # Pre-2026-06-02 behavior: filter the LIMIT-bounded result set
+        # in Python (`msg["recipient_id"] == agent_id and not
+        # msg["read"]`), then issue an UPDATE with an IN-list of
+        # message_ids. Two problems:
+        #   1. Unread messages beyond `limit` stayed unread — surprising
+        #      since the user asked to mark "as read" without qualifier.
+        #   2. The Python filter + IN-list is unnecessary when SQL can
+        #      express the same predicate in a single UPDATE.
+        #
+        # New behavior per the 2026-06-02 database review (item 10):
+        # one UPDATE keyed on `(recipient_id, read = 0)` covers every
+        # unread message addressed to this agent — including those
+        # truncated by the SELECT's LIMIT. The fetched message rows
+        # we return still show their pre-update read flag (we don't
+        # re-fetch), so the response shape is unchanged from the
+        # caller's perspective.
         if mark_as_read and include_received:
-            message_ids_to_mark = [msg["message_id"] for msg in messages 
-                                 if msg["recipient_id"] == agent_id and not msg["read"]]
-            if message_ids_to_mark:
-                placeholders = ",".join("?" * len(message_ids_to_mark))
-                cursor.execute(f"UPDATE agent_messages SET read = ? WHERE message_id IN ({placeholders})", 
-                             [True] + message_ids_to_mark)
+            cursor.execute(
+                "UPDATE agent_messages SET read = 1 "
+                "WHERE recipient_id = ? AND read = 0",
+                (agent_id,),
+            )
+            if cursor.rowcount:
                 conn.commit()
         
         # Format response

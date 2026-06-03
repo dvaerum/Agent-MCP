@@ -51,8 +51,8 @@ async def test_all_data_applies_default_limit_per_section(tmp_path) -> None:
                 "/api/tasks",
                 json={
                     "token": admin.admin_token,
-                    "title": f"seed-{i}",
-                    "description": "limit test",
+                    "task_title": f"seed-{i}",
+                    "task_description": "limit test",
                 },
             )
 
@@ -70,14 +70,15 @@ async def test_all_data_accepts_limit_query_param(tmp_path) -> None:
     """`?limit=N` overrides the default per-section cap."""
     async with mcp_session(tmp_path) as admin:
         for i in range(10):
-            admin.client.post(
+            r = admin.client.post(
                 "/api/tasks",
                 json={
                     "token": admin.admin_token,
-                    "title": f"limit-override-{i}",
-                    "description": "x",
+                    "task_title": f"limit-override-{i}",
+                    "task_description": "x",
                 },
             )
+            assert r.status_code == 200, r.text
 
         resp = admin.client.get("/api/all-data?limit=3")
         assert resp.status_code == 200
