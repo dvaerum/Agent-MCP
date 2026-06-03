@@ -121,7 +121,11 @@ async function callMessages(
   const base = apiClient.getServerUrl()
   const res = await fetch(`${base}/messages${pathSuffix}`, {
     method,
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      // PR-A: REST endpoints require the strict v1 media type.
+      "Accept": "application/vnd.agent-mcp.v1+json",
+    },
     body: JSON.stringify(body),
   })
   if (!res.ok) {

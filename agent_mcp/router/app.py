@@ -135,7 +135,7 @@ DEFAULT_WORKSPACE_PARENT = Path(
 ).expanduser()
 # AGENT_MCP_README_HTML used to be read here and embedded in the legacy
 # server-rendered HTML index page. The index page was deleted in Phase
-# 6 (see ``index_redirect_handler`` further down); the env var is still
+# 6 (see ``index_handler`` further down); the env var is still
 # accepted by the CLI / module for back-compat but the router no longer
 # reads it.
 
@@ -174,6 +174,139 @@ ASSET_PREFIX: str = os.environ.get(
 # them without threading state through every handler signature.
 SINGLE_TENANT_NAME: str | None = None
 SINGLE_TENANT_WORKSPACE: str | None = None
+
+
+# ── API versioning (PR-A) ───────────────────────────────────────────
+# The REST surface under /agent-mcp/__api/ requires an explicit,
+# version-pinned Accept header so callers opt in to a known wire
+# contract. A future v2 ships under a new media-type subtype
+# (vnd.agent-mcp.v2+json) while v1 callers keep working unchanged.
+#
+# Design notes (locked in /grill-me, recorded in URL-redesign plan):
+#   * Strict match — Accept: application/json, */* etc. are 406. We
+#     want explicit consent, not an inferred default, so that adding
+#     v2 doesn't silently break "any JSON" clients.
+#   * Parameters allowed — Accept: application/vnd.agent-mcp.v1+json;q=0.9
+#     is fine. Per RFC 7231 §5.3.2 the q parameter is informational
+#     only at the server side.
+#   * The MCP transport at /agent-mcp/<name>/mcp is NOT gated by this
+#     header — MCP has its own version negotiation in initialize.
+#   * Dashboard HTML / asset routes are NOT gated — browser fetches
+#     don't send our private media type, and gating them would break
+#     the dashboard.
+#   * Folds in audit §3.7: the tokens endpoint's bearer check is
+#     bypassed when no Authorization header is sent. This Accept gate
+#     runs first, so an unversioned + unauthenticated request fails
+#     at 406 before reaching the tokens endpoint at all.
+API_VERSION_CURRENT = "v1"
+API_SUPPORTED_VERSIONS = ("v1",)
+API_MEDIA_TYPE = "application/vnd.agent-mcp.v1+json"
+_API_DOCS_URL = (
+    "https://github.com/dvaerum/Agent-MCP/blob/main/docs/api-versioning.md"
+)
+
+
+def _accept_includes_strict_api_media(accept_header: str) -> bool:
+    """Return True iff Accept lists ``application/vnd.agent-mcp.v1+json``.
+
+    Handles three shapes:
+      * bare: ``application/vnd.agent-mcp.v1+json``
+      * with parameters (RFC 7231 §5.3.2): ``…;q=0.9``
+      * inside a comma-separated list: ``text/plain, application/vnd.agent-mcp.v1+json``
+
+    Anything else — including ``application/json``, ``*/*``, missing —
+    returns False. We deliberately do not honour wildcards; an explicit
+    opt-in is the point of the gate.
+    """
+    if not accept_header:
+        return False
+    for raw_part in accept_header.split(","):
+        media_type = raw_part.split(";", 1)[0].strip().lower()
+        if media_type == API_MEDIA_TYPE:
+            return True
+    return False
+
+
+def _api_version_required_response() -> web.Response:
+    """406 body when the Accept-header gate refuses a request.
+
+    Body shape is the public API-versioning error contract — clients
+    parse ``error == "version_required"`` to know they should retry
+    with the supported media type, and ``supported_versions`` /
+    ``current_default`` let an upgrade path light up automatically the
+    moment v2 ships. ``message`` is the human-readable single-line
+    diagnostic; it contains the exact header value the caller should
+    add so operators don't have to read docs to fix the request.
+    """
+    return web.json_response(
+        {
+            "error": "version_required",
+            "message": (
+                "agent-mcp REST endpoints require an Accept header "
+                "specifying the API version. Resend with: "
+                f"Accept: {API_MEDIA_TYPE}"
+            ),
+            "supported_versions": list(API_SUPPORTED_VERSIONS),
+            "current_default": API_VERSION_CURRENT,
+            "docs": _API_DOCS_URL,
+        },
+        status=406,
+    )
+
+
+def _accept_prefers_html(accept_header: str) -> bool:
+    """Return True iff Accept lists text/html (or an */* aliased to it).
+
+    Used by ``index_handler`` to decide between the JSON service
+    descriptor and the legacy 302 → /__dashboard/ redirect. The
+    browser → HTML side of the split. ``*/*`` does NOT count — a
+    generic API client sending ``*/*`` gets JSON.
+    """
+    if not accept_header:
+        return False
+    for raw_part in accept_header.split(","):
+        media_type = raw_part.split(";", 1)[0].strip().lower()
+        if media_type in ("text/html", "application/xhtml+xml"):
+            return True
+    return False
+
+
+# ── Service descriptor (PR-A) ───────────────────────────────────────
+# ``GET /agent-mcp/`` returns a small JSON document describing the
+# public URL surface so a plain-HTTP client can discover the endpoint
+# layout without scraping HTML or hard-coding paths. PR-A surfaces the
+# CURRENT shape (still under __api / __dashboard); PR-B's rename
+# updates the embedded URLs to the new top-level prefixes.
+def _read_package_version() -> str:
+    """Best-effort fork version, read once at module import.
+
+    Prefers ``importlib.metadata.version`` (correct when the package
+    is installed), falls back to reading ``pyproject.toml`` from the
+    repo root (correct in editable / dev installs), final fallback to
+    ``agent_mcp.__version__`` (stale, but never raises).
+    """
+    try:  # installed-package path
+        from importlib.metadata import version as _pkg_version
+        return _pkg_version("agent-mcp")
+    except Exception:  # noqa: BLE001 — fall through to next path
+        pass
+    try:  # editable / dev path
+        import tomllib  # py311+, available on the supported Python
+        pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        data = tomllib.loads(pyproject.read_text())
+        v = data.get("project", {}).get("version")
+        if v:
+            return str(v)
+    except Exception:  # noqa: BLE001 — fall through to last-resort
+        pass
+    try:
+        from agent_mcp import __version__ as _legacy_version
+        return str(_legacy_version)
+    except Exception:  # noqa: BLE001
+        return "0.0.0"
+
+
+_PACKAGE_VERSION = _read_package_version()
 
 
 def _single_tenant_disabled_response() -> web.Response:
@@ -648,7 +781,21 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
 
 
 async def backend_api_handler(req: web.Request) -> web.StreamResponse:
-    """/agent-mcp/__api/<name>/{rest} → backend /api/{rest}"""
+    """/agent-mcp/__api/<name>/{rest} → backend /api/{rest}
+
+    PR-A: gated by the strict Accept header
+    ``application/vnd.agent-mcp.v1+json``. A request that doesn't ask
+    for that media type explicitly gets a 406 with a structured error
+    body (see ``_api_version_required_response``). This is a public
+    breaking change for callers that previously sent no Accept header
+    at all — that's intentional. CORS preflights (OPTIONS) are exempt
+    because the browser sends them automatically without an Accept
+    header.
+    """
+    if req.method != "OPTIONS":
+        if not _accept_includes_strict_api_media(req.headers.get("Accept", "")):
+            return _api_version_required_response()
+
     rest = req.match_info.get("rest", "")
     name = req.match_info["name"]
     redirect = _maybe_single_tenant_redirect(req, name)
@@ -1944,31 +2091,69 @@ async def create_agent_handler(req: web.Request) -> web.StreamResponse:
     )
 
 
-# ── Index redirect ───────────────────────────────────────────────────
-# The legacy server-rendered HTML index page (`index_handler` and its
-# `_list_view` / `_INDEX_STYLE` / `_wiring_help_panel` / `_create_form`
-# helpers) was deleted in Phase 6 of the router-upstream plan
-# (prancy-napping-pie). The bare `/agent-mcp/` URL has been a 302 to
-# the React dashboard since Phase 3.5a (ADR-0009); the HTML page was
-# only retained "for reference" while we shipped the React equivalents
-# of its wiring + create-project surfaces. Those equivalents shipped in
-# Phase 3.5b/c, so the legacy HTML is now dead code.
+# ── Index handler ────────────────────────────────────────────────────
+# The legacy server-rendered HTML index page (the original
+# ``index_handler`` and its ``_list_view`` / ``_INDEX_STYLE`` /
+# ``_wiring_help_panel`` / ``_create_form`` helpers) was deleted in
+# Phase 6 of the router-upstream plan (prancy-napping-pie). The bare
+# ``/agent-mcp/`` URL has been a 302 to the React dashboard since Phase
+# 3.5a (ADR-0009); the HTML page was only retained "for reference"
+# while we shipped the React equivalents of its wiring + create-project
+# surfaces. Those equivalents shipped in Phase 3.5b/c, so the legacy
+# HTML is now dead code.
+#
+# PR-A turned the bare URL into an Accept-negotiated handler: browsers
+# (Accept: text/html) keep the 302; non-browser clients (everything
+# else) get a JSON service descriptor instead. See ``_service_descriptor``
+# and the API-versioning section higher in this file.
 
-async def index_redirect_handler(req: web.Request) -> web.Response:
-    """GET /agent-mcp/ — 302 to the dashboard overview.
+def _service_descriptor() -> dict:
+    """Build the JSON service-descriptor body.
 
-    The HTML index page is gone (decision #3 / ADR-0009). In
-    multi-tenant mode this redirects to the React overview at
-    `/agent-mcp/__dashboard/`. In single-tenant mode it goes straight
-    to the configured project's per-project dashboard so the operator
-    isn't bounced through an "All projects" page that lists exactly
-    one entry.
+    PR-A: the endpoint URLs reflect the CURRENT (Phase 6) surface —
+    /__api, /__dashboard, /__dashboard/_next. PR-B will rewrite these
+    to the top-level prefixes (/api, /app, /assets, /mcp) and the
+    descriptor moves with the rename, so a client that follows the
+    embedded links keeps working across the major version boundary.
     """
-    if SINGLE_TENANT_NAME is not None:
-        target = f"/agent-mcp/__dashboard/{quote(SINGLE_TENANT_NAME)}/"
-    else:
-        target = "/agent-mcp/__dashboard/"
-    raise web.HTTPFound(location=target)
+    return {
+        "service": "agent-mcp",
+        "version": _PACKAGE_VERSION,
+        "mode": "single-tenant" if SINGLE_TENANT_NAME is not None else "multi-tenant",
+        "endpoints": {
+            "api": "/agent-mcp/__api",
+            "app": "/agent-mcp/__dashboard",
+            "assets": "/agent-mcp/__dashboard/_next",
+            "mcp": "/agent-mcp",
+        },
+        "projects_url": "/agent-mcp/__projects",
+        "overview_url": "/agent-mcp/__overview",
+        "single_tenant_project": SINGLE_TENANT_NAME,
+    }
+
+
+async def index_handler(req: web.Request) -> web.Response:
+    """GET /agent-mcp/ — Accept-negotiated descriptor / dashboard.
+
+    PR-A (locked design, /grill-me):
+      Accept: text/html       → 302 to /agent-mcp/__dashboard/
+                                 (or to /__dashboard/<name>/ in
+                                 single-tenant mode — same destination
+                                 the pre-PR-A redirect targeted)
+      anything else / unset   → 200 JSON service descriptor
+
+    The HTML index page was deleted in Phase 6; the redirect path here
+    preserves the existing browser UX while letting non-browser
+    clients fetch a discovery document instead of a 302 they then have
+    to parse.
+    """
+    if _accept_prefers_html(req.headers.get("Accept", "")):
+        if SINGLE_TENANT_NAME is not None:
+            target = f"/agent-mcp/__dashboard/{quote(SINGLE_TENANT_NAME)}/"
+        else:
+            target = "/agent-mcp/__dashboard/"
+        raise web.HTTPFound(location=target)
+    return web.json_response(_service_descriptor(), headers={"Cache-Control": "no-store"})
 
 
 # ── Wire-up ──────────────────────────────────────────────────────────
@@ -2020,8 +2205,8 @@ def make_app(
     # `/agent-mcp/__dashboard/` (multi-tenant) or to the configured
     # single project's dashboard (single-tenant). The legacy
     # `index_handler` and its private HTML-render helpers were deleted
-    # in Phase 6 — see the comment above ``index_redirect_handler``.
-    app.router.add_get("/agent-mcp/", index_redirect_handler)
+    # in Phase 6 — see the comment above ``index_handler``.
+    app.router.add_get("/agent-mcp/", index_handler)
     app.router.add_get(
         "/agent-mcp",
         lambda r: web.HTTPMovedPermanently(location="/agent-mcp/"),
