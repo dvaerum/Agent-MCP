@@ -66,23 +66,22 @@ export function AddProjectModal({
     setSubmitting(true)
     setError(null)
     try {
-      const body = new URLSearchParams()
-      body.set("name", name)
-      if (workspace.trim()) body.set("workspace", workspace.trim())
-      const r = await fetch("/agent-mcp/__create", {
+      // PR-C: POST /api/projects with JSON body. The legacy
+      // /__create endpoint still works for back-compat but the new
+      // shape is the canonical one — JSON in, unified envelope out.
+      const r = await fetch("/agent-mcp/api/projects", {
         method: "POST",
-        body,
-        headers: { Accept: "application/json" },
-        redirect: "manual",
+        body: JSON.stringify({ name }),
+        headers: {
+          "Accept": "application/vnd.agent-mcp.v1+json",
+          "Content-Type": "application/json",
+        },
       })
-      // The handler returns 303 (HTTPSeeOther). `redirect: "manual"`
-      // surfaces it as `type: "opaqueredirect"` rather than following.
-      if (
-        r.type !== "opaqueredirect" &&
-        r.status >= 400
-      ) {
-        const text = await r.text().catch(() => "")
-        throw new Error(text || `HTTP ${r.status}`)
+      const body = await r.json().catch(() => ({} as any))
+      if (!r.ok || body.success === false) {
+        throw new Error(
+          body.message || body.error || `HTTP ${r.status}`,
+        )
       }
       await fetchOverview()
       resetAndClose()

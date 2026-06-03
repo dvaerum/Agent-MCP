@@ -71,33 +71,33 @@ export function RemoveProjectModal({
     setError(null)
     setActiveConns(null)
     try {
-      const body = new URLSearchParams()
-      body.set("name", projectName)
-      if (deleteWorkspace) body.set("delete_workspace", "true")
-      const r = await fetch("/agent-mcp/__unregister", {
-        method: "POST",
-        body,
-        headers: { Accept: "application/json" },
-        redirect: "manual",
-      })
-      if (r.status === 409) {
-        const detail = await r.json().catch(() => ({}))
+      // PR-C: DELETE /api/projects/<name>. Cascade signal is a
+      // query-string flag (?delete_workspace=true) not a body field,
+      // because browsers strip DELETE bodies on some Fetch
+      // implementations (audit §3.2).
+      const qs = deleteWorkspace ? "?delete_workspace=true" : ""
+      const r = await fetch(
+        `/agent-mcp/api/projects/${encodeURIComponent(projectName)}${qs}`,
+        {
+          method: "DELETE",
+          headers: { "Accept": "application/vnd.agent-mcp.v1+json" },
+        },
+      )
+      const body = await r.json().catch(() => ({} as any))
+      if (r.status === 409 && body.error === "active_sessions") {
         setActiveConns(
-          typeof detail.active_connections === "number"
-            ? detail.active_connections
+          typeof body.active_connections === "number"
+            ? body.active_connections
             : 0,
         )
-        setError(
-          typeof detail.reason === "string"
-            ? detail.reason
-            : "Active sessions block removal.",
-        )
+        setError(body.message || "Active sessions block removal.")
         setSubmitting(false)
         return
       }
-      if (r.type !== "opaqueredirect" && r.status >= 400) {
-        const text = await r.text().catch(() => "")
-        throw new Error(text || `HTTP ${r.status}`)
+      if (!r.ok || body.success === false) {
+        throw new Error(
+          body.message || body.error || `HTTP ${r.status}`,
+        )
       }
       await fetchOverview()
       close()

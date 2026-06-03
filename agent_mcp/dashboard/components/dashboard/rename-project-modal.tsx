@@ -82,25 +82,28 @@ export function RenameProjectModal({
     setSubmitting(true)
     setError(null)
     try {
-      const body = new URLSearchParams()
-      body.set("old_name", projectName)
-      body.set("new_name", newName)
-      body.set("grace_days", String(graceInt))
-      const r = await fetch("/agent-mcp/__rename", {
-        method: "POST",
-        body,
-        headers: { Accept: "application/json" },
-      })
-      if (r.status === 409 || r.status === 400) {
-        const detail = await r.json().catch(() => null)
-        const reason =
-          (detail && typeof detail.reason === "string" && detail.reason) ||
-          `HTTP ${r.status}`
-        throw new Error(reason)
-      }
-      if (!r.ok) {
-        const text = await r.text().catch(() => "")
-        throw new Error(text || `HTTP ${r.status}`)
+      // PR-C: POST /api/projects/<name>/rename with JSON body. The
+      // unified envelope's `message` field is the human-readable
+      // error string; `error` is the discriminator code.
+      const r = await fetch(
+        `/agent-mcp/api/projects/${encodeURIComponent(projectName)}/rename`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            new_name: newName,
+            grace_days: graceInt,
+          }),
+          headers: {
+            "Accept": "application/vnd.agent-mcp.v1+json",
+            "Content-Type": "application/json",
+          },
+        },
+      )
+      const body = await r.json().catch(() => ({} as any))
+      if (!r.ok || body.success === false) {
+        throw new Error(
+          body.message || body.error || `HTTP ${r.status}`,
+        )
       }
       await fetchOverview()
       close()
