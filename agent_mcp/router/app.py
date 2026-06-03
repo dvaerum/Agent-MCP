@@ -1945,7 +1945,12 @@ def make_app(
 
 
 def main() -> None:
-    web.run_app(make_app(), host="127.0.0.1", port=ROUTER_PORT)
+    # AGENT_MCP_ROUTER_HOST lets the VM module bind 0.0.0.0 so qemu's
+    # user-mode hostfwd packets (which arrive on the guest's primary
+    # IP, not loopback) can be served. Production deploys keep the
+    # 127.0.0.1 default and front the router with nginx/Tailscale.
+    host = os.environ.get("AGENT_MCP_ROUTER_HOST", "127.0.0.1")
+    web.run_app(make_app(), host=host, port=ROUTER_PORT)
 
 
 if __name__ == "__main__":

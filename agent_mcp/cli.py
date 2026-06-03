@@ -832,6 +832,32 @@ def server_cmd(
     show_default="(none)",
     help="Optional README rendered to HTML, embedded in the index page.",
 )
+@click.option(
+    "--single-tenant",
+    "single_tenant_name",
+    type=str,
+    default=lambda: os.environ.get("AGENT_MCP_SINGLE_TENANT_NAME") or None,
+    show_default="$AGENT_MCP_SINGLE_TENANT_NAME (else multi-tenant)",
+    help=(
+        "Run the router in single-tenant mode for the named project. "
+        "Disables __create / __unregister / __rename (410); URLs naming "
+        "any other project are 302-redirected to the configured one "
+        "(W1; ADR-0008). Pair with --single-workspace."
+    ),
+)
+@click.option(
+    "--single-workspace",
+    "single_tenant_workspace",
+    type=click.Path(file_okay=False, resolve_path=True),
+    default=lambda: os.environ.get("AGENT_MCP_SINGLE_TENANT_WORKSPACE") or None,
+    show_default="$AGENT_MCP_SINGLE_TENANT_WORKSPACE",
+    help=(
+        "Workspace path for the single-tenant project. The home-manager "
+        "module's ExecStartPre seeds projects.local.json with this entry "
+        "before the router starts, so the router can still resolve the "
+        "single project's UDS via its registry lookup."
+    ),
+)
 def router_cmd(
     port: int,
     projects_file: str,
@@ -841,6 +867,8 @@ def router_cmd(
     idle_sec: int,
     installer_template: Optional[str],
     readme_html: str,
+    single_tenant_name: Optional[str],
+    single_tenant_workspace: Optional[str],
 ) -> None:
     """Run the always-on URL-keyed HTTP router.
 
@@ -882,12 +910,28 @@ def router_cmd(
             "router subcommand requires: " + ", ".join(missing)
         )
 
+    # --single-tenant / --single-workspace must come as a pair (or
+    # not at all). Catch the lopsided invocation here so the operator
+    # gets a clean error rather than a router that's half-toggled.
+    if (single_tenant_name is None) != (single_tenant_workspace is None):
+        raise click.UsageError(
+            "--single-tenant and --single-workspace must be passed together"
+        )
+
     # Lazy import — the router module reads env at top level, so
     # importing it before the os.environ assignments above would
     # bind to stale (likely missing) values.
-    from .router.app import main as router_main
+    from .router.app import make_app
+    from aiohttp import web
 
-    router_main()
+    app = make_app(
+        single_tenant_name=single_tenant_name,
+        single_tenant_workspace=single_tenant_workspace,
+    )
+    # Same env-override-on-bind-host pattern as router.app.main —
+    # used by the VM tests' module so qemu hostfwd can route in.
+    host = os.environ.get("AGENT_MCP_ROUTER_HOST", "127.0.0.1")
+    web.run_app(app, host=host, port=port)
 
 
 # --- Backward-compatibility shim ---
