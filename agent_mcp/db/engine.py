@@ -59,10 +59,20 @@ def _make_engine(url: str) -> Engine:
 
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragmas(dbapi_connection, _connection_record) -> None:
+        # Keep in sync with the PRAGMA block in
+        # `agent_mcp/db/connection.py::get_db_connection` — the raw-SQL
+        # and SQLAlchemy surfaces must agree on these per the 2026-06-02
+        # database review (busy_timeout, synchronous, cache_size,
+        # mmap_size, temp_store).
         cursor = dbapi_connection.cursor()
         try:
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA busy_timeout=5000")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA cache_size=-20000")
+            cursor.execute("PRAGMA mmap_size=268435456")
+            cursor.execute("PRAGMA temp_store=MEMORY")
         finally:
             cursor.close()
 

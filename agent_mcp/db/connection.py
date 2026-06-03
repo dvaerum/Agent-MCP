@@ -120,8 +120,27 @@ def get_db_connection() -> sqlite3.Connection:
         )  # Added timeout
         # From main.py:226 (original line numbers)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")  # Improve concurrency and performance
-        conn.execute("PRAGMA foreign_keys = ON;")  # Enforce foreign key constraints
+        # Per-connection PRAGMAs. These are tuned per the 2026-06-02
+        # database review:
+        #   journal_mode=WAL          -- readers don't block writers
+        #   foreign_keys=ON           -- enforce FK DDL once declared
+        #   busy_timeout=5000         -- retry SQLITE_BUSY for 5s rather
+        #                                than failing immediately
+        #   synchronous=NORMAL        -- safe under WAL, ~2x faster
+        #                                writes vs the default FULL
+        #   cache_size=-20000         -- 20 MiB page cache (negative
+        #                                means KiB) vs the 2 MiB default
+        #   mmap_size=268435456       -- 256 MiB memory-mapped I/O
+        #   temp_store=MEMORY         -- keep temp tables/indexes in RAM
+        # Mirror these in `agent_mcp/db/engine.py`'s SQLAlchemy connect
+        # event so ORM-routed callers get the same behavior.
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("PRAGMA busy_timeout=5000;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA cache_size=-20000;")
+        conn.execute("PRAGMA mmap_size=268435456;")
+        conn.execute("PRAGMA temp_store=MEMORY;")
 
         # Attempt to load VSS extension if it was deemed loadable globally and sqlite_vec is imported
         if g.global_vss_load_successful and sqlite_vec:
