@@ -230,22 +230,30 @@ async def test_alias_header_middleware_parses_scope(tmp_path: Path) -> None:
 def _extract_initialize_result(response_text: str) -> dict:
     """Pull the `result` JSON out of a Streamable HTTP initialize reply.
 
-    The transport returns either inline JSON (one `{"jsonrpc": …}`
-    envelope) or an SSE body (`data: <json>\n\n`). Either shape parses
-    the same once we strip the `data: ` prefix on each line.
+    The transport returns either:
+      * inline JSON — one bare ``{"jsonrpc": …}`` envelope, or
+      * SSE — one or more frames of the shape
+
+            event: message\\r\\n
+            data: {"jsonrpc": "2.0", "id": 1, "result": {...}}\\r\\n
+            \\r\\n
+
+    We accept both shapes (and either CRLF or LF line endings) by
+    iterating lines, picking up anything prefixed by ``data:``, and
+    JSON-decoding the first payload that carries a ``result`` field.
     """
     import json
 
     text = response_text.strip()
-    if text.startswith("data:"):
-        # SSE — find the first data: line and decode its payload.
-        for line in text.splitlines():
-            line = line.strip()
-            if line.startswith("data:"):
-                payload = json.loads(line[len("data:"):].strip())
-                if "result" in payload:
-                    return payload["result"]
-        raise AssertionError(f"no result line in SSE body: {response_text!r}")
+    # SSE: split on either CRLF or LF; ``str.splitlines`` handles both.
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = json.loads(line[len("data:"):].strip())
+        if isinstance(payload, dict) and "result" in payload:
+            return payload["result"]
+    # Inline JSON fallback (no `data:` prefix anywhere).
     envelope = json.loads(text)
     assert "result" in envelope, f"no result in {envelope!r}"
     return envelope["result"]

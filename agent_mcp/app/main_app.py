@@ -210,6 +210,66 @@ class AuthHeaderMiddleware(BaseHTTPMiddleware):
 mcp_app_instance = MCPLowLevelServer("mcp-server")
 
 
+# Phase 1c — alias deprecation warning block, appended to the MCP
+# `initialize` response's top-level `instructions` field when the
+# request arrived via an alias URL. Per spec rev 2025-03-26 the field
+# is `InitializeResult.instructions` (sibling of `serverInfo`, not
+# nested inside it) — clients display it as authoritative guidance.
+_ALIAS_WARNING_TEMPLATE = (
+    "\n\n"
+    "ALIAS DEPRECATION WARNING\n"
+    "This server was reached via the alias '{alias_name}', which is "
+    "scheduled to expire on {expires_at}. Once the alias expires, "
+    "this URL will stop working.\n"
+    "Ask your operator to update your MCP client configuration to use "
+    "the canonical project name before that date."
+)
+
+
+def _build_alias_warning(alias_name: str, expires_at: str) -> str:
+    """Format the deprecation warning block for one alias/expiry pair.
+
+    Extracted so tests + future callers (e.g. a CLI `agent-mcp router
+    list-aliases` command that wants the same wording) can reuse it
+    without re-implementing the template.
+    """
+    return _ALIAS_WARNING_TEMPLATE.format(
+        alias_name=alias_name, expires_at=expires_at
+    )
+
+
+def _patched_create_initialization_options(self, *args, **kwargs):
+    """Wrap ``Server.create_initialization_options`` to inject the
+    alias deprecation warning into ``instructions`` when present.
+
+    Called once per request in stateless mode (the SDK's
+    ``StreamableHTTPSessionManager._handle_stateless_request`` spawns
+    a fresh server task per request, and that task calls this method
+    immediately). We read ``request_alias_info`` from the inherited
+    Context — set by ``AuthHeaderMiddleware`` on the incoming request
+    — and append the warning to whatever the underlying server's
+    static instructions were (None today; this is the only producer).
+    """
+    base = _ORIG_CREATE_INIT_OPTIONS(self, *args, **kwargs)
+    alias_info = request_alias_info.get()
+    if alias_info is None:
+        return base
+    alias_name, expires_at = alias_info
+    warning = _build_alias_warning(alias_name, expires_at)
+    base.instructions = (base.instructions or "") + warning
+    return base
+
+
+# Capture the original *before* monkey-patching so the wrapper has a
+# stable handle. Class-level method override (rather than per-instance
+# attribute) keeps the patch visible to any future Server subclass that
+# we might construct down the line.
+_ORIG_CREATE_INIT_OPTIONS = MCPLowLevelServer.create_initialization_options
+MCPLowLevelServer.create_initialization_options = (  # type: ignore[assignment]
+    _patched_create_initialization_options
+)
+
+
 @mcp_app_instance.list_tools()
 async def mcp_list_tools_handler() -> List[mcp_types.Tool]:
     """MCP endpoint to list available tools."""
