@@ -24,6 +24,7 @@ import os
 import sys
 import json
 import sqlite3
+import warnings
 from typing import Optional
 from pathlib import Path
 from dotenv import load_dotenv, dotenv_values
@@ -114,9 +115,50 @@ def get_admin_token_from_db(project_dir: str) -> Optional[str]:
         return None
 
 
-# --- Click Command Definition ---
-# This replicates the @click.command and options from the original main.py (lines 1936-1950)
-@click.command(context_settings=dict(help_option_names=["-h", "--help"]))
+# --- Click Command Group ---
+# Top-level dispatcher. Two subcommands today:
+#   * `agent-mcp server …`  — the MCP backend (Starlette/uvicorn or stdio).
+#   * `agent-mcp router …`  — the always-on URL-keyed HTTP router that
+#                              proxies per-project backends.
+# Phase 1a of the router-upstream plan (prancy-napping-pie). Before
+# this the CLI had a single `@click.command` whose options matched
+# today's `server` subcommand exactly; we keep a backward-compat shim
+# below so existing `python -m agent_mcp.cli --transport sse …`
+# invocations route to `server` and warn loudly.
+@click.group(
+    context_settings=dict(help_option_names=["-h", "--help"]),
+    invoke_without_command=True,
+)
+@click.pass_context
+def cli(ctx: click.Context) -> None:
+    """Agent-MCP command-line interface.
+
+    Run `agent-mcp server --help` for the MCP backend, or
+    `agent-mcp router --help` for the always-on HTTP router.
+    """
+    # Subcommand will run on its own. When invoked with no
+    # subcommand and no args at all, default to `server` for
+    # backward compat — same as pre-Phase-1a behaviour. Tests rely
+    # on `--help` printing the group help, which click handles
+    # before we get here.
+    if ctx.invoked_subcommand is None:
+        # Empty invocation: keep the historic behaviour of starting
+        # the server with defaults. Emit a deprecation note so we
+        # can remove this in a future release.
+        warnings.warn(
+            "Invoking agent-mcp with no subcommand is deprecated; "
+            "use 'agent-mcp server' (or 'agent-mcp router') instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        ctx.invoke(server_cmd)
+
+
+# --- `server` subcommand ---
+# This replicates the original @click.command's options exactly so
+# pre-Phase-1a invocations keep working once routed through the
+# backward-compat shim below.
+@cli.command("server", context_settings=dict(help_option_names=["-h", "--help"]))
 @click.option(
     "--port",
     type=int,
@@ -186,7 +228,7 @@ def get_admin_token_from_db(project_dir: str) -> Optional[str]:
     default=False,
     help="Disable automatic markdown file indexing. Allows selective manual indexing of specific content into the RAG system.",
 )
-def main_cli(
+def server_cmd(
     port: int,
     uds: Optional[str],
     transport: str,
@@ -199,7 +241,7 @@ def main_cli(
     no_index: bool,
 ):
     """
-    Main Command-Line Interface for starting the MCP Server.
+    Start the MCP Server (was the only command pre-Phase-1a).
 
     The server supports two embedding modes:
     - Simple mode (default): Uses text-embedding-3-large (1536 dimensions) - indexes markdown files and context
@@ -716,6 +758,193 @@ def main_cli(
     sys.exit(0)  # Explicitly exit after cleanup if not already exited by SystemExit
 
 
-# This allows running `python -m mcp_server_src.cli --port ...`
+# --- `router` subcommand ---
+# Thin wrapper around `agent_mcp.router.app.main`. The underlying app
+# reads its config from `AGENT_MCP_*` env vars at module import time —
+# this subcommand sets defaults for them from CLI flags before doing
+# the import, so users get both an ergonomic CLI and the env-var
+# escape hatch the deploy repo currently uses.
+@cli.command("router", context_settings=dict(help_option_names=["-h", "--help"]))
+@click.option(
+    "--port",
+    type=int,
+    default=lambda: int(os.environ.get("AGENT_MCP_ROUTER_PORT", "1337")),
+    show_default="1337 (or $AGENT_MCP_ROUTER_PORT)",
+    help="Port to listen on for the URL-keyed router.",
+)
+@click.option(
+    "--projects-file",
+    type=click.Path(dir_okay=False, resolve_path=True),
+    default=lambda: os.environ.get(
+        "AGENT_MCP_PROJECTS_FILE",
+        str(
+            Path(
+                os.environ.get(
+                    "XDG_CONFIG_HOME", str(Path.home() / ".config")
+                )
+            )
+            / "agent-mcp"
+            / "projects.local.json"
+        ),
+    ),
+    show_default="~/.config/agent-mcp/projects.local.json",
+    help="JSON file mapping project name → workspace path.",
+)
+@click.option(
+    "--sock-dir",
+    type=click.Path(file_okay=False, resolve_path=True),
+    default=lambda: os.environ.get("AGENT_MCP_SOCK_DIR"),
+    show_default="$AGENT_MCP_SOCK_DIR",
+    help="Directory containing per-project Unix-domain backend sockets.",
+)
+@click.option(
+    "--dashboard-dir",
+    type=click.Path(file_okay=False, resolve_path=True),
+    default=lambda: os.environ.get("AGENT_MCP_DASHBOARD_DIR"),
+    show_default="$AGENT_MCP_DASHBOARD_DIR",
+    help="Directory holding the Next.js static dashboard export.",
+)
+@click.option(
+    "--external-url",
+    type=str,
+    default=lambda: os.environ.get("AGENT_MCP_EXTERNAL_URL"),
+    show_default="$AGENT_MCP_EXTERNAL_URL",
+    help="Base URL the router reachable at (used in copy-paste wiring snippets).",
+)
+@click.option(
+    "--idle-sec",
+    type=int,
+    default=lambda: int(os.environ.get("AGENT_MCP_IDLE_SEC", str(4 * 60 * 60))),
+    show_default="14400 (4h)",
+    help="Idle seconds before stopping an inactive backend.",
+)
+@click.option(
+    "--installer-template",
+    type=click.Path(dir_okay=False, resolve_path=True),
+    default=lambda: os.environ.get("AGENT_MCP_INSTALLER_TEMPLATE"),
+    show_default="packaged installer.sh.in (or $AGENT_MCP_INSTALLER_TEMPLATE)",
+    help="Path to the installer.sh.in template (env override).",
+)
+@click.option(
+    "--readme-html",
+    type=click.Path(dir_okay=False, resolve_path=True),
+    default=lambda: os.environ.get("AGENT_MCP_README_HTML") or None,
+    show_default="(none)",
+    help="Optional README rendered to HTML, embedded in the index page.",
+)
+def router_cmd(
+    port: int,
+    projects_file: str,
+    sock_dir: Optional[str],
+    dashboard_dir: Optional[str],
+    external_url: Optional[str],
+    idle_sec: int,
+    installer_template: Optional[str],
+    readme_html: str,
+) -> None:
+    """Run the always-on URL-keyed HTTP router.
+
+    The router proxies /agent-mcp/<name>/* to the per-project backend
+    over Unix-domain sockets and serves the shared Next.js dashboard
+    + index page at /agent-mcp/.
+    """
+    # Promote CLI flags to env vars so the app module's import-time
+    # reads pick them up. The deploy repo still sets these env vars
+    # directly via systemd; both paths converge here.
+    os.environ["AGENT_MCP_ROUTER_PORT"] = str(port)
+    os.environ["AGENT_MCP_PROJECTS_FILE"] = projects_file
+    if sock_dir:
+        os.environ["AGENT_MCP_SOCK_DIR"] = sock_dir
+    if dashboard_dir:
+        os.environ["AGENT_MCP_DASHBOARD_DIR"] = dashboard_dir
+    if external_url:
+        os.environ["AGENT_MCP_EXTERNAL_URL"] = external_url
+    os.environ["AGENT_MCP_IDLE_SEC"] = str(idle_sec)
+    if installer_template:
+        os.environ["AGENT_MCP_INSTALLER_TEMPLATE"] = installer_template
+    if readme_html:
+        os.environ["AGENT_MCP_README_HTML"] = readme_html
+
+    # Required env vars without defaults: surface a clean error
+    # rather than a KeyError stack trace deep inside the app.
+    required = {
+        "AGENT_MCP_SOCK_DIR": "--sock-dir",
+        "AGENT_MCP_DASHBOARD_DIR": "--dashboard-dir",
+        "AGENT_MCP_EXTERNAL_URL": "--external-url",
+    }
+    missing = [
+        f"{flag} (or ${env})"
+        for env, flag in required.items()
+        if not os.environ.get(env)
+    ]
+    if missing:
+        raise click.UsageError(
+            "router subcommand requires: " + ", ".join(missing)
+        )
+
+    # Lazy import — the router module reads env at top level, so
+    # importing it before the os.environ assignments above would
+    # bind to stale (likely missing) values.
+    from .router.app import main as router_main
+
+    router_main()
+
+
+# --- Backward-compatibility shim ---
+# Pre-Phase-1a invocations looked like:
+#   python -m agent_mcp.cli --transport sse --uds /run/.../backend.sock \
+#                           --project-dir /path --no-tui
+# i.e. top-level flags, no subcommand. The deploy repo's wrapper
+# script (`agent-mcp-backend`) used this exact shape. We keep one
+# release of compatibility by sniffing argv and rerouting through
+# the new `server` subcommand with a DeprecationWarning. Remove in
+# a future PR once the deploy repo has switched over.
+_TOP_LEVEL_FLAGS_THAT_NOW_BELONG_TO_SERVER = {
+    "--port",
+    "--uds",
+    "--transport",
+    "--project-dir",
+    "--admin-token",
+    "--debug",
+    "--no-tui",
+    "--advanced",
+    "--git",
+    "--no-index",
+}
+
+
+def _looks_like_legacy_top_level_invocation(argv: list[str]) -> bool:
+    """True iff argv[1] is a flag that used to live on the top-level
+    command but now lives under `server`. Subcommands like `server`
+    and `router` never start with `-`, so this is unambiguous."""
+    if len(argv) < 2:
+        return False
+    first = argv[1]
+    if not first.startswith("-"):
+        return False
+    # Accept both `--flag` and `--flag=value`.
+    head = first.split("=", 1)[0]
+    return head in _TOP_LEVEL_FLAGS_THAT_NOW_BELONG_TO_SERVER
+
+
+def main() -> None:
+    """Public entry point.
+
+    Handles the backward-compat rewrite (legacy top-level flags →
+    `server` subcommand) before handing off to the click group.
+    """
+    if _looks_like_legacy_top_level_invocation(sys.argv):
+        warnings.warn(
+            "Top-level flags will be removed in a future release; "
+            "use 'agent-mcp server …' (e.g. "
+            "'agent-mcp server --transport sse …') instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        sys.argv = [sys.argv[0], "server", *sys.argv[1:]]
+    cli()
+
+
+# This allows running `python -m agent_mcp.cli --port ...`
 if __name__ == "__main__":
-    main_cli()
+    main()
