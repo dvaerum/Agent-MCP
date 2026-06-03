@@ -197,6 +197,16 @@ def upgrade() -> None:
     bind = op.get_bind()
     _cleanup_orphans(bind)
 
+    # NOTE: env.py turns `foreign_keys=OFF` for the migration
+    # connection (hotfix 2026-06-03) so the batch_alter_table
+    # rebuild dance can DROP child tables without the previously-
+    # added FK blocking it. env.py re-enables FKs and runs
+    # `PRAGMA foreign_key_check` after all migrations complete.
+    # Earlier versions ran with FKs ON and broke on live washing-
+    # brothers-style DBs (CI's pristine schemas masked the bug).
+    # Orphan cleanup above ensures the data is FK-clean before the
+    # rebuild, so the post-migration foreign_key_check passes.
+
     # Group FKs by table so each table is rebuilt at most once.
     tables = []
     for fk in _FKS:

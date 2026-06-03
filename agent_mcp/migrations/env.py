@@ -82,18 +82,33 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
     )
 
-    # Mirror the runtime `agent_mcp.db.engine` PRAGMA block — most
-    # critically `foreign_keys=ON`. Without it, a migration that
-    # rebuilds a table via `batch_alter_table` can silently copy rows
-    # that violate the new FKs; the violation only surfaces when the
-    # next request-time connection checks the schema. Turning the
-    # pragma on here makes the migration itself fail loudly, which is
-    # the only point at which an operator is watching for it.
+    # SQLite FK pragma policy for migrations (hotfix 2026-06-03):
+    #
+    # Earlier this file set `PRAGMA foreign_keys=ON` for the migration
+    # connection on the theory that any FK-violating data the
+    # migration introduced should fail loudly at migration time. That's
+    # correct in the steady state — but it has a catastrophic
+    # interaction with the batch_alter_table copy-and-rename dance
+    # SQLite-Alembic uses for structural changes.
+    #
+    # When migration 0007 rebuilds `agents` to add `agents.current_task
+    # -> tasks(task_id)`, the FK is in place. The subsequent rebuild
+    # of `tasks` (to add `tasks.parent_task -> tasks(task_id)`) then
+    # fails on `DROP TABLE tasks` because the `agents` FK references
+    # it. Long-lived production DBs hit this on every deploy of
+    # 0007/0008; CI's pristine schemas mask it.
+    #
+    # The fix is the SQLite-recommended pattern for any structural
+    # migration: turn FKs OFF for the migration's duration, then
+    # turn them back ON afterwards and run `foreign_key_check` as
+    # the safety net. The migrations themselves (0007, 0008) do their
+    # own orphan cleanup BEFORE the rebuild, so by the time FKs come
+    # back on the data should already be FK-clean.
     @event.listens_for(connectable, "connect")
     def _set_pragmas(dbapi_connection, _record):  # noqa: ARG001
         cursor = dbapi_connection.cursor()
         try:
-            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA foreign_keys=OFF")
         finally:
             cursor.close()
 
@@ -108,6 +123,21 @@ def run_migrations_online() -> None:
         )
         with context.begin_transaction():
             context.run_migrations()
+
+        # Safety net: re-enable FKs and run `foreign_key_check` once
+        # the migration transaction has committed. `PRAGMA foreign_keys`
+        # can't be flipped inside an open transaction, so this runs
+        # after `context.begin_transaction()` exits.
+        connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+        violations = connection.exec_driver_sql(
+            "PRAGMA foreign_key_check"
+        ).fetchall()
+        if violations:
+            raise RuntimeError(
+                f"Foreign key violations after migrations: {violations}. "
+                f"Migration left the DB in an inconsistent state — "
+                f"investigate before retrying."
+            )
 
 
 if context.is_offline_mode():
