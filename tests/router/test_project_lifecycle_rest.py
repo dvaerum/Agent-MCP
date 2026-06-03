@@ -31,12 +31,8 @@ removes them.
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from typing import Awaitable, Callable
 
 import pytest
-import pytest_asyncio
-from aiohttp import web
 
 
 pytestmark = pytest.mark.asyncio
