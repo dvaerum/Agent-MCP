@@ -2053,20 +2053,29 @@ async def create_message_api_route(request: Request) -> JSONResponse:
                 if rid and rid != "admin" and rid != sender_id:
                     recipients.append(rid)
 
+            # PR-G4 cutover: one bulk INSERT via the agent_messages_db
+            # action module (executemany-style under the hood). The
+            # surrounding action-log INSERT keeps its raw cursor so
+            # everything still commits atomically with the broadcast.
+            from ..db.actions.agent_messages_db import bulk_insert_messages
+
             sent_ids: list[str] = []
+            broadcast_rows: list[dict] = []
             for rid in recipients:
                 msg_id = f"msg_{_secrets.token_hex(8)}"
-                cursor.execute(
-                    """
-                    INSERT INTO agent_messages (
-                        message_id, sender_id, recipient_id, message_content,
-                        message_type, priority, timestamp, delivered, read
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (msg_id, sender_id, rid, content,
-                     message_type, priority, timestamp, 0, 0),
-                )
                 sent_ids.append(msg_id)
+                broadcast_rows.append({
+                    "message_id": msg_id,
+                    "sender_id": sender_id,
+                    "recipient_id": rid,
+                    "message_content": content,
+                    "message_type": message_type,
+                    "priority": priority,
+                    "timestamp": timestamp,
+                    "delivered": False,
+                    "read": False,
+                })
+            bulk_insert_messages(broadcast_rows)
             log_agent_action_to_db(
                 cursor, sender_id, "broadcast_message_via_dashboard",
                 details={"recipients": recipients,
