@@ -170,14 +170,20 @@ async def test_delete_project_returns_unregister_envelope(
 
 
 async def test_delete_project_with_workspace_query_flag(
-    aiohttp_client, router_app, register_project, tmp_path,
+    aiohttp_client, router_app, register_project, router_env,
 ) -> None:
     """``?delete_workspace=true`` cascades into the on-disk dir.
     Query-string signal (audit §3.2 — pick ONE convention, query
     string preferred for DELETE since browsers strip DELETE bodies
-    on some Fetch implementations)."""
-    ws = tmp_path / "ws-to-blow-away"
-    ws.mkdir()
+    on some Fetch implementations).
+
+    Defence-in-depth: the cascade is only honoured when the workspace
+    resolves inside the configured DEFAULT_WORKSPACE_PARENT (see
+    ``_is_within_default_workspace``). The test fixture configures
+    DEFAULT_WORKSPACE to ``env.root / "workspaces"`` so we put the
+    workspace there to actually exercise the delete path."""
+    ws = router_env.root / "workspaces" / "doomed"
+    ws.mkdir(parents=True)
     register_project("doomed", str(ws))
     assert ws.exists()
     client = await aiohttp_client(router_app)
