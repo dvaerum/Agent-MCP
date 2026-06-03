@@ -139,6 +139,44 @@ DEFAULT_WORKSPACE_PARENT = Path(
     )
 ).expanduser()
 README_HTML_PATH = os.environ.get("AGENT_MCP_README_HTML", "")
+
+# ── Single-tenant mode (Phase 3) ────────────────────────────────────
+# When set, the router runs in N=1 mode (services.agent-mcp.multiTenant
+# = false; decision #1, ADR-0008). The same URL surface is exposed,
+# but the write endpoints (__create / __unregister / __rename) return
+# 410 with a documented JSON body, and proxy/dashboard URLs naming any
+# other project are W1-redirected (decision #9) to the configured
+# single-tenant project at the same section path.
+#
+# These start as None (multi-tenant default) and are populated by
+# `make_app(single_tenant_name=…, single_tenant_workspace=…)` when the
+# CLI passes the flags through. Module-level so the route handlers
+# (registered as bare async functions on the aiohttp app) can read
+# them without threading state through every handler signature.
+SINGLE_TENANT_NAME: str | None = None
+SINGLE_TENANT_WORKSPACE: str | None = None
+
+
+def _single_tenant_disabled_response() -> web.Response:
+    """410 body shared by the three disabled write endpoints.
+
+    Body shape is locked by the dashboard contract (Phase 3.5):
+    ``{ error: "endpoint_disabled_in_single_tenant_mode",
+        single_tenant_name: "<name>" }``.
+    The dashboard surfaces ``single_tenant_name`` next to the error so
+    operators see which project is the configured one without having
+    to grep the home-manager config.
+    """
+    body = {
+        "error": "endpoint_disabled_in_single_tenant_mode",
+        "single_tenant_name": SINGLE_TENANT_NAME,
+    }
+    return web.Response(
+        status=410,
+        body=json.dumps(body).encode("utf-8"),
+        content_type="application/json",
+        headers={"Cache-Control": "no-store"},
+    )
 # Installer template: env var overrides (deploy repo still sets this
 # explicitly for now); the default falls back to the packaged
 # installer.sh.in shipped alongside this module. Resolving via
@@ -523,6 +561,45 @@ _MIGRATION_BODY = json.dumps(
 ).encode("utf-8")
 
 
+def _w1_redirect(new_path: str) -> web.Response:
+    """Build a 302 to ``new_path`` for the W1 single-tenant redirect.
+
+    302 (not 301/308) because the wrong-name URL isn't *permanently*
+    invalid — switching the operator's home-manager config back to
+    multi-tenant would restore independent project URLs. Use 302
+    Found so caches and clients don't pin the rewrite.
+
+    Decision #9 (W1) in plan ``prancy-napping-pie`` locks the
+    section-path-preserving shape: e.g. a request for
+    ``/agent-mcp/__dashboard/foo/tasks/`` when only ``bar`` is
+    configured becomes ``/agent-mcp/__dashboard/bar/tasks/``.
+    """
+    return web.Response(
+        status=302,
+        headers={"Location": new_path, "Cache-Control": "no-store"},
+    )
+
+
+def _maybe_single_tenant_redirect(
+    req: web.Request, name: str,
+) -> web.Response | None:
+    """If single-tenant mode is on and ``name`` ≠ the configured project,
+    return the W1 redirect response. Otherwise None (continue normally).
+
+    The replacement substitutes only the *first* occurrence of the
+    wrong name in the path, since the project segment is what the
+    URL grammar guarantees uniqueness of — any later collision with
+    a literal segment that happens to spell ``foo`` is coincidental
+    and we don't want to touch it.
+    """
+    if SINGLE_TENANT_NAME is None or name == SINGLE_TENANT_NAME:
+        return None
+    new_path = req.path.replace(name, SINGLE_TENANT_NAME, 1)
+    if req.query_string:
+        new_path = f"{new_path}?{req.query_string}"
+    return _w1_redirect(new_path)
+
+
 async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
     """/agent-mcp/<name>/mcp → backend /mcp (Streamable HTTP transport)
 
@@ -538,6 +615,9 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
     token reject one hop closer to the client for a faster failure).
     """
     name = req.match_info["name"]
+    redirect = _maybe_single_tenant_redirect(req, name)
+    if redirect is not None:
+        return redirect
     bearer = _extract_bearer(req)
     if bearer is None:
         raise _unauthorized()
@@ -582,6 +662,9 @@ async def backend_api_handler(req: web.Request) -> web.StreamResponse:
     """/agent-mcp/__api/<name>/{rest} → backend /api/{rest}"""
     rest = req.match_info.get("rest", "")
     name = req.match_info["name"]
+    redirect = _maybe_single_tenant_redirect(req, name)
+    if redirect is not None:
+        return redirect
     real_name, alias_entry = _resolve_project_or_alias(name)
     alias_info: tuple[str, str] | None = None
     if alias_entry is not None:
@@ -772,6 +855,11 @@ async def dashboard_handler(req: web.Request) -> web.StreamResponse:
     only deals with the page itself (index.html or any nested
     page route from the static export).
     """
+    name = req.match_info.get("name", "")
+    if name:
+        redirect = _maybe_single_tenant_redirect(req, name)
+        if redirect is not None:
+            return redirect
     rest = req.match_info.get("rest", "")
     if rest == "" or rest.endswith("/"):
         candidate = _safe_dashboard_path(rest + "index.html")
@@ -950,7 +1038,13 @@ async def create_handler(req: web.Request) -> web.StreamResponse:
     Workspace location is fixed at the nix-managed
     DEFAULT_WORKSPACE_PARENT — the caller picks the name only.
     Any body-supplied 'workspace' field is silently ignored.
+
+    In single-tenant mode (Phase 3) this endpoint returns 410 with
+    ``endpoint_disabled_in_single_tenant_mode`` so the dashboard
+    overview can show the operator-facing 'unavailable' explanation.
     """
+    if SINGLE_TENANT_NAME is not None:
+        return _single_tenant_disabled_response()
     form = await req.post()
     name = (form.get("name") or "").strip()
 
@@ -1059,7 +1153,14 @@ async def rename_handler(req: web.Request) -> web.StreamResponse:
         with the active-connection count surfaced in the body so the
         operator knows what's blocking them.
       * 404 if ``old_name`` isn't registered.
+
+    In single-tenant mode (Phase 3) this endpoint returns 410 — the
+    sole project's name is configured statically by the operator's
+    home-manager profile, and there's no value in supporting rename
+    of an N=1 set.
     """
+    if SINGLE_TENANT_NAME is not None:
+        return _single_tenant_disabled_response()
     form = await req.post()
     old_name = (form.get("old_name") or "").strip()
     new_name = (form.get("new_name") or "").strip()
@@ -1224,7 +1325,13 @@ async def unregister_handler(req: web.Request) -> web.StreamResponse:
     Stops the systemd unit; does NOT touch the workspace directory
     (the user's SQLite state lives there) nor any .mcp.json on any
     host (the router didn't create those).
+
+    In single-tenant mode (Phase 3) this endpoint returns 410 — the
+    project is fixed at module-config time, can't be unregistered
+    over HTTP.
     """
+    if SINGLE_TENANT_NAME is not None:
+        return _single_tenant_disabled_response()
     form = await req.post()
     name = (form.get("name") or "").strip()
     if not name:
@@ -1728,7 +1835,29 @@ async def _start_alias_reaper_task(app: web.Application) -> None:
     asyncio.create_task(alias_reaper(app))
 
 
-def make_app() -> web.Application:
+def make_app(
+    *,
+    single_tenant_name: str | None = None,
+    single_tenant_workspace: str | None = None,
+) -> web.Application:
+    """Build the aiohttp Application.
+
+    When ``single_tenant_name`` is set, the router runs in N=1 mode
+    (Phase 3 / ADR-0008). The route table is unchanged — same URL
+    surface in both modes (decision #1) — but module-level
+    ``SINGLE_TENANT_NAME`` is populated so the disabled-write
+    endpoints and W1 redirect short-circuits kick in for individual
+    handlers.
+
+    ``single_tenant_workspace`` is informational at the router level
+    (the ExecStartPre seed step in the home-manager module does the
+    registry write); we still accept it so the CLI can pass it
+    straight through without re-deriving the registry write here.
+    """
+    global SINGLE_TENANT_NAME, SINGLE_TENANT_WORKSPACE
+    SINGLE_TENANT_NAME = single_tenant_name
+    SINGLE_TENANT_WORKSPACE = single_tenant_workspace
+
     app = web.Application()
     app.on_startup.append(reconcile_on_startup)
     app.on_startup.append(_start_reaper_task)
@@ -1816,7 +1945,12 @@ def make_app() -> web.Application:
 
 
 def main() -> None:
-    web.run_app(make_app(), host="127.0.0.1", port=ROUTER_PORT)
+    # AGENT_MCP_ROUTER_HOST lets the VM module bind 0.0.0.0 so qemu's
+    # user-mode hostfwd packets (which arrive on the guest's primary
+    # IP, not loopback) can be served. Production deploys keep the
+    # 127.0.0.1 default and front the router with nginx/Tailscale.
+    host = os.environ.get("AGENT_MCP_ROUTER_HOST", "127.0.0.1")
+    web.run_app(make_app(), host=host, port=ROUTER_PORT)
 
 
 if __name__ == "__main__":

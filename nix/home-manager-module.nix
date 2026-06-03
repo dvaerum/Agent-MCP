@@ -29,9 +29,13 @@
 # The module materialises the router + systemd template + the
 # daemon-agent wiring; project list lives outside source control.
 #
-# Phase 2 ships multi-tenant only — the router unconditionally runs
-# with project routing enabled. The `services.agent-mcp.multiTenant`
-# toggle (decision #1, ADR-0008) lands in Phase 3.
+# Phase 3 adds the `services.agent-mcp.multiTenant` toggle (default
+# true). When set to false, the operator additionally declares
+# `services.agent-mcp.singleProject = { name, workspace }`; the
+# module seeds a one-entry projects.local.json via ExecStartPre on
+# the router unit and passes --single-tenant / --single-workspace
+# to the router so its write endpoints 410 and W1 redirects fire
+# (decision #1 + #9; ADR-0008).
 
 let
   cfg = config.services.agent-mcp;
@@ -57,6 +61,40 @@ let
 
   daemonAgentWrapper =
     resolvedPkgs.agentMcpDaemonAgentWrapper cfg.router.port;
+
+  # ── Single-tenant ExecStartPre seed ───────────────────────────────
+  # When the module is configured for N=1 (`multiTenant = false` +
+  # `singleProject = {…}`), we seed ~/.config/agent-mcp/projects.local.json
+  # with the single declared entry before the router starts. The
+  # router's registry reads this file on every request, so without the
+  # seed the launcher couldn't resolve <name> → workspace path and the
+  # backend would never start.
+  #
+  # The seed is idempotent and conservative: if a file already exists
+  # AND already contains the declared project under the declared
+  # name, we leave it alone (operators may have hand-extended the
+  # file, or it may be a successful seed from a previous boot). When
+  # in doubt we overwrite — single-tenant mode is the operator's
+  # explicit declaration that the file should contain exactly one
+  # entry.
+  singleProjectSeedScript = lib.mkIf (!cfg.multiTenant) (
+    pkgs.writeShellScript "agent-mcp-single-tenant-seed" ''
+      set -euo pipefail
+      cfg_dir="''${XDG_CONFIG_HOME:-$HOME/.config}/agent-mcp"
+      mkdir -p "$cfg_dir"
+      file="$cfg_dir/projects.local.json"
+      desired='{"${cfg.singleProject.name}":"${cfg.singleProject.workspace}"}'
+      if [[ -f "$file" ]] \
+        && ${pkgs.jq}/bin/jq -e \
+            --arg n "${cfg.singleProject.name}" \
+            --arg w "${cfg.singleProject.workspace}" \
+            '.[$n] == $w' "$file" >/dev/null 2>&1; then
+        exit 0
+      fi
+      echo "$desired" > "$file.new"
+      mv "$file.new" "$file"
+    ''
+  );
 
 in {
   options.services.agent-mcp = {
@@ -145,6 +183,57 @@ in {
       };
     };
 
+    multiTenant = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        When true (default), the router runs in multi-tenant mode:
+        projects are registered at runtime via POST /agent-mcp/__create
+        and the dashboard's overview lists them all.
+
+        When false, the router runs in single-tenant mode (N=1):
+        `services.agent-mcp.singleProject` declares the only project,
+        the module seeds projects.local.json before the router starts,
+        and the router 410s __create / __unregister / __rename plus
+        302-redirects any wrong-project URL to the configured one
+        (ADR-0008, plan decisions #1 + #9).
+      '';
+    };
+
+    singleProject = lib.mkOption {
+      type = lib.types.nullOr (lib.types.submodule {
+        options = {
+          name = lib.mkOption {
+            type = lib.types.strMatching "^[a-z]([a-z0-9-]*[a-z0-9])?$";
+            example = "washing-brothers";
+            description = ''
+              Slug for the single-tenant project. Must match the
+              router's slug regex (lowercase letters / digits /
+              hyphens; no underscores; no leading/trailing hyphen).
+              Single-letter names are permitted.
+            '';
+          };
+          workspace = lib.mkOption {
+            type = lib.types.str;
+            example = "/home/alice/code/washing-brothers";
+            description = ''
+              Absolute workspace path the backend will run against
+              (--project-dir on agent-mcp@<name>.service). The
+              directory is NOT auto-created — the operator either
+              provisions it ahead of time or hands the module an
+              existing repo checkout.
+            '';
+          };
+        };
+      });
+      default = null;
+      description = ''
+        Required when `multiTenant = false`; must remain `null` when
+        `multiTenant = true`. An assertion enforces the pairing so a
+        half-toggled config fails at evaluation, not at runtime.
+      '';
+    };
+
     daemonAgents = lib.mkOption {
       type = lib.types.listOf (lib.types.submodule {
         options = {
@@ -187,6 +276,30 @@ in {
   };
 
   config = lib.mkIf cfg.enable {
+    # Catch the lopsided configurations at evaluation time, before
+    # the user wastes a `home-manager switch` on a broken profile.
+    assertions = [
+      {
+        assertion = cfg.multiTenant -> cfg.singleProject == null;
+        message = ''
+          services.agent-mcp.singleProject must be null when
+          services.agent-mcp.multiTenant = true (multi-tenant mode
+          discovers projects at runtime via __create; the
+          singleProject option only applies to single-tenant mode).
+        '';
+      }
+      {
+        assertion = (!cfg.multiTenant) -> cfg.singleProject != null;
+        message = ''
+          services.agent-mcp.multiTenant = false requires
+          services.agent-mcp.singleProject = { name = "<slug>";
+          workspace = "<abs-path>"; }. The router refuses to start
+          without a configured project in single-tenant mode (the
+          dashboard would have no project to point at).
+        '';
+      }
+    ];
+
     home.packages = [
       resolvedPkgs.agentMcpBackendWrapper        # invoked by the systemd template launcher
       resolvedPkgs.agentMcpRouterWrapper         # invoked by agent-mcp-router.service
@@ -266,7 +379,22 @@ in {
           # %t/agent-mcp/<name>/; this just ensures the parent exists.)
           RuntimeDirectory = "agent-mcp";
           RuntimeDirectoryMode = "0700";
-          ExecStart = "${resolvedPkgs.agentMcpRouterWrapper}/bin/agent-mcp-router";
+          # Single-tenant: seed projects.local.json with the one
+          # declared project before the router starts. Multi-tenant
+          # this is a no-op (no ExecStartPre is set).
+          ExecStartPre = lib.mkIf (!cfg.multiTenant) [
+            "${singleProjectSeedScript}"
+          ];
+          ExecStart =
+            if cfg.multiTenant then
+              "${resolvedPkgs.agentMcpRouterWrapper}/bin/agent-mcp-router"
+            else
+              # The wrapper does `exec python -m agent_mcp.cli router "$@"`,
+              # so passing flags through it lands them on the router
+              # subcommand as expected.
+              "${resolvedPkgs.agentMcpRouterWrapper}/bin/agent-mcp-router "
+              + "--single-tenant ${lib.escapeShellArg cfg.singleProject.name} "
+              + "--single-workspace ${lib.escapeShellArg cfg.singleProject.workspace}";
           Restart = "on-failure";
           RestartSec = 10;
         };
