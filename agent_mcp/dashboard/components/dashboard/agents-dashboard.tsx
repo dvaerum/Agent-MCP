@@ -16,6 +16,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { apiClient, Agent, Task } from "@/lib/api"
 import { projectContext } from "@/lib/project-context"
+import { mcpUrl } from "@/lib/urls"
 import { useServerStore } from "@/lib/stores/server-store"
 import { useDataStore } from "@/lib/stores/data-store"
 import { cn } from "@/lib/utils"
@@ -870,17 +871,21 @@ const ACTIVE_TAB_STORAGE_KEY = 'agent-mcp-popup-active-client'
  * Derive the public MCP endpoint URL for this dashboard's project.
  *
  * Under path-prefix deployments (the production shape) the dashboard
- * loads from `/agent-mcp/__dashboard/<name>/...` and the per-project
- * backend is proxied at `/agent-mcp/__api/<name>` — so the MCP
- * transport lives at `<origin>/agent-mcp/__api/<name>/mcp`.
+ * loads from `/agent-mcp/app/<name>/...` and the MCP transport lives
+ * at `<origin>/agent-mcp/<name>/mcp` (PR-D will move it under the
+ * top-level /mcp/ prefix). Standalone deployments (single-tenant, no
+ * path prefix) expose the MCP transport at `<origin>/mcp` directly.
  *
- * Standalone deployments (single-tenant, no path prefix) expose the
- * MCP transport at `<origin>/mcp` directly.
+ * Pre-PR-B this function had a bug (audit §1.1): it concatenated
+ * `apiPrefix + "/mcp"`, which produced `/agent-mcp/__api/<name>/mcp`
+ * — a path that doesn't exist (the MCP route is a sibling of __api,
+ * not a child). PR-B routes the URL build through ``mcpUrl()`` in
+ * ``lib/urls.ts`` so the next URL rename (PR-D) is a one-line change.
  */
 function deriveMcpUrl(): string {
   const origin = typeof window !== 'undefined' ? window.location.origin : ''
   if (projectContext.projectName) {
-    return `${origin}${projectContext.apiPrefix}/mcp`
+    return mcpUrl(projectContext.projectName, origin)
   }
   return `${origin}/mcp`
 }

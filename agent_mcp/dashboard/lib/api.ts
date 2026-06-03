@@ -144,7 +144,8 @@ class ApiClient {
    * already knows the absolute or relative URL of the API root
    * (for example, path-prefixed deployments mounted behind a
    * reverse-proxy router where the dashboard fetches resolve via
-   * `/agent-mcp/__api/<name>` rather than a `http://host:port/api`
+   * `/agent-mcp/api/<name>` (PR-B renamed from /__api/) rather than
+   * a `http://host:port/api`
    * origin).
    *
    * The provided URL should be the API root including any `/api`
@@ -178,7 +179,7 @@ class ApiClient {
     // Enhanced CORS configuration.
     //
     // PR-A: the strict, version-pinned API media type is required by
-    // the router's Accept-header gate (/agent-mcp/__api/<name>/*). A
+    // the router's Accept-header gate (/agent-mcp/api/<name>/*). A
     // plain `application/json` Accept value is rejected with 406. The
     // dashboard is a first-class consumer of the v1 surface, so the
     // gate header is part of every request.

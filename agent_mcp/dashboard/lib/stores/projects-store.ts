@@ -22,6 +22,7 @@
 // for ~3s, so the round-trip on each page load is cheap.
 
 import { create } from 'zustand'
+import { internalRouterUrl } from '../urls'
 
 export type ProjectStatus =
   | 'active'
@@ -62,7 +63,7 @@ interface ProjectsStore {
   reset: () => void
 }
 
-const OVERVIEW_ENDPOINT = '/agent-mcp/__overview'
+const OVERVIEW_ENDPOINT = internalRouterUrl('__overview')
 
 export const useProjectsStore = create<ProjectsStore>((set, get) => ({
   envelope: null,

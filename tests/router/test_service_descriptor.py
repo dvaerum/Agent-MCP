@@ -111,14 +111,13 @@ async def test_index_returns_service_descriptor_for_json_client(
     assert body["service"] == "agent-mcp"
     assert "version" in body and body["version"]
     assert body["mode"] == "multi-tenant"
-    # The endpoint URLs are the PR-A surface shape (still under __api /
-    # __dashboard prefixes; PR-B renames them). They MUST point at
-    # actual mounted routes today.
+    # The endpoint URLs are the Shape-3 surface (PR-B). They MUST
+    # point at actual mounted routes — see ``make_app`` wire-up.
     assert "endpoints" in body
     eps = body["endpoints"]
-    assert eps["api"] == "/agent-mcp/__api"
-    assert eps["app"] == "/agent-mcp/__dashboard"
-    assert eps["assets"] == "/agent-mcp/__dashboard/_next"
+    assert eps["api"] == "/agent-mcp/api"
+    assert eps["app"] == "/agent-mcp/app"
+    assert eps["assets"] == "/agent-mcp/assets"
     assert eps["mcp"] == "/agent-mcp"
     # Discovery links the dashboard's two READ entry points so a plain
     # HTTP client can iterate projects without scraping HTML.
@@ -144,7 +143,7 @@ async def test_index_redirects_browser_to_dashboard(
     )
 
     assert resp.status == 302
-    assert resp.headers["Location"] == "/agent-mcp/__dashboard/"
+    assert resp.headers["Location"] == "/agent-mcp/app/"
 
 
 async def test_index_descriptor_reports_single_tenant_project(
@@ -184,7 +183,7 @@ async def test_index_browser_redirects_to_single_tenant_dashboard(
     )
 
     assert resp.status == 302
-    assert resp.headers["Location"] == "/agent-mcp/__dashboard/only/"
+    assert resp.headers["Location"] == "/agent-mcp/app/only/"
 
 
 # ── Accept-header gate on /__api/* ───────────────────────────────────
@@ -328,7 +327,7 @@ async def test_dashboard_route_does_not_require_accept_header(
     write_dashboard_file("index.html", "<html>dashboard</html>")
     client = await aiohttp_client(router_app)
 
-    resp = await client.get("/agent-mcp/__dashboard/")
+    resp = await client.get("/agent-mcp/app/")
 
     assert resp.status == 200
     assert "dashboard" in await resp.text()

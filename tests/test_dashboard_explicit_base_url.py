@@ -44,15 +44,22 @@ def test_path_prefix_singleton_uses_set_base_url() -> None:
     the old api-client-initializer.tsx useEffect into the module-load
     body of `lib/project-context.ts`. When the path-prefix matches,
     the singleton must call `apiClient.setBaseUrl` with the derived
-    `/agent-mcp/__api/<name>` URL so the very first fetch already
-    routes through the proxy."""
+    `/agent-mcp/api/<name>` URL (PR-B renamed from /__api/) so the
+    very first fetch already routes through the proxy."""
     src = _read("lib/project-context.ts")
     assert "setBaseUrl" in src, (
         "expected lib/project-context.ts to call apiClient.setBaseUrl "
         "with the derived URL when the dashboard URL matches "
-        "/agent-mcp/__dashboard/<name>/"
+        "/agent-mcp/app/<name>/"
     )
-    assert "/agent-mcp/__api/" in src, (
-        "expected the path-derived URL (/agent-mcp/__api/...) in "
-        "lib/project-context.ts"
+    # PR-B centralised the URL build in lib/urls.ts; project-context
+    # now imports `apiUrl()` instead of templating the URL inline.
+    assert "apiUrl" in src, (
+        "expected lib/project-context.ts to import the apiUrl() helper "
+        "from lib/urls.ts (PR-B centralisation)"
+    )
+    urls_src = _read("lib/urls.ts")
+    assert "/agent-mcp/api" in urls_src, (
+        "expected the path-derived URL prefix /agent-mcp/api in "
+        "lib/urls.ts"
     )

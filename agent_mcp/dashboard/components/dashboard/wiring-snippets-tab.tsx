@@ -28,6 +28,7 @@ import {
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { useProjectsStore } from "@/lib/stores/projects-store"
+import { internalRouterUrl, mcpUrl } from "@/lib/urls"
 
 interface ClientConfig {
   mcpServers: {
@@ -46,7 +47,7 @@ interface AdminTokenResult {
 }
 
 const EXTERNAL_URL_SCRIPT_HINT = (
-  // When the dashboard runs at https://host.tailnet.ts.net/agent-mcp/__dashboard/
+  // When the dashboard runs at https://host.tailnet.ts.net/agent-mcp/app/
   // we want the wiring URLs to use the same origin. The router
   // doesn't surface its configured EXTERNAL_URL via /__overview today
   // (kept out of this PR to avoid expanding the envelope shape),
@@ -62,7 +63,7 @@ function originBase(): string {
 function buildMcpJsonFor(projectName: string, token: string | null): ClientConfig {
   const entry: ClientConfig["mcpServers"][string] = {
     type: "http",
-    url: `${originBase()}/agent-mcp/${projectName}/mcp`,
+    url: mcpUrl(projectName, originBase()),
   }
   if (token) {
     entry.headers = { Authorization: `Bearer ${token}` }
@@ -71,10 +72,10 @@ function buildMcpJsonFor(projectName: string, token: string | null): ClientConfi
 }
 
 function buildInstallerOneliner(projectName: string): string {
-  return (
-    `curl -fsSL "${originBase()}/agent-mcp/__client-installer/` +
-    `${encodeURIComponent(projectName)}.sh" | bash`
+  const path = internalRouterUrl(
+    `__client-installer/${encodeURIComponent(projectName)}.sh`,
   )
+  return `curl -fsSL "${originBase()}${path}" | bash`
 }
 
 function MaskedToken({
@@ -116,7 +117,9 @@ function ProjectWiringPanel({
       // cheapest way to surface it without hitting the per-project
       // backend directly. It returns the .mcp.json JSON body.
       const r = await fetch(
-        `/agent-mcp/__client-config/${encodeURIComponent(projectName)}.mcp.json`,
+        internalRouterUrl(
+          `__client-config/${encodeURIComponent(projectName)}.mcp.json`,
+        ),
         { cache: "no-store" },
       )
       if (!r.ok) throw new Error(`HTTP ${r.status}`)
@@ -244,7 +247,9 @@ function ProjectWiringPanel({
               asChild
             >
               <a
-                href={`/agent-mcp/__client-installer/${encodeURIComponent(projectName)}.sh`}
+                href={internalRouterUrl(
+                  `__client-installer/${encodeURIComponent(projectName)}.sh`,
+                )}
                 target="_blank"
                 rel="noopener noreferrer"
               >

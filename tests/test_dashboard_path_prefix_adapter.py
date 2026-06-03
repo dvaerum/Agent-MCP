@@ -91,13 +91,22 @@ def test_project_context_derives_from_pathname_synchronously() -> None:
         "expected `typeof window !== 'undefined'` SSR guard so the "
         "module imports cleanly during Next.js prerender"
     )
-    assert "/agent-mcp/__dashboard" in src, (
-        "expected the path-prefix regex literal `/agent-mcp/__dashboard` "
-        "in project-context.ts"
+    # PR-B moved the URL string literals into lib/urls.ts and
+    # project-context now imports the regex helper. Assert the import
+    # exists; the literal-presence guard moved into the urls.ts test
+    # (test_dashboard_urls_module below).
+    assert "APP_PROJECT_PATH_RE" in src, (
+        "expected project-context.ts to import the URL regex helper "
+        "from lib/urls.ts (PR-B centralisation)"
     )
-    assert "/agent-mcp/__api/" in src, (
-        "expected the derived API root literal `/agent-mcp/__api/` "
-        "in project-context.ts"
+    urls_src = _read(DASHBOARD / "lib" / "urls.ts")
+    assert "/agent-mcp/app" in urls_src, (
+        "expected the path-prefix literal `/agent-mcp/app` in "
+        "lib/urls.ts (PR-B renamed from /__dashboard/)"
+    )
+    assert "/agent-mcp/api" in urls_src, (
+        "expected the derived API root literal `/agent-mcp/api` in "
+        "lib/urls.ts (PR-B renamed from /__api/)"
     )
 
 

@@ -50,10 +50,12 @@ def test_substitute_replaces_sentinel_with_configured_prefix() -> None:
         + b"/_next/static/chunks/main.js\"></script></html>"
     )
 
-    out = substitute_asset_prefix(payload, "/agent-mcp/__dashboard")
+    out = substitute_asset_prefix(payload, "/agent-mcp/assets")
 
     assert SENTINEL.encode() not in out
-    assert b"/agent-mcp/__dashboard/_next/static/chunks/main.js" in out
+    # PR-B: assets moved out from under /__dashboard/_next/ to the
+    # top-level /assets/ prefix; substitution emits the new shape.
+    assert b"/agent-mcp/assets/_next/static/chunks/main.js" in out
 
 
 def test_substitute_handles_multiple_sentinel_occurrences() -> None:
@@ -103,7 +105,11 @@ def test_substitute_with_alternate_prefix_tools() -> None:
 async def test_html_response_has_sentinel_substituted(
     aiohttp_client, router_app, write_dashboard_file,
 ) -> None:
-    """``GET /agent-mcp/__dashboard/<name>/`` rewrites HTML bodies."""
+    """``GET /agent-mcp/app/`` rewrites HTML bodies.
+
+    PR-B: default ASSET_PREFIX is /agent-mcp/assets (top-level segment,
+    decoupled from the /app/ pages prefix); substituted output points
+    at the new asset URL shape."""
     write_dashboard_file(
         "index.html",
         '<html><body>'
@@ -112,18 +118,18 @@ async def test_html_response_has_sentinel_substituted(
     )
     client = await aiohttp_client(router_app)
 
-    resp = await client.get("/agent-mcp/__dashboard/")
+    resp = await client.get("/agent-mcp/app/")
     assert resp.status == 200
     body = await resp.text()
     assert "__AGENT_MCP_ASSET_PREFIX__" not in body
-    assert "/agent-mcp/__dashboard/_next/main.js" in body
+    assert "/agent-mcp/assets/_next/main.js" in body
 
 
 @pytest.mark.asyncio
 async def test_js_response_has_sentinel_substituted(
     aiohttp_client, router_app, write_dashboard_file,
 ) -> None:
-    """``GET /agent-mcp/__dashboard/_next/<path>.js`` rewrites JS bodies.
+    """``GET /agent-mcp/assets/_next/<path>.js`` rewrites JS bodies.
 
     Next.js bakes the asset prefix into webpack's __webpack_require__
     runtime in chunk JS, so the JS itself contains the sentinel and
@@ -135,12 +141,12 @@ async def test_js_response_has_sentinel_substituted(
     client = await aiohttp_client(router_app)
 
     resp = await client.get(
-        "/agent-mcp/__dashboard/_next/static/chunks/main-abc123.js"
+        "/agent-mcp/assets/_next/static/chunks/main-abc123.js"
     )
     assert resp.status == 200
     body = await resp.text()
     assert "__AGENT_MCP_ASSET_PREFIX__" not in body
-    assert '"/agent-mcp/__dashboard/_next/"' in body
+    assert '"/agent-mcp/assets/_next/"' in body
 
 
 @pytest.mark.asyncio
@@ -155,12 +161,12 @@ async def test_css_response_has_sentinel_substituted(
     client = await aiohttp_client(router_app)
 
     resp = await client.get(
-        "/agent-mcp/__dashboard/_next/static/css/app-def456.css"
+        "/agent-mcp/assets/_next/static/css/app-def456.css"
     )
     assert resp.status == 200
     body = await resp.text()
     assert "__AGENT_MCP_ASSET_PREFIX__" not in body
-    assert "/agent-mcp/__dashboard/_next/static/media/logo.svg" in body
+    assert "/agent-mcp/assets/_next/static/media/logo.svg" in body
 
 
 @pytest.mark.asyncio
@@ -202,7 +208,7 @@ async def test_binary_png_response_is_passed_through_unchanged(
 
     client = await aiohttp_client(router_app)
     resp = await client.get(
-        "/agent-mcp/__dashboard/_next/static/media/badge.png"
+        "/agent-mcp/assets/_next/static/media/badge.png"
     )
     assert resp.status == 200
     body = await resp.read()
@@ -231,7 +237,7 @@ async def test_alternate_configured_prefix_propagates_to_served_html(
     app = router_module.make_app()
     client = await aiohttp_client(app)
 
-    resp = await client.get("/agent-mcp/__dashboard/")
+    resp = await client.get("/agent-mcp/app/")
     assert resp.status == 200
     body = await resp.text()
     assert "/tools/_next/x.js" in body

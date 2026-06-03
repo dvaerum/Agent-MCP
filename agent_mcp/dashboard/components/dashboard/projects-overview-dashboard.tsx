@@ -1,10 +1,10 @@
 "use client"
 
 // Cross-project overview dashboard (Phase 3.5a — prancy-napping-pie).
-// Lives at `/agent-mcp/__dashboard/` (no project segment). Renders one
-// card per registered project (R2 + S2 + multi-line per the locked
-// design table) backed by the new `/agent-mcp/__overview` router
-// endpoint via `useProjectsStore`.
+// Lives at `/agent-mcp/app/` (no project segment, PR-B renamed from
+// /__dashboard/). Renders one card per registered project (R2 + S2 +
+// multi-line per the locked design table) backed by the
+// `/agent-mcp/__overview` router endpoint via `useProjectsStore`.
 //
 // Per-card layout (multi-line, ~2-3 visible lines + "Show details"
 // toggle):
@@ -44,6 +44,7 @@ import {
   type ProjectOverviewRow,
   type ProjectStatus,
 } from "@/lib/stores/projects-store"
+import { appUrl } from "@/lib/urls"
 import { AddProjectModal } from "./add-project-modal"
 import { RemoveProjectModal } from "./remove-project-modal"
 import { RenameProjectModal } from "./rename-project-modal"
@@ -88,7 +89,7 @@ function ProjectCard({
   const [renameOpen, setRenameOpen] = useState(false)
   const [removeOpen, setRemoveOpen] = useState(false)
   const [openAlias, setOpenAlias] = useState<string | null>(null)
-  const dashboardHref = `/agent-mcp/__dashboard/${encodeURIComponent(row.name)}/`
+  const dashboardHref = appUrl(row.name)
   return (
     <Card className="overflow-hidden">
       <CardHeader className="flex flex-row items-start justify-between space-y-0 pb-2">

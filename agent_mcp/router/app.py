@@ -156,7 +156,7 @@ DEFAULT_WORKSPACE_PARENT = Path(
 # ``prancy-napping-pie.md`` for the design rationale (single build,
 # runtime substitution, sentinel-as-self-documenting marker).
 ASSET_PREFIX: str = os.environ.get(
-    "AGENT_MCP_ASSET_PREFIX", "/agent-mcp/__dashboard"
+    "AGENT_MCP_ASSET_PREFIX", "/agent-mcp/assets"
 )
 
 # ── Single-tenant mode (Phase 3) ────────────────────────────────────
@@ -475,6 +475,14 @@ def _projects_dict() -> dict[str, str]:
     return {row["name"]: row["workspace"] for row in _REGISTRY.list()}
 
 
+# Reserved project names. After PR-B's URL rename these four segments
+# are top-level paths on the router; a project literally named after
+# one of them would become structurally unreachable behind the
+# more-specific route registration (audit §2.6). Rejected at create /
+# rename time so the registry never holds a name that would collide.
+_RESERVED_NAMES = frozenset({"api", "app", "assets", "mcp"})
+
+
 def _validate_name(name: str, existing: dict[str, str]) -> str | None:
     """Return None if valid, otherwise a human-readable error."""
     if not name:
@@ -486,6 +494,12 @@ def _validate_name(name: str, existing: dict[str, str]) -> str | None:
             f"name must match {_SLUG_RE.pattern} — lowercase letters, "
             "digits, and hyphens only; first char is a letter, no "
             "leading/trailing hyphen, no underscores (single letter ok)"
+        )
+    if name in _RESERVED_NAMES:
+        return (
+            f"name {name!r} is reserved — it conflicts with the "
+            f"top-level router path /agent-mcp/{name}/. Reserved names: "
+            f"{', '.join(sorted(_RESERVED_NAMES))}."
         )
     if name in existing:
         return f"project {name!r} is already registered"
@@ -1081,22 +1095,25 @@ async def dashboard_handler(req: web.Request) -> web.StreamResponse:
 
 
 async def dashboard_assets_handler(req: web.Request) -> web.StreamResponse:
-    """Serve Next.js static assets at /agent-mcp/__dashboard/_next/…
+    """Serve Next.js static assets at /agent-mcp/assets/<rest> (PR-B).
 
-    The dashboard's webpack chunks bake the sentinel into
-    ``__webpack_public_path__`` at build time; Phase 4's
-    `_serve_dashboard_file` substitutes the configured runtime prefix
-    in JS / CSS responses so chunks resolve under the correct URL no
-    matter where the dashboard is mounted. Binary files (fonts,
-    images) pass through unchanged.
+    PR-B moved the assets prefix to a top-level segment
+    (/agent-mcp/assets/<rest>) so the asset bundle is decoupled from
+    the dashboard pages path. The on-disk layout is unchanged: every
+    asset still lives under DASHBOARD_DIR/_next/... as Next.js emits
+    it. The sentinel substitution rewrites the build-time
+    ``__AGENT_MCP_ASSET_PREFIX__`` to the configured ASSET_PREFIX
+    (default /agent-mcp/assets), and Next.js's webpack runtime
+    appends its own ``/_next/static/...`` segments on top of that —
+    so the resulting public URLs are /agent-mcp/assets/_next/... .
+    The route's `{rest:.*}` captures the `_next/...` tail and the
+    handler resolves it against the dashboard dir as-is.
 
-    All projects share the same on-disk dist tree (assetPrefix is
-    project-agnostic; it's only the URL prefix that varies), so a
-    single route serving from DASHBOARD_DIR/_next/... is the right
-    thing.
+    Binary files (fonts, images) pass through unchanged; substitution
+    only touches HTML/JS/CSS Content-Types.
     """
     rest = req.match_info.get("rest", "")
-    candidate = _safe_dashboard_path(f"_next/{rest}")
+    candidate = _safe_dashboard_path(rest)
     if candidate is None or not candidate.is_file():
         raise web.HTTPNotFound()
     # Next.js content-hashes every chunk filename; the same URL is
@@ -2110,26 +2127,57 @@ async def create_agent_handler(req: web.Request) -> web.StreamResponse:
 def _service_descriptor() -> dict:
     """Build the JSON service-descriptor body.
 
-    PR-A: the endpoint URLs reflect the CURRENT (Phase 6) surface —
-    /__api, /__dashboard, /__dashboard/_next. PR-B will rewrite these
-    to the top-level prefixes (/api, /app, /assets, /mcp) and the
-    descriptor moves with the rename, so a client that follows the
-    embedded links keeps working across the major version boundary.
+    PR-B: endpoint URLs now reflect the Shape-3 surface — the four
+    top-level prefixes (``api``, ``app``, ``assets``, ``mcp``). A
+    client that follows the descriptor links lands on the new URLs.
+
+    The MCP transport URL stays project-suffixed (``/agent-mcp/<name>/mcp``)
+    in PR-B; PR-D moves it to ``/agent-mcp/mcp/<name>``. The descriptor
+    publishes the parent prefix only.
     """
     return {
         "service": "agent-mcp",
         "version": _PACKAGE_VERSION,
         "mode": "single-tenant" if SINGLE_TENANT_NAME is not None else "multi-tenant",
         "endpoints": {
-            "api": "/agent-mcp/__api",
-            "app": "/agent-mcp/__dashboard",
-            "assets": "/agent-mcp/__dashboard/_next",
+            "api": "/agent-mcp/api",
+            "app": "/agent-mcp/app",
+            "assets": "/agent-mcp/assets",
+            # PR-D will fold this into /agent-mcp/mcp/<name>; today the
+            # MCP transport is at /agent-mcp/<name>/mcp so the parent
+            # prefix is just /agent-mcp.
             "mcp": "/agent-mcp",
         },
         "projects_url": "/agent-mcp/__projects",
         "overview_url": "/agent-mcp/__overview",
         "single_tenant_project": SINGLE_TENANT_NAME,
     }
+
+
+def _make_rename_redirect(old_prefix: str, new_prefix: str):
+    """Return an aiohttp handler that 308-redirects ``old_prefix/<rest>``
+    to ``new_prefix/<rest>`` while preserving the request's method,
+    body, and query string.
+
+    PR-B uses this for the 30-day grace period after the URL rename so
+    operators with hard-coded paths (bookmarks, scripts, external
+    services) don't break the day the rename lands. 308 (Permanent
+    Redirect) is the right status: 301 dropped POST → GET historically
+    on some clients; 307/308 preserve method explicitly per RFC 7231.
+
+    The old prefix is matched as a literal prefix in the path; the
+    suffix (everything after) gets concatenated onto the new prefix.
+    Query strings ride through via ``req.path_qs`` (path + ``?…``).
+    """
+    async def handler(req: web.Request) -> web.Response:
+        path_qs = req.path_qs  # includes ?query=… if present
+        assert path_qs.startswith(old_prefix), (
+            f"_make_rename_redirect mismatch: expected prefix "
+            f"{old_prefix!r}, got path {path_qs!r}"
+        )
+        new_path_qs = new_prefix + path_qs[len(old_prefix):]
+        raise web.HTTPPermanentRedirect(location=new_path_qs)
+    return handler
 
 
 async def index_handler(req: web.Request) -> web.Response:
@@ -2149,9 +2197,9 @@ async def index_handler(req: web.Request) -> web.Response:
     """
     if _accept_prefers_html(req.headers.get("Accept", "")):
         if SINGLE_TENANT_NAME is not None:
-            target = f"/agent-mcp/__dashboard/{quote(SINGLE_TENANT_NAME)}/"
+            target = f"/agent-mcp/app/{quote(SINGLE_TENANT_NAME)}/"
         else:
-            target = "/agent-mcp/__dashboard/"
+            target = "/agent-mcp/app/"
         raise web.HTTPFound(location=target)
     return web.json_response(_service_descriptor(), headers={"Cache-Control": "no-store"})
 
@@ -2230,65 +2278,104 @@ def make_app(
         "/agent-mcp/__client-installer/{name}.sh", client_installer_handler
     )
 
-    # Dashboard. Two routes:
-    #   - /agent-mcp/__dashboard/_next/...  →  shared static assets
-    #     (one on-disk tree serves every project; Next.js's
-    #     `assetPrefix` patch makes the HTML embed this exact path).
-    #     MUST be registered before the project-aware route so the
-    #     more-specific prefix wins.
-    #   - /agent-mcp/__dashboard/<name>/... →  page HTML for the
-    #     project (one on-disk index.html; the dashboard JS picks
-    #     project from window.location.pathname for its API calls).
+    # Dashboard surface — PR-B Shape-3 rename. Three top-level prefixes:
+    #
+    #   /agent-mcp/assets/<rest>     →  Next.js static bundle (was
+    #                                   /agent-mcp/__dashboard/_next/<rest>).
+    #                                   Top-level prefix decouples assets
+    #                                   from any project segment so one
+    #                                   on-disk tree serves all projects.
+    #   /agent-mcp/app/              →  React overview (cross-project
+    #                                   cards). Was /agent-mcp/__dashboard/.
+    #   /agent-mcp/app/<name>/<rest> →  per-project dashboard page HTML.
+    #                                   Was /agent-mcp/__dashboard/<name>/<rest>.
+    #
+    # The Next.js asset URLs inside the served HTML are rewritten at
+    # serve time from the sentinel __AGENT_MCP_ASSET_PREFIX__ to the
+    # value of ASSET_PREFIX (now /agent-mcp/assets by default) — see
+    # ``_serve_dashboard_file`` + the Phase 4 substitution module.
     app.router.add_get(
-        "/agent-mcp/__dashboard/_next/{rest:.*}", dashboard_assets_handler
+        "/agent-mcp/assets/{rest:.*}", dashboard_assets_handler
     )
-    # Phase 3.5a — bare `/agent-mcp/__dashboard/` (no project segment)
-    # serves the React overview page (cross-project cards). Must be
-    # registered BEFORE the `{name}` routes so the more-specific
-    # zero-segment match wins.
-    app.router.add_get("/agent-mcp/__dashboard/", overview_dashboard_handler)
+    app.router.add_get("/agent-mcp/app/", overview_dashboard_handler)
+    app.router.add_get(
+        "/agent-mcp/app",
+        lambda r: web.HTTPMovedPermanently(location="/agent-mcp/app/"),
+    )
+    app.router.add_get(
+        "/agent-mcp/app/{name}",
+        lambda req: web.HTTPMovedPermanently(
+            location=f"/agent-mcp/app/{req.match_info['name']}/"
+        ),
+    )
+    app.router.add_get("/agent-mcp/app/{name}/", dashboard_handler)
+    app.router.add_get(
+        "/agent-mcp/app/{name}/{rest:.*}", dashboard_handler
+    )
+
+    # Old Phase-6 paths kept alive as 308 redirects for ~30 days so
+    # external services and bookmarks survive the rename. 308 (not 302)
+    # preserves the HTTP method and request body across the redirect —
+    # important for POST /agent-mcp/__api/<name>/<rest> calls that
+    # carry a JSON body. Query strings ride through via req.path_qs.
+    #
+    # The _next/ tail under __dashboard/ split off to /assets/ rather
+    # than /app/ — the assets bundle is now top-level, decoupled from
+    # the dashboard pages path. Register the more-specific _next/
+    # redirect first so it wins over the generic /__dashboard/ redirect.
+    app.router.add_get(
+        "/agent-mcp/__dashboard/_next/{rest:.*}",
+        _make_rename_redirect("/agent-mcp/__dashboard/_next", "/agent-mcp/assets/_next"),
+    )
+    app.router.add_get(
+        "/agent-mcp/__dashboard/",
+        _make_rename_redirect("/agent-mcp/__dashboard", "/agent-mcp/app"),
+    )
     app.router.add_get(
         "/agent-mcp/__dashboard",
-        lambda r: web.HTTPMovedPermanently(
-            location="/agent-mcp/__dashboard/"
-        ),
+        _make_rename_redirect("/agent-mcp/__dashboard", "/agent-mcp/app"),
     )
-    # Bare /agent-mcp/__dashboard/<name> (no trailing slash) is a common
-    # typed/bookmarked URL; redirect to the canonical trailing-slash form
-    # so the relative asset URLs in index.html resolve correctly.
     app.router.add_get(
         "/agent-mcp/__dashboard/{name}",
-        lambda req: web.HTTPMovedPermanently(
-            location=f"/agent-mcp/__dashboard/{req.match_info['name']}/"
-        ),
+        _make_rename_redirect("/agent-mcp/__dashboard", "/agent-mcp/app"),
     )
-    app.router.add_get("/agent-mcp/__dashboard/{name}/", dashboard_handler)
     app.router.add_get(
-        "/agent-mcp/__dashboard/{name}/{rest:.*}", dashboard_handler
+        "/agent-mcp/__dashboard/{name}/",
+        _make_rename_redirect("/agent-mcp/__dashboard", "/agent-mcp/app"),
+    )
+    app.router.add_get(
+        "/agent-mcp/__dashboard/{name}/{rest:.*}",
+        _make_rename_redirect("/agent-mcp/__dashboard", "/agent-mcp/app"),
     )
 
     # Backend operations.
     #
-    # /agent-mcp/<name>/mcp is the new Streamable HTTP transport
-    # (dvaerum/Agent-MCP 3.0.0; MCP spec rev 2025-03-26). The path
-    # segment after the project name is `mcp` (3 lowercase letters),
-    # which the project-name slug regex (`^[a-z](?:[a-z0-9-]*[a-z0-9])?$`)
-    # could in principle also match — but the more-specific route
-    # takes precedence in aiohttp's matching order, so a project
-    # literally named "mcp" would lose access to its own dashboard
-    # under that path. We accept that edge case; "mcp" is reserved.
+    # /agent-mcp/<name>/mcp is the Streamable HTTP transport
+    # (dvaerum/Agent-MCP 3.0.0; MCP spec rev 2025-03-26). PR-D will move
+    # this to /agent-mcp/mcp/<name>; PR-B keeps the per-project shape so
+    # the dashboard + REST rename can land without the MCP client-config
+    # rewrite churn that PR-D will carry. The four reserved names (api,
+    # app, assets, mcp) ensure no project shadows a top-level segment;
+    # see ``_validate_name``.
     app.router.add_route(
         "*", "/agent-mcp/{name}/mcp", backend_mcp_handler
+    )
+    # PR-B Shape-3 REST surface. Strict Accept-header gate (PR-A) still
+    # applies — see ``backend_api_handler``.
+    app.router.add_route(
+        "*", "/agent-mcp/api/{name}/{rest:.*}", backend_api_handler
+    )
+    # Old REST path — 308-redirects to the renamed surface. 308 lets
+    # the redirect carry the original method + body, including POST
+    # JSON bodies for the writes the dashboard used to send to /__api.
+    app.router.add_route(
+        "*", "/agent-mcp/__api/{name}/{rest:.*}",
+        _make_rename_redirect("/agent-mcp/__api", "/agent-mcp/api"),
     )
     # Phase 6 removed the transitional 410-Gone handlers for the
     # `/agent-mcp/__sse/<name>` and `/agent-mcp/__messages/<name>/...`
     # URLs (the SSE+messages transport from dvaerum/Agent-MCP <3.0.0).
-    # Those URLs now hit aiohttp's default 404, which is the intent:
-    # any client still configured for SSE should fail hard rather than
-    # receive a structured migration hint indefinitely.
-    app.router.add_route(
-        "*", "/agent-mcp/__api/{name}/{rest:.*}", backend_api_handler
-    )
+    # Those URLs now hit aiohttp's default 404, which is the intent.
 
     # __bridge routes removed: dashboard now uses upstream REST
     # endpoints directly (dvaerum/Agent-MCP#12 + #22).

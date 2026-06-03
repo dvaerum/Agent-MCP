@@ -1,9 +1,10 @@
 # Agent-MCP REST API versioning
 
-The Agent-MCP REST surface under `/agent-mcp/__api/<name>/...` requires
-every request to carry an explicit, version-pinned `Accept` header. A
-request without it (or with a generic `application/json`, `*/*`, etc.)
-is rejected with HTTP 406 and a structured error body.
+The Agent-MCP REST surface under `/agent-mcp/api/<name>/...` (PR-B
+renamed from `/__api/`) requires every request to carry an explicit,
+version-pinned `Accept` header. A request without it (or with a
+generic `application/json`, `*/*`, etc.) is rejected with HTTP 406 and
+a structured error body.
 
 ## TL;DR for clients
 
@@ -27,7 +28,7 @@ Two reasons:
    sent `Accept: application/json` would have no way to tell which
    version it got — fragile.
 2. **Subsumes the §3.7 audit finding.** Previously, the
-   `/agent-mcp/__api/<name>/tokens` endpoint applied its
+   `/agent-mcp/api/<name>/tokens` endpoint applied its
    `Authorization: Bearer` admin-role check only when a header was
    present, leaving the response readable to a request that sent no
    credentials at all. The Accept gate runs first, so an unauthenticated
@@ -71,13 +72,13 @@ about the *content*:
 - `/agent-mcp/<name>/mcp` — the MCP transport has its own version
   negotiation inside `initialize.protocolVersion`. Adding our Accept
   gate would break every MCP client.
-- `/agent-mcp/__dashboard/...` — dashboard HTML and Next.js static
-  assets are loaded by browsers, which don't send our private media
-  type.
+- `/agent-mcp/app/...` and `/agent-mcp/assets/...` — dashboard HTML
+  and Next.js static assets are loaded by browsers, which don't send
+  our private media type.
 - `/agent-mcp/__projects`, `/agent-mcp/__overview`, `/agent-mcp/__create`,
   `/agent-mcp/__rename`, etc. — direct router endpoints, not under
-  `/__api/`. PR-B will fold them into the renamed surface; PR-A keeps
-  them ungated to minimise blast radius.
+  `/api/`. PR-C will fold the project-lifecycle ones into POST
+  /api/projects; the others stay router-only utilities.
 - CORS preflights (`OPTIONS`) — exempted so browsers can complete
   preflight before sending the real request. The Accept gate runs on
   the request itself.
@@ -90,12 +91,12 @@ client can find the endpoint layout without scraping HTML:
 ```json
 {
   "service": "agent-mcp",
-  "version": "3.29.0",
+  "version": "4.0.0",
   "mode": "multi-tenant",
   "endpoints": {
-    "api": "/agent-mcp/__api",
-    "app": "/agent-mcp/__dashboard",
-    "assets": "/agent-mcp/__dashboard/_next",
+    "api": "/agent-mcp/api",
+    "app": "/agent-mcp/app",
+    "assets": "/agent-mcp/assets",
     "mcp": "/agent-mcp"
   },
   "projects_url": "/agent-mcp/__projects",
@@ -104,8 +105,13 @@ client can find the endpoint layout without scraping HTML:
 }
 ```
 
+PR-B (v4.0.0) renamed the top-level prefixes from
+`/__api` / `/__dashboard` / `/__dashboard/_next` to `/api` / `/app` /
+`/assets`. The old paths 308-redirect to the new ones during a 30-day
+grace period for external services and bookmarks.
+
 The descriptor is Accept-negotiated: a browser (`Accept: text/html`)
-sees the existing 302 → `/agent-mcp/__dashboard/`; everything else
+sees the existing 302 → `/agent-mcp/app/`; everything else
 sees the JSON above. The descriptor itself does NOT require the v1
 media type — discovery is the entry point, not a v1-specific
 operation.

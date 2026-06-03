@@ -199,7 +199,7 @@ async def test_multi_tenant_index_redirects_to_dashboard_overview(
     aiohttp_client, router_app,
 ) -> None:
     """``GET /agent-mcp/`` with a browser Accept (text/html) 302s to
-    ``/agent-mcp/__dashboard/`` (decision #2 / ADR-0009).
+    ``/agent-mcp/app/`` (PR-B renamed /__dashboard/ → /app/).
 
     PR-A added Accept-header negotiation: non-browser clients get the
     JSON service descriptor instead — covered in
@@ -213,7 +213,7 @@ async def test_multi_tenant_index_redirects_to_dashboard_overview(
     )
 
     assert resp.status == 302
-    assert resp.headers["Location"] == "/agent-mcp/__dashboard/"
+    assert resp.headers["Location"] == "/agent-mcp/app/"
 
 
 # ── Single-tenant index redirect ────────────────────────────────────
@@ -236,7 +236,7 @@ async def test_single_tenant_index_redirects_to_single_project_dashboard(
     )
 
     assert resp.status == 302
-    assert resp.headers["Location"] == "/agent-mcp/__dashboard/only/"
+    assert resp.headers["Location"] == "/agent-mcp/app/only/"
 
 
 async def test_overview_envelope_reports_single_tenant(

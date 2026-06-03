@@ -38,13 +38,14 @@ async def test_projects_endpoint_returns_json_list(
 async def test_dashboard_with_trailing_slash_resolves(
     aiohttp_client, router_app, write_dashboard_file,
 ) -> None:
-    """``/agent-mcp/__dashboard/foo/`` must hit the dashboard handler
+    """``/agent-mcp/app/foo/`` (PR-B renamed from /__dashboard/) must
+    hit the dashboard handler
     even if no ``foo`` project exists — the handler ignores ``name``
     today (one on-disk tree serves every project)."""
     write_dashboard_file("index.html", "<html>root</html>")
     client = await aiohttp_client(router_app)
 
-    resp = await client.get("/agent-mcp/__dashboard/foo/")
+    resp = await client.get("/agent-mcp/app/foo/")
 
     assert resp.status == 200
     assert "root" in await resp.text()
@@ -59,7 +60,7 @@ async def test_dashboard_nested_path_resolves(
     write_dashboard_file("index.html", "<html>root</html>")
     client = await aiohttp_client(router_app)
 
-    resp = await client.get("/agent-mcp/__dashboard/foo/tasks")
+    resp = await client.get("/agent-mcp/app/foo/tasks")
 
     # 200 from SPA fallback; the targeted SPA test covers the body.
     assert resp.status == 200
@@ -75,10 +76,10 @@ async def test_dashboard_bare_redirects_to_trailing_slash(
     """
     client = await aiohttp_client(router_app)
 
-    resp = await client.get("/agent-mcp/__dashboard/foo", allow_redirects=False)
+    resp = await client.get("/agent-mcp/app/foo", allow_redirects=False)
 
     assert resp.status == 301
-    assert resp.headers["Location"] == "/agent-mcp/__dashboard/foo/"
+    assert resp.headers["Location"] == "/agent-mcp/app/foo/"
 
 
 async def test_create_accepts_form_encoded_name(

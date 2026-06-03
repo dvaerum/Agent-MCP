@@ -11,16 +11,19 @@
  * singleton (computed at import time) is strictly simpler than chaining
  * useEffects through React's render cycle.
  *
- * URL pattern. Path-prefixed deployments mount the dashboard at
- * `/agent-mcp/__dashboard/<name>/...` (the always-on Python router
- * URL-routes each `<name>` to a per-project systemd-template backend
- * on a Unix socket). When pathname matches, we derive:
+ * URL pattern (PR-B). Path-prefixed deployments mount the dashboard at
+ * `/agent-mcp/app/<name>/...` (the always-on Python router URL-routes
+ * each `<name>` to a per-project systemd-template backend on a Unix
+ * socket). When pathname matches, we derive:
  *   - projectName: the `<name>` segment (e.g. `washing-brothers`)
  *   - baseUrl:     the router-proxied API root for fetches
- *                  (`/agent-mcp/__api/<name>`)
+ *                  (`/agent-mcp/api/<name>`)
  *   - apiPrefix:   the same value, exposed separately for callers
  *                  building URLs that aren't simple `${baseUrl}/...`
  *                  concatenations
+ *
+ * URL building goes through `lib/urls.ts` — the single source of URL
+ * truth — so the next URL rename touches one file plus consumers.
  *
  * SSR fallback. Next.js prerenders this module at build time, where
  * `window` is undefined. We fall through to safe defaults
@@ -54,13 +57,11 @@
 import { createContext } from 'react'
 import { apiClient } from './api'
 import { useServerStore } from './stores/server-store'
-
-const DASHBOARD_PATH_RE = /\/agent-mcp\/__dashboard\/([^/]+)/
-// Phase 3.5a — bare `/agent-mcp/__dashboard/` (or no trailing slash)
-// is the cross-project overview route. Detect it separately from the
-// per-project pattern so the dashboard can render `<ProjectsOverview/>`
-// instead of `<DashboardWrapper>`.
-const DASHBOARD_OVERVIEW_PATH_RE = /\/agent-mcp\/__dashboard\/?$/
+import {
+  APP_OVERVIEW_PATH_RE,
+  APP_PROJECT_PATH_RE,
+  apiUrl,
+} from './urls'
 
 function derive(): {
   projectName: string | null
@@ -70,7 +71,7 @@ function derive(): {
 } {
   const pathname =
     typeof window !== 'undefined' ? window.location.pathname : ''
-  if (DASHBOARD_OVERVIEW_PATH_RE.test(pathname)) {
+  if (APP_OVERVIEW_PATH_RE.test(pathname)) {
     // Cross-project overview route — no per-project API root.
     return {
       projectName: null,
@@ -79,9 +80,9 @@ function derive(): {
       apiPrefix: '',
     }
   }
-  const match = pathname.match(DASHBOARD_PATH_RE)
+  const match = pathname.match(APP_PROJECT_PATH_RE)
   if (match) {
-    const apiRoot = `/agent-mcp/__api/${match[1]}`
+    const apiRoot = apiUrl(match[1])
     return {
       projectName: match[1],
       isOverview: false,
