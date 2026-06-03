@@ -109,13 +109,26 @@
       nixosModules.default = ./nix/module.nix;
       nixosModules.agent-mcp = ./nix/module.nix;
 
-      # `nix flake check` smoke test: build the python package + the
-      # dashboard + the router wrapper. Building the full VM is too
-      # heavy for CI.
+      # `nix flake check` smoke test. Two flavours:
+      #
+      #   - Build the three production derivations (agent-mcp,
+      #     dashboard, router wrapper). Cheap; under a minute on a
+      #     warm cache.
+      #   - The two `pkgs.nixosTest` VM scaffolds — multi-tenant +
+      #     single-tenant — added in Phase 3. First run is 10-15 min
+      #     because the test driver builds a NixOS VM, but the result
+      #     is cacheable and CI runners only pay it once per nixpkgs
+      #     bump.
       checks.${system} = {
         agent-mcp = productionPkgs.agentMcpPy;
         agent-mcp-dashboard = productionPkgs.agentMcpDashboard;
         agent-mcp-router-wrapper = productionPkgs.agentMcpRouterWrapper;
+        vm-multi-tenant = import ./nix/tests/multi-tenant.nix {
+          inherit pkgs lib self;
+        };
+        vm-single-tenant = import ./nix/tests/single-tenant.nix {
+          inherit pkgs lib self;
+        };
       };
     };
 }
