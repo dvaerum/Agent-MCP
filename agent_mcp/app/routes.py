@@ -1372,6 +1372,13 @@ routes = [
     Route('/api/task-tree-data', endpoint=task_tree_data_api_route, name="task_tree_data_api", methods=['GET', 'OPTIONS']),
     Route('/api/node-details', endpoint=node_details_api_route, name="node_details_api", methods=['GET', 'OPTIONS']),
     Route('/api/agents', endpoint=agents_list_api_route, name="agents_list_api", methods=['GET', 'OPTIONS']),
+    # Modern POST shape — mirrors /api/agents/<id>/restore, /edit,
+    # /purge-preview, etc. The dashboard's apiClient.createAgent has
+    # always called this URL; pre-fix it 405'd because only GET was
+    # registered (Deploy button was silently broken since the
+    # dashboard was introduced). The handler is the same one the
+    # back-compat /api/create-agent alias below routes to.
+    Route('/api/agents', endpoint=create_agent_dashboard_api_route, name="create_agent_api", methods=['POST']),
     Route('/api/tokens', endpoint=tokens_api_route, name="tokens_api", methods=['GET', 'OPTIONS']),
     Route('/api/tasks', endpoint=all_tasks_api_route, name="all_tasks_api", methods=['GET', 'OPTIONS']),
     Route('/api/update-task-dashboard', endpoint=update_task_details_api_route, name="update_task_dashboard_api", methods=['POST', 'OPTIONS']),

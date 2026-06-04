@@ -36,9 +36,6 @@ import pytest
 from tests.harness import mcp_session
 
 
-pytestmark = pytest.mark.asyncio
-
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 API_FILE = REPO_ROOT / "agent_mcp" / "dashboard" / "lib" / "api.ts"
 
@@ -59,6 +56,7 @@ def _row(table: str, where_sql: str, params: tuple) -> dict | None:
 # -------------------- backend: POST /api/agents ------------------------
 
 
+@pytest.mark.asyncio
 async def test_post_api_agents_creates_agent_row(tmp_path) -> None:
     """The dashboard's createAgent posts to /api/agents. The route must
     accept POST + return 200 + create the agents row.
@@ -88,6 +86,7 @@ async def test_post_api_agents_creates_agent_row(tmp_path) -> None:
         )
 
 
+@pytest.mark.asyncio
 async def test_post_api_agents_rejects_missing_token(tmp_path) -> None:
     """No admin token in body → 401, not 200 or 500."""
     async with mcp_session(tmp_path) as admin:
@@ -102,6 +101,7 @@ async def test_post_api_agents_rejects_missing_token(tmp_path) -> None:
         assert _row("agents", "agent_id = ?", ("no-token-attempt",)) is None
 
 
+@pytest.mark.asyncio
 async def test_post_api_agents_rejects_bad_token(tmp_path) -> None:
     """Non-admin token in body → 401."""
     async with mcp_session(tmp_path) as admin:
@@ -119,6 +119,7 @@ async def test_post_api_agents_rejects_bad_token(tmp_path) -> None:
         assert _row("agents", "agent_id = ?", ("bad-token-attempt",)) is None
 
 
+@pytest.mark.asyncio
 async def test_post_api_create_agent_back_compat_alias_still_works(tmp_path) -> None:
     """The original on-disk endpoint /api/create-agent stays as an alias.
 

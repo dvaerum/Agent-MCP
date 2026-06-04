@@ -104,20 +104,24 @@ async def create_agent_tool_impl(
             )
         ]
 
-    # Validate task_ids parameter
-    if not task_ids:
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text="Error: task_ids is required and must be a non-empty list.",
-            )
-        ]
+    # Validate task_ids parameter.
+    #
+    # task_ids is OPTIONAL — admin may create an unassigned agent and
+    # wire up tasks later (this is how the dashboard's Deploy modal
+    # creates workers; tasks are assigned via the Tasks page). When
+    # provided, it must be a list of strings. The unbundled-create
+    # contract was the original shape (pre-July-2025); the brief
+    # "task_ids required" window broke the dashboard's Deploy button
+    # entirely (no place in the form to enter task IDs). See
+    # tests/test_dashboard_create_agent_endpoint.py.
+    if task_ids is None:
+        task_ids = []
 
-    if not isinstance(task_ids, list) or not task_ids:
+    if not isinstance(task_ids, list):
         return [
             mcp_types.TextContent(
                 type="text",
-                text="Error: task_ids must be a non-empty list of task IDs.",
+                text="Error: task_ids must be a list of task IDs (or omitted).",
             )
         ]
 
@@ -1330,8 +1334,8 @@ async def relaunch_agent_tool_impl(
 def register_admin_tools():
     register_tool(
         name="create_agent",
-        description="Create a new agent with the specified ID, capabilities, and prompt configuration. The agent will be assigned the specified tasks upon creation. Agents work in the shared project directory with file-level locking for coordination.",
-        input_schema={  # Enhanced with prompt template support and required task_ids
+        description="Create a new agent with the specified ID, capabilities, and prompt configuration. task_ids is optional — pass a non-empty list to bundle initial task assignment, or omit to create an idle/unassigned agent (tasks can be assigned later via the Tasks page). Agents work in the shared project directory with file-level locking for coordination.",
+        input_schema={  # Enhanced with prompt template support; task_ids OPTIONAL.
             "type": "object",
             "properties": {
                 "token": {
@@ -1344,9 +1348,8 @@ def register_admin_tools():
                 },
                 "task_ids": {
                     "type": "array",
-                    "description": "List of task IDs to assign to the agent (required). Tasks must exist and be unassigned.",
+                    "description": "List of task IDs to assign to the agent at creation time (optional). When present, each task must exist and be unassigned. Omit to create an idle agent — admins can assign tasks later via the Tasks page.",
                     "items": {"type": "string"},
-                    "minItems": 1,
                 },
                 "capabilities": {
                     "type": "array",
@@ -1383,7 +1386,7 @@ def register_admin_tools():
                     "maximum": 30,
                 },
             },
-            "required": ["agent_id", "task_ids"],
+            "required": ["agent_id"],
             "additionalProperties": False,
         },
         implementation=create_agent_tool_impl,
