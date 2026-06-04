@@ -71,8 +71,22 @@ payload=$(@jq@/bin/jq -nc \
   --arg k "$context_key" --argjson v "$value_json" \
   '{context_key: $k, context_value: $v, description: "Daemon agent PreCompact resume state"}')
 
-# Derive the REST API root from the MCP URL: swap `/mcp` for `/api`.
-api_root="${mcp_url%/mcp}/api"
+# Derive the REST API root from the MCP URL.
+#
+# Daemon wrapper builds AGENT_MCP_MCP_URL as
+#   <scheme>://<host>[:<port>]/agent-mcp/mcp/<project>
+# (PR-D Shape-3 layout; the legacy /agent-mcp/<project>/mcp shape was
+# retired in v5.0.0). The matching project_context REST resource lives
+# at
+#   <scheme>://<host>[:<port>]/agent-mcp/api/projects/<project>/project-context
+#
+# Strip the trailing /mcp/<project> off the URL, then append the
+# /api/projects/<project> prefix. We get <project> from the URL's
+# last path segment rather than from $AGENT_MCP_PROJECT so this hook
+# stays resilient to env-var drift.
+project_name="${mcp_url##*/}"
+url_base="${mcp_url%/mcp/${project_name}}"
+api_root="${url_base}/api/projects/${project_name}"
 
 @curl@/bin/curl -sSf -X POST "${api_root}/project-context" \
   -H "Authorization: Bearer $bearer" \

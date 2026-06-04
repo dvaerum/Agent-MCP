@@ -173,8 +173,9 @@ async def test_alias_resolves_in_mcp_proxy_with_header_injection(
         monkeypatch.setattr(router_module, "_agent_token_map", fake_tokens)
 
         client = await aiohttp_client(router_app)
+        # v5.0.0: MCP transport URL is /agent-mcp/mcp/<name>.
         resp = await client.post(
-            "/agent-mcp/old-alias/mcp",
+            "/agent-mcp/mcp/old-alias",
             data=b"{}",
             headers={
                 "Authorization": "Bearer test-token",

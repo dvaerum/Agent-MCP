@@ -203,7 +203,7 @@ async def test_api_proxy_rejects_request_without_strict_accept_header(
     register_project("proj")
     client = await aiohttp_client(router_app)
 
-    resp = await client.get("/agent-mcp/__api/proj/tokens")
+    resp = await client.get("/agent-mcp/api/proj/tokens")
 
     assert resp.status == 406
     body = await resp.json()
@@ -229,7 +229,7 @@ async def test_api_proxy_rejects_request_with_wrong_accept_header(
 
     for accept in ("application/json", "*/*", "text/html"):
         resp = await client.get(
-            "/agent-mcp/__api/proj/tokens",
+            "/agent-mcp/api/proj/tokens",
             headers={"Accept": accept},
         )
         assert resp.status == 406, f"Accept: {accept!r} should be rejected"
@@ -248,7 +248,7 @@ async def test_api_proxy_accepts_request_with_strict_accept_header(
     client = await aiohttp_client(router_app)
 
     resp = await client.get(
-        "/agent-mcp/__api/proj/tokens",
+        "/agent-mcp/api/proj/tokens",
         headers={"Accept": "application/vnd.agent-mcp.v1+json"},
     )
 
@@ -266,7 +266,7 @@ async def test_api_proxy_accepts_strict_accept_with_parameters(
     client = await aiohttp_client(router_app)
 
     resp = await client.get(
-        "/agent-mcp/__api/proj/tokens",
+        "/agent-mcp/api/proj/tokens",
         headers={"Accept": "application/vnd.agent-mcp.v1+json;q=0.9"},
     )
 
@@ -282,7 +282,7 @@ async def test_api_proxy_accepts_strict_accept_inside_multi_value(
     client = await aiohttp_client(router_app)
 
     resp = await client.get(
-        "/agent-mcp/__api/proj/tokens",
+        "/agent-mcp/api/proj/tokens",
         headers={
             "Accept": "text/plain;q=0.1, application/vnd.agent-mcp.v1+json"
         },
@@ -307,7 +307,7 @@ async def test_mcp_endpoint_does_not_require_accept_header(
     client = await aiohttp_client(router_app)
 
     resp = await client.post(
-        "/agent-mcp/proj/mcp",
+        "/agent-mcp/mcp/proj",
         data=b'{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
         headers={
             "Authorization": "Bearer tok-1234",

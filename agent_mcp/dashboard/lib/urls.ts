@@ -106,9 +106,7 @@ export const APP_PROJECT_PATH_RE = /\/agent-mcp\/app\/([^/]+)/
  *  segment). The cross-project React overview lives here. */
 export const APP_OVERVIEW_PATH_RE = /\/agent-mcp\/app\/?$/
 
-// ── Legacy / deprecated path matchers ───────────────────────────────
-// Kept around for the 30-day 308-redirect grace period. Components that
-// run on the OLD URL get bounced to the new path by the router; any
-// regex parsing in client code should look for BOTH shapes so the
-// transient state is handled gracefully.
-export const LEGACY_DASHBOARD_PATH_RE = /\/agent-mcp\/__dashboard\/([^/]+)/
+// v5.0.0: ``LEGACY_DASHBOARD_PATH_RE`` (the regex for the old
+// /agent-mcp/__dashboard/<name> path shape) was removed alongside the
+// router's 308 redirects for that surface. No importers existed at
+// the time of removal.
