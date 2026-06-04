@@ -1153,12 +1153,26 @@ async def all_data_api_route(request: Request) -> JSONResponse:
         agents_data = []
         for row in cursor.fetchall():
             agent_dict = dict(row)
+            # Skip the synthetic 'admin' pseudo-agent row (seeded by
+            # migration 0008 / `_ensure_admin_pseudo_agent_row` so the
+            # post-PR #100 FK constraints have a target). The row stays
+            # in the DB — it's still load-bearing for FKs — but we
+            # don't surface it in the agents list, otherwise it shows
+            # up alongside the hardcoded 'Admin' display entry inserted
+            # below and the dashboard renders two Admin rows.
+            if agent_dict.get('agent_id') == 'admin':
+                continue
             agent_dict['auth_token'] = active_token_by_agent.get(
                 agent_dict['agent_id']
             )
             agents_data.append(agent_dict)
 
-        # Add admin as special agent
+        # Add admin as special agent. The display label stays 'Admin'
+        # (capital A) because the entire dashboard frontend keys off
+        # `agent_id === 'Admin'` for special-case handling (no edit /
+        # terminate buttons, admin-token mapping, "always show" filter).
+        # The underlying DB row is `agent_id='admin'` lowercase — kept
+        # separate from this UI entry on purpose.
         agents_data.insert(0, {
             'agent_id': 'Admin',
             'status': 'system',
