@@ -122,46 +122,9 @@ async def test_new_api_path_keeps_accept_gate(
     assert body["error"] == "version_required"
 
 
-# ── Old REST path 308-redirects to new ───────────────────────────────
-
-
-async def test_old_api_path_redirects_to_new(
-    aiohttp_client, router_app, register_project,
-) -> None:
-    """The pre-PR-B path /agent-mcp/__api/<name>/<rest> 308-redirects
-    to /agent-mcp/api/<name>/<rest> so external services that hard-coded
-    the URL keep working for ~30 days. 308 (not 302) preserves the
-    method + body across the redirect."""
-    register_project("proj")
-    client = await aiohttp_client(router_app)
-
-    resp = await client.get(
-        "/agent-mcp/__api/proj/tokens",
-        allow_redirects=False,
-        headers=_STRICT_ACCEPT,
-    )
-
-    assert resp.status == 308
-    assert resp.headers["Location"] == "/agent-mcp/api/proj/tokens"
-
-
-async def test_old_api_path_redirect_preserves_query_string(
-    aiohttp_client, router_app, register_project,
-) -> None:
-    register_project("proj")
-    client = await aiohttp_client(router_app)
-
-    resp = await client.get(
-        "/agent-mcp/__api/proj/messages?filter=unread",
-        allow_redirects=False,
-        headers=_STRICT_ACCEPT,
-    )
-
-    assert resp.status == 308
-    assert (
-        resp.headers["Location"]
-        == "/agent-mcp/api/proj/messages?filter=unread"
-    )
+# Old REST path 308 redirects were dropped in v5.0.0 after the 30-day
+# grace window. test_legacy_url_removal.py now asserts /agent-mcp/__api/
+# 404s; the historical 308 behaviour pinned by this section is gone.
 
 
 # ── New dashboard surface: /agent-mcp/app/<name>/ ───────────────────
@@ -195,21 +158,8 @@ async def test_new_app_bare_path_serves_overview(
     assert resp.status == 200
 
 
-async def test_old_dashboard_path_redirects_to_app(
-    aiohttp_client, router_app, write_dashboard_file,
-) -> None:
-    """The pre-PR-B /agent-mcp/__dashboard/<name>/ path 308-redirects to
-    /agent-mcp/app/<name>/. Bookmarks and external links survive the
-    rename for 30 days."""
-    write_dashboard_file("index.html", "<html>dashboard</html>")
-    client = await aiohttp_client(router_app)
-
-    resp = await client.get(
-        "/agent-mcp/__dashboard/proj/", allow_redirects=False,
-    )
-
-    assert resp.status == 308
-    assert resp.headers["Location"] == "/agent-mcp/app/proj/"
+# The /agent-mcp/__dashboard/<name>/ 308 redirect was dropped in
+# v5.0.0. test_legacy_url_removal.py asserts the 404 behaviour.
 
 
 # ── New asset surface: /agent-mcp/assets/<path> ─────────────────────
@@ -237,27 +187,10 @@ async def test_new_assets_path_serves_next_static_bundle(
     assert resp.content_type == "application/javascript"
 
 
-async def test_old_assets_path_redirects_to_new(
-    aiohttp_client, router_app, write_dashboard_file,
-) -> None:
-    """Old asset path 308-redirects so cached HTML pages from before
-    the rename still resolve assets (within the 30-day window)."""
-    write_dashboard_file("_next/static/chunks/main.js", "x")
-    client = await aiohttp_client(router_app)
-
-    resp = await client.get(
-        "/agent-mcp/__dashboard/_next/static/chunks/main.js",
-        allow_redirects=False,
-    )
-
-    assert resp.status == 308
-    # The _next/ tail under __dashboard/ redirects to /assets/_next/
-    # rather than /app/_next/ — the assets bundle is top-level after
-    # PR-B, decoupled from the dashboard pages path.
-    assert (
-        resp.headers["Location"]
-        == "/agent-mcp/assets/_next/static/chunks/main.js"
-    )
+# The /agent-mcp/__dashboard/_next/<rest> 308 redirect was dropped in
+# v5.0.0; cached HTML pages from before the rename no longer resolve
+# assets via the legacy URL. test_legacy_url_removal.py asserts the
+# 404 behaviour.
 
 
 # ── Service descriptor reflects new URLs ─────────────────────────────

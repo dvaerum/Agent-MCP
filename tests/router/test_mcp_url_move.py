@@ -65,26 +65,9 @@ async def test_new_mcp_path_routes_to_backend_mcp_handler(
     )
 
 
-# ── Old path 308-redirects ───────────────────────────────────────────
-
-
-async def test_old_mcp_path_redirects_to_new(
-    aiohttp_client, router_app, router_module,
-) -> None:
-    """``/agent-mcp/<name>/mcp`` 308-redirects to the new path. 308
-    preserves the POST + body across the redirect so MCP clients on
-    the old URL keep working during the 30-day grace window."""
-    router_module._REGISTRY.register("proj", "/tmp/ws-prd-test")
-    client = await aiohttp_client(router_app)
-
-    resp = await client.post(
-        "/agent-mcp/proj/mcp",
-        data=b'{}',
-        allow_redirects=False,
-    )
-
-    assert resp.status == 308
-    assert resp.headers["Location"] == "/agent-mcp/mcp/proj"
+# The /agent-mcp/<name>/mcp 308 redirect was dropped in v5.0.0 after
+# the 30-day grace window. test_legacy_url_removal.py now asserts the
+# legacy path 404s.
 
 
 # ── Service descriptor reflects new shape ───────────────────────────

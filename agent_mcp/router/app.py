@@ -2536,53 +2536,10 @@ def _service_descriptor() -> dict:
     }
 
 
-def _make_mcp_url_redirect():
-    """Return an aiohttp handler that 308-redirects the legacy MCP URL
-    ``/agent-mcp/<name>/mcp`` to the PR-D Shape-3 location
-    ``/agent-mcp/mcp/<name>``.
-
-    The path components shuffle (the project name moves from a
-    middle segment to a trailing one), so this is a different shape
-    transformation than ``_make_rename_redirect`` — that one rewrites
-    a leading prefix, this one peels a trailing literal off and
-    reorders.
-    """
-    async def handler(req: web.Request) -> web.Response:
-        name = req.match_info["name"]
-        # Drop any URL query string back onto the new location so it
-        # rides through the redirect.
-        qs = req.rel_url.raw_query_string
-        target = f"/agent-mcp/mcp/{name}"
-        if qs:
-            target = f"{target}?{qs}"
-        raise web.HTTPPermanentRedirect(location=target)
-    return handler
-
-
-def _make_rename_redirect(old_prefix: str, new_prefix: str):
-    """Return an aiohttp handler that 308-redirects ``old_prefix/<rest>``
-    to ``new_prefix/<rest>`` while preserving the request's method,
-    body, and query string.
-
-    PR-B uses this for the 30-day grace period after the URL rename so
-    operators with hard-coded paths (bookmarks, scripts, external
-    services) don't break the day the rename lands. 308 (Permanent
-    Redirect) is the right status: 301 dropped POST → GET historically
-    on some clients; 307/308 preserve method explicitly per RFC 7231.
-
-    The old prefix is matched as a literal prefix in the path; the
-    suffix (everything after) gets concatenated onto the new prefix.
-    Query strings ride through via ``req.path_qs`` (path + ``?…``).
-    """
-    async def handler(req: web.Request) -> web.Response:
-        path_qs = req.path_qs  # includes ?query=… if present
-        assert path_qs.startswith(old_prefix), (
-            f"_make_rename_redirect mismatch: expected prefix "
-            f"{old_prefix!r}, got path {path_qs!r}"
-        )
-        new_path_qs = new_prefix + path_qs[len(old_prefix):]
-        raise web.HTTPPermanentRedirect(location=new_path_qs)
-    return handler
+# v5.0.0: ``_make_mcp_url_redirect`` and ``_make_rename_redirect``
+# helpers were deleted alongside the legacy 308 routes they powered.
+# The 30-day grace window for /__dashboard/, /__api/<name>/<rest>, and
+# /<name>/mcp shapes has expired; those URLs now 404.
 
 
 async def index_handler(req: web.Request) -> web.Response:
@@ -2718,40 +2675,9 @@ def make_app(
         "/agent-mcp/app/{name}/{rest:.*}", dashboard_handler
     )
 
-    # Old Phase-6 paths kept alive as 308 redirects for ~30 days so
-    # external services and bookmarks survive the rename. 308 (not 302)
-    # preserves the HTTP method and request body across the redirect —
-    # important for POST /agent-mcp/__api/<name>/<rest> calls that
-    # carry a JSON body. Query strings ride through via req.path_qs.
-    #
-    # The _next/ tail under __dashboard/ split off to /assets/ rather
-    # than /app/ — the assets bundle is now top-level, decoupled from
-    # the dashboard pages path. Register the more-specific _next/
-    # redirect first so it wins over the generic /__dashboard/ redirect.
-    app.router.add_get(
-        "/agent-mcp/__dashboard/_next/{rest:.*}",
-        _make_rename_redirect("/agent-mcp/__dashboard/_next", "/agent-mcp/assets/_next"),
-    )
-    app.router.add_get(
-        "/agent-mcp/__dashboard/",
-        _make_rename_redirect("/agent-mcp/__dashboard", "/agent-mcp/app"),
-    )
-    app.router.add_get(
-        "/agent-mcp/__dashboard",
-        _make_rename_redirect("/agent-mcp/__dashboard", "/agent-mcp/app"),
-    )
-    app.router.add_get(
-        "/agent-mcp/__dashboard/{name}",
-        _make_rename_redirect("/agent-mcp/__dashboard", "/agent-mcp/app"),
-    )
-    app.router.add_get(
-        "/agent-mcp/__dashboard/{name}/",
-        _make_rename_redirect("/agent-mcp/__dashboard", "/agent-mcp/app"),
-    )
-    app.router.add_get(
-        "/agent-mcp/__dashboard/{name}/{rest:.*}",
-        _make_rename_redirect("/agent-mcp/__dashboard", "/agent-mcp/app"),
-    )
+    # v5.0.0: the 30-day grace-window 308 redirects from the legacy
+    # ``__dashboard/`` paths (and the legacy ``__dashboard/_next/``
+    # asset paths) have been deleted. Those URLs now 404.
 
     # Backend operations.
     #
@@ -2764,14 +2690,9 @@ def make_app(
     app.router.add_route(
         "*", "/agent-mcp/mcp/{name}", backend_mcp_handler
     )
-    # Old path 308-redirects for ~30 days so MCP clients on the
-    # pre-PR-D shape keep working until operators rotate their
-    # .mcp.json files. 308 preserves method + body so the POST that
-    # carries an initialize body survives the redirect.
-    app.router.add_route(
-        "*", "/agent-mcp/{name}/mcp",
-        _make_mcp_url_redirect(),
-    )
+    # v5.0.0: the 30-day grace-window 308 redirect from the legacy
+    # /agent-mcp/<name>/mcp path has been deleted. Old clients that
+    # never updated their .mcp.json now 404.
     # PR-C: REST resource shape for project lifecycle.
     #
     # Mounted BEFORE the catch-all /api/<name>/<rest> proxy so the
@@ -2800,13 +2721,9 @@ def make_app(
     app.router.add_route(
         "*", "/agent-mcp/api/{name}/{rest:.*}", backend_api_handler
     )
-    # Old REST path — 308-redirects to the renamed surface. 308 lets
-    # the redirect carry the original method + body, including POST
-    # JSON bodies for the writes the dashboard used to send to /__api.
-    app.router.add_route(
-        "*", "/agent-mcp/__api/{name}/{rest:.*}",
-        _make_rename_redirect("/agent-mcp/__api", "/agent-mcp/api"),
-    )
+    # v5.0.0: the 30-day grace-window 308 redirect from the legacy
+    # /agent-mcp/__api/<name>/<rest> path to the renamed surface has
+    # been deleted. Old REST clients now 404.
     # Phase 6 removed the transitional 410-Gone handlers for the
     # `/agent-mcp/__sse/<name>` and `/agent-mcp/__messages/<name>/...`
     # URLs (the SSE+messages transport from dvaerum/Agent-MCP <3.0.0).
