@@ -418,6 +418,21 @@ async def application_startup(
     # 8. Register Signal Handlers (Original main.py: 839-840, called before server run)
     register_signal_handlers()  # utils.signal_utils.register_signal_handlers
 
+    # 9. Signal startup-complete to background tasks.
+    # The CLI's SSE-mode runner (cli.py::run_sse_server_with_bg_tasks)
+    # awaits `start_background_tasks(tg)` BEFORE `server.serve()`, which
+    # is the call that triggers Starlette's lifespan → this function.
+    # So bg tasks (session-registry pruner, message-retention pruner,
+    # RAG indexer, claude-session monitor) are already scheduled by the
+    # time we get here — but they MUST NOT fire their first cycle until
+    # `MCP_PROJECT_DIR` is set (step 1 above), the DB schema + Alembic
+    # migrations are applied (steps 3 + 3a), and the write-queue is
+    # running (step 6.5). Without this gate, the pruner's SQLAlchemy
+    # `get_engine()` call resolves the DB path via the fallback
+    # `Path(".")` and the engine cache binds to a wrong / empty
+    # bystander file — every subsequent ORM query then sees "no such
+    # table: …" against that file.
+    g.startup_complete_event.set()
     logger.info("MCP Server application startup sequence finished.")
 
 

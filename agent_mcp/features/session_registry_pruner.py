@@ -50,6 +50,17 @@ async def run_session_registry_pruner(
         threshold_seconds,
     )
 
+    # Defer the first cycle until lifespan startup finishes.
+    # `session_registry.expire_stale` issues an ORM query through
+    # `db.engine.get_session()`, which resolves the DB path via
+    # `get_db_path()` → `get_project_dir()`. `MCP_PROJECT_DIR` is only
+    # set inside `app.server_lifecycle.application_startup` (step 1).
+    # If we sweep before lifespan finishes, the engine cache binds to
+    # the wrong DB URL (cwd-relative fallback) and every subsequent
+    # ORM query against the shared cache sees "no such table:
+    # mcp_sessions". See g.startup_complete_event for the contract.
+    await g.startup_complete_event.wait()
+
     while g.server_running:
         try:
             # SQLite call inside a thread so we don't stall the event loop.

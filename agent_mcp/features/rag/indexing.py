@@ -151,7 +151,13 @@ async def run_rag_indexing_periodically(
     # Signal that the task has started successfully for the TaskGroup
     task_status.started()
 
-    await anyio.sleep(10)  # Initial sleep to allow server startup (main.py:515)
+    # Defer first cycle until lifespan startup finishes. RAG opens its
+    # own DB connections via `get_db_connection()` and resolves paths
+    # via `get_project_dir()`; both require MCP_PROJECT_DIR which is
+    # set inside `app.server_lifecycle.application_startup`. The
+    # previous 10s `anyio.sleep` was an implicit margin for the same
+    # ordering; the explicit `await` removes the timing assumption.
+    await g.startup_complete_event.wait()
 
     # Get OpenAI client. The service initializes it and stores in g.openai_client_instance
     # The API key itself is also needed for the truly async batch embedding function.
