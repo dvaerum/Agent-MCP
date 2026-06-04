@@ -213,6 +213,22 @@ class ApiClient {
       // Bounded at 3 attempts (200ms + 400ms = 600ms total backoff
       // budget plus the original request's own timeout). 4xx and
       // non-5xx are not retried.
+      //
+      // Method gate: only safe (read-only) methods are retried. The
+      // original implementation retried EVERY method, which silently
+      // double-fired non-idempotent mutations when the backend
+      // processed a POST/PATCH/DELETE, committed the side-effect, and
+      // then crashed/disconnected returning 502 on the response phase.
+      // Concrete bug shapes that caused: createTask → two identical
+      // tasks (server-generated task_id, no uniqueness collision to
+      // catch the dup); sendMessage → double fan-out; terminateAgent
+      // → safe (idempotent server-side, but still pointless retry).
+      // 5xx on a mutation must reach the caller's catch handler so the
+      // operator sees the error and decides whether to retry manually.
+      const method = (
+        typeof fetchOptions.method === 'string' ? fetchOptions.method : 'GET'
+      ).toUpperCase()
+      const isReadOnly = method === 'GET' || method === 'HEAD'
       let response: Response | null = null
       for (let attempt = 0; attempt < 3; attempt++) {
         response = await fetch(url, {
@@ -220,6 +236,7 @@ class ApiClient {
           signal: controller.signal
         })
         if (
+          isReadOnly &&
           response.status >= 500 &&
           response.status < 600 &&
           attempt < 2
