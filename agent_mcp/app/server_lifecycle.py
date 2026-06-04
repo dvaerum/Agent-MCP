@@ -313,14 +313,21 @@ async def application_startup(
         conn_load_state = get_db_connection()
         cursor = conn_load_state.cursor()
 
-        # Load Active Agents (status != 'terminated')
+        # Load Active Agents (status != 'terminated'). Excludes the
+        # synthetic 'admin' pseudo-agent row (seeded above by
+        # `_ensure_admin_pseudo_agent_row`) — that row exists only to
+        # satisfy the post-#100 FK constraints; surfacing it in
+        # g.active_agents would cause `view_status`, /api/all-data
+        # (which falls back on this map for live tokens), and every
+        # other code path that iterates the active map to render a
+        # phantom 'admin' entry alongside the hardcoded 'Admin' UI row.
         active_agents_count = 0
         cursor.execute(
             """
-            SELECT token, agent_id, capabilities, created_at, status, current_task, working_directory, color 
-            FROM agents WHERE status != ?
+            SELECT token, agent_id, capabilities, created_at, status, current_task, working_directory, color
+            FROM agents WHERE status != ? AND agent_id != ?
         """,
-            ("terminated",),
+            ("terminated", _ADMIN_PSEUDO_AGENT_ID),
         )
         for row in cursor.fetchall():
             agent_token_val = row["token"]
