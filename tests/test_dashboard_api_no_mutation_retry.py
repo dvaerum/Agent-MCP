@@ -88,12 +88,12 @@ def test_request_retry_loop_gates_on_method() -> None:
     # bug by deleting the whole retry — the cold-start absorption is
     # still useful for GETs).
     assert "attempt" in body, (
-        f"`request<T>()` no longer has an `attempt` retry loop. The "
-        f"transparent cold-start retry is intentional for GET — "
-        f"removing it would resurface the boundary-level useEffect "
-        f"retry loop the Candidate-C refactor replaced. If the loop "
-        f"was renamed, update this test; if it was deleted, restore "
-        f"it but keep the method gate."
+        "`request<T>()` no longer has an `attempt` retry loop. The "
+        "transparent cold-start retry is intentional for GET — "
+        "removing it would resurface the boundary-level useEffect "
+        "retry loop the Candidate-C refactor replaced. If the loop "
+        "was renamed, update this test; if it was deleted, restore "
+        "it but keep the method gate."
     )
 
     # The retry-eligibility check must reference the method somehow.
