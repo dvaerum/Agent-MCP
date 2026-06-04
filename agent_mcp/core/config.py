@@ -89,7 +89,7 @@ def setup_logging():
         file_handler.setFormatter(file_formatter)
         root_logger.addHandler(file_handler)
 
-    # 2. Console Handler (with colors, conditional)
+    # 2. Console Handler (with colors, conditional on MCP_DEBUG)
     if CONSOLE_LOGGING_ENABLED:
         console_formatter = ColorfulFormatter(
             LOG_FORMAT_CONSOLE, datefmt="%H:%M:%S"
@@ -99,6 +99,24 @@ def setup_logging():
         # Filter out less important messages for console if desired
         # console_handler.setLevel(logging.INFO)  # Example: only INFO and above for console
         root_logger.addHandler(console_handler)
+
+    # 3. Stderr lifecycle handler — always attached at WARNING+ so
+    # critical events (lifespan failures, DB errors, signal-driven
+    # shutdowns) reach journald even when MCP_DEBUG is unset. Without
+    # this, `journalctl --user -u agent-mcp@<project>.service` shows
+    # only the banner + Python tracebacks; structured `logger.error(…)`
+    # calls go to /dev/null because no handler is attached. Operators
+    # then can't tell the difference between "lifespan crashed" and
+    # "lifespan succeeded silently". WARNING (not INFO) is the floor
+    # because INFO is too chatty for steady-state operation.
+    if not any(
+        isinstance(h, logging.StreamHandler) and h.stream == sys.stderr
+        for h in root_logger.handlers
+    ):
+        stderr_handler = logging.StreamHandler(sys.stderr)
+        stderr_handler.setFormatter(logging.Formatter(LOG_FORMAT_FILE))
+        stderr_handler.setLevel(logging.WARNING)
+        root_logger.addHandler(stderr_handler)
 
     # Suppress overly verbose logs from specific libraries for both file and console
     logging.getLogger("watchfiles").setLevel(logging.WARNING)

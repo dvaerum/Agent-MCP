@@ -1,5 +1,6 @@
 # Agent-MCP/mcp_template/mcp_server_src/app/server_lifecycle.py
 import os
+import sys
 import json
 import datetime
 import sqlite3
@@ -343,6 +344,17 @@ async def application_startup(
             g.agent_working_dirs[agent_id_val] = row["working_directory"]
             active_agents_count += 1
         logger.info(f"Loaded {active_agents_count} active agents from database.")
+        # Echo to stderr so operators see this in `journalctl` without
+        # needing MCP_DEBUG=true. This is the single most important
+        # operational signal for the worker-auth-401 class of bugs: if
+        # this number is 0 (or missing entirely from the journal), no
+        # worker bearer will authenticate post-restart. Mirrors the
+        # banner prints above which already go to stdout unconditionally.
+        print(
+            f"📡 Loaded {active_agents_count} active agent(s) into auth allow-list.",
+            file=sys.stderr,
+            flush=True,
+        )
 
         # Load All Tasks into g.tasks
         task_count = 0
