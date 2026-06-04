@@ -30,8 +30,6 @@ representative URL shapes so the contract is locked.
 
 from __future__ import annotations
 
-import os
-import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -59,13 +57,35 @@ def _derive_api_root(mcp_url: str) -> str:
 
     source = HOOK_TEMPLATE.read_text()
 
-    # Pull out the api_root derivation block (lines containing api_root=).
-    # Run it standalone with mcp_url pre-set; print the result.
-    deriv = "\n".join(
-        line for line in source.splitlines()
-        if "api_root=" in line and not line.lstrip().startswith("#")
+    # Pull out the api_root derivation block. Anchored on the comment
+    # ``# Derive the REST API root from the MCP URL`` (a stable marker
+    # that survives template churn) and runs until the first blank line
+    # — by convention the block ends with a blank line before the
+    # curl invocation.
+    lines = source.splitlines()
+    start = next(
+        (i for i, ln in enumerate(lines)
+         if "Derive the REST API root from the MCP URL" in ln),
+        None,
     )
-    assert deriv, "could not extract api_root= derivation from hook template"
+    assert start is not None, (
+        "could not find api_root derivation marker comment in hook template"
+    )
+    # Walk forward until the first blank line *after* we've seen at least
+    # one non-comment, non-blank assignment.
+    block: list[str] = []
+    seen_code = False
+    for ln in lines[start:]:
+        if ln.strip() == "" and seen_code:
+            break
+        block.append(ln)
+        stripped = ln.strip()
+        if stripped and not stripped.startswith("#"):
+            seen_code = True
+    deriv = "\n".join(block)
+    assert "api_root=" in deriv, (
+        f"extracted block does not assign api_root: {deriv!r}"
+    )
 
     script = f"""
 set -euo pipefail
