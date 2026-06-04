@@ -960,7 +960,12 @@ def router_cmd(
     # Same env-override-on-bind-host pattern as router.app.main —
     # used by the VM tests' module so qemu hostfwd can route in.
     host = os.environ.get("AGENT_MCP_ROUTER_HOST", "127.0.0.1")
-    web.run_app(app, host=host, port=port)
+    # `shutdown_timeout=3.0` matches `router.app.main()` — see the
+    # comment there. Capping the aiohttp drain window paired with
+    # the `_drain_proxy_tasks` on_shutdown hook keeps the SIGTERM-
+    # to-exit window inside systemd's `TimeoutStopSec=15s`, fixing
+    # the 90 s deploy outage caused by long-lived MCP proxy streams.
+    web.run_app(app, host=host, port=port, shutdown_timeout=3.0)
 
 
 # --- Backward-compatibility shim ---

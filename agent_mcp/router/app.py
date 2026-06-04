@@ -392,6 +392,32 @@ async def _track_connection(name: str):
             active_conns.pop(name, None)
 
 
+@contextlib.asynccontextmanager
+async def _track_proxy_task(app: web.Application):
+    """Register the calling task in the app's proxy-task set.
+
+    The `_drain_proxy_tasks` shutdown hook (registered on
+    `app.on_shutdown`) cancels every task in this set on SIGTERM —
+    that's how an in-flight `_proxy_to_backend` blocked on
+    `await up.read()` gets nudged out of its read instead of waiting
+    for aiohttp's `shutdown_timeout` (default 60 s, which used to
+    overshoot systemd's `TimeoutStopSec` and earn the router a
+    SIGKILL on every deploy).
+
+    Self-cleaning on exit so the set stays bounded — completion,
+    error, and cancellation all run through the `finally`.
+    """
+    tasks = _proxy_task_set(app)
+    current = asyncio.current_task()
+    if current is not None:
+        tasks.add(current)
+    try:
+        yield
+    finally:
+        if current is not None:
+            tasks.discard(current)
+
+
 # Per-project agent-token cache. Keyed by project name, value is
 # (expires_at, {token → agent_id}). The MCP messages handler hits
 # this on every POST so a 3-second TTL is plenty.
@@ -656,7 +682,7 @@ async def _proxy_to_backend(
     # upstream. Reading first guarantees the full body reaches the
     # backend before we wait on its response.
     req_body = await req.read()
-    async with _track_connection(name):
+    async with _track_proxy_task(req.app), _track_connection(name):
         async with ClientSession(connector=connector, timeout=timeout) as sess:
             async with sess.request(
                 req.method,
@@ -1224,6 +1250,64 @@ async def reconcile_on_startup(app: web.Application) -> None:
 async def shutdown(app: web.Application) -> None:
     """No-op: backends are systemd-supervised and outlive the router."""
     return
+
+
+# ── Graceful proxy drain (router-graceful-shutdown) ────────────────
+#
+# An in-flight `_proxy_to_backend` task can be open for minutes — the
+# MCP Streamable-HTTP dashboard channel sits inside one `await
+# up.read()` while the backend trickles SSE events. On SIGTERM,
+# aiohttp's runner asks `Application.shutdown()` to run the
+# `on_shutdown` callbacks, then waits up to `shutdown_timeout`
+# (default 60 s) for in-flight handlers to finish. Without
+# intervention the proxy task never sees the signal: it's blocked on
+# I/O, not awaiting a cancellation point we control.
+#
+# Fix: track every proxy task in `app["_proxy_tasks"]`. The
+# `_drain_proxy_tasks` shutdown hook cancels each one, which
+# propagates through aiohttp's ClientSession context and tears down
+# the upstream UDS read. Combined with the `shutdown_timeout=3.0` on
+# `web.run_app` (see `main()` / `cli.router_cmd`), this caps the
+# router's SIGTERM-to-exit window well inside systemd's
+# `TimeoutStopSec=15s` (defense-in-depth) — the operator-visible
+# "Stopping … Stopped" gap drops from 90 s to ~3 s.
+PROXY_TASKS_KEY = "_proxy_tasks"
+
+
+def _proxy_task_set(app: web.Application) -> set[asyncio.Task]:
+    """Return the per-app in-flight proxy-task tracking set.
+
+    Allocated eagerly in ``make_app``; the ``.setdefault`` here is
+    a belt-and-braces guard for callers (typically tests) that
+    construct an aiohttp Application directly without going through
+    ``make_app``.
+    """
+    return app.setdefault(PROXY_TASKS_KEY, set())
+
+
+async def _drain_proxy_tasks(app: web.Application) -> None:
+    """``on_shutdown`` hook: cancel every in-flight `_proxy_to_backend`.
+
+    Logs the count for post-mortem visibility but does not swallow
+    cancellation errors — propagating them keeps aiohttp's runner
+    informed that handlers were torn down cleanly rather than timed
+    out, which is the difference between an ordered shutdown and a
+    SIGKILL on the next restart.
+    """
+    tasks = list(app.get(PROXY_TASKS_KEY, ()))
+    if not tasks:
+        return
+    log.info(
+        "router shutdown: cancelling %d in-flight proxy task(s)",
+        len(tasks),
+    )
+    for t in tasks:
+        if not t.done():
+            t.cancel()
+    # Wait briefly for the cancellations to propagate. Anything still
+    # hanging after this falls through to aiohttp's `shutdown_timeout`
+    # window, which we keep short on purpose.
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # ── Create / unregister handlers ─────────────────────────────────────
@@ -2603,9 +2687,18 @@ def make_app(
     SINGLE_TENANT_WORKSPACE = single_tenant_workspace
 
     app = web.Application()
+    # Eagerly allocate the proxy-task tracking set so `_track_proxy_task`
+    # never writes to a frozen/started app dict (aiohttp emits a
+    # DeprecationWarning for mutations after startup).
+    app[PROXY_TASKS_KEY] = set()
     app.on_startup.append(reconcile_on_startup)
     app.on_startup.append(_start_reaper_task)
     app.on_startup.append(_start_alias_reaper_task)
+    # `on_shutdown` runs before `on_cleanup` and before aiohttp's
+    # `shutdown_timeout` countdown begins — cancelling in-flight
+    # proxy tasks here lets the runner exit promptly. See
+    # `_drain_proxy_tasks` for the why.
+    app.on_shutdown.append(_drain_proxy_tasks)
     app.on_cleanup.append(shutdown)
 
     # Index + project lifecycle.
@@ -2741,7 +2834,21 @@ def main() -> None:
     # IP, not loopback) can be served. Production deploys keep the
     # 127.0.0.1 default and front the router with nginx/Tailscale.
     host = os.environ.get("AGENT_MCP_ROUTER_HOST", "127.0.0.1")
-    web.run_app(make_app(), host=host, port=ROUTER_PORT)
+    # `shutdown_timeout=3.0` caps the window aiohttp waits for
+    # in-flight handlers to drain after `on_shutdown` fires. The
+    # `_drain_proxy_tasks` hook cancels every tracked proxy task
+    # before that window begins, so this is a defense-in-depth
+    # ceiling rather than the primary mechanism. With the prior 60 s
+    # default + systemd's `TimeoutStopSec`, the router routinely
+    # earned a SIGKILL after 90 s with the dashboard's MCP channel
+    # open; the 3 s value keeps us well inside the 15 s
+    # `TimeoutStopSec` set in the home-manager module.
+    web.run_app(
+        make_app(),
+        host=host,
+        port=ROUTER_PORT,
+        shutdown_timeout=3.0,
+    )
 
 
 if __name__ == "__main__":
