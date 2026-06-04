@@ -593,7 +593,18 @@ def server_cmd(
                         print()
                         print(get_responsive_agent_mcp_banner())
                         print()
-                        print(f"🚀 MCP Server running on port {port}")
+                        # When --uds is set, the server is listening on a
+                        # Unix domain socket, NOT a TCP port. Logging
+                        # `port {port}` here is actively misleading — a
+                        # reverse-proxy operator reading the journal sees
+                        # the wrong endpoint and concludes the binary
+                        # ignored --uds, when in fact uvicorn was
+                        # correctly configured with `uds=...` upstream
+                        # (see _uvicorn_kwargs build around line 555).
+                        if uds:
+                            print(f"🚀 MCP Server listening on UDS {uds}")
+                        else:
+                            print(f"🚀 MCP Server running on port {port}")
                         print(f"📁 Project: {project_dir}")
 
                         # Display admin token from database
