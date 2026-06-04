@@ -98,7 +98,6 @@ interface DataStore {
   refreshData: () => Promise<void>
   shouldDisplayAgent: (agent: any) => boolean
   getActiveAgents: () => any[]
-  getIdleAgentsForCleanup: () => any[]
 }
 
 export const useDataStore = create<DataStore>((set, get) => ({
@@ -432,50 +431,20 @@ export const useDataStore = create<DataStore>((set, get) => ({
     await get().fetchAllData()
   }, 500),
 
-  // Agent lifecycle management
-  shouldDisplayAgent: (agent: any) => {
-    // Always show admin
-    if (agent.agent_id === 'Admin' || agent.agent_id === 'admin') return true
-    
-    // Show if agent has an active task
-    if (agent.current_task) return true
-    
-    // Show if agent is new (created within last 10 minutes)
-    const now = new Date()
-    const createdAt = new Date(agent.created_at)
-    const ageInMinutes = (now.getTime() - createdAt.getTime()) / (1000 * 60)
-    
-    return ageInMinutes <= 10
-  },
+  // Agent display predicate.
+  //
+  // The dashboard used to hide any non-admin agent older than 10
+  // minutes without a current_task — the same predicate the
+  // (now-removed) auto-cleanup loop used to pick termination targets.
+  // That combination silently killed valid worker agents and hid the
+  // crime scene. Fix: surface every non-terminated row; rely on the
+  // existing status-filter dropdown if users want to hide terminated.
+  shouldDisplayAgent: (agent: any) => agent.status !== 'terminated',
 
   getActiveAgents: () => {
     const state = get()
     if (!state.data) return []
-    
     return state.data.agents.filter(agent => get().shouldDisplayAgent(agent))
-  },
-
-  getIdleAgentsForCleanup: () => {
-    const state = get()
-    if (!state.data) return []
-    
-    const now = new Date()
-    return state.data.agents.filter(agent => {
-      // Never cleanup admin
-      if (agent.agent_id === 'Admin' || agent.agent_id === 'admin') return false
-      
-      // Don't cleanup if has active task
-      if (agent.current_task) return false
-      
-      // Don't cleanup if already terminated
-      if (agent.status === 'terminated') return false
-      
-      // Cleanup if older than 10 minutes without task
-      const createdAt = new Date(agent.created_at)
-      const ageInMinutes = (now.getTime() - createdAt.getTime()) / (1000 * 60)
-      
-      return ageInMinutes > 10
-    })
   }
 }))
 

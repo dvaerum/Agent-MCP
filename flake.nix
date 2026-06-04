@@ -129,6 +129,14 @@
         vm-single-tenant = import ./nix/tests/single-tenant.nix {
           inherit pkgs lib self;
         };
+        # Regression guard: the dashboard auto-terminate-idle-agents
+        # loop fixed in v5.0.3. Boots the multi-tenant stack, plants
+        # an "old idle" worker row, and proves the server does not
+        # auto-terminate it across a 3-minute window without any
+        # browser connected. See ./nix/tests/no-auto-cleanup.nix.
+        vm-no-auto-cleanup = import ./nix/tests/no-auto-cleanup.nix {
+          inherit pkgs lib self;
+        };
       };
     };
 }

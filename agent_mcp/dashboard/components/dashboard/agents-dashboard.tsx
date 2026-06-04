@@ -1445,7 +1445,7 @@ const AgentDetailDialog = ({
 export function AgentsDashboard() {
   const { servers, activeServerId } = useServerStore()
   const activeServer = servers.find(s => s.id === activeServerId)
-  const { data, loading, error, fetchAllData, refreshData, getActiveAgents, getIdleAgentsForCleanup } = useDataStore()
+  const { data, loading, error, fetchAllData, refreshData, getActiveAgents } = useDataStore()
   const [searchTerm, setSearchTerm] = useState('')
   const [statusFilter, setStatusFilter] = useState<string>('all')
   // selectedAgent is the "current selection" marker the header chip
@@ -1523,31 +1523,11 @@ export function AgentsDashboard() {
     }
   }, [activeServerId, activeServer?.status, fetchAllData])
 
-  // Auto-cleanup of "idle" agents (any agent with no current_task and
-  // older than 10 minutes) was removed in PR #117. The previous loop
-  // here ran every 2 minutes, called the same `terminate_agent` tool
-  // an admin click would have, and killed long-lived workers like
-  // `backend-dev` / `ios-app-dev` behind the operator's back. Symptom:
-  // worker bearer tokens authenticate fine immediately post-restart,
-  // then start returning 401 every ~2 minutes once the agent crosses
-  // the 10-minute age threshold and the next dashboard poll fires.
-  //
-  // The premise (a dashboard tab open in the operator's browser
-  // implicitly grants the dashboard authority to reap workers) is
-  // wrong. Termination is destructive (clears current_task, nulls out
-  // the in-memory map, requires manual restore + cursor recovery for
-  // any daemon-agent loop bound to the bearer); it must be an explicit
-  // admin action, never a side-effect of having a tab open. The
-  // `getIdleAgentsForCleanup` selector still exists for the
-  // informational "N idle" stat shown in the header chip — it just
-  // no longer drives an automatic destructive action.
-  //
-  // No replacement timer. If a future "cleanup unused workers"
-  // workflow is needed, surface it as an explicit dashboard action
-  // ("Terminate idle agents (N)") with a confirmation dialog — same
-  // shape as the existing per-agent Terminate flow.
-  
-  
+  // Auto-cleanup loop removed (regression: silently terminated valid
+  // worker agents every 2 minutes while the tab was open). Agent
+  // termination is now strictly explicit user action via the Terminate
+  // button. See tests/test_dashboard_no_auto_cleanup.py.
+
   const handleTaskClick = (task: Task) => {
     taskDialog.open(task.task_id)
   }
@@ -1564,9 +1544,7 @@ export function AgentsDashboard() {
     running: agents.filter(a => a.status === 'running').length,
     pending: agents.filter(a => a.status === 'pending').length,
     failed: agents.filter(a => a.status === 'failed').length,
-    // Also track cleanup statistics
     totalInSystem: allAgents.length,
-    idleForCleanup: getIdleAgentsForCleanup().length
   }
 
   const handleCreateAgent = async (data: CreateAgentData) => {
@@ -1687,12 +1665,7 @@ export function AgentsDashboard() {
               Last updated: {new Date(data.timestamp).toLocaleTimeString()}
             </span>
           )}
-          {stats.idleForCleanup > 0 && (
-            <Badge variant="outline" className="text-xs bg-orange-500/15 text-orange-600 border-orange-500/30 font-medium">
-              {stats.idleForCleanup} pending cleanup
-            </Badge>
-          )}
-          <Button 
+          <Button
             variant="outline" 
             size="sm" 
             onClick={refreshData}
