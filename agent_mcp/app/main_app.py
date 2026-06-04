@@ -19,7 +19,7 @@ import mcp.types as mcp_types
 
 # Project-specific imports
 from ..core.config import logger
-from ..core.auth import verify_token, get_agent_id
+from ..core.auth import verify_token, get_agent_id, query_agent_status
 from ..core import session_registry
 from .routes import routes as http_routes
 from .server_lifecycle import application_startup, application_shutdown
@@ -128,6 +128,69 @@ def _parse_alias_header(value: Optional[str]) -> Optional[tuple[str, str]]:
     return alias_name, expires_at
 
 
+def _build_unauthorized_response(token: str):
+    """Craft the 401 response body for a /mcp request that failed
+    the in-memory bearer check.
+
+    Two outcomes:
+
+    1. The bearer is the PK of a real row in the `agents` table whose
+       status is ``'terminated'`` — the agent was terminated and its
+       token, though structurally valid, no longer authenticates. We
+       return an `agent_terminated` envelope naming the agent_id, the
+       `terminated_at` timestamp, and the `restore_agent` tool path
+       so the client (Claude Code, a CLI, an integration test) can
+       tell the operator exactly what to do.
+
+       This case used to surface as the generic 401 below — the user
+       saw "Server rejected the configured Authorization header. Check
+       that the token is valid." even though the token *was* valid;
+       only the agent was gone. Specific error → specific fix.
+
+    2. Anything else (no token, wrong bearer, unknown agent_id) →
+       `invalid_bearer` envelope. Migrated from the prior plain-text
+       body to JSON so consumers can rely on a single response shape
+       across both failure modes.
+
+    DB-failure note: `query_agent_status` returns None on any DB
+    error (the engine layer logs it). The middleware falls through
+    to the `invalid_bearer` branch — never silently misattribute a
+    transient DB blip to "your agent was terminated".
+    """
+    from starlette.responses import JSONResponse
+
+    info = query_agent_status(token) if token else None
+    if info is not None and info.get("status") == "terminated":
+        agent_id = info.get("agent_id")
+        terminated_at = info.get("terminated_at")
+        message = (
+            f"Agent {agent_id!r} was terminated on {terminated_at}. "
+            f"Use the restore_agent tool to revive it, or rotate to a "
+            f"different agent token."
+        )
+        return JSONResponse(
+            {
+                "error": "agent_terminated",
+                "agent_id": agent_id,
+                "terminated_at": terminated_at,
+                "message": message,
+            },
+            status_code=401,
+        )
+
+    return JSONResponse(
+        {
+            "error": "invalid_bearer",
+            "message": (
+                "Bearer token does not match the admin token or any "
+                "active agent. Send Authorization: Bearer "
+                "<admin-or-agent-token> on POST /mcp."
+            ),
+        },
+        status_code=401,
+    )
+
+
 class AuthHeaderMiddleware(BaseHTTPMiddleware):
     """Capture Authorization: Bearer into request_auth_token + gate /mcp.
 
@@ -190,18 +253,7 @@ class AuthHeaderMiddleware(BaseHTTPMiddleware):
                 verify_token(token, required_role="admin")
                 or verify_token(token, required_role="agent")
             ):
-                from starlette.responses import JSONResponse
-
-                return JSONResponse(
-                    {
-                        "error": "unauthorized",
-                        "hint": (
-                            "Send Authorization: Bearer <admin-or-agent-token> "
-                            "on POST /mcp."
-                        ),
-                    },
-                    status_code=401,
-                )
+                return _build_unauthorized_response(token)
 
         return await call_next(request)
 
