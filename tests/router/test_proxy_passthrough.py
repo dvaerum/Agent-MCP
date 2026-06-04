@@ -105,7 +105,7 @@ async def fake_backend(router_module, router_env, systemctl_stub):
 async def test_request_body_arrives_byte_for_byte(
     aiohttp_client, router_app, fake_backend, router_module,
 ) -> None:
-    """``POST /agent-mcp/proj/mcp`` body must reach the backend unmodified.
+    """``POST /agent-mcp/mcp/proj`` body must reach the backend unmodified.
 
     The MCP /mcp endpoint is auth-gated at the router edge, so we also
     seed the agent-token cache so the bearer check passes without the
@@ -120,7 +120,7 @@ async def test_request_body_arrives_byte_for_byte(
     client = await aiohttp_client(router_app)
 
     resp = await client.post(
-        "/agent-mcp/proj/mcp",
+        "/agent-mcp/mcp/proj",
         data=payload,
         headers={
             "Authorization": "Bearer tok-1234",
@@ -156,7 +156,7 @@ async def test_response_body_byte_for_byte(
     client = await aiohttp_client(router_app)
 
     resp = await client.post(
-        "/agent-mcp/proj/mcp",
+        "/agent-mcp/mcp/proj",
         data=b"{}",
         headers={"Authorization": "Bearer tok-1234"},
     )
@@ -198,7 +198,7 @@ async def test_sse_shaped_payload_passes_through_cleanly(
     client = await aiohttp_client(router_app)
 
     resp = await client.post(
-        "/agent-mcp/proj/mcp",
+        "/agent-mcp/mcp/proj",
         data=b"{}",
         headers={"Authorization": "Bearer tok-1234"},
     )
@@ -225,7 +225,7 @@ async def test_query_string_passes_through(
     client = await aiohttp_client(router_app)
 
     await client.post(
-        "/agent-mcp/proj/mcp?stream=1&trace=on",
+        "/agent-mcp/mcp/proj?stream=1&trace=on",
         data=b"{}",
         headers={"Authorization": "Bearer tok-1234"},
     )
@@ -241,7 +241,7 @@ async def test_missing_bearer_returns_401(
     hop closer to the client)."""
     client = await aiohttp_client(router_app)
 
-    resp = await client.post("/agent-mcp/proj/mcp", data=b"{}")
+    resp = await client.post("/agent-mcp/mcp/proj", data=b"{}")
 
     assert resp.status == 401
     assert "Bearer" in resp.headers.get("WWW-Authenticate", "")
