@@ -57,6 +57,10 @@ def reset_globals() -> Iterator[None]:
     # event loop. asyncio.Event instances cannot be awaited across
     # loops; signal_for() lazily recreates as needed.
     g.agent_event_signals.clear()
+    # Lifespan startup-complete sentinel: every test starts with a
+    # fresh, cleared Event so we can detect a regression where
+    # application_startup forgets to set it.
+    g.reset_startup_complete_event()
 
     snapshot = {
         "connections": dict(g.connections),
@@ -94,6 +98,7 @@ def reset_globals() -> Iterator[None]:
     _wq._global_write_queue = None
     _engine.reset_engine_cache()
     g.agent_event_signals.clear()
+    g.reset_startup_complete_event()
 
 
 @pytest.fixture

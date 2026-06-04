@@ -127,6 +127,14 @@ async def run_message_retention_periodically(
         "Message retention pruner started (interval=%ds)", interval_seconds
     )
 
+    # Defer the first cycle until lifespan startup finishes — same
+    # rationale as session_registry_pruner. This pruner uses raw
+    # `get_db_connection()` rather than the ORM, so the failure mode is
+    # less severe (a per-cycle reopen, no engine-cache poisoning); we
+    # still gate for consistency so every DB-touching bg task has the
+    # same startup contract.
+    await g.startup_complete_event.wait()
+
     # Run prune_old_messages in a thread so the sqlite call doesn't
     # block the event loop (same pattern as other DB-touching tasks).
     while g.server_running:

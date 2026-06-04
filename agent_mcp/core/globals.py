@@ -94,6 +94,43 @@ message_retention_task_scope: Optional[anyio.abc.CancelScope] = None
 # emitters keep fanning out to it. See features.session_registry_pruner.
 session_registry_pruner_task_scope: Optional[anyio.abc.CancelScope] = None
 
+# --- Lifespan startup-completion sentinel ---
+# Set at the END of `app.server_lifecycle.application_startup`. Every
+# background task that touches the DB via the SQLAlchemy engine cache
+# (`db.engine.get_engine` / `get_session`) MUST `await
+# startup_complete_event.wait()` before its first cycle.
+#
+# Why: `get_engine()` resolves `MCP_PROJECT_DIR` via `get_db_path()`,
+# but the env var is only set INSIDE `application_startup` (line 157
+# of server_lifecycle.py). The CLI's SSE-mode runner
+# (cli.py::run_sse_server_with_bg_tasks) launches background tasks via
+# `start_background_tasks(tg)` BEFORE awaiting `server.serve()`, which
+# is the call that triggers Starlette's lifespan → `application_startup`.
+# Without this gate, the first pruner cycle fires against the wrong DB
+# URL (cwd-relative fallback from `get_project_dir()`) and caches that
+# engine in `db.engine._engines`. All subsequent queries through the
+# ORM then see "no such table: …" against an empty bystander file.
+#
+# Tests that don't go through the full lifespan (e.g. unit tests for
+# the pruner with a hand-rolled DB) can pre-set this event to skip the
+# wait. The default-unset state is safe: tests that run via
+# `tests/harness.py::mcp_session` exercise the real lifespan and set
+# the event naturally.
+startup_complete_event: asyncio.Event = asyncio.Event()
+
+
+def reset_startup_complete_event() -> None:
+    """Replace the startup-complete sentinel with a fresh, cleared Event.
+
+    Test isolation: each test that runs `application_startup` sets the
+    event; without a reset, the next test's bg-task-wait check would
+    short-circuit and we'd never catch a regression where lifespan
+    forgets to signal. `conftest.py::reset_globals` calls this before
+    every test.
+    """
+    global startup_complete_event
+    startup_complete_event = asyncio.Event()
+
 # --- wait_for_events long-poll signals (plan Phase 2) ---
 # Per-agent asyncio.Event signals used by the `wait_for_events` tool to
 # block until the agent has new activity (direct messages, broadcasts,

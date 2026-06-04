@@ -18,10 +18,30 @@ class ClaudeSessionMonitor:
     """
 
     def __init__(self):
-        self.project_dir = get_project_dir()
-        self.registry_path = Path(self.project_dir) / ".agent" / "registry.json"
+        # Defer project_dir resolution to first use. The module-level
+        # singleton `claude_session_monitor` is constructed at import
+        # time (before `application_startup` sets MCP_PROJECT_DIR), so
+        # eagerly calling `get_project_dir()` here logs four spurious
+        # "CRITICAL: MCP_PROJECT_DIR environment variable is not set."
+        # lines on every launcher invocation AND silently captures the
+        # cwd as the registry root — which means a backend started from
+        # the wrong cwd would watch /random/.agent/registry.json.
+        self._project_dir: Optional[Path] = None
+        self._registry_path: Optional[Path] = None
         self.last_modified = None
         self.known_sessions = {}
+
+    @property
+    def project_dir(self) -> Path:
+        if self._project_dir is None:
+            self._project_dir = get_project_dir()
+        return self._project_dir
+
+    @property
+    def registry_path(self) -> Path:
+        if self._registry_path is None:
+            self._registry_path = self.project_dir / ".agent" / "registry.json"
+        return self._registry_path
 
     async def monitor_registry_file(self, interval: int = 5):
         """
@@ -236,4 +256,10 @@ async def run_claude_session_monitoring(interval: int = 5, *, task_status=None):
     """Background task for monitoring Claude Code sessions."""
     if task_status:
         task_status.started()
+    # Defer first poll until lifespan startup finishes so
+    # `get_project_dir()` resolves correctly (MCP_PROJECT_DIR is set
+    # inside application_startup). See g.startup_complete_event.
+    from ..core import globals as g
+
+    await g.startup_complete_event.wait()
     await claude_session_monitor.monitor_registry_file(interval)
