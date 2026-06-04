@@ -31,9 +31,6 @@ common case of a valid bearer.
 
 from __future__ import annotations
 
-import datetime as _dt
-import json
-
 import pytest
 
 from tests.harness import mcp_session

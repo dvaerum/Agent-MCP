@@ -1,6 +1,6 @@
 # Agent-MCP/mcp_template/mcp_server_src/core/auth.py
 import secrets
-from typing import Optional
+from typing import Any, Dict, Optional
 
 # Import globals that these functions will operate on
 from . import globals as g
@@ -46,3 +46,60 @@ def get_agent_id(token: str) -> Optional[str]:
         if isinstance(agent_data, dict) and "agent_id" in agent_data:
             return agent_data["agent_id"]
     return None
+
+
+def query_agent_status(token: str) -> Optional[Dict[str, Any]]:
+    """If `token` matches a row in the `agents` table, return its
+    identifying status info; else return None.
+
+    Purpose
+    -------
+    `verify_token()` only consults the in-memory `g.active_agents`
+    map, which is rebuilt on startup from rows whose
+    `status != 'terminated'`. A bearer for a terminated agent
+    therefore fails `verify_token()` and is indistinguishable from a
+    freshly-invented unknown token — both produce the same generic
+    401.
+
+    `AuthHeaderMiddleware` calls this helper on the auth-failure
+    path so it can distinguish "this token belongs to an agent that
+    was terminated on <date>" from "this token matches nothing" and
+    return a more actionable 401 body in the former case.
+
+    Returns
+    -------
+    ``{"agent_id": str, "status": str, "terminated_at": Optional[str]}``
+    when a matching row exists, else ``None``. The shape is JSON-ready
+    so the middleware can copy fields straight onto the response body.
+
+    Implementation
+    --------------
+    Uses the `Agent` ORM model from PR-G2 — same model
+    `get_agent_by_token` consumes. We don't reuse `get_agent_by_token`
+    directly because that helper returns a dict with eleven columns
+    (including `token`, the bearer itself); the middleware-facing
+    surface returns only the three fields the error envelope needs,
+    so accidental leakage of internal state into client-facing JSON
+    is structurally impossible.
+
+    Failure mode: any DB error returns None (logged inside the
+    ORM layer). The middleware then falls through to the
+    `invalid_bearer` branch, which is the safe default — we never
+    want a transient DB blip to elevate an unknown-token error into
+    a wrong "agent terminated" diagnostic.
+    """
+    if not token:
+        return None
+    # Local import — `agent_mcp.db.actions.agent_db` pulls in the
+    # SQLAlchemy engine which we don't want to load at module-import
+    # time for callers that just want `verify_token`/`get_agent_id`.
+    from ..db.actions.agent_db import get_agent_by_token
+
+    row = get_agent_by_token(token)
+    if row is None:
+        return None
+    return {
+        "agent_id": row.get("agent_id"),
+        "status": row.get("status"),
+        "terminated_at": row.get("terminated_at"),
+    }
