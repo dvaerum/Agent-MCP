@@ -1523,33 +1523,29 @@ export function AgentsDashboard() {
     }
   }, [activeServerId, activeServer?.status, fetchAllData])
 
-  // Automatic agent cleanup - check every 2 minutes
-  useEffect(() => {
-    if (!isConnected) return
-
-    const cleanupInterval = setInterval(async () => {
-      const idleAgents = getIdleAgentsForCleanup()
-      
-      if (idleAgents.length > 0) {
-        console.log(`🧹 Found ${idleAgents.length} idle agents for cleanup:`, idleAgents.map(a => a.agent_id))
-        
-        // Terminate each idle agent
-        for (const agent of idleAgents) {
-          try {
-            await handleTerminateAgent(agent.agent_id)
-            console.log(`✅ Terminated idle agent: ${agent.agent_id}`)
-          } catch (error) {
-            console.error(`❌ Failed to terminate idle agent ${agent.agent_id}:`, error)
-          }
-        }
-        
-        // Refresh data after cleanup
-        await refreshData()
-      }
-    }, 2 * 60 * 1000) // Check every 2 minutes
-
-    return () => clearInterval(cleanupInterval)
-  }, [isConnected, getIdleAgentsForCleanup, refreshData])
+  // Auto-cleanup of "idle" agents (any agent with no current_task and
+  // older than 10 minutes) was removed in PR #117. The previous loop
+  // here ran every 2 minutes, called the same `terminate_agent` tool
+  // an admin click would have, and killed long-lived workers like
+  // `backend-dev` / `ios-app-dev` behind the operator's back. Symptom:
+  // worker bearer tokens authenticate fine immediately post-restart,
+  // then start returning 401 every ~2 minutes once the agent crosses
+  // the 10-minute age threshold and the next dashboard poll fires.
+  //
+  // The premise (a dashboard tab open in the operator's browser
+  // implicitly grants the dashboard authority to reap workers) is
+  // wrong. Termination is destructive (clears current_task, nulls out
+  // the in-memory map, requires manual restore + cursor recovery for
+  // any daemon-agent loop bound to the bearer); it must be an explicit
+  // admin action, never a side-effect of having a tab open. The
+  // `getIdleAgentsForCleanup` selector still exists for the
+  // informational "N idle" stat shown in the header chip — it just
+  // no longer drives an automatic destructive action.
+  //
+  // No replacement timer. If a future "cleanup unused workers"
+  // workflow is needed, surface it as an explicit dashboard action
+  // ("Terminate idle agents (N)") with a confirmation dialog — same
+  // shape as the existing per-agent Terminate flow.
   
   
   const handleTaskClick = (task: Task) => {
