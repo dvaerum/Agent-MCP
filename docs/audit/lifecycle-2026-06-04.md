@@ -39,17 +39,18 @@ so the synthetic-admin pattern from PR #113 is safe.
 stats card and table both reflect the new state without a manual
 refresh. The Purge confirmation dialog also fires `refreshData()` on
 `onConfirmed`. **The "count drops by 1 after purge" assertion
-Dennis specified holds.**
+Dennis specified holds post-PR #123.**
 
 ## Findings
 
 | # | Severity | Finding | Disposition |
 |---|----------|---------|-------------|
 | L1 | **HIGH** | Deploy button completely non-functional. Three layered defects: `POST /api/agents` → 405 (route was GET-only); `apiClient.createAgent` omitted the admin token; `create_agent_tool_impl` required a non-empty `task_ids` list the modal cannot collect. All three combined since the dashboard was introduced (July 2025). | Fixed in **PR #121** (v5.0.6). Regression guard: `tests/test_dashboard_create_agent_endpoint.py` (6 assertions). |
-| L2 | LOW | Spec/UI naming drift. Dennis's spec uses "delete"; the row-action button is labelled "Terminate" (Trash2 icon). Both refer to the soft-delete (status='terminated'); the hard-delete is "Purge". Tooltip on the Terminate button already says "soft-delete; can be restored or purged after". | Documentation; no code change. |
-| L3 | LOW | "Working Directory" field in the Deploy modal is surfaced but post-PR #100 every agent shares the project root via file-level locking (see `agent_mcp/tools/admin_tools.py` line ~218 `# All agents work in the same shared directory`). The field is accepted by the REST shim and stored, but never honoured for non-daemon workers. | Out of scope for this lifecycle audit; flag for a future dashboard cleanup PR. |
-| L4 | INFO | Purge dialog correctly fetches preview counts (`getPurgePreview`) and surfaces blast-radius (messages_sent, tasks_created, etc.) before confirming. Transaction is BEGIN/COMMIT-wrapped with `DELETE FROM agents` ordered last so half-purged state is impossible. | No action — model is correct. |
-| L5 | INFO | After Purge succeeds, the dialog's `onConfirmed` calls `void refreshData()` and the table re-renders. `stats.total = agents.length` reads from the post-refetch state, so the Total chip drops by one alongside the row disappearance. | No action — model is correct. |
+| L2 | **MEDIUM** | Purge cascade tombstone rows leak into the user-facing agents list. PR-G1 INSERTs `[deleted-<id>]` rows with `status='tombstone'` so `agent_messages.{sender_id,recipient_id}` FK targets exist before the original row is `DELETE`'d. The tombstone row then leaked into `/api/all-data` and `/api/agents`, so the dashboard's Total stat never dropped on Purge (smoke-target → `[deleted-smoke-target]` replaces it in the table). Direct violation of Dennis's spec: "purge drops the count by 1". Discovered during PR #121's post-deploy live smoke. | Fixed in **PR #123** (v5.0.7). Regression guard: `tests/test_purge_drops_visible_count.py` (4 assertions, including end-to-end create→terminate→purge with explicit Δ=1 assertion). |
+| L3 | LOW | Spec/UI naming drift. Dennis's spec uses "delete"; the row-action button is labelled "Terminate" (Trash2 icon). Both refer to the soft-delete (status='terminated'); the hard-delete is "Purge". Tooltip on the Terminate button already says "soft-delete; can be restored or purged after". | Documentation; no code change. |
+| L4 | LOW | "Working Directory" field in the Deploy modal is surfaced but post-PR #100 every agent shares the project root via file-level locking (see `agent_mcp/tools/admin_tools.py` line ~218 `# All agents work in the same shared directory`). The field is accepted by the REST shim and stored, but never honoured for non-daemon workers. | Out of scope for this lifecycle audit; flag for a future dashboard cleanup PR. |
+| L5 | INFO | Purge dialog correctly fetches preview counts (`getPurgePreview`) and surfaces blast-radius (messages_sent, tasks_created, etc.) before confirming. Transaction is BEGIN/COMMIT-wrapped with `DELETE FROM agents` ordered last so half-purged state is impossible. | No action — model is correct. |
+| L6 | INFO | After Purge succeeds, the dialog's `onConfirmed` calls `void refreshData()` and the table re-renders. `stats.total = agents.length` reads from the post-refetch state, so the Total chip drops by one alongside the row disappearance — **once the tombstone leak in L2 is fixed**. | No action — model is correct. |
 
 ## What pre-existing safety guards already covered
 
@@ -87,3 +88,22 @@ correctly on explicit user actions.
 - **PR #121** (v5.0.6) — `fix(dashboard): make Agents-page Deploy
   button functional`. RED `e8ded7f` + GREEN `3036dae`. 6 new tests,
   3 file fixes (backend route, frontend api.ts, MCP tool schema).
+  Merged at `d3bdc95`.
+- **PR #123** (v5.0.7) — `fix(dashboard): purge tombstone rows leak
+  into agents list`. RED `7ab474c` + GREEN `0196fe9`. 4 new tests,
+  2 endpoint filters in `agent_mcp/app/routes.py`. Merged at
+  `5b16aa7`. Discovered during PR #121's post-deploy live smoke;
+  closes the spec's count-drops-by-1 assertion end-to-end.
+
+## Live verification (post-PR #123 deploy, washing-brothers)
+
+- Before deploy: 4 visible agents (Admin, test-9099e4, ios-app-dev, backend-dev).
+- After Deploy `smoke-final-<ts>`: 5 visible agents.
+- After Terminate: 5 visible agents (TERMINATED status, row stays).
+- **After Purge: 4 visible agents** — smoke-final-... row is gone,
+  no `[deleted-smoke-final-...]` tombstone row visible. Δ = -1.
+
+The three pre-existing tombstone rows from earlier test runs
+(`[deleted-test-9227aa]` and friends) also disappeared from the
+dashboard after PR #123 deploy, without any DB cleanup needed — they
+were filtered at the REST layer.
