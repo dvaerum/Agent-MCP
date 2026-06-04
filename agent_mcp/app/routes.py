@@ -264,18 +264,30 @@ async def node_details_api_route(request: Request) -> JSONResponse:
 async def agents_list_api_route(request: Request) -> JSONResponse:
     # GET /api/agents[?status=<status>]
     #
-    # Without a `status` query param, returns every agent row plus the
-    # synthetic "Admin" row used by the dashboard graph (back-compat).
+    # Without a `status` query param, returns every non-tombstone
+    # agent row plus the synthetic "Admin" row used by the dashboard
+    # graph (back-compat). Tombstone rows (status='tombstone',
+    # agent_id like '[deleted-<original>]') are FK-target artefacts
+    # of the purge cascade and never belong in user-facing output —
+    # see all_data_api_route for the same filter rationale.
     #
     # With `status=<value>`, returns only agent rows whose status
-    # matches exactly. The synthetic Admin row (status='system') is
-    # also filtered out — only rows whose status equals the filter
-    # value survive. This shape replaces the router's `list_agents`
-    # synthetic tool (Phase 7c, Q7.2 in plan).
+    # matches exactly, EXCEPT `status=tombstone` which always
+    # returns the empty list (tombstone is an internal DB state,
+    # not an operator-queryable agent status). The synthetic Admin
+    # row (status='system') is also filtered out under any
+    # `status=<value>` filter — only rows whose status equals the
+    # filter value survive. This shape replaces the router's
+    # `list_agents` synthetic tool (Phase 7c, Q7.2 in plan).
     status_filter: Optional[str] = request.query_params.get('status')
     agents_list_data: List[Dict[str, Any]] = []
     conn = None
     try:
+        # tombstone rows are a DB-internal FK artefact; refuse the
+        # query early so a curious operator can't read them out.
+        if status_filter == 'tombstone':
+            return JSONResponse([])
+
         conn = get_db_connection()
         cursor = conn.cursor()
         if status_filter is None:
@@ -284,11 +296,18 @@ async def agents_list_api_route(request: Request) -> JSONResponse:
                 'agent_id': 'Admin', 'status': 'system', 'color': admin_style.get('color', '#607D8B'),
                 'created_at': 'N/A', 'current_task': 'N/A'
             })
-            cursor.execute("SELECT agent_id, status, color, created_at, current_task FROM agents ORDER BY created_at DESC")
+            # WHERE status != 'tombstone' filters the cascade-tombstone
+            # rows out at the DB layer.
+            cursor.execute(
+                "SELECT agent_id, status, color, created_at, current_task "
+                "FROM agents WHERE status != 'tombstone' "
+                "ORDER BY created_at DESC"
+            )
         else:
             cursor.execute(
                 "SELECT agent_id, status, color, created_at, current_task "
-                "FROM agents WHERE status = ? ORDER BY created_at DESC",
+                "FROM agents WHERE status = ? AND status != 'tombstone' "
+                "ORDER BY created_at DESC",
                 (status_filter,),
             )
         for row in cursor.fetchall(): agents_list_data.append(dict(row))
@@ -1161,6 +1180,20 @@ async def all_data_api_route(request: Request) -> JSONResponse:
             # up alongside the hardcoded 'Admin' display entry inserted
             # below and the dashboard renders two Admin rows.
             if agent_dict.get('agent_id') == 'admin':
+                continue
+            # Skip purge-cascade tombstone rows (status='tombstone',
+            # agent_id like '[deleted-<original>]'). PR-G1 INSERTs
+            # these so agent_messages.{sender_id,recipient_id} FK can
+            # be UPDATE'd to point at the tombstone before the
+            # original row is DELETE'd. The tombstone row is
+            # load-bearing for FKs — it must stay in the DB — but it
+            # has no business in the user-facing dashboard list.
+            # Without this filter, purge never drops the dashboard's
+            # visible agent count (the tombstone takes the place of
+            # the deleted row), which silently violates the spec
+            # contract "purge drops count by 1". See
+            # tests/test_purge_drops_visible_count.py.
+            if agent_dict.get('status') == 'tombstone':
                 continue
             agent_dict['auth_token'] = active_token_by_agent.get(
                 agent_dict['agent_id']
