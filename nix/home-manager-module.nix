@@ -397,6 +397,17 @@ in {
               + "--single-workspace ${lib.escapeShellArg cfg.singleProject.workspace}";
           Restart = "on-failure";
           RestartSec = 10;
+          # Defense-in-depth ceiling on the SIGTERM → exit window.
+          # The router's own `_drain_proxy_tasks` on_shutdown hook +
+          # `shutdown_timeout=3.0` on `web.run_app` close down
+          # in-flight MCP Streamable-HTTP proxy connections inside
+          # a few seconds; this 15 s ceiling means even if the
+          # in-process drain misfires, systemd's SIGKILL window is
+          # short enough that the operator sees "router restarting"
+          # rather than the previous 90 s deploy outage. The default
+          # (90 s, inherited from systemd) was the source of the
+          # 2026-06-04 08:57 production stall — see PR <#TBD>.
+          TimeoutStopSec = 15;
         };
         Install.WantedBy = [ "default.target" ];
       };
