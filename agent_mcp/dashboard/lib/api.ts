@@ -342,9 +342,17 @@ class ApiClient {
     capabilities?: string[]
     working_directory?: string
   }): Promise<{ success: boolean; message: string }> {
+    // Admin-only — the backend's verify_token() check requires the
+    // admin token in the request body, matching the convention used by
+    // terminateAgent / restoreAgent / editAgent / purgeAgent. Pre-fix
+    // this method shipped just JSON.stringify(data) with no token,
+    // which silently 401'd once a POST handler existed. Combined with
+    // the missing POST route on /api/agents (also fixed in the same
+    // PR) the Deploy button was completely non-functional.
+    const tokens = await this.getTokens()
     return this.request('/agents', {
       method: 'POST',
-      body: JSON.stringify(data)
+      body: JSON.stringify({ token: tokens.admin_token, ...data }),
     })
   }
 
