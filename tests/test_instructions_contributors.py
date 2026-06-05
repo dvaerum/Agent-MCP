@@ -124,6 +124,61 @@ def test_contributor_returning_none_is_skipped() -> None:
         restore()
 
 
+def test_byte_identical_alias_warning_output() -> None:
+    """Regression: the alias-warning contributor's output must be
+    byte-identical to the pre-refactor inline construction.
+
+    Before PR-W1b the warning was produced by
+    ``_build_alias_warning(name, expires)`` and appended directly. The
+    contributor must call the same builder with the same args so the
+    wire text doesn't drift — clients comparing two consecutive
+    initialize responses (e.g. for caching) must see no diff.
+    """
+    from agent_mcp.app.instructions_contributors import (
+        InitContext,
+        _alias_warning_contributor,
+    )
+    from agent_mcp.app.main_app import _build_alias_warning
+
+    ctx = InitContext(
+        bearer=None,
+        alias_info=("legacy-name", "2026-07-15T00:00:00Z"),
+    )
+    contributor_output = _alias_warning_contributor(ctx)
+    direct_output = _build_alias_warning(
+        "legacy-name", "2026-07-15T00:00:00Z"
+    )
+    assert contributor_output == direct_output, (
+        "alias-warning contributor output drifted from "
+        "_build_alias_warning; clients diffing initialize responses "
+        "will see a behaviour change."
+    )
+
+
+def test_byte_identical_wake_loop_output() -> None:
+    """Regression: the wake-loop contributor must return exactly
+    ``WAKE_LOOP_INSTRUCTIONS`` (no leading/trailing modification)
+    when the gate passes. The text is also surfaced via the
+    ``agent-mcp-enter-event-loop`` MCP prompt and through the
+    initialize injection; both paths must serve the same bytes.
+
+    We force the gate ON by monkeypatching the eligibility check; the
+    point of this test is to lock the contributor's output, not to
+    re-test the gating logic (covered in test_event_coord_toggles.py).
+    """
+    from agent_mcp.app import instructions_contributors as ic
+    from agent_mcp.app import main_app
+    from agent_mcp.app.event_loop_instructions import WAKE_LOOP_INSTRUCTIONS
+
+    original_gate = main_app._bearer_has_wake_loop_enabled
+    main_app._bearer_has_wake_loop_enabled = lambda: True
+    try:
+        ctx = ic.InitContext(bearer="anything", alias_info=None)
+        assert ic._wake_loop_contributor(ctx) == WAKE_LOOP_INSTRUCTIONS
+    finally:
+        main_app._bearer_has_wake_loop_enabled = original_gate
+
+
 @pytest.mark.asyncio
 async def test_initialize_surfaces_registered_contributor(
     tmp_path: Path,
