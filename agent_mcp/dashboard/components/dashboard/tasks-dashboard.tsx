@@ -678,6 +678,34 @@ const ViewTaskDialog = React.memo(({ task, onOpenChange }: RowDialogProps) => {
                 )}
               </div>
 
+              {/*
+                Required capabilities (event-coord PR-1). Renders only
+                when the task carries any — JSON-encoded in the column
+                so parseJsonField handles both shapes. Lowercase chips
+                so an admin can verify normalization landed.
+              */}
+              {(() => {
+                const caps = task ? parseJsonField(task.required_capabilities) : []
+                return caps.length > 0 && (
+                  <div className="border-t border-border pt-4 space-y-2">
+                    <Label className="text-xs text-muted-foreground uppercase tracking-wider">
+                      Required capabilities
+                    </Label>
+                    <div className="flex flex-wrap gap-2">
+                      {caps.map((cap: any, idx) => (
+                        <Badge
+                          key={`${cap}-${idx}`}
+                          variant="outline"
+                          className="text-xs font-mono lowercase"
+                        >
+                          {String(cap).toLowerCase()}
+                        </Badge>
+                      ))}
+                    </div>
+                  </div>
+                )
+              })()}
+
               {/* Group 3: relations (only renders if present) */}
               {(dependencies.length > 0 || childTasks.length > 0) && (
                 <div className="border-t border-border pt-4 space-y-4">
