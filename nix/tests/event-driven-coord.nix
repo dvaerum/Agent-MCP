@@ -201,6 +201,10 @@ pkgs.testers.nixosTest {
     # the two newly-inserted tokens are accepted.
     machine.succeed("systemctl restart agent-mcp@coord-test.service")
     machine.wait_for_unit("agent-mcp@coord-test.service")
+    # The router caches /api/tokens for 3s; sleep a bit longer so
+    # the next /mcp request triggers a fresh fetch that includes
+    # the newly-inserted agents.
+    machine.sleep(5)
     # Seed an initialize JSON body to disk and curl it; avoids the
     # double-shell-escape minefield of inlining JSON in nix → python →
     # bash.
