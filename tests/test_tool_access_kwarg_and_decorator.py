@@ -68,7 +68,7 @@ async def test_decorator_and_kwarg_admin_only_blocks_worker() -> None:
     """
     from agent_mcp.core.authorize import AuthRejected
     from agent_mcp.tools._access import requires_role
-    from agent_mcp.tools.registry import register_tool, tool_registry
+    from agent_mcp.tools.registry import register_tool
 
     @requires_role("admin")
     async def _fake_impl(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
@@ -116,7 +116,7 @@ async def test_decorator_only_still_enforces_at_call_site() -> None:
     """
     from agent_mcp.core.authorize import AuthRejected
     from agent_mcp.tools._access import requires_role
-    from agent_mcp.tools.registry import register_tool, tool_registry
+    from agent_mcp.tools.registry import register_tool
 
     @requires_role("admin")
     async def _fake_impl(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
@@ -154,7 +154,7 @@ def test_kwarg_only_reports_admin_in_derived_access_map() -> None:
     UI even when the decorator was forgotten.
     """
     from agent_mcp.tools.access import TOOL_ACCESS
-    from agent_mcp.tools.registry import register_tool, tool_registry
+    from agent_mcp.tools.registry import register_tool
 
     async def _fake_impl(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
         # No decorator. (In practice this would be a bug — but the
@@ -222,7 +222,7 @@ def test_derivation_admin_when_decorator_says_admin_kwarg_says_any() -> None:
     """
     from agent_mcp.tools._access import requires_role
     from agent_mcp.tools.access import TOOL_ACCESS
-    from agent_mcp.tools.registry import register_tool, tool_registry
+    from agent_mcp.tools.registry import register_tool
 
     @requires_role("admin")
     async def _fake_impl(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
