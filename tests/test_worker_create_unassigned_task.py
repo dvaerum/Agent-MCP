@@ -22,10 +22,9 @@ Behavior matrix:
   can't assign tasks to others; that's a separate plan item)
 
 Migrated to `tests/harness.py::mcp_session` (Candidate F from
-architecture review 2026-06-02). The `_inline_write_queue` shim is
-preserved (same Mode-0 deadlock applies — execute_db_write's
-per-loop queue is process-wide state) but reduced to the loop the
-harness actually drives.
+architecture review 2026-06-02). The earlier per-test write-queue
+monkeypatch was retired in PR-W1a once `execute_db_write` learned
+to rebind its worker to the current event loop on every call.
 """
 
 from __future__ import annotations
@@ -39,28 +38,6 @@ from tests.harness import mcp_session
 
 
 pytestmark = pytest.mark.asyncio
-
-
-@pytest.fixture(autouse=True)
-def _inline_write_queue(monkeypatch):
-    """Mode 0 (`_create_unassigned_tasks`) routes its INSERT through
-    `execute_db_write`, which puts work on a per-loop asyncio.Queue
-    drained by a worker started inside the TestClient's loop. The
-    harness's `await admin.call(...)` runs in pytest-asyncio's loop
-    rather than the lifespan loop, so the worker isn't draining — the
-    future returned by `queue.put()` never completes and the test
-    hangs.
-
-    Bypass for tests: replace `execute_db_write` with a direct call so
-    the operation runs in the test's loop. Production behavior is
-    unchanged.
-    """
-    async def _inline(operation):
-        return await operation()
-
-    monkeypatch.setattr(
-        "agent_mcp.tools.task_tools.execute_db_write", _inline
-    )
 
 
 def _set_toggle(value: bool) -> None:

@@ -11,9 +11,9 @@ Behavior:
 - Admin + BOTH agent_id and agent_token: agent_token wins, agent_id ignored.
 
 Migrated to use `tests/harness.py::mcp_session` (Candidate E from
-architecture review 2026-06-01). The `_inline_write_queue` shim is
-preserved (same Mode-0 deadlock applies under the harness's
-asyncio.run flow — the underlying execute_db_write queue is per-loop).
+architecture review 2026-06-01). The earlier per-test write-queue
+monkeypatch was retired in PR-W1a once `execute_db_write` learned
+to rebind its worker to the current event loop on every call.
 """
 
 from __future__ import annotations
@@ -26,26 +26,6 @@ from tests.harness import mcp_session
 
 
 pytestmark = pytest.mark.asyncio
-
-
-@pytest.fixture(autouse=True)
-def _inline_write_queue(monkeypatch):
-    """The Mode 0 unassigned-task path (which the admin+unknown-agent_id
-    fallback exercises today, pre-impl) routes its INSERT through
-    `execute_db_write`, a per-loop asyncio queue that deadlocks when
-    invoked via `asyncio.run` from a sync test. Run the operation
-    inline so the test surfaces the real error (or success) instead of
-    hanging.
-
-    Same shim as `test_worker_self_assign_task.py`.
-    """
-
-    async def _inline(operation):
-        return await operation()
-
-    monkeypatch.setattr(
-        "agent_mcp.tools.task_tools.execute_db_write", _inline
-    )
 
 
 async def test_admin_can_use_agent_id_instead_of_agent_token(tmp_path) -> None:

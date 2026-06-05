@@ -358,26 +358,9 @@ def test_normalize_capabilities_strips_lowercases_and_dedupes() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def _inline_write_queue(monkeypatch: pytest.MonkeyPatch):
-    """Same shim as `test_assign_task_agent_id_alt.py`: Mode 0
-    unassigned-task creation routes its INSERT through
-    `execute_db_write` (per-loop asyncio queue) which deadlocks when
-    invoked via `asyncio.run` from a sync test. Run the operation
-    inline so the test surfaces the real outcome instead of hanging.
-    """
-
-    async def _inline(operation):
-        return await operation()
-
-    monkeypatch.setattr(
-        "agent_mcp.tools.task_tools.execute_db_write", _inline
-    )
-
-
 @pytest.mark.asyncio
 async def test_assign_task_tool_normalizes_required_capabilities(
-    tmp_path: Path, _inline_write_queue: None,
+    tmp_path: Path,
 ) -> None:
     """assign_task with required_capabilities=['Backend', 'DB'] stores
     ['backend', 'db'] in the column. Uses the full TestClient harness

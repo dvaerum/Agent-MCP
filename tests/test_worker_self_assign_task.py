@@ -36,23 +36,6 @@ from tests.harness import mcp_session
 pytestmark = pytest.mark.asyncio
 
 
-@pytest.fixture(autouse=True)
-def _inline_write_queue(monkeypatch):
-    """Same shim as `test_worker_create_unassigned_task`: Mode 0's
-    INSERT routes through `execute_db_write` (per-loop asyncio queue)
-    which deadlocks when called via `asyncio.run` from a sync test.
-    Mode 3 uses direct cursor.execute + commit, so this only matters
-    for the admin-creates-then-worker-claims regression case here.
-    """
-
-    async def _inline(operation):
-        return await operation()
-
-    monkeypatch.setattr(
-        "agent_mcp.tools.task_tools.execute_db_write", _inline
-    )
-
-
 def _set_toggle(key: str, value: bool) -> None:
     from agent_mcp.db.connection import get_db_connection
 

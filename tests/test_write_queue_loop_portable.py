@@ -7,11 +7,11 @@ event loop happened to call `start()` first. Once that loop finished
 new loop would hang forever: the `asyncio.Queue` belongs to the dead
 loop, and the worker awaiting `queue.get()` is on a dead loop too.
 
-That deadlock is what every `_inline_write_queue` monkeypatch in
-the suite works around. The contract below pins the fix: the queue
-must lazily rebind to the current running loop on every
-`execute_db_write` call, so tests can drive writes from independent
-`asyncio.run(...)` blocks without a shim.
+That deadlock is what every per-test write-queue monkeypatch
+in the suite used to work around. The contract below pins the
+fix: the queue must lazily rebind to the current running loop on
+every `execute_db_write` call, so tests can drive writes from
+independent `asyncio.run(...)` blocks without a shim.
 """
 
 from __future__ import annotations
