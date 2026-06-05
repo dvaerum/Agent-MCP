@@ -290,25 +290,101 @@ def _build_alias_warning(alias_name: str, expires_at: str) -> str:
     )
 
 
+def _bearer_has_wake_loop_enabled() -> bool:
+    """Check the calling bearer's wake-loop eligibility.
+
+    Returns True iff:
+      * `request_auth_token` resolves to an active agent (not admin —
+        admins coordinate, they don't run the worker wake loop), AND
+      * `project_context.config_auto_event_loop_global` is truthy
+        (default TRUE), AND
+      * `agents.auto_event_loop` is truthy for that agent (default TRUE).
+
+    Returns False on any failure path (no bearer, lookup error, etc.)
+    so a degraded environment doesn't accidentally inject the
+    instructions when we can't verify the flags.
+    """
+    try:
+        bearer = request_auth_token.get()
+    except LookupError:
+        bearer = None
+    if not bearer:
+        return False
+    try:
+        from ..tools import access as _access
+        from ..db.connection import get_db_connection
+
+        # Admin bearer should not get the wake-loop instructions —
+        # admins are coordinators, not workers.
+        if verify_token(bearer, required_role="admin"):
+            return False
+
+        agent_id = get_agent_id(bearer)
+        if not agent_id:
+            return False
+
+        global_on = _access._get_config_bool(
+            "config_auto_event_loop_global", default=True,
+        )
+        if not global_on:
+            return False
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT auto_event_loop FROM agents WHERE agent_id = ?",
+                (agent_id,),
+            )
+            row = cursor.fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return False
+        return bool(row["auto_event_loop"])
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(
+            "wake-loop bootstrap eligibility check failed: %s", e,
+        )
+        return False
+
+
 def _patched_create_initialization_options(self, *args, **kwargs):
-    """Wrap ``Server.create_initialization_options`` to inject the
-    alias deprecation warning into ``instructions`` when present.
+    """Wrap ``Server.create_initialization_options`` to inject:
+
+      1. The alias deprecation warning into ``instructions`` when the
+         request arrived via an alias URL (Phase 1c).
+      2. The wake-loop bootstrap text when the bearer's agent has both
+         the global and per-agent ``auto_event_loop`` flags ON
+         (PR-2 event-coord).
 
     Called once per request in stateless mode (the SDK's
     ``StreamableHTTPSessionManager._handle_stateless_request`` spawns
     a fresh server task per request, and that task calls this method
-    immediately). We read ``request_alias_info`` from the inherited
-    Context — set by ``AuthHeaderMiddleware`` on the incoming request
-    — and append the warning to whatever the underlying server's
-    static instructions were (None today; this is the only producer).
+    immediately). We read ``request_alias_info`` and the bearer from
+    the inherited Context — set by ``AuthHeaderMiddleware`` on the
+    incoming request — and compose the additions onto whatever the
+    underlying server's static instructions were.
+
+    Both additions can apply to the same response. Order is alias
+    warning first, then wake-loop bootstrap — alias warnings are about
+    the URL the client is using right now and should be the first thing
+    the agent reads; wake-loop is operational guidance that applies
+    every session.
     """
     base = _ORIG_CREATE_INIT_OPTIONS(self, *args, **kwargs)
+    extra: list[str] = []
     alias_info = request_alias_info.get()
-    if alias_info is None:
+    if alias_info is not None:
+        alias_name, expires_at = alias_info
+        extra.append(_build_alias_warning(alias_name, expires_at))
+    if _bearer_has_wake_loop_enabled():
+        from .event_loop_instructions import WAKE_LOOP_INSTRUCTIONS
+
+        extra.append(WAKE_LOOP_INSTRUCTIONS)
+    if not extra:
         return base
-    alias_name, expires_at = alias_info
-    warning = _build_alias_warning(alias_name, expires_at)
-    base.instructions = (base.instructions or "") + warning
+    base.instructions = (base.instructions or "") + "".join(extra)
     return base
 
 

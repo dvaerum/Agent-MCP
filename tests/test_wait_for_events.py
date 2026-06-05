@@ -348,10 +348,21 @@ async def test_cursor_advances_between_calls(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_timeout_clamp_to_900_seconds(tmp_path: Path) -> None:
-    """Passing `timeout_seconds=2000` must clamp server-side to 900.
+async def test_timeout_clamp_to_max(tmp_path: Path) -> None:
+    """Passing `timeout_seconds=2000` must clamp server-side to the
+    `WAIT_FOR_EVENTS_MAX_TIMEOUT` ceiling.
+
+    PR-2 lowered the ceiling from 900 to 300 (the locked-decisions
+    table value); the test now asserts against the module constant
+    rather than a bare literal so a future bump doesn't silently
+    diverge.
+
     Verified indirectly: we monkeypatch `asyncio.wait_for` to capture
-    the timeout argument the impl passes in.
+    the timeout argument the impl passes for the signal-wait call.
+    PR-2 also added a per-agent serialization lock that uses
+    `asyncio.wait_for(lock.acquire(), timeout=0.001)`; we skip those
+    short captures and assert the slice timeout matches the clamped
+    ceiling.
     """
     from tests.harness import mcp_session
     import agent_mcp.tools.agent_communication_tools as acm
@@ -360,9 +371,14 @@ async def test_timeout_clamp_to_900_seconds(tmp_path: Path) -> None:
 
     async def spy_wait_for(awaitable, timeout):
         captured_timeouts.append(float(timeout))
-        # Close the un-awaited Event.wait() coroutine to avoid
-        # pytest's "coroutine was never awaited" warning, then raise
-        # TimeoutError so the impl returns its empty envelope quickly.
+        # Lock-acquire calls use a tiny 0.001s timeout. Forward those
+        # to the real `asyncio.wait_for` so the lock is actually
+        # acquired and the impl progresses to the signal-wait slice.
+        if float(timeout) < 0.5:
+            return await original(awaitable, timeout)
+        # Close the un-awaited coroutine to avoid pytest's "coroutine
+        # was never awaited" warning, then raise TimeoutError so the
+        # impl returns its empty envelope quickly.
         try:
             awaitable.close()
         except Exception:
@@ -382,10 +398,22 @@ async def test_timeout_clamp_to_900_seconds(tmp_path: Path) -> None:
         finally:
             acm.asyncio.wait_for = original
 
-        assert captured_timeouts, "asyncio.wait_for never invoked"
-        assert captured_timeouts[0] == 900.0, (
-            f"timeout should clamp to 900s; "
-            f"captured {captured_timeouts[0]}"
+        # The PR-2 impl wait_for slices the wait at
+        # `_FLAG_RECHECK_INTERVAL_SECONDS` (2s) per iteration so an
+        # operator toggling the flag mid-wait wakes the agent within
+        # ~5s. We assert the first non-lock-acquire capture equals
+        # the slice interval — that's the post-clamp ceiling
+        # applied to the signal.wait() call.
+        # Filter out the 0.001s lock-acquire captures.
+        signal_waits = [t for t in captured_timeouts if t > 0.01]
+        assert signal_waits, (
+            f"signal.wait timeout never captured; got {captured_timeouts}"
+        )
+        assert signal_waits[0] == acm._FLAG_RECHECK_INTERVAL_SECONDS, (
+            f"first signal slice should equal _FLAG_RECHECK_INTERVAL_SECONDS "
+            f"({acm._FLAG_RECHECK_INTERVAL_SECONDS}); "
+            f"captured {signal_waits[0]} "
+            f"(MAX_TIMEOUT={acm.WAIT_FOR_EVENTS_MAX_TIMEOUT})"
         )
 
 

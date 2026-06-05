@@ -148,14 +148,36 @@ def render_prompt(prompt_id: str, arguments: Dict[str, str]) -> str:
 def _build_registry_from_catalog() -> None:
     """Populate `prompt_registry` from the active catalog. Idempotent —
     safe to call after `_reload_catalog_for_tests` swaps the source.
+
+    Special case: the ``agent-mcp-enter-event-loop`` prompt's template
+    is sourced from the ``WAKE_LOOP_INSTRUCTIONS`` constant in
+    ``agent_mcp.app.event_loop_instructions`` rather than the catalog's
+    serialised copy. This keeps the prompt and the ``serverInfo.instructions``
+    injection literally identical even if a future edit only updates the
+    Python constant (so the JSON catalog can't go stale).
     """
     prompt_registry.clear()
+    # Resolve the wake-loop text once per build — defensive import in
+    # case the prompts package is consumed by tooling that doesn't
+    # have the app module on its path (unlikely but cheap).
+    try:
+        from ..app.event_loop_instructions import WAKE_LOOP_INSTRUCTIONS
+        _wake_loop_text: Optional[str] = WAKE_LOOP_INSTRUCTIONS.lstrip()
+    except Exception:
+        _wake_loop_text = None
+
     for raw in load_catalog().get("prompts", []):
         visibility: Visibility = raw.get("visibility", "any")
         if visibility not in ("any", "admin"):
             # Be conservative on an unknown sentinel — log via the
             # core resolver's warning path at filter time.
             visibility = "admin"
+        template = raw.get("template", "")
+        if (
+            raw.get("id") == "agent-mcp-enter-event-loop"
+            and _wake_loop_text is not None
+        ):
+            template = _wake_loop_text
         prompt_registry.register(
             RegistryEntry(
                 name=raw["id"],
@@ -163,7 +185,7 @@ def _build_registry_from_catalog() -> None:
                 meta=PromptEntry(
                     title=raw.get("title", raw["id"]),
                     description=raw.get("description", ""),
-                    template=raw.get("template", ""),
+                    template=template,
                     variables=list(raw.get("variables", []) or []),
                     category=raw.get("category", ""),
                     raw=raw,
