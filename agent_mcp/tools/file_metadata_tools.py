@@ -10,9 +10,9 @@ import mcp.types as mcp_types
 
 from .registry import register_tool
 from ..core.config import logger
-from ..core import globals as g  # For agent_working_dirs
 from ..core.auth import get_agent_id, verify_token
 from ..core.authorize import requires
+from ..core.repositories import agent_repo
 from ..utils.audit_utils import log_audit
 from ..db.connection import get_db_connection
 from ..db.actions.agent_actions_db import log_agent_action_to_db
@@ -25,12 +25,16 @@ def _normalize_filepath(filepath_arg: str, agent_id_for_wd: Optional[str]) -> st
     """
     if not os.path.isabs(filepath_arg):
         working_dir = os.getcwd()  # Default to CWD if no agent context
-        if agent_id_for_wd and agent_id_for_wd in g.agent_working_dirs:
-            working_dir = g.agent_working_dirs[agent_id_for_wd]
-        elif agent_id_for_wd:  # Agent ID provided but not in map
-            logger.warning(
-                f"Agent '{agent_id_for_wd}' not found in agent_working_dirs for path resolution. Using CWD."
-            )
+        # PR-W2c: route through AgentRepository so cache misses fall
+        # through to the DB row instead of dropping to CWD.
+        if agent_id_for_wd:
+            wd_from_repo = agent_repo.get_working_directory(agent_id_for_wd)
+            if wd_from_repo:
+                working_dir = wd_from_repo
+            else:
+                logger.warning(
+                    f"Agent '{agent_id_for_wd}' not found in agent registry for path resolution. Using CWD."
+                )
 
         resolved_path = Path(working_dir) / filepath_arg
     else:

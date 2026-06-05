@@ -33,18 +33,27 @@ def verify_token(token: str, required_role: str = "agent") -> bool:
 def get_agent_id(token: str) -> Optional[str]:
     """
     Get agent ID from token.
-    Uses global `g.admin_token` and `g.active_agents`.
+    Uses global `g.admin_token` and the AgentRepository (cache-first
+    lookup; falls through to the DB on miss).
+
+    Migrated to ``agent_repo.get_agent_by_token`` in PR-W2c so a token
+    for a row that's only in the DB (e.g. just restored by a peer
+    process) resolves correctly without waiting for the next lifespan
+    reload. The repo keeps the cache-hit semantics for the common
+    case via ``state.active_agents``.
     """
     if not token: # Added a check for empty/None token
         return None
     if token == g.admin_token:
         return "admin" # 'admin' is a special agent_id for admin operations
-    # Check active_agents only if it's not None and token is a key
-    if g.active_agents and token in g.active_agents:
-        # Ensure the agent data dictionary has 'agent_id'
-        agent_data = g.active_agents[token]
-        if isinstance(agent_data, dict) and "agent_id" in agent_data:
-            return agent_data["agent_id"]
+    # Local import to keep the legacy module-load contract: callers
+    # that only want verify_token/get_agent_id shouldn't pay the cost
+    # of loading the SQLAlchemy engine until the first DB-miss path.
+    from .repositories import agent_repo
+
+    agent_data = agent_repo.get_agent_by_token(token)
+    if isinstance(agent_data, dict) and "agent_id" in agent_data:
+        return agent_data["agent_id"]
     return None
 
 

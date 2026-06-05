@@ -153,12 +153,16 @@ def generate_system_prompt(
     """
     Generate a system prompt for an agent.
     Original main.py: lines 1206-1239.
-    Uses g.agent_working_dirs.
+    PR-W2c: routed through AgentRepository.get_working_directory() so
+    a cache miss falls through to the DB row instead of dropping to
+    CWD silently.
     """
     # Determine working directory for the prompt
-    # Fallback to CWD if agent_id not in g.agent_working_dirs, though it should be by the time this is called.
-    # (Original main.py line 1226: agent_working_dirs.get(agent_id, os.getcwd()))
-    working_dir = g.agent_working_dirs.get(agent_id, os.getcwd())
+    # Fallback to CWD if agent_id is unknown to the repo, though it
+    # should be known by the time this is called.
+    from ..core.repositories import agent_repo
+
+    working_dir = agent_repo.get_working_directory(agent_id) or os.getcwd()
 
     # Base prompt content from original main.py lines 1208-1224
     base_prompt = f"""You are an AI agent running in Cursor, connected to a Multi-Agent Collaboration Protocol (MCP) server.
