@@ -25,6 +25,12 @@ export interface Agent {
   // Event-coord PR-1: ISO cursor for `fetch_events_since` (PR-2).
   // NULL until the agent first drains its catch-up window.
   last_event_seen_at?: string | null
+  // Event-coord PR-3: TRUE while the agent currently has an
+  // in-flight `wait_for_events` long-poll call (i.e. while its
+  // `g.lock_for(agent_id)` is held). Drives the "waiting" chip on
+  // the Agents table and the "X agents currently in wait" count on
+  // the Settings page. Always FALSE for the synthetic Admin row.
+  wait_for_events_in_flight?: boolean
 }
 
 export interface Task {
