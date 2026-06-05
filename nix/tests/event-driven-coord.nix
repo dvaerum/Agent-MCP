@@ -95,6 +95,12 @@ pkgs.testers.nixosTest {
         AGENT_MCP_IDLE_SEC = "14400";
         AGENT_MCP_README_HTML = "${packagedPkgs.readmeHtml}";
         AGENT_MCP_INSTALLER_TEMPLATE = "${packagedPkgs.installerTemplate}";
+        # The router defaults to `systemctl --user`, which matches
+        # the nixos-developer-system home-manager deployment. In the
+        # VM test the agent-mcp@%i template is system-level, so flip
+        # the mode (mirrors nix/module.nix's setting for the home-
+        # manager system-mode deployment path).
+        AGENT_MCP_SYSTEMCTL_MODE = "system";
       };
       serviceConfig = {
         Type = "simple";
