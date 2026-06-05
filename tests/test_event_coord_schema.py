@@ -237,10 +237,16 @@ def test_migration_backfills_auto_event_loop_true_for_existing_agents(
             f"got {row[1]!r}"
         )
 
-        # Migration also bumped alembic_version.
+        # Migration also bumped alembic_version. The chain runs all
+        # the way to head; for PR-1 we only care that 0010 has been
+        # applied (i.e. version_num is >= 0010_*). Post-PR-W3 the head
+        # is 0011_orm_is_source_of_truth (a no-op marker); compare by
+        # numeric prefix rather than exact value so future no-op
+        # markers don't drift this test again.
         ver = conn.execute("SELECT version_num FROM alembic_version").fetchone()[0]
-        assert ver.startswith("0010_"), (
-            f"alembic_version should advance to a 0010_* migration; "
+        ver_prefix = ver.split("_", 1)[0]
+        assert ver_prefix.isdigit() and int(ver_prefix) >= 10, (
+            f"alembic_version should advance to a >=0010 migration; "
             f"got {ver!r}"
         )
 

@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import Integer, Text
+from sqlalchemy import Index, Integer, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ..engine import Base
@@ -50,6 +50,12 @@ class TaskNote(Base):
     author: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     timestamp: Mapped[str] = mapped_column(Text, nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # PR-W3 (ORM big-bang): single-column index on task_id (was
+    # previously only in init_database()'s raw SQL).
+    __table_args__ = (
+        Index("idx_task_notes_task", "task_id"),
+    )
 
     def __repr__(self) -> str:  # pragma: no cover — debug aid
         return (
