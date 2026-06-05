@@ -141,25 +141,14 @@ pkgs.testers.nixosTest {
     machine.wait_for_open_port(${toString ports.routerPort})
 
     # ── Bootstrap the project ────────────────────────────────────
-    # Seed the projects file in the LEGACY bare-string shape
-    # (matches the production launcher's `jq -er '.[$n]'`
-    # extraction), then mkdir the workspace. We skip the router's
-    # __create endpoint because the new agent_mcp/router/ code
-    # writes the NESTED dict shape, which the existing
-    # agentMcpLauncher script can't parse — that's a separate
-    # production-infra bug outside PR-2 scope.
     machine.succeed(
-        "mkdir -p /home/testuser/.config/agent-mcp "
-        "/home/testuser/projects/coord-test "
-        "&& chown -R testuser:testuser /home/testuser"
-    )
-    machine.succeed(
-        "echo '{\\\"coord-test\\\": \\\"/home/testuser/projects/coord-test\\\"}' "
-        "> /home/testuser/.config/agent-mcp/projects.local.json "
-        "&& chown testuser:testuser /home/testuser/.config/agent-mcp/projects.local.json"
+        "curl -fsSL -o /dev/null -F name=coord-test "
+        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__create"
     )
 
-    # Start the per-project backend explicitly.
+    # Start the per-project backend explicitly. The router would
+    # lazy-spawn on the first /mcp request, but starting directly
+    # gives us a deterministic readiness probe (wait_for_unit).
     machine.succeed("systemctl start agent-mcp@coord-test.service")
     machine.wait_for_unit("agent-mcp@coord-test.service")
 

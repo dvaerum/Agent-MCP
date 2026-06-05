@@ -147,9 +147,18 @@ let
     cfg_dir="''${XDG_CONFIG_HOME:-$HOME/.config}/agent-mcp"
     loc_file="$cfg_dir/projects.local.json"
 
+    # The projects file has two valid shapes:
+    #   * Legacy: {"<name>": "<workspace_path>"}
+    #     (washing-brothers and any other pre-PR-1 entry).
+    #   * Nested: {"<name>": {"workspace": "<path>", "aliases": [...]}}
+    #     (anything written by agent_mcp.router.project_registry).
+    # The jq below handles both: if the value is an object, extract
+    # `.workspace`; otherwise use it as-is.
     path=""
     if [[ -r "$loc_file" ]]; then
-      path="$(${pkgs.jq}/bin/jq -er --arg n "$name" '.[$n] // empty' "$loc_file" 2>/dev/null || true)"
+      path="$(${pkgs.jq}/bin/jq -er --arg n "$name" '
+        .[$n] | if type == "object" then .workspace else . end // empty
+      ' "$loc_file" 2>/dev/null || true)"
     fi
 
     if [[ -z "$path" ]]; then
