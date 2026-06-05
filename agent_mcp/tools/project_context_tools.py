@@ -1490,6 +1490,7 @@ def register_project_context_tools():
             "additionalProperties": False,
         },
         implementation=backup_project_context_tool_impl,
+        visibility="admin",
     )
 
     register_tool(

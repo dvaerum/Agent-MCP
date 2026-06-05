@@ -4030,6 +4030,10 @@ def register_task_tools():
             "additionalProperties": False,
         },
         implementation=assign_task_tool_impl,
+        visibility=(
+            "worker-if-toggled:config_allow_worker_self_assign,"
+            "config_allow_worker_create_unassigned"
+        ),
     )
 
     register_tool(
@@ -4147,6 +4151,9 @@ def register_task_tools():
             "additionalProperties": False,
         },
         implementation=update_task_status_tool_impl,
+        visibility=(
+            "worker-if-toggled:config_allow_worker_update_own_status"
+        ),
     )
 
     register_tool(
@@ -4393,6 +4400,11 @@ def register_task_tools():
             "additionalProperties": False,
         },
         implementation=bulk_task_operations_tool_impl,
+        # @requires("any") on the impl (admin gets full control; per-op
+        # ownership check rejects worker writes on non-owned tasks),
+        # but the tool's purpose is admin-orchestrated batch — workers
+        # have no use case that justifies tools/list advertisement.
+        visibility="admin",
     )
 
     register_tool(
@@ -4419,6 +4431,7 @@ def register_task_tools():
             "additionalProperties": False,
         },
         implementation=delete_task_tool_impl,
+        visibility="admin",
     )
 
 

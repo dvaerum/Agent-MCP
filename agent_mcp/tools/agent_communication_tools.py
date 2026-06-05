@@ -1096,7 +1096,10 @@ def register_agent_communication_tools():
             "required": ["recipient_id", "message"],
             "additionalProperties": False
         },
-        implementation=send_agent_message_tool_impl
+        implementation=send_agent_message_tool_impl,
+        visibility=(
+            "worker-if-toggled:config_allow_worker_to_worker"
+        ),
     )
     
     register_tool(
@@ -1178,7 +1181,8 @@ def register_agent_communication_tools():
             "required": ["message"],
             "additionalProperties": False
         },
-        implementation=broadcast_admin_message_tool_impl
+        implementation=broadcast_admin_message_tool_impl,
+        visibility="admin",
     )
 
     register_tool(

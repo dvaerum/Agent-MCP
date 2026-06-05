@@ -145,11 +145,23 @@ tool_schemas: List[Dict[str, Any]] = []
 
 @_dataclass
 class ToolImpl:
-    """Per-tool payload stored in the shared registry."""
+    """Per-tool payload stored in the shared registry.
+
+    PR-W1c (2026-06-05) added ``declared_visibility``: the literal
+    string the caller passed to ``register_tool(..., visibility=...)``
+    (``"admin"``, ``"any"``, or ``"worker-if-toggled:<keys>"``). The
+    legacy ``RegistryEntry.visibility`` field stays a callable so the
+    shared :class:`agent_mcp.core.registry.Registry` filter keeps
+    working; the raw declaration is preserved here so
+    :data:`agent_mcp.tools.access.TOOL_ACCESS` can derive the access
+    table from registry introspection (kwarg + decorator
+    ``_required_role``) without re-parsing source.
+    """
 
     description: str
     input_schema: Dict[str, Any]
     implementation: Callable[..., Awaitable[List[mcp_types.TextContent]]]
+    declared_visibility: str = "any"
 
 
 class ToolRegistry(Registry[ToolImpl]):
@@ -211,14 +223,30 @@ def register_tool(
     name: str,
     description: str,
     input_schema: Dict[str, Any],
-    implementation: Callable[..., Awaitable[List[mcp_types.TextContent]]]
+    implementation: Callable[..., Awaitable[List[mcp_types.TextContent]]],
+    *,
+    visibility: str = "any",
 ):
     """
     Registers a tool's schema and its implementation.
     This function will be called by each tool module to register itself.
+
+    ``visibility`` (PR-W1c, 2026-06-05): one of ``"admin"``, ``"any"``,
+    or ``"worker-if-toggled:<key>[,<key>...]"``. Surfaces the access
+    policy at the registration site so the registry / ``tools/list``
+    filter / UI can introspect it without re-reading source. Defaults
+    to ``"any"`` (matches the pre-PR-W1c implicit default in
+    ``is_visible_to_role`` — unclassified tools are visible to
+    everyone).
+
+    Enforcement of the policy lives at the call site in the impl's
+    ``@requires_role(...)`` / ``@requires_policy(...)`` decorator —
+    the kwarg here is metadata for the visibility filter, not the
+    auth gate. See :mod:`agent_mcp.tools._access` for the decorator
+    and the double-source-of-truth rationale.
     """
     global tool_schemas, tool_implementations
-    
+
     # Check for duplicate tool names
     if name in tool_implementations:
         logger.warning(f"Tool '{name}' is being re-registered. Overwriting previous definition.")
@@ -231,11 +259,12 @@ def register_tool(
     })
     tool_implementations[name] = implementation
 
-    # Mirror the registration into the shared Registry[T]. Visibility
-    # is delegated to `tools.access.is_visible_to_role` (lazy-loaded
-    # inside the policy callable) so adding a new tool keeps the
-    # single source of truth for classification at access.py — no
-    # duplication.
+    # Mirror the registration into the shared Registry[T]. The
+    # callable visibility still defers to
+    # `tools.access.is_visible_to_role` (which itself derives from
+    # registry introspection post-W1c); the raw declared visibility
+    # is stored on the meta payload so the derivation can read it
+    # without re-parsing.
     tool_registry.register(
         RegistryEntry(
             name=name,
@@ -244,6 +273,7 @@ def register_tool(
                 description=description,
                 input_schema=input_schema,
                 implementation=implementation,
+                declared_visibility=visibility,
             ),
         )
     )
