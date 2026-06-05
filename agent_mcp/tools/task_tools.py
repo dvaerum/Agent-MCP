@@ -929,6 +929,38 @@ async def _create_unassigned_tasks(
     try:
         created_tasks = await execute_db_write(write_operation)
 
+        # PR-2 event-coord: fan out `unassigned_task_appeared` events
+        # to every active agent whose capabilities satisfy the task's
+        # required_capabilities. Per-task fanout (so a multi-task call
+        # with heterogeneous capability requirements still wakes the
+        # right subset per task). Wrapped in broad try/except so a
+        # notification failure can't poison a successful task write.
+        for task in created_tasks:
+            try:
+                task_id = task["task_id"]
+                # Per-task required_capabilities (may have overridden
+                # the top-level value in the multi path); resolve from
+                # `g.tasks` (populated by `write_operation`) to keep
+                # this branch independent of which arg path produced
+                # the row.
+                cached = g.tasks.get(task_id, {})
+                raw_caps = cached.get("required_capabilities")
+                if isinstance(raw_caps, str):
+                    try:
+                        caps_list = json.loads(raw_caps)
+                    except Exception:
+                        caps_list = []
+                elif isinstance(raw_caps, list):
+                    caps_list = raw_caps
+                else:
+                    caps_list = []
+                g.notify_unassigned_task_appeared(task_id, caps_list)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "notify_unassigned_task_appeared(%s) failed: %s",
+                    task.get("task_id"), e,
+                )
+
         # Build response
         response_parts = [
             f"✅ **Unassigned Tasks Created**",

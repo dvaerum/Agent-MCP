@@ -818,6 +818,19 @@ async def edit_agent_api_route(request: Request) -> JSONResponse:
             for field, value in applied.items():
                 g.active_agents[agent_token][field] = value
 
+        # PR-2 event-coord: if `auto_event_loop` was flipped, wake any
+        # in-flight wait_for_events for this agent so it re-evaluates
+        # the flag state. The wait_for_events impl returns
+        # `stop_listening` when the new state is OFF.
+        if "auto_event_loop" in applied:
+            try:
+                g.wake_for_flag_recheck(agent_id)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "wake_for_flag_recheck(%s) failed after toggle: %s",
+                    agent_id, e,
+                )
+
         log_agent_action_to_db(
             cursor, "admin", "edited_agent",
             details={"agent_id": agent_id, "fields": list(applied.keys())},
@@ -1583,6 +1596,18 @@ async def create_memory_api_route(request: Request) -> JSONResponse:
         log_agent_action_to_db(cursor, requesting_admin_id, "created_memory", details={"context_key": context_key})
         session.commit()
 
+        # PR-2 event-coord: creating the global toggle key with a
+        # falsy initial value should wake in-flight wait_for_events
+        # so they re-evaluate (same shape as the update path).
+        if context_key == "config_auto_event_loop_global":
+            try:
+                g.wake_all_for_flag_recheck()
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "wake_all_for_flag_recheck failed after global "
+                    "toggle create: %s", e,
+                )
+
         return JSONResponse({
             "success": True,
             "message": f"Memory '{context_key}' created successfully"
@@ -1656,6 +1681,18 @@ async def update_memory_api_route(request: Request) -> JSONResponse:
         cursor = raw_conn.cursor()
         log_agent_action_to_db(cursor, requesting_admin_id, "updated_memory", details={"context_key": context_key})
         session.commit()
+
+        # PR-2 event-coord: a flip of the global wake-loop toggle must
+        # wake every in-flight wait_for_events so they can re-evaluate
+        # and return `stop_listening` if the new state is OFF.
+        if context_key == "config_auto_event_loop_global":
+            try:
+                g.wake_all_for_flag_recheck()
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "wake_all_for_flag_recheck failed after global "
+                    "toggle update: %s", e,
+                )
 
         return JSONResponse({
             "success": True,

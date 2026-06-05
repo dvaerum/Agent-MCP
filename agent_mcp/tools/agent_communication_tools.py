@@ -474,14 +474,31 @@ async def broadcast_admin_message_tool_impl(arguments: Dict[str, Any]) -> List[m
 
 
 # ---------------------------------------------------------------------------
-# wait_for_events long-poll tool (plan Phase 2)
+# wait_for_events long-poll tool (plan Phase 2 + PR-2 event-coord)
 # ---------------------------------------------------------------------------
 
 # Default and cap per locked grilling decision #3: 60s default keeps
 # round-trips brisk and stays under typical HTTP intermediary
-# idle-timeouts; 900s ceiling for advanced low-traffic callers.
-WAIT_FOR_EVENTS_DEFAULT_TIMEOUT = 60
-WAIT_FOR_EVENTS_MAX_TIMEOUT = 900
+# idle-timeouts; 300s ceiling per the locked-decisions table.
+#
+# `AGENT_MCP_EVENT_WAIT_TIMEOUT` env var overrides the default at module
+# load time. Per-call `timeout_seconds` argument still overrides per
+# request, clamped to `WAIT_FOR_EVENTS_MAX_TIMEOUT`.
+def _read_default_timeout() -> int:
+    raw = os.environ.get("AGENT_MCP_EVENT_WAIT_TIMEOUT", "60")
+    try:
+        v = int(raw)
+        return v if v > 0 else 60
+    except (TypeError, ValueError):
+        return 60
+
+
+WAIT_FOR_EVENTS_DEFAULT_TIMEOUT = _read_default_timeout()
+WAIT_FOR_EVENTS_MAX_TIMEOUT = 300
+# How frequently the wake-loop re-checks the global + per-agent flags
+# during a long wait. Set short enough that a toggle flip is visible to
+# the operator within a handful of seconds (test 6 requires < 5s).
+_FLAG_RECHECK_INTERVAL_SECONDS = 2.0
 
 
 _BROADCAST_MESSAGE_TYPES = ("broadcast", "announcement", "system_alert")
@@ -620,13 +637,211 @@ def _envelope(
     caller's progress through the timeline).
     """
     if events:
-        next_cursor = max(e["timestamp"] for e in events)
+        next_cursor = max((e.get("timestamp") or "") for e in events) or (since or "")
     else:
         next_cursor = since or ""
     payload = {"events": events, "next_cursor": next_cursor}
     return [mcp_types.TextContent(
         type="text", text=json.dumps(payload, ensure_ascii=False)
     )]
+
+
+# ---------------------------------------------------------------------------
+# PR-2: flag check + stop_listening
+# ---------------------------------------------------------------------------
+
+
+def _check_auto_event_loop_flags(agent_id: str) -> tuple[bool, Optional[str]]:
+    """Return (enabled, reason_when_disabled).
+
+    The wake loop is enabled iff BOTH:
+      * `project_context["config_auto_event_loop_global"]` is truthy
+        (default TRUE — un-set means "no opt-out").
+      * `agents.auto_event_loop` is truthy for `agent_id` (default TRUE
+        from the column DEFAULT).
+
+    When either is OFF, `reason_when_disabled` carries a short human
+    string the impl drops into the `stop_listening` payload.
+    """
+    # Global flag — default TRUE (opt-out, not opt-in). Operators who
+    # don't know about the toggle should still get the new behavior.
+    global_on = _access._get_config_bool(
+        "config_auto_event_loop_global", default=True,
+    )
+    if not global_on:
+        return False, "config_auto_event_loop_global is OFF"
+
+    # Per-agent flag — read fresh from DB on every call (cheap; one
+    # indexed lookup) so a mid-flight toggle flip wins.
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT auto_event_loop FROM agents WHERE agent_id = ?",
+            (agent_id,),
+        )
+        row = cursor.fetchone()
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(
+            "wait_for_events: per-agent flag lookup failed for %s: %s "
+            "(treating as ON)",
+            agent_id, e,
+        )
+        return True, None
+    finally:
+        if conn:
+            conn.close()
+
+    if row is None:
+        return False, f"agent '{agent_id}' not found"
+    # SQLite stores BOOLEAN as INTEGER; both 0/1 and True/False arrive.
+    per_agent_on = bool(row["auto_event_loop"])
+    if not per_agent_on:
+        return False, f"auto_event_loop is OFF for agent '{agent_id}'"
+    return True, None
+
+
+def _stop_listening_event(reason: str) -> Dict[str, Any]:
+    """Build the canonical ``stop_listening`` event dict."""
+    return {
+        "type": "stop_listening",
+        "ref_id": None,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "payload": {"reason": reason},
+    }
+
+
+def _write_last_event_seen_at(agent_id: str, cursor_value: str) -> None:
+    """Persist the high-water cursor to `agents.last_event_seen_at`.
+
+    Best-effort: a DB failure here doesn't fail the tool call (the
+    envelope is already built and the next call will just re-issue the
+    same backlog query against the previous cursor).
+    """
+    if not cursor_value:
+        return
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE agents SET last_event_seen_at = ? WHERE agent_id = ?",
+            (cursor_value, agent_id),
+        )
+        conn.commit()
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(
+            "wait_for_events: failed to persist last_event_seen_at "
+            "for %s: %s",
+            agent_id, e,
+        )
+    finally:
+        if conn:
+            conn.close()
+
+
+def _read_last_event_seen_at(agent_id: str) -> Optional[str]:
+    """Read the persisted cursor for `agent_id`, or None if unset."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT last_event_seen_at FROM agents WHERE agent_id = ?",
+            (agent_id,),
+        )
+        row = cursor.fetchone()
+    except Exception:  # pragma: no cover - defensive
+        return None
+    finally:
+        if conn:
+            conn.close()
+    if row is None:
+        return None
+    return row["last_event_seen_at"]
+
+
+def _collect_unassigned_task_events_for(
+    agent_id: str, since: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Find unassigned tasks created after `since` that match this
+    agent's capabilities.
+
+    Reused by both `wait_for_events_tool_impl` (on wake) and
+    `fetch_events_since_tool_impl`. Produces the same skinny payload
+    that `notify_unassigned_task_appeared` pushes to the in-memory
+    queue, so a worker that misses the push event still picks up the
+    same shape on its next catch-up.
+    """
+    from ..utils.capability_normalization import normalize_capabilities
+
+    since_iso = since if since else "0000-01-01T00:00:00"
+    events: List[Dict[str, Any]] = []
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT capabilities FROM agents WHERE agent_id = ?",
+            (agent_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return []
+        try:
+            agent_caps_raw = row["capabilities"] or "[]"
+            agent_caps = set(
+                normalize_capabilities(
+                    json.loads(agent_caps_raw)
+                    if isinstance(agent_caps_raw, str)
+                    else list(agent_caps_raw)
+                )
+            )
+        except Exception:
+            agent_caps = set()
+
+        cursor.execute(
+            """
+            SELECT task_id, title, priority, required_capabilities,
+                   created_at
+            FROM tasks
+            WHERE assigned_to IS NULL
+              AND created_at > ?
+            ORDER BY created_at ASC
+            """,
+            (since_iso,),
+        )
+        for trow in cursor.fetchall():
+            try:
+                req_raw = trow["required_capabilities"] or "[]"
+                req = set(
+                    normalize_capabilities(
+                        json.loads(req_raw)
+                        if isinstance(req_raw, str)
+                        else list(req_raw)
+                    )
+                )
+            except Exception:
+                req = set()
+            # Subset match: req ⊆ agent_caps. Empty req → matches everyone.
+            if not req.issubset(agent_caps):
+                continue
+            events.append({
+                "type": "unassigned_task_appeared",
+                "ref_id": trow["task_id"],
+                "timestamp": trow["created_at"],
+                "payload": {
+                    "task_id": trow["task_id"],
+                    "title": trow["title"],
+                    "priority": trow["priority"],
+                    "required_capabilities": sorted(req),
+                },
+            })
+    finally:
+        if conn:
+            conn.close()
+    return events
 
 
 @requires("any")
@@ -637,7 +852,19 @@ async def wait_for_events_tool_impl(
 
     Returns immediately with any events newer than `since`; otherwise
     blocks until `signal_for(agent_id).set()` fires or
-    `timeout_seconds` (default 60, max 900) elapses.
+    `timeout_seconds` (default 60, max 300) elapses.
+
+    PR-2 hardening:
+      * Reads `config_auto_event_loop_global` + `agents.auto_event_loop`
+        on every call; returns ``stop_listening`` if either is OFF.
+      * Per-agent serialization lock — a second concurrent call returns
+        ``{"error": "another_wait_in_flight"}`` immediately (HTTP-409
+        analog).
+      * Rechecks flags during long waits at 2s cadence so a toggle flip
+        wakes the call within ~5s with ``stop_listening``.
+      * Drains the per-agent out-of-band queue (synthetic events like
+        ``unassigned_task_appeared``) on every wake.
+      * Persists the high-water cursor to `agents.last_event_seen_at`.
     """
     token = arguments.get("token")
     agent_id = get_agent_id(token)
@@ -668,19 +895,162 @@ async def wait_for_events_tool_impl(
     if timeout > WAIT_FOR_EVENTS_MAX_TIMEOUT:
         timeout = WAIT_FOR_EVENTS_MAX_TIMEOUT
 
-    # Fast path — return immediately if backlog is non-empty.
-    events = _collect_events_for(agent_id, since)
-    if events:
-        return _envelope(events, since)
-
-    # Slow path — clear the signal, wait for `.set()` or timeout, re-query.
-    sig = g.signal_for(agent_id)
-    sig.clear()
+    # One-call-per-agent enforcement (HTTP 409 analog).
+    lock = g.lock_for(agent_id)
+    acquired = False
     try:
-        await asyncio.wait_for(sig.wait(), timeout=timeout)
-    except asyncio.TimeoutError:
-        return _envelope([], since)
-    return _envelope(_collect_events_for(agent_id, since), since)
+        # Non-blocking acquire — second concurrent call sees the lock
+        # already held and gets the conflict envelope.
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=0.001)
+            acquired = True
+        except asyncio.TimeoutError:
+            conflict_body = {
+                "error": "another_wait_in_flight",
+                "agent_id": agent_id,
+                "message": (
+                    "Another wait_for_events call is already in flight "
+                    "for this agent. Only one concurrent call per agent "
+                    "is supported."
+                ),
+            }
+            return [mcp_types.TextContent(
+                type="text", text=json.dumps(conflict_body)
+            )]
+
+        # Flag gate: if either toggle is OFF, return stop_listening now.
+        enabled, reason = _check_auto_event_loop_flags(agent_id)
+        if not enabled:
+            stop_evt = _stop_listening_event(reason or "auto_event_loop is OFF")
+            # Also drain any pending synthetic events so the queue
+            # doesn't accumulate while the agent is opted out.
+            g.drain_events(agent_id)
+            return _envelope([stop_evt], since)
+
+        # Fast path — combine DB backlog with queued synthetic events.
+        events: List[Dict[str, Any]] = _collect_events_for(agent_id, since)
+        events.extend(_collect_unassigned_task_events_for(agent_id, since))
+        events.extend(g.drain_events(agent_id))
+        if events:
+            events.sort(key=lambda e: e.get("timestamp") or "")
+            env = _envelope(events, since)
+            cursor_value = (
+                max((e.get("timestamp") or "") for e in events) or (since or "")
+            )
+            if cursor_value:
+                _write_last_event_seen_at(agent_id, cursor_value)
+            return env
+
+        # Slow path — clear the signal, wait in short slices so flag
+        # flips during the wait are caught within ~5s.
+        sig = g.signal_for(agent_id)
+        sig.clear()
+        deadline = asyncio.get_event_loop().time() + timeout
+        while True:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                return _envelope([], since)
+            slice_timeout = min(_FLAG_RECHECK_INTERVAL_SECONDS, remaining)
+            try:
+                await asyncio.wait_for(sig.wait(), timeout=slice_timeout)
+                # Woken — recheck flags first; the wake may have come
+                # from `wake_for_flag_recheck` (toggle flip), in which
+                # case the new flag state requires stop_listening.
+                enabled, reason = _check_auto_event_loop_flags(agent_id)
+                if not enabled:
+                    stop_evt = _stop_listening_event(
+                        reason or "auto_event_loop is OFF"
+                    )
+                    g.drain_events(agent_id)
+                    return _envelope([stop_evt], since)
+                # Drain everything that accumulated.
+                events = _collect_events_for(agent_id, since)
+                events.extend(_collect_unassigned_task_events_for(agent_id, since))
+                events.extend(g.drain_events(agent_id))
+                if events:
+                    events.sort(key=lambda e: e.get("timestamp") or "")
+                    env = _envelope(events, since)
+                    cursor_value = (
+                        max((e.get("timestamp") or "") for e in events)
+                        or (since or "")
+                    )
+                    if cursor_value:
+                        _write_last_event_seen_at(agent_id, cursor_value)
+                    return env
+                # Spurious wake — clear and loop.
+                sig.clear()
+            except asyncio.TimeoutError:
+                # Slice expired without a wake — recheck flags so an
+                # operator who flips a toggle during a long wait sees
+                # it within `_FLAG_RECHECK_INTERVAL_SECONDS`.
+                enabled, reason = _check_auto_event_loop_flags(agent_id)
+                if not enabled:
+                    stop_evt = _stop_listening_event(
+                        reason or "auto_event_loop is OFF"
+                    )
+                    g.drain_events(agent_id)
+                    return _envelope([stop_evt], since)
+                # Loop and wait another slice (or until deadline).
+                continue
+    finally:
+        if acquired:
+            lock.release()
+
+
+@requires("any")
+async def fetch_events_since_tool_impl(
+    arguments: Dict[str, Any],
+) -> List[mcp_types.TextContent]:
+    """Pure-DB catch-up: return events newer than `cursor` without
+    blocking.
+
+    Spec: ``fetch_events_since(cursor: str | None) -> {events, cursor}``.
+    Called by a worker on session start (and after recovery from any
+    ``wait_for_events`` error) to drain any backlog missed while the
+    worker was disconnected. Wakes nobody, blocks on nothing — just a
+    SELECT.
+
+    When `cursor` is None, falls back to the persisted
+    `agents.last_event_seen_at`. The returned `cursor` advances to the
+    max timestamp seen (or the input cursor if no events).
+    """
+    token = arguments.get("token")
+    agent_id = get_agent_id(token)
+    if not agent_id:
+        return [mcp_types.TextContent(
+            type="text",
+            text="Unauthorized: token does not resolve to an agent",
+        )]
+
+    cursor = arguments.get("cursor")
+    if cursor is not None and not isinstance(cursor, str):
+        return [mcp_types.TextContent(
+            type="text",
+            text="Error: cursor must be an ISO-UTC timestamp string or null",
+        )]
+
+    if cursor is None:
+        cursor = _read_last_event_seen_at(agent_id)
+
+    # Gather everything since the cursor: DB-backed events + matching
+    # unassigned tasks. We deliberately do NOT drain the in-memory
+    # queue here — fetch_events_since is the "fresh catch-up" path and
+    # the queue contents are only meaningful in the context of a
+    # wait_for_events session that established expectations about
+    # ordering.
+    events = _collect_events_for(agent_id, cursor)
+    events.extend(_collect_unassigned_task_events_for(agent_id, cursor))
+    events.sort(key=lambda e: e.get("timestamp") or "")
+    if events:
+        new_cursor = max((e.get("timestamp") or "") for e in events) or (cursor or "")
+        _write_last_event_seen_at(agent_id, new_cursor)
+    else:
+        new_cursor = cursor or ""
+
+    body = {"events": events, "cursor": new_cursor}
+    return [mcp_types.TextContent(
+        type="text", text=json.dumps(body, ensure_ascii=False)
+    )]
 
 
 def register_agent_communication_tools():
@@ -809,6 +1179,45 @@ def register_agent_communication_tools():
             "additionalProperties": False
         },
         implementation=broadcast_admin_message_tool_impl
+    )
+
+    register_tool(
+        name="fetch_events_since",
+        description=(
+            "Pure-DB catch-up: return events addressed to the calling "
+            "agent that are newer than `cursor`, without blocking. Use "
+            "this on session start (and after recovery from any "
+            "wait_for_events error) to drain anything missed while "
+            "disconnected. When `cursor` is omitted/null, falls back to "
+            "the agent's persisted `last_event_seen_at`. Response is a "
+            "JSON envelope {\"events\": [...], \"cursor\": \"<iso-ts>\"}; "
+            "pass the returned `cursor` as the next `cursor` (or to "
+            "wait_for_events as `since`) to advance through the timeline."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "token": {
+                    "type": "string",
+                    "description": (
+                        "Calling agent's token. Optional if "
+                        "Authorization: Bearer header is supplied "
+                        "(recommended)."
+                    ),
+                },
+                "cursor": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "ISO-UTC timestamp; only events with timestamp "
+                        "> cursor are returned. Null/absent means start "
+                        "from the agent's persisted last_event_seen_at."
+                    ),
+                },
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+        implementation=fetch_events_since_tool_impl,
     )
 
     register_tool(

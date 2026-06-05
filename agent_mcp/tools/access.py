@@ -68,6 +68,8 @@ TOOL_ACCESS: Dict[str, str] = {
     # agent_id; no spoofing because the bearer resolves to the
     # caller's agent_id server-side.
     "wait_for_events": "any",
+    # Pure-DB catch-up; same scope as wait_for_events.
+    "fetch_events_since": "any",
     # Worker→worker delivery gated on config_allow_worker_to_worker
     # (default deny per PR #16 / Q6b.1). Admin always permitted.
     "send_agent_message": "worker-if-toggled:config_allow_worker_to_worker",
