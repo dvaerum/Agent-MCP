@@ -153,8 +153,10 @@ pkgs.testers.nixosTest {
     machine.wait_for_unit("agent-mcp@coord-test.service")
 
     # Poll the backend's DB file until it exists (the unit's
-    # "active" state can precede DB initialisation).
-    db_path = "/home/testuser/.local/share/agent-mcp/projects/coord-test/.agent/mcp_state.db"
+    # "active" state can precede DB initialisation). The workspace
+    # path is what __create wrote to projects.local.json, which is
+    # AGENT_MCP_DEFAULT_WORKSPACE / <name> = /home/testuser/projects/coord-test.
+    db_path = "/home/testuser/projects/coord-test/.agent/mcp_state.db"
     machine.wait_until_succeeds(f"test -f {db_path}", timeout=60)
 
     # ── Provision two agents directly via SQL ────────────────────

@@ -171,7 +171,15 @@ let
       exit 1
     fi
 
-    sock="''${XDG_RUNTIME_DIR}/agent-mcp/$name/backend.sock"
+    # Production deploys typically run with XDG_RUNTIME_DIR set
+    # (/run/user/<uid>); the router and launcher both anchor their
+    # socket paths there. When the deploy overrides this — e.g. the
+    # VM test sets AGENT_MCP_SOCK_DIR=/run/agent-mcp and uses
+    # systemd's RuntimeDirectory to materialise the dir — fall back
+    # to AGENT_MCP_SOCK_DIR so launcher and router agree on the
+    # sock path under both deployment shapes.
+    sock_root="''${AGENT_MCP_SOCK_DIR:-''${XDG_RUNTIME_DIR}/agent-mcp}"
+    sock="$sock_root/$name/backend.sock"
     mkdir -p "$(dirname "$sock")"
     exec ${agentMcpBackendWrapper}/bin/agent-mcp-backend \
       --uds "$sock" \
