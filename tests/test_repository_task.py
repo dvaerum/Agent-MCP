@@ -23,8 +23,6 @@ from __future__ import annotations
 
 import datetime
 
-import pytest
-
 from agent_mcp.app.main_app import create_app
 from starlette.testclient import TestClient
 
@@ -131,7 +129,18 @@ def test_update_task_status_publishes_event(
     sys.modules["agent_mcp.core.event_bus"] = _FakeBus()  # type: ignore[assignment]
     try:
         with _make_client(project_dir):
-            from agent_mcp.core.repositories import task_repo
+            from agent_mcp.core.repositories import agent_repo, task_repo
+
+            # tasks.assigned_to has a FK to agents.agent_id (PR #96),
+            # so the assignee row must exist before the task.
+            agent_repo.create_agent(
+                token="tok-w-a",
+                agent_id="worker-a",
+                capabilities=[],
+                status="active",
+                working_directory="/tmp/wa",
+                color="#000000",
+            )
 
             task_repo.create_task(
                 task_id="task-event-bus",

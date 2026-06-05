@@ -22,11 +22,28 @@ def _make_client(project_dir):
     return TestClient(app)
 
 
+def _seed_agent(agent_id: str, token: str | None = None) -> None:
+    """agent_messages FKs sender_id/recipient_id to agents.agent_id, so
+    every message test needs the referenced agent rows to exist."""
+    from agent_mcp.core.repositories import agent_repo
+
+    agent_repo.create_agent(
+        token=token or f"tok-{agent_id}",
+        agent_id=agent_id,
+        capabilities=[],
+        status="active",
+        working_directory="/tmp/wd",
+        color="#abcdef",
+    )
+
+
 def test_create_message_visible_via_repo_read(project_dir, reset_globals):
     """Test A/B combined: write through repo, read by id, agrees with DB."""
     with _make_client(project_dir):
         from agent_mcp.core.repositories import message_repo
         from agent_mcp.db.actions.agent_messages_db import get_message_by_id
+
+        _seed_agent("worker-A")
 
         now = datetime.datetime.now().isoformat()
         ok = message_repo.create_message(
@@ -66,6 +83,9 @@ def test_create_message_publishes_event(project_dir, reset_globals):
         with _make_client(project_dir):
             from agent_mcp.core.repositories import message_repo
 
+            _seed_agent("worker-bus")
+            captured.clear()  # ignore the agent.created event from the seed
+
             now = datetime.datetime.now().isoformat()
             message_repo.create_message(
                 message_id="msg-bus-1",
@@ -91,6 +111,8 @@ def test_disable_cache_is_a_noop_contract(project_dir, reset_globals):
     uniform across the four repos."""
     with _make_client(project_dir):
         from agent_mcp.core.repositories import message_repo
+
+        _seed_agent("worker-nc")
 
         with message_repo.disable_cache():
             now = datetime.datetime.now().isoformat()
