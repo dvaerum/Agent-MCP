@@ -86,13 +86,21 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, op
   const cleanAgentId = agent.agent_id.startsWith('agent_') ? agent.agent_id.substring(6) : agent.agent_id
   const normalizedAgentId = cleanAgentId === 'Admin' ? 'admin' : cleanAgentId
   
-  const assignedTasks = agentTasks.filter(t => 
-    t.assigned_to === normalizedAgentId || 
-    t.assigned_to === cleanAgentId ||
-    (normalizedAgentId === 'admin' && (t.assigned_to === 'Admin' || t.assigned_to === 'admin'))
+  // "Assigned" on this row means "still on the agent's plate" — i.e.
+  // open work. Finished tasks ('completed' / 'cancelled' / 'failed')
+  // must be excluded so the '{n} assigned' pill matches the user's
+  // mental model. Before this filter, ios-app-dev showed 18
+  // 'assigned' on washing-brothers when 16 were completed.
+  const assignedTasks = agentTasks.filter(t =>
+    (t.assigned_to === normalizedAgentId ||
+      t.assigned_to === cleanAgentId ||
+      (normalizedAgentId === 'admin' && (t.assigned_to === 'Admin' || t.assigned_to === 'admin'))) &&
+    t.status !== 'completed' &&
+    t.status !== 'cancelled' &&
+    t.status !== 'failed'
   )
-  const workedOnTasks = agentTasks.filter(t => 
-    t.assigned_to !== normalizedAgentId && 
+  const workedOnTasks = agentTasks.filter(t =>
+    t.assigned_to !== normalizedAgentId &&
     t.assigned_to !== cleanAgentId &&
     !(normalizedAgentId === 'admin' && (t.assigned_to === 'Admin' || t.assigned_to === 'admin'))
   )
