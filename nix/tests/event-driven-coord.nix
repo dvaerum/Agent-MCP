@@ -146,20 +146,14 @@ pkgs.testers.nixosTest {
         "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__create"
     )
 
-    # The per-project backend systemd unit is lazy-spawned by the
-    # router on the first /mcp request. Issue an unauthenticated
-    # request just to wake the spawn (we don't care about the body —
-    # 401 is fine, that confirms the backend booted enough to run
-    # the auth middleware).
-    machine.wait_until_succeeds(
-        "curl -s -o /dev/null "
-        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/mcp/coord-test",
-        timeout=60,
-    )
-    machine.wait_until_succeeds(
-        "systemctl is-active agent-mcp@coord-test.service",
-        timeout=60,
-    )
+    # Start the per-project backend explicitly. The router would
+    # normally lazy-spawn it on the first /mcp request, but
+    # starting it directly here gives the test a deterministic
+    # readiness probe (wait_for_unit vs polling /mcp with bare curl
+    # which can't distinguish success from spawn failure with
+    # -s -o /dev/null).
+    machine.succeed("systemctl start agent-mcp@coord-test.service")
+    machine.wait_for_unit("agent-mcp@coord-test.service")
 
     # Poll the backend's DB file until it exists (the unit's
     # "active" state can precede DB initialisation).
