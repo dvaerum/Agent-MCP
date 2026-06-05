@@ -36,6 +36,26 @@ import mcp.types as mcp_types
 import pytest
 
 
+def _purge_tool(name: str) -> None:
+    """Remove a tool from all three registry surfaces so it doesn't
+    leak into other tests via `tool_schemas` (the legacy list),
+    `tool_implementations` (legacy dict), or `tool_registry` (the
+    shared Registry[T]).
+
+    `register_tool` writes to all three; cleanup must too.
+    """
+    from agent_mcp.tools.registry import (
+        tool_implementations,
+        tool_registry,
+        tool_schemas,
+    )
+
+    tool_registry._entries.pop(name, None)
+    tool_implementations.pop(name, None)
+    # `tool_schemas` is a list of {"name": ..., ...} dicts.
+    tool_schemas[:] = [e for e in tool_schemas if e.get("name") != name]
+
+
 # --- Test A: both decorator + kwarg, decorator enforces ---
 
 
@@ -67,23 +87,21 @@ async def test_decorator_and_kwarg_admin_only_blocks_worker() -> None:
         with pytest.raises(AuthRejected):
             await _fake_impl({"token": "definitely-not-admin"})
 
-        # Admin bearer → succeeds. Use the live admin token from auth.
-        from agent_mcp.core import auth as _auth
-        admin_token = _auth.admin_token
-        if not admin_token:
-            # Auth module hasn't been bootstrapped (no project loaded).
-            # Set one for this test.
-            _auth.admin_token = "test-admin-token-for-w1c"
-            admin_token = _auth.admin_token
+        # Admin bearer → succeeds. The admin token lives at
+        # `agent_mcp.core.globals.admin_token`; set one for the
+        # duration of this test (verify_token compares against it).
+        from agent_mcp.core import globals as _g
+
+        prior = _g.admin_token
+        _g.admin_token = "test-admin-token-for-w1c"
         try:
-            result = await _fake_impl({"token": admin_token})
+            result = await _fake_impl({"token": "test-admin-token-for-w1c"})
             assert result[0].text == "ok"
         finally:
-            _auth.admin_token = ""
+            _g.admin_token = prior
     finally:
         # Clean up registry state to avoid polluting other tests.
-        if "_test_admin_dec_and_kwarg" in tool_registry.names():
-            tool_registry._entries.pop("_test_admin_dec_and_kwarg", None)
+        _purge_tool("_test_admin_dec_and_kwarg")
 
 
 # --- Test B: decorator-only (no kwarg) — decorator still enforces ---
@@ -121,7 +139,7 @@ async def test_decorator_only_still_enforces_at_call_site() -> None:
         # introspection (used by the derived TOOL_ACCESS).
         assert getattr(_fake_impl, "_required_role", None) == "admin"
     finally:
-        tool_registry._entries.pop("_test_admin_dec_only", None)
+        _purge_tool("_test_admin_dec_only")
 
 
 # --- Test C: kwarg-only (no decorator) — kwarg surfaces in access map ---
@@ -160,7 +178,7 @@ def test_kwarg_only_reports_admin_in_derived_access_map() -> None:
             access = TOOL_ACCESS
         assert access.get("_test_admin_kwarg_only") == "admin"
     finally:
-        tool_registry._entries.pop("_test_admin_kwarg_only", None)
+        _purge_tool("_test_admin_kwarg_only")
 
 
 # --- Test D: derived TOOL_ACCESS preserves invariant ---
@@ -225,7 +243,7 @@ def test_derivation_admin_when_decorator_says_admin_kwarg_says_any() -> None:
             "tools/list must not advertise an admin-decorated tool to workers"
         )
     finally:
-        tool_registry._entries.pop("_test_disagree_dec_admin_kwarg_any", None)
+        _purge_tool("_test_disagree_dec_admin_kwarg_any")
 
 
 # --- Test F: requires_role is importable from _access ---

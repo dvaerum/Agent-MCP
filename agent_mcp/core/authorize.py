@@ -122,6 +122,13 @@ def requires(role: str) -> Callable[[ToolImpl], ToolImpl]:
                     raise AuthRejected("Unauthorized: Valid token required")
             return await func(arguments)
 
+        # PR-W1c (2026-06-05): expose the role on the wrapper for the
+        # derived `agent_mcp.tools.access.TOOL_ACCESS` map. The
+        # `requires_role` alias in `agent_mcp/tools/_access.py` sets
+        # the same attribute; tagging it here keeps the existing
+        # `@requires("admin")` call sites discoverable without
+        # forcing every tool module to re-decorate.
+        wrapper._required_role = role  # type: ignore[attr-defined]
         return wrapper
 
     return decorator
@@ -184,6 +191,13 @@ def requires_policy(
                 "one in dashboard Settings."
             )
 
+        # PR-W1c (2026-06-05): expose the toggle keys + default on the
+        # wrapper so the derived TOOL_ACCESS map can rebuild the
+        # `worker-if-toggled:<keys>` access level string without
+        # re-parsing the source. The level string keeps any-of
+        # semantics (matches `is_visible_to_role`).
+        wrapper._required_policy_keys = tuple(config_keys)  # type: ignore[attr-defined]
+        wrapper._required_policy_default = default  # type: ignore[attr-defined]
         return wrapper
 
     return decorator
