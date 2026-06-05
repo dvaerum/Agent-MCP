@@ -147,6 +147,23 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, op
               NEW
             </Badge>
           )}
+          {/* Event-coord PR-3: in-flight wait_for_events indicator.
+              `wait_for_events_in_flight` is sourced from /api/all-data,
+              which snapshots `g.lock_for(agent_id).locked()` server-side
+              (the PR-2 per-agent serialization lock). Hidden when
+              FALSE / absent so the row stays uncluttered when the
+              agent isn't auto-looping. Distinct sky-blue palette so it
+              reads as "status decoration" rather than the primary
+              running/pending/terminated/failed status. */}
+          {agent.wait_for_events_in_flight && (
+            <Badge
+              variant="outline"
+              className="text-xs bg-sky-500/15 text-sky-600 border-sky-500/30 font-medium"
+              title="Agent is in a wait_for_events long-poll (auto event-loop)"
+            >
+              WAITING
+            </Badge>
+          )}
         </div>
       </TableCell>
       

@@ -167,6 +167,13 @@ export function SettingsDashboard() {
   })
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // Event-coord PR-3: count of agents currently inside a
+  // `wait_for_events` long-poll call. Read from /api/all-data's new
+  // per-agent `wait_for_events_in_flight` boolean and refreshed
+  // alongside the policy toggles. Surfaces under the global
+  // event-loop toggle so operators have a live "how many agents are
+  // sleeping right now" signal.
+  const [agentsInWait, setAgentsInWait] = useState<number>(0)
 
   const refresh = async () => {
     setLoading(true)
@@ -174,6 +181,10 @@ export function SettingsDashboard() {
     try {
       const all = await apiClient.getAllData()
       const contexts = all.context ?? []
+      const agents = (all.agents ?? []) as Array<{ wait_for_events_in_flight?: boolean }>
+      setAgentsInWait(
+        agents.filter((a) => a.wait_for_events_in_flight === true).length,
+      )
       setState((prev) => {
         const next = { ...prev }
         for (const p of POLICIES) {
@@ -331,6 +342,20 @@ export function SettingsDashboard() {
                       </span>
                     )}
                   </div>
+                  {/* Event-coord PR-3: live "X agents currently in
+                      wait" count rendered only under the global
+                      event-loop toggle. Read-only — the count comes
+                      from /api/all-data's `wait_for_events_in_flight`
+                      booleans. Hidden when the global toggle is OFF
+                      since no agent should be in wait in that state
+                      anyway (existing in-flight calls receive
+                      stop_listening per PR-2). */}
+                  {p.key === "config_auto_event_loop_global" && s.value && (
+                    <div className="text-xs text-muted-foreground mt-2">
+                      {agentsInWait} agent{agentsInWait === 1 ? "" : "s"}{" "}
+                      currently in wait.
+                    </div>
+                  )}
                 </div>
                 <div className="flex-shrink-0 sm:pt-1 self-end sm:self-auto">
                   <Switch
