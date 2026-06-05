@@ -150,6 +150,25 @@ def reset_startup_complete_event() -> None:
 # don't need Redis pubsub or Postgres LISTEN.
 agent_event_signals: Dict[str, asyncio.Event] = {}
 
+# --- Per-agent serialization for wait_for_events (PR-2) ---
+# Spec: only one `wait_for_events` call per agent at a time. A second
+# concurrent call returns immediately with an
+# `{"error": "another_wait_in_flight", ...}` envelope (HTTP-409 analog).
+# The lock is acquired non-blocking by the tool impl — if it's already
+# held we return the conflict shape without queueing.
+agent_event_locks: Dict[str, asyncio.Lock] = {}
+
+# --- Out-of-band event queue (PR-2) ---
+# `signal_for(agent_id)` + DB re-query covers everything that has its
+# own table row (messages, task changes). The
+# `unassigned_task_appeared` event has no per-recipient row — it's
+# fanned out in-Python to capability-matched agents — so we need a
+# transient per-agent queue for synthetic events that don't materialise
+# from a SELECT. Drained by `wait_for_events_tool_impl` on wake; never
+# persisted (intentional, since the agent can always
+# `view_tasks(status=unassigned)` to reconstruct missed events).
+agent_event_queues: Dict[str, List[Dict[str, Any]]] = {}
+
 
 def signal_for(agent_id: str) -> asyncio.Event:
     """Lazily fetch (or create) the asyncio.Event for `agent_id`.
@@ -213,6 +232,179 @@ def notify_agent_inbox(agent_id: str) -> None:
         session_registry.fanout_to_agent(agent_id, payload)
     except Exception:  # pragma: no cover - defensive
         pass
+
+
+def lock_for(agent_id: str) -> asyncio.Lock:
+    """Lazily fetch (or create) the per-agent serialization lock.
+
+    Used by ``wait_for_events_tool_impl`` to enforce one-call-per-agent.
+    `acquire(blocking=False)` returns False if another call is already
+    in flight; the tool then returns the conflict envelope without
+    queueing.
+    """
+    lock = agent_event_locks.get(agent_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        agent_event_locks[agent_id] = lock
+    return lock
+
+
+def push_event(agent_id: str, event: Dict[str, Any]) -> None:
+    """Append a synthetic event to `agent_id`'s out-of-band queue.
+
+    Used for events that have no DB row of their own (notably
+    ``unassigned_task_appeared``). The queue is drained on the next
+    ``wait_for_events`` wake.
+
+    Wrapped in try/except by callers; this function itself is total
+    (list.append never raises on bounded inputs).
+    """
+    queue = agent_event_queues.get(agent_id)
+    if queue is None:
+        queue = []
+        agent_event_queues[agent_id] = queue
+    queue.append(event)
+
+
+def drain_events(agent_id: str) -> List[Dict[str, Any]]:
+    """Pop and return all queued synthetic events for `agent_id`.
+
+    Returns an empty list if no events are queued. The list is detached
+    from internal state on return — callers may freely mutate it.
+    """
+    queue = agent_event_queues.get(agent_id)
+    if not queue:
+        return []
+    out = list(queue)
+    queue.clear()
+    return out
+
+
+def notify_unassigned_task_appeared(
+    task_id: str,
+    task_required_capabilities: List[str],
+) -> None:
+    """Fan out an ``unassigned_task_appeared`` event to every agent
+    whose capabilities satisfy the task's `required_capabilities`.
+
+    Subset semantics (locked design decision):
+      * Empty ``task_required_capabilities`` → wake every active agent.
+      * Empty ``agent.capabilities`` → wake only when the task also has
+        empty required (no labels to satisfy).
+      * Non-empty both → wake when ``agent.capabilities`` is a superset.
+
+    Implemented in-Python because we don't need SQL-indexed matching at
+    sub-100-agent scale. Each match pushes a skinny event to the
+    target agent's queue + sets their signal so any in-flight
+    ``wait_for_events`` wakes immediately.
+
+    Wrapped in broad try/except so notification side-effects can never
+    poison the source write (the unassigned task is already persisted
+    by the time we're called).
+    """
+    try:
+        # Lazy import to avoid circular dependency.
+        from ..db.connection import get_db_connection
+        from ..utils.capability_normalization import normalize_capabilities
+        import datetime as _dt
+        import json as _json
+
+        # Normalize the task's required caps once. PR-1 already
+        # normalizes at write time so this is idempotent; defensive
+        # against tests that bypass the normalizer.
+        required = normalize_capabilities(task_required_capabilities or [])
+        required_set = set(required)
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT task_id, title, priority, required_capabilities, "
+                "       created_at "
+                "FROM tasks WHERE task_id = ?",
+                (task_id,),
+            )
+            task_row = cursor.fetchone()
+            if task_row is None:
+                # Source row gone — nothing to fan out. (Race with
+                # delete_task; not our problem.)
+                return
+
+            cursor.execute(
+                "SELECT agent_id, capabilities FROM agents "
+                "WHERE status != 'terminated'",
+            )
+            agent_rows = cursor.fetchall()
+        finally:
+            conn.close()
+
+        timestamp = _dt.datetime.now().isoformat()
+        ref_id = task_row["task_id"]
+        payload = {
+            "task_id": task_id,
+            "title": task_row["title"],
+            "priority": task_row["priority"],
+            "required_capabilities": list(required),
+        }
+
+        for row in agent_rows:
+            agent_id = row["agent_id"]
+            # Admin pseudo-agent never wakes for unassigned tasks (PR
+            # #117 made admin a real DB row but admins don't run worker
+            # loops).
+            if agent_id and agent_id.lower().startswith("admin"):
+                continue
+            try:
+                raw_caps = row["capabilities"] or "[]"
+                caps_list = _json.loads(raw_caps) if isinstance(raw_caps, str) else list(raw_caps)
+            except Exception:
+                caps_list = []
+            agent_caps = set(normalize_capabilities(caps_list))
+
+            # Subset match: required ⊆ agent_caps.
+            # Empty required → matches everyone (set.issubset(empty) is True).
+            if not required_set.issubset(agent_caps):
+                continue
+
+            event = {
+                "type": "unassigned_task_appeared",
+                "ref_id": ref_id,
+                "timestamp": timestamp,
+                "payload": payload,
+            }
+            push_event(agent_id, event)
+            try:
+                signal_for(agent_id).set()
+            except Exception:  # pragma: no cover - defensive
+                pass
+    except Exception:  # pragma: no cover - defensive
+        # Source write is committed; notification is best-effort.
+        pass
+
+
+def wake_all_for_flag_recheck() -> None:
+    """Wake every agent with a pending signal so they re-evaluate the
+    auto_event_loop flags.
+
+    Called by the toggle-write paths (per-agent and global) so any
+    in-flight ``wait_for_events`` returns within ~immediately and the
+    impl can return a ``stop_listening`` envelope when the new flag
+    state requires it.
+    """
+    for agent_id in list(agent_event_signals.keys()):
+        try:
+            agent_event_signals[agent_id].set()
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+
+def wake_for_flag_recheck(agent_id: str) -> None:
+    """Wake one agent's in-flight wait so it re-evaluates flags."""
+    try:
+        signal_for(agent_id).set()
+    except Exception:  # pragma: no cover - defensive
+        pass
+
 
 # Note: The original `main.py` also had `openai_client = None` at line 185.
 # I've named it `openai_client_instance` here to avoid confusion with the module name
