@@ -774,6 +774,14 @@ async def _create_unassigned_tasks(
     tasks = arguments.get("tasks")
     priority = arguments.get("priority", "medium")
     parent_task_id_arg = arguments.get("parent_task_id")
+    # Event-coord PR-1: top-level required_capabilities applies to
+    # every task in the call (single + multi). For the multi path,
+    # individual task entries may override via their own
+    # `required_capabilities` key; otherwise they inherit the top-level
+    # value. Normalize once at write time.
+    from agent_mcp.utils.capability_normalization import normalize_capabilities
+
+    top_level_required_caps_raw = arguments.get("required_capabilities")
 
     # Define the write operation as an async function
     async def write_operation():
@@ -794,6 +802,14 @@ async def _create_unassigned_tasks(
                     description = task["description"]
                     task_priority = task.get("priority", "medium")
                     parent_task = task.get("parent_task_id")
+                    # Per-task override of top-level required_capabilities.
+                    per_task_caps_raw = task.get(
+                        "required_capabilities", top_level_required_caps_raw
+                    )
+                    normalized_caps = normalize_capabilities(per_task_caps_raw)
+                    required_caps_json = (
+                        json.dumps(normalized_caps) if normalized_caps else None
+                    )
 
                     # Create unassigned task
                     task_data = {
@@ -810,14 +826,17 @@ async def _create_unassigned_tasks(
                         "child_tasks": json.dumps([]),
                         "depends_on_tasks": json.dumps([]),
                         "notes": json.dumps([]),
+                        "required_capabilities": required_caps_json,
                     }
 
                     cursor.execute(
                         """
-                        INSERT INTO tasks (task_id, title, description, assigned_to, created_by, status, priority, 
-                                           created_at, updated_at, parent_task, child_tasks, depends_on_tasks, notes)
-                        VALUES (:task_id, :title, :description, :assigned_to, :created_by, :status, :priority, 
-                                :created_at, :updated_at, :parent_task, :child_tasks, :depends_on_tasks, :notes)
+                        INSERT INTO tasks (task_id, title, description, assigned_to, created_by, status, priority,
+                                           created_at, updated_at, parent_task, child_tasks, depends_on_tasks, notes,
+                                           required_capabilities)
+                        VALUES (:task_id, :title, :description, :assigned_to, :created_by, :status, :priority,
+                                :created_at, :updated_at, :parent_task, :child_tasks, :depends_on_tasks, :notes,
+                                :required_capabilities)
                     """,
                         task_data,
                     )
@@ -840,6 +859,10 @@ async def _create_unassigned_tasks(
             elif task_title and task_description:
                 # Single unassigned task creation
                 task_id = f"task_{int(datetime.datetime.now().timestamp() * 1000)}"
+                normalized_caps = normalize_capabilities(top_level_required_caps_raw)
+                required_caps_json = (
+                    json.dumps(normalized_caps) if normalized_caps else None
+                )
 
                 task_data = {
                     "task_id": task_id,
@@ -855,14 +878,17 @@ async def _create_unassigned_tasks(
                     "child_tasks": json.dumps([]),
                     "depends_on_tasks": json.dumps([]),
                     "notes": json.dumps([]),
+                    "required_capabilities": required_caps_json,
                 }
 
                 cursor.execute(
                     """
-                    INSERT INTO tasks (task_id, title, description, assigned_to, created_by, status, priority, 
-                                       created_at, updated_at, parent_task, child_tasks, depends_on_tasks, notes)
-                    VALUES (:task_id, :title, :description, :assigned_to, :created_by, :status, :priority, 
-                            :created_at, :updated_at, :parent_task, :child_tasks, :depends_on_tasks, :notes)
+                    INSERT INTO tasks (task_id, title, description, assigned_to, created_by, status, priority,
+                                       created_at, updated_at, parent_task, child_tasks, depends_on_tasks, notes,
+                                       required_capabilities)
+                    VALUES (:task_id, :title, :description, :assigned_to, :created_by, :status, :priority,
+                            :created_at, :updated_at, :parent_task, :child_tasks, :depends_on_tasks, :notes,
+                            :required_capabilities)
                 """,
                     task_data,
                 )
@@ -1674,6 +1700,17 @@ async def assign_task_tool_impl(
                 }
             )
 
+        # Event-coord PR-1: normalize required_capabilities at write
+        # time. None / missing key ⇒ store NULL ("anyone can claim",
+        # though this is the assigned path so the field is informational
+        # for routing on future reassignment / unassign).
+        from agent_mcp.utils.capability_normalization import normalize_capabilities
+
+        _norm_caps = normalize_capabilities(
+            arguments.get("required_capabilities")
+        )
+        _required_caps_json = json.dumps(_norm_caps) if _norm_caps else None
+
         task_data_for_db = {  # main.py:1354-1367
             "task_id": new_task_id,
             "title": task_title,
@@ -1690,15 +1727,18 @@ async def assign_task_tool_impl(
                 final_depends_on_tasks or []
             ),  # Use validated value
             "notes": json.dumps(initial_notes),
+            "required_capabilities": _required_caps_json,
         }
 
         # Save task to database (main.py:1370-1373)
         cursor.execute(
             """
-            INSERT INTO tasks (task_id, title, description, assigned_to, created_by, status, priority, 
-                               created_at, updated_at, parent_task, child_tasks, depends_on_tasks, notes)
-            VALUES (:task_id, :title, :description, :assigned_to, :created_by, :status, :priority, 
-                    :created_at, :updated_at, :parent_task, :child_tasks, :depends_on_tasks, :notes)
+            INSERT INTO tasks (task_id, title, description, assigned_to, created_by, status, priority,
+                               created_at, updated_at, parent_task, child_tasks, depends_on_tasks, notes,
+                               required_capabilities)
+            VALUES (:task_id, :title, :description, :assigned_to, :created_by, :status, :priority,
+                    :created_at, :updated_at, :parent_task, :child_tasks, :depends_on_tasks, :notes,
+                    :required_capabilities)
         """,
             task_data_for_db,
         )
@@ -3826,6 +3866,23 @@ def register_task_tools():
                     "type": "string",
                     "description": "ID of the parent task (Mode 1 only)",
                 },
+                # Event-coord PR-1: capability routing for unassigned tasks.
+                # Subset match — an agent receives the
+                # `unassigned_task_appeared` event (PR-2) iff
+                # agent.capabilities ⊇ task.required_capabilities. Empty
+                # list / null ⇒ broadcast (everyone wakes). Server
+                # normalizes (strip + lowercase + dedupe) at write time.
+                "required_capabilities": {
+                    "type": "array",
+                    "description": (
+                        "Capability labels a worker must satisfy to be "
+                        "considered for this task (PR-1 event-coord). "
+                        "Subset match against agent.capabilities. Empty/"
+                        "missing = no capability gate. Free-text strings; "
+                        "lowercase-normalized at write time."
+                    ),
+                    "items": {"type": "string"},
+                },
                 # Mode 2: Multiple task creation
                 "tasks": {
                     "type": "array",
@@ -3847,6 +3904,15 @@ def register_task_tools():
                             "parent_task_id": {
                                 "type": "string",
                                 "description": "Parent task ID for this task",
+                            },
+                            "required_capabilities": {
+                                "type": "array",
+                                "description": (
+                                    "Per-task capability gate; overrides the "
+                                    "top-level required_capabilities for this "
+                                    "entry only (PR-1 event-coord)."
+                                ),
+                                "items": {"type": "string"},
                             },
                         },
                         "required": ["title", "description"],

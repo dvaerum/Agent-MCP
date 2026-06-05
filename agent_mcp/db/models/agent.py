@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import Text
+from sqlalchemy import Boolean, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ..engine import Base
@@ -54,6 +54,17 @@ class Agent(Base):
     terminated_at: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     updated_at: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     aoe_session_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Event-coord PR-1: per-agent wake-loop toggle (default TRUE; FALSE
+    # disables the wake-loop bootstrap shipped in PR-2). NOT NULL with
+    # DEFAULT 1 in DDL.
+    auto_event_loop: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="1",
+    )
+    # Event-coord PR-1: cursor for fetch_events_since (PR-2). NULL ⇒
+    # "from the beginning".
+    last_event_seen_at: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+    )
 
     def __repr__(self) -> str:  # pragma: no cover — debug aid
         return f"<Agent agent_id={self.agent_id!r} status={self.status!r}>"

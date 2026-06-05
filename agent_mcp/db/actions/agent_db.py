@@ -38,6 +38,9 @@ _MUTABLE_FIELDS: set[str] = {
     "capabilities",
     "updated_at",
     "aoe_session_id",
+    # Event-coord PR-1 + PR-2.
+    "auto_event_loop",
+    "last_event_seen_at",
 }
 
 
@@ -60,6 +63,11 @@ def _agent_to_dict(row: Agent) -> Dict[str, Any]:
         "terminated_at": row.terminated_at,
         "updated_at": row.updated_at,
         "aoe_session_id": row.aoe_session_id,
+        # Event-coord PR-1 columns. `auto_event_loop` defaults TRUE for
+        # legacy rows via the migration's `DEFAULT 1`; `last_event_seen_at`
+        # is NULL until the agent first calls `fetch_events_since` (PR-2).
+        "auto_event_loop": getattr(row, "auto_event_loop", True),
+        "last_event_seen_at": getattr(row, "last_event_seen_at", None),
     }
     raw_caps = data.get("capabilities")
     if isinstance(raw_caps, str):
@@ -165,7 +173,19 @@ def update_agent_db_field(
 
     value_to_set = new_value
     if field_name == "capabilities":
-        value_to_set = json.dumps(new_value or [])
+        # Event-coord PR-1: normalize at write time (strip + lowercase +
+        # dedupe, preserve order of first occurrence). One source of
+        # truth for both agents.capabilities and
+        # tasks.required_capabilities (task_tools applies the same
+        # helper). Read paths must NOT re-normalize.
+        from ...utils.capability_normalization import normalize_capabilities
+
+        value_to_set = json.dumps(normalize_capabilities(new_value))
+    elif field_name == "auto_event_loop":
+        # SQLite has no native bool; coerce any truthy value to 1, any
+        # falsy to 0 so dashboard PATCH bodies (true/false/0/1) all
+        # land as the integer the column expects.
+        value_to_set = 1 if new_value else 0
     elif field_name == "updated_at" and new_value is None:
         value_to_set = datetime.datetime.now().isoformat()
 

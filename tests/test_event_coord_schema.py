@@ -163,15 +163,25 @@ def _table_columns(db_path: str, table: str) -> Dict[str, sqlite3.Row]:
 # ---------------------------------------------------------------------------
 
 
-def test_migration_applies_on_fresh_db_creates_columns(tmp_path: Path) -> None:
-    project_dir = str(tmp_path / "fresh")
-    Path(project_dir).mkdir()
-    agent_dir = Path(project_dir) / ".agent"
-    agent_dir.mkdir()
+def test_migration_applies_on_fresh_db_creates_columns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reset_globals: None,
+) -> None:
+    """Fresh DB path: init_database() bootstraps the raw-SQL schema,
+    then `alembic upgrade head` plays every migration against it
+    (the 0001 baseline / 0002 ownership cols / etc are all
+    schema-aware idempotent). End state must have the three new
+    columns."""
+    project_dir = tmp_path / "fresh"
+    project_dir.mkdir()
+    monkeypatch.setenv("MCP_PROJECT_DIR", str(project_dir))
 
-    _run_alembic_upgrade(project_dir)
+    from agent_mcp.db.schema import init_database
+    from agent_mcp.db.migrations_runner import run_migrations_upgrade
 
-    db_path = str(agent_dir / "mcp_state.db")
+    init_database()
+    run_migrations_upgrade()
+
+    db_path = str(project_dir / ".agent" / "mcp_state.db")
     agents_cols = _table_columns(db_path, "agents")
     tasks_cols = _table_columns(db_path, "tasks")
 
@@ -348,57 +358,68 @@ def test_normalize_capabilities_strips_lowercases_and_dedupes() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def _inline_write_queue(monkeypatch: pytest.MonkeyPatch):
+    """Same shim as `test_assign_task_agent_id_alt.py`: Mode 0
+    unassigned-task creation routes its INSERT through
+    `execute_db_write` (per-loop asyncio queue) which deadlocks when
+    invoked via `asyncio.run` from a sync test. Run the operation
+    inline so the test surfaces the real outcome instead of hanging.
+    """
+
+    async def _inline(operation):
+        return await operation()
+
+    monkeypatch.setattr(
+        "agent_mcp.tools.task_tools.execute_db_write", _inline
+    )
+
+
 @pytest.mark.asyncio
 async def test_assign_task_tool_normalizes_required_capabilities(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reset_globals: None,
+    tmp_path: Path, _inline_write_queue: None,
 ) -> None:
     """assign_task with required_capabilities=['Backend', 'DB'] stores
-    ['backend', 'db'] in the column."""
-    # Drive a real DB up through the migration.
-    project_dir = tmp_path / "wd"
-    project_dir.mkdir()
-    monkeypatch.setenv("MCP_PROJECT_DIR", str(project_dir))
+    ['backend', 'db'] in the column. Uses the full TestClient harness
+    so the write queue is running (raw direct calls hit
+    "Database write queue is not running" otherwise)."""
+    from tests.harness import mcp_session
 
-    from agent_mcp.core import globals as g
-    from agent_mcp.db.schema import init_database
-    from agent_mcp.db.migrations_runner import run_migrations_upgrade
-    from agent_mcp.tools.task_tools import assign_task_tool_impl
+    async with mcp_session(tmp_path) as admin:
+        result = await admin.assert_tool_succeeds(
+            "assign_task",
+            {
+                "task_title": "Build something",
+                "task_description": "...",
+                "priority": "medium",
+                # No agent_token → unassigned path (Mode 0).
+                "required_capabilities": ["Backend", "DB", "backend"],
+            },
+        )
+        text_blob = "\n".join(c.text for c in result)
+        assert "error" not in text_blob.lower() or "Error" not in text_blob, text_blob
 
-    init_database()
-    run_migrations_upgrade()
+        # Read back the row via direct sqlite query — the dashboard
+        # /api/all-data + /api/tasks paths return dict(row) without
+        # parsing required_capabilities, so the asserted shape stays
+        # JSON-encoded text.
+        from agent_mcp.db.connection import get_db_connection
 
-    # Tool runs as admin.
-    g.admin_token = "admin-test-tok"
-
-    args = {
-        "token": "admin-test-tok",
-        "task_title": "Build something",
-        "task_description": "...",
-        "priority": "medium",
-        # No agent_token → unassigned path (Mode 0).
-        "required_capabilities": ["Backend", "DB", "backend"],
-    }
-    result = await assign_task_tool_impl(args)
-    # Tool returns a list[TextContent]; pull the text for diagnostics.
-    text_blob = "\n".join(c.text for c in result)
-    assert "Error" not in text_blob, text_blob
-
-    # Read back the row.
-    from agent_mcp.db.connection import get_db_connection
-
-    conn = get_db_connection()
-    try:
-        rows = conn.execute(
-            "SELECT task_id, required_capabilities FROM tasks "
-            "WHERE title = ?",
-            ("Build something",),
-        ).fetchall()
-        assert len(rows) == 1, rows
-        stored = rows[0]["required_capabilities"]
-        assert stored is not None, "required_capabilities must be stored"
-        assert _json.loads(stored) == ["backend", "db"], stored
-    finally:
-        conn.close()
+        conn = get_db_connection()
+        try:
+            rows = conn.execute(
+                "SELECT task_id, required_capabilities FROM tasks "
+                "WHERE title = ?",
+                ("Build something",),
+            ).fetchall()
+            assert len(rows) == 1, rows
+            stored = rows[0]["required_capabilities"]
+            assert stored is not None, (
+                "required_capabilities must be stored as JSON, got NULL"
+            )
+            assert _json.loads(stored) == ["backend", "db"], stored
+        finally:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -407,45 +428,34 @@ async def test_assign_task_tool_normalizes_required_capabilities(
 
 
 @pytest.mark.asyncio
-async def test_create_agent_normalizes_capabilities(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reset_globals: None,
-) -> None:
-    project_dir = tmp_path / "wd"
-    project_dir.mkdir()
-    monkeypatch.setenv("MCP_PROJECT_DIR", str(project_dir))
+async def test_create_agent_normalizes_capabilities(tmp_path: Path) -> None:
+    """create_agent with capabilities=['BACKEND', 'db', 'Backend']
+    stores ['backend', 'db'] in the column. Uses the harness for the
+    same reason as the assign_task test above."""
+    from tests.harness import mcp_session
 
-    from agent_mcp.core import globals as g
-    from agent_mcp.db.schema import init_database
-    from agent_mcp.db.migrations_runner import run_migrations_upgrade
-    from agent_mcp.tools.admin_tools import create_agent_tool_impl
+    async with mcp_session(tmp_path) as admin:
+        await admin.call(
+            "create_agent",
+            {
+                "agent_id": "cap-test-agent",
+                "capabilities": ["BACKEND", "db", "Backend"],
+            },
+        )
+        from agent_mcp.db.connection import get_db_connection
 
-    init_database()
-    run_migrations_upgrade()
-
-    g.admin_token = "admin-tok-cv"
-
-    result = await create_agent_tool_impl(
-        {
-            "token": "admin-tok-cv",
-            "agent_id": "cap-test-agent",
-            "capabilities": ["BACKEND", "db", "Backend"],
-        }
-    )
-    text_blob = "\n".join(c.text for c in result)
-    assert "Error" not in text_blob, text_blob
-
-    from agent_mcp.db.connection import get_db_connection
-
-    conn = get_db_connection()
-    try:
-        row = conn.execute(
-            "SELECT capabilities FROM agents WHERE agent_id = ?",
-            ("cap-test-agent",),
-        ).fetchone()
-        assert row is not None
-        assert _json.loads(row["capabilities"]) == ["backend", "db"], row["capabilities"]
-    finally:
-        conn.close()
+        conn = get_db_connection()
+        try:
+            row = conn.execute(
+                "SELECT capabilities FROM agents WHERE agent_id = ?",
+                ("cap-test-agent",),
+            ).fetchone()
+            assert row is not None, "agent row missing"
+            assert _json.loads(row["capabilities"]) == ["backend", "db"], (
+                row["capabilities"]
+            )
+        finally:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------

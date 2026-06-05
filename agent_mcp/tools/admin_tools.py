@@ -198,7 +198,14 @@ async def create_agent_tool_impl(
         # Generate token and prepare data (main.py:1089-1092)
         new_agent_token = generate_token()
         created_at_iso = datetime.datetime.now().isoformat()
-        capabilities_json = json.dumps(capabilities or [])
+        # Event-coord PR-1: normalize capabilities once at write time
+        # (strip + lowercase + dedupe, preserve insertion order). All
+        # subsequent read paths can treat the stored JSON as canonical
+        # — no read-time normalization fallbacks.
+        from agent_mcp.utils.capability_normalization import normalize_capabilities
+
+        normalized_caps = normalize_capabilities(capabilities)
+        capabilities_json = json.dumps(normalized_caps)
         status = "created"  # Or "active" immediately? Original used "created".
 
         # Assign a color (main.py:1095-1097)
@@ -325,7 +332,7 @@ async def create_agent_tool_impl(
         # Update in-memory state (main.py:1126-1133)
         g.active_agents[new_agent_token] = {
             "agent_id": agent_id,
-            "capabilities": capabilities or [],
+            "capabilities": normalized_caps,
             "created_at": created_at_iso,
             "status": status,
             "current_task": assigned_tasks[0] if assigned_tasks else None,
@@ -339,7 +346,7 @@ async def create_agent_tool_impl(
             "create_agent",
             {
                 "agent_id": agent_id,
-                "capabilities": capabilities or [],
+                "capabilities": normalized_caps,
                 "working_directory": agent_working_dir_abs,
                 "assigned_color": agent_color,
                 "assigned_tasks": assigned_tasks,
