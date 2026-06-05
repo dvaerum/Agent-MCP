@@ -345,8 +345,12 @@ tmp/
 # Documentation drafts
 docs/TERMINAL_UI.md
 
-# Scripts in development
-scripts/
+# PR-W3 (ORM big-bang) ships scripts/generate_ts_types.py as the
+# deterministic TS-type generator that emits
+# agent_mcp/dashboard/lib/api-types.generated.ts from the Pydantic
+# mirrors in agent_mcp/db/pydantic_mirrors.py. The scripts/ folder
+# is therefore tracked. Untracked junk inside it should be added
+# explicitly here.
 !agent_mcp/dashboard/scripts/
 
 # Development folder

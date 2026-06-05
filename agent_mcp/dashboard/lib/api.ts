@@ -1,4 +1,20 @@
 // API client for Agent-MCP backend
+//
+// PR-W3 (ORM big-bang, v5.0.19): the canonical row shapes for every
+// persistent table live in `./api-types.generated.ts`, emitted by
+// `scripts/generate_ts_types.py` from the Pydantic mirrors in
+// `agent_mcp/db/pydantic_mirrors.py`. New dashboard code should
+// prefer those interfaces (suffixed `Mirror`) because they are
+// guaranteed to stay column-accurate with the ORM via the CI
+// invariant in tests/test_orm_is_source_of_truth.py.
+//
+// The hand-maintained `Agent` / `Task` / `Memory` etc interfaces
+// declared below are kept for back-compat. They add richer literal
+// unions (status: 'pending' | 'running' | ...) and structured array
+// types (capabilities: string[]) the bare DB column types can't
+// express. As callers migrate to the generated types, the manual
+// declarations here will get trimmed.
+export * from './api-types.generated'
 
 export interface Agent {
   agent_id: string
