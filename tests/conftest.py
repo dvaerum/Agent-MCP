@@ -57,6 +57,10 @@ def reset_globals() -> Iterator[None]:
     # event loop. asyncio.Event instances cannot be awaited across
     # loops; signal_for() lazily recreates as needed.
     g.agent_event_signals.clear()
+    # PR-2 event-coord: locks and queues are also per-test (locks bound
+    # to event loop; queues are transient by design).
+    g.agent_event_locks.clear()
+    g.agent_event_queues.clear()
     # Lifespan startup-complete sentinel: every test starts with a
     # fresh, cleared Event so we can detect a regression where
     # application_startup forgets to set it.
@@ -98,6 +102,8 @@ def reset_globals() -> Iterator[None]:
     _wq._global_write_queue = None
     _engine.reset_engine_cache()
     g.agent_event_signals.clear()
+    g.agent_event_locks.clear()
+    g.agent_event_queues.clear()
     g.reset_startup_complete_event()
 
 

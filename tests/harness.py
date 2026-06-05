@@ -161,6 +161,11 @@ def _snapshot_and_reset_globals(stack: ExitStack) -> None:
     # in a new loop ("Event is bound to a different event loop").
     # Clear unconditionally — `signal_for(agent_id)` recreates lazily.
     g.agent_event_signals.clear()
+    # PR-2 event-coord: per-agent serialization locks and out-of-band
+    # event queues. Locks share the event-loop binding concern with
+    # signals; queues are transient by design.
+    g.agent_event_locks.clear()
+    g.agent_event_queues.clear()
     # Same loop-binding concern applies to `startup_complete_event`;
     # rebuild it so the lifespan inside `mcp_session` signals on the
     # current loop and bg-task waiters can `await` without raising.
@@ -204,6 +209,8 @@ def _snapshot_and_reset_globals(stack: ExitStack) -> None:
         # Drop any signals created during this test so the next test
         # (different event loop) starts with a fresh registry.
         g.agent_event_signals.clear()
+        g.agent_event_locks.clear()
+        g.agent_event_queues.clear()
         g.reset_startup_complete_event()
 
     stack.callback(_restore)
