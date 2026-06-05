@@ -23,22 +23,6 @@ import pytest
 pytestmark = pytest.mark.asyncio
 
 
-@pytest.fixture(autouse=True)
-def _inline_write_queue(monkeypatch: pytest.MonkeyPatch):
-    """Same shim as test_event_coord_schema.py: Mode 0 unassigned-task
-    creation routes its INSERT through `execute_db_write` (per-loop
-    asyncio queue) which can deadlock when invoked from an asyncio
-    test. Run the operation inline so the test surfaces the real
-    outcome instead of hanging."""
-
-    async def _inline(operation):
-        return await operation()
-
-    monkeypatch.setattr(
-        "agent_mcp.tools.task_tools.execute_db_write", _inline
-    )
-
-
 def _content_text(blocks) -> str:
     assert blocks, "tool returned no content blocks"
     return blocks[0].text
