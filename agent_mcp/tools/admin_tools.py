@@ -1397,6 +1397,7 @@ def register_admin_tools():
             "additionalProperties": False,
         },
         implementation=create_agent_tool_impl,
+        visibility="admin",
     )
 
     register_tool(
@@ -1411,6 +1412,7 @@ def register_admin_tools():
             "additionalProperties": False,
         },
         implementation=view_status_tool_impl,
+        visibility="admin",
     )
 
     register_tool(
@@ -1432,6 +1434,7 @@ def register_admin_tools():
             "additionalProperties": False,
         },
         implementation=terminate_agent_tool_impl,
+        visibility="admin",
     )
 
     register_tool(
@@ -1464,6 +1467,7 @@ def register_admin_tools():
             "additionalProperties": False,
         },
         implementation=view_audit_log_tool_impl,
+        visibility="admin",
     )
 
     register_tool(
@@ -1532,6 +1536,7 @@ def register_admin_tools():
             "additionalProperties": False,
         },
         implementation=get_agent_tokens_tool_impl,
+        visibility="admin",
     )
 
     register_tool(
@@ -1567,6 +1572,7 @@ def register_admin_tools():
             "additionalProperties": False,
         },
         implementation=relaunch_agent_tool_impl,
+        visibility="admin",
     )
 
 

@@ -316,6 +316,12 @@ def register_file_metadata_tools():
             "additionalProperties": False,
         },
         implementation=update_file_metadata_tool_impl,
+        # @requires("admin") on the impl gates call-time; the old
+        # hand-maintained TOOL_ACCESS classified this "any" (a
+        # pre-existing visibility quirk: workers saw it in tools/list
+        # but the call always failed). PR-W1c aligns visibility with
+        # call-time enforcement — strictly an improvement.
+        visibility="admin",
     )
 
 
