@@ -164,6 +164,13 @@ pkgs.testers.nixosTest {
     db_path = "/home/testuser/projects/coord-test/.agent/mcp_state.db"
     machine.wait_until_succeeds(f"test -f {db_path}", timeout=60)
 
+    # Stop the backend before SQL inserts: the backend holds the
+    # sqlite file with WAL mode and SQLITE_BUSY errors otherwise.
+    # The wait_until_succeeds restart-trigger curl earlier in the
+    # test confirms it boots cleanly; we restart it again after the
+    # SQL seed completes.
+    machine.succeed("systemctl stop agent-mcp@coord-test.service")
+
     # ── Provision two agents directly via SQL ────────────────────
     # The harness pattern from existing VM tests: skip the
     # create_agent tool and INSERT directly so we control both the
