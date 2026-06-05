@@ -26,13 +26,10 @@ neither is part of the ORM cut-over.
 from __future__ import annotations
 
 import importlib
-import inspect
 import re
 import subprocess
 import sys
 from pathlib import Path
-
-import pytest
 
 
 # Tables expected to live under `agent_mcp.db.models` after PR-W3.
