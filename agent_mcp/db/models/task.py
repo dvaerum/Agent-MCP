@@ -58,6 +58,13 @@ class Task(Base):
         Text, nullable=True,
     )
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Event-coord PR-1: JSON list of lowercase capability labels. NULL
+    # ⇒ "anyone can claim" (matches the empty-set broadcast semantics
+    # locked in the plan). Normalized at write time via
+    # `agent_mcp.utils.capability_normalization.normalize_capabilities`.
+    required_capabilities: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+    )
 
     def __repr__(self) -> str:  # pragma: no cover — debug aid
         return f"<Task task_id={self.task_id!r} status={self.status!r}>"

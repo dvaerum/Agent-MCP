@@ -11,6 +11,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
+import { Switch } from "@/components/ui/switch"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
@@ -571,6 +572,21 @@ const normalizeCapabilities = (caps: unknown): string[] => {
   return []
 }
 
+// Event-coord PR-1: SQLite BOOLEAN columns arrive as JS number (0/1)
+// after the JSON round-trip; the JSON serializer never coerces them
+// back to true/false. Default to TRUE when missing — matches the
+// migration's `DEFAULT 1` backfill semantics.
+const coerceAutoEventLoop = (raw: unknown): boolean => {
+  if (typeof raw === 'boolean') return raw
+  if (typeof raw === 'number') return raw !== 0
+  if (typeof raw === 'string') {
+    const s = raw.trim().toLowerCase()
+    if (s === 'true' || s === '1') return true
+    if (s === 'false' || s === '0') return false
+  }
+  return true
+}
+
 // Terminate confirmation. Soft-delete only — the row stays so the
 // admin can hit Restore / Purge after.
 const TerminateAgentDialog = ({
@@ -657,8 +673,34 @@ const EditAgentDialog = ({
   const [color, setColor] = useState('')
   const [workingDirectory, setWorkingDirectory] = useState('')
   const [aoeSessionId, setAoeSessionId] = useState('')
+  // Event-coord PR-1: per-agent wake-loop toggle. Default true matches
+  // the migration's DEFAULT 1 backfill.
+  const [autoEventLoop, setAutoEventLoop] = useState(true)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  // Read the global event-loop flag from project_context so we can
+  // disable + annotate the per-agent toggle when global is OFF (per
+  // the locked-decisions table in the event-coord plan).
+  const dataAll = useDataStore((s) => s.data)
+  const globalEventLoop = React.useMemo<boolean>(() => {
+    const row = dataAll?.context?.find(
+      (c: any) => c.context_key === 'config_auto_event_loop_global'
+    )
+    if (!row) return true  // unset ⇒ default ON
+    const raw = (row as any).value
+    if (typeof raw === 'boolean') return raw
+    if (typeof raw === 'string') {
+      const s = raw.trim().toLowerCase()
+      if (s === 'true') return true
+      if (s === 'false') return false
+      try {
+        const parsed = JSON.parse(s)
+        if (typeof parsed === 'boolean') return parsed
+      } catch { /* fall through */ }
+    }
+    return true
+  }, [dataAll])
 
   // Re-seed form whenever the dialog opens for a *different* agent.
   // With live-lookup useDialog (Candidate D, 2026-06-02) the agent
@@ -672,6 +714,11 @@ const EditAgentDialog = ({
     setColor(agent.color || '')
     setWorkingDirectory(agent.working_directory || '')
     setAoeSessionId(agent.aoe_session_id || '')
+    // Event-coord PR-1: SQLite stores BOOLEAN as INTEGER 0/1, which
+    // arrives as a JS number after the JSON round-trip. Coerce to
+    // strict boolean and default to TRUE when the field is missing
+    // (legacy backends).
+    setAutoEventLoop(coerceAutoEventLoop(agent.auto_event_loop))
     setError(null)
     // Intentionally key on agentId, not the agent object — see above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -687,6 +734,7 @@ const EditAgentDialog = ({
       color?: string
       working_directory?: string
       aoe_session_id?: string
+      auto_event_loop?: boolean
     } = {}
     const parsedCaps = capabilities
       .split(',')
@@ -711,6 +759,12 @@ const EditAgentDialog = ({
         return
       }
       updates.aoe_session_id = aoeTrimmed
+    }
+    // Event-coord PR-1: only send if changed from the agent's current
+    // value (or from the default TRUE when the field is absent).
+    const currentAutoEventLoop = coerceAutoEventLoop(agent.auto_event_loop)
+    if (autoEventLoop !== currentAutoEventLoop) {
+      updates.auto_event_loop = autoEventLoop
     }
     if (Object.keys(updates).length === 0) {
       onOpenChange(false)
@@ -796,6 +850,44 @@ const EditAgentDialog = ({
               Binds this agent to a specific Agents-of-Empires tmux session for the
               notification side-channel. Leave empty to fall back to title-match.
             </p>
+          </div>
+          {/*
+            Event-coord PR-1: per-agent wake-loop toggle. Default TRUE.
+            Disabled (greyed) when the global flag is OFF — the
+            wake-loop bootstrap requires BOTH flags ON per the
+            locked-decisions table in the event-coord plan. Note text
+            explicitly directs the operator to Settings to flip the
+            global flag.
+          */}
+          <div className="rounded-md border border-border p-3 space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <div className="space-y-0.5">
+                <label
+                  htmlFor="agent-edit-auto-event-loop"
+                  className="text-xs font-medium text-foreground uppercase tracking-wider"
+                >
+                  Auto event-loop
+                </label>
+                <p className="text-[11px] text-muted-foreground leading-snug">
+                  When on (default), this agent receives the wake-loop
+                  bootstrap and auto-calls wait_for_events on connect.
+                  Both this toggle and the global Settings toggle must
+                  be on.
+                </p>
+              </div>
+              <Switch
+                id="agent-edit-auto-event-loop"
+                checked={autoEventLoop}
+                onCheckedChange={setAutoEventLoop}
+                disabled={!globalEventLoop || busy}
+              />
+            </div>
+            {!globalEventLoop && (
+              <p className="text-[11px] text-warning">
+                Global event-loop is disabled — toggle it on in
+                Settings to enable per-agent control.
+              </p>
+            )}
           </div>
           {error && <div className="text-sm text-destructive">{error}</div>}
           <DialogFooter className="gap-2">

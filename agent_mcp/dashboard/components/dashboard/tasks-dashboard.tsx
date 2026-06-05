@@ -392,21 +392,44 @@ const CreateTaskModal = React.memo(({ onCreateTask }: { onCreateTask: (data: any
     title: '',
     description: '',
     priority: 'medium' as Task['priority'],
-    assigned_to: ''
+    assigned_to: '',
+    // Event-coord PR-1: free-text comma-separated capability labels.
+    // Server normalizes at write time (lowercase + strip + dedupe).
+    required_capabilities: '',
   })
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     if (!formData.title.trim()) return
 
+    // Event-coord PR-1: split / strip / dedupe locally too so the
+    // create-task POST shape matches the assign_task tool's
+    // expectations (array of strings). Server re-normalizes — this is
+    // belt-and-suspenders so a stray blank doesn't propagate.
+    const capsParsed = formData.required_capabilities
+      .split(',')
+      .map((c) => c.trim().toLowerCase())
+      .filter((c) => c.length > 0)
+    const capsDeduped: string[] = []
+    for (const c of capsParsed) {
+      if (!capsDeduped.includes(c)) capsDeduped.push(c)
+    }
+
     onCreateTask({
       title: formData.title.trim(),
       description: formData.description.trim() || undefined,
       priority: formData.priority,
-      assigned_to: formData.assigned_to.trim() || undefined
+      assigned_to: formData.assigned_to.trim() || undefined,
+      required_capabilities: capsDeduped.length > 0 ? capsDeduped : undefined,
     })
 
-    setFormData({ title: '', description: '', priority: 'medium', assigned_to: '' })
+    setFormData({
+      title: '',
+      description: '',
+      priority: 'medium',
+      assigned_to: '',
+      required_capabilities: '',
+    })
     setOpen(false)
   }
 
@@ -476,6 +499,30 @@ const CreateTaskModal = React.memo(({ onCreateTask }: { onCreateTask: (data: any
                 className="bg-background border-border text-foreground font-mono text-sm"
               />
             </div>
+          </div>
+          {/*
+            Event-coord PR-1: required capability tags. Comma-separated;
+            lowercase-normalized server-side (and locally on submit).
+            When the unassigned-task routing ships in PR-2, an agent
+            must satisfy `agent.capabilities ⊇ task.required_capabilities`
+            to receive the `unassigned_task_appeared` wake event.
+            Empty / blank ⇒ no capability gate (broadcasts to all idle
+            agents).
+          */}
+          <div>
+            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
+              Required capabilities
+            </label>
+            <Input
+              value={formData.required_capabilities}
+              onChange={(e) => setFormData(prev => ({ ...prev, required_capabilities: e.target.value }))}
+              placeholder="backend, db"
+              className="bg-background border-border text-foreground font-mono text-sm"
+            />
+            <p className="text-[10px] text-muted-foreground mt-1">
+              Comma-separated, lowercase on submit. Leave blank to
+              broadcast to every idle agent (PR-2 wake-loop routing).
+            </p>
           </div>
           <DialogFooter className="gap-2">
             <Button type="button" variant="outline" onClick={() => setOpen(false)} size="sm">

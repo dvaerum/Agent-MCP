@@ -172,7 +172,9 @@ def init_database() -> None:
                 color TEXT,           -- For dashboard visualization
                 terminated_at TEXT,   -- Timestamp of termination
                 updated_at TEXT,      -- Timestamp of last update
-                aoe_session_id TEXT   -- 16-hex AoE session id for notification side-channel (nullable)
+                aoe_session_id TEXT,  -- 16-hex AoE session id for notification side-channel (nullable)
+                auto_event_loop BOOLEAN NOT NULL DEFAULT 1, -- per-agent event-loop toggle (PR-1 event-coord)
+                last_event_seen_at TEXT -- ISO cursor for fetch_events_since (PR-2 event-coord)
             )
         """
         )
@@ -194,7 +196,8 @@ def init_database() -> None:
                 parent_task TEXT,         -- Task ID of parent task or None
                 child_tasks TEXT,         -- JSON List of child Task IDs
                 depends_on_tasks TEXT,    -- JSON List of Task IDs this task depends on
-                notes TEXT                -- JSON List of note objects: [{"timestamp": "", "author": "", "content": ""}]
+                notes TEXT,               -- JSON List of note objects: [{"timestamp": "", "author": "", "content": ""}]
+                required_capabilities TEXT -- JSON List of lowercase capability labels (PR-1 event-coord)
             )
         """
         )

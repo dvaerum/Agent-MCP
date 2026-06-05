@@ -174,11 +174,20 @@ def test_migration_0009_copies_legacy_notes_to_side_table(tmp_path) -> None:
         }
         assert "notes" in cols
 
-        # alembic_version advanced.
+        # alembic_version advanced past 0009. Originally pinned to
+        # "0009_task_notes_side_table" (the head at the time this test
+        # was written); now that event-coord PR-1's migration 0010
+        # sits downstream, `alembic upgrade head` advances past 0009 —
+        # so accept any 00NN_* version where NN >= 9 (it still proves
+        # the 0009 step ran, since `head` walks the chain through it).
         v = conn.execute(
             "SELECT version_num FROM alembic_version"
         ).fetchone()[0]
-        assert v == "0009_task_notes_side_table"
+        # Lexicographic 0009 <= v works for the zero-padded ID prefixes
+        # the project uses (0001 .. 0010 .. and onward).
+        assert v >= "0009_task_notes_side_table", (
+            f"alembic_version did not advance past 0009; got {v!r}"
+        )
     finally:
         conn.close()
 

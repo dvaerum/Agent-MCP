@@ -101,6 +101,33 @@ export function TaskDetailsDialog({ task, open, onOpenChange }: TaskDetailsDialo
               </>
             )}
 
+            {/* Required capabilities (event-coord PR-1). The column is
+                stored as JSON-encoded text on the server; parseJsonField
+                tolerates both shapes. Render as lowercase chips so an
+                admin can verify the normalization landed. */}
+            {(() => {
+              const caps = parseJsonField(task.required_capabilities) as string[]
+              return caps.length > 0 && (
+                <>
+                  <div>
+                    <h4 className="text-sm font-semibold mb-2">Required capabilities</h4>
+                    <div className="flex flex-wrap gap-1.5">
+                      {caps.map((cap, idx) => (
+                        <Badge
+                          key={`${cap}-${idx}`}
+                          variant="outline"
+                          className="text-[10px] font-mono lowercase"
+                        >
+                          {String(cap).toLowerCase()}
+                        </Badge>
+                      ))}
+                    </div>
+                  </div>
+                  <Separator />
+                </>
+              )
+            })()}
+
             {/* Notes */}
             {(() => {
               const notes = parseJsonField(task.notes)
