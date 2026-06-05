@@ -350,41 +350,40 @@ def _bearer_has_wake_loop_enabled() -> bool:
 
 
 def _patched_create_initialization_options(self, *args, **kwargs):
-    """Wrap ``Server.create_initialization_options`` to inject:
-
-      1. The alias deprecation warning into ``instructions`` when the
-         request arrived via an alias URL (Phase 1c).
-      2. The wake-loop bootstrap text when the bearer's agent has both
-         the global and per-agent ``auto_event_loop`` flags ON
-         (PR-2 event-coord).
+    """Wrap ``Server.create_initialization_options`` so registered
+    ``InstructionsContributor`` callables can append text onto the
+    ``instructions`` field of the MCP ``initialize`` response.
 
     Called once per request in stateless mode (the SDK's
     ``StreamableHTTPSessionManager._handle_stateless_request`` spawns
     a fresh server task per request, and that task calls this method
-    immediately). We read ``request_alias_info`` and the bearer from
-    the inherited Context — set by ``AuthHeaderMiddleware`` on the
-    incoming request — and compose the additions onto whatever the
-    underlying server's static instructions were.
+    immediately). We assemble an ``InitContext`` from the request-
+    scoped ContextVars (``request_alias_info``, ``request_auth_token``)
+    — set by ``AuthHeaderMiddleware`` on the incoming request — and
+    hand it to ``render_all`` which walks the registry.
 
-    Both additions can apply to the same response. Order is alias
-    warning first, then wake-loop bootstrap — alias warnings are about
-    the URL the client is using right now and should be the first thing
-    the agent reads; wake-loop is operational guidance that applies
-    every session.
+    Pre-PR-W1b this method inlined both the alias-warning and wake-
+    loop logic; the registry in ``instructions_contributors.py`` now
+    owns the chain, so adding a third contributor is one
+    ``register(...)`` call instead of a reach-in here. The wire
+    output is byte-identical: same contributors, same gating, same
+    text, same ordering.
     """
-    base = _ORIG_CREATE_INIT_OPTIONS(self, *args, **kwargs)
-    extra: list[str] = []
-    alias_info = request_alias_info.get()
-    if alias_info is not None:
-        alias_name, expires_at = alias_info
-        extra.append(_build_alias_warning(alias_name, expires_at))
-    if _bearer_has_wake_loop_enabled():
-        from .event_loop_instructions import WAKE_LOOP_INSTRUCTIONS
+    from .instructions_contributors import InitContext, render_all
 
-        extra.append(WAKE_LOOP_INSTRUCTIONS)
+    base = _ORIG_CREATE_INIT_OPTIONS(self, *args, **kwargs)
+    try:
+        bearer = request_auth_token.get()
+    except LookupError:
+        bearer = None
+    ctx = InitContext(
+        bearer=bearer or None,
+        alias_info=request_alias_info.get(),
+    )
+    extra = render_all(ctx)
     if not extra:
         return base
-    base.instructions = (base.instructions or "") + "".join(extra)
+    base.instructions = (base.instructions or "") + extra
     return base
 
 
