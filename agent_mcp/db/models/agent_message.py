@@ -32,7 +32,7 @@ Column rationale:
 
 from __future__ import annotations
 
-from sqlalchemy import Boolean, Text
+from sqlalchemy import Boolean, Index, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ..engine import Base
@@ -45,11 +45,43 @@ class AgentMessage(Base):
     sender_id: Mapped[str] = mapped_column(Text, nullable=False)
     recipient_id: Mapped[str] = mapped_column(Text, nullable=False)
     message_content: Mapped[str] = mapped_column(Text, nullable=False)
-    message_type: Mapped[str] = mapped_column(Text, nullable=False)
-    priority: Mapped[str] = mapped_column(Text, nullable=False)
+    message_type: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'text'"),
+    )
+    priority: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'normal'"),
+    )
     timestamp: Mapped[str] = mapped_column(Text, nullable=False)
-    delivered: Mapped[bool] = mapped_column(Boolean, nullable=False)
-    read: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    delivered: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("0"),
+    )
+    read: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("0"),
+    )
+
+    # PR-W3 (ORM big-bang): these four indexes were previously
+    # only declared in init_database()'s raw SQL. Moving them onto
+    # the ORM model means Base.metadata.create_all() reproduces the
+    # full canonical index set for a fresh DB.
+    __table_args__ = (
+        Index(
+            "idx_agent_messages_recipient_timestamp",
+            "recipient_id",
+            "timestamp",
+        ),
+        Index(
+            "idx_agent_messages_sender_timestamp",
+            "sender_id",
+            "timestamp",
+        ),
+        Index(
+            "idx_agent_messages_unread",
+            "recipient_id",
+            "read",
+            "timestamp",
+        ),
+        Index("idx_agent_messages_delivered", "delivered"),
+    )
 
     def __repr__(self) -> str:  # pragma: no cover — debug aid
         return (

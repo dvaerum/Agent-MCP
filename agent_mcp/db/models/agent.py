@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import Boolean, Text
+from sqlalchemy import Boolean, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ..engine import Base
@@ -58,7 +58,7 @@ class Agent(Base):
     # disables the wake-loop bootstrap shipped in PR-2). NOT NULL with
     # DEFAULT 1 in DDL.
     auto_event_loop: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=True, server_default="1",
+        Boolean, nullable=False, default=True, server_default=text("1"),
     )
     # Event-coord PR-1: cursor for fetch_events_since (PR-2). NULL ⇒
     # "from the beginning".

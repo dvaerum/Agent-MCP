@@ -36,7 +36,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import Text
+from sqlalchemy import Index, Text
 from sqlalchemy.orm import Mapped, foreign, mapped_column, relationship
 
 from ..engine import Base
@@ -52,6 +52,20 @@ class McpSession(Base):
     last_seen_at: Mapped[str] = mapped_column(Text, nullable=False)
     bearer_token_hash: Mapped[str] = mapped_column(Text, nullable=False)
     alias_used: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # PR-W3 (ORM big-bang): the three indexes that mirror the raw
+    # SQL in init_database() / migrations 0004/0005/0006. Keeping
+    # them on the ORM model means create_all() emits the full
+    # canonical index set on a fresh DB.
+    __table_args__ = (
+        Index("idx_mcp_sessions_agent", "agent_id"),
+        Index("idx_mcp_sessions_last_seen", "last_seen_at"),
+        Index(
+            "idx_mcp_sessions_alias_used",
+            "alias_used",
+            "last_seen_at",
+        ),
+    )
 
     # Many-to-one navigation to the parent Agent row. The DDL-level FK
     # was added by migration 0008 (PR-G1); we declare the join here

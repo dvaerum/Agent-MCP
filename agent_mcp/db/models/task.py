@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import Text
+from sqlalchemy import Index, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ..engine import Base
@@ -64,6 +64,19 @@ class Task(Base):
     # `agent_mcp.utils.capability_normalization.normalize_capabilities`.
     required_capabilities: Mapped[Optional[str]] = mapped_column(
         Text, nullable=True,
+    )
+
+    # PR-W3 (ORM big-bang): the three hot-path indexes (composite
+    # for wait_for_events, single-column for status/priority filters)
+    # were previously only in init_database()'s raw SQL.
+    __table_args__ = (
+        Index(
+            "idx_tasks_assigned_to_updated_at",
+            "assigned_to",
+            "updated_at",
+        ),
+        Index("idx_tasks_status", "status"),
+        Index("idx_tasks_priority", "priority"),
     )
 
     def __repr__(self) -> str:  # pragma: no cover — debug aid

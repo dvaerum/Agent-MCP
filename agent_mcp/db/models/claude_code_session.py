@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import Index, Integer, Text
+from sqlalchemy import Index, Integer, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ..engine import Base
@@ -51,7 +51,7 @@ class ClaudeCodeSession(Base):
     )
     agent_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     status: Mapped[Optional[str]] = mapped_column(
-        Text, nullable=True, server_default="detected",
+        Text, nullable=True, server_default=text("'detected'"),
     )
     git_commits: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     metadata_: Mapped[Optional[str]] = mapped_column(
