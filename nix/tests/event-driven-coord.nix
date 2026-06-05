@@ -68,6 +68,11 @@ pkgs.testers.nixosTest {
           # `wait_for_events(timeout=10)` calls in the test don't
           # blow past the polkit-managed unit's grace period.
           "AGENT_MCP_EVENT_WAIT_TIMEOUT=60"
+          # Launcher / router share this for socket path discovery.
+          # In the VM test we use the systemd RuntimeDirectory at
+          # /run/agent-mcp (created with 0700 perms below) instead
+          # of XDG_RUNTIME_DIR which testuser can't write to.
+          "AGENT_MCP_SOCK_DIR=/run/agent-mcp"
         ];
         RuntimeDirectory = "agent-mcp/%i";
         RuntimeDirectoryMode = "0700";
