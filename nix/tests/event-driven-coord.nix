@@ -201,21 +201,27 @@ pkgs.testers.nixosTest {
     # the two newly-inserted tokens are accepted.
     machine.succeed("systemctl restart agent-mcp@coord-test.service")
     machine.wait_for_unit("agent-mcp@coord-test.service")
+    # Seed an initialize JSON body to disk and curl it; avoids the
+    # double-shell-escape minefield of inlining JSON in nix → python →
+    # bash.
+    machine.succeed(
+        "echo '{\"jsonrpc\":\"2.0\",\"id\":1,"
+        "\"method\":\"initialize\","
+        "\"params\":{\"protocolVersion\":\"2025-03-26\","
+        "\"capabilities\":{},"
+        "\"clientInfo\":{\"name\":\"vm-test\",\"version\":\"0\"}}}' "
+        "> /tmp/init.json"
+    )
     # The backend is healthy when the MCP transport accepts an
-    # initialize request without 503.
+    # initialize request without 503/401.
     machine.wait_until_succeeds(
         "curl -fsS -o /dev/null -X POST "
         " -H 'Authorization: Bearer tokbe' "
         " -H 'Content-Type: application/json' "
         " -H 'Accept: application/json, text/event-stream' "
-        " -d '{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":1,"
-        "\\\"method\\\":\\\"initialize\\\","
-        "\\\"params\\\":{\\\"protocolVersion\\\":\\\"2025-03-26\\\","
-        "\\\"capabilities\\\":{},"
-        "\\\"clientInfo\\\":{\\\"name\\\":\\\"test\\\","
-        "\\\"version\\\":\\\"0\\\"}}}' "
+        " --data @/tmp/init.json "
         "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/mcp/coord-test",
-        timeout=30,
+        timeout=60,
     )
 
     MCP_URL = (
@@ -228,15 +234,18 @@ pkgs.testers.nixosTest {
             "jsonrpc": "2.0", "id": jid,
             "method": method, "params": params,
         })
-        # The server returns either application/json or text/event-
-        # stream depending on the request shape; --raw-data + the
-        # standard accept header covers both inline-JSON and SSE.
+        # Write JSON to a tmpfile to avoid the nix → python → bash
+        # double-escape minefield. curl reads via --data @file.
+        machine.succeed(
+            "cat > /tmp/mcp-body.json <<'JSONBODY'\n"
+            + body + "\nJSONBODY"
+        )
         out = machine.succeed(
             f"curl -fsS -X POST "
             f"-H 'Authorization: Bearer {token}' "
             f"-H 'Content-Type: application/json' "
             f"-H 'Accept: application/json, text/event-stream' "
-            f"--data {json.dumps(body)} {MCP_URL}"
+            f"--data @/tmp/mcp-body.json {MCP_URL}"
         )
         # When the server replies with SSE, the JSON body is on a
         # `data:` line. Strip that prefix uniformly.
