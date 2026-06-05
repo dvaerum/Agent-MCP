@@ -573,6 +573,26 @@ async def _update_single_task(
             if new_depends_on_tasks is not None:
                 g.tasks[task_id]["depends_on_tasks"] = new_depends_on_tasks
 
+    # Clear agents.current_task when the task it points at reaches a
+    # terminal status. Before this guard, ios-app-dev (washing-brothers
+    # production DB, 2026-06-04) had `agents.current_task` still
+    # pointing at a long-completed task, which leaked into every
+    # consumer of /api/all-data and the dashboard's "current task"
+    # indicator. Scoped to `WHERE current_task = ?` so unrelated
+    # agents (e.g. bob's row) are left alone.
+    if new_status in ["completed", "cancelled", "failed"]:
+        cursor.execute(
+            "UPDATE agents SET current_task = NULL, updated_at = ? "
+            "WHERE current_task = ?",
+            (updated_at_iso, task_id),
+        )
+        # Mirror into the in-memory active-agents cache so the next
+        # tool-call sees the cleared state without waiting for the
+        # next lifespan reload.
+        for _entry in g.active_agents.values():
+            if _entry.get("current_task") == task_id:
+                _entry["current_task"] = None
+
     # Handle parent task notifications
     if new_status in ["completed", "cancelled", "failed"] and task_current_data.get(
         "parent_task"
@@ -3534,6 +3554,20 @@ async def bulk_task_operations_tool_impl(
                         g.tasks[task_id]["status"] = new_status
                         g.tasks[task_id]["updated_at"] = updated_at_iso
                         g.tasks[task_id]["notes"] = current_notes
+
+                    # Mirror the terminal-status agents.current_task
+                    # clear that `_update_single_task` does on the
+                    # non-bulk path, so the bulk surface doesn't
+                    # leak the same stale-current_task bug.
+                    if new_status in ["completed", "cancelled", "failed"]:
+                        cursor.execute(
+                            "UPDATE agents SET current_task = NULL, "
+                            "updated_at = ? WHERE current_task = ?",
+                            (updated_at_iso, task_id),
+                        )
+                        for _entry in g.active_agents.values():
+                            if _entry.get("current_task") == task_id:
+                                _entry["current_task"] = None
 
                     results.append(
                         f"Operation {i+1}: Task '{task_id}' status updated to '{new_status}'"
