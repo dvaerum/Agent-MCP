@@ -1,31 +1,49 @@
 # Agent-MCP/agent_mcp/db/models/__init__.py
 """SQLAlchemy ORM models for agent-mcp.
 
-Phase 7a starts with `ProjectContext` only; subsequent phases
-(7g–7m per the roadmap) will add the remaining tables one by one.
-Until then, the raw-SQL surface in `agent_mcp.db.connection` keeps
-serving the unmigrated tables.
+Post PR-W3 (ORM big-bang) every persistent table in the project DB
+has a model here, with two exceptions called out explicitly:
+
+* `rag_embeddings` — sqlite-vec `vec0` virtual table; ORM/DDL via
+  `init_database()` only.
+* `alembic_version` — managed by Alembic itself.
+
+Importing this module registers every model class against the shared
+`Base.metadata`, which is what `init_database()` and the Alembic
+env consult to emit DDL.
 
 Adding a new model:
 
-1. Drop a file in this package (e.g. `agents.py`).
+1. Drop a file in this package (e.g. `widgets.py`).
 2. Subclass `agent_mcp.db.engine.Base`.
-3. Re-export it here so `from agent_mcp.db.models import Foo` works.
-4. Generate an Alembic revision under `migrations/versions/`.
+3. Re-export it here so `from agent_mcp.db.models import Widget`
+   works and the metadata picks it up at import time.
+4. Add a Pydantic mirror in `agent_mcp.db.pydantic_mirrors`.
+5. Generate an Alembic revision under `migrations/versions/`.
 """
 
 from .agent import Agent
+from .agent_action import AgentAction
 from .agent_message import AgentMessage
+from .claude_code_session import ClaudeCodeSession
+from .file_metadata import FileMetadata
 from .mcp_session import McpSession
 from .project_context import ProjectContext
+from .rag_chunk import RagChunk
+from .rag_meta import RagMeta
 from .task import Task
 from .task_note import TaskNote
 
 __all__ = [
     "Agent",
+    "AgentAction",
     "AgentMessage",
+    "ClaudeCodeSession",
+    "FileMetadata",
     "McpSession",
     "ProjectContext",
+    "RagChunk",
+    "RagMeta",
     "Task",
     "TaskNote",
 ]
