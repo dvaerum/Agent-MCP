@@ -217,47 +217,34 @@ def signal_for(agent_id: str) -> asyncio.Event:
 def notify_agent_inbox(agent_id: str) -> None:
     """Wake waiters AND fan out resources/updated to subscribed sessions.
 
-    Single call site for the "new event for this agent" trigger. Two
-    sinks:
-
-    1. ``signal_for(agent_id).set()`` - wakes any in-process
-       ``wait_for_events`` tool call (POST /mcp blocking on the Event).
-       This is the long-poll path workers rely on today.
-
-    2. ``session_registry.fanout_to_agent`` - enqueues
-       ``notifications/resources/updated`` on every GET /mcp stream
-       registered for the agent. The stream-side draining loop ships
-       these to the wire (Phase: transport-wiring); until that lands
-       the queue accumulates and the in-process signal still works,
-       so worker UX is unchanged.
+    Since PR-W2b (v5.0.17) this is a one-line shim over the EventBus.
+    The bus walks its adapter registry — by default LongPollSignal
+    (wakes ``wait_for_events`` via ``signal_for``), StreamingQueue
+    (pushes ``notifications/resources/updated`` to GET /mcp sessions
+    via ``session_registry.fanout_to_agent``), and AuditLog (env-gated
+    DEBUG log). New sinks plug in by calling ``event_bus.register``
+    without touching writers.
 
     Writers (`send_agent_message_tool_impl`, broadcast,
     `assign_task_*`, `update_task_status`) call this exactly once,
     AFTER commit, so the waiter / subscriber's re-query sees the new
     row.
 
-    Wrapped in broad try/except because notification side-effects must
-    never crash the tool that called the writer - the source-of-truth
-    write is already committed.
+    Signature kept unchanged for backwards compatibility — every
+    existing call site (5 sites across ``agent_mcp/tools/``) continues
+    to work without edits. Callsite migrations to
+    ``event_bus.notify(...)`` directly land in Wave-2c or a follow-up.
+
+    The bus catches per-adapter exceptions internally, so this
+    function inherits the "notification side-effects can never crash
+    the writer" contract without an extra try/except here.
     """
-    try:
-        signal_for(agent_id).set()
-    except Exception:  # pragma: no cover - defensive
-        pass
+    # Lazy import to avoid a circular dependency at module load
+    # (event_bus's default StreamingQueueAdapter imports
+    # session_registry, which transitively imports state).
+    from . import event_bus
 
-    try:
-        # Lazy import to avoid a circular dependency at module load
-        # (session_registry -> db.connection -> core.config).
-        from . import session_registry
-
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "notifications/resources/updated",
-            "params": {"uri": f"agent-mcp://inbox/{agent_id}"},
-        }
-        session_registry.fanout_to_agent(agent_id, payload)
-    except Exception:  # pragma: no cover - defensive
-        pass
+    event_bus.notify(agent_id, "agent_inbox", None)
 
 
 def lock_for(agent_id: str) -> asyncio.Lock:
@@ -324,6 +311,15 @@ def notify_unassigned_task_appeared(
     target agent's queue + sets their signal so any in-flight
     ``wait_for_events`` wakes immediately.
 
+    Since PR-W2b (v5.0.17) the per-agent wake is routed through the
+    EventBus: this function does the DB capability-matching and then
+    calls ``event_bus.notify(agent_id, "unassigned_task_appeared",
+    payload)`` for each matched agent. The default
+    ``LongPollSignalAdapter`` handles the legacy ``push_event`` + signal
+    set so ``wait_for_events`` keeps draining synthetic events; the
+    ``StreamingQueueAdapter`` additionally publishes the event to GET
+    /mcp subscribers.
+
     Wrapped in broad try/except so notification side-effects can never
     poison the source write (the unassigned task is already persisted
     by the time we're called).
@@ -332,6 +328,7 @@ def notify_unassigned_task_appeared(
         # Lazy import to avoid circular dependency.
         from ..db.connection import get_db_connection
         from ..utils.capability_normalization import normalize_capabilities
+        from . import event_bus
         import datetime as _dt
         import json as _json
 
@@ -364,9 +361,17 @@ def notify_unassigned_task_appeared(
         finally:
             conn.close()
 
+        # ``ref_id`` and ``timestamp`` ride on the payload so the
+        # LongPollSignalAdapter can reconstruct the legacy
+        # ``{"type", "ref_id", "timestamp", "payload"}`` event shape
+        # that ``wait_for_events`` already drains from
+        # ``agent_event_queues``. The bus contract (agent_id,
+        # event_type, payload) intentionally stays flat — adapters
+        # pull the meta out of ``payload`` when they need it.
         timestamp = _dt.datetime.now().isoformat()
-        ref_id = task_row["task_id"]
         payload = {
+            "ref_id": task_row["task_id"],
+            "timestamp": timestamp,
             "task_id": task_id,
             "title": task_row["title"],
             "priority": task_row["priority"],
@@ -394,17 +399,7 @@ def notify_unassigned_task_appeared(
             if not required_set.issubset(agent_caps):
                 continue
 
-            event = {
-                "type": "unassigned_task_appeared",
-                "ref_id": ref_id,
-                "timestamp": timestamp,
-                "payload": payload,
-            }
-            push_event(agent_id, event)
-            try:
-                signal_for(agent_id).set()
-            except Exception:  # pragma: no cover - defensive
-                pass
+            event_bus.notify(agent_id, "unassigned_task_appeared", payload)
     except Exception:  # pragma: no cover - defensive
         # Source write is committed; notification is best-effort.
         pass
