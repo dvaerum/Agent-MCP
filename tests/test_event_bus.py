@@ -22,7 +22,6 @@ continues to wake long-poll waiters and streaming subscribers.
 from __future__ import annotations
 
 import asyncio
-import os
 from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import patch
 
