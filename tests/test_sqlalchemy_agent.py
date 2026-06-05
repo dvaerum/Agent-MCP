@@ -81,6 +81,10 @@ async def test_agent_model_columns_match_raw_schema(tmp_path) -> None:
             "terminated_at",
             "updated_at",
             "aoe_session_id",
+            # Event-coord PR-1 (migration 0010): per-agent wake-loop
+            # toggle + cursor for fetch_events_since (PR-2).
+            "auto_event_loop",
+            "last_event_seen_at",
         }, f"ORM columns drifted from raw schema: {model_cols}"
 
         from agent_mcp.core.config import get_db_path

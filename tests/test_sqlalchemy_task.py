@@ -92,6 +92,9 @@ async def test_task_model_columns_match_raw_schema(tmp_path) -> None:
             "child_tasks",
             "depends_on_tasks",
             "notes",
+            # Event-coord PR-1 (migration 0010): capability gate for
+            # the PR-2 `unassigned_task_appeared` wake event.
+            "required_capabilities",
         }, f"ORM columns drifted from raw schema: {model_cols}"
 
         from agent_mcp.core.config import get_db_path

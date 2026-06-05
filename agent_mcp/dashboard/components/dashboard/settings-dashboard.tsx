@@ -69,6 +69,22 @@ const POLICIES: PolicySpec[] = [
       "When on, send_agent_message also POSTs a tmux-pane wake-up to a local Agents-of-Empires (AoE) instance so the recipient notices the message even between polls. Disabled by default. Configure config_aoe_base_url, config_aoe_bearer_token (secret), and config_aoe_notify_template via the Memories tab. The message body itself is never forwarded — only {sender}, {recipient}, {message_id} are interpolated.",
     default: false,
   },
+  {
+    // Event-coord PR-1: global wake-loop toggle. When on, the server
+    // appends the wake-loop bootstrap text to serverInfo.instructions
+    // (PR-2 wires the injection) for every agent whose own
+    // auto_event_loop flag is also on. When off, NO agent receives
+    // the wake-loop instructions regardless of its per-agent flag —
+    // and in-flight wait_for_events calls return a stop_listening
+    // event (PR-2). Default ON: every existing deployment opts in
+    // automatically once PR-2 ships; flip it off here to keep the
+    // legacy "human-prompts-every-turn" workflow.
+    key: "config_auto_event_loop_global",
+    title: "Agent event-loop (wake on inbox / task events)",
+    description:
+      "When on (default), worker agents are instructed to call wait_for_events on session start and after each event, so they wake automatically when messages or tasks arrive. When off, the wake-loop bootstrap text is omitted from serverInfo.instructions for every agent — workers fall back to human-prompted polling. Per-agent overrides live on the Agents tab (disabled here also disables every per-agent toggle).",
+    default: true,
+  },
 ]
 
 interface PolicyState {

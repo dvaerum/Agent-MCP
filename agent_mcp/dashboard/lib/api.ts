@@ -16,6 +16,15 @@ export interface Agent {
   // channel. Empty/missing = no AoE binding (notifier will fall back
   // to title-match resolution).
   aoe_session_id?: string | null
+  // Event-coord PR-1: per-agent wake-loop toggle. Default TRUE for
+  // every existing row (backfilled via 0010 migration `DEFAULT 1`).
+  // When FALSE, the PR-2 `serverInfo.instructions` wake-loop
+  // bootstrap is omitted for this agent regardless of the global
+  // flag. Greyed out in the edit modal when global is OFF.
+  auto_event_loop?: boolean
+  // Event-coord PR-1: ISO cursor for `fetch_events_since` (PR-2).
+  // NULL until the agent first drains its catch-up window.
+  last_event_seen_at?: string | null
 }
 
 export interface Task {
@@ -35,6 +44,12 @@ export interface Task {
   }>
   created_at: string
   updated_at: string
+  // Event-coord PR-1: JSON-encoded list of lowercase capability
+  // labels (the server stores it as TEXT and the /api endpoints
+  // currently return the raw column). The dashboard parses it lazily
+  // for the task-detail view; for routing decisions it's always
+  // already-normalized lowercase strings.
+  required_capabilities?: string | string[] | null
 }
 
 export interface GraphNode {
@@ -392,6 +407,9 @@ class ApiClient {
       color?: string
       working_directory?: string
       aoe_session_id?: string
+      // Event-coord PR-1: per-agent wake-loop toggle. Whitelisted on
+      // the server side in /api/agents/<id>/edit.
+      auto_event_loop?: boolean
     },
   ): Promise<{ success: boolean; agent_id: string; updated: Record<string, unknown>; message: string }> {
     const tokens = await this.getTokens()
@@ -526,6 +544,10 @@ class ApiClient {
     priority?: 'low' | 'medium' | 'high'
     assigned_to?: string
     parent_task?: string
+    // Event-coord PR-1: free-text capability labels for the
+    // routing-on-unassigned-task path shipped in PR-2. Server
+    // normalizes (lowercase + strip + dedupe) at write time.
+    required_capabilities?: string[]
   }): Promise<{ success: boolean; message: string; task_id?: string }> {
     const tokens = await this.getTokens()
     return this.request('/tasks', {
@@ -537,6 +559,7 @@ class ApiClient {
         priority: data.priority,
         assigned_to: data.assigned_to,
         parent_task: data.parent_task,
+        required_capabilities: data.required_capabilities,
       }),
     })
   }

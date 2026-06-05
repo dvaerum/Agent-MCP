@@ -749,7 +749,15 @@ async def edit_agent_api_route(request: Request) -> JSONResponse:
         # Whitelisted editable fields. Anything else in `data` is ignored
         # (defense in depth — status / agent_id / token must not flow
         # through this endpoint).
-        editable = ('capabilities', 'color', 'working_directory', 'aoe_session_id')
+        #
+        # Event-coord PR-1: `auto_event_loop` (per-agent wake-loop
+        # toggle) joins the editable list — dashboard's agent-edit
+        # modal flips it to opt this agent out of the wake-loop
+        # bootstrap shipped in PR-2.
+        editable = (
+            'capabilities', 'color', 'working_directory', 'aoe_session_id',
+            'auto_event_loop',
+        )
         updates = {k: data[k] for k in editable if k in data}
         if not updates:
             return JSONResponse(
@@ -1722,7 +1730,7 @@ async def create_task_api_route(request: Request) -> JSONResponse:
     """Create a new task. Admin token in JSON body (Q6a.1 convention).
 
     Body: {"token", "task_title", "task_description", "priority"?,
-           "assigned_to"?, "parent_task"?}
+           "assigned_to"?, "parent_task"?, "required_capabilities"?}
     Returns: {"success": true, "task_id": "...", "message": "..."}
     """
     if request.method == 'OPTIONS':
@@ -1739,6 +1747,14 @@ async def create_task_api_route(request: Request) -> JSONResponse:
         priority = data.get('priority', 'medium')
         assigned_to = data.get('assigned_to')  # nullable
         parent_task = data.get('parent_task')  # nullable
+        # Event-coord PR-1: optional capability gate (list of free-text
+        # labels, normalized to lowercase+stripped+deduped at write
+        # time via the shared helper). Empty/missing => stored as NULL
+        # ("anyone can claim", matches broadcast semantics).
+        from agent_mcp.utils.capability_normalization import normalize_capabilities
+
+        _norm_caps = normalize_capabilities(data.get('required_capabilities'))
+        required_caps_json = json.dumps(_norm_caps) if _norm_caps else None
 
         if not verify_token(admin_token, required_role='admin'):
             return JSONResponse({"error": "Invalid admin token"}, status_code=403)
@@ -1760,13 +1776,15 @@ async def create_task_api_route(request: Request) -> JSONResponse:
             INSERT INTO tasks (
                 task_id, title, description, assigned_to, created_by,
                 status, priority, created_at, updated_at,
-                parent_task, child_tasks, depends_on_tasks, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                parent_task, child_tasks, depends_on_tasks, notes,
+                required_capabilities
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id, title, description, assigned_to, requesting_admin_id,
                 status, priority, now, now,
                 parent_task, '[]', '[]', '[]',
+                required_caps_json,
             ),
         )
         log_agent_action_to_db(
