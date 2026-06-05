@@ -137,6 +137,14 @@
         vm-no-auto-cleanup = import ./nix/tests/no-auto-cleanup.nix {
           inherit pkgs lib self;
         };
+        # PR-2 event-coord E2E: drives wait_for_events,
+        # fetch_events_since, and the toggle-flip stop_listening path
+        # via curl over the multi-tenant transport, exercising the
+        # full server end-to-end without a browser. See
+        # ./nix/tests/event-driven-coord.nix.
+        vm-event-driven-coord = import ./nix/tests/event-driven-coord.nix {
+          inherit pkgs lib self;
+        };
       };
     };
 }
