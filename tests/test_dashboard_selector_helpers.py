@@ -124,13 +124,24 @@ def test_data_store_selectors_call_helpers() -> None:
     were actually refactored, not just left alongside dead helpers).
     """
     src = _read(DATA_STORE)
+    # Scope the search to the create() body so we don't accidentally
+    # match the TypeScript interface declaration at the top of the
+    # file.
+    impl_start = src.find("create<DataStore>")
+    assert impl_start != -1, "expected create<DataStore>(...) in data-store.ts"
+    impl_src = src[impl_start:]
     for selector in ("getAgentTasks", "getAgentActions", "getAgentTaskAnalysis"):
-        m = re.search(rf"{selector}\s*:\s*\(", src)
-        assert m is not None, f"selector {selector} not found in data-store.ts"
+        # Implementation form: `selector: (agentId: string) => {` with
+        # a function body brace (the interface uses `=> ReturnType`
+        # without an opening body brace, or an inline object literal
+        # for the return type -- but that's in the type-only block
+        # above `create<DataStore>`).
+        m = re.search(rf"{selector}\s*:\s*\([^)]*\)\s*=>\s*\{{", impl_src)
+        assert m is not None, f"selector {selector} implementation not found in data-store.ts"
         # The selector body spans until the next selector definition or
-        # closing of the create() block. A 1200-char window is enough
+        # closing of the create() block. A 1500-char window is enough
         # to cover the largest of the three.
-        body = src[m.start(): m.start() + 1200]
+        body = impl_src[m.start(): m.start() + 1500]
         assert (
             "normalizeAgentId" in body or "selectTasks" in body
         ), (

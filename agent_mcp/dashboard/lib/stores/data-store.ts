@@ -1,27 +1,18 @@
 import { create } from 'zustand'
 import { Agent, Task, apiClient } from '../api'
 import type { PromptTemplate, PromptCategory } from '../prompt-book'
+import {
+  normalizeAgentId,
+  selectTasks,
+  selectActions,
+  TERMINAL_TASK_STATUSES,
+} from './selectors'
 
-// Memoization cache for expensive computations
-const memoCache = new Map<string, { data: any, timestamp: number }>()
-const CACHE_DURATION = 5000 // 5 seconds cache
-
-function memoize<T>(key: string, computation: () => T): T {
-  const cached = memoCache.get(key)
-  const now = Date.now()
-  
-  if (cached && now - cached.timestamp < CACHE_DURATION) {
-    return cached.data as T
-  }
-  
-  const result = computation()
-  memoCache.set(key, { data: result, timestamp: now })
-  return result
-}
-
-function clearMemoCache() {
-  memoCache.clear()
-}
+// Re-export the helpers so callers that want to read from the store's
+// module path (a habit established by the rest of the lib/stores/
+// surface) can do so without learning about the new sibling file.
+export { normalizeAgentId, selectTasks, selectActions, TERMINAL_TASK_STATUSES }
+export type { TaskCriteria, ActionCriteria } from './selectors'
 
 // Debounce utility for API calls
 function debounce<T extends (...args: any[]) => any>(
@@ -204,11 +195,13 @@ export const useDataStore = create<DataStore>((set, get) => ({
         actions: data.actions?.length || 0
       })
       console.debug('Context data received:', data.context)
-      
-      // Clear memoization cache when data updates
-      clearMemoCache()
-      
-      set({ 
+
+      // (No selector memoisation to invalidate any more: PR-W1d
+      // dropped the per-selector cache in favour of pure
+      // `selectTasks`/`selectActions` helpers. The 30s fetchAllData
+      // gate above is the only freshness throttle now.)
+
+      set({
         data, 
         loading: false,
         isRefreshing: false, 
@@ -228,83 +221,71 @@ export const useDataStore = create<DataStore>((set, get) => ({
   getAgent: (agentId: string) => {
     const state = get()
     if (!state.data) return undefined
-    
-    // Handle Admin specially
-    if (agentId === 'Admin' || agentId === 'admin') {
+
+    // Admin row lives under the capitalised 'Admin' agent_id; both
+    // 'Admin' and 'admin' inputs must resolve to it. For other
+    // agents, strip the optional 'agent_' prefix. The
+    // `normalizeAgentId` helper does the prefix-strip + Admin->admin
+    // collapse; we then map 'admin' back to 'Admin' for the lookup.
+    const normalized = normalizeAgentId(agentId)
+    if (normalized === 'admin') {
       return state.data.agents.find(a => a.agent_id === 'Admin')
     }
-    
-    // Strip prefix if present
-    const cleanId = agentId.startsWith('agent_') ? agentId.substring(6) : agentId
-    return state.data.agents.find(a => a.agent_id === cleanId)
+    return state.data.agents.find(a => a.agent_id === normalized)
   },
 
+  // Tasks this agent has touched: assigned to them OR they recorded an
+  // action against. Composes `selectTasks({ assignedTo })` for the
+  // assigned slice, derives the worked-on task-id set from
+  // `selectActions`, and uses `selectTasks({ taskIdIn, notAssignedTo })`
+  // for the worked-on-but-not-assigned slice. The Admin/admin/prefix
+  // dance lives in `matchesAgent` inside selectors.ts.
+  //
+  // No memoisation: the selector is O(tasks + actions), fetchAllData
+  // already gates network refresh at 30s, and zustand re-runs are
+  // cheap at this size. The previous `memoize(cacheKey, ...)` wrapper
+  // conflated cache plumbing with filter logic.
+  //
+  // Note: this selector intentionally does NOT filter by status. The
+  // dashboard's "currently open" view is computed at the call site
+  // (see agents-dashboard.tsx) so callers that need history (e.g.
+  // the agent-details panel) keep getting it. Callers that want the
+  // PR #130 open-only semantics layer `statusNotIn:
+  // TERMINAL_TASK_STATUSES` on top via `selectTasks` themselves.
   getAgentTasks: (agentId: string) => {
     const state = get()
     if (!state.data) return []
-    
-    // Create cache key including data timestamp for cache invalidation
-    const cacheKey = `agent-tasks-${agentId}-${state.data.timestamp}`
-    
-    return memoize(cacheKey, () => {
-      // Strip prefix if present for consistent matching
-      const cleanAgentId = agentId.startsWith('agent_') ? agentId.substring(6) : agentId
-      // Handle admin variations - both 'Admin' and 'admin' are used in the system
-      const normalizedAgentId = cleanAgentId === 'Admin' ? 'admin' : cleanAgentId
-      
-      // Get tasks assigned to this agent (handle both admin variations)
-      const assignedTasks = state.data!.tasks.filter(t => 
-        t.assigned_to === normalizedAgentId || 
-        t.assigned_to === cleanAgentId ||
-        (normalizedAgentId === 'admin' && (t.assigned_to === 'Admin' || t.assigned_to === 'admin'))
-      )
-      
-      // Get tasks this agent has worked on (via actions)
-      const workedOnTaskIds = new Set<string>()
-      const agentActions = state.data!.actions.filter(a => 
-        a.agent_id === normalizedAgentId || 
-        a.agent_id === cleanAgentId ||
-        (normalizedAgentId === 'admin' && (a.agent_id === 'Admin' || a.agent_id === 'admin'))
-      )
-      
-      agentActions.forEach(action => {
-        if (action.task_id) {
-          workedOnTaskIds.add(action.task_id)
-        }
-      })
-      
-      // Get tasks worked on but not assigned
-      const workedOnTasks = state.data!.tasks.filter(t => 
-        workedOnTaskIds.has(t.task_id) && 
-        t.assigned_to !== normalizedAgentId && 
-        t.assigned_to !== cleanAgentId &&
-        !(normalizedAgentId === 'admin' && (t.assigned_to === 'Admin' || t.assigned_to === 'admin'))
-      )
-      
-      // Combine and deduplicate
-      const allTasks = [...assignedTasks, ...workedOnTasks]
-      const uniqueTasks = allTasks.filter((task, index, arr) => 
-        arr.findIndex(t => t.task_id === task.task_id) === index
-      )
-      
-      return uniqueTasks
+
+    const assignedTasks = selectTasks(state.data.tasks, { assignedTo: agentId })
+
+    const agentActions = selectActions(state.data.actions, { agentId })
+    const workedOnTaskIds = new Set<string>()
+    agentActions.forEach((action) => {
+      if (action.task_id) workedOnTaskIds.add(action.task_id)
     })
+
+    const workedOnTasks = selectTasks(state.data.tasks, {
+      taskIdIn: workedOnTaskIds,
+      notAssignedTo: agentId,
+    })
+
+    // Combine and deduplicate (a task could appear in both slices in
+    // pathological data; the original code defended against this).
+    const seen = new Set<string>()
+    const merged: Task[] = []
+    for (const t of [...assignedTasks, ...workedOnTasks]) {
+      if (!seen.has(t.task_id)) {
+        seen.add(t.task_id)
+        merged.push(t)
+      }
+    }
+    return merged
   },
 
   getAgentActions: (agentId: string) => {
     const state = get()
     if (!state.data) return []
-    
-    // Strip prefix if present for consistent matching
-    const cleanAgentId = agentId.startsWith('agent_') ? agentId.substring(6) : agentId
-    // Handle admin variations - both 'Admin' and 'admin' are used in the system
-    const normalizedAgentId = cleanAgentId === 'Admin' ? 'admin' : cleanAgentId
-    
-    return state.data.actions.filter(a => 
-      a.agent_id === normalizedAgentId || 
-      a.agent_id === cleanAgentId ||
-      (normalizedAgentId === 'admin' && (a.agent_id === 'Admin' || a.agent_id === 'admin'))
-    )
+    return selectActions(state.data.actions, { agentId })
   },
 
   getTask: (taskId: string) => {
@@ -348,32 +329,30 @@ export const useDataStore = create<DataStore>((set, get) => ({
       completedCount: 0,
       completionActionCount: 0
     }
-    
-    const cleanAgentId = agentId.startsWith('agent_') ? agentId.substring(6) : agentId
-    // Handle admin variations
-    const normalizedAgentId = cleanAgentId === 'Admin' ? 'admin' : cleanAgentId
-    
+
+    // `allTasks` here is the union "assigned to this agent OR worked
+    // on by this agent" -- see getAgentTasks. We compose selectTasks
+    // back over that union to get the disjoint slices.
     const allTasks = get().getAgentTasks(agentId)
-    
-    const assignedTasks = allTasks.filter(t => 
-      t.assigned_to === normalizedAgentId || 
-      t.assigned_to === cleanAgentId ||
-      (normalizedAgentId === 'admin' && (t.assigned_to === 'Admin' || t.assigned_to === 'admin'))
-    )
-    const workedOnTasks = allTasks.filter(t => 
-      t.assigned_to !== normalizedAgentId && 
-      t.assigned_to !== cleanAgentId &&
-      !(normalizedAgentId === 'admin' && (t.assigned_to === 'Admin' || t.assigned_to === 'admin'))
-    )
-    const completedTasks = allTasks.filter(t => t.status === 'completed')
-    
-    // Get completion actions for this agent
-    const completionActions = state.data.actions.filter(a => 
-      (a.agent_id === normalizedAgentId || a.agent_id === cleanAgentId) && 
-      (a.action_type === 'task_completed' || a.action_type === 'complete_task' || a.action_type.includes('complet'))
-    )
-    
-    
+
+    const assignedTasks = selectTasks(allTasks, { assignedTo: agentId })
+    const workedOnTasks = selectTasks(allTasks, { notAssignedTo: agentId })
+    // 'completed' is the only status this aggregator surfaces today
+    // (the dashboard widget that consumes `completedCount` shows
+    // strictly-completed work; cancelled/failed go elsewhere).
+    const completedTasks = selectTasks(allTasks, { statusIn: ['completed'] })
+
+    // Completion actions for this agent. `selectActions` handles the
+    // Admin/admin/prefix dance; we then filter for completion-shaped
+    // action types. `action.action_type` can be null for legacy
+    // rows, so guard the `.includes()` call.
+    const completionActions = selectActions(state.data.actions, { agentId })
+      .filter((a) => {
+        const t = a.action_type
+        if (!t) return false
+        return t === 'task_completed' || t === 'complete_task' || t.includes('complet')
+      })
+
     return {
       assignedTasks,
       workedOnTasks,
