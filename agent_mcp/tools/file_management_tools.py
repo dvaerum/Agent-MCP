@@ -10,6 +10,7 @@ from ..core.config import logger
 from ..core import globals as g
 from ..core.auth import get_agent_id # verify_token not strictly needed here if get_agent_id implies valid token
 from ..core.authorize import requires
+from ..core.repositories import agent_repo
 from ..utils.audit_utils import log_audit
 # No DB interactions for these specific tools as they manage in-memory state (g.file_map)
 
@@ -27,17 +28,19 @@ async def check_file_status_tool_impl(arguments: Dict[str, Any]) -> List[mcp_typ
         return [mcp_types.TextContent(type="text", text="Error: filepath is required and must be a string.")]
 
     # Resolve the filepath to absolute path (main.py:1781-1785)
-    # This uses the agent's working directory from g.agent_working_dirs
+    # PR-W2c: routed through AgentRepository.get_working_directory()
+    # so a cache miss falls through to the DB row instead of silently
+    # falling back to server CWD.
     if not os.path.isabs(filepath_arg):
-        agent_wd = g.agent_working_dirs.get(requesting_agent_id)
+        agent_wd = agent_repo.get_working_directory(requesting_agent_id)
         if not agent_wd:
             # This case should ideally not happen if agent is properly initialized
-            logger.warning(f"Agent '{requesting_agent_id}' has no working directory set in g.agent_working_dirs. Using current server CWD as fallback for path resolution.")
-            agent_wd = os.getcwd() 
+            logger.warning(f"Agent '{requesting_agent_id}' has no working directory recorded. Using current server CWD as fallback for path resolution.")
+            agent_wd = os.getcwd()
         resolved_abs_filepath = os.path.abspath(os.path.join(agent_wd, filepath_arg))
     else:
         resolved_abs_filepath = os.path.abspath(filepath_arg)
-    
+
     # Log the file status check (main.py:1788)
     log_audit(requesting_agent_id, "check_file_status", {"filepath": resolved_abs_filepath, "original_path": filepath_arg})
     
@@ -80,10 +83,11 @@ async def update_file_status_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
         return [mcp_types.TextContent(type="text", text="Error: filepath and status are required and must be strings.")]
 
     # Resolve the filepath to absolute path (main.py:1812-1816)
+    # PR-W2c: routed through AgentRepository.get_working_directory().
     if not os.path.isabs(filepath_arg):
-        agent_wd = g.agent_working_dirs.get(requesting_agent_id)
+        agent_wd = agent_repo.get_working_directory(requesting_agent_id)
         if not agent_wd:
-            logger.warning(f"Agent '{requesting_agent_id}' has no working directory set. Using CWD for path resolution.")
+            logger.warning(f"Agent '{requesting_agent_id}' has no working directory recorded. Using CWD for path resolution.")
             agent_wd = os.getcwd()
         resolved_abs_filepath = os.path.abspath(os.path.join(agent_wd, filepath_arg))
     else:
