@@ -49,6 +49,19 @@
       vmMulti = mkVm "multi";
       vmSingle = mkVm "single";
 
+      # Path B interactive sandbox VM (feat/agent-select-dropdown).
+      # Same shape as vmMulti but with host:18080 → guest:1337
+      # forwardPort and a first-boot seed dataset (Admin + one live
+      # + one terminated worker) for dashboard E2E acceptance via
+      # Firefox-MCP. See nix/vm-dev.nix for the rationale.
+      vmDev = (lib.nixosSystem {
+        inherit system;
+        specialArgs = {
+          src = self;
+        };
+        modules = [ ./nix/vm-dev.nix ];
+      }).config.system.build.vm;
+
       # Wrapper script: parses flags, picks the right VM derivation,
       # bind-mounts the persist dir, launches qemu.
       runScript = pkgs.runCommand "agent-mcp-vm-run" {
@@ -61,6 +74,22 @@
         chmod +x $out/bin/agent-mcp
         # Ensure qemu + coreutils are on PATH for the run-*-vm script.
         wrapProgram $out/bin/agent-mcp \
+          --prefix PATH : ${lib.makeBinPath [ pkgs.qemu pkgs.coreutils pkgs.bash ]}
+      '';
+
+      # Path B sandbox runner — parallel to runScript above, but
+      # points at the host:18080 vm-dev derivation. Distinct binary
+      # name so a developer can `nix run .#vm-dev` without
+      # conflicting with `nix run .#` (which targets vmMulti on
+      # host:5454).
+      runScriptDev = pkgs.runCommand "agent-mcp-vm-dev-run" {
+        nativeBuildInputs = [ pkgs.makeWrapper ];
+      } ''
+        mkdir -p $out/bin
+        substitute ${./nix/run-vm-dev.sh} $out/bin/agent-mcp-vm-dev \
+          --replace-fail "@VM_DEV@" "${vmDev}"
+        chmod +x $out/bin/agent-mcp-vm-dev
+        wrapProgram $out/bin/agent-mcp-vm-dev \
           --prefix PATH : ${lib.makeBinPath [ pkgs.qemu pkgs.coreutils pkgs.bash ]}
       '';
     in {
@@ -83,12 +112,24 @@
         vm = vmMulti;
         vm-multi = vmMulti;
         vm-single = vmSingle;
+        vm-dev = vmDev;
         vm-run = runScript;
+        vm-dev-run = runScriptDev;
       };
 
-      apps.${system}.default = {
-        type = "app";
-        program = "${runScript}/bin/agent-mcp";
+      apps.${system} = {
+        default = {
+          type = "app";
+          program = "${runScript}/bin/agent-mcp";
+        };
+        # `nix run .#vm-dev` — Path B interactive sandbox for
+        # dashboard E2E (feat/agent-select-dropdown). Forwards
+        # host:18080 → guest:1337 and seeds a tiny dataset on first
+        # boot. See nix/vm-dev.nix + nix/run-vm-dev.sh.
+        vm-dev = {
+          type = "app";
+          program = "${runScriptDev}/bin/agent-mcp-vm-dev";
+        };
       };
 
       # ── home-manager module (Phase 2) ───────────────────────────
