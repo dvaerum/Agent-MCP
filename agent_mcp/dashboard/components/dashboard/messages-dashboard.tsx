@@ -39,6 +39,7 @@ import { apiClient, type Agent } from "@/lib/api"
 import { useDialog } from "@/hooks/use-dialog"
 import { Skeleton } from "@/components/ui/skeleton"
 import { EmptyState } from "@/components/dashboard/shared/empty-state"
+import { AgentSelect } from "@/components/dashboard/shared/agent-select"
 import { MessagesMobileList } from "@/components/dashboard/messages-mobile-list"
 
 // Render a relative-time hint like "5 hours ago" / "in 3 minutes" so
@@ -183,35 +184,40 @@ export function MessagesDashboard() {
   const [composePriority, setComposePriority] = useState("normal")
   const [composing, setComposing] = useState(false)
 
-  // Participants drive the dropdowns. The old code sourced from
-  // apiClient.getAgents(), which returns EVERY row including
-  // status='terminated' — leaking ghost agents into the From/To
-  // filters that no longer appear on the Agents page. The new
-  // /api/messages/participants endpoint returns {live, tombstones}:
-  //   - live: agents whose status != 'terminated' (admin synthesised)
-  //   - tombstones: DISTINCT sender_id/recipient_id values starting
-  //     with '[deleted-' (PR C agent-purge cascade marker; empty list
-  //     until that PR lands).
-  // Compose recipient renders live agents only (you cannot message a
-  // deleted agent). The From/To filters render live + tombstones so
-  // admins can still grep history for purged agents.
+  // Participants drive the Compose recipient dropdown only.
+  //
+  // History (pre-feat/agent-select-dropdown):
+  //   - The old code sourced from apiClient.getAgents(), which returns
+  //     EVERY row including status='terminated' — leaking ghost agents
+  //     into the From/To filters and Compose recipient.
+  //   - PR #N introduced /api/messages/participants returning
+  //     {live, tombstones}; Compose used `live` only, From/To filters
+  //     concatenated `live + tombstones` so admins could grep history
+  //     for purged agents.
+  //
+  // Now (feat/agent-select-dropdown):
+  //   - The From/To filter dropdowns use the shared <AgentSelect>
+  //     which reads live agents directly from the data-store. They no
+  //     longer surface tombstones; see the comment block on the
+  //     filter <AgentSelect>s below for the tradeoff and follow-up.
+  //   - The Compose recipient still uses /api/messages/participants
+  //     because it needs the BROADCAST option ("*") which is NOT an
+  //     agent and is outside <AgentSelect>'s contract. The hardcoded
+  //     "admin" entry mirrors data-store::shouldDisplayAgent so the
+  //     compose UX matches the rest of the dashboard.
   const [liveParticipants, setLiveParticipants] = useState<
     { agent_id: string; status?: string }[]
   >([])
-  const [tombstones, setTombstones] = useState<string[]>([])
 
   const loadParticipants = async () => {
     try {
       const t = await adminToken()
       const data = await callMessages("POST", "/participants", { token: t })
       const live = Array.isArray(data?.live) ? data.live : []
-      const tomb = Array.isArray(data?.tombstones) ? data.tombstones : []
       setLiveParticipants(live)
-      setTombstones(tomb)
     } catch {
       // Soft-fail: dropdown just shows the hardcoded admin entry.
       setLiveParticipants([])
-      setTombstones([])
     }
   }
   useEffect(() => {
@@ -226,17 +232,6 @@ export function MessagesDashboard() {
     }
     return Array.from(ids)
   }, [liveParticipants])
-
-  // Filter dropdown list (From / To). Live agents first, then
-  // tombstone strings appended at the bottom so the live agents are
-  // the primary affordance and historical purged ids are still
-  // selectable.
-  const filterOptions = useMemo(() => {
-    const live = recipientOptions
-    // Tombstones are already DISTINCT + lexicographically sorted on
-    // the server; preserve that order.
-    return [...live, ...tombstones]
-  }, [recipientOptions, tombstones])
 
   // Build a body matching the REST contract.
   const queryBody = useMemo(() => {
@@ -504,34 +499,46 @@ export function MessagesDashboard() {
               ("priority", "any sender") didn't fit. Now stepped
               1 → 2 → 3 → 6 so each step keeps comfortable widths. */}
           <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-6">
-            <Select
-              value={filters.from || ALL}
-              onValueChange={(v) =>
-                setFilters((f) => ({ ...f, from: v === ALL ? "" : v }))
+            {/*
+              Migrated 2026-06-04 (feat/agent-select-dropdown): the
+              From/To filter dropdowns now share <AgentSelect> with
+              every other agent-input site in the dashboard.
+              noneLabel="— Any —" because filter semantics differ from
+              task assignment ("Unassigned"): an empty filter means
+              "no filter".
+
+              Tradeoff acknowledged in the PR body: the previous
+              implementation sourced from `filterOptions` which
+              appended `tombstones` (sender_id / recipient_id strings
+              starting with "[deleted-...") so an admin could still
+              grep history for purged agents. <AgentSelect> sources
+              live agents only — per the locked design decision in
+              the prancy-napping-pie plan. If the lost-tombstone-
+              search affordance matters in practice, a follow-up PR
+              should add a parallel "Tombstones" search box or extend
+              <AgentSelect> with an explicit `extraItems` prop. For
+              now, consistency wins.
+            */}
+            <AgentSelect
+              value={filters.from || null}
+              onChange={(v) =>
+                setFilters((f) => ({ ...f, from: v ?? "" }))
               }
-            >
-              <SelectTrigger><SelectValue placeholder="from" /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ALL}>any sender</SelectItem>
-                {filterOptions.map((id) => (
-                  <SelectItem key={`from-${id}`} value={id}>{id}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Select
-              value={filters.to || ALL}
-              onValueChange={(v) =>
-                setFilters((f) => ({ ...f, to: v === ALL ? "" : v }))
+              noneLabel="— Any —"
+              placeholder="from"
+            />
+            <AgentSelect
+              value={filters.to || null}
+              onChange={(v) =>
+                setFilters((f) => ({ ...f, to: v ?? "" }))
               }
-            >
-              <SelectTrigger><SelectValue placeholder="to" /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ALL}>any recipient</SelectItem>
-                {filterOptions.map((id) => (
-                  <SelectItem key={`to-${id}`} value={id}>{id}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+              noneLabel="— Any —"
+              placeholder="to"
+            />
+            {/* Retain the underlying ALL sentinel constant for the
+                non-agent filter dropdowns below (type / priority /
+                read?). Those have their own enums and are not
+                migration targets for <AgentSelect>. */}
             <Select
               value={filters.type || ALL}
               onValueChange={(v) => setFilters((f) => ({ ...f, type: v === ALL ? "" : v }))}

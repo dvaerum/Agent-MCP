@@ -14,12 +14,13 @@ import { Textarea } from "@/components/ui/textarea"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
 import { Label } from "@/components/ui/label"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { apiClient, Task, Agent } from "@/lib/api"
+import { apiClient, Task } from "@/lib/api"
 import { useServerStore } from "@/lib/stores/server-store"
 import { useDialog } from "@/hooks/use-dialog"
 import { cn } from "@/lib/utils"
 import { Skeleton } from "@/components/ui/skeleton"
 import { EmptyState } from "@/components/dashboard/shared/empty-state"
+import { AgentSelect } from "@/components/dashboard/shared/agent-select"
 import { TasksMobileList } from "@/components/dashboard/tasks-mobile-list"
 
 // Status / priority colour helpers shared by the row + the View / Edit
@@ -388,11 +389,21 @@ StatsCard.displayName = 'StatsCard'
 
 const CreateTaskModal = React.memo(({ onCreateTask }: { onCreateTask: (data: any) => void }) => {
   const [open, setOpen] = useState(false)
-  const [formData, setFormData] = useState({
+  const [formData, setFormData] = useState<{
+    title: string
+    description: string
+    priority: Task['priority']
+    // null = "— Unassigned —" sentinel selected (no assignment).
+    // Migrated from the pre-PR `<Input>` text field to the shared
+    // <AgentSelect> dropdown, which surfaces the live agent roster
+    // instead of asking the admin to type an agent_id.
+    assigned_to: string | null
+    required_capabilities: string
+  }>({
     title: '',
     description: '',
-    priority: 'medium' as Task['priority'],
-    assigned_to: '',
+    priority: 'medium',
+    assigned_to: null,
     // Event-coord PR-1: free-text comma-separated capability labels.
     // Server normalizes at write time (lowercase + strip + dedupe).
     required_capabilities: '',
@@ -419,7 +430,10 @@ const CreateTaskModal = React.memo(({ onCreateTask }: { onCreateTask: (data: any
       title: formData.title.trim(),
       description: formData.description.trim() || undefined,
       priority: formData.priority,
-      assigned_to: formData.assigned_to.trim() || undefined,
+      // AgentSelect returns string | null — the null sentinel maps
+      // to "no assignment", which the create-task endpoint already
+      // accepts as undefined / missing.
+      assigned_to: formData.assigned_to ?? undefined,
       required_capabilities: capsDeduped.length > 0 ? capsDeduped : undefined,
     })
 
@@ -427,7 +441,7 @@ const CreateTaskModal = React.memo(({ onCreateTask }: { onCreateTask: (data: any
       title: '',
       description: '',
       priority: 'medium',
-      assigned_to: '',
+      assigned_to: null,
       required_capabilities: '',
     })
     setOpen(false)
@@ -492,11 +506,22 @@ const CreateTaskModal = React.memo(({ onCreateTask }: { onCreateTask: (data: any
               <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
                 Assign To
               </label>
-              <Input
+              {/*
+                Migrated 2026-06-04 (feat/agent-select-dropdown): was a
+                plain text Input with placeholder hint that asked
+                the admin to *type* the agent_id. Typo-friendly, no
+                validation that the agent exists, no visibility of
+                available agents. Now uses the shared <AgentSelect>
+                which sources live agents from the data-store (filters
+                terminated rows via shouldDisplayAgent) and pins Admin
+                at the top. noneLabel="— Unassigned —" because the
+                underlying field is a nullable assignment, not a
+                filter (filters use the "Any" label).
+              */}
+              <AgentSelect
                 value={formData.assigned_to}
-                onChange={(e) => setFormData(prev => ({ ...prev, assigned_to: e.target.value }))}
-                placeholder="agent-01"
-                className="bg-background border-border text-foreground font-mono text-sm"
+                onChange={(v) => setFormData(prev => ({ ...prev, assigned_to: v }))}
+                noneLabel="— Unassigned —"
               />
             </div>
           </div>
@@ -822,13 +847,15 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
   const [editDescription, setEditDescription] = useState('')
   const [editStatus, setEditStatus] = useState<Task['status'] | 'unassigned'>('pending')
   const [editPriority, setEditPriority] = useState<Task['priority']>('medium')
-  // Sentinel '__unassigned__' so the shadcn Select can represent NULL.
-  const [editAssignedTo, setEditAssignedTo] = useState<string>('__unassigned__')
+  // AgentSelect speaks `string | null` directly; null = unassigned.
+  // Pre-PR this was the string sentinel `__unassigned__` because the
+  // local <Select> couldn't use an empty value — that hack moved
+  // inside <AgentSelect>'s NONE_SENTINEL plumbing.
+  const [editAssignedTo, setEditAssignedTo] = useState<string | null>(null)
   // New-note textarea is append-only: the backend stores notes as a
   // JSON array and `/api/update-task-dashboard` appends a single
   // entry per request. Empty string = no note added. Cleared on save.
   const [editNote, setEditNote] = useState<string>('')
-  const [agents, setAgents] = useState<Agent[]>([])
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
 
@@ -851,7 +878,7 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
     setEditDescription(task.description || '')
     setEditStatus(task.status || 'pending')
     setEditPriority(task.priority || 'medium')
-    setEditAssignedTo(task.assigned_to || '__unassigned__')
+    setEditAssignedTo(task.assigned_to || null)
     setEditNote('')
     setSaveError(null)
     // We deliberately depend on taskId, not the whole task object —
@@ -859,12 +886,12 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [taskId])
 
-  // Fetch agents for the Assigned-to dropdown. Best-effort: if it
-  // fails, the dropdown is empty (admin can still unassign).
-  useEffect(() => {
-    if (!open) return
-    apiClient.getAgents().then(setAgents).catch(() => setAgents([]))
-  }, [open])
+  // Pre-PR: this dialog fetched its own agent list via the unfiltered
+  // apiClient.getAgents() endpoint, which returns every row including
+  // status='terminated' — leaking ghost agents into the Assigned-to
+  // dropdown. Replaced 2026-06-04 by the shared <AgentSelect>, which
+  // reads from data-store::getActiveAgents() (live-only). No local
+  // fetch needed.
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -880,7 +907,8 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
         description: editDescription,
         status: editStatus as Task['status'],
         priority: editPriority,
-        assigned_to: editAssignedTo === '__unassigned__' ? null : editAssignedTo,
+        // AgentSelect speaks string|null directly — pass it through.
+        assigned_to: editAssignedTo,
       }
       // Append-only: only include `notes` in the patch when the new-note
       // textarea has content. The backend treats `notes: str` as "append
@@ -963,29 +991,25 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
                 </div>
                 <div className="space-y-2">
                   <Label htmlFor="edit-task-assigned" className="text-sm text-muted-foreground">Assigned to</Label>
-                  <Select value={editAssignedTo} onValueChange={setEditAssignedTo}>
-                    <SelectTrigger id="edit-task-assigned" className="w-full bg-background border-border text-foreground">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent className="bg-background border-border">
-                      <SelectItem value="__unassigned__">(unassigned)</SelectItem>
-                      {agents.map((a) => (
-                        <SelectItem key={a.agent_id} value={a.agent_id}>{a.agent_id}</SelectItem>
-                      ))}
-                      {/*
-                        Live-lookup useDialog (Candidate D, 2026-06-02)
-                        retired the previous fallback SelectItem hack
-                        that re-injected a non-roster assignee with a
-                        sentinel label. editAssignedTo is initialised
-                        from the task row that the dialog reads live
-                        from the store, so it is always in lock-step
-                        with the live agent roster — when an agent is
-                        terminated, the row update flows in and the
-                        value snaps to either a present agent_id or
-                        __unassigned__.
-                      */}
-                    </SelectContent>
-                  </Select>
+                  {/*
+                    Migrated 2026-06-04 (feat/agent-select-dropdown):
+                    previously a local <Select> populated by fetching
+                    the unfiltered apiClient.getAgents endpoint — which
+                    returns every row including status='terminated',
+                    leaking ghost agents into the dropdown. Now uses
+                    the shared <AgentSelect> backed by
+                    data-store::getActiveAgents (live-only).
+                    noneLabel="— Unassigned —" matches CreateTaskModal
+                    so both forms speak the same nullable-assignment
+                    language. Pre-PR sentinel `__unassigned__` is now
+                    an internal detail of <AgentSelect>.
+                  */}
+                  <AgentSelect
+                    id="edit-task-assigned"
+                    value={editAssignedTo}
+                    onChange={setEditAssignedTo}
+                    noneLabel="— Unassigned —"
+                  />
                 </div>
                 {/*
                   Add-note section. Append-only — the backend appends a
