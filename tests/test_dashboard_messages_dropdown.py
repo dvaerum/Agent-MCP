@@ -105,16 +105,28 @@ def test_to_filter_uses_select_not_input() -> None:
     )
 
 
-def test_filter_dropdowns_have_any_sender_recipient_options() -> None:
+def test_filter_dropdowns_have_no_filter_sentinel() -> None:
+    """Both From and To filter dropdowns must expose a sentinel that
+    clears the filter.
+
+    Pre-feat/agent-select-dropdown: bespoke ``<SelectItem>``s rendered
+    the literal text ``any sender`` / ``any recipient``.
+
+    Post-feat/agent-select-dropdown (2026-06-04): the From/To filters
+    are migrated to the shared ``<AgentSelect>`` with
+    ``noneLabel="— Any —"`` — the component's caller-provided
+    sentinel-label convention. Both filters speak the same neutral
+    "Any" label because filter semantics differ from task-form
+    assignment semantics.
+    """
     src = _read("components/dashboard/messages-dashboard.tsx")
-    # Must include an "any sender" / "any recipient" sentinel option so
-    # the dropdowns can clear the filter — same __all pattern used for
-    # type/priority/read filters.
-    assert "any sender" in src.lower(), (
-        "expected from filter to expose an 'any sender' option"
-    )
-    assert "any recipient" in src.lower(), (
-        "expected to filter to expose an 'any recipient' option"
+    # Look for two AgentSelect occurrences carrying noneLabel with the
+    # "Any" label — one for `from`, one for `to`.
+    matches = [m for m in src.split("AgentSelect") if "noneLabel" in m[:200] and "Any" in m[:200]]
+    assert len(matches) >= 2, (
+        "expected both the From and the To filter to render "
+        "<AgentSelect noneLabel=\"— Any —\" /> so admins can clear "
+        "the filter through the shared component's neutral sentinel"
     )
 
 
@@ -217,15 +229,27 @@ def test_filter_dropdowns_exclude_terminated_agents() -> None:
         )
 
 
-def test_filter_dropdowns_render_tombstone_values() -> None:
+def test_filter_dropdowns_render_live_agents_only() -> None:
+    """Post-feat/agent-select-dropdown (2026-06-04): the From/To filter
+    dropdowns are migrated to the shared ``<AgentSelect>``, which
+    sources live agents only via ``data-store::getActiveAgents``.
+
+    The previous assertion required tombstone rendering so admins
+    could grep history for purged agents — a useful affordance, but
+    the prancy-napping-pie plan's locked design decision was
+    live-only across every <AgentSelect> call site for consistency.
+    If lost-tombstone-search matters in practice, a follow-up PR can
+    either add a parallel "Tombstones" search box or extend
+    <AgentSelect> with an explicit ``extraItems`` prop. For now the
+    invariant is: the filter dropdowns are <AgentSelect> instances
+    and therefore live-only by construction.
+    """
     src = _read("components/dashboard/messages-dashboard.tsx")
-    # The participants endpoint returns {live, tombstones}. The From/To
-    # dropdowns must render BOTH so admins can grep history for purged
-    # agents. Look for evidence of the tombstones key being read.
-    assert "tombstones" in src, (
-        "expected the Messages tab to read the `tombstones` array from "
-        "the participants endpoint and render those values in the "
-        "Sender/Recipient filter dropdowns"
+    # The filter dropdowns must use AgentSelect rather than the old
+    # local Select-over-filterOptions wiring.
+    assert "AgentSelect" in src and "agent-select" in src, (
+        "expected the From/To filter dropdowns to render via the "
+        "shared <AgentSelect> component (live-only by construction)"
     )
 
 
