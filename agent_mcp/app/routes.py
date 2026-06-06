@@ -2076,13 +2076,16 @@ async def list_participants_api_route(request: Request) -> JSONResponse:
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # Live agents: anything that hasn't been terminated. We keep
-        # 'pending'/'failed'/etc. visible so historical messages from
-        # those agents stay filterable — only 'terminated' is the ghost
-        # state Dennis flagged.
+        # Live agents: anything that hasn't been terminated AND isn't a
+        # tombstone row. We keep 'pending'/'failed'/etc. visible so
+        # historical messages from those agents stay filterable. The
+        # 'tombstone' state is a DB-internal FK target written by
+        # _purge_tombstone (same file) — it must never surface in the
+        # participants dropdown (live-verified leak on washing-brothers
+        # 2026-06-06: 6 [deleted-*] tombstones in /live).
         cursor.execute(
             "SELECT agent_id, status FROM agents "
-            "WHERE status IS NULL OR status != 'terminated' "
+            "WHERE status IS NULL OR status NOT IN ('terminated', 'tombstone') "
             "ORDER BY agent_id ASC"
         )
         live = [dict(row) for row in cursor.fetchall()]
