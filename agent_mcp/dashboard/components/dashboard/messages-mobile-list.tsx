@@ -46,6 +46,18 @@ interface MessagesMobileListProps {
   // Falls back to the message_id if the parent isn't loaded.
   // Optional so older callers (none currently in-tree) still compile.
   labelForParent?: (parentId: string | null) => string
+  // v5.0.26 pagination — wired by the parent
+  // (messages-dashboard.tsx) so the mobile list can render the same
+  // « Newest / Newer / Older / Oldest » footer the desktop does, but
+  // stacked-vertical for narrow viewports. Optional so older callers
+  // (none currently in-tree) still compile.
+  currentOffset?: number
+  total?: number
+  pageSize?: number
+  onNewest?: () => void
+  onNewer?: () => void
+  onOlder?: () => void
+  onOldest?: () => void
 }
 
 export function MessagesMobileList({
@@ -55,9 +67,37 @@ export function MessagesMobileList({
   openDetail,
   deleteOne,
   labelForParent,
+  currentOffset,
+  total,
+  pageSize,
+  onNewest,
+  onNewer,
+  onOlder,
+  onOldest,
 }: MessagesMobileListProps): React.ReactElement {
+  // v5.0.26 pagination footer derived state. Only render the footer
+  // when the parent wired the props (back-compat) and the dataset has
+  // something to paginate (total > 0). Disabled-state mirrors the
+  // desktop variant in messages-dashboard.tsx.
+  const showPagination =
+    typeof currentOffset === "number" &&
+    typeof total === "number" &&
+    typeof pageSize === "number" &&
+    total > 0 &&
+    !!onNewest && !!onNewer && !!onOlder && !!onOldest
+  const onFirstPage =
+    showPagination && (currentOffset as number) === 0
+  const onLastPage =
+    showPagination &&
+    (currentOffset as number) + (pageSize as number) >= (total as number)
+  const rangeStart = showPagination ? (currentOffset as number) + 1 : 0
+  const rangeEnd = showPagination
+    ? Math.min((currentOffset as number) + (pageSize as number), total as number)
+    : 0
+
   return (
-    <ul role="list" className="divide-y divide-border">
+    <>
+      <ul role="list" className="divide-y divide-border">
       {messages.map((m) => {
         const isRead = m.read === 1 || m.read === true
         // v5.0.22: reply rows render with a left border + indent so the
@@ -155,6 +195,57 @@ export function MessagesMobileList({
           </li>
         )
       })}
-    </ul>
+      </ul>
+      {/* v5.0.26: mobile pagination footer. Rendered INSIDE the
+          parent's `-m-6` full-bleed container (so the row divider
+          line continues edge-to-edge above), but its own node is
+          wrapped in `px-6 py-4` counter-padding to re-align the
+          visible label + buttons back to the card boundary.
+          Stacked-vertical: label row above a 4-column grid of
+          buttons so the labels stay readable at 375 px. */}
+      {showPagination && (
+        <div className="px-6 py-4 border-t bg-background">
+          <div className="text-[11px] text-muted-foreground tabular-nums text-center mb-2">
+            Showing {rangeStart}–{rangeEnd} of {total}
+          </div>
+          <div className="grid grid-cols-4 gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onNewest}
+              disabled={onFirstPage}
+              aria-label="jump to newest page"
+            >
+              « Newest
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onNewer}
+              disabled={onFirstPage}
+            >
+              Newer
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onOlder}
+              disabled={onLastPage}
+            >
+              Older
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onOldest}
+              disabled={onLastPage}
+              aria-label="jump to oldest page"
+            >
+              Oldest »
+            </Button>
+          </div>
+        </div>
+      )}
+    </>
   )
 }
