@@ -75,7 +75,7 @@ async def test_sender_with_include_sent_false_does_not_see_own_sent(
     """
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
-        bob = await admin.create_worker("bob")
+        await admin.create_worker("bob")
 
         _seed_message(
             "msg-from-alice",
@@ -105,7 +105,7 @@ async def test_recipient_with_include_sent_false_still_sees_received(
     message Alice sent to him.
     """
     async with mcp_session(tmp_path) as admin:
-        alice = await admin.create_worker("alice")
+        await admin.create_worker("alice")
         bob = await admin.create_worker("bob")
 
         _seed_message(
