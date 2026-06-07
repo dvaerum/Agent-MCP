@@ -38,6 +38,8 @@ export interface AgentMessageMirror {
   timestamp: string
   delivered: boolean
   read: boolean
+  subject?: string | null
+  parent_message_id?: string | null
 }
 
 /** Pydantic mirror of the `agents` table. */
