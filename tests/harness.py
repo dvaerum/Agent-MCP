@@ -166,6 +166,9 @@ def _snapshot_and_reset_globals(stack: ExitStack) -> None:
     # signals; queues are transient by design.
     g.agent_event_locks.clear()
     g.agent_event_queues.clear()
+    # PR-B / v5.0.24: per-waiter queue registry (asyncio.Queue is also
+    # loop-bound — same recreation pattern as signals).
+    g.agent_event_waiters.clear()
     # Same loop-binding concern applies to `startup_complete_event`;
     # rebuild it so the lifespan inside `mcp_session` signals on the
     # current loop and bg-task waiters can `await` without raising.
@@ -211,6 +214,7 @@ def _snapshot_and_reset_globals(stack: ExitStack) -> None:
         g.agent_event_signals.clear()
         g.agent_event_locks.clear()
         g.agent_event_queues.clear()
+        g.agent_event_waiters.clear()
         g.reset_startup_complete_event()
 
     stack.callback(_restore)
