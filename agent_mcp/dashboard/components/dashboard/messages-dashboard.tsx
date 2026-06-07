@@ -106,6 +106,14 @@ const PRIORITIES = ["low", "normal", "high", "urgent"]
 const ALL = "__all"
 const BROADCAST = "__broadcast"
 
+// v5.0.26: pagination footer on the messages list. Per-page size stays
+// at 100 (Dennis explicitly does not want bigger pages — see plan
+// prancy-napping-pie.md). The footer adds « Newest / Newer / Older /
+// Oldest » cursor buttons + a "Showing N–M of T" range label so admins
+// can reach messages past the first 100 rows. Component state only —
+// no URL state, matches the existing filter behavior.
+const PAGE_SIZE = 100
+
 // The admin token is fetched once and reused; the dashboard runs as
 // admin per ADR-0003. We don't display it.
 async function adminToken(): Promise<string> {
@@ -156,6 +164,12 @@ export function MessagesDashboard() {
   // Per-row selection (message_id set). Cleared after every refresh
   // so we don't accidentally act on stale rows.
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+
+  // v5.0.26: pagination cursor + total count from the API. currentOffset
+  // is the offset of the first row on the current page; total is the
+  // count the backend reports for the active filter set.
+  const [currentOffset, setCurrentOffset] = useState(0)
+  const [total, setTotal] = useState(0)
 
   // Detail modal — opened by clicking a row's content area (not the
   // checkbox / per-row action cells, which stopPropagation). Live-
@@ -250,10 +264,16 @@ export function MessagesDashboard() {
   }, [liveParticipants])
 
   // Build a body matching the REST contract.
+  // v5.0.26: include `offset` so the « Newest / Newer / Older / Oldest »
+  // footer can walk past the first PAGE_SIZE rows.
   const queryBody = useMemo(() => {
     return async () => {
       const t = await adminToken()
-      const body: Record<string, unknown> = { token: t, limit: 100 }
+      const body: Record<string, unknown> = {
+        token: t,
+        limit: PAGE_SIZE,
+        offset: currentOffset,
+      }
       if (filters.from) body.from = filters.from
       if (filters.to) body.to = filters.to
       if (filters.type) body.type = filters.type
@@ -262,7 +282,7 @@ export function MessagesDashboard() {
       if (filters.q) body.q = filters.q
       return body
     }
-  }, [filters])
+  }, [filters, currentOffset])
 
   const refresh = async () => {
     setLoading(true)
@@ -271,6 +291,10 @@ export function MessagesDashboard() {
       const body = await queryBody()
       const data = await callMessages("POST", "/query", body)
       setMessages(data.messages ?? [])
+      // v5.0.26: capture the total so the pagination footer can render
+      // "Showing N–M of T" and toggle disabled-state on the Older /
+      // Oldest » buttons.
+      setTotal(typeof data.total === "number" ? data.total : 0)
       // Clear selection — IDs that survive filter changes would
       // silently act on rows the user can no longer see.
       setSelectedIds(new Set())
@@ -285,11 +309,22 @@ export function MessagesDashboard() {
     }
   }
 
+  // v5.0.26: reset to page 1 whenever a filter changes. React fires
+  // useEffect callbacks in declaration order, so this effect MUST be
+  // declared before the refresh effect below — otherwise refresh would
+  // fire with the stale offset for one render cycle. setCurrentOffset
+  // is a no-op when we're already on page 1, so this doesn't double-
+  // fetch on the initial mount.
   useEffect(() => {
-    refresh()
-    // refresh on filter changes
+    setCurrentOffset(0)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filters])
+
+  useEffect(() => {
+    refresh()
+    // refresh on filter changes OR pagination cursor changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filters, currentOffset])
 
   // v5.0.24 polish: human-readable label for a parent message id.
   // Used by the reply chip + the in-table reply marker so the user
@@ -485,6 +520,22 @@ export function MessagesDashboard() {
       setError(e.message ?? String(e))
     }
   }
+
+  // v5.0.26 pagination handlers. Disabled-state in the JSX guards
+  // against overshoot, so these don't need to clamp defensively beyond
+  // the Math.max on Newer (which prevents a negative offset when
+  // PAGE_SIZE changes).
+  const goNewest = () => setCurrentOffset(0)
+  const goNewer = () =>
+    setCurrentOffset(Math.max(0, currentOffset - PAGE_SIZE))
+  const goOlder = () => setCurrentOffset(currentOffset + PAGE_SIZE)
+  const goOldest = () =>
+    setCurrentOffset(Math.floor(Math.max(0, total - 1) / PAGE_SIZE) * PAGE_SIZE)
+
+  const onFirstPage = currentOffset === 0
+  const onLastPage = currentOffset + PAGE_SIZE >= total
+  const rangeStart = total === 0 ? 0 : currentOffset + 1
+  const rangeEnd = Math.min(currentOffset + PAGE_SIZE, total)
 
   const deleteOne = async (m: Message) => {
     setError(null)
@@ -905,9 +956,65 @@ export function MessagesDashboard() {
                   openDetail={(m) => detailDialog.open(m.message_id)}
                   deleteOne={deleteOne}
                   labelForParent={labelForParent}
+                  currentOffset={currentOffset}
+                  total={total}
+                  pageSize={PAGE_SIZE}
+                  onNewest={goNewest}
+                  onNewer={goNewer}
+                  onOlder={goOlder}
+                  onOldest={goOldest}
                 />
               </div>
             </>
+          )}
+          {/* v5.0.26: pagination footer — desktop only. Hidden on
+              mobile because <MessagesMobileList> renders its own
+              stacked-vertical variant (the desktop flex row doesn't
+              fit narrow viewports comfortably). */}
+          {total > 0 && (
+            <div className="hidden sm:flex items-center justify-between gap-2 mt-4 pt-3 border-t">
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={goNewest}
+                  disabled={onFirstPage}
+                  aria-label="jump to newest page"
+                >
+                  « Newest
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={goNewer}
+                  disabled={onFirstPage}
+                >
+                  Newer
+                </Button>
+              </div>
+              <div className="text-xs text-muted-foreground tabular-nums">
+                Showing {rangeStart}–{rangeEnd} of {total}
+              </div>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={goOlder}
+                  disabled={onLastPage}
+                >
+                  Older
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={goOldest}
+                  disabled={onLastPage}
+                  aria-label="jump to oldest page"
+                >
+                  Oldest »
+                </Button>
+              </div>
+            </div>
           )}
         </CardContent>
       </Card>
