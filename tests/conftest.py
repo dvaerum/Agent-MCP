@@ -58,9 +58,12 @@ def reset_globals() -> Iterator[None]:
     # loops; signal_for() lazily recreates as needed.
     g.agent_event_signals.clear()
     # PR-2 event-coord: locks and queues are also per-test (locks bound
-    # to event loop; queues are transient by design).
+    # to event loop; queues are transient by design). PR-B / v5.0.24
+    # added the per-waiter queue registry; clear it for the same
+    # reason — asyncio.Queue is bound to its loop.
     g.agent_event_locks.clear()
     g.agent_event_queues.clear()
+    g.agent_event_waiters.clear()
     # Lifespan startup-complete sentinel: every test starts with a
     # fresh, cleared Event so we can detect a regression where
     # application_startup forgets to set it.
@@ -104,6 +107,7 @@ def reset_globals() -> Iterator[None]:
     g.agent_event_signals.clear()
     g.agent_event_locks.clear()
     g.agent_event_queues.clear()
+    g.agent_event_waiters.clear()
     g.reset_startup_complete_event()
 
 

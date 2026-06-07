@@ -922,45 +922,25 @@ async def wait_for_events_tool_impl(
     blocks until `signal_for(agent_id).set()` fires or
     `timeout_seconds` (default 60, max 300) elapses.
 
-    PR-2 hardening:
+    Hardening (PR-2, partially reversed by PR-B / v5.0.24):
       * Reads `config_auto_event_loop_global` + `agents.auto_event_loop`
         on every call; returns ``stop_listening`` if either is OFF.
-      * Per-agent serialization lock — a second concurrent call returns
-        ``{"error": "another_wait_in_flight"}`` immediately (HTTP-409
-        analog). **Slated for removal — see audit note below.**
+      * **Fan-out semantics** (PR-B): N concurrent ``wait_for_events``
+        callers per agent are supported. Each call allocates its own
+        synthetic-event queue via ``state.register_waiter(agent_id)``;
+        the EventBus walks every queue on notify so all callers
+        observe every event. DB-backed events (messages, task changes)
+        are naturally fan-out because each waiter independently
+        re-queries SQLite on wake. The previous "HTTP-409 analog" lock
+        is gone — see ``docs/adr/0012-wait_for_events_fanout.md``.
       * Rechecks flags during long waits at 2s cadence so a toggle flip
         wakes the call within ~5s with ``stop_listening``.
-      * Drains the per-agent out-of-band queue (synthetic events like
-        ``unassigned_task_appeared``) on every wake.
+      * Drains the waiter's private synthetic-event queue on every
+        wake; never touches a peer's queue.
       * Persists the high-water cursor to `agents.last_event_seen_at`.
-
-    Audit note (pre-fan-out, PR-B / v5.0.24):
-      The 409 lock is being reverted in favor of a per-call fan-out so
-      a worker's Claude Code MCP session + a shell-based monitor with
-      the same bearer can both await the same events. Inventory of
-      surfaces currently coupled to the lock:
-        * ``g.lock_for(agent_id)`` / ``g.agent_event_locks`` in
-          ``agent_mcp/core/state.py`` — gates the wait_for_events call.
-        * ``g.drain_events(agent_id)`` in ``agent_mcp/core/state.py``
-          — destructive single-consumer drain of synthetic events
-          (e.g. ``unassigned_task_appeared``). With multiple waiters
-          this MUST become per-waiter so each consumer sees every
-          synthetic event.
-        * ``agent_event_signals`` in ``agent_mcp/core/state.py`` — the
-          shared ``asyncio.Event`` is already broadcast-friendly:
-          ``.set()`` wakes every waiter on ``.wait()``. No change
-          needed here.
-        * ``agent_mcp/app/routes.py:/api/all-data`` reads
-          ``existing_lock.locked()`` to surface
-          ``wait_for_events_in_flight``. Will switch to a waiter-count
-          probe (``>0`` waiters = in flight).
-        * ``tests/test_event_coord_serialization.py`` — 409 regression
-          test, retired by PR-B (semantics reversed).
-        * ``tests/test_dashboard_wait_in_flight_flag.py`` — migrated to
-          probe the new waiter-count registry instead of the lock.
-        * Test fixtures in ``tests/conftest.py`` + ``tests/harness.py``
-          clear ``g.agent_event_locks``; harmless to keep as long as
-          the dict exists, but cleaned up alongside the registry swap.
+        Multiple waiters racing to write the same cursor is safe — the
+        write is idempotent (max-timestamp converges) and SQLite
+        serializes the row update under the write queue.
     """
     token = arguments.get("token")
     agent_id = get_agent_id(token)
@@ -991,42 +971,25 @@ async def wait_for_events_tool_impl(
     if timeout > WAIT_FOR_EVENTS_MAX_TIMEOUT:
         timeout = WAIT_FOR_EVENTS_MAX_TIMEOUT
 
-    # One-call-per-agent enforcement (HTTP 409 analog).
-    lock = g.lock_for(agent_id)
-    acquired = False
+    # PR-B fan-out: each call owns a private synthetic-event queue so
+    # N concurrent waiters per agent each receive every notification.
+    # Register on entry; unregister in the finally block on exit.
+    waiter_queue = g.register_waiter(agent_id)
     try:
-        # Non-blocking acquire — second concurrent call sees the lock
-        # already held and gets the conflict envelope.
-        try:
-            await asyncio.wait_for(lock.acquire(), timeout=0.001)
-            acquired = True
-        except asyncio.TimeoutError:
-            conflict_body = {
-                "error": "another_wait_in_flight",
-                "agent_id": agent_id,
-                "message": (
-                    "Another wait_for_events call is already in flight "
-                    "for this agent. Only one concurrent call per agent "
-                    "is supported."
-                ),
-            }
-            return [mcp_types.TextContent(
-                type="text", text=json.dumps(conflict_body)
-            )]
-
         # Flag gate: if either toggle is OFF, return stop_listening now.
         enabled, reason = _check_auto_event_loop_flags(agent_id)
         if not enabled:
             stop_evt = _stop_listening_event(reason or "auto_event_loop is OFF")
-            # Also drain any pending synthetic events so the queue
-            # doesn't accumulate while the agent is opted out.
-            g.drain_events(agent_id)
+            # Drop anything that landed in our queue before the gate
+            # check — agent is opted out, the events are stale.
+            g.drain_waiter_queue(waiter_queue)
             return _envelope([stop_evt], since)
 
-        # Fast path — combine DB backlog with queued synthetic events.
+        # Fast path — combine DB backlog with synthetic events that
+        # arrived between register_waiter() and this point.
         events: List[Dict[str, Any]] = _collect_events_for(agent_id, since)
         events.extend(_collect_unassigned_task_events_for(agent_id, since))
-        events.extend(g.drain_events(agent_id))
+        events.extend(g.drain_waiter_queue(waiter_queue))
         if events:
             events.sort(key=lambda e: e.get("timestamp") or "")
             env = _envelope(events, since)
@@ -1037,10 +1000,18 @@ async def wait_for_events_tool_impl(
                 _write_last_event_seen_at(agent_id, cursor_value)
             return env
 
-        # Slow path — clear the signal, wait in short slices so flag
-        # flips during the wait are caught within ~5s.
-        sig = g.signal_for(agent_id)
-        sig.clear()
+        # Slow path — block on the per-call queue. The EventBus pushes
+        # either a real synthetic event (e.g. ``unassigned_task_appeared``)
+        # OR a ``WAITER_WAKE_SENTINEL`` (for DB-backed events) onto the
+        # queue, which releases ``queue.get()`` so we re-query the DB.
+        # Wake-up is per-waiter — no shared ``asyncio.Event.clear()``
+        # race because each waiter owns its queue.
+        #
+        # We keep the shared ``signal_for(agent_id)`` Event in sync as
+        # a secondary wake-edge: ``wake_for_flag_recheck`` and any other
+        # legacy callers that fire it directly will still release us
+        # because the slice timeout is bounded — the flag re-check
+        # happens at most ``_FLAG_RECHECK_INTERVAL_SECONDS`` late.
         deadline = asyncio.get_event_loop().time() + timeout
         while True:
             remaining = deadline - asyncio.get_event_loop().time()
@@ -1048,7 +1019,16 @@ async def wait_for_events_tool_impl(
                 return _envelope([], since)
             slice_timeout = min(_FLAG_RECHECK_INTERVAL_SECONDS, remaining)
             try:
-                await asyncio.wait_for(sig.wait(), timeout=slice_timeout)
+                # Block until either (a) the EventBus puts something on
+                # our queue or (b) the slice expires. The item returned
+                # by ``.get()`` is the wake trigger — keep it so it
+                # joins the rest of the drain below. (Otherwise the
+                # event we just consumed gets dropped on the floor
+                # because ``drain_waiter_queue`` only sees what's
+                # still on the queue.)
+                first_item = await asyncio.wait_for(
+                    waiter_queue.get(), timeout=slice_timeout
+                )
                 # Woken — recheck flags first; the wake may have come
                 # from `wake_for_flag_recheck` (toggle flip), in which
                 # case the new flag state requires stop_listening.
@@ -1057,12 +1037,18 @@ async def wait_for_events_tool_impl(
                     stop_evt = _stop_listening_event(
                         reason or "auto_event_loop is OFF"
                     )
-                    g.drain_events(agent_id)
+                    g.drain_waiter_queue(waiter_queue)
                     return _envelope([stop_evt], since)
-                # Drain everything that accumulated.
+                # Drain everything that accumulated — our own private
+                # synthetic queue (plus the first_item we already
+                # popped to release ``queue.get()``) + a fresh re-query
+                # of DB-backed events.
                 events = _collect_events_for(agent_id, since)
                 events.extend(_collect_unassigned_task_events_for(agent_id, since))
-                events.extend(g.drain_events(agent_id))
+                rest = g.drain_waiter_queue(waiter_queue)
+                if first_item is not g.WAITER_WAKE_SENTINEL and first_item is not None:
+                    events.append(first_item)
+                events.extend(rest)
                 if events:
                     events.sort(key=lambda e: e.get("timestamp") or "")
                     env = _envelope(events, since)
@@ -1073,8 +1059,9 @@ async def wait_for_events_tool_impl(
                     if cursor_value:
                         _write_last_event_seen_at(agent_id, cursor_value)
                     return env
-                # Spurious wake — clear and loop.
-                sig.clear()
+                # Wake with no events for this caller's ``since`` cursor —
+                # treat as a spurious wake (e.g. flag toggle that flips
+                # back) and loop for another slice.
             except asyncio.TimeoutError:
                 # Slice expired without a wake — recheck flags so an
                 # operator who flips a toggle during a long wait sees
@@ -1084,13 +1071,12 @@ async def wait_for_events_tool_impl(
                     stop_evt = _stop_listening_event(
                         reason or "auto_event_loop is OFF"
                     )
-                    g.drain_events(agent_id)
+                    g.drain_waiter_queue(waiter_queue)
                     return _envelope([stop_evt], since)
                 # Loop and wait another slice (or until deadline).
                 continue
     finally:
-        if acquired:
-            lock.release()
+        g.unregister_waiter(agent_id, waiter_queue)
 
 
 @requires("any")

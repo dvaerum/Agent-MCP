@@ -1219,20 +1219,19 @@ async def all_data_api_route(request: Request) -> JSONResponse:
             agent_dict['auth_token'] = active_token_by_agent.get(
                 agent_dict['agent_id']
             )
-            # Event-coord PR-3: surface whether this agent currently
-            # has an in-flight `wait_for_events` long-poll call. PR-2
-            # serialises wait_for_events via `g.lock_for(agent_id)`
-            # (one-call-per-agent enforcement). The locked() snapshot
-            # is what powers the dashboard "waiting" chip + the
-            # Settings page "X agents currently in wait" count. We
-            # don't lazily create the lock here — only agents that
-            # have ever entered `wait_for_events` have a lock object
-            # in the registry; the absence means definitively FALSE.
-            existing_lock = g.agent_event_locks.get(
-                agent_dict['agent_id']
-            )
+            # Event-coord PR-3 (updated by PR-B / v5.0.24): surface
+            # whether this agent currently has any in-flight
+            # ``wait_for_events`` long-poll call. Pre-fan-out (PR-2)
+            # this read ``g.lock_for(agent_id).locked()`` because
+            # only one waiter at a time was permitted. After PR-B the
+            # lock is gone — multiple concurrent waiters are
+            # supported — so the flag now reflects "≥1 waiter parked"
+            # via ``g.waiter_count()``. Dashboard + Settings page
+            # consume the same boolean shape; semantics widen from
+            # "this single call is in flight" to "at least one call
+            # is in flight" without changing the contract.
             agent_dict['wait_for_events_in_flight'] = bool(
-                existing_lock is not None and existing_lock.locked()
+                g.waiter_count(agent_dict['agent_id']) > 0
             )
             agents_data.append(agent_dict)
 

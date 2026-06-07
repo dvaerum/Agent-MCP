@@ -169,17 +169,19 @@ class LongPollSignalAdapter:
         from . import state
 
         if event_type in _SYNTHETIC_EVENT_TYPES:
-            # Preserve the legacy queued-event shape
-            # ``{type, ref_id, timestamp, payload}`` that
-            # ``wait_for_events_tool_impl`` drains via
-            # ``state.drain_events``. ``ref_id`` and ``timestamp`` ride
-            # on the payload dict from the writer (see
-            # ``state.notify_unassigned_task_appeared``) so the bus
-            # interface stays a flat ``(agent_id, event_type,
-            # payload)`` triple.
+            # Fan-out the synthetic event to every registered waiter
+            # queue for this agent (PR-B / v5.0.24). Pre-fan-out the
+            # event was appended to a single shared per-agent queue
+            # drained destructively by the first waiter; with fan-out
+            # each waiter owns its own queue so two concurrent
+            # ``wait_for_events`` calls each receive every event.
+            #
+            # Event shape ``{type, ref_id, timestamp, payload}`` is
+            # preserved verbatim so existing waiters / dashboard
+            # consumers don't need to change.
             data = payload or {}
             try:
-                state.push_event(
+                state.dispatch_synthetic_event(
                     agent_id,
                     {
                         "type": event_type,
@@ -195,6 +197,21 @@ class LongPollSignalAdapter:
 
         try:
             state.signal_for(agent_id).set()
+        except Exception:  # pragma: no cover — defensive
+            pass
+
+        # PR-B fan-out: also poke every per-waiter queue with a wake
+        # sentinel so each ``wait_for_events`` caller exits its
+        # ``queue.get()`` slice and re-queries the DB. The shared
+        # ``signal_for(agent_id)`` Event is kept for backwards
+        # compatibility with any other code that ``await``s it, but the
+        # waiter's loop now blocks on its own queue (so it gets the
+        # wake without any clear/race coordination).
+        try:
+            if event_type not in _SYNTHETIC_EVENT_TYPES:
+                # Synthetic event types already pushed a real event
+                # above — no need to also push a sentinel.
+                state.notify_waiters(agent_id)
         except Exception:  # pragma: no cover — defensive
             pass
 

@@ -181,8 +181,12 @@ async def test_synthetic_event_fans_out_to_all_waiters(
     """Synthetic events (currently ``unassigned_task_appeared``) are
     queued out-of-band rather than read from a DB row. The pre-fan-out
     impl drained them destructively, so only one waiter saw them. With
-    fan-out, every waiter gets its own copy."""
-    from agent_mcp.core import state as core_state
+    fan-out, every waiter gets its own copy. We drive the notify
+    directly via the EventBus so the test is decoupled from the
+    capability-matching SQL inside
+    ``notify_unassigned_task_appeared`` — the fan-out contract is the
+    bus, not the matcher."""
+    from agent_mcp.core import event_bus
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -196,11 +200,19 @@ async def test_synthetic_event_fans_out_to_all_waiters(
         second = asyncio.create_task(waiter())
         await asyncio.sleep(0.3)
 
-        # Fire a synthetic event via the canonical entry point.
-        # capability empty -> matches every agent.
-        core_state.notify_unassigned_task_appeared(
-            task_id="synthetic-task-1",
-            task_required_capabilities=[],
+        # Synthetic event via the bus — same path the matcher uses
+        # after it picks alice out of the capability join.
+        event_bus.notify(
+            "alice",
+            "unassigned_task_appeared",
+            {
+                "ref_id": "synthetic-task-1",
+                "timestamp": "2026-06-07T00:00:00",
+                "task_id": "synthetic-task-1",
+                "title": "synthetic test task",
+                "priority": "normal",
+                "required_capabilities": [],
+            },
         )
 
         first_blocks, second_blocks = await asyncio.gather(first, second)
