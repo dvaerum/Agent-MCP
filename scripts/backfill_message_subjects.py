@@ -106,9 +106,17 @@ def _fallback_subject(content: str) -> str:
     return content
 
 
+_PROMPT_CONTENT_CAP = 500  # chars — keeps small-model latency tolerable.
+
+
 async def _suggest_or_fallback(content: str) -> Tuple[str, bool]:
     """Return (subject, used_ollama). `used_ollama` lets the summary
-    distinguish the two paths."""
+    distinguish the two paths.
+
+    The content passed to Ollama is capped at _PROMPT_CONTENT_CAP chars
+    so a small CPU-only model (e.g. qwen2.5:3b) stays in the few-
+    seconds-per-call range. The truncation only affects the LLM
+    prompt; the stored subject is independent of the source length."""
     if not os.environ.get("AGENT_MCP_SUBJECT_MODEL", "").strip():
         return _fallback_subject(content), False
     # Local import so the script can run on hosts without the agent_mcp
@@ -124,8 +132,12 @@ async def _suggest_or_fallback(content: str) -> Tuple[str, bool]:
         )
         return _fallback_subject(content), False
 
+    prompt_content = content
+    if len(prompt_content) > _PROMPT_CONTENT_CAP:
+        prompt_content = prompt_content[:_PROMPT_CONTENT_CAP] + "..."
+
     try:
-        suggested = await suggest_subject(content)
+        suggested = await suggest_subject(prompt_content)
     except Exception as e:  # pragma: no cover — defensive
         print(
             f"WARNING: suggest_subject raised {type(e).__name__}: {e}; "
@@ -187,16 +199,21 @@ async def _backfill(
             fallback_count += 1
 
         if dry_run:
-            print(f"  [{idx}/{total}] {msg_id}  →  {subject!r}  (dry-run)")
+            print(f"  [{idx}/{total}] {msg_id}  →  {subject!r}  (dry-run)", flush=True)
         else:
             cur.execute(
                 "UPDATE agent_messages SET subject = ? WHERE message_id = ?",
                 (subject, msg_id),
             )
             write_count += 1
-            if idx % 50 == 0:
-                conn.commit()
-                print(f"  [{idx}/{total}] committed batch ending at {msg_id}")
+            # Commit + log every row so long-running backfills are
+            # observable mid-flight (progress visible in `tail -F`,
+            # mid-run kills don't lose any completed work).
+            conn.commit()
+            print(
+                f"  [{idx}/{total}] {msg_id}  →  {subject!r}",
+                flush=True,
+            )
 
         # Rate-limit on Ollama calls only — fallback rows are CPU-only
         # and shouldn't slow down the script. (The min_interval check

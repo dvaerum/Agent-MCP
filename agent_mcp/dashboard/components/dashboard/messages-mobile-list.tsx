@@ -42,6 +42,10 @@ interface MessagesMobileListProps {
   toggleOne: (id: string) => void
   openDetail: (m: MessageRow) => void
   deleteOne: (m: MessageRow) => void
+  // v5.0.24 polish: parent-id → human-readable label resolver.
+  // Falls back to the message_id if the parent isn't loaded.
+  // Optional so older callers (none currently in-tree) still compile.
+  labelForParent?: (parentId: string | null) => string
 }
 
 export function MessagesMobileList({
@@ -50,6 +54,7 @@ export function MessagesMobileList({
   toggleOne,
   openDetail,
   deleteOne,
+  labelForParent,
 }: MessagesMobileListProps): React.ReactElement {
   return (
     <ul role="list" className="divide-y divide-border">
@@ -104,9 +109,14 @@ export function MessagesMobileList({
                     {m.subject}
                   </p>
                 ) : isReply ? (
+                  // v5.0.24 polish: human-readable parent label.
                   <p className="text-[11px] mt-1 text-muted-foreground">
                     ↳ reply to:{" "}
-                    <span className="font-mono">{m.parent_message_id}</span>
+                    <span className="text-foreground">
+                      {labelForParent
+                        ? labelForParent(m.parent_message_id)
+                        : m.parent_message_id}
+                    </span>
                   </p>
                 ) : null}
                 <p
