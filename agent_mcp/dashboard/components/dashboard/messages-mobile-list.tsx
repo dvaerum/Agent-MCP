@@ -31,6 +31,9 @@ interface MessageRow {
   timestamp: string
   delivered: number | boolean
   read: number | boolean
+  // v5.0.22 message threads + subjects.
+  subject: string | null
+  parent_message_id: string | null
 }
 
 interface MessagesMobileListProps {
@@ -52,11 +55,17 @@ export function MessagesMobileList({
     <ul role="list" className="divide-y divide-border">
       {messages.map((m) => {
         const isRead = m.read === 1 || m.read === true
+        // v5.0.22: reply rows render with a left border + indent so the
+        // mobile list mirrors the desktop visual treatment.
+        const isReply = !!m.parent_message_id
         return (
           <li
             key={m.message_id}
             onClick={() => openDetail(m)}
-            className="px-4 py-3 hover:bg-muted/30 active:bg-muted/50 transition-colors duration-150 cursor-pointer"
+            className={
+              "px-4 py-3 hover:bg-muted/30 active:bg-muted/50 transition-colors duration-150 cursor-pointer" +
+              (isReply ? " border-l-2 border-l-muted-foreground/30 pl-6" : "")
+            }
           >
             <div className="flex items-start gap-3">
               <input
@@ -83,6 +92,23 @@ export function MessagesMobileList({
                     />
                   )}
                 </div>
+                {/* v5.0.22: surface subject (root) or reply marker
+                    (reply) on its own line above the body. */}
+                {m.subject ? (
+                  <p
+                    className={
+                      "text-sm mt-1 font-medium truncate " +
+                      (isRead ? "text-muted-foreground" : "text-foreground")
+                    }
+                  >
+                    {m.subject}
+                  </p>
+                ) : isReply ? (
+                  <p className="text-[11px] mt-1 text-muted-foreground">
+                    ↳ reply to:{" "}
+                    <span className="font-mono">{m.parent_message_id}</span>
+                  </p>
+                ) : null}
                 <p
                   className={
                     "text-sm mt-1 line-clamp-2 " +

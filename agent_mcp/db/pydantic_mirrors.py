@@ -105,6 +105,9 @@ class AgentMessageMirror(BaseModel):
     timestamp: str
     delivered: bool
     read: bool
+    # v5.0.22 — message threads + subjects (migration 0012).
+    subject: Optional[str] = None
+    parent_message_id: Optional[str] = None
 
 
 class ClaudeCodeSessionMirror(BaseModel):

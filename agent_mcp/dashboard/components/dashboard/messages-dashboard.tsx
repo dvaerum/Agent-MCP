@@ -66,6 +66,8 @@ function relativeTime(iso: string): string {
 }
 
 // Message row shape returned by POST /api/messages/query.
+// v5.0.22: subject (root-only) + parent_message_id (NULL for roots,
+// reply→root.message_id for replies).
 interface Message {
   message_id: string
   sender_id: string
@@ -76,6 +78,8 @@ interface Message {
   timestamp: string
   delivered: number | boolean
   read: number | boolean
+  subject: string | null
+  parent_message_id: string | null
 }
 
 interface Filters {
@@ -183,6 +187,18 @@ export function MessagesDashboard() {
   const [composeType, setComposeType] = useState("text")
   const [composePriority, setComposePriority] = useState("normal")
   const [composing, setComposing] = useState(false)
+  // v5.0.22 subject + reply state.
+  //   * composeSubject — user-typed or Suggest-populated root subject.
+  //     Hidden + ignored when replying.
+  //   * composeReplyParentId — non-empty means this is a reply to the
+  //     named root message_id; the backend force-NULLs subject in that
+  //     case, and we hide the subject input.
+  //   * suggestLoading — guards the Suggest button so it can't double-fire.
+  const [composeSubject, setComposeSubject] = useState("")
+  const [composeReplyParentId, setComposeReplyParentId] = useState<string | null>(
+    null,
+  )
+  const [suggestLoading, setSuggestLoading] = useState(false)
 
   // Participants drive the Compose recipient dropdown only.
   //
@@ -288,14 +304,27 @@ export function MessagesDashboard() {
       // BROADCAST sentinel maps to recipient_id="*" on the backend.
       const recipient =
         composeRecipient === BROADCAST ? "*" : composeRecipient
-      await callMessages("POST", "", {
+      // v5.0.22 — wire the new fields through. Reply mode pins
+      // parent_message_id and lets the backend force-NULL the subject;
+      // otherwise we either pass the typed subject (verbatim) or omit
+      // the key entirely so the backend can pick suggest_subject /
+      // truncated body.
+      const body: Record<string, unknown> = {
         token: t,
         recipient_id: recipient,
         message_content: composeContent,
         message_type: composeType,
         priority: composePriority,
-      })
+      }
+      if (composeReplyParentId) {
+        body.parent_message_id = composeReplyParentId
+      } else if (composeSubject.trim()) {
+        body.subject = composeSubject.trim()
+      }
+      await callMessages("POST", "", body)
       setComposeContent("")
+      setComposeSubject("")
+      setComposeReplyParentId(null)
       setComposeOpen(false)
       await refresh()
     } catch (e: any) {
@@ -303,6 +332,47 @@ export function MessagesDashboard() {
     } finally {
       setComposing(false)
     }
+  }
+
+  // v5.0.22: ask the backend (which delegates to Ollama if
+  // AGENT_MCP_SUBJECT_MODEL is configured) to propose a subject from
+  // the current compose body. Returns {subject: string | null}.
+  // null → leave the field as-is so the user knows the helper didn't
+  // have anything to suggest.
+  const suggestSubject = async () => {
+    if (!composeContent.trim()) return
+    setSuggestLoading(true)
+    setError(null)
+    try {
+      const t = await adminToken()
+      const data = await callMessages("POST", "/suggest-subject", {
+        token: t,
+        content: composeContent,
+      })
+      if (data?.subject) {
+        setComposeSubject(String(data.subject))
+      }
+    } catch (e: any) {
+      // Soft-fail — the user can still type a subject manually.
+      setError(e.message ?? String(e))
+    } finally {
+      setSuggestLoading(false)
+    }
+  }
+
+  // Open the compose form pre-wired for a reply to the given message.
+  // Mirrors how an email client's "Reply" button works: prefill the
+  // recipient (other party of the parent thread), pin parent_message_id,
+  // hide the subject input.
+  const openReply = (parent: Message) => {
+    const me = "admin" // dashboard runs as admin per ADR-0003
+    const otherParty =
+      parent.sender_id === me ? parent.recipient_id : parent.sender_id
+    setComposeRecipient(otherParty)
+    setComposeSubject("")
+    setComposeContent("")
+    setComposeReplyParentId(parent.message_id)
+    setComposeOpen(true)
   }
 
   const toggleRead = async (m: Message) => {
@@ -470,6 +540,43 @@ export function MessagesDashboard() {
                 </Select>
               </div>
             </div>
+            {/* v5.0.22: Subject input + Suggest button. Hidden when
+                replying — replies always have subject = NULL per the
+                schema contract. */}
+            {composeReplyParentId ? (
+              <div className="rounded-md border border-muted bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+                ↳ reply to:{" "}
+                <span className="font-mono">{composeReplyParentId}</span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="ml-2 h-6 px-2"
+                  onClick={() => setComposeReplyParentId(null)}
+                >
+                  Cancel reply
+                </Button>
+              </div>
+            ) : (
+              <div>
+                <Label className="text-xs">Subject</Label>
+                <div className="flex gap-2">
+                  <Input
+                    placeholder="Subject (optional — Suggest will fill from Ollama)"
+                    value={composeSubject}
+                    onChange={(e) => setComposeSubject(e.target.value)}
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={suggestSubject}
+                    disabled={suggestLoading || !composeContent.trim()}
+                    title="Ask the configured Ollama model for a subject — POST /api/messages/suggest-subject"
+                  >
+                    {suggestLoading ? "…" : "Suggest"}
+                  </Button>
+                </div>
+              </div>
+            )}
             <div>
               <Label className="text-xs">Content</Label>
               <textarea
@@ -657,6 +764,10 @@ export function MessagesDashboard() {
                       <TableHead>Time</TableHead>
                       <TableHead>From</TableHead>
                       <TableHead>To</TableHead>
+                      {/* v5.0.22: subject column between To and Type so
+                          the most-scanned thread label sits next to
+                          the participants. */}
+                      <TableHead>Subject</TableHead>
                       <TableHead>Type</TableHead>
                       <TableHead>Priority</TableHead>
                       <TableHead>Read?</TableHead>
@@ -667,10 +778,18 @@ export function MessagesDashboard() {
                   <TableBody>
                     {messages.map((m) => {
                       const checked = selectedIds.has(m.message_id)
+                      // v5.0.22: rows whose parent_message_id is non-null
+                      // are replies. Visual cue = subtle left border +
+                      // indent + "↳ reply to: <parent_id>" prefix in
+                      // the Subject column.
+                      const isReply = !!m.parent_message_id
                       return (
                         <TableRow
                           key={m.message_id}
-                          className="cursor-pointer"
+                          className={
+                            "cursor-pointer" +
+                            (isReply ? " border-l-2 border-l-muted-foreground/30" : "")
+                          }
                           onClick={() => detailDialog.open(m.message_id)}
                         >
                           <TableCell onClick={(e) => e.stopPropagation()}>
@@ -686,6 +805,18 @@ export function MessagesDashboard() {
                           </TableCell>
                           <TableCell><Badge variant="outline">{m.sender_id}</Badge></TableCell>
                           <TableCell><Badge variant="outline">{m.recipient_id}</Badge></TableCell>
+                          <TableCell className="text-xs max-w-[200px] truncate">
+                            {m.subject ? (
+                              m.subject
+                            ) : isReply ? (
+                              <span className="text-muted-foreground">
+                                ↳ reply to:{" "}
+                                <span className="font-mono">{m.parent_message_id}</span>
+                              </span>
+                            ) : (
+                              <span className="text-muted-foreground/50">—</span>
+                            )}
+                          </TableCell>
                           <TableCell className="text-xs">{m.message_type}</TableCell>
                           <TableCell className="text-xs">{m.priority}</TableCell>
                           <TableCell>
@@ -808,6 +939,19 @@ export function MessagesDashboard() {
               </div>
 
               <DialogFooter>
+                {/* v5.0.22: Reply opens the compose form pre-wired
+                    with parent_message_id pinned to this row. */}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    openReply(detailMessage)
+                    detailDialog.close()
+                  }}
+                >
+                  <Send className="h-4 w-4 mr-1" />
+                  Reply
+                </Button>
                 <Button
                   variant="outline"
                   size="sm"

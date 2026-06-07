@@ -53,6 +53,9 @@ def _message_to_dict(row: AgentMessage) -> Dict[str, Any]:
         "timestamp": row.timestamp,
         "delivered": bool(row.delivered),
         "read": bool(row.read),
+        # v5.0.22 message-threads + subjects.
+        "subject": row.subject,
+        "parent_message_id": row.parent_message_id,
     }
 
 
@@ -152,6 +155,13 @@ def bulk_insert_messages(rows: Iterable[Dict[str, Any]]) -> int:
             "timestamp": r["timestamp"],
             "delivered": r.get("delivered", False),
             "read": r.get("read", False),
+            # v5.0.22 — both default to None when not present so
+            # broadcast callers (every fan-out is a root, no reply
+            # threading) don't have to think about them. The route /
+            # tool layers compute the effective subject before calling
+            # this helper if Ollama auto-fill is desired.
+            "subject": r.get("subject"),
+            "parent_message_id": r.get("parent_message_id"),
         })
 
     if not payload:

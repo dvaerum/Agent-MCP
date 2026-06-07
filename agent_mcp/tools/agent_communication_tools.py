@@ -92,6 +92,13 @@ async def send_agent_message_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
     message_type = arguments.get("message_type", "text")  # text, assistance_request, task_update
     priority = arguments.get("priority", "normal")  # low, normal, high, urgent
     deliver_method = arguments.get("deliver_method", "tmux")  # tmux, store, both
+    # v5.0.22 (message threads + subjects). Both optional:
+    #   * explicit_subject — caller-provided one-liner; persisted
+    #     verbatim. Replies (parent_message_id set) ignore it.
+    #   * parent_message_id — link to a root message. Replies always
+    #     end up with subject NULL.
+    explicit_subject = arguments.get("subject")
+    parent_message_id = arguments.get("parent_message_id")
 
     # The @requires_policy decorator already guaranteed `sender_token`
     # resolves to either admin or a worker permitted under
@@ -121,31 +128,65 @@ async def send_agent_message_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
     # Create message data
     message_id = _generate_message_id()
     timestamp = datetime.datetime.now().isoformat()
-    
-    message_data = {
-        "message_id": message_id,
-        "sender_id": sender_id,
-        "recipient_id": recipient_id,
-        "message_content": message_content,
-        "message_type": message_type,
-        "priority": priority,
-        "timestamp": timestamp,
-        "delivered": False,
-        "read": False
-    }
-    
+
+    # v5.0.22: compute the effective subject. Three branches:
+    #   1. Reply (parent_message_id set) → always NULL. The dashboard
+    #      surfaces the root's subject as the thread label; replies
+    #      don't carry their own.
+    #   2. Explicit subject supplied → persist verbatim.
+    #   3. Root w/o explicit subject → ask the Ollama helper
+    #      (`suggest_subject`). If unconfigured or it returns None,
+    #      fall back to a truncated body.
+    effective_subject: Optional[str]
+    if parent_message_id:
+        effective_subject = None
+    elif explicit_subject:
+        effective_subject = explicit_subject
+    else:
+        # Two-stage gate so tests / operators can disable Ollama
+        # without paying the import + helper-call cost:
+        #   1. AGENT_MCP_SUBJECT_MODEL unset → straight to fallback.
+        #   2. Model set → call helper; if it returns None (HTTP
+        #      failure, empty completion, etc.) fall back too.
+        suggested: Optional[str] = None
+        if os.environ.get("AGENT_MCP_SUBJECT_MODEL", "").strip():
+            from ..features.message_suggestions import suggest_subject
+
+            suggested = await suggest_subject(message_content)
+
+        if suggested:
+            effective_subject = suggested
+        else:
+            # Truncated-body fallback. 50-char + "..." matches the
+            # locked-in plan and the backfill script's "no Ollama"
+            # branch — so a backfill run on a host without the model
+            # leaves the same shape as the live send path.
+            effective_subject = (
+                message_content[:50] + "..."
+                if len(message_content) > 50
+                else message_content
+            )
+
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        
+
         # Store message in database
-        cursor.execute("""
-            INSERT INTO agent_messages (message_id, sender_id, recipient_id, message_content, 
-                                      message_type, priority, timestamp, delivered, read)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (message_id, sender_id, recipient_id, message_content, message_type, 
-              priority, timestamp, False, False))
+        cursor.execute(
+            """
+            INSERT INTO agent_messages (message_id, sender_id, recipient_id,
+                                        message_content, message_type, priority,
+                                        timestamp, delivered, read,
+                                        subject, parent_message_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                message_id, sender_id, recipient_id, message_content,
+                message_type, priority, timestamp, False, False,
+                effective_subject, parent_message_id,
+            ),
+        )
         
         # Attempt delivery based on method
         delivery_status = "stored"
@@ -346,11 +387,12 @@ async def get_agent_messages_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
         where_clause = " AND ".join(query_conditions)
         
         query = f"""
-            SELECT message_id, sender_id, recipient_id, message_content, message_type, 
-                   priority, timestamp, delivered, read
-            FROM agent_messages 
+            SELECT message_id, sender_id, recipient_id, message_content, message_type,
+                   priority, timestamp, delivered, read,
+                   subject, parent_message_id
+            FROM agent_messages
             WHERE {where_clause}
-            ORDER BY timestamp DESC 
+            ORDER BY timestamp DESC
             LIMIT ?
         """
         query_params.append(limit)
@@ -397,9 +439,23 @@ async def get_agent_messages_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
             other_agent = msg["recipient_id"] if msg["sender_id"] == agent_id else msg["sender_id"]
             read_status = "📖" if msg["read"] else "📩"
             priority_icon = {"low": "🔵", "normal": "⚪", "high": "🟡", "urgent": "🔴"}.get(msg["priority"], "⚪")
-            
+
             response_lines.append(f"{direction} {read_status} {priority_icon} [{msg['message_type']}] {other_agent}")
             response_lines.append(f"   {msg['timestamp']}")
+            # v5.0.22: surface subject (root) or reply-marker (reply).
+            # sqlite3.Row supports `in` via .keys(); guard for legacy
+            # callers that may not have migrated yet.
+            row_keys = set(msg.keys()) if hasattr(msg, "keys") else set()
+            subj = msg["subject"] if "subject" in row_keys else None
+            parent_id = (
+                msg["parent_message_id"]
+                if "parent_message_id" in row_keys
+                else None
+            )
+            if subj:
+                response_lines.append(f"   Subject: {subj}")
+            elif parent_id:
+                response_lines.append(f"   ↳ reply to: {parent_id}")
             response_lines.append(f"   {msg['message_content']}")
             response_lines.append("")
         
@@ -431,6 +487,11 @@ async def broadcast_admin_message_tool_impl(arguments: Dict[str, Any]) -> List[m
     message_content = arguments.get("message")
     message_type = arguments.get("message_type", "broadcast")
     priority = arguments.get("priority", "high")
+    # v5.0.22: broadcasts can carry an explicit subject. Each fan-out
+    # send is a root message, so the per-recipient send_agent_message
+    # call will compute the subject the same way (verbatim if set,
+    # Ollama-suggested otherwise, truncated body as last resort).
+    explicit_subject = arguments.get("subject")
 
     if not message_content:
         return [mcp_types.TextContent(type="text", text="Error: message is required")]
@@ -451,14 +512,17 @@ async def broadcast_admin_message_tool_impl(arguments: Dict[str, Any]) -> List[m
         if recipient_id and recipient_id != "admin":  # Don't send to admin itself
             try:
                 # Use the send message function
-                result = await send_agent_message_tool_impl({
+                fanout_args: Dict[str, Any] = {
                     "token": admin_token,
                     "recipient_id": recipient_id,
                     "message": message_content,
                     "message_type": message_type,
                     "priority": priority,
-                    "deliver_method": "both"
-                })
+                    "deliver_method": "both",
+                }
+                if explicit_subject is not None:
+                    fanout_args["subject"] = explicit_subject
+                result = await send_agent_message_tool_impl(fanout_args)
                 sent_count += 1
             except Exception as e:
                 logger.error(f"Failed to send broadcast to {recipient_id}: {e}")
@@ -1095,7 +1159,25 @@ def register_agent_communication_tools():
                     "description": "How to deliver the message",
                     "enum": ["tmux", "store", "both"],
                     "default": "tmux"
-                }
+                },
+                "subject": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "Optional one-line subject for root messages. "
+                        "Ignored for replies (parent_message_id set). "
+                        "If omitted on a root message, an Ollama-backed "
+                        "helper proposes one when AGENT_MCP_SUBJECT_MODEL "
+                        "is configured; otherwise the body is truncated "
+                        "to 50 chars + '...' as a fallback."
+                    ),
+                },
+                "parent_message_id": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "If set, this message is a reply to the named "
+                        "root message_id. Replies always have subject = NULL."
+                    ),
+                },
             },
             "required": ["recipient_id", "message"],
             "additionalProperties": False
@@ -1180,7 +1262,15 @@ def register_agent_communication_tools():
                     "description": "Message priority",
                     "enum": ["low", "normal", "high", "urgent"],
                     "default": "high"
-                }
+                },
+                "subject": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "Optional subject applied to every fan-out root "
+                        "message. Omit to let each per-recipient send go "
+                        "through the standard Ollama/truncated-body path."
+                    ),
+                },
             },
             "required": ["message"],
             "additionalProperties": False
