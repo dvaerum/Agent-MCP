@@ -3726,24 +3726,45 @@ async def search_tasks_tool_impl(
     # only see their own (per-row filter below).
     requesting_agent_id = get_agent_id(agent_auth_token)
 
-    if not search_query or not search_query.strip():
-        return [
-            mcp_types.TextContent(
-                type="text", text="Error: search_query is required and cannot be empty."
-            )
-        ]
+    # `search_query` is optional as of v5.0.22 — callers may supply
+    # only `status_filter` to list tasks by status without text
+    # scoring (filter-only mode). When both are absent, the response
+    # surfaces a guidance error rather than crashing.
+    has_query = bool(search_query and search_query.strip())
 
     is_admin_request = verify_token(agent_auth_token, "admin")
 
-    # Prepare search terms
-    search_terms = [
-        term.strip().lower() for term in search_query.split() if len(term.strip()) > 2
-    ]
-    if not search_terms:
+    # Prepare search terms (only when a query is present)
+    search_terms: List[str] = []
+    if has_query:
+        search_terms = [
+            term.strip().lower()
+            for term in search_query.split()
+            if len(term.strip()) > 2
+        ]
+        if not search_terms:
+            return [
+                mcp_types.TextContent(
+                    type="text",
+                    text=(
+                        "Error: Search query must contain terms longer "
+                        "than 2 characters."
+                    ),
+                )
+            ]
+
+    # Guidance error: with neither a usable query nor a filter, there
+    # is no implicit "everything" semantic — ask the caller to narrow.
+    # `view_tasks` is the right tool for unbounded listing.
+    if not has_query and not status_filter:
         return [
             mcp_types.TextContent(
                 type="text",
-                text="Error: Search query must contain terms longer than 2 characters.",
+                text=(
+                    "Error: search_tasks requires either a search_query "
+                    "or a status_filter. For an unfiltered listing of "
+                    "tasks, use view_tasks instead."
+                ),
             )
         ]
 
@@ -3766,6 +3787,73 @@ async def search_tasks_tool_impl(
                 type="text", text="No tasks found matching the criteria."
             )
         ]
+
+    # Filter-only path: no query, only filters. Skip the scoring loop
+    # and return the candidate tasks ordered by (updated_at DESC).
+    if not has_query:
+        candidate_tasks.sort(
+            key=lambda t: t.get("updated_at", ""), reverse=True
+        )
+        truncated = candidate_tasks[:max_results]
+        filter_descr_parts: list[str] = []
+        if status_filter:
+            filter_descr_parts.append(f"status={status_filter}")
+        filter_descr = ", ".join(filter_descr_parts) or "no filters"
+
+        response_parts = [
+            f"Tasks matching filters ({filter_descr}) — "
+            f"{len(truncated)} of {len(candidate_tasks)} shown:\n"
+        ]
+        current_tokens = len("\n".join(response_parts)) // 4
+        for i, task in enumerate(truncated):
+            task_text = (
+                f"\n{i+1}. **{task.get('title', 'Untitled')}** "
+                f"(ID: {task.get('task_id', 'N/A')})"
+            )
+            task_text += (
+                f"\n   Status: {task.get('status', 'N/A')} | "
+                f"Priority: {task.get('priority', 'medium')} | "
+                f"Assigned: {task.get('assigned_to', 'None')}"
+            )
+            desc = task.get("description", "No description")
+            if len(desc) > 200:
+                desc = desc[:200] + "..."
+            task_text += f"\n   Description: {desc}"
+
+            task_tokens = estimate_tokens(task_text)
+            safety_buffer = 1000
+            if current_tokens + task_tokens <= (20000 - safety_buffer):
+                response_parts.append(task_text)
+                current_tokens += task_tokens
+            else:
+                remaining = len(truncated) - i
+                response_parts.append(
+                    f"\n⚠️  Response truncated - {remaining} more "
+                    f"results available"
+                )
+                break
+
+        response_parts.append("\n\n💡 Tips:")
+        response_parts.append(
+            "• Use view_tasks(task_id='ID') for full task details"
+        )
+        response_parts.append(
+            "• Add search_query to score results by text relevance"
+        )
+        response_parts.append(
+            "• Use max_results to control response size"
+        )
+
+        log_audit(
+            requesting_agent_id,
+            "search_tasks",
+            {
+                "query": None,
+                "status_filter": status_filter,
+                "results": len(truncated),
+            },
+        )
+        return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
 
     # Score tasks by relevance
     scored_results = []
@@ -4269,14 +4357,14 @@ def register_task_tools():
 
     register_tool(
         name="search_tasks",
-        description="Full-text search across task titles, descriptions, and notes. Critical for finding related work and avoiding duplication.",
+        description="Full-text search across task titles, descriptions, and notes — or filter-only listing when no query is supplied. Critical for finding related work, avoiding duplication, and quickly listing tasks by status.",
         input_schema={
             "type": "object",
             "properties": {
                 "token": {"type": "string", "description": "Authentication token. Optional if Authorization: Bearer header is supplied (recommended)."},
                 "search_query": {
                     "type": "string",
-                    "description": "Search terms to find in tasks",
+                    "description": "Search terms to find in tasks. Optional — when omitted, the tool returns tasks matching the other filter arguments (e.g. status_filter) without text scoring.",
                 },
                 "status_filter": {
                     "type": "string",
@@ -4300,7 +4388,7 @@ def register_task_tools():
                     "description": "Include notes content in search (default: true)",
                 },
             },
-            "required": ["search_query"],
+            "required": [],
             "additionalProperties": False,
         },
         implementation=search_tasks_tool_impl,
