@@ -91,6 +91,9 @@ async def test_agent_message_model_columns_match_raw_schema(tmp_path) -> None:
             "timestamp",
             "delivered",
             "read",
+            # v5.0.22: message threads + subjects (migration 0012).
+            "subject",
+            "parent_message_id",
         }, f"ORM columns drifted from raw schema: {model_cols}"
 
         from agent_mcp.core.config import get_db_path

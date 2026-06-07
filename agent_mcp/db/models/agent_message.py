@@ -59,6 +59,18 @@ class AgentMessage(Base):
         Boolean, nullable=False, server_default=text("0"),
     )
 
+    # v5.0.22 (feat: message threads + subjects). Both nullable:
+    #   * subject       — root-only summary line (replies stay NULL).
+    #   * parent_message_id — self-FK; NULL = root message.
+    # The FK itself (ON DELETE SET NULL) is declared in migration 0012
+    # rather than via a SQLAlchemy `ForeignKey()` annotation here, for
+    # the same reason `sender_id` / `recipient_id` carry no annotation:
+    # `create_all()` and the migration would race on FK DDL emission.
+    # The migration is idempotent and runs for fresh DBs too, so the
+    # FK lands either way.
+    subject: Mapped[str | None] = mapped_column(Text, nullable=True)
+    parent_message_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # PR-W3 (ORM big-bang): these four indexes were previously
     # only declared in init_database()'s raw SQL. Moving them onto
     # the ORM model means Base.metadata.create_all() reproduces the
@@ -81,6 +93,9 @@ class AgentMessage(Base):
             "timestamp",
         ),
         Index("idx_agent_messages_delivered", "delivered"),
+        # v5.0.22: thread-by-root lookups. Supports
+        # WHERE parent_message_id = ? for fanning out a thread.
+        Index("idx_agent_messages_parent", "parent_message_id"),
     )
 
     def __repr__(self) -> str:  # pragma: no cover — debug aid
