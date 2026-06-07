@@ -291,6 +291,32 @@ export function MessagesDashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filters])
 
+  // v5.0.24 polish: human-readable label for a parent message id.
+  // Used by the reply chip + the in-table reply marker so the user
+  // sees "reply to: Build debug help" instead of the opaque
+  // "reply to: msg_a04d4d5666e5c19d".
+  //
+  // Lookup order:
+  //   1. If we have the parent in the current page (messages map),
+  //      return its subject; else first 40 chars of its content.
+  //   2. Otherwise fall back to the message_id — the page just
+  //      didn't load that far back, but the link is still valid.
+  const labelForParent = useCallback(
+    (parentId: string | null): string => {
+      if (!parentId) return ""
+      const parent = messages.find((m) => m.message_id === parentId)
+      if (parent) {
+        if (parent.subject && parent.subject.trim()) return parent.subject
+        const snippet = (parent.message_content || "").replace(/\s+/g, " ").trim()
+        if (snippet) {
+          return snippet.length > 40 ? snippet.slice(0, 40) + "…" : snippet
+        }
+      }
+      return parentId
+    },
+    [messages],
+  )
+
   const clearFilters = () => {
     setFilters({ from: "", to: "", type: "", priority: "", read: "", q: "" })
   }
@@ -337,12 +363,17 @@ export function MessagesDashboard() {
   // v5.0.22: ask the backend (which delegates to Ollama if
   // AGENT_MCP_SUBJECT_MODEL is configured) to propose a subject from
   // the current compose body. Returns {subject: string | null}.
-  // null → leave the field as-is so the user knows the helper didn't
-  // have anything to suggest.
+  //
+  // v5.0.24 polish: when the response is null (Ollama unconfigured
+  // OR helper returned empty), surface a transient hint so the user
+  // knows the silence is intentional, not a hang. The hint clears on
+  // the next Suggest attempt or when the user types into the field.
+  const [suggestHint, setSuggestHint] = useState<string | null>(null)
   const suggestSubject = async () => {
     if (!composeContent.trim()) return
     setSuggestLoading(true)
     setError(null)
+    setSuggestHint(null)
     try {
       const t = await adminToken()
       const data = await callMessages("POST", "/suggest-subject", {
@@ -351,6 +382,11 @@ export function MessagesDashboard() {
       })
       if (data?.subject) {
         setComposeSubject(String(data.subject))
+      } else {
+        setSuggestHint(
+          "No suggestion available — type a subject manually " +
+            "(or set AGENT_MCP_SUBJECT_MODEL server-side to enable Ollama).",
+        )
       }
     } catch (e: any) {
       // Soft-fail — the user can still type a subject manually.
@@ -545,8 +581,13 @@ export function MessagesDashboard() {
                 schema contract. */}
             {composeReplyParentId ? (
               <div className="rounded-md border border-muted bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+                {/* v5.0.24 polish: show the parent's subject (or a
+                    content snippet) instead of the opaque
+                    message_id. */}
                 ↳ reply to:{" "}
-                <span className="font-mono">{composeReplyParentId}</span>
+                <span className="font-medium text-foreground">
+                  {labelForParent(composeReplyParentId)}
+                </span>
                 <Button
                   variant="ghost"
                   size="sm"
@@ -563,7 +604,12 @@ export function MessagesDashboard() {
                   <Input
                     placeholder="Subject (optional — Suggest will fill from Ollama)"
                     value={composeSubject}
-                    onChange={(e) => setComposeSubject(e.target.value)}
+                    onChange={(e) => {
+                      setComposeSubject(e.target.value)
+                      // v5.0.24 polish: typing into the field clears
+                      // any stale "no suggestion" hint.
+                      if (suggestHint) setSuggestHint(null)
+                    }}
                   />
                   <Button
                     type="button"
@@ -575,6 +621,11 @@ export function MessagesDashboard() {
                     {suggestLoading ? "…" : "Suggest"}
                   </Button>
                 </div>
+                {suggestHint && (
+                  <p className="text-[11px] text-muted-foreground mt-1">
+                    {suggestHint}
+                  </p>
+                )}
               </div>
             )}
             <div>
@@ -809,9 +860,13 @@ export function MessagesDashboard() {
                             {m.subject ? (
                               m.subject
                             ) : isReply ? (
+                              // v5.0.24 polish: human-readable parent
+                              // label instead of the opaque message_id.
                               <span className="text-muted-foreground">
                                 ↳ reply to:{" "}
-                                <span className="font-mono">{m.parent_message_id}</span>
+                                <span className="text-foreground">
+                                  {labelForParent(m.parent_message_id)}
+                                </span>
                               </span>
                             ) : (
                               <span className="text-muted-foreground/50">—</span>
@@ -849,6 +904,7 @@ export function MessagesDashboard() {
                   toggleOne={toggleOne}
                   openDetail={(m) => detailDialog.open(m.message_id)}
                   deleteOne={deleteOne}
+                  labelForParent={labelForParent}
                 />
               </div>
             </>
