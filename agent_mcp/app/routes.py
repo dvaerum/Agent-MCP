@@ -2123,8 +2123,15 @@ async def list_participants_api_route(request: Request) -> JSONResponse:
 async def create_message_api_route(request: Request) -> JSONResponse:
     """POST /api/messages — admin composes a message to a recipient.
 
-    Body: {token, recipient_id, message_content, message_type?, priority?}
+    Body: {token, recipient_id, message_content, message_type?, priority?,
+           subject?, parent_message_id?}
     Returns: {success, message_id, message}
+
+    v5.0.22 (message threads + subjects):
+      * `subject` — root-only one-liner; persisted verbatim when
+        present. Force-NULLed for replies.
+      * `parent_message_id` — when set, this message is a reply to
+        the named root; subject is forced NULL regardless of input.
     """
     if request.method == 'OPTIONS':
         return await handle_options(request)
@@ -2139,6 +2146,9 @@ async def create_message_api_route(request: Request) -> JSONResponse:
         content = data.get('message_content')
         message_type = data.get('message_type', 'text')
         priority = data.get('priority', 'normal')
+        # v5.0.22 — message threads + subjects.
+        explicit_subject = data.get('subject')
+        parent_message_id = data.get('parent_message_id')
 
         if not verify_token(admin_token, required_role='admin'):
             return JSONResponse({"error": "Invalid admin token"}, status_code=403)
@@ -2219,15 +2229,41 @@ async def create_message_api_route(request: Request) -> JSONResponse:
             })
 
         message_id = f"msg_{_secrets.token_hex(8)}"
+
+        # v5.0.22 effective-subject computation. Three branches —
+        # mirrors send_agent_message_tool_impl exactly:
+        #   1. Reply (parent set) → subject NULL regardless of body.
+        #   2. Explicit subject → verbatim.
+        #   3. Root w/o subject → Ollama suggest_subject if
+        #      AGENT_MCP_SUBJECT_MODEL is set; otherwise truncated body.
+        effective_subject: str | None
+        if parent_message_id:
+            effective_subject = None
+        elif explicit_subject:
+            effective_subject = explicit_subject
+        else:
+            suggested: str | None = None
+            if os.environ.get("AGENT_MCP_SUBJECT_MODEL", "").strip():
+                from ..features.message_suggestions import suggest_subject
+                suggested = await suggest_subject(content)
+            if suggested:
+                effective_subject = suggested
+            else:
+                effective_subject = (
+                    content[:50] + "..." if len(content) > 50 else content
+                )
+
         cursor.execute(
             """
             INSERT INTO agent_messages (
                 message_id, sender_id, recipient_id, message_content,
-                message_type, priority, timestamp, delivered, read
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                message_type, priority, timestamp, delivered, read,
+                subject, parent_message_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (message_id, sender_id, recipient_id, content,
-             message_type, priority, timestamp, 0, 0),
+             message_type, priority, timestamp, 0, 0,
+             effective_subject, parent_message_id),
         )
         log_agent_action_to_db(
             cursor, sender_id, "sent_message_via_dashboard",
@@ -2252,6 +2288,57 @@ async def create_message_api_route(request: Request) -> JSONResponse:
     finally:
         if conn:
             conn.close()
+
+
+async def suggest_subject_api_route(request: Request) -> JSONResponse:
+    """POST /api/messages/suggest-subject — Ollama-backed subject helper.
+
+    Body: {token, content}
+    Returns: {"subject": "<string>"}   on success
+             {"subject": null}          when AGENT_MCP_SUBJECT_MODEL is
+                                        unset OR the helper failed.
+    Status 401 when the token is missing/invalid (any agent token,
+    not just admin — the helper is read-only and cheap).
+
+    Why graceful degrade (200 + null) rather than 503: the dashboard
+    treats this as a hint, not a hard requirement. If the helper is
+    down, the user types a subject by hand; we don't want to colour
+    that "subject is empty" path as an error in the network panel.
+    """
+    if request.method == 'OPTIONS':
+        return await handle_options(request)
+    if request.method != 'POST':
+        return JSONResponse({"error": "Method not allowed"}, status_code=405)
+
+    try:
+        data = await get_sanitized_json_body(request)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    token = data.get('token')
+    # `verify_token(t)` with no required_role accepts any valid agent
+    # token (admin or worker). Returns False on missing/invalid.
+    if not token or not verify_token(token):
+        return JSONResponse({"error": "Invalid token"}, status_code=401)
+
+    content = (data.get('content') or "").strip()
+    if not content:
+        return JSONResponse({"subject": None})
+
+    # Short-circuit when no Ollama backend is configured. Saves the
+    # helper import + the no-op call. Matches the gate inside
+    # send_agent_message_tool_impl.
+    if not os.environ.get("AGENT_MCP_SUBJECT_MODEL", "").strip():
+        return JSONResponse({"subject": None})
+
+    try:
+        from ..features.message_suggestions import suggest_subject
+        subject = await suggest_subject(content)
+    except Exception as e:  # pragma: no cover — defensive
+        logger.warning("suggest_subject endpoint helper raised: %s", e)
+        subject = None
+
+    return JSONResponse({"subject": subject})
 
 
 async def patch_message_api_route(request: Request) -> JSONResponse:
@@ -2357,6 +2444,10 @@ routes.extend([
     # filter dropdowns so terminated agents don't ghost the UI.
     Route('/api/messages/participants', endpoint=list_participants_api_route, name="list_participants_api", methods=['POST', 'OPTIONS']),
     Route('/api/messages', endpoint=create_message_api_route, name="create_message_api", methods=['POST', 'OPTIONS']),
+    # v5.0.22: subject-suggest helper. Declared BEFORE
+    # /api/messages/{message_id} so the static path matches before the
+    # dynamic one (Starlette walks routes in registration order).
+    Route('/api/messages/suggest-subject', endpoint=suggest_subject_api_route, name="suggest_subject_api", methods=['POST', 'OPTIONS']),
     Route('/api/messages/{message_id}', endpoint=patch_message_api_route, name="patch_message_api", methods=['PATCH', 'DELETE', 'OPTIONS']),
 ])
 
