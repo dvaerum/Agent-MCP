@@ -927,12 +927,40 @@ async def wait_for_events_tool_impl(
         on every call; returns ``stop_listening`` if either is OFF.
       * Per-agent serialization lock — a second concurrent call returns
         ``{"error": "another_wait_in_flight"}`` immediately (HTTP-409
-        analog).
+        analog). **Slated for removal — see audit note below.**
       * Rechecks flags during long waits at 2s cadence so a toggle flip
         wakes the call within ~5s with ``stop_listening``.
       * Drains the per-agent out-of-band queue (synthetic events like
         ``unassigned_task_appeared``) on every wake.
       * Persists the high-water cursor to `agents.last_event_seen_at`.
+
+    Audit note (pre-fan-out, PR-B / v5.0.24):
+      The 409 lock is being reverted in favor of a per-call fan-out so
+      a worker's Claude Code MCP session + a shell-based monitor with
+      the same bearer can both await the same events. Inventory of
+      surfaces currently coupled to the lock:
+        * ``g.lock_for(agent_id)`` / ``g.agent_event_locks`` in
+          ``agent_mcp/core/state.py`` — gates the wait_for_events call.
+        * ``g.drain_events(agent_id)`` in ``agent_mcp/core/state.py``
+          — destructive single-consumer drain of synthetic events
+          (e.g. ``unassigned_task_appeared``). With multiple waiters
+          this MUST become per-waiter so each consumer sees every
+          synthetic event.
+        * ``agent_event_signals`` in ``agent_mcp/core/state.py`` — the
+          shared ``asyncio.Event`` is already broadcast-friendly:
+          ``.set()`` wakes every waiter on ``.wait()``. No change
+          needed here.
+        * ``agent_mcp/app/routes.py:/api/all-data`` reads
+          ``existing_lock.locked()`` to surface
+          ``wait_for_events_in_flight``. Will switch to a waiter-count
+          probe (``>0`` waiters = in flight).
+        * ``tests/test_event_coord_serialization.py`` — 409 regression
+          test, retired by PR-B (semantics reversed).
+        * ``tests/test_dashboard_wait_in_flight_flag.py`` — migrated to
+          probe the new waiter-count registry instead of the lock.
+        * Test fixtures in ``tests/conftest.py`` + ``tests/harness.py``
+          clear ``g.agent_event_locks``; harmless to keep as long as
+          the dict exists, but cleaned up alongside the registry swap.
     """
     token = arguments.get("token")
     agent_id = get_agent_id(token)
