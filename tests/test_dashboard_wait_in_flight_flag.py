@@ -1,20 +1,20 @@
-"""RED tests for PR-3 of the event-coord plan: surface the
-``wait_for_events_in_flight`` per-agent boolean in /api/all-data so
-the dashboard can render the "waiting" chip + Settings page count.
+"""Tests for the ``wait_for_events_in_flight`` per-agent boolean in
+``/api/all-data`` — the dashboard "waiting" chip + Settings page
+count consume this field.
 
-Contract:
+Contract (PR-3, updated by PR-B / v5.0.24):
   (i)   Every agent row in /api/all-data carries a
         ``wait_for_events_in_flight: bool`` field.
-  (ii)  Defaults to FALSE for every agent when no per-agent
-        long-poll lock is held.
-  (iii) Returns TRUE while a `wait_for_events` call is in flight for
-        that agent (i.e. while ``g.lock_for(agent_id)`` is held).
+  (ii)  Defaults to FALSE for every agent when no ``wait_for_events``
+        call is currently parked.
+  (iii) Returns TRUE while ≥1 ``wait_for_events`` call is in flight
+        for that agent (i.e. while ``state.waiter_count(agent_id)``
+        > 0). Pre-fan-out this was ``g.lock_for(agent_id).locked()``;
+        the lock was retired alongside the per-agent serialization
+        decision in PR #128 (see ``docs/adr/0012-wait_for_events_fanout.md``).
 
-The PR-2 hardening uses ``g.lock_for(agent_id)`` (an asyncio.Lock)
-to enforce one-call-per-agent on `wait_for_events`. The dashboard
-surface just exposes ``lock.locked()`` per agent under the agent's
-JSON object. The synthetic 'Admin' display row is exempt — admin
-never enters the wake loop.
+The synthetic 'Admin' display row is exempt — admin never enters the
+wake loop.
 """
 
 from __future__ import annotations
@@ -76,16 +76,23 @@ async def test_wait_in_flight_defaults_false_when_no_lock_held(
             )
 
 
-async def test_wait_in_flight_true_while_lock_held(tmp_path: Path) -> None:
-    """While a `wait_for_events` call holds the per-agent lock, the
+async def test_wait_in_flight_true_while_waiter_registered(
+    tmp_path: Path,
+) -> None:
+    """While ≥1 ``wait_for_events`` call is parked for an agent the
     /api/all-data row for that agent must report TRUE. Other agents
     stay FALSE.
 
-    We acquire the lock directly via ``g.lock_for(agent_id)`` rather
-    than calling the tool itself — simulates the in-flight state
-    without needing to also drive a concurrent task. The flag is
-    purely a snapshot of ``lock.locked()``; if the snapshot matches
-    the lock state, the tool-in-flight case is covered by definition.
+    We register a fake waiter directly via ``g.register_waiter`` (the
+    same entry point ``wait_for_events_tool_impl`` uses on entry).
+    The flag is a snapshot of ``g.waiter_count(agent_id) > 0``; if
+    the snapshot matches the registry state, the real tool-in-flight
+    case is covered by definition.
+
+    PR-B / v5.0.24 swapped the underlying probe from ``lock.locked()``
+    to a waiter-count query so multiple concurrent waiters all
+    register correctly — the boolean ``wait_for_events_in_flight``
+    contract stays the same shape the dashboard already consumed.
     """
     from agent_mcp.core import globals as g
 
@@ -93,8 +100,9 @@ async def test_wait_in_flight_true_while_lock_held(tmp_path: Path) -> None:
         await admin.create_worker("alice")
         await admin.create_worker("bob")
 
-        lock = g.lock_for("alice")
-        await lock.acquire()
+        # Stand in for an actual wait_for_events call — register a
+        # queue and leave it parked while we probe the API surface.
+        waiter_queue = g.register_waiter("alice")
         try:
             resp = admin.client.get("/api/all-data")
             assert resp.status_code == 200, resp.text
@@ -103,21 +111,40 @@ async def test_wait_in_flight_true_while_lock_held(tmp_path: Path) -> None:
             assert "alice" in by_id, sorted(by_id)
             assert "bob" in by_id, sorted(by_id)
             assert by_id["alice"]["wait_for_events_in_flight"] is True, (
-                f"alice should be in-flight while her lock is held; "
-                f"got {by_id['alice']['wait_for_events_in_flight']!r}"
+                f"alice should be in-flight while a waiter is "
+                f"registered; got "
+                f"{by_id['alice']['wait_for_events_in_flight']!r}"
             )
             assert by_id["bob"]["wait_for_events_in_flight"] is False, (
-                f"bob's lock is not held; got "
+                f"bob has no waiter; got "
                 f"{by_id['bob']['wait_for_events_in_flight']!r}"
             )
-        finally:
-            lock.release()
 
-        # After release the next /api/all-data call sees the false state.
+            # Fan-out coverage: a second waiter for the same agent
+            # must NOT flip the flag back to False — the count-based
+            # probe is "any waiter parked", which covers both single
+            # and multi-waiter cases.
+            extra_queue = g.register_waiter("alice")
+            try:
+                resp = admin.client.get("/api/all-data")
+                by_id = {
+                    a["agent_id"]: a for a in resp.json().get("agents", [])
+                }
+                assert by_id["alice"]["wait_for_events_in_flight"] is True, (
+                    "two concurrent waiters should still surface TRUE"
+                )
+            finally:
+                g.unregister_waiter("alice", extra_queue)
+        finally:
+            g.unregister_waiter("alice", waiter_queue)
+
+        # After every waiter unregisters the next /api/all-data call
+        # sees the false state.
         resp = admin.client.get("/api/all-data")
         assert resp.status_code == 200, resp.text
         agents = resp.json().get("agents", [])
         by_id = {a["agent_id"]: a for a in agents}
         assert by_id["alice"]["wait_for_events_in_flight"] is False, (
-            "alice should no longer report in-flight after lock release"
+            "alice should no longer report in-flight after every waiter "
+            "deregisters"
         )
