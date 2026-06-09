@@ -35,8 +35,6 @@ from __future__ import annotations
 import datetime
 import sys
 
-import pytest
-
 from agent_mcp.app.main_app import create_app
 from starlette.testclient import TestClient
 

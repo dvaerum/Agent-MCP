@@ -1,5 +1,5 @@
 # Agent-MCP/agent_mcp/repositories/__init__.py
-"""Lifespan-owned Repository singletons (PR #146).
+"""Lifespan-owned Repository singletons.
 
 This package establishes the **class-based** Repository pattern as the
 canonical seam between business logic and persistence. PR #137 ("per-
@@ -9,10 +9,12 @@ ruled that did not deliver on the "Repository" name — there was no
 identity, no lifecycle, and no place to attach future state (request
 counters, batched writes, per-process subscriber registries).
 
-This PR makes the contract real for **Task**. Agent and Message
-follow in PRs 2-3 of the architecture-review series.
+PR #146 made the contract real for **Task** (the first concept in the
+series). This PR clones the pattern for **Agent** — the same shape,
+same lifecycle, same lazy ``__getattr__`` resolution; just a different
+domain. Message follows in PR 3 of the architecture-review series.
 
-Design decisions locked in grilling:
+Design decisions locked in grilling (verbatim from PR #146):
 
 * **Shape**: Repository **classes**, not modules of functions. Each
   class is the single owner of its concept's cache+DB invariant.
@@ -20,42 +22,39 @@ Design decisions locked in grilling:
   startup hook instantiates and attaches the singleton; teardown
   clears it. Tests using the in-process harness pick up the same
   singleton — no per-test wiring.
-* **First concept**: Task. Highest leakage in the architecture
-  review (12 raw ``get_db_connection()`` sites in ``task_tools.py``
-  + 4 in ``app/routes.py``) and the most complex domain (cascade
-  deletes, parent-child trees, dependency edges).
 
-Import pattern at call sites:
+Import pattern at call sites::
 
-    from agent_mcp.repositories import task_repo
+    from agent_mcp.repositories import agent_repo, task_repo
+    agent = agent_repo.get_by_token(bearer_token)
     task = task_repo.get_by_id(task_id)
-    task_repo.update_fields(task_id, {"status": "completed"})
+    agent_repo.update_field(agent_id, "status", "active")
 
 Lifecycle:
 
-* ``set_task_repo(instance)`` is called by
+* ``set_<concept>_repo(instance)`` is called by
   ``app.server_lifecycle.application_startup`` once the DB is ready.
-* ``clear_task_repo()`` is called by ``application_shutdown``.
-* ``task_repo`` is a module attribute resolved lazily via
+* ``clear_<concept>_repo()`` is called by ``application_shutdown``.
+* ``<concept>_repo`` is a module attribute resolved lazily via
   ``__getattr__`` so callers can ``from agent_mcp.repositories
-  import task_repo`` at import time without forcing a startup-order
+  import <concept>_repo`` at import time without forcing a startup-order
   constraint.
 
 Co-existence with PR #137 module-of-functions:
 
-The old module ``agent_mcp.core.repositories.task_repo`` stays alive
-as a thin wrapper around the singleton — every call site that
-imports the module form keeps working with no edits. The class
-form is the new canonical surface; existing-call-site migration
-follows in subsequent PRs once the foundation is proven.
+The old modules ``agent_mcp.core.repositories.task_repo`` /
+``agent_repo`` stay alive — every call site that imports the module
+form keeps working with no edits. The class form is the new canonical
+surface; existing-call-site migration follows in subsequent PRs once
+the foundation is proven.
 """
 from __future__ import annotations
 
 from typing import Any, Optional
 
 
-# Module-level singleton slot. Populated by ``set_task_repo`` during
-# lifespan startup; cleared by ``clear_task_repo`` on shutdown.
+# --- TaskRepository singleton slot (PR #146) ---------------------------
+
 _task_repo_instance: Optional["TaskRepository"] = None  # noqa: F821
 
 
@@ -107,29 +106,77 @@ def get_task_repo() -> "TaskRepository":  # noqa: F821
     return _task_repo_instance
 
 
+# --- AgentRepository singleton slot ------------------------------------
+
+_agent_repo_instance: Optional["AgentRepository"] = None  # noqa: F821
+
+
+def set_agent_repo(instance: "AgentRepository") -> None:  # noqa: F821
+    """Install the AgentRepository singleton.
+
+    Mirrors :func:`set_task_repo`. Called by
+    ``app.server_lifecycle.application_startup`` after the DB schema
+    is ready.
+    """
+    global _agent_repo_instance
+    _agent_repo_instance = instance
+
+
+def clear_agent_repo() -> None:
+    """Drop the AgentRepository singleton.
+
+    Mirrors :func:`clear_task_repo`. Called by
+    ``application_shutdown`` so a stale instance bound to a closed
+    engine doesn't leak across the lifespan boundary.
+    """
+    global _agent_repo_instance
+    _agent_repo_instance = None
+
+
+def get_agent_repo() -> "AgentRepository":  # noqa: F821
+    """Return the live singleton, instantiating a default if needed.
+
+    Same lazy-init rationale as :func:`get_task_repo`: protects tests
+    and the legacy module-of-functions shim from a cold-start race
+    against the lifespan hook.
+    """
+    global _agent_repo_instance
+    if _agent_repo_instance is None:
+        from .agent_repository import AgentRepository
+
+        _agent_repo_instance = AgentRepository()
+    return _agent_repo_instance
+
+
 def __getattr__(name: str) -> Any:
     """Module-level lazy attribute lookup.
 
-    ``from agent_mcp.repositories import task_repo`` resolves through
-    here. The attribute is computed on every access (cheap) so a
-    later ``set_task_repo`` is picked up by call sites that have
-    already imported the name.
+    ``from agent_mcp.repositories import task_repo`` (or
+    ``agent_repo``) resolves through here. The attribute is computed
+    on every access (cheap) so a later ``set_*_repo`` is picked up by
+    call sites that have already imported the name.
 
-    NB: callers that bind the name once (``r = task_repo``) capture
+    NB: callers that bind the name once (``r = agent_repo``) capture
     the value of the singleton at bind time. That's fine for normal
     use; tests that need to swap instances per test should call
-    ``get_task_repo()`` directly.
+    ``get_agent_repo()`` directly.
     """
     if name == "task_repo":
         return get_task_repo()
+    if name == "agent_repo":
+        return get_agent_repo()
     raise AttributeError(
         f"module 'agent_mcp.repositories' has no attribute {name!r}"
     )
 
 
 __all__ = [
+    "agent_repo",
+    "clear_agent_repo",
     "clear_task_repo",
+    "get_agent_repo",
     "get_task_repo",
+    "set_agent_repo",
     "set_task_repo",
     "task_repo",
 ]
