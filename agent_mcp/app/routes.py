@@ -170,10 +170,13 @@ async def simple_status_api_route(request: Request) -> JSONResponse:
     try:
         # Get system status
         from ..db.actions.agent_db import get_all_active_agents_from_db
-        from ..db.actions.task_db import get_all_tasks_from_db
-        
+        from ..repositories import task_repo
+
         agents = get_all_active_agents_from_db()
-        tasks = get_all_tasks_from_db()
+        # PR #146: route the listing through the class-based
+        # TaskRepository so future per-instance hooks (audit, metrics)
+        # apply uniformly to dashboard reads too.
+        tasks = task_repo.list_all()
         
         # Count task statuses
         pending_tasks = len([t for t in tasks if t.get('status') == 'pending'])
@@ -368,30 +371,27 @@ async def all_tasks_api_route(request: Request) -> JSONResponse:
     unassigned_raw = request.query_params.get('unassigned', '')
     unassigned_filter: bool = unassigned_raw.lower() in ('true', '1', 'yes')
 
-    conn = None
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        # PR #146: route reads through TaskRepository. The `unassigned`
+        # branch is the only one without a direct repo method
+        # (`list_by_agent` takes an agent_id, not "no agent"), so it
+        # filters the full listing in Python — fine for the listing
+        # cardinality this endpoint serves (≤ thousands).
+        from ..repositories import task_repo
+
         if unassigned_filter:
-            cursor.execute(
-                "SELECT * FROM tasks WHERE assigned_to IS NULL "
-                "ORDER BY created_at DESC"
-            )
+            tasks_data = [
+                t for t in task_repo.list_all()
+                if t.get("assigned_to") in (None, "")
+            ]
         elif assigned_to_filter is not None:
-            cursor.execute(
-                "SELECT * FROM tasks WHERE assigned_to = ? "
-                "ORDER BY created_at DESC",
-                (assigned_to_filter,),
-            )
+            tasks_data = task_repo.list_by_agent(assigned_to_filter)
         else:
-            cursor.execute("SELECT * FROM tasks ORDER BY created_at DESC")
-        tasks_data = [dict(row) for row in cursor.fetchall()]
+            tasks_data = task_repo.list_all()
         return JSONResponse(tasks_data)
     except Exception as e:
         logger.error(f"Error fetching all tasks: {e}", exc_info=True)
         return JSONResponse({"error": f"Failed to fetch all tasks: {str(e)}"}, status_code=500)
-    finally:
-        if conn: conn.close()
 
 async def update_task_details_api_route(request: Request) -> JSONResponse:
     # Dashboard task edit endpoint.
