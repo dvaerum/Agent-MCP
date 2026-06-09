@@ -425,11 +425,14 @@ async def application_startup(
     # without worrying about cold-start races. The teardown counterpart
     # lives in ``application_shutdown`` so a stale instance bound to a
     # closed engine doesn't leak across the lifespan boundary.
-    from ..repositories import set_task_repo
+    from ..repositories import set_agent_repo, set_task_repo
+    from ..repositories.agent_repository import AgentRepository
     from ..repositories.task_repository import TaskRepository
 
     set_task_repo(TaskRepository())
     logger.info("TaskRepository singleton installed.")
+    set_agent_repo(AgentRepository())
+    logger.info("AgentRepository singleton installed.")
 
     # 7. Perform VSS Loadability Check (Original main.py: called by init_database)
     # This ensures g.global_vss_load_successful is set.
@@ -568,12 +571,14 @@ async def application_shutdown():
     # instance bound to the new engine cache rather than the stale one
     # this lifespan just tore down.
     try:
-        from ..repositories import clear_task_repo
+        from ..repositories import clear_agent_repo, clear_task_repo
 
         clear_task_repo()
         logger.info("TaskRepository singleton cleared.")
+        clear_agent_repo()
+        logger.info("AgentRepository singleton cleared.")
     except Exception as e:  # pragma: no cover - defensive
-        logger.warning(f"Failed to clear TaskRepository singleton: {e}")
+        logger.warning(f"Failed to clear Repository singletons: {e}")
 
     # Add any other cleanup (e.g., closing persistent connections if not managed by context)
     # For SQLite, connections are typically short-lived per request/operation.

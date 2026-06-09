@@ -1,6 +1,22 @@
 # Agent-MCP/agent_mcp/db/actions/agent_db.py
 """Reusable DB operations for the `agents` table.
 
+.. deprecated:: PR follow-up to #146
+   This module is kept as a thin compatibility surface so existing
+   call sites (``cli.py``, the older module-of-functions repos under
+   ``agent_mcp.core.repositories``, the legacy ``admin_tools.py``
+   multi-table transactions) keep working. New code should import
+   :class:`agent_mcp.repositories.AgentRepository` via the
+   ``agent_repo`` singleton instead — it's the single owner of the
+   ``state.active_agents`` + ``state.agent_working_dirs`` cache + DB
+   invariant.
+
+   The functions in this module remain ORM-backed and behaviourally
+   unchanged (no cache touch — that's the repo's job); the deprecation
+   only signals which surface to reach for in new code. A follow-up
+   PR in the architecture-review series will delete this module once
+   the call-site migration is complete.
+
 Cutover to SQLAlchemy in db-review PR-G2 — the model lives in
 `agent_mcp.db.models.agent::Agent`. The function signatures + return
 shapes (Optional[Dict[str, Any]] / List[Dict[str, Any]] keyed by
