@@ -1,11 +1,25 @@
 """Reusable DB operations for the `tasks` table.
 
-Cutover to SQLAlchemy in db-review PR-G3 — the model lives in
-`agent_mcp.db.models.task::Task`. Function signatures + return
-shapes (Optional[Dict[str, Any]] / List[Dict[str, Any]] keyed by
-column name, JSON-typed fields deserialised to Python lists) are
+.. deprecated:: PR #146
+   This module is kept as a thin compatibility surface so existing
+   call sites (``cli.py``, the older module-of-functions repos under
+   ``agent_mcp.core.repositories``) keep working. New code should
+   import :class:`agent_mcp.repositories.TaskRepository` via the
+   ``task_repo`` singleton instead — it's the single owner of the
+   ``state.tasks`` cache + DB invariant.
+
+   The functions in this module remain ORM-backed and behaviourally
+   unchanged (no double-write, no cache touch — that's the repo's
+   job); the deprecation only signals which surface to reach for in
+   new code. A follow-up PR in the architecture-review series will
+   delete this module once the call-site migration is complete.
+
+Cutover to SQLAlchemy happened in db-review PR-G3 — the model lives
+in :class:`agent_mcp.db.models.task.Task`. Function signatures +
+return shapes (Optional[Dict[str, Any]] / List[Dict[str, Any]] keyed
+by column name, JSON-typed fields deserialised to Python lists) are
 preserved 1:1 so consumers (cli, app/routes, dashboard API) don't
-need to change.
+need to change during the transition.
 
 The raw-SQL update path in `update_task_fields_in_db` keeps its
 allowlist of mutable fields — that allowlist doubles as

@@ -417,6 +417,20 @@ async def application_startup(
     await write_queue.start()
     logger.info("Database write queue initialized and started.")
 
+    # 6.6. Install Repository singletons (PR #146).
+    # The class-based ``TaskRepository`` is the single owner of the
+    # ``state.tasks`` cache + DB invariant; installing here (after the
+    # DB schema is applied and the write queue is running) means every
+    # request handler can ``from agent_mcp.repositories import task_repo``
+    # without worrying about cold-start races. The teardown counterpart
+    # lives in ``application_shutdown`` so a stale instance bound to a
+    # closed engine doesn't leak across the lifespan boundary.
+    from ..repositories import set_task_repo
+    from ..repositories.task_repository import TaskRepository
+
+    set_task_repo(TaskRepository())
+    logger.info("TaskRepository singleton installed.")
+
     # 7. Perform VSS Loadability Check (Original main.py: called by init_database)
     # This ensures g.global_vss_load_successful is set.
     check_vss_loadability()  # db.connection.check_vss_loadability
@@ -548,6 +562,18 @@ async def application_shutdown():
     write_queue = get_write_queue()
     await write_queue.stop()
     logger.info("Database write queue stopped.")
+
+    # Clear Repository singletons (PR #146) so a subsequent app build
+    # in the same process (test harness, hot reload) gets a fresh
+    # instance bound to the new engine cache rather than the stale one
+    # this lifespan just tore down.
+    try:
+        from ..repositories import clear_task_repo
+
+        clear_task_repo()
+        logger.info("TaskRepository singleton cleared.")
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(f"Failed to clear TaskRepository singleton: {e}")
 
     # Add any other cleanup (e.g., closing persistent connections if not managed by context)
     # For SQLite, connections are typically short-lived per request/operation.
