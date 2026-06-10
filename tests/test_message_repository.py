@@ -592,3 +592,176 @@ def test_disable_cache_is_a_noop_context_manager(project_dir, reset_globals):
         with message_repo.disable_cache():
             row = message_repo.get_by_id("nc1")
             assert row is not None
+
+
+# --- rename_participant (PR 6 — purge cascade) --------------------------
+
+
+def test_rename_participant_rewrites_sender_and_recipient(
+    project_dir, reset_globals,
+):
+    """``rename_participant`` rewrites both ``sender_id`` and
+    ``recipient_id`` from ``old_id`` to ``new_id``.
+
+    Used by the purge-cascade in :func:`purge_agent_api_route` to
+    tombstone the rows that reference a deleted agent.
+    """
+    with _make_client(project_dir):
+        from agent_mcp.repositories import message_repo
+
+        _seed_agent("alice")
+        _seed_agent("bob")
+        _seed_agent("carol")
+        # alice → bob: bob is the recipient
+        _seed_message("m1", sender_id="alice", recipient_id="bob")
+        # bob → carol: bob is the sender
+        _seed_message("m2", sender_id="bob", recipient_id="carol")
+        # alice → carol: bob not involved
+        _seed_message("m3", sender_id="alice", recipient_id="carol")
+
+        # The tombstone target row must exist BEFORE the rename — the
+        # agent_messages.{sender_id,recipient_id} FK constraints forbid
+        # rewriting to a non-existent agent_id.
+        _seed_agent("[deleted-bob]")
+
+        n = message_repo.rename_participant("bob", "[deleted-bob]")
+        assert n == 2  # m1.recipient_id + m2.sender_id
+
+        # Verify the rewrites landed.
+        m1 = message_repo.get_by_id("m1")
+        m2 = message_repo.get_by_id("m2")
+        m3 = message_repo.get_by_id("m3")
+        assert m1["recipient_id"] == "[deleted-bob]"
+        assert m1["sender_id"] == "alice"
+        assert m2["sender_id"] == "[deleted-bob]"
+        assert m2["recipient_id"] == "carol"
+        # m3 untouched.
+        assert m3["sender_id"] == "alice"
+        assert m3["recipient_id"] == "carol"
+
+
+def test_rename_participant_returns_zero_on_no_match(
+    project_dir, reset_globals,
+):
+    """Renaming a non-existent participant is a no-op returning 0."""
+    with _make_client(project_dir):
+        from agent_mcp.repositories import message_repo
+
+        _seed_agent("alice")
+        _seed_agent("bob")
+        _seed_message("m1", sender_id="alice", recipient_id="bob")
+        _seed_agent("[deleted-ghost]")
+
+        n = message_repo.rename_participant("ghost", "[deleted-ghost]")
+        assert n == 0
+        # m1 unchanged.
+        row = message_repo.get_by_id("m1")
+        assert row["sender_id"] == "alice"
+        assert row["recipient_id"] == "bob"
+
+
+def test_rename_participant_with_sqlite_cursor_uses_caller_transaction(
+    project_dir, reset_globals,
+):
+    """The ``connection=`` seam tolerates a raw sqlite3 cursor.
+
+    The purge cascade in routes.py wraps its rewrites in a hand-rolled
+    ``BEGIN``/``COMMIT`` against a sqlite3 cursor. The repo must
+    rewrite via the caller's cursor so the wider transaction stays
+    atomic.
+    """
+    with _make_client(project_dir):
+        from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import message_repo
+
+        _seed_agent("alice")
+        _seed_agent("bob")
+        _seed_message("m1", sender_id="alice", recipient_id="bob")
+        _seed_agent("[deleted-bob]")
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN")
+            n = message_repo.rename_participant(
+                "bob", "[deleted-bob]", connection=cursor,
+            )
+            assert n == 1  # one recipient_id row rewritten
+            conn.commit()
+        finally:
+            conn.close()
+
+        row = message_repo.get_by_id("m1")
+        assert row["recipient_id"] == "[deleted-bob]"
+
+
+# --- list_participants (PR 6 — dropdown source) -------------------------
+
+
+def test_list_participants_returns_live_agents_excluding_terminated(
+    project_dir, reset_globals,
+):
+    """``list_participants`` excludes terminated / tombstone agents and
+    prepends a synthetic ``admin`` row when missing."""
+    with _make_client(project_dir):
+        from agent_mcp.db.engine import get_session
+        from agent_mcp.db.models import Agent
+        from agent_mcp.repositories import message_repo
+
+        _seed_agent("alice")
+        _seed_agent("bob")
+        # Mark bob terminated; he must NOT appear in the live list.
+        with get_session() as session:
+            row = (
+                session.query(Agent)
+                .filter(Agent.agent_id == "bob")
+                .one()
+            )
+            row.status = "terminated"
+            session.commit()
+        # Seed a tombstone row; it must NOT appear either.
+        _seed_agent("[deleted-old]")
+        with get_session() as session:
+            row = (
+                session.query(Agent)
+                .filter(Agent.agent_id == "[deleted-old]")
+                .one()
+            )
+            row.status = "tombstone"
+            session.commit()
+
+        result = message_repo.list_participants()
+        live_ids = [a["agent_id"] for a in result["live"]]
+        # Synthetic admin prepended at the front.
+        assert live_ids[0].lower() == "admin"
+        assert "alice" in live_ids
+        assert "bob" not in live_ids
+        assert "[deleted-old]" not in live_ids
+
+
+def test_list_participants_extracts_tombstones_from_messages(
+    project_dir, reset_globals,
+):
+    """``tombstones`` mines DISTINCT sender_id / recipient_id values
+    starting with ``[deleted-`` from agent_messages."""
+    with _make_client(project_dir):
+        from agent_mcp.repositories import message_repo
+
+        _seed_agent("alice")
+        _seed_agent("[deleted-bob]")
+        _seed_agent("[deleted-carol]")
+        # Two tombstoned senders, one tombstoned recipient.
+        _seed_message(
+            "m1", sender_id="[deleted-bob]", recipient_id="alice",
+        )
+        _seed_message(
+            "m2", sender_id="[deleted-bob]", recipient_id="alice",
+        )
+        _seed_message(
+            "m3", sender_id="alice", recipient_id="[deleted-carol]",
+        )
+
+        result = message_repo.list_participants()
+        # DISTINCT + UNION across columns + sorted ascending.
+        assert result["tombstones"] == ["[deleted-bob]", "[deleted-carol]"]
+

@@ -58,7 +58,7 @@ from __future__ import annotations
 import contextlib
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
-from sqlalchemy import select
+from sqlalchemy import distinct, or_, select, update as sa_update
 from sqlalchemy.exc import SQLAlchemyError
 
 from ..core.config import logger
@@ -74,7 +74,7 @@ from ..db.actions.agent_messages_db import (
     mark_read_for_recipient as _db_mark_read_for_recipient,
 )
 from ..db.engine import get_session
-from ..db.models import AgentMessage
+from ..db.models import Agent, AgentMessage
 
 
 class MessageRepository:
@@ -493,6 +493,183 @@ class MessageRepository:
                 {"recipient_id": recipient_id, "count": n},
             )
         return n
+
+    # --- Write interface: rename_participant ----------------------------
+
+    def rename_participant(
+        self,
+        old_id: str,
+        new_id: str,
+        *,
+        connection: Any = None,
+    ) -> int:
+        """Rewrite ``sender_id`` and ``recipient_id`` from ``old_id`` to ``new_id``.
+
+        Used by the agent purge-cascade in
+        :func:`agent_mcp.app.routes.purge_agent_api_route` to tombstone
+        the rows that reference a deleted agent. Returns the total
+        count of rows touched across both columns.
+
+        ``connection`` is the transaction-aware seam: when the caller
+        already holds an open SQLAlchemy ``Session`` (or a
+        sqlite3-style cursor — see below), the rename happens inside
+        that transaction so the wider cascade stays atomic. When
+        ``None`` (the standalone case), the method opens its own
+        session and commits.
+
+        Two connection shapes are tolerated:
+
+        * **SQLAlchemy Session** — used directly via ORM queries; the
+          caller owns commit. This is the going-forward path the other
+          repos already support.
+        * **sqlite3 Cursor (DB-API)** — used via ``cursor.execute``.
+          The purge-cascade route holds a raw sqlite3 cursor today
+          inside a hand-rolled ``BEGIN``/``COMMIT`` block; supporting
+          the cursor shape lets that migration land without rewriting
+          the entire cascade to SQLAlchemy first.
+
+        No EventBus publish — the rename is a tombstoning operation
+        not a real message event; subscribers shouldn't see it.
+        """
+        if not old_id or not new_id:
+            return 0
+
+        # sqlite3 cursor path: detect by absence of `query` (Session)
+        # / `execute` only attribute. SQLAlchemy Session has `query`;
+        # sqlite3.Cursor only has `execute`.
+        if connection is not None and not hasattr(connection, "query"):
+            cur = connection
+            cur.execute(
+                "UPDATE agent_messages SET sender_id = ? "
+                "WHERE sender_id = ?",
+                (new_id, old_id),
+            )
+            n_sender = cur.rowcount if cur.rowcount != -1 else 0
+            cur.execute(
+                "UPDATE agent_messages SET recipient_id = ? "
+                "WHERE recipient_id = ?",
+                (new_id, old_id),
+            )
+            n_recipient = cur.rowcount if cur.rowcount != -1 else 0
+            return n_sender + n_recipient
+
+        if connection is not None:
+            # SQLAlchemy Session path: caller commits.
+            session = connection
+            try:
+                r1 = session.execute(
+                    sa_update(AgentMessage)
+                    .where(AgentMessage.sender_id == old_id)
+                    .values(sender_id=new_id)
+                )
+                r2 = session.execute(
+                    sa_update(AgentMessage)
+                    .where(AgentMessage.recipient_id == old_id)
+                    .values(recipient_id=new_id)
+                )
+                return (r1.rowcount or 0) + (r2.rowcount or 0)
+            except SQLAlchemyError as e:
+                logger.error(
+                    f"Database error renaming participant "
+                    f"'{old_id}' -> '{new_id}' via shared session: {e}",
+                    exc_info=True,
+                )
+                return 0
+
+        # Standalone path: open our own session and commit.
+        try:
+            with get_session() as session:
+                r1 = session.execute(
+                    sa_update(AgentMessage)
+                    .where(AgentMessage.sender_id == old_id)
+                    .values(sender_id=new_id)
+                )
+                r2 = session.execute(
+                    sa_update(AgentMessage)
+                    .where(AgentMessage.recipient_id == old_id)
+                    .values(recipient_id=new_id)
+                )
+                session.commit()
+                return (r1.rowcount or 0) + (r2.rowcount or 0)
+        except SQLAlchemyError as e:
+            logger.error(
+                f"Database error renaming participant "
+                f"'{old_id}' -> '{new_id}': {e}",
+                exc_info=True,
+            )
+            return 0
+
+    # --- Read interface: list_participants ------------------------------
+
+    def list_participants(self) -> Dict[str, Any]:
+        """Return the participant lists that source the Messages-tab dropdowns.
+
+        Reads agents whose status is neither ``terminated`` nor
+        ``tombstone`` (the live set the dashboard already exposes
+        elsewhere) plus a synthetic ``admin`` row prepended for
+        compose-to-admin use. The ``tombstones`` list mines the
+        distinct ``sender_id`` / ``recipient_id`` values starting with
+        the ``[deleted-`` marker that the purge cascade writes — so
+        the dropdown can still filter historical messages from purged
+        agents.
+
+        Replaces the inline raw-SQL in
+        :func:`agent_mcp.app.routes.list_participants_api_route` 1:1.
+
+        Returns ``{"live": [...], "tombstones": [...]}``. On DB error
+        returns ``{"live": [], "tombstones": []}`` and logs at error.
+        """
+        try:
+            with get_session() as session:
+                # Live agents — excludes terminated AND tombstone rows.
+                # Mirrors the WHERE clause in routes.py exactly.
+                live_rows = (
+                    session.query(Agent.agent_id, Agent.status)
+                    .filter(
+                        or_(
+                            Agent.status.is_(None),
+                            Agent.status.notin_(("terminated", "tombstone")),
+                        )
+                    )
+                    .order_by(Agent.agent_id.asc())
+                    .all()
+                )
+                live = [
+                    {"agent_id": r.agent_id, "status": r.status}
+                    for r in live_rows
+                ]
+                if not any(
+                    (a.get("agent_id") or "").lower() == "admin"
+                    for a in live
+                ):
+                    live.insert(0, {"agent_id": "admin", "status": "system"})
+
+                # Tombstones: distinct sender_id ∪ recipient_id values
+                # beginning with "[deleted-". UNION dedupes.
+                senders = (
+                    session.query(distinct(AgentMessage.sender_id))
+                    .filter(AgentMessage.sender_id.like("[deleted-%"))
+                    .all()
+                )
+                recipients = (
+                    session.query(distinct(AgentMessage.recipient_id))
+                    .filter(AgentMessage.recipient_id.like("[deleted-%"))
+                    .all()
+                )
+                tombstones = sorted(
+                    {r[0] for r in senders} | {r[0] for r in recipients}
+                )
+                return {"live": live, "tombstones": tombstones}
+        except SQLAlchemyError as e:
+            logger.error(
+                f"Database error listing participants: {e}", exc_info=True,
+            )
+            return {"live": [], "tombstones": []}
+        except Exception as e:
+            logger.error(
+                f"Unexpected error listing participants: {e}", exc_info=True,
+            )
+            return {"live": [], "tombstones": []}
 
     # --- Write interface: delete ----------------------------------------
 
