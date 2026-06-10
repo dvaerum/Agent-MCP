@@ -17,6 +17,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { apiClient, Task } from "@/lib/api"
 import { useServerStore } from "@/lib/stores/server-store"
 import { useDialog } from "@/hooks/use-dialog"
+import { useFilters } from "@/hooks/use-filters"
 import { cn } from "@/lib/utils"
 import { Skeleton } from "@/components/ui/skeleton"
 import { EmptyState } from "@/components/dashboard/shared/empty-state"
@@ -1165,9 +1166,24 @@ export function TasksDashboard() {
   const { tasks, loading, error, refresh, lastFetch, isConnected } = useTasksData()
   const { servers, activeServerId } = useServerStore()
   const activeServer = servers.find(s => s.id === activeServerId)
-  const [searchTerm, setSearchTerm] = useState('')
-  const [statusFilter, setStatusFilter] = useState<string>('all')
-  const [priorityFilter, setPriorityFilter] = useState<string>('all')
+  // Filter state — owned by useFilters<TaskFilters> (PR 4 of the
+  // 2026-06-09 architecture review). Replaces the three sibling
+  // useStates (searchTerm / statusFilter / priorityFilter) shared
+  // with messages-/agents-dashboard.tsx as the same hand-rolled
+  // pattern. Tasks-dashboard doesn't expose a "Clear filters" button
+  // today, so `clearAll` / `isActive` are unused — but the hook still
+  // owns the state shape and the per-field updater (`setFilter`),
+  // and the migration unblocks adding that button uniformly later.
+  // No `onReset` callback: tasks-dashboard has no pagination cursor
+  // to reset; filter changes just re-run the memoised filter pass.
+  const { filters, setFilter } = useFilters<{
+    searchTerm: string
+    statusFilter: string
+    priorityFilter: string
+  }>({
+    initial: { searchTerm: '', statusFilter: 'all', priorityFilter: 'all' },
+  })
+  const { searchTerm, statusFilter, priorityFilter } = filters
   // Row-action dialog state. Each holds the **task_id** of the task
   // being viewed / edited / deleted via the live-lookup useDialog<T>
   // hook (Candidate D, architecture review 2026-06-02). The dialog
@@ -1375,11 +1391,11 @@ export function TasksDashboard() {
           <Input
             placeholder="Search tasks..."
             value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
+            onChange={(e) => setFilter("searchTerm", e.target.value)}
             className="pl-10"
           />
         </div>
-        <Select value={statusFilter} onValueChange={setStatusFilter}>
+        <Select value={statusFilter} onValueChange={(v) => setFilter("statusFilter", v)}>
           <SelectTrigger className="w-full sm:w-36">
             <SelectValue />
           </SelectTrigger>
@@ -1392,7 +1408,7 @@ export function TasksDashboard() {
             <SelectItem value="cancelled">Cancelled</SelectItem>
           </SelectContent>
         </Select>
-        <Select value={priorityFilter} onValueChange={setPriorityFilter}>
+        <Select value={priorityFilter} onValueChange={(v) => setFilter("priorityFilter", v)}>
           <SelectTrigger className="w-full sm:w-32">
             <SelectValue />
           </SelectTrigger>

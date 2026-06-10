@@ -22,6 +22,7 @@ import { useServerStore } from "@/lib/stores/server-store"
 import { useDataStore } from "@/lib/stores/data-store"
 import { cn } from "@/lib/utils"
 import { useDialog } from "@/hooks/use-dialog"
+import { useFilters } from "@/hooks/use-filters"
 import { TaskDetailsDialog } from "./task-details-dialog"
 import { Skeleton } from "@/components/ui/skeleton"
 import { EmptyState } from "@/components/dashboard/shared/empty-state"
@@ -1563,8 +1564,22 @@ export function AgentsDashboard() {
   const { servers, activeServerId } = useServerStore()
   const activeServer = servers.find(s => s.id === activeServerId)
   const { data, loading, error, fetchAllData, refreshData, getActiveAgents } = useDataStore()
-  const [searchTerm, setSearchTerm] = useState('')
-  const [statusFilter, setStatusFilter] = useState<string>('all')
+  // Filter state — owned by useFilters<AgentFilters> (PR 4 of the
+  // 2026-06-09 architecture review). Replaces the two sibling
+  // useStates (searchTerm / statusFilter) shared with messages-/
+  // tasks-dashboard.tsx as the same hand-rolled pattern.
+  // Agents-dashboard doesn't expose a "Clear filters" button today, so
+  // `clearAll` / `isActive` are unused — the hook still owns the
+  // state shape + per-field updater (`setFilter`). No `onReset`
+  // callback: agents-dashboard has no pagination cursor; filter
+  // changes just re-run the client-side filter pass.
+  const { filters, setFilter } = useFilters<{
+    searchTerm: string
+    statusFilter: string
+  }>({
+    initial: { searchTerm: '', statusFilter: 'all' },
+  })
+  const { searchTerm, statusFilter } = filters
   // selectedAgent is the "current selection" marker the header chip
   // and the detail dialog both observe; the detail dialog's
   // open/close drives it via useDialog (see handleSelectAgent / the
@@ -1835,11 +1850,11 @@ export function AgentsDashboard() {
           <Input
             placeholder="Search agents..."
             value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
+            onChange={(e) => setFilter("searchTerm", e.target.value)}
             className="pl-10 bg-background border-border text-foreground placeholder:text-muted-foreground focus:border-primary/50 focus:ring-primary/20 transition-all"
           />
         </div>
-        <Select value={statusFilter} onValueChange={setStatusFilter}>
+        <Select value={statusFilter} onValueChange={(v) => setFilter("statusFilter", v)}>
           <SelectTrigger className="w-full sm:w-32 bg-background border-border text-foreground">
             <SelectValue />
           </SelectTrigger>
