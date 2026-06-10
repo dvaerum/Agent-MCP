@@ -434,7 +434,9 @@ def test_bulk_send_writes_all_and_publishes_per_recipient(
         with _make_client(project_dir):
             from agent_mcp.repositories import message_repo
 
-            _seed_agent("admin")
+            # NOTE: `admin` is the pseudo-agent seeded by migration
+            # 0008 (admin_pseudo_agent_and_fks); reuse it as the
+            # broadcast sender so we don't double-INSERT it.
             _seed_agent("bob")
             _seed_agent("carol")
 

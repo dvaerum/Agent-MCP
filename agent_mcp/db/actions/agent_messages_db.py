@@ -1,5 +1,25 @@
 """Reusable DB operations for the `agent_messages` table.
 
+.. deprecated:: PR 3 of the repository-deepening series (follow-up
+   to #146 / #147)
+   This module is kept as a thin compatibility surface so existing
+   call sites (``app.routes.list_messages_api_route``, the inline
+   raw-SQL writers in ``tools.agent_communication_tools``, the
+   broadcast loop in the dashboard route, the older module-of-
+   functions repo under ``agent_mcp.core.repositories.message_repo``)
+   keep working. New code should import
+   :class:`agent_mcp.repositories.MessageRepository` via the
+   ``message_repo`` singleton instead — it's the single owner of the
+   message DB writes + EventBus publishing, so subscribers don't
+   have to poll the DB to notice new messages.
+
+   The functions in this module remain ORM-backed and behaviourally
+   unchanged (no EventBus publish — that's the repo's job); the
+   deprecation only signals which surface to reach for in new code.
+   A follow-up PR in the architecture-review series (PR 6) will
+   migrate the call sites and may delete this module once the
+   migration is complete.
+
 Introduced in db-review PR-G4 alongside the `AgentMessage` ORM
 model. Before this PR, every `agent_messages` SQL lived inline in
 `tools/agent_communication_tools.py`, `app/routes.py`,
