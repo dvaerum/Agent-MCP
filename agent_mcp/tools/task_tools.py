@@ -1387,43 +1387,30 @@ async def assign_task_tool_impl(
         # Mode 0: Create unassigned tasks
         return await _create_unassigned_tasks(arguments)
 
-    # Convert agent_token to agent_id and validate agent
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    # PR 6: routed through AgentRepository — drops a raw cursor that
+    # only does an indexed lookup by token. The repo's
+    # get_by_token() uses the same DB seam (and reads through the
+    # token-keyed cache when warm), so behaviour is wire-equivalent.
+    from ..repositories import agent_repo
+    agent_row = agent_repo.get_by_token(target_agent_token)
+    if not agent_row:
+        return [
+            mcp_types.TextContent(
+                type="text",
+                text="Error: Agent token not found. Agent may not exist or token is invalid.",
+            )
+        ]
 
-    try:
-        # Find agent by token
-        cursor.execute(
-            "SELECT agent_id FROM agents WHERE token = ?", (target_agent_token,)
-        )
-        agent_row = cursor.fetchone()
-        if not agent_row:
-            conn.close()
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text="Error: Agent token not found. Agent may not exist or token is invalid.",
-                )
-            ]
+    target_agent_id = agent_row["agent_id"]
 
-        target_agent_id = agent_row["agent_id"]
-
-        # Prevent admin agents from being assigned tasks
-        if target_agent_id.lower().startswith("admin"):
-            conn.close()
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text="Error: Admin agents cannot be assigned tasks. Admin agents are for coordination and management only.",
-                )
-            ]
-
-    except Exception as e:
-        conn.close()
-        logger.error(f"Error validating agent token: {e}", exc_info=True)
-        return [mcp_types.TextContent(type="text", text=f"Error validating agent: {e}")]
-    finally:
-        conn.close()
+    # Prevent admin agents from being assigned tasks
+    if target_agent_id.lower().startswith("admin"):
+        return [
+            mcp_types.TextContent(
+                type="text",
+                text="Error: Admin agents cannot be assigned tasks. Admin agents are for coordination and management only.",
+            )
+        ]
 
     # Determine operation mode and validate parameters (when agent_token provided)
     if task_ids:
