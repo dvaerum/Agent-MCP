@@ -37,6 +37,7 @@ import {
 } from "@/components/ui/dialog"
 import { apiClient, type Agent } from "@/lib/api"
 import { useDialog } from "@/hooks/use-dialog"
+import { useFilters } from "@/hooks/use-filters"
 import { Skeleton } from "@/components/ui/skeleton"
 import { EmptyState } from "@/components/dashboard/shared/empty-state"
 import { AgentSelect } from "@/components/dashboard/shared/agent-select"
@@ -152,24 +153,42 @@ export function MessagesDashboard() {
   const [messages, setMessages] = useState<Message[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [filters, setFilters] = useState<Filters>({
-    from: "",
-    to: "",
-    type: "",
-    priority: "",
-    read: "",
-    q: "",
+
+  // v5.0.26: pagination cursor + total count from the API. currentOffset
+  // is the offset of the first row on the current page; total is the
+  // count the backend reports for the active filter set. Declared
+  // before `filters` because the useFilters() `onReset` callback below
+  // closes over `setCurrentOffset` — the legacy
+  // `useEffect(() => setCurrentOffset(0), [filters])` block is gone;
+  // useFilters fires `onReset` on every filter change instead.
+  const [currentOffset, setCurrentOffset] = useState(0)
+  const [total, setTotal] = useState(0)
+
+  // Filter state — owned by useFilters<Filters> (PR 4 of the
+  // 2026-06-09 architecture review). The hook collapses the
+  // useState-per-field + per-field updater + clearAll + filter-
+  // watching effect quartet shared with tasks-/agents-dashboard.tsx.
+  // `onReset` preserves the v5.0.26 "filter changed -> page 1"
+  // semantics that used to live in a dedicated useEffect.
+  const {
+    filters,
+    setFilter,
+    clearAll: clearFilters,
+  } = useFilters<Filters>({
+    initial: {
+      from: "",
+      to: "",
+      type: "",
+      priority: "",
+      read: "",
+      q: "",
+    },
+    onReset: () => setCurrentOffset(0),
   })
 
   // Per-row selection (message_id set). Cleared after every refresh
   // so we don't accidentally act on stale rows.
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
-
-  // v5.0.26: pagination cursor + total count from the API. currentOffset
-  // is the offset of the first row on the current page; total is the
-  // count the backend reports for the active filter set.
-  const [currentOffset, setCurrentOffset] = useState(0)
-  const [total, setTotal] = useState(0)
 
   // Detail modal — opened by clicking a row's content area (not the
   // checkbox / per-row action cells, which stopPropagation). Live-
@@ -309,17 +328,14 @@ export function MessagesDashboard() {
     }
   }
 
-  // v5.0.26: reset to page 1 whenever a filter changes. React fires
-  // useEffect callbacks in declaration order, so this effect MUST be
-  // declared before the refresh effect below — otherwise refresh would
-  // fire with the stale offset for one render cycle. setCurrentOffset
-  // is a no-op when we're already on page 1, so this doesn't double-
-  // fetch on the initial mount.
-  useEffect(() => {
-    setCurrentOffset(0)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filters])
-
+  // v5.0.26: reset to page 1 whenever a filter changes — this used to
+  // live in a dedicated `useEffect(() => setCurrentOffset(0),
+  // [filters])` block here. PR 4 (useFilters) moved it into the
+  // `onReset` callback wired on the useFilters() call above, which
+  // fires before this refresh effect on every filter change. The
+  // effect below still watches `[filters, currentOffset]` so it picks
+  // up both the post-reset cursor change AND any direct pagination
+  // button click.
   useEffect(() => {
     refresh()
     // refresh on filter changes OR pagination cursor changes
@@ -351,10 +367,6 @@ export function MessagesDashboard() {
     },
     [messages],
   )
-
-  const clearFilters = () => {
-    setFilters({ from: "", to: "", type: "", priority: "", read: "", q: "" })
-  }
 
   const send = async () => {
     if (!composeRecipient || !composeContent) return
@@ -730,17 +742,13 @@ export function MessagesDashboard() {
             */}
             <AgentSelect
               value={filters.from || null}
-              onChange={(v) =>
-                setFilters((f) => ({ ...f, from: v ?? "" }))
-              }
+              onChange={(v) => setFilter("from", v ?? "")}
               noneLabel="— Any —"
               placeholder="from"
             />
             <AgentSelect
               value={filters.to || null}
-              onChange={(v) =>
-                setFilters((f) => ({ ...f, to: v ?? "" }))
-              }
+              onChange={(v) => setFilter("to", v ?? "")}
               noneLabel="— Any —"
               placeholder="to"
             />
@@ -750,7 +758,7 @@ export function MessagesDashboard() {
                 migration targets for <AgentSelect>. */}
             <Select
               value={filters.type || ALL}
-              onValueChange={(v) => setFilters((f) => ({ ...f, type: v === ALL ? "" : v }))}
+              onValueChange={(v) => setFilter("type", v === ALL ? "" : v)}
             >
               <SelectTrigger><SelectValue placeholder="type" /></SelectTrigger>
               <SelectContent>
@@ -760,7 +768,7 @@ export function MessagesDashboard() {
             </Select>
             <Select
               value={filters.priority || ALL}
-              onValueChange={(v) => setFilters((f) => ({ ...f, priority: v === ALL ? "" : v }))}
+              onValueChange={(v) => setFilter("priority", v === ALL ? "" : v)}
             >
               <SelectTrigger><SelectValue placeholder="priority" /></SelectTrigger>
               <SelectContent>
@@ -770,7 +778,7 @@ export function MessagesDashboard() {
             </Select>
             <Select
               value={filters.read || ALL}
-              onValueChange={(v) => setFilters((f) => ({ ...f, read: v === ALL ? "" : (v as "true" | "false") }))}
+              onValueChange={(v) => setFilter("read", v === ALL ? "" : (v as "true" | "false"))}
             >
               <SelectTrigger><SelectValue placeholder="read?" /></SelectTrigger>
               <SelectContent>
@@ -782,7 +790,7 @@ export function MessagesDashboard() {
             <Input
               placeholder="content (substring)"
               value={filters.q}
-              onChange={(e) => setFilters((f) => ({ ...f, q: e.target.value }))}
+              onChange={(e) => setFilter("q", e.target.value)}
             />
           </div>
           <div className="flex justify-end mt-2">
