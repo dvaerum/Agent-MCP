@@ -10,9 +10,16 @@ identity, no lifecycle, and no place to attach future state (request
 counters, batched writes, per-process subscriber registries).
 
 PR #146 made the contract real for **Task** (the first concept in the
-series). This PR clones the pattern for **Agent** — the same shape,
-same lifecycle, same lazy ``__getattr__`` resolution; just a different
-domain. Message follows in PR 3 of the architecture-review series.
+series). PR #147 cloned it for **Agent**. This PR (PR 3 of the
+series) clones it again for **Message** — the same shape, same
+lifecycle, same lazy ``__getattr__`` resolution; just a different
+domain.
+
+Note: ``MessageRepository`` carries **no in-memory cache** today —
+messages have no ``state.messages``-shaped dict in the codebase, so
+the class is a thinner seam over the DB + EventBus than its peers.
+``disable_cache`` exists as a no-op so call sites can write the same
+``with repo.disable_cache():`` block across all three concepts.
 
 Design decisions locked in grilling (verbatim from PR #146):
 
@@ -148,6 +155,48 @@ def get_agent_repo() -> "AgentRepository":  # noqa: F821
     return _agent_repo_instance
 
 
+# --- MessageRepository singleton slot ----------------------------------
+
+_message_repo_instance: Optional["MessageRepository"] = None  # noqa: F821
+
+
+def set_message_repo(instance: "MessageRepository") -> None:  # noqa: F821
+    """Install the MessageRepository singleton.
+
+    Mirrors :func:`set_task_repo`. Called by
+    ``app.server_lifecycle.application_startup`` after the DB schema
+    is ready.
+    """
+    global _message_repo_instance
+    _message_repo_instance = instance
+
+
+def clear_message_repo() -> None:
+    """Drop the MessageRepository singleton.
+
+    Mirrors :func:`clear_task_repo`. Called by
+    ``application_shutdown`` so a stale instance bound to a closed
+    engine doesn't leak across the lifespan boundary.
+    """
+    global _message_repo_instance
+    _message_repo_instance = None
+
+
+def get_message_repo() -> "MessageRepository":  # noqa: F821
+    """Return the live singleton, instantiating a default if needed.
+
+    Same lazy-init rationale as :func:`get_task_repo`: protects tests
+    and the legacy module-of-functions shim from a cold-start race
+    against the lifespan hook.
+    """
+    global _message_repo_instance
+    if _message_repo_instance is None:
+        from .message_repository import MessageRepository
+
+        _message_repo_instance = MessageRepository()
+    return _message_repo_instance
+
+
 def __getattr__(name: str) -> Any:
     """Module-level lazy attribute lookup.
 
@@ -165,6 +214,8 @@ def __getattr__(name: str) -> Any:
         return get_task_repo()
     if name == "agent_repo":
         return get_agent_repo()
+    if name == "message_repo":
+        return get_message_repo()
     raise AttributeError(
         f"module 'agent_mcp.repositories' has no attribute {name!r}"
     )
@@ -173,10 +224,14 @@ def __getattr__(name: str) -> Any:
 __all__ = [
     "agent_repo",
     "clear_agent_repo",
+    "clear_message_repo",
     "clear_task_repo",
     "get_agent_repo",
+    "get_message_repo",
     "get_task_repo",
+    "message_repo",
     "set_agent_repo",
+    "set_message_repo",
     "set_task_repo",
     "task_repo",
 ]
