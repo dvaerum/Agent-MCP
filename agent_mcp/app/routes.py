@@ -859,17 +859,18 @@ async def edit_agent_api_route(request: Request) -> JSONResponse:
 
 
 def _gather_purge_preview(cursor, agent_id: str) -> Dict[str, Any]:
-    """Compute the blast-radius counts + samples for a future purge."""
-    cursor.execute(
-        "SELECT COUNT(*) AS n FROM agent_messages WHERE sender_id = ?",
-        (agent_id,),
-    )
-    messages_sent = cursor.fetchone()["n"]
-    cursor.execute(
-        "SELECT COUNT(*) AS n FROM agent_messages WHERE recipient_id = ?",
-        (agent_id,),
-    )
-    messages_received = cursor.fetchone()["n"]
+    """Compute the blast-radius counts + samples for a future purge.
+
+    PR 6: message counts + sample go through ``message_repo`` so the
+    repo owns the agent_messages query surface. The task / agent_actions
+    counts stay on the cursor — they live in tables the message repo
+    doesn't own, and the surrounding purge cascade is a multi-table
+    transaction the cursor still drives.
+    """
+    from ..repositories import message_repo
+
+    messages_sent = message_repo.count_query({"from": agent_id})
+    messages_received = message_repo.count_query({"to": agent_id})
     cursor.execute(
         "SELECT COUNT(*) AS n FROM tasks WHERE created_by = ?",
         (agent_id,),
@@ -892,14 +893,12 @@ def _gather_purge_preview(cursor, agent_id: str) -> Dict[str, Any]:
             return ""
         return s if len(s) <= n else s[:n] + "..."
 
-    cursor.execute(
-        "SELECT message_content, timestamp FROM agent_messages "
-        "WHERE sender_id = ? ORDER BY timestamp DESC LIMIT 3",
-        (agent_id,),
-    )
     sample_messages_sent = [
-        {"content": _trim(r["message_content"]), "timestamp": r["timestamp"]}
-        for r in cursor.fetchall()
+        {"content": _trim(m["message_content"]),
+         "timestamp": m["timestamp"]}
+        for m in message_repo.query(
+            {"from": agent_id, "limit": 3, "offset": 0}
+        )
     ]
     cursor.execute(
         "SELECT title FROM tasks WHERE created_by = ? "
@@ -1067,14 +1066,13 @@ async def purge_agent_api_route(request: Request) -> JSONResponse:
                     datetime.datetime.now().isoformat(),
                 ),
             )
-            cursor.execute(
-                "UPDATE agent_messages SET sender_id = ? WHERE sender_id = ?",
-                (tombstone, agent_id),
-            )
-            cursor.execute(
-                "UPDATE agent_messages SET recipient_id = ? "
-                "WHERE recipient_id = ?",
-                (tombstone, agent_id),
+            # PR 6: tombstone rewrite goes through message_repo with
+            # the caller's cursor so the wider BEGIN/COMMIT cascade
+            # stays atomic. The repo's transaction-aware seam tolerates
+            # a sqlite3 cursor on the `connection=` kwarg.
+            from ..repositories import message_repo as _msg_repo
+            _msg_repo.rename_participant(
+                agent_id, tombstone, connection=cursor,
             )
             cursor.execute(
                 "UPDATE tasks SET created_by = ? WHERE created_by = ?",
@@ -1944,22 +1942,12 @@ async def list_messages_api_route(request: Request) -> JSONResponse:
     if request.method != 'POST':
         return JSONResponse({"error": "Method not allowed"}, status_code=405)
 
-    conn = None
     try:
         data = await get_sanitized_json_body(request)
         admin_token = data.get('token')
         if not verify_token(admin_token, required_role='admin'):
             return JSONResponse({"error": "Invalid admin token"}, status_code=403)
 
-        filter_from = data.get('from')
-        filter_to = data.get('to')
-        filter_between = data.get('between')  # list of two ids
-        filter_type = data.get('type')
-        filter_priority = data.get('priority')
-        filter_read = data.get('read')  # bool
-        filter_since = data.get('since')
-        filter_until = data.get('until')
-        filter_q = data.get('q')
         limit = int(data.get('limit', 50))
         offset = int(data.get('offset', 0))
 
@@ -1968,58 +1956,27 @@ async def list_messages_api_route(request: Request) -> JSONResponse:
                 {"error": "limit must be 1..500"}, status_code=400
             )
 
-        where = []
-        params: list = []
-        if filter_from is not None:
-            where.append("sender_id = ?")
-            params.append(filter_from)
-        if filter_to is not None:
-            where.append("recipient_id = ?")
-            params.append(filter_to)
-        if (
-            isinstance(filter_between, list)
-            and len(filter_between) == 2
-            and all(isinstance(x, str) for x in filter_between)
-        ):
-            a, b = filter_between
-            where.append("((sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?))")
-            params.extend([a, b, b, a])
-        if filter_type is not None:
-            where.append("message_type = ?")
-            params.append(filter_type)
-        if filter_priority is not None:
-            where.append("priority = ?")
-            params.append(filter_priority)
-        if filter_read is not None:
-            where.append("read = ?")
-            params.append(1 if filter_read else 0)
-        if filter_since is not None:
-            where.append("timestamp >= ?")
-            params.append(filter_since)
-        if filter_until is not None:
-            where.append("timestamp <= ?")
-            params.append(filter_until)
-        if filter_q:
-            where.append("message_content LIKE ?")
-            params.append(f"%{filter_q}%")
+        # PR 6: route through MessageRepository.query / count_query.
+        # The repo owns the WHERE-building loop today — one entry
+        # point shared with the MCP get_agent_messages tool (Candidate
+        # 3 folding). The route just funnels the body through.
+        from ..repositories import message_repo
 
-        sql = "SELECT * FROM agent_messages"
-        if where:
-            sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(sql, params)
-        rows = [dict(r) for r in cursor.fetchall()]
-
-        # total count for pagination UIs
-        count_sql = "SELECT COUNT(*) AS n FROM agent_messages"
-        if where:
-            count_sql += " WHERE " + " AND ".join(where)
-        cursor.execute(count_sql, params[:-2] if where else [])
-        total = cursor.fetchone()["n"]
+        filters = {
+            "from": data.get("from"),
+            "to": data.get("to"),
+            "between": data.get("between"),
+            "type": data.get("type"),
+            "priority": data.get("priority"),
+            "read": data.get("read"),
+            "since": data.get("since"),
+            "until": data.get("until"),
+            "q": data.get("q"),
+            "limit": limit,
+            "offset": offset,
+        }
+        rows = message_repo.query(filters)
+        total = message_repo.count_query(filters)
 
         return JSONResponse({"messages": rows, "total": total,
                              "limit": limit, "offset": offset})
@@ -2030,9 +1987,6 @@ async def list_messages_api_route(request: Request) -> JSONResponse:
         return JSONResponse(
             {"error": f"Failed to list messages: {str(e)}"}, status_code=500
         )
-    finally:
-        if conn:
-            conn.close()
 
 
 async def list_participants_api_route(request: Request) -> JSONResponse:
@@ -2065,58 +2019,25 @@ async def list_participants_api_route(request: Request) -> JSONResponse:
     if request.method != 'POST':
         return JSONResponse({"error": "Method not allowed"}, status_code=405)
 
-    conn = None
     try:
         data = await get_sanitized_json_body(request)
         admin_token = data.get('token')
         if not verify_token(admin_token, required_role='admin'):
             return JSONResponse({"error": "Invalid admin token"}, status_code=403)
 
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        # Live agents: anything that hasn't been terminated AND isn't a
-        # tombstone row. We keep 'pending'/'failed'/etc. visible so
-        # historical messages from those agents stay filterable. The
-        # 'tombstone' state is a DB-internal FK target written by
-        # _purge_tombstone (same file) — it must never surface in the
-        # participants dropdown (live-verified leak on washing-brothers
-        # 2026-06-06: 6 [deleted-*] tombstones in /live).
-        cursor.execute(
-            "SELECT agent_id, status FROM agents "
-            "WHERE status IS NULL OR status NOT IN ('terminated', 'tombstone') "
-            "ORDER BY agent_id ASC"
-        )
-        live = [dict(row) for row in cursor.fetchall()]
-
-        # Always-present admin participant. Prepended so it sorts to the
-        # top of the dropdown regardless of agent_id ordering.
-        if not any(a.get('agent_id', '').lower() == 'admin' for a in live):
-            live.insert(0, {"agent_id": "admin", "status": "system"})
-
-        # Tombstones: DISTINCT sender_id UNION recipient_id values
-        # beginning with the literal '[deleted-' marker. UNION
-        # deduplicates across the two columns.
-        cursor.execute(
-            "SELECT sender_id AS id FROM agent_messages "
-            "WHERE sender_id LIKE '[deleted-%' "
-            "UNION "
-            "SELECT recipient_id AS id FROM agent_messages "
-            "WHERE recipient_id LIKE '[deleted-%' "
-            "ORDER BY id ASC"
-        )
-        tombstones = [row["id"] for row in cursor.fetchall()]
-
-        return JSONResponse({"live": live, "tombstones": tombstones})
+        # PR 6: route through MessageRepository.list_participants. The
+        # repo owns the filter rules (excludes terminated/tombstone,
+        # prepends synthetic admin, mines tombstones from DISTINCT
+        # sender/recipient UNION).
+        from ..repositories import message_repo
+        result = message_repo.list_participants()
+        return JSONResponse(result)
     except Exception as e:
         logger.error(f"Error listing participants: {e}", exc_info=True)
         return JSONResponse(
             {"error": f"Failed to list participants: {str(e)}"},
             status_code=500,
         )
-    finally:
-        if conn:
-            conn.close()
 
 
 async def create_message_api_route(request: Request) -> JSONResponse:
