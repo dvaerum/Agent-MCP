@@ -419,13 +419,12 @@ async def get_agent_messages_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
         # re-fetch), so the response shape is unchanged from the
         # caller's perspective.
         if mark_as_read and include_received:
-            cursor.execute(
-                "UPDATE agent_messages SET read = 1 "
-                "WHERE recipient_id = ? AND read = 0",
-                (agent_id,),
-            )
-            if cursor.rowcount:
-                conn.commit()
+            # PR 6: route through MessageRepository so the EventBus
+            # `message.read` publish fires (subscribers don't need to
+            # poll the DB to notice the flag flip). The repo opens
+            # its own session/commit; our cursor here only reads.
+            from ..repositories import message_repo
+            message_repo.mark_read_for_recipient(agent_id)
         
         # Format response
         if not messages:
@@ -608,44 +607,56 @@ def _collect_events_for(
     since_iso = since if since else "0000-01-01T00:00:00"
 
     events: List[Dict[str, Any]] = []
+
+    # --- agent_messages (PR 6: routed through MessageRepository.query) ---
+    # The repo's `since` filter uses `>=` while the legacy raw SQL was
+    # strict `>`. The cursor-string comparison is over ISO timestamps,
+    # so we bump the cursor by an "epsilon" (1 char) so `>= cursor+ε`
+    # is equivalent to `> cursor` for ASCII-only ISO timestamps.
+    from ..repositories import message_repo
+    # The repo query orders DESC + limits; for the event stream we want
+    # ASC + unbounded. The natural way: query with a large limit and
+    # reverse. The wait_for_events tool today doesn't bound the
+    # per-poll event count, so 500 (the query() upper bound) is a soft
+    # cap we apply transparently — see docstring on query().
+    msg_rows = message_repo.query(
+        {"to": agent_id, "since": since_iso, "limit": 500}
+    )
+    # Repo returns timestamp DESC; reverse for the ASC event stream.
+    msg_rows.reverse()
+    for row in msg_rows:
+        # repo `since` is inclusive (`>=`); the legacy SQL was strict
+        # `>`. Re-apply the strict filter here to preserve the old
+        # behaviour — a message exactly at `since_iso` shouldn't fire
+        # again on the next long-poll wake.
+        if (row.get("timestamp") or "") <= since_iso:
+            continue
+        data = {
+            "message_id": row["message_id"],
+            "sender_id": row["sender_id"],
+            "recipient_id": row["recipient_id"],
+            "message_content": row["message_content"],
+            "message_type": row["message_type"],
+            "priority": row["priority"],
+            "timestamp": row["timestamp"],
+            "delivered": bool(row["delivered"]),
+            "read": bool(row["read"]),
+        }
+        evt_type = (
+            "broadcast"
+            if (row["message_type"] or "") in _BROADCAST_MESSAGE_TYPES
+            else "message"
+        )
+        events.append({
+            "type": evt_type,
+            "timestamp": row["timestamp"],
+            "data": data,
+        })
+
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-
-        # --- agent_messages -------------------------------------------------
-        cursor.execute(
-            """
-            SELECT message_id, sender_id, recipient_id, message_content,
-                   message_type, priority, timestamp, delivered, read
-            FROM agent_messages
-            WHERE recipient_id = ? AND timestamp > ?
-            ORDER BY timestamp ASC
-            """,
-            (agent_id, since_iso),
-        )
-        for row in cursor.fetchall():
-            data = {
-                "message_id": row["message_id"],
-                "sender_id": row["sender_id"],
-                "recipient_id": row["recipient_id"],
-                "message_content": row["message_content"],
-                "message_type": row["message_type"],
-                "priority": row["priority"],
-                "timestamp": row["timestamp"],
-                "delivered": bool(row["delivered"]),
-                "read": bool(row["read"]),
-            }
-            evt_type = (
-                "broadcast"
-                if (row["message_type"] or "") in _BROADCAST_MESSAGE_TYPES
-                else "message"
-            )
-            events.append({
-                "type": evt_type,
-                "timestamp": row["timestamp"],
-                "data": data,
-            })
 
         # --- tasks ----------------------------------------------------------
         cursor.execute(
