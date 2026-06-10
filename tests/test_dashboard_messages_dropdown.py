@@ -66,12 +66,34 @@ def test_recipient_dropdown_includes_admin() -> None:
 
 
 def test_listing_uses_post_query_not_get() -> None:
+    """The message listing must POST to ``/api/messages/query``.
+
+    History: the original bug was a GET with a JSON body — browsers
+    strip GET bodies per the Fetch spec, so the listing silently
+    failed. The fix was a bespoke ``callMessages('POST', '/query', …)``
+    helper. Post v5.0.31 / PR 5 the listing is owned by
+    ``usePagedQuery<Message>`` (PR 5 of the 2026-06-09 architecture
+    review); the hook's default fetch path is POST + JSON body, and
+    the call-site declares ``endpoint: "/messages/query"``. We
+    therefore now assert via the hook indirection: messages-dashboard
+    declares the endpoint, and the hook itself is the lone owner of
+    the POST verb.
+    """
     src = _read("components/dashboard/messages-dashboard.tsx")
-    # The previous bug was a GET with a JSON body — browsers strip
-    # GET bodies per the Fetch spec, so the listing silently failed.
-    assert '"POST", "/query"' in src or "'POST', '/query'" in src, (
-        "expected listing to call POST /api/messages/query (POST + /query "
-        "suffix in callMessages)"
+    # 1. The call-site declares the right endpoint on the hook.
+    assert '"/messages/query"' in src or "'/messages/query'" in src, (
+        "expected messages-dashboard to wire usePagedQuery with "
+        'endpoint: "/messages/query"'
+    )
+    assert "usePagedQuery" in src, (
+        "expected messages-dashboard to delegate the listing fetch to "
+        "usePagedQuery (PR 5, v5.0.31)"
+    )
+    # 2. The hook itself uses POST (not GET) for that endpoint.
+    hook_src = (DASHBOARD / "hooks" / "use-paged-query.ts").read_text()
+    assert '"POST"' in hook_src or "'POST'" in hook_src, (
+        "expected usePagedQuery's default fetch path to use POST "
+        "(the GET-with-body bug must stay buried)"
     )
     # And the original buggy call must be gone.
     assert '"GET", ""' not in src and "'GET', ''" not in src, (

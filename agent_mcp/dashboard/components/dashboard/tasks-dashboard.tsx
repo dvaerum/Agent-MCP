@@ -18,6 +18,7 @@ import { apiClient, Task } from "@/lib/api"
 import { useServerStore } from "@/lib/stores/server-store"
 import { useDialog } from "@/hooks/use-dialog"
 import { useFilters } from "@/hooks/use-filters"
+import { usePagedQuery } from "@/hooks/use-paged-query"
 import { cn } from "@/lib/utils"
 import { Skeleton } from "@/components/ui/skeleton"
 import { EmptyState } from "@/components/dashboard/shared/empty-state"
@@ -76,89 +77,94 @@ const formatRelative = (iso: string | undefined): string => {
   return `${Math.floor(diff / 86_400_000)}d ago`
 }
 
-// Cache for tasks data
-const tasksCache = new Map<string, { data: Task[], timestamp: number }>()
+// v5.0.31: cache TTL + background-refresh interval for the tasks
+// listing. The 30s cache was a module-level Map pre-migration
+// (``tasksCache = new Map(...)``); now it lives inside
+// ``usePagedQuery`` via its ``cacheMs`` option. The 60s interval
+// keeps the "background refresh while tab open" semantic from
+// pre-migration ``useTasksData`` — the hook itself is reactive only,
+// not interval-driven, so we still wire the timer here.
 const CACHE_DURATION = 30000 // 30 seconds
 const REFRESH_INTERVAL = 60000 // 1 minute for background refresh
 
-// Real data hook for tasks with caching
+// Tasks-dashboard data hook — delegates the loading/error/lastFetch/
+// refresh state machine to ``usePagedQuery<Task>`` (PR 5 of the
+// 2026-06-09 architecture review). The underlying request still
+// goes through ``apiClient.getTasks()`` (a GET ``/tasks`` that
+// returns ``Task[]`` directly — no envelope, no pagination, no token
+// in body), so we use the hook's ``fetchFn`` escape hatch to wrap
+// it. The escape hatch threads the AbortSignal into the response so
+// a slow stale fetch can't overwrite a fresh fast one. ``cacheMs``
+// preserves the 30s TTL; the 60s background refresh interval still
+// lives here because the hook is reactive-only by design.
 const useTasksData = () => {
   const { activeServerId, servers } = useServerStore()
   const activeServer = servers.find(s => s.id === activeServerId)
-  
-  const [tasks, setTasks] = useState<Task[]>([])
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [lastFetch, setLastFetch] = useState<number>(0)
+  const isConnected = !!activeServerId && activeServer?.status === 'connected'
 
-  const fetchData = useCallback(async (forceRefresh = false) => {
-    if (!activeServerId || !activeServer || activeServer.status !== 'connected') {
-      setTasks([])
-      setError(null)
-      setLoading(false)
-      return
-    }
-
-    const cacheKey = `${activeServerId}-tasks`
-    const now = Date.now()
-    const cached = tasksCache.get(cacheKey)
-
-    // Use cache if it's fresh and not forcing refresh
-    if (!forceRefresh && cached && (now - cached.timestamp) < CACHE_DURATION) {
-      setTasks(cached.data)
-      setError(null)
-      setLoading(false)
-      return
-    }
-
-    // Only show loading on first fetch or force refresh
-    if (tasks.length === 0 || forceRefresh) {
-      setLoading(true)
-    }
-
-    try {
-      const tasksData = await apiClient.getTasks()
-      
-      // Update cache
-      tasksCache.set(cacheKey, { data: tasksData, timestamp: now })
-      
-      setTasks(tasksData)
-      setError(null)
-      setLastFetch(now)
-    } catch (err) {
-      // Don't set error state for no server connection - that's handled by DashboardWrapper
-      if (err instanceof Error && err.message !== 'NO_SERVER_CONNECTED') {
-        setError(err.message)
-        console.error('Error fetching tasks:', err)
+  // Disconnected: surface an empty result without firing the fetch
+  // (the wrapper short-circuits via fetchFn returning empty). The
+  // hook's state machine still runs — that's fine, it just stays at
+  // {data: [], total: 0, loading: false, error: null}.
+  const fetchFn = useCallback(
+    async (_signal: AbortSignal): Promise<{ data: Task[]; total: number }> => {
+      if (!isConnected) {
+        return { data: [], total: 0 }
       }
-    } finally {
-      setLoading(false)
-    }
-  }, [activeServerId, activeServer, tasks.length])
+      try {
+        const tasksData = await apiClient.getTasks()
+        return { data: tasksData, total: tasksData.length }
+      } catch (err) {
+        // Pre-migration ``useTasksData`` silenced 'NO_SERVER_CONNECTED'
+        // errors so a transient disconnect didn't paint a red banner
+        // (the DashboardWrapper handles connection state). Preserve
+        // that quirk by returning empty instead of throwing.
+        if (err instanceof Error && err.message === 'NO_SERVER_CONNECTED') {
+          return { data: [], total: 0 }
+        }
+        throw err
+      }
+    },
+    [isConnected],
+  )
 
-  useEffect(() => {
-    fetchData()
-
-    // Background refresh - less frequent and doesn't show loading
-    const interval = setInterval(() => {
-      fetchData(false)
-    }, REFRESH_INTERVAL)
-
-    return () => clearInterval(interval)
-  }, [fetchData])
-
-  // Manual refresh function
-  const refresh = useCallback(() => fetchData(true), [fetchData])
-
-  // Memoize return value to prevent unnecessary re-renders
-  return useMemo(() => ({
-    tasks, 
-    loading, 
-    error, 
+  const {
+    data: tasks,
+    loading,
+    error: queryError,
     refresh,
     lastFetch,
-    isConnected: !!activeServerId && activeServer?.status === 'connected' 
-  }), [tasks, loading, error, refresh, lastFetch, activeServerId, activeServer])
+  } = usePagedQuery<Task>({
+    fetchFn,
+    cacheMs: CACHE_DURATION,
+    deps: [activeServerId],
+  })
+
+  // The pre-migration shape exposed ``error`` as ``string | null``.
+  // The hook returns a real ``Error | null``; map it for backward
+  // compat with the consumer below.
+  const error: string | null = queryError ? queryError.message : null
+
+  // Background refresh — separate from the hook (which is reactive
+  // only). Bypass the cache by calling ``refresh()`` directly; the
+  // hook treats refresh() as a force-fetch.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      refresh()
+    }, REFRESH_INTERVAL)
+    return () => clearInterval(interval)
+  }, [refresh])
+
+  // ``lastFetch`` is ``number | null`` from the hook; the consumer
+  // below assumes ``number`` (it checks ``> 0``). Coalesce.
+  return useMemo(() => ({
+    tasks,
+    loading,
+    error,
+    refresh,
+    lastFetch: lastFetch ?? 0,
+    isConnected,
+  }), [tasks, loading, error, refresh, lastFetch, isConnected])
 }
 
 const StatusDot = React.memo(({ status }: { status: Task['status'] }) => {

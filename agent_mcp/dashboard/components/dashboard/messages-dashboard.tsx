@@ -38,6 +38,7 @@ import {
 import { apiClient, type Agent } from "@/lib/api"
 import { useDialog } from "@/hooks/use-dialog"
 import { useFilters } from "@/hooks/use-filters"
+import { usePagedQuery } from "@/hooks/use-paged-query"
 import { Skeleton } from "@/components/ui/skeleton"
 import { EmptyState } from "@/components/dashboard/shared/empty-state"
 import { AgentSelect } from "@/components/dashboard/shared/agent-select"
@@ -150,19 +151,24 @@ async function callMessages(
 }
 
 export function MessagesDashboard() {
-  const [messages, setMessages] = useState<Message[]>([])
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  // v5.0.31: ``messages`` / ``total`` / ``loading`` / data-side
+  // ``error`` are now owned by ``usePagedQuery<Message>`` (PR 5 of the
+  // 2026-06-09 architecture review). The hook subsumes the bespoke
+  // ``callMessages POST query`` listing fetch + the four
+  // ``useState`` slots that used to mirror its result. We keep a
+  // separate ``actionError`` slot below for compose / mark-read /
+  // delete failures, since those code paths talk to other endpoints
+  // (``POST /api/messages``, ``PATCH /api/messages/<id>``,
+  // ``DELETE /api/messages/<id>``) and aren't the hook's
+  // responsibility.
+  const [actionError, setActionError] = useState<string | null>(null)
 
-  // v5.0.26: pagination cursor + total count from the API. currentOffset
-  // is the offset of the first row on the current page; total is the
-  // count the backend reports for the active filter set. Declared
+  // v5.0.26: pagination cursor. Total comes from the hook. Declared
   // before `filters` because the useFilters() `onReset` callback below
   // closes over `setCurrentOffset` — the legacy
   // `useEffect(() => setCurrentOffset(0), [filters])` block is gone;
   // useFilters fires `onReset` on every filter change instead.
   const [currentOffset, setCurrentOffset] = useState(0)
-  const [total, setTotal] = useState(0)
 
   // Filter state — owned by useFilters<Filters> (PR 4 of the
   // 2026-06-09 architecture review). The hook collapses the
@@ -189,29 +195,6 @@ export function MessagesDashboard() {
   // Per-row selection (message_id set). Cleared after every refresh
   // so we don't accidentally act on stale rows.
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
-
-  // Detail modal — opened by clicking a row's content area (not the
-  // checkbox / per-row action cells, which stopPropagation). Live-
-  // lookup useDialog (Candidate D, 2026-06-02) stores only the
-  // message_id and asks the selector for the current row on every
-  // render — so when the local messages list is reloaded (e.g. after
-  // a mark-read PATCH) the open dialog re-renders with the fresh
-  // row instead of a snapshot from when it was opened.
-  const messageSelector = useCallback(
-    (id: string | null) =>
-      id ? messages.find((m) => m.message_id === id) ?? null : null,
-    [messages],
-  )
-  const detailDialog = useDialog<Message>(messageSelector)
-
-  // Deleted-while-open: if the row is removed from the list (delete
-  // from any source — this tab, another tab, server-side cleanup),
-  // the selector returns null. Auto-close so the user isn't stuck
-  // on an empty modal. Explicit detailDialog.close() in deleteOne is
-  // redundant but kept for code clarity.
-  useEffect(() => {
-    if (detailDialog.isOpen && detailDialog.data === null) detailDialog.close()
-  }, [detailDialog.isOpen, detailDialog.data, detailDialog.close])
 
   // Compose state.
   const [composeOpen, setComposeOpen] = useState(false)
@@ -282,65 +265,85 @@ export function MessagesDashboard() {
     return Array.from(ids)
   }, [liveParticipants])
 
-  // Build a body matching the REST contract.
-  // v5.0.26: include `offset` so the « Newest / Newer / Older / Oldest »
-  // footer can walk past the first PAGE_SIZE rows.
-  const queryBody = useMemo(() => {
-    return async () => {
-      const t = await adminToken()
-      const body: Record<string, unknown> = {
-        token: t,
-        limit: PAGE_SIZE,
-        offset: currentOffset,
-      }
-      if (filters.from) body.from = filters.from
-      if (filters.to) body.to = filters.to
-      if (filters.type) body.type = filters.type
-      if (filters.priority) body.priority = filters.priority
-      if (filters.read !== "") body.read = filters.read === "true"
-      if (filters.q) body.q = filters.q
-      return body
-    }
-  }, [filters, currentOffset])
+  // Build the spread-filter slice for the POST body. Empty-string
+  // fields are dropped so the backend doesn't have to special-case
+  // them; ``read`` is converted from its tri-state string form
+  // ("" | "true" | "false") into the real boolean the API wants.
+  const queryFilters = useMemo<Record<string, unknown>>(() => {
+    const f: Record<string, unknown> = {}
+    if (filters.from) f.from = filters.from
+    if (filters.to) f.to = filters.to
+    if (filters.type) f.type = filters.type
+    if (filters.priority) f.priority = filters.priority
+    if (filters.read !== "") f.read = filters.read === "true"
+    if (filters.q) f.q = filters.q
+    return f
+  }, [filters])
 
-  const refresh = async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      const body = await queryBody()
-      const data = await callMessages("POST", "/query", body)
-      setMessages(data.messages ?? [])
-      // v5.0.26: capture the total so the pagination footer can render
-      // "Showing N–M of T" and toggle disabled-state on the Older /
-      // Oldest » buttons.
-      setTotal(typeof data.total === "number" ? data.total : 0)
-      // Clear selection — IDs that survive filter changes would
-      // silently act on rows the user can no longer see.
-      setSelectedIds(new Set())
-      // Re-pull participants so tombstone strings introduced by deletes
-      // (or live agents created/terminated mid-session) stay in sync.
-      // Fire-and-forget; soft-fails in loadParticipants.
-      void loadParticipants()
-    } catch (e: any) {
-      setError(e.message ?? String(e))
-    } finally {
-      setLoading(false)
-    }
-  }
+  // v5.0.31: paginated listing fetch — was a bespoke
+  // ``callMessages POST query`` flow with its own
+  // useState/loading/error plumbing; now owned by ``usePagedQuery<T>``
+  // (PR 5 of the 2026-06-09 architecture review). The hook handles
+  // POST body construction (``{token, limit, offset, ...filters}``),
+  // AbortController cancellation on filter/cursor change, and
+  // surfaces ``data`` / ``total`` / ``loading`` / ``error`` /
+  // ``refresh`` directly. ``adminToken`` is an async producer so the
+  // tokens-fetch is deferred until the first request and re-runs on
+  // reload.
+  const {
+    data: messages,
+    total,
+    loading,
+    error: queryError,
+    refresh: refreshQuery,
+  } = usePagedQuery<Message>({
+    endpoint: "/messages/query",
+    filters: queryFilters,
+    limit: PAGE_SIZE,
+    offset: currentOffset,
+    token: adminToken,
+  })
 
-  // v5.0.26: reset to page 1 whenever a filter changes — this used to
-  // live in a dedicated `useEffect(() => setCurrentOffset(0),
-  // [filters])` block here. PR 4 (useFilters) moved it into the
-  // `onReset` callback wired on the useFilters() call above, which
-  // fires before this refresh effect on every filter change. The
-  // effect below still watches `[filters, currentOffset]` so it picks
-  // up both the post-reset cursor change AND any direct pagination
-  // button click.
+  // Surface either an action error (compose / mark / delete) OR the
+  // hook's query error — whichever is freshest. The UI just wants
+  // the most-recent failure string.
+  const error: string | null =
+    actionError ?? (queryError ? queryError.message : null)
+
+  // Wrapper that also re-pulls participants + clears selection. The
+  // hook owns the actual listing fetch; this wrapper preserves the
+  // pre-migration ``refresh()`` semantics where every refresh also
+  // re-syncs tombstones and drops the selection set.
+  const refresh = useCallback(() => {
+    refreshQuery()
+    setSelectedIds(new Set())
+    void loadParticipants()
+  }, [refreshQuery])
+
+  // Detail modal — opened by clicking a row's content area (not the
+  // checkbox / per-row action cells, which stopPropagation). Live-
+  // lookup useDialog (Candidate D, 2026-06-02) stores only the
+  // message_id and asks the selector for the current row on every
+  // render — so when the local messages list is reloaded (e.g. after
+  // a mark-read PATCH) the open dialog re-renders with the fresh
+  // row instead of a snapshot from when it was opened. Declared
+  // after ``usePagedQuery`` so the selector closure captures the
+  // hook-owned ``messages`` array.
+  const messageSelector = useCallback(
+    (id: string | null) =>
+      id ? messages.find((m) => m.message_id === id) ?? null : null,
+    [messages],
+  )
+  const detailDialog = useDialog<Message>(messageSelector)
+
+  // Deleted-while-open: if the row is removed from the list (delete
+  // from any source — this tab, another tab, server-side cleanup),
+  // the selector returns null. Auto-close so the user isn't stuck
+  // on an empty modal. Explicit detailDialog.close() in deleteOne is
+  // redundant but kept for code clarity.
   useEffect(() => {
-    refresh()
-    // refresh on filter changes OR pagination cursor changes
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filters, currentOffset])
+    if (detailDialog.isOpen && detailDialog.data === null) detailDialog.close()
+  }, [detailDialog.isOpen, detailDialog.data, detailDialog.close])
 
   // v5.0.24 polish: human-readable label for a parent message id.
   // Used by the reply chip + the in-table reply marker so the user
@@ -371,7 +374,7 @@ export function MessagesDashboard() {
   const send = async () => {
     if (!composeRecipient || !composeContent) return
     setComposing(true)
-    setError(null)
+    setActionError(null)
     try {
       const t = await adminToken()
       // BROADCAST sentinel maps to recipient_id="*" on the backend.
@@ -401,7 +404,7 @@ export function MessagesDashboard() {
       setComposeOpen(false)
       await refresh()
     } catch (e: any) {
-      setError(e.message ?? String(e))
+      setActionError(e.message ?? String(e))
     } finally {
       setComposing(false)
     }
@@ -419,7 +422,7 @@ export function MessagesDashboard() {
   const suggestSubject = async () => {
     if (!composeContent.trim()) return
     setSuggestLoading(true)
-    setError(null)
+    setActionError(null)
     setSuggestHint(null)
     try {
       const t = await adminToken()
@@ -437,7 +440,7 @@ export function MessagesDashboard() {
       }
     } catch (e: any) {
       // Soft-fail — the user can still type a subject manually.
-      setError(e.message ?? String(e))
+      setActionError(e.message ?? String(e))
     } finally {
       setSuggestLoading(false)
     }
@@ -472,7 +475,7 @@ export function MessagesDashboard() {
       // into the open modal automatically.
       await refresh()
     } catch (e: any) {
-      setError(e.message ?? String(e))
+      setActionError(e.message ?? String(e))
     }
   }
 
@@ -503,7 +506,7 @@ export function MessagesDashboard() {
 
   const bulkMark = async (read: boolean) => {
     if (selectedIds.size === 0) return
-    setError(null)
+    setActionError(null)
     try {
       const t = await adminToken()
       await Promise.all(
@@ -513,13 +516,13 @@ export function MessagesDashboard() {
       )
       await refresh()
     } catch (e: any) {
-      setError(e.message ?? String(e))
+      setActionError(e.message ?? String(e))
     }
   }
 
   const bulkDelete = async () => {
     if (selectedIds.size === 0) return
-    setError(null)
+    setActionError(null)
     try {
       const t = await adminToken()
       await Promise.all(
@@ -529,7 +532,7 @@ export function MessagesDashboard() {
       )
       await refresh()
     } catch (e: any) {
-      setError(e.message ?? String(e))
+      setActionError(e.message ?? String(e))
     }
   }
 
@@ -550,7 +553,7 @@ export function MessagesDashboard() {
   const rangeEnd = Math.min(currentOffset + PAGE_SIZE, total)
 
   const deleteOne = async (m: Message) => {
-    setError(null)
+    setActionError(null)
     try {
       const t = await adminToken()
       await callMessages("DELETE", `/${m.message_id}`, { token: t })
@@ -561,7 +564,7 @@ export function MessagesDashboard() {
       }
       await refresh()
     } catch (e: any) {
-      setError(e.message ?? String(e))
+      setActionError(e.message ?? String(e))
     }
   }
 
