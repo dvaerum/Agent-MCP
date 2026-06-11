@@ -54,7 +54,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import json
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -186,6 +186,101 @@ class AgentRepository:
         """
         return get_all_active_agents_from_db()
 
+    def query(
+        self,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Run a filtered SELECT and return (page, total_count).
+
+        Replaces the inline filter+count SQL in
+        ``view_agents_tool_impl`` (admin_tools.py).
+
+        Recognised filter keys:
+
+        * ``status`` (str)            — exact status match
+        * ``agent_id_pattern`` (str)  — LIKE pattern on ``agent_id``
+        * ``include_terminated`` (bool, default True) — when False,
+          excludes ``status='terminated'`` rows.
+        * ``created_after`` (str)     — ``created_at >= created_after``
+        * ``created_before`` (str)    — ``created_at <= created_before``
+        * ``sort_by`` (str)           — one of {agent_id, status,
+          created_at, terminated_at}; defaults to ``created_at``.
+        * ``sort_order`` (str)        — ``ASC`` or ``DESC``;
+          defaults to ``DESC``.
+        * ``limit`` (int, default 50)
+        * ``offset`` (int, default 0)
+
+        Returns ``(rows, total)`` where ``rows`` is the page and
+        ``total`` is the unfiltered row count for the filter set.
+        On DB error returns ``([], 0)``.
+        """
+        from sqlalchemy import func
+
+        filters = filters or {}
+        allowed_sort = {
+            "agent_id", "status", "created_at", "terminated_at",
+        }
+        sort_by = filters.get("sort_by", "created_at")
+        if sort_by not in allowed_sort:
+            sort_by = "created_at"
+        sort_order = (filters.get("sort_order") or "DESC").upper()
+        if sort_order not in ("ASC", "DESC"):
+            sort_order = "DESC"
+        limit = int(filters.get("limit", 50))
+        offset = int(filters.get("offset", 0))
+        if limit < 1:
+            limit = 1
+        if offset < 0:
+            offset = 0
+        include_terminated = filters.get("include_terminated", True)
+        filter_status = filters.get("status")
+        filter_pattern = filters.get("agent_id_pattern")
+        filter_after = filters.get("created_after")
+        filter_before = filters.get("created_before")
+
+        try:
+            with get_session() as session:
+                q = session.query(Agent)
+                if filter_status:
+                    q = q.filter(Agent.status == filter_status)
+                if filter_pattern:
+                    q = q.filter(Agent.agent_id.like(filter_pattern))
+                if not include_terminated:
+                    q = q.filter(Agent.status != "terminated")
+                if filter_after:
+                    q = q.filter(Agent.created_at >= filter_after)
+                if filter_before:
+                    q = q.filter(Agent.created_at <= filter_before)
+
+                total = q.with_entities(func.count(Agent.agent_id)).scalar() or 0
+
+                sort_col = getattr(Agent, sort_by)
+                if sort_order == "ASC":
+                    q = q.order_by(sort_col.asc())
+                else:
+                    q = q.order_by(sort_col.desc())
+
+                rows = q.limit(limit).offset(offset).all()
+                return [
+                    {
+                        "token": r.token,
+                        "agent_id": r.agent_id,
+                        "status": r.status,
+                        "created_at": r.created_at,
+                    }
+                    for r in rows
+                ], int(total)
+        except SQLAlchemyError as e:
+            logger.error(
+                f"Database error querying agents: {e}", exc_info=True,
+            )
+            return [], 0
+        except Exception as e:
+            logger.error(
+                f"Unexpected error querying agents: {e}", exc_info=True,
+            )
+            return [], 0
+
     def get_working_directory(self, agent_id: str) -> Optional[str]:
         """Return the working directory for ``agent_id``, or ``None``.
 
@@ -211,6 +306,7 @@ class AgentRepository:
         current_task: Optional[str] = None,
         working_directory: str,
         color: Optional[str] = None,
+        connection: Any = None,
     ) -> Dict[str, Any]:
         """INSERT an agent row, update both caches, publish ``"agent.created"``.
 
@@ -218,17 +314,40 @@ class AgentRepository:
         Optional: ``capabilities``, ``status``, ``current_task``,
         ``color``.
 
+        ``connection`` is the transaction-aware seam. Tolerates a
+        SQLAlchemy ``Session`` OR a raw ``sqlite3.Cursor`` so the
+        caller's wider transaction stays atomic — used by
+        ``create_agent_tool_impl`` which writes the agent row plus
+        an ``agent_actions`` audit-log entry plus the task-assignment
+        UPDATEs in one transaction. When ``None``, the method opens
+        its own session.
+
         Returns the freshly-stored row in the same dict shape
         consumers expect (capabilities deserialised). On DB conflict
         (e.g. duplicate ``agent_id`` or duplicate ``token``), raises
-        the underlying ``SQLAlchemyError`` — silently returning the
-        existing row would mask write conflicts and the legacy raw-SQL
-        path raised IntegrityError too.
+        the underlying ``SQLAlchemyError``.
         """
         now = datetime.datetime.now().isoformat()
         caps_json = json.dumps(capabilities or [])
 
-        with get_session() as session:
+        if connection is not None and not hasattr(connection, "query"):
+            cur = connection
+            cur.execute(
+                """
+                INSERT INTO agents (
+                    token, agent_id, capabilities, created_at, status,
+                    current_task, working_directory, color,
+                    terminated_at, updated_at, aoe_session_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    token, agent_id, caps_json, now, status,
+                    current_task, working_directory, color,
+                    None, now, None,
+                ),
+            )
+        elif connection is not None:
+            session = connection
             row = Agent(
                 token=token,
                 agent_id=agent_id,
@@ -243,14 +362,44 @@ class AgentRepository:
                 aoe_session_id=None,
             )
             session.add(row)
-            session.commit()
+            session.flush()
+        else:
+            with get_session() as session:
+                row = Agent(
+                    token=token,
+                    agent_id=agent_id,
+                    capabilities=caps_json,
+                    created_at=now,
+                    status=status,
+                    current_task=current_task,
+                    working_directory=working_directory,
+                    color=color,
+                    terminated_at=None,
+                    updated_at=now,
+                    aoe_session_id=None,
+                )
+                session.add(row)
+                session.commit()
 
-        # Re-fetch via the existing dict projection so consumers see
-        # the exact shape they're used to (capabilities deserialised).
-        fresh = _db_get_agent_by_id(agent_id)
-        if fresh is None:
-            # Should be unreachable; defensive fallback mirrors the
-            # legacy module-of-functions implementation.
+        # Build the return dict. For the no-connection path we can
+        # re-fetch via the legacy projection; for the connection paths
+        # the row hasn't committed yet so build the dict in place.
+        if connection is None:
+            fresh = _db_get_agent_by_id(agent_id)
+            if fresh is None:
+                fresh = {
+                    "token": token,
+                    "agent_id": agent_id,
+                    "capabilities": capabilities or [],
+                    "created_at": now,
+                    "status": status,
+                    "current_task": current_task,
+                    "working_directory": working_directory,
+                    "color": color,
+                    "terminated_at": None,
+                    "updated_at": now,
+                }
+        else:
             fresh = {
                 "token": token,
                 "agent_id": agent_id,
@@ -264,15 +413,21 @@ class AgentRepository:
                 "updated_at": now,
             }
 
-        if not self._cache_disabled:
-            state.active_agents[token] = fresh
-            state.agent_working_dirs[agent_id] = working_directory
+        # Cache + EventBus only on the standalone path. With a
+        # ``connection=`` the caller's transaction is still open; a
+        # publish or cache write before commit could be observed by
+        # subscribers or persist after rollback. Caller is responsible
+        # for calling :meth:`upsert_cache` after their own commit.
+        if connection is None:
+            if not self._cache_disabled:
+                state.active_agents[token] = fresh
+                state.agent_working_dirs[agent_id] = working_directory
 
-        _event_bus_shim.publish(
-            agent_id,
-            "agent.created",
-            {"agent_id": agent_id, "status": status},
-        )
+            _event_bus_shim.publish(
+                agent_id,
+                "agent.created",
+                {"agent_id": agent_id, "status": status},
+            )
         return fresh
 
     # --- Write interface: update ----------------------------------------
@@ -304,6 +459,19 @@ class AgentRepository:
           * ``"agent.status_changed"`` when ``field_name == "status"``.
           * ``"agent.updated"`` for every other allowlisted field.
         """
+        # sqlite3 cursor path: caller owns BEGIN/COMMIT. PR #152.
+        if connection is not None and not hasattr(connection, "query"):
+            ok = self._update_field_with_cursor(
+                connection, agent_id, field_name, new_value,
+            )
+            if not ok:
+                return None
+            # Caller owns transaction — cache + publish deferred to
+            # them (post-commit). Return a thin shape carrying only
+            # the field that changed so they can wire it into their
+            # own response.
+            return {"agent_id": agent_id, field_name: new_value}
+
         if connection is not None:
             ok = self._update_field_with_session(
                 connection, agent_id, field_name, new_value,
@@ -336,6 +504,51 @@ class AgentRepository:
             {"agent_id": agent_id, "field": field_name, "value": new_value},
         )
         return fresh
+
+    def _update_field_with_cursor(
+        self,
+        cursor: Any,
+        agent_id: str,
+        field_name: str,
+        new_value: Any,
+    ) -> bool:
+        """Internal helper for the sqlite3.Cursor ``connection=`` path.
+
+        Mirrors the allowlist + capabilities-normalisation logic of
+        :func:`update_agent_db_field` but writes via raw SQL against
+        the caller's cursor so the wider BEGIN/COMMIT stays atomic.
+        """
+        if field_name not in _MUTABLE_FIELDS:
+            logger.error(
+                f"Attempted to update an invalid or unsupported agent "
+                f"field via shared cursor: {field_name}"
+            )
+            return False
+
+        value_to_set = new_value
+        if field_name == "capabilities":
+            from ..utils.capability_normalization import normalize_capabilities
+            value_to_set = json.dumps(normalize_capabilities(new_value))
+        elif field_name == "auto_event_loop":
+            value_to_set = 1 if new_value else 0
+        elif field_name == "updated_at" and new_value is None:
+            value_to_set = datetime.datetime.now().isoformat()
+
+        now = datetime.datetime.now().isoformat()
+        try:
+            cursor.execute(
+                f"UPDATE agents SET {field_name} = ?, updated_at = ? "
+                f"WHERE agent_id = ?",
+                (value_to_set, now, agent_id),
+            )
+            return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(
+                f"Database error updating agent '{agent_id}' field "
+                f"'{field_name}' via shared cursor: {e}",
+                exc_info=True,
+            )
+            return False
 
     def _update_field_with_session(
         self,
@@ -393,7 +606,12 @@ class AgentRepository:
 
     # --- Write interface: terminate -------------------------------------
 
-    def terminate(self, agent_id: str) -> bool:
+    def terminate(
+        self,
+        agent_id: str,
+        *,
+        connection: Any = None,
+    ) -> bool:
         """Set status='terminated', evict both caches, publish.
 
         Returns True on success, False if the row didn't exist, was
@@ -401,18 +619,48 @@ class AgentRepository:
         after the DB commit so a failed commit doesn't desync the
         in-memory state.
 
-        Note: this is the *simple* terminate path — no cascade. The
-        legacy ``admin_tools.terminate_agent`` path also writes to
-        ``agent_actions`` and tears down tmux sessions; it still
-        owns those concerns in its outer transaction. Once a follow-up
-        PR untangles the multi-table teardown, the admin handler will
-        be able to call ``agent_repo.terminate(agent_id)`` and stop
-        spelling the SQL by hand.
+        ``connection`` is the transaction-aware seam. Tolerates a
+        SQLAlchemy ``Session`` OR a raw ``sqlite3.Cursor`` so
+        ``terminate_agent_tool_impl`` (which writes the status
+        update + an ``agent_actions`` audit row in one transaction)
+        can keep them atomic. When ``None``, the method opens its
+        own session.
         """
         terminated_at = datetime.datetime.now().isoformat()
         token: Optional[str] = None
-        try:
-            with get_session() as session:
+
+        if connection is not None and not hasattr(connection, "query"):
+            cur = connection
+            cur.execute(
+                "SELECT token, status FROM agents WHERE agent_id = ?",
+                (agent_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return False
+            try:
+                row_token = row["token"]
+                row_status = row["status"]
+            except (KeyError, IndexError):
+                row_token, row_status = row[0], row[1]
+            if row_status == "terminated":
+                return False
+            token = row_token
+            cur.execute(
+                """
+                UPDATE agents
+                SET status = ?, terminated_at = ?, updated_at = ?,
+                    current_task = NULL
+                WHERE agent_id = ? AND status != ?
+                """,
+                ("terminated", terminated_at, terminated_at,
+                 agent_id, "terminated"),
+            )
+            if cur.rowcount == 0:
+                return False
+        elif connection is not None:
+            session = connection
+            try:
                 row = (
                     session.query(Agent)
                     .filter(Agent.agent_id == agent_id)
@@ -426,29 +674,61 @@ class AgentRepository:
                 row.terminated_at = terminated_at
                 row.updated_at = terminated_at
                 row.current_task = None
-                session.commit()
-        except SQLAlchemyError as e:
-            logger.error(
-                f"Database error terminating agent '{agent_id}': {e}",
-                exc_info=True,
+                session.flush()
+            except SQLAlchemyError as e:
+                logger.error(
+                    f"Database error terminating agent '{agent_id}' via "
+                    f"shared session: {e}",
+                    exc_info=True,
+                )
+                return False
+        else:
+            try:
+                with get_session() as session:
+                    row = (
+                        session.query(Agent)
+                        .filter(Agent.agent_id == agent_id)
+                        .filter(Agent.status != "terminated")
+                        .one_or_none()
+                    )
+                    if row is None:
+                        return False
+                    token = row.token
+                    row.status = "terminated"
+                    row.terminated_at = terminated_at
+                    row.updated_at = terminated_at
+                    row.current_task = None
+                    session.commit()
+            except SQLAlchemyError as e:
+                logger.error(
+                    f"Database error terminating agent '{agent_id}': {e}",
+                    exc_info=True,
+                )
+                return False
+
+        # Cache + EventBus only on the standalone path. With a
+        # ``connection=`` the caller still owns the transaction; the
+        # cache eviction and publish are deferred to the caller's
+        # post-commit step (typically :meth:`evict_from_cache` for
+        # cache, then their own publish or a follow-up call).
+        if connection is None:
+            if not self._cache_disabled:
+                state.agent_working_dirs.pop(agent_id, None)
+                if token is not None:
+                    state.active_agents.pop(token, None)
+                else:
+                    # token unknown: scan to find the right entry.
+                    for cached_token, data in list(
+                        state.active_agents.items()
+                    ):
+                        if data.get("agent_id") == agent_id:
+                            state.active_agents.pop(cached_token, None)
+
+            _event_bus_shim.publish(
+                agent_id,
+                "agent.terminated",
+                {"agent_id": agent_id, "terminated_at": terminated_at},
             )
-            return False
-
-        if not self._cache_disabled:
-            state.agent_working_dirs.pop(agent_id, None)
-            if token is not None:
-                state.active_agents.pop(token, None)
-            else:
-                # token unknown: scan to find the right entry.
-                for cached_token, data in list(state.active_agents.items()):
-                    if data.get("agent_id") == agent_id:
-                        state.active_agents.pop(cached_token, None)
-
-        _event_bus_shim.publish(
-            agent_id,
-            "agent.terminated",
-            {"agent_id": agent_id, "terminated_at": terminated_at},
-        )
         return True
 
     # --- Cache-only helpers ---------------------------------------------
