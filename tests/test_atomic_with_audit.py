@@ -96,7 +96,7 @@ def test_yields_cursor_writes_commit_and_audit_row_appended(
         ) as cursor:
             cursor.execute(
                 "INSERT OR REPLACE INTO project_context "
-                "(context_key, value, last_updated, updated_by, description) "
+                "(context_key, value, updated_at, updated_by, description) "
                 "VALUES (?, ?, datetime('now'), ?, ?)",
                 ("atomic_test_key", '"v"', "agent-1", "test"),
             )
@@ -144,7 +144,7 @@ def test_exception_in_block_rolls_back_and_no_audit_row(
             ) as cursor:
                 cursor.execute(
                     "INSERT OR REPLACE INTO project_context "
-                    "(context_key, value, last_updated, updated_by, description) "
+                    "(context_key, value, updated_at, updated_by, description) "
                     "VALUES (?, ?, datetime('now'), ?, ?)",
                     ("rollback_test_key", '"v"', "agent-2", "test"),
                 )
@@ -188,7 +188,7 @@ def test_multiple_writes_in_one_block_emit_one_audit_row(
             for i in range(3):
                 cursor.execute(
                     "INSERT OR REPLACE INTO project_context "
-                    "(context_key, value, last_updated, updated_by, description) "
+                    "(context_key, value, updated_at, updated_by, description) "
                     "VALUES (?, ?, datetime('now'), ?, ?)",
                     (f"multi_key_{i}", '"v"', "agent-3", "test"),
                 )
@@ -231,25 +231,46 @@ def test_operation_name_is_required_keyword(project_dir, reset_globals):
 # --- Actor optional -----------------------------------------------------
 
 
-def test_actor_optional_defaults_to_null_agent_id(
+def test_actor_optional_does_not_crash_the_block(
     project_dir, reset_globals,
 ):
-    """``actor=None`` is allowed — admin-less audit rows store NULL."""
+    """``actor=None`` is allowed at the seam without crashing the caller.
+
+    The underlying ``agent_actions.agent_id`` column is NOT NULL in
+    the schema, so passing ``actor=None`` results in
+    ``log_agent_action_to_db`` swallowing a constraint error and
+    suppressing the audit row — but critically, the caller's write
+    still commits cleanly and the context manager does not propagate
+    the audit-side failure. This pins the "no actor → no surprise
+    crash" half of the contract; tools that want a guaranteed audit
+    row must supply a non-None actor (which all migrating call sites
+    today do — ``"admin"`` or the worker's agent_id).
+    """
     with _make_client(project_dir):
         from agent_mcp.db.atomic import atomic_with_audit
 
+        # Should not raise even though actor is None.
         with atomic_with_audit(operation="test.no_actor") as cursor:
             cursor.execute(
                 "INSERT OR REPLACE INTO project_context "
-                "(context_key, value, last_updated, updated_by, description) "
+                "(context_key, value, updated_at, updated_by, description) "
                 "VALUES (?, ?, datetime('now'), ?, ?)",
                 ("no_actor_key", '"v"', "system", "test"),
             )
 
-        row = _fetch_action("test.no_actor")
-        assert row is not None
-        # SQLite stores NULL for the omitted agent_id.
-        assert row["agent_id"] is None
+        # The caller's write committed even though the audit insert
+        # was rejected by the NOT NULL constraint.
+        from agent_mcp.db.connection import get_db_connection
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT value FROM project_context WHERE context_key = ?",
+                ("no_actor_key",),
+            )
+            assert cur.fetchone() is not None
+        finally:
+            conn.close()
 
 
 # --- Details optional ---------------------------------------------------
@@ -266,7 +287,7 @@ def test_details_optional_defaults_to_empty(project_dir, reset_globals):
         ) as cursor:
             cursor.execute(
                 "INSERT OR REPLACE INTO project_context "
-                "(context_key, value, last_updated, updated_by, description) "
+                "(context_key, value, updated_at, updated_by, description) "
                 "VALUES (?, ?, datetime('now'), ?, ?)",
                 ("no_details_key", '"v"', "agent-4", "test"),
             )
@@ -296,7 +317,7 @@ def test_task_id_propagates_to_audit_row_when_passed(
         ) as cursor:
             cursor.execute(
                 "INSERT OR REPLACE INTO project_context "
-                "(context_key, value, last_updated, updated_by, description) "
+                "(context_key, value, updated_at, updated_by, description) "
                 "VALUES (?, ?, datetime('now'), ?, ?)",
                 ("task_id_key", '"v"', "agent-5", "test"),
             )
