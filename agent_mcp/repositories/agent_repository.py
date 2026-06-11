@@ -43,11 +43,22 @@ Event types published (subscribers can route by exact string):
   :mod:`core.repositories.agent_repo` established.
 * ``"agent.terminated"`` — emitted by ``terminate`` on success.
 
-The class delegates DB I/O to the existing helpers in
-:mod:`agent_mcp.db.actions.agent_db` and the SQLAlchemy ORM layer
-behind them — no SQL gets re-written here. The class is the *seam*
-between business logic and persistence, not a re-implementation of
-either.
+PR 8 of the architecture-review series — the "Agent flip". Until this
+PR the class delegated DB I/O to the helpers in
+``agent_mcp.db.actions.agent_db``: handler → repo → db/actions →
+SQL. Two layers, not one — the "single ownership" the class claims in
+its docstring did not match the code.
+
+After the flip:
+
+* All read/write SQL bodies live here (module-level functions for the
+  legacy free-function API, instance methods for the cache-aware
+  surface).
+* ``agent_mcp.db.actions.agent_db`` is a re-export shim that keeps
+  legacy importers (``cli.py``, ``core.auth``, ``app.routes`` lifespan,
+  the older module-of-functions repo under ``core.repositories``,
+  ``tests/test_sqlalchemy_agent.py``) working unchanged.
+* ``AgentRepository`` is the single owner — handler → repo → SQL.
 """
 from __future__ import annotations
 
@@ -60,16 +71,265 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from ..core import state
 from ..core.config import logger
-from ..core.repositories import _event_bus_shim
-from ..db.actions.agent_db import (
-    _MUTABLE_FIELDS,
-    get_agent_by_id as _db_get_agent_by_id,
-    get_agent_by_token as _db_get_agent_by_token,
-    get_all_active_agents_from_db,
-    update_agent_db_field,
-)
+# NOTE: we import the bus shim lazily inside the publish call sites
+# below. A top-level ``from ..core.repositories import _event_bus_shim``
+# would execute ``core.repositories.__init__``, which eagerly imports
+# the legacy module-of-functions ``core.repositories.agent_repo``,
+# which in turn imports ``db.actions.agent_db`` — now a shim that
+# re-exports from THIS module. That produces a circular import at
+# first load. The lazy import inside ``_publish`` breaks the cycle
+# without changing publish semantics (the shim is itself lazy-imports
+# event_bus on every call, so call-site latency is unaffected).
 from ..db.engine import get_session
 from ..db.models import Agent
+
+
+def _publish(addressee: str, event: str, payload: Dict[str, Any]) -> None:
+    """Lazy-import shim around ``_event_bus_shim.publish``.
+
+    Importing the submodule path directly under ``core.repositories``
+    via ``from ... import _event_bus_shim`` would still trigger
+    ``core.repositories.__init__`` (which eagerly imports the legacy
+    ``agent_repo`` module-of-functions, which imports the shim at
+    ``db.actions.agent_db``, which now re-exports from THIS module —
+    circular). Doing the import at call time keeps the publish
+    side-effect identical while avoiding the cycle.
+    """
+    from ..core.repositories import _event_bus_shim
+
+    _event_bus_shim.publish(addressee, event, payload)
+
+
+# ---------------------------------------------------------------------------
+# Module-level constants — formerly lived in db/actions/agent_db.py.
+# Both the class methods and the free-function API below consume these.
+# ---------------------------------------------------------------------------
+
+# Columns the caller is allowed to mutate via :func:`update_agent_db_field`
+# and :meth:`AgentRepository.update_field`. Used both as an allowlist
+# (anti-injection / anti-typo) and to centralise the JSON-serialisation
+# rule for ``capabilities``.
+#
+# ``token`` is deliberately OFF this allowlist — it's the auth secret,
+# and the surface for rotating it lives in :meth:`AgentRepository.rotate_token`
+# (PR 8), not the generic field-update API.
+_MUTABLE_FIELDS: set[str] = {
+    "status",
+    "current_task",
+    "working_directory",
+    "color",
+    "capabilities",
+    "updated_at",
+    "aoe_session_id",
+    # Event-coord PR-1 + PR-2.
+    "auto_event_loop",
+    "last_event_seen_at",
+    # PR 8 (Agent flip): added so the restore-agent path
+    # (``app.routes.restore_agent``) can clear ``terminated_at`` via
+    # the repo's transaction-aware ``update_field`` seam instead of
+    # owning a raw UPDATE.
+    "terminated_at",
+}
+
+
+# ---------------------------------------------------------------------------
+# Module-level free functions — formerly lived in db/actions/agent_db.py.
+# These remain ORM-backed and behaviourally unchanged. They are exported
+# unchanged via the ``db.actions.agent_db`` shim so legacy callers
+# (``cli.py``, ``core.auth``, ``app.routes`` lifespan,
+# ``core.repositories.agent_repo``, tests) keep working.
+# ---------------------------------------------------------------------------
+
+
+def _agent_to_dict(row: Agent) -> Dict[str, Any]:
+    """Project an ``Agent`` ORM row into the dict shape consumers expect.
+
+    Mirrors the pre-cutover ``dict(sqlite_row)`` projection: every column
+    is exposed by name, and ``capabilities`` is JSON-decoded (the column
+    stores a JSON-encoded list).
+    """
+    data: Dict[str, Any] = {
+        "token": row.token,
+        "agent_id": row.agent_id,
+        "capabilities": row.capabilities,
+        "created_at": row.created_at,
+        "status": row.status,
+        "current_task": row.current_task,
+        "working_directory": row.working_directory,
+        "color": row.color,
+        "terminated_at": row.terminated_at,
+        "updated_at": row.updated_at,
+        "aoe_session_id": row.aoe_session_id,
+        # Event-coord PR-1 columns. ``auto_event_loop`` defaults TRUE
+        # for legacy rows via the migration's ``DEFAULT 1``;
+        # ``last_event_seen_at`` is NULL until the agent first calls
+        # ``fetch_events_since`` (PR-2).
+        "auto_event_loop": getattr(row, "auto_event_loop", True),
+        "last_event_seen_at": getattr(row, "last_event_seen_at", None),
+    }
+    raw_caps = data.get("capabilities")
+    if isinstance(raw_caps, str):
+        try:
+            data["capabilities"] = json.loads(raw_caps or "[]")
+        except json.JSONDecodeError:
+            logger.warning(
+                f"Failed to parse capabilities JSON for agent "
+                f"{row.agent_id!r}. Raw: {raw_caps!r}"
+            )
+            data["capabilities"] = []
+    return data
+
+
+def get_agent_by_id(agent_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch a single agent by agent_id. Returns None if not found."""
+    try:
+        with get_session() as session:
+            row = (
+                session.query(Agent)
+                .filter(Agent.agent_id == agent_id)
+                .one_or_none()
+            )
+            return _agent_to_dict(row) if row is not None else None
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error fetching agent by ID '{agent_id}': {e}",
+            exc_info=True,
+        )
+        return None
+    except Exception as e:
+        logger.error(
+            f"Unexpected error fetching agent by ID '{agent_id}': {e}",
+            exc_info=True,
+        )
+        return None
+
+
+def get_agent_by_token(token: str) -> Optional[Dict[str, Any]]:
+    """Fetch a single agent by bearer token. Returns None if not found."""
+    try:
+        with get_session() as session:
+            row = (
+                session.query(Agent)
+                .filter(Agent.token == token)
+                .one_or_none()
+            )
+            return _agent_to_dict(row) if row is not None else None
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error fetching agent by token: {e}", exc_info=True,
+        )
+        return None
+    except Exception as e:
+        logger.error(
+            f"Unexpected error fetching agent by token: {e}", exc_info=True,
+        )
+        return None
+
+
+def get_all_active_agents_from_db() -> List[Dict[str, Any]]:
+    """Fetch every agent whose status is not 'terminated'.
+
+    Used by ``application_startup`` to populate ``g.active_agents``.
+    """
+    try:
+        with get_session() as session:
+            rows = (
+                session.query(Agent)
+                .filter(Agent.status != "terminated")
+                .all()
+            )
+            return [_agent_to_dict(r) for r in rows]
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error fetching all active agents: {e}", exc_info=True,
+        )
+        return []
+    except Exception as e:
+        logger.error(
+            f"Unexpected error fetching all active agents: {e}",
+            exc_info=True,
+        )
+        return []
+
+
+def update_agent_db_field(
+    agent_id: str, field_name: str, new_value: Any,
+) -> bool:
+    """Update a single field on an agent row + bump ``updated_at``.
+
+    Returns True on success, False on any failure (unknown field,
+    no matching agent, or DB error). The allowlist is non-negotiable —
+    callers must not be able to mutate ``token`` or ``agent_id`` /
+    ``created_at`` via this surface.
+    """
+    if field_name not in _MUTABLE_FIELDS:
+        logger.error(
+            f"Attempted to update an invalid or unsupported agent "
+            f"field: {field_name}"
+        )
+        return False
+
+    value_to_set = new_value
+    if field_name == "capabilities":
+        # Event-coord PR-1: normalize at write time (strip + lowercase +
+        # dedupe, preserve order of first occurrence). One source of
+        # truth for both agents.capabilities and
+        # tasks.required_capabilities (task_tools applies the same
+        # helper). Read paths must NOT re-normalize.
+        from ..utils.capability_normalization import normalize_capabilities
+
+        value_to_set = json.dumps(normalize_capabilities(new_value))
+    elif field_name == "auto_event_loop":
+        # SQLite has no native bool; coerce any truthy value to 1, any
+        # falsy to 0 so dashboard PATCH bodies (true/false/0/1) all
+        # land as the integer the column expects.
+        value_to_set = 1 if new_value else 0
+    elif field_name == "updated_at" and new_value is None:
+        value_to_set = datetime.datetime.now().isoformat()
+
+    try:
+        with get_session() as session:
+            row = (
+                session.query(Agent)
+                .filter(Agent.agent_id == agent_id)
+                .one_or_none()
+            )
+            if row is None:
+                logger.warning(
+                    f"Agent '{agent_id}' not found; "
+                    f"field '{field_name}' update is a no-op."
+                )
+                return False
+            setattr(row, field_name, value_to_set)
+            # Always bump updated_at, even if the caller's field IS
+            # updated_at (the value above already accounts for that).
+            row.updated_at = datetime.datetime.now().isoformat()
+            session.commit()
+            logger.info(
+                f"Agent '{agent_id}' field '{field_name}' updated in DB."
+            )
+            return True
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error updating agent '{agent_id}' field "
+            f"'{field_name}': {e}",
+            exc_info=True,
+        )
+        return False
+    except Exception as e:
+        logger.error(
+            f"Unexpected error updating agent '{agent_id}' field "
+            f"'{field_name}': {e}",
+            exc_info=True,
+        )
+        return False
+
+
+# Convenience aliases used by the class below — kept private so the
+# class-method code reads ``_db_get_agent_by_id(...)`` (matching the
+# pre-flip naming) without re-importing from the shim.
+_db_get_agent_by_id = get_agent_by_id
+_db_get_agent_by_token = get_agent_by_token
 
 
 class AgentRepository:
@@ -423,7 +683,7 @@ class AgentRepository:
                 state.active_agents[token] = fresh
                 state.agent_working_dirs[agent_id] = working_directory
 
-            _event_bus_shim.publish(
+            _publish(
                 agent_id,
                 "agent.created",
                 {"agent_id": agent_id, "status": status},
@@ -498,7 +758,7 @@ class AgentRepository:
             if field_name == "status"
             else "agent.updated"
         )
-        _event_bus_shim.publish(
+        _publish(
             agent_id,
             event_type,
             {"agent_id": agent_id, "field": field_name, "value": new_value},
@@ -724,7 +984,7 @@ class AgentRepository:
                         if data.get("agent_id") == agent_id:
                             state.active_agents.pop(cached_token, None)
 
-            _event_bus_shim.publish(
+            _publish(
                 agent_id,
                 "agent.terminated",
                 {"agent_id": agent_id, "terminated_at": terminated_at},
