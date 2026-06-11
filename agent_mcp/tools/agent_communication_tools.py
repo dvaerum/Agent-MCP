@@ -172,20 +172,23 @@ async def send_agent_message_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # Store message in database
-        cursor.execute(
-            """
-            INSERT INTO agent_messages (message_id, sender_id, recipient_id,
-                                        message_content, message_type, priority,
-                                        timestamp, delivered, read,
-                                        subject, parent_message_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                message_id, sender_id, recipient_id, message_content,
-                message_type, priority, timestamp, False, False,
-                effective_subject, parent_message_id,
-            ),
+        # PR 6: message INSERT goes through message_repo with the
+        # caller's cursor so it's atomic with the subsequent delivery
+        # UPDATE + audit-log INSERT below.
+        from ..repositories import message_repo as _msg_repo
+        _msg_repo.send(
+            message_id=message_id,
+            sender_id=sender_id,
+            recipient_id=recipient_id,
+            message_content=message_content,
+            message_type=message_type,
+            priority=priority,
+            timestamp=timestamp,
+            delivered=False,
+            read=False,
+            subject=effective_subject,
+            parent_message_id=parent_message_id,
+            connection=cursor,
         )
         
         # Attempt delivery based on method
@@ -223,10 +226,11 @@ async def send_agent_message_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
                                 delivery_status = "stop_command_failed"
                                 logger.error(f"Failed to send stop command: {result.stderr}")
                             
-                            # Mark as delivered in database
-                            cursor.execute("UPDATE agent_messages SET delivered = ? WHERE message_id = ?", 
-                                         (success, message_id))
-                                         
+                            # PR 6: mark_delivered via repo with caller's cursor.
+                            _msg_repo.mark_delivered(
+                                message_id, bool(success), connection=cursor,
+                            )
+
                         except Exception as e:
                             logger.error(f"Failed to send stop command to tmux session '{session_name}': {e}")
                             delivery_status = "stop_command_failed"
@@ -239,10 +243,11 @@ async def send_agent_message_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
                             send_prompt_async(session_name, formatted_message, delay_seconds=1)
                             delivery_status = "delivered_tmux"
                             
-                            # Mark as delivered in database
-                            cursor.execute("UPDATE agent_messages SET delivered = ? WHERE message_id = ?", 
-                                         (True, message_id))
-                            
+                            # PR 6: mark_delivered via repo with caller's cursor.
+                            _msg_repo.mark_delivered(
+                                message_id, True, connection=cursor,
+                            )
+
                         except Exception as e:
                             logger.error(f"Failed to deliver message to tmux session '{session_name}': {e}")
                             delivery_status = "delivery_failed"
