@@ -1,36 +1,45 @@
 # Agent-MCP/agent_mcp/repositories/task_repository.py
 """TaskRepository — class-based single owner of the task cache+DB invariant.
 
-PR #146 promotes the module-of-functions ``task_repo`` from PR #137
-into a real class with an instance lifecycle. The behavior on
-existing methods is preserved verbatim (return shapes, JSON-list
-deserialisation, ``state.tasks`` write-through, EventBus publish);
-the class form adds:
+PR #146 promoted the module-of-functions ``task_repo`` from PR #137
+into a real class with an instance lifecycle. Subsequent PRs
+(#151, #152) migrated the call sites that previously talked directly
+to ``agent_mcp.db.actions.task_db`` over to this class.
 
-* **``delete(task_id)``** — the legacy purge path in ``app.routes``
-  owned its own SQL DELETE and ad-hoc ``del state.tasks[task_id]``
-  follow-up. ``delete`` centralises both, plus the
-  ``"task.deleted"`` publish, so the cache invariant is owned in
-  exactly one place.
+This PR (PR 7 of the architecture-review series — the "Task flip")
+finishes the deepening. Until now the class delegated DB I/O to the
+helpers in ``agent_mcp.db.actions.task_db`` — so even though every
+handler called ``task_repo.X(...)``, the SQL still lived in
+``db/actions/task_db.py``. Two layers, not one.
 
-* **``update_fields(... , connection=)``** — Risk #1 mitigation
-  from the grilling: handlers that ran the legacy
-  ``update_task_fields_in_db`` inside a wider transaction can pass
-  their own open SQLAlchemy ``Session`` so the migration doesn't
-  fragment one atomic write into two commits. The class signature
-  carries this even though the current call sites don't need it —
-  it's a documented affordance for future migrations.
+After the flip:
 
-* **``bulk_update_fields(task_ids, fields)``** — Risk #2 mitigation:
-  20 separate ``update_fields`` calls in a loop produce 20 events;
-  the bulk variant produces one batched event so subscribers don't
-  drown in per-row noise.
+* All read/write SQL bodies live here (module-level functions for the
+  legacy free-function API, instance methods for the cache-aware
+  surface).
+* ``agent_mcp.db.actions.task_db`` is a ~30-line re-export shim that
+  keeps legacy importers (``cli.py``, the older module-of-functions
+  repo, tests pinning the read-side cutover) working unchanged.
+* ``TaskRepository`` is the single owner — handler → repo → SQL.
 
-The class delegates DB I/O to the existing helpers in
-``agent_mcp.db.actions.task_db`` and the SQLAlchemy ORM layer
-behind them — no SQL gets re-written here. The class is the *seam*
-between business logic and persistence, not a re-implementation of
-either.
+Public surface (class methods):
+
+* ``delete(task_id)`` — centralised purge + cache eviction +
+  ``"task.deleted"`` publish.
+* ``update_fields(... , connection=)`` — Risk #1 mitigation:
+  handlers that ran the legacy ``update_task_fields_in_db`` inside a
+  wider transaction can pass their own open SQLAlchemy ``Session`` or
+  raw ``sqlite3.Cursor`` so the migration doesn't fragment one atomic
+  write into two commits.
+* ``bulk_update_fields(task_ids, fields)`` — Risk #2 mitigation: 20
+  separate ``update_fields`` calls in a loop produce 20 events; the
+  bulk variant produces one batched event.
+
+Module-level free functions (preserved for legacy importers via the
+``db.actions.task_db`` shim):
+
+* ``get_task_by_id`` / ``get_all_tasks_from_db`` / ``get_tasks_by_agent_id``
+* ``update_task_fields_in_db``
 
 Event types published (subscribers can route by exact string):
 
@@ -55,17 +64,274 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from ..core import state
 from ..core.config import logger
-from ..core.repositories import _event_bus_shim
-from ..db.actions.task_db import (
-    _MUTABLE_FIELDS,
-    _JSON_LIST_FIELDS,
-    get_all_tasks_from_db,
-    get_task_by_id,
-    get_tasks_by_agent_id,
-    update_task_fields_in_db,
-)
+# NOTE: we import the bus shim lazily inside the publish call sites
+# below. A top-level ``from ..core.repositories import _event_bus_shim``
+# would execute ``core.repositories.__init__``, which eagerly imports
+# the legacy module-of-functions ``core.repositories.task_repo``, which
+# in turn imports ``db.actions.task_db`` — now a shim that re-exports
+# from THIS module. That produces a circular import at first load.
+# The lazy import inside ``_publish`` breaks the cycle without
+# changing publish semantics (the shim is itself lazy-imports event_bus
+# on every call, so call-site latency is unaffected).
 from ..db.engine import get_session
 from ..db.models import Task
+
+
+def _publish(addressee: str, event: str, payload: Dict[str, Any]) -> None:
+    """Lazy-import shim around ``_event_bus_shim.publish``.
+
+    Importing the submodule path directly under ``core.repositories``
+    via ``from ... import _event_bus_shim`` would still trigger
+    ``core.repositories.__init__`` (which eagerly imports the legacy
+    ``task_repo`` module-of-functions, which imports the shim at
+    ``db.actions.task_db``, which now re-exports from THIS module —
+    circular). Doing the import at call time keeps the publish
+    side-effect identical while avoiding the cycle.
+    """
+    from ..core.repositories import _event_bus_shim
+
+    _event_bus_shim.publish(addressee, event, payload)
+
+
+# ---------------------------------------------------------------------------
+# Module-level constants — formerly lived in db/actions/task_db.py.
+# Both the class methods and the free-function API below consume these.
+# ---------------------------------------------------------------------------
+
+# Columns the caller is allowed to mutate via :func:`update_task_fields_in_db`
+# and :meth:`TaskRepository.update_fields`. Used both as an allowlist
+# (anti-injection / anti-typo) and to centralise the JSON-serialisation
+# rule for the list-typed fields.
+_MUTABLE_FIELDS: set[str] = {
+    "title",
+    "description",
+    "assigned_to",
+    "status",
+    "priority",
+    "parent_task",
+    "child_tasks",
+    "depends_on_tasks",
+    "notes",
+}
+
+# Subset of _MUTABLE_FIELDS that store a JSON-encoded list in their
+# TEXT column. Callers pass a Python list; we json.dumps before write.
+_JSON_LIST_FIELDS: set[str] = {
+    "child_tasks",
+    "depends_on_tasks",
+    "notes",
+}
+
+
+# ---------------------------------------------------------------------------
+# Module-level free functions — formerly lived in db/actions/task_db.py.
+# These remain ORM-backed and behaviourally unchanged. They are exported
+# unchanged via the ``db.actions.task_db`` shim so legacy callers
+# (``cli.py``, ``core.repositories.task_repo``, tests) keep working.
+# ---------------------------------------------------------------------------
+
+
+def _task_to_dict(row: Task) -> Dict[str, Any]:
+    """Project a ``Task`` ORM row into the dict shape consumers expect.
+
+    Mirrors the pre-cutover ``dict(sqlite_row)`` projection then
+    ``_parse_task_json_fields``: every column is exposed by name, and
+    the three JSON-typed columns are deserialised to Python lists.
+    Parse failures fall back to an empty list with a warning (matches
+    the legacy helper's behaviour exactly).
+    """
+    data: Dict[str, Any] = {
+        "task_id": row.task_id,
+        "title": row.title,
+        "description": row.description,
+        "assigned_to": row.assigned_to,
+        "created_by": row.created_by,
+        "status": row.status,
+        "priority": row.priority,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+        "parent_task": row.parent_task,
+        "child_tasks": row.child_tasks,
+        "depends_on_tasks": row.depends_on_tasks,
+        "notes": row.notes,
+    }
+    for field_key in _JSON_LIST_FIELDS:
+        raw = data.get(field_key)
+        if isinstance(raw, str):
+            try:
+                data[field_key] = json.loads(raw or "[]")
+            except json.JSONDecodeError:
+                logger.warning(
+                    f"Failed to parse JSON for field '{field_key}' in "
+                    f"task '{data.get('task_id', 'Unknown')}'. Raw: {raw}"
+                )
+                data[field_key] = []
+        elif raw is None:
+            data[field_key] = []
+    return data
+
+
+def get_task_by_id(task_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch a single task's details from the database by task_id.
+
+    Parses JSON fields (child_tasks, depends_on_tasks, notes) into
+    Python lists. Returns None if the task is not found.
+    """
+    try:
+        with get_session() as session:
+            row = (
+                session.query(Task)
+                .filter(Task.task_id == task_id)
+                .one_or_none()
+            )
+            return _task_to_dict(row) if row is not None else None
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error fetching task by ID '{task_id}': {e}",
+            exc_info=True,
+        )
+        return None
+    except Exception as e:
+        logger.error(
+            f"Unexpected error fetching task by ID '{task_id}': {e}",
+            exc_info=True,
+        )
+        return None
+
+
+def get_all_tasks_from_db() -> List[Dict[str, Any]]:
+    """Fetch all tasks from the database, newest first.
+
+    Used by ``application_startup`` (populates ``g.tasks``) and by the
+    ``/api/all-data`` dashboard route.
+    """
+    try:
+        with get_session() as session:
+            rows = (
+                session.query(Task)
+                .order_by(Task.created_at.desc())
+                .all()
+            )
+            return [_task_to_dict(r) for r in rows]
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error fetching all tasks: {e}", exc_info=True,
+        )
+        return []
+    except Exception as e:
+        logger.error(
+            f"Unexpected error fetching all tasks: {e}", exc_info=True,
+        )
+        return []
+
+
+def get_tasks_by_agent_id(
+    agent_id: str, status_filter: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Fetch tasks assigned to a specific agent, optionally filtered
+    by status. Parses JSON fields for each task."""
+    try:
+        with get_session() as session:
+            query = session.query(Task).filter(Task.assigned_to == agent_id)
+            if status_filter:
+                query = query.filter(Task.status == status_filter)
+            rows = query.order_by(Task.created_at.desc()).all()
+            return [_task_to_dict(r) for r in rows]
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error fetching tasks for agent '{agent_id}': {e}",
+            exc_info=True,
+        )
+        return []
+    except Exception as e:
+        logger.error(
+            f"Unexpected error fetching tasks for agent '{agent_id}': {e}",
+            exc_info=True,
+        )
+        return []
+
+
+def update_task_fields_in_db(
+    task_id: str, fields_to_update: Dict[str, Any],
+) -> bool:
+    """Update specified fields for a task in the database.
+
+    Always refreshes ``updated_at``. JSON-typed list fields
+    (notes/child_tasks/depends_on_tasks) are serialised to TEXT.
+    Returns True on success, False on any failure (unknown task,
+    no valid fields, or DB error).
+
+    The allowlist is non-negotiable — callers must not be able to
+    mutate ``task_id``, ``created_by``, ``created_at``, or
+    ``updated_at`` directly via this surface.
+    """
+    if not task_id or not fields_to_update:
+        logger.warning(
+            "update_task_fields_in_db called with no task_id or no "
+            "fields to update."
+        )
+        return False
+
+    # Pre-filter to the allowlist so the ORM ``setattr`` loop can't
+    # touch anything off-limits. Mirrors the legacy
+    # safe_field_mapping[field] KeyError-on-unknown guard.
+    sanitised: Dict[str, Any] = {}
+    for field, value in fields_to_update.items():
+        if field not in _MUTABLE_FIELDS:
+            logger.warning(
+                f"Attempted to update invalid task field: {field} for "
+                f"task {task_id}. Skipping."
+            )
+            continue
+        if field in _JSON_LIST_FIELDS:
+            sanitised[field] = json.dumps(value or [])
+        else:
+            sanitised[field] = value
+
+    if not sanitised:
+        logger.info(f"No valid fields to update for task {task_id}.")
+        return False
+
+    try:
+        with get_session() as session:
+            row = (
+                session.query(Task)
+                .filter(Task.task_id == task_id)
+                .one_or_none()
+            )
+            if row is None:
+                logger.warning(
+                    f"Task '{task_id}' not found or update had no "
+                    f"effect in DB."
+                )
+                return False
+            for field, value in sanitised.items():
+                setattr(row, field, value)
+            # Always bump updated_at, even if the caller passed one
+            # (matches the legacy behaviour: updated_at was always
+            # appended to the SET clause unconditionally).
+            row.updated_at = datetime.datetime.now().isoformat()
+            session.commit()
+            logger.info(
+                f"Task '{task_id}' updated in DB with fields: "
+                f"{list(sanitised.keys())}."
+            )
+            return True
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error updating task '{task_id}': {e}", exc_info=True,
+        )
+        return False
+    except Exception as e:
+        logger.error(
+            f"Unexpected error updating task '{task_id}': {e}", exc_info=True,
+        )
+        return False
+
+
+# ---------------------------------------------------------------------------
+# TaskRepository — the cache-aware seam.
+# ---------------------------------------------------------------------------
 
 
 class TaskRepository:
@@ -73,7 +339,7 @@ class TaskRepository:
 
     Instances are cheap and stateless — every method opens a fresh
     SQLAlchemy session via ``get_session()`` (the same pattern the
-    existing ``task_db`` helpers use). The class identity exists so
+    free-function helpers above use). The class identity exists so
     callers can hold a reference, type-check against
     ``TaskRepository``, and (in future PRs) attach per-instance
     state like batching policies or audit hooks without rewriting
@@ -331,7 +597,7 @@ class TaskRepository:
             if not self._cache_disabled:
                 state.tasks[task_id] = fresh
 
-            _event_bus_shim.publish(
+            _publish(
                 fresh.get("assigned_to") or "*",
                 "task.created",
                 {
@@ -393,7 +659,7 @@ class TaskRepository:
         if not self._cache_disabled:
             state.tasks[task_id] = fresh
 
-        _event_bus_shim.publish(
+        _publish(
             fresh.get("assigned_to") or "*",
             "task.updated",
             {"task_id": task_id, "fields": list(fields.keys())},
@@ -587,7 +853,7 @@ class TaskRepository:
         # Single batched publish — no per-row events. Addressee is "*"
         # because bulk updates almost always span multiple agents (or
         # touch unassigned rows).
-        _event_bus_shim.publish(
+        _publish(
             "*",
             "task.bulk_updated",
             {
@@ -687,7 +953,7 @@ class TaskRepository:
             if not self._cache_disabled:
                 state.tasks.pop(task_id, None)
 
-            _event_bus_shim.publish(
+            _publish(
                 assigned_to or "*",
                 "task.deleted",
                 {"task_id": task_id, "assigned_to": assigned_to},
@@ -731,4 +997,12 @@ class TaskRepository:
         state.tasks.pop(task_id, None)
 
 
-__all__ = ["TaskRepository"]
+__all__ = [
+    "TaskRepository",
+    # Module-level free functions kept for legacy compatibility.
+    # The shim at ``agent_mcp.db.actions.task_db`` re-exports these.
+    "get_task_by_id",
+    "get_all_tasks_from_db",
+    "get_tasks_by_agent_id",
+    "update_task_fields_in_db",
+]
