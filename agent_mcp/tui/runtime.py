@@ -16,7 +16,6 @@ The loop is kept verbatim from the legacy implementation modulo:
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any
 
 import anyio

@@ -60,9 +60,9 @@ import json
 import os
 import sqlite3
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 from dotenv import dotenv_values, load_dotenv
 
