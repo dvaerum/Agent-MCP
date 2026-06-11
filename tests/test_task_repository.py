@@ -416,3 +416,133 @@ def test_bulk_update_fields_emits_single_event_per_invocation(
             )
     finally:
         sys.modules.pop("agent_mcp.core.event_bus", None)
+
+
+# --- Transaction-aware seam on create / delete (PR #152) ----------------
+
+
+def test_create_with_sqlite_cursor_lands_in_caller_transaction(
+    project_dir, reset_globals,
+):
+    """``create(connection=cursor)`` writes through the caller's
+    sqlite3 cursor so the row lands inside the caller's BEGIN/COMMIT.
+
+    This pins the seam the admin_tools / task_tools migration relies
+    on to keep the task INSERT atomic with the surrounding
+    ``agent_actions`` audit-log INSERT.
+    """
+    with _make_client(project_dir):
+        from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import task_repo
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN")
+            fresh = task_repo.create(
+                {
+                    "task_id": "task_seam_1",
+                    "title": "via cursor",
+                    "description": "seam test",
+                    "created_by": "admin",
+                },
+                connection=cursor,
+            )
+            assert fresh["task_id"] == "task_seam_1"
+            # Visible to OTHER connections only after commit.
+            conn.commit()
+        finally:
+            conn.close()
+
+        row = task_repo.get_by_id("task_seam_1")
+        assert row is not None
+        assert row["title"] == "via cursor"
+
+
+def test_create_with_sqlite_cursor_rolls_back_with_outer_transaction(
+    project_dir, reset_globals,
+):
+    """If the caller's transaction rolls back, the repo-created row
+    must NOT persist — proves the INSERT really uses the caller's
+    transaction (not a hidden session that commits on its own)."""
+    with _make_client(project_dir):
+        from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import task_repo
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN")
+            task_repo.create(
+                {
+                    "task_id": "task_seam_rollback",
+                    "title": "should not persist",
+                    "created_by": "admin",
+                },
+                connection=cursor,
+            )
+            conn.rollback()
+        finally:
+            conn.close()
+
+        # No row should exist because the outer transaction rolled back.
+        assert task_repo.get_by_id("task_seam_rollback") is None
+
+
+def test_delete_with_sqlite_cursor_uses_caller_transaction(
+    project_dir, reset_globals,
+):
+    """``delete(connection=cursor)`` removes the row through the
+    caller's cursor, returns True, and the deletion is atomic with
+    the caller's transaction.
+
+    The caller is responsible for evicting the cache after their own
+    commit (the repo defers cache+publish on the connection= path so
+    a rollback can't leave the cache desynced). This test exercises
+    the caller-owns-cache contract explicitly.
+    """
+    with _make_client(project_dir):
+        from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import task_repo
+
+        _seed_task("task_seam_delete")
+        # Don't warm the cache from a different path — the test
+        # validates the DB delete + caller-driven eviction, not the
+        # cache-warm path.
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN")
+            ok = task_repo.delete(
+                "task_seam_delete", connection=cursor,
+            )
+            assert ok is True
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Caller-owns-cache: evict after commit. This is what the
+        # admin_tools/task_tools migration sites are expected to do.
+        task_repo.evict_from_cache("task_seam_delete")
+        assert task_repo.get_by_id("task_seam_delete") is None
+
+
+def test_delete_with_sqlite_cursor_returns_false_for_missing_row(
+    project_dir, reset_globals,
+):
+    """A delete for a non-existent task returns False without raising,
+    even on the cursor seam path."""
+    with _make_client(project_dir):
+        from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import task_repo
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN")
+            ok = task_repo.delete("does_not_exist", connection=cursor)
+            assert ok is False
+            conn.commit()
+        finally:
+            conn.close()

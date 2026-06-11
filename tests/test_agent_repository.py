@@ -345,3 +345,98 @@ def test_terminate_missing_returns_false(project_dir, reset_globals):
     with _make_client(project_dir):
         from agent_mcp.repositories import agent_repo
         assert agent_repo.terminate("missing") is False
+
+
+# --- Transaction-aware seam on create / terminate (PR #152) -------------
+
+
+def test_create_with_sqlite_cursor_lands_in_caller_transaction(
+    project_dir, reset_globals,
+):
+    """``create(connection=cursor)`` writes the agent row through the
+    caller's cursor so it's atomic with the surrounding agent_actions
+    audit-log INSERT (the create_agent_tool_impl pattern)."""
+    with _make_client(project_dir):
+        from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import agent_repo
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN")
+            agent_repo.create(
+                token="tok-seam-1",
+                agent_id="seam-1",
+                capabilities=["python"],
+                working_directory="/tmp/seam-1",
+                connection=cursor,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        row = agent_repo.get_by_id("seam-1")
+        assert row is not None
+        assert row["token"] == "tok-seam-1"
+
+
+def test_create_with_sqlite_cursor_rolls_back_with_outer_transaction(
+    project_dir, reset_globals,
+):
+    """Rollback of the caller's transaction must drop the row.
+
+    Proves the agent INSERT really runs against the caller's
+    transaction (not a hidden auto-committed session).
+    """
+    with _make_client(project_dir):
+        from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import agent_repo
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN")
+            agent_repo.create(
+                token="tok-rollback",
+                agent_id="seam-rollback",
+                working_directory="/tmp/seam-rollback",
+                connection=cursor,
+            )
+            conn.rollback()
+        finally:
+            conn.close()
+
+        assert agent_repo.get_by_id("seam-rollback") is None
+
+
+def test_terminate_with_sqlite_cursor_uses_caller_transaction(
+    project_dir, reset_globals,
+):
+    """``terminate(connection=cursor)`` flips status via the caller's
+    cursor. The caller is responsible for cache eviction post-commit
+    (mirrors the task_repo.delete contract)."""
+    with _make_client(project_dir):
+        from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import agent_repo
+
+        agent_repo.create(
+            token="tok-term",
+            agent_id="seam-term",
+            working_directory="/tmp/seam-term",
+        )
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN")
+            ok = agent_repo.terminate("seam-term", connection=cursor)
+            assert ok is True
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Caller evicts cache after commit.
+        agent_repo.evict_from_cache("seam-term", token="tok-term")
+        row = agent_repo.get_by_id("seam-term")
+        assert row is not None
+        assert row["status"] == "terminated"

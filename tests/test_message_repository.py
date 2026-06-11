@@ -765,3 +765,133 @@ def test_list_participants_extracts_tombstones_from_messages(
         # DISTINCT + UNION across columns + sorted ascending.
         assert result["tombstones"] == ["[deleted-bob]", "[deleted-carol]"]
 
+
+# --- Transaction-aware seam on send / mark_delivered / delete (PR #152) ---
+
+
+def test_send_with_sqlite_cursor_lands_in_caller_transaction(
+    project_dir, reset_globals,
+):
+    """``send(connection=cursor)`` writes the message row through the
+    caller's cursor so the message INSERT is atomic with the audit-log
+    INSERT in the send_agent_message_tool_impl pattern."""
+    with _make_client(project_dir):
+        from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import message_repo
+
+        _seed_agent("alice")
+        _seed_agent("bob")
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN")
+            fresh = message_repo.send(
+                message_id="msg_seam_1",
+                sender_id="alice",
+                recipient_id="bob",
+                message_content="hello via cursor",
+                message_type="text",
+                priority="normal",
+                timestamp="2026-06-11T12:00:00",
+                subject="seam test",
+                connection=cursor,
+            )
+            assert fresh is not None
+            assert fresh["subject"] == "seam test"
+            conn.commit()
+        finally:
+            conn.close()
+
+        row = message_repo.get_by_id("msg_seam_1")
+        assert row is not None
+        assert row["message_content"] == "hello via cursor"
+
+
+def test_send_with_sqlite_cursor_rolls_back_with_outer_transaction(
+    project_dir, reset_globals,
+):
+    """Rollback of the caller's tx must drop the message — proves the
+    INSERT runs in the caller's transaction, not a hidden session."""
+    with _make_client(project_dir):
+        from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import message_repo
+
+        _seed_agent("alice")
+        _seed_agent("bob")
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN")
+            message_repo.send(
+                message_id="msg_seam_rollback",
+                sender_id="alice",
+                recipient_id="bob",
+                message_content="should not persist",
+                message_type="text",
+                priority="normal",
+                timestamp="2026-06-11T12:00:00",
+                connection=cursor,
+            )
+            conn.rollback()
+        finally:
+            conn.close()
+
+        assert message_repo.get_by_id("msg_seam_rollback") is None
+
+
+def test_mark_delivered_with_sqlite_cursor_uses_caller_transaction(
+    project_dir, reset_globals,
+):
+    """``mark_delivered(connection=cursor)`` flips the flag through
+    the caller's cursor, returns True on success."""
+    with _make_client(project_dir):
+        from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import message_repo
+
+        _seed_agent("alice")
+        _seed_agent("bob")
+        _seed_message("m1", sender_id="alice", recipient_id="bob",
+                      delivered=False)
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN")
+            ok = message_repo.mark_delivered("m1", connection=cursor)
+            assert ok is True
+            conn.commit()
+        finally:
+            conn.close()
+
+        row = message_repo.get_by_id("m1")
+        assert row["delivered"] is True
+
+
+def test_delete_with_sqlite_cursor_uses_caller_transaction(
+    project_dir, reset_globals,
+):
+    """``delete(connection=cursor)`` removes the row through the
+    caller's cursor — supports the patch_message_api_route DELETE
+    + audit-log atomic write."""
+    with _make_client(project_dir):
+        from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import message_repo
+
+        _seed_agent("alice")
+        _seed_agent("bob")
+        _seed_message("m1", sender_id="alice", recipient_id="bob")
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN")
+            ok = message_repo.delete("m1", connection=cursor)
+            assert ok is True
+            conn.commit()
+        finally:
+            conn.close()
+
+        assert message_repo.get_by_id("m1") is None
+

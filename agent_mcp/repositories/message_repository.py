@@ -341,6 +341,7 @@ class MessageRepository:
         read: bool = False,
         subject: Optional[str] = None,
         parent_message_id: Optional[str] = None,
+        connection: Any = None,
     ) -> Optional[Dict[str, Any]]:
         """INSERT a single message + publish ``"message.created"``.
 
@@ -349,65 +350,153 @@ class MessageRepository:
         legacy module-of-functions semantics so callers that today
         branch on a falsy return don't need to change.
 
+        ``connection`` is the transaction-aware seam. Tolerates a
+        SQLAlchemy ``Session`` OR a raw ``sqlite3.Cursor`` so
+        ``send_agent_message_tool_impl`` and
+        ``create_message_api_route`` can keep their multi-table
+        writes (message INSERT + tmux delivery flag UPDATE + audit
+        log INSERT) atomic. When ``None``, the method opens its own
+        session.
+
         ``subject`` and ``parent_message_id`` are the v5.0.22 threading
         fields. Root messages carry an optional subject; replies
         (``parent_message_id`` set) always have ``subject = None``.
         The threading-policy decision (Ollama-suggested vs. truncated
-        body vs. explicit) is owned by the *caller* — by the time the
-        write reaches the repo, the policy has already chosen the
-        effective subject.
+        body vs. explicit) is owned by the *caller*.
         """
-        ok = insert_message(
-            message_id=message_id,
-            sender_id=sender_id,
-            recipient_id=recipient_id,
-            message_content=message_content,
-            message_type=message_type,
-            priority=priority,
-            timestamp=timestamp,
-            delivered=delivered,
-            read=read,
-        )
-        if not ok:
-            return None
-
-        # Threading columns aren't carried by the legacy
-        # `insert_message` signature; if they're supplied, write them
-        # directly via the ORM in a small follow-up update so the
-        # caller doesn't have to special-case the two-step write.
-        if subject is not None or parent_message_id is not None:
+        if connection is not None and not hasattr(connection, "query"):
+            cur = connection
             try:
-                with get_session() as session:
-                    row = (
-                        session.query(AgentMessage)
-                        .filter(AgentMessage.message_id == message_id)
-                        .one_or_none()
-                    )
-                    if row is not None:
-                        if subject is not None:
-                            row.subject = subject
-                        if parent_message_id is not None:
-                            row.parent_message_id = parent_message_id
-                        session.commit()
-            except SQLAlchemyError as e:  # pragma: no cover - defensive
-                logger.error(
-                    f"Database error setting thread fields on "
-                    f"'{message_id}': {e}",
-                    exc_info=True,
+                cur.execute(
+                    """
+                    INSERT INTO agent_messages (
+                        message_id, sender_id, recipient_id,
+                        message_content, message_type, priority,
+                        timestamp, delivered, read,
+                        subject, parent_message_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        message_id, sender_id, recipient_id,
+                        message_content, message_type, priority,
+                        timestamp, delivered, read,
+                        subject, parent_message_id,
+                    ),
                 )
-
-        fresh = _db_get_message_by_id(message_id)
-        _event_bus_shim.publish(
-            recipient_id,
-            "message.created",
-            {
+            except Exception as e:
+                logger.error(
+                    f"Database error inserting message '{message_id}' "
+                    f"via shared cursor: {e}", exc_info=True,
+                )
+                return None
+            fresh = {
                 "message_id": message_id,
                 "sender_id": sender_id,
                 "recipient_id": recipient_id,
+                "message_content": message_content,
                 "message_type": message_type,
                 "priority": priority,
-            },
-        )
+                "timestamp": timestamp,
+                "delivered": bool(delivered),
+                "read": bool(read),
+                "subject": subject,
+                "parent_message_id": parent_message_id,
+            }
+        elif connection is not None:
+            session = connection
+            try:
+                row = AgentMessage(
+                    message_id=message_id,
+                    sender_id=sender_id,
+                    recipient_id=recipient_id,
+                    message_content=message_content,
+                    message_type=message_type,
+                    priority=priority,
+                    timestamp=timestamp,
+                    delivered=delivered,
+                    read=read,
+                    subject=subject,
+                    parent_message_id=parent_message_id,
+                )
+                session.add(row)
+                session.flush()
+            except SQLAlchemyError as e:
+                logger.error(
+                    f"Database error inserting message '{message_id}' "
+                    f"via shared session: {e}", exc_info=True,
+                )
+                return None
+            fresh = {
+                "message_id": message_id,
+                "sender_id": sender_id,
+                "recipient_id": recipient_id,
+                "message_content": message_content,
+                "message_type": message_type,
+                "priority": priority,
+                "timestamp": timestamp,
+                "delivered": bool(delivered),
+                "read": bool(read),
+                "subject": subject,
+                "parent_message_id": parent_message_id,
+            }
+        else:
+            ok = insert_message(
+                message_id=message_id,
+                sender_id=sender_id,
+                recipient_id=recipient_id,
+                message_content=message_content,
+                message_type=message_type,
+                priority=priority,
+                timestamp=timestamp,
+                delivered=delivered,
+                read=read,
+            )
+            if not ok:
+                return None
+
+            # Threading columns aren't carried by the legacy
+            # `insert_message` signature; write them in a follow-up
+            # session so the caller doesn't have to special-case it.
+            if subject is not None or parent_message_id is not None:
+                try:
+                    with get_session() as session:
+                        row = (
+                            session.query(AgentMessage)
+                            .filter(AgentMessage.message_id == message_id)
+                            .one_or_none()
+                        )
+                        if row is not None:
+                            if subject is not None:
+                                row.subject = subject
+                            if parent_message_id is not None:
+                                row.parent_message_id = parent_message_id
+                            session.commit()
+                except SQLAlchemyError as e:  # pragma: no cover - defensive
+                    logger.error(
+                        f"Database error setting thread fields on "
+                        f"'{message_id}': {e}",
+                        exc_info=True,
+                    )
+            fresh = _db_get_message_by_id(message_id)
+
+        # EventBus publish only on the standalone path. With a
+        # ``connection=`` the caller's transaction is still open; a
+        # publish before commit could be observed by subscribers
+        # (e.g. wait_for_events long-poll) BEFORE the message row is
+        # visible to other connections, or could persist after a
+        # rollback. Caller owns the publish post-commit if needed.
+        if connection is None:
+            _event_bus_shim.publish(
+                recipient_id,
+                "message.created",
+                {
+                    "message_id": message_id,
+                    "sender_id": sender_id,
+                    "recipient_id": recipient_id,
+                    "message_type": message_type,
+                    "priority": priority,
+                },
+            )
         return fresh
 
     def bulk_send(self, rows: Iterable[Dict[str, Any]]) -> int:
@@ -449,32 +538,84 @@ class MessageRepository:
 
     # --- Write interface: mark_delivered / mark_read --------------------
 
-    def mark_delivered(self, message_id: str, delivered: bool = True) -> bool:
+    def mark_delivered(
+        self,
+        message_id: str,
+        delivered: bool = True,
+        *,
+        connection: Any = None,
+    ) -> bool:
         """Flip the ``delivered`` flag and publish ``"message.delivered"``.
 
         Returns False if the row didn't exist or the DB call errored.
         The publish only fires on success — a failed flip can't notify
         subscribers about state that didn't change.
+
+        ``connection`` is the transaction-aware seam. Used by
+        ``send_agent_message_tool_impl`` to flip the delivered flag
+        after a successful tmux delivery inside the same transaction
+        as the original INSERT.
         """
-        ok = _db_mark_delivered(message_id, delivered)
-        if not ok:
-            return False
+        recipient: str = "*"
 
-        # Fetch the row to recover the recipient (the address used by
-        # subscribers to route the event). Skipping this would force
-        # the bus into a "broadcast to all" mode for every delivery
-        # flip; the extra read is cheap (PK lookup).
-        row = _db_get_message_by_id(message_id)
-        recipient = row.get("recipient_id") if row else "*"
+        if connection is not None and not hasattr(connection, "query"):
+            cur = connection
+            cur.execute(
+                "SELECT recipient_id FROM agent_messages "
+                "WHERE message_id = ?",
+                (message_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return False
+            try:
+                recipient = row["recipient_id"]
+            except (KeyError, IndexError):
+                recipient = row[0]
+            cur.execute(
+                "UPDATE agent_messages SET delivered = ? "
+                "WHERE message_id = ?",
+                (delivered, message_id),
+            )
+            if cur.rowcount == 0:
+                return False
+        elif connection is not None:
+            session = connection
+            try:
+                row = (
+                    session.query(AgentMessage)
+                    .filter(AgentMessage.message_id == message_id)
+                    .one_or_none()
+                )
+                if row is None:
+                    return False
+                recipient = row.recipient_id
+                row.delivered = delivered
+                session.flush()
+            except SQLAlchemyError as e:
+                logger.error(
+                    f"Database error marking '{message_id}' delivered "
+                    f"via shared session: {e}", exc_info=True,
+                )
+                return False
+        else:
+            ok = _db_mark_delivered(message_id, delivered)
+            if not ok:
+                return False
+            row = _db_get_message_by_id(message_id)
+            recipient = row.get("recipient_id") if row else "*"
 
-        _event_bus_shim.publish(
-            recipient,
-            "message.delivered",
-            {
-                "message_id": message_id,
-                "delivered": delivered,
-            },
-        )
+        # EventBus publish only on standalone path — caller's
+        # transaction is still open when ``connection=`` is supplied.
+        if connection is None:
+            _event_bus_shim.publish(
+                recipient,
+                "message.delivered",
+                {
+                    "message_id": message_id,
+                    "delivered": delivered,
+                },
+            )
         return True
 
     def mark_read_for_recipient(self, recipient_id: str) -> int:
@@ -673,18 +814,49 @@ class MessageRepository:
 
     # --- Write interface: delete ----------------------------------------
 
-    def delete(self, message_id: str) -> bool:
+    def delete(
+        self,
+        message_id: str,
+        *,
+        connection: Any = None,
+    ) -> bool:
         """DELETE a message row.
 
         Returns True on success, False if the row didn't exist or the
         DB raised. Matches the legacy semantics.
 
+        ``connection`` is the transaction-aware seam. Used by
+        ``patch_message_api_route`` (DELETE branch) so the message
+        DELETE + agent_actions audit-log INSERT land atomically.
+
         No ``message.deleted`` publish today — the legacy module-of-
         functions doesn't publish on delete either, and no subscriber
-        currently consumes that event. If a future feature needs it
-        (e.g. dashboard live-removal of a row), add the publish here
-        and the contract test will pick it up.
+        currently consumes that event.
         """
+        if connection is not None and not hasattr(connection, "query"):
+            cur = connection
+            cur.execute(
+                "DELETE FROM agent_messages WHERE message_id = ?",
+                (message_id,),
+            )
+            return (cur.rowcount or 0) > 0
+        if connection is not None:
+            session = connection
+            try:
+                from sqlalchemy import delete as sa_delete
+                result = session.execute(
+                    sa_delete(AgentMessage).where(
+                        AgentMessage.message_id == message_id
+                    )
+                )
+                session.flush()
+                return (result.rowcount or 0) > 0
+            except SQLAlchemyError as e:
+                logger.error(
+                    f"Database error deleting '{message_id}' via "
+                    f"shared session: {e}", exc_info=True,
+                )
+                return False
         return _db_delete_message(message_id)
 
 

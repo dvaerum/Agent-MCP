@@ -160,7 +160,12 @@ class TaskRepository:
 
     # --- Write interface: create ----------------------------------------
 
-    def create(self, fields: Dict[str, Any]) -> Dict[str, Any]:
+    def create(
+        self,
+        fields: Dict[str, Any],
+        *,
+        connection: Any = None,
+    ) -> Dict[str, Any]:
         """INSERT a task row, update the cache, publish ``"task.created"``.
 
         ``fields`` is a dict carrying every column the caller wants to
@@ -168,6 +173,15 @@ class TaskRepository:
         Optional: ``description``, ``assigned_to``, ``status``,
         ``priority``, ``parent_task``, ``child_tasks``,
         ``depends_on_tasks``, ``notes``, ``required_capabilities``.
+
+        ``connection`` is the transaction-aware seam introduced in
+        PR #151 and expanded here for the multi-table writes in
+        ``admin_tools`` / ``task_tools`` (task INSERTs that wrap an
+        ``agent_actions`` audit-log INSERT in the same transaction).
+        Tolerates EITHER a SQLAlchemy ``Session`` OR a raw
+        ``sqlite3.Cursor`` so legacy hand-rolled cascades can keep
+        their BEGIN/COMMIT atomic. When ``None`` (the standalone
+        case), the method opens its own session.
 
         Returns the freshly-stored row in the same dict shape
         consumers expect (JSON list fields deserialised). On DB
@@ -182,14 +196,68 @@ class TaskRepository:
         notes = fields.get("notes") or []
         required_caps = fields.get("required_capabilities")
 
-        with get_session() as session:
+        task_id = fields["task_id"]
+        assigned_to = fields.get("assigned_to")
+        status = fields.get("status", "pending")
+
+        # sqlite3 cursor path: caller owns the BEGIN/COMMIT. Use raw
+        # SQL so the INSERT lands in the caller's transaction.
+        if connection is not None and not hasattr(connection, "query"):
+            cur = connection
+            cur.execute(
+                """
+                INSERT INTO tasks (
+                    task_id, title, description, assigned_to, created_by,
+                    status, priority, created_at, updated_at, parent_task,
+                    child_tasks, depends_on_tasks, notes,
+                    required_capabilities
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    fields["title"],
+                    fields.get("description"),
+                    assigned_to,
+                    fields["created_by"],
+                    status,
+                    fields.get("priority", "medium"),
+                    now,
+                    now,
+                    fields.get("parent_task"),
+                    json.dumps(child_tasks),
+                    json.dumps(depends_on_tasks),
+                    json.dumps(notes),
+                    json.dumps(required_caps) if required_caps else None,
+                ),
+            )
+            # Build the dict to return + cache without re-querying —
+            # the caller's transaction hasn't committed yet, so a
+            # cross-session re-fetch wouldn't see the row.
+            fresh = {
+                "task_id": task_id,
+                "title": fields["title"],
+                "description": fields.get("description"),
+                "assigned_to": assigned_to,
+                "created_by": fields["created_by"],
+                "status": status,
+                "priority": fields.get("priority", "medium"),
+                "created_at": now,
+                "updated_at": now,
+                "parent_task": fields.get("parent_task"),
+                "child_tasks": child_tasks,
+                "depends_on_tasks": depends_on_tasks,
+                "notes": notes,
+            }
+        elif connection is not None:
+            # SQLAlchemy Session path: caller owns commit.
+            session = connection
             row = Task(
-                task_id=fields["task_id"],
+                task_id=task_id,
                 title=fields["title"],
                 description=fields.get("description"),
-                assigned_to=fields.get("assigned_to"),
+                assigned_to=assigned_to,
                 created_by=fields["created_by"],
-                status=fields.get("status", "pending"),
+                status=status,
                 priority=fields.get("priority", "medium"),
                 created_at=now,
                 updated_at=now,
@@ -202,28 +270,74 @@ class TaskRepository:
                 ),
             )
             session.add(row)
-            session.commit()
+            session.flush()
+            fresh = {
+                "task_id": task_id,
+                "title": fields["title"],
+                "description": fields.get("description"),
+                "assigned_to": assigned_to,
+                "created_by": fields["created_by"],
+                "status": status,
+                "priority": fields.get("priority", "medium"),
+                "created_at": now,
+                "updated_at": now,
+                "parent_task": fields.get("parent_task"),
+                "child_tasks": child_tasks,
+                "depends_on_tasks": depends_on_tasks,
+                "notes": notes,
+            }
+        else:
+            # Standalone path — open session + commit.
+            with get_session() as session:
+                row = Task(
+                    task_id=task_id,
+                    title=fields["title"],
+                    description=fields.get("description"),
+                    assigned_to=assigned_to,
+                    created_by=fields["created_by"],
+                    status=status,
+                    priority=fields.get("priority", "medium"),
+                    created_at=now,
+                    updated_at=now,
+                    parent_task=fields.get("parent_task"),
+                    child_tasks=json.dumps(child_tasks),
+                    depends_on_tasks=json.dumps(depends_on_tasks),
+                    notes=json.dumps(notes),
+                    required_capabilities=(
+                        json.dumps(required_caps) if required_caps else None
+                    ),
+                )
+                session.add(row)
+                session.commit()
 
-        # Re-fetch via the existing dict projection so consumers see
-        # the exact shape they're used to (JSON fields deserialised).
-        fresh = get_task_by_id(fields["task_id"])
-        if fresh is None:
-            # Should be unreachable; defensive fallback mirrors the
-            # legacy module-of-functions implementation.
-            fresh = dict(fields)
+            # Re-fetch via the existing dict projection so consumers see
+            # the exact shape they're used to (JSON fields deserialised).
+            fresh = get_task_by_id(task_id)
+            if fresh is None:
+                # Should be unreachable; defensive fallback.
+                fresh = dict(fields)
 
-        if not self._cache_disabled:
-            state.tasks[fields["task_id"]] = fresh
+        # Cache + EventBus publish only on the standalone path. When
+        # a ``connection=`` is supplied, the caller's transaction is
+        # still open — a publish or cache write here could be observed
+        # by a subscriber before the caller commits (or persist after
+        # a rollback). The caller is responsible for calling
+        # :meth:`upsert_cache` + emitting the event after its own
+        # commit. The dict returned still describes the would-be row
+        # so the caller can hand it straight to ``upsert_cache``.
+        if connection is None:
+            if not self._cache_disabled:
+                state.tasks[task_id] = fresh
 
-        _event_bus_shim.publish(
-            fresh.get("assigned_to") or "*",
-            "task.created",
-            {
-                "task_id": fields["task_id"],
-                "status": fresh.get("status"),
-                "assigned_to": fresh.get("assigned_to"),
-            },
-        )
+            _event_bus_shim.publish(
+                fresh.get("assigned_to") or "*",
+                "task.created",
+                {
+                    "task_id": task_id,
+                    "status": fresh.get("status"),
+                    "assigned_to": fresh.get("assigned_to"),
+                },
+            )
         return fresh
 
     # --- Write interface: update ----------------------------------------
@@ -421,24 +535,49 @@ class TaskRepository:
 
     # --- Write interface: delete ----------------------------------------
 
-    def delete(self, task_id: str) -> bool:
+    def delete(
+        self,
+        task_id: str,
+        *,
+        connection: Any = None,
+    ) -> bool:
         """DELETE a task row, evict the cache, publish ``"task.deleted"``.
 
         Returns True on success, False if the row didn't exist or
         the DB raised. The cache eviction happens after the DB
         commit so a failed commit doesn't desync the in-memory state.
 
-        Note: this is the *simple* delete path — no cascade. The
-        legacy purge-cascade in ``app.routes`` (which deletes
-        ``agent_actions`` / ``agent_messages`` / ``task_notes``
-        rows in the same transaction) still owns its own SQL. Once
-        a follow-up PR untangles that cascade, the routes will be
-        able to call ``task_repo.delete(task_id)`` for each row
-        without losing transactional atomicity (or — preferred — the
-        cascade moves into this method behind a flag).
+        ``connection`` is the transaction-aware seam. Tolerates a
+        SQLAlchemy ``Session`` OR a raw ``sqlite3.Cursor`` so the
+        caller's wider transaction stays atomic. When ``None``, the
+        method opens its own session.
+
+        Note: this is the *simple* delete path — no cascade across
+        ``agent_actions`` / ``agent_messages``. The purge-cascade in
+        ``app.routes`` still owns its own multi-table SQL.
         """
-        try:
-            with get_session() as session:
+        assigned_to: Optional[str] = None
+
+        # sqlite3 cursor path: caller owns BEGIN/COMMIT.
+        if connection is not None and not hasattr(connection, "query"):
+            cur = connection
+            cur.execute(
+                "SELECT assigned_to FROM tasks WHERE task_id = ?",
+                (task_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return False
+            try:
+                assigned_to = row["assigned_to"]
+            except (KeyError, IndexError):
+                assigned_to = row[0]
+            cur.execute(
+                "DELETE FROM tasks WHERE task_id = ?", (task_id,),
+            )
+        elif connection is not None:
+            session = connection
+            try:
                 row = (
                     session.query(Task)
                     .filter(Task.task_id == task_id)
@@ -448,22 +587,47 @@ class TaskRepository:
                     return False
                 assigned_to = row.assigned_to
                 session.delete(row)
-                session.commit()
-        except SQLAlchemyError as e:
-            logger.error(
-                f"Database error deleting task '{task_id}': {e}",
-                exc_info=True,
+                session.flush()
+            except SQLAlchemyError as e:
+                logger.error(
+                    f"Database error deleting task '{task_id}' via "
+                    f"shared session: {e}",
+                    exc_info=True,
+                )
+                return False
+        else:
+            try:
+                with get_session() as session:
+                    row = (
+                        session.query(Task)
+                        .filter(Task.task_id == task_id)
+                        .one_or_none()
+                    )
+                    if row is None:
+                        return False
+                    assigned_to = row.assigned_to
+                    session.delete(row)
+                    session.commit()
+            except SQLAlchemyError as e:
+                logger.error(
+                    f"Database error deleting task '{task_id}': {e}",
+                    exc_info=True,
+                )
+                return False
+
+        # As with create(connection=), defer cache + EventBus to the
+        # caller when they own the transaction. Otherwise a rollback
+        # would leave the cache desynced and a subscriber could see
+        # "task.deleted" for a row that's still in the DB.
+        if connection is None:
+            if not self._cache_disabled:
+                state.tasks.pop(task_id, None)
+
+            _event_bus_shim.publish(
+                assigned_to or "*",
+                "task.deleted",
+                {"task_id": task_id, "assigned_to": assigned_to},
             )
-            return False
-
-        if not self._cache_disabled:
-            state.tasks.pop(task_id, None)
-
-        _event_bus_shim.publish(
-            assigned_to or "*",
-            "task.deleted",
-            {"task_id": task_id, "assigned_to": assigned_to},
-        )
         return True
 
     # --- Cache-only helpers ---------------------------------------------
