@@ -25,12 +25,11 @@ chasing the response-text adapter.
 from __future__ import annotations
 
 import datetime as _dt
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import pytest
 
 from agent_mcp.features.task_queries import (
-    QueryResult,
     TaskFilterSpec,
     TaskQueryEngine,
     TaskSortSpec,
