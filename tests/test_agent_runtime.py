@@ -44,9 +44,7 @@ These tests fail on ``main`` because:
 
 from __future__ import annotations
 
-import subprocess
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -141,7 +139,6 @@ def test_send_prompt_to_known_session_succeeds(
     from agent_mcp.runtime.agent_runtime import AgentRuntime
 
     def dispatcher(cmd):
-        head = " ".join(cmd[:3])
         if cmd[:2] == ["tmux", "-V"]:
             return FakeProcResult(0, "tmux 3.3", "")
         if cmd[:2] == ["tmux", "has-session"]:
