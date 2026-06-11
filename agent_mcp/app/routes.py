@@ -676,18 +676,20 @@ async def restore_agent_api_route(request: Request) -> JSONResponse:
             )
 
         agent_token = row["token"]
-        # PR 6: restore via agent_repo.update_field with caller's
-        # cursor — atomic with the audit log INSERT below. terminated_at
-        # is cleared via a second UPDATE on the cursor since the repo's
-        # update_field accepts one field at a time (the value None
-        # is acceptable for the agent_repo allowlist).
+        # PR 6 + PR 8 (Agent flip): restore goes through
+        # agent_repo.update_field with caller's cursor — atomic with
+        # the audit log INSERT below. ``terminated_at`` was added to
+        # the allowlist in PR 8 so the second field clear also goes
+        # through the repo instead of owning a raw UPDATE on the
+        # cursor. update_field accepts one field at a time, so two
+        # calls; both share the caller's cursor so they stay inside
+        # the wider BEGIN/COMMIT.
         from ..repositories import agent_repo as _agent_repo
         _agent_repo.update_field(
             agent_id, "status", "created", connection=cursor,
         )
-        cursor.execute(
-            "UPDATE agents SET terminated_at = NULL WHERE agent_id = ?",
-            (agent_id,),
+        _agent_repo.update_field(
+            agent_id, "terminated_at", None, connection=cursor,
         )
         log_agent_action_to_db(
             cursor, "admin", "restored_agent",
@@ -1084,17 +1086,17 @@ async def purge_agent_api_route(request: Request) -> JSONResponse:
             # IGNORE so a re-purge (same agent_id, already tombstoned)
             # is a no-op. The token PK is namespaced under
             # `__tombstone_` so it can't collide with a real bearer.
-            cursor.execute(
-                "INSERT OR IGNORE INTO agents "
-                "(token, agent_id, capabilities, created_at, status, "
-                " working_directory, color, updated_at) "
-                "VALUES (?, ?, '[]', ?, 'tombstone', '', '#000000', ?)",
-                (
-                    f"__tombstone_{agent_id}",
-                    tombstone,
-                    datetime.datetime.now().isoformat(),
-                    datetime.datetime.now().isoformat(),
-                ),
+            #
+            # PR 8 (Agent flip): goes through
+            # agent_repo.insert_tombstone with the caller's cursor so
+            # the wider purge transaction (FK rewrites across
+            # agent_messages / tasks / agent_actions, then the DELETE
+            # of the original agents row) stays atomic.
+            from ..repositories import agent_repo as _agent_repo
+            _agent_repo.insert_tombstone(
+                token=f"__tombstone_{agent_id}",
+                tombstone_agent_id=tombstone,
+                connection=cursor,
             )
             # PR 6: tombstone rewrite goes through message_repo with
             # the caller's cursor so the wider BEGIN/COMMIT cascade
@@ -1130,9 +1132,13 @@ async def purge_agent_api_route(request: Request) -> JSONResponse:
                     "counts": counts,
                 },
             )
-            # DELETE the agents row LAST.
-            cursor.execute("DELETE FROM agents WHERE agent_id = ?",
-                           (agent_id,))
+            # DELETE the agents row LAST. PR 8 (Agent flip): goes
+            # through agent_repo.delete with the caller's cursor so
+            # cache eviction is owned by the repo (the explicit cache
+            # pops below still run because the caller knows the
+            # ``agent_token`` and doesn't want to depend on the repo's
+            # post-commit scan).
+            _agent_repo.delete(agent_id, connection=cursor)
             conn.commit()
         except Exception:
             conn.rollback()
