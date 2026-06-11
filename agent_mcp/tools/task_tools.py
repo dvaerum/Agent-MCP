@@ -25,6 +25,11 @@ from ..features.task_placement.suggestions import (
     should_escalate_to_admin,
 )
 from ..features.rag.indexing import index_task_data
+from ..features.task_queries import (
+    TaskFilterSpec,
+    TaskQueryEngine,
+    TaskSortSpec,
+)
 
 # For request_assistance, generate_id was used. Let's use secrets.token_hex for consistency.
 # from main.py:1191 (generate_id - not present, assuming secrets.token_hex was intended)
@@ -608,157 +613,9 @@ async def _update_single_task(
     }
 
 
-def _analyze_task_dependencies(
-    task: Dict[str, Any], all_tasks: Dict[str, Dict[str, Any]]
-) -> Dict[str, Any]:
-    """Analyze task dependencies and blocking conditions"""
-    task_id = task.get("task_id")
-    status = task.get("status")
-    depends_on = task.get("depends_on_tasks", [])
-
-    if isinstance(depends_on, str):
-        try:
-            depends_on = json.loads(depends_on)
-        except:
-            depends_on = []
-
-    analysis = {
-        "is_blocked": False,
-        "blocking_dependencies": [],
-        "completed_dependencies": [],
-        "missing_dependencies": [],
-        "can_start": True,
-        "blocks_tasks": [],
-        "dependency_health": "healthy",
-    }
-
-    # Check dependencies
-    for dep_id in depends_on:
-        if dep_id in all_tasks:
-            dep_task = all_tasks[dep_id]
-            dep_status = dep_task.get("status")
-
-            if dep_status == "completed":
-                analysis["completed_dependencies"].append(dep_id)
-            elif dep_status in ["failed", "cancelled"]:
-                analysis["blocking_dependencies"].append(dep_id)
-                analysis["is_blocked"] = True
-                analysis["can_start"] = False
-            elif dep_status in ["pending", "in_progress"]:
-                analysis["blocking_dependencies"].append(dep_id)
-                if status == "pending":
-                    analysis["can_start"] = False
-        else:
-            analysis["missing_dependencies"].append(dep_id)
-            analysis["is_blocked"] = True
-            analysis["can_start"] = False
-
-    # Find tasks that depend on this one
-    for other_id, other_task in all_tasks.items():
-        other_deps = other_task.get("depends_on_tasks", [])
-        if isinstance(other_deps, str):
-            try:
-                other_deps = json.loads(other_deps)
-            except:
-                other_deps = []
-
-        if task_id in other_deps:
-            analysis["blocks_tasks"].append(other_id)
-
-    # Determine health
-    if analysis["missing_dependencies"]:
-        analysis["dependency_health"] = "critical"
-    elif analysis["is_blocked"] and status == "in_progress":
-        analysis["dependency_health"] = "warning"
-    elif not analysis["can_start"] and status == "pending":
-        analysis["dependency_health"] = "waiting"
-
-    return analysis
-
-
-def _calculate_task_health_metrics(tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Calculate overall task health metrics"""
-    if not tasks:
-        return {"total": 0, "status": "no_data"}
-
-    total = len(tasks)
-    status_counts = {}
-    priority_counts = {}
-    blocked_count = 0
-    overdue_count = 0
-    stale_count = 0
-
-    current_time = datetime.datetime.now()
-
-    for task in tasks:
-        # Status distribution
-        status = task.get("status", "unknown")
-        status_counts[status] = status_counts.get(status, 0) + 1
-
-        # Priority distribution
-        priority = task.get("priority", "medium")
-        priority_counts[priority] = priority_counts.get(priority, 0) + 1
-
-        # Check for blocked tasks (has dependencies but can't proceed)
-        deps = task.get("depends_on_tasks", [])
-        if isinstance(deps, str):
-            try:
-                deps = json.loads(deps)
-            except:
-                deps = []
-
-        if deps and status == "pending":
-            blocked_count += 1
-
-        # Check for stale tasks (no updates in 7+ days)
-        updated_at = task.get("updated_at")
-        if updated_at:
-            try:
-                updated_time = datetime.datetime.fromisoformat(
-                    updated_at.replace("Z", "+00:00").replace("+00:00", "")
-                )
-                days_since_update = (current_time - updated_time).days
-                if days_since_update > 7 and status in ["in_progress", "pending"]:
-                    stale_count += 1
-            except:
-                pass
-
-    # Calculate health score (0-100)
-    completed_ratio = status_counts.get("completed", 0) / total
-    active_ratio = (
-        status_counts.get("in_progress", 0) + status_counts.get("pending", 0)
-    ) / total
-    blocked_ratio = blocked_count / total if total > 0 else 0
-    stale_ratio = stale_count / total if total > 0 else 0
-
-    health_score = max(
-        0,
-        min(
-            100,
-            completed_ratio * 30  # 30% weight for completion
-            + active_ratio * 40  # 40% weight for active work
-            + (1 - blocked_ratio) * 20  # 20% penalty for blocked tasks
-            + (1 - stale_ratio) * 10,  # 10% penalty for stale tasks
-        ),
-    )
-
-    return {
-        "total": total,
-        "status_distribution": status_counts,
-        "priority_distribution": priority_counts,
-        "blocked_tasks": blocked_count,
-        "stale_tasks": stale_count,
-        "health_score": round(health_score, 1),
-        "health_status": (
-            "excellent"
-            if health_score >= 80
-            else (
-                "good"
-                if health_score >= 60
-                else "needs_attention" if health_score >= 40 else "critical"
-            )
-        ),
-    }
+# Filter / sort / dependency-analysis / health-metrics rules moved to
+# ``agent_mcp/features/task_queries.py`` (TaskQueryEngine). The
+# handler now consumes the engine directly.
 
 
 # --- Helper functions for assign_task modes ---
@@ -2562,85 +2419,43 @@ async def view_tasks_tool_impl(
                 )
             ]
 
-    # Advanced filtering with dependency analysis
-    tasks_to_display: List[Dict[str, Any]] = []
+    # Delegate filter/sort/dependency-analysis to the engine — the
+    # handler stays an adapter (parse args -> query -> presentation).
+    # See agent_mcp/features/task_queries.py for the rules.
+    engine = TaskQueryEngine(task_source=lambda: g.tasks)
 
-    # Pre-analyze all tasks for dependency checking
-    all_tasks_dict = dict(g.tasks)
-
-    for task_id, task_data in g.tasks.items():
-        # Basic permission filtering
-        matches_agent = True
-        if (
-            target_agent_id_for_filter
-            and task_data.get("assigned_to") != target_agent_id_for_filter
-        ):
-            matches_agent = False
-
-        # Status filtering
-        matches_status = True
-        if filter_status and task_data.get("status") != filter_status:
-            matches_status = False
-
-        # Priority filtering
-        matches_priority = True
-        if filter_priority and task_data.get("priority") != filter_priority:
-            matches_priority = False
-
-        # Parent task filtering
-        matches_parent = True
-        if filter_parent_task and task_data.get("parent_task") != filter_parent_task:
-            matches_parent = False
-
-        # Blocked tasks filtering
-        matches_blocked = True
-        if show_blocked_tasks:
-            dependency_analysis = _analyze_task_dependencies(task_data, all_tasks_dict)
-            matches_blocked = (
-                dependency_analysis["is_blocked"]
-                or not dependency_analysis["can_start"]
-            )
-
-        if (
-            matches_agent
-            and matches_status
-            and matches_priority
-            and matches_parent
-            and matches_blocked
-        ):
-            # Add dependency analysis if requested
-            if show_dependencies:
-                task_data_copy = task_data.copy()
-                task_data_copy["_dependency_analysis"] = _analyze_task_dependencies(
-                    task_data, all_tasks_dict
-                )
-                tasks_to_display.append(task_data_copy)
-            else:
-                tasks_to_display.append(task_data)
-
-    # Smart sorting
-    def get_sort_key(task):
-        if sort_by == "priority":
-            priority_order = {"high": 3, "medium": 2, "low": 1}
-            return priority_order.get(task.get("priority", "medium"), 2)
-        elif sort_by == "status":
-            status_order = {
-                "failed": 5,
-                "in_progress": 4,
-                "pending": 3,
-                "completed": 2,
-                "cancelled": 1,
+    query_result = engine.query(
+        filters=TaskFilterSpec(
+            status=filter_status,
+            priority=filter_priority,
+            agent_id=target_agent_id_for_filter,
+            parent_task_id=filter_parent_task,
+            blocked_only=bool(show_blocked_tasks),
+        ),
+        sort=TaskSortSpec(by=sort_by),
+    )
+    tasks_to_display: List[Dict[str, Any]] = query_result.tasks
+    # Dependency analysis is attached for the formatter as the legacy
+    # dict shape (`_dependency_analysis`) — done after the engine query
+    # so the snapshot used here is the same snapshot the engine saw.
+    if show_dependencies:
+        # Need the full snapshot (not just the window) to compute
+        # `blocks_tasks` correctly across the whole graph.
+        full_snapshot = dict(g.tasks)
+        tasks_to_display = [
+            {
+                **t,
+                "_dependency_analysis": engine.health_of(
+                    t, full_snapshot
+                ).as_dict(),
             }
-            return status_order.get(task.get("status", "pending"), 3)
-        elif sort_by == "updated_at":
-            return task.get("updated_at", "")
-        else:  # created_at (default)
-            return task.get("created_at", "")
+            for t in tasks_to_display
+        ]
 
-    reverse_sort = sort_by in ["created_at", "updated_at", "priority", "status"]
-    tasks_to_display.sort(key=get_sort_key, reverse=reverse_sort)
-
-    # Handle pagination with start_after
+    # Legacy token-style pagination: `start_after=<task_id>` skips to
+    # the first task AFTER the named one. Kept here (vs. inside the
+    # engine) because it's a presentation-window concern — the engine
+    # already supports offset/limit which is the structural API.
     if start_after:
         start_index = 0
         for i, task in enumerate(tasks_to_display):
@@ -2650,9 +2465,11 @@ async def view_tasks_tool_impl(
         tasks_to_display = tasks_to_display[start_index:]
 
     # Page-based pagination: capture the total matching count BEFORE
-    # slicing so we can report "Total: N" to the caller. Only emit the
-    # Total line when `limit` is explicitly set — older callers that
-    # don't pass `limit` must see the exact same response shape.
+    # offset/limit slicing so we can report "Total: N" to the caller.
+    # Only emit the Total line when `limit` is explicitly set — older
+    # callers that don't pass `limit` must see the exact same response
+    # shape. Mirrors the legacy: total reflects the list AFTER
+    # start_after but BEFORE offset+limit.
     total_matching = len(tasks_to_display)
     if offset:
         tasks_to_display = tasks_to_display[offset:]
@@ -2662,10 +2479,11 @@ async def view_tasks_tool_impl(
     if not tasks_to_display:
         response_text = "No tasks found matching the criteria."
     else:
-        # Generate health analysis if requested
+        # Generate health analysis if requested — engine owns the rule;
+        # the handler renders the icon + summary line.
         health_analysis = None
         if show_health_analysis:
-            health_analysis = _calculate_task_health_metrics(tasks_to_display)
+            health_analysis = engine.health_metrics(tasks_to_display)
 
         # Build response with smart headers
         filter_info = []
