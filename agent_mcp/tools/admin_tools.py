@@ -15,7 +15,7 @@ from ..core.auth import generate_token  # For create_agent, terminate_agent
 from ..core.authorize import requires  # @requires(\"admin\") gates entry
 from ..utils.audit_utils import log_audit
 from ..utils.project_utils import generate_system_prompt  # For create_agent
-from ..utils.tmux_utils import (
+from ..runtime.agent_runtime import (
     is_tmux_available,
     create_tmux_session,
     kill_tmux_session,

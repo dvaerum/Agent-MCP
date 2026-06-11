@@ -38,7 +38,7 @@ from .agent_communication_tools import send_agent_message_tool_impl
 # For testing agent auto-launch
 from ..core.auth import generate_token
 from ..core.config import AGENT_COLORS
-from ..utils.tmux_utils import (
+from ..runtime.agent_runtime import (
     create_tmux_session,
     send_prompt_async,
     send_command_to_session,
@@ -226,7 +226,7 @@ async def _launch_testing_agent_for_completed_task(
         testing_agent_id = f"test-{completed_task_id[-6:]}"
 
         # 4. Kill existing testing agent if it exists (task re-completed after fixes)
-        from ..utils.tmux_utils import kill_tmux_session
+        from ..runtime.agent_runtime import kill_tmux_session
 
         # Check if testing agent already exists
         existing_agent = None

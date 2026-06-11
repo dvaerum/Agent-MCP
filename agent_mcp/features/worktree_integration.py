@@ -11,7 +11,7 @@ import logging
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 
-from ..utils.worktree_utils import (
+from ..runtime.agent_runtime import (
     is_git_repository,
     validate_worktree_requirements,
     create_git_worktree,
