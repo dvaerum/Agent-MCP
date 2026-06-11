@@ -247,8 +247,12 @@ async def _launch_testing_agent_for_completed_task(
             if testing_agent_id in g.active_agents:
                 del g.active_agents[testing_agent_id]
 
-            # Remove from database
-            cursor.execute("DELETE FROM agents WHERE agent_id = ?", (testing_agent_id,))
+            # Remove from database. PR 8 (Agent flip): goes through
+            # agent_repo.delete with the caller's cursor so the wider
+            # testing-agent recycle transaction stays atomic with the
+            # new INSERT below. Cache eviction is owned by the repo.
+            from ..repositories import agent_repo as _agent_repo
+            _agent_repo.delete(testing_agent_id, connection=cursor)
             logger.info(f"Cleaned up existing testing agent {testing_agent_id}")
 
         # 5. Create testing agent token and database entry
@@ -555,17 +559,14 @@ async def _update_single_task(
     # indicator. Scoped to `WHERE current_task = ?` so unrelated
     # agents (e.g. bob's row) are left alone.
     if new_status in ["completed", "cancelled", "failed"]:
-        cursor.execute(
-            "UPDATE agents SET current_task = NULL, updated_at = ? "
-            "WHERE current_task = ?",
-            (updated_at_iso, task_id),
-        )
-        # Mirror into the in-memory active-agents cache so the next
-        # tool-call sees the cleared state without waiting for the
-        # next lifespan reload.
-        for _entry in g.active_agents.values():
-            if _entry.get("current_task") == task_id:
-                _entry["current_task"] = None
+        # PR 8 (Agent flip): filter-based bulk UPDATE goes through
+        # agent_repo.clear_current_task_for so the cache mirror is
+        # owned by the repo (the loop over state.active_agents below
+        # used to be duplicated at every call site). The caller's
+        # cursor is passed through so the UPDATE stays inside the
+        # wider task-status BEGIN/COMMIT.
+        from ..repositories import agent_repo as _agent_repo
+        _agent_repo.clear_current_task_for(task_id, connection=cursor)
 
     # Handle parent task notifications
     if new_status in ["completed", "cancelled", "failed"] and task_current_data.get(
@@ -3491,14 +3492,15 @@ async def bulk_task_operations_tool_impl(
                     # non-bulk path, so the bulk surface doesn't
                     # leak the same stale-current_task bug.
                     if new_status in ["completed", "cancelled", "failed"]:
-                        cursor.execute(
-                            "UPDATE agents SET current_task = NULL, "
-                            "updated_at = ? WHERE current_task = ?",
-                            (updated_at_iso, task_id),
+                        # PR 8 (Agent flip): filter-based bulk UPDATE
+                        # goes through agent_repo.clear_current_task_for
+                        # (same as the non-bulk path in
+                        # _update_single_task). Cache mirror is owned
+                        # by the repo.
+                        from ..repositories import agent_repo as _agent_repo
+                        _agent_repo.clear_current_task_for(
+                            task_id, connection=cursor,
                         )
-                        for _entry in g.active_agents.values():
-                            if _entry.get("current_task") == task_id:
-                                _entry["current_task"] = None
 
                     results.append(
                         f"Operation {i+1}: Task '{task_id}' status updated to '{new_status}'"

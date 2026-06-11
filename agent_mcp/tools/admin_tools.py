@@ -1149,13 +1149,19 @@ async def relaunch_agent_tool_impl(
         agent_token = agent_data.get("token")
         if generate_new_token:
             agent_token = generate_token()
-            # `token` isn't in agent_repo.update_field's allowlist by
-            # design (the token is the auth secret; rotating it lives
-            # in the relaunch flow, not the generic field-update
-            # surface). Keep this UPDATE on the cursor.
-            cursor.execute(
-                "UPDATE agents SET token = ? WHERE agent_id = ?",
-                (agent_token, agent_id),
+            # `token` is deliberately OFF agent_repo.update_field's
+            # allowlist by design (the token is the auth secret;
+            # rotating it must not be reachable via the generic
+            # field-update API). PR 8 (Agent flip) gives token rotation
+            # its own dedicated surface — agent_repo.rotate_token —
+            # so the write goes through the repo (with the caller's
+            # cursor) instead of owning a raw UPDATE here. The cache
+            # re-key is deferred to the caller's post-commit step;
+            # the relaunch flow rebuilds the active-agents entry
+            # below once the wider transaction commits.
+            from ..repositories import agent_repo as _agent_repo
+            _agent_repo.rotate_token(
+                agent_id, agent_token, connection=cursor,
             )
 
         # PR 6: status flip goes through agent_repo with the caller's

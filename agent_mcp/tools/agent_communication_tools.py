@@ -805,24 +805,29 @@ def _write_last_event_seen_at(agent_id: str, cursor_value: str) -> None:
     """
     if not cursor_value:
         return
-    conn = None
+    # PR 8 (Agent flip): single-field write — goes through
+    # agent_repo.update_field so the cache + EventBus stay in sync
+    # with the DB. ``last_event_seen_at`` is on the allowlist
+    # (event-coord PR-2). Best-effort wrap stays — a falsy/None return
+    # from update_field is logged the same way as the previous raw-SQL
+    # exception path.
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE agents SET last_event_seen_at = ? WHERE agent_id = ?",
-            (cursor_value, agent_id),
+        from ..repositories import agent_repo
+        result = agent_repo.update_field(
+            agent_id, "last_event_seen_at", cursor_value,
         )
-        conn.commit()
+        if result is None:
+            logger.warning(
+                "wait_for_events: failed to persist last_event_seen_at "
+                "for %s (unknown agent or DB error)",
+                agent_id,
+            )
     except Exception as e:  # pragma: no cover - defensive
         logger.warning(
             "wait_for_events: failed to persist last_event_seen_at "
             "for %s: %s",
             agent_id, e,
         )
-    finally:
-        if conn:
-            conn.close()
 
 
 def _read_last_event_seen_at(agent_id: str) -> Optional[str]:
