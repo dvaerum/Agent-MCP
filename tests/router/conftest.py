@@ -167,11 +167,20 @@ def router_module(
     for mod_name in (
         "agent_mcp.router",
         "agent_mcp.router.app",
+        "agent_mcp.router.project_orchestrator",
         "agent_mcp.router.project_registry",
     ):
         sys.modules.pop(mod_name, None)
     router = importlib.import_module("agent_mcp.router.app")
+    # PR-C extracted the lifecycle state machine into
+    # ``project_orchestrator``; ``router/app.py`` re-exports
+    # ``_systemctl`` so legacy tests that monkeypatch it via the
+    # router module keep working, but the actual function call sites
+    # live in the orchestrator module, so we patch both attribute
+    # bindings to point at the same stub.
+    from agent_mcp.router import project_orchestrator as _po
     monkeypatch.setattr(router, "_systemctl", systemctl_stub)
+    monkeypatch.setattr(_po, "_systemctl", systemctl_stub)
     # The reaper/reconcile hooks call _systemctl too; stub already
     # handles that, but the reaper itself never runs in unit tests
     # because we never wire it up via web.run_app — make_app() only
