@@ -491,11 +491,14 @@ async def _update_single_task(
 
     updated_at_iso = datetime.datetime.now().isoformat()
 
-    # Build update query
-    update_fields_sql = ["status = ?", "updated_at = ?"]
-    update_params = [new_status, updated_at_iso]
+    # PR 6: route the main UPDATE through task_repo with the caller's
+    # cursor — the repo's allowlist enforces the same safe-field set
+    # the legacy inline code did (status/notes/title/description/
+    # priority/assigned_to/depends_on_tasks all live in _MUTABLE_FIELDS).
+    from ..repositories import task_repo
 
-    # Handle notes
+    # Notes are append-only; build the new list here since the legacy
+    # path did the same.
     current_notes_list = json.loads(task_current_data.get("notes") or "[]")
     if notes_content:
         current_notes_list.append(
@@ -505,58 +508,31 @@ async def _update_single_task(
                 "content": notes_content,
             }
         )
-    update_fields_sql.append("notes = ?")
-    update_params.append(json.dumps(current_notes_list))
 
-    # Admin-only field updates
+    fields_to_update: Dict[str, Any] = {
+        "status": new_status,
+        "notes": current_notes_list,
+    }
     if is_admin_request:
         if new_title is not None:
-            update_fields_sql.append("title = ?")
-            update_params.append(new_title)
+            fields_to_update["title"] = new_title
         if new_description is not None:
-            update_fields_sql.append("description = ?")
-            update_params.append(new_description)
+            fields_to_update["description"] = new_description
         if new_priority is not None:
-            update_fields_sql.append("priority = ?")
-            update_params.append(new_priority)
+            fields_to_update["priority"] = new_priority
         if new_assigned_to is not None:
-            update_fields_sql.append("assigned_to = ?")
-            update_params.append(new_assigned_to)
+            fields_to_update["assigned_to"] = new_assigned_to
         if new_depends_on_tasks is not None:
-            update_fields_sql.append("depends_on_tasks = ?")
-            update_params.append(json.dumps(new_depends_on_tasks))
+            fields_to_update["depends_on_tasks"] = new_depends_on_tasks
 
-    update_params.append(task_id)
+    task_repo.update_fields(task_id, fields_to_update, connection=cursor)
 
-    # Execute update with validated field assignments
-    if update_fields_sql:
-        # Validate all field assignments are safe (contain only expected patterns)
-        allowed_field_patterns = [
-            "status = ?",
-            "updated_at = ?",
-            "notes = ?",
-            "title = ?",
-            "description = ?",
-            "priority = ?",
-            "assigned_to = ?",
-            "depends_on_tasks = ?",
-        ]
-
-        safe_fields = []
-        for field in update_fields_sql:
-            if field in allowed_field_patterns:
-                safe_fields.append(field)
-            else:
-                logger.warning(
-                    f"Task update: Skipping unsafe field assignment: {field}"
-                )
-
-        if safe_fields:
-            set_clause = ", ".join(safe_fields)
-            update_sql = f"UPDATE tasks SET {set_clause} WHERE task_id = ?"
-            cursor.execute(update_sql, tuple(update_params))
-
-    # Update in-memory cache
+    # Update in-memory cache — the repo defers cache write on the
+    # connection= path because the caller's transaction is still open;
+    # we apply the same per-field updates the legacy inline code did
+    # so the cache reflects the in-flight transaction. A subsequent
+    # rollback path doesn't exist in this helper's call sites (its
+    # callers commit immediately after the helper returns).
     if task_id in g.tasks:
         g.tasks[task_id]["status"] = new_status
         g.tasks[task_id]["updated_at"] = updated_at_iso
@@ -812,6 +788,13 @@ async def _create_unassigned_tasks(
             created_tasks = []
             created_at = datetime.datetime.now().isoformat()
 
+            # PR 6: task INSERTs now go through task_repo.create with
+            # the caller's cursor so they stay atomic with the
+            # agent_actions audit-log INSERT below. Cache reconciliation
+            # happens after conn.commit() via task_repo.upsert_cache.
+            from ..repositories import task_repo
+            cached_dicts: list[dict] = []
+
             if tasks:
                 # Multiple unassigned task creation
                 for i, task in enumerate(tasks):
@@ -827,39 +810,27 @@ async def _create_unassigned_tasks(
                         "required_capabilities", top_level_required_caps_raw
                     )
                     normalized_caps = normalize_capabilities(per_task_caps_raw)
-                    required_caps_json = (
-                        json.dumps(normalized_caps) if normalized_caps else None
-                    )
 
-                    # Create unassigned task
-                    task_data = {
-                        "task_id": task_id,
-                        "title": title,
-                        "description": description,
-                        "assigned_to": None,  # UNASSIGNED
-                        "created_by": "admin",
-                        "status": "unassigned",
-                        "priority": task_priority,
-                        "created_at": created_at,
-                        "updated_at": created_at,
-                        "parent_task": parent_task,
-                        "child_tasks": json.dumps([]),
-                        "depends_on_tasks": json.dumps([]),
-                        "notes": json.dumps([]),
-                        "required_capabilities": required_caps_json,
-                    }
-
-                    cursor.execute(
-                        """
-                        INSERT INTO tasks (task_id, title, description, assigned_to, created_by, status, priority,
-                                           created_at, updated_at, parent_task, child_tasks, depends_on_tasks, notes,
-                                           required_capabilities)
-                        VALUES (:task_id, :title, :description, :assigned_to, :created_by, :status, :priority,
-                                :created_at, :updated_at, :parent_task, :child_tasks, :depends_on_tasks, :notes,
-                                :required_capabilities)
-                    """,
-                        task_data,
+                    fresh = task_repo.create(
+                        {
+                            "task_id": task_id,
+                            "title": title,
+                            "description": description,
+                            "assigned_to": None,
+                            "created_by": "admin",
+                            "status": "unassigned",
+                            "priority": task_priority,
+                            "parent_task": parent_task,
+                            "child_tasks": [],
+                            "depends_on_tasks": [],
+                            "notes": [],
+                            "required_capabilities": (
+                                normalized_caps if normalized_caps else None
+                            ),
+                        },
+                        connection=cursor,
                     )
+                    cached_dicts.append(fresh)
 
                     log_agent_action_to_db(
                         cursor,
@@ -869,9 +840,6 @@ async def _create_unassigned_tasks(
                         details={"title": title, "mode": "unassigned_multiple"},
                     )
 
-                    # Add to global cache
-                    g.tasks[task_id] = task_data
-
                     created_tasks.append(
                         {"task_id": task_id, "title": title, "priority": task_priority}
                     )
@@ -880,38 +848,27 @@ async def _create_unassigned_tasks(
                 # Single unassigned task creation
                 task_id = f"task_{int(datetime.datetime.now().timestamp() * 1000)}"
                 normalized_caps = normalize_capabilities(top_level_required_caps_raw)
-                required_caps_json = (
-                    json.dumps(normalized_caps) if normalized_caps else None
-                )
 
-                task_data = {
-                    "task_id": task_id,
-                    "title": task_title,
-                    "description": task_description,
-                    "assigned_to": None,  # UNASSIGNED
-                    "created_by": "admin",
-                    "status": "unassigned",
-                    "priority": priority,
-                    "created_at": created_at,
-                    "updated_at": created_at,
-                    "parent_task": parent_task_id_arg,
-                    "child_tasks": json.dumps([]),
-                    "depends_on_tasks": json.dumps([]),
-                    "notes": json.dumps([]),
-                    "required_capabilities": required_caps_json,
-                }
-
-                cursor.execute(
-                    """
-                    INSERT INTO tasks (task_id, title, description, assigned_to, created_by, status, priority,
-                                       created_at, updated_at, parent_task, child_tasks, depends_on_tasks, notes,
-                                       required_capabilities)
-                    VALUES (:task_id, :title, :description, :assigned_to, :created_by, :status, :priority,
-                            :created_at, :updated_at, :parent_task, :child_tasks, :depends_on_tasks, :notes,
-                            :required_capabilities)
-                """,
-                    task_data,
+                fresh = task_repo.create(
+                    {
+                        "task_id": task_id,
+                        "title": task_title,
+                        "description": task_description,
+                        "assigned_to": None,
+                        "created_by": "admin",
+                        "status": "unassigned",
+                        "priority": priority,
+                        "parent_task": parent_task_id_arg,
+                        "child_tasks": [],
+                        "depends_on_tasks": [],
+                        "notes": [],
+                        "required_capabilities": (
+                            normalized_caps if normalized_caps else None
+                        ),
+                    },
+                    connection=cursor,
                 )
+                cached_dicts.append(fresh)
 
                 log_agent_action_to_db(
                     cursor,
@@ -920,9 +877,6 @@ async def _create_unassigned_tasks(
                     task_id=task_id,
                     details={"title": task_title, "mode": "unassigned_single"},
                 )
-
-                # Add to global cache
-                g.tasks[task_id] = task_data
 
                 created_tasks.append(
                     {"task_id": task_id, "title": task_title, "priority": priority}
@@ -934,6 +888,14 @@ async def _create_unassigned_tasks(
                 )
 
             conn.commit()
+
+            # Post-commit cache reconciliation through the repo. Mirrors
+            # the legacy inline `g.tasks[task_id] = task_data` writes
+            # but routes them through the repo so the cache invariant
+            # is owned in one place.
+            for d in cached_dicts:
+                task_repo.upsert_cache(d)
+
             return created_tasks
 
         except Exception as e:
@@ -1068,22 +1030,16 @@ async def _assign_to_existing_tasks(
                 )
             ]
 
-        # Assign all tasks to the agent. Both the UPDATEs and the
-        # audit-log INSERTs are wrapped in a single transaction via
-        # the connection's default isolation; using `executemany`
-        # for the UPDATE avoids round-trips through the SQLite
-        # statement preparation step on each row (db review item 5).
-        # The audit log keeps its per-row call because
-        # `log_agent_action_to_db` constructs a fresh `details` JSON
-        # blob per row — batching that requires inlining the helper,
-        # which is out of scope here.
-        updated_at = datetime.datetime.now().isoformat()
-        cursor.executemany(
-            "UPDATE tasks SET assigned_to = ?, updated_at = ? "
-            "WHERE task_id = ?",
-            [(target_agent_id, updated_at, tid) for tid in task_ids],
-        )
+        # PR 6: task assignment UPDATEs go through task_repo with the
+        # caller's cursor so they're atomic with the audit-log
+        # INSERTs. The repo defers cache + publish on the
+        # connection= path; we reconcile after commit below.
+        from ..repositories import agent_repo, task_repo
         for task_id in task_ids:
+            task_repo.update_fields(
+                task_id, {"assigned_to": target_agent_id},
+                connection=cursor,
+            )
             log_agent_action_to_db(
                 cursor,
                 "admin",
@@ -1101,12 +1057,18 @@ async def _assign_to_existing_tasks(
         )
         agent_row = cursor.fetchone()
         if agent_row and agent_row["current_task"] is None:
-            cursor.execute(
-                "UPDATE agents SET current_task = ?, updated_at = ? WHERE agent_id = ?",
-                (task_ids[0], updated_at, target_agent_id),
+            agent_repo.update_field(
+                target_agent_id, "current_task", task_ids[0],
+                connection=cursor,
             )
 
         conn.commit()
+
+        # Post-commit cache reconciliation through the repos.
+        for task_id in task_ids:
+            fresh = task_repo.get_by_id(task_id)
+            if fresh is not None:
+                task_repo.upsert_cache(fresh)
 
         # Wake wait_for_events waiter + fan out resources/updated to
         # every registered GET /mcp stream for the newly-assigned agent.
@@ -1173,6 +1135,12 @@ async def _create_and_assign_multiple_tasks(
         created_tasks = []
         created_at = datetime.datetime.now().isoformat()
 
+        # PR 6: task INSERTs go through task_repo.create with the
+        # caller's cursor — atomic with agent_actions audit log.
+        # Cache reconciliation deferred to post-commit.
+        from ..repositories import agent_repo, task_repo
+        cached_dicts: list[dict] = []
+
         # Create each task
         for i, task in enumerate(tasks):
             task_id = f"task_{int(datetime.datetime.now().timestamp() * 1000)}_{i}"
@@ -1181,33 +1149,23 @@ async def _create_and_assign_multiple_tasks(
             priority = task.get("priority", "medium")
             parent_task = task.get("parent_task_id")
 
-            # Create task data
-            task_data = {
-                "task_id": task_id,
-                "title": title,
-                "description": description,
-                "assigned_to": target_agent_id,
-                "created_by": "admin",
-                "status": "pending",
-                "priority": priority,
-                "created_at": created_at,
-                "updated_at": created_at,
-                "parent_task": parent_task,
-                "child_tasks": json.dumps([]),
-                "depends_on_tasks": json.dumps([]),
-                "notes": json.dumps([]),
-            }
-
-            # Insert task
-            cursor.execute(
-                """
-                INSERT INTO tasks (task_id, title, description, assigned_to, created_by, status, priority, 
-                                   created_at, updated_at, parent_task, child_tasks, depends_on_tasks, notes)
-                VALUES (:task_id, :title, :description, :assigned_to, :created_by, :status, :priority, 
-                        :created_at, :updated_at, :parent_task, :child_tasks, :depends_on_tasks, :notes)
-            """,
-                task_data,
+            fresh = task_repo.create(
+                {
+                    "task_id": task_id,
+                    "title": title,
+                    "description": description,
+                    "assigned_to": target_agent_id,
+                    "created_by": "admin",
+                    "status": "pending",
+                    "priority": priority,
+                    "parent_task": parent_task,
+                    "child_tasks": [],
+                    "depends_on_tasks": [],
+                    "notes": [],
+                },
+                connection=cursor,
             )
+            cached_dicts.append(fresh)
 
             # Log the creation
             log_agent_action_to_db(
@@ -1232,12 +1190,16 @@ async def _create_and_assign_multiple_tasks(
         )
         agent_row = cursor.fetchone()
         if agent_row and agent_row["current_task"] is None and created_tasks:
-            cursor.execute(
-                "UPDATE agents SET current_task = ?, updated_at = ? WHERE agent_id = ?",
-                (created_tasks[0]["task_id"], created_at, target_agent_id),
+            agent_repo.update_field(
+                target_agent_id, "current_task", created_tasks[0]["task_id"],
+                connection=cursor,
             )
 
         conn.commit()
+
+        # Post-commit cache reconciliation through the repo.
+        for d in cached_dicts:
+            task_repo.upsert_cache(d)
 
         # Wake wait_for_events waiter + fan out resources/updated to
         # every registered GET /mcp stream for the newly-assigned agent.
@@ -1325,14 +1287,14 @@ async def assign_task_tool_impl(
                     ),
                 )
             ]
-        conn = get_db_connection()
-        try:
-            row = conn.execute(
-                "SELECT token FROM agents WHERE agent_id = ?",
-                (target_agent_id_alias,),
-            ).fetchone()
-        finally:
-            conn.close()
+        # PR 6: routed through agent_repo (drops raw cursor that only
+        # did a PK lookup). disable_cache to force a DB read — the
+        # cache shape (state.active_agents) is token-keyed and the
+        # cached value dicts don't carry the `token` field; the DB
+        # projection does.
+        from ..repositories import agent_repo
+        with agent_repo.disable_cache():
+            row = agent_repo.get_by_id(target_agent_id_alias)
         if not row:
             return [
                 mcp_types.TextContent(
@@ -1750,36 +1712,28 @@ async def assign_task_tool_impl(
         )
         _required_caps_json = json.dumps(_norm_caps) if _norm_caps else None
 
-        task_data_for_db = {  # main.py:1354-1367
-            "task_id": new_task_id,
-            "title": task_title,
-            "description": task_description,
-            "assigned_to": target_agent_id,
-            "created_by": "admin",  # Admin is assigning
-            "status": status,
-            "priority": priority,
-            "created_at": created_at_iso,
-            "updated_at": created_at_iso,
-            "parent_task": final_parent_task_id,  # Use validated value
-            "child_tasks": json.dumps([]),
-            "depends_on_tasks": json.dumps(
-                final_depends_on_tasks or []
-            ),  # Use validated value
-            "notes": json.dumps(initial_notes),
-            "required_capabilities": _required_caps_json,
-        }
+        # PR 6: task INSERT goes through task_repo with the caller's
+        # cursor so it's atomic with the agent UPDATE and audit log.
+        from ..repositories import agent_repo, task_repo
 
-        # Save task to database (main.py:1370-1373)
-        cursor.execute(
-            """
-            INSERT INTO tasks (task_id, title, description, assigned_to, created_by, status, priority,
-                               created_at, updated_at, parent_task, child_tasks, depends_on_tasks, notes,
-                               required_capabilities)
-            VALUES (:task_id, :title, :description, :assigned_to, :created_by, :status, :priority,
-                    :created_at, :updated_at, :parent_task, :child_tasks, :depends_on_tasks, :notes,
-                    :required_capabilities)
-        """,
-            task_data_for_db,
+        fresh_task = task_repo.create(
+            {
+                "task_id": new_task_id,
+                "title": task_title,
+                "description": task_description,
+                "assigned_to": target_agent_id,
+                "created_by": "admin",
+                "status": status,
+                "priority": priority,
+                "parent_task": final_parent_task_id,
+                "child_tasks": [],
+                "depends_on_tasks": final_depends_on_tasks or [],
+                "notes": initial_notes,
+                "required_capabilities": (
+                    _norm_caps if _norm_caps else None
+                ),
+            },
+            connection=cursor,
         )
 
         # Update agent's current task in DB if they don't have one (main.py:1376-1387)
@@ -1799,9 +1753,10 @@ async def assign_task_tool_impl(
                 should_update_agent_current_task = True
 
         if should_update_agent_current_task:
-            cursor.execute(
-                "UPDATE agents SET current_task = ?, updated_at = ? WHERE agent_id = ?",
-                (new_task_id, created_at_iso, target_agent_id),
+            # PR 6: routed through agent_repo with caller's cursor.
+            agent_repo.update_field(
+                target_agent_id, "current_task", new_task_id,
+                connection=cursor,
             )
 
         log_agent_action_to_db(
@@ -1812,6 +1767,9 @@ async def assign_task_tool_impl(
             details={"agent_id": target_agent_id, "title": task_title},
         )
         conn.commit()
+
+        # Post-commit cache reconciliation.
+        task_repo.upsert_cache(fresh_task)
 
         # Wake wait_for_events waiter + fan out resources/updated to
         # every registered GET /mcp stream for the new assignee. Done
@@ -1832,19 +1790,10 @@ async def assign_task_tool_impl(
         ):
             g.active_agents[assigned_agent_active_token]["current_task"] = new_task_id
 
-        # Add task to in-memory tasks dictionary (main.py:1394-1398)
-        # Convert JSON strings back for in-memory representation
-        task_data_for_memory = task_data_for_db.copy()
-        task_data_for_memory["child_tasks"] = []
-        task_data_for_memory["depends_on_tasks"] = (
-            final_depends_on_tasks or []
-        )  # Use validated value
-        task_data_for_memory["notes"] = []
-        g.tasks[new_task_id] = task_data_for_memory
-
-        # System 8: Index the new task for RAG
-        # Convert database format to the format expected by indexing
-        index_data = task_data_for_memory.copy()
+        # PR 6: in-memory cache already reconciled by task_repo.upsert_cache
+        # above; fresh_task carries the dict shape consumers expect
+        # (JSON list fields deserialised). Use it for the RAG index call.
+        index_data = dict(fresh_task)
         index_data["depends_on_tasks"] = final_depends_on_tasks or []
         # Start indexing asynchronously (fire and forget)
         import asyncio
@@ -2090,32 +2039,23 @@ async def create_self_task_tool_impl(
             else:
                 validation_message = "\n✓ RAG validation approved placement\n"
 
-        task_data_for_db = {  # main.py:1439-1452
-            "task_id": new_task_id,
-            "title": task_title,
-            "description": task_description,
-            "assigned_to": requesting_agent_id,
-            "created_by": requesting_agent_id,  # Agent creates for self
-            "status": status,
-            "priority": priority,
-            "created_at": created_at_iso,
-            "updated_at": created_at_iso,
-            "parent_task": final_parent_task_id,  # Use validated value
-            "child_tasks": json.dumps([]),
-            "depends_on_tasks": json.dumps(
-                final_depends_on_tasks or []
-            ),  # Use validated value
-            "notes": json.dumps([]),
-        }
-
-        cursor.execute(
-            """
-            INSERT INTO tasks (task_id, title, description, assigned_to, created_by, status, priority, 
-                               created_at, updated_at, parent_task, child_tasks, depends_on_tasks, notes)
-            VALUES (:task_id, :title, :description, :assigned_to, :created_by, :status, :priority, 
-                    :created_at, :updated_at, :parent_task, :child_tasks, :depends_on_tasks, :notes)
-        """,
-            task_data_for_db,
+        # PR 6: task INSERT via task_repo with the caller's cursor.
+        from ..repositories import agent_repo, task_repo
+        fresh_task = task_repo.create(
+            {
+                "task_id": new_task_id,
+                "title": task_title,
+                "description": task_description,
+                "assigned_to": requesting_agent_id,
+                "created_by": requesting_agent_id,  # Agent creates for self
+                "status": status,
+                "priority": priority,
+                "parent_task": final_parent_task_id,
+                "child_tasks": [],
+                "depends_on_tasks": final_depends_on_tasks or [],
+                "notes": [],
+            },
+            connection=cursor,
         )
 
         # Update agent's current task in DB if they don't have one (main.py:1455-1469)
@@ -2136,9 +2076,9 @@ async def create_self_task_tool_impl(
         # Admin agents don't have a persistent 'current_task' in the agents table.
 
         if should_update_agent_current_task and requesting_agent_id != "admin":
-            cursor.execute(
-                "UPDATE agents SET current_task = ?, updated_at = ? WHERE agent_id = ?",
-                (new_task_id, created_at_iso, requesting_agent_id),
+            agent_repo.update_field(
+                requesting_agent_id, "current_task", new_task_id,
+                connection=cursor,
             )
 
         log_agent_action_to_db(
@@ -2150,20 +2090,14 @@ async def create_self_task_tool_impl(
         )
         conn.commit()
 
+        # Post-commit: reconcile caches through repos.
+        task_repo.upsert_cache(fresh_task)
+
         if should_update_agent_current_task and agent_auth_token in g.active_agents:
             g.active_agents[agent_auth_token]["current_task"] = new_task_id
 
-        task_data_for_memory = task_data_for_db.copy()
-        task_data_for_memory["child_tasks"] = []
-        task_data_for_memory["depends_on_tasks"] = (
-            final_depends_on_tasks or []
-        )  # Use validated value
-        task_data_for_memory["notes"] = []
-        g.tasks[new_task_id] = task_data_for_memory
-
-        # System 8: Index the new task for RAG
-        # Convert database format to the format expected by indexing
-        index_data = task_data_for_memory.copy()
+        # Build RAG index payload from the fresh dict.
+        index_data = dict(fresh_task)
         # No need to override depends_on_tasks again, it's already the validated value
         # Start indexing asynchronously (fire and forget)
         import asyncio

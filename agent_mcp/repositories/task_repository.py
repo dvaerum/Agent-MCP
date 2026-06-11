@@ -247,6 +247,7 @@ class TaskRepository:
                 "child_tasks": child_tasks,
                 "depends_on_tasks": depends_on_tasks,
                 "notes": notes,
+                "required_capabilities": required_caps,
             }
         elif connection is not None:
             # SQLAlchemy Session path: caller owns commit.
@@ -285,6 +286,7 @@ class TaskRepository:
                 "child_tasks": child_tasks,
                 "depends_on_tasks": depends_on_tasks,
                 "notes": notes,
+                "required_capabilities": required_caps,
             }
         else:
             # Standalone path — open session + commit.
