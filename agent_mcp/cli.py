@@ -1,6 +1,37 @@
 #!/usr/bin/env python3
 """
-Agent-MCP CLI: Command-line interface for multi-agent collaboration.
+Agent-MCP CLI: command-line interface for multi-agent collaboration.
+
+Post-PR-E (round-2 architecture review): this module is a thin click
+adapter. It owns the user-facing surface — argparse / click
+decorators, deprecation shims, the `router` + `backup` subcommands
+that don't go through the server boot path — and delegates the
+``server`` subcommand's orchestration to
+``agent_mcp.server_bootstrap.run_server``.
+
+What used to live here and now lives in dedicated modules:
+
+* ``.env`` discovery, embedding-mode flag translation, debug-flag
+  promotion, transport branching, uvicorn config, anyio task-group
+  setup → ``agent_mcp.server_bootstrap``.
+* TUI display loop → ``agent_mcp.tui.runtime``.
+* DB admin-token reader (used by the TUI + startup banner) →
+  ``agent_mcp.server_bootstrap.get_admin_token_from_db``.
+
+What stays here on purpose:
+
+* The click ``cli`` group + subcommand registrations — this is the
+  user-facing surface.
+* The pre-import ``.env`` walk (the same loop the legacy CLI ran).
+  ``core.config`` reads ``OPENAI_API_KEY`` at module-import time, so
+  the discovery has to run BEFORE any other ``agent_mcp`` import; we
+  can't move this block into ``server_bootstrap`` because importing
+  that module triggers ``core.config`` as a side effect.
+* The ``router`` + ``backup`` subcommands — separate concerns from
+  the server boot path (the router is its own aiohttp app; the backup
+  command is a one-shot SQLite copy). They keep their callbacks here.
+* The legacy-invocation sniffer / deprecation shim — same surface as
+  before, no rewrites.
 
 Copyright (C) 2025 Luis Alejandro Rincon (rinadelph)
 
@@ -17,114 +48,78 @@ GNU Affero General Public License for more details.
 You should have received a copy of the GNU Affero General Public License
 along with this program. If not, see <https://www.gnu.org/licenses/>.
 """
-import click
-import uvicorn  # For running the Starlette app in SSE mode
-import anyio  # For running async functions and task groups
+# --- Pre-import .env discovery ---------------------------------------
+# Done inline here (rather than via server_bootstrap) because
+# ``core.config`` reads ``OPENAI_API_KEY`` from the environment at
+# module-import time. Any ``from agent_mcp.*`` import below — even a
+# transitive one through server_bootstrap — locks in the env state
+# at that point. So we walk the .env discovery as the very first
+# thing, then import the rest.
 import os
 import sys
-import json
 import sqlite3
 import warnings
-from typing import Optional
 from pathlib import Path
-from dotenv import load_dotenv, dotenv_values
 
-# Load environment variables before importing other modules
-# Try explicit paths
+from dotenv import dotenv_values, load_dotenv
 
-# Get the directory of the current script
-script_dir = Path(__file__).resolve().parent
-
-# Try parent directories
-for parent_level in range(3):  # Go up to 3 levels
-    env_path = script_dir / (".." * parent_level) / ".env"
-    env_path = env_path.resolve()
-    print(f"Trying to load .env from: {env_path}")
-    if env_path.exists():
-        print(f"Found .env at: {env_path}")
-        env_vars = dotenv_values(str(env_path))
-        print(f"Loaded variables: {list(env_vars.keys())}")
-        print(
-            f"OPENAI_API_KEY from file: {env_vars.get('OPENAI_API_KEY', 'NOT FOUND')[:10]}..."
-        )
-        # Manually set the environment variables
-        for key, value in env_vars.items():
-            os.environ[key] = value
-        # Check if API key was set (without logging the actual key)
-        api_key = os.environ.get('OPENAI_API_KEY')
-        if api_key:
+_script_dir = Path(__file__).resolve().parent
+for _parent_level in range(3):
+    _env_path = (_script_dir / ("../" * _parent_level) / ".env").resolve()
+    print(f"Trying to load .env from: {_env_path}")
+    if _env_path.exists():
+        print(f"Found .env at: {_env_path}")
+        _env_vars = dotenv_values(str(_env_path))
+        print(f"Loaded variables: {list(_env_vars.keys())}")
+        # Avoid printing secrets in plaintext while still confirming
+        # they're present.
+        _printable_key = _env_vars.get("OPENAI_API_KEY", "NOT FOUND") or "NOT FOUND"
+        print(f"OPENAI_API_KEY from file: {_printable_key[:10]}...")
+        for _key, _value in _env_vars.items():
+            if _value is not None:
+                os.environ[_key] = _value
+        if os.environ.get("OPENAI_API_KEY"):
             print("OPENAI_API_KEY successfully loaded from environment")
         else:
             print("OPENAI_API_KEY not found in environment")
         break
 
-# Also try normal load_dotenv in case
+# Also try cwd-relative load_dotenv in case the deploy repo's
+# wrapper script puts the .env somewhere this walk doesn't find.
 load_dotenv()
 
-# Project-specific imports
-# Ensure core.config (and thus logging) is initialized early.
-from .core.config import (
-    logger,
-    CONSOLE_LOGGING_ENABLED,
-    enable_console_logging,
-)  # Logger is initialized in config.py
-from .core import globals as g  # For g.server_running and other globals
+# Cleanup of loop locals so a future reader doesn't mistake them for
+# config surface.
+del _script_dir, _parent_level
+for _local in ("_env_path", "_env_vars", "_printable_key", "_key", "_value", "_local"):
+    if _local in dir():
+        try:
+            del globals()[_local]
+        except KeyError:
+            pass
 
-# Import app creation and lifecycle functions
-from .app.main_app import create_app, mcp_app_instance  # mcp_app_instance for stdio
-from .app.server_lifecycle import (
-    start_background_tasks,
-    application_startup,
-    application_shutdown,
-)  # application_startup is called by create_app's on_startup
-from .tui.display import TUIDisplay  # Import TUI display
+# --- Now safe to import core.config (it reads env at import time) ----
+from typing import Optional  # noqa: E402
 
+import click  # noqa: E402
 
-def get_admin_token_from_db(project_dir: str) -> Optional[str]:
-    """Get the admin token from the SQLite database."""
-    try:
-        # Construct the path to the database
-        db_path = Path(project_dir).resolve() / ".agent" / "mcp_state.db"
-
-        if not db_path.exists():
-            return None
-
-        conn = sqlite3.connect(str(db_path))
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-
-        # Get the admin token from project_context table
-        cursor.execute(
-            "SELECT value FROM project_context WHERE context_key = ?",
-            ("config_admin_token",),
-        )
-        row = cursor.fetchone()
-
-        if row and row["value"]:
-            try:
-                admin_token = json.loads(row["value"])
-                if isinstance(admin_token, str) and admin_token:
-                    return admin_token
-            except json.JSONDecodeError:
-                pass
-
-        conn.close()
-        return None
-    except Exception as e:
-        logger.error(f"Error reading admin token from database: {e}")
-        return None
+from .server_bootstrap import (  # noqa: E402
+    ServerConfig,
+    get_admin_token_from_db,
+    run_server,
+)
 
 
-# --- Click Command Group ---
-# Top-level dispatcher. Two subcommands today:
-#   * `agent-mcp server …`  — the MCP backend (Starlette/uvicorn or stdio).
-#   * `agent-mcp router …`  — the always-on URL-keyed HTTP router that
-#                              proxies per-project backends.
-# Phase 1a of the router-upstream plan (prancy-napping-pie). Before
-# this the CLI had a single `@click.command` whose options matched
-# today's `server` subcommand exactly; we keep a backward-compat shim
-# below so existing `python -m agent_mcp.cli --transport sse …`
-# invocations route to `server` and warn loudly.
+# --- Click command group --------------------------------------------
+# Two subcommands today:
+#   * ``agent-mcp server …``  — the MCP backend (Starlette/uvicorn or stdio).
+#   * ``agent-mcp router …``  — the always-on URL-keyed HTTP router that
+#                                proxies per-project backends.
+#   * ``agent-mcp backup …``  — full-DB sqlite3 online backup.
+# Phase 1a of the router-upstream plan (prancy-napping-pie) converted
+# the pre-existing single ``@click.command`` into the group below;
+# the backward-compat shim at the bottom routes legacy top-level
+# flag invocations through ``server``.
 @click.group(
     context_settings=dict(help_option_names=["-h", "--help"]),
     invoke_without_command=True,
@@ -133,18 +128,13 @@ def get_admin_token_from_db(project_dir: str) -> Optional[str]:
 def cli(ctx: click.Context) -> None:
     """Agent-MCP command-line interface.
 
-    Run `agent-mcp server --help` for the MCP backend, or
-    `agent-mcp router --help` for the always-on HTTP router.
+    Run ``agent-mcp server --help`` for the MCP backend, or
+    ``agent-mcp router --help`` for the always-on HTTP router.
     """
-    # Subcommand will run on its own. When invoked with no
-    # subcommand and no args at all, default to `server` for
-    # backward compat — same as pre-Phase-1a behaviour. Tests rely
-    # on `--help` printing the group help, which click handles
-    # before we get here.
     if ctx.invoked_subcommand is None:
         # Empty invocation: keep the historic behaviour of starting
-        # the server with defaults. Emit a deprecation note so we
-        # can remove this in a future release.
+        # the server with defaults. Emit a deprecation note so we can
+        # remove this in a future release.
         warnings.warn(
             "Invoking agent-mcp with no subcommand is deprecated; "
             "use 'agent-mcp server' (or 'agent-mcp router') instead.",
@@ -154,15 +144,16 @@ def cli(ctx: click.Context) -> None:
         ctx.invoke(server_cmd)
 
 
-# --- `server` subcommand ---
-# This replicates the original @click.command's options exactly so
-# pre-Phase-1a invocations keep working once routed through the
-# backward-compat shim below.
+# --- ``server`` subcommand ------------------------------------------
+# Option set is unchanged from pre-PR-E so the deploy repo's wrapper
+# scripts and the legacy-invocation shim keep working bit-for-bit;
+# only the callback body is now a thin two-liner that hands off to
+# ``server_bootstrap.run_server``.
 @cli.command("server", context_settings=dict(help_option_names=["-h", "--help"]))
 @click.option(
     "--port",
     type=int,
-    default=os.environ.get("PORT", 8080),  # Read from env var PORT if set, else 8080
+    default=os.environ.get("PORT", 8080),
     show_default=True,
     help="Port to listen on for SSE and HTTP dashboard.",
 )
@@ -191,8 +182,8 @@ def cli(ctx: click.Context) -> None:
     help="Project directory. The .agent folder will be created/used here. Defaults to current directory.",
 )
 @click.option(
-    "--admin-token",  # Renamed from admin_token_param for clarity
-    "admin_token_cli",  # Variable name for the parameter
+    "--admin-token",
+    "admin_token_cli",
     type=str,
     default=None,
     help="Admin token for authentication. If not provided, one will be loaded from DB or generated.",
@@ -200,8 +191,7 @@ def cli(ctx: click.Context) -> None:
 @click.option(
     "--debug",
     is_flag=True,
-    default=os.environ.get("MCP_DEBUG", "false").lower()
-    == "true",  # Default from env var
+    default=os.environ.get("MCP_DEBUG", "false").lower() == "true",
     help="Enable debug mode for the server (more verbose logging, Starlette debug pages).",
 )
 @click.option(
@@ -239,542 +229,45 @@ def server_cmd(
     advanced: bool,
     git: bool,
     no_index: bool,
-):
+) -> None:
     """
-    Start the MCP Server (was the only command pre-Phase-1a).
+    Start the MCP Server.
 
     The server supports two embedding modes:
-    - Simple mode (default): Uses text-embedding-3-large (1536 dimensions) - indexes markdown files and context
-    - Advanced mode (--advanced): Uses text-embedding-3-large (3072 dimensions) - includes code analysis, task indexing
+      * Simple (default): text-embedding-3-large (1536 dimensions) —
+        indexes markdown files and context.
+      * Advanced (``--advanced``): text-embedding-3-large (3072
+        dimensions) — includes code analysis, task indexing.
 
     Indexing options:
-    - Default: Automatic indexing of all markdown files in project directory
-    - --no-index: Disable automatic markdown indexing for selective manual control
+      * Default: automatic indexing of all markdown files in the
+        project directory.
+      * ``--no-index``: disable automatic markdown indexing for
+        selective manual control.
 
-    Note: Switching between modes will require re-indexing all content.
+    Switching between modes will require re-indexing all content.
     """
-    # Set advanced embeddings mode before other imports that might use it
-    if advanced:
-        from .core import config
-
-        config.ADVANCED_EMBEDDINGS = True
-        # Update the dynamic configs
-        config.EMBEDDING_MODEL = config.ADVANCED_EMBEDDING_MODEL
-        config.EMBEDDING_DIMENSION = config.ADVANCED_EMBEDDING_DIMENSION
-        logger.info(
-            "Advanced embeddings mode enabled (3072 dimensions, text-embedding-3-large, code & task indexing)"
-        )
-    else:
-        from .core.config import SIMPLE_EMBEDDING_DIMENSION, SIMPLE_EMBEDDING_MODEL
-
-        logger.info(
-            f"Using simple embeddings mode ({SIMPLE_EMBEDDING_DIMENSION} dimensions, {SIMPLE_EMBEDDING_MODEL}, markdown & context only)"
-        )
-
-    # Initialize Git worktree support if enabled
-    if git:
-        try:
-            from .features.worktree_integration import enable_worktree_support
-
-            worktree_enabled = enable_worktree_support()
-            if worktree_enabled:
-                logger.info(
-                    "🌿 Git worktree support enabled for parallel agent development"
-                )
-            else:
-                logger.warning(
-                    "❌ Git worktree support could not be enabled - check requirements"
-                )
-                logger.warning("   Continuing without worktree support...")
-        except ImportError:
-            logger.error(
-                "❌ Git worktree features not available - missing dependencies"
-            )
-            logger.warning("   Continuing without worktree support...")
-        except Exception as e:
-            logger.error(f"❌ Failed to initialize Git worktree support: {e}")
-            logger.warning("   Continuing without worktree support...")
-    else:
-        logger.info("Git worktree support disabled (use --git to enable)")
-
-    # Set auto-indexing configuration
-    if no_index:
-        from .core import config
-
-        config.DISABLE_AUTO_INDEXING = True
-        logger.info(
-            "Automatic markdown indexing disabled. Use manual indexing via RAG tools for selective content."
-        )
-    else:
-        from .core import config
-
-        config.DISABLE_AUTO_INDEXING = False
-        logger.info("Automatic markdown indexing enabled.")
-
-    if debug:
-        os.environ["MCP_DEBUG"] = (
-            "true"  # Ensure env var is set for Starlette debug mode
-        )
-        enable_console_logging()  # Enable console logging for debug mode
-        logger.info(
-            "Debug mode enabled via CLI flag or MCP_DEBUG environment variable."
-        )
-        logger.info("Console logging enabled for debug mode.")
-        # Logging level might need to be adjusted here if not already handled by config.py
-        # For now, config.py sets the base level. Uvicorn also has its own log level.
-    else:
-        os.environ["MCP_DEBUG"] = "false"
-
-    # Determine if the TUI should be active
-    # TUI is active if console logging is disabled AND --no-tui is NOT passed AND not in debug mode
-    from .core.config import (
-        CONSOLE_LOGGING_ENABLED as current_console_logging,
-    )  # Get updated value
-
-    tui_active = not current_console_logging and not no_tui and not debug
-
-    if tui_active:
-        logger.info(
-            "TUI display mode is active. Standard console logging is suppressed."
-        )
-    elif current_console_logging or debug:
-        logger.info("Standard console logging is enabled (TUI display mode is off).")
-        print("MCP Server starting with standard console logging...")
-    else:  # Console logging is off, and TUI is also off
-        logger.info(
-            "Console logging and TUI display are both disabled. Check log file for server messages."
-        )
-
-    # Log the embedding mode being used
-    embedding_mode_info = "advanced" if advanced else "simple"
-    if advanced:
-        embedding_model_info = (
-            config.EMBEDDING_MODEL if "config" in locals() else "text-embedding-3-large"
-        )
-        embedding_dim_info = (
-            config.EMBEDDING_DIMENSION if "config" in locals() else 3072
-        )
-    else:
-        from .core.config import SIMPLE_EMBEDDING_DIMENSION, SIMPLE_EMBEDDING_MODEL
-
-        embedding_model_info = SIMPLE_EMBEDDING_MODEL
-        embedding_dim_info = SIMPLE_EMBEDDING_DIMENSION
-
-    logger.info(
-        f"Attempting to start MCP Server: Port={port}, Transport={transport}, ProjectDir='{project_dir}'"
+    config = ServerConfig.from_cli_args(
+        port=port,
+        uds=uds,
+        transport=transport,
+        project_dir=project_dir,
+        admin_token_cli=admin_token_cli,
+        debug=debug,
+        no_tui=no_tui,
+        advanced=advanced,
+        git=git,
+        no_index=no_index,
     )
-    logger.info(
-        f"Embedding Mode: {embedding_mode_info} (Model: {embedding_model_info}, Dimensions: {embedding_dim_info})"
-    )
-
-    # --- TUI Display Loop (if not disabled) ---
-    async def tui_display_loop(
-        cli_port: int,
-        cli_transport: str,
-        cli_project_dir: str,
-        *,
-        task_status=anyio.TASK_STATUS_IGNORED,
-    ):
-        task_status.started()
-        logger.info("TUI display loop started.")
-        tui = TUIDisplay()
-        initial_display = True
-
-        # Import required modules
-        from .core import globals as globals_module
-        from .db.actions.agent_db import get_all_active_agents_from_db
-        from .db.actions.task_db import (
-            get_all_tasks_from_db,
-            get_task_by_id,
-            get_tasks_by_agent_id,
-        )
-        from datetime import datetime
-        from .tui.colors import TUITheme
-
-        # Simple tracking of server status for display
-        async def get_server_status():
-            try:
-                return {
-                    "running": globals_module.server_running,
-                    "status": "Running" if globals_module.server_running else "Stopped",
-                    "port": cli_port,
-                }
-            except Exception as e:
-                logger.error(f"Error getting server status: {e}")
-                return {
-                    "running": globals_module.server_running,
-                    "status": "Error",
-                    "port": cli_port,
-                }
-
-        try:
-            # Wait a moment for server initialization to complete
-            await anyio.sleep(2)
-
-            # Setup alternate screen and hide cursor for smoother display
-            tui.enable_alternate_screen()
-            tui.hide_cursor()
-
-            first_draw = True
-
-            while globals_module.server_running:
-                server_status = await get_server_status()
-
-                # Clear screen only on first draw
-                if first_draw:
-                    tui.clear_screen()
-                    first_draw = False
-
-                # Move to top and redraw
-                tui.move_cursor(1, 1)
-                current_row = tui.draw_header(clear_first=False)
-
-                # Position cursor for status bar
-                tui.move_cursor(current_row, 1)
-                tui.draw_status_bar(server_status)
-                current_row += 2
-
-                # Display simplified server info
-                tui.move_cursor(current_row, 1)
-                tui.clear_line()
-                print(TUITheme.header(" MCP Server Running"))
-                current_row += 2
-
-                tui.move_cursor(current_row, 1)
-                tui.clear_line()
-                print(f"Project Directory: {TUITheme.info(cli_project_dir)}")
-                current_row += 1
-
-                tui.move_cursor(current_row, 1)
-                tui.clear_line()
-                print(f"Transport: {TUITheme.info(cli_transport)}")
-                current_row += 1
-
-                tui.move_cursor(current_row, 1)
-                tui.clear_line()
-                print(f"MCP Port: {TUITheme.info(str(cli_port))}")
-                current_row += 1
-
-                # Display admin token
-                admin_token = get_admin_token_from_db(cli_project_dir)
-                if admin_token:
-                    tui.move_cursor(current_row, 1)
-                    tui.clear_line()
-                    print(f"Admin Token: {TUITheme.info(admin_token)}")
-                    current_row += 1
-
-                current_row += 2
-
-                # Display dashboard instructions
-                tui.move_cursor(current_row, 1)
-                tui.clear_line()
-                print(TUITheme.header(" Next Steps"))
-                current_row += 2
-
-                tui.move_cursor(current_row, 1)
-                tui.clear_line()
-                print("1. Open a new terminal window")
-                current_row += 1
-
-                tui.move_cursor(current_row, 1)
-                tui.clear_line()
-                dashboard_path = (
-                    f"{cli_project_dir}/agent_mcp/dashboard"
-                    if cli_project_dir != "."
-                    else "agent_mcp/dashboard"
-                )
-                print(f"2. Navigate to: {TUITheme.info(dashboard_path)}")
-                current_row += 1
-
-                tui.move_cursor(current_row, 1)
-                tui.clear_line()
-                print(f"3. Run: {TUITheme.bold('npm run dev')}")
-                current_row += 1
-
-                tui.move_cursor(current_row, 1)
-                tui.clear_line()
-                print(f"4. Open: {TUITheme.info('http://localhost:3847')}")
-                current_row += 3
-
-                tui.move_cursor(current_row, 1)
-                tui.clear_line()
-                print(
-                    TUITheme.warning(
-                        "Keep this MCP server running while using the dashboard"
-                    )
-                )
-                current_row += 2
-
-                tui.move_cursor(current_row, 1)
-                tui.clear_line()
-                print(TUITheme.info("Press Ctrl+C to stop the MCP server"))
-                current_row += 1
-
-                # Clear remaining lines to prevent artifacts
-                for row in range(current_row, tui.terminal_height):
-                    tui.move_cursor(row, 1)
-                    tui.clear_line()
-
-                if initial_display:
-                    initial_display = False
-
-                await anyio.sleep(5)  # Refresh less frequently since display is simpler
-        except anyio.get_cancelled_exc_class():
-            logger.info("TUI display loop cancelled.")
-        finally:
-            # Cleanup the terminal
-            tui.show_cursor()
-            tui.disable_alternate_screen()
-            tui.clear_screen()
-            print("MCP Server TUI has exited.")
-            logger.info("TUI display loop finished.")
-
-    # The application_startup logic (including setting MCP_PROJECT_DIR env var,
-    # DB init, admin token handling, state loading, OpenAI init, VSS check, signal handlers)
-    # is now part of the Starlette app's on_startup event, triggered by create_app.
-
-    if transport == "sse":
-        # Create the Starlette application instance.
-        # `application_startup` will be called by Starlette during its startup phase.
-        starlette_app = create_app(
-            project_dir=project_dir, admin_token_cli=admin_token_cli
-        )
-
-        # Uvicorn configuration
-        # log_config=None prevents Uvicorn from overriding our logging setup from config.py
-        # (Original main.py:2630)
-        # When --uds is set, bind a Unix domain socket instead of a TCP
-        # host:port. Useful for reverse-proxy deployments where the
-        # proxy speaks to the backend over a UDS and never exposes it
-        # to the network.
-        _uvicorn_kwargs: dict = dict(
-            log_config=None,  # Use our custom logging setup
-            access_log=False,  # Disable access logs
-            lifespan="on",  # Ensure Starlette's on_startup/on_shutdown are used
-        )
-        if uds:
-            _uvicorn_kwargs["uds"] = uds
-        else:
-            _uvicorn_kwargs["host"] = "0.0.0.0"
-            _uvicorn_kwargs["port"] = port
-        uvicorn_config = uvicorn.Config(starlette_app, **_uvicorn_kwargs)
-        server = uvicorn.Server(uvicorn_config)
-
-        # Run Uvicorn server with background tasks managed by an AnyIO task group
-        # This replaces the original run_server_with_background_tasks (main.py:2624)
-        async def run_sse_server_with_bg_tasks():
-            nonlocal server  # Allow modification if server needs to be accessed (e.g. server.should_exit)
-            try:
-                async with anyio.create_task_group() as tg:
-                    # Start background tasks (e.g., RAG indexer)
-                    # `application_startup` (called by Starlette) prepares everything.
-                    # `start_background_tasks` actually launches them in the task group.
-                    await start_background_tasks(tg)
-
-                    # Start TUI display loop if enabled
-                    if tui_active:
-                        await tg.start(tui_display_loop, port, transport, project_dir)
-
-                    # Start the Uvicorn server
-                    logger.info(
-                        f"Starting Uvicorn server for SSE transport on http://0.0.0.0:{port}"
-                    )
-                    logger.info(f"Dashboard available at http://localhost:{port}")
-                    logger.info(
-                        f"Admin token will be displayed by server startup sequence if generated/loaded."
-                    )
-                    logger.info("Press Ctrl+C to shut down the server gracefully.")
-
-                    # Show standard startup messages only if TUI is not active
-                    if not tui_active:
-                        # Show AGENT MCP banner
-                        from .tui.colors import get_responsive_agent_mcp_banner
-
-                        print()
-                        print(get_responsive_agent_mcp_banner())
-                        print()
-                        # When --uds is set, the server is listening on a
-                        # Unix domain socket, NOT a TCP port. Logging
-                        # `port {port}` here is actively misleading — a
-                        # reverse-proxy operator reading the journal sees
-                        # the wrong endpoint and concludes the binary
-                        # ignored --uds, when in fact uvicorn was
-                        # correctly configured with `uds=...` upstream
-                        # (see _uvicorn_kwargs build around line 555).
-                        if uds:
-                            print(f"🚀 MCP Server listening on UDS {uds}")
-                        else:
-                            print(f"🚀 MCP Server running on port {port}")
-                        print(f"📁 Project: {project_dir}")
-
-                        # Display admin token from database
-                        admin_token = get_admin_token_from_db(project_dir)
-                        if admin_token:
-                            print(f"🔑 Admin Token: {admin_token}")
-
-                        print()
-                        print("Next steps:")
-                        dashboard_path = (
-                            f"{project_dir}/agent_mcp/dashboard"
-                            if project_dir != "."
-                            else "agent_mcp/dashboard"
-                        )
-                        print(f"1. Open new terminal → cd {dashboard_path}")
-                        print("2. Run: npm run dev")
-                        print("3. Open: http://localhost:3847")
-                        print()
-                        print("Keep this server running. Press Ctrl+C to quit.")
-
-                    await server.serve()
-
-                    # This part is reached after server.serve() finishes (e.g., on shutdown signal)
-                    logger.info(
-                        "Uvicorn server has stopped. Waiting for background tasks to finalize..."
-                    )
-            except Exception as e:  # Catch errors during server run or task group setup
-                logger.critical(
-                    f"Fatal error during SSE server execution: {e}", exc_info=True
-                )
-                # Ensure g.server_running is false so other parts know to stop
-                g.server_running = False
-                # Consider re-raising or exiting if this is a critical unrecoverable error
-            finally:
-                logger.info("SSE server and background task group scope exited.")
-                # application_shutdown is called by Starlette's on_shutdown event.
-
-        try:
-            anyio.run(run_sse_server_with_bg_tasks)
-        except (
-            KeyboardInterrupt
-        ):  # Should be handled by signal handlers and graceful shutdown
-            logger.info(
-                "Keyboard interrupt received by AnyIO runner. Server should be shutting down."
-            )
-        except SystemExit as e:  # Catch SystemExit from application_startup
-            logger.error(f"SystemExit caught: {e}. Server will not start.")
-            if tui_active:
-                tui = TUIDisplay()
-                tui.clear_screen()
-            sys.exit(e.code if isinstance(e.code, int) else 1)
-
-    elif transport == "stdio":
-        # Handle stdio transport (Original main.py:2639-2656 - arun function)
-        # For stdio, we don't use Uvicorn or Starlette's HTTP capabilities.
-        # We directly run the MCPLowLevelServer with stdio streams.
-
-        async def run_stdio_server_with_bg_tasks():
-            try:
-                # Perform application startup manually for stdio mode as Starlette lifecycle isn't used.
-                await application_startup(
-                    project_dir_path_str=project_dir, admin_token_param=admin_token_cli
-                )
-
-                async with anyio.create_task_group() as tg:
-                    await start_background_tasks(tg)  # Start RAG indexer etc.
-
-                    # Start TUI display loop if enabled
-                    if tui_active:
-                        await tg.start(
-                            tui_display_loop, 0, transport, project_dir
-                        )  # Port is 0 for stdio
-
-                    logger.info("Starting MCP server with stdio transport.")
-                    logger.info("Press Ctrl+C to shut down.")
-
-                    # Show standard startup messages only if TUI is not active
-                    if not tui_active:
-                        # Show AGENT MCP banner
-                        from .tui.colors import get_responsive_agent_mcp_banner
-
-                        print()
-                        print(get_responsive_agent_mcp_banner())
-                        print()
-                        print("🚀 MCP Server running (stdio transport)")
-                        print("Server is ready for AI assistant connections.")
-
-                        # Display admin token from database
-                        admin_token = get_admin_token_from_db(project_dir)
-                        if admin_token:
-                            print(f"🔑 Admin Token: {admin_token}")
-
-                        print("Use Ctrl+C to quit.")
-
-                    # Import stdio_server from mcp library
-                    try:
-                        from mcp.server.stdio import stdio_server
-                    except ImportError:
-                        logger.error(
-                            "Failed to import mcp.server.stdio. Stdio transport is unavailable."
-                        )
-                        return
-
-                    try:
-                        async with stdio_server() as streams:
-                            # mcp_app_instance is created in main_app.py and imported
-                            await mcp_app_instance.run(
-                                streams[0],  # input_stream
-                                streams[1],  # output_stream
-                                mcp_app_instance.create_initialization_options(),
-                            )
-                    except (
-                        Exception
-                    ) as e_mcp_run:  # Catch errors from mcp_app_instance.run
-                        logger.error(
-                            f"Error during MCP stdio server run: {e_mcp_run}",
-                            exc_info=True,
-                        )
-                    finally:
-                        logger.info("MCP stdio server run finished.")
-                        # Ensure g.server_running is false to stop background tasks
-                        g.server_running = False
-
-            except Exception as e:  # Catch errors during stdio setup or task group
-                logger.critical(
-                    f"Fatal error during stdio server execution: {e}", exc_info=True
-                )
-                g.server_running = False
-            finally:
-                logger.info("Stdio server and background task group scope exited.")
-                # Manually call application_shutdown for stdio mode
-                await application_shutdown()
-
-        try:
-            anyio.run(run_stdio_server_with_bg_tasks)
-        except KeyboardInterrupt:
-            logger.info(
-                "Keyboard interrupt received by AnyIO runner for stdio. Server should be shutting down."
-            )
-        except SystemExit as e:  # Catch SystemExit from application_startup
-            logger.error(f"SystemExit caught: {e}. Server will not start.")
-            if tui_active:
-                tui = TUIDisplay()
-                tui.clear_screen()
-            sys.exit(e.code if isinstance(e.code, int) else 1)
-
-    else:  # Should not happen due to click.Choice
-        logger.error(f"Invalid transport type specified: {transport}")
-        click.echo(
-            f"Error: Invalid transport type '{transport}'. Choose 'stdio' or 'sse'.",
-            err=True,
-        )
-        sys.exit(1)
-
-    logger.info("MCP Server has shut down.")
-
-    # Clear console one last time if TUI was active
-    if tui_active:
-        tui = TUIDisplay()
-        tui.clear_screen()
-
-    sys.exit(0)  # Explicitly exit after cleanup if not already exited by SystemExit
+    run_server(config)
 
 
-# --- `router` subcommand ---
-# Thin wrapper around `agent_mcp.router.app.main`. The underlying app
-# reads its config from `AGENT_MCP_*` env vars at module import time —
-# this subcommand sets defaults for them from CLI flags before doing
-# the import, so users get both an ergonomic CLI and the env-var
-# escape hatch the deploy repo currently uses.
+# --- ``router`` subcommand ------------------------------------------
+# Thin wrapper around ``agent_mcp.router.app.main``. The underlying
+# app reads its config from ``AGENT_MCP_*`` env vars at module import
+# time — this subcommand sets defaults for them from CLI flags before
+# doing the import, so users get both an ergonomic CLI and the env-
+# var escape hatch the deploy repo currently uses.
 @cli.command("router", context_settings=dict(help_option_names=["-h", "--help"]))
 @click.option(
     "--port",
@@ -790,9 +283,7 @@ def server_cmd(
         "AGENT_MCP_PROJECTS_FILE",
         str(
             Path(
-                os.environ.get(
-                    "XDG_CONFIG_HOME", str(Path.home() / ".config")
-                )
+                os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
             )
             / "agent-mcp"
             / "projects.local.json"
@@ -899,9 +390,9 @@ def router_cmd(
 ) -> None:
     """Run the always-on URL-keyed HTTP router.
 
-    The router proxies /agent-mcp/<name>/* to the per-project backend
-    over Unix-domain sockets and serves the shared Next.js dashboard
-    + index page at /agent-mcp/.
+    The router proxies ``/agent-mcp/<name>/*`` to the per-project
+    backend over Unix-domain sockets and serves the shared Next.js
+    static dashboard + index page at ``/agent-mcp/``.
     """
     # Promote CLI flags to env vars so the app module's import-time
     # reads pick them up. The deploy repo still sets these env vars
@@ -960,22 +451,22 @@ def router_cmd(
     # Same env-override-on-bind-host pattern as router.app.main —
     # used by the VM tests' module so qemu hostfwd can route in.
     host = os.environ.get("AGENT_MCP_ROUTER_HOST", "127.0.0.1")
-    # `shutdown_timeout=3.0` matches `router.app.main()` — see the
-    # comment there. Capping the aiohttp drain window paired with
-    # the `_drain_proxy_tasks` on_shutdown hook keeps the SIGTERM-
-    # to-exit window inside systemd's `TimeoutStopSec=15s`, fixing
-    # the 90 s deploy outage caused by long-lived MCP proxy streams.
+    # ``shutdown_timeout=3.0`` matches ``router.app.main()`` — capping
+    # the aiohttp drain window paired with the ``_drain_proxy_tasks``
+    # on_shutdown hook keeps the SIGTERM-to-exit window inside
+    # systemd's ``TimeoutStopSec=15s``, fixing the 90 s deploy outage
+    # caused by long-lived MCP proxy streams.
     web.run_app(app, host=host, port=port, shutdown_timeout=3.0)
 
 
-# --- Backward-compatibility shim ---
+# --- Backward-compatibility shim ------------------------------------
 # Pre-Phase-1a invocations looked like:
 #   python -m agent_mcp.cli --transport sse --uds /run/.../backend.sock \
 #                           --project-dir /path --no-tui
 # i.e. top-level flags, no subcommand. The deploy repo's wrapper
-# script (`agent-mcp-backend`) used this exact shape. We keep one
+# script (``agent-mcp-backend``) used this exact shape. We keep one
 # release of compatibility by sniffing argv and rerouting through
-# the new `server` subcommand with a DeprecationWarning. Remove in
+# the new ``server`` subcommand with a DeprecationWarning. Remove in
 # a future PR once the deploy repo has switched over.
 _TOP_LEVEL_FLAGS_THAT_NOW_BELONG_TO_SERVER = {
     "--port",
@@ -993,23 +484,23 @@ _TOP_LEVEL_FLAGS_THAT_NOW_BELONG_TO_SERVER = {
 
 def _looks_like_legacy_top_level_invocation(argv: list[str]) -> bool:
     """True iff argv[1] is a flag that used to live on the top-level
-    command but now lives under `server`. Subcommands like `server`
-    and `router` never start with `-`, so this is unambiguous."""
+    command but now lives under ``server``. Subcommands like ``server``
+    and ``router`` never start with ``-``, so this is unambiguous."""
     if len(argv) < 2:
         return False
     first = argv[1]
     if not first.startswith("-"):
         return False
-    # Accept both `--flag` and `--flag=value`.
+    # Accept both ``--flag`` and ``--flag=value``.
     head = first.split("=", 1)[0]
     return head in _TOP_LEVEL_FLAGS_THAT_NOW_BELONG_TO_SERVER
 
 
-# --- `backup` subcommand ---
+# --- ``backup`` subcommand ------------------------------------------
 # Per item 12 of the 2026-06-02 database review. The previous
 # project_context-only JSON dump was the only backup surface; this
-# is a full-DB online backup via sqlite3.Connection.backup(), which
-# is safe under WAL (doesn't block writers).
+# is a full-DB online backup via ``sqlite3.Connection.backup()``,
+# which is safe under WAL (doesn't block writers).
 @cli.command("backup", context_settings=dict(help_option_names=["-h", "--help"]))
 @click.argument(
     "project_dir",
@@ -1027,21 +518,18 @@ def _looks_like_legacy_top_level_invocation(argv: list[str]) -> bool:
 def backup_cmd(project_dir: str, output_path: str, force: bool) -> None:
     """Back up a project's SQLite database to OUTPUT_PATH.
 
-    Uses sqlite3.Connection.backup() — the canonical online backup
+    Uses ``sqlite3.Connection.backup()`` — the canonical online backup
     API. Safe to run while the server is live; readers and writers
     keep going.
 
-    PROJECT_DIR is the directory containing `.agent/mcp_state.db`
-    (the same path you'd pass to `agent-mcp server --project-dir`).
+    PROJECT_DIR is the directory containing ``.agent/mcp_state.db``
+    (the same path you'd pass to ``agent-mcp server --project-dir``).
     """
     src_path = Path(project_dir).resolve() / ".agent" / "mcp_state.db"
     dst_path = Path(output_path)
 
     if not src_path.exists():
-        click.echo(
-            f"Error: database not found at {src_path}",
-            err=True,
-        )
+        click.echo(f"Error: database not found at {src_path}", err=True)
         sys.exit(1)
 
     if dst_path.exists() and not force:
@@ -1075,7 +563,7 @@ def main() -> None:
     """Public entry point.
 
     Handles the backward-compat rewrite (legacy top-level flags →
-    `server` subcommand) before handing off to the click group.
+    ``server`` subcommand) before handing off to the click group.
     """
     if _looks_like_legacy_top_level_invocation(sys.argv):
         warnings.warn(
@@ -1089,6 +577,28 @@ def main() -> None:
     cli()
 
 
-# This allows running `python -m agent_mcp.cli --port ...`
+# Public aliases. ``main_cli`` is referenced by ``agent_mcp/__main__.py``
+# (the ``python -m agent_mcp`` entry point); pre-Phase-1a code also
+# called the inner click command ``main_cli``. Keep the alias so old
+# import paths don't break.
+main_cli = main
+
+
+# Re-export ``get_admin_token_from_db`` from this module too so any
+# external script that imported it from ``agent_mcp.cli`` pre-PR-E
+# keeps working. The canonical home is ``server_bootstrap``.
+__all__ = [
+    "backup_cmd",
+    "cli",
+    "get_admin_token_from_db",
+    "main",
+    "main_cli",
+    "router_cmd",
+    "server_cmd",
+    "_looks_like_legacy_top_level_invocation",
+]
+
+
+# This allows running ``python -m agent_mcp.cli --port …``
 if __name__ == "__main__":
     main()

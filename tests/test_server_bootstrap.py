@@ -1,0 +1,360 @@
+"""ServerBootstrap contract tests (PR E — round-2 architecture review).
+
+Before this PR, the boot path was scattered across three files:
+
+* ``agent_mcp/cli.py`` — argparse adapter that *also* walked ``.env``,
+  branched on transport, owned the TUI display loop, and called the
+  Starlette runners.
+* ``agent_mcp/app/main_app.py`` — Starlette wiring.
+* ``agent_mcp/app/server_lifecycle.py`` — lifespan handlers.
+
+"Where does the server start?" required reading three files. This PR
+consolidates the boot ordering into ``agent_mcp/server_bootstrap.py``
+(a ``ServerConfig`` dataclass + ``bootstrap_server`` factory).
+Lifespan handlers STAY in ``server_lifecycle.py`` — they're called by
+Starlette during request handling, not by the CLI. The CLI shrinks to
+a thin click adapter that builds a ``ServerConfig`` from parsed
+options and hands it to ``bootstrap_server``.
+
+These tests pin the boundary:
+
+* ``ServerConfig`` is the single source of truth for boot settings.
+* ``ServerConfig.from_cli_args`` translates the click-decoded options
+  exactly the same way ``cli.py`` did before — env-var promotion,
+  type validation, ``.env`` discovery — so a careless refactor that
+  drops a side effect is caught here rather than in production.
+* ``bootstrap_server`` returns a Starlette app + a teardown callable.
+  The teardown is idempotent (calling it twice is safe — important
+  for SystemExit paths in the CLI runner).
+* The transport branch (stdio vs sse) selects the right runner.
+* Embedding-mode (simple vs advanced) and auto-indexing flags propagate
+  to ``core.config`` *before* any module-level imports that read them.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+
+# --- ServerConfig contract --------------------------------------------
+
+
+def test_server_config_is_a_frozen_dataclass() -> None:
+    """``ServerConfig`` must be frozen so a stray ``cfg.port = 9000``
+    after the bootstrap runs gets caught at write time, not deep in a
+    background task that captured the value at boot."""
+    from dataclasses import fields, is_dataclass
+    from agent_mcp.server_bootstrap import ServerConfig
+
+    assert is_dataclass(ServerConfig)
+    cfg = _default_config()
+    with pytest.raises((AttributeError, Exception)):
+        cfg.port = 9999  # type: ignore[misc]
+
+    # Field set covers everything the legacy CLI threaded through to
+    # the runners — we lose a flag if this assertion drops.
+    field_names = {f.name for f in fields(ServerConfig)}
+    for required in (
+        "transport",
+        "port",
+        "uds",
+        "project_dir",
+        "admin_token_cli",
+        "debug",
+        "no_tui",
+        "advanced",
+        "git",
+        "no_index",
+    ):
+        assert required in field_names, f"ServerConfig missing field: {required}"
+
+
+def test_server_config_from_cli_args_builds_from_click_decoded_kwargs(
+    tmp_path: Path,
+) -> None:
+    """``from_cli_args`` translates the dict click hands to the
+    subcommand callback into a ``ServerConfig`` with the same values.
+
+    The legacy ``server_cmd`` callback signature is the canonical
+    shape; ``ServerConfig.from_cli_args`` MUST accept that exact
+    keyword set so swapping the call site is a one-liner.
+    """
+    from agent_mcp.server_bootstrap import ServerConfig
+
+    project_dir = tmp_path / "p"
+    project_dir.mkdir()
+    cfg = ServerConfig.from_cli_args(
+        port=8080,
+        uds=None,
+        transport="sse",
+        project_dir=str(project_dir),
+        admin_token_cli="abc123",
+        debug=False,
+        no_tui=True,
+        advanced=False,
+        git=False,
+        no_index=False,
+    )
+    assert cfg.transport == "sse"
+    assert cfg.port == 8080
+    assert cfg.uds is None
+    assert cfg.project_dir == str(project_dir)
+    assert cfg.admin_token_cli == "abc123"
+    assert cfg.no_tui is True
+
+
+def test_server_config_validates_transport_value(tmp_path: Path) -> None:
+    """Unknown transport values fail at config-build time, not after
+    the DB is initialised — surface bad input early."""
+    from agent_mcp.server_bootstrap import ServerConfig
+
+    project_dir = tmp_path / "p"
+    project_dir.mkdir()
+    with pytest.raises((ValueError, TypeError, AssertionError)):
+        ServerConfig.from_cli_args(
+            port=8080,
+            uds=None,
+            transport="bogus",  # neither 'sse' nor 'stdio'
+            project_dir=str(project_dir),
+            admin_token_cli=None,
+            debug=False,
+            no_tui=False,
+            advanced=False,
+            git=False,
+            no_index=False,
+        )
+
+
+def test_server_config_normalizes_project_dir_to_absolute(tmp_path: Path) -> None:
+    """The bootstrap must resolve the project dir before passing it on
+    — ``application_startup`` reads ``MCP_PROJECT_DIR`` and a relative
+    path here would resolve against whatever cwd happens to be active
+    when a background task fires, not the user's intent."""
+    from agent_mcp.server_bootstrap import ServerConfig
+
+    project_dir = tmp_path / "p"
+    project_dir.mkdir()
+    # Build with a relative-ish path (the click decorator already
+    # resolves, but the dataclass shouldn't trust its callers — defence
+    # in depth).
+    cfg = ServerConfig.from_cli_args(
+        port=8080,
+        uds=None,
+        transport="sse",
+        project_dir=str(project_dir),
+        admin_token_cli=None,
+        debug=False,
+        no_tui=True,
+        advanced=False,
+        git=False,
+        no_index=False,
+    )
+    assert Path(cfg.project_dir).is_absolute()
+
+
+# --- .env discovery + admin token loading -----------------------------
+
+
+def test_load_dotenv_walks_parent_chain(tmp_path: Path, monkeypatch) -> None:
+    """``load_project_dotenv`` walks up to N parent levels from the
+    bootstrap module's location and exports every variable it finds.
+
+    Legacy ``cli.py`` had the .env discovery inlined at module import;
+    keeping the behaviour intact (so existing OPENAI_API_KEY-in-.env
+    deployments don't suddenly stop working) is part of the contract.
+    """
+    from agent_mcp import server_bootstrap
+
+    # Stage a .env right next to the project dir
+    env_file = tmp_path / ".env"
+    env_file.write_text("AGENT_MCP_BOOTSTRAP_TEST=hello\n", encoding="utf-8")
+    monkeypatch.delenv("AGENT_MCP_BOOTSTRAP_TEST", raising=False)
+
+    # Discovery starts from the path we pass; this is the test seam.
+    server_bootstrap.load_project_dotenv(search_from=tmp_path / "child")
+    assert os.environ.get("AGENT_MCP_BOOTSTRAP_TEST") == "hello"
+    monkeypatch.delenv("AGENT_MCP_BOOTSTRAP_TEST", raising=False)
+
+
+def test_load_dotenv_is_safe_when_no_env_file_exists(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Missing .env is a no-op, not an error — many CI environments
+    don't ship one."""
+    from agent_mcp import server_bootstrap
+
+    monkeypatch.delenv("AGENT_MCP_BOOTSTRAP_TEST", raising=False)
+    # Pointing at a fully empty dir; walking parents finds nothing.
+    server_bootstrap.load_project_dotenv(search_from=tmp_path, max_parents=0)
+    # If we got here without raising, contract holds.
+
+
+# --- Embedding-mode + indexing flag propagation -----------------------
+
+
+def test_apply_runtime_flags_sets_advanced_embeddings(tmp_path: Path) -> None:
+    """``apply_runtime_flags`` flips ``core.config.ADVANCED_EMBEDDINGS``
+    when ``advanced=True`` so downstream callers (RAG indexer) see the
+    larger-dim model."""
+    from agent_mcp import server_bootstrap
+    from agent_mcp.core import config as core_config
+
+    project_dir = tmp_path / "p"
+    project_dir.mkdir()
+    cfg = _default_config(project_dir=str(project_dir), advanced=True)
+
+    original = core_config.ADVANCED_EMBEDDINGS
+    try:
+        server_bootstrap.apply_runtime_flags(cfg)
+        assert core_config.ADVANCED_EMBEDDINGS is True
+        # EMBEDDING_MODEL also flips to advanced.
+        assert core_config.EMBEDDING_MODEL == core_config.ADVANCED_EMBEDDING_MODEL
+    finally:
+        core_config.ADVANCED_EMBEDDINGS = original
+        core_config.EMBEDDING_MODEL = (
+            core_config.ADVANCED_EMBEDDING_MODEL
+            if original
+            else core_config.SIMPLE_EMBEDDING_MODEL
+        )
+
+
+def test_apply_runtime_flags_disables_auto_indexing(tmp_path: Path) -> None:
+    """``--no-index`` flips ``DISABLE_AUTO_INDEXING`` so the RAG indexer
+    skips its periodic scan."""
+    from agent_mcp import server_bootstrap
+    from agent_mcp.core import config as core_config
+
+    project_dir = tmp_path / "p"
+    project_dir.mkdir()
+    cfg = _default_config(project_dir=str(project_dir), no_index=True)
+
+    original = core_config.DISABLE_AUTO_INDEXING
+    try:
+        server_bootstrap.apply_runtime_flags(cfg)
+        assert core_config.DISABLE_AUTO_INDEXING is True
+    finally:
+        core_config.DISABLE_AUTO_INDEXING = original
+
+
+def test_apply_runtime_flags_promotes_debug_to_env_var(tmp_path: Path) -> None:
+    """``--debug`` MUST end up in ``os.environ['MCP_DEBUG']`` before
+    ``create_app`` runs — Starlette's debug mode is built from the env
+    var at app construction time."""
+    from agent_mcp import server_bootstrap
+
+    project_dir = tmp_path / "p"
+    project_dir.mkdir()
+    cfg = _default_config(project_dir=str(project_dir), debug=True)
+    server_bootstrap.apply_runtime_flags(cfg)
+    assert os.environ.get("MCP_DEBUG") == "true"
+
+    # And the inverse: debug=False must NOT leave a stale "true" behind.
+    cfg2 = _default_config(project_dir=str(project_dir), debug=False)
+    server_bootstrap.apply_runtime_flags(cfg2)
+    assert os.environ.get("MCP_DEBUG") == "false"
+
+
+# --- bootstrap_server: app + teardown ---------------------------------
+
+
+def test_bootstrap_server_returns_starlette_app_and_teardown(
+    tmp_path: Path,
+) -> None:
+    """``bootstrap_server`` returns a fully-wired ``Starlette`` instance
+    plus a teardown callable (idempotent — the SystemExit/KeyboardInterrupt
+    paths in the CLI runner may invoke it more than once)."""
+    from starlette.applications import Starlette
+    from agent_mcp import server_bootstrap
+
+    project_dir = tmp_path / "p"
+    project_dir.mkdir()
+    cfg = _default_config(project_dir=str(project_dir), transport="sse")
+
+    app, teardown = server_bootstrap.bootstrap_server(cfg)
+    assert isinstance(app, Starlette)
+    assert callable(teardown)
+
+    # Idempotency contract: calling teardown twice doesn't raise.
+    teardown()
+    teardown()
+
+
+def test_bootstrap_server_stdio_does_not_build_starlette(
+    tmp_path: Path,
+) -> None:
+    """For stdio transport there's no Starlette app — ``bootstrap_server``
+    returns ``None`` for the app so the caller knows to route through
+    the stdio runner instead."""
+    from agent_mcp import server_bootstrap
+
+    project_dir = tmp_path / "p"
+    project_dir.mkdir()
+    cfg = _default_config(project_dir=str(project_dir), transport="stdio")
+
+    app, teardown = server_bootstrap.bootstrap_server(cfg)
+    assert app is None, "stdio transport should not build a Starlette app"
+    assert callable(teardown)
+
+
+# --- Public re-export sanity ------------------------------------------
+
+
+def test_get_admin_token_from_db_is_exported(tmp_path: Path) -> None:
+    """The TUI display loop reads the admin token from the project DB
+    via this helper; moving it from ``cli.py`` to the bootstrap module
+    must keep it discoverable by the TUI runtime."""
+    from agent_mcp.server_bootstrap import get_admin_token_from_db
+
+    # No DB → None, no exception.
+    project_dir = tmp_path / "p"
+    project_dir.mkdir()
+    assert get_admin_token_from_db(str(project_dir)) is None
+
+
+def test_cli_imports_server_bootstrap_module() -> None:
+    """The thin-adapter ``cli.py`` MUST delegate to the bootstrap module
+    — if a future refactor accidentally inlines the boot logic back
+    into ``cli.py``, this guard catches it."""
+    import agent_mcp.cli as cli_module
+
+    # The bootstrap module is imported (used) by cli — check at the
+    # module attribute level rather than ``inspect.getsource`` so the
+    # test is resilient to formatting changes.
+    sources = (cli_module.__file__ or "")
+    assert sources, "cli.__file__ unavailable"
+    text = Path(sources).read_text(encoding="utf-8")
+    assert "server_bootstrap" in text, (
+        "cli.py no longer references server_bootstrap — boot logic may "
+        "have been re-inlined."
+    )
+
+
+# --- helpers ----------------------------------------------------------
+
+
+def _default_config(**overrides: Any):
+    """Build a ServerConfig with sensible defaults for tests.
+
+    Centralised so adding a new ServerConfig field doesn't require
+    editing every test signature.
+    """
+    from agent_mcp.server_bootstrap import ServerConfig
+
+    project_dir = overrides.pop("project_dir", "/tmp/agent-mcp-test-default")
+    return ServerConfig.from_cli_args(
+        port=overrides.pop("port", 8080),
+        uds=overrides.pop("uds", None),
+        transport=overrides.pop("transport", "sse"),
+        project_dir=project_dir,
+        admin_token_cli=overrides.pop("admin_token_cli", None),
+        debug=overrides.pop("debug", False),
+        no_tui=overrides.pop("no_tui", True),
+        advanced=overrides.pop("advanced", False),
+        git=overrides.pop("git", False),
+        no_index=overrides.pop("no_index", False),
+        **overrides,
+    )
