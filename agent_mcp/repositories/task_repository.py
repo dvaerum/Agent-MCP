@@ -363,6 +363,18 @@ class TaskRepository:
         legacy semantics so callers that today branch on a falsy
         return don't need to change.
         """
+        # sqlite3 cursor path (PR #152) — caller owns BEGIN/COMMIT.
+        if connection is not None and not hasattr(connection, "query"):
+            ok = self._update_fields_with_cursor(
+                connection, task_id, fields,
+            )
+            if not ok:
+                return None
+            # Caller's transaction is still open; defer cache + publish
+            # to post-commit. Return a thin dict carrying the changed
+            # fields so the caller can wire them into their response.
+            return {"task_id": task_id, **fields}
+
         if connection is not None:
             ok = self._update_fields_with_session(
                 connection, task_id, fields,
@@ -385,6 +397,56 @@ class TaskRepository:
             {"task_id": task_id, "fields": list(fields.keys())},
         )
         return fresh
+
+    def _update_fields_with_cursor(
+        self,
+        cursor: Any,
+        task_id: str,
+        fields: Dict[str, Any],
+    ) -> bool:
+        """Internal helper for the sqlite3.Cursor seam path.
+
+        Mirrors the allowlist + JSON-serialisation logic the standalone
+        ``update_task_fields_in_db`` does, but writes via raw SQL
+        against the caller's cursor so the wider BEGIN/COMMIT stays
+        atomic.
+        """
+        if not task_id or not fields:
+            return False
+
+        sanitised: Dict[str, Any] = {}
+        for field, value in fields.items():
+            if field not in _MUTABLE_FIELDS:
+                logger.warning(
+                    f"Attempted to update invalid task field via cursor: "
+                    f"{field} for task {task_id}. Skipping."
+                )
+                continue
+            if field in _JSON_LIST_FIELDS:
+                sanitised[field] = json.dumps(value or [])
+            else:
+                sanitised[field] = value
+
+        if not sanitised:
+            return False
+
+        now = datetime.datetime.now().isoformat()
+        set_parts = [f"{f} = ?" for f in sanitised.keys()]
+        set_parts.append("updated_at = ?")
+        sql = (
+            f"UPDATE tasks SET {', '.join(set_parts)} WHERE task_id = ?"
+        )
+        params = list(sanitised.values()) + [now, task_id]
+        try:
+            cursor.execute(sql, params)
+            return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(
+                f"Database error updating task '{task_id}' via shared "
+                f"cursor: {e}",
+                exc_info=True,
+            )
+            return False
 
     def _update_fields_with_session(
         self,

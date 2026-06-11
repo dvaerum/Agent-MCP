@@ -242,22 +242,23 @@ async def create_agent_tool_impl(
                 )
             ]
 
-        # Insert into Database (main.py:1107-1117)
-        cursor.execute(
-            """
-            INSERT INTO agents (token, agent_id, capabilities, created_at, status, working_directory, color, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-            (
-                new_agent_token,
-                agent_id,
-                capabilities_json,
-                created_at_iso,
-                status,
-                agent_working_dir_abs,
-                agent_color,
-                created_at_iso,  # updated_at initially same as created_at
-            ),
+        # PR 6: agent INSERT goes through agent_repo with the caller's
+        # cursor so the agent row lands in the same transaction as the
+        # subsequent agent_actions audit log + task UPDATEs. The repo
+        # defers cache write + EventBus publish until we call
+        # `upsert_cache` post-commit (see below) — that way a rollback
+        # can't desync the cache.
+        from ..repositories import agent_repo, task_repo
+
+        agent_repo.create(
+            token=new_agent_token,
+            agent_id=agent_id,
+            capabilities=normalized_caps,
+            status=status,
+            current_task=None,
+            working_directory=agent_working_dir_abs,
+            color=agent_color,
+            connection=cursor,
         )
 
         # Log action to agent_actions table (main.py:1119)
@@ -272,40 +273,24 @@ async def create_agent_tool_impl(
             },
         )
 
-        # Assign tasks to the agent atomically
+        # Assign tasks to the agent atomically — each UPDATE goes
+        # through task_repo with the same cursor so the wider
+        # transaction stays intact. The repo defers cache + publish on
+        # the connection= path; we reconcile the in-memory cache after
+        # commit below.
         assigned_tasks = []
         for task_id in task_ids:
-            # Update task assignment
-            cursor.execute(
-                "UPDATE tasks SET assigned_to = ?, status = 'pending', updated_at = ? WHERE task_id = ?",
-                (agent_id, created_at_iso, task_id),
+            updated = task_repo.update_fields(
+                task_id,
+                {"assigned_to": agent_id, "status": "pending"},
+                connection=cursor,
             )
-
-            if cursor.rowcount == 0:
-                # This should not happen since we validated earlier, but let's be safe
+            if not updated:
+                # Should not happen since we validated earlier.
                 raise Exception(
                     f"Failed to assign task '{task_id}' to agent '{agent_id}'"
                 )
-
             assigned_tasks.append(task_id)
-
-            # Update the in-memory global cache (g.tasks) to reflect the assignment
-            if task_id in g.tasks:
-                g.tasks[task_id]["assigned_to"] = agent_id
-                g.tasks[task_id]["status"] = "pending"
-                g.tasks[task_id]["updated_at"] = created_at_iso
-            else:
-                # If task not in cache, fetch from database and add to cache
-                cursor.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
-                task_row = cursor.fetchone()
-                if task_row:
-                    task_data = dict(task_row)
-                    task_data["assigned_to"] = (
-                        agent_id  # Ensure assignment is reflected
-                    )
-                    task_data["status"] = "pending"
-                    task_data["updated_at"] = created_at_iso
-                    g.tasks[task_id] = task_data
 
             # Log task assignment action
             log_agent_action_to_db(
@@ -319,26 +304,40 @@ async def create_agent_tool_impl(
                 },
             )
 
-        # Update agent with current task (set to first task if multiple)
+        # Update agent with current task (set to first task if multiple).
+        # PR 6: now goes through agent_repo with the caller's cursor —
+        # the seam handles the raw-SQL UPDATE atomically with the
+        # surrounding transaction.
         if assigned_tasks:
-            cursor.execute(
-                "UPDATE agents SET current_task = ? WHERE agent_id = ?",
-                (assigned_tasks[0], agent_id),
+            agent_repo.update_field(
+                agent_id, "current_task", assigned_tasks[0],
+                connection=cursor,
             )
 
         # Commit the transaction (agent creation + task assignments)
         conn.commit()
 
-        # Update in-memory state (main.py:1126-1133)
-        g.active_agents[new_agent_token] = {
+        # PR 6: now that the transaction committed, reconcile caches
+        # through the repos. upsert_cache is the documented escape
+        # hatch for callers that own their own transactions.
+        agent_repo.upsert_cache({
+            "token": new_agent_token,
             "agent_id": agent_id,
             "capabilities": normalized_caps,
             "created_at": created_at_iso,
             "status": status,
             "current_task": assigned_tasks[0] if assigned_tasks else None,
             "color": agent_color,
-        }
-        g.agent_working_dirs[agent_id] = agent_working_dir_abs
+            "working_directory": agent_working_dir_abs,
+            "terminated_at": None,
+            "updated_at": created_at_iso,
+        })
+        # Refresh task cache from DB so the assigned_to/status/updated_at
+        # all reflect what landed. Cheap (one PK lookup per task).
+        for task_id in assigned_tasks:
+            fresh = task_repo.get_by_id(task_id)
+            if fresh is not None:
+                task_repo.upsert_cache(fresh)
 
         # Log to audit log file (main.py:1136-1144)
         log_audit(
@@ -741,25 +740,17 @@ async def terminate_agent_tool_impl(
                     )
                 ]
 
-        # Update agent status in Database (main.py:1295-1302)
-        terminated_at_iso = datetime.datetime.now().isoformat()
-        cursor.execute(
-            """
-            UPDATE agents SET status = ?, terminated_at = ?, updated_at = ?, current_task = NULL
-            WHERE agent_id = ? AND status != ? 
-        """,
-            (
-                "terminated",
-                terminated_at_iso,
-                terminated_at_iso,
-                agent_id_to_terminate,
-                "terminated",
-            ),
+        # PR 6: terminate UPDATE goes through agent_repo with the
+        # caller's cursor so it stays atomic with the agent_actions
+        # audit-log INSERT below. The repo defers cache eviction +
+        # `agent.terminated` publish to the post-commit step.
+        from ..repositories import agent_repo
+        ok = agent_repo.terminate(
+            agent_id_to_terminate, connection=cursor,
         )
-        # Set current_task to NULL as well.
 
         if (
-            cursor.rowcount == 0 and not found_agent_token
+            not ok and not found_agent_token
         ):  # If DB check didn't find it initially and update affected 0 rows
             return [
                 mcp_types.TextContent(
@@ -776,11 +767,13 @@ async def terminate_agent_tool_impl(
         )
         conn.commit()
 
-        # Remove from active in-memory state if present (main.py:1309-1311)
-        if found_agent_token and found_agent_token in g.active_agents:
-            del g.active_agents[found_agent_token]
-        if agent_id_to_terminate in g.agent_working_dirs:
-            del g.agent_working_dirs[agent_id_to_terminate]
+        # Post-commit cache reconciliation through the repo. Mirrors
+        # the manual evictions the legacy code did inline; the repo's
+        # `evict_from_cache` handles both the token-keyed and
+        # agent_id-keyed maps in lockstep.
+        agent_repo.evict_from_cache(
+            agent_id_to_terminate, token=found_agent_token,
+        )
 
         # Release any files held by this agent from g.file_map
         files_released_count = 0
@@ -982,97 +975,37 @@ async def get_agent_tokens_tool_impl(
     if sort_order.upper() not in ["ASC", "DESC"]:
         sort_order = "DESC"
 
-    conn = None
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        # PR 6: filter + count go through AgentRepository.query — the
+        # repo owns the WHERE-building loop and the pagination total.
+        from ..repositories import agent_repo
 
-        # Build dynamic query
-        base_query = """
-            SELECT token, agent_id, status, created_at
-            FROM agents
-            WHERE 1=1
-        """
+        rows, total_count = agent_repo.query({
+            "status": filter_status,
+            "agent_id_pattern": filter_agent_id_pattern,
+            "include_terminated": include_terminated,
+            "created_after": filter_created_after,
+            "created_before": filter_created_before,
+            "sort_by": sort_by,
+            "sort_order": sort_order,
+            "limit": limit,
+            "offset": offset,
+        })
 
-        query_params = []
-
-        # Apply filters
-        if filter_status:
-            base_query += " AND status = ?"
-            query_params.append(filter_status)
-
-        if filter_agent_id_pattern:
-            base_query += " AND agent_id LIKE ?"
-            query_params.append(filter_agent_id_pattern)
-
-        if not include_terminated:
-            base_query += " AND status != ?"
-            query_params.append("terminated")
-
-        if filter_created_after:
-            base_query += " AND created_at >= ?"
-            query_params.append(filter_created_after)
-
-        if filter_created_before:
-            base_query += " AND created_at <= ?"
-            query_params.append(filter_created_before)
-
-        # Add sorting and pagination
-        base_query += f" ORDER BY {sort_by} {sort_order}"
-        base_query += " LIMIT ? OFFSET ?"
-        query_params.extend([limit, offset])
-
-        # Execute query
-        cursor.execute(base_query, query_params)
-        rows = cursor.fetchall()
-
-        # Process results
+        # Mask sensitive data the same way the legacy inline path did.
         agents_data = []
         for row in rows:
             agent_data = dict(row)
-
-            # Handle sensitive data
             if not include_sensitive_data:
-                # Mask the token for security
                 if "token" in agent_data:
                     token_value = agent_data["token"]
                     if token_value and len(token_value) > 8:
-                        agent_data["token"] = token_value[:4] + "..." + token_value[-4:]
+                        agent_data["token"] = (
+                            token_value[:4] + "..." + token_value[-4:]
+                        )
                     else:
                         agent_data["token"] = "***"
-
             agents_data.append(agent_data)
-
-        # Get total count for pagination info
-        count_query = """
-            SELECT COUNT(*) as total
-            FROM agents
-            WHERE 1=1
-        """
-
-        count_params = []
-        if filter_status:
-            count_query += " AND status = ?"
-            count_params.append(filter_status)
-
-        if filter_agent_id_pattern:
-            count_query += " AND agent_id LIKE ?"
-            count_params.append(filter_agent_id_pattern)
-
-        if not include_terminated:
-            count_query += " AND status != ?"
-            count_params.append("terminated")
-
-        if filter_created_after:
-            count_query += " AND created_at >= ?"
-            count_params.append(filter_created_after)
-
-        if filter_created_before:
-            count_query += " AND created_at <= ?"
-            count_params.append(filter_created_before)
-
-        cursor.execute(count_query, count_params)
-        total_count = cursor.fetchone()[0]
 
         # Log this access
         log_audit(
@@ -1135,9 +1068,6 @@ async def get_agent_tokens_tool_impl(
                 type="text", text=f"Unexpected error retrieving agent tokens: {e}"
             )
         ]
-    finally:
-        if conn:
-            conn.close()
 
 
 # --- relaunch_agent tool ---
@@ -1219,16 +1149,21 @@ async def relaunch_agent_tool_impl(
         agent_token = agent_data.get("token")
         if generate_new_token:
             agent_token = generate_token()
+            # `token` isn't in agent_repo.update_field's allowlist by
+            # design (the token is the auth secret; rotating it lives
+            # in the relaunch flow, not the generic field-update
+            # surface). Keep this UPDATE on the cursor.
             cursor.execute(
                 "UPDATE agents SET token = ? WHERE agent_id = ?",
                 (agent_token, agent_id),
             )
 
-        # Update agent status to active
+        # PR 6: status flip goes through agent_repo with the caller's
+        # cursor so it stays atomic with the audit-log INSERT below.
+        from ..repositories import agent_repo
         updated_at_iso = datetime.datetime.now().isoformat()
-        cursor.execute(
-            "UPDATE agents SET status = ?, updated_at = ? WHERE agent_id = ?",
-            ("active", updated_at_iso, agent_id),
+        agent_repo.update_field(
+            agent_id, "status", "active", connection=cursor,
         )
 
         # Build and send new prompt
@@ -1243,10 +1178,9 @@ async def relaunch_agent_tool_impl(
 
         except Exception as e_prompt:
             logger.error(f"Failed to build or send prompt for relaunch: {e_prompt}")
-            # Revert status change
-            cursor.execute(
-                "UPDATE agents SET status = ? WHERE agent_id = ?",
-                (current_status, agent_id),
+            # Revert status change via repo on the same cursor.
+            agent_repo.update_field(
+                agent_id, "status", current_status, connection=cursor,
             )
             conn.commit()
             return [

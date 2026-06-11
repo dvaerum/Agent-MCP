@@ -54,7 +54,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import json
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -185,6 +185,101 @@ class AgentRepository:
         dashboard ``/api/all-data``) go through here.
         """
         return get_all_active_agents_from_db()
+
+    def query(
+        self,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Run a filtered SELECT and return (page, total_count).
+
+        Replaces the inline filter+count SQL in
+        ``view_agents_tool_impl`` (admin_tools.py).
+
+        Recognised filter keys:
+
+        * ``status`` (str)            — exact status match
+        * ``agent_id_pattern`` (str)  — LIKE pattern on ``agent_id``
+        * ``include_terminated`` (bool, default True) — when False,
+          excludes ``status='terminated'`` rows.
+        * ``created_after`` (str)     — ``created_at >= created_after``
+        * ``created_before`` (str)    — ``created_at <= created_before``
+        * ``sort_by`` (str)           — one of {agent_id, status,
+          created_at, terminated_at}; defaults to ``created_at``.
+        * ``sort_order`` (str)        — ``ASC`` or ``DESC``;
+          defaults to ``DESC``.
+        * ``limit`` (int, default 50)
+        * ``offset`` (int, default 0)
+
+        Returns ``(rows, total)`` where ``rows`` is the page and
+        ``total`` is the unfiltered row count for the filter set.
+        On DB error returns ``([], 0)``.
+        """
+        from sqlalchemy import func
+
+        filters = filters or {}
+        allowed_sort = {
+            "agent_id", "status", "created_at", "terminated_at",
+        }
+        sort_by = filters.get("sort_by", "created_at")
+        if sort_by not in allowed_sort:
+            sort_by = "created_at"
+        sort_order = (filters.get("sort_order") or "DESC").upper()
+        if sort_order not in ("ASC", "DESC"):
+            sort_order = "DESC"
+        limit = int(filters.get("limit", 50))
+        offset = int(filters.get("offset", 0))
+        if limit < 1:
+            limit = 1
+        if offset < 0:
+            offset = 0
+        include_terminated = filters.get("include_terminated", True)
+        filter_status = filters.get("status")
+        filter_pattern = filters.get("agent_id_pattern")
+        filter_after = filters.get("created_after")
+        filter_before = filters.get("created_before")
+
+        try:
+            with get_session() as session:
+                q = session.query(Agent)
+                if filter_status:
+                    q = q.filter(Agent.status == filter_status)
+                if filter_pattern:
+                    q = q.filter(Agent.agent_id.like(filter_pattern))
+                if not include_terminated:
+                    q = q.filter(Agent.status != "terminated")
+                if filter_after:
+                    q = q.filter(Agent.created_at >= filter_after)
+                if filter_before:
+                    q = q.filter(Agent.created_at <= filter_before)
+
+                total = q.with_entities(func.count(Agent.agent_id)).scalar() or 0
+
+                sort_col = getattr(Agent, sort_by)
+                if sort_order == "ASC":
+                    q = q.order_by(sort_col.asc())
+                else:
+                    q = q.order_by(sort_col.desc())
+
+                rows = q.limit(limit).offset(offset).all()
+                return [
+                    {
+                        "token": r.token,
+                        "agent_id": r.agent_id,
+                        "status": r.status,
+                        "created_at": r.created_at,
+                    }
+                    for r in rows
+                ], int(total)
+        except SQLAlchemyError as e:
+            logger.error(
+                f"Database error querying agents: {e}", exc_info=True,
+            )
+            return [], 0
+        except Exception as e:
+            logger.error(
+                f"Unexpected error querying agents: {e}", exc_info=True,
+            )
+            return [], 0
 
     def get_working_directory(self, agent_id: str) -> Optional[str]:
         """Return the working directory for ``agent_id``, or ``None``.
@@ -364,6 +459,19 @@ class AgentRepository:
           * ``"agent.status_changed"`` when ``field_name == "status"``.
           * ``"agent.updated"`` for every other allowlisted field.
         """
+        # sqlite3 cursor path: caller owns BEGIN/COMMIT. PR #152.
+        if connection is not None and not hasattr(connection, "query"):
+            ok = self._update_field_with_cursor(
+                connection, agent_id, field_name, new_value,
+            )
+            if not ok:
+                return None
+            # Caller owns transaction — cache + publish deferred to
+            # them (post-commit). Return a thin shape carrying only
+            # the field that changed so they can wire it into their
+            # own response.
+            return {"agent_id": agent_id, field_name: new_value}
+
         if connection is not None:
             ok = self._update_field_with_session(
                 connection, agent_id, field_name, new_value,
@@ -396,6 +504,51 @@ class AgentRepository:
             {"agent_id": agent_id, "field": field_name, "value": new_value},
         )
         return fresh
+
+    def _update_field_with_cursor(
+        self,
+        cursor: Any,
+        agent_id: str,
+        field_name: str,
+        new_value: Any,
+    ) -> bool:
+        """Internal helper for the sqlite3.Cursor ``connection=`` path.
+
+        Mirrors the allowlist + capabilities-normalisation logic of
+        :func:`update_agent_db_field` but writes via raw SQL against
+        the caller's cursor so the wider BEGIN/COMMIT stays atomic.
+        """
+        if field_name not in _MUTABLE_FIELDS:
+            logger.error(
+                f"Attempted to update an invalid or unsupported agent "
+                f"field via shared cursor: {field_name}"
+            )
+            return False
+
+        value_to_set = new_value
+        if field_name == "capabilities":
+            from ..utils.capability_normalization import normalize_capabilities
+            value_to_set = json.dumps(normalize_capabilities(new_value))
+        elif field_name == "auto_event_loop":
+            value_to_set = 1 if new_value else 0
+        elif field_name == "updated_at" and new_value is None:
+            value_to_set = datetime.datetime.now().isoformat()
+
+        now = datetime.datetime.now().isoformat()
+        try:
+            cursor.execute(
+                f"UPDATE agents SET {field_name} = ?, updated_at = ? "
+                f"WHERE agent_id = ?",
+                (value_to_set, now, agent_id),
+            )
+            return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(
+                f"Database error updating agent '{agent_id}' field "
+                f"'{field_name}' via shared cursor: {e}",
+                exc_info=True,
+            )
+            return False
 
     def _update_field_with_session(
         self,
