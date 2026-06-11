@@ -25,6 +25,7 @@ from typing import NoReturn
 from ..core.config import logger
 from ..core import globals as g
 from ..db.connection import get_db_connection
+from ..repositories import message_repo
 
 
 # Default loop interval (24 hours). Settable via env for tests / ops.
@@ -75,6 +76,12 @@ def prune_old_messages() -> int:
 
     Returns the number of rows deleted. Safe to call when retention is
     disabled (returns 0 without touching the table).
+
+    PR 9 (Message flip): the DELETE goes through
+    ``message_repo.prune_read_before`` so the only DELETE against
+    ``agent_messages`` lives in one place. The repo wraps SQLAlchemy
+    error handling identically; behaviour on the read-and-old tail
+    is unchanged.
     """
     days = _read_retention_days()
     if days <= 0:
@@ -82,34 +89,14 @@ def prune_old_messages() -> int:
 
     cutoff = (datetime.datetime.now() - datetime.timedelta(days=days)).isoformat()
 
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "DELETE FROM agent_messages WHERE read = 1 AND timestamp < ?",
-            (cutoff,),
+    deleted = message_repo.prune_read_before(cutoff)
+    if deleted:
+        logger.info(
+            "Message retention: deleted %d read messages older than %s "
+            "(retention=%d days)",
+            deleted, cutoff, days,
         )
-        deleted = cursor.rowcount
-        conn.commit()
-        if deleted:
-            logger.info(
-                "Message retention: deleted %d read messages older than %s "
-                "(retention=%d days)",
-                deleted, cutoff, days,
-            )
-        return deleted
-    except Exception as e:
-        logger.error("Message retention pruner failed: %s", e, exc_info=True)
-        if conn:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-        return 0
-    finally:
-        if conn:
-            conn.close()
+    return deleted
 
 
 async def run_message_retention_periodically(

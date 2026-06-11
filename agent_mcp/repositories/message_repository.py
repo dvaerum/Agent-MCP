@@ -17,12 +17,6 @@ EventBus seam — but the class identity matters for the same reasons:
   publish" — subscribers don't have to poll the DB to notice new
   messages.
 
-The class delegates DB I/O to the existing helpers in
-:mod:`agent_mcp.db.actions.agent_messages_db` and the SQLAlchemy ORM
-layer behind them — no SQL gets re-written here. The class is the
-*seam* between business logic and persistence, not a re-implementation
-of either.
-
 Event types published (subscribers can route by exact string):
 
 * ``"message.created"`` — emitted by ``send`` on success; emitted by
@@ -52,29 +46,357 @@ The old module-of-functions ``agent_mcp.core.repositories.message_repo``
 stays alive — every call site that imports the module form keeps
 working with no edits. The class form is the new canonical surface;
 existing-call-site migration follows in PR 6 of the series.
+
+PR 9 of the architecture-review series — the "Message flip". Until
+this PR the class delegated DB I/O to the helpers in
+``agent_mcp.db.actions.agent_messages_db``: handler → repo →
+db/actions → SQL. Two layers, not one — the "single ownership" the
+class claims in its docstring did not match the code.
+
+After the flip:
+
+* All read/write SQL bodies live here (module-level functions for the
+  legacy free-function API, instance methods for the EventBus-aware
+  surface).
+* ``agent_mcp.db.actions.agent_messages_db`` is a re-export shim that
+  keeps legacy importers (``app.routes`` broadcast,
+  ``core.repositories.message_repo`` free-function form,
+  ``tests/test_sqlalchemy_agent_message.py``,
+  ``tests/test_repository_message.py``) working unchanged.
+* ``MessageRepository`` is the single owner — handler → repo → SQL.
 """
 from __future__ import annotations
 
 import contextlib
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
-from sqlalchemy import distinct, or_, select, update as sa_update
+from sqlalchemy import (
+    delete as sa_delete,
+    distinct,
+    func,
+    insert as sa_insert,
+    or_,
+    select,
+    update as sa_update,
+)
 from sqlalchemy.exc import SQLAlchemyError
 
 from ..core.config import logger
-from ..core.repositories import _event_bus_shim
-from ..db.actions.agent_messages_db import (
-    _message_to_dict,
-    bulk_insert_messages,
-    count_unread_for_recipient,
-    delete_message as _db_delete_message,
-    get_message_by_id as _db_get_message_by_id,
-    insert_message,
-    mark_delivered as _db_mark_delivered,
-    mark_read_for_recipient as _db_mark_read_for_recipient,
-)
+# NOTE: we import the bus shim lazily inside the publish call sites
+# below via ``_publish``. A top-level
+# ``from ..core.repositories import _event_bus_shim`` would execute
+# ``core.repositories.__init__``, which eagerly imports the legacy
+# module-of-functions ``core.repositories.message_repo``, which in
+# turn imports ``db.actions.agent_messages_db`` — now a shim that
+# re-exports from THIS module. That produces a circular import at
+# first load. The lazy import inside ``_publish`` breaks the cycle
+# without changing publish semantics (the shim is itself lazy-
+# imports event_bus on every call, so call-site latency is
+# unaffected). Mirrors the pattern PR #153 (Task flip) / PR #154
+# (Agent flip) introduced when they hit the same hazard.
 from ..db.engine import get_session
 from ..db.models import Agent, AgentMessage
+
+
+def _publish(addressee: str, event: str, payload: Dict[str, Any]) -> None:
+    """Lazy-import shim around ``_event_bus_shim.publish``.
+
+    Importing the submodule path directly under ``core.repositories``
+    via ``from ... import _event_bus_shim`` would still trigger
+    ``core.repositories.__init__`` (which eagerly imports the legacy
+    ``message_repo`` module-of-functions, which imports the shim at
+    ``db.actions.agent_messages_db``, which now re-exports from THIS
+    module — circular). Doing the import at call time keeps the
+    publish side-effect identical while avoiding the cycle.
+    """
+    from ..core.repositories import _event_bus_shim
+
+    _event_bus_shim.publish(addressee, event, payload)
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers — formerly lived in db/actions/agent_messages_db.py.
+# Both the class methods below and the re-export shim at
+# ``agent_mcp.db.actions.agent_messages_db`` consume these.
+#
+# Behaviour is byte-for-byte identical to the pre-flip helpers (same
+# SQLAlchemy ORM model, same commit semantics, same logging shape).
+# Tests pin the helpers via their public names; renaming any of these
+# would break the shim's re-export contract.
+# ---------------------------------------------------------------------------
+
+
+def _message_to_dict(row: AgentMessage) -> Dict[str, Any]:
+    """Project an ``AgentMessage`` ORM row into the dict shape consumers
+    expect. Mirrors the pre-cutover ``dict(sqlite_row)`` projection."""
+    return {
+        "message_id": row.message_id,
+        "sender_id": row.sender_id,
+        "recipient_id": row.recipient_id,
+        "message_content": row.message_content,
+        "message_type": row.message_type,
+        "priority": row.priority,
+        "timestamp": row.timestamp,
+        "delivered": bool(row.delivered),
+        "read": bool(row.read),
+        # v5.0.22 message-threads + subjects.
+        "subject": row.subject,
+        "parent_message_id": row.parent_message_id,
+    }
+
+
+def get_message_by_id(message_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch a single message by id. Returns None if not found."""
+    try:
+        with get_session() as session:
+            row = (
+                session.query(AgentMessage)
+                .filter(AgentMessage.message_id == message_id)
+                .one_or_none()
+            )
+            return _message_to_dict(row) if row is not None else None
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error fetching message '{message_id}': {e}",
+            exc_info=True,
+        )
+        return None
+    except Exception as e:
+        logger.error(
+            f"Unexpected error fetching message '{message_id}': {e}",
+            exc_info=True,
+        )
+        return None
+
+
+def insert_message(
+    *,
+    message_id: str,
+    sender_id: str,
+    recipient_id: str,
+    message_content: str,
+    message_type: str,
+    priority: str,
+    timestamp: str,
+    delivered: bool = False,
+    read: bool = False,
+) -> bool:
+    """INSERT a single message row.
+
+    All NOT NULL columns are required as keyword arguments to match
+    the schema's strictness (and to catch missing fields at the call
+    site instead of as a sqlite IntegrityError at runtime).
+    """
+    try:
+        with get_session() as session:
+            row = AgentMessage(
+                message_id=message_id,
+                sender_id=sender_id,
+                recipient_id=recipient_id,
+                message_content=message_content,
+                message_type=message_type,
+                priority=priority,
+                timestamp=timestamp,
+                delivered=delivered,
+                read=read,
+            )
+            session.add(row)
+            session.commit()
+            return True
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error inserting message '{message_id}': {e}",
+            exc_info=True,
+        )
+        return False
+    except Exception as e:
+        logger.error(
+            f"Unexpected error inserting message '{message_id}': {e}",
+            exc_info=True,
+        )
+        return False
+
+
+def bulk_insert_messages(rows: Iterable[Dict[str, Any]]) -> int:
+    """INSERT many messages in a single executemany-style statement.
+
+    Used by the dashboard broadcast route (one INSERT per recipient
+    became N INSERTs in a Python loop; this collapses them into one
+    ``INSERT ... VALUES (...), (...), ...`` round-trip via SQLAlchemy's
+    Core ``insert()`` + executemany pattern from PR #98).
+
+    Returns the count of rows actually written. Each dict must carry
+    every NOT NULL column (caller responsibility); missing keys
+    surface as a clean Python KeyError, not a sqlite IntegrityError.
+    """
+    payload: List[Dict[str, Any]] = []
+    for r in rows:
+        payload.append({
+            "message_id": r["message_id"],
+            "sender_id": r["sender_id"],
+            "recipient_id": r["recipient_id"],
+            "message_content": r["message_content"],
+            "message_type": r["message_type"],
+            "priority": r["priority"],
+            "timestamp": r["timestamp"],
+            "delivered": r.get("delivered", False),
+            "read": r.get("read", False),
+            # v5.0.22 — both default to None when not present so
+            # broadcast callers (every fan-out is a root, no reply
+            # threading) don't have to think about them. The route /
+            # tool layers compute the effective subject before calling
+            # this helper if Ollama auto-fill is desired.
+            "subject": r.get("subject"),
+            "parent_message_id": r.get("parent_message_id"),
+        })
+
+    if not payload:
+        return 0
+
+    try:
+        with get_session() as session:
+            # ``executemany`` semantics: pass a list of dicts to
+            # ``session.execute(insert(...), payload)``. SQLAlchemy
+            # batches them under the hood. With multi-row INSERT,
+            # ``result.rowcount`` is not always populated (it's an
+            # IteratorResult under the hood); rely on ``len(payload)``
+            # for the count since the all-or-nothing transaction
+            # guarantees either every row landed or none did.
+            session.execute(sa_insert(AgentMessage), payload)
+            session.commit()
+            return len(payload)
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error bulk-inserting {len(payload)} messages: {e}",
+            exc_info=True,
+        )
+        return 0
+    except Exception as e:
+        logger.error(
+            f"Unexpected error bulk-inserting messages: {e}", exc_info=True,
+        )
+        return 0
+
+
+def mark_delivered(message_id: str, delivered: bool) -> bool:
+    """Flip the ``delivered`` flag on a message. Returns False if the
+    message doesn't exist or the DB call errors."""
+    try:
+        with get_session() as session:
+            row = (
+                session.query(AgentMessage)
+                .filter(AgentMessage.message_id == message_id)
+                .one_or_none()
+            )
+            if row is None:
+                return False
+            row.delivered = delivered
+            session.commit()
+            return True
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error marking message '{message_id}' delivered: {e}",
+            exc_info=True,
+        )
+        return False
+    except Exception as e:
+        logger.error(
+            f"Unexpected error marking message '{message_id}' delivered: {e}",
+            exc_info=True,
+        )
+        return False
+
+
+def mark_read_for_recipient(recipient_id: str) -> int:
+    """Flip ``read=1`` on every unread message for a recipient.
+
+    Returns the number of rows touched (sqlite rowcount). Matches the
+    behaviour of the inline ``UPDATE agent_messages SET read = 1 WHERE
+    recipient_id = ? AND read = 0`` in ``agent_communication_tools``.
+    """
+    try:
+        with get_session() as session:
+            result = session.execute(
+                sa_update(AgentMessage)
+                .where(AgentMessage.recipient_id == recipient_id)
+                .where(AgentMessage.read.is_(False))
+                .values(read=True)
+            )
+            session.commit()
+            return result.rowcount if result.rowcount != -1 else 0
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error marking messages read for '{recipient_id}': {e}",
+            exc_info=True,
+        )
+        return 0
+    except Exception as e:
+        logger.error(
+            f"Unexpected error marking messages read for "
+            f"'{recipient_id}': {e}",
+            exc_info=True,
+        )
+        return 0
+
+
+def count_unread_for_recipient(recipient_id: str) -> int:
+    """Count unread messages for a given recipient."""
+    try:
+        with get_session() as session:
+            result = session.execute(
+                select(func.count())
+                .select_from(AgentMessage)
+                .where(AgentMessage.recipient_id == recipient_id)
+                .where(AgentMessage.read.is_(False))
+            )
+            return int(result.scalar_one())
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error counting unread for '{recipient_id}': {e}",
+            exc_info=True,
+        )
+        return 0
+    except Exception as e:
+        logger.error(
+            f"Unexpected error counting unread for '{recipient_id}': {e}",
+            exc_info=True,
+        )
+        return 0
+
+
+def delete_message(message_id: str) -> bool:
+    """DELETE a message by id. Returns False if the row didn't exist
+    or the DB call errored."""
+    try:
+        with get_session() as session:
+            result = session.execute(
+                sa_delete(AgentMessage).where(
+                    AgentMessage.message_id == message_id
+                )
+            )
+            session.commit()
+            return (result.rowcount or 0) > 0
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error deleting message '{message_id}': {e}",
+            exc_info=True,
+        )
+        return False
+    except Exception as e:
+        logger.error(
+            f"Unexpected error deleting message '{message_id}': {e}",
+            exc_info=True,
+        )
+        return False
+
+
+# Aliases used inside the class methods below — keeps the existing
+# in-class call sites (which reference ``_db_*`` names) compiling
+# without rewriting their bodies.
+_db_get_message_by_id = get_message_by_id
+_db_delete_message = delete_message
+_db_mark_delivered = mark_delivered
+_db_mark_read_for_recipient = mark_read_for_recipient
 
 
 class MessageRepository:
@@ -486,7 +808,7 @@ class MessageRepository:
         # visible to other connections, or could persist after a
         # rollback. Caller owns the publish post-commit if needed.
         if connection is None:
-            _event_bus_shim.publish(
+            _publish(
                 recipient_id,
                 "message.created",
                 {
@@ -524,7 +846,7 @@ class MessageRepository:
             if not recipient or recipient in seen:
                 continue
             seen.add(recipient)
-            _event_bus_shim.publish(
+            _publish(
                 recipient,
                 "message.created",
                 {
@@ -608,7 +930,7 @@ class MessageRepository:
         # EventBus publish only on standalone path — caller's
         # transaction is still open when ``connection=`` is supplied.
         if connection is None:
-            _event_bus_shim.publish(
+            _publish(
                 recipient,
                 "message.delivered",
                 {
@@ -628,12 +950,129 @@ class MessageRepository:
         """
         n = _db_mark_read_for_recipient(recipient_id)
         if n > 0:
-            _event_bus_shim.publish(
+            _publish(
                 recipient_id,
                 "message.read",
                 {"recipient_id": recipient_id, "count": n},
             )
         return n
+
+    def mark_read(
+        self,
+        message_id: str,
+        read: bool = True,
+        *,
+        connection: Any = None,
+    ) -> bool:
+        """Flip the ``read`` flag on a single message.
+
+        Returns False if the row didn't exist or the DB call errored.
+        Distinct from :meth:`mark_read_for_recipient` which operates
+        on every unread row for a recipient — this is the
+        "I, the dashboard PATCH handler, want to flip THIS one message"
+        surface that ``patch_message_api_route`` needs to share its
+        cursor with the audit log INSERT.
+
+        No EventBus publish — the dashboard PATCH flow is initiated by
+        admin, not a worker, and there is no subscriber today that
+        would benefit from a per-message read event (the
+        ``message.read`` event the bulk method publishes is keyed on
+        recipient_id, which is what the long-poll waiters consume).
+        Keeping this method publish-free matches the legacy raw
+        UPDATE's behaviour byte-for-byte; subscribers that DO want a
+        per-message-read signal in future can opt in here.
+
+        ``connection`` is the transaction-aware seam — the cursor
+        shape is what ``patch_message_api_route`` already holds.
+        """
+        if connection is not None and not hasattr(connection, "query"):
+            cur = connection
+            cur.execute(
+                "UPDATE agent_messages SET read = ? "
+                "WHERE message_id = ?",
+                (1 if read else 0, message_id),
+            )
+            return (cur.rowcount or 0) > 0
+        if connection is not None:
+            session = connection
+            try:
+                row = (
+                    session.query(AgentMessage)
+                    .filter(AgentMessage.message_id == message_id)
+                    .one_or_none()
+                )
+                if row is None:
+                    return False
+                row.read = read
+                session.flush()
+                return True
+            except SQLAlchemyError as e:
+                logger.error(
+                    f"Database error marking '{message_id}' read "
+                    f"via shared session: {e}", exc_info=True,
+                )
+                return False
+        # Standalone path: open our own session.
+        try:
+            with get_session() as session:
+                result = session.execute(
+                    sa_update(AgentMessage)
+                    .where(AgentMessage.message_id == message_id)
+                    .values(read=read)
+                )
+                session.commit()
+                return (result.rowcount or 0) > 0
+        except SQLAlchemyError as e:
+            logger.error(
+                f"Database error marking '{message_id}' read: {e}",
+                exc_info=True,
+            )
+            return False
+
+    # --- Write interface: prune ------------------------------------------
+
+    def prune_read_before(self, cutoff_timestamp: str) -> int:
+        """DELETE every ``read=1`` message whose ``timestamp < cutoff``.
+
+        Returns the number of rows deleted. Used by the per-project
+        message-retention pruner (:mod:`agent_mcp.features.message_retention`)
+        which today owns a raw ``DELETE FROM agent_messages WHERE read = 1
+        AND timestamp < ?`` against the connection pool. Routing it
+        through the repo keeps the only DELETE against this table in
+        one place, which matters because adding a ``message.deleted``
+        publish (none today; deliberate per :meth:`delete`) would
+        need to fire here too.
+
+        No EventBus publish — the pruner is a background sweep that
+        runs every 24h on the read-and-old tail; per-row wake-ups
+        would just spam subscribers with rows that have been read for
+        days (and their inboxes have long since re-rendered without
+        them).
+
+        On DB error returns ``0`` and logs at error.
+        """
+        try:
+            with get_session() as session:
+                result = session.execute(
+                    sa_delete(AgentMessage)
+                    .where(AgentMessage.read.is_(True))
+                    .where(AgentMessage.timestamp < cutoff_timestamp)
+                )
+                session.commit()
+                return result.rowcount or 0
+        except SQLAlchemyError as e:
+            logger.error(
+                f"Database error pruning read messages older than "
+                f"'{cutoff_timestamp}': {e}",
+                exc_info=True,
+            )
+            return 0
+        except Exception as e:
+            logger.error(
+                f"Unexpected error pruning read messages: {e}",
+                exc_info=True,
+            )
+            return 0
 
     # --- Write interface: rename_participant ----------------------------
 
