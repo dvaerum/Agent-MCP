@@ -312,8 +312,14 @@ async def test_alias_expiry_tick_removes_expired_alias(
     """
     orchestrator.registry.register("mu", str(router_env.root / "ws" / "mu"))
     orchestrator.registry.register("old1", str(router_env.root / "ws" / "old1"))
+    # ``old2`` is registered and then unregistered: the register step
+    # gives the alias-collision check below something to compare
+    # against momentarily, but ``add_alias`` itself runs against an
+    # already-unregistered "old2" so the realname-collision check in
+    # ``ProjectRegistry.add_alias`` skips it cleanly.
     orchestrator.registry.register("old2", str(router_env.root / "ws" / "old2"))
     orchestrator.registry.unregister("mu")
+    orchestrator.registry.unregister("old2")
     # Rename creates "old1" → "mu" alias. To get the past expiry we
     # directly call add_alias with a negative TTL.
     orchestrator.registry.rename("old1", "mu", grace_days=30)
@@ -354,11 +360,11 @@ async def test_alias_expiry_tick_preserves_malformed_entries(
     import json
     raw = router_env.projects_file.read_text()
     data = json.loads(raw)
-    # Find the "nu" project's aliases and overwrite expires_at.
-    for row in data["projects"]:
-        if row["name"] == "nu":
-            for entry in row.get("aliases", []):
-                entry["expires_at"] = "not-a-valid-timestamp"
+    # The registry file stores ``{<name>: {workspace, aliases, …}}``
+    # at the top level (no ``projects`` envelope), so we surgically
+    # overwrite the alias's expires_at on the "nu" record directly.
+    for entry in data.get("nu", {}).get("aliases", []) or []:
+        entry["expires_at"] = "not-a-valid-timestamp"
     router_env.projects_file.write_text(json.dumps(data))
 
     await orchestrator.alias_expiry_tick()
@@ -420,9 +426,9 @@ async def test_url_dispatch_proxy_resolves_alias_via_orchestrator(
     ws.mkdir(parents=True, exist_ok=True)
     router_module._REGISTRY.register(name, str(ws))
     # Rename to create an alias.
-    router_module._REGISTRY.register("renamed_target", str(router_env.root / "ws" / "renamed_target"))
-    router_module._REGISTRY.unregister("renamed_target")
-    router_module._REGISTRY.rename(name, "renamed_target", grace_days=30)
+    router_module._REGISTRY.register("renamed-target", str(router_env.root / "ws" / "renamed-target"))
+    router_module._REGISTRY.unregister("renamed-target")
+    router_module._REGISTRY.rename(name, "renamed-target", grace_days=30)
 
     client = await aiohttp_client(router_module.make_app())
     # Hit the MCP transport via the alias (the legacy name). Without

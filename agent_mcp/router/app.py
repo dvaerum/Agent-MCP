@@ -95,8 +95,6 @@ import os
 import re
 import subprocess
 import time
-from collections import defaultdict
-from html import escape
 from pathlib import Path
 from urllib.parse import quote, urlencode
 
@@ -104,6 +102,7 @@ from aiohttp import ClientSession, ClientTimeout, UnixConnector, web
 
 from . import project_registry  # sibling module — see ./project_registry.py
 from . import asset_prefix as _asset_prefix  # Phase 4: runtime sentinel sub
+from . import project_orchestrator as _po  # PR-C: lifecycle state machine
 
 
 log = logging.getLogger(__name__)
@@ -122,10 +121,10 @@ project_registry.REGISTRY_PATH = PROJECTS_FILE
 # call site. Tests can monkeypatch project_registry.REGISTRY_PATH —
 # this instance picks the new value up via its lazy `.path` property.
 _REGISTRY = project_registry.ProjectRegistry()
-SOCK_DIR = Path(os.environ["AGENT_MCP_SOCK_DIR"])
+SOCK_DIR = _po.SOCK_DIR
 DASHBOARD_DIR = os.environ["AGENT_MCP_DASHBOARD_DIR"]
 ROUTER_PORT = int(os.environ.get("AGENT_MCP_ROUTER_PORT", "1337"))
-IDLE_SEC = int(os.environ.get("AGENT_MCP_IDLE_SEC", str(4 * 60 * 60)))
+IDLE_SEC = _po.IDLE_SEC
 EXTERNAL_URL = os.environ["AGENT_MCP_EXTERNAL_URL"].rstrip("/")
 DEFAULT_WORKSPACE_PARENT = Path(
     os.environ.get(
@@ -352,44 +351,18 @@ else:
 _SLUG_RE = re.compile(r"^[a-z](?:[a-z0-9-]*[a-z0-9])?$")
 _NAME_MAX = 64
 
-# Activity timestamps per (name, role). role is always "backend"
-# today (the dashboard is static, served by the router itself), but
-# the dict shape is kept tuple-keyed so a future sidecar role
-# drops in cleanly.
-last_active: dict[tuple[str, str], float] = {}
-
-# Per-project in-flight connection counter. Incremented when a
-# proxied request enters _proxy_to_backend, decremented when it
-# leaves (including on error/cancel). __stop refuses to act while
-# the counter is non-zero so an SSE session isn't yanked mid-stream.
-active_conns: dict[str, int] = defaultdict(int)
-
-# Per-(name, role) lock serialising _ensure. The dashboard fires
-# several parallel API calls on first load; without this each one
-# raced systemctl independently — fastest wins, the rest see the
-# unit in a transient state and issue a `restart`, causing a
-# stop/start storm and a ~10 s window where requests 504.
-ensure_locks: dict[tuple[str, str], asyncio.Lock] = {}
-
-
-def _ensure_lock(name: str, role: str) -> asyncio.Lock:
-    key = (name, role)
-    lock = ensure_locks.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        ensure_locks[key] = lock
-    return lock
-
-
-@contextlib.asynccontextmanager
-async def _track_connection(name: str):
-    active_conns[name] += 1
-    try:
-        yield
-    finally:
-        active_conns[name] -= 1
-        if active_conns[name] <= 0:
-            active_conns.pop(name, None)
+# ── Lifecycle state — owned by project_orchestrator (PR-C) ──────────
+# These names are re-exported from the orchestrator module so existing
+# handlers below (and tests that monkeypatch ``router_module.<name>``)
+# keep working without churn. They are bound to the same module-level
+# objects in ``project_orchestrator``; mutations from either side are
+# visible to the other because the underlying values are mutable
+# (dict, defaultdict, dict-of-locks) and we never rebind the names.
+last_active = _po.last_active
+active_conns = _po.active_conns
+ensure_locks = _po.ensure_locks
+_ensure_lock = _po._ensure_lock
+_track_connection = _po._track_connection
 
 
 @contextlib.asynccontextmanager
@@ -533,24 +506,25 @@ def _validate_name(name: str, existing: dict[str, str]) -> str | None:
 
 
 # ── Backend lifecycle helpers ────────────────────────────────────────
-
-
-def _sock_path(name: str, role: str) -> Path:
-    d = SOCK_DIR / name
-    d.mkdir(parents=True, exist_ok=True)
-    return d / f"{role}.sock"
-
-
-def _unit_name(name: str, role: str) -> str:
-    if role == "backend":
-        return f"agent-mcp@{name}.service"
-    raise ValueError(f"unsupported role: {role!r}")
+# Delegated to ``project_orchestrator`` (PR-C). The aliases here keep
+# the existing local-name call sites in this file working without
+# textual churn; tests that ``monkeypatch.setattr(router, "_systemctl",
+# stub)`` still hit the same stub via the orchestrator because the
+# router-test conftest patches both attribute bindings.
+_sock_path = _po._sock_path
+_unit_name = _po._unit_name
 
 
 def _systemctl(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["systemctl", "--user", *args], capture_output=True, text=True
-    )
+    """Thin re-export of ``project_orchestrator._systemctl``.
+
+    Kept as a function (rather than a name alias like ``_sock_path``)
+    so legacy tests that ``monkeypatch.setattr(router, "_systemctl",
+    stub)`` see their stub used by every call site in *this* module;
+    call sites inside ``project_orchestrator`` use the orchestrator's
+    own binding, which the router-test conftest patches in parallel.
+    """
+    return _po._systemctl(*args)
 
 
 def _is_active(unit: str) -> bool:
@@ -560,39 +534,11 @@ def _is_active(unit: str) -> bool:
 async def _ensure(name: str, role: str) -> Path:
     """Make sure the backend for (name, role) is running, return its sock.
 
-    "Running" requires both is-active and the socket file existing;
-    the backend's systemd unit can stay "active" while the socket
-    has gone stale (e.g. after a backend crash mid-write). In that
-    case we restart, not start.
-
-    Serialised per (name, role) so a burst of parallel requests
-    (e.g. the dashboard's first-paint fan-out of /status /agents
-    /tasks /graph-data) only triggers one systemctl invocation.
+    Thin re-export of ``project_orchestrator._ensure`` — see that
+    function's docstring for the lock / retry / last_active write
+    semantics.
     """
-    if name not in _projects_dict():
-        raise web.HTTPNotFound(reason=f"unknown project: {name!r}")
-    unit = _unit_name(name, role)
-    sock = _sock_path(name, role)
-
-    async with _ensure_lock(name, role):
-        needs_start = not _is_active(unit) or not sock.exists()
-        if needs_start:
-            action = "restart" if _is_active(unit) else "start"
-            r = _systemctl(action, unit)
-            if r.returncode != 0:
-                raise web.HTTPInternalServerError(
-                    reason=f"systemctl {action} {unit} failed: {r.stderr.strip()}"
-                )
-            for _ in range(200):  # ≤20 s for the socket file to appear
-                if sock.exists() and sock.is_socket():
-                    break
-                await asyncio.sleep(0.1)
-            else:
-                raise web.HTTPGatewayTimeout(
-                    reason=f"{unit} did not create {sock} within 20 s"
-                )
-        last_active[(name, role)] = time.time()
-    return sock
+    return await _po._ensure(name, role)
 
 
 # ── Backend proxy ────────────────────────────────────────────────────
@@ -601,35 +547,13 @@ async def _ensure(name: str, role: str) -> Path:
 def _resolve_project_or_alias(name: str) -> tuple[str, dict | None]:
     """Return (real_name, alias_entry) for the URL segment `name`.
 
-    `alias_entry` is None if `name` is itself a real project, or the
-    matching ``{"name", "expires_at"}`` alias entry if `name` is a
-    grace-period alias of some other project. Raises ``HTTPNotFound``
-    if neither resolution succeeds.
-
-    Used by the backend MCP + REST proxy handlers to support the
-    Phase 1b alias-with-grace-period decision (#4 in the plan):
-    requests to an alias URL are transparently re-pointed at the
-    backend for the real project, with a sentinel header injected so
-    the backend can later surface the deprecation warning to clients
-    (Phase 1c — `serverInfo.instructions`).
+    PR-C: thin delegation to ``ProjectOrchestrator.resolve``. The
+    state machine lives in ``project_orchestrator``; this module-level
+    wrapper survives so the proxy handlers below (which read the
+    module-level ``_REGISTRY``) don't need to know about the
+    orchestrator instance.
     """
-    row = _REGISTRY.get(name)
-    if row is not None:
-        return name, None
-    real_name = _REGISTRY.resolve_alias(name)
-    if real_name is None:
-        raise web.HTTPNotFound(reason=f"unknown project: {name!r}")
-    # Re-read the real project's row to find the alias entry's
-    # expires_at — `resolve_alias` only returns the name, so we look
-    # it up here to populate the X-Agent-MCP-Alias header.
-    real_row = _REGISTRY.get(real_name)
-    alias_entry: dict | None = None
-    if real_row is not None:
-        for entry in real_row.get("aliases", []):
-            if entry.get("name") == name:
-                alias_entry = entry
-                break
-    return real_name, alias_entry
+    return _po.ProjectOrchestrator(_REGISTRY).resolve(name)
 
 
 async def _proxy_to_backend(
@@ -1153,98 +1077,16 @@ async def dashboard_assets_handler(req: web.Request) -> web.StreamResponse:
     )
 
 
-# ── Idle reaper + startup reconciliation ─────────────────────────────
-
-
-async def reaper(app: web.Application) -> None:
-    while True:
-        await asyncio.sleep(60)
-        now = time.time()
-        for key in list(last_active.keys()):
-            if now - last_active[key] > IDLE_SEC:
-                _systemctl("stop", _unit_name(*key))
-                last_active.pop(key, None)
-
-
-# ── Alias reaper ────────────────────────────────────────────────────
-
-
-# Cadence between alias-reaper ticks. The grace period for aliases is
-# measured in days (default 30), so a 60 s tick gives near-instant
-# cleanup of past-due aliases without paying for a tighter loop. Held
-# at module scope so tests can monkeypatch to a smaller value.
-_ALIAS_REAPER_INTERVAL_SEC = 60
-
-
-async def _alias_reaper_tick(registry: project_registry.ProjectRegistry) -> None:
-    """Single pass over the registry, removing any alias whose
-    `expires_at` is in the past. Emits one INFO log line per removal.
-
-    Extracted from the loop so tests can call it directly with a
-    deterministic registry instance — the loop wrapper just wakes up,
-    calls this, and goes back to sleep.
-    """
-    from datetime import datetime, timezone
-
-    now = datetime.now(timezone.utc)
-    for row in registry.list():
-        name = row["name"]
-        for entry in list(row.get("aliases", []) or []):
-            alias_name = entry.get("name")
-            expires_at = entry.get("expires_at", "")
-            if not alias_name or not expires_at:
-                continue
-            try:
-                exp = project_registry._parse_iso(expires_at)
-            except (TypeError, ValueError):
-                # Malformed entry — leave it; the operator can clean
-                # up by hand and we don't want to silently drop data
-                # we can't reason about.
-                continue
-            if exp <= now:
-                registry.expire_alias(name, alias_name)
-                log.info(
-                    "Alias %r for project %r expired and was removed.",
-                    alias_name, name,
-                )
-
-
-async def alias_reaper(app: web.Application) -> None:
-    """Long-running background task: every
-    ``_ALIAS_REAPER_INTERVAL_SEC`` seconds, sweep the registry for
-    aliases whose grace period has lapsed. Idempotent w.r.t.
-    concurrent rename/add_alias — `expire_alias` is a write-locked
-    operation.
-    """
-    while True:
-        await asyncio.sleep(_ALIAS_REAPER_INTERVAL_SEC)
-        try:
-            await _alias_reaper_tick(_REGISTRY)
-        except Exception:
-            log.exception("alias reaper tick failed; will retry next pass")
-
-
-async def reconcile_on_startup(app: web.Application) -> None:
-    """Adopt already-running backend units after a router restart."""
-    r = _systemctl(
-        "list-units",
-        "--type=service",
-        "--state=active",
-        "--no-legend",
-        "--plain",
-        "agent-mcp@*",
-    )
-    now = time.time()
-    prefix = "agent-mcp@"
-    suffix = ".service"
-    for line in r.stdout.splitlines():
-        parts = line.split()
-        if not parts:
-            continue
-        unit = parts[0]
-        if unit.startswith(prefix) and unit.endswith(suffix):
-            name = unit[len(prefix) : -len(suffix)]
-            last_active[(name, "backend")] = now
+# ── Idle reaper + alias reaper + startup reconciliation ─────────────
+# All three live in ``project_orchestrator`` (PR-C). Re-exported here
+# so existing call sites (the on_startup hooks below, tests that
+# monkeypatch ``router_module.reaper`` / ``router_module._alias_reaper_tick``)
+# keep working without churn.
+reaper = _po.reaper
+alias_reaper = _po.alias_reaper
+_alias_reaper_tick = _po._alias_reaper_tick
+reconcile_on_startup = _po.reconcile_on_startup
+_ALIAS_REAPER_INTERVAL_SEC = _po._ALIAS_REAPER_INTERVAL_SEC
 
 
 async def shutdown(app: web.Application) -> None:

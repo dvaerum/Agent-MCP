@@ -257,14 +257,27 @@ class ProjectRegistry:
         name: str,
         alias: str,
         expires_at: str | None = None,
+        *,
+        grace_days: int | None = None,
     ) -> None:
         """Append `alias` to `name`'s alias list with the given expiry.
 
         Default expiry is `now + DEFAULT_ALIAS_GRACE_DAYS` (30 days).
+        Callers can pass either ``expires_at`` (an ISO-8601 string) or
+        ``grace_days`` (an int); ``grace_days`` wins if both are
+        supplied. ``grace_days`` mirrors ``rename()``'s knob so the
+        orchestrator can express "alias is dead on arrival, let the
+        sweeper clean it up" by passing ``grace_days=0``.
+
         Validation under LOCK_EX:
 
           * `alias` must match the project-name slug regex.
-          * `alias` must not collide with any existing project name.
+          * `alias` must not collide with any existing project name
+            *if* the resulting alias would still be active when
+            written. An already-expired alias (``grace_days=0`` or an
+            ``expires_at`` in the past) is allowed even when the name
+            collides, because the next ``alias_expiry_tick`` will
+            evict it before it could ever shadow the real project.
           * `alias` must not collide with any *currently active*
             alias for some other project. (Expired aliases are
             allowed to be reclaimed — `resolve_alias` would never
@@ -281,17 +294,32 @@ class ProjectRegistry:
                 f"{_SLUG_RE.pattern}"
             )
 
+        if grace_days is not None:
+            expires_at = (
+                datetime.now(timezone.utc)
+                + timedelta(days=grace_days)
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
         if expires_at is None:
             expires_at = (
                 datetime.now(timezone.utc)
                 + timedelta(days=DEFAULT_ALIAS_GRACE_DAYS)
             ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+        # Whether the alias being added is already past its expiry —
+        # if so, it's dead on arrival and the collision check below
+        # can safely skip it (the next reaper tick evicts it).
+        try:
+            already_expired = (
+                _parse_iso(expires_at) <= datetime.now(timezone.utc)
+            )
+        except (TypeError, ValueError):
+            already_expired = False
+
         with self._lock_for_write() as (fd, data):
             if name not in data:
                 raise KeyError(name)
 
-            if alias in data:
+            if alias in data and not already_expired:
                 raise ValueError(
                     f"alias {alias!r} collides with a real project name"
                 )
