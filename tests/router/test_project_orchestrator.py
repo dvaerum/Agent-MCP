@@ -33,11 +33,9 @@ Scope of the cases pinned here:
 
 from __future__ import annotations
 
-import asyncio
 import importlib
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -96,7 +94,6 @@ async def test_start_activates_and_returns_socket(
 
     # Make .is_socket() pass by patching it for the test (the stub
     # touched file is a regular file, not a socket).
-    monkey_target = orchestrator_module._sock_path
     real_is_socket = Path.is_socket
     Path.is_socket = lambda self: True  # type: ignore[assignment]
     try:
