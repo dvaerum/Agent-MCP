@@ -167,105 +167,113 @@ async def send_agent_message_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
                 else message_content
             )
 
-    conn = None
+    # PR A (round 2): the send → mark_delivered → audit-log → commit
+    # boilerplate becomes a single `atomic_with_audit` block. Details
+    # of the audit row are built incrementally as the delivery branch
+    # decides what happened; the seam reads the dict at block exit so
+    # the final `delivery_status` is what the audit row reflects.
+    from ..db.atomic import atomic_with_audit
+    audit_details: Dict[str, Any] = {
+        "recipient": recipient_id,
+        "message_type": message_type,
+        "priority": priority,
+        "delivery_status": "stored",
+    }
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        with atomic_with_audit(
+            operation="send_message",
+            actor=sender_id,
+            details=audit_details,
+        ) as cursor:
+            # PR 6: message INSERT goes through message_repo with the
+            # caller's cursor so it's atomic with the subsequent delivery
+            # UPDATE + audit-log INSERT below.
+            from ..repositories import message_repo as _msg_repo
+            _msg_repo.send(
+                message_id=message_id,
+                sender_id=sender_id,
+                recipient_id=recipient_id,
+                message_content=message_content,
+                message_type=message_type,
+                priority=priority,
+                timestamp=timestamp,
+                delivered=False,
+                read=False,
+                subject=effective_subject,
+                parent_message_id=parent_message_id,
+                connection=cursor,
+            )
 
-        # PR 6: message INSERT goes through message_repo with the
-        # caller's cursor so it's atomic with the subsequent delivery
-        # UPDATE + audit-log INSERT below.
-        from ..repositories import message_repo as _msg_repo
-        _msg_repo.send(
-            message_id=message_id,
-            sender_id=sender_id,
-            recipient_id=recipient_id,
-            message_content=message_content,
-            message_type=message_type,
-            priority=priority,
-            timestamp=timestamp,
-            delivered=False,
-            read=False,
-            subject=effective_subject,
-            parent_message_id=parent_message_id,
-            connection=cursor,
-        )
-        
-        # Attempt delivery based on method
-        delivery_status = "stored"
-        
-        if deliver_method in ["tmux", "both"]:
-            # Try to deliver to recipient's tmux session
-            if recipient_id in g.agent_tmux_sessions:
-                session_name = g.agent_tmux_sessions[recipient_id]
-                if session_exists(session_name):
-                    # Handle stop commands differently
-                    if message_type == "stop_command":
-                        # Send control sequence to interrupt the agent
-                        try:
-                            import subprocess
-                            clean_session_name = sanitize_session_name(session_name)
-                            
-                            # Send Escape 4 times with 1 second intervals to stop current operation
-                            import time
-                            success = True
-                            for i in range(4):
-                                result = subprocess.run(['tmux', 'send-keys', '-t', clean_session_name, 'Escape'], 
-                                                      capture_output=True, text=True, timeout=5)
-                                if result.returncode != 0:
-                                    success = False
-                                    break
-                                logger.debug(f"Sent Escape {i+1}/4 to agent {recipient_id}")
-                                if i < 3:  # Don't sleep after the last one
-                                    time.sleep(1)
-                            
-                            if success:
-                                delivery_status = "delivered_stop_command"
-                                logger.info(f"Stop command (4x Escape) sent to agent {recipient_id} in session {session_name}")
-                            else:
+            # Attempt delivery based on method
+            delivery_status = "stored"
+
+            if deliver_method in ["tmux", "both"]:
+                # Try to deliver to recipient's tmux session
+                if recipient_id in g.agent_tmux_sessions:
+                    session_name = g.agent_tmux_sessions[recipient_id]
+                    if session_exists(session_name):
+                        # Handle stop commands differently
+                        if message_type == "stop_command":
+                            # Send control sequence to interrupt the agent
+                            try:
+                                import subprocess
+                                clean_session_name = sanitize_session_name(session_name)
+
+                                # Send Escape 4 times with 1 second intervals to stop current operation
+                                import time
+                                success = True
+                                for i in range(4):
+                                    result = subprocess.run(['tmux', 'send-keys', '-t', clean_session_name, 'Escape'],
+                                                          capture_output=True, text=True, timeout=5)
+                                    if result.returncode != 0:
+                                        success = False
+                                        break
+                                    logger.debug(f"Sent Escape {i+1}/4 to agent {recipient_id}")
+                                    if i < 3:  # Don't sleep after the last one
+                                        time.sleep(1)
+
+                                if success:
+                                    delivery_status = "delivered_stop_command"
+                                    logger.info(f"Stop command (4x Escape) sent to agent {recipient_id} in session {session_name}")
+                                else:
+                                    delivery_status = "stop_command_failed"
+                                    logger.error(f"Failed to send stop command: {result.stderr}")
+
+                                # PR 6: mark_delivered via repo with caller's cursor.
+                                _msg_repo.mark_delivered(
+                                    message_id, bool(success), connection=cursor,
+                                )
+
+                            except Exception as e:
+                                logger.error(f"Failed to send stop command to tmux session '{session_name}': {e}")
                                 delivery_status = "stop_command_failed"
-                                logger.error(f"Failed to send stop command: {result.stderr}")
-                            
-                            # PR 6: mark_delivered via repo with caller's cursor.
-                            _msg_repo.mark_delivered(
-                                message_id, bool(success), connection=cursor,
-                            )
+                        else:
+                            # Format regular message for delivery
+                            formatted_message = f"\n💬 Message from {sender_id} ({priority}): {message_content}\n"
 
-                        except Exception as e:
-                            logger.error(f"Failed to send stop command to tmux session '{session_name}': {e}")
-                            delivery_status = "stop_command_failed"
+                            # Send message to tmux session
+                            try:
+                                send_prompt_async(session_name, formatted_message, delay_seconds=1)
+                                delivery_status = "delivered_tmux"
+
+                                # PR 6: mark_delivered via repo with caller's cursor.
+                                _msg_repo.mark_delivered(
+                                    message_id, True, connection=cursor,
+                                )
+
+                            except Exception as e:
+                                logger.error(f"Failed to deliver message to tmux session '{session_name}': {e}")
+                                delivery_status = "delivery_failed"
                     else:
-                        # Format regular message for delivery
-                        formatted_message = f"\n💬 Message from {sender_id} ({priority}): {message_content}\n"
-                        
-                        # Send message to tmux session
-                        try:
-                            send_prompt_async(session_name, formatted_message, delay_seconds=1)
-                            delivery_status = "delivered_tmux"
-                            
-                            # PR 6: mark_delivered via repo with caller's cursor.
-                            _msg_repo.mark_delivered(
-                                message_id, True, connection=cursor,
-                            )
-
-                        except Exception as e:
-                            logger.error(f"Failed to deliver message to tmux session '{session_name}': {e}")
-                            delivery_status = "delivery_failed"
+                        delivery_status = "session_not_found"
                 else:
-                    delivery_status = "session_not_found"
-            else:
-                delivery_status = "no_session"
-        
-        # Log the communication
-        log_agent_action_to_db(cursor, sender_id, "send_message", 
-                               details={
-                                   "recipient": recipient_id,
-                                   "message_type": message_type,
-                                   "priority": priority,
-                                   "delivery_status": delivery_status
-                               })
-        
-        conn.commit()
+                    delivery_status = "no_session"
+
+            # Mutate the audit-details dict in place; `atomic_with_audit`
+            # reads it at block exit, so the final delivery_status lands
+            # on the audit row alongside the message INSERT + delivery
+            # UPDATE, all under one commit.
+            audit_details["delivery_status"] = delivery_status
 
         # Wake any `wait_for_events` waiter for the recipient AND fan
         # out `notifications/resources/updated` on every registered
@@ -321,18 +329,15 @@ async def send_agent_message_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
             response_text += f" (Message ID: {message_id})"
         
         return [mcp_types.TextContent(type="text", text=response_text)]
-        
+
     except sqlite3.Error as e:
-        if conn: conn.rollback()
+        # `atomic_with_audit` already rolled back + closed the conn
+        # before re-raising; nothing left for us to do but report.
         logger.error(f"Database error sending message: {e}", exc_info=True)
         return [mcp_types.TextContent(type="text", text=f"Database error sending message: {e}")]
     except Exception as e:
-        if conn: conn.rollback()
         logger.error(f"Unexpected error sending message: {e}", exc_info=True)
         return [mcp_types.TextContent(type="text", text=f"Unexpected error sending message: {e}")]
-    finally:
-        if conn:
-            conn.close()
 
 
 @requires("any")

@@ -3113,35 +3113,46 @@ async def request_assistance_tool_impl(
 
     # Fetch parent task data (original used in-memory g.tasks, main.py:1674)
     # For robustness, let's fetch from DB, then update g.tasks.
-    conn = None
+    # PR A (round 2): pre-flight validation moves out of the write
+    # transaction. The original code did the SELECT on the same cursor
+    # the writes used; splitting it out lets the not-found / unauthorized
+    # early-returns happen *without* opening a transaction that the
+    # `atomic_with_audit` seam would otherwise commit-and-audit.
+    from ..db.connection import get_db_connection_read
+
+    _read_conn = get_db_connection_read()
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        _read_cur = _read_conn.cursor()
+        _read_cur.execute(
+            "SELECT * FROM tasks WHERE task_id = ?", (parent_task_id,)
+        )
+        parent_task_db_row = _read_cur.fetchone()
+    finally:
+        _read_conn.close()
 
-        cursor.execute("SELECT * FROM tasks WHERE task_id = ?", (parent_task_id,))
-        parent_task_db_row = cursor.fetchone()
-        if not parent_task_db_row:
-            return [
-                mcp_types.TextContent(
-                    type="text", text=f"Parent task '{parent_task_id}' not found."
-                )
-            ]
+    if not parent_task_db_row:
+        return [
+            mcp_types.TextContent(
+                type="text", text=f"Parent task '{parent_task_id}' not found."
+            )
+        ]
 
-        parent_task_current_data = dict(parent_task_db_row)
+    parent_task_current_data = dict(parent_task_db_row)
 
-        # Verify ownership or admin (main.py:1688-1691)
-        is_admin_request = verify_token(agent_auth_token, "admin")
-        if (
-            parent_task_current_data.get("assigned_to") != requesting_agent_id
-            and not is_admin_request
-        ):
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text="Unauthorized: You can only request assistance for tasks assigned to you, or use an admin token.",
-                )
-            ]
+    # Verify ownership or admin (main.py:1688-1691)
+    is_admin_request = verify_token(agent_auth_token, "admin")
+    if (
+        parent_task_current_data.get("assigned_to") != requesting_agent_id
+        and not is_admin_request
+    ):
+        return [
+            mcp_types.TextContent(
+                type="text",
+                text="Unauthorized: You can only request assistance for tasks assigned to you, or use an admin token.",
+            )
+        ]
 
+    try:
         # Create child assistance task (main.py:1694-1696)
         child_task_id = _generate_task_id()
         child_task_title = f"Assistance for {parent_task_id}: {parent_task_current_data.get('title', 'Untitled Task')}"
@@ -3188,29 +3199,70 @@ async def request_assistance_tool_impl(
                     exc_info=True,
                 )
 
-        # Insert the child (assistance) task into DB (main.py:1722-1734).
-        # PR 7 (Task flip): write flows through task_repo.create with
-        # the caller's cursor so the wider audit-log INSERT stays in
-        # the same transaction. The dict mirrors what we cached after
-        # commit (JSON list fields stored as Python lists for the
-        # in-memory shape).
-        from ..repositories import task_repo
-        task_repo.create(
-            {
-                "task_id": child_task_id,
-                "title": child_task_title,
-                "description": assistance_description,
-                "status": "pending",
-                "assigned_to": None,
-                "priority": "high",  # Assistance tasks are high priority
-                "parent_task": parent_task_id,
-                "depends_on_tasks": [],
-                "created_by": requesting_agent_id,
-                "child_tasks": [],
-                "notes": [],
-            },
-            connection=cursor,
+        # Build the parent's updated child_tasks + notes lists once,
+        # before the write transaction, so the atomic block reads only
+        # in-memory dicts (no extra SELECTs inside the seam).
+        parent_child_tasks_list = json.loads(
+            parent_task_current_data.get("child_tasks") or "[]"
         )
+        parent_child_tasks_list.append(child_task_id)
+
+        parent_notes_list = json.loads(parent_task_current_data.get("notes") or "[]")
+        parent_notes_list.append(
+            {
+                "timestamp": timestamp_iso,
+                "author": requesting_agent_id,
+                "content": f"Requested assistance: {assistance_description}. Assistance task created: {child_task_id}",
+            }
+        )
+
+        # PR A (round 2): the child INSERT + parent UPDATE + audit-log
+        # INSERT collapse into a single atomic_with_audit block. The
+        # writes were already atomic on the legacy path (one cursor,
+        # one commit); the seam now names the audit-row identity at
+        # the call site.
+        from ..db.atomic import atomic_with_audit
+        from ..repositories import task_repo
+        with atomic_with_audit(
+            operation="request_assistance",
+            actor=requesting_agent_id,
+            task_id=parent_task_id,
+            details={
+                "description": assistance_description,
+                "child_task_id": child_task_id,
+            },
+        ) as cursor:
+            # Insert the child (assistance) task. PR 7 (Task flip): write
+            # flows through task_repo.create with the caller's cursor.
+            task_repo.create(
+                {
+                    "task_id": child_task_id,
+                    "title": child_task_title,
+                    "description": assistance_description,
+                    "status": "pending",
+                    "assigned_to": None,
+                    "priority": "high",  # Assistance tasks are high priority
+                    "parent_task": parent_task_id,
+                    "depends_on_tasks": [],
+                    "created_by": requesting_agent_id,
+                    "child_tasks": [],
+                    "notes": [],
+                },
+                connection=cursor,
+            )
+
+            # PR 7 (Task flip): parent-task UPDATE goes through
+            # task_repo with the caller's cursor; allowlist + JSON
+            # serialisation rule now live in one place.
+            task_repo.update_fields(
+                parent_task_id,
+                {
+                    "child_tasks": parent_child_tasks_list,
+                    "notes": parent_notes_list,
+                },
+                connection=cursor,
+            )
+
         # Build the in-memory cache shape (matches the post-commit dict
         # the repo would have produced on the standalone path).
         child_task_db_data = {
@@ -3228,45 +3280,6 @@ async def request_assistance_tool_impl(
             "child_tasks": json.dumps([]),
             "notes": json.dumps([]),
         }
-
-        # Update parent task's child_tasks field and notes (main.py:1737-1764)
-        parent_child_tasks_list = json.loads(
-            parent_task_current_data.get("child_tasks") or "[]"
-        )
-        parent_child_tasks_list.append(child_task_id)
-
-        parent_notes_list = json.loads(parent_task_current_data.get("notes") or "[]")
-        parent_notes_list.append(
-            {
-                "timestamp": timestamp_iso,
-                "author": requesting_agent_id,
-                "content": f"Requested assistance: {assistance_description}. Assistance task created: {child_task_id}",
-            }
-        )
-
-        # PR 7 (Task flip): parent-task UPDATE goes through task_repo
-        # with the caller's cursor; allowlist + JSON serialisation rule
-        # now live in one place.
-        task_repo.update_fields(
-            parent_task_id,
-            {
-                "child_tasks": parent_child_tasks_list,
-                "notes": parent_notes_list,
-            },
-            connection=cursor,
-        )
-
-        log_agent_action_to_db(
-            cursor,
-            requesting_agent_id,
-            "request_assistance",
-            task_id=parent_task_id,
-            details={
-                "description": assistance_description,
-                "child_task_id": child_task_id,
-            },
-        )
-        conn.commit()
 
         # Update in-memory caches (g.tasks)
         # Parent task
@@ -3337,8 +3350,7 @@ async def request_assistance_tool_impl(
         ]
 
     except sqlite3.Error as e_sql:
-        if conn:
-            conn.rollback()
+        # atomic_with_audit already rolled back + closed before re-raising.
         logger.error(
             f"Database error requesting assistance for task {parent_task_id}: {e_sql}",
             exc_info=True,
@@ -3349,8 +3361,6 @@ async def request_assistance_tool_impl(
             )
         ]
     except Exception as e:
-        if conn:
-            conn.rollback()
         logger.error(
             f"Unexpected error requesting assistance for task {parent_task_id}: {e}",
             exc_info=True,
@@ -3360,9 +3370,6 @@ async def request_assistance_tool_impl(
                 type="text", text=f"Unexpected error requesting assistance: {e}"
             )
         ]
-    finally:
-        if conn:
-            conn.close()
 
 
 # --- bulk_task_operations tool ---
@@ -3390,237 +3397,243 @@ async def bulk_task_operations_tool_impl(
 
     is_admin_request = verify_token(agent_auth_token, "admin")
 
-    # Process operations in a single transaction
-    conn = None
+    # Process operations in a single transaction. PR A (round 2): the
+    # whole "open conn → loop writes → log audit → commit → close"
+    # boilerplate collapses into one `atomic_with_audit` block. Per-op
+    # validation failures still go into `results` via `continue`; only
+    # an actual sqlite/Python exception aborts the transaction.
+    from ..db.atomic import atomic_with_audit
+    results: List[str] = []
+    updated_at_iso = datetime.datetime.now().isoformat()
+    # Mutated in-place during the loop; the seam reads it at block
+    # exit so the final success_count lands on the audit row.
+    audit_details: Dict[str, Any] = {
+        "operations_count": len(operations),
+        "success_count": 0,
+    }
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        with atomic_with_audit(
+            operation="bulk_task_operations",
+            actor=requesting_agent_id,
+            details=audit_details,
+        ) as cursor:
+            for i, op in enumerate(operations):
+                if not isinstance(op, dict):
+                    results.append(
+                        f"Operation {i+1}: Invalid operation format (must be object)"
+                    )
+                    continue
 
-        results = []
-        updated_at_iso = datetime.datetime.now().isoformat()
+                operation_type = op.get("type")
+                task_id = op.get("task_id")
 
-        for i, op in enumerate(operations):
-            if not isinstance(op, dict):
-                results.append(
-                    f"Operation {i+1}: Invalid operation format (must be object)"
-                )
-                continue
+                if not task_id or not operation_type:
+                    results.append(
+                        f"Operation {i+1}: Missing required fields 'type' and 'task_id'"
+                    )
+                    continue
 
-            operation_type = op.get("type")
-            task_id = op.get("task_id")
+                # Verify task exists and permissions
+                cursor.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+                task_row = cursor.fetchone()
+                if not task_row:
+                    results.append(f"Operation {i+1}: Task '{task_id}' not found")
+                    continue
 
-            if not task_id or not operation_type:
-                results.append(
-                    f"Operation {i+1}: Missing required fields 'type' and 'task_id'"
-                )
-                continue
+                task_data = dict(task_row)
 
-            # Verify task exists and permissions
-            cursor.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
-            task_row = cursor.fetchone()
-            if not task_row:
-                results.append(f"Operation {i+1}: Task '{task_id}' not found")
-                continue
+                # Permission check
+                if (
+                    task_data.get("assigned_to") != requesting_agent_id
+                    and not is_admin_request
+                ):
+                    results.append(
+                        f"Operation {i+1}: Unauthorized - can only modify own tasks"
+                    )
+                    continue
 
-            task_data = dict(task_row)
+                try:
+                    if operation_type == "update_status":
+                        new_status = op.get("status")
+                        notes_content = op.get("notes")
 
-            # Permission check
-            if (
-                task_data.get("assigned_to") != requesting_agent_id
-                and not is_admin_request
-            ):
-                results.append(
-                    f"Operation {i+1}: Unauthorized - can only modify own tasks"
-                )
-                continue
+                        if not new_status:
+                            results.append(
+                                f"Operation {i+1}: Missing 'status' for update_status operation"
+                            )
+                            continue
 
-            try:
-                if operation_type == "update_status":
-                    new_status = op.get("status")
-                    notes_content = op.get("notes")
+                        valid_statuses = [
+                            "pending",
+                            "in_progress",
+                            "completed",
+                            "cancelled",
+                            "failed",
+                        ]
+                        if new_status not in valid_statuses:
+                            results.append(
+                                f"Operation {i+1}: Invalid status '{new_status}'"
+                            )
+                            continue
 
-                    if not new_status:
-                        results.append(
-                            f"Operation {i+1}: Missing 'status' for update_status operation"
+                        # PR 7 (Task flip): bulk status+notes update flows
+                        # through task_repo.update_fields with the caller's
+                        # cursor. The repo's _MUTABLE_FIELDS allowlist
+                        # replaces the inline `allowed_bulk_fields` guard.
+                        from ..repositories import task_repo as _task_repo
+
+                        # Handle notes (append-only, like the non-bulk path)
+                        current_notes = json.loads(task_data.get("notes") or "[]")
+                        if notes_content:
+                            current_notes.append(
+                                {
+                                    "timestamp": updated_at_iso,
+                                    "author": requesting_agent_id,
+                                    "content": notes_content,
+                                }
+                            )
+
+                        _task_repo.update_fields(
+                            task_id,
+                            {"status": new_status, "notes": current_notes},
+                            connection=cursor,
                         )
-                        continue
 
-                    valid_statuses = [
-                        "pending",
-                        "in_progress",
-                        "completed",
-                        "cancelled",
-                        "failed",
-                    ]
-                    if new_status not in valid_statuses:
+                        # Update in-memory cache
+                        if task_id in g.tasks:
+                            g.tasks[task_id]["status"] = new_status
+                            g.tasks[task_id]["updated_at"] = updated_at_iso
+                            g.tasks[task_id]["notes"] = current_notes
+
+                        # Mirror the terminal-status agents.current_task
+                        # clear that `_update_single_task` does on the
+                        # non-bulk path, so the bulk surface doesn't
+                        # leak the same stale-current_task bug.
+                        if new_status in ["completed", "cancelled", "failed"]:
+                            # PR 8 (Agent flip): filter-based bulk UPDATE
+                            # goes through agent_repo.clear_current_task_for
+                            # (same as the non-bulk path in
+                            # _update_single_task). Cache mirror is owned
+                            # by the repo.
+                            from ..repositories import agent_repo as _agent_repo
+                            _agent_repo.clear_current_task_for(
+                                task_id, connection=cursor,
+                            )
+
                         results.append(
-                            f"Operation {i+1}: Invalid status '{new_status}'"
+                            f"Operation {i+1}: Task '{task_id}' status updated to '{new_status}'"
                         )
-                        continue
 
-                    # PR 7 (Task flip): bulk status+notes update flows
-                    # through task_repo.update_fields with the caller's
-                    # cursor. The repo's _MUTABLE_FIELDS allowlist
-                    # replaces the inline `allowed_bulk_fields` guard.
-                    from ..repositories import task_repo as _task_repo
+                    elif operation_type == "update_priority":
+                        new_priority = op.get("priority")
 
-                    # Handle notes (append-only, like the non-bulk path)
-                    current_notes = json.loads(task_data.get("notes") or "[]")
-                    if notes_content:
+                        if not new_priority or new_priority not in [
+                            "low",
+                            "medium",
+                            "high",
+                        ]:
+                            results.append(
+                                f"Operation {i+1}: Invalid priority '{new_priority}'"
+                            )
+                            continue
+
+                        # PR 7 (Task flip): bulk priority update flows
+                        # through task_repo.update_fields with the caller's
+                        # cursor.
+                        from ..repositories import task_repo as _task_repo
+                        _task_repo.update_fields(
+                            task_id,
+                            {"priority": new_priority},
+                            connection=cursor,
+                        )
+
+                        if task_id in g.tasks:
+                            g.tasks[task_id]["priority"] = new_priority
+                            g.tasks[task_id]["updated_at"] = updated_at_iso
+
+                        results.append(
+                            f"Operation {i+1}: Task '{task_id}' priority updated to '{new_priority}'"
+                        )
+
+                    elif operation_type == "add_note":
+                        note_content = op.get("content")
+
+                        if not note_content:
+                            results.append(
+                                f"Operation {i+1}: Missing 'content' for add_note operation"
+                            )
+                            continue
+
+                        current_notes = json.loads(task_data.get("notes") or "[]")
                         current_notes.append(
                             {
                                 "timestamp": updated_at_iso,
                                 "author": requesting_agent_id,
-                                "content": notes_content,
+                                "content": note_content,
                             }
                         )
 
-                    _task_repo.update_fields(
-                        task_id,
-                        {"status": new_status, "notes": current_notes},
-                        connection=cursor,
-                    )
-
-                    # Update in-memory cache
-                    if task_id in g.tasks:
-                        g.tasks[task_id]["status"] = new_status
-                        g.tasks[task_id]["updated_at"] = updated_at_iso
-                        g.tasks[task_id]["notes"] = current_notes
-
-                    # Mirror the terminal-status agents.current_task
-                    # clear that `_update_single_task` does on the
-                    # non-bulk path, so the bulk surface doesn't
-                    # leak the same stale-current_task bug.
-                    if new_status in ["completed", "cancelled", "failed"]:
-                        # PR 8 (Agent flip): filter-based bulk UPDATE
-                        # goes through agent_repo.clear_current_task_for
-                        # (same as the non-bulk path in
-                        # _update_single_task). Cache mirror is owned
-                        # by the repo.
-                        from ..repositories import agent_repo as _agent_repo
-                        _agent_repo.clear_current_task_for(
-                            task_id, connection=cursor,
+                        # PR 7 (Task flip): bulk add_note flows through
+                        # task_repo.update_fields with the caller's cursor.
+                        from ..repositories import task_repo as _task_repo
+                        _task_repo.update_fields(
+                            task_id,
+                            {"notes": current_notes},
+                            connection=cursor,
                         )
 
-                    results.append(
-                        f"Operation {i+1}: Task '{task_id}' status updated to '{new_status}'"
-                    )
+                        if task_id in g.tasks:
+                            g.tasks[task_id]["notes"] = current_notes
+                            g.tasks[task_id]["updated_at"] = updated_at_iso
 
-                elif operation_type == "update_priority":
-                    new_priority = op.get("priority")
+                        results.append(f"Operation {i+1}: Note added to task '{task_id}'")
 
-                    if not new_priority or new_priority not in [
-                        "low",
-                        "medium",
-                        "high",
-                    ]:
+                    elif operation_type == "reassign" and is_admin_request:
+                        new_assigned_to = op.get("assigned_to")
+
+                        if not new_assigned_to:
+                            results.append(
+                                f"Operation {i+1}: Missing 'assigned_to' for reassign operation"
+                            )
+                            continue
+
+                        # PR 7 (Task flip): bulk reassign flows through
+                        # task_repo.update_fields with the caller's cursor.
+                        from ..repositories import task_repo as _task_repo
+                        _task_repo.update_fields(
+                            task_id,
+                            {"assigned_to": new_assigned_to},
+                            connection=cursor,
+                        )
+
+                        if task_id in g.tasks:
+                            g.tasks[task_id]["assigned_to"] = new_assigned_to
+                            g.tasks[task_id]["updated_at"] = updated_at_iso
+
                         results.append(
-                            f"Operation {i+1}: Invalid priority '{new_priority}'"
+                            f"Operation {i+1}: Task '{task_id}' reassigned to '{new_assigned_to}'"
                         )
-                        continue
 
-                    # PR 7 (Task flip): bulk priority update flows
-                    # through task_repo.update_fields with the caller's
-                    # cursor.
-                    from ..repositories import task_repo as _task_repo
-                    _task_repo.update_fields(
-                        task_id,
-                        {"priority": new_priority},
-                        connection=cursor,
-                    )
-
-                    if task_id in g.tasks:
-                        g.tasks[task_id]["priority"] = new_priority
-                        g.tasks[task_id]["updated_at"] = updated_at_iso
-
-                    results.append(
-                        f"Operation {i+1}: Task '{task_id}' priority updated to '{new_priority}'"
-                    )
-
-                elif operation_type == "add_note":
-                    note_content = op.get("content")
-
-                    if not note_content:
-                        results.append(
-                            f"Operation {i+1}: Missing 'content' for add_note operation"
-                        )
-                        continue
-
-                    current_notes = json.loads(task_data.get("notes") or "[]")
-                    current_notes.append(
-                        {
-                            "timestamp": updated_at_iso,
-                            "author": requesting_agent_id,
-                            "content": note_content,
-                        }
-                    )
-
-                    # PR 7 (Task flip): bulk add_note flows through
-                    # task_repo.update_fields with the caller's cursor.
-                    from ..repositories import task_repo as _task_repo
-                    _task_repo.update_fields(
-                        task_id,
-                        {"notes": current_notes},
-                        connection=cursor,
-                    )
-
-                    if task_id in g.tasks:
-                        g.tasks[task_id]["notes"] = current_notes
-                        g.tasks[task_id]["updated_at"] = updated_at_iso
-
-                    results.append(f"Operation {i+1}: Note added to task '{task_id}'")
-
-                elif operation_type == "reassign" and is_admin_request:
-                    new_assigned_to = op.get("assigned_to")
-
-                    if not new_assigned_to:
-                        results.append(
-                            f"Operation {i+1}: Missing 'assigned_to' for reassign operation"
-                        )
-                        continue
-
-                    # PR 7 (Task flip): bulk reassign flows through
-                    # task_repo.update_fields with the caller's cursor.
-                    from ..repositories import task_repo as _task_repo
-                    _task_repo.update_fields(
-                        task_id,
-                        {"assigned_to": new_assigned_to},
-                        connection=cursor,
-                    )
-
-                    if task_id in g.tasks:
-                        g.tasks[task_id]["assigned_to"] = new_assigned_to
-                        g.tasks[task_id]["updated_at"] = updated_at_iso
-
-                    results.append(
-                        f"Operation {i+1}: Task '{task_id}' reassigned to '{new_assigned_to}'"
-                    )
-
-                else:
-                    if operation_type == "reassign" and not is_admin_request:
-                        results.append(
-                            f"Operation {i+1}: Reassign operation requires admin privileges"
-                        )
                     else:
-                        results.append(
-                            f"Operation {i+1}: Unknown operation type '{operation_type}'"
-                        )
+                        if operation_type == "reassign" and not is_admin_request:
+                            results.append(
+                                f"Operation {i+1}: Reassign operation requires admin privileges"
+                            )
+                        else:
+                            results.append(
+                                f"Operation {i+1}: Unknown operation type '{operation_type}'"
+                            )
 
-            except Exception as e:
-                results.append(f"Operation {i+1}: Error processing - {str(e)}")
-                logger.error(f"Error in bulk operation {i+1}: {e}", exc_info=True)
+                except Exception as e:
+                    results.append(f"Operation {i+1}: Error processing - {str(e)}")
+                    logger.error(f"Error in bulk operation {i+1}: {e}", exc_info=True)
 
-        # Log the bulk operation
-        log_agent_action_to_db(
-            cursor,
-            requesting_agent_id,
-            "bulk_task_operations",
-            details={
-                "operations_count": len(operations),
-                "success_count": len([r for r in results if "Error" not in r]),
-            },
-        )
-        conn.commit()
+            # Final success_count is patched onto the audit-row details
+            # dict; `atomic_with_audit` reads the same dict at block
+            # exit and emits one agent_actions row before committing.
+            audit_details["success_count"] = len(
+                [r for r in results if "Error" not in r]
+            )
 
         response_text = (
             f"Bulk Task Operations Results ({len(operations)} operations):\n\n"
@@ -3635,8 +3648,8 @@ async def bulk_task_operations_tool_impl(
         return [mcp_types.TextContent(type="text", text=response_text)]
 
     except sqlite3.Error as e_sql:
-        if conn:
-            conn.rollback()
+        # `atomic_with_audit` already rolled back + closed before
+        # re-raising; we just translate to a user-facing error.
         logger.error(f"Database error in bulk task operations: {e_sql}", exc_info=True)
         return [
             mcp_types.TextContent(
@@ -3644,17 +3657,12 @@ async def bulk_task_operations_tool_impl(
             )
         ]
     except Exception as e:
-        if conn:
-            conn.rollback()
         logger.error(f"Unexpected error in bulk task operations: {e}", exc_info=True)
         return [
             mcp_types.TextContent(
                 type="text", text=f"Unexpected error in bulk operations: {e}"
             )
         ]
-    finally:
-        if conn:
-            conn.close()
 
 
 # --- search_tasks tool ---
