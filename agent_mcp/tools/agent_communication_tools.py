@@ -20,7 +20,7 @@ from ..features.aoe_notify import notify_aoe as _aoe_notify
 from ..utils.audit_utils import log_audit
 from ..db.connection import get_db_connection
 from ..db.actions.agent_actions_db import log_agent_action_to_db
-from ..utils.tmux_utils import send_prompt_async, session_exists, sanitize_session_name, send_command_to_session
+from ..runtime.agent_runtime import send_prompt_async, session_exists, sanitize_session_name, send_command_to_session
 
 
 def _generate_message_id() -> str:
