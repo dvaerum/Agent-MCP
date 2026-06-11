@@ -658,11 +658,18 @@ async def restore_agent_api_route(request: Request) -> JSONResponse:
             )
 
         agent_token = row["token"]
-        now = datetime.datetime.now().isoformat()
+        # PR 6: restore via agent_repo.update_field with caller's
+        # cursor — atomic with the audit log INSERT below. terminated_at
+        # is cleared via a second UPDATE on the cursor since the repo's
+        # update_field accepts one field at a time (the value None
+        # is acceptable for the agent_repo allowlist).
+        from ..repositories import agent_repo as _agent_repo
+        _agent_repo.update_field(
+            agent_id, "status", "created", connection=cursor,
+        )
         cursor.execute(
-            "UPDATE agents SET status = ?, terminated_at = NULL, "
-            "updated_at = ? WHERE agent_id = ?",
-            ("created", now, agent_id),
+            "UPDATE agents SET terminated_at = NULL WHERE agent_id = ?",
+            (agent_id,),
         )
         log_agent_action_to_db(
             cursor, "admin", "restored_agent",
@@ -797,14 +804,19 @@ async def edit_agent_api_route(request: Request) -> JSONResponse:
                 status_code=404,
             )
 
-        # Use the existing helper so JSON-serialisation of capabilities
-        # + updated_at bookkeeping stays consistent.
-        from agent_mcp.db.actions.agent_db import update_agent_db_field
+        # PR 6: route field updates through agent_repo with the
+        # caller's cursor so each update + the audit log INSERT below
+        # land in the same transaction. The repo's allowlist + JSON
+        # serialisation rules mirror the legacy update_agent_db_field
+        # behaviour 1:1.
+        from ..repositories import agent_repo as _agent_repo
 
         applied: Dict[str, Any] = {}
         for field, value in updates.items():
-            ok = update_agent_db_field(agent_id, field, value)
-            if not ok:
+            result = _agent_repo.update_field(
+                agent_id, field, value, connection=cursor,
+            )
+            if result is None:
                 return JSONResponse(
                     {"error": f"Failed to update field {field!r}"},
                     status_code=500,
@@ -2173,17 +2185,20 @@ async def create_message_api_route(request: Request) -> JSONResponse:
                     content[:50] + "..." if len(content) > 50 else content
                 )
 
-        cursor.execute(
-            """
-            INSERT INTO agent_messages (
-                message_id, sender_id, recipient_id, message_content,
-                message_type, priority, timestamp, delivered, read,
-                subject, parent_message_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (message_id, sender_id, recipient_id, content,
-             message_type, priority, timestamp, 0, 0,
-             effective_subject, parent_message_id),
+        # PR 6: single-recipient message INSERT goes through message_repo
+        # with the caller's cursor so it's atomic with the audit log.
+        from ..repositories import message_repo
+        message_repo.send(
+            message_id=message_id,
+            sender_id=sender_id,
+            recipient_id=recipient_id,
+            message_content=content,
+            message_type=message_type,
+            priority=priority,
+            timestamp=timestamp,
+            subject=effective_subject,
+            parent_message_id=parent_message_id,
+            connection=cursor,
         )
         log_agent_action_to_db(
             cursor, sender_id, "sent_message_via_dashboard",
@@ -2284,20 +2299,18 @@ async def patch_message_api_route(request: Request) -> JSONResponse:
         if not verify_token(admin_token, required_role='admin'):
             return JSONResponse({"error": "Invalid admin token"}, status_code=403)
 
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT message_id FROM agent_messages WHERE message_id = ?",
-            (message_id,),
-        )
-        if not cursor.fetchone():
+        # PR 6: existence check via message_repo (cache-bypassing read).
+        from ..repositories import message_repo
+        if message_repo.get_by_id(message_id) is None:
             return JSONResponse({"error": "Message not found"}, status_code=404)
 
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
         if request.method == 'DELETE':
-            cursor.execute(
-                "DELETE FROM agent_messages WHERE message_id = ?",
-                (message_id,),
-            )
+            # PR 6: message DELETE goes through message_repo with the
+            # caller's cursor so it stays atomic with the audit log.
+            message_repo.delete(message_id, connection=cursor)
             log_agent_action_to_db(
                 cursor, auth_get_agent_id(admin_token) or "admin",
                 "deleted_message_via_dashboard",
@@ -2318,12 +2331,26 @@ async def patch_message_api_route(request: Request) -> JSONResponse:
                 status_code=400,
             )
 
-        set_clause = ", ".join(f"{col} = ?" for col, _ in updates)
-        params = [v for _, v in updates] + [message_id]
-        cursor.execute(
-            f"UPDATE agent_messages SET {set_clause} WHERE message_id = ?",
-            params,
-        )
+        # PR 6: PATCH flips run through message_repo.mark_delivered for
+        # the `delivered` field; `read=true` becomes the single-message
+        # variant of mark_read (the bulk recipient version is for the
+        # MCP tool path). Both go through the caller's cursor so the
+        # audit-log INSERT below lands in the same transaction.
+        for col, val in updates:
+            if col == "delivered":
+                message_repo.mark_delivered(
+                    message_id, bool(val), connection=cursor,
+                )
+            elif col == "read":
+                # No dedicated single-message mark-read on the repo;
+                # use the cursor for this one flag. The audit log is
+                # logged with the row tracking so the cursor write here
+                # is small and self-contained.
+                cursor.execute(
+                    "UPDATE agent_messages SET read = ? "
+                    "WHERE message_id = ?",
+                    (val, message_id),
+                )
         log_agent_action_to_db(
             cursor, auth_get_agent_id(admin_token) or "admin",
             "updated_message", details={"message_id": message_id,
