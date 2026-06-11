@@ -957,6 +957,123 @@ class MessageRepository:
             )
         return n
 
+    def mark_read(
+        self,
+        message_id: str,
+        read: bool = True,
+        *,
+        connection: Any = None,
+    ) -> bool:
+        """Flip the ``read`` flag on a single message.
+
+        Returns False if the row didn't exist or the DB call errored.
+        Distinct from :meth:`mark_read_for_recipient` which operates
+        on every unread row for a recipient — this is the
+        "I, the dashboard PATCH handler, want to flip THIS one message"
+        surface that ``patch_message_api_route`` needs to share its
+        cursor with the audit log INSERT.
+
+        No EventBus publish — the dashboard PATCH flow is initiated by
+        admin, not a worker, and there is no subscriber today that
+        would benefit from a per-message read event (the
+        ``message.read`` event the bulk method publishes is keyed on
+        recipient_id, which is what the long-poll waiters consume).
+        Keeping this method publish-free matches the legacy raw
+        UPDATE's behaviour byte-for-byte; subscribers that DO want a
+        per-message-read signal in future can opt in here.
+
+        ``connection`` is the transaction-aware seam — the cursor
+        shape is what ``patch_message_api_route`` already holds.
+        """
+        if connection is not None and not hasattr(connection, "query"):
+            cur = connection
+            cur.execute(
+                "UPDATE agent_messages SET read = ? "
+                "WHERE message_id = ?",
+                (1 if read else 0, message_id),
+            )
+            return (cur.rowcount or 0) > 0
+        if connection is not None:
+            session = connection
+            try:
+                row = (
+                    session.query(AgentMessage)
+                    .filter(AgentMessage.message_id == message_id)
+                    .one_or_none()
+                )
+                if row is None:
+                    return False
+                row.read = read
+                session.flush()
+                return True
+            except SQLAlchemyError as e:
+                logger.error(
+                    f"Database error marking '{message_id}' read "
+                    f"via shared session: {e}", exc_info=True,
+                )
+                return False
+        # Standalone path: open our own session.
+        try:
+            with get_session() as session:
+                result = session.execute(
+                    sa_update(AgentMessage)
+                    .where(AgentMessage.message_id == message_id)
+                    .values(read=read)
+                )
+                session.commit()
+                return (result.rowcount or 0) > 0
+        except SQLAlchemyError as e:
+            logger.error(
+                f"Database error marking '{message_id}' read: {e}",
+                exc_info=True,
+            )
+            return False
+
+    # --- Write interface: prune ------------------------------------------
+
+    def prune_read_before(self, cutoff_timestamp: str) -> int:
+        """DELETE every ``read=1`` message whose ``timestamp < cutoff``.
+
+        Returns the number of rows deleted. Used by the per-project
+        message-retention pruner (:mod:`agent_mcp.features.message_retention`)
+        which today owns a raw ``DELETE FROM agent_messages WHERE read = 1
+        AND timestamp < ?`` against the connection pool. Routing it
+        through the repo keeps the only DELETE against this table in
+        one place, which matters because adding a ``message.deleted``
+        publish (none today; deliberate per :meth:`delete`) would
+        need to fire here too.
+
+        No EventBus publish — the pruner is a background sweep that
+        runs every 24h on the read-and-old tail; per-row wake-ups
+        would just spam subscribers with rows that have been read for
+        days (and their inboxes have long since re-rendered without
+        them).
+
+        On DB error returns ``0`` and logs at error.
+        """
+        try:
+            with get_session() as session:
+                result = session.execute(
+                    sa_delete(AgentMessage)
+                    .where(AgentMessage.read.is_(True))
+                    .where(AgentMessage.timestamp < cutoff_timestamp)
+                )
+                session.commit()
+                return result.rowcount or 0
+        except SQLAlchemyError as e:
+            logger.error(
+                f"Database error pruning read messages older than "
+                f"'{cutoff_timestamp}': {e}",
+                exc_info=True,
+            )
+            return 0
+        except Exception as e:
+            logger.error(
+                f"Unexpected error pruning read messages: {e}",
+                exc_info=True,
+            )
+            return 0
+
     # --- Write interface: rename_participant ----------------------------
 
     def rename_participant(

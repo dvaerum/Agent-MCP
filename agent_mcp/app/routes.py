@@ -2140,6 +2140,10 @@ async def create_message_api_route(request: Request) -> JSONResponse:
         conn = get_db_connection()
         cursor = conn.cursor()
 
+        # PR 9 (Message flip): single import covers both the broadcast
+        # bulk_send below and the single-recipient send further down.
+        from ..repositories import message_repo
+
         # Broadcast: recipient_id="*" fans out to every active worker
         # (admin excluded), mirroring the broadcast_message MCP tool.
         # One INSERT per recipient so the messages show up in the
@@ -2152,12 +2156,14 @@ async def create_message_api_route(request: Request) -> JSONResponse:
                 if rid and rid != "admin" and rid != sender_id:
                     recipients.append(rid)
 
-            # PR-G4 cutover: one bulk INSERT via the agent_messages_db
-            # action module (executemany-style under the hood). The
-            # surrounding action-log INSERT keeps its raw cursor so
-            # everything still commits atomically with the broadcast.
-            from ..db.actions.agent_messages_db import bulk_insert_messages
-
+            # PR 9 (Message flip): the broadcast bulk INSERT now goes
+            # through `message_repo.bulk_send` instead of the legacy
+            # `bulk_insert_messages` shim. Same executemany pattern
+            # under the hood (PR #98), plus an EventBus
+            # `message.created` publish per distinct recipient — the
+            # action-log INSERT keeps its raw cursor so the audit
+            # entry still commits atomically with whatever else this
+            # route writes.
             sent_ids: list[str] = []
             broadcast_rows: list[dict] = []
             for rid in recipients:
@@ -2174,7 +2180,7 @@ async def create_message_api_route(request: Request) -> JSONResponse:
                     "delivered": False,
                     "read": False,
                 })
-            bulk_insert_messages(broadcast_rows)
+            message_repo.bulk_send(broadcast_rows)
             log_agent_action_to_db(
                 cursor, sender_id, "broadcast_message_via_dashboard",
                 details={"recipients": recipients,
@@ -2216,7 +2222,6 @@ async def create_message_api_route(request: Request) -> JSONResponse:
 
         # PR 6: single-recipient message INSERT goes through message_repo
         # with the caller's cursor so it's atomic with the audit log.
-        from ..repositories import message_repo
         message_repo.send(
             message_id=message_id,
             sender_id=sender_id,
@@ -2371,14 +2376,12 @@ async def patch_message_api_route(request: Request) -> JSONResponse:
                     message_id, bool(val), connection=cursor,
                 )
             elif col == "read":
-                # No dedicated single-message mark-read on the repo;
-                # use the cursor for this one flag. The audit log is
-                # logged with the row tracking so the cursor write here
-                # is small and self-contained.
-                cursor.execute(
-                    "UPDATE agent_messages SET read = ? "
-                    "WHERE message_id = ?",
-                    (val, message_id),
+                # PR 9 (Message flip): single-message mark-read goes
+                # through `message_repo.mark_read` with the caller's
+                # cursor so the UPDATE and the audit-log INSERT below
+                # land in one transaction.
+                message_repo.mark_read(
+                    message_id, bool(val), connection=cursor,
                 )
         log_agent_action_to_db(
             cursor, auth_get_agent_id(admin_token) or "admin",
