@@ -265,23 +265,21 @@ async def _launch_testing_agent_for_completed_task(
             logger.error("MCP_PROJECT_DIR not set, cannot launch testing agent")
             return False
 
-        # Insert testing agent into database
-        cursor.execute(
-            """
-            INSERT INTO agents (token, agent_id, capabilities, created_at, status, 
-                              current_task, working_directory, color)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-            (
-                testing_token,
-                testing_agent_id,
-                json.dumps(["testing", "validation", "criticism"]),
-                created_at_iso,
-                "created",
-                completed_task_id,  # Set the completed task as current task
-                project_dir_env,
-                agent_color,
-            ),
+        # Insert testing agent into database.
+        # PR 7 (Task flip): cross-concept write — flow through
+        # agent_repo.create with the caller's cursor so the wider
+        # BEGIN/COMMIT (this INSERT + the audit-log INSERT downstream)
+        # stays atomic.
+        from ..repositories import agent_repo as _agent_repo
+        _agent_repo.create(
+            token=testing_token,
+            agent_id=testing_agent_id,
+            capabilities=["testing", "validation", "criticism"],
+            status="created",
+            current_task=completed_task_id,
+            working_directory=project_dir_env,
+            color=agent_color,
+            connection=cursor,
         )
 
         # 6. Build enriched prompt for testing agent
@@ -585,9 +583,13 @@ async def _update_single_task(
                     "content": f"Subtask '{task_id}' ({task_current_data.get('title', '')}) status changed to: {new_status}",
                 }
             )
-            cursor.execute(
-                "UPDATE tasks SET notes = ?, updated_at = ? WHERE task_id = ?",
-                (json.dumps(parent_notes_list), updated_at_iso, parent_task_id),
+            # PR 7 (Task flip): parent-task note write now flows
+            # through task_repo with the caller's cursor so the
+            # allowlist + JSON serialisation rule live in one place.
+            task_repo.update_fields(
+                parent_task_id,
+                {"notes": parent_notes_list},
+                connection=cursor,
             )
             if parent_task_id in g.tasks:
                 g.tasks[parent_task_id]["notes"] = parent_notes_list
@@ -3185,31 +3187,46 @@ async def request_assistance_tool_impl(
                     exc_info=True,
                 )
 
-        # Insert the child (assistance) task into DB (main.py:1722-1734)
+        # Insert the child (assistance) task into DB (main.py:1722-1734).
+        # PR 7 (Task flip): write flows through task_repo.create with
+        # the caller's cursor so the wider audit-log INSERT stays in
+        # the same transaction. The dict mirrors what we cached after
+        # commit (JSON list fields stored as Python lists for the
+        # in-memory shape).
+        from ..repositories import task_repo
+        task_repo.create(
+            {
+                "task_id": child_task_id,
+                "title": child_task_title,
+                "description": assistance_description,
+                "status": "pending",
+                "assigned_to": None,
+                "priority": "high",  # Assistance tasks are high priority
+                "parent_task": parent_task_id,
+                "depends_on_tasks": [],
+                "created_by": requesting_agent_id,
+                "child_tasks": [],
+                "notes": [],
+            },
+            connection=cursor,
+        )
+        # Build the in-memory cache shape (matches the post-commit dict
+        # the repo would have produced on the standalone path).
         child_task_db_data = {
             "task_id": child_task_id,
             "title": child_task_title,
             "description": assistance_description,
             "status": "pending",
             "assigned_to": None,
-            "priority": "high",  # Assistance tasks are high priority
+            "priority": "high",
             "created_at": timestamp_iso,
             "updated_at": timestamp_iso,
             "parent_task": parent_task_id,
             "depends_on_tasks": json.dumps([]),
-            "created_by": requesting_agent_id,  # The agent who requested assistance
+            "created_by": requesting_agent_id,
             "child_tasks": json.dumps([]),
             "notes": json.dumps([]),
         }
-        cursor.execute(
-            """
-            INSERT INTO tasks (task_id, title, description, status, assigned_to, priority, created_at, 
-                               updated_at, parent_task, depends_on_tasks, created_by, child_tasks, notes)
-            VALUES (:task_id, :title, :description, :status, :assigned_to, :priority, :created_at, 
-                    :updated_at, :parent_task, :depends_on_tasks, :created_by, :child_tasks, :notes)
-        """,
-            child_task_db_data,
-        )
 
         # Update parent task's child_tasks field and notes (main.py:1737-1764)
         parent_child_tasks_list = json.loads(
@@ -3226,14 +3243,16 @@ async def request_assistance_tool_impl(
             }
         )
 
-        cursor.execute(
-            "UPDATE tasks SET child_tasks = ?, notes = ?, updated_at = ? WHERE task_id = ?",
-            (
-                json.dumps(parent_child_tasks_list),
-                json.dumps(parent_notes_list),
-                timestamp_iso,
-                parent_task_id,
-            ),
+        # PR 7 (Task flip): parent-task UPDATE goes through task_repo
+        # with the caller's cursor; allowlist + JSON serialisation rule
+        # now live in one place.
+        task_repo.update_fields(
+            parent_task_id,
+            {
+                "child_tasks": parent_child_tasks_list,
+                "notes": parent_notes_list,
+            },
+            connection=cursor,
         )
 
         log_agent_action_to_db(
@@ -3438,11 +3457,13 @@ async def bulk_task_operations_tool_impl(
                         )
                         continue
 
-                    # Update status
-                    update_fields = ["status = ?", "updated_at = ?"]
-                    update_params = [new_status, updated_at_iso]
+                    # PR 7 (Task flip): bulk status+notes update flows
+                    # through task_repo.update_fields with the caller's
+                    # cursor. The repo's _MUTABLE_FIELDS allowlist
+                    # replaces the inline `allowed_bulk_fields` guard.
+                    from ..repositories import task_repo as _task_repo
 
-                    # Handle notes
+                    # Handle notes (append-only, like the non-bulk path)
                     current_notes = json.loads(task_data.get("notes") or "[]")
                     if notes_content:
                         current_notes.append(
@@ -3452,23 +3473,12 @@ async def bulk_task_operations_tool_impl(
                                 "content": notes_content,
                             }
                         )
-                    update_fields.append("notes = ?")
-                    update_params.append(json.dumps(current_notes))
 
-                    update_params.append(task_id)
-
-                    # Validate field assignments for security
-                    allowed_bulk_fields = ["status = ?", "updated_at = ?", "notes = ?"]
-                    safe_fields = [
-                        field for field in update_fields if field in allowed_bulk_fields
-                    ]
-
-                    if safe_fields:
-                        set_clause = ", ".join(safe_fields)
-                        bulk_update_sql = (
-                            f"UPDATE tasks SET {set_clause} WHERE task_id = ?"
-                        )
-                        cursor.execute(bulk_update_sql, tuple(update_params))
+                    _task_repo.update_fields(
+                        task_id,
+                        {"status": new_status, "notes": current_notes},
+                        connection=cursor,
+                    )
 
                     # Update in-memory cache
                     if task_id in g.tasks:
@@ -3507,9 +3517,14 @@ async def bulk_task_operations_tool_impl(
                         )
                         continue
 
-                    cursor.execute(
-                        "UPDATE tasks SET priority = ?, updated_at = ? WHERE task_id = ?",
-                        (new_priority, updated_at_iso, task_id),
+                    # PR 7 (Task flip): bulk priority update flows
+                    # through task_repo.update_fields with the caller's
+                    # cursor.
+                    from ..repositories import task_repo as _task_repo
+                    _task_repo.update_fields(
+                        task_id,
+                        {"priority": new_priority},
+                        connection=cursor,
                     )
 
                     if task_id in g.tasks:
@@ -3538,9 +3553,13 @@ async def bulk_task_operations_tool_impl(
                         }
                     )
 
-                    cursor.execute(
-                        "UPDATE tasks SET notes = ?, updated_at = ? WHERE task_id = ?",
-                        (json.dumps(current_notes), updated_at_iso, task_id),
+                    # PR 7 (Task flip): bulk add_note flows through
+                    # task_repo.update_fields with the caller's cursor.
+                    from ..repositories import task_repo as _task_repo
+                    _task_repo.update_fields(
+                        task_id,
+                        {"notes": current_notes},
+                        connection=cursor,
                     )
 
                     if task_id in g.tasks:
@@ -3558,9 +3577,13 @@ async def bulk_task_operations_tool_impl(
                         )
                         continue
 
-                    cursor.execute(
-                        "UPDATE tasks SET assigned_to = ?, updated_at = ? WHERE task_id = ?",
-                        (new_assigned_to, updated_at_iso, task_id),
+                    # PR 7 (Task flip): bulk reassign flows through
+                    # task_repo.update_fields with the caller's cursor.
+                    from ..repositories import task_repo as _task_repo
+                    _task_repo.update_fields(
+                        task_id,
+                        {"assigned_to": new_assigned_to},
+                        connection=cursor,
                     )
 
                     if task_id in g.tasks:
@@ -4522,13 +4545,14 @@ async def delete_task_tool_impl(
                 parent_children = json.loads(parent_row["child_tasks"] or "[]")
                 if task_id in parent_children:
                     parent_children.remove(task_id)
-                    cursor.execute(
-                        "UPDATE tasks SET child_tasks = ?, updated_at = ? WHERE task_id = ?",
-                        (
-                            json.dumps(parent_children),
-                            datetime.datetime.now().isoformat(),
-                            parent_id,
-                        ),
+                    # PR 7 (Task flip): cascade child-removal goes
+                    # through task_repo with the caller's cursor so
+                    # the wider delete transaction stays atomic.
+                    from ..repositories import task_repo as _task_repo
+                    _task_repo.update_fields(
+                        parent_id,
+                        {"child_tasks": parent_children},
+                        connection=cursor,
                     )
                     cascade_operations.append(
                         f"Updated parent task '{parent_id}' to remove child reference"
@@ -4556,13 +4580,15 @@ async def delete_task_tool_impl(
                     )
                     if task_id in dep_dependencies:
                         dep_dependencies.remove(task_id)
-                        cursor.execute(
-                            "UPDATE tasks SET depends_on_tasks = ?, updated_at = ? WHERE task_id = ?",
-                            (
-                                json.dumps(dep_dependencies),
-                                datetime.datetime.now().isoformat(),
-                                dep_id,
-                            ),
+                        # PR 7 (Task flip): cascade dependency-removal
+                        # goes through task_repo with the caller's
+                        # cursor so the wider delete transaction stays
+                        # atomic.
+                        from ..repositories import task_repo as _task_repo
+                        _task_repo.update_fields(
+                            dep_id,
+                            {"depends_on_tasks": dep_dependencies},
+                            connection=cursor,
                         )
                         cascade_operations.append(
                             f"Updated task '{dep_id}' to remove dependency on '{task_id}'"

@@ -428,14 +428,26 @@ async def update_task_details_api_route(request: Request) -> JSONResponse:
         cursor.execute("SELECT notes FROM tasks WHERE task_id = ?", (task_id_to_update,)); task_row = cursor.fetchone()
         if not task_row: return JSONResponse({"error": "Task not found"}, status_code=404)
         existing_notes_str = task_row["notes"]
-        update_fields: List[str] = []; params: List[Any] = []; log_details: Dict[str, Any] = {}
+        # PR 7 (Task flip): build the field dict the same way the
+        # legacy code built its SET clause, then hand it to
+        # task_repo.update_fields(connection=cursor). The repo's
+        # _MUTABLE_FIELDS allowlist + JSON-serialisation rule (for
+        # `notes`) live in one place now; the route stops carrying
+        # them as inline SQL fragments.
+        fields_to_update: Dict[str, Any] = {}
+        log_details: Dict[str, Any] = {}
         if new_status:
-            update_fields.append("status = ?"); params.append(new_status)
+            fields_to_update["status"] = new_status
             log_details["status_updated_to"] = new_status
-        update_fields.append("updated_at = ?"); params.append(datetime.datetime.now().isoformat())
-        if 'title' in data and data['title'] is not None: update_fields.append("title = ?"); params.append(data['title']); log_details["title_changed"] = True
-        if 'description' in data and data['description'] is not None: update_fields.append("description = ?"); params.append(data['description']); log_details["description_changed"] = True
-        if 'priority' in data and data['priority']: update_fields.append("priority = ?"); params.append(data['priority']); log_details["priority_changed"] = True
+        if 'title' in data and data['title'] is not None:
+            fields_to_update["title"] = data['title']
+            log_details["title_changed"] = True
+        if 'description' in data and data['description'] is not None:
+            fields_to_update["description"] = data['description']
+            log_details["description_changed"] = True
+        if 'priority' in data and data['priority']:
+            fields_to_update["priority"] = data['priority']
+            log_details["priority_changed"] = True
         if 'assigned_to' in data:
             # null / '' / 'unassigned' clears the assignment; any other
             # value is stored verbatim as the agent_id.
@@ -445,18 +457,24 @@ async def update_task_details_api_route(request: Request) -> JSONResponse:
                 new_assigned = None
             else:
                 new_assigned = str(raw_assigned).strip()
-            update_fields.append("assigned_to = ?"); params.append(new_assigned)
+            fields_to_update["assigned_to"] = new_assigned
             log_details["assigned_to_changed"] = new_assigned
         if 'notes' in data and data['notes'] and isinstance(data['notes'], str) and data['notes'].strip():
             try: current_notes_list = json.loads(existing_notes_str or "[]")
             except json.JSONDecodeError: current_notes_list = []
             new_note_entry = {"timestamp": datetime.datetime.now().isoformat(), "author": requesting_admin_id, "content": data['notes'].strip()}
-            current_notes_list.append(new_note_entry); update_fields.append("notes = ?"); params.append(json.dumps(current_notes_list)); log_details["notes_added"] = True
-        params.append(task_id_to_update)
-        if update_fields:
-            placeholders = ', '.join(update_fields)
-            query = f"UPDATE tasks SET {placeholders} WHERE task_id = ?"
-            cursor.execute(query, tuple(params))
+            current_notes_list.append(new_note_entry)
+            # The repo serialises list fields with json.dumps internally;
+            # pass the Python list directly.
+            fields_to_update["notes"] = current_notes_list
+            log_details["notes_added"] = True
+        if fields_to_update:
+            from ..repositories import task_repo as _task_repo
+            _task_repo.update_fields(
+                task_id_to_update,
+                fields_to_update,
+                connection=cursor,
+            )
         log_agent_action_to_db(cursor, requesting_admin_id, "updated_task_dashboard", task_id=task_id_to_update, details=log_details); conn.commit()
         if task_id_to_update in g.tasks:
             cursor.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id_to_update,)); updated_task_for_cache = cursor.fetchone()
@@ -1817,8 +1835,8 @@ async def create_task_api_route(request: Request) -> JSONResponse:
         # ("anyone can claim", matches broadcast semantics).
         from agent_mcp.utils.capability_normalization import normalize_capabilities
 
+        # The repo (task_repo.create) handles json.dumps internally.
         _norm_caps = normalize_capabilities(data.get('required_capabilities'))
-        required_caps_json = json.dumps(_norm_caps) if _norm_caps else None
 
         if not verify_token(admin_token, required_role='admin'):
             return JSONResponse({"error": "Invalid admin token"}, status_code=403)
@@ -1830,26 +1848,31 @@ async def create_task_api_route(request: Request) -> JSONResponse:
 
         requesting_admin_id = auth_get_agent_id(admin_token)
         task_id = f"task_{_uuid.uuid4().hex[:12]}"
-        now = datetime.datetime.now().isoformat()
         status = 'pending' if assigned_to else 'unassigned'
 
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO tasks (
-                task_id, title, description, assigned_to, created_by,
-                status, priority, created_at, updated_at,
-                parent_task, child_tasks, depends_on_tasks, notes,
-                required_capabilities
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                task_id, title, description, assigned_to, requesting_admin_id,
-                status, priority, now, now,
-                parent_task, '[]', '[]', '[]',
-                required_caps_json,
-            ),
+        # PR 7 (Task flip): create flows through task_repo.create with
+        # the caller's cursor so the wider audit-log INSERT stays in
+        # the same transaction. The repo handles JSON serialisation
+        # of list fields + the `required_capabilities` quirk.
+        from ..repositories import task_repo as _task_repo
+        _task_repo.create(
+            {
+                "task_id": task_id,
+                "title": title,
+                "description": description,
+                "assigned_to": assigned_to,
+                "created_by": requesting_admin_id,
+                "status": status,
+                "priority": priority,
+                "parent_task": parent_task,
+                "child_tasks": [],
+                "depends_on_tasks": [],
+                "notes": [],
+                "required_capabilities": _norm_caps if _norm_caps else None,
+            },
+            connection=cursor,
         )
         log_agent_action_to_db(
             cursor, requesting_admin_id, "created_task",
