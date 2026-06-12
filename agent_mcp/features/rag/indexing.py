@@ -203,23 +203,30 @@ async def run_rag_indexing_periodically(
                 await anyio.sleep(interval_seconds * 2)  # Sleep longer if VSS fails
                 continue  # Skip to next iteration of the while loop
 
-            # Check for rag_embeddings table specifically
-            cursor.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='rag_embeddings'"
-            )
-            if cursor.fetchone() is None:
+            # Check for rag_embeddings table specifically. PR F
+            # exposes the existence-check via
+            # ``agent_mcp.db.actions.rag_db._embeddings_table_exists``
+            # — re-exported from the repository so the gate check
+            # uses the same source-of-truth predicate.
+            from ...db.actions.rag_db import _embeddings_table_exists
+            if not _embeddings_table_exists(cursor):
                 logger.warning(
                     "Vector table 'rag_embeddings' not found. Skipping RAG indexing cycle. Ensure DB schema is initialized."
                 )
                 await anyio.sleep(interval_seconds * 2)
                 continue
 
-            # Get last indexed timestamps and stored hashes
-            # Original main.py:534-535 (last_indexed) and main.py:597-598 (stored_hashes)
-            cursor.execute("SELECT meta_key, meta_value FROM rag_meta")
-            rag_meta_data = {
-                row["meta_key"]: row["meta_value"] for row in cursor.fetchall()
-            }
+            # Get last indexed timestamps and stored hashes.
+            # PR F: rag_repo owns the rag_meta read surface now —
+            # ``get_all_meta`` returns the whole table in one shot
+            # so the partition into ``last_indexed_*`` /  ``hash_*``
+            # keys stays exactly as before. We keep the partition
+            # logic here because the indexer's hash-comparison loop
+            # depends on the ``hash_<source_type>_<source_ref>`` key
+            # shape (see the per-source filter below).
+            from ...repositories import rag_repo
+
+            rag_meta_data = rag_repo.get_all_meta()
             last_indexed_timestamps = {
                 k: v for k, v in rag_meta_data.items() if k.startswith("last_indexed_")
             }
@@ -449,29 +456,21 @@ async def run_rag_indexing_periodically(
 
                 processed_hashes_to_update_in_meta: Dict[str, str] = {}
 
-                # Delete existing chunks for sources needing update (Original main.py:619-628)
+                # Delete existing chunks for sources needing update.
+                # PR F: rag_repo.delete_chunks_for owns the
+                # embeddings-then-chunks delete ordering and the
+                # rag_embeddings-existence guard. We pass the
+                # cycle's shared ``cursor`` so the deletes join the
+                # same transaction as the inserts further down.
                 logger.info(
                     "Deleting existing chunks and embeddings for sources needing update..."
                 )
                 delete_count = 0
                 for source_type, source_ref, _, _ in sources_to_process_for_embedding:
-                    # Delete from embeddings first (using rowid from chunks)
-                    # Ensure rag_embeddings table exists before attempting delete
-                    cursor.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table' AND name='rag_embeddings'"
+                    n_deleted = rag_repo.delete_chunks_for(
+                        source_type, source_ref, connection=cursor,
                     )
-                    if cursor.fetchone() is not None:
-                        res_emb = cursor.execute(
-                            "DELETE FROM rag_embeddings WHERE rowid IN (SELECT chunk_id FROM rag_chunks WHERE source_type = ? AND source_ref = ?)",
-                            (source_type, source_ref),
-                        )
-                    # Delete from chunks
-                    res_chk = cursor.execute(
-                        "DELETE FROM rag_chunks WHERE source_type = ? AND source_ref = ?",
-                        (source_type, source_ref),
-                    )
-                    if res_chk.rowcount > 0:
-                        delete_count += res_chk.rowcount
+                    delete_count += n_deleted
                 if delete_count > 0:
                     logger.info(
                         f"Deleted {delete_count} old chunks and their embeddings."
@@ -674,13 +673,18 @@ async def run_rag_indexing_periodically(
                                 "More than half of the embeddings failed. Marking RAG indexing cycle for these sources as unsuccessful."
                             )
 
-                    # Insert new chunks and embeddings into DB (Original main.py:697-722)
+                    # Insert new chunks and embeddings into DB.
+                    # PR F: rag_repo.bulk_index_chunks owns the
+                    # chunk + embedding INSERT pair and the
+                    # rag_embeddings-existence guard. We call it per
+                    # chunk so the per-iteration error tolerance and
+                    # hash-on-success bookkeeping below stay
+                    # byte-for-byte identical to the pre-flip loop.
                     if embeddings_api_successful:
                         logger.info(
                             "Inserting new chunks and embeddings into the database..."
                         )
                         inserted_count = 0
-                        indexed_at_iso = datetime.datetime.now().isoformat()
                         for i, chunk_text_to_insert in enumerate(
                             all_chunks_texts_to_embed
                         ):
@@ -697,31 +701,18 @@ async def run_rag_indexing_periodically(
                                 current_hash_of_source,
                                 chunk_metadata,
                             ) = chunk_source_metadata_map[i]
-                            try:
-                                # Store chunk with optional metadata
-                                metadata_json = (
-                                    json.dumps(chunk_metadata)
-                                    if chunk_metadata
-                                    else None
-                                )
-                                cursor.execute(
-                                    "INSERT INTO rag_chunks (source_type, source_ref, chunk_text, indexed_at, metadata) VALUES (?, ?, ?, ?, ?)",
-                                    (
-                                        source_type,
-                                        source_ref,
-                                        chunk_text_to_insert,
-                                        indexed_at_iso,
-                                        metadata_json,
-                                    ),
-                                )
-                                chunk_rowid = cursor.lastrowid  # This is the chunk_id
-
-                                embedding_json_str = json.dumps(embedding_vector)
-                                cursor.execute(
-                                    "INSERT INTO rag_embeddings (rowid, embedding) VALUES (?, ?)",
-                                    (chunk_rowid, embedding_json_str),
-                                )
-                                inserted_count += 1
+                            n_written = rag_repo.bulk_index_chunks(
+                                source_type=source_type,
+                                source_ref=source_ref,
+                                chunks=[{
+                                    "chunk_text": chunk_text_to_insert,
+                                    "embedding": embedding_vector,
+                                    "metadata": chunk_metadata,
+                                }],
+                                connection=cursor,
+                            )
+                            if n_written > 0:
+                                inserted_count += n_written
                                 # Mark this source's hash to be updated in rag_meta
                                 meta_key_for_hash_update = (
                                     f"hash_{source_type}_{source_ref}"
@@ -729,48 +720,61 @@ async def run_rag_indexing_periodically(
                                 processed_hashes_to_update_in_meta[
                                     meta_key_for_hash_update
                                 ] = current_hash_of_source
-                            except sqlite3.Error as db_err:
-                                logger.error(
-                                    f"DB Error inserting chunk/embedding for {source_type}:{source_ref} (Chunk index {i}): {db_err}"
-                                )
-                                # If one insert fails, we might lose its hash update.
-                                # Consider if transaction should be per source or all-or-nothing for the cycle.
-                                # Original code continued, so we do too.
-                            except Exception as e_ins:
-                                logger.error(
-                                    f"Unexpected error inserting chunk/embedding: {e_ins}",
-                                    exc_info=True,
-                                )
 
                         logger.info(
                             f"Successfully inserted {inserted_count} new chunks/embeddings."
                         )
 
-                        # Update rag_meta with the new hashes for successfully processed sources
-                        # Original main.py:725-728
+                        # Update rag_meta with the new hashes for
+                        # successfully processed sources. PR F:
+                        # rag_repo.set_meta groups per source_type;
+                        # the in-cycle dict keys ``hash_<src>_<ref>``
+                        # are split back into per-source groups and
+                        # set_meta is called once per source_type so
+                        # the repo owns the canonical key shape.
                         if processed_hashes_to_update_in_meta:
                             logger.info(
                                 f"Updating {len(processed_hashes_to_update_in_meta)} source hashes in rag_meta..."
                             )
-                            meta_update_tuples = list(
+                            per_source: Dict[str, Dict[str, str]] = {}
+                            for full_key, hash_val in (
                                 processed_hashes_to_update_in_meta.items()
-                            )
-                            cursor.executemany(
-                                "INSERT OR REPLACE INTO rag_meta (meta_key, meta_value) VALUES (?, ?)",
-                                meta_update_tuples,
-                            )
+                            ):
+                                # Strip the ``hash_`` prefix and split
+                                # ``<source_type>_<source_ref>`` on
+                                # the FIRST underscore — source_ref can
+                                # itself contain underscores
+                                # (``docs/sub_dir/file.md``) so a
+                                # naive split would mis-attribute.
+                                without_prefix = full_key[len("hash_"):]
+                                source_type, _, source_ref = (
+                                    without_prefix.partition("_")
+                                )
+                                per_source.setdefault(
+                                    source_type, {}
+                                )[source_ref] = hash_val
+                            for source_type, mapping in per_source.items():
+                                rag_repo.set_meta(
+                                    source_type=source_type,
+                                    source_hashes=mapping,
+                                    connection=cursor,
+                                )
                     else:
                         logger.warning(
                             "Skipping DB insertion and hash updates for this RAG cycle due to embedding API errors."
                         )
 
-            # Update last indexed *timestamps* in rag_meta (Original main.py:731-737)
-            # Only update if the embedding part (if attempted) was successful or no embeddings were needed.
-            # The 'embeddings_api_successful' flag covers this.
+            # Update last indexed *timestamps* in rag_meta. Only
+            # update if the embedding part (if attempted) was
+            # successful or no embeddings were needed. The
+            # ``embeddings_api_successful`` flag covers this.
+            # PR F: rag_repo.set_meta owns the writes; the
+            # auto-indexing / advanced-mode gates remain at the call
+            # site because they're decisions about WHEN to update,
+            # not about HOW to write the row.
             if (
                 "embeddings_api_successful" not in locals() or embeddings_api_successful
             ):  # Check if flag exists and is True
-                # Only update markdown timestamp if auto-indexing is enabled
                 if not DISABLE_AUTO_INDEXING:
                     new_md_time_iso = (
                         datetime.datetime.fromtimestamp(
@@ -778,13 +782,15 @@ async def run_rag_indexing_periodically(
                         ).isoformat()
                         + "Z"
                     )
-                    cursor.execute(
-                        "INSERT OR REPLACE INTO rag_meta (meta_key, meta_value) VALUES (?, ?)",
-                        ("last_indexed_markdown", new_md_time_iso),
+                    rag_repo.set_meta(
+                        source_type="markdown",
+                        last_indexed_at=new_md_time_iso,
+                        connection=cursor,
                     )
-                cursor.execute(
-                    "INSERT OR REPLACE INTO rag_meta (meta_key, meta_value) VALUES (?, ?)",
-                    ("last_indexed_context", max_ctx_mod_time_iso),
+                rag_repo.set_meta(
+                    source_type="context",
+                    last_indexed_at=max_ctx_mod_time_iso,
+                    connection=cursor,
                 )
 
                 # Only update code and tasks timestamps in advanced mode
@@ -795,13 +801,15 @@ async def run_rag_indexing_periodically(
                         ).isoformat()
                         + "Z"
                     )
-                    cursor.execute(
-                        "INSERT OR REPLACE INTO rag_meta (meta_key, meta_value) VALUES (?, ?)",
-                        ("last_indexed_code", new_code_time_iso),
+                    rag_repo.set_meta(
+                        source_type="code",
+                        last_indexed_at=new_code_time_iso,
+                        connection=cursor,
                     )
-                    cursor.execute(
-                        "INSERT OR REPLACE INTO rag_meta (meta_key, meta_value) VALUES (?, ?)",
-                        ("last_indexed_tasks", max_task_mod_time_iso),
+                    rag_repo.set_meta(
+                        source_type="tasks",
+                        last_indexed_at=max_task_mod_time_iso,
+                        connection=cursor,
                     )
                 # Add other source types here
             else:
@@ -880,6 +888,13 @@ async def index_task_data(task_id: str, task_data: Dict[str, Any]) -> None:
         logger.warning("Cannot index task - VSS not available")
         return
 
+    # PR F: rag_repo owns the delete-then-insert pair for the per-task
+    # re-index. We still hold the connection so the OpenAI embedding
+    # call (which can take several seconds) doesn't pin a transaction;
+    # delete first standalone, then bulk-index the freshly-embedded
+    # chunks via the repo on its own commit.
+    from ...repositories import rag_repo
+
     conn = None
     try:
         conn = get_db_connection()
@@ -891,16 +906,10 @@ async def index_task_data(task_id: str, task_data: Dict[str, Any]) -> None:
         # Generate chunks (tasks are usually small, so one chunk is fine)
         chunks = simple_chunker(content, chunk_size=2000)
 
-        # Delete existing chunks for this task
-        cursor.execute(
-            "DELETE FROM rag_embeddings WHERE rowid IN "
-            "(SELECT chunk_id FROM rag_chunks WHERE source_type = ? AND source_ref = ?)",
-            ("task", task_id),
-        )
-        cursor.execute(
-            "DELETE FROM rag_chunks WHERE source_type = ? AND source_ref = ?",
-            ("task", task_id),
-        )
+        # Delete existing chunks for this task. Shares the owner
+        # cursor so the delete + the openai-call + the subsequent
+        # inserts all stage atomically.
+        rag_repo.delete_chunks_for("task", task_id, connection=cursor)
 
         # Get OpenAI client for embeddings
         client = get_openai_client()
@@ -908,32 +917,25 @@ async def index_task_data(task_id: str, task_data: Dict[str, Any]) -> None:
             logger.error("OpenAI client not available for task indexing")
             return
 
-        # Generate embeddings for each chunk
+        # Generate embeddings for each chunk + insert via repo.
         for chunk_text in chunks:
             try:
-                # Generate embedding
                 embedding_response = client.embeddings.create(
                     model=EMBEDDING_MODEL,
                     input=chunk_text,
                     dimensions=EMBEDDING_DIMENSION,
                 )
                 embedding_vector = embedding_response.data[0].embedding
-
-                # Insert chunk
-                cursor.execute(
-                    "INSERT INTO rag_chunks (source_type, source_ref, chunk_text, indexed_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    ("task", task_id, chunk_text, datetime.datetime.now().isoformat()),
+                rag_repo.bulk_index_chunks(
+                    source_type="task",
+                    source_ref=task_id,
+                    chunks=[{
+                        "chunk_text": chunk_text,
+                        "embedding": embedding_vector,
+                        "metadata": None,
+                    }],
+                    connection=cursor,
                 )
-                chunk_id = cursor.lastrowid
-
-                # Insert embedding
-                embedding_json_str = json.dumps(embedding_vector)
-                cursor.execute(
-                    "INSERT INTO rag_embeddings (rowid, embedding) VALUES (?, ?)",
-                    (chunk_id, embedding_json_str),
-                )
-
             except Exception as e:
                 logger.error(f"Error generating embedding for task {task_id}: {e}")
 
@@ -979,10 +981,12 @@ async def index_all_tasks() -> None:
 
             await index_task_data(task_data["task_id"], task_data)
 
-        # Update last indexed time
-        cursor.execute(
-            "INSERT OR REPLACE INTO rag_meta (meta_key, meta_value) VALUES (?, ?)",
-            ("last_indexed_tasks", datetime.datetime.now().isoformat()),
+        # Update last indexed time via rag_repo (PR F).
+        from ...repositories import rag_repo
+        rag_repo.set_meta(
+            source_type="tasks",
+            last_indexed_at=datetime.datetime.now().isoformat(),
+            connection=cursor,
         )
         conn.commit()
 

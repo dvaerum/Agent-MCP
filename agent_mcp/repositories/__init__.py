@@ -197,6 +197,56 @@ def get_message_repo() -> "MessageRepository":  # noqa: F821
     return _message_repo_instance
 
 
+# --- RagRepository singleton slot --------------------------------------
+#
+# PR F of the round-2 architecture-review series — the final repository
+# in the four-concept set (tasks, agents, messages, RAG). Mirrors the
+# Task/Agent/Message lifecycle byte-for-byte; the RAG concept did not
+# have a module-of-functions form pre-flip (db/actions/rag_db.py was an
+# empty placeholder), so this class is the first canonical surface for
+# RAG persistence rather than a re-shaping of an existing one.
+
+_rag_repo_instance: Optional["RagRepository"] = None  # noqa: F821
+
+
+def set_rag_repo(instance: "RagRepository") -> None:  # noqa: F821
+    """Install the RagRepository singleton.
+
+    Mirrors :func:`set_task_repo`. Called by
+    ``app.server_lifecycle.application_startup`` after the DB schema
+    is ready (which is also when the sqlite-vec extension's per-
+    connection load gets validated).
+    """
+    global _rag_repo_instance
+    _rag_repo_instance = instance
+
+
+def clear_rag_repo() -> None:
+    """Drop the RagRepository singleton.
+
+    Mirrors :func:`clear_task_repo`. Called by
+    ``application_shutdown`` so a stale instance bound to a closed
+    engine doesn't leak across the lifespan boundary.
+    """
+    global _rag_repo_instance
+    _rag_repo_instance = None
+
+
+def get_rag_repo() -> "RagRepository":  # noqa: F821
+    """Return the live singleton, instantiating a default if needed.
+
+    Same lazy-init rationale as :func:`get_task_repo`: protects tests
+    and any legacy importer of the shim-to-be from a cold-start race
+    against the lifespan hook.
+    """
+    global _rag_repo_instance
+    if _rag_repo_instance is None:
+        from .rag_repository import RagRepository
+
+        _rag_repo_instance = RagRepository()
+    return _rag_repo_instance
+
+
 def __getattr__(name: str) -> Any:
     """Module-level lazy attribute lookup.
 
@@ -216,6 +266,8 @@ def __getattr__(name: str) -> Any:
         return get_agent_repo()
     if name == "message_repo":
         return get_message_repo()
+    if name == "rag_repo":
+        return get_rag_repo()
     raise AttributeError(
         f"module 'agent_mcp.repositories' has no attribute {name!r}"
     )
@@ -225,13 +277,17 @@ __all__ = [
     "agent_repo",
     "clear_agent_repo",
     "clear_message_repo",
+    "clear_rag_repo",
     "clear_task_repo",
     "get_agent_repo",
     "get_message_repo",
+    "get_rag_repo",
     "get_task_repo",
     "message_repo",
+    "rag_repo",
     "set_agent_repo",
     "set_message_repo",
+    "set_rag_repo",
     "set_task_repo",
     "task_repo",
 ]

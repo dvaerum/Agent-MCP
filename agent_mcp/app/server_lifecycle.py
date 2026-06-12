@@ -428,10 +428,12 @@ async def application_startup(
     from ..repositories import (
         set_agent_repo,
         set_message_repo,
+        set_rag_repo,
         set_task_repo,
     )
     from ..repositories.agent_repository import AgentRepository
     from ..repositories.message_repository import MessageRepository
+    from ..repositories.rag_repository import RagRepository
     from ..repositories.task_repository import TaskRepository
 
     set_task_repo(TaskRepository())
@@ -440,6 +442,14 @@ async def application_startup(
     logger.info("AgentRepository singleton installed.")
     set_message_repo(MessageRepository())
     logger.info("MessageRepository singleton installed.")
+    # PR F of round 2 — RagRepository is the single owner of
+    # rag_chunks / rag_embeddings / rag_meta. Installed alongside the
+    # other three concept repos so call sites (features/rag/indexing
+    # and features/rag/query post-migration) can resolve it via
+    # ``from agent_mcp.repositories import rag_repo`` with no startup-
+    # order constraint.
+    set_rag_repo(RagRepository())
+    logger.info("RagRepository singleton installed.")
 
     # 7. Perform VSS Loadability Check (Original main.py: called by init_database)
     # This ensures g.global_vss_load_successful is set.
@@ -581,6 +591,7 @@ async def application_shutdown():
         from ..repositories import (
             clear_agent_repo,
             clear_message_repo,
+            clear_rag_repo,
             clear_task_repo,
         )
 
@@ -590,6 +601,8 @@ async def application_shutdown():
         logger.info("AgentRepository singleton cleared.")
         clear_message_repo()
         logger.info("MessageRepository singleton cleared.")
+        clear_rag_repo()
+        logger.info("RagRepository singleton cleared.")
     except Exception as e:  # pragma: no cover - defensive
         logger.warning(f"Failed to clear Repository singletons: {e}")
 
