@@ -84,16 +84,39 @@ def _vss_available() -> bool:
     return bool(g.global_vss_load_successful)
 
 
-# Use a vector dimension small enough to keep test fixtures readable but
-# matching what the repo defaults to (EMBEDDING_DIMENSION). The schema
-# bootstrap reads EMBEDDING_DIMENSION at virtual-table-create time; we
-# fetch it back here so the fixtures line up automatically.
+# Use a vector dimension matching the on-disk vec0 table. The schema
+# bootstrap reads EMBEDDING_DIMENSION at virtual-table-create time, and
+# a leaky-fixture interaction with test_embedding_config can leave the
+# config module's EMBEDDING_DIMENSION out of sync with the dim baked
+# into the table for this test's project_dir. Re-reading the table's
+# declared dimension straight from sqlite_master keeps the fixtures
+# correct regardless of import-time state.
 def _emb(values):
-    """Pad/truncate a short fixture vector to the configured embedding
-    dimension, so the values land exactly inside the vec0 table."""
-    from agent_mcp.core.config import EMBEDDING_DIMENSION
-    out = list(values) + [0.0] * max(0, EMBEDDING_DIMENSION - len(values))
-    return out[:EMBEDDING_DIMENSION]
+    """Pad/truncate a short fixture vector to whatever dimension the
+    on-disk vec0 ``rag_embeddings`` table declares."""
+    import re
+    from agent_mcp.db.connection import get_db_connection
+
+    conn = get_db_connection()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type IN ('table', 'virtual') AND name='rag_embeddings'"
+        )
+        row = c.fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        # No table: fall back to the config value (the test that needs
+        # the table will skip via _vss_available).
+        from agent_mcp.core.config import EMBEDDING_DIMENSION
+        dim = EMBEDDING_DIMENSION
+    else:
+        m = re.search(r"FLOAT\[(\d+)\]", row[0])
+        dim = int(m.group(1)) if m else 1536
+    out = list(values) + [0.0] * max(0, dim - len(values))
+    return out[:dim]
 
 
 # --- Singleton + lifespan wiring ---------------------------------------
@@ -517,31 +540,36 @@ def test_fetch_recent_context_time_windowed(project_dir, reset_globals):
         from agent_mcp.repositories import rag_repo
         from agent_mcp.db.connection import get_db_connection
 
-        # Seed two project_context rows with distinct timestamps.
+        # Seed two project_context rows with distinct timestamps far
+        # in the future so the admin-token row (inserted at lifespan
+        # startup with a "now" timestamp) doesn't pollute the
+        # comparison. The cutoff sits between the two seeded rows.
         conn = get_db_connection()
         try:
             c = conn.cursor()
             c.execute(
                 "INSERT INTO project_context "
-                "(context_key, value, description, "
-                "updated_by, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                ("old_key", '"old"', "old desc", "admin",
-                 "2026-06-01T00:00:00Z"),
+                "(context_key, value, description, created_at, "
+                "created_by, updated_at, updated_by) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("old_key", '"old"', "old desc",
+                 "2099-06-01T00:00:00Z", "test",
+                 "2099-06-01T00:00:00Z", "test"),
             )
             c.execute(
                 "INSERT INTO project_context "
-                "(context_key, value, description, "
-                "updated_by, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                ("new_key", '"new"', "new desc", "admin",
-                 "2026-06-10T00:00:00Z"),
+                "(context_key, value, description, created_at, "
+                "created_by, updated_at, updated_by) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("new_key", '"new"', "new desc",
+                 "2099-06-10T00:00:00Z", "test",
+                 "2099-06-10T00:00:00Z", "test"),
             )
             conn.commit()
         finally:
             conn.close()
 
-        results = rag_repo.fetch_recent_context(since="2026-06-05T00:00:00Z")
+        results = rag_repo.fetch_recent_context(since="2099-06-05T00:00:00Z")
         assert len(results) == 1
         assert results[0]["context_key"] == "new_key"
 
