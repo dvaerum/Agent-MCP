@@ -1,7 +1,6 @@
 # Agent-MCP/mcp_template/mcp_server_src/features/rag/query.py
-import json
 import sqlite3  # For type hinting and error handling
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any
 
 # Imports from our project
 from ...core.config import (
@@ -54,31 +53,21 @@ async def query_rag_system(query_text: str) -> str:
         )  # Store as dicts for easier access
 
         # --- 1. Fetch Live Context (Recently Updated) ---
-        # Original main.py: lines 1445 - 1457
-        try:
-            cursor.execute(
-                "SELECT meta_value FROM rag_meta WHERE meta_key = ?",
-                ("last_indexed_context",),
-            )
-            last_indexed_context_row = cursor.fetchone()
-            last_indexed_context_time = (
-                last_indexed_context_row["meta_value"]
-                if last_indexed_context_row
-                else "1970-01-01T00:00:00Z"
-            )
+        # PR F: rag_repo.get_last_indexed + fetch_recent_context own
+        # the rag_meta read and the project_context time-windowed
+        # fetch. The repo normalises the column rename from
+        # ``last_updated`` -> ``updated_at`` (Phase 7b) so callers
+        # don't have to remember which name to use.
+        from ...repositories import rag_repo
 
-            cursor.execute(
-                """
-                SELECT context_key, value, description, last_updated
-                FROM project_context
-                WHERE last_updated > ?
-                ORDER BY last_updated DESC
-                LIMIT 5
-            """,
-                (last_indexed_context_time,),
+        try:
+            last_indexed_context_time = (
+                rag_repo.get_last_indexed("context")
+                or "1970-01-01T00:00:00Z"
             )
-            # Convert rows to dicts for easier processing
-            live_context_results = [dict(row) for row in cursor.fetchall()]
+            live_context_results = rag_repo.fetch_recent_context(
+                since=last_indexed_context_time, limit=5,
+            )
         except sqlite3.Error as e_live_ctx:
             logger.warning(
                 f"RAG Query: Failed to fetch live project context: {e_live_ctx}"
@@ -144,52 +133,25 @@ async def query_rag_system(query_text: str) -> str:
             )
 
         # --- 3. Perform Vector Search (Indexed Knowledge) ---
-        # Original main.py: lines 1479 - 1506
-        if is_vss_loadable():  # Check global VSS status
+        # PR F: rag_repo.search_similar owns the vec0 ``MATCH`` +
+        # ``k = ?`` ORDER BY distance dialect, the
+        # rag_embeddings-existence guard, AND the metadata-JSON
+        # hydration. The caller's job is to embed the query and pass
+        # the vector in.
+        if is_vss_loadable():
             try:
-                # Check if rag_embeddings table exists (main.py:1480-1484)
-                cursor.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='rag_embeddings'"
+                response = openai_client.embeddings.create(
+                    input=[query_text],
+                    model=EMBEDDING_MODEL,
+                    dimensions=EMBEDDING_DIMENSION,
                 )
-                if cursor.fetchone() is not None:
-                    # Embed the query (main.py:1487-1492)
-                    response = openai_client.embeddings.create(
-                        input=[query_text],
-                        model=EMBEDDING_MODEL,
-                        dimensions=EMBEDDING_DIMENSION,
-                    )
-                    query_embedding = response.data[0].embedding
-                    query_embedding_json = json.dumps(query_embedding)
-
-                    # Search Vector Table with metadata
-                    k_results = 13  # Optimized based on recent RAG research
-                    sql_vector_search = """
-                        SELECT c.chunk_text, c.source_type, c.source_ref, c.metadata, r.distance
-                        FROM rag_embeddings r
-                        JOIN rag_chunks c ON r.rowid = c.chunk_id
-                        WHERE r.embedding MATCH ? AND k = ?
-                        ORDER BY r.distance
-                    """
-                    cursor.execute(sql_vector_search, (query_embedding_json, k_results))
-                    raw_results = cursor.fetchall()
-
-                    # Process results to parse metadata
-                    for row in raw_results:
-                        result = dict(row)
-                        # Parse metadata JSON if present
-                        if result.get("metadata"):
-                            try:
-                                result["metadata"] = json.loads(result["metadata"])
-                            except json.JSONDecodeError:
-                                result["metadata"] = None
-                        vector_search_results.append(result)
-                else:
-                    logger.warning(
-                        "RAG Query: 'rag_embeddings' table not found. Skipping vector search."
-                    )
-            except sqlite3.Error as e_vec_sql:
-                logger.error(
-                    f"RAG Query: Database error during vector search: {e_vec_sql}"
+                query_embedding = response.data[0].embedding
+                # k=13 is the legacy knn-results constant the previous
+                # raw SQL used; preserved exactly so retrieval quality
+                # is unchanged across the migration.
+                vector_search_results = rag_repo.search_similar(
+                    query_embedding=query_embedding,
+                    limit=13,
                 )
             except (
                 openai.APIError
@@ -212,11 +174,17 @@ async def query_rag_system(query_text: str) -> str:
         context_parts: List[str] = []
         current_token_count: int = 0  # Approximate token count
 
-        # Add Live Context
+        # Add Live Context. Note: Phase 7b renamed the project_context
+        # column ``last_updated`` -> ``updated_at``. The pre-PR-F code
+        # here referenced the old name (a latent bug; the SELECT used
+        # ``last_updated`` too, so the legacy path threw KeyError on
+        # a post-Phase-7b DB and silently returned an empty list).
+        # Through rag_repo.fetch_recent_context the field is now
+        # ``updated_at`` end-to-end.
         if live_context_results:
             context_parts.append("--- Recently Updated Project Context (Live) ---")
             for item in live_context_results:
-                entry_text = f"Key: {item['context_key']}\nValue: {item['value']}\nDescription: {item.get('description', 'N/A')}\n(Updated: {item['last_updated']})\n"
+                entry_text = f"Key: {item['context_key']}\nValue: {item['value']}\nDescription: {item.get('description', 'N/A')}\n(Updated: {item['updated_at']})\n"
                 entry_tokens = len(entry_text.split())  # Approximation
                 if current_token_count + entry_tokens < MAX_CONTEXT_TOKENS:
                     context_parts.append(entry_text)
@@ -391,52 +359,22 @@ async def query_rag_system_with_model(
         )
         live_task_results = [dict(row) for row in cursor.fetchall()]
 
-        # Get vector search results if VSS is available
+        # Get vector search results if VSS is available.
+        # PR F: rag_repo.search_similar owns the vec0 dialect; same
+        # k=13 retrieval window as the main RAG path.
         if is_vss_loadable():
             try:
-                # Check if rag_embeddings table exists
-                cursor.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='rag_embeddings'"
+                from ...repositories import rag_repo
+
+                query_embedding_response = openai_client.embeddings.create(
+                    input=[query_text],
+                    model=EMBEDDING_MODEL,
+                    dimensions=EMBEDDING_DIMENSION,
                 )
-                if cursor.fetchone() is not None:
-                    # Embed the query
-                    query_embedding_response = openai_client.embeddings.create(
-                        input=[query_text],
-                        model=EMBEDDING_MODEL,
-                        dimensions=EMBEDDING_DIMENSION,
-                    )
-                    query_embedding = query_embedding_response.data[0].embedding
-                    query_embedding_json = json.dumps(query_embedding)
-
-                    # Perform vector search using sqlite-vec (matching working implementation)
-                    k_results = 13  # Optimized based on recent RAG research
-                    vector_search_sql = """
-                        SELECT c.chunk_text, c.source_type, c.source_ref, c.metadata, r.distance
-                        FROM rag_embeddings r
-                        JOIN rag_chunks c ON r.rowid = c.chunk_id
-                        WHERE r.embedding MATCH ? AND k = ?
-                        ORDER BY r.distance
-                    """
-                    cursor.execute(vector_search_sql, (query_embedding_json, k_results))
-                    raw_results = cursor.fetchall()
-
-                    # Process results to parse metadata
-                    for row in raw_results:
-                        result = dict(row)
-                        # Parse metadata JSON if present
-                        if result.get("metadata"):
-                            try:
-                                result["metadata"] = json.loads(result["metadata"])
-                            except json.JSONDecodeError:
-                                result["metadata"] = None
-                        vector_search_results.append(result)
-                else:
-                    logger.warning(
-                        "RAG Query: 'rag_embeddings' table not found. Skipping vector search."
-                    )
-            except sqlite3.Error as e_vec_sql:
-                logger.error(
-                    f"RAG Query: Database error during vector search: {e_vec_sql}"
+                query_embedding = query_embedding_response.data[0].embedding
+                vector_search_results = rag_repo.search_similar(
+                    query_embedding=query_embedding,
+                    limit=13,
                 )
             except openai.APIError as e_openai_emb:
                 logger.error(

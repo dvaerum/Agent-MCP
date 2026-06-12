@@ -52,9 +52,6 @@ green-because-degraded results.
 
 from __future__ import annotations
 
-import datetime
-import json
-
 import pytest
 from starlette.testclient import TestClient
 

@@ -61,7 +61,7 @@ from __future__ import annotations
 import datetime
 import json
 import sqlite3
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 from ..core import globals as g
 from ..core.config import logger
