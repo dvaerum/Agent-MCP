@@ -444,6 +444,86 @@ class MessageRepository:
         finally:
             self._cache_disabled = prev
 
+    # --- Invariant helpers ----------------------------------------------
+
+    @staticmethod
+    def _recipient_exists(
+        recipient_id: Any,
+        *,
+        connection: Any = None,
+    ) -> bool:
+        """Return True iff ``recipient_id`` resolves to an ``agents`` row.
+
+        Used by :meth:`send` to enforce the recipient-existence
+        contract. Tombstones are real agents rows
+        (``status='tombstone'`` — see
+        :meth:`AgentRepository.insert_tombstone`), and ``admin`` is
+        seeded by lifespan startup, so a single existence check
+        covers all three legitimate recipient classes (live, admin,
+        tombstone) and rejects typos.
+
+        Three connection shapes tolerated so the check works on every
+        path :meth:`send` is reachable from:
+
+        * ``None`` — open our own session.
+        * SQLAlchemy ``Session`` — query against the caller's session.
+        * sqlite3 ``Cursor`` — query against the caller's cursor so the
+          existence check participates in the caller's open transaction.
+        """
+        if not isinstance(recipient_id, str) or not recipient_id:
+            return False
+
+        # sqlite3 cursor path.
+        if connection is not None and not hasattr(connection, "query"):
+            cur = connection
+            try:
+                cur.execute(
+                    "SELECT 1 FROM agents WHERE agent_id = ? LIMIT 1",
+                    (recipient_id,),
+                )
+                return cur.fetchone() is not None
+            except Exception as e:  # pragma: no cover - defensive
+                logger.error(
+                    f"Database error checking recipient existence for "
+                    f"{recipient_id!r} via shared cursor: {e}",
+                    exc_info=True,
+                )
+                return False
+
+        # SQLAlchemy session path (caller-provided OR standalone).
+        if connection is not None:
+            session = connection
+            try:
+                row = (
+                    session.query(Agent.agent_id)
+                    .filter(Agent.agent_id == recipient_id)
+                    .one_or_none()
+                )
+                return row is not None
+            except SQLAlchemyError as e:  # pragma: no cover - defensive
+                logger.error(
+                    f"Database error checking recipient existence for "
+                    f"{recipient_id!r} via shared session: {e}",
+                    exc_info=True,
+                )
+                return False
+
+        try:
+            with get_session() as session:
+                row = (
+                    session.query(Agent.agent_id)
+                    .filter(Agent.agent_id == recipient_id)
+                    .one_or_none()
+                )
+                return row is not None
+        except SQLAlchemyError as e:  # pragma: no cover - defensive
+            logger.error(
+                f"Database error checking recipient existence for "
+                f"{recipient_id!r}: {e}",
+                exc_info=True,
+            )
+            return False
+
     # --- Read interface --------------------------------------------------
 
     def get_by_id(self, message_id: str) -> Optional[Dict[str, Any]]:
@@ -685,7 +765,30 @@ class MessageRepository:
         (``parent_message_id`` set) always have ``subject = None``.
         The threading-policy decision (Ollama-suggested vs. truncated
         body vs. explicit) is owned by the *caller*.
+
+        Raises ``LookupError`` if ``recipient_id`` doesn't resolve to
+        an existing ``agents`` row. VM e2e on 2026-06-16 surfaced that
+        ``send_agent_message`` to a typo'd recipient silently succeeded
+        ("Message stored; recipient has no active session"), bypassing
+        the PR #138 FK contract. The check covers live agents, the
+        ``admin`` pseudo-agent (migration 0008), and tombstone rows
+        ``[deleted-<id>]`` — they're all rows in ``agents``, so a
+        single existence check preserves audit-message semantics while
+        rejecting typos.
         """
+        # VM e2e fix 2026-06-16: recipient must exist in agents table.
+        # Live agents, the admin pseudo-agent, and tombstones all
+        # qualify (they're all agent rows); typos / unknown IDs do not.
+        # Raise BEFORE any DB write so no partial state is left behind
+        # in the caller's wider transaction.
+        if not self._recipient_exists(recipient_id, connection=connection):
+            raise LookupError(
+                f"recipient not found: {recipient_id!r} is not a known "
+                f"agent. The recipient must be a live agent, the "
+                f"`admin` pseudo-agent, or a tombstone row "
+                f"(`[deleted-<id>]`)."
+            )
+
         if connection is not None and not hasattr(connection, "query"):
             cur = connection
             try:
