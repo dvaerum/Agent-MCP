@@ -406,6 +406,77 @@ async def test_reconcile_on_startup_adopts_active_units(
     assert ("adopted", "backend") in orchestrator_module.last_active
 
 
+# ── Regression: AGENT_MCP_SYSTEMCTL_MODE env-var contract ─────────
+
+
+@pytest.mark.parametrize(
+    "env_value, expects_user_flag",
+    [
+        (None, True),         # default → --user (home-manager deploys)
+        ("user", True),       # explicit user mode
+        ("USER", True),       # case-insensitive
+        ("system", False),    # system mode (VM / root deploy)
+        ("System", False),    # case-insensitive
+        ("anything-else", False),  # non-"user" → no --user flag
+    ],
+)
+async def test_systemctl_honors_agent_mcp_systemctl_mode_env_var(
+    env_value, expects_user_flag,
+    router_env, monkeypatch: pytest.MonkeyPatch,
+):
+    """``_systemctl`` must respect ``AGENT_MCP_SYSTEMCTL_MODE``.
+
+    Regression guard for the env-var contract that the vendored
+    pre-upstream ``nix/router.py`` honored. PR #159 ("ProjectOrchestrator
+    deepening — split lifecycle from URL dispatch") extracted the
+    systemctl helper out of the vendored router but dropped the env-var
+    check, hardcoding ``--user``. That broke every
+    ``/agent-mcp/api/<project>/...`` request inside the in-VM flake
+    deployment (root system service, no D-Bus session bus) with::
+
+        Failed to connect to user scope bus via local transport
+
+    surfaced by retroactive VM e2e on 2026-06-16. This test pins the
+    restored contract:
+
+      * unset / "user" / "USER" → prepend ``--user``
+      * "system" / anything-else → do NOT prepend ``--user``
+    """
+    if env_value is None:
+        monkeypatch.delenv("AGENT_MCP_SYSTEMCTL_MODE", raising=False)
+    else:
+        monkeypatch.setenv("AGENT_MCP_SYSTEMCTL_MODE", env_value)
+
+    # Drop + reimport so the module-level ``_SYSTEMCTL_MODE`` constant
+    # is recomputed from the (now-patched) environment.
+    for mod_name in (
+        "agent_mcp.router.app",
+        "agent_mcp.router.project_orchestrator",
+    ):
+        sys.modules.pop(mod_name, None)
+    orch = importlib.import_module("agent_mcp.router.project_orchestrator")
+
+    captured: dict = {}
+
+    def fake_run(argv, *args, **kwargs):
+        captured["argv"] = list(argv)
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(orch.subprocess, "run", fake_run)
+
+    orch._systemctl("is-active", "agent-mcp@x.service")
+    argv = captured["argv"]
+    assert argv[0] == "systemctl"
+    if expects_user_flag:
+        assert argv[1] == "--user", (
+            f"expected '--user' for env={env_value!r}; got {argv!r}"
+        )
+    else:
+        assert "--user" not in argv, (
+            f"expected no '--user' for env={env_value!r}; got {argv!r}"
+        )
+
+
 # ── Regression: URL dispatch through the router still resolves aliases ──
 
 

@@ -108,9 +108,26 @@ def _unit_name(name: str, role: str) -> str:
     raise ValueError(f"unsupported role: {role!r}")
 
 
+# Whether to call ``systemctl --user`` (default, matches the
+# nixos-developer-system / home-manager deployment) or plain
+# ``systemctl`` (system mode, used by the in-VM flake deployment
+# where the router runs as a root system service with no D-Bus
+# session bus available). Reads ``AGENT_MCP_SYSTEMCTL_MODE`` env
+# var; preserved from the pre-upstream vendored router (PR #159
+# missed this env-var check during extraction; surfaced by VM e2e
+# 2026-06-16 — every /agent-mcp/api/<project>/... 500'd with
+# "Failed to connect to user scope bus").
+_SYSTEMCTL_MODE = os.environ.get(
+    "AGENT_MCP_SYSTEMCTL_MODE", "user"
+).strip().lower()
+
+
 def _systemctl(*args: str) -> subprocess.CompletedProcess:
+    base = ["systemctl"]
+    if _SYSTEMCTL_MODE == "user":
+        base.append("--user")
     return subprocess.run(
-        ["systemctl", "--user", *args], capture_output=True, text=True
+        [*base, *args], capture_output=True, text=True
     )
 
 
