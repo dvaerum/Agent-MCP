@@ -895,3 +895,161 @@ def test_delete_with_sqlite_cursor_uses_caller_transaction(
 
         assert message_repo.get_by_id("m1") is None
 
+
+# --- Write interface: recipient existence enforcement -------------------
+#
+# VM e2e on 2026-06-16 surfaced that ``send_agent_message`` to a
+# typo'd recipient succeeded with response "Message sent to
+# nonexistent. Message stored; recipient has no active session." —
+# the FK from PR #138 was being silently bypassed somewhere on the
+# tool path.
+#
+# Locked design (Dennis, 2026-06-16): the Repository rejects with a
+# clear error when ``recipient_id`` isn't a known agent (live agents,
+# the synthetic ``admin`` pseudo-agent seeded by migration 0008, and
+# tombstone rows ``[deleted-<id>]`` are all valid agent rows so a
+# single "exists in agents table" check covers all three legitimate
+# cases). Typos / non-existent IDs are rejected.
+
+
+def test_send_to_live_recipient_succeeds(project_dir, reset_globals):
+    """``send`` accepts a recipient that exists in the agents table."""
+    with _make_client(project_dir):
+        from agent_mcp.repositories import message_repo
+
+        _seed_agent("alice")
+        _seed_agent("backend-dev")
+
+        entity = message_repo.send(
+            message_id="msg_live",
+            sender_id="alice",
+            recipient_id="backend-dev",
+            message_content="hi",
+            message_type="text",
+            priority="normal",
+            timestamp=datetime.datetime.now().isoformat(),
+        )
+        assert entity is not None
+        assert message_repo.get_by_id("msg_live") is not None
+
+
+def test_send_to_admin_pseudo_agent_succeeds(project_dir, reset_globals):
+    """``send`` accepts ``admin`` — the synthetic pseudo-agent seeded by
+    migration 0008 is a legitimate recipient (worker → admin handoffs)."""
+    with _make_client(project_dir):
+        from agent_mcp.repositories import message_repo
+
+        _seed_agent("worker-1")
+
+        # `admin` is seeded by application lifespan startup
+        # (`_ensure_admin_pseudo_agent_row`) — no _seed_agent call needed.
+        entity = message_repo.send(
+            message_id="msg_admin",
+            sender_id="worker-1",
+            recipient_id="admin",
+            message_content="help",
+            message_type="text",
+            priority="normal",
+            timestamp=datetime.datetime.now().isoformat(),
+        )
+        assert entity is not None
+        assert message_repo.get_by_id("msg_admin") is not None
+
+
+def test_send_to_tombstone_recipient_succeeds(project_dir, reset_globals):
+    """``send`` accepts a tombstone recipient ``[deleted-<id>]``.
+
+    Tombstones live as ``agents`` rows with ``status='tombstone'``
+    (seeded by :meth:`AgentRepository.insert_tombstone` on purge).
+    Audit messages to / about purged agents are legitimate; only
+    *typo'd* nonexistent IDs should be rejected.
+    """
+    with _make_client(project_dir):
+        from agent_mcp.repositories import agent_repo, message_repo
+
+        _seed_agent("alice")
+        # Create a tombstone agent row via the standard repo seam.
+        agent_repo.insert_tombstone(
+            token="__tombstone_old-worker",
+            tombstone_agent_id="[deleted-old-worker]",
+        )
+
+        entity = message_repo.send(
+            message_id="msg_tomb",
+            sender_id="alice",
+            recipient_id="[deleted-old-worker]",
+            message_content="audit",
+            message_type="text",
+            priority="normal",
+            timestamp=datetime.datetime.now().isoformat(),
+        )
+        assert entity is not None
+        assert message_repo.get_by_id("msg_tomb") is not None
+
+
+def test_send_to_unknown_recipient_raises(project_dir, reset_globals):
+    """``send`` raises ``LookupError`` for an unknown recipient_id.
+
+    Repo is the single owner of this invariant — every caller (MCP
+    tool, REST, CLI) hits the same check, and the bypass observed in
+    VM e2e on 2026-06-16 cannot recur.
+    """
+    import pytest
+
+    with _make_client(project_dir):
+        from agent_mcp.repositories import message_repo
+
+        _seed_agent("alice")
+
+        with pytest.raises(LookupError):
+            message_repo.send(
+                message_id="msg_unknown",
+                sender_id="alice",
+                recipient_id="nonexistent-xyz",
+                message_content="oops",
+                message_type="text",
+                priority="normal",
+                timestamp=datetime.datetime.now().isoformat(),
+            )
+
+        # And the row was NOT inserted — rejection happens BEFORE
+        # any DB write.
+        assert message_repo.get_by_id("msg_unknown") is None
+
+
+def test_send_with_cursor_to_unknown_recipient_raises(
+    project_dir, reset_globals,
+):
+    """The ``connection=`` (sqlite3 cursor) overload of ``send`` must
+    enforce the same recipient-exists check. ``send_agent_message_
+    tool_impl`` is the production caller; rejecting at the repo seam
+    before the INSERT fires is what protects the wider transaction.
+    """
+    import pytest
+    from agent_mcp.db.connection import get_db_connection
+
+    with _make_client(project_dir):
+        from agent_mcp.repositories import message_repo
+
+        _seed_agent("alice")
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN")
+            with pytest.raises(LookupError):
+                message_repo.send(
+                    message_id="msg_cursor_unknown",
+                    sender_id="alice",
+                    recipient_id="nonexistent-xyz",
+                    message_content="oops",
+                    message_type="text",
+                    priority="normal",
+                    timestamp=datetime.datetime.now().isoformat(),
+                    connection=cursor,
+                )
+            conn.rollback()
+        finally:
+            conn.close()
+
+        assert message_repo.get_by_id("msg_cursor_unknown") is None

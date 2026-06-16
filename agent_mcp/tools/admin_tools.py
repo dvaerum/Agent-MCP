@@ -250,16 +250,32 @@ async def create_agent_tool_impl(
         # can't desync the cache.
         from ..repositories import agent_repo, task_repo
 
-        agent_repo.create(
-            token=new_agent_token,
-            agent_id=agent_id,
-            capabilities=normalized_caps,
-            status=status,
-            current_task=None,
-            working_directory=agent_working_dir_abs,
-            color=agent_color,
-            connection=cursor,
-        )
+        try:
+            agent_repo.create(
+                token=new_agent_token,
+                agent_id=agent_id,
+                capabilities=normalized_caps,
+                status=status,
+                current_task=None,
+                working_directory=agent_working_dir_abs,
+                color=agent_color,
+                connection=cursor,
+            )
+        except ValueError as ve:
+            # Server-side agent_id regex rejection (VM e2e fix
+            # 2026-06-16). The repo raises BEFORE any DB write, so the
+            # cursor's open transaction has nothing to roll back beyond
+            # the BEGIN itself — but unwind the conn defensively.
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return [
+                mcp_types.TextContent(
+                    type="text",
+                    text=f"Error: {ve}",
+                )
+            ]
 
         # Log action to agent_actions table (main.py:1119)
         log_agent_action_to_db(

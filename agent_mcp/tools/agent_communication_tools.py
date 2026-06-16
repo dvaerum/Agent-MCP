@@ -330,6 +330,13 @@ async def send_agent_message_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
         
         return [mcp_types.TextContent(type="text", text=response_text)]
 
+    except LookupError as e:
+        # Repository rejected an unknown recipient (VM e2e fix
+        # 2026-06-16). `atomic_with_audit` already rolled back the
+        # message INSERT + audit row. Surface the repo's message
+        # verbatim — it explains live / admin / tombstone semantics.
+        logger.warning(f"send_agent_message rejected: {e}")
+        return [mcp_types.TextContent(type="text", text=f"Error: {e}")]
     except sqlite3.Error as e:
         # `atomic_with_audit` already rolled back + closed the conn
         # before re-raising; nothing left for us to do but report.
