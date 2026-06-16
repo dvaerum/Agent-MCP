@@ -65,6 +65,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import json
+import re
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -113,6 +114,19 @@ def _publish(addressee: str, event: str, payload: Dict[str, Any]) -> None:
 # ``token`` is deliberately OFF this allowlist — it's the auth secret,
 # and the surface for rotating it lives in :meth:`AgentRepository.rotate_token`
 # (PR 8), not the generic field-update API.
+# Server-side agent_id validation regex — matches the dashboard's
+# client-side pattern verbatim. VM e2e on 2026-06-16 surfaced that
+# `create_agent` accepted garbage IDs (`"InvalidName!@#"`) because the
+# server enforced nothing while the dashboard form pinned this regex.
+# Downstream consumers (URL routing, tmux session names, git worktree
+# paths) assume slug shape; non-slug IDs are a poisoning vector.
+#
+# The two-branch alternation `|^[a-z]$` handles single-character names
+# (the first branch requires at least two chars: a leading lowercase
+# letter and a trailing lowercase letter/digit).
+_AGENT_ID_RE = re.compile(r"^[a-z][a-z0-9-]*[a-z0-9]$|^[a-z]$")
+
+
 _MUTABLE_FIELDS: set[str] = {
     "status",
     "current_task",
@@ -586,7 +600,22 @@ class AgentRepository:
         consumers expect (capabilities deserialised). On DB conflict
         (e.g. duplicate ``agent_id`` or duplicate ``token``), raises
         the underlying ``SQLAlchemyError``.
+
+        Raises ``ValueError`` if ``agent_id`` doesn't match the slug
+        regex (see ``_AGENT_ID_RE``) — caught at the seam so every
+        caller (MCP tool, REST, CLI) hits the same check.
         """
+        # VM e2e on 2026-06-16: `create_agent` accepted garbage IDs.
+        # The repository is the single owner of this invariant — raise
+        # BEFORE any DB write so no partial state is left behind.
+        if not isinstance(agent_id, str) or not _AGENT_ID_RE.match(agent_id):
+            raise ValueError(
+                f"invalid agent_id {agent_id!r}: must match "
+                f"{_AGENT_ID_RE.pattern} "
+                f"(lowercase letters, digits, hyphens; must start with "
+                f"a letter; must not end with a hyphen)."
+            )
+
         now = datetime.datetime.now().isoformat()
         caps_json = json.dumps(capabilities or [])
 
