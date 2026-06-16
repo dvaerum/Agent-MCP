@@ -35,6 +35,7 @@ from __future__ import annotations
 import datetime
 import sys
 
+import pytest
 from agent_mcp.app.main_app import create_app
 from starlette.testclient import TestClient
 
@@ -455,8 +456,6 @@ def test_terminate_with_sqlite_cursor_uses_caller_transaction(
 # already owns SQL invariants for this concept (PR 8 / Agent flip);
 # this extends that contract to "the repo owns invariants on this
 # concept's identity, too."
-
-import pytest
 
 
 _VALID_AGENT_IDS = [
