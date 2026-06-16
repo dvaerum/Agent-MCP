@@ -17,11 +17,9 @@
 
 let
   cfg = config.services.agent-mcp;
-  pkgs' = import ./package.nix {
+  pkgs' = import ./packages.nix {
     inherit pkgs lib;
     src = cfg.src;
-    assetPrefix =
-      if cfg.mode == "multi" then "/agent-mcp/__dashboard" else "";
   };
 in {
   options.services.agent-mcp = {
@@ -149,7 +147,7 @@ in {
           # system bus, which requires root or polkit grants. Root
           # is the path of least friction inside a single-purpose VM.
           AmbientCapabilities = [ ];
-          ExecStart = "${pkgs'.agentMcpRouter}/bin/agent-mcp-router";
+          ExecStart = "${pkgs'.agentMcpRouterWrapper}/bin/agent-mcp-router";
           Restart = "on-failure";
           RestartSec = 10;
         };
