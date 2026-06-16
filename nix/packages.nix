@@ -144,8 +144,22 @@ let
   agentMcpLauncher = pkgs.writeShellScriptBin "agent-mcp-launcher" ''
     set -euo pipefail
     name="''${1:?usage: agent-mcp-launcher <instance>}"
-    cfg_dir="''${XDG_CONFIG_HOME:-$HOME/.config}/agent-mcp"
-    loc_file="$cfg_dir/projects.local.json"
+    # Project-file location lookup order:
+    #   1. AGENT_MCP_PROJECTS_FILE (explicit override; how the VM
+    #      module and other system-mode deploys set it).
+    #   2. $XDG_CONFIG_HOME/agent-mcp/projects.local.json (home-manager
+    #      / user-mode deploys).
+    #   3. $HOME/.config/agent-mcp/projects.local.json (fallback).
+    # The AGENT_MCP_PROJECTS_FILE env var contract was the OLD
+    # vendored launcher's behavior; PR #88 (router upstreaming)
+    # dropped it, breaking VM e2e for system-mode deploys.
+    # Restored 2026-06-16 after the regression surfaced via VM smoke.
+    if [[ -n "''${AGENT_MCP_PROJECTS_FILE:-}" ]]; then
+      loc_file="$AGENT_MCP_PROJECTS_FILE"
+    else
+      cfg_dir="''${XDG_CONFIG_HOME:-$HOME/.config}/agent-mcp"
+      loc_file="$cfg_dir/projects.local.json"
+    fi
 
     # The projects file has two valid shapes:
     #   * Legacy: {"<name>": "<workspace_path>"}
