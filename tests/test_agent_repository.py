@@ -440,3 +440,91 @@ def test_terminate_with_sqlite_cursor_uses_caller_transaction(
         row = agent_repo.get_by_id("seam-term")
         assert row is not None
         assert row["status"] == "terminated"
+
+
+# --- Write interface: agent_id regex validation -------------------------
+#
+# VM e2e on 2026-06-16 surfaced that `create_agent` accepted garbage
+# agent IDs (literal `"InvalidName!@#"` was successfully created). The
+# dashboard form already pins `[a-z][a-z0-9-]*[a-z0-9]|[a-z]` but the
+# server enforced nothing — a poisoning vector for URL routing, tmux
+# session names, and git worktree paths that all assume slug shape.
+#
+# Locked design (Dennis, 2026-06-16): the validation lives in the
+# Repository so every caller (MCP tool, REST, CLI) hits it. The repo
+# already owns SQL invariants for this concept (PR 8 / Agent flip);
+# this extends that contract to "the repo owns invariants on this
+# concept's identity, too."
+
+import pytest
+
+
+_VALID_AGENT_IDS = [
+    "backend-dev",
+    "a",                # single-char branch of the regex
+    "agent-1",
+    "a-b-c",
+    "z9",
+    "abc",
+]
+
+_INVALID_AGENT_IDS = [
+    "InvalidName!@#",   # special chars + uppercase (the original VM finding)
+    "1starts-with-digit",
+    "-starts-with-dash",
+    "ends-with-dash-",
+    "has space",
+    "",                 # empty
+    "A",                # uppercase single
+    "UPPERCASE",
+    "agent_with_underscore",
+    "agent.with.dots",
+]
+
+
+@pytest.mark.parametrize("agent_id", _VALID_AGENT_IDS)
+def test_create_accepts_valid_agent_id(agent_id, project_dir, reset_globals):
+    """``create`` accepts every agent_id the dashboard regex accepts.
+
+    The regex is ``^[a-z][a-z0-9-]*[a-z0-9]$|^[a-z]$`` — matches the
+    client-side pattern in the dashboard's Deploy modal exactly. The
+    ``|^[a-z]$`` branch covers single-character names.
+    """
+    with _make_client(project_dir):
+        from agent_mcp.repositories import agent_repo
+
+        fresh = agent_repo.create(
+            token=f"tok-valid-{agent_id}",
+            agent_id=agent_id,
+            capabilities=[],
+            status="created",
+            working_directory=f"/tmp/{agent_id}",
+        )
+        assert fresh is not None
+        assert fresh["agent_id"] == agent_id
+
+
+@pytest.mark.parametrize("agent_id", _INVALID_AGENT_IDS)
+def test_create_rejects_invalid_agent_id(agent_id, project_dir, reset_globals):
+    """``create`` raises a ``ValueError`` on any agent_id the regex rejects.
+
+    The Repository is the single owner of this invariant — every
+    caller (MCP tool, REST, CLI) hits the same check.
+    """
+    with _make_client(project_dir):
+        from agent_mcp.repositories import agent_repo
+
+        with pytest.raises(ValueError):
+            agent_repo.create(
+                token=f"tok-invalid-{abs(hash(agent_id))}",
+                agent_id=agent_id,
+                capabilities=[],
+                status="created",
+                working_directory="/tmp/invalid",
+            )
+
+        # And the row was NOT inserted — the rejection happens BEFORE
+        # any DB write, so no partial state is left behind. Cache is
+        # disabled for the lookup so we hit the DB authoritatively.
+        with agent_repo.disable_cache():
+            assert agent_repo.get_by_id(agent_id) is None
