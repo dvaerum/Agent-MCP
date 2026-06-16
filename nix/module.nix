@@ -241,6 +241,10 @@ in {
         environment = {
           OPENAI_BASE_URL = "http://127.0.0.1:11434/v1";
           OPENAI_API_KEY = "ollama";
+          # v5.0.44: completion_service.completion_client() requires
+          # OPENAI_MODEL when OPENAI_API_KEY is set. Matches the chat
+          # model loaded by services.ollama.loadModels.
+          OPENAI_MODEL = "qwen3:1.7b";
           AGENT_MCP_EMBEDDING_MODEL = "qwen3-embedding:0.6b";
           AGENT_MCP_EMBEDDING_DIMENSION = "1024";
         };

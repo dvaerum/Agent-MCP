@@ -219,12 +219,13 @@ EMBEDDING_DIMENSION: int = (
     ADVANCED_EMBEDDING_DIMENSION if ADVANCED_EMBEDDINGS else SIMPLE_EMBEDDING_DIMENSION
 )
 
-CHAT_MODEL: str = (
-    "gpt-4.1-2025-04-14"  # From main.py:179 (Ensure this matches your desired model)
-)
-TASK_ANALYSIS_MODEL: str = (
-    "gpt-4.1-2025-04-14"  # Same model for consistent task placement analysis
-)
+# Chat / task-analysis model names are no longer hardcoded here.
+# v5.0.43 hardcoded "gpt-4.1-2025-04-14" — a non-existent OpenAI model
+# id (typo) — which broke RAG on the first deployment that lacked an
+# OPENAI_API_KEY. The model now flows through
+# `agent_mcp.external.completion_service.completion_client()`, which
+# picks Ollama vs OpenAI from env vars (OPENAI_API_KEY / OPENAI_MODEL
+# / OLLAMA_MODEL). See that module's docstring for the decision table.
 MAX_EMBEDDING_BATCH_SIZE: int = 100  # From main.py:181
 MAX_CONTEXT_TOKENS: int = 1000000  # GPT-4.1 has 1M token context window
 TASK_ANALYSIS_MAX_TOKENS: int = (

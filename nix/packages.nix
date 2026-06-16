@@ -86,6 +86,13 @@ let
   agentMcpBackendWrapper = pkgs.writeShellScriptBin "agent-mcp-backend" ''
     export OPENAI_BASE_URL="''${OPENAI_BASE_URL:-http://127.0.0.1:11434/v1}"
     export OPENAI_API_KEY="''${OPENAI_API_KEY:-ollama}"
+    # v5.0.44: the in-code "gpt-4.1-2025-04-14" default was removed.
+    # Completions now flow through completion_service.completion_client(),
+    # which requires OPENAI_MODEL when OPENAI_API_KEY is set. The VM
+    # ships qwen3:1.7b via services.ollama.loadModels (~1 GB), so the
+    # default routes the OpenAI SDK at the local Ollama endpoint with
+    # a model Ollama actually has.
+    export OPENAI_MODEL="''${OPENAI_MODEL:-qwen3:1.7b}"
     export AGENT_MCP_EMBEDDING_MODEL="''${AGENT_MCP_EMBEDDING_MODEL:-qwen3-embedding:0.6b}"
     export AGENT_MCP_EMBEDDING_DIMENSION="''${AGENT_MCP_EMBEDDING_DIMENSION:-1024}"
     export PYTHONPATH="${agentMcpPyPath}''${PYTHONPATH:+:$PYTHONPATH}"

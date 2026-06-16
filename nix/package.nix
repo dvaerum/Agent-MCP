@@ -48,6 +48,10 @@ let
   agentMcpBackendWrapper = pkgs.writeShellScriptBin "agent-mcp-backend" ''
     export OPENAI_BASE_URL="''${OPENAI_BASE_URL:-http://127.0.0.1:11434/v1}"
     export OPENAI_API_KEY="''${OPENAI_API_KEY:-ollama}"
+    # v5.0.44: completion_service.completion_client() requires
+    # OPENAI_MODEL when OPENAI_API_KEY is set. Match the chat model
+    # the VM ships via services.ollama.loadModels.
+    export OPENAI_MODEL="''${OPENAI_MODEL:-qwen3:1.7b}"
     export AGENT_MCP_EMBEDDING_MODEL="''${AGENT_MCP_EMBEDDING_MODEL:-qwen3-embedding:0.6b}"
     export AGENT_MCP_EMBEDDING_DIMENSION="''${AGENT_MCP_EMBEDDING_DIMENSION:-1024}"
     export PYTHONPATH="${agentMcpPyPath}''${PYTHONPATH:+:$PYTHONPATH}"

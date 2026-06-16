@@ -3,8 +3,7 @@ import json
 from typing import Optional, List, Dict, Any
 from ...tools.rag_tools import ask_project_rag_tool_impl
 import mcp.types as mcp_types
-from ...core.config import logger, TASK_ANALYSIS_MODEL, TASK_ANALYSIS_MAX_TOKENS
-from ...external.openai_service import get_openai_client
+from ...core.config import logger, TASK_ANALYSIS_MAX_TOKENS
 
 async def validate_task_placement(
     title: str,
@@ -143,11 +142,11 @@ async def validate_task_placement(
                 "query": query
             })
         else:
-            # Use the cheaper model for task analysis
+            # v5.0.44: model selection moved into completion_service;
+            # the ``model_name`` parameter is now informational only.
             response_text = await query_rag_system_with_model(
                 query_text=query,
-                model_name=TASK_ANALYSIS_MODEL,
-                max_tokens=TASK_ANALYSIS_MAX_TOKENS
+                max_tokens=TASK_ANALYSIS_MAX_TOKENS,
             )
             rag_response = [mcp_types.TextContent(type="text", text=response_text)]
         

@@ -40,14 +40,21 @@ in
   networking.interfaces.eth0.useDHCP = true;
   networking.hostName = "agent-mcp";
 
-  # ── Ollama (local embedding endpoint) ──────────────────────────
-  # qwen3-embedding:0.6b is ~620 MB; first-boot download lands in
-  # the host-bound /var/lib/ollama and survives qcow2 deletion.
+  # ── Ollama (local embedding + chat endpoint) ───────────────────
+  # qwen3-embedding:0.6b   ~620 MB — embeddings used by the RAG indexer.
+  # qwen3:1.7b            ~1.0 GB — chat model used by the RAG
+  #                                  completion abstraction
+  #                                  (agent_mcp/external/completion_service.py).
+  #
+  # v5.0.44 added the chat model so RAG `ask_project_rag` works
+  # self-contained on the VM (no OPENAI_API_KEY needed). First-boot
+  # download lands in the host-bound /var/lib/ollama and survives
+  # qcow2 deletion.
   services.ollama = {
     enable = true;
     host = "127.0.0.1";
     port = 11434;
-    loadModels = [ "qwen3-embedding:0.6b" ];
+    loadModels = [ "qwen3-embedding:0.6b" "qwen3:1.7b" ];
   };
 
   # Override DynamicUser=yes — systemd's per-service state-dir

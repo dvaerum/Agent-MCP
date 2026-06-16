@@ -1,17 +1,20 @@
 # Agent-MCP/mcp_template/mcp_server_src/features/rag/query.py
 import sqlite3  # For type hinting and error handling
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 # Imports from our project
 from ...core.config import (
     logger,
     EMBEDDING_MODEL,
     EMBEDDING_DIMENSION,
-    CHAT_MODEL,
     MAX_CONTEXT_TOKENS,  # From main.py:182
 )
 from ...db.connection import get_db_connection, is_vss_loadable
 from ...external.openai_service import get_openai_client
+from ...external.completion_service import (
+    CompletionConfigError,
+    completion_client,
+)
 
 # For OpenAI exceptions
 import openai
@@ -277,15 +280,20 @@ Always err on the side of providing more detailed explanations and comprehensive
                 f"RAG Query: User message for LLM:\n{user_message_for_llm[:500]}..."
             )
 
-            chat_response = openai_client.chat.completions.create(
-                model=CHAT_MODEL,
+            # Provider-agnostic chat call. completion_client() picks
+            # Ollama vs OpenAI from env vars; both implement .chat().
+            try:
+                cc = completion_client()
+            except CompletionConfigError as e_cfg:
+                logger.error(f"RAG Query: completion config error: {e_cfg}")
+                return f"RAG Error: {e_cfg}"
+            answer = await cc.chat(
                 messages=[
                     {"role": "system", "content": system_prompt_for_llm},
                     {"role": "user", "content": user_message_for_llm},
                 ],
-                temperature=0.4,  # Increased for more diverse context discovery while maintaining accuracy
+                temperature=0.4,
             )
-            answer = chat_response.choices[0].message.content
 
     except openai.APIError as e_openai:  # main.py:1563
         logger.error(f"RAG Query: OpenAI API error: {e_openai}", exc_info=True)
@@ -306,16 +314,19 @@ Always err on the side of providing more detailed explanations and comprehensive
 
 
 async def query_rag_system_with_model(
-    query_text: str, model_name: str, max_tokens: int = None
+    query_text: str, model_name: Optional[str] = None, max_tokens: int = None
 ) -> str:
     """
-    Processes a query using the RAG system with a specific OpenAI model.
+    Processes a query using the RAG system with a specific completion model.
     This is useful for task analysis with cheaper models while keeping
     main RAG queries on the premium model.
 
     Args:
         query_text: The natural language question from the user.
-        model_name: The OpenAI model name to use (e.g., 'gpt-3.5-turbo-16k')
+        model_name: Deprecated since v5.0.44 — kept for signature
+            compatibility with existing call sites. The actual model
+            is now selected by env vars via completion_client(); this
+            argument is ignored.
         max_tokens: The maximum context tokens for this model
 
     Returns:
@@ -484,24 +495,32 @@ Answer in the exact JSON format requested, but include thorough explanations in 
 
             user_message_for_llm = f"CONTEXT:\n{combined_context_str}\n\nQUERY:\n{query_text}\n\nBased on the CONTEXT provided above, please answer the QUERY."
 
+            # Provider-agnostic chat call (v5.0.44). The
+            # ``model_name`` arg is now informational only — env vars
+            # select the provider & model. Log it so operators can
+            # see what context_limit was requested.
+            try:
+                cc = completion_client()
+            except CompletionConfigError as e_cfg:
+                logger.error(
+                    f"RAG Query (task analysis): completion config error: {e_cfg}"
+                )
+                return f"RAG Error: {e_cfg}"
             logger.info(
-                f"Task Analysis Query: Using model {model_name} with {context_limit} token limit"
+                f"Task Analysis Query: using {cc.provider}/{cc.model} "
+                f"(context_limit={context_limit})"
             )
-
-            # Use the specified model for this query
-            chat_response = openai_client.chat.completions.create(
-                model=model_name,
+            answer = await cc.chat(
                 messages=[
                     {"role": "system", "content": system_prompt_for_llm},
                     {"role": "user", "content": user_message_for_llm},
                 ],
-                temperature=0.4,  # Increased for more diverse analysis while maintaining JSON consistency
+                temperature=0.4,
             )
-            answer = chat_response.choices[0].message.content
 
     except Exception as e:
-        logger.error(f"RAG Query with model {model_name}: Error: {e}", exc_info=True)
-        answer = f"Error during RAG query with {model_name}: {str(e)}"
+        logger.error(f"RAG Query (task analysis): Error: {e}", exc_info=True)
+        answer = f"Error during RAG task-analysis query: {str(e)}"
     finally:
         if conn:
             conn.close()
