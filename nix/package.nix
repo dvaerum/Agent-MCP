@@ -26,7 +26,7 @@ let
     inherit src;
     build-system = [ python.pkgs.setuptools ];
     dependencies = with python.pkgs; [
-      anyio click openai starlette uvicorn jinja2
+      anyio click openai fastapi starlette uvicorn jinja2
       python-dotenv sqlite-vec httpx mcp
       sqlalchemy alembic
     ];

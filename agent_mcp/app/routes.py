@@ -6,10 +6,19 @@ import sqlite3
 from pathlib import Path
 from typing import Callable, List, Dict, Any, Optional # Added List, Dict, Any, Optional
 
-from starlette.routing import Route, Mount
-from starlette.staticfiles import StaticFiles
-from starlette.responses import JSONResponse, Response, PlainTextResponse
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse, Response, PlainTextResponse
 from starlette.requests import Request
+# `routes.py` still references ``Mount`` + ``StaticFiles`` from
+# Starlette via the existing imports below — FastAPI inherits the same
+# route primitives so these continue to work unchanged. PR D
+# (prancy-napping-pie Phase 1) will rewrite individual handlers to use
+# FastAPI-style typed parameters + Pydantic body models; for this PR
+# the registration glue swaps from a top-level ``routes = [...]`` list
+# to ``register_routes(app)`` below, which is what the FastAPI app
+# created in ``main_app.create_app`` calls.
+from starlette.routing import Mount
+from starlette.staticfiles import StaticFiles
 
 # Project-specific imports
 from ..core.config import logger
@@ -1456,7 +1465,7 @@ async def aoe_health_api_route(request: Request) -> JSONResponse:
 
 
 # --- Prompt Book catalog (plan Phase 6) ---
-async def prompts_catalog_api_route(request):
+async def prompts_catalog_api_route(request: Request):
     """`GET /api/prompts/catalog` — the single source of truth
     for the Prompt Book catalogue.
 
@@ -1467,40 +1476,59 @@ async def prompts_catalog_api_route(request):
     return JSONResponse(load_catalog())
 
 
-# --- Route Definitions List ---
-routes = [
-    Route('/api/prompts/catalog', endpoint=prompts_catalog_api_route, name="prompts_catalog_api", methods=['GET', 'OPTIONS']),
-    Route('/api/aoe/health', endpoint=aoe_health_api_route, name="aoe_health_api", methods=['GET', 'OPTIONS']),
-    Route('/api/all-data', endpoint=all_data_api_route, name="all_data_api", methods=['GET', 'OPTIONS']),
-    Route('/api/status', endpoint=simple_status_api_route, name="simple_status_api", methods=['GET', 'OPTIONS']),
-    Route('/api/graph-data', endpoint=graph_data_api_route, name="graph_data_api", methods=['GET', 'OPTIONS']),
-    Route('/api/task-tree-data', endpoint=task_tree_data_api_route, name="task_tree_data_api", methods=['GET', 'OPTIONS']),
-    Route('/api/node-details', endpoint=node_details_api_route, name="node_details_api", methods=['GET', 'OPTIONS']),
-    Route('/api/agents', endpoint=agents_list_api_route, name="agents_list_api", methods=['GET', 'OPTIONS']),
+# --- Route Definitions ---
+#
+# Phase 1 PR A (prancy-napping-pie): registration migrated from a
+# top-level ``routes = [Route(...)]`` list to ``register_routes(app)``
+# below, which calls ``app.add_api_route(...)`` on the FastAPI app
+# created in :func:`agent_mcp.app.main_app.create_app`. The handler
+# signatures still take ``Request`` and return ``Response`` (legacy
+# Starlette shape, kept for this PR's mechanical-only scope); PR D
+# rewrites them to FastAPI-style typed parameters + Pydantic body
+# models alongside the dashboard session-cookie auth migration.
+#
+# TODO(prancy-napping-pie PR D): convert each handler below to a
+# typed FastAPI signature (``async def name(body: SomeModel) -> ...``)
+# and drop the ad-hoc ``data = await get_sanitized_json_body(request)``
+# + ``data.get(...)`` plumbing inside each handler.
+#
+# We keep a module-level ``_dashboard_route_specs`` list so the spec
+# table stays the single source of truth — easier to diff in review
+# than a series of ``app.add_route`` calls scattered across the file.
+_dashboard_route_specs: list[tuple[str, Callable, list[str], str]] = [
+    # (path, endpoint, methods, name)
+    ('/api/prompts/catalog', prompts_catalog_api_route, ['GET', 'OPTIONS'], "prompts_catalog_api"),
+    ('/api/aoe/health', aoe_health_api_route, ['GET', 'OPTIONS'], "aoe_health_api"),
+    ('/api/all-data', all_data_api_route, ['GET', 'OPTIONS'], "all_data_api"),
+    ('/api/status', simple_status_api_route, ['GET', 'OPTIONS'], "simple_status_api"),
+    ('/api/graph-data', graph_data_api_route, ['GET', 'OPTIONS'], "graph_data_api"),
+    ('/api/task-tree-data', task_tree_data_api_route, ['GET', 'OPTIONS'], "task_tree_data_api"),
+    ('/api/node-details', node_details_api_route, ['GET', 'OPTIONS'], "node_details_api"),
+    ('/api/agents', agents_list_api_route, ['GET', 'OPTIONS'], "agents_list_api"),
     # Modern POST shape — mirrors /api/agents/<id>/restore, /edit,
     # /purge-preview, etc. The dashboard's apiClient.createAgent has
     # always called this URL; pre-fix it 405'd because only GET was
     # registered (Deploy button was silently broken since the
     # dashboard was introduced). The handler is the same one the
     # back-compat /api/create-agent alias below routes to.
-    Route('/api/agents', endpoint=create_agent_dashboard_api_route, name="create_agent_api", methods=['POST']),
-    Route('/api/tokens', endpoint=tokens_api_route, name="tokens_api", methods=['GET', 'OPTIONS']),
-    Route('/api/tasks', endpoint=all_tasks_api_route, name="all_tasks_api", methods=['GET', 'OPTIONS']),
-    Route('/api/update-task-dashboard', endpoint=update_task_details_api_route, name="update_task_dashboard_api", methods=['POST', 'OPTIONS']),
-    
-    # Added back for 1-to-1 dashboard compatibility
-    Route('/api/create-agent', endpoint=create_agent_dashboard_api_route, name="create_agent_dashboard_api", methods=['POST', 'OPTIONS']),
-    Route('/api/terminate-agent', endpoint=terminate_agent_dashboard_api_route, name="terminate_agent_dashboard_api", methods=['POST', 'OPTIONS']),
+    ('/api/agents', create_agent_dashboard_api_route, ['POST'], "create_agent_api"),
+    ('/api/tokens', tokens_api_route, ['GET', 'OPTIONS'], "tokens_api"),
+    ('/api/tasks', all_tasks_api_route, ['GET', 'OPTIONS'], "all_tasks_api"),
+    ('/api/update-task-dashboard', update_task_details_api_route, ['POST', 'OPTIONS'], "update_task_dashboard_api"),
 
-    # Restore + Purge (this PR). Path-style routes so the agent_id is
-    # part of the URL — matches the dashboard's `/agents/<id>/...` shape.
-    Route('/api/agents/{agent_id}/restore', endpoint=restore_agent_api_route, name="restore_agent_api", methods=['POST', 'OPTIONS']),
-    Route('/api/agents/{agent_id}/edit', endpoint=edit_agent_api_route, name="edit_agent_api", methods=['POST', 'OPTIONS']),
-    Route('/api/agents/{agent_id}/purge-preview', endpoint=purge_preview_api_route, name="purge_preview_api", methods=['GET', 'OPTIONS']),
-    Route('/api/agents/{agent_id}', endpoint=purge_agent_api_route, name="purge_agent_api", methods=['DELETE', 'OPTIONS']),
+    # Added back for 1-to-1 dashboard compatibility
+    ('/api/create-agent', create_agent_dashboard_api_route, ['POST', 'OPTIONS'], "create_agent_dashboard_api"),
+    ('/api/terminate-agent', terminate_agent_dashboard_api_route, ['POST', 'OPTIONS'], "terminate_agent_dashboard_api"),
+
+    # Restore + Purge. Path-style routes so the agent_id is part of the
+    # URL — matches the dashboard's `/agents/<id>/...` shape.
+    ('/api/agents/{agent_id}/restore', restore_agent_api_route, ['POST', 'OPTIONS'], "restore_agent_api"),
+    ('/api/agents/{agent_id}/edit', edit_agent_api_route, ['POST', 'OPTIONS'], "edit_agent_api"),
+    ('/api/agents/{agent_id}/purge-preview', purge_preview_api_route, ['GET', 'OPTIONS'], "purge_preview_api"),
+    ('/api/agents/{agent_id}', purge_agent_api_route, ['DELETE', 'OPTIONS'], "purge_agent_api"),
 
     # Catch-all OPTIONS handler for any API route
-    Route('/api/{path:path}', endpoint=handle_options, methods=['OPTIONS']),
+    ('/api/{path:path}', handle_options, ['OPTIONS'], None),
 ]
 
 # --- Test/Demo Data Endpoint ---
@@ -2404,31 +2432,66 @@ async def patch_message_api_route(request: Request) -> JSONResponse:
             conn.close()
 
 
-# Add the memory CRUD routes
-routes.extend([
-    Route('/api/memories', endpoint=create_memory_api_route, name="create_memory_api", methods=['POST', 'OPTIONS']),
-    Route('/api/memories/{context_key}', endpoint=update_memory_api_route, name="update_memory_api", methods=['PUT', 'OPTIONS']),
-    Route('/api/memories/{context_key}', endpoint=delete_memory_api_route, name="delete_memory_api", methods=['DELETE', 'OPTIONS']),
-    Route('/api/context-data', endpoint=context_data_api_route, name="context_data_api", methods=['GET', 'OPTIONS']),
+# Memory CRUD routes
+_dashboard_route_specs.extend([
+    ('/api/memories', create_memory_api_route, ['POST', 'OPTIONS'], "create_memory_api"),
+    ('/api/memories/{context_key}', update_memory_api_route, ['PUT', 'OPTIONS'], "update_memory_api"),
+    ('/api/memories/{context_key}', delete_memory_api_route, ['DELETE', 'OPTIONS'], "delete_memory_api"),
+    ('/api/context-data', context_data_api_route, ['GET', 'OPTIONS'], "context_data_api"),
     # Task CRUD (issue C). GET /api/tasks (list) already exists earlier.
-    Route('/api/tasks', endpoint=create_task_api_route, name="create_task_api", methods=['POST', 'OPTIONS']),
-    Route('/api/tasks/{task_id}', endpoint=delete_task_api_route, name="delete_task_api", methods=['DELETE', 'OPTIONS']),
+    ('/api/tasks', create_task_api_route, ['POST', 'OPTIONS'], "create_task_api"),
+    ('/api/tasks/{task_id}', delete_task_api_route, ['DELETE', 'OPTIONS'], "delete_task_api"),
     # Messages CRUD (Phase 6 PR #20 / issue P).
     # Listing uses POST /api/messages/query (not GET) because browsers
     # strip GET bodies per the Fetch spec; declared before the
     # compose route so the more specific path matches first.
-    Route('/api/messages/query', endpoint=list_messages_api_route, name="list_messages_api", methods=['POST', 'OPTIONS']),
+    ('/api/messages/query', list_messages_api_route, ['POST', 'OPTIONS'], "list_messages_api"),
     # Participants endpoint: live agents (status != terminated) + tombstones
     # for purged agents (PR C cascade). Sources the Sender/Recipient
     # filter dropdowns so terminated agents don't ghost the UI.
-    Route('/api/messages/participants', endpoint=list_participants_api_route, name="list_participants_api", methods=['POST', 'OPTIONS']),
-    Route('/api/messages', endpoint=create_message_api_route, name="create_message_api", methods=['POST', 'OPTIONS']),
+    ('/api/messages/participants', list_participants_api_route, ['POST', 'OPTIONS'], "list_participants_api"),
+    ('/api/messages', create_message_api_route, ['POST', 'OPTIONS'], "create_message_api"),
     # v5.0.22: subject-suggest helper. Declared BEFORE
     # /api/messages/{message_id} so the static path matches before the
-    # dynamic one (Starlette walks routes in registration order).
-    Route('/api/messages/suggest-subject', endpoint=suggest_subject_api_route, name="suggest_subject_api", methods=['POST', 'OPTIONS']),
-    Route('/api/messages/{message_id}', endpoint=patch_message_api_route, name="patch_message_api", methods=['PATCH', 'DELETE', 'OPTIONS']),
+    # dynamic one (FastAPI walks routes in registration order, same as
+    # the underlying Starlette router).
+    ('/api/messages/suggest-subject', suggest_subject_api_route, ['POST', 'OPTIONS'], "suggest_subject_api"),
+    ('/api/messages/{message_id}', patch_message_api_route, ['PATCH', 'DELETE', 'OPTIONS'], "patch_message_api"),
 ])
 
-# Add the sample data route
-routes.append(Route('/api/create-sample-memories', endpoint=create_sample_memories_route, name="create_sample_memories", methods=['POST', 'OPTIONS']))
+# Sample data route
+_dashboard_route_specs.append(
+    ('/api/create-sample-memories', create_sample_memories_route, ['POST', 'OPTIONS'], "create_sample_memories"),
+)
+
+
+def register_routes(app: FastAPI) -> None:
+    """Attach every dashboard REST handler to ``app``.
+
+    Replaces the prior top-level ``routes = [Route(...)]`` list that
+    ``main_app.create_app`` spliced into the Starlette ``routes=``
+    kwarg. With FastAPI the registration is now imperative — we walk
+    :data:`_dashboard_route_specs` and call ``app.add_api_route(...)``
+    per entry.
+
+    Why ``app.add_api_route`` rather than per-handler ``@app.post``
+    decorators: the handlers in this module still use the legacy
+    ``async def name(request: Request) -> Response`` shape (PR D
+    rewrites them to typed FastAPI signatures). ``add_api_route``
+    accepts a callable + methods list which preserves the existing
+    shape verbatim while routing requests through FastAPI's router so
+    middleware, dependency injection (added in PR D), and OpenAPI
+    discovery all see these endpoints.
+
+    The ``include_in_schema=False`` flag suppresses each handler from
+    the auto-generated OpenAPI doc — until the request/response
+    schemas are pinned in PR D the doc would be misleading.
+    """
+    for path, endpoint, methods, name in _dashboard_route_specs:
+        app.add_api_route(
+            path,
+            endpoint,
+            methods=methods,
+            name=name,
+            include_in_schema=False,
+        )
