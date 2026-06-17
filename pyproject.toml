@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-mcp"
-version = "5.0.50"
+version = "5.0.51"
 description = "AgentMCP v2.5 - Enhanced multi-agent system with tmux integration and worktree support"
 authors = [
     {name = "Luis Alejandro Rincon", email = "alejandro@rinconnect.com"},
@@ -27,6 +27,7 @@ dependencies = [
     "python-dotenv",
     "sqlite-vec",
     "httpx",
+    "requests",
     "mcp>=1.8.1",
     "sqlalchemy>=2.0",
     "alembic",

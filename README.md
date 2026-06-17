@@ -83,31 +83,6 @@ uv run -m agent_mcp.cli --port 8080 --project-dir path-to-directory
 cd agent_mcp/dashboard && npm install && npm run dev
 ```
 
-### Node.js/TypeScript Implementation (Alternative)
-
-```bash
-# Clone and setup
-git clone https://github.com/rinadelph/Agent-MCP.git
-cd Agent-MCP/agent-mcp-node
-
-# Install dependencies
-npm install
-
-# Configure environment
-cp .env.example .env  # Add your OpenAI API key
-
-# Start the server
-npm run server
-
-# Or use the built version
-npm run build
-npm start
-
-# Or install globally
-npm install -g agent-mcp-node
-agent-mcp --port 8080 --project-dir path-to-directory
-```
-
 ## MCP Integration Guide
 
 ### What is MCP?
