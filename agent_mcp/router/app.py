@@ -2552,7 +2552,22 @@ def make_app(
     SINGLE_TENANT_NAME = single_tenant_name
     SINGLE_TENANT_WORKSPACE = single_tenant_workspace
 
-    app = web.Application()
+    # Wire-in: Phase 1 PR C of prancy-napping-pie (operator login).
+    #
+    # ``register_setup_routes`` appends the empty-users redirect
+    # middleware; aiohttp requires middlewares to be present on the
+    # Application AT CONSTRUCTION TIME (the middleware chain is frozen
+    # once the app starts), so we must pass ``middlewares=`` to the
+    # constructor rather than mutating ``app.middlewares`` post-hoc.
+    # We import lazily to keep the Jinja Environment off any
+    # ``agent_mcp.router.app`` import that doesn't go through
+    # ``make_app`` (e.g. a future ``router_module.do_thing()`` call
+    # path used only by tests).
+    from .setup_wizard import empty_users_redirect_middleware
+    from .login import register_login_routes
+    from .setup_wizard import register_setup_routes
+
+    app = web.Application(middlewares=[empty_users_redirect_middleware])
     # Eagerly allocate the proxy-task tracking set so `_track_proxy_task`
     # never writes to a frozen/started app dict (aiohttp emits a
     # DeprecationWarning for mutations after startup).
@@ -2681,6 +2696,15 @@ def make_app(
         "/agent-mcp/api/projects/{name}/stop",
         _rest_gated(rest_stop_project_handler),
     )
+
+    # Phase 1 PR C: login + setup-wizard routes. Registered AFTER the
+    # /api routes so a project literally named "login" can't shadow
+    # them — though "login" isn't in ``_RESERVED_NAMES`` because the
+    # ``/agent-mcp/<name>/...`` shape was retired in PR-D; routes that
+    # name "login" today live at the top-level ``/agent-mcp/login``,
+    # not under a project segment, so the collision can't happen.
+    register_login_routes(app)
+    register_setup_routes(app)
 
     # PR-B Shape-3 REST surface. Strict Accept-header gate (PR-A) still
     # applies — see ``backend_api_handler``.

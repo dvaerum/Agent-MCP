@@ -16,7 +16,7 @@ from __future__ import annotations
 import pytest
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.no_seed_operator]
 
 
 def _identity_module():
