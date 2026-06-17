@@ -68,8 +68,9 @@ python --version  # Should be >=3.10
 node --version    # Should be >=18.0.0
 npm --version     # Should be >=9.0.0
 
-# If using nvm for Node.js version management
-nvm use  # Uses the version specified in .nvmrc
+# If using nvm for Node.js version management (the .nvmrc lives next
+# to the dashboard, since that's the only Node code in the repo)
+(cd agent_mcp/dashboard && nvm use)
 
 # Configure environment
 cp .env.example .env  # Add your OpenAI API key
@@ -731,8 +732,9 @@ Watch your AI team work in real-time through the dashboard. Every action is logg
 
 For consistent development environment:
 ```bash
-# Using nvm (Node Version Manager)
-nvm use  # Automatically uses Node v22.16.0 from .nvmrc
+# Using nvm (Node Version Manager) — the .nvmrc lives in the
+# dashboard directory, so cd there first
+(cd agent_mcp/dashboard && nvm use)  # Automatically uses Node v22.16.0 from .nvmrc
 
 # Or manually check versions
 node --version  # Should be >=18.0.0
