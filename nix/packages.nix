@@ -78,23 +78,17 @@ let
     + "${python.pkgs.makePythonPath agentMcpPy.dependencies}";
 
   # ── Backend launcher ─────────────────────────────────────────────
-  # Sets the Ollama-shaped OpenAI-compatible endpoint defaults and
-  # exec's `python -m agent_mcp.cli server` via the fork's CLI group.
-  # Callers can override OPENAI_BASE_URL / OPENAI_API_KEY /
-  # AGENT_MCP_EMBEDDING_MODEL / AGENT_MCP_EMBEDDING_DIMENSION via the
-  # systemd unit's Environment list.
+  # Thin wrapper that exec's `python -m agent_mcp.cli server` via the
+  # fork's CLI group. v5.0.53: the Ollama-shaped OpenAI-compatible
+  # defaults (OPENAI_BASE_URL / OPENAI_API_KEY / OPENAI_MODEL /
+  # AGENT_MCP_EMBEDDING_MODEL / AGENT_MCP_EMBEDDING_DIMENSION) are now
+  # seeded by core.config when OPENAI_API_KEY is unset, so we no longer
+  # set them here. Callers who want to point this backend at the
+  # OpenAI cloud (or a different Ollama model) simply pre-export
+  # OPENAI_API_KEY (or any of the other vars) via the systemd unit's
+  # Environment list — core.config's `setdefault` honours pre-set
+  # values.
   agentMcpBackendWrapper = pkgs.writeShellScriptBin "agent-mcp-backend" ''
-    export OPENAI_BASE_URL="''${OPENAI_BASE_URL:-http://127.0.0.1:11434/v1}"
-    export OPENAI_API_KEY="''${OPENAI_API_KEY:-ollama}"
-    # v5.0.44: the in-code "gpt-4.1-2025-04-14" default was removed.
-    # Completions now flow through completion_service.completion_client(),
-    # which requires OPENAI_MODEL when OPENAI_API_KEY is set. The VM
-    # ships qwen3:1.7b via services.ollama.loadModels (~1 GB), so the
-    # default routes the OpenAI SDK at the local Ollama endpoint with
-    # a model Ollama actually has.
-    export OPENAI_MODEL="''${OPENAI_MODEL:-qwen3:1.7b}"
-    export AGENT_MCP_EMBEDDING_MODEL="''${AGENT_MCP_EMBEDDING_MODEL:-qwen3-embedding:0.6b}"
-    export AGENT_MCP_EMBEDDING_DIMENSION="''${AGENT_MCP_EMBEDDING_DIMENSION:-1024}"
     export PYTHONPATH="${agentMcpPyPath}''${PYTHONPATH:+:$PYTHONPATH}"
     exec ${python}/bin/python -m agent_mcp.cli server --transport sse "$@"
   '';
