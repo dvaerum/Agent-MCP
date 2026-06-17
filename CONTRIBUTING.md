@@ -134,12 +134,10 @@ is that our patches are upstream-shaped if/when they wake up.
 
 ## Tree layout reminder
 
-This repo has **two parallel implementations**: `agent_mcp/` (Python,
-what the NixOS deployment runs) and `agent-mcp-node/` (TypeScript,
-upstream's newer rewrite). PRs in this fork target Python by default.
-CI builds + tests Python only. Don't delete the Node tree — keeping
-both keeps upstream PRs clean and leaves room to absorb Node work
-into Python later.
+This repo's implementation lives in `agent_mcp/` (Python, what the
+NixOS deployment runs). The upstream's Node/TypeScript rewrite is
+not carried in this fork. PRs target Python; CI builds + tests
+Python only.
 
 ## Out of scope for this fork
 

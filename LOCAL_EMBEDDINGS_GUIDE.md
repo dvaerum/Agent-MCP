@@ -260,33 +260,14 @@ curl http://localhost:11434/api/embeddings -d '{
 
 ### Full Test: Agent-MCP Integration
 
-Run the comprehensive test suite:
+Once configured, start Agent-MCP normally and confirm that the
+embeddings provider initializes from your `.env` (look for
+`EMBEDDING_PROVIDER=ollama` being honored in startup logs and that
+RAG queries succeed).
 
-```bash
-cd agent-mcp-node
-node test-ollama-embeddings.js
-```
+**If queries succeed**: You're all set!
 
-**What You'll See**:
-```
-🚀 Ollama Embedding Provider Test Suite
-✅ Provider created
-✅ Provider is available
-✅ Warmup completed in 54ms
-✅ Single embedding generated in 53ms
-✅ Dimension normalization working correctly
-✅ All tests passed successfully!
-
-📊 Performance Summary:
-   - Warmup: 54ms
-   - Single text: 53ms
-   - Batch (3 texts): 109ms (36.3ms avg)
-   - Large batch (10 texts): 375ms (37.5ms avg)
-```
-
-**If tests pass**: You're all set! 🎉
-
-**If tests fail**: See [Troubleshooting](#troubleshooting) below
+**If something fails**: See [Troubleshooting](#troubleshooting) below
 
 ---
 
@@ -370,23 +351,7 @@ ollama pull qwen3-embedding:0.6b
 ollama list
 ```
 
-### Issue #3: "Module not found" when running tests
-
-**Symptoms**:
-```
-Cannot find module '.../OllamaEmbeddingProvider.js'
-```
-
-**Solution**:
-The TypeScript needs to be compiled. The build directory should already have the compiled files. If not:
-
-```bash
-cd agent-mcp-node
-npm install
-# The build folder should already exist
-```
-
-### Issue #4: Slow performance
+### Issue #3: Slow performance
 
 **Possible causes**:
 
@@ -401,7 +366,7 @@ npm install
    - Check CPU: `htop`
    - Make sure laptop is plugged in (not on battery saver)
 
-### Issue #5: "Dimension mismatch"
+### Issue #4: "Dimension mismatch"
 
 **Symptoms**:
 ```
@@ -415,7 +380,7 @@ Expected 1536 dimensions, got 1024
 
 **If you see this as an error**, the auto-padding might not be working. Check that you're using the latest version of the code.
 
-### Issue #6: Port already in use
+### Issue #5: Port already in use
 
 **Symptoms**:
 ```
@@ -545,7 +510,6 @@ Once your local embeddings are working:
 
 - **Ollama Documentation**: https://ollama.ai/docs
 - **Agent-MCP README**: [README.md](README.md)
-- **Embedding Providers Guide**: [agent-mcp-node/README-EMBEDDING-PROVIDERS.md](agent-mcp-node/README-EMBEDDING-PROVIDERS.md)
 - **Discord Community**: [Join for help](https://discord.gg/agent-mcp) *(check README for link)*
 
 ---
