@@ -6,7 +6,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from starlette.applications import Starlette
+from fastapi import FastAPI
 from starlette.routing import Mount
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -21,7 +21,7 @@ import mcp.types as mcp_types
 from ..core.config import logger
 from ..core.auth import verify_token, get_agent_id, query_agent_status
 from ..core import session_registry
-from .routes import routes as http_routes
+from .routes import register_routes
 from .server_lifecycle import application_startup, application_shutdown
 from ..tools.registry import list_available_tools, dispatch_tool_call, request_auth_token
 
@@ -843,7 +843,7 @@ async def _send_simple_response(send, status: int, body: bytes) -> None:
     await send({"type": "http.response.body", "body": body, "more_body": False})
 
 
-# --- Starlette Application Creation --------------------------------
+# --- FastAPI Application Creation ----------------------------------
 def create_app(
     project_dir: str,
     admin_token_cli: Optional[str] = None,
@@ -851,15 +851,24 @@ def create_app(
     admin_token_out_format: str = "raw",
     admin_token_in_path: Optional[str] = None,
     admin_token_log: bool = False,
-) -> Starlette:
-    """Build and configure the main Starlette application.
+) -> FastAPI:
+    """Build and configure the main FastAPI application.
 
-    Lifespan: starlette >= 0.45 uses a single `lifespan` async context
-    manager (the on_startup/on_shutdown kwargs are gone). We chain the
-    app's own startup/shutdown with the StreamableHTTP session
-    manager's `.run()` context — the SDK requires `.run()` to wrap
-    request handling, otherwise the manager's task group is not
-    initialised and `handle_request` raises RuntimeError.
+    Phase 1 PR A (prancy-napping-pie): migrated from Starlette to
+    FastAPI. FastAPI is a Starlette subclass so the wire contract is
+    unchanged — the auth middleware, lifespan, CORS, and mounted
+    Starlette routes (``/mcp``, ``/sse``, ``/messages``) all attach to
+    the FastAPI instance via the same Starlette APIs. Subsequent PRs
+    (B/C/D) will convert the route layer's ad-hoc ``Request``-based
+    handlers to typed FastAPI signatures and replace the
+    BaseHTTPMiddleware-style auth with a ``Depends(...)`` dep.
+
+    Lifespan: FastAPI accepts the same ``@asynccontextmanager`` shape
+    via the ``lifespan=`` kwarg. We chain the app's own
+    startup/shutdown with the StreamableHTTP session manager's
+    ``.run()`` context — the SDK requires ``.run()`` to wrap request
+    handling, otherwise the manager's task group is not initialised
+    and ``handle_request`` raises RuntimeError.
     """
 
     # Build a fresh StreamableHTTP session manager per app instance.
@@ -876,7 +885,7 @@ def create_app(
     session_manager = manager
 
     @asynccontextmanager
-    async def lifespan(_app: Starlette):
+    async def lifespan(_app: FastAPI):
         await application_startup(
             project_dir_path_str=project_dir,
             admin_token_param=admin_token_cli,
@@ -886,7 +895,7 @@ def create_app(
             admin_token_log=admin_token_log,
         )
         logger.info(
-            "Starlette app startup complete. Background tasks should be started by the server runner."
+            "FastAPI app startup complete. Background tasks should be started by the server runner."
         )
         # `manager.run()` must wrap any request handling — it creates
         # the task group that spawns per-request server tasks.
@@ -895,7 +904,7 @@ def create_app(
                 yield
             finally:
                 await application_shutdown()
-                logger.info("Starlette app shutdown complete.")
+                logger.info("FastAPI app shutdown complete.")
 
     middleware_stack = [
         Middleware(AuthHeaderMiddleware),
@@ -916,27 +925,36 @@ def create_app(
         ),
     ]
 
-    all_routes = list(http_routes)
+    # Mount the bare-ASGI routes (``/mcp``, ``/sse``, ``/messages``)
+    # before constructing the FastAPI app so they participate in the
+    # initial ``routes=`` list. FastAPI doesn't intercept Mounts it
+    # doesn't define, so these stay pass-through ASGI.
+    mounted_routes = [
+        # New Streamable HTTP transport at /mcp (spec rev 2025-03-26).
+        Mount('/mcp', app=_McpAsgiApp(manager), name="mcp_transport"),
+        # Legacy endpoints — 410 Gone with the migration JSON body.
+        # Kept mounted (rather than deleted outright) so any
+        # client/router still pointed at the old shape gets a
+        # structured, parseable hint rather than a bare 404. Remove
+        # these mounts in a later major version once telemetry shows
+        # no traffic.
+        Mount('/sse', app=_GoneApp(), name="legacy_sse_gone"),
+        Mount('/messages', app=_GoneApp(), name="legacy_messages_gone"),
+    ]
 
-    # New Streamable HTTP transport at /mcp (spec rev 2025-03-26).
-    all_routes.append(Mount('/mcp', app=_McpAsgiApp(manager), name="mcp_transport"))
-
-    # Legacy endpoints — 410 Gone with the migration JSON body. Kept
-    # mounted (rather than deleted outright) so any client/router
-    # still pointed at the old shape gets a structured, parseable hint
-    # rather than a bare 404. Remove these mounts in a later major
-    # version once telemetry shows no traffic.
-    all_routes.append(Mount('/sse', app=_GoneApp(), name="legacy_sse_gone"))
-    all_routes.append(Mount('/messages', app=_GoneApp(), name="legacy_messages_gone"))
-
-    app = Starlette(
-        routes=all_routes,
+    app = FastAPI(
+        routes=mounted_routes,
         lifespan=lifespan,
         middleware=middleware_stack,
         debug=os.environ.get("MCP_DEBUG", "false").lower() == "true",
     )
 
-    logger.info("Starlette application instance created with routes and lifecycle events.")
+    # Dashboard REST handlers register themselves via the FastAPI
+    # ``add_api_route`` API after the app exists. See
+    # :func:`agent_mcp.app.routes.register_routes` for the spec table.
+    register_routes(app)
+
+    logger.info("FastAPI application instance created with routes and lifecycle events.")
     return app
 
 # The actual running of the app (e.g., with uvicorn) will be handled by cli.py
