@@ -97,6 +97,13 @@ def _apply_env(monkeypatch: pytest.MonkeyPatch, env: _RouterEnv) -> None:
     monkeypatch.setenv(
         "AGENT_MCP_DEFAULT_WORKSPACE", str(env.root / "workspaces")
     )
+    # Phase 1 PR B (prancy-napping-pie): the router's startup hook
+    # runs Alembic migrations against router.db, defaulting to
+    # /var/lib/agent-mcp/router.db. Point it at the test root so we
+    # never touch the production path.
+    monkeypatch.setenv(
+        "AGENT_MCP_ROUTER_DB", str(env.root / "router.db")
+    )
 
 
 # ── systemctl stub ──────────────────────────────────────────────────

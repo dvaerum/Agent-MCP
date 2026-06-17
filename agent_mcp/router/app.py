@@ -2505,6 +2505,30 @@ async def _start_alias_reaper_task(app: web.Application) -> None:
     asyncio.create_task(alias_reaper(app))
 
 
+async def _init_router_identity_on_startup(app: web.Application) -> None:
+    """Run router-identity migrations + env-var bootstrap at startup.
+
+    Delegates to `agent_mcp.router.identity.init_router_db`, which:
+
+      1. Runs the router-level Alembic migrations against router.db
+         (creates the users / sessions / project_membership tables on
+         a fresh deploy; no-op on already-migrated DBs).
+      2. If `AGENT_MCP_BOOTSTRAP_USERNAME` and `_PASSWORD` are set
+         AND the users table is empty, creates the first operator
+         from them — and then strips both env vars from os.environ
+         so they don't leak into agent subprocess spawns.
+
+    The call is sync (SQLite is fine on the event loop here — it's
+    a one-shot at startup, not a hot path). We import lazily to keep
+    argon2-cffi's CFFI bindings off the cold-import critical path
+    for any module that pulls `agent_mcp.router.app`.
+    """
+    del app  # signature required by aiohttp's on_startup contract.
+    from .identity import init_router_db
+
+    init_router_db()
+
+
 def make_app(
     *,
     single_tenant_name: str | None = None,
@@ -2533,6 +2557,13 @@ def make_app(
     # never writes to a frozen/started app dict (aiohttp emits a
     # DeprecationWarning for mutations after startup).
     app[PROXY_TASKS_KEY] = set()
+    # Router identity DB: run Alembic migrations and (if applicable)
+    # the env-var bootstrap before anything else, so a fresh deploy
+    # has the users table ready before the first dashboard request
+    # lands. The handler itself is sync; wrap in a tiny coroutine to
+    # satisfy aiohttp's on_startup signature. Added in Phase 1 PR B
+    # of the operator-login plan (prancy-napping-pie).
+    app.on_startup.append(_init_router_identity_on_startup)
     app.on_startup.append(reconcile_on_startup)
     app.on_startup.append(_start_reaper_task)
     app.on_startup.append(_start_alias_reaper_task)

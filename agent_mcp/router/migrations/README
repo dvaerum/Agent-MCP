@@ -1,0 +1,18 @@
+Alembic migration scripts for the agent-mcp router-level identity
+database (router.db). Separate Alembic tree from the per-project
+migrations under `agent_mcp/migrations/` — the router DB holds
+users, sessions, and project_membership; per-project DBs hold tasks,
+agents, RAG chunks, etc.
+
+At runtime the router's lifespan calls
+`agent_mcp.router.migrations_runner.run_router_migrations_upgrade()`,
+which constructs an Alembic Config pointed at the router DB and runs
+`command.upgrade(config, "head")`. Idempotent: re-running on an
+already-migrated DB is a no-op.
+
+Manual usage (rare — the runtime path covers nearly all needs):
+
+    AGENT_MCP_ROUTER_DB=/var/lib/agent-mcp/router.db \
+        alembic -c agent_mcp/router/migrations/alembic.ini upgrade head
+
+(or use the runner directly from a Python shell).

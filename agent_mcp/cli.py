@@ -353,7 +353,18 @@ def server_cmd(
 # time — this subcommand sets defaults for them from CLI flags before
 # doing the import, so users get both an ergonomic CLI and the env-
 # var escape hatch the deploy repo currently uses.
-@cli.command("router", context_settings=dict(help_option_names=["-h", "--help"]))
+#
+# Phase 1 PR B of prancy-napping-pie promoted ``router`` from a leaf
+# command to a click group so a sibling ``create-operator``
+# subcommand could live alongside it. The default-invocation shape
+# (``agent-mcp router --port … --sock-dir …``) is preserved via
+# ``invoke_without_command=True`` plus an ``invoked_subcommand``
+# check: passing flags with no subcommand still runs the router.
+@cli.group(
+    "router",
+    context_settings=dict(help_option_names=["-h", "--help"]),
+    invoke_without_command=True,
+)
 @click.option(
     "--port",
     type=int,
@@ -460,7 +471,9 @@ def server_cmd(
         "single project's UDS via its registry lookup."
     ),
 )
+@click.pass_context
 def router_cmd(
+    ctx: click.Context,
     port: int,
     projects_file: str,
     sock_dir: Optional[str],
@@ -478,7 +491,19 @@ def router_cmd(
     The router proxies ``/agent-mcp/<name>/*`` to the per-project
     backend over Unix-domain sockets and serves the shared Next.js
     static dashboard + index page at ``/agent-mcp/``.
+
+    Sibling subcommands (``router create-operator``, etc.) reuse the
+    same group; when one of those is invoked the body below short-
+    circuits and the subcommand handler runs instead.
     """
+    # Subcommand dispatch — see comment on @cli.group above.
+    # Stash the resolved options on the context in case a subcommand
+    # wants them (today none do, but it keeps the door open).
+    ctx.ensure_object(dict)
+    ctx.obj["projects_file"] = projects_file
+    if ctx.invoked_subcommand is not None:
+        return
+
     # Promote CLI flags to env vars so the app module's import-time
     # reads pick them up. The deploy repo still sets these env vars
     # directly via systemd; both paths converge here.
@@ -542,6 +567,94 @@ def router_cmd(
     # systemd's ``TimeoutStopSec=15s``, fixing the 90 s deploy outage
     # caused by long-lived MCP proxy streams.
     web.run_app(app, host=host, port=port, shutdown_timeout=3.0)
+
+
+# --- ``router create-operator`` subcommand --------------------------
+# Phase 1 PR B (operator-login, prancy-napping-pie). Wraps the same
+# ``create_user`` code path the env-var bootstrap and the (PR-C)
+# setup wizard use, so all three bootstrap routes share argon2
+# hashing + retroactive project_membership semantics.
+#
+# Two password input shapes:
+#   * ``--password-stdin``   read the password as the first line of
+#                            stdin; designed for ``cat secret | …``
+#                            and ``-c '…' <<<password`` invocations
+#                            in scripts and systemd ExecStartPre.
+#   * no flag                interactive ``getpass()`` prompt with
+#                            confirmation; the operator-friendly path.
+@router_cmd.command(
+    "create-operator", context_settings=dict(help_option_names=["-h", "--help"])
+)
+@click.option(
+    "--username",
+    required=True,
+    help="Username for the new operator account.",
+)
+@click.option(
+    "--email",
+    default=None,
+    help="Optional email address (used by Phase 3 SSO linking).",
+)
+@click.option(
+    "--password-stdin",
+    "password_stdin",
+    is_flag=True,
+    default=False,
+    help=(
+        "Read the password from the first line of stdin instead of "
+        "prompting. Use this for non-interactive provisioning "
+        "(scripts, systemd ExecStartPre, container entrypoints)."
+    ),
+)
+def router_create_operator_cmd(
+    username: str,
+    email: Optional[str],
+    password_stdin: bool,
+) -> None:
+    """Create the first operator (or an additional one).
+
+    Same code path as the env-var bootstrap and the (PR-C) setup
+    wizard. The first operator created on a fresh router.db gets
+    membership in every existing project; subsequent operators get
+    no automatic memberships and need explicit grants.
+    """
+    if password_stdin:
+        # First line of stdin only; everything else gets discarded.
+        # Strip trailing newline but preserve internal whitespace in
+        # case the operator picked a multi-word passphrase.
+        password = sys.stdin.readline().rstrip("\n")
+        if not password:
+            raise click.UsageError(
+                "--password-stdin received an empty first line of stdin."
+            )
+    else:
+        # Interactive prompt with confirmation. Click's hide_input
+        # routes through getpass so the password doesn't echo.
+        password = click.prompt(
+            "Password", hide_input=True, confirmation_prompt=True
+        )
+
+    # Lazy import: identity pulls argon2-cffi at module load, no need
+    # to pay that cost on every ``agent-mcp router …`` invocation
+    # (the leaf one that runs the HTTP router, in particular).
+    from .router.identity import (
+        UsernameAlreadyExistsError,
+        create_user,
+        run_router_migrations_upgrade,
+    )
+
+    # Ensure router.db exists + is migrated before the insert. The
+    # leaf ``router`` invocation would do this in its lifespan; the
+    # standalone CLI path has to do it here.
+    run_router_migrations_upgrade()
+    try:
+        user_id = create_user(
+            username=username, password=password, email=email
+        )
+    except UsernameAlreadyExistsError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"Created operator {username!r} (user_id={user_id}).")
 
 
 # --- Backward-compatibility shim ------------------------------------

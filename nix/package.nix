@@ -29,6 +29,8 @@ let
       anyio click openai fastapi starlette uvicorn jinja2
       python-dotenv sqlite-vec httpx mcp
       sqlalchemy alembic
+      # Router identity store (Phase 1 PR B, prancy-napping-pie).
+      argon2-cffi
     ];
     # Upstream tests need a writable HOME, an OPENAI_API_KEY, and at
     # least one network-hitting fixture. Run them in CI, not here.
