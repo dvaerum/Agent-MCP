@@ -79,6 +79,13 @@ include = ["agent_mcp*"]
     "migrations/versions/*.py",
     "prompts/*.json",
     "router/*.in",
+    # Router-level identity migrations (Phase 1 PR B,
+    # prancy-napping-pie). Separate Alembic tree from the per-project
+    # migrations/ above — same packaging story.
+    "router/migrations/*.py",
+    "router/migrations/*.mako",
+    "router/migrations/README",
+    "router/migrations/versions/*.py",
 ]
 
 [tool.rye]
