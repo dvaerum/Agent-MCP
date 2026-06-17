@@ -61,7 +61,10 @@ export function searchPrompts(
   return catalog.filter(prompt =>
     prompt.title.toLowerCase().includes(lowercaseQuery) ||
     prompt.description.toLowerCase().includes(lowercaseQuery) ||
-    prompt.tags.some(tag => tag.toLowerCase().includes(lowercaseQuery)) ||
+    // Defensive `?? []` guard added 2026-06-17 alongside the
+    // catalog.json backfill + store normalization. See the
+    // `s.tags is undefined` Firefox-MCP regression for context.
+    (prompt.tags ?? []).some(tag => tag.toLowerCase().includes(lowercaseQuery)) ||
     prompt.template.toLowerCase().includes(lowercaseQuery)
   )
 }

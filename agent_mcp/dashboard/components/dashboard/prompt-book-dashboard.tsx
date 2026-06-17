@@ -129,14 +129,20 @@ const PromptCard = ({ prompt, onSelect, onDelete, isCustom }: {
         </div>
         
         <div className="flex flex-wrap gap-1 mt-2">
-          {prompt.tags.slice(0, 3).map(tag => (
+          {/* Defensive `?? []` guard added 2026-06-17: catalog.json
+              and the zustand store both normalize `tags` to an
+              array, but if this component is ever rendered with a
+              prompt that bypasses the store (e.g. a future direct
+              import or a test harness) the read sites must still
+              survive `tags: undefined`. See PR following #166. */}
+          {(prompt.tags ?? []).slice(0, 3).map(tag => (
             <Badge key={tag} variant="secondary" className="text-xs">
               {tag}
             </Badge>
           ))}
-          {prompt.tags.length > 3 && (
+          {(prompt.tags ?? []).length > 3 && (
             <Badge variant="outline" className="text-xs">
-              +{prompt.tags.length - 3}
+              +{(prompt.tags ?? []).length - 3}
             </Badge>
           )}
         </div>
@@ -390,7 +396,7 @@ export function PromptBookDashboard() {
       const customResults = customPrompts.filter(p =>
         p.title.toLowerCase().includes(searchTerm.toLowerCase()) ||
         p.description.toLowerCase().includes(searchTerm.toLowerCase()) ||
-        p.tags.some(tag => tag.toLowerCase().includes(searchTerm.toLowerCase()))
+        (p.tags ?? []).some(tag => tag.toLowerCase().includes(searchTerm.toLowerCase()))
       )
       prompts = [...standardResults, ...customResults]
     }
