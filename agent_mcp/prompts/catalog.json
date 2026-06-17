@@ -396,7 +396,8 @@
       "variables": [],
       "visibility": "any",
       "usage": "Manual fallback for clients that want the wake-loop behavior without enabling the global auto_event_loop toggle. Shipping copy stays in sync with agent_mcp/app/event_loop_instructions.py.",
-      "examples": []
+      "examples": [],
+      "tags": []
     }
   ]
 }
