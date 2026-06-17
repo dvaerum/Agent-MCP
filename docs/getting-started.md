@@ -31,12 +31,13 @@ Welcome to Agent-MCP! This guide will take you from installation to your first s
 git clone https://github.com/rinadelph/Agent-MCP.git
 cd Agent-MCP
 
-# Setup environment
-cp .env.example .env
-# Edit .env and add your OpenAI API key
-
 # Install dependencies
 uv venv && uv pip install -e .
+
+# (Optional) Switch to OpenAI cloud. When OPENAI_API_KEY is unset, the
+# server defaults to a local Ollama endpoint (qwen3:1.7b) — see the
+# "Environment variables" section below.
+# export OPENAI_API_KEY=sk-...
 
 # Configure Claude Code hooks for multi-agent file locking
 ./setup-claude-hooks.sh
@@ -96,6 +97,37 @@ npm run dev
 ```
 
 **🎉 You're ready!** The server is running and your AI assistant can connect.
+
+---
+
+## Environment variables
+
+Agent-MCP defaults are designed to work out of the box — none of the
+following are required.
+
+| Variable                          | Default                          | Notes |
+| --------------------------------- | -------------------------------- | ----- |
+| `OPENAI_API_KEY`                  | `ollama` (auto-seeded)           | Set to a real OpenAI key to use the cloud. |
+| `OPENAI_BASE_URL`                 | `http://127.0.0.1:11434/v1`      | Override only if Ollama is not on localhost. |
+| `OPENAI_MODEL`                    | `qwen3:1.7b`                     | Chat-completions model. |
+| `AGENT_MCP_EMBEDDING_MODEL`       | `qwen3-embedding:0.6b`           | RAG embedding model. |
+| `AGENT_MCP_EMBEDDING_DIMENSION`   | `1024`                           | Must match the embedding model. |
+| `MCP_PROJECT_DIR`                 | (set by `--project-dir`)         | **Advanced.** The CLI sets this from `--project-dir`. Only export manually for cases like running Alembic migrations outside the CLI (see `agent_mcp/db/README.md`). |
+
+Pre-v5.0.53 wirings used a `.env.example` checked into the repo
+referencing `MCP_SERVER_URL` and `MCP_ADMIN_TOKEN`. Those are
+**deprecated / removed** — `MCP_SERVER_URL` is no longer read, and
+the admin token is now surfaced via the new CLI flags:
+
+| Flag                              | Purpose |
+| --------------------------------- | ------- |
+| `--admin-token-out PATH`          | Write the resolved admin token to PATH (mode 0600). |
+| `--admin-token-format raw\|env`   | Output format for `--admin-token-out`. |
+| `--admin-token-in PATH`           | Read the admin token from PATH at startup (overrides the stored DB token). |
+| `--admin-token-log`               | Log the admin token to stdout/log on startup. |
+
+The default behavior is silent — operators read the token from the
+TUI display, the dashboard, or `--admin-token-out` plumbing.
 
 ---
 

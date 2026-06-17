@@ -191,15 +191,15 @@ cd /path/to/Agent-MCP
 
 ### Step 2: Create or Edit .env File
 
-If `.env` doesn't exist, create it:
-```bash
-cp .env.example .env
-```
-
-Or create from scratch:
+Create one if you want a persistent file (Agent-MCP loads `.env` from
+the project directory at startup):
 ```bash
 touch .env
 ```
+
+Or just `export` the variables in your shell — both work. Pre-v5.0.53
+the repo shipped a `.env.example` template; that file is gone (the
+server now defaults to Ollama out of the box without one).
 
 ### Step 3: Add Ollama Configuration
 
@@ -233,8 +233,10 @@ EMBEDDING_PROVIDER=ollama
 OLLAMA_MODEL=qwen3-embedding:0.6b
 OLLAMA_URL=http://localhost:11434
 
-# Project Settings
-MCP_PROJECT_DIR=.
+# Project Settings — normally set by `--project-dir` on the CLI.
+# Only export manually for advanced cases (e.g. running Alembic
+# migrations outside the CLI; see agent_mcp/db/README.md).
+# MCP_PROJECT_DIR=.
 ```
 
 **Important**:
