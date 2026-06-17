@@ -16,6 +16,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { apiClient, Agent, Task } from "@/lib/api"
+import { toastError, toastSuccess } from "@/components/ui/toast"
 import { projectContext } from "@/lib/project-context"
 import { mcpUrl } from "@/lib/urls"
 import { useServerStore } from "@/lib/stores/server-store"
@@ -334,31 +335,54 @@ interface CreateAgentData {
   working_directory?: string;
 }
 
-const CreateAgentModal = ({ onCreateAgent }: { onCreateAgent: (data: CreateAgentData) => void }) => {
+const CreateAgentModal = ({ onCreateAgent }: { onCreateAgent: (data: CreateAgentData) => Promise<void> }) => {
   const [open, setOpen] = useState(false)
+  const [submitting, setSubmitting] = useState(false)
   const [formData, setFormData] = useState({
     agent_id: '',
     capabilities: '',
     working_directory: ''
   })
 
-  const handleSubmit = (e: React.FormEvent) => {
+  // Pre-PR (silent-error UX bug surfaced by Firefox-MCP click-through
+  // on 2026-06-17 against v5.0.47): this handler was sync, fired
+  // ``onCreateAgent`` without awaiting, and then immediately called
+  // ``setOpen(false)`` + reset the form. The Deploy button always
+  // appeared to "work" — even when the server returned 400 with a
+  // clear ``{message: ...}`` body explaining what was wrong. The
+  // dialog vanished and the user's typed input was wiped along with
+  // it.
+  //
+  // The fix: ``await`` the call, only close + reset on success. On
+  // failure the upstream ``handleCreateAgent`` has already shown a
+  // toast with the server's exact message; keep the modal open with
+  // the user's input intact so they can adjust and retry.
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!formData.agent_id.trim()) return
+    if (!formData.agent_id.trim() || submitting) return
 
     const capabilities = formData.capabilities
       .split(',')
       .map(c => c.trim())
       .filter(c => c.length > 0)
 
-    onCreateAgent({
-      agent_id: formData.agent_id.trim(),
-      capabilities: capabilities.length > 0 ? capabilities : undefined,
-      working_directory: formData.working_directory.trim() || undefined
-    })
-
-    setFormData({ agent_id: '', capabilities: '', working_directory: '' })
-    setOpen(false)
+    setSubmitting(true)
+    try {
+      await onCreateAgent({
+        agent_id: formData.agent_id.trim(),
+        capabilities: capabilities.length > 0 ? capabilities : undefined,
+        working_directory: formData.working_directory.trim() || undefined
+      })
+      // Success path only: clear the form & close the dialog.
+      setFormData({ agent_id: '', capabilities: '', working_directory: '' })
+      setOpen(false)
+    } catch {
+      // ``handleCreateAgent`` already surfaced the toast — re-throw is
+      // unnecessary here; just leave the dialog open with the user's
+      // input so they can adjust and retry.
+    } finally {
+      setSubmitting(false)
+    }
   }
 
   return (
@@ -412,11 +436,11 @@ const CreateAgentModal = ({ onCreateAgent }: { onCreateAgent: (data: CreateAgent
             />
           </div>
           <DialogFooter className="gap-2">
-            <Button type="button" variant="outline" onClick={() => setOpen(false)} size="sm">
+            <Button type="button" variant="outline" onClick={() => setOpen(false)} size="sm" disabled={submitting}>
               Cancel
             </Button>
-            <Button type="submit" size="sm" className="bg-primary hover:bg-primary/90 shadow-lg hover:shadow-primary/25 transition-all">
-              Deploy
+            <Button type="submit" size="sm" className="bg-primary hover:bg-primary/90 shadow-lg hover:shadow-primary/25 transition-all" disabled={submitting}>
+              {submitting ? 'Deploying...' : 'Deploy'}
             </Button>
           </DialogFooter>
         </form>
@@ -1679,11 +1703,21 @@ export function AgentsDashboard() {
     totalInSystem: allAgents.length,
   }
 
+  // Pre-PR (silent-error UX bug surfaced by Firefox-MCP click-through
+  // on 2026-06-17 against v5.0.47): every mutation handler in this
+  // file caught its API error, called ``console.error``, and
+  // returned undefined — the failure was completely invisible to the
+  // user. The fix surfaces the server's ``message`` via toastError
+  // (api.ts already prefers the JSON body's ``message`` field) and
+  // re-throws so callers like ``CreateAgentModal.handleSubmit`` can
+  // gate their dialog-close logic on success.
   const handleCreateAgent = async (data: CreateAgentData) => {
     try {
       await apiClient.createAgent(data)
+      toastSuccess(`Agent "${data.agent_id}" deployed.`)
     } catch (error) {
-      console.error('Failed to create agent:', error)
+      toastError(error, 'Failed to deploy agent')
+      throw error
     }
   }
 
@@ -1692,7 +1726,7 @@ export function AgentsDashboard() {
       await apiClient.terminateAgent(agentId)
       await refreshData()
     } catch (error) {
-      console.error('Failed to terminate agent:', error)
+      toastError(error, `Failed to terminate ${agentId}`)
     }
   }
 
@@ -1701,7 +1735,7 @@ export function AgentsDashboard() {
       await apiClient.restoreAgent(agentId)
       await refreshData()
     } catch (error) {
-      console.error('Failed to restore agent:', error)
+      toastError(error, `Failed to restore ${agentId}`)
     }
   }
 

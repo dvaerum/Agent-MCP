@@ -151,6 +151,42 @@ export interface AgentDetails {
   }>
 }
 
+/**
+ * Typed error thrown by ``ApiClient.request`` on a !ok HTTP response.
+ *
+ * Pre-PR (silent-error UX bug surfaced by Firefox-MCP click-through on
+ * 2026-06-17 against v5.0.47): the request layer only threw
+ * ``new Error('API Error: 400 Bad Request')`` — the status line, no
+ * body. The server's carefully-worded validation message (e.g. PR
+ * #163's "invalid agent_id 'BadName!@#': must match ...") was logged
+ * to console but never reached the UI; mutation handlers'
+ * ``console.error`` swallow-pattern then made the failure invisible.
+ *
+ * ``ApiError`` carries:
+ *   - ``status``  HTTP status code (e.g. 400 / 404 / 500).
+ *   - ``message`` Best-effort human-readable text — preferring the
+ *                 server's JSON ``{message: ...}`` field, falling back
+ *                 to ``{detail}`` / ``{error}`` / raw body / status
+ *                 line so toasts never end up empty.
+ *   - ``body``    Raw response text for callers / logs that want the
+ *                 full payload (parsing failures still preserved).
+ *
+ * Callers in components/ pass the caught error to ``toastError`` from
+ * ``components/ui/toast`` which prefers ``err.message`` so the user
+ * sees what the server actually said.
+ */
+export class ApiError extends Error {
+  readonly status: number
+  readonly body: string
+
+  constructor(status: number, message: string, body: string) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+    this.body = body
+  }
+}
+
 class ApiClient {
   private baseUrl: string
   private suppressErrors: boolean = false
@@ -297,7 +333,34 @@ class ApiClient {
         if (r.status !== 404) {
           console.error(`API Error [${r.status}]:`, errorText)
         }
-        throw new Error(`API Error: ${r.status} ${r.statusText}`)
+        // Prefer the server's JSON ``{message: ...}`` payload (the
+        // 400 / 422 / 500 paths in agent_mcp/api/* all emit a
+        // ``message`` field — see
+        // tests/test_dashboard_create_agent_endpoint.py). Fall back
+        // through ``detail`` (FastAPI default) / ``error`` (some
+        // legacy endpoints) / raw body / status line so the surfaced
+        // ``error.message`` is never an empty string.
+        let surfaced = `${r.status} ${r.statusText}`.trim()
+        try {
+          const parsed = JSON.parse(errorText)
+          if (parsed && typeof parsed === 'object') {
+            const candidate =
+              (typeof parsed.message === 'string' && parsed.message) ||
+              (typeof parsed.detail === 'string' && parsed.detail) ||
+              (typeof parsed.error === 'string' && parsed.error) ||
+              ''
+            if (candidate) {
+              surfaced = candidate
+            }
+          }
+        } catch {
+          // Body wasn't JSON — fall back to the raw text if
+          // non-empty, otherwise keep the status-line default.
+          if (errorText && errorText !== 'Unknown error') {
+            surfaced = errorText
+          }
+        }
+        throw new ApiError(r.status, surfaced, errorText)
       }
 
       return await r.json()
