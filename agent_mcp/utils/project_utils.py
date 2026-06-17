@@ -214,13 +214,17 @@ Agent Type: {agent_type}
 
     # Connection code snippet for the agent to use
     # (Original main.py lines 1229-1237 for connection code structure)
-    # The MCP_SERVER_URL should come from a config or be dynamically determined.
-    # The original used os.environ.get('PORT', '8080') which implies it's for the SSE server.
-    # The agent's connection example should use the Streamable HTTP /mcp
-    # endpoint (spec rev 2025-03-26). Old /messages/ paired-endpoint
-    # transport was removed; see main_app.py:_MIGRATION_BODY.
-    mcp_server_url_for_client = os.environ.get(
-        "MCP_SERVER_URL", f"http://localhost:{os.environ.get('PORT', '8080')}/mcp"
+    # The agent's connection example uses the Streamable HTTP /mcp
+    # endpoint (spec rev 2025-03-26); the old /messages/ paired-endpoint
+    # transport was removed (see main_app.py:_MIGRATION_BODY).
+    #
+    # Pre-v5.0.53 this honoured an MCP_SERVER_URL env override, but
+    # nothing else in the codebase reads that variable — leaving the
+    # override in place would let a stray export inject an attacker-
+    # controlled URL into every worker's system prompt. The PORT env
+    # var (which the server itself binds to) is the only knob.
+    mcp_server_url_for_client = (
+        f"http://localhost:{os.environ.get('PORT', '8080')}/mcp"
     )
 
     # The original connection code snippet in main.py was quite extensive and specific.

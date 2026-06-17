@@ -238,16 +238,12 @@ in {
         # alone doesn't guarantee that for non-default-fs paths.
         after = [ "network.target" "ollama.service" "local-fs.target" ];
         requires = [ "local-fs.target" ];
-        environment = {
-          OPENAI_BASE_URL = "http://127.0.0.1:11434/v1";
-          OPENAI_API_KEY = "ollama";
-          # v5.0.44: completion_service.completion_client() requires
-          # OPENAI_MODEL when OPENAI_API_KEY is set. Matches the chat
-          # model loaded by services.ollama.loadModels.
-          OPENAI_MODEL = "qwen3:1.7b";
-          AGENT_MCP_EMBEDDING_MODEL = "qwen3-embedding:0.6b";
-          AGENT_MCP_EMBEDDING_DIMENSION = "1024";
-        };
+        # v5.0.53: core.config now seeds Ollama defaults automatically
+        # when OPENAI_API_KEY is unset, so the unit no longer needs to
+        # set OPENAI_BASE_URL / OPENAI_API_KEY / OPENAI_MODEL /
+        # AGENT_MCP_EMBEDDING_MODEL / AGENT_MCP_EMBEDDING_DIMENSION.
+        # Re-add an `environment` block here if you need to point this
+        # tenant at a non-default Ollama endpoint or model.
         serviceConfig = {
           Type = "simple";
           User = cfg.user;

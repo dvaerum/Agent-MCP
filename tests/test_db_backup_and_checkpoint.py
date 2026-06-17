@@ -167,10 +167,16 @@ def test_backup_subcommand_missing_db_errors(tmp_path: Path) -> None:
         "backup", str(tmp_path / "no-such-project"), str(tmp_path / "out.db")
     )
     assert result.returncode != 0
+    # Click's stock error text for a non-existent --type=Path arg is
+    # "does not exist"; older click versions used "not found" or "no
+    # such". Accept any of those phrasings so the test pins behaviour
+    # without coupling to a specific click release.
+    combined = (result.stderr + result.stdout).lower()
     assert (
-        "not found" in (result.stderr + result.stdout).lower()
-        or "no such" in (result.stderr + result.stdout).lower()
-    )
+        "does not exist" in combined
+        or "not found" in combined
+        or "no such" in combined
+    ), f"unexpected error text: {combined!r}"
 
 
 # ---------------------------------------------------------------------------

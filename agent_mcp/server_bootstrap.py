@@ -95,6 +95,10 @@ class ServerConfig:
     project_dir: str
     uds: Optional[str] = None
     admin_token_cli: Optional[str] = None
+    admin_token_out_path: Optional[str] = None
+    admin_token_out_format: str = "raw"
+    admin_token_in_path: Optional[str] = None
+    admin_token_log: bool = False
     debug: bool = False
     no_tui: bool = False
     advanced: bool = False
@@ -122,6 +126,10 @@ class ServerConfig:
         advanced: bool,
         git: bool,
         no_index: bool,
+        admin_token_out_path: Optional[str] = None,
+        admin_token_out_format: str = "raw",
+        admin_token_in_path: Optional[str] = None,
+        admin_token_log: bool = False,
     ) -> "ServerConfig":
         """Build a config from the keyword set the click ``server``
         subcommand passes to its callback.
@@ -139,6 +147,10 @@ class ServerConfig:
             project_dir=resolved_project,
             uds=uds,
             admin_token_cli=admin_token_cli,
+            admin_token_out_path=admin_token_out_path,
+            admin_token_out_format=admin_token_out_format,
+            admin_token_in_path=admin_token_in_path,
+            admin_token_log=bool(admin_token_log),
             debug=bool(debug),
             no_tui=bool(no_tui),
             advanced=bool(advanced),
@@ -389,6 +401,10 @@ def bootstrap_server(
         app = create_app(
             project_dir=config.project_dir,
             admin_token_cli=config.admin_token_cli,
+            admin_token_out_path=config.admin_token_out_path,
+            admin_token_out_format=config.admin_token_out_format,
+            admin_token_in_path=config.admin_token_in_path,
+            admin_token_log=config.admin_token_log,
         )
 
     teardown_state = {"called": False}
@@ -563,6 +579,10 @@ async def _run_stdio(config: ServerConfig, tui_active: bool) -> None:
         await application_startup(
             project_dir_path_str=config.project_dir,
             admin_token_param=config.admin_token_cli,
+            admin_token_out_path=config.admin_token_out_path,
+            admin_token_out_format=config.admin_token_out_format,
+            admin_token_in_path=config.admin_token_in_path,
+            admin_token_log=config.admin_token_log,
         )
 
         async with anyio.create_task_group() as tg:
@@ -637,9 +657,15 @@ def _print_startup_banner(config: ServerConfig) -> None:
         print(f"🚀 MCP Server running on port {config.port}")
         print(f"📁 Project: {config.project_dir}")
 
-    admin_token = get_admin_token_from_db(config.project_dir)
-    if admin_token:
-        print(f"🔑 Admin Token: {admin_token}")
+    # The startup banner only surfaces the admin token when the
+    # operator opted in via --admin-token-log. Default is silent —
+    # the dashboard's tokens view, --admin-token-out, or the TUI
+    # (which the operator is actively staring at) are the supported
+    # surfaces. Same gate as the application_startup log line.
+    if config.admin_token_log:
+        admin_token = get_admin_token_from_db(config.project_dir)
+        if admin_token:
+            print(f"🔑 Admin Token: {admin_token}")
 
     print()
     if config.transport != "stdio":

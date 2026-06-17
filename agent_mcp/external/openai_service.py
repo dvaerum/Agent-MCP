@@ -48,9 +48,16 @@ def initialize_openai_client() -> Optional[openai.OpenAI]:
 
     logger.info("Initializing OpenAI client...")
     try:
-        # Create the OpenAI client instance
-        # Original main.py:191
-        client = openai.OpenAI(api_key=OPENAI_API_KEY_ENV)
+        # Create the OpenAI client instance.
+        # The SDK reads OPENAI_BASE_URL from the env automatically, but
+        # pass it explicitly so the wiring is visible to anyone reading
+        # this file — and so a future SDK regression doesn't silently
+        # break our Ollama-by-default path (core.config sets the env
+        # var when OPENAI_API_KEY is unset).
+        client = openai.OpenAI(
+            api_key=OPENAI_API_KEY_ENV,
+            base_url=os.environ.get("OPENAI_BASE_URL") or None,
+        )
 
         # Test the connection by making a simple, low-cost API call
         # Original main.py:193 (client.models.list())

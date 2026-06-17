@@ -72,10 +72,15 @@ npm --version     # Should be >=9.0.0
 # to the dashboard, since that's the only Node code in the repo)
 (cd agent_mcp/dashboard && nvm use)
 
-# Configure environment
-cp .env.example .env  # Add your OpenAI API key
+# Install
 uv venv
-uv install
+uv pip install -e .
+
+# (Optional) point at OpenAI cloud instead of the bundled local
+# Ollama default. With OPENAI_API_KEY unset, the server falls back
+# to http://127.0.0.1:11434/v1 (qwen3:1.7b) automatically — see
+# docs/getting-started.md for the full env-var reference.
+# export OPENAI_API_KEY="sk-..."
 
 # Start the server
 uv run -m agent_mcp.cli --port 8080 --project-dir path-to-directory
@@ -214,12 +219,19 @@ uv run -m agent_mcp.cli --port 8080
 
 **Environment Variables**:
 ```bash
-export AGENT_MCP_HOST=0.0.0.0          # Server host
-export AGENT_MCP_PORT=8000              # Server port  
-export AGENT_MCP_LOG_LEVEL=INFO         # Logging level
-export AGENT_MCP_PROJECT_DIR=/your/project  # Default project directory
-export AGENT_MCP_MAX_AGENTS=10          # Maximum concurrent agents
+# OpenAI / Ollama wiring (defaults to local Ollama when unset):
+# export OPENAI_API_KEY="sk-..."                    # Switch to OpenAI cloud
+# export OPENAI_BASE_URL="http://127.0.0.1:11434/v1"
+# export OPENAI_MODEL="qwen3:1.7b"
+# export AGENT_MCP_EMBEDDING_MODEL="qwen3-embedding:0.6b"
+# export AGENT_MCP_EMBEDDING_DIMENSION="1024"
+
+# Project directory — normally set by `--project-dir`. Only export
+# manually for advanced use cases (Alembic migrations outside the CLI;
+# see agent_mcp/db/README.md).
+# export MCP_PROJECT_DIR=/your/project
 ```
+See `docs/getting-started.md` for the full reference.
 
 ### MCP Client Examples
 

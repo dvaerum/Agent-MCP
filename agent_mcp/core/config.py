@@ -259,15 +259,30 @@ def get_db_path() -> Path:
     return get_agent_dir() / DB_FILE_NAME
 
 
-# --- Environment Variable Check (Optional but good practice) ---
-OPENAI_API_KEY_ENV: Optional[str] = os.environ.get("OPENAI_API_KEY")  # From main.py:174
-# Debug print statement removed for clean console output
-if not OPENAI_API_KEY_ENV:
-    logger.error(
-        "CRITICAL: OPENAI_API_KEY not found in environment variables. Please set it in your .env file or environment."
+# --- OpenAI / Ollama defaults --------------------------------------
+# When OPENAI_API_KEY is unset (or empty), default to the bundled
+# local Ollama endpoint. Operators get a functional server out of the
+# box; setting OPENAI_API_KEY to a real key switches over to the
+# OpenAI cloud — we deliberately do NOT touch OPENAI_BASE_URL /
+# OPENAI_MODEL in that branch because clobbering a user-supplied key
+# with Ollama defaults would silently break the cloud path.
+#
+# Uses os.environ.setdefault so an operator who exported some of the
+# vars but not OPENAI_API_KEY still wins where they set a value.
+_OPENAI_API_KEY_RAW = os.environ.get("OPENAI_API_KEY")
+if not _OPENAI_API_KEY_RAW:
+    os.environ.setdefault("OPENAI_API_KEY", "ollama")
+    os.environ.setdefault("OPENAI_BASE_URL", "http://127.0.0.1:11434/v1")
+    os.environ.setdefault("OPENAI_MODEL", "qwen3:1.7b")
+    os.environ.setdefault("AGENT_MCP_EMBEDDING_MODEL", "qwen3-embedding:0.6b")
+    os.environ.setdefault("AGENT_MCP_EMBEDDING_DIMENSION", "1024")
+    logger.info(
+        "OPENAI_API_KEY not set — defaulting to local Ollama at "
+        "http://127.0.0.1:11434/v1 (qwen3:1.7b). Set OPENAI_API_KEY to "
+        "use a different endpoint."
     )
-    # Depending on strictness, you might want to raise an exception or sys.exit(1) here
-    # For now, just logging, as the openai_service.py will handle the client init failure.
+
+OPENAI_API_KEY_ENV: Optional[str] = os.environ.get("OPENAI_API_KEY")
 
 # --- Task Placement Configuration (System 8) ---
 ENABLE_TASK_PLACEMENT_RAG: bool = (

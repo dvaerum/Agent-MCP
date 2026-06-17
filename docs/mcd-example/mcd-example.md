@@ -126,22 +126,22 @@
     * anyio
     * click
 *   **Environment Variables:** 
-    * `OPENAI_API_KEY` - OpenAI API key
-    * `MCP_SERVER_URL` - MCP server URL
-    * `MCP_ADMIN_TOKEN` - (Optional) Admin token
-    * `MCP_PROJECT_DIR` - Project directory
+    * `OPENAI_API_KEY` - (Optional) OpenAI API key; defaults to local Ollama when unset
+    * `OPENAI_BASE_URL` / `OPENAI_MODEL` - Override the Ollama defaults
+    * `AGENT_MCP_EMBEDDING_MODEL` / `AGENT_MCP_EMBEDDING_DIMENSION` - Embedding wiring
+    * `MCP_PROJECT_DIR` - Advanced; normally set by `--project-dir`
 
 ---
 
 ## 6. Implementation Units & Tasks (Agent Instructions)
 
 *   **Unit 1: Environment Setup**
-    *   **File(s):** `pyproject.toml`, `.env`, `.env.example`, `requirements.txt`
-    *   **Purpose:** Configure project and environment variables
+    *   **File(s):** `pyproject.toml`
+    *   **Purpose:** Configure project build configuration. No `.env`
+        template is needed — Agent-MCP defaults to a local Ollama
+        endpoint when `OPENAI_API_KEY` is unset.
     *   **Agent Task(s):**
         1.  `CREATE_FILE`: Create pyproject.toml with build configuration
-        2.  `CREATE_FILE`: Create .env.example for environment variable template
-        3.  `CREATE_FILE`: Create requirements.txt for pip installation
 *   **Unit 2: Update Code to Use Environment Variables**
     *   **File(s):** `main.py`, `mcp_client.py`, `rag_agent_test.py`
     *   **Purpose:** Replace hardcoded API keys with environment variables

@@ -189,6 +189,49 @@ def cli(ctx: click.Context) -> None:
     help="Admin token for authentication. If not provided, one will be loaded from DB or generated.",
 )
 @click.option(
+    "--admin-token-out",
+    "admin_token_out_path",
+    type=click.Path(dir_okay=False, resolve_path=True),
+    default=None,
+    help=(
+        "Write the resolved admin token to this file on startup "
+        "(mode 0600). Use --admin-token-format to pick raw vs "
+        "MCP_ADMIN_TOKEN=<token> output."
+    ),
+)
+@click.option(
+    "--admin-token-format",
+    "admin_token_out_format",
+    type=click.Choice(["raw", "env"], case_sensitive=False),
+    default="raw",
+    show_default=True,
+    help=(
+        "Format for --admin-token-out: 'raw' writes just the token; "
+        "'env' writes MCP_ADMIN_TOKEN=<token>. No effect without "
+        "--admin-token-out."
+    ),
+)
+@click.option(
+    "--admin-token-in",
+    "admin_token_in_path",
+    type=click.Path(dir_okay=False, resolve_path=True, exists=True),
+    default=None,
+    help=(
+        "Read the admin token from this file at startup. Overrides "
+        "any token stored in the DB and any --admin-token value."
+    ),
+)
+@click.option(
+    "--admin-token-log",
+    is_flag=True,
+    default=False,
+    help=(
+        "Log the admin token to stdout/log on startup (opt-in; the "
+        "default is silent — operators read the token from the TUI, "
+        "the dashboard, or via --admin-token-out)."
+    ),
+)
+@click.option(
     "--debug",
     is_flag=True,
     default=os.environ.get("MCP_DEBUG", "false").lower() == "true",
@@ -224,6 +267,10 @@ def server_cmd(
     transport: str,
     project_dir: str,
     admin_token_cli: Optional[str],
+    admin_token_out_path: Optional[str],
+    admin_token_out_format: str,
+    admin_token_in_path: Optional[str],
+    admin_token_log: bool,
     debug: bool,
     no_tui: bool,
     advanced: bool,
@@ -247,12 +294,50 @@ def server_cmd(
 
     Switching between modes will require re-indexing all content.
     """
+    # Validate the admin-token output / input / log flags. At most one
+    # of out/in/log may be set; --admin-token-format only makes sense
+    # with --admin-token-out. Caught at CLI time so the lifecycle code
+    # never has to defend against a contradictory combination.
+    sinks = sum(
+        1
+        for v in (admin_token_out_path, admin_token_in_path, admin_token_log)
+        if v
+    )
+    if sinks > 1:
+        raise click.UsageError(
+            "--admin-token-out, --admin-token-in, and --admin-token-log "
+            "are mutually exclusive — pick at most one."
+        )
+    # Click defaults --admin-token-format to "raw"; only error if the
+    # operator explicitly passed a value AND no -out sink. We detect
+    # "explicit" by looking at sys.argv (Click's get_current_context
+    # would also work but argv is simpler here).
+    if (
+        admin_token_out_format
+        and admin_token_out_format.lower() != "raw"
+        and not admin_token_out_path
+    ):
+        raise click.UsageError(
+            "--admin-token-format requires --admin-token-out."
+        )
+    if (
+        "--admin-token-format" in sys.argv
+        and not admin_token_out_path
+    ):
+        raise click.UsageError(
+            "--admin-token-format requires --admin-token-out."
+        )
+
     config = ServerConfig.from_cli_args(
         port=port,
         uds=uds,
         transport=transport,
         project_dir=project_dir,
         admin_token_cli=admin_token_cli,
+        admin_token_out_path=admin_token_out_path,
+        admin_token_out_format=admin_token_out_format.lower(),
+        admin_token_in_path=admin_token_in_path,
+        admin_token_log=admin_token_log,
         debug=debug,
         no_tui=no_tui,
         advanced=advanced,
