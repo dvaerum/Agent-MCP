@@ -1,7 +1,0 @@
-{
-  "mcpServers": {
-    "Agent-MCP": {
-      "url": "http://localhost:8080/sse"
-    }
-  }
-}
