@@ -114,8 +114,21 @@ export const useDataStore = create<DataStore>((set, get) => ({
     set({ promptsCatalogLoading: true })
     try {
       const envelope = await apiClient.getPromptsCatalog()
+      // Normalize `tags` at the store boundary so any drift in the
+      // JSON catalogue (a prompt without a `tags` key, a null, etc.)
+      // is healed before it reaches the React tree. The 2026-06-17
+      // Firefox-MCP click-through caught a catalog.json entry
+      // (`agent-mcp-enter-event-loop`) that lacked `tags` entirely
+      // and threw `TypeError: s.tags is undefined` from the
+      // dashboard's direct dereference. catalog.json is now
+      // backfilled (layer 1) — this map() is the defense-in-depth
+      // layer that prevents future regressions even if the
+      // catalogue drifts again.
       set({
-        promptsCatalog: envelope.prompts as PromptTemplate[],
+        promptsCatalog: (envelope.prompts as PromptTemplate[]).map(p => ({
+          ...p,
+          tags: p.tags ?? [],
+        })),
         promptsCategories: envelope.categories as PromptCategory[],
         promptsCatalogLoading: false,
       })
