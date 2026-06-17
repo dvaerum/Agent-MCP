@@ -119,7 +119,13 @@ def _ensure_admin_pseudo_agent_row() -> None:
 
 # This function encapsulates the logic originally in main() before server run.
 async def application_startup(
-    project_dir_path_str: str, admin_token_param: Optional[str] = None
+    project_dir_path_str: str,
+    admin_token_param: Optional[str] = None,
+    *,
+    admin_token_out_path: Optional[str] = None,
+    admin_token_out_format: str = "raw",
+    admin_token_in_path: Optional[str] = None,
+    admin_token_log: bool = False,
 ):
     """
     Handles all application startup procedures:
@@ -225,15 +231,61 @@ async def application_startup(
 
     # 4. Handle Admin Token Persistence (Original main.py:1977-2012)
     # This logic ensures g.admin_token is set.
+    #
+    # Resolution priority (highest wins):
+    #   1. --admin-token-in PATH  — read raw token text from a file;
+    #      written back to the DB unconditionally (overrides any
+    #      pre-existing stored token).
+    #   2. --admin-token (legacy) — explicit token value on the CLI.
+    #   3. Stored token in project_context (the normal warm-start path).
+    #   4. Newly generated token.
+    #
+    # Whether the resolved token leaves the process is controlled
+    # separately by --admin-token-log (logs the value) and
+    # --admin-token-out (writes the value to a file). The CLI enforces
+    # mutual exclusion of the three sinks — lifecycle code does not
+    # need to re-check.
     admin_token_key_in_db = "config_admin_token"  # As used in original
     conn_admin_token = None
     effective_admin_token: Optional[str] = None
     token_source_description: str = ""
 
+    # Read --admin-token-in up front; falls into the same DB-upsert
+    # path as --admin-token so a future restart without the flag picks
+    # the same value back up.
+    token_from_in_file: Optional[str] = None
+    if admin_token_in_path:
+        try:
+            token_from_in_file = Path(admin_token_in_path).read_text().strip()
+        except OSError as exc:
+            logger.error(
+                "Failed to read admin-token-in file %s: %s. Falling back to "
+                "stored / generated token.",
+                admin_token_in_path,
+                exc,
+            )
+        if not token_from_in_file:
+            logger.warning(
+                "admin-token-in file %s was empty after strip(); ignoring.",
+                admin_token_in_path,
+            )
+            token_from_in_file = None
+
     try:
         conn_admin_token = get_db_connection()
         cursor = conn_admin_token.cursor()
-        if admin_token_param:
+        if token_from_in_file:
+            effective_admin_token = token_from_in_file
+            token_source_description = "--admin-token-in file"
+            _upsert_admin_token_row(
+                cursor,
+                admin_token_key_in_db,
+                json.dumps(effective_admin_token),
+                "Persistent MCP Admin Token",
+            )
+            conn_admin_token.commit()
+            logger.info(f"Using admin token provided via {token_source_description}.")
+        elif admin_token_param:
             effective_admin_token = admin_token_param
             token_source_description = "command-line parameter"
             _upsert_admin_token_row(
@@ -281,24 +333,40 @@ async def application_startup(
                 logger.info(f"Generated and stored new admin token.")
 
         g.admin_token = effective_admin_token  # Set the global admin token
-        logger.info(f"MCP Admin Token ({token_source_description}): {g.admin_token}")
+        # Silent default. Pre-v5.0.53 we logged the token here on every
+        # boot; now operators opt in via --admin-token-log, surface it
+        # via --admin-token-out, or read it from the dashboard / TUI.
+        if admin_token_log:
+            logger.info(
+                f"MCP Admin Token ({token_source_description}): {g.admin_token}"
+            )
 
     except sqlite3.Error as e_sql_admin:
         logger.error(
             f"Database error during admin token persistence: {e_sql_admin}. Falling back to temporary token.",
             exc_info=True,
         )
-        g.admin_token = admin_token_param if admin_token_param else generate_token()
-        logger.warning(f"Using temporary admin token due to DB error: {g.admin_token}")
+        g.admin_token = (
+            token_from_in_file
+            or admin_token_param
+            or generate_token()
+        )
+        logger.warning("Using temporary admin token due to DB error.")
+        if admin_token_log:
+            logger.warning(f"Temporary admin token: {g.admin_token}")
     except Exception as e_admin:
         logger.error(
             f"Unexpected error during admin token persistence: {e_admin}. Falling back to temporary token.",
             exc_info=True,
         )
-        g.admin_token = admin_token_param if admin_token_param else generate_token()
-        logger.warning(
-            f"Using temporary admin token due to unexpected error: {g.admin_token}"
+        g.admin_token = (
+            token_from_in_file
+            or admin_token_param
+            or generate_token()
         )
+        logger.warning("Using temporary admin token due to unexpected error.")
+        if admin_token_log:
+            logger.warning(f"Temporary admin token: {g.admin_token}")
     finally:
         if conn_admin_token:
             conn_admin_token.close()
@@ -306,6 +374,46 @@ async def application_startup(
     if not g.admin_token:  # Should not happen if logic above is correct
         logger.error("CRITICAL: Admin token could not be set. Exiting.")
         raise SystemExit("Admin token initialization failed.")
+
+    # If --admin-token-out was set, write the resolved token to the
+    # file now. Mode 0600 — operators surface this through the dash
+    # or to wire-up automation, not for casual reading.
+    if admin_token_out_path:
+        try:
+            out_path = Path(admin_token_out_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            if admin_token_out_format == "env":
+                payload = f"MCP_ADMIN_TOKEN={g.admin_token}\n"
+            else:
+                payload = f"{g.admin_token}\n"
+            # Atomic-ish: open with O_CREAT|O_TRUNC + 0o600, then write.
+            fd = os.open(
+                str(out_path),
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o600,
+            )
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(payload)
+            except Exception:
+                # fdopen owns the descriptor; on success the with-block
+                # closes it. On failure the descriptor leaks — defensive
+                # close to avoid that.
+                os.close(fd)
+                raise
+            # If the file pre-existed with broader perms, force-tighten.
+            os.chmod(str(out_path), 0o600)
+            logger.info(
+                "Wrote admin token to %s (format=%s, mode 0600).",
+                out_path,
+                admin_token_out_format,
+            )
+        except OSError as exc:
+            logger.error(
+                "Failed to write admin token to %s: %s",
+                admin_token_out_path,
+                exc,
+            )
 
     # 5. Load existing state from Database (Original main.py:2015-2045)
     logger.info("Loading existing state from database...")

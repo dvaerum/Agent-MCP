@@ -844,7 +844,14 @@ async def _send_simple_response(send, status: int, body: bytes) -> None:
 
 
 # --- Starlette Application Creation --------------------------------
-def create_app(project_dir: str, admin_token_cli: Optional[str] = None) -> Starlette:
+def create_app(
+    project_dir: str,
+    admin_token_cli: Optional[str] = None,
+    admin_token_out_path: Optional[str] = None,
+    admin_token_out_format: str = "raw",
+    admin_token_in_path: Optional[str] = None,
+    admin_token_log: bool = False,
+) -> Starlette:
     """Build and configure the main Starlette application.
 
     Lifespan: starlette >= 0.45 uses a single `lifespan` async context
@@ -871,7 +878,12 @@ def create_app(project_dir: str, admin_token_cli: Optional[str] = None) -> Starl
     @asynccontextmanager
     async def lifespan(_app: Starlette):
         await application_startup(
-            project_dir_path_str=project_dir, admin_token_param=admin_token_cli
+            project_dir_path_str=project_dir,
+            admin_token_param=admin_token_cli,
+            admin_token_out_path=admin_token_out_path,
+            admin_token_out_format=admin_token_out_format,
+            admin_token_in_path=admin_token_in_path,
+            admin_token_log=admin_token_log,
         )
         logger.info(
             "Starlette app startup complete. Background tasks should be started by the server runner."
