@@ -32,6 +32,11 @@ dependencies = [
     "mcp>=1.8.1",
     "sqlalchemy>=2.0",
     "alembic",
+    # Router-side identity store (Phase 1 PR B of prancy-napping-pie).
+    # argon2id is the recommended modern password-hashing scheme; the
+    # default PasswordHasher params (time_cost=2, memory_cost=64 MiB,
+    # parallelism=4) match OWASP guidance for 2024+.
+    "argon2-cffi",
 ]
 
 [project.optional-dependencies]
