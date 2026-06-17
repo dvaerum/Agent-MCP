@@ -170,6 +170,34 @@ async def test_css_response_has_sentinel_substituted(
 
 
 @pytest.mark.asyncio
+async def test_rsc_txt_response_has_sentinel_substituted(
+    aiohttp_client, router_app, write_dashboard_file,
+) -> None:
+    """Next.js RSC flight payloads (served from ``<page>.txt``) carry the
+    sentinel inline — both as the page's CSS-preload ``href`` and as the
+    runtime ``assetPrefix`` value. The browser fetches them during
+    client-side navigation and constructs CSS/JS URLs from the payload,
+    so the substitution must fire on ``text/plain`` bodies too.
+    Regression: bare RSC ``.txt`` payloads were passing through
+    unchanged because the default extension MIME ``text/plain`` was not
+    in the substitutable types tuple. Surfaced via Firefox-MCP
+    click-through on 2026-06-17."""
+    write_dashboard_file(
+        "index.txt",
+        ':HL["__AGENT_MCP_ASSET_PREFIX__/_next/static/css/app.css","style"]\n'
+        '0:{"p":"__AGENT_MCP_ASSET_PREFIX__","c":["",""]}\n',
+    )
+    client = await aiohttp_client(router_app)
+
+    resp = await client.get("/agent-mcp/app/e2e/index.txt")
+    assert resp.status == 200
+    body = await resp.text()
+    assert "__AGENT_MCP_ASSET_PREFIX__" not in body
+    assert "/agent-mcp/assets/_next/static/css/app.css" in body
+    assert '"p":"/agent-mcp/assets"' in body
+
+
+@pytest.mark.asyncio
 async def test_json_api_response_is_not_substituted(
     aiohttp_client, router_app,
 ) -> None:

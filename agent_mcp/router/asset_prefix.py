@@ -64,11 +64,26 @@ SENTINEL_BYTES: bytes = SENTINEL.encode("ascii")
 # Content-Type prefixes that need substitution. Anything else passes
 # through unchanged. Tuple-of-startswith rather than equality so we
 # match charset suffixes like ``text/html; charset=utf-8``.
+#
+# ``text/plain`` and ``text/x-component`` cover Next.js's RSC (React
+# Server Components) flight payloads: the static export emits these
+# alongside each page as ``<page>.txt`` and the browser fetches them
+# during client-side navigation to render the new route. The payload
+# encodes the page's CSS-preload links and the runtime ``assetPrefix``
+# value, both as plain strings containing the build-time sentinel — so
+# if the response body is not run through substitution the browser
+# constructs CSS/JS URLs with the literal ``__AGENT_MCP_ASSET_PREFIX__``
+# segment and the load fails with a MIME mismatch (the SPA fallback
+# returns the index.html which is text/html, not text/css). Surfaced
+# via Firefox-MCP click-through on 2026-06-17 against the post-PR-#164
+# build.
 _SUBSTITUTABLE_CTYPE_PREFIXES: tuple[str, ...] = (
     "text/html",
     "text/css",
     "application/javascript",
     "text/javascript",  # legacy alias some tooling still emits
+    "text/plain",       # Next.js RSC flight payloads (.txt extension)
+    "text/x-component", # canonical RSC MIME if a future build uses it
 )
 
 
