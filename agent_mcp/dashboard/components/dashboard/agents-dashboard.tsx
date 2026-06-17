@@ -347,7 +347,7 @@ const CreateAgentModal = ({ onCreateAgent }: { onCreateAgent: (data: CreateAgent
   // Pre-PR (silent-error UX bug surfaced by Firefox-MCP click-through
   // on 2026-06-17 against v5.0.47): this handler was sync, fired
   // ``onCreateAgent`` without awaiting, and then immediately called
-  // ``setOpen(false)`` + reset the form. The Deploy button always
+  // ``setOpen(false)`` + reset the form. The submit button always
   // appeared to "work" — even when the server returned 400 with a
   // clear ``{message: ...}`` body explaining what was wrong. The
   // dialog vanished and the user's typed input was wiped along with
@@ -390,14 +390,14 @@ const CreateAgentModal = ({ onCreateAgent }: { onCreateAgent: (data: CreateAgent
       <DialogTrigger asChild>
         <Button size="sm" className="bg-primary hover:bg-primary/90 text-primary-foreground shadow-lg hover:shadow-primary/25 transition-all duration-200">
           <Plus className="h-4 w-4 mr-1.5" />
-          Deploy
+          Add Agent
         </Button>
       </DialogTrigger>
       <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground">
         <DialogHeader>
-          <DialogTitle className="text-lg">Deploy Agent</DialogTitle>
+          <DialogTitle className="text-lg">Add Agent</DialogTitle>
           <DialogDescription className="text-muted-foreground">
-            Configure a new agent for deployment.
+            Register a new agent. The agent process is started separately.
           </DialogDescription>
         </DialogHeader>
         <form onSubmit={handleSubmit} className="space-y-4">
@@ -440,7 +440,7 @@ const CreateAgentModal = ({ onCreateAgent }: { onCreateAgent: (data: CreateAgent
               Cancel
             </Button>
             <Button type="submit" size="sm" className="bg-primary hover:bg-primary/90 shadow-lg hover:shadow-primary/25 transition-all" disabled={submitting}>
-              {submitting ? 'Deploying...' : 'Deploy'}
+              {submitting ? 'Adding...' : 'Add Agent'}
             </Button>
           </DialogFooter>
         </form>
@@ -1714,9 +1714,9 @@ export function AgentsDashboard() {
   const handleCreateAgent = async (data: CreateAgentData) => {
     try {
       await apiClient.createAgent(data)
-      toastSuccess(`Agent "${data.agent_id}" deployed.`)
+      toastSuccess(`Agent "${data.agent_id}" added.`)
     } catch (error) {
-      toastError(error, 'Failed to deploy agent')
+      toastError(error, 'Failed to add agent')
       throw error
     }
   }
@@ -1914,7 +1914,7 @@ export function AgentsDashboard() {
             title="No agents found"
             description={
               agents.length === 0
-                ? "Deploy your first agent to get started."
+                ? "Add your first agent to get started."
                 : "No agents match your current filters."
             }
             action={
