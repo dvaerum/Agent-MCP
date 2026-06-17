@@ -86,6 +86,10 @@ include = ["agent_mcp*"]
     "router/migrations/*.mako",
     "router/migrations/README",
     "router/migrations/versions/*.py",
+    # Router-level login + setup-wizard templates (Phase 1 PR C,
+    # prancy-napping-pie). Jinja loads these via FileSystemLoader
+    # rooted at agent_mcp/router/templates/.
+    "router/templates/*.html",
 ]
 
 [tool.rye]
