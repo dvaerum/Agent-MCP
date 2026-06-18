@@ -240,15 +240,51 @@ async def login_get_handler(request: web.Request) -> web.Response:
 
     If the operator is already authenticated, bounce to ``next=`` (or
     to /agent-mcp/) so a back-button hit doesn't show a useless form.
+
+    Phase 3 Wave 3: when OIDC SSO mode is active the rendered HTML
+    replaces the username/password form with a single "Sign in with
+    <provider>" button. The user/password path is reserved for the
+    setup-wizard bootstrap (first user, no SSO accounts yet).
     """
     if resolve_current_user(request) is not None:
         target = _safe_next(request.rel_url.query.get("next"))
         raise web.HTTPSeeOther(location=target)
     next_url = request.rel_url.query.get("next", "")
-    html = _render("login.html", error=None, username="", next=next_url)
+    sso_provider_name = _resolve_sso_provider_name()
+    html = _render(
+        "login.html",
+        error=None,
+        username="",
+        next=next_url,
+        sso_provider_name=sso_provider_name,
+    )
     return web.Response(
         text=html, content_type="text/html", charset="utf-8",
     )
+
+
+def _resolve_sso_provider_name() -> str | None:
+    """Return the OIDC provider's display name when OIDC mode is on.
+
+    Lazy import + defensive: the SSO config layer reads env vars at
+    process start and raises ``SSOConfigError`` on a misconfigured
+    state. The login page must still render in that case so the
+    operator can read the error from the journal and fix the config
+    — return None ("show the legacy form") on any config-load failure.
+    """
+    try:
+        from . import sso
+
+        settings = sso.get_sso_config()
+    except Exception:  # pragma: no cover - defensive
+        logger.exception(
+            "SSO config load failed in login_get; "
+            "falling back to legacy form.",
+        )
+        return None
+    if settings.mode is sso.SSOMode.OIDC and settings.oidc is not None:
+        return settings.oidc.provider_name
+    return None
 
 
 async def login_post_handler(request: web.Request) -> web.StreamResponse:

@@ -77,6 +77,10 @@ _UNAUTH_PREFIXES = (
     "/agent-mcp/assets/",
     "/agent-mcp/mcp/",
     "/agent-mcp/api/router/health",
+    # Phase 3 Wave 3 (prancy-napping-pie): the SSO handshake itself
+    # MUST be reachable without a session cookie, or an operator
+    # mid-flow can't complete the redirect dance with the IdP.
+    "/agent-mcp/sso/",
 )
 
 
@@ -190,6 +194,48 @@ def _project_from_path(path: str) -> str | None:
     return None
 
 
+def _try_proxy_header_identity(
+    request: web.Request,
+) -> dict[str, object] | None:
+    """Resolve a user from the trusted proxy header, if SSO mode allows.
+
+    Returns None when:
+
+      * proxy-header SSO mode isn't active,
+      * the request didn't originate from a trusted source IP,
+      * the trusted header is missing or empty,
+      * the SSO config layer fails to load (defensive — surfaced via
+        the journal; the legacy cookie path still functions).
+
+    The trusted-source check inside ``sso.extract_proxy_header_user``
+    is what prevents a remote attacker from spoofing the header to
+    impersonate an operator. We deliberately do NOT consult
+    ``X-Forwarded-For`` here — that header is operator-supplied and
+    the IP check is the trust gatekeeper.
+    """
+    try:
+        from . import sso
+
+        settings = sso.get_sso_config()
+    except Exception:  # pragma: no cover - defensive
+        logger.exception(
+            "SSO config load failed in auth middleware; falling "
+            "through to session-cookie-only path.",
+        )
+        return None
+    if settings.mode is not sso.SSOMode.PROXY_HEADER or settings.proxy is None:
+        return None
+    try:
+        return sso.extract_proxy_header_user(request, settings.proxy)
+    except sqlite3.OperationalError:
+        # Router DB not yet migrated — same fail-closed UX as the
+        # session-cookie path.
+        return None
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("proxy-header SSO lookup failed; rejecting")
+        return None
+
+
 def _unauth_response(message: str = "login_required") -> web.Response:
     """Render the JSON envelope dashboards expect on a 401.
 
@@ -250,7 +296,19 @@ async def require_operator_session_middleware(
 
     user = resolve_current_user(request)
     if user is None:
-        return _unauth_response("session cookie missing or invalid")
+        # Phase 3 Wave 3 (prancy-napping-pie): proxy-header trust
+        # mode. When the operator has configured an upstream proxy
+        # to populate ``AGENT_MCP_SSO_PROXY_HEADER``, ALSO accept a
+        # session-equivalent identity derived from that header — but
+        # ONLY if the request arrives from a configured trusted
+        # source IP. Otherwise an attacker who reaches the router
+        # directly could spoof the header and walk in. The trusted-
+        # source enforcement lives inside
+        # ``sso.extract_proxy_header_user``; this branch is purely
+        # the wiring.
+        user = _try_proxy_header_identity(request)
+        if user is None:
+            return _unauth_response("session cookie missing or invalid")
 
     # Phase 3 Wave 2: sysadmin bypasses the project-membership check
     # entirely. The bit travels via either ``users.is_sysadmin = 1``

@@ -219,6 +219,13 @@ export function projectMembershipUrl(
   )
 }
 
+// ── Router admin: SSO config (Phase 3 Wave 3) ──────────────────────
+
+/** SSO config introspection (``GET``). Sysadmin-only. */
+export function routerSsoConfigUrl(): string {
+  return `${ROUTER_API}/sso/config`
+}
+
 // ── URL pattern matchers (used by project-context.ts) ───────────────
 
 /** Regex matching /agent-mcp/app/<name>/<rest?> — extracts the project

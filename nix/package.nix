@@ -31,6 +31,10 @@ let
       sqlalchemy alembic
       # Router identity store (Phase 1 PR B, prancy-napping-pie).
       argon2-cffi
+      # OIDC SSO client (Phase 3 Wave 3, prancy-napping-pie). Authlib
+      # powers the authorization-code + PKCE flow and the id_token
+      # signature validation on the /agent-mcp/sso/* routes.
+      authlib
     ];
     # Upstream tests need a writable HOME, an OPENAI_API_KEY, and at
     # least one network-hitting fixture. Run them in CI, not here.
