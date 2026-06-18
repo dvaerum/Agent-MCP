@@ -85,6 +85,10 @@ async def test_agent_model_columns_match_raw_schema(tmp_path) -> None:
             # toggle + cursor for fetch_events_since (PR-2).
             "auto_event_loop",
             "last_event_seen_at",
+            # Phase 2 Wave 1a (migration 0013): per-agent privilege
+            # tier. Read by @requires_role in Wave 2; column-only in
+            # this PR.
+            "agent_role",
         }, f"ORM columns drifted from raw schema: {model_cols}"
 
         from agent_mcp.core.config import get_db_path
