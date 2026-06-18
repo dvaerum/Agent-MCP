@@ -164,6 +164,61 @@ export function projectAgentsUrl(name: string): string {
   return `${ROUTER_PROJECTS}/${encodeURIComponent(name)}/agents`
 }
 
+// ── Router admin: users / groups / memberships (Phase 3 Wave 1b) ───
+
+/** Users collection (``GET`` list, ``POST`` create). */
+export function routerUsersUrl(): string {
+  return `${ROUTER_API}/users`
+}
+
+/** Per-user resource (``PATCH`` edit, ``DELETE`` remove). */
+export function routerUserUrl(userId: string): string {
+  return `${ROUTER_API}/users/${encodeURIComponent(userId)}`
+}
+
+/** Groups collection (``GET`` list, ``POST`` create). */
+export function routerGroupsUrl(): string {
+  return `${ROUTER_API}/groups`
+}
+
+/** Per-group resource (``PATCH`` edit, ``DELETE`` remove). */
+export function routerGroupUrl(groupId: string): string {
+  return `${ROUTER_API}/groups/${encodeURIComponent(groupId)}`
+}
+
+/** Group members collection (``GET`` list, ``POST`` add). */
+export function routerGroupMembersUrl(groupId: string): string {
+  return `${ROUTER_API}/groups/${encodeURIComponent(groupId)}/members`
+}
+
+/** Single group member by surrogate member_id (``DELETE``). */
+export function routerGroupMemberUrl(
+  groupId: string,
+  memberId: string,
+): string {
+  return (
+    `${ROUTER_API}/groups/${encodeURIComponent(groupId)}` +
+    `/members/${encodeURIComponent(memberId)}`
+  )
+}
+
+/** Per-project memberships collection (``GET`` list, ``POST`` add). */
+export function projectMembershipsUrl(name: string): string {
+  return `${ROUTER_PROJECTS}/${encodeURIComponent(name)}/memberships`
+}
+
+/** Per-project membership by surrogate ``u:<id>``/``g:<id>``
+ *  (``PATCH`` change role, ``DELETE`` remove). */
+export function projectMembershipUrl(
+  name: string,
+  membershipId: string,
+): string {
+  return (
+    `${ROUTER_PROJECTS}/${encodeURIComponent(name)}` +
+    `/memberships/${encodeURIComponent(membershipId)}`
+  )
+}
+
 // ── URL pattern matchers (used by project-context.ts) ───────────────
 
 /** Regex matching /agent-mcp/app/<name>/<rest?> — extracts the project
