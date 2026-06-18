@@ -62,7 +62,14 @@ def _authorize_assign_task(
 
     Permission matrix:
 
-    - admin token → always permitted (no further checks).
+    - admin (system) token → always permitted (no further checks).
+    - manager-role agent token → always permitted (Phase 2 Wave 3,
+      plan §2c: managers can assign tasks to other agents — the
+      supervision-tier feature that distinguishes manager from
+      worker). Treated like the system bearer for this gate, but the
+      tool's downstream code paths still attribute the creator to the
+      manager's agent_id (not "admin") because `verify_token(token,
+      "admin")` remains False.
     - worker token + no `target_agent_token` (Mode 0, file
       unassigned) → gated by `config_allow_worker_create_unassigned`
       (default true). Tags `arguments["_worker_created_by"]` so the
@@ -74,7 +81,7 @@ def _authorize_assign_task(
       `task_ids` (would be Mode 1/2 = create-and-assign-to-self) →
       rejected; the supported worker self-claim flow is Mode 3.
     - worker token + `target_agent_token != own token` → always
-      rejected. Worker→worker delegation is admin-only.
+      rejected. Worker→worker delegation is operator/manager-only.
 
     Kept as a free function so the matrix is testable in isolation
     and so the diff against the call site stays one line; this also
@@ -82,6 +89,14 @@ def _authorize_assign_task(
     the admin-side `agent_id` alternative path below.
     """
     if verify_token(admin_auth_token, "admin"):
+        return None
+
+    # Phase 2 Wave 3 (plan §2c): manager-role agents can assign tasks
+    # to peers. `verify_token(.., "manager")` returns True for the
+    # system bearer (already handled above) OR an agent token whose
+    # row has `agent_role='manager'` — so the worker → "self-only"
+    # branch below is reached only for actual worker-role agents.
+    if verify_token(admin_auth_token, "manager"):
         return None
 
     worker_id = get_agent_id(admin_auth_token)
