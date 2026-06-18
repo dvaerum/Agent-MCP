@@ -80,6 +80,7 @@ class AgentMirror(BaseModel):
     aoe_session_id: Optional[str] = None
     auto_event_loop: bool = True
     last_event_seen_at: Optional[str] = None
+    agent_role: str = "worker"
 
 
 class AgentActionMirror(BaseModel):
