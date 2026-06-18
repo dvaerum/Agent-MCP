@@ -89,6 +89,12 @@ def test_users_table_has_is_sysadmin_column(identity, router_db: Path) -> None:
 
 
 def test_user_default_is_sysadmin_false(identity) -> None:
+    # Phase 3 Wave 2 (v5.0.69): the FIRST user a router creates gets
+    # is_sysadmin=1 implicitly so a fresh deployment always has a
+    # working sysadmin. To assert the COLUMN default ('0' for any
+    # subsequent user) we need to seed someone else into the
+    # first-user slot first.
+    identity.create_user(username="__first_op", password="firstoperatorpw")
     uid = identity.create_user(username="plain_user", password="pw")
     row = identity.get_user_by_id(uid)
     assert row is not None

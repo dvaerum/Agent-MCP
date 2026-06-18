@@ -74,8 +74,28 @@ def _seed_user(
     is_sysadmin: bool = False,
 ) -> str:
     """Create a user via ``identity.create_user`` and optionally
-    promote them to sysadmin in the same step."""
+    promote them to sysadmin in the same step.
+
+    Wave-2 sysadmin contract: the FIRST user a router ever sees gets
+    is_sysadmin=1 implicitly (so a fresh deployment always has a
+    working sysadmin). Tests that want to assert "non-sysadmin
+    operator can't do X" must therefore make sure SOMEBODY else
+    grabbed the first-user slot. This helper takes care of that
+    automatically: if the users table is empty when called, a
+    sentinel sysadmin (``__test_first_sysadmin``) is created first
+    so the actual test user lands as user #2 — non-sysadmin unless
+    explicitly opted in.
+    """
     identity = _identity_module()
+    with identity._connect() as conn:
+        is_empty = (
+            conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is None
+        )
+    if is_empty and username != "__test_first_sysadmin":
+        identity.create_user(
+            username="__test_first_sysadmin",
+            password="ignoredsentinelpassword",
+        )
     user_id = identity.create_user(username=username, password=password)
     if is_sysadmin:
         with identity._connect() as conn:

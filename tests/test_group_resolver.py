@@ -225,6 +225,11 @@ def test_sysadmin_via_nested_group(resolver, identity) -> None:
 
 
 def test_sysadmin_false_without_path(resolver, identity) -> None:
+    # Phase 3 Wave 2 (v5.0.69): the FIRST user auto-becomes sysadmin
+    # (so a fresh deployment always has a working sysadmin). Seed
+    # an unrelated first user so alice — the user we want to
+    # observe as non-sysadmin — lands as user #2.
+    identity.create_user(username="__first_op", password="firstoperatorpw")
     _make_group(identity, "g_users", "users", is_sysadmin=False)
     uid = identity.create_user(username="alice", password="pw")
     resolver.add_group_member("g_users", member_user_id=uid)

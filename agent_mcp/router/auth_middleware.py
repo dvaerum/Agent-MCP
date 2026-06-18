@@ -39,6 +39,18 @@ from .login import resolve_current_user
 logger = logging.getLogger(__name__)
 
 
+# Phase 3 Wave 2 (v5.0.69): HTTP methods that are treated as
+# mutations for the per-project operator/viewer split. Anything
+# OUTSIDE this set is a read (operator OR viewer admits). Anything
+# inside requires the operator tier — viewers get 403. GET / HEAD /
+# OPTIONS are reads; POST / PATCH / DELETE / PUT are mutations. The
+# distinction is deliberately HTTP-verb-shaped (not "is this URL a
+# mutation URL") so a future read-only POST (rare; e.g. search) would
+# need an explicit allow-list rather than silently flipping a viewer
+# into write access.
+_MUTATION_METHODS = frozenset({"POST", "PATCH", "DELETE", "PUT"})
+
+
 # ── Path policy ────────────────────────────────────────────────────
 
 
@@ -241,23 +253,72 @@ async def require_operator_session_middleware(
     if user is None:
         return _unauth_response("session cookie missing or invalid")
 
+    # Phase 3 Wave 2: sysadmin bypasses the project-membership check
+    # entirely. The bit travels via either ``users.is_sysadmin = 1``
+    # or membership in a group that's flagged sysadmin (the resolver
+    # walks the transitive closure). Resolve once per request and
+    # stash for downstream handlers.
+    is_sysadmin = False
+    try:
+        from . import group_resolver
+        is_sysadmin = group_resolver.resolve_user_is_sysadmin(
+            user["user_id"]
+        )
+    except sqlite3.OperationalError:
+        # router.db not migrated — same fail-closed UX as the
+        # is_project_member path.
+        is_sysadmin = False
+    except Exception:  # pragma: no cover - defensive
+        logger.exception(
+            "sysadmin resolution failed for user %r; treating as non-sysadmin",
+            user.get("username"),
+        )
+        is_sysadmin = False
+
     project = _project_from_path(path)
     if project is not None and _project_exists(project):
-        try:
-            is_member = identity.is_project_member(user["user_id"], project)
-        except sqlite3.OperationalError:
-            # router.db not migrated — same UX as a missing membership.
-            is_member = False
-        if not is_member:
-            return _unauth_response(
-                f"operator {user['username']!r} has no membership in "
-                f"project {project!r}"
-            )
+        if not is_sysadmin:
+            # Phase 3 Wave 2: per-project role gating. Reads (GET /
+            # HEAD / OPTIONS) admit on either tier; mutations
+            # (POST / PATCH / PUT / DELETE) require operator —
+            # viewer gets 403. The resolver walks group membership
+            # too, so a viewer via a parent group is still a
+            # viewer here.
+            try:
+                role = group_resolver.resolve_user_project_role(
+                    user["user_id"], project
+                )
+            except sqlite3.OperationalError:
+                role = None
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(
+                    "project-role resolution failed for user=%r project=%r",
+                    user.get("username"), project,
+                )
+                role = None
+            if role is None:
+                return _unauth_response(
+                    f"operator {user['username']!r} has no membership in "
+                    f"project {project!r}"
+                )
+            method = request.method.upper()
+            if method in _MUTATION_METHODS and role != "operator":
+                return web.json_response(
+                    {
+                        "error": "forbidden",
+                        "message": (
+                            f"viewer-tier operator {user['username']!r} "
+                            f"cannot mutate project {project!r}"
+                        ),
+                    },
+                    status=403,
+                )
 
-    # Stash the resolved user on the request so downstream handlers
-    # (audit logging, future per-route policy) can use it without
-    # re-resolving the cookie.
+    # Stash the resolved user (and sysadmin flag) on the request so
+    # downstream handlers (audit logging, sysadmin-only routes, future
+    # per-route policy) can use them without re-resolving.
     request["user"] = user
+    request["is_sysadmin"] = is_sysadmin
     return await handler(request)
 
 
