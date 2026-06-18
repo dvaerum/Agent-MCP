@@ -47,7 +47,7 @@ from typing import Any, Awaitable, Callable, Dict, List
 
 import mcp.types as mcp_types
 
-from ..core.authorize import requires as _core_requires
+from ..core.authorize import requires_role as _core_requires_role
 
 
 ToolImpl = Callable[[Dict[str, Any]], Awaitable[List[mcp_types.TextContent]]]
@@ -57,27 +57,17 @@ def requires_role(role: str) -> Callable[[ToolImpl], ToolImpl]:
     """Authorise a tool entry point against a static role *and* expose
     the role for introspection.
 
-    Delegates the actual auth check to
-    :func:`agent_mcp.core.authorize.requires` (the existing
-    implementation — single source of token-verification logic). On
-    top of that, sets the wrapper's ``_required_role`` attribute so
-    the derived :data:`agent_mcp.tools.access.TOOL_ACCESS` map can
-    discover the policy without re-parsing the source.
+    Thin re-export of :func:`agent_mcp.core.authorize.requires_role` so
+    tool modules can ``from .tools._access import requires_role``
+    without crossing the core boundary. The core decorator already
+    sets ``_required_role`` on the wrapper, so the derived
+    :data:`agent_mcp.tools.access.TOOL_ACCESS` map can discover the
+    policy without re-parsing the source.
 
-    ``role`` is one of ``"admin"`` or ``"any"`` (the same vocabulary
-    the underlying :func:`requires` accepts).
+    ``role`` is one of ``"operator"``, ``"manager"``, ``"any"``, or
+    the legacy alias ``"admin"`` (== ``"operator"``).
     """
-    inner = _core_requires(role)
-
-    def decorator(func: ToolImpl) -> ToolImpl:
-        wrapped = inner(func)
-        # Make the role introspectable on the wrapper. The derived
-        # TOOL_ACCESS map reads this when building its dict from the
-        # live `tool_registry`.
-        wrapped._required_role = role  # type: ignore[attr-defined]
-        return wrapped
-
-    return decorator
+    return _core_requires_role(role)
 
 
 __all__ = ["requires_role"]

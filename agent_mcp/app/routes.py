@@ -51,7 +51,11 @@ import mcp.types as mcp_types # For handling the result from tool_impl
 # through `dispatch_tool_call` so validation, auth, and audit logging
 # live once — in the tool's inputSchema + @requires decorator + impl
 # — rather than being re-implemented per surface.
-from ..tools.registry import dispatch_tool_call, request_auth_token
+from ..tools.registry import (
+    dispatch_tool_call,
+    operator_session_active,
+    request_auth_token,
+)
 from ..core.authorize import AuthRejected
 from ..tools.registry import ToolInputValidationError
 
@@ -75,6 +79,7 @@ async def _dispatch_through_tool(
     bearer_token: Optional[str],
     success_message: Optional[str] = None,
     extra_response: Optional[Dict[str, Any]] = None,
+    operator_session: bool = False,
 ) -> JSONResponse:
     """Run an MCP tool from a REST handler and translate the
     `list[TextContent]` result back into a dashboard-friendly JSON
@@ -98,8 +103,18 @@ async def _dispatch_through_tool(
     dashboard's ApiClient doesn't have to change.
     """
     cv_token = None
+    cv_op_session = None
     if bearer_token:
         cv_token = request_auth_token.set(bearer_token)
+    # Phase 2 Wave 2a (v5.0.63): mark the dispatch as originating from
+    # a logged-in operator session so @requires_role("operator") /
+    # @requires_role("manager") gates can distinguish "operator at the
+    # dashboard" from "script holding the raw system token". Both
+    # currently pass operator-tier gates (the system bearer is
+    # accepted on the legacy path), but the distinction matters for
+    # audit attribution and for future per-project membership checks.
+    if operator_session:
+        cv_op_session = operator_session_active.set(True)
     try:
         result = await dispatch_tool_call(tool_name, arguments)
     except AuthRejected as e:
@@ -128,6 +143,8 @@ async def _dispatch_through_tool(
     finally:
         if cv_token is not None:
             request_auth_token.reset(cv_token)
+        if cv_op_session is not None:
+            operator_session_active.reset(cv_op_session)
 
     text = _result_text(result)
     # Tool impls report errors as plain-text "Error: ..." blocks. Map
