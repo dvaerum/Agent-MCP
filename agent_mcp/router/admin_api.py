@@ -635,8 +635,17 @@ def register_admin_routes(app: web.Application) -> None:
     source-order dispatcher). Each handler is wrapped with the
     Accept-header gate (PR-A) so version-pinned clients reach the
     JSON envelope and unversioned ones get the v1-required error.
+
+    Phase 3 Wave 2 (v5.0.69): project create / delete / rename are
+    additionally wrapped with ``require_sysadmin`` — the system
+    perm matrix reserves project lifecycle (and the rename, which
+    is a re-key with grace-alias semantics) for sysadmins.
+    ``stop`` stays operator-tier because it doesn't change the
+    project's identity or membership; an operator with mutation
+    access to a project may bounce its backend.
     """
     from . import app as _app
+    from .perm_gates import require_sysadmin
 
     gated = _app._rest_gated
 
@@ -647,18 +656,19 @@ def register_admin_routes(app: web.Application) -> None:
         "/agent-mcp/api/router/projects", gated(list_projects_handler),
     )
     app.router.add_post(
-        "/agent-mcp/api/router/projects", gated(create_project_handler),
+        "/agent-mcp/api/router/projects",
+        gated(require_sysadmin(create_project_handler)),
     )
     app.router.add_get(
         "/agent-mcp/api/router/overview", gated(overview_handler),
     )
     app.router.add_patch(
         "/agent-mcp/api/router/projects/{name}",
-        gated(rename_project_handler),
+        gated(require_sysadmin(rename_project_handler)),
     )
     app.router.add_delete(
         "/agent-mcp/api/router/projects/{name}",
-        gated(delete_project_handler),
+        gated(require_sysadmin(delete_project_handler)),
     )
     app.router.add_post(
         "/agent-mcp/api/router/projects/{name}/stop",
