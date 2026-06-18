@@ -210,9 +210,11 @@ pkgs.testers.nixosTest {
 
     # 3. Legacy SSE handshake URL → 404 (Phase 6: deleted the 410-
     # Gone handler; aiohttp's default 404 is now the contract).
-    # Allow-listed (/mcp/) so no cookie needed for this assertion.
+    # ADR 0014 dropped the `/__sse` exemption from `_UNAUTH_PREFIXES`
+    # along with the rest of the `__` namespace, so the cookie is now
+    # required to reach the 404 (middleware would otherwise 401 first).
     out_404 = machine.succeed(
-        "curl -s -o /dev/null -w '%{http_code}' "
+        "curl -s -b /tmp/agent-mcp-cookies.txt -o /dev/null -w '%{http_code}' "
         "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__sse/alpha"
     )
     assert out_404 == "404", f"expected 404 on legacy SSE; got {out_404}"
