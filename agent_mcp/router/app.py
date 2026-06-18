@@ -1558,6 +1558,20 @@ async def rest_create_project_handler(req: web.Request) -> web.Response:
         return _error_envelope(
             error=_ERROR_ALREADY_REGISTERED, message=str(e), status=409,
         )
+    # Auto-grant the creator membership in the new project (same
+    # rationale as the form-encoded /agent-mcp/__create handler).
+    creator = req.get("user")
+    if creator and creator.get("user_id"):
+        from .identity import add_project_membership
+
+        try:
+            add_project_membership(creator["user_id"], name)
+        except Exception:
+            logger.exception(
+                "Failed to add project_membership for creator=%s project=%s",
+                creator.get("username"),
+                name,
+            )
     return _success_envelope(
         {"project": {"name": name, "workspace": str(workspace)}},
         status=201,
@@ -1853,6 +1867,24 @@ async def create_handler(req: web.Request) -> web.StreamResponse:
         # rare, but a real possibility after we released the snapshot
         # we used for _validate_name.
         raise web.HTTPBadRequest(reason=str(e))
+
+    # Auto-grant the creator membership in the project they just
+    # created — otherwise GET /agent-mcp/app/<name>/ 401s for them
+    # immediately after creation. The middleware stashes the resolved
+    # operator at request['user']; absent it (single-tenant bypass,
+    # internal callers) skip silently.
+    creator = req.get("user")
+    if creator and creator.get("user_id"):
+        from .identity import add_project_membership
+
+        try:
+            add_project_membership(creator["user_id"], name)
+        except Exception:
+            logger.exception(
+                "Failed to add project_membership for creator=%s project=%s",
+                creator.get("username"),
+                name,
+            )
 
     raise web.HTTPSeeOther(
         location="/agent-mcp/?" + urlencode({"created": name})
