@@ -51,6 +51,12 @@ import { RemoveProjectModal } from "./remove-project-modal"
 import { RenameProjectModal } from "./rename-project-modal"
 import { AliasChipPanel } from "./alias-chip-panel"
 import { WiringSnippetsTab } from "./wiring-snippets-tab"
+// Phase 3 Wave 1b: router-level identity views surface as tabs on the
+// cross-project overview. Project-membership management opens as a
+// modal from the per-project dropdown.
+import { UsersDashboard } from "./users-dashboard"
+import { GroupsDashboard } from "./groups-dashboard"
+import { ProjectMembershipsModal } from "./project-memberships-modal"
 
 const STATUS_VARIANT: Record<ProjectStatus, "default" | "secondary" | "destructive" | "outline"> = {
   active: "default",
@@ -90,6 +96,7 @@ function ProjectCard({
   const [renameOpen, setRenameOpen] = useState(false)
   const [removeOpen, setRemoveOpen] = useState(false)
   const [openAlias, setOpenAlias] = useState<string | null>(null)
+  const [membershipsOpen, setMembershipsOpen] = useState(false)
   const dashboardHref = appUrl(row.name)
   return (
     <Card className="overflow-hidden">
@@ -127,6 +134,10 @@ function ProjectCard({
                 <DropdownMenuItem onClick={() => setRenameOpen(true)}>
                   <Pencil className="h-4 w-4 mr-2" />
                   Rename
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setMembershipsOpen(true)}>
+                  <MoreHorizontal className="h-4 w-4 mr-2" />
+                  Memberships
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
@@ -243,6 +254,11 @@ function ProjectCard({
         open={removeOpen}
         onOpenChange={setRemoveOpen}
       />
+      <ProjectMembershipsModal
+        projectName={row.name}
+        open={membershipsOpen}
+        onOpenChange={setMembershipsOpen}
+      />
     </Card>
   )
 }
@@ -315,6 +331,8 @@ export function ProjectsOverviewDashboard(): React.ReactElement {
         <Tabs defaultValue="projects" className="w-full">
           <TabsList>
             <TabsTrigger value="projects">Projects</TabsTrigger>
+            <TabsTrigger value="users">Users</TabsTrigger>
+            <TabsTrigger value="groups">Groups</TabsTrigger>
             <TabsTrigger value="setup">Setup</TabsTrigger>
           </TabsList>
 
@@ -347,6 +365,18 @@ export function ProjectsOverviewDashboard(): React.ReactElement {
                 ))}
               </div>
             )}
+          </TabsContent>
+
+          <TabsContent value="users">
+            <div className="border rounded-md bg-card min-h-[400px]">
+              <UsersDashboard />
+            </div>
+          </TabsContent>
+
+          <TabsContent value="groups">
+            <div className="border rounded-md bg-card min-h-[400px]">
+              <GroupsDashboard />
+            </div>
           </TabsContent>
 
           <TabsContent value="setup">
