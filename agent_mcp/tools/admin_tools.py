@@ -12,7 +12,7 @@ from .registry import register_tool
 from ..core.config import logger, AGENT_COLORS  # AGENT_COLORS for create_agent
 from ..core import globals as g
 from ..core.auth import generate_token  # For create_agent, terminate_agent
-from ..core.authorize import requires  # @requires(\"admin\") gates entry
+from ..core.authorize import requires_role  # @requires_role("operator") gates entry
 from ..utils.audit_utils import log_audit
 from ..utils.project_utils import generate_system_prompt  # For create_agent
 from ..runtime.agent_runtime import (
@@ -64,7 +64,7 @@ def create_agent_session_name(agent_id: str, admin_token: str) -> str:
 
 # --- create_agent tool ---
 # Original logic from main.py: lines 1060-1203 (create_agent_tool function)
-@requires("admin")
+@requires_role("operator")
 async def create_agent_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -639,7 +639,7 @@ async def create_agent_tool_impl(
 
 # --- view_status tool ---
 # Original logic from main.py: lines 1242-1268 (view_status_tool function)
-@requires("admin")
+@requires_role("operator")
 async def view_status_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -726,7 +726,7 @@ async def view_status_tool_impl(
 
 # --- terminate_agent tool ---
 # Original logic from main.py: lines 1270-1316 (terminate_agent_tool function)
-@requires("admin")
+@requires_role("operator")
 async def terminate_agent_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -889,7 +889,7 @@ async def terminate_agent_tool_impl(
 
 # --- view_audit_log tool ---
 # Original logic from main.py: lines 1387-1408 (view_audit_log_tool function)
-@requires("admin")
+@requires_role("operator")
 async def view_audit_log_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -960,7 +960,7 @@ async def view_audit_log_tool_impl(
 
 
 # --- get_agent_tokens tool ---
-@requires("admin")
+@requires_role("operator")
 async def get_agent_tokens_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -1103,7 +1103,7 @@ async def get_agent_tokens_tool_impl(
 
 
 # --- relaunch_agent tool ---
-@requires("admin")
+@requires_role("operator")
 async def relaunch_agent_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -1369,7 +1369,7 @@ def register_admin_tools():
             "additionalProperties": False,
         },
         implementation=create_agent_tool_impl,
-        visibility="admin",
+        visibility="operator",
     )
 
     register_tool(
@@ -1384,7 +1384,7 @@ def register_admin_tools():
             "additionalProperties": False,
         },
         implementation=view_status_tool_impl,
-        visibility="admin",
+        visibility="operator",
     )
 
     register_tool(
@@ -1406,7 +1406,7 @@ def register_admin_tools():
             "additionalProperties": False,
         },
         implementation=terminate_agent_tool_impl,
-        visibility="admin",
+        visibility="operator",
     )
 
     register_tool(
@@ -1439,7 +1439,7 @@ def register_admin_tools():
             "additionalProperties": False,
         },
         implementation=view_audit_log_tool_impl,
-        visibility="admin",
+        visibility="operator",
     )
 
     register_tool(
@@ -1508,7 +1508,7 @@ def register_admin_tools():
             "additionalProperties": False,
         },
         implementation=get_agent_tokens_tool_impl,
-        visibility="admin",
+        visibility="operator",
     )
 
     register_tool(
@@ -1544,7 +1544,7 @@ def register_admin_tools():
             "additionalProperties": False,
         },
         implementation=relaunch_agent_tool_impl,
-        visibility="admin",
+        visibility="operator",
     )
 
 

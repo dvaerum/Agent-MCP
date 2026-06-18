@@ -14,7 +14,7 @@ from . import access as _access  # Canonical home for _get_config_bool
 from ..core.config import logger, ENABLE_TASK_PLACEMENT_RAG, ALLOW_RAG_OVERRIDE
 from ..core import globals as g
 from ..core.auth import verify_token, get_agent_id
-from ..core.authorize import requires, requires_policy
+from ..core.authorize import requires, requires_policy, requires_role
 from ..utils.audit_utils import log_audit
 from ..db.connection import get_db_connection, execute_db_write
 from ..db.actions.agent_actions_db import log_agent_action_to_db
@@ -4279,7 +4279,7 @@ def register_task_tools():
         # ownership check rejects worker writes on non-owned tasks),
         # but the tool's purpose is admin-orchestrated batch — workers
         # have no use case that justifies tools/list advertisement.
-        visibility="admin",
+        visibility="operator",
     )
 
     register_tool(
@@ -4306,11 +4306,11 @@ def register_task_tools():
             "additionalProperties": False,
         },
         implementation=delete_task_tool_impl,
-        visibility="admin",
+        visibility="operator",
     )
 
 
-@requires("admin")
+@requires_role("operator")
 async def delete_task_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:

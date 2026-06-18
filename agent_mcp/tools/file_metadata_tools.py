@@ -11,7 +11,7 @@ import mcp.types as mcp_types
 from .registry import register_tool
 from ..core.config import logger
 from ..core.auth import get_agent_id, verify_token
-from ..core.authorize import requires
+from ..core.authorize import requires, requires_role
 from ..core.repositories import agent_repo
 from ..utils.audit_utils import log_audit
 from ..db.connection import get_db_connection
@@ -144,10 +144,10 @@ async def view_file_metadata_tool_impl(
 #
 # Note: access.py classifies this as "any" (workers see it in tools/list)
 # but the impl gates admin-only. We preserve current enforcement and decorate
-# with @requires("admin") — workers calling it directly get AuthRejected.
+# with @requires_role("operator") — workers calling it directly get AuthRejected.
 # (The access.py mismatch is a pre-existing visibility quirk; tightening
 # tools/list would be a separate behavior-change PR.)
-@requires("admin")
+@requires_role("operator")
 async def update_file_metadata_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -320,12 +320,12 @@ def register_file_metadata_tools():
             "additionalProperties": False,
         },
         implementation=update_file_metadata_tool_impl,
-        # @requires("admin") on the impl gates call-time; the old
+        # @requires_role("operator") on the impl gates call-time; the old
         # hand-maintained TOOL_ACCESS classified this "any" (a
         # pre-existing visibility quirk: workers saw it in tools/list
         # but the call always failed). PR-W1c aligns visibility with
         # call-time enforcement — strictly an improvement.
-        visibility="admin",
+        visibility="operator",
     )
 
 

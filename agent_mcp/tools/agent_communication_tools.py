@@ -15,7 +15,7 @@ from . import access as _access  # Canonical home for _get_config_bool
 from ..core.config import logger
 from ..core import globals as g
 from ..core.auth import verify_token, get_agent_id
-from ..core.authorize import requires, requires_policy
+from ..core.authorize import requires, requires_policy, requires_role
 from ..features.aoe_notify import notify_aoe as _aoe_notify
 from ..utils.audit_utils import log_audit
 from ..db.connection import get_db_connection
@@ -494,7 +494,7 @@ async def get_agent_messages_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
             conn.close()
 
 
-@requires("admin")
+@requires_role("operator")
 async def broadcast_admin_message_tool_impl(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
     """
     Admin-only tool to broadcast a message to all active agents.
@@ -1323,7 +1323,7 @@ def register_agent_communication_tools():
             "additionalProperties": False
         },
         implementation=broadcast_admin_message_tool_impl,
-        visibility="admin",
+        visibility="operator",
     )
 
     register_tool(
