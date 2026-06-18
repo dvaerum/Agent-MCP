@@ -5,15 +5,30 @@
   {% if error %}
     <div class="error" role="alert">{{ error }}</div>
   {% endif %}
-  <form method="post" action="/agent-mcp/login{% if next %}?next={{ next }}{% endif %}">
-    <label for="username">Username</label>
-    <input id="username" name="username" type="text" autocomplete="username"
-           autofocus required value="{{ username or '' }}">
+  {% if sso_provider_name %}
+    {# OIDC mode is active. Replace the password form with a single
+       Sign-in button that routes the operator through the IdP. The
+       username/password form is intentionally not rendered — the only
+       way to obtain a session in OIDC mode is via the IdP. The
+       setup-wizard's first-user bootstrap remains accessible at
+       /agent-mcp/setup before any user exists. #}
+    <p>Sign in via your organisation's identity provider.</p>
+    <p>
+      <a class="sso-button" href="/agent-mcp/sso/login">
+        Sign in with {{ sso_provider_name }}
+      </a>
+    </p>
+  {% else %}
+    <form method="post" action="/agent-mcp/login{% if next %}?next={{ next }}{% endif %}">
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" autocomplete="username"
+             autofocus required value="{{ username or '' }}">
 
-    <label for="password">Password</label>
-    <input id="password" name="password" type="password"
-           autocomplete="current-password" required>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password"
+             autocomplete="current-password" required>
 
-    <button type="submit">Log in</button>
-  </form>
+      <button type="submit">Log in</button>
+    </form>
+  {% endif %}
 {% endblock %}

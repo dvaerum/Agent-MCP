@@ -1784,6 +1784,14 @@ def make_app(
     # not under a project segment, so the collision can't happen.
     register_login_routes(app)
     register_setup_routes(app)
+    # Phase 3 Wave 3 (prancy-napping-pie): /agent-mcp/sso/{login,callback}
+    # for the OIDC authorization-code flow. The proxy-header trust
+    # mode (the other SSO front-end) is implemented inside the
+    # operator-session middleware rather than as a separate route —
+    # the trusted header is consulted on every request alongside the
+    # session cookie.
+    from . import sso as _sso_module
+    _sso_module.register_sso_routes(app)
 
     # PR-B Shape-3 REST surface. Strict Accept-header gate (PR-A) still
     # applies — see ``backend_api_handler``.

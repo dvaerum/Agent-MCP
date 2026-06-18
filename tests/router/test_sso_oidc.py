@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import base64
 import json
-import time
 import urllib.parse
 from pathlib import Path
 from typing import Any
@@ -60,6 +59,29 @@ def _b64url_nopad(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
+def _group_names_for(group_ids: set[str]) -> set[str]:
+    """Resolve a set of group_ids to the corresponding group names.
+
+    The router stores ``groups.name`` UNIQUE; the SSO callback's
+    apply_group_mapping uses that name as the dashboard-visible
+    identifier, so the test assertions live in name-space, not id-
+    space.
+    """
+    from agent_mcp.router import identity
+    import sqlite3
+
+    if not group_ids:
+        return set()
+    placeholders = ",".join("?" for _ in group_ids)
+    with sqlite3.connect(str(identity.get_router_db_path())) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            f"SELECT name FROM groups WHERE group_id IN ({placeholders})",
+            tuple(group_ids),
+        )
+        return {row["name"] for row in cur.fetchall()}
+
+
 def _fake_id_token(claims: dict[str, Any]) -> str:
     """Build an unsigned JWT (alg=none) for the OIDC callback fakes.
 
@@ -75,11 +97,30 @@ def _fake_id_token(claims: dict[str, Any]) -> str:
     ])
 
 
+_FAKE_DISCOVERY = {
+    "issuer": _FAKE_ISSUER,
+    "authorization_endpoint": (
+        f"{_FAKE_ISSUER}/protocol/openid-connect/auth"
+    ),
+    "token_endpoint": f"{_FAKE_ISSUER}/protocol/openid-connect/token",
+    "userinfo_endpoint": (
+        f"{_FAKE_ISSUER}/protocol/openid-connect/userinfo"
+    ),
+    "jwks_uri": f"{_FAKE_ISSUER}/protocol/openid-connect/certs",
+    "id_token_signing_alg_values_supported": ["RS256"],
+}
+
+
 @pytest.fixture
 def sso_oidc_env(
     router_env, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ):
-    """Configure OIDC env vars + secret file. Returns the secret file."""
+    """Configure OIDC env vars + secret file + stub IdP discovery.
+
+    Discovery is patched unconditionally so the routes never reach the
+    real network during a test. Individual tests still patch the
+    token-exchange + id-token-decode seams to inject their claims.
+    """
     secret_file = tmp_path / "oidc.secret"
     secret_file.write_text(_FAKE_CLIENT_SECRET)
     monkeypatch.setenv("AGENT_MCP_SSO_OIDC_ISSUER", _FAKE_ISSUER)
@@ -88,6 +129,22 @@ def sso_oidc_env(
         "AGENT_MCP_SSO_OIDC_CLIENT_SECRET_FILE", str(secret_file),
     )
     monkeypatch.setenv("AGENT_MCP_SSO_OIDC_PROVIDER_NAME", "Test IdP")
+
+    # Patch the IdP discovery seam in-place on whichever sso module is
+    # cached. The route handlers reference ``_fetch_oidc_metadata`` as
+    # a bare global, so the patch MUST land on the module object the
+    # handler functions close over (i.e. the one already loaded by
+    # make_app() in the router_app fixture above us). Reset the SSO
+    # config cache so the new env vars are re-read on the next call.
+    import sys
+    sso = sys.modules.get("agent_mcp.router.sso")
+    if sso is None:
+        import importlib
+        sso = importlib.import_module("agent_mcp.router.sso")
+    sso._reset_cache_for_tests()
+    monkeypatch.setattr(
+        sso, "_fetch_oidc_metadata", lambda _issuer: dict(_FAKE_DISCOVERY),
+    )
     return secret_file
 
 
@@ -102,7 +159,8 @@ def _patch_idp(monkeypatch: pytest.MonkeyPatch, *, id_token_claims: dict):
         signature check; we exercise the signature path in a separate
         Authlib-level unit test, not the route-shape tests here).
     """
-    import agent_mcp.router.sso as sso
+    import sys
+    sso = sys.modules["agent_mcp.router.sso"]
 
     discovery = {
         "issuer": _FAKE_ISSUER,
@@ -243,6 +301,9 @@ async def test_sso_callback_matches_existing_user_by_email(
     })
     client = await aiohttp_client(router_app)
     init = await client.get("/agent-mcp/sso/login", allow_redirects=False)
+    assert init.status in (302, 303), (
+        f"unexpected init status {init.status}: {await init.text()}"
+    )
     state = urllib.parse.parse_qs(
         urllib.parse.urlparse(init.headers["Location"]).query
     )["state"][0]
@@ -251,7 +312,7 @@ async def test_sso_callback_matches_existing_user_by_email(
         params={"code": "ok", "state": state},
         allow_redirects=False,
     )
-    assert cb.status in (302, 303)
+    assert cb.status in (302, 303), await cb.text()
 
     # The existing user MUST be reused — no duplicate by SSO username.
     assert identity.get_user_by_username("bobfromsso") is None
@@ -302,10 +363,11 @@ async def test_sso_group_mapping_explicit(
 
     user = identity.get_user_by_username("carol")
     assert user is not None
-    user_groups = group_resolver.resolve_user_groups(user["user_id"])
-    assert "backend-team" in user_groups
+    group_ids = group_resolver.resolve_user_groups(user["user_id"])
+    group_names = _group_names_for(group_ids)
+    assert "backend-team" in group_names
     # Unmapped OIDC group MUST NOT leak in as a new group.
-    assert "unrelated-group" not in user_groups
+    assert "unrelated-group" not in group_names
 
 
 async def test_sso_group_mapping_wildcard_jit(
@@ -337,10 +399,11 @@ async def test_sso_group_mapping_wildcard_jit(
     from agent_mcp.router import identity, group_resolver
     user = identity.get_user_by_username("dave")
     assert user is not None
-    user_groups = group_resolver.resolve_user_groups(user["user_id"])
+    group_ids = group_resolver.resolve_user_groups(user["user_id"])
+    group_names = _group_names_for(group_ids)
     # Names get sanitized (lowercase, spaces → dashes) but should appear.
-    assert any("eng-backend" in g for g in user_groups)
-    assert any("ops-team" in g for g in user_groups)
+    assert "eng-backend" in group_names
+    assert "ops-team" in group_names
 
 
 async def test_sso_callback_rejects_bad_state(

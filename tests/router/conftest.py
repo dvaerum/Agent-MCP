@@ -217,6 +217,9 @@ def router_module(
         "agent_mcp.router.login",
         "agent_mcp.router.setup_wizard",
         "agent_mcp.router.migrations_runner",
+        # Phase 3 Wave 3 (prancy-napping-pie): SSO config cache lives
+        # at module scope; drop it so each test re-reads env vars.
+        "agent_mcp.router.sso",
     ):
         sys.modules.pop(mod_name, None)
     if request.node.get_closest_marker("no_seed_operator") is None:

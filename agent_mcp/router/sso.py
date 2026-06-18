@@ -1,0 +1,962 @@
+"""SSO config + OIDC + proxy-header trust (Phase 3 Wave 3).
+
+Two mutually-exclusive SSO modes layer on top of the Phase 1
+username+password store:
+
+  * **OIDC** — full authorization-code + PKCE flow against an external
+    identity provider. The router becomes a Relying Party; one OIDC
+    issuer is configured at a time (option A from the locked grilling
+    in ``docs/plans/prancy-napping-pie.md``). On a successful callback
+    we JIT-create the local ``users`` row (matched by ``email`` claim)
+    and apply optional group-claim → agent-mcp-group mapping.
+
+  * **proxy-header trust** — an upstream reverse proxy
+    (nginx+oauth2-proxy, traefik+forward-auth, tailscale-serve+Tailnet
+    identity, …) authenticates the request and forwards the username
+    in a header (typically ``Remote-User``). The router treats that
+    header as a session-equivalent identity. CRITICAL SAFETY RULE: the
+    router MUST refuse to honour the header unless the request arrives
+    from a configured trusted source (default: localhost). Without
+    this enforcement a remote attacker could spoof the header and walk
+    straight in.
+
+Config travels via env vars (matching the rest of the router) so the
+nix / sops deployment pattern lifts cleanly:
+
+  OIDC:
+    AGENT_MCP_SSO_OIDC_ISSUER             (turning this on activates OIDC)
+    AGENT_MCP_SSO_OIDC_CLIENT_ID
+    AGENT_MCP_SSO_OIDC_CLIENT_SECRET_FILE — path to a chmod-0600 file
+    AGENT_MCP_SSO_OIDC_PROVIDER_NAME      — display name on the button
+    AGENT_MCP_SSO_OIDC_GROUP_MAPPING      — JSON {oidc_group: amcp_group}.
+                                            "*" enables JIT-create.
+    AGENT_MCP_SSO_OIDC_REDIRECT_URL       — override; defaults to
+                                            "{EXTERNAL_URL}/agent-mcp/sso/callback"
+    AGENT_MCP_SSO_OIDC_SCOPES             — space-separated scopes;
+                                            default "openid profile email groups"
+
+  Proxy-header:
+    AGENT_MCP_SSO_PROXY_HEADER            (turning this on activates the mode)
+    AGENT_MCP_SSO_PROXY_TRUSTED_IPS       — comma list; default
+                                            "127.0.0.1,::1"
+    AGENT_MCP_SSO_PROXY_DEFAULT_SYSADMIN  — "true"/"false"; default false
+
+ADR-0015 records the design rationale (single issuer; mapped + wildcard
+group provisioning; localhost-only proxy trust by default).
+"""
+
+from __future__ import annotations
+
+import enum
+import functools
+import ipaddress
+import json
+import logging
+import os
+import re
+import secrets
+import sqlite3
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Awaitable, Callable
+from urllib.parse import urlsplit
+
+from aiohttp import web
+
+
+__all__ = [
+    "SSOConfigError",
+    "SSOMode",
+    "OIDCSettings",
+    "ProxyHeaderSettings",
+    "SSOSettings",
+    "load_sso_config",
+    "get_sso_config",
+    "find_or_create_sso_user",
+    "apply_group_mapping",
+    "is_trusted_proxy_source",
+    "extract_proxy_header_user",
+    "init_oidc_login_handler",
+    "handle_oidc_callback",
+    "register_sso_routes",
+]
+
+
+logger = logging.getLogger(__name__)
+
+
+# ── Errors ──────────────────────────────────────────────────────────
+
+
+class SSOConfigError(Exception):
+    """Raised when the env-var SSO config is incoherent.
+
+    Today the only enforced rule is the OIDC + proxy-header mutex; a
+    future config layer (e.g. SAML when ADR-0016 lands) will reuse
+    this error type.
+    """
+
+
+# ── Config dataclasses ──────────────────────────────────────────────
+
+
+class SSOMode(str, enum.Enum):
+    """The three possible authentication front-ends."""
+
+    BUILTIN = "builtin"
+    OIDC = "oidc"
+    PROXY_HEADER = "proxy_header"
+
+
+@dataclass(frozen=True)
+class OIDCSettings:
+    """Resolved OIDC RP settings.
+
+    ``client_secret`` is the file CONTENTS, not the path — we read it
+    once at config-load so the live router never re-reads from disk on
+    every callback. The secret rotates by writing a new file and
+    restarting the router (the same pattern the rest of the deploy
+    follows for sops-managed secrets).
+    """
+
+    issuer: str
+    client_id: str
+    client_secret: str
+    provider_name: str
+    group_mapping: dict[str, str]
+    redirect_url: str | None
+    scopes: list[str]
+
+
+@dataclass(frozen=True)
+class ProxyHeaderSettings:
+    """Resolved proxy-header trust settings.
+
+    ``trusted_ips`` is the parsed set of source-IP strings the router
+    will trust to set ``trust_header``. Anything else gets the header
+    silently dropped.
+    """
+
+    trust_header: str
+    trusted_ips: frozenset[str]
+    default_is_sysadmin: bool
+
+
+@dataclass(frozen=True)
+class SSOSettings:
+    """The whole SSO surface — exactly one of (oidc, proxy) is set."""
+
+    mode: SSOMode
+    oidc: OIDCSettings | None
+    proxy: ProxyHeaderSettings | None
+
+
+# ── Config loading ──────────────────────────────────────────────────
+
+
+_DEFAULT_SCOPES = ["openid", "profile", "email", "groups"]
+_DEFAULT_TRUSTED_IPS = "127.0.0.1,::1"
+
+
+def _env_truthy(value: str | None) -> bool:
+    """Loose truthiness for env-var booleans."""
+    if value is None:
+        return False
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _parse_group_mapping(raw: str | None) -> dict[str, str]:
+    """Parse the JSON mapping; return {} on missing / malformed."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning(
+            "AGENT_MCP_SSO_OIDC_GROUP_MAPPING is not valid JSON; "
+            "ignoring (no claim → group mapping will fire).",
+        )
+        return {}
+    if not isinstance(parsed, dict):
+        logger.warning(
+            "AGENT_MCP_SSO_OIDC_GROUP_MAPPING must be a JSON object; "
+            "got %s. Ignoring.", type(parsed).__name__,
+        )
+        return {}
+    out: dict[str, str] = {}
+    for k, v in parsed.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            continue
+        out[k] = v
+    return out
+
+
+def _parse_trusted_ips(raw: str | None) -> frozenset[str]:
+    """Comma-separated → frozenset of canonical IP strings.
+
+    Garbage entries are dropped silently with a warning so a typo in
+    one entry doesn't lock the operator out.
+    """
+    if not raw:
+        return frozenset()
+    out: set[str] = set()
+    for raw_part in raw.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        try:
+            addr = ipaddress.ip_address(part)
+            out.add(str(addr))
+        except ValueError:
+            logger.warning(
+                "AGENT_MCP_SSO_PROXY_TRUSTED_IPS: %r is not a valid IP "
+                "address; dropping.", part,
+            )
+    return frozenset(out)
+
+
+def load_sso_config() -> SSOSettings:
+    """Read the env vars; return a fully-resolved SSOSettings.
+
+    Raises ``SSOConfigError`` when both OIDC and proxy-header are
+    configured simultaneously — the locked design admits exactly one
+    SSO front-end at a time.
+    """
+    oidc_issuer = os.environ.get("AGENT_MCP_SSO_OIDC_ISSUER", "").strip()
+    proxy_header = os.environ.get("AGENT_MCP_SSO_PROXY_HEADER", "").strip()
+
+    if oidc_issuer and proxy_header:
+        raise SSOConfigError(
+            "Both AGENT_MCP_SSO_OIDC_ISSUER and "
+            "AGENT_MCP_SSO_PROXY_HEADER are set. Pick one: OIDC "
+            "(authorization-code flow against an IdP) OR proxy-header "
+            "trust (upstream proxy populates the user identity). "
+            "They are mutually exclusive."
+        )
+
+    if oidc_issuer:
+        client_id = os.environ.get("AGENT_MCP_SSO_OIDC_CLIENT_ID", "").strip()
+        secret_file = os.environ.get(
+            "AGENT_MCP_SSO_OIDC_CLIENT_SECRET_FILE", "",
+        ).strip()
+        if not client_id:
+            raise SSOConfigError(
+                "AGENT_MCP_SSO_OIDC_ISSUER is set but "
+                "AGENT_MCP_SSO_OIDC_CLIENT_ID is missing."
+            )
+        client_secret = ""
+        if secret_file:
+            try:
+                client_secret = Path(secret_file).read_text().strip()
+            except OSError as e:
+                raise SSOConfigError(
+                    f"AGENT_MCP_SSO_OIDC_CLIENT_SECRET_FILE={secret_file!r} "
+                    f"could not be read: {e}"
+                ) from e
+        provider_name = (
+            os.environ.get("AGENT_MCP_SSO_OIDC_PROVIDER_NAME", "").strip()
+            or "SSO"
+        )
+        group_mapping = _parse_group_mapping(
+            os.environ.get("AGENT_MCP_SSO_OIDC_GROUP_MAPPING"),
+        )
+        redirect_url = (
+            os.environ.get("AGENT_MCP_SSO_OIDC_REDIRECT_URL", "").strip()
+            or None
+        )
+        scopes_raw = os.environ.get(
+            "AGENT_MCP_SSO_OIDC_SCOPES", "",
+        ).strip()
+        scopes = (
+            scopes_raw.split() if scopes_raw else list(_DEFAULT_SCOPES)
+        )
+        return SSOSettings(
+            mode=SSOMode.OIDC,
+            oidc=OIDCSettings(
+                issuer=oidc_issuer.rstrip("/"),
+                client_id=client_id,
+                client_secret=client_secret,
+                provider_name=provider_name,
+                group_mapping=group_mapping,
+                redirect_url=redirect_url,
+                scopes=scopes,
+            ),
+            proxy=None,
+        )
+
+    if proxy_header:
+        trusted_ips = _parse_trusted_ips(
+            os.environ.get(
+                "AGENT_MCP_SSO_PROXY_TRUSTED_IPS", _DEFAULT_TRUSTED_IPS,
+            )
+        )
+        default_sysadmin = _env_truthy(
+            os.environ.get("AGENT_MCP_SSO_PROXY_DEFAULT_SYSADMIN"),
+        )
+        return SSOSettings(
+            mode=SSOMode.PROXY_HEADER,
+            oidc=None,
+            proxy=ProxyHeaderSettings(
+                trust_header=proxy_header,
+                trusted_ips=trusted_ips,
+                default_is_sysadmin=default_sysadmin,
+            ),
+        )
+
+    return SSOSettings(mode=SSOMode.BUILTIN, oidc=None, proxy=None)
+
+
+_cached_config: SSOSettings | None = None
+
+
+def get_sso_config(*, reload: bool = False) -> SSOSettings:
+    """Return the process-cached SSOSettings, loading on first call.
+
+    Tests that monkey-patch env vars after the first call can pass
+    ``reload=True`` to force a re-read. The router's own routes use
+    the cached value because env vars don't change at runtime in
+    production.
+    """
+    global _cached_config
+    if reload or _cached_config is None:
+        _cached_config = load_sso_config()
+    return _cached_config
+
+
+def _reset_cache_for_tests() -> None:
+    """Test-only: drop the cache so the next ``get_sso_config`` re-reads."""
+    global _cached_config
+    _cached_config = None
+
+
+# ── JIT user creation ──────────────────────────────────────────────
+
+
+_USERNAME_SANITISE = re.compile(r"[^a-z0-9-]+")
+
+
+def _sanitise_username(raw: str) -> str:
+    """Convert an arbitrary IdP-provided name to our slug shape.
+
+    Lowercase, runs of non-[a-z0-9-] characters collapse to a single
+    dash, leading / trailing dashes stripped. We accept whatever
+    comes out — usernames in the router store are TEXT UNIQUE, not
+    constrained by a regex.
+    """
+    s = _USERNAME_SANITISE.sub("-", raw.lower())
+    s = s.strip("-")
+    return s or "user"
+
+
+def _sanitise_group_name(raw: str) -> str:
+    """Same shape as a username — groups share the slug convention."""
+    return _sanitise_username(raw)
+
+
+def find_or_create_sso_user(
+    *,
+    email: str | None,
+    preferred_username: str | None,
+    default_is_sysadmin: bool = False,
+) -> dict[str, Any]:
+    """Match-by-email or JIT-create the local user; return the row.
+
+    Matching algorithm:
+
+      1. If ``email`` matches an existing ``users.email``, return that
+         row. The SSO username is ignored — operators rename users in
+         the local store; matching by email keeps the link stable.
+      2. Else, sanitise ``preferred_username`` and create a new row
+         with ``password_hash = NULL`` (the row exists only to anchor
+         the session; the operator cannot log in via the password
+         form). When the requested username already exists for a
+         DIFFERENT email, suffix ``-2``, ``-3``, … until we land on a
+         free slot.
+
+    ``default_is_sysadmin`` flips the sysadmin bit on the JIT row;
+    only the proxy-header path passes True today, gated by
+    ``AGENT_MCP_SSO_PROXY_DEFAULT_SYSADMIN``.
+    """
+    from . import identity
+
+    if email:
+        existing = _find_user_by_email(email)
+        if existing is not None:
+            identity.touch_last_login(existing["user_id"])
+            return existing
+
+    base = _sanitise_username(preferred_username or (email or "user"))
+    candidate = base
+    suffix = 2
+    while identity.get_user_by_username(candidate) is not None:
+        candidate = f"{base}-{suffix}"
+        suffix += 1
+
+    user_id = _create_passwordless_user(
+        username=candidate,
+        email=email,
+        is_sysadmin=default_is_sysadmin,
+    )
+    identity.touch_last_login(user_id)
+    row = identity.get_user_by_id(user_id)
+    assert row is not None, "freshly-created user should be readable"
+    return row
+
+
+def _find_user_by_email(email: str) -> dict[str, Any] | None:
+    """Return the users row for ``email`` (case-insensitive), or None."""
+    from . import identity
+
+    with sqlite3.connect(str(identity.get_router_db_path())) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            "SELECT * FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1",
+            (email,),
+        )
+        row = cur.fetchone()
+    return dict(row) if row is not None else None
+
+
+def _create_passwordless_user(
+    *, username: str, email: str | None, is_sysadmin: bool,
+) -> str:
+    """Insert a NULL-password user row directly.
+
+    ``identity.create_user`` hashes a password into ``password_hash``;
+    SSO-only users have no password at all. We bypass the helper for
+    the INSERT — but we DO copy the "first user in an empty table is
+    a sysadmin + gets membership in every project" promotion path so
+    a fresh deploy that boots straight into SSO mode doesn't lock the
+    operator out.
+    """
+    from . import identity
+    from datetime import datetime, timezone
+
+    user_id = secrets.token_hex(8)
+    created_at = datetime.now(timezone.utc).isoformat(
+        timespec="milliseconds",
+    )
+    with sqlite3.connect(str(identity.get_router_db_path())) as conn:
+        conn.row_factory = sqlite3.Row
+        was_empty = (
+            conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is None
+        )
+        conn.execute(
+            """
+            INSERT INTO users
+                (user_id, username, email, password_hash, created_at,
+                 last_login_at, is_sysadmin)
+            VALUES (?, ?, ?, NULL, ?, NULL, ?)
+            """,
+            (
+                user_id, username, email, created_at,
+                1 if (is_sysadmin or was_empty) else 0,
+            ),
+        )
+        if was_empty:
+            existing = identity._list_registered_projects()
+            for project_name in existing:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO project_membership
+                        (project_name, user_id)
+                    VALUES (?, ?)
+                    """,
+                    (project_name, user_id),
+                )
+        conn.commit()
+    return user_id
+
+
+# ── Group mapping ──────────────────────────────────────────────────
+
+
+def apply_group_mapping(
+    user_id: str,
+    group_claims: list[str],
+    mapping: dict[str, str],
+) -> set[str]:
+    """Map OIDC group claims → agent-mcp groups; return the names added.
+
+    Rules:
+
+      * Explicit ``{oidc_name: amcp_name}`` mapping wins — if the
+        named ``amcp_name`` group exists, the user becomes a member;
+        if it doesn't exist, the entry is silently skipped (the
+        sysadmin pre-creates groups before binding claims).
+      * ``"*"`` in the mapping is the wildcard JIT escape — every
+        unmatched claim auto-creates a sanitized agent-mcp group and
+        the user is added.
+      * Unmapped claims (no entry, no wildcard) are silently ignored.
+
+    Idempotent: re-running with the same claims is a no-op for the
+    group_membership rows that already exist.
+    """
+    from . import identity
+
+    added: set[str] = set()
+    wildcard = mapping.get("*")
+
+    for claim in group_claims:
+        if not isinstance(claim, str):
+            continue
+        target = mapping.get(claim)
+        if target:
+            group_name = target
+        elif wildcard is not None:
+            group_name = _sanitise_group_name(claim)
+        else:
+            continue
+        if not group_name:
+            continue
+        group_id = _ensure_group(group_name)
+        if group_id is None:
+            continue
+        if _add_user_to_group_idempotent(group_id, user_id):
+            added.add(group_name)
+    return added
+
+
+def _ensure_group(name: str) -> str | None:
+    """Return the group_id for ``name``, JIT-creating if missing.
+
+    Returns None if the schema doesn't have the groups table — the
+    Phase-3 migrations haven't run, which means the operator is on a
+    backlevel deploy and we should silently skip group provisioning
+    rather than 500 the callback.
+    """
+    from . import identity
+
+    try:
+        with sqlite3.connect(str(identity.get_router_db_path())) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(
+                "SELECT group_id FROM groups WHERE name = ?", (name,),
+            )
+            row = cur.fetchone()
+            if row is not None:
+                return row["group_id"]
+            group_id = secrets.token_hex(8)
+            conn.execute(
+                "INSERT INTO groups (group_id, name, is_sysadmin, "
+                "created_at) VALUES (?, ?, 0, datetime('now'))",
+                (group_id, name),
+            )
+            conn.commit()
+            return group_id
+    except sqlite3.OperationalError:
+        return None
+
+
+def _add_user_to_group_idempotent(group_id: str, user_id: str) -> bool:
+    """Insert a user→group edge; return True iff a row was added."""
+    from . import identity
+
+    try:
+        with sqlite3.connect(str(identity.get_router_db_path())) as conn:
+            cur = conn.execute(
+                "SELECT 1 FROM group_membership WHERE group_id = ? "
+                "AND member_user_id = ?", (group_id, user_id),
+            )
+            if cur.fetchone() is not None:
+                return False
+            conn.execute(
+                "INSERT INTO group_membership "
+                "(group_id, member_user_id, member_group_id, added_at) "
+                "VALUES (?, ?, NULL, datetime('now'))",
+                (group_id, user_id),
+            )
+            conn.commit()
+            return True
+    except sqlite3.OperationalError:
+        return False
+
+
+# ── Proxy-header trust helpers ─────────────────────────────────────
+
+
+def is_trusted_proxy_source(
+    request: web.Request, settings: ProxyHeaderSettings,
+) -> bool:
+    """Return True iff this request originates from a trusted source IP.
+
+    The peer IP comes from aiohttp's ``request.remote`` (which honours
+    the transport's reported peername; we deliberately do NOT consult
+    ``X-Forwarded-For`` for trust decisions — the forwarded chain is
+    operator-supplied and the trusted-IP check IS the gatekeeper that
+    prevents header spoofing).
+    """
+    peer = request.remote or ""
+    if not peer:
+        return False
+    try:
+        parsed = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    canonical = str(parsed)
+    return canonical in settings.trusted_ips
+
+
+def extract_proxy_header_user(
+    request: web.Request, settings: ProxyHeaderSettings,
+) -> dict[str, Any] | None:
+    """Resolve (or JIT-create) the user identified by the trusted header.
+
+    Returns None when:
+
+      * the header is absent or empty,
+      * the request didn't originate from a trusted source (the header
+        is silently dropped — we don't log per-request, but
+        ``is_trusted_proxy_source`` is auditable).
+
+    On success, returns the user dict (suitable for stashing on
+    ``request['user']`` as the cookie path does).
+    """
+    if not is_trusted_proxy_source(request, settings):
+        return None
+    raw = request.headers.get(settings.trust_header, "").strip()
+    if not raw:
+        return None
+    return find_or_create_sso_user(
+        email=None,
+        preferred_username=raw,
+        default_is_sysadmin=settings.default_is_sysadmin,
+    )
+
+
+# ── OIDC flow ──────────────────────────────────────────────────────
+
+
+_FLOW_COOKIE_NAME = "agent_mcp_sso_flow"
+_FLOW_COOKIE_PATH = "/agent-mcp/sso/"
+_FLOW_COOKIE_MAX_AGE = 10 * 60  # 10 minutes — plenty for the round-trip
+
+
+@dataclass(frozen=True)
+class _FlowState:
+    state: str
+    code_verifier: str
+
+
+def _encode_flow_cookie(state: _FlowState) -> str:
+    """Encode the per-flow state as a single cookie value.
+
+    The state + PKCE verifier are bound to the operator's browser via
+    an opaque cookie (so a phishing IdP can't replay another user's
+    in-flight state). We pack as base64url(JSON) since both fields
+    are short ASCII strings.
+    """
+    import base64
+    payload = json.dumps({
+        "state": state.state, "verifier": state.code_verifier,
+    }).encode()
+    return base64.urlsafe_b64encode(payload).rstrip(b"=").decode()
+
+
+def _decode_flow_cookie(raw: str) -> _FlowState | None:
+    import base64
+    try:
+        padded = raw + "=" * (-len(raw) % 4)
+        data = base64.urlsafe_b64decode(padded.encode())
+        parsed = json.loads(data)
+        return _FlowState(
+            state=parsed["state"], code_verifier=parsed["verifier"],
+        )
+    except Exception:
+        return None
+
+
+def _default_redirect_url(request: web.Request) -> str:
+    """Build a redirect_uri rooted at the same host the operator hit.
+
+    Honours ``X-Forwarded-Host`` / ``X-Forwarded-Proto`` so the URL
+    handed to the IdP matches what the operator saw in the address
+    bar (the IdP enforces an exact match against the registered
+    redirect URI).
+    """
+    proto = (
+        request.headers.get("X-Forwarded-Proto")
+        or request.url.scheme
+    )
+    host = (
+        request.headers.get("X-Forwarded-Host")
+        or request.host
+    )
+    return f"{proto}://{host}/agent-mcp/sso/callback"
+
+
+def _resolve_redirect_url(
+    request: web.Request, settings: OIDCSettings,
+) -> str:
+    if settings.redirect_url:
+        return settings.redirect_url
+    external = os.environ.get("AGENT_MCP_EXTERNAL_URL", "").rstrip("/")
+    if external:
+        return f"{external}/agent-mcp/sso/callback"
+    return _default_redirect_url(request)
+
+
+# ── Authlib seam (monkey-patchable for tests) ──────────────────────
+
+
+def _fetch_oidc_metadata(issuer: str) -> dict[str, Any]:
+    """Fetch the OIDC discovery document.
+
+    Sync call (we use requests for parity with Authlib's sync surface);
+    the route handler runs this in an executor so the event loop
+    doesn't block on the network.
+    """
+    import requests
+    url = issuer.rstrip("/") + "/.well-known/openid-configuration"
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _exchange_code_for_tokens(
+    *,
+    settings: OIDCSettings,
+    metadata: dict[str, Any],
+    code: str,
+    redirect_uri: str,
+    code_verifier: str,
+) -> dict[str, Any]:
+    """POST the authorization code to the IdP's token endpoint.
+
+    Wraps Authlib's ``OAuth2Session.fetch_token``; the sync transport
+    matches the rest of this module's IdP-facing calls.
+    """
+    from authlib.integrations.requests_client import OAuth2Session
+    sess = OAuth2Session(
+        client_id=settings.client_id,
+        client_secret=settings.client_secret,
+        redirect_uri=redirect_uri,
+        scope=" ".join(settings.scopes),
+    )
+    token = sess.fetch_token(
+        url=metadata["token_endpoint"],
+        code=code,
+        code_verifier=code_verifier,
+        grant_type="authorization_code",
+    )
+    return dict(token)
+
+
+def _decode_id_token(
+    token: str,
+    metadata: dict[str, Any],
+    client_id: str,
+    nonce: str | None = None,
+) -> dict[str, Any]:
+    """Decode + validate the OIDC id_token; return the claims dict.
+
+    Uses Authlib's JWS surface against the IdP's JWKS — signature
+    verification is mandatory in production. Tests monkey-patch this
+    function to skip the network fetch + signature math.
+    """
+    from authlib.jose import jwt
+    from authlib.oidc.core import CodeIDToken
+    import requests
+
+    jwks_resp = requests.get(metadata["jwks_uri"], timeout=10)
+    jwks_resp.raise_for_status()
+    claims = jwt.decode(
+        token,
+        key=jwks_resp.json(),
+        claims_cls=CodeIDToken,
+        claims_options={
+            "iss": {"essential": True, "value": metadata["issuer"]},
+            "aud": {"essential": True, "value": client_id},
+        },
+        claims_params={"nonce": nonce},
+    )
+    claims.validate()
+    return dict(claims)
+
+
+# ── Route handlers ─────────────────────────────────────────────────
+
+
+async def init_oidc_login_handler(request: web.Request) -> web.StreamResponse:
+    """GET /agent-mcp/sso/login → 303 to the IdP's authorize endpoint.
+
+    Builds a per-flow state + PKCE verifier, stashes them in an
+    opaque cookie scoped to ``/agent-mcp/sso/``, then redirects the
+    browser at the IdP. The cookie is consumed (and cleared) by the
+    callback handler.
+    """
+    import asyncio
+    settings = get_sso_config()
+    if settings.mode is not SSOMode.OIDC or settings.oidc is None:
+        raise web.HTTPNotFound()
+    cfg = settings.oidc
+
+    try:
+        metadata = await asyncio.to_thread(_fetch_oidc_metadata, cfg.issuer)
+    except Exception as e:
+        logger.exception("OIDC discovery fetch failed for %s", cfg.issuer)
+        return web.Response(
+            status=502,
+            text=f"OIDC discovery fetch failed: {e}",
+            content_type="text/plain",
+        )
+
+    from authlib.integrations.requests_client import OAuth2Session
+
+    code_verifier = secrets.token_urlsafe(64)
+    redirect_uri = _resolve_redirect_url(request, cfg)
+    sess = OAuth2Session(
+        client_id=cfg.client_id,
+        client_secret=cfg.client_secret,
+        redirect_uri=redirect_uri,
+        scope=" ".join(cfg.scopes),
+        code_challenge_method="S256",
+    )
+    url, state = sess.create_authorization_url(
+        metadata["authorization_endpoint"],
+        code_verifier=code_verifier,
+    )
+
+    cookie_value = _encode_flow_cookie(
+        _FlowState(state=state, code_verifier=code_verifier),
+    )
+    response = web.HTTPSeeOther(location=url)
+    response.set_cookie(
+        _FLOW_COOKIE_NAME, cookie_value,
+        path=_FLOW_COOKIE_PATH,
+        httponly=True,
+        secure=_cookie_secure_flag(request),
+        samesite="Lax",
+        max_age=_FLOW_COOKIE_MAX_AGE,
+    )
+    raise response
+
+
+def _cookie_secure_flag(request: web.Request) -> bool:
+    """Same heuristic as ``login.cookie_secure_flag`` — kept local so
+    this module doesn't take a hard import on the login submodule."""
+    forwarded = request.headers.get("X-Forwarded-Proto", "").lower()
+    if forwarded == "https":
+        return True
+    if forwarded == "http":
+        return False
+    return request.url.scheme == "https"
+
+
+async def handle_oidc_callback(request: web.Request) -> web.StreamResponse:
+    """GET /agent-mcp/sso/callback?code=…&state=… → mint session cookie."""
+    import asyncio
+    settings = get_sso_config()
+    if settings.mode is not SSOMode.OIDC or settings.oidc is None:
+        raise web.HTTPNotFound()
+    cfg = settings.oidc
+
+    state_param = request.rel_url.query.get("state", "")
+    code_param = request.rel_url.query.get("code", "")
+    flow_cookie = request.cookies.get(_FLOW_COOKIE_NAME, "")
+
+    if not state_param or not code_param or not flow_cookie:
+        return web.Response(status=400, text="missing oidc callback params")
+    flow = _decode_flow_cookie(flow_cookie)
+    if flow is None or flow.state != state_param:
+        return web.Response(status=400, text="invalid oidc state")
+
+    try:
+        metadata = await asyncio.to_thread(_fetch_oidc_metadata, cfg.issuer)
+    except Exception as e:
+        logger.exception("OIDC discovery fetch failed during callback")
+        return web.Response(
+            status=502, text=f"OIDC discovery fetch failed: {e}",
+        )
+
+    redirect_uri = _resolve_redirect_url(request, cfg)
+    try:
+        token = await asyncio.to_thread(
+            _exchange_code_for_tokens,
+            settings=cfg,
+            metadata=metadata,
+            code=code_param,
+            redirect_uri=redirect_uri,
+            code_verifier=flow.code_verifier,
+        )
+    except Exception as e:
+        logger.exception("OIDC token exchange failed")
+        return web.Response(
+            status=502, text=f"OIDC token exchange failed: {e}",
+        )
+
+    id_token = token.get("id_token", "")
+    if not id_token:
+        return web.Response(
+            status=502, text="OIDC token response missing id_token",
+        )
+    try:
+        claims = await asyncio.to_thread(
+            _decode_id_token, id_token, metadata, cfg.client_id,
+        )
+    except Exception as e:
+        logger.exception("OIDC id_token decode failed")
+        return web.Response(
+            status=502, text=f"OIDC id_token decode failed: {e}",
+        )
+
+    email = claims.get("email")
+    preferred_username = claims.get("preferred_username") or claims.get("sub")
+    groups_claim = claims.get("groups") or []
+    if not isinstance(groups_claim, list):
+        groups_claim = []
+
+    user = find_or_create_sso_user(
+        email=email,
+        preferred_username=preferred_username,
+    )
+    if cfg.group_mapping:
+        apply_group_mapping(
+            user["user_id"], groups_claim, cfg.group_mapping,
+        )
+
+    # Mint the operator session cookie via the existing helper path.
+    from . import identity
+    from .login import SESSION_COOKIE_NAME, COOKIE_PATH, COOKIE_MAX_AGE
+
+    session_id = identity.create_session(user["user_id"])
+    identity.touch_last_login(user["user_id"])
+
+    response = web.HTTPSeeOther(location="/agent-mcp/")
+    response.set_cookie(
+        SESSION_COOKIE_NAME, session_id,
+        path=COOKIE_PATH,
+        httponly=True,
+        secure=_cookie_secure_flag(request),
+        samesite="Lax",
+        max_age=COOKIE_MAX_AGE,
+    )
+    # Clear the per-flow cookie now that we've consumed it.
+    response.set_cookie(
+        _FLOW_COOKIE_NAME, "",
+        path=_FLOW_COOKIE_PATH,
+        httponly=True,
+        secure=_cookie_secure_flag(request),
+        samesite="Lax",
+        max_age=0,
+    )
+    raise response
+
+
+# ── Wire-up ────────────────────────────────────────────────────────
+
+
+def register_sso_routes(app: web.Application) -> None:
+    """Register /agent-mcp/sso/{login,callback} on ``app``.
+
+    Always-registered (we don't gate the route on OIDC mode being
+    active) because the handlers themselves 404 cleanly when SSO is
+    off; this keeps URL discoverability consistent for dashboards
+    that probe for the route.
+    """
+    app.router.add_get(
+        "/agent-mcp/sso/login", init_oidc_login_handler,
+    )
+    app.router.add_get(
+        "/agent-mcp/sso/callback", handle_oidc_callback,
+    )
