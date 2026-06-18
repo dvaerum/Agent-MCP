@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Callable, List, Dict, Any, Optional # Added List, Dict, Any, Optional
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.responses import JSONResponse, Response, PlainTextResponse
 from starlette.requests import Request
 # `routes.py` still references ``Mount`` + ``StaticFiles`` from
@@ -24,6 +24,7 @@ from starlette.staticfiles import StaticFiles
 from ..core.config import logger
 from ..core import globals as g
 from ..core.auth import verify_token, get_agent_id as auth_get_agent_id
+from .deps import caller_identity, require_operator_session
 from ..utils.json_utils import get_sanitized_json_body
 from ..db.connection import get_db_connection
 from ..db.engine import SessionLocal
@@ -402,27 +403,34 @@ async def all_tasks_api_route(request: Request) -> JSONResponse:
         logger.error(f"Error fetching all tasks: {e}", exc_info=True)
         return JSONResponse({"error": f"Failed to fetch all tasks: {str(e)}"}, status_code=500)
 
-async def update_task_details_api_route(request: Request) -> JSONResponse:
+async def update_task_details_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
     # Dashboard task edit endpoint.
     #
     # Originally required (task_id, status) and used `status` as the
     # only mandatory field. The dashboard's Edit modal needs to mutate
     # individual fields independently (title-only, priority-only, …)
     # and to manage assignment, so the rules are:
-    #   - task_id + admin token still required.
+    #   - task_id still required.
     #   - status is now OPTIONAL (status-only updates still supported).
     #   - At least one editable field must be supplied (otherwise the
     #     UPDATE is a no-op and 400 is clearer than success).
     #   - assigned_to: new field. <agent_id> assigns; null/empty
     #     string clears the assignment (NULL in DB).
+    #
+    # PR D (prancy-napping-pie): auth moved to require_operator_session.
+    # The handler no longer reads or verifies an admin token from the
+    # body; the dep accepts cookie OR Authorization-bearer OR
+    # legacy body-token paths.
     if request.method != 'POST': return JSONResponse({"error": "Method not allowed"}, status_code=405)
     conn = None
     try:
         data = await get_sanitized_json_body(request)
-        admin_auth_token = data.get('token'); task_id_to_update = data.get('task_id'); new_status = data.get('status')
+        task_id_to_update = data.get('task_id'); new_status = data.get('status')
         if not task_id_to_update:
             return JSONResponse({"error": "task_id is a required field."}, status_code=400)
-        if not verify_token(admin_auth_token, required_role='admin'): return JSONResponse({"error": "Invalid admin token"}, status_code=403)
         # The set of recognised editable fields. At least one must be
         # supplied; otherwise the request is a no-op and rejected.
         EDITABLE_KEYS = {"status", "title", "description", "priority", "notes", "assigned_to"}
@@ -432,7 +440,7 @@ async def update_task_details_api_route(request: Request) -> JSONResponse:
                 {"error": "at least one editable field is required (status, title, description, priority, notes, assigned_to)."},
                 status_code=400,
             )
-        requesting_admin_id = auth_get_agent_id(admin_auth_token)
+        requesting_admin_id = caller_identity(auth)
         conn = get_db_connection(); cursor = conn.cursor()
         cursor.execute("SELECT notes FROM tasks WHERE task_id = ?", (task_id_to_update,)); task_row = cursor.fetchone()
         if not task_row: return JSONResponse({"error": "Task not found"}, status_code=404)
@@ -511,20 +519,34 @@ async def update_task_details_api_route(request: Request) -> JSONResponse:
 # --- ADDED: Dashboard-specific Agent Management API Endpoints ---
 
 # Original: main.py lines 2022-2058 (create_agent_api function)
-async def create_agent_dashboard_api_route(request: Request) -> JSONResponse:
-    """Dashboard API endpoint to create an agent. Calls the admin tool internally."""
+async def create_agent_dashboard_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    """Dashboard API endpoint to create an agent. Calls the admin tool internally.
+
+    PR D (prancy-napping-pie): auth via ``require_operator_session``.
+    The handler reuses the admin token for the inner
+    ``create_agent_tool_impl`` call (which still needs an admin
+    token to satisfy its own ``@requires("admin")`` decorator);
+    that's read from ``g.admin_token`` rather than the request
+    body so the dashboard's cookie path doesn't need to ferry the
+    token through.
+    """
     if request.method != 'POST':
         return JSONResponse({"error": "Method not allowed"}, status_code=405)
     try:
         data = await get_sanitized_json_body(request)
-        admin_auth_token = data.get("token")
         agent_id = data.get("agent_id")
         capabilities = data.get("capabilities", []) # Optional
         working_directory = data.get("working_directory") # Optional
-
-        # This endpoint itself requires admin authentication
-        if not verify_token(admin_auth_token, "admin"):
-            return JSONResponse({"message": "Unauthorized: Invalid admin token for API call"}, status_code=401)
+        # The inner tool call still wants an admin token to satisfy
+        # its own decorator chain; the session-authenticated dashboard
+        # caller doesn't ferry one, so pull from the in-process
+        # admin token (defence-in-depth: the dep already validated
+        # the operator session, so synthesising the bearer here is
+        # privilege-preserving).
+        admin_auth_token = g.admin_token
 
         if not agent_id:
             return JSONResponse({"message": "Agent ID is required"}, status_code=400)
@@ -586,13 +608,20 @@ async def create_agent_dashboard_api_route(request: Request) -> JSONResponse:
 # auth-rejection wording cannot drift between the dashboard surface
 # and the MCP surface. Wire-shape parity is pinned by
 # tests/test_rest_mcp_tool_parity.py.
-async def terminate_agent_dashboard_api_route(request: Request) -> JSONResponse:
+async def terminate_agent_dashboard_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
     """POST /api/terminate-agent — admin terminates an agent.
 
     Thin adapter over the ``terminate_agent`` MCP tool. The tool's
     ``inputSchema`` enforces ``agent_id`` required + admin-only role
     (via ``@requires("admin")``); this handler just translates the
     HTTP request → tool call → JSON response.
+
+    PR D (prancy-napping-pie): auth via ``require_operator_session``.
+    The inner tool call still needs an admin bearer; synthesised
+    from ``g.admin_token`` (defence-in-depth, dep already gated us).
     """
     if request.method == 'OPTIONS':
         return await handle_options(request)
@@ -603,12 +632,11 @@ async def terminate_agent_dashboard_api_route(request: Request) -> JSONResponse:
     except ValueError as e_val:
         return JSONResponse({"message": str(e_val)}, status_code=400)
 
-    admin_token = data.get("token")
     agent_id = data.get("agent_id")
     return await _dispatch_through_tool(
         "terminate_agent",
         {"agent_id": agent_id} if agent_id else {},
-        bearer_token=admin_token,
+        bearer_token=g.admin_token,
         success_message=(
             f"Agent '{agent_id}' terminated successfully via dashboard API."
             if agent_id else None
@@ -637,7 +665,10 @@ def _purge_tombstone(agent_id: str) -> str:
     return f"[deleted-{agent_id}]"
 
 
-async def restore_agent_api_route(request: Request) -> JSONResponse:
+async def restore_agent_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
     """POST /api/agents/<id>/restore — admin reverses a soft-delete.
 
     Side effects of the original terminate (cleared current_task,
@@ -645,6 +676,8 @@ async def restore_agent_api_route(request: Request) -> JSONResponse:
     reassigns work explicitly. We only flip status back and re-add to
     g.active_agents so the dashboard's active-list/token-list pick it
     up again.
+
+    PR D (prancy-napping-pie): auth via ``require_operator_session``.
     """
     if request.method == 'OPTIONS':
         return await handle_options(request)
@@ -657,13 +690,12 @@ async def restore_agent_api_route(request: Request) -> JSONResponse:
 
     conn = None
     try:
-        data = await get_sanitized_json_body(request)
-        admin_token = data.get('token')
-        if not verify_token(admin_token, required_role='admin'):
-            return JSONResponse(
-                {"error": "Unauthorized: admin token required"},
-                status_code=403,
-            )
+        # Body is read for shape-compat with legacy callers but no
+        # field is required; the dep enforces auth.
+        try:
+            _ = await get_sanitized_json_body(request)
+        except ValueError:
+            pass
 
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -701,7 +733,7 @@ async def restore_agent_api_route(request: Request) -> JSONResponse:
             agent_id, "terminated_at", None, connection=cursor,
         )
         log_agent_action_to_db(
-            cursor, "admin", "restored_agent",
+            cursor, caller_identity(auth), "restored_agent",
             details={"agent_id": agent_id},
         )
         conn.commit()
@@ -749,19 +781,24 @@ async def restore_agent_api_route(request: Request) -> JSONResponse:
             conn.close()
 
 
-async def edit_agent_api_route(request: Request) -> JSONResponse:
+async def edit_agent_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
     """POST /api/agents/<id>/edit — admin updates mutable agent fields.
 
-    Accepts an admin token in the JSON body alongside any combination of
-    the editable fields: `capabilities` (list[str]), `color` (str),
-    `working_directory` (str). Returns 400 if none of the editable
-    fields are supplied (avoids no-op writes), 404 if the agent does
-    not exist.
+    Accepts any combination of the editable fields: ``capabilities``
+    (list[str]), ``color`` (str), ``working_directory`` (str),
+    ``aoe_session_id`` (str), ``auto_event_loop`` (bool). Returns
+    400 if none of the editable fields are supplied (avoids no-op
+    writes), 404 if the agent does not exist.
 
     Non-whitelisted fields in the body are silently ignored — the
     endpoint never touches status/agent_id/token; those have their own
     dedicated flows (terminate/restore/purge for status; create for
     agent_id+token; nothing for editing tokens).
+
+    PR D (prancy-napping-pie): auth via ``require_operator_session``.
     """
     if request.method == 'OPTIONS':
         return await handle_options(request)
@@ -775,12 +812,6 @@ async def edit_agent_api_route(request: Request) -> JSONResponse:
     conn = None
     try:
         data = await get_sanitized_json_body(request)
-        admin_token = data.get('token')
-        if not verify_token(admin_token, required_role='admin'):
-            return JSONResponse(
-                {"error": "Unauthorized: admin token required"},
-                status_code=403,
-            )
 
         # Whitelisted editable fields. Anything else in `data` is ignored
         # (defense in depth — status / agent_id / token must not flow
@@ -873,7 +904,7 @@ async def edit_agent_api_route(request: Request) -> JSONResponse:
                 )
 
         log_agent_action_to_db(
-            cursor, "admin", "edited_agent",
+            cursor, caller_identity(auth), "edited_agent",
             details={"agent_id": agent_id, "fields": list(applied.keys())},
         )
         conn.commit()
@@ -970,11 +1001,14 @@ def _gather_purge_preview(cursor, agent_id: str) -> Dict[str, Any]:
     }
 
 
-async def purge_preview_api_route(request: Request) -> JSONResponse:
+async def purge_preview_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
     """GET /api/agents/<id>/purge-preview — blast-radius counts + samples.
 
-    Admin-only. Accepts the admin token via query parameter (so a plain
-    GET works without a body, which browsers strip per the Fetch spec).
+    PR D (prancy-napping-pie): auth via ``require_operator_session``.
+    Dashboard no longer passes the admin token in the query string.
     """
     if request.method == 'OPTIONS':
         return await handle_options(request)
@@ -984,13 +1018,6 @@ async def purge_preview_api_route(request: Request) -> JSONResponse:
     agent_id = request.path_params.get('agent_id')
     if not agent_id:
         return JSONResponse({"error": "agent_id required"}, status_code=400)
-
-    admin_token = request.query_params.get('token')
-    if not verify_token(admin_token, required_role='admin'):
-        return JSONResponse(
-            {"error": "Unauthorized: admin token required"},
-            status_code=403,
-        )
 
     conn = None
     try:
@@ -1024,10 +1051,13 @@ async def purge_preview_api_route(request: Request) -> JSONResponse:
             conn.close()
 
 
-async def purge_agent_api_route(request: Request) -> JSONResponse:
+async def purge_agent_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
     """DELETE /api/agents/<id>?cascade=true — hard delete + cascade tombstone.
 
-    Admin-only. Wraps the cascade in a transaction (BEGIN/COMMIT) so a
+    Wraps the cascade in a transaction (BEGIN/COMMIT) so a
     half-purged state is impossible if any step fails. The DELETE on
     agents runs LAST so logical references can be tombstoned while the
     row is still present (no DB foreign keys, but this preserves
@@ -1035,6 +1065,8 @@ async def purge_agent_api_route(request: Request) -> JSONResponse:
 
     Refuses without ?cascade=true so a bare DELETE doesn't silently
     hard-delete data.
+
+    PR D (prancy-napping-pie): auth via ``require_operator_session``.
     """
     if request.method == 'OPTIONS':
         return await handle_options(request)
@@ -1054,13 +1086,12 @@ async def purge_agent_api_route(request: Request) -> JSONResponse:
 
     conn = None
     try:
-        data = await get_sanitized_json_body(request)
-        admin_token = data.get('token')
-        if not verify_token(admin_token, required_role='admin'):
-            return JSONResponse(
-                {"error": "Unauthorized: admin token required"},
-                status_code=403,
-            )
+        # Body is read for shape-compat with legacy callers but no
+        # field is required; the dep enforces auth.
+        try:
+            _ = await get_sanitized_json_body(request)
+        except ValueError:
+            pass
 
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -1134,7 +1165,7 @@ async def purge_agent_api_route(request: Request) -> JSONResponse:
             # disappears so the action log has a non-tombstoned
             # 'purged_agent' entry attributable to admin.
             log_agent_action_to_db(
-                cursor, "admin", "purged_agent",
+                cursor, caller_identity(auth), "purged_agent",
                 details={
                     "agent_id": agent_id,
                     "tombstone": tombstone,
@@ -1417,8 +1448,14 @@ async def handle_options(request: Request) -> Response:
         }
     )
 
-async def aoe_health_api_route(request: Request) -> JSONResponse:
+async def aoe_health_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
     """GET /api/aoe/health — admin-only AoE-reachability probe.
+
+    PR D (prancy-napping-pie): auth via ``require_operator_session``.
+    The dashboard no longer passes the admin token in the query string.
 
     Pings the configured AoE instance with the current bearer token
     (resolved live, including file-sourced rotations) and reports back:
@@ -1436,20 +1473,6 @@ async def aoe_health_api_route(request: Request) -> JSONResponse:
         return await handle_options(request)
     if request.method != 'GET':
         return JSONResponse({"error": "Method not allowed"}, status_code=405)
-
-    # Auth: admin only. Accept token via Authorization: Bearer header
-    # OR ?token=<>.
-    auth_header = request.headers.get("Authorization", "")
-    token: Optional[str] = None
-    if auth_header.lower().startswith("bearer "):
-        token = auth_header[7:].strip() or None
-    if token is None:
-        token = request.query_params.get("token")
-    if not token or not verify_token(token, "admin"):
-        return JSONResponse(
-            {"error": "Unauthorized: admin token required"},
-            status_code=401,
-        )
 
     from agent_mcp.features.aoe_notify import check_health
 
@@ -1481,16 +1504,16 @@ async def prompts_catalog_api_route(request: Request):
 # Phase 1 PR A (prancy-napping-pie): registration migrated from a
 # top-level ``routes = [Route(...)]`` list to ``register_routes(app)``
 # below, which calls ``app.add_api_route(...)`` on the FastAPI app
-# created in :func:`agent_mcp.app.main_app.create_app`. The handler
-# signatures still take ``Request`` and return ``Response`` (legacy
-# Starlette shape, kept for this PR's mechanical-only scope); PR D
-# rewrites them to FastAPI-style typed parameters + Pydantic body
-# models alongside the dashboard session-cookie auth migration.
+# created in :func:`agent_mcp.app.main_app.create_app`.
 #
-# TODO(prancy-napping-pie PR D): convert each handler below to a
-# typed FastAPI signature (``async def name(body: SomeModel) -> ...``)
-# and drop the ad-hoc ``data = await get_sanitized_json_body(request)``
-# + ``data.get(...)`` plumbing inside each handler.
+# PR D (prancy-napping-pie) folded the per-handler ``verify_token``
+# ladder into the ``require_operator_session`` FastAPI dependency
+# (``agent_mcp.app.deps``). Each mutation handler now declares the
+# dep via ``auth: dict = Depends(require_operator_session)``; the
+# handler body is free of any direct body-token reads. Pydantic
+# body models for the request bodies are a follow-up Phase 2 sweep —
+# the dep's three-path acceptance (cookie / Authorization-Bearer /
+# legacy body-token) means callers don't need to migrate in lockstep.
 #
 # We keep a module-level ``_dashboard_route_specs`` list so the spec
 # table stays the single source of truth — easier to diff in review
@@ -1618,8 +1641,11 @@ async def create_sample_memories_route(request: Request) -> JSONResponse:
         session.close()
 
 # Memory CRUD API endpoints
-async def create_memory_api_route(request: Request) -> JSONResponse:
-    """Create a new memory entry"""
+async def create_memory_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    """Create a new memory entry. PR D: auth via require_operator_session."""
     if request.method == 'OPTIONS':
         return await handle_options(request)
 
@@ -1629,18 +1655,14 @@ async def create_memory_api_route(request: Request) -> JSONResponse:
     session = None
     try:
         data = await get_sanitized_json_body(request)
-        admin_token = data.get('token')
         context_key = data.get('context_key')
         context_value = data.get('context_value')
         description = data.get('description')
 
-        if not verify_token(admin_token, required_role='admin'):
-            return JSONResponse({"error": "Invalid admin token"}, status_code=403)
-
         if not context_key:
             return JSONResponse({"error": "context_key is required"}, status_code=400)
 
-        requesting_admin_id = auth_get_agent_id(admin_token)
+        requesting_admin_id = caller_identity(auth)
 
         session = SessionLocal()
 
@@ -1703,8 +1725,11 @@ async def create_memory_api_route(request: Request) -> JSONResponse:
         if session is not None:
             session.close()
 
-async def update_memory_api_route(request: Request) -> JSONResponse:
-    """Update an existing memory entry"""
+async def update_memory_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    """Update an existing memory entry. PR D: auth via require_operator_session."""
     if request.method == 'OPTIONS':
         return await handle_options(request)
 
@@ -1721,14 +1746,10 @@ async def update_memory_api_route(request: Request) -> JSONResponse:
     session = None
     try:
         data = await get_sanitized_json_body(request)
-        admin_token = data.get('token')
         context_value = data.get('context_value')
         description = data.get('description')
 
-        if not verify_token(admin_token, required_role='admin'):
-            return JSONResponse({"error": "Invalid admin token"}, status_code=403)
-
-        requesting_admin_id = auth_get_agent_id(admin_token)
+        requesting_admin_id = caller_identity(auth)
 
         session = SessionLocal()
 
@@ -1789,7 +1810,10 @@ async def update_memory_api_route(request: Request) -> JSONResponse:
         if session is not None:
             session.close()
 
-async def delete_memory_api_route(request: Request) -> JSONResponse:
+async def delete_memory_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
     """DELETE /api/memories/<context_key> — admin deletes a memory.
 
     Thin adapter over the ``delete_project_context`` MCP tool
@@ -1805,6 +1829,8 @@ async def delete_memory_api_route(request: Request) -> JSONResponse:
     the dashboard never sent this flag and would otherwise start
     seeing 400s on system keys it could delete before. Wire-shape
     parity is pinned by tests/test_rest_mcp_tool_parity.py.
+
+    PR D (prancy-napping-pie): auth via ``require_operator_session``.
     """
     if request.method == 'OPTIONS':
         return await handle_options(request)
@@ -1820,15 +1846,14 @@ async def delete_memory_api_route(request: Request) -> JSONResponse:
     context_key = path_parts[-1]
 
     try:
-        data = await get_sanitized_json_body(request)
+        _ = await get_sanitized_json_body(request)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-    admin_token = data.get('token')
     return await _dispatch_through_tool(
         "delete_project_context",
         {"context_key": context_key, "force_delete": True},
-        bearer_token=admin_token,
+        bearer_token=g.admin_token,
         success_message=f"Memory '{context_key}' deleted successfully",
     )
 
@@ -1842,10 +1867,13 @@ async def delete_memory_api_route(request: Request) -> JSONResponse:
 import uuid as _uuid
 
 
-async def create_task_api_route(request: Request) -> JSONResponse:
-    """Create a new task. Admin token in JSON body (Q6a.1 convention).
+async def create_task_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    """Create a new task. PR D: auth via require_operator_session.
 
-    Body: {"token", "task_title", "task_description", "priority"?,
+    Body: {"task_title", "task_description", "priority"?,
            "assigned_to"?, "parent_task"?, "required_capabilities"?}
     Returns: {"success": true, "task_id": "...", "message": "..."}
     """
@@ -1857,7 +1885,6 @@ async def create_task_api_route(request: Request) -> JSONResponse:
     conn = None
     try:
         data = await get_sanitized_json_body(request)
-        admin_token = data.get('token')
         title = data.get('task_title')
         description = data.get('task_description', '')
         priority = data.get('priority', 'medium')
@@ -1872,15 +1899,12 @@ async def create_task_api_route(request: Request) -> JSONResponse:
         # The repo (task_repo.create) handles json.dumps internally.
         _norm_caps = normalize_capabilities(data.get('required_capabilities'))
 
-        if not verify_token(admin_token, required_role='admin'):
-            return JSONResponse({"error": "Invalid admin token"}, status_code=403)
-
         if not title:
             return JSONResponse(
                 {"error": "task_title is required"}, status_code=400
             )
 
-        requesting_admin_id = auth_get_agent_id(admin_token)
+        requesting_admin_id = caller_identity(auth)
         task_id = f"task_{_uuid.uuid4().hex[:12]}"
         status = 'pending' if assigned_to else 'unassigned'
 
@@ -1934,7 +1958,10 @@ async def create_task_api_route(request: Request) -> JSONResponse:
             conn.close()
 
 
-async def delete_task_api_route(request: Request) -> JSONResponse:
+async def delete_task_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
     """DELETE /api/tasks/<task_id> — admin deletes a task.
 
     Thin adapter over the ``delete_task`` MCP tool (Candidate C,
@@ -1943,6 +1970,8 @@ async def delete_task_api_route(request: Request) -> JSONResponse:
     ``inputSchema`` + ``@requires("admin")``. Cascade safety (children
     / dependents) is handled by the tool impl. Wire-shape parity is
     pinned by tests/test_rest_mcp_tool_parity.py.
+
+    PR D (prancy-napping-pie): auth via ``require_operator_session``.
     """
     if request.method == 'OPTIONS':
         return await handle_options(request)
@@ -1956,11 +1985,10 @@ async def delete_task_api_route(request: Request) -> JSONResponse:
     task_id = path_parts[-1]
 
     try:
-        data = await get_sanitized_json_body(request)
+        _ = await get_sanitized_json_body(request)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-    admin_token = data.get('token')
     # ``force_delete=True`` matches the legacy REST behavior (the
     # direct-DB handler had no cascade safety check). The MCP tool's
     # default is False; passing True here preserves wire compatibility
@@ -1969,7 +1997,7 @@ async def delete_task_api_route(request: Request) -> JSONResponse:
     return await _dispatch_through_tool(
         "delete_task",
         {"task_id": task_id, "force_delete": True},
-        bearer_token=admin_token,
+        bearer_token=g.admin_token,
         success_message=f"Task '{task_id}' deleted successfully",
     )
 
@@ -1985,8 +2013,13 @@ _MESSAGE_TYPES = ("text", "system", "notification", "task_update",
 _MESSAGE_PRIORITIES = ("low", "normal", "high", "urgent")
 
 
-async def list_messages_api_route(request: Request) -> JSONResponse:
-    """POST /api/messages/query with rich filters (admin token in JSON body).
+async def list_messages_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    """POST /api/messages/query with rich filters.
+
+    PR D (prancy-napping-pie): auth via ``require_operator_session``.
 
     Originally exposed as GET, but browsers strip request bodies from
     GET (per the Fetch spec), which broke the dashboard's Messages tab.
@@ -1995,7 +2028,6 @@ async def list_messages_api_route(request: Request) -> JSONResponse:
     without method overloading.
 
     Body fields:
-      token          (required, admin)
       from           sender_id filter
       to             recipient_id filter
       between        [a, b] — messages either direction between two agents
@@ -2013,9 +2045,6 @@ async def list_messages_api_route(request: Request) -> JSONResponse:
 
     try:
         data = await get_sanitized_json_body(request)
-        admin_token = data.get('token')
-        if not verify_token(admin_token, required_role='admin'):
-            return JSONResponse({"error": "Invalid admin token"}, status_code=403)
 
         limit = int(data.get('limit', 50))
         offset = int(data.get('offset', 0))
@@ -2058,8 +2087,13 @@ async def list_messages_api_route(request: Request) -> JSONResponse:
         )
 
 
-async def list_participants_api_route(request: Request) -> JSONResponse:
+async def list_participants_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
     """POST /api/messages/participants — agents available as filter values.
+
+    PR D (prancy-napping-pie): auth via ``require_operator_session``.
 
     Returns the set of agent identifiers that should populate the
     Messages tab's From/To filter dropdowns. /api/agents was the
@@ -2089,10 +2123,7 @@ async def list_participants_api_route(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Method not allowed"}, status_code=405)
 
     try:
-        data = await get_sanitized_json_body(request)
-        admin_token = data.get('token')
-        if not verify_token(admin_token, required_role='admin'):
-            return JSONResponse({"error": "Invalid admin token"}, status_code=403)
+        _ = await get_sanitized_json_body(request)
 
         # PR 6: route through MessageRepository.list_participants. The
         # repo owns the filter rules (excludes terminated/tombstone,
@@ -2109,10 +2140,15 @@ async def list_participants_api_route(request: Request) -> JSONResponse:
         )
 
 
-async def create_message_api_route(request: Request) -> JSONResponse:
+async def create_message_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
     """POST /api/messages — admin composes a message to a recipient.
 
-    Body: {token, recipient_id, message_content, message_type?, priority?,
+    PR D (prancy-napping-pie): auth via ``require_operator_session``.
+
+    Body: {recipient_id, message_content, message_type?, priority?,
            subject?, parent_message_id?}
     Returns: {success, message_id, message}
 
@@ -2130,7 +2166,6 @@ async def create_message_api_route(request: Request) -> JSONResponse:
     conn = None
     try:
         data = await get_sanitized_json_body(request)
-        admin_token = data.get('token')
         recipient_id = data.get('recipient_id')
         content = data.get('message_content')
         message_type = data.get('message_type', 'text')
@@ -2138,9 +2173,6 @@ async def create_message_api_route(request: Request) -> JSONResponse:
         # v5.0.22 — message threads + subjects.
         explicit_subject = data.get('subject')
         parent_message_id = data.get('parent_message_id')
-
-        if not verify_token(admin_token, required_role='admin'):
-            return JSONResponse({"error": "Invalid admin token"}, status_code=403)
 
         if not recipient_id:
             return JSONResponse(
@@ -2163,7 +2195,7 @@ async def create_message_api_route(request: Request) -> JSONResponse:
 
         import secrets as _secrets
         timestamp = datetime.datetime.now().isoformat()
-        sender_id = auth_get_agent_id(admin_token) or "admin"
+        sender_id = caller_identity(auth)
 
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -2287,15 +2319,18 @@ async def create_message_api_route(request: Request) -> JSONResponse:
             conn.close()
 
 
-async def suggest_subject_api_route(request: Request) -> JSONResponse:
+async def suggest_subject_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
     """POST /api/messages/suggest-subject — Ollama-backed subject helper.
 
-    Body: {token, content}
+    PR D (prancy-napping-pie): auth via ``require_operator_session``.
+
+    Body: {content}
     Returns: {"subject": "<string>"}   on success
              {"subject": null}          when AGENT_MCP_SUBJECT_MODEL is
                                         unset OR the helper failed.
-    Status 401 when the token is missing/invalid (any agent token,
-    not just admin — the helper is read-only and cheap).
 
     Why graceful degrade (200 + null) rather than 503: the dashboard
     treats this as a hint, not a hard requirement. If the helper is
@@ -2311,12 +2346,6 @@ async def suggest_subject_api_route(request: Request) -> JSONResponse:
         data = await get_sanitized_json_body(request)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
-
-    token = data.get('token')
-    # `verify_token(t)` with no required_role accepts any valid agent
-    # token (admin or worker). Returns False on missing/invalid.
-    if not token or not verify_token(token):
-        return JSONResponse({"error": "Invalid token"}, status_code=401)
 
     content = (data.get('content') or "").strip()
     if not content:
@@ -2338,11 +2367,16 @@ async def suggest_subject_api_route(request: Request) -> JSONResponse:
     return JSONResponse({"subject": subject})
 
 
-async def patch_message_api_route(request: Request) -> JSONResponse:
+async def patch_message_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
     """PATCH/DELETE /api/messages/{message_id}.
 
     PATCH flips read/delivered. DELETE removes the row (used by the
-    dashboard's row-level + bulk delete actions). Admin-only.
+    dashboard's row-level + bulk delete actions).
+
+    PR D (prancy-napping-pie): auth via ``require_operator_session``.
     """
     if request.method == 'OPTIONS':
         return await handle_options(request)
@@ -2357,9 +2391,6 @@ async def patch_message_api_route(request: Request) -> JSONResponse:
     conn = None
     try:
         data = await get_sanitized_json_body(request)
-        admin_token = data.get('token')
-        if not verify_token(admin_token, required_role='admin'):
-            return JSONResponse({"error": "Invalid admin token"}, status_code=403)
 
         # PR 6: existence check via message_repo (cache-bypassing read).
         from ..repositories import message_repo
@@ -2374,7 +2405,7 @@ async def patch_message_api_route(request: Request) -> JSONResponse:
             # caller's cursor so it stays atomic with the audit log.
             message_repo.delete(message_id, connection=cursor)
             log_agent_action_to_db(
-                cursor, auth_get_agent_id(admin_token) or "admin",
+                cursor, caller_identity(auth),
                 "deleted_message_via_dashboard",
                 details={"message_id": message_id},
             )
@@ -2412,7 +2443,7 @@ async def patch_message_api_route(request: Request) -> JSONResponse:
                     message_id, bool(val), connection=cursor,
                 )
         log_agent_action_to_db(
-            cursor, auth_get_agent_id(admin_token) or "admin",
+            cursor, caller_identity(auth),
             "updated_message", details={"message_id": message_id,
                                         "fields": [c for c, _ in updates]},
         )

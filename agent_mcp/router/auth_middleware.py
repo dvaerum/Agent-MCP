@@ -25,7 +25,6 @@ and risks drift.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import sqlite3
@@ -34,7 +33,7 @@ from typing import Awaitable, Callable
 from aiohttp import web
 
 from . import identity
-from .login import SESSION_COOKIE_NAME, resolve_current_user
+from .login import resolve_current_user
 
 
 logger = logging.getLogger(__name__)
