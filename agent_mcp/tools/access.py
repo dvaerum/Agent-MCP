@@ -113,10 +113,20 @@ def _derive_access_level(entry) -> str:
     role = getattr(impl, "_required_role", None)
     policy_keys = getattr(impl, "_required_policy_keys", None)
 
-    # Decorator says admin → the call site rejects workers → hide.
-    # (Overrides any softer kwarg.)
-    if role == "admin":
-        return "admin"
+    # Decorator says operator/admin → the call site rejects all
+    # agent tokens (worker AND manager) → hide from both. The
+    # legacy "admin" tag is preserved as a synonym in the derived
+    # map for one release so dashboard code that string-matches on
+    # "admin" keeps working until Wave 3.
+    if role in ("operator", "admin"):
+        return "operator" if role == "operator" else "admin"
+
+    # Decorator says manager → call site rejects workers but admits
+    # manager agents + operator session. Surface as the new
+    # "manager" tag so tools/list shows the tool to manager and
+    # operator callers (and hides it from workers).
+    if role == "manager":
+        return "manager"
 
     # Decorator says worker-if-toggled → render the canonical string
     # from the decorator's keys. A kwarg-declared
@@ -128,15 +138,18 @@ def _derive_access_level(entry) -> str:
         return f"worker-if-toggled:{joined}"
 
     # No decorator (or `@requires("any")`) → fall back to the kwarg.
-    # Recognised values: "admin", "any", or
-    # "worker-if-toggled:<keys>". Unknown values default to "any"
-    # with a loud log.
-    if declared == "admin":
-        # `visibility="admin"` kwarg without the decorator → hide
-        # from worker tools/list, but call-time enforcement would
-        # slip through. The `@requires_role` decorator is the right
-        # fix; this is the "kwarg-only" path from PR-W1c Test C.
-        return "admin"
+    # Recognised values: "operator", "manager", "admin" (legacy),
+    # "any", or "worker-if-toggled:<keys>". Unknown values default
+    # to "any" with a loud log.
+    if declared in ("operator", "admin"):
+        # `visibility="operator"` (or legacy "admin") kwarg without
+        # the matching decorator → hide from worker / manager
+        # tools/list, but call-time enforcement would slip through.
+        # The `@requires_role` decorator is the right fix; this is
+        # the "kwarg-only" path from PR-W1c Test C.
+        return declared
+    if declared == "manager":
+        return "manager"
     if declared == "any":
         return "any"
     if declared.startswith("worker-if-toggled:"):
@@ -271,8 +284,21 @@ def _get_config_bool(key: str, default: bool) -> bool:
 
 def is_visible_to_role(tool_name: str, role: str) -> bool:
     """Return True if ``tool_name`` should appear in ``tools/list``
-    for the given ``role`` (``"admin"`` | ``"worker"`` |
-    ``"anonymous"``).
+    for the given ``role`` (``"admin"`` | ``"manager"`` | ``"worker"``
+    | ``"anonymous"``).
+
+    Phase 2 Wave 2a adds the ``"manager"`` role tier between worker
+    and admin. The role-to-level visibility matrix:
+
+    +-------------+-----+---------+---------+----------+-----------------+
+    | level\\role | admin | manager | worker | anonymous              |
+    +=============+=======+=========+========+========================+
+    | operator   |  yes  |  no     |  no    |  no                    |
+    | admin (legacy) | yes | no    |  no    |  no                    |
+    | manager    |  yes  |  yes    |  no    |  no                    |
+    | any        |  yes  |  yes    |  yes   |  yes                   |
+    | worker-if-toggled:... | yes | yes  | toggle-dependent | no    |
+    +------------+-------+---------+--------+-------------------------+
 
     Unknown tool names default to visible — registry callers should
     not silently hide tools the policy file forgot to classify; the
@@ -293,13 +319,27 @@ def is_visible_to_role(tool_name: str, role: str) -> bool:
         return True
 
     if role == "admin":
+        # Admin/operator sees everything.
         return True
 
-    if level == "admin":
+    if level in ("operator", "admin"):
+        # Operator-only tools: hidden from manager + worker +
+        # anonymous. Only the "admin" role above sees them.
         return False
+    if level == "manager":
+        # Manager-tier tools: visible to manager agents (and the
+        # admin role handled above). Hidden from workers and
+        # anonymous callers.
+        return role == "manager"
     if level == "any":
         return True
     if level.startswith("worker-if-toggled:"):
+        if role == "manager":
+            # Managers can see everything a worker can see, plus
+            # everything they alone can. The toggle gate is a
+            # worker-side constraint that doesn't apply to manager
+            # callers.
+            return True
         if role != "worker":
             # Anonymous: only "any" tools.
             return False
