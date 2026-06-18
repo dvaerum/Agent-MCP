@@ -87,6 +87,11 @@ pkgs.testers.nixosTest {
       after = [ "fake-openai.service" "network.target" ];
       environment = {
         AGENT_MCP_PROJECTS_FILE = "/home/testuser/.config/agent-mcp/projects.local.json";
+        # Phase 1 PR B (prancy-napping-pie): router runs Alembic
+        # against this DB at startup. Default /var/lib/agent-mcp is
+        # not writable by testuser; point at testuser's home so the
+        # ExecStartPre mkdir below covers both.
+        AGENT_MCP_ROUTER_DB = "/home/testuser/.config/agent-mcp/router.db";
         AGENT_MCP_SOCK_DIR = "/run/agent-mcp";
         AGENT_MCP_DASHBOARD_DIR = "${packagedPkgs.agentMcpDashboard}/share/agent-mcp-dashboard";
         AGENT_MCP_EXTERNAL_URL = "http://localhost:${toString ports.routerPort}";
