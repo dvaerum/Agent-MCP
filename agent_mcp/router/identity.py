@@ -213,6 +213,22 @@ def init_router_db() -> None:
             os.environ.pop("AGENT_MCP_BOOTSTRAP_USERNAME", None)
             os.environ.pop("AGENT_MCP_BOOTSTRAP_PASSWORD", None)
 
+    # Phase 3 Wave 2 (v5.0.69): make sure SOME user is a sysadmin
+    # after bootstrap. The Wave-1a migration promotes the earliest
+    # operator when upgrading an existing deployment, but on a
+    # FRESH deployment the migration runs before any user exists,
+    # so the data step finds nothing to promote. Re-run the
+    # idempotent helper after the bootstrap path has had a chance
+    # to create the first operator — same SQL, same idempotency
+    # guarantee (never demotes, never crowns a second sysadmin).
+    try:
+        from . import group_resolver
+        group_resolver.bootstrap_first_operator_as_sysadmin()
+    except Exception:  # pragma: no cover - defensive
+        logger.exception(
+            "bootstrap_first_operator_as_sysadmin failed post-init",
+        )
+
 
 def _users_table_is_empty() -> bool:
     with _connect() as conn:
@@ -265,6 +281,17 @@ def create_user(
             ) from e
 
         if was_empty:
+            # Phase 3 Wave 2 (v5.0.69): the FIRST operator is also
+            # implicitly the sysadmin. This is the fresh-deployment
+            # bootstrap rule (the Wave-1a Alembic migration handles
+            # the upgrade-existing path; this handles the brand-new
+            # router). Same transaction as the membership grants so
+            # no concurrent reader sees a "first operator, no
+            # sysadmin" half-state.
+            conn.execute(
+                "UPDATE users SET is_sysadmin = 1 WHERE user_id = ?",
+                (user_id,),
+            )
             # First operator: grant membership in every registered
             # project. Done inside the same transaction so a
             # half-state (user without memberships) can't be observed

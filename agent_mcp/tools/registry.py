@@ -408,6 +408,38 @@ operator_session_active: _cv.ContextVar = _cv.ContextVar(
 )
 
 
+# Phase 3 Wave 2 (v5.0.69): operator-identity ContextVars.
+#
+# When the REST seam dispatches a tool call on behalf of a logged-in
+# operator, it stamps the operator's user_id + the project name the
+# call is targeting on these ContextVars. The Wave-2 @requires_role
+# extension consults ``resolve_user_project_role(user_id, project)``
+# to enforce the operator-vs-viewer split at the tool-dispatch
+# boundary as well as at the router middleware. The two gates work
+# in tandem:
+#
+#   * Router middleware (``require_operator_session_middleware``)
+#     is the early gate — it 403s viewer mutations BEFORE the
+#     request reaches the per-project backend at all.
+#   * Decorator (``@requires_role("operator")`` etc.) is the
+#     defence-in-depth gate — if a hypothetical code path
+#     synthesised an in-process tool call without going through
+#     the REST seam (tests, batch jobs), the resolver still rejects
+#     a viewer attempt.
+#
+# Both ContextVars default to None so the legacy MCP-protocol path
+# (agent bearer; no operator) sees "no operator identity", which
+# means the project-role check is skipped and the static role gate
+# (system bearer / agent_role) is the only one that runs — i.e. the
+# pre-Phase-3 behaviour is preserved 1:1 for agent traffic.
+operator_user_id: _cv.ContextVar = _cv.ContextVar(
+    "operator_user_id", default=None
+)
+operator_project_name: _cv.ContextVar = _cv.ContextVar(
+    "operator_project_name", default=None
+)
+
+
 class ToolInputValidationError(Exception):
     """Raised when caller-supplied arguments fail jsonschema validation
     after the dispatcher's pre-validation cleanup.

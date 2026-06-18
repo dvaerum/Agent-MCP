@@ -125,15 +125,58 @@ def _check_role(role: str, token: Optional[str]) -> None:
     """
     # Lazy import — avoid an import cycle (registry imports authorize
     # transitively via tool implementations' @requires decorators).
-    from ..tools.registry import operator_session_active
+    from ..tools.registry import (
+        operator_session_active,
+        operator_user_id,
+        operator_project_name,
+    )
 
     op_session = bool(operator_session_active.get())
+
+    # Phase 3 Wave 2 (v5.0.69): when the REST seam stamps an
+    # operator's user_id + the targeted project on the contextvars,
+    # consult ``resolve_user_project_role`` so a viewer-tier
+    # operator can't reach an ``"operator"``-gated tool. This is the
+    # defence-in-depth gate; the router's
+    # ``require_operator_session_middleware`` is the primary one
+    # (rejects viewer mutations before they reach the backend), but
+    # the decorator stays as a backstop for in-process callers that
+    # bypass the REST seam.
+    def _viewer_blocked() -> bool:
+        if not op_session:
+            return False
+        uid = operator_user_id.get()
+        proj = operator_project_name.get()
+        if not uid or not proj:
+            return False
+        try:
+            from ..router import group_resolver
+            # Sysadmin always admits regardless of project role.
+            if group_resolver.resolve_user_is_sysadmin(uid):
+                return False
+            resolved = group_resolver.resolve_user_project_role(uid, proj)
+        except Exception:  # pragma: no cover - defensive
+            # Resolver failure → don't double-restrict; the
+            # middleware already gated the call.
+            return False
+        # No row → no membership; fall through to "blocked" because
+        # the static role gates below would otherwise admit on
+        # op_session alone. The middleware would have rejected this
+        # case already; defence in depth.
+        if resolved is None:
+            return True
+        return resolved == "viewer"
 
     if role in ("operator", "admin"):
         # Operator session is sufficient — no token needed (the REST
         # seam still passes the system token, but a hypothetical
         # operator-only path that doesn't could authorise here).
         if op_session:
+            if _viewer_blocked():
+                raise AuthRejected(
+                    "Unauthorized: viewer-tier operator cannot perform "
+                    "this operator-only action"
+                )
             return
         # System bearer is sufficient (legacy admin scripts, the
         # REST seam's standard path).
@@ -143,6 +186,11 @@ def _check_role(role: str, token: Optional[str]) -> None:
 
     if role == "manager":
         if op_session:
+            if _viewer_blocked():
+                raise AuthRejected(
+                    "Unauthorized: viewer-tier operator cannot perform "
+                    "this manager-or-above action"
+                )
             return
         # Manager-tier check accepts the system bearer OR an agent
         # whose row has agent_role='manager'.
