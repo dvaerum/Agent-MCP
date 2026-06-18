@@ -54,7 +54,7 @@ def test_create_agent_modal_trigger_button_says_add_agent() -> None:
     # Bound to the CreateAgentModal region so the test doesn't trip on
     # the unrelated "path-prefix deployments" code comments further
     # down the file.
-    region = _slice_lines(src, 380, 460)
+    region = _slice_lines(src, 380, 500)
     assert ">\n          Add Agent\n        </Button>" in region or (
         "Add Agent" in region and "Plus" in region
     ), (
@@ -72,7 +72,7 @@ def test_create_agent_modal_title_says_add_agent() -> None:
     flow makes a DB row + token; there is no deployment step, so
     calling the modal "Deploy Agent" is wrong copy."""
     src = _read(AGENTS_TSX)
-    region = _slice_lines(src, 380, 460)
+    region = _slice_lines(src, 380, 500)
     assert "<DialogTitle" in region and "Add Agent" in region, (
         "CreateAgentModal DialogTitle must say 'Add Agent'"
     )
@@ -87,7 +87,7 @@ def test_create_agent_modal_description_does_not_say_deployment() -> None:
     Pre-fix it read 'Configure a new agent for deployment.' which made
     the same false promise as the button label."""
     src = _read(AGENTS_TSX)
-    region = _slice_lines(src, 380, 460)
+    region = _slice_lines(src, 380, 500)
     assert "Configure a new agent for deployment." not in region, (
         "CreateAgentModal description still claims a deployment "
         "happens — rename to make clear the worker is started "
@@ -103,7 +103,7 @@ def test_create_agent_modal_submit_button_says_add_agent() -> None:
     """The submit button inside the modal footer must read ``Add Agent``
     (and the pending state must not say 'Deploying...')."""
     src = _read(AGENTS_TSX)
-    region = _slice_lines(src, 380, 460)
+    region = _slice_lines(src, 380, 500)
     assert "Add Agent" in region, (
         "CreateAgentModal submit button must say 'Add Agent'"
     )
@@ -120,7 +120,7 @@ def test_empty_state_copy_says_add_your_first() -> None:
     """The empty-state shown when no agents exist must invite the user
     to ``Add your first agent`` — not ``Deploy your first agent``."""
     src = _read(AGENTS_TSX)
-    region = _slice_lines(src, 1880, 1930)
+    region = _slice_lines(src, 2000, 2050)
     assert "Add your first agent to get started." in region, (
         "Empty-state copy must say 'Add your first agent to get "
         "started.' (was 'Deploy your first agent ...')"

@@ -49,6 +49,10 @@ export interface Agent {
   // the Agents table and the "X agents currently in wait" count on
   // the Settings page. Always FALSE for the synthetic Admin row.
   wait_for_events_in_flight?: boolean
+  // Phase 2 Wave 2b (plan §2e): role tier. Defaults to 'worker' for
+  // any legacy row that pre-dates Wave 1a's migration. 'manager'
+  // grants the manager-tier privileges Wave 3 enforces on tool calls.
+  agent_role?: 'worker' | 'manager'
 }
 
 export interface Task {
@@ -474,6 +478,10 @@ class ApiClient {
     agent_id: string
     capabilities?: string[]
     working_directory?: string
+    // Phase 2 Wave 2b (plan §2e): role tier for the new agent.
+    // 'worker' (default) keeps legacy behaviour; 'manager' opts the
+    // agent into the manager-tier privileges that ship in Wave 3.
+    agent_role?: 'worker' | 'manager'
   }): Promise<{ success: boolean; message: string }> {
     // PR D (prancy-napping-pie): the operator session cookie carries
     // auth — no body-token field. Browsers attach the cookie
@@ -522,6 +530,10 @@ class ApiClient {
       // Event-coord PR-1: per-agent wake-loop toggle. Whitelisted on
       // the server side in /api/agents/<id>/edit.
       auto_event_loop?: boolean
+      // Phase 2 Wave 2b (plan §2e): promote a worker to manager (or
+      // demote). Whitelisted on the server side; the API-boundary
+      // check 422s anything outside {'worker', 'manager'}.
+      agent_role?: 'worker' | 'manager'
     },
   ): Promise<{ success: boolean; agent_id: string; updated: Record<string, unknown>; message: string }> {
     return this.request(
