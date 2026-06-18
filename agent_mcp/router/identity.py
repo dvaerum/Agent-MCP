@@ -71,6 +71,7 @@ __all__ = [
     "get_user_by_username",
     "hash_password",
     "init_router_db",
+    "is_project_member",
     "list_user_projects",
     "prune_expired_sessions",
     "remove_project_membership",
@@ -439,6 +440,35 @@ def remove_project_membership(user_id: str, project_name: str) -> None:
             """,
             (user_id, project_name),
         )
+
+
+def is_project_member(user_id: str, project_name: str) -> bool:
+    """Return True iff ``user_id`` has a row in ``project_membership``
+    for ``project_name``.
+
+    Phase 1 PR D helper. The router's ``require_operator_session``
+    middleware calls this on every project-scoped dashboard mutation
+    so a logged-in operator without explicit access to ``project_name``
+    gets a clean 401 rather than reaching the backend.
+
+    Returns False on a missing ``project_membership`` table — same
+    "treat as no access" defence as ``get_session``'s missing-row
+    branch. The router's startup hook always runs migrations before
+    the first request, so the missing-table case is genuinely the
+    "router.db not initialised yet" path.
+    """
+    try:
+        with _connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT 1 FROM project_membership
+                WHERE user_id = ? AND project_name = ?
+                """,
+                (user_id, project_name),
+            )
+            return cur.fetchone() is not None
+    except sqlite3.OperationalError:
+        return False
 
 
 def list_user_projects(user_id: str) -> list[str]:

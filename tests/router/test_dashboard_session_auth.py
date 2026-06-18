@@ -27,7 +27,14 @@ from __future__ import annotations
 import pytest
 
 
-pytestmark = pytest.mark.asyncio
+# These tests exercise the auth gate directly, so we MUST start
+# without the sentinel-operator cookie the router/conftest.py
+# auto-attaches via the overridden ``aiohttp_client`` fixture —
+# otherwise the 401 path can't be observed.
+pytestmark = [
+    pytest.mark.asyncio,
+    pytest.mark.no_auth_seed_session,
+]
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
@@ -167,6 +174,7 @@ async def test_project_scoped_route_requires_membership(
     assert resp.status == 401, await resp.text()
 
 
+@pytest.mark.no_seed_operator
 async def test_first_operator_inherits_all_projects(
     aiohttp_client, router_app, register_project,
 ) -> None:
@@ -179,6 +187,10 @@ async def test_first_operator_inherits_all_projects(
     middleware doesn't 401 us at the router edge — the request flows
     through to ``backend_api_handler`` (which may 502 when the
     backend isn't running, but 502 != 401 → dep passed).
+
+    ``no_seed_operator`` skips the sentinel bootstrap so alice
+    becomes the FIRST user — which triggers PR B's retroactive
+    membership pass over the already-registered ``beta``.
     """
     register_project("beta")
     _seed_user("alice")

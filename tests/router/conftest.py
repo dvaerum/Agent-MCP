@@ -46,17 +46,24 @@ import pytest
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Register custom marker for opting out of the sentinel-operator seed.
+    """Register custom markers for the router test fixtures.
 
-    The ``router_module`` fixture seeds a sentinel operator via the
-    PR B env-var bootstrap so the PR C empty-users redirect middleware
-    is dormant in legacy tests (which don't care about identity at
-    all). Tests that DO need the "no users" state (the setup-wizard
-    tests in particular) decorate with ``@pytest.mark.no_seed_operator``.
+      * ``no_seed_operator``: skip the sentinel-operator bootstrap.
+        Used by the setup-wizard tests that exercise the empty-users
+        state directly.
+      * ``no_auth_seed_session``: skip the auto-login of the sentinel
+        operator into the aiohttp TestClient's cookie jar (PR D).
+        Used by tests that exercise the unauthenticated 401 path
+        explicitly.
     """
     config.addinivalue_line(
         "markers",
         "no_seed_operator: do not seed a sentinel operator into router.db",
+    )
+    config.addinivalue_line(
+        "markers",
+        "no_auth_seed_session: do not pre-login the sentinel operator "
+        "into the aiohttp TestClient's cookie jar",
     )
 
 
@@ -259,6 +266,88 @@ def router_app(router_module):
     return router_module.make_app()
 
 
+_SENTINEL_USERNAME = "test_sentinel_op"
+_SENTINEL_PASSWORD = "test_sentinel_pw"
+
+
+import pytest_asyncio  # noqa: E402 — kept local to the fixture
+
+
+@pytest_asyncio.fixture
+async def aiohttp_client(aiohttp_client_cls, request, router_env):
+    """Override pytest-aiohttp's ``aiohttp_client`` to auto-login.
+
+    PR D (prancy-napping-pie) added a router-side middleware that
+    enforces an operator session on every dashboard mutation/read.
+    Legacy tests don't care about identity — they care about the
+    proxy, registry, dashboard, etc. — so we automatically log in
+    the sentinel operator seeded by ``router_module`` and attach
+    the resulting session cookie to the TestClient's jar.
+
+    Tests that need the unauthenticated state (the new PR D
+    auth-gate tests, plus the setup-wizard tests that rely on the
+    empty-users middleware bouncing them) opt out with
+    ``@pytest.mark.no_auth_seed_session`` (or implicitly via
+    ``@pytest.mark.no_seed_operator``, which skips the operator
+    seed entirely).
+
+    Implementation notes:
+
+    * The factory wrapper around pytest-aiohttp's own ``go``
+      (re-implemented here because the upstream fixture's ``go`` is
+      not exposed as a public API). On exit we close every TestClient
+      we made.
+    * The login round-trip uses ``client.post("/agent-mcp/login", ...)``
+      which goes through the SAME middleware stack we're about to test
+      against — and the login route is allow-listed by the middleware,
+      so the post never 401s. On a successful login the TestClient's
+      cookie_jar absorbs ``Set-Cookie`` and replays it on subsequent
+      requests automatically.
+    """
+    from aiohttp.test_utils import TestServer
+
+    skip_login = (
+        request.node.get_closest_marker("no_auth_seed_session") is not None
+        or request.node.get_closest_marker("no_seed_operator") is not None
+    )
+
+    clients: list = []
+    servers: list = []
+
+    async def go(app, **kwargs):
+        server = TestServer(app, host="127.0.0.1")
+        await server.start_server()
+        servers.append(server)
+        client = aiohttp_client_cls(server, **kwargs)
+        await client.start_server()
+        clients.append(client)
+        if not skip_login:
+            # The sentinel operator is seeded by ``router_module``
+            # via the env-var bootstrap. Convert that into a live
+            # session by hitting /login; the cookie jar persists.
+            resp = await client.post(
+                "/agent-mcp/login",
+                data={
+                    "username": _SENTINEL_USERNAME,
+                    "password": _SENTINEL_PASSWORD,
+                },
+                allow_redirects=False,
+            )
+            # On a 303 the cookie is set; on anything else, leave
+            # the client as-is so the test can introspect the failure.
+            assert resp.status in (303, 401), (
+                f"unexpected sentinel login status {resp.status}"
+            )
+        return client
+
+    yield go
+
+    for c in clients:
+        await c.close()
+    for s in servers:
+        await s.close()
+
+
 @pytest.fixture
 def write_dashboard_file(router_env: _RouterEnv) -> Callable[[str, str], Path]:
     """Helper to drop an HTML/JS/etc file into the dashboard tree."""
@@ -274,14 +363,61 @@ def write_dashboard_file(router_env: _RouterEnv) -> Callable[[str, str], Path]:
 
 @pytest.fixture
 def register_project(
-    router_module, router_env: _RouterEnv
+    router_module, router_env: _RouterEnv, request,
 ) -> Callable[[str, str | None], Path]:
-    """Register a project in the test registry, returning its workspace."""
+    """Register a project in the test registry, returning its workspace.
+
+    Phase 1 PR D: after registering, also grant the sentinel
+    operator membership in the project so the
+    ``require_operator_session_middleware`` passes the membership
+    check for tests that hit ``/agent-mcp/api/<name>/...`` or
+    ``/agent-mcp/app/<name>/...`` with the auto-attached sentinel
+    cookie.
+
+    Tests marked ``@pytest.mark.no_seed_operator`` skip the
+    sentinel-operator bootstrap entirely; for those, the membership
+    grant is a no-op (no operator exists to grant to).
+
+    Tests marked ``@pytest.mark.no_auth_seed_session`` still want
+    the sentinel operator to exist (so the empty-users middleware
+    doesn't bounce them) but want to control the cookie themselves;
+    they may seed their own users + memberships per scenario.
+    """
+    skip_seed_op = (
+        request.node.get_closest_marker("no_seed_operator") is not None
+    )
 
     def _register(name: str, workspace: str | None = None) -> Path:
         ws = Path(workspace) if workspace else (router_env.root / "ws" / name)
         ws.mkdir(parents=True, exist_ok=True)
         router_module._REGISTRY.register(name, str(ws))
+        if not skip_seed_op:
+            # router.db migrations run on app startup; for tests that
+            # haven't built the app yet, run them eagerly so the
+            # users table exists.
+            from agent_mcp.router import identity as _identity
+            try:
+                _identity.run_router_migrations_upgrade()
+            except Exception:  # pragma: no cover - defensive
+                pass
+            try:
+                row = _identity.get_user_by_username(_SENTINEL_USERNAME)
+            except Exception:
+                row = None
+            if row is None:
+                # The on_startup bootstrap hasn't fired yet (e.g.,
+                # single-tenant test variants build the app
+                # differently); create the sentinel here.
+                try:
+                    _identity.create_user(
+                        username=_SENTINEL_USERNAME,
+                        password=_SENTINEL_PASSWORD,
+                    )
+                    row = _identity.get_user_by_username(_SENTINEL_USERNAME)
+                except Exception:  # pragma: no cover - defensive
+                    row = None
+            if row is not None:
+                _identity.add_project_membership(row["user_id"], name)
         return ws
 
     return _register

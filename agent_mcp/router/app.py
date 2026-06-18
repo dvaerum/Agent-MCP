@@ -2566,8 +2566,19 @@ def make_app(
     from .setup_wizard import empty_users_redirect_middleware
     from .login import register_login_routes
     from .setup_wizard import register_setup_routes
+    from .auth_middleware import require_operator_session_middleware
 
-    app = web.Application(middlewares=[empty_users_redirect_middleware])
+    # Middleware order matters: empty-users-redirect fires FIRST so a
+    # fresh deploy with no operator account 303s to /setup before the
+    # session-cookie gate has anything to gate. Once an operator
+    # exists, the redirect middleware no-ops and the session gate
+    # takes over.
+    app = web.Application(
+        middlewares=[
+            empty_users_redirect_middleware,
+            require_operator_session_middleware,
+        ],
+    )
     # Eagerly allocate the proxy-task tracking set so `_track_proxy_task`
     # never writes to a frozen/started app dict (aiohttp emits a
     # DeprecationWarning for mutations after startup).
