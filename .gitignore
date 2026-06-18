@@ -387,3 +387,10 @@ conversations/
 **/conversations/
 session-*/
 **/session-*/.playwright-mcp/
+
+# VM scratch produced by `nix run .#vm-dev` and friends — never commit.
+result
+result-*
+*.qcow2
+vm-dev-persistent-data/
+vm-persistent-data/

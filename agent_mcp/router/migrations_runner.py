@@ -73,7 +73,21 @@ def run_router_migrations_upgrade(revision: str = "head") -> None:
     one-off invocations benefit from the autocreate.
     """
     db_path = get_router_db_path()
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    # Production deploys provision /var/lib/agent-mcp via systemd
+    # tmpfiles/StateDirectory, owned by the service user; the
+    # parent /var/lib is root-only-writable, so a fallback mkdir
+    # from inside the service process can't create siblings of
+    # already-existing dirs. If the leaf already exists with the
+    # right owner (the production case), this swallowed
+    # PermissionError is the no-op we want; if it doesn't exist
+    # and we can't create it, re-raise so the operator sees the
+    # missing-path problem instead of a confusing later sqlite
+    # error.
+    try:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        if not db_path.parent.exists():
+            raise
     config = _build_config(db_path)
     logger.info(
         "Applying Alembic migrations to router DB %s (target=%s)",

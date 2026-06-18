@@ -45,6 +45,21 @@ from typing import Callable
 import pytest
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    """Register custom marker for opting out of the sentinel-operator seed.
+
+    The ``router_module`` fixture seeds a sentinel operator via the
+    PR B env-var bootstrap so the PR C empty-users redirect middleware
+    is dormant in legacy tests (which don't care about identity at
+    all). Tests that DO need the "no users" state (the setup-wizard
+    tests in particular) decorate with ``@pytest.mark.no_seed_operator``.
+    """
+    config.addinivalue_line(
+        "markers",
+        "no_seed_operator: do not seed a sentinel operator into router.db",
+    )
+
+
 # ── Env scaffolding ─────────────────────────────────────────────────
 
 
@@ -163,12 +178,27 @@ def router_module(
     router_env: _RouterEnv,
     systemctl_stub: _SystemctlRecorder,
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ):
     """Import ``agent_mcp.router.app`` with all side-effects test-scoped.
 
     Each test that requests this fixture gets a freshly re-imported
     module — module-level state (token cache, last_active, ensure
     locks, the global registry handle) is reset by definition.
+
+    Phase 1 PR C (prancy-napping-pie) added an empty-users redirect
+    middleware that bounces every ``/agent-mcp/`` request to
+    ``/agent-mcp/setup`` until an operator account exists. The legacy
+    router tests don't care about identity at all — they test the
+    proxy, registry, dashboard, etc. — so we seed a sentinel operator
+    via the existing env-var bootstrap path so ``init_router_db``
+    (called from ``make_app``'s ``on_startup`` hook) creates one
+    automatically and the middleware is a no-op by the time the test
+    issues its first request.
+
+    Tests that DO want the empty-users state (the setup-wizard
+    tests in particular) opt out with the ``no_seed_operator``
+    pytest mark — checked via the request fixture below.
     """
     # Drop any prior copy so module-level env reads run again.
     for mod_name in (
@@ -176,8 +206,19 @@ def router_module(
         "agent_mcp.router.app",
         "agent_mcp.router.project_orchestrator",
         "agent_mcp.router.project_registry",
+        "agent_mcp.router.identity",
+        "agent_mcp.router.login",
+        "agent_mcp.router.setup_wizard",
+        "agent_mcp.router.migrations_runner",
     ):
         sys.modules.pop(mod_name, None)
+    if request.node.get_closest_marker("no_seed_operator") is None:
+        monkeypatch.setenv(
+            "AGENT_MCP_BOOTSTRAP_USERNAME", "test_sentinel_op"
+        )
+        monkeypatch.setenv(
+            "AGENT_MCP_BOOTSTRAP_PASSWORD", "test_sentinel_pw"
+        )
     router = importlib.import_module("agent_mcp.router.app")
     # PR-C extracted the lifecycle state machine into
     # ``project_orchestrator``; ``router/app.py`` re-exports

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-mcp"
-version = "5.0.57"
+version = "5.0.58"
 description = "AgentMCP v2.5 - Enhanced multi-agent system with tmux integration and worktree support"
 authors = [
     {name = "Luis Alejandro Rincon", email = "alejandro@rinconnect.com"},
@@ -86,6 +86,10 @@ include = ["agent_mcp*"]
     "router/migrations/*.mako",
     "router/migrations/README",
     "router/migrations/versions/*.py",
+    # Router-level login + setup-wizard templates (Phase 1 PR C,
+    # prancy-napping-pie). Jinja loads these via FileSystemLoader
+    # rooted at agent_mcp/router/templates/.
+    "router/templates/*.html",
 ]
 
 [tool.rye]

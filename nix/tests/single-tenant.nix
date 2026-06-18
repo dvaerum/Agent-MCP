@@ -77,6 +77,14 @@ pkgs.testers.nixosTest {
       after = [ "fake-openai.service" "network.target" ];
       environment = {
         AGENT_MCP_PROJECTS_FILE = "/home/testuser/.config/agent-mcp/projects.local.json";
+        # Phase 1 PR B (prancy-napping-pie): see multi-tenant.nix.
+        AGENT_MCP_ROUTER_DB = "/home/testuser/.config/agent-mcp/router.db";
+        # Phase 1 PR C: seed a sentinel operator via the env-var
+        # bootstrap so the empty-users redirect middleware is dormant
+        # — this VM test asserts routing/URL behaviour that predates
+        # auth and shouldn't be wedged behind the first-boot wizard.
+        AGENT_MCP_BOOTSTRAP_USERNAME = "ci-sentinel";
+        AGENT_MCP_BOOTSTRAP_PASSWORD = "ci-sentinel-pw";
         AGENT_MCP_SOCK_DIR = "/run/agent-mcp";
         AGENT_MCP_DASHBOARD_DIR = "${packagedPkgs.agentMcpDashboard}/share/agent-mcp-dashboard";
         AGENT_MCP_EXTERNAL_URL = "http://localhost:${toString ports.routerPort}";

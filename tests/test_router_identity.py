@@ -441,3 +441,60 @@ def test_cli_create_operator_duplicate_username(
     assert second.returncode != 0
     combined = (second.stdout + second.stderr).lower()
     assert "exists" in combined or "duplicate" in combined or "already" in combined
+
+
+def test_run_router_migrations_tolerates_existing_unwritable_parent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When `/var/lib/agent-mcp` (the production parent dir) is already
+    provisioned by systemd-tmpfiles and the service can't escalate to
+    create siblings, `run_router_migrations_upgrade` should swallow the
+    `PermissionError` from `mkdir(parents=True)` rather than crash.
+
+    Simulates the case by stubbing `Path.mkdir` to raise `PermissionError`
+    while the parent already exists — the same shape the VM hit on PR C.
+    """
+    db_path = tmp_path / "router.db"
+    monkeypatch.setenv("AGENT_MCP_ROUTER_DB", str(db_path))
+    # The parent (tmp_path) already exists.
+
+    from pathlib import Path as _Path
+
+    original_mkdir = _Path.mkdir
+
+    def raising_mkdir(self, *args, **kwargs):
+        if str(self) == str(db_path.parent):
+            raise PermissionError(13, "Permission denied", str(self))
+        return original_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(_Path, "mkdir", raising_mkdir)
+
+    from agent_mcp.router import migrations_runner
+
+    importlib.reload(migrations_runner)
+    # Should NOT raise — parent exists, swallowed PermissionError is OK.
+    migrations_runner.run_router_migrations_upgrade()
+    assert db_path.exists()
+
+
+def test_run_router_migrations_re_raises_when_parent_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If the parent dir genuinely doesn't exist AND mkdir fails, we want
+    the operator to see the missing-path problem — re-raise the
+    PermissionError instead of swallowing it into a later sqlite error."""
+    missing = tmp_path / "missing" / "router.db"
+    monkeypatch.setenv("AGENT_MCP_ROUTER_DB", str(missing))
+
+    from pathlib import Path as _Path
+
+    def always_raising_mkdir(self, *args, **kwargs):
+        raise PermissionError(13, "Permission denied", str(self))
+
+    monkeypatch.setattr(_Path, "mkdir", always_raising_mkdir)
+
+    from agent_mcp.router import migrations_runner
+
+    importlib.reload(migrations_runner)
+    with pytest.raises(PermissionError):
+        migrations_runner.run_router_migrations_upgrade()
