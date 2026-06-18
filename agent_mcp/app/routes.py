@@ -540,6 +540,24 @@ async def create_agent_dashboard_api_route(
         agent_id = data.get("agent_id")
         capabilities = data.get("capabilities", []) # Optional
         working_directory = data.get("working_directory") # Optional
+        # Phase 2 Wave 2b (plan §2e): dashboard's Role dropdown ships
+        # ``agent_role`` ∈ {worker, manager}. Default ``'worker'``
+        # mirrors the column default added by Wave 1a (v5.0.61, PR
+        # #182) so legacy callers (and the back-compat
+        # /api/create-agent alias) keep behaving identically. Reject
+        # any other value at the API boundary with 422 — the CHECK
+        # constraint would also catch it at the DB layer, but bubbling
+        # an IntegrityError as a 500 would be a worse operator
+        # experience than a clean validation message.
+        agent_role = data.get("agent_role", "worker")
+        if agent_role not in ("worker", "manager"):
+            return JSONResponse(
+                {"message": (
+                    f"Invalid agent_role {agent_role!r}: must be "
+                    "'worker' or 'manager'."
+                )},
+                status_code=422,
+            )
         # The inner tool call still wants an admin token to satisfy
         # its own decorator chain; the session-authenticated dashboard
         # caller doesn't ferry one, so pull from the in-process
@@ -567,7 +585,10 @@ async def create_agent_dashboard_api_route(
             "token": admin_auth_token, # The tool_impl will verify this again
             "agent_id": agent_id,
             "capabilities": capabilities,
-            "working_directory": working_directory
+            "working_directory": working_directory,
+            # Wave 2b: thread the validated role into the tool impl,
+            # which persists it via agent_repo.create(... agent_role=).
+            "agent_role": agent_role,
         }
         
         # Call the already refactored tool implementation
@@ -821,11 +842,30 @@ async def edit_agent_api_route(
         # toggle) joins the editable list — dashboard's agent-edit
         # modal flips it to opt this agent out of the wake-loop
         # bootstrap shipped in PR-2.
+        #
+        # Phase 2 Wave 2b (plan §2e): `agent_role` joins the editable
+        # list so the dashboard's Edit Agent modal can promote a
+        # worker to manager (or demote). The Pydantic-equivalent
+        # validation lives just below — rejecting anything outside
+        # {worker, manager} with 422 so the CHECK constraint never
+        # surfaces as a 500.
         editable = (
             'capabilities', 'color', 'working_directory', 'aoe_session_id',
-            'auto_event_loop',
+            'auto_event_loop', 'agent_role',
         )
         updates = {k: data[k] for k in editable if k in data}
+
+        if 'agent_role' in updates and updates['agent_role'] not in (
+            'worker', 'manager',
+        ):
+            return JSONResponse(
+                {"error": (
+                    f"Invalid agent_role {updates['agent_role']!r}: "
+                    "must be 'worker' or 'manager'."
+                )},
+                status_code=422,
+            )
+
         if not updates:
             return JSONResponse(
                 {"error": "No editable fields supplied. Accepts any of: "

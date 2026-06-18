@@ -143,6 +143,13 @@ _MUTABLE_FIELDS: set[str] = {
     # the repo's transaction-aware ``update_field`` seam instead of
     # owning a raw UPDATE.
     "terminated_at",
+    # Phase 2 Wave 2b (plan §2e): the dashboard's Edit Agent modal
+    # promotes a worker to manager (or demotes) by patching
+    # ``agent_role``. The API-boundary check in
+    # ``edit_agent_api_route`` already restricts the value to
+    # {'worker', 'manager'} before reaching the repo; the column
+    # CHECK constraint (Wave 1a) is the last-resort guard.
+    "agent_role",
 }
 
 
@@ -180,6 +187,9 @@ def _agent_to_dict(row: Agent) -> Dict[str, Any]:
         # ``fetch_events_since`` (PR-2).
         "auto_event_loop": getattr(row, "auto_event_loop", True),
         "last_event_seen_at": getattr(row, "last_event_seen_at", None),
+        # Phase 2 Wave 2b: persisted by Wave 1a's migration with
+        # ``DEFAULT 'worker'`` + CHECK in {'worker', 'manager'}.
+        "agent_role": getattr(row, "agent_role", "worker"),
     }
     raw_caps = data.get("capabilities")
     if isinstance(raw_caps, str):
@@ -580,6 +590,7 @@ class AgentRepository:
         current_task: Optional[str] = None,
         working_directory: str,
         color: Optional[str] = None,
+        agent_role: str = "worker",
         connection: Any = None,
     ) -> Dict[str, Any]:
         """INSERT an agent row, update both caches, publish ``"agent.created"``.
@@ -619,6 +630,11 @@ class AgentRepository:
         now = datetime.datetime.now().isoformat()
         caps_json = json.dumps(capabilities or [])
 
+        # Phase 2 Wave 2b: persist ``agent_role`` through every code
+        # path (raw-cursor, caller-owned-session, repo-owned-session).
+        # The column CHECK constraint (Wave 1a, v5.0.61) is the
+        # last-resort guard; callers validate the value at the API
+        # boundary before reaching the repo.
         if connection is not None and not hasattr(connection, "query"):
             cur = connection
             cur.execute(
@@ -626,13 +642,13 @@ class AgentRepository:
                 INSERT INTO agents (
                     token, agent_id, capabilities, created_at, status,
                     current_task, working_directory, color,
-                    terminated_at, updated_at, aoe_session_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    terminated_at, updated_at, aoe_session_id, agent_role
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     token, agent_id, caps_json, now, status,
                     current_task, working_directory, color,
-                    None, now, None,
+                    None, now, None, agent_role,
                 ),
             )
         elif connection is not None:
@@ -649,6 +665,7 @@ class AgentRepository:
                 terminated_at=None,
                 updated_at=now,
                 aoe_session_id=None,
+                agent_role=agent_role,
             )
             session.add(row)
             session.flush()
@@ -666,6 +683,7 @@ class AgentRepository:
                     terminated_at=None,
                     updated_at=now,
                     aoe_session_id=None,
+                    agent_role=agent_role,
                 )
                 session.add(row)
                 session.commit()
@@ -700,6 +718,7 @@ class AgentRepository:
                 "color": color,
                 "terminated_at": None,
                 "updated_at": now,
+                "agent_role": agent_role,
             }
 
         # Cache + EventBus only on the standalone path. With a
