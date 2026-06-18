@@ -200,6 +200,152 @@ in {
       '';
     };
 
+    sso = {
+      # Phase 3 Wave 3 (prancy-napping-pie): two SSO front-ends, exactly
+      # one active at a time. OIDC runs the authorization-code + PKCE
+      # flow against an external IdP; proxy-header trust lets an
+      # upstream reverse proxy (nginx + oauth2-proxy, traefik +
+      # forward-auth, tailscale-funnel + Tailnet identity, …) supply
+      # the username via a header. The router refuses to start when
+      # both are configured. The dashboard's System → SSO tab renders
+      # the live config so a sysadmin can verify the deploy without
+      # journalctl access.
+      oidc = lib.mkOption {
+        type = lib.types.nullOr (lib.types.submodule {
+          options = {
+            issuer = lib.mkOption {
+              type = lib.types.str;
+              example = "https://keycloak.example.com/realms/agent-mcp";
+              description = ''
+                OIDC issuer URL. The router fetches its discovery
+                document at `''${issuer}/.well-known/openid-configuration`
+                and binds the resulting authorize / token endpoints.
+              '';
+            };
+            clientId = lib.mkOption {
+              type = lib.types.str;
+              example = "agent-mcp";
+              description = "RP client identifier registered with the IdP.";
+            };
+            clientSecretFile = lib.mkOption {
+              type = lib.types.path;
+              example = "/run/secrets/agent-mcp-oidc-client-secret";
+              description = ''
+                Path to a chmod-0600 file holding the OIDC client
+                secret. The router reads it once at startup; secret
+                rotation is "edit the file, restart the unit". Matches
+                the existing sops-nix secret pattern.
+              '';
+            };
+            providerName = lib.mkOption {
+              type = lib.types.str;
+              default = "SSO";
+              example = "Keycloak";
+              description = ''
+                Display name on the login page's "Sign in with ..."
+                button. Purely cosmetic; the router doesn't validate
+                this against the issuer.
+              '';
+            };
+            groupMapping = lib.mkOption {
+              type = lib.types.attrsOf lib.types.str;
+              default = { };
+              example = {
+                "eng-backend" = "backend-team";
+                "*" = "";
+              };
+              description = ''
+                Map IdP-supplied group claims to agent-mcp groups.
+                Each entry is `oidc_group_name = agent_mcp_group_name`.
+                Unmapped claims are silently ignored.
+
+                Special: an entry with key `"*"` enables the wildcard
+                JIT escape — every unmatched group claim auto-creates
+                a sanitized agent-mcp group (lowercase, dashes only)
+                and the user is added.
+              '';
+            };
+            scopes = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ "openid" "profile" "email" "groups" ];
+              description = ''
+                OAuth2 scopes requested at the IdP. Defaults to
+                openid + profile + email + groups; trim if the IdP
+                rejects unknown scopes.
+              '';
+            };
+            redirectUrl = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              example = "https://router.example.com/agent-mcp/sso/callback";
+              description = ''
+                Override the redirect URL handed to the IdP.
+                Defaults to `''${externalUrl}/agent-mcp/sso/callback`
+                — only set this if the IdP's registered redirect URI
+                differs from the natural one.
+              '';
+            };
+          };
+        });
+        default = null;
+        description = ''
+          OIDC SSO. When non-null, the dashboard's login page swaps
+          the username/password form for a single "Sign in with
+          ''${providerName}" button that initiates the OAuth2
+          authorization-code + PKCE flow. Mutually exclusive with
+          `sso.proxyHeader`.
+        '';
+      };
+
+      proxyHeader = lib.mkOption {
+        type = lib.types.nullOr (lib.types.submodule {
+          options = {
+            trustHeader = lib.mkOption {
+              type = lib.types.str;
+              default = "Remote-User";
+              description = ''
+                HTTP header carrying the trusted username. Common
+                values: `Remote-User` (nginx + oauth2-proxy),
+                `X-Forwarded-User` (traefik + forward-auth),
+                `Tailscale-User-Login` (tailscale-serve).
+              '';
+            };
+            trustedIps = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ "127.0.0.1" "::1" ];
+              example = [ "127.0.0.1" "::1" "10.0.0.5" ];
+              description = ''
+                Source IPs the router will accept the trusted header
+                from. CRITICAL SAFETY RULE: any other source is
+                treated as a spoof attempt and the header is silently
+                ignored. Default is localhost-only — appropriate for
+                deploys where the upstream proxy runs on the same
+                host (the common pattern).
+              '';
+            };
+            defaultIsSysadmin = lib.mkOption {
+              type = lib.types.bool;
+              default = false;
+              description = ''
+                When a JIT-created user lands via the proxy-header
+                path, give them the sysadmin bit. Default false —
+                the operator promotes users to sysadmin manually
+                via the dashboard. Set true ONLY when the upstream
+                proxy is your sole, well-trusted auth boundary.
+              '';
+            };
+          };
+        });
+        default = null;
+        description = ''
+          Proxy-header trust SSO. When non-null, the router accepts
+          the configured header as a session-equivalent identity
+          provided the request originates from one of `trustedIps`.
+          Mutually exclusive with `sso.oidc`.
+        '';
+      };
+    };
+
     singleProject = lib.mkOption {
       type = lib.types.nullOr (lib.types.submodule {
         options = {
@@ -298,6 +444,19 @@ in {
           dashboard would have no project to point at).
         '';
       }
+      {
+        # Phase 3 Wave 3 (prancy-napping-pie): OIDC + proxy-header
+        # are mutually exclusive. Catch at evaluation so the
+        # operator never reaches the runtime SSOConfigError.
+        assertion = !(cfg.sso.oidc != null && cfg.sso.proxyHeader != null);
+        message = ''
+          services.agent-mcp.sso.oidc and services.agent-mcp.sso.proxyHeader
+          are mutually exclusive. Pick one: OIDC (authorization-code
+          flow against an external IdP) OR proxy-header trust
+          (upstream proxy supplies the username). Setting both would
+          create surprising precedence rules and a security footgun.
+        '';
+      }
     ];
 
     home.packages = [
@@ -372,6 +531,39 @@ in {
             "AGENT_MCP_IDLE_SEC=${toString cfg.router.idleSec}"
             "AGENT_MCP_README_HTML=${resolvedPkgs.readmeHtml}"
             "AGENT_MCP_INSTALLER_TEMPLATE=${resolvedPkgs.installerTemplate}"
+          ]
+          # Phase 3 Wave 3 (prancy-napping-pie): SSO env vars are
+          # appended conditionally. OIDC and proxy-header are
+          # mutually exclusive (enforced via the assertion above);
+          # both branches expand to [] when not configured, which
+          # leaves the legacy username/password mode active.
+          ++ lib.optionals (cfg.sso.oidc != null) [
+            "AGENT_MCP_SSO_OIDC_ISSUER=${cfg.sso.oidc.issuer}"
+            "AGENT_MCP_SSO_OIDC_CLIENT_ID=${cfg.sso.oidc.clientId}"
+            "AGENT_MCP_SSO_OIDC_CLIENT_SECRET_FILE=${
+              toString cfg.sso.oidc.clientSecretFile
+            }"
+            "AGENT_MCP_SSO_OIDC_PROVIDER_NAME=${cfg.sso.oidc.providerName}"
+            "AGENT_MCP_SSO_OIDC_GROUP_MAPPING=${
+              builtins.toJSON cfg.sso.oidc.groupMapping
+            }"
+            "AGENT_MCP_SSO_OIDC_SCOPES=${
+              lib.concatStringsSep " " cfg.sso.oidc.scopes
+            }"
+          ]
+          ++ lib.optionals (
+            cfg.sso.oidc != null && cfg.sso.oidc.redirectUrl != null
+          ) [
+            "AGENT_MCP_SSO_OIDC_REDIRECT_URL=${cfg.sso.oidc.redirectUrl}"
+          ]
+          ++ lib.optionals (cfg.sso.proxyHeader != null) [
+            "AGENT_MCP_SSO_PROXY_HEADER=${cfg.sso.proxyHeader.trustHeader}"
+            "AGENT_MCP_SSO_PROXY_TRUSTED_IPS=${
+              lib.concatStringsSep "," cfg.sso.proxyHeader.trustedIps
+            }"
+            "AGENT_MCP_SSO_PROXY_DEFAULT_SYSADMIN=${
+              if cfg.sso.proxyHeader.defaultIsSysadmin then "true" else "false"
+            }"
           ];
           # systemd creates and owns %t/agent-mcp/ at 0700 so the per-
           # project subdirs the template creates inherit a private
