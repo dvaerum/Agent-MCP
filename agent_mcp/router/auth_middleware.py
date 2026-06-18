@@ -65,6 +65,14 @@ _UNAUTH_PREFIXES = (
     "/agent-mcp/assets/",
     "/agent-mcp/mcp/",
     "/agent-mcp/__projects",
+    # Legacy MCP transport paths — exempt so the route layer can
+    # return its semantic 404 ('this URL shape is gone') instead of
+    # the middleware pre-empting with a 401. Agent-side auth on the
+    # live MCP path lives in backend_mcp_handler via the bearer
+    # token; cookies don't apply to MCP traffic.
+    "/agent-mcp/__sse",
+    "/agent-mcp/__messages",
+    "/agent-mcp/__mcp",
 )
 
 
