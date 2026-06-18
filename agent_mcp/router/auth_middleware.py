@@ -97,6 +97,22 @@ _NON_PROJECT_API_SEGMENTS = frozenset({"projects"})
 # ── Helpers ────────────────────────────────────────────────────────
 
 
+def _single_tenant_mode() -> bool:
+    """Return True iff the router is running in single-tenant mode.
+
+    Lazy import so this module stays free of app-level import-time
+    side effects. Single-tenant deploys (ADR-0008) are pinned to one
+    operator-owned host; Phase 1 of the operator-login plan does not
+    gate that audience — Phase 3 will revisit when groups + system
+    perms arrive.
+    """
+    try:
+        from . import app as _app
+        return _app.SINGLE_TENANT_NAME is not None
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
 def _path_is_unauth(path: str) -> bool:
     """Return True iff ``path`` skips the operator-session gate."""
     if path in _UNAUTH_EXACT:
@@ -207,6 +223,14 @@ async def require_operator_session_middleware(
     if not path.startswith("/agent-mcp"):
         return await handler(request)
     if _path_is_unauth(path):
+        return await handler(request)
+    # Single-tenant mode: the deploy is pinned to one operator-owned
+    # box (per ADR-0008); there is no multi-operator audience to gate
+    # against. Phase 1 bypass — Phase 3 revisits when groups + system
+    # perms arrive. Skipping the gate also lets the existing 410
+    # "endpoint disabled in single-tenant mode" responses surface for
+    # __create/__unregister/__rename (covered by nix/tests/single-tenant.nix).
+    if _single_tenant_mode():
         return await handler(request)
 
     user = resolve_current_user(request)
