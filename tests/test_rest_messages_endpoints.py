@@ -109,7 +109,7 @@ async def test_post_messages_rejects_bad_token(tmp_path) -> None:
                 "message_content": "hi",
             },
         )
-        assert r.status_code == 403, r.text
+        assert r.status_code == 401, r.text
 
 
 async def test_post_messages_rejects_missing_recipient(tmp_path) -> None:
@@ -320,7 +320,7 @@ async def test_get_messages_rejects_bad_token(tmp_path) -> None:
         r = admin.client.post(
             "/api/messages/query", json={"token": "x" * 32}
         )
-        assert r.status_code == 403, r.text
+        assert r.status_code == 401, r.text
 
 
 # ---------- PATCH /api/messages/<id> ----------------------------
@@ -384,7 +384,7 @@ async def test_patch_messages_rejects_bad_token(tmp_path) -> None:
             f"/api/messages/{posted['message_id']}",
             json={"token": "x" * 32, "read": True},
         )
-        assert r.status_code == 403, r.text
+        assert r.status_code == 401, r.text
 
 
 # ---------- DELETE /api/messages/<id> ---------------------------
@@ -447,7 +447,7 @@ async def test_delete_messages_rejects_bad_token(tmp_path) -> None:
             f"/api/messages/{posted['message_id']}",
             json={"token": "x" * 32},
         )
-        assert r.status_code == 403, r.text
+        assert r.status_code == 401, r.text
 
 
 # ---------- Broadcast via POST /api/messages -------------------
@@ -497,7 +497,7 @@ async def test_post_messages_broadcast_rejects_bad_token(tmp_path) -> None:
                 "message_content": "nope",
             },
         )
-        assert r.status_code == 403, r.text
+        assert r.status_code == 401, r.text
 
 
 # ---------- POST /api/messages/participants --------------------
@@ -620,4 +620,4 @@ async def test_participants_rejects_bad_token(tmp_path) -> None:
         r = admin.client.post(
             "/api/messages/participants", json={"token": "x" * 32}
         )
-        assert r.status_code == 403, r.text
+        assert r.status_code == 401, r.text

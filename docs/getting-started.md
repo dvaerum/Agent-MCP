@@ -100,6 +100,64 @@ npm run dev
 
 ---
 
+## First-boot setup (operator login)
+
+As of v5.0.59 the dashboard requires operator login (Phase 1 of the
+operator-login plan; ADR-0013). The agent-side MCP transport
+(`/agent-mcp/mcp/<project>`) is unchanged — agents still
+authenticate with the project admin token via the
+`Authorization: Bearer` header. Only the dashboard surface migrates
+to cookie sessions.
+
+Pick the bootstrap path that matches your deploy shape:
+
+### Wizard (browser, easiest)
+
+```bash
+# Start the router (multi-tenant), then browse to the dashboard.
+uv run -m agent_mcp.router
+# Open http://localhost:5454/agent-mcp/
+```
+
+The empty-users state redirects you to `/agent-mcp/setup`. Pick a
+username + password; that account becomes the first operator and
+inherits membership in every existing project.
+
+### Env vars (NixOS, Docker, declarative deploys)
+
+```bash
+export AGENT_MCP_BOOTSTRAP_USERNAME="dennis"
+# Pass the password via a sops-decrypted env file or systemd
+# `EnvironmentFile=` — anything that doesn't leak into the
+# command line / `ps`-readable args.
+export AGENT_MCP_BOOTSTRAP_PASSWORD="$(cat /run/secrets/agent-mcp-bootstrap-pw)"
+uv run -m agent_mcp.router
+```
+
+The router creates the first operator on startup, then unsets both
+env vars in-process so they don't leak into spawned backend
+subprocesses (per agent.create_user → init_router_db).
+
+### CLI (ops fallback, subsequent operators)
+
+```bash
+# Interactive password prompt:
+uv run -m agent_mcp.router create-operator --username alice
+
+# Non-interactive (piped):
+echo "$NEW_PW" | uv run -m agent_mcp.router create-operator \
+    --username alice --password-stdin
+```
+
+After first boot, log in at `http://localhost:5454/agent-mcp/login`.
+The session cookie is `agent_mcp_session=<opaque>; HttpOnly; Secure;
+SameSite=Lax; Path=/agent-mcp/`. Sessions live 30 days idle, sliding
+on every dashboard request; revoke immediately via `agent-mcp router
+delete-operator <username>` (Phase 2) or directly with a SQL `DELETE
+FROM sessions WHERE user_id = ...` against `/var/lib/agent-mcp/router.db`.
+
+---
+
 ## Environment variables
 
 Agent-MCP defaults are designed to work out of the box — none of the

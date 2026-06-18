@@ -89,6 +89,41 @@ uv run -m agent_mcp.cli --port 8080 --project-dir path-to-directory
 cd agent_mcp/dashboard && npm install && npm run dev
 ```
 
+### First-boot setup (operator login)
+
+The dashboard requires operator login as of v5.0.59 (Phase 1 of the
+operator-login plan; supersedes the legacy "anyone-with-the-URL"
+admin assumption). On a fresh install, choose ONE of three bootstrap
+paths:
+
+1. **Setup wizard** — easiest for desktop use. Open the dashboard at
+   `http://localhost:5454/agent-mcp/` and you'll be redirected to
+   `/agent-mcp/setup`. Choose a username and password; that account
+   becomes the first operator and inherits membership in every
+   existing project.
+2. **Env vars** — for declarative deployments (NixOS+sops, Docker
+   Compose with a secrets file):
+
+   ```bash
+   export AGENT_MCP_BOOTSTRAP_USERNAME="dennis"
+   export AGENT_MCP_BOOTSTRAP_PASSWORD="..."
+   uv run -m agent_mcp.router
+   ```
+
+   The router creates the first operator on startup and unsets the
+   env vars in-process so the password doesn't leak into subprocess
+   spawns.
+3. **CLI** — `uv run -m agent_mcp.router create-operator --username
+   alice` (prompts for password). Useful for adding subsequent
+   operators after first boot.
+
+After first boot, navigate to `http://localhost:5454/agent-mcp/login`
+to authenticate. The session cookie is HttpOnly + Secure +
+SameSite=Lax, scoped to `/agent-mcp/`. Agent-side MCP traffic
+(`/agent-mcp/mcp/<project>`) continues to use the legacy
+`Authorization: Bearer <admin_token>` header — agents don't need to
+be aware of the operator login.
+
 ## MCP Integration Guide
 
 ### What is MCP?

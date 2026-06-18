@@ -148,9 +148,23 @@ pkgs.testers.nixosTest {
     machine.wait_for_unit("agent-mcp-router.service")
     machine.wait_for_open_port(${toString ports.routerPort})
 
-    # __projects starts empty.
+    # Phase 1 PR D (prancy-napping-pie): the router now requires an
+    # operator session cookie on every /agent-mcp/... mutation +
+    # most reads. The router's startup hook seeds the
+    # `ci-sentinel` user from the env-var bootstrap; log in here so
+    # the cookie jar persists across the rest of the test.
+    machine.succeed(
+        "curl -fsS -c /tmp/agent-mcp-cookies.txt "
+        "-F username=ci-sentinel -F password=ci-sentinel-pw "
+        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/login"
+    )
+
+    # __projects starts empty. (Allow-listed for unauth callers so
+    # the project picker on the landing page works without a cookie;
+    # the cookie jar carries through anyway.)
     out = machine.succeed(
-        "curl -fsS http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__projects"
+        "curl -fsS -b /tmp/agent-mcp-cookies.txt "
+        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__projects"
     )
     assert '"projects": []' in out or '"projects":[]' in out, (
         f"expected empty project list; got: {out!r}"
@@ -159,12 +173,14 @@ pkgs.testers.nixosTest {
     # 1. Register two projects via __create.
     for name in ("alpha", "beta"):
         machine.succeed(
-            f"curl -fsSL -o /dev/null -F name={name} "
+            f"curl -fsSL -b /tmp/agent-mcp-cookies.txt -o /dev/null "
+            f"-F name={name} "
             f"http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__create"
         )
 
     out = machine.succeed(
-        "curl -fsS http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__projects"
+        "curl -fsS -b /tmp/agent-mcp-cookies.txt "
+        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__projects"
     )
     assert '"alpha"' in out and '"beta"' in out, (
         f"both alpha and beta should be listed; got: {out!r}"
@@ -175,13 +191,15 @@ pkgs.testers.nixosTest {
     # answer here. PR-B Shape-3: the dashboard surface moved from
     # /agent-mcp/__dashboard/<name>/ to /agent-mcp/app/<name>/.
     code = machine.succeed(
-        "curl -fsS -o /dev/null -w '%{http_code}' "
+        "curl -fsS -b /tmp/agent-mcp-cookies.txt "
+        "-o /dev/null -w '%{http_code}' "
         "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/app/alpha/"
     )
     assert code == "200", f"expected 200 from dashboard handler; got {code}"
 
     # 3. Legacy SSE handshake URL → 404 (Phase 6: deleted the 410-
     # Gone handler; aiohttp's default 404 is now the contract).
+    # Allow-listed (/mcp/) so no cookie needed for this assertion.
     out_404 = machine.succeed(
         "curl -s -o /dev/null -w '%{http_code}' "
         "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__sse/alpha"
@@ -191,7 +209,8 @@ pkgs.testers.nixosTest {
     # 4. __create / __unregister / __rename are NOT 410 in multi-tenant
     # mode — they're the documented multi-tenant write surface.
     code_create = machine.succeed(
-        "curl -s -o /dev/null -w '%{http_code}' "
+        "curl -s -b /tmp/agent-mcp-cookies.txt "
+        "-o /dev/null -w '%{http_code}' "
         "-F name=gamma "
         "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__create"
     )
@@ -205,7 +224,8 @@ pkgs.testers.nixosTest {
     # default `/agent-mcp/assets` on serve. A leak here = a broken
     # white dashboard in the browser.
     sentinel_count = machine.succeed(
-        "curl -fsS http://127.0.0.1:${toString ports.routerPort}/agent-mcp/app/alpha/"
+        "curl -fsS -b /tmp/agent-mcp-cookies.txt "
+        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/app/alpha/"
         " | grep -c '__AGENT_MCP_ASSET_PREFIX__' || true"
     ).strip()
     assert sentinel_count == "0", (
@@ -218,7 +238,8 @@ pkgs.testers.nixosTest {
     # Asset URLs in the served HTML must now reference the configured
     # runtime prefix (PR-B Shape-3 default: /agent-mcp/assets).
     served = machine.succeed(
-        "curl -fsS http://127.0.0.1:${toString ports.routerPort}/agent-mcp/app/alpha/"
+        "curl -fsS -b /tmp/agent-mcp-cookies.txt "
+        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/app/alpha/"
     )
     assert "/agent-mcp/assets/_next/" in served, (
         "Phase 4: expected substituted asset URLs in served HTML; "
@@ -266,7 +287,12 @@ pkgs.testers.nixosTest {
     rsc_urls = [f"/agent-mcp/app/alpha/{p}" for p in txt_paths]
     offenders = []
     for url in asset_urls + rsc_urls:
-        body = machine.succeed(f"curl -fsS {base}{url}")
+        # /agent-mcp/assets/... is allow-listed by the operator-session
+        # middleware (PR D) so no cookie is needed; /agent-mcp/app/...
+        # RSC paths do need it.
+        body = machine.succeed(
+            f"curl -fsS -b /tmp/agent-mcp-cookies.txt {base}{url}"
+        )
         if "__AGENT_MCP_ASSET_PREFIX__" in body:
             offenders.append(url)
     assert not offenders, (

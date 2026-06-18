@@ -60,7 +60,7 @@ async def test_post_tasks_rejects_bad_token(tmp_path) -> None:
                 "task_description": "...",
             },
         )
-        assert r.status_code == 403, r.text
+        assert r.status_code == 401, r.text
 
 
 async def test_post_tasks_rejects_missing_title(tmp_path) -> None:
@@ -117,7 +117,7 @@ async def test_delete_tasks_rejects_bad_token(tmp_path) -> None:
             f"/api/tasks/{task_id}",
             json={"token": "x" * 32},
         )
-        assert r.status_code == 403, r.text
+        assert r.status_code == 401, r.text
 
 
 async def test_delete_tasks_404_on_unknown_id(tmp_path) -> None:

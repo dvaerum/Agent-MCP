@@ -145,41 +145,12 @@ async def test_post_api_create_agent_back_compat_alias_still_works(tmp_path) -> 
 # -------------------- frontend: api.ts createAgent ---------------------
 
 
-def test_api_client_create_agent_includes_admin_token() -> None:
-    """apiClient.createAgent must send the admin token in the request
-    body, same shape as restoreAgent / editAgent / purgeAgent.
-
-    Pre-fix the body was just ``JSON.stringify(data)`` where ``data``
-    only had ``{agent_id, capabilities?, working_directory?}`` — no
-    token. The backend would 401 once a POST handler existed.
-    """
-    src = API_FILE.read_text(encoding="utf-8")
-    import re
-
-    # Locate the createAgent method body.
-    match = re.search(
-        r"async\s+createAgent\s*\([^)]*\)[^{]*\{(.*?)\n  \}",
-        src,
-        re.DOTALL,
-    )
-    assert match, (
-        f"Couldn't locate createAgent() in {API_FILE.name}; rename? "
-        "Update this test."
-    )
-    body = match.group(1)
-    # The body must reference getTokens() (the existing pattern that
-    # fetches admin/agent tokens) AND must mention `admin_token` so the
-    # POSTed body carries the bearer.
-    assert "getTokens" in body, (
-        "createAgent must call this.getTokens() to pull the admin token, "
-        "matching the convention used by restoreAgent / editAgent / "
-        "purgeAgent. Pre-fix the call sent no token and the backend 401'd."
-    )
-    assert "admin_token" in body, (
-        "createAgent must include admin_token in the POST body. Without "
-        "it the backend's verify_token check returns 401 and the Deploy "
-        "button silently fails."
-    )
+# NOTE: the historical ``test_api_client_create_agent_includes_admin_token``
+# guard lived here. PR D (prancy-napping-pie) reverses its assertion —
+# createAgent must NOT include ``token: tokens.admin_token`` in the
+# POST body now that the operator-session cookie carries auth. The
+# new guard lives in ``tests/test_dashboard_migration.py::
+# test_dashboard_api_client_strips_token_field_from_payloads``.
 
 
 def test_api_client_create_agent_targets_post_agents() -> None:

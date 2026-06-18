@@ -256,6 +256,15 @@ class ApiClient {
     // plain `application/json` Accept value is rejected with 406. The
     // dashboard is a first-class consumer of the v1 surface, so the
     // gate header is part of every request.
+    //
+    // PR D (prancy-napping-pie): credentials='include' so the
+    // ``agent_mcp_session`` cookie is sent with every fetch. The
+    // cookie is set by /agent-mcp/login (PR C) and is what
+    // authenticates dashboard mutations now that the body-token
+    // path is retired. Same-origin requests still attach the cookie
+    // with omit (Path matches), but credentials='include' covers
+    // cross-origin dev setups too (the cookie's SameSite=Lax
+    // attribute keeps it scoped sensibly).
     const fetchOptions: RequestInit = {
       headers: {
         'Content-Type': 'application/json',
@@ -263,7 +272,7 @@ class ApiClient {
         // Don't set Origin header - let browser handle it automatically
         ...options.headers,
       },
-      credentials: 'omit', // Don't include credentials for CORS
+      credentials: 'include',
       mode: 'cors', // Explicitly set CORS mode
       cache: 'no-cache', // Always get fresh data
       ...options,
@@ -329,6 +338,30 @@ class ApiClient {
 
       if (!r.ok) {
         const errorText = await r.text().catch(() => 'Unknown error')
+        // PR D (prancy-napping-pie): on a 401 from any mutation OR
+        // read, the operator's session cookie has expired (or was
+        // never set). Bounce to /agent-mcp/login and preserve the
+        // current path in ?next= so we land back here post-login.
+        //
+        // Guard the redirect with the standard SSR check (typeof
+        // window) so this method stays safe to call from Next.js
+        // server components / tests that import the singleton.
+        // Also guard against an infinite loop: if we're already on
+        // the login page, skip the bounce.
+        if (
+          r.status === 401 &&
+          typeof window !== 'undefined' &&
+          !window.location.pathname.endsWith('/agent-mcp/login')
+        ) {
+          const nextParam = encodeURIComponent(
+            window.location.pathname + window.location.search,
+          )
+          window.location.assign(`/agent-mcp/login?next=${nextParam}`)
+          // Throw so the caller's `.catch` doesn't accidentally
+          // surface stale data; the navigation will tear down the
+          // page before this matters in practice.
+          throw new ApiError(401, 'session expired; redirecting to login', errorText)
+        }
         // Only log non-404 errors
         if (r.status !== 404) {
           console.error(`API Error [${r.status}]:`, errorText)
@@ -442,48 +475,42 @@ class ApiClient {
     capabilities?: string[]
     working_directory?: string
   }): Promise<{ success: boolean; message: string }> {
-    // Admin-only — the backend's verify_token() check requires the
-    // admin token in the request body, matching the convention used by
-    // terminateAgent / restoreAgent / editAgent / purgeAgent. Pre-fix
-    // this method shipped just JSON.stringify(data) with no token,
-    // which silently 401'd once a POST handler existed. Combined with
-    // the missing POST route on /api/agents (also fixed in the same
-    // PR) the Deploy button was completely non-functional.
-    const tokens = await this.getTokens()
+    // PR D (prancy-napping-pie): the operator session cookie carries
+    // auth — no body-token field. Browsers attach the cookie
+    // automatically. The 401-handling redirect in this.request
+    // bounces the operator to /agent-mcp/login if the cookie has
+    // expired between page-load and click.
     return this.request('/agents', {
       method: 'POST',
-      body: JSON.stringify({ token: tokens.admin_token, ...data }),
+      body: JSON.stringify(data),
     })
   }
 
   async terminateAgent(agentId: string): Promise<{ success: boolean; message: string }> {
-    // Routes to the dashboard shim that wraps the terminate_agent admin tool.
-    const tokens = await this.getTokens()
+    // PR D: cookie auth, no body-token field.
     return this.request('/terminate-agent', {
       method: 'POST',
-      body: JSON.stringify({ token: tokens.admin_token, agent_id: agentId }),
+      body: JSON.stringify({ agent_id: agentId }),
     })
   }
 
   // Restore + Purge for terminated agents. `restoreAgent` flips the
   // soft-delete back; `getPurgePreview` returns blast-radius counts
   // and samples for the confirmation modal; `purgeAgent` runs the
-  // cascade tombstone + DELETE. All admin-only.
+  // cascade tombstone + DELETE. PR D: cookie auth.
   async restoreAgent(
     agentId: string,
   ): Promise<{ success: boolean; agent_id: string; status: string; message: string }> {
-    const tokens = await this.getTokens()
     return this.request(`/agents/${encodeURIComponent(agentId)}/restore`, {
       method: 'POST',
-      body: JSON.stringify({ token: tokens.admin_token }),
+      body: JSON.stringify({}),
     })
   }
 
   // editAgent updates the editable agent fields (capabilities, color,
-  // working_directory, aoe_session_id). Admin-only; backed by
-  // POST /api/agents/<id>/edit added alongside the dashboard's
-  // per-row Edit icon. aoe_session_id is a 16-char lowercase hex
-  // string (or empty to clear) used by the AoE notification side-
+  // working_directory, aoe_session_id). PR D: cookie auth; backed by
+  // POST /api/agents/<id>/edit. aoe_session_id is a 16-char lowercase
+  // hex string (or empty to clear) used by the AoE notification side-
   // channel — see features/aoe_notify.py.
   async editAgent(
     agentId: string,
@@ -497,12 +524,11 @@ class ApiClient {
       auto_event_loop?: boolean
     },
   ): Promise<{ success: boolean; agent_id: string; updated: Record<string, unknown>; message: string }> {
-    const tokens = await this.getTokens()
     return this.request(
       `/agents/${encodeURIComponent(agentId)}/edit`,
       {
         method: 'POST',
-        body: JSON.stringify({ token: tokens.admin_token, ...updates }),
+        body: JSON.stringify(updates),
       },
     )
   }
@@ -510,15 +536,14 @@ class ApiClient {
   // aoeHealth probes the configured Agents-of-Empires instance with
   // the current bearer token. Settings panel uses it to warn when the
   // token has gone stale (AoE rotates the file-sourced token on a
-  // schedule). Admin-only.
+  // schedule). PR D: cookie auth (was ?token=<admin> query param).
   async aoeHealth(): Promise<{
     status: 'ok' | 'disabled' | 'unauthorized' | 'unreachable' | 'misconfigured'
     message?: string
     session_count?: number
     base_url?: string
   }> {
-    const tokens = await this.getTokens()
-    return this.request(`/aoe/health?token=${encodeURIComponent(tokens.admin_token)}`)
+    return this.request(`/aoe/health`)
   }
 
   async getPurgePreview(agentId: string): Promise<{
@@ -538,10 +563,9 @@ class ApiClient {
       tasks_assigned: string[]
     }
   }> {
-    const tokens = await this.getTokens()
-    const qs = new URLSearchParams({ token: tokens.admin_token }).toString()
+    // PR D: cookie auth (was ?token=<admin> query param).
     return this.request(
-      `/agents/${encodeURIComponent(agentId)}/purge-preview?${qs}`,
+      `/agents/${encodeURIComponent(agentId)}/purge-preview`,
     )
   }
 
@@ -552,12 +576,12 @@ class ApiClient {
     counts: Record<string, number>
     message: string
   }> {
-    const tokens = await this.getTokens()
+    // PR D: cookie auth.
     return this.request(
       `/agents/${encodeURIComponent(agentId)}?cascade=true`,
       {
         method: 'DELETE',
-        body: JSON.stringify({ token: tokens.admin_token }),
+        body: JSON.stringify({}),
       },
     )
   }
@@ -601,11 +625,8 @@ class ApiClient {
       notes?: string
     }
   ): Promise<{ success: boolean; message: string }> {
-    const tokens = await this.getTokens()
-    const body: Record<string, unknown> = {
-      token: tokens.admin_token,
-      task_id: taskId,
-    }
+    // PR D (prancy-napping-pie): cookie auth, no body-token field.
+    const body: Record<string, unknown> = { task_id: taskId }
     if (data.status) body.status = data.status
     if (data.title !== undefined) body.title = data.title
     if (data.description !== undefined) body.description = data.description
@@ -634,11 +655,10 @@ class ApiClient {
     // normalizes (lowercase + strip + dedupe) at write time.
     required_capabilities?: string[]
   }): Promise<{ success: boolean; message: string; task_id?: string }> {
-    const tokens = await this.getTokens()
+    // PR D (prancy-napping-pie): cookie auth, no body-token field.
     return this.request('/tasks', {
       method: 'POST',
       body: JSON.stringify({
-        token: tokens.admin_token,
         task_title: data.title,
         task_description: data.description ?? '',
         priority: data.priority,
@@ -650,11 +670,11 @@ class ApiClient {
   }
 
   // Delete a task via DELETE /api/tasks/<id> (added upstream in dvaerum#12).
+  // PR D: cookie auth.
   async deleteTask(taskId: string): Promise<{ success: boolean; message: string }> {
-    const tokens = await this.getTokens()
     return this.request(`/tasks/${taskId}`, {
       method: 'DELETE',
-      body: JSON.stringify({ token: tokens.admin_token }),
+      body: JSON.stringify({}),
     })
   }
 
