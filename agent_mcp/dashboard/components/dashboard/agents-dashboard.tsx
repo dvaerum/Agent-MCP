@@ -333,15 +333,27 @@ interface CreateAgentData {
   agent_id: string;
   capabilities?: string[];
   working_directory?: string;
+  // Phase 2 Wave 2b (plan §2e): role tier. 'worker' (default) keeps
+  // legacy behaviour; 'manager' opts the agent into the manager
+  // privileges that Wave 3 enforces on tool calls.
+  agent_role?: 'worker' | 'manager';
 }
 
 const CreateAgentModal = ({ onCreateAgent }: { onCreateAgent: (data: CreateAgentData) => Promise<void> }) => {
   const [open, setOpen] = useState(false)
   const [submitting, setSubmitting] = useState(false)
-  const [formData, setFormData] = useState({
+  const [formData, setFormData] = useState<{
+    agent_id: string
+    capabilities: string
+    working_directory: string
+    agent_role: 'worker' | 'manager'
+  }>({
     agent_id: '',
     capabilities: '',
-    working_directory: ''
+    working_directory: '',
+    // Wave 2b: default to worker so existing operator muscle-memory
+    // (Add Agent → type name → click Add) keeps producing a worker.
+    agent_role: 'worker'
   })
 
   // Pre-PR (silent-error UX bug surfaced by Firefox-MCP click-through
@@ -371,10 +383,11 @@ const CreateAgentModal = ({ onCreateAgent }: { onCreateAgent: (data: CreateAgent
       await onCreateAgent({
         agent_id: formData.agent_id.trim(),
         capabilities: capabilities.length > 0 ? capabilities : undefined,
-        working_directory: formData.working_directory.trim() || undefined
+        working_directory: formData.working_directory.trim() || undefined,
+        agent_role: formData.agent_role
       })
       // Success path only: clear the form & close the dialog.
-      setFormData({ agent_id: '', capabilities: '', working_directory: '' })
+      setFormData({ agent_id: '', capabilities: '', working_directory: '', agent_role: 'worker' })
       setOpen(false)
     } catch {
       // ``handleCreateAgent`` already surfaced the toast — re-throw is
@@ -434,6 +447,45 @@ const CreateAgentModal = ({ onCreateAgent }: { onCreateAgent: (data: CreateAgent
               placeholder="/workspace/analytics"
               className="bg-background border-border text-foreground font-mono text-sm"
             />
+          </div>
+          {/*
+            Phase 2 Wave 2b (plan §2e): Role dropdown. Default
+            'worker' matches the agents.agent_role column default
+            shipped by Wave 1a (v5.0.61, PR #182). 'manager' opts the
+            agent into the manager-tier privileges Wave 3 enforces
+            (assign tasks to peers, edit subordinate agents); it is
+            still rejected from any operator-only tool (config_*
+            writes, create_agent, etc.).
+          */}
+          <div>
+            <label
+              htmlFor="create-agent-role"
+              className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2"
+            >
+              Role
+            </label>
+            <Select
+              value={formData.agent_role}
+              onValueChange={(value) => setFormData(prev => ({
+                ...prev,
+                agent_role: value as 'worker' | 'manager',
+              }))}
+            >
+              <SelectTrigger
+                id="create-agent-role"
+                className="bg-background border-border text-foreground"
+              >
+                <SelectValue placeholder="Select role" />
+              </SelectTrigger>
+              <SelectContent className="bg-background border-border">
+                <SelectItem value="worker">Worker</SelectItem>
+                <SelectItem value="manager">Manager</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-[10px] text-muted-foreground mt-1">
+              Workers run assigned tasks. Managers also supervise
+              subordinates (assign tasks, edit agent fields).
+            </p>
           </div>
           <DialogFooter className="gap-2">
             <Button type="button" variant="outline" onClick={() => setOpen(false)} size="sm" disabled={submitting}>
@@ -726,6 +778,9 @@ const EditAgentDialog = ({
   // Event-coord PR-1: per-agent wake-loop toggle. Default true matches
   // the migration's DEFAULT 1 backfill.
   const [autoEventLoop, setAutoEventLoop] = useState(true)
+  // Phase 2 Wave 2b (plan §2e): role tier. Default 'worker' matches
+  // the agents.agent_role column default (Wave 1a, v5.0.61, PR #182).
+  const [agentRole, setAgentRole] = useState<'worker' | 'manager'>('worker')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -769,6 +824,11 @@ const EditAgentDialog = ({
     // strict boolean and default to TRUE when the field is missing
     // (legacy backends).
     setAutoEventLoop(coerceAutoEventLoop(agent.auto_event_loop))
+    // Wave 2b: seed the Role dropdown from the row, falling back to
+    // 'worker' for any legacy agent whose row pre-dates Wave 1a.
+    setAgentRole(
+      agent.agent_role === 'manager' ? 'manager' : 'worker'
+    )
     setError(null)
     // Intentionally key on agentId, not the agent object — see above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -785,6 +845,7 @@ const EditAgentDialog = ({
       working_directory?: string
       aoe_session_id?: string
       auto_event_loop?: boolean
+      agent_role?: 'worker' | 'manager'
     } = {}
     const parsedCaps = capabilities
       .split(',')
@@ -815,6 +876,14 @@ const EditAgentDialog = ({
     const currentAutoEventLoop = coerceAutoEventLoop(agent.auto_event_loop)
     if (autoEventLoop !== currentAutoEventLoop) {
       updates.auto_event_loop = autoEventLoop
+    }
+    // Wave 2b: same diff pattern for the role tier. Only ship the
+    // field when it has actually changed so an unrelated capability
+    // edit doesn't redundantly re-write the role.
+    const currentRole: 'worker' | 'manager' =
+      agent.agent_role === 'manager' ? 'manager' : 'worker'
+    if (agentRole !== currentRole) {
+      updates.agent_role = agentRole
     }
     if (Object.keys(updates).length === 0) {
       onOpenChange(false)
@@ -899,6 +968,41 @@ const EditAgentDialog = ({
             <p className="text-[10px] text-muted-foreground mt-1">
               Binds this agent to a specific Agents-of-Empires tmux session for the
               notification side-channel. Leave empty to fall back to title-match.
+            </p>
+          </div>
+          {/*
+            Phase 2 Wave 2b (plan §2e): Role dropdown — promote a
+            worker to manager (or demote). The server-side check in
+            /api/agents/<id>/edit 422s anything outside
+            {'worker', 'manager'}; the column CHECK constraint is
+            the last-resort guard.
+          */}
+          <div>
+            <label
+              htmlFor="edit-agent-role"
+              className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2"
+            >
+              Role
+            </label>
+            <Select
+              value={agentRole}
+              onValueChange={(value) => setAgentRole(value as 'worker' | 'manager')}
+              disabled={busy}
+            >
+              <SelectTrigger
+                id="edit-agent-role"
+                className="bg-background border-border text-foreground"
+              >
+                <SelectValue placeholder="Select role" />
+              </SelectTrigger>
+              <SelectContent className="bg-background border-border">
+                <SelectItem value="worker">Worker</SelectItem>
+                <SelectItem value="manager">Manager</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-[10px] text-muted-foreground mt-1">
+              Workers run assigned tasks. Managers also supervise
+              subordinates (assign tasks, edit agent fields).
             </p>
           </div>
           {/*

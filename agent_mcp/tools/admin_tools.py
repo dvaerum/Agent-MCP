@@ -72,6 +72,15 @@ async def create_agent_tool_impl(
     agent_id = arguments.get("agent_id")
     capabilities = arguments.get("capabilities")  # This was List[str]
     task_ids = arguments.get("task_ids")  # Required list of task IDs
+    # Phase 2 Wave 2b: dashboard's Role dropdown reaches this tool
+    # impl via ``create_agent_dashboard_api_route``. Validation
+    # already ran at the API boundary; defence-in-depth: if a direct
+    # MCP caller (or back-compat /api/create-agent path) supplies
+    # something other than worker|manager, fall back to 'worker'
+    # rather than letting the column CHECK constraint 500 us.
+    agent_role = arguments.get("agent_role", "worker")
+    if agent_role not in ("worker", "manager"):
+        agent_role = "worker"
 
     # New prompt-related parameters
     prompt_template = arguments.get(
@@ -259,6 +268,7 @@ async def create_agent_tool_impl(
                 current_task=None,
                 working_directory=agent_working_dir_abs,
                 color=agent_color,
+                agent_role=agent_role,
                 connection=cursor,
             )
         except ValueError as ve:
