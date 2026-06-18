@@ -30,7 +30,6 @@ import json
 import sqlite3
 from pathlib import Path
 
-import pytest
 from click.testing import CliRunner
 
 
@@ -193,7 +192,7 @@ def test_existing_config_admin_token_is_migrated(
     MUST exist under ``config_system_token`` and the in-memory token
     MUST match.
     """
-    from agent_mcp.db.schema import initialize_database_schema
+    from agent_mcp.db.schema import init_database
     from agent_mcp.db import engine as _engine
     import os
 
@@ -202,7 +201,7 @@ def test_existing_config_admin_token_is_migrated(
     # Seed the DB with the legacy key BEFORE lifespan runs.
     os.environ["MCP_PROJECT_DIR"] = str(project_dir)
     (project_dir / ".agent").mkdir(parents=True, exist_ok=True)
-    initialize_database_schema()
+    init_database()
     db_path = project_dir / ".agent" / "mcp_state.db"
 
     legacy_token = "legacy-system-token-abc123"

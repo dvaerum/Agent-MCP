@@ -34,17 +34,19 @@ from ..utils.signal_utils import register_signal_handlers  # For graceful shutdo
 from ..db.write_queue import get_write_queue
 
 
-def _upsert_admin_token_row(
+def _upsert_system_token_row(
     cursor: sqlite3.Cursor,
     context_key: str,
     value_json: str,
     description: str,
 ) -> None:
-    """INSERT-or-UPDATE the admin-token row, preserving ownership columns.
+    """INSERT-or-UPDATE the system-token row, preserving ownership columns.
 
     Post-Phase-7b, project_context carries `created_at`/`created_by` that
-    must never be overwritten by an admin-token refresh. INSERT OR REPLACE
+    must never be overwritten by a system-token refresh. INSERT OR REPLACE
     would clobber those columns; do an explicit existence check + branch.
+
+    Phase 2 Wave 1b rename of ``_upsert_admin_token_row``.
     """
     now = datetime.datetime.now().isoformat()
     cursor.execute(
@@ -69,6 +71,25 @@ def _upsert_admin_token_row(
             """,
             (value_json, description, now, "server_startup", context_key),
         )
+
+
+def _drop_legacy_admin_token_row(
+    cursor: sqlite3.Cursor,
+    legacy_context_key: str,
+) -> None:
+    """DELETE the legacy ``config_admin_token`` row if present.
+
+    Phase 2 Wave 1b moves the persisted token under
+    ``config_system_token``. Once the canonical row exists (either
+    freshly minted or migrated from the legacy row), we drop the legacy
+    row so a future operator-level inspection of project_context sees
+    one row, not two diverging copies. Idempotent: no-op if the row is
+    absent.
+    """
+    cursor.execute(
+        "DELETE FROM project_context WHERE context_key = ?",
+        (legacy_context_key,),
+    )
 
 
 # Synthetic constants for the admin pseudo-agent row. Mirror the
@@ -120,24 +141,52 @@ def _ensure_admin_pseudo_agent_row() -> None:
 # This function encapsulates the logic originally in main() before server run.
 async def application_startup(
     project_dir_path_str: str,
-    admin_token_param: Optional[str] = None,
+    system_token_param: Optional[str] = None,
     *,
+    system_token_out_path: Optional[str] = None,
+    system_token_out_format: str = "raw",
+    system_token_in_path: Optional[str] = None,
+    system_token_log: bool = False,
+    # Phase 2 Wave 1b: legacy ``admin_token_*`` keyword aliases. Kept
+    # for one release so external callers (deploy scripts, tests not
+    # yet migrated) keep working. If both new and legacy values are
+    # passed, the new ``system_token_*`` value wins.
+    admin_token_param: Optional[str] = None,
     admin_token_out_path: Optional[str] = None,
-    admin_token_out_format: str = "raw",
+    admin_token_out_format: Optional[str] = None,
     admin_token_in_path: Optional[str] = None,
-    admin_token_log: bool = False,
+    admin_token_log: Optional[bool] = None,
 ):
     """
     Handles all application startup procedures:
     - Sets project directory environment variable.
     - Initializes .agent directory.
     - Initializes database schema.
-    - Handles admin token persistence (load or generate).
+    - Handles system token persistence (load or generate).
     - Loads existing state (agents, tasks) from DB.
     - Initializes external services (OpenAI client).
     - Performs VSS loadability check.
     - Registers signal handlers.
+
+    The ``system_token`` (formerly ``admin_token``; renamed in Phase 2
+    Wave 1b) is the router-internal authority bearer used by agents'
+    ``Authorization: Bearer`` header. Operator-side dashboard auth uses
+    the session cookie set by Phase 1 PR D, NOT this token.
     """
+    # Phase 2 Wave 1b: coalesce legacy ``admin_token_*`` kwargs into
+    # the new ``system_token_*`` ones so the rest of the function only
+    # sees the canonical names. New name wins if both are set.
+    if system_token_param is None and admin_token_param is not None:
+        system_token_param = admin_token_param
+    if system_token_out_path is None and admin_token_out_path is not None:
+        system_token_out_path = admin_token_out_path
+    if system_token_out_format == "raw" and admin_token_out_format is not None:
+        system_token_out_format = admin_token_out_format
+    if system_token_in_path is None and admin_token_in_path is not None:
+        system_token_in_path = admin_token_in_path
+    if system_token_log is False and admin_token_log is True:
+        system_token_log = True
+
     # Load environment variables from .env file
     load_dotenv()
 
@@ -229,163 +278,217 @@ async def application_startup(
             f"the row is missing."
         )
 
-    # 4. Handle Admin Token Persistence (Original main.py:1977-2012)
-    # This logic ensures g.admin_token is set.
+    # 4. Handle System Token Persistence (Original main.py:1977-2012;
+    #    renamed from "Admin Token" in Phase 2 Wave 1b).
+    # This logic ensures g.system_token is set.
     #
     # Resolution priority (highest wins):
-    #   1. --admin-token-in PATH  — read raw token text from a file;
+    #   1. --system-token-in PATH  — read raw token text from a file;
     #      written back to the DB unconditionally (overrides any
     #      pre-existing stored token).
-    #   2. --admin-token (legacy) — explicit token value on the CLI.
+    #   2. --system-token (legacy --admin-token) — explicit token value
+    #      on the CLI.
     #   3. Stored token in project_context (the normal warm-start path).
+    #      We migrate the legacy ``config_admin_token`` row to
+    #      ``config_system_token`` in-place on first read so an upgrade
+    #      from a pre-v5.0.62 install picks up the same token.
     #   4. Newly generated token.
     #
     # Whether the resolved token leaves the process is controlled
-    # separately by --admin-token-log (logs the value) and
-    # --admin-token-out (writes the value to a file). The CLI enforces
+    # separately by --system-token-log (logs the value) and
+    # --system-token-out (writes the value to a file). The CLI enforces
     # mutual exclusion of the three sinks — lifecycle code does not
     # need to re-check.
-    admin_token_key_in_db = "config_admin_token"  # As used in original
-    conn_admin_token = None
-    effective_admin_token: Optional[str] = None
+    system_token_key_in_db = "config_system_token"
+    legacy_admin_token_key_in_db = "config_admin_token"
+    conn_system_token = None
+    effective_system_token: Optional[str] = None
     token_source_description: str = ""
 
-    # Read --admin-token-in up front; falls into the same DB-upsert
-    # path as --admin-token so a future restart without the flag picks
+    # Read --system-token-in up front; falls into the same DB-upsert
+    # path as --system-token so a future restart without the flag picks
     # the same value back up.
     token_from_in_file: Optional[str] = None
-    if admin_token_in_path:
+    if system_token_in_path:
         try:
-            token_from_in_file = Path(admin_token_in_path).read_text().strip()
+            token_from_in_file = Path(system_token_in_path).read_text().strip()
         except OSError as exc:
             logger.error(
-                "Failed to read admin-token-in file %s: %s. Falling back to "
+                "Failed to read system-token-in file %s: %s. Falling back to "
                 "stored / generated token.",
-                admin_token_in_path,
+                system_token_in_path,
                 exc,
             )
         if not token_from_in_file:
             logger.warning(
-                "admin-token-in file %s was empty after strip(); ignoring.",
-                admin_token_in_path,
+                "system-token-in file %s was empty after strip(); ignoring.",
+                system_token_in_path,
             )
             token_from_in_file = None
 
     try:
-        conn_admin_token = get_db_connection()
-        cursor = conn_admin_token.cursor()
+        conn_system_token = get_db_connection()
+        cursor = conn_system_token.cursor()
         if token_from_in_file:
-            effective_admin_token = token_from_in_file
-            token_source_description = "--admin-token-in file"
-            _upsert_admin_token_row(
+            effective_system_token = token_from_in_file
+            token_source_description = "--system-token-in file"
+            _upsert_system_token_row(
                 cursor,
-                admin_token_key_in_db,
-                json.dumps(effective_admin_token),
-                "Persistent MCP Admin Token",
+                system_token_key_in_db,
+                json.dumps(effective_system_token),
+                "Persistent MCP System Token",
             )
-            conn_admin_token.commit()
-            logger.info(f"Using admin token provided via {token_source_description}.")
-        elif admin_token_param:
-            effective_admin_token = admin_token_param
+            _drop_legacy_admin_token_row(cursor, legacy_admin_token_key_in_db)
+            conn_system_token.commit()
+            logger.info(f"Using system token provided via {token_source_description}.")
+        elif system_token_param:
+            effective_system_token = system_token_param
             token_source_description = "command-line parameter"
-            _upsert_admin_token_row(
+            _upsert_system_token_row(
                 cursor,
-                admin_token_key_in_db,
-                json.dumps(effective_admin_token),
-                "Persistent MCP Admin Token",
+                system_token_key_in_db,
+                json.dumps(effective_system_token),
+                "Persistent MCP System Token",
             )
-            conn_admin_token.commit()
-            logger.info(f"Using admin token provided via {token_source_description}.")
+            _drop_legacy_admin_token_row(cursor, legacy_admin_token_key_in_db)
+            conn_system_token.commit()
+            logger.info(f"Using system token provided via {token_source_description}.")
         else:
+            # Warm-start path: try the canonical key first; if absent,
+            # fall back to the legacy ``config_admin_token`` row and
+            # migrate it in place so the next boot finds the canonical
+            # key directly. Idempotent: if both rows exist (operator
+            # double-wrote), the canonical key wins and the legacy is
+            # dropped.
             cursor.execute(
                 "SELECT value FROM project_context WHERE context_key = ?",
-                (admin_token_key_in_db,),
+                (system_token_key_in_db,),
             )
             row = cursor.fetchone()
             if row and row["value"]:
                 try:
                     loaded_token = json.loads(row["value"])
                     if isinstance(loaded_token, str) and loaded_token:
-                        effective_admin_token = loaded_token
+                        effective_system_token = loaded_token
                         token_source_description = "stored configuration in database"
                         logger.info(
-                            f"Loaded admin token from {token_source_description}."
+                            f"Loaded system token from {token_source_description}."
                         )
                     else:
                         logger.warning(
-                            "Stored admin token in DB is invalid. Generating a new one."
+                            "Stored system token in DB is invalid. Generating a new one."
                         )
                 except json.JSONDecodeError:
                     logger.warning(
-                        "Failed to decode stored admin token from DB. Generating a new one."
+                        "Failed to decode stored system token from DB. Generating a new one."
                     )
-
-            if not effective_admin_token:  # If not loaded or invalid
-                effective_admin_token = generate_token()
-                token_source_description = "newly generated"
-                _upsert_admin_token_row(
-                    cursor,
-                    admin_token_key_in_db,
-                    json.dumps(effective_admin_token),
-                    "Persistent MCP Admin Token",
+                # Defensive: any stale legacy row should be dropped now
+                # that the canonical key is the source of truth.
+                _drop_legacy_admin_token_row(cursor, legacy_admin_token_key_in_db)
+                conn_system_token.commit()
+            else:
+                # Look for the legacy key and migrate it in place.
+                cursor.execute(
+                    "SELECT value FROM project_context WHERE context_key = ?",
+                    (legacy_admin_token_key_in_db,),
                 )
-                conn_admin_token.commit()
-                logger.info(f"Generated and stored new admin token.")
+                legacy_row = cursor.fetchone()
+                if legacy_row and legacy_row["value"]:
+                    try:
+                        loaded_token = json.loads(legacy_row["value"])
+                        if isinstance(loaded_token, str) and loaded_token:
+                            effective_system_token = loaded_token
+                            token_source_description = (
+                                "stored configuration in database "
+                                "(migrated from config_admin_token)"
+                            )
+                            logger.info(
+                                "Migrated legacy config_admin_token row to "
+                                "config_system_token (Phase 2 Wave 1b)."
+                            )
+                            _upsert_system_token_row(
+                                cursor,
+                                system_token_key_in_db,
+                                json.dumps(effective_system_token),
+                                "Persistent MCP System Token",
+                            )
+                            _drop_legacy_admin_token_row(
+                                cursor, legacy_admin_token_key_in_db
+                            )
+                            conn_system_token.commit()
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            "Failed to decode legacy config_admin_token row; "
+                            "generating a new system token."
+                        )
 
-        g.admin_token = effective_admin_token  # Set the global admin token
+            if not effective_system_token:  # If not loaded or invalid
+                effective_system_token = generate_token()
+                token_source_description = "newly generated"
+                _upsert_system_token_row(
+                    cursor,
+                    system_token_key_in_db,
+                    json.dumps(effective_system_token),
+                    "Persistent MCP System Token",
+                )
+                _drop_legacy_admin_token_row(cursor, legacy_admin_token_key_in_db)
+                conn_system_token.commit()
+                logger.info(f"Generated and stored new system token.")
+
+        g.system_token = effective_system_token  # Set the global system token
         # Silent default. Pre-v5.0.53 we logged the token here on every
-        # boot; now operators opt in via --admin-token-log, surface it
-        # via --admin-token-out, or read it from the dashboard / TUI.
-        if admin_token_log:
+        # boot; now operators opt in via --system-token-log, surface it
+        # via --system-token-out, or read it from the dashboard / TUI.
+        if system_token_log:
             logger.info(
-                f"MCP Admin Token ({token_source_description}): {g.admin_token}"
+                f"MCP System Token ({token_source_description}): {g.system_token}"
             )
 
     except sqlite3.Error as e_sql_admin:
         logger.error(
-            f"Database error during admin token persistence: {e_sql_admin}. Falling back to temporary token.",
+            f"Database error during system token persistence: {e_sql_admin}. Falling back to temporary token.",
             exc_info=True,
         )
-        g.admin_token = (
+        g.system_token = (
             token_from_in_file
-            or admin_token_param
+            or system_token_param
             or generate_token()
         )
-        logger.warning("Using temporary admin token due to DB error.")
-        if admin_token_log:
-            logger.warning(f"Temporary admin token: {g.admin_token}")
+        logger.warning("Using temporary system token due to DB error.")
+        if system_token_log:
+            logger.warning(f"Temporary system token: {g.system_token}")
     except Exception as e_admin:
         logger.error(
-            f"Unexpected error during admin token persistence: {e_admin}. Falling back to temporary token.",
+            f"Unexpected error during system token persistence: {e_admin}. Falling back to temporary token.",
             exc_info=True,
         )
-        g.admin_token = (
+        g.system_token = (
             token_from_in_file
-            or admin_token_param
+            or system_token_param
             or generate_token()
         )
-        logger.warning("Using temporary admin token due to unexpected error.")
-        if admin_token_log:
-            logger.warning(f"Temporary admin token: {g.admin_token}")
+        logger.warning("Using temporary system token due to unexpected error.")
+        if system_token_log:
+            logger.warning(f"Temporary system token: {g.system_token}")
     finally:
-        if conn_admin_token:
-            conn_admin_token.close()
+        if conn_system_token:
+            conn_system_token.close()
 
-    if not g.admin_token:  # Should not happen if logic above is correct
-        logger.error("CRITICAL: Admin token could not be set. Exiting.")
-        raise SystemExit("Admin token initialization failed.")
+    if not g.system_token:  # Should not happen if logic above is correct
+        logger.error("CRITICAL: System token could not be set. Exiting.")
+        raise SystemExit("System token initialization failed.")
 
-    # If --admin-token-out was set, write the resolved token to the
+    # If --system-token-out was set, write the resolved token to the
     # file now. Mode 0600 — operators surface this through the dash
     # or to wire-up automation, not for casual reading.
-    if admin_token_out_path:
+    if system_token_out_path:
         try:
-            out_path = Path(admin_token_out_path)
+            out_path = Path(system_token_out_path)
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            if admin_token_out_format == "env":
-                payload = f"MCP_ADMIN_TOKEN={g.admin_token}\n"
+            if system_token_out_format == "env":
+                payload = f"MCP_SYSTEM_TOKEN={g.system_token}\n"
             else:
-                payload = f"{g.admin_token}\n"
+                payload = f"{g.system_token}\n"
             # Atomic-ish: open with O_CREAT|O_TRUNC + 0o600, then write.
             fd = os.open(
                 str(out_path),
@@ -404,14 +507,14 @@ async def application_startup(
             # If the file pre-existed with broader perms, force-tighten.
             os.chmod(str(out_path), 0o600)
             logger.info(
-                "Wrote admin token to %s (format=%s, mode 0600).",
+                "Wrote system token to %s (format=%s, mode 0600).",
                 out_path,
-                admin_token_out_format,
+                system_token_out_format,
             )
         except OSError as exc:
             logger.error(
-                "Failed to write admin token to %s: %s",
-                admin_token_out_path,
+                "Failed to write system token to %s: %s",
+                system_token_out_path,
                 exc,
             )
 

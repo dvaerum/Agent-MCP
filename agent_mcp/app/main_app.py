@@ -846,11 +846,19 @@ async def _send_simple_response(send, status: int, body: bytes) -> None:
 # --- FastAPI Application Creation ----------------------------------
 def create_app(
     project_dir: str,
+    system_token_cli: Optional[str] = None,
+    system_token_out_path: Optional[str] = None,
+    system_token_out_format: str = "raw",
+    system_token_in_path: Optional[str] = None,
+    system_token_log: bool = False,
+    # Phase 2 Wave 1b: legacy admin_token_* aliases kept for one
+    # release so external callers (tests not yet migrated, deploy
+    # scripts) keep working. New name wins on collision.
     admin_token_cli: Optional[str] = None,
     admin_token_out_path: Optional[str] = None,
-    admin_token_out_format: str = "raw",
+    admin_token_out_format: Optional[str] = None,
     admin_token_in_path: Optional[str] = None,
-    admin_token_log: bool = False,
+    admin_token_log: Optional[bool] = None,
 ) -> FastAPI:
     """Build and configure the main FastAPI application.
 
@@ -884,15 +892,26 @@ def create_app(
     )
     session_manager = manager
 
+    # Coalesce legacy aliases — new name wins.
+    _system_token_cli = system_token_cli if system_token_cli is not None else admin_token_cli
+    _system_token_out_path = system_token_out_path if system_token_out_path is not None else admin_token_out_path
+    _system_token_out_format = (
+        admin_token_out_format
+        if system_token_out_format == "raw" and admin_token_out_format is not None
+        else system_token_out_format
+    )
+    _system_token_in_path = system_token_in_path if system_token_in_path is not None else admin_token_in_path
+    _system_token_log = system_token_log or bool(admin_token_log)
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         await application_startup(
             project_dir_path_str=project_dir,
-            admin_token_param=admin_token_cli,
-            admin_token_out_path=admin_token_out_path,
-            admin_token_out_format=admin_token_out_format,
-            admin_token_in_path=admin_token_in_path,
-            admin_token_log=admin_token_log,
+            system_token_param=_system_token_cli,
+            system_token_out_path=_system_token_out_path,
+            system_token_out_format=_system_token_out_format,
+            system_token_in_path=_system_token_in_path,
+            system_token_log=_system_token_log,
         )
         logger.info(
             "FastAPI app startup complete. Background tasks should be started by the server runner."

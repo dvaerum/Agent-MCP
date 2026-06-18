@@ -15,25 +15,40 @@ def generate_token() -> str:
 def verify_token(token: str, required_role: str = "agent") -> bool:
     """
     Verify if a token is valid and has the required role.
-    Uses global `g.admin_token` and `g.active_agents`.
+
+    Uses globals ``g.system_token`` (the router-internal authority
+    bearer, formerly known as ``admin_token``) and ``g.active_agents``.
+
+    Roles:
+
+    * ``"system"`` — only the router-internal authority bearer is
+      accepted. This is the canonical role name introduced by Phase 2
+      Wave 1b's rename.
+    * ``"admin"`` — deprecated alias for ``"system"``. Kept for one
+      release so existing per-tool ``verify_token(token, "admin")``
+      sites continue to work; new code should use ``"system"``.
+    * ``"agent"`` — any currently-active agent token, or the system
+      bearer (which can act as an agent).
     """
     if not token: # Added a check for empty/None token
         return False
-    if required_role == "admin" and token == g.admin_token:
+    # Treat "admin" as a deprecated alias for "system" — see docstring.
+    if required_role in ("system", "admin") and token == g.system_token:
         return True
     # Check active_agents only if it's not None and token is a key
     if required_role == "agent" and g.active_agents and token in g.active_agents:
         return True
-    # Allow admin token to be used for agent roles as well
-    if required_role == "agent" and token == g.admin_token:
-        return True  # Admins can act as agents
+    # Allow the system bearer to be used for agent roles as well.
+    if required_role == "agent" and token == g.system_token:
+        return True  # The system bearer can act as an agent.
     return False
 
 # Original location: main.py, lines 868-873
 def get_agent_id(token: str) -> Optional[str]:
     """
     Get agent ID from token.
-    Uses global `g.admin_token` and the AgentRepository (cache-first
+    Uses global ``g.system_token`` (Phase 2 Wave 1b rename of the
+    legacy ``admin_token``) and the AgentRepository (cache-first
     lookup; falls through to the DB on miss).
 
     Migrated to ``agent_repo.get_agent_by_token`` in PR-W2c so a token
@@ -44,8 +59,8 @@ def get_agent_id(token: str) -> Optional[str]:
     """
     if not token: # Added a check for empty/None token
         return None
-    if token == g.admin_token:
-        return "admin" # 'admin' is a special agent_id for admin operations
+    if token == g.system_token:
+        return "admin" # 'admin' is a special agent_id for the system bearer's actions
     # Local import to keep the legacy module-load contract: callers
     # that only want verify_token/get_agent_id shouldn't pay the cost
     # of loading the SQLAlchemy engine until the first DB-miss path.
