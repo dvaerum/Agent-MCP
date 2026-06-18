@@ -92,6 +92,13 @@ pkgs.testers.nixosTest {
         # not writable by testuser; point at testuser's home so the
         # ExecStartPre mkdir below covers both.
         AGENT_MCP_ROUTER_DB = "/home/testuser/.config/agent-mcp/router.db";
+        # Phase 1 PR C: seed a sentinel operator via env-var bootstrap
+        # so the empty-users redirect middleware is dormant — this
+        # test asserts routing behaviour (e.g. /__projects, /app/)
+        # that predates auth and shouldn't be wedged behind the
+        # first-boot wizard.
+        AGENT_MCP_BOOTSTRAP_USERNAME = "ci-sentinel";
+        AGENT_MCP_BOOTSTRAP_PASSWORD = "ci-sentinel-pw";
         AGENT_MCP_SOCK_DIR = "/run/agent-mcp";
         AGENT_MCP_DASHBOARD_DIR = "${packagedPkgs.agentMcpDashboard}/share/agent-mcp-dashboard";
         AGENT_MCP_EXTERNAL_URL = "http://localhost:${toString ports.routerPort}";
