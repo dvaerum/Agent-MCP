@@ -342,9 +342,15 @@ def test_bootstrap_marks_first_operator_as_sysadmin(
     # Re-run the migration's data step (the migration is idempotent —
     # calling upgrade() again is a no-op for Alembic, so we exercise
     # the data step directly through the public bootstrap helper).
-    from agent_mcp.router import group_resolver
+    sys.modules.pop("agent_mcp.router.group_resolver", None)
+    import agent_mcp.router.group_resolver as group_resolver
 
-    importlib.reload(group_resolver)
+    # NOTE: in the bootstrap-from-existing scenario the migration
+    # already promoted one user during `identity.init_router_db()`.
+    # We explicitly reset the table before exercising the helper so
+    # this test pins THAT codepath rather than the migration's.
+    with identity._connect() as conn:
+        conn.execute("UPDATE users SET is_sysadmin = 0")
     group_resolver.bootstrap_first_operator_as_sysadmin()
 
     alpha = identity.get_user_by_username("alpha")
@@ -388,9 +394,13 @@ def test_bootstrap_first_operator_idempotent(
             "('u_b', 'beta', NULL, 'x', '2026-06-18T02:00:00', NULL, 0)"
         )
 
-    from agent_mcp.router import group_resolver
+    sys.modules.pop("agent_mcp.router.group_resolver", None)
+    import agent_mcp.router.group_resolver as group_resolver
 
-    importlib.reload(group_resolver)
+    # Reset so we exercise the helper rather than the migration's
+    # implicit promotion during init_router_db.
+    with identity._connect() as conn:
+        conn.execute("UPDATE users SET is_sysadmin = 0")
     group_resolver.bootstrap_first_operator_as_sysadmin()
     # second run must be a no-op
     group_resolver.bootstrap_first_operator_as_sysadmin()
@@ -424,9 +434,9 @@ def test_bootstrap_no_users_is_noop(
     importlib.reload(identity)
     identity.init_router_db()
 
-    from agent_mcp.router import group_resolver
+    sys.modules.pop("agent_mcp.router.group_resolver", None)
+    import agent_mcp.router.group_resolver as group_resolver
 
-    importlib.reload(group_resolver)
     # Must not raise on an empty users table.
     group_resolver.bootstrap_first_operator_as_sysadmin()
     with identity._connect() as conn:
