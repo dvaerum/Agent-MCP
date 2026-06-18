@@ -126,7 +126,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from .registry import register_tool
-from ..core.authorize import requires
+from ..core.authorize import requires, requires_role
 from ..core.config import logger
 from ..core import globals as g  # Not directly used here, but auth uses it
 from ..core.auth import get_agent_id, verify_token
@@ -1087,7 +1087,7 @@ async def bulk_update_project_context_tool_impl(
 
 
 # --- backup_project_context tool ---
-@requires("admin")
+@requires_role("operator")
 async def backup_project_context_tool_impl(
     arguments: Dict[str, Any],
 ) -> List[mcp_types.TextContent]:
@@ -1097,7 +1097,7 @@ async def backup_project_context_tool_impl(
         "include_health_report", True
     )  # Include health analysis in backup
 
-    # @requires("admin") guaranteed entry; admin id is always "admin".
+    # @requires_role("operator") guaranteed entry; admin id is always "admin".
     requesting_agent_id = get_agent_id(auth_token)
 
     log_audit(
@@ -1490,7 +1490,7 @@ def register_project_context_tools():
             "additionalProperties": False,
         },
         implementation=backup_project_context_tool_impl,
-        visibility="admin",
+        visibility="operator",
     )
 
     register_tool(
