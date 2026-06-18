@@ -34,9 +34,12 @@ def test_server_command_exists_and_keeps_legacy_options() -> None:
     # Every option the pre-Phase-1a command had MUST still be on the
     # server subcommand — otherwise the deploy-repo wrapper script
     # (and any user shell aliases) will silently lose flags.
+    # Phase 2 Wave 1b renamed ``admin_token_cli`` → ``system_token_cli``;
+    # the legacy ``--admin-token`` flag is preserved as a Click alias
+    # routed onto the canonical ``system_token_cli`` option.
     option_names = {opt.name for opt in server_cmd.params}
     for required in (
-        "port", "uds", "transport", "project_dir", "admin_token_cli",
+        "port", "uds", "transport", "project_dir", "system_token_cli",
         "debug", "no_tui", "advanced", "git", "no_index",
     ):
         assert required in option_names, f"server is missing --{required.replace('_', '-')}"

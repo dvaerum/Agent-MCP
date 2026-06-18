@@ -151,13 +151,15 @@ def test_admin_token_in_reads_file_and_overrides_db(
     token = _run_startup(project_dir, admin_token_in_path=str(token_in))
     assert token == "supplied-token-abc"
 
-    # And it must be persisted to the DB.
+    # And it must be persisted to the DB. Phase 2 Wave 1b renamed the
+    # context key from ``config_admin_token`` to ``config_system_token``;
+    # the legacy alias kwarg above still routes to the new storage.
     db_path = project_dir / ".agent" / "mcp_state.db"
     conn = sqlite3.connect(db_path)
     try:
         cur = conn.execute(
             "SELECT value FROM project_context WHERE context_key = ?",
-            ("config_admin_token",),
+            ("config_system_token",),
         )
         row = cur.fetchone()
     finally:
@@ -200,7 +202,10 @@ def test_admin_token_out_env_writes_env_assignment(
         admin_token_out_format="env",
     )
     content = out_path.read_text()
-    assert content == f"MCP_ADMIN_TOKEN={token}\n"
+    # Phase 2 Wave 1b renamed the env variable from MCP_ADMIN_TOKEN to
+    # MCP_SYSTEM_TOKEN; the legacy --admin-token-out alias above routes
+    # through the new code path that emits the new name.
+    assert content == f"MCP_SYSTEM_TOKEN={token}\n"
 
 
 def test_admin_token_log_logs_token(
