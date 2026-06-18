@@ -377,6 +377,37 @@ request_auth_token: _cv.ContextVar = _cv.ContextVar(
 )
 
 
+# Phase 2 Wave 2a (v5.0.63): operator-session ContextVar.
+#
+# The new ``@requires_role("manager")`` / ``@requires_role("operator")``
+# decorators need to distinguish three caller populations that all
+# arrive at ``dispatch_tool_call`` via different paths:
+#
+#   1. A logged-in human operator hitting the dashboard. Their request
+#      flows through the FastAPI REST seam, ``require_operator_session``
+#      validates the session cookie, and ``_dispatch_through_tool`` sets
+#      this ContextVar to ``True`` before dispatch. The tool's bearer
+#      stays the system token (so the legacy admin-only impls keep
+#      working unchanged); the ContextVar lets the decorator say
+#      "this call originated from a logged-in operator" without
+#      conflating it with a script holding the raw system token.
+#   2. A spawned agent calling MCP directly with its agent bearer.
+#      The ContextVar is unset; the decorator falls through to
+#      ``verify_token`` / ``get_agent_id`` against ``agents.agent_role``.
+#   3. A legacy admin script using the system token in
+#      ``Authorization: Bearer <token>``. Both ContextVars are set
+#      (the bearer ContextVar holds the system token; the operator
+#      ContextVar stays False); the decorator admits because the
+#      system token satisfies any role gate.
+#
+# Default ``False`` matches "no operator session" — the safe default
+# for any code path that bypasses the REST seam (MCP-protocol callers,
+# direct dispatch_tool_call invocations from tests, in-process bridges).
+operator_session_active: _cv.ContextVar = _cv.ContextVar(
+    "operator_session_active", default=False
+)
+
+
 class ToolInputValidationError(Exception):
     """Raised when caller-supplied arguments fail jsonschema validation
     after the dispatcher's pre-validation cleanup.

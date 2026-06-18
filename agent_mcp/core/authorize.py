@@ -88,24 +88,118 @@ def _extract_token(arguments: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+#: Roles accepted by :func:`requires_role`. The legacy ``"admin"`` is a
+#: deprecated alias for ``"operator"`` (kept for one release so existing
+#: per-tool ``@requires("admin")`` decorators keep working until Wave 3
+#: sweeps through with the new vocabulary).
+_VALID_ROLES = frozenset({"operator", "manager", "any", "admin"})
+
+
+def _check_role(role: str, token: Optional[str]) -> None:
+    """Run the role gate. Raise :class:`AuthRejected` on rejection.
+
+    Centralises the role → check mapping so :func:`requires` and
+    :func:`requires_role` share one implementation. The function
+    consults ``operator_session_active`` (set by the REST seam when
+    the call originates from a logged-in operator's session cookie)
+    in addition to the static token verification.
+
+    Role semantics (Phase 2 Wave 2a):
+
+    * ``"operator"`` (and legacy alias ``"admin"``) — admits operator
+      session OR the system bearer. Agent tokens — including
+      ``agent_role='manager'`` — are rejected. This is the strictest
+      gate; reserved for spawn/terminate-agent, mutate ``config_*``,
+      ``broadcast_admin_message``, backup-context, and RAG-index
+      rebuild.
+    * ``"manager"`` — admits operator session OR system bearer OR
+      agent token whose row has ``agent_role='manager'``. The
+      supervision-tier gate: assign-task to peers, edit subordinate
+      agent metadata.
+    * ``"any"`` — any active agent token (worker, manager, or the
+      system bearer acting as an agent). Operator session does NOT
+      satisfy ``"any"`` on its own because ``"any"`` is about
+      agent-side identity (audit-log attribution needs an agent_id);
+      operator-session callers always set ``token=g.system_token``
+      via the REST seam so they pass via the system-bearer branch.
+    """
+    # Lazy import — avoid an import cycle (registry imports authorize
+    # transitively via tool implementations' @requires decorators).
+    from ..tools.registry import operator_session_active
+
+    op_session = bool(operator_session_active.get())
+
+    if role in ("operator", "admin"):
+        # Operator session is sufficient — no token needed (the REST
+        # seam still passes the system token, but a hypothetical
+        # operator-only path that doesn't could authorise here).
+        if op_session:
+            return
+        # System bearer is sufficient (legacy admin scripts, the
+        # REST seam's standard path).
+        if verify_token(token, "system"):
+            return
+        raise AuthRejected("Unauthorized: Operator session or system token required")
+
+    if role == "manager":
+        if op_session:
+            return
+        # Manager-tier check accepts the system bearer OR an agent
+        # whose row has agent_role='manager'.
+        if verify_token(token, "manager"):
+            return
+        raise AuthRejected("Unauthorized: Manager role or operator session required")
+
+    if role == "any":
+        if not get_agent_id(token):
+            raise AuthRejected("Unauthorized: Valid token required")
+        return
+
+    raise ValueError(  # pragma: no cover — guarded at decorator construction
+        f"_check_role: unknown role {role!r}"
+    )
+
+
 def requires(role: str) -> Callable[[ToolImpl], ToolImpl]:
     """Authorise a tool entry point against a static role.
 
-    ``role`` is one of:
+    Backwards-compat thin wrapper around :func:`requires_role`. New
+    code should call ``requires_role`` directly (it accepts the full
+    vocabulary; ``requires`` is kept for one release so the existing
+    ``@requires("admin")`` decorators continue to work unmodified).
 
-    * ``"admin"`` — only the admin token is accepted.
-    * ``"any"`` — any *currently active* agent token is accepted
-      (admin token also counts; it can act as an agent per
-      :func:`agent_mcp.core.auth.verify_token`'s rule).
+    ``role`` is one of ``"admin"`` (deprecated alias for ``"operator"``)
+    or ``"any"`` — the same vocabulary the pre-Wave-2a decorator
+    accepted. Use :func:`requires_role` for the new ``"manager"`` and
+    ``"operator"`` gates.
 
-    Raises :class:`AuthRejected` on miss. The wording matches what the
-    old per-tool ``if not verify_token(...): return TextContent(
-    "Unauthorized: ...")`` blocks produced so existing clients that
-    string-match on the message keep working.
+    Raises :class:`AuthRejected` on miss.
     """
     if role not in ("admin", "any"):
         raise ValueError(
-            f"@requires(role={role!r}) — role must be 'admin' or 'any'"
+            f"@requires(role={role!r}) — role must be 'admin' or 'any'; "
+            "use @requires_role for 'operator' / 'manager'"
+        )
+    return requires_role(role)
+
+
+def requires_role(role: str) -> Callable[[ToolImpl], ToolImpl]:
+    """Authorise a tool entry point against a Phase 2 Wave 2a role.
+
+    See :func:`_check_role` for the per-role admission matrix.
+
+    ``role`` is one of ``"operator"``, ``"manager"``, ``"any"``, or
+    the legacy alias ``"admin"`` (== ``"operator"`` for backwards
+    compat). The wrapper exposes ``_required_role`` so
+    :func:`agent_mcp.tools.access._derive_access_level` can build the
+    tools/list visibility map without re-parsing the source.
+
+    Raises :class:`AuthRejected` on miss.
+    """
+    if role not in _VALID_ROLES:
+        raise ValueError(
+            f"@requires_role(role={role!r}) — role must be one of "
+            f"{sorted(_VALID_ROLES)}"
         )
 
     def decorator(func: ToolImpl) -> ToolImpl:
@@ -114,12 +208,7 @@ def requires(role: str) -> Callable[[ToolImpl], ToolImpl]:
             arguments: Dict[str, Any],
         ) -> List[mcp_types.TextContent]:
             token = _extract_token(arguments)
-            if role == "admin":
-                if not verify_token(token, "admin"):
-                    raise AuthRejected("Unauthorized: Admin token required")
-            else:  # role == "any"
-                if not get_agent_id(token):
-                    raise AuthRejected("Unauthorized: Valid token required")
+            _check_role(role, token)
             return await func(arguments)
 
         # PR-W1c (2026-06-05): expose the role on the wrapper for the

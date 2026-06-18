@@ -27,6 +27,13 @@ def verify_token(token: str, required_role: str = "agent") -> bool:
     * ``"admin"`` — deprecated alias for ``"system"``. Kept for one
       release so existing per-tool ``verify_token(token, "admin")``
       sites continue to work; new code should use ``"system"``.
+    * ``"manager"`` — Phase 2 Wave 2a (v5.0.63). Accepts the system
+      bearer OR an agent token whose row in ``agents`` has
+      ``agent_role == 'manager'``. Worker-role agent tokens are
+      rejected. Used by ``@requires_role("manager")`` to gate
+      supervision-tier tools (assign-task to other agents, edit
+      subordinate agent metadata) without granting operator-tier
+      powers (spawn/terminate agents, mutate ``config_*`` keys).
     * ``"agent"`` — any currently-active agent token, or the system
       bearer (which can act as an agent).
     """
@@ -35,6 +42,19 @@ def verify_token(token: str, required_role: str = "agent") -> bool:
     # Treat "admin" as a deprecated alias for "system" — see docstring.
     if required_role in ("system", "admin") and token == g.system_token:
         return True
+    # "manager" — system bearer OR an agent token whose row has
+    # agent_role='manager'. Read via agent_repo so a freshly-restored
+    # row missing from the in-memory cache still resolves. (Same
+    # cache-first contract as get_agent_id; see PR-W2c.)
+    if required_role == "manager":
+        if token == g.system_token:
+            return True
+        from .repositories import agent_repo
+
+        row = agent_repo.get_agent_by_token(token)
+        if isinstance(row, dict) and row.get("agent_role") == "manager":
+            return True
+        return False
     # Check active_agents only if it's not None and token is a key
     if required_role == "agent" and g.active_agents and token in g.active_agents:
         return True
