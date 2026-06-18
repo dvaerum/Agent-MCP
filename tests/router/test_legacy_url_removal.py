@@ -14,11 +14,13 @@ Scope (locked by Dennis, ship-the-legacy-cleanup PR, v5.0.0):
     - /api/agents-list  (legacy alias for /api/agents)
     - /api/tasks-all    (legacy alias for /api/tasks)
 
-The OTHER ``__``-prefixed router endpoints (/__projects, /__overview,
-/__create, /__rename, /__unregister, /__alias-usage, /__remove-alias,
-/__client-config, /__client-installer) are STILL PRIMARY handlers —
-PR-C added the REST shape alongside them but didn't migrate the
-dashboard. Those stay and are covered by other tests.
+ADR 0014 (v5.0.60) extended this set: the remaining ``__``-prefixed
+router endpoints (``__projects``, ``__overview``, ``__create``,
+``__rename``, ``__unregister``, ``__alias-usage``, ``__remove-alias``,
+``__client-config``, ``__client-installer``, ``__create-agent``)
+were retired in favour of REST shapes under ``/api/router/...``. The
+404-on-legacy guards for those URLs live in
+``test_router_admin_api.py``.
 """
 
 from __future__ import annotations

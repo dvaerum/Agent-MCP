@@ -66,18 +66,20 @@ async def test_static_assets_not_redirected(
 async def test_internal_json_apis_not_redirected(
     aiohttp_client, router_app,
 ) -> None:
-    """Machine-to-machine surfaces (/__*, /api/, /mcp/) must NOT
-    redirect; they're hit by agents, dashboard fetch() calls, and CI
-    integrations that have no business rendering a wizard. The
-    __projects handler is project-listing JSON — should be 200 even
+    """Machine-to-machine surfaces (/api/, /mcp/) must NOT redirect;
+    they're hit by agents, dashboard fetch() calls, and CI
+    integrations that have no business rendering a wizard. The public
+    ``/api/router/health`` descriptor is JSON — should be 200 even
     on a brand-new deploy with no users."""
     client = await aiohttp_client(router_app)
     resp = await client.get(
-        "/agent-mcp/__projects", allow_redirects=False,
+        "/agent-mcp/api/router/health",
+        headers={"Accept": "application/vnd.agent-mcp.v1+json"},
+        allow_redirects=False,
     )
     assert resp.status == 200, await resp.text()
     body = await resp.json()
-    assert body == {"projects": []}
+    assert body["ok"] is True
 
 
 # ── Setup page rendering ───────────────────────────────────────────

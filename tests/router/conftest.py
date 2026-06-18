@@ -260,7 +260,7 @@ def router_app(router_module):
 
         async def test_x(aiohttp_client, router_app):
             client = await aiohttp_client(router_app)
-            resp = await client.get("/agent-mcp/__projects")
+            resp = await client.get("/agent-mcp/api/router/projects")
             ...
     """
     return router_module.make_app()

@@ -6,14 +6,14 @@ PR D wires the operator session cookie (created by PR C's
   * The router's aiohttp middleware
     (``require_operator_session_middleware``) gates every
     ``/agent-mcp/...`` request EXCEPT the explicit unauth allow-list
-    (login/logout/setup/assets/mcp + the WIP ``__projects``
-    discovery endpoint).
+    (login/logout/setup/assets/mcp + the ``/api/router/health``
+    service descriptor).
   * Project-scoped paths
     (``/agent-mcp/api/<name>/...``, ``/agent-mcp/app/<name>/...``)
     also check ``project_membership`` for the resolved user.
-  * Router-global mutations (``/agent-mcp/__create``,
-    ``/agent-mcp/__create-agent``, etc.) require ANY logged-in
-    operator.
+  * Router-global mutations (``POST /agent-mcp/api/router/projects``,
+    ``POST /agent-mcp/api/router/projects/<name>/agents``, etc.)
+    require ANY logged-in operator (ADR 0014).
   * The legacy ``Authorization: Bearer <admin_token>`` path stays
     valid for ``/agent-mcp/mcp/<name>`` (MCP transport) and the
     per-project REST surface — agents must keep authenticating.
@@ -74,18 +74,27 @@ async def _login(client, username: str, password: str = "pw") -> str:
 # ── 401 surface for dashboard mutation routes ──────────────────────
 
 
+_REST_HEADERS = {
+    "Accept": "application/vnd.agent-mcp.v1+json",
+    "Content-Type": "application/json",
+}
+
+
 async def test_mutation_without_cookie_returns_401(
     aiohttp_client, router_app,
 ) -> None:
-    """A POST to a project-scoped dashboard mutation without the
-    session cookie must 401 — PR D closes the "anyone with the URL
-    can hit it" dashboard-side hole.
+    """A POST to a router-admin mutation without the session cookie
+    must 401 — PR D closes the "anyone with the URL can hit it"
+    dashboard-side hole.
     """
+    import json
+
     _seed_user("alice")
     client = await aiohttp_client(router_app)
     resp = await client.post(
-        "/agent-mcp/__create",
-        data={"name": "proj-x"},
+        "/agent-mcp/api/router/projects",
+        data=json.dumps({"name": "proj-x"}),
+        headers=_REST_HEADERS,
         allow_redirects=False,
     )
     assert resp.status == 401, await resp.text()
@@ -94,9 +103,10 @@ async def test_mutation_without_cookie_returns_401(
 async def test_router_global_route_requires_session(
     aiohttp_client, router_app,
 ) -> None:
-    """Router-global READ surfaces (``__projects``, ``__overview``)
-    used by the operator-facing dashboard require a logged-in user
-    too — Phase 1 doesn't yet split read vs write perms.
+    """Router-global READ surfaces (``/api/router/projects``,
+    ``/api/router/overview``) used by the operator-facing dashboard
+    require a logged-in user too — Phase 1 doesn't yet split read
+    vs write perms.
 
     Phase 3 adds finer system-perm gating; for now any logged-in
     operator can call these.
@@ -105,13 +115,18 @@ async def test_router_global_route_requires_session(
     client = await aiohttp_client(router_app)
 
     # Without cookie: 401.
-    resp = await client.get("/agent-mcp/__overview", allow_redirects=False)
+    resp = await client.get(
+        "/agent-mcp/api/router/overview",
+        headers={"Accept": "application/vnd.agent-mcp.v1+json"},
+        allow_redirects=False,
+    )
     assert resp.status == 401, await resp.text()
 
     # With cookie: 200.
     cookie = await _login(client, "alice")
     resp = await client.get(
-        "/agent-mcp/__overview",
+        "/agent-mcp/api/router/overview",
+        headers={"Accept": "application/vnd.agent-mcp.v1+json"},
         cookies={"agent_mcp_session": cookie},
         allow_redirects=False,
     )
@@ -121,27 +136,26 @@ async def test_router_global_route_requires_session(
 async def test_mutation_with_session_cookie_succeeds(
     aiohttp_client, router_app,
 ) -> None:
-    """With a logged-in operator's cookie, POST to ``__create``
-    actually creates a project (or surfaces the registry's own
-    validation error).
-
-    We don't assert on the body — just that the auth gate let us
-    through to the handler (which itself returns 303 or 400 depending
-    on validation outcomes; both prove we're past the dep).
+    """With a logged-in operator's cookie, POST to the create-project
+    REST resource actually creates a project (or surfaces the
+    registry's own validation error). The auth gate let us through
+    to the handler.
     """
+    import json
+
     _seed_user("alice")
     client = await aiohttp_client(router_app)
     cookie = await _login(client, "alice")
     resp = await client.post(
-        "/agent-mcp/__create",
-        data={"name": "proj-y"},
+        "/agent-mcp/api/router/projects",
+        data=json.dumps({"name": "proj-y"}),
+        headers=_REST_HEADERS,
         cookies={"agent_mcp_session": cookie},
         allow_redirects=False,
     )
-    # 303 (redirect to index) on success; 400 on invalid slug; never
-    # 401 with a valid cookie.
+    # 201 on success; 4xx on validation; never 401 with a valid cookie.
     assert resp.status != 401, await resp.text()
-    assert resp.status in (303, 400, 409), await resp.text()
+    assert resp.status in (201, 400, 409), await resp.text()
 
 
 # ── Project membership ─────────────────────────────────────────────

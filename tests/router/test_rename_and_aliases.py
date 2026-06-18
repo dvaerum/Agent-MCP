@@ -1,5 +1,11 @@
-"""Tests for the router's __rename endpoint, alias-in-proxy
-plumbing, and the alias reaper background task (Phase 1b).
+"""Tests for the router rename endpoint, alias-in-proxy plumbing,
+and the alias reaper background task (Phase 1b).
+
+ADR 0014 moved the rename surface from the legacy
+``POST /agent-mcp/__rename`` (form-encoded) to
+``PATCH /agent-mcp/api/router/projects/<name>`` (JSON body), but the
+underlying registry semantics + active-session refusal + grace-alias
+behaviour are unchanged.
 
 The registry data-model tests live next door in
 ``test_project_registry.py`` — this file is for the router-layer
@@ -8,6 +14,7 @@ plumbing that consumes the new registry primitives.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,11 +28,17 @@ import pytest
 pytestmark = pytest.mark.asyncio
 
 
+_STRICT_ACCEPT = {
+    "Accept": "application/vnd.agent-mcp.v1+json",
+    "Content-Type": "application/json",
+}
+
+
 def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# ── __rename endpoint ───────────────────────────────────────────────
+# ── PATCH /api/router/projects/<name> ──────────────────────────────
 
 
 async def test_rename_endpoint_happy_path(
@@ -36,20 +49,17 @@ async def test_rename_endpoint_happy_path(
     assert ws.exists()
 
     client = await aiohttp_client(router_app)
-    resp = await client.post(
-        "/agent-mcp/__rename",
-        data={
-            "old_name": "old-name",
-            "new_name": "new-name",
-            "grace_days": "7",
-        },
+    resp = await client.patch(
+        "/agent-mcp/api/router/projects/old-name",
+        data=json.dumps({"name": "new-name", "grace_days": 7}),
+        headers=_STRICT_ACCEPT,
     )
     assert resp.status == 200, await resp.text()
     body = await resp.json()
-    assert body["renamed"] is True
-    assert body["old"] == "old-name"
-    assert body["new"] == "new-name"
-    assert "alias_expires_at" in body
+    assert body["success"] is True
+    assert body["renamed"] == {"from": "old-name", "to": "new-name"}
+    assert body["alias"]["name"] == "old-name"
+    assert "expires_at" in body["alias"]
 
     # Registry was updated.
     assert router_module._REGISTRY.get("old-name") is None
@@ -77,9 +87,10 @@ async def test_rename_endpoint_rejects_existing_new_name(
     register_project("alpha")
     register_project("beta")
     client = await aiohttp_client(router_app)
-    resp = await client.post(
-        "/agent-mcp/__rename",
-        data={"old_name": "alpha", "new_name": "beta"},
+    resp = await client.patch(
+        "/agent-mcp/api/router/projects/alpha",
+        data=json.dumps({"name": "beta"}),
+        headers=_STRICT_ACCEPT,
     )
     assert resp.status == 409
 
@@ -91,12 +102,10 @@ async def test_rename_endpoint_rejects_inflight_session(
     router_module.active_conns["busy-project"] = 2
     try:
         client = await aiohttp_client(router_app)
-        resp = await client.post(
-            "/agent-mcp/__rename",
-            data={
-                "old_name": "busy-project",
-                "new_name": "calm-project",
-            },
+        resp = await client.patch(
+            "/agent-mcp/api/router/projects/busy-project",
+            data=json.dumps({"name": "calm-project"}),
+            headers=_STRICT_ACCEPT,
         )
         assert resp.status == 409
         body = await resp.json()
@@ -115,9 +124,10 @@ async def test_rename_endpoint_rejects_bad_slug(
 ) -> None:
     register_project("alpha")
     client = await aiohttp_client(router_app)
-    resp = await client.post(
-        "/agent-mcp/__rename",
-        data={"old_name": "alpha", "new_name": "Bad_Slug"},
+    resp = await client.patch(
+        "/agent-mcp/api/router/projects/alpha",
+        data=json.dumps({"name": "Bad_Slug"}),
+        headers=_STRICT_ACCEPT,
     )
     assert resp.status == 400
 

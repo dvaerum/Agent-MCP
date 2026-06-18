@@ -223,9 +223,10 @@ async def test_descriptor_advertises_new_endpoint_urls(
 async def test_reserved_top_level_names_rejected(router_module) -> None:
     """The slug regex doesn't reserve any names today — a project
     literally named ``api`` would become unreachable behind the renamed
-    /api/* route. ``_validate_name`` MUST reject the four top-level
-    path segments now used by the URL surface."""
-    for reserved in ("api", "app", "assets", "mcp"):
+    /api/* route. ``_validate_name`` MUST reject the five top-level
+    path segments now used by the URL surface. ``router`` is the
+    admin-namespace segment added by ADR 0014."""
+    for reserved in ("api", "app", "assets", "mcp", "router"):
         err = router_module._validate_name(reserved, existing={})
         assert err is not None, f"name {reserved!r} should be rejected"
         assert "reserved" in err.lower(), (
@@ -241,22 +242,23 @@ async def test_non_reserved_names_still_accepted(router_module) -> None:
         assert err is None, f"name {ok!r} should be accepted, got: {err!r}"
 
 
-# ── Old /__projects, /__overview etc. unchanged ──────────────────────
+# ── Router admin surface (ADR 0014) ──────────────────────────────────
 
 
-async def test_old_direct_router_routes_unchanged(
+async def test_router_admin_projects_listed(
     aiohttp_client, router_app, register_project,
 ) -> None:
-    """The direct router endpoints (/__projects, /__overview, /__create,
-    /__rename, /__unregister, /__alias-usage, /__remove-alias,
-    /__client-config, /__client-installer) are NOT renamed in PR-B —
-    PR-C folds the project-lifecycle ones into POST /api/projects.
-    Verify a sample still resolves so PR-B doesn't accidentally break
-    them."""
+    """Sanity guard: the project list at the new admin URL resolves
+    and returns the JSON envelope the dashboard consumes. The legacy
+    ``__projects`` shape was retired in ADR 0014; the new path is
+    ``/api/router/projects``."""
     register_project("alpha")
     client = await aiohttp_client(router_app)
 
-    resp = await client.get("/agent-mcp/__projects")
+    resp = await client.get(
+        "/agent-mcp/api/router/projects",
+        headers={"Accept": "application/vnd.agent-mcp.v1+json"},
+    )
 
     assert resp.status == 200
     body = await resp.json()
