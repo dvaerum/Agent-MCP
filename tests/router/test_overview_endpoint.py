@@ -1,9 +1,10 @@
-"""Tests for the dashboard ``GET /agent-mcp/__overview`` endpoint and
-the ``GET /agent-mcp/`` → ``/__dashboard/`` redirect, both added in
-Phase 3.5a of the router-upstream plan (prancy-napping-pie).
+"""Tests for the dashboard ``GET /agent-mcp/api/router/overview``
+endpoint (ADR 0014; legacy ``/__overview`` was retired) and the
+``GET /agent-mcp/`` → ``/app/`` redirect (Phase 3.5a of the
+router-upstream plan, prancy-napping-pie).
 
 The overview endpoint is consumed by the React overview route
-(``/__dashboard/``). It must return a JSON envelope of one record per
+(``/app/``). It must return a JSON envelope of one record per
 registered project containing the fields the cards render (R2 + S2):
 
   ``name``            : str — project name (canonical).
@@ -44,6 +45,9 @@ import pytest
 pytestmark = pytest.mark.asyncio
 
 
+_STRICT_ACCEPT = {"Accept": "application/vnd.agent-mcp.v1+json"}
+
+
 # ── /__overview shape ──────────────────────────────────────────────
 
 
@@ -53,7 +57,9 @@ async def test_overview_returns_empty_list_when_no_projects(
     """No registered projects → ``{"projects": [], "multi_tenant": true}``."""
     client = await aiohttp_client(router_app)
 
-    resp = await client.get("/agent-mcp/__overview")
+    resp = await client.get(
+        "/agent-mcp/api/router/overview", headers=_STRICT_ACCEPT,
+    )
 
     assert resp.status == 200
     assert resp.headers["Content-Type"].startswith("application/json")
@@ -72,7 +78,9 @@ async def test_overview_one_project_stopped_no_db(
     workspace = register_project("alpha")
     client = await aiohttp_client(router_app)
 
-    resp = await client.get("/agent-mcp/__overview")
+    resp = await client.get(
+        "/agent-mcp/api/router/overview", headers=_STRICT_ACCEPT,
+    )
 
     assert resp.status == 200
     body = await resp.json()
@@ -127,7 +135,9 @@ async def test_overview_counts_from_sqlite(
     con.close()
 
     client = await aiohttp_client(router_app)
-    resp = await client.get("/agent-mcp/__overview")
+    resp = await client.get(
+        "/agent-mcp/api/router/overview", headers=_STRICT_ACCEPT,
+    )
 
     assert resp.status == 200
     body = await resp.json()
@@ -150,7 +160,9 @@ async def test_overview_status_active_when_systemd_active_and_fresh(
     router_module.last_active[("hot", "backend")] = time.time()
     client = await aiohttp_client(router_app)
 
-    resp = await client.get("/agent-mcp/__overview")
+    resp = await client.get(
+        "/agent-mcp/api/router/overview", headers=_STRICT_ACCEPT,
+    )
     body = await resp.json()
     row = next(r for r in body["projects"] if r["name"] == "hot")
     assert row["status"] == "active"
@@ -167,7 +179,9 @@ async def test_overview_status_idle_after_five_minutes(
     router_module.last_active[("warm", "backend")] = time.time() - (10 * 60)
     client = await aiohttp_client(router_app)
 
-    resp = await client.get("/agent-mcp/__overview")
+    resp = await client.get(
+        "/agent-mcp/api/router/overview", headers=_STRICT_ACCEPT,
+    )
     body = await resp.json()
     row = next(r for r in body["projects"] if r["name"] == "warm")
     assert row["status"] == "idle"
@@ -183,7 +197,9 @@ async def test_overview_alias_rows_surface(
     router_module._REGISTRY.add_alias("renamed", "oldname")
     client = await aiohttp_client(router_app)
 
-    resp = await client.get("/agent-mcp/__overview")
+    resp = await client.get(
+        "/agent-mcp/api/router/overview", headers=_STRICT_ACCEPT,
+    )
     body = await resp.json()
     row = next(r for r in body["projects"] if r["name"] == "renamed")
     assert len(row["alias"]) == 1
@@ -248,7 +264,9 @@ async def test_overview_envelope_reports_single_tenant(
     app = router_module.make_app(single_tenant_name="only")
     client = await aiohttp_client(app)
 
-    resp = await client.get("/agent-mcp/__overview")
+    resp = await client.get(
+        "/agent-mcp/api/router/overview", headers=_STRICT_ACCEPT,
+    )
 
     assert resp.status == 200
     body = await resp.json()

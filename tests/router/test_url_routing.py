@@ -18,6 +18,9 @@ import pytest
 pytestmark = pytest.mark.asyncio
 
 
+_STRICT_ACCEPT = {"Accept": "application/vnd.agent-mcp.v1+json"}
+
+
 async def test_projects_endpoint_returns_json_list(
     aiohttp_client, router_app, register_project,
 ) -> None:
@@ -25,7 +28,9 @@ async def test_projects_endpoint_returns_json_list(
     register_project("beta")
     client = await aiohttp_client(router_app)
 
-    resp = await client.get("/agent-mcp/__projects")
+    resp = await client.get(
+        "/agent-mcp/api/router/projects", headers=_STRICT_ACCEPT,
+    )
 
     assert resp.status == 200
     body = await resp.json()
@@ -82,23 +87,25 @@ async def test_dashboard_bare_redirects_to_trailing_slash(
     assert resp.headers["Location"] == "/agent-mcp/app/foo/"
 
 
-async def test_create_accepts_form_encoded_name(
+async def test_create_accepts_json_post(
     aiohttp_client, router_app,
 ) -> None:
-    """``POST /agent-mcp/__create`` accepts ``name=<slug>`` form bodies
-    and returns a 303 redirect to the index page (HTTPSeeOther)."""
+    """``POST /agent-mcp/api/router/projects`` accepts a JSON body
+    ``{"name": "<slug>"}`` and returns 201 with the unified envelope."""
+    import json
     client = await aiohttp_client(router_app)
 
     resp = await client.post(
-        "/agent-mcp/__create",
-        data={"name": "newproj"},
+        "/agent-mcp/api/router/projects",
+        data=json.dumps({"name": "newproj"}),
+        headers={**_STRICT_ACCEPT, "Content-Type": "application/json"},
         allow_redirects=False,
     )
 
-    assert resp.status == 303
-    location = resp.headers["Location"]
-    assert location.startswith("/agent-mcp/?")
-    assert "created=newproj" in location
+    assert resp.status == 201
+    body = await resp.json()
+    assert body["success"] is True
+    assert body["project"]["name"] == "newproj"
 
 
 async def test_legacy_sse_returns_404(

@@ -25,26 +25,32 @@ REST routes: request bodies and response chunks are streamed
 unchanged. The router does NOT parse MCP protocol bodies;
 tools/list and tools/call are forwarded byte-for-byte.
 
-URL convention: every router-internal operation segment
-starts with `__`, every other path segment under /agent-mcp/ is a
-project name. Because project names are matched against a slug
-regex that does not allow underscores, the two namespaces cannot
-collide.
+URL convention: the admin surface lives under
+`/agent-mcp/api/router/...` (ADR 0014). Project names occupy every
+other segment under `/agent-mcp/`; a single reserved top-level
+segment ``router`` (joined by `api`, `app`, `assets`, `mcp` —
+defended at validate-name time) carves out the admin namespace so
+the two cannot collide.
 
-  GET  /agent-mcp/                            HTML index page
-  GET  /agent-mcp/__projects                  JSON name list (dashboard picker)
-  POST /agent-mcp/__create                    create project
-  POST /agent-mcp/__create-agent              create a worker agent on a project
-  POST /agent-mcp/__stop                      stop a project (refuses if busy)
-  POST /agent-mcp/__unregister                drop project
-  GET  /agent-mcp/__client-config/<n>.mcp.json[?agent=<id>]  download .mcp.json
-  GET  /agent-mcp/__client-installer/<n>.sh[?agent=<id>]     download merge script
+  GET  /agent-mcp/                            HTML index page / JSON descriptor
+  GET  /agent-mcp/api/router/health           public service descriptor
+  GET  /agent-mcp/api/router/projects         JSON name list
+  POST /agent-mcp/api/router/projects         create project
+  PATCH  /agent-mcp/api/router/projects/<n>   rename (body: {name, grace_days?})
+  DELETE /agent-mcp/api/router/projects/<n>   unregister
+  POST /agent-mcp/api/router/projects/<n>/stop  stop a project (refuses if busy)
+  GET  /agent-mcp/api/router/overview         cross-project envelope
+  GET  /agent-mcp/api/router/projects/<n>/client-config[?agent=<id>]
+  GET  /agent-mcp/api/router/projects/<n>/installer[?agent=<id>]
+  GET  /agent-mcp/api/router/projects/<n>/aliases?alias=<a>
+  DELETE /agent-mcp/api/router/projects/<n>/aliases/<a>
+  POST /agent-mcp/api/router/projects/<n>/agents
 
-  *    /agent-mcp/<name>/mcp                  proxy → backend /mcp
+  *    /agent-mcp/mcp/<name>                  proxy → backend /mcp
                                               (Streamable HTTP transport,
                                               MCP spec rev 2025-03-26)
-  *    /agent-mcp/__api/<name>/{rest}         proxy → backend /api/{rest}
-  GET  /agent-mcp/__dashboard/<name>/{rest}   static Next.js export
+  *    /agent-mcp/api/<name>/{rest}           proxy → backend /api/{rest}
+  GET  /agent-mcp/app/<name>/{rest}           static Next.js export
 
 dvaerum/Agent-MCP 3.0.0 dropped the SSE+messages pair in favour of
 a single stateless Streamable HTTP /mcp endpoint. Sessions are no
@@ -65,8 +71,8 @@ processes itself; systemd owns lifecycle.
 Configuration (all via environment variables):
 
   AGENT_MCP_PROJECTS_FILE        JSON {name: path}. Maintained by
-                                 the router itself via __create /
-                                 __unregister.
+                                 the router itself via POST /
+                                 DELETE on /api/router/projects.
   AGENT_MCP_SOCK_DIR             where backend.sock files live
                                  (typically $XDG_RUNTIME_DIR/agent-mcp).
   AGENT_MCP_DASHBOARD_DIR        static Next.js export root.
@@ -96,7 +102,7 @@ import re
 import subprocess
 import time
 from pathlib import Path
-from urllib.parse import quote, urlencode
+from urllib.parse import quote
 
 from aiohttp import ClientSession, ClientTimeout, UnixConnector, web
 
@@ -474,12 +480,16 @@ def _projects_dict() -> dict[str, str]:
     return {row["name"]: row["workspace"] for row in _REGISTRY.list()}
 
 
-# Reserved project names. After PR-B's URL rename these four segments
-# are top-level paths on the router; a project literally named after
-# one of them would become structurally unreachable behind the
-# more-specific route registration (audit §2.6). Rejected at create /
-# rename time so the registry never holds a name that would collide.
-_RESERVED_NAMES = frozenset({"api", "app", "assets", "mcp"})
+# Reserved project names. After PR-B's URL rename four segments are
+# top-level paths on the router (``api``, ``app``, ``assets``,
+# ``mcp``); a project literally named after one of them would become
+# structurally unreachable behind the more-specific route registration
+# (audit §2.6). ADR 0014 adds ``router`` to the set — it's the single
+# admin-namespace segment under ``/api/router/...`` and a project of
+# that name would shadow ``/api/router/projects/<router>/...``.
+# Rejected at create / rename time so the registry never holds a name
+# that would collide.
+_RESERVED_NAMES = frozenset({"api", "app", "assets", "mcp", "router"})
 
 
 def _validate_name(name: str, existing: dict[str, str]) -> str | None:
@@ -1152,23 +1162,10 @@ async def _drain_proxy_tasks(app: web.Application) -> None:
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-# ── Create / unregister handlers ─────────────────────────────────────
-
-
-async def projects_handler(req: web.Request) -> web.Response:
-    """GET /agent-mcp/__projects — list of registered project names.
-
-    Consumed by the dashboard's project picker so it can offer
-    cross-project navigation (each pick becomes a navigation to
-    /agent-mcp/__dashboard/<name>/). Sorted for stable UI.
-    """
-    return web.json_response(
-        {"projects": sorted(_projects_dict().keys())},
-        headers={"Cache-Control": "no-store"},
-    )
-
-
-# ── Overview endpoint (Phase 3.5a) ──────────────────────────────────
+# ── Overview support (Phase 3.5a) ───────────────────────────────────
+# Project list + overview handlers themselves live in
+# ``agent_mcp.router.admin_api`` (ADR 0014) and call into the
+# helpers below.
 #
 # Backs the new React route `/__dashboard/` (the dashboard overview).
 # One JSON envelope per request — three small COUNTs per project on a
@@ -1302,140 +1299,18 @@ def _build_overview_envelope() -> dict:
     return envelope
 
 
-async def alias_usage_handler(req: web.Request) -> web.Response:
-    """GET /agent-mcp/__alias-usage?alias=<name>
-
-    Backs the dashboard's alias-chip expansion panel (Phase 3.5c).
-    Resolves the alias to its real project, then queries the
-    project's SQLite `mcp_sessions.alias_used` column (added in
-    Phase 1c migration 0005) for the distinct agent_ids that have
-    used the alias. The dashboard shows this list so the operator
-    can see "who's still on the old name" before deciding to expire
-    the alias early.
-
-    Returns 404 if the alias isn't currently active on any project.
-    Returns ``{alias, project, expires_at, agents}`` on success.
-    """
-    alias = (req.rel_url.query.get("alias") or "").strip()
-    if not alias:
-        raise web.HTTPBadRequest(reason="missing 'alias' query parameter")
-
-    real_name = _REGISTRY.resolve_alias(alias)
-    if real_name is None:
-        raise web.HTTPNotFound(
-            reason=f"alias {alias!r} is not active on any project"
-        )
-
-    row = _REGISTRY.get(real_name)
-    if row is None:
-        # Race: resolve_alias hit a row that was unregistered between
-        # the two reads. Treat as 404.
-        raise web.HTTPNotFound(reason=f"alias {alias!r} no longer resolves")
-
-    # Find the alias's expires_at on the project's record.
-    expires_at = ""
-    for entry in row.get("aliases", []) or []:
-        if entry.get("name") == alias:
-            expires_at = entry.get("expires_at", "")
-            break
-
-    # Pull distinct agent_ids from the project's SQLite (best-effort —
-    # missing DB or missing column → empty list, never raises).
-    agents: list[str] = []
-    db = _project_db_path(row["workspace"])
-    if db.is_file():
-        try:
-            import sqlite3
-
-            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1.0)
-            try:
-                cur = con.cursor()
-                rows = cur.execute(
-                    "SELECT DISTINCT agent_id FROM mcp_sessions "
-                    "WHERE alias_used = ? AND agent_id IS NOT NULL",
-                    (alias,),
-                ).fetchall()
-                agents = [r[0] for r in rows if r[0]]
-            finally:
-                con.close()
-        except Exception:
-            # Table missing in a half-migrated DB, or unexpected DB
-            # error — return [] rather than 500 the panel.
-            log.exception("alias-usage: query failed for %s", db)
-
-    return web.json_response(
-        {
-            "alias": alias,
-            "project": real_name,
-            "expires_at": expires_at,
-            "agents": agents,
-        },
-        headers={"Cache-Control": "no-store"},
-    )
+# The handlers for ``alias-usage``, ``remove-alias`` and ``overview``
+# live in ``agent_mcp.router.admin_api`` (ADR 0014). They reuse
+# ``_build_overview_envelope``, ``_project_db_path`` and the
+# ``_OVERVIEW_CACHE_TTL_SEC`` cache state defined above.
 
 
-async def remove_alias_handler(req: web.Request) -> web.Response:
-    """POST /agent-mcp/__remove-alias
-
-    Form fields: ``name`` (the real project), ``alias`` (the alias
-    to drop). Removes the alias immediately, skipping the grace
-    reaper. Surface on the dashboard via the alias-chip expansion's
-    "Remove alias now" button (Phase 3.5c).
-
-    Disabled in single-tenant mode (Phase 3) — there's no rename
-    surface in N=1 mode, so there's no alias surface either.
-    """
-    if SINGLE_TENANT_NAME is not None:
-        return _single_tenant_disabled_response()
-    form = await req.post()
-    name = (form.get("name") or "").strip()
-    alias = (form.get("alias") or "").strip()
-    if not name or not alias:
-        raise web.HTTPBadRequest(reason="missing 'name' or 'alias'")
-
-    row = _REGISTRY.get(name)
-    if row is None:
-        raise web.HTTPNotFound(reason=f"unknown project: {name!r}")
-
-    _REGISTRY.expire_alias(name, alias)
-
-    updated = _REGISTRY.get(name)
-    remaining = list((updated or {}).get("aliases", []) or [])
-    return web.json_response(
-        {
-            "removed": alias,
-            "project": name,
-            "remaining_aliases": remaining,
-        },
-        headers={"Cache-Control": "no-store"},
-    )
-
-
-async def overview_handler(req: web.Request) -> web.Response:
-    """GET /agent-mcp/__overview — JSON envelope for the dashboard
-    overview cards (R2 + S2 + multi-line per Phase 3.5).
-
-    Cached for ``_OVERVIEW_CACHE_TTL_SEC`` to avoid hammering
-    systemctl + SQLite on the dashboard's first-paint fan-out. The
-    cache is process-local; one router process = one cache."""
-    global _overview_cache
-    now = time.time()
-    if _overview_cache is not None and _overview_cache[0] > now:
-        envelope = _overview_cache[1]
-    else:
-        envelope = _build_overview_envelope()
-        _overview_cache = (now + _OVERVIEW_CACHE_TTL_SEC, envelope)
-    return web.json_response(envelope, headers={"Cache-Control": "no-store"})
-
-
-# ── PR-C: REST resource shape for project lifecycle ────────────────
+# ── Shared envelope / gate helpers ─────────────────────────────────
 #
-# The JSON-bodied /api/projects family added in PR-C is the new
-# canonical surface for project lifecycle operations. The legacy
-# form-encoded handlers (__create / __unregister / __rename / __stop)
-# remain mounted as DEPRECATED — they keep the pre-PR-C dashboard
-# modals working until they migrate. PR-F or a later major can drop
-# the legacy mounts once telemetry shows no traffic on them.
+# The handlers themselves moved to ``agent_mcp.router.admin_api``
+# (ADR 0014); these helpers stay here because they're imported from
+# that module and from the per-project REST routes in
+# ``agent_mcp/app/routes.py``.
 #
 # Unified error envelope (audit §2.5 — picked the
 # _dispatch_through_tool shape since it already has the most adoption):
@@ -1517,617 +1392,21 @@ def _rest_gated(handler):
     return wrapped
 
 
-async def rest_create_project_handler(req: web.Request) -> web.Response:
-    """POST /agent-mcp/api/projects — create a new project (PR-C JSON shape).
-
-    Body: ``{"name": "<slug>"}``. Workspace location is fixed at
-    DEFAULT_WORKSPACE_PARENT/<name>.
-
-    Returns 201 + ``{success, project: {name, workspace}}`` on success.
-    Maps validator errors (invalid slug, reserved name, duplicate) to
-    400 / 409 with discriminator codes so the dashboard can branch on
-    body.error rather than parsing message strings.
-    """
-    if SINGLE_TENANT_NAME is not None:
-        return _single_tenant_disabled_response()
-    body = await _parse_json_body(req)
-    name = (body.get("name") or "").strip()
-    err = _validate_name(name, _projects_dict())
-    if err is not None:
-        # _validate_name lumps "already registered" with slug errors;
-        # discriminate so callers can branch on the discriminator.
-        if "already is registered" in err or "already registered" in err:
-            return _error_envelope(
-                error=_ERROR_ALREADY_REGISTERED, message=err, status=409,
-            )
-        return _error_envelope(
-            error=_ERROR_INVALID_NAME, message=err, status=400,
-        )
-    workspace = (DEFAULT_WORKSPACE_PARENT / name).expanduser().resolve()
-    try:
-        workspace.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        return _error_envelope(
-            error=_ERROR_INTERNAL,
-            message=f"could not create workspace {workspace}: {e.strerror}",
-            status=500,
-        )
-    try:
-        _REGISTRY.register(name, str(workspace))
-    except ValueError as e:
-        return _error_envelope(
-            error=_ERROR_ALREADY_REGISTERED, message=str(e), status=409,
-        )
-    # Auto-grant the creator membership in the new project (same
-    # rationale as the form-encoded /agent-mcp/__create handler).
-    creator = req.get("user")
-    if creator and creator.get("user_id"):
-        from .identity import add_project_membership
-
-        try:
-            add_project_membership(creator["user_id"], name)
-        except Exception:
-            logger.exception(
-                "Failed to add project_membership for creator=%s project=%s",
-                creator.get("username"),
-                name,
-            )
-    return _success_envelope(
-        {"project": {"name": name, "workspace": str(workspace)}},
-        status=201,
-    )
+# The PR-C ``/api/projects/...`` handlers moved to
+# ``agent_mcp.router.admin_api`` under ``/api/router/projects/...``
+# (ADR 0014). The single reserved top-level segment ``router``
+# replaces the per-route reservation of ``projects`` in the
+# middleware's ``_NON_PROJECT_API_SEGMENTS``.
 
 
-async def rest_delete_project_handler(req: web.Request) -> web.Response:
-    """DELETE /agent-mcp/api/projects/<name> — unregister a project.
-
-    Query param ``?delete_workspace=true`` cascades into the on-disk
-    workspace dir (audit §3.2: query-string preferred for DELETE
-    cascade signals since some Fetch implementations strip DELETE
-    bodies).
-
-    Active-session refusal mirrors the legacy handler: a project with
-    in-flight router-tracked connections returns 409 with the count.
-    """
-    if SINGLE_TENANT_NAME is not None:
-        return _single_tenant_disabled_response()
-    name = req.match_info["name"]
-    projects = _projects_dict()
-    if name not in projects:
-        return _error_envelope(
-            error=_ERROR_NOT_REGISTERED,
-            message=f"unknown project: {name!r}",
-            status=404,
-        )
-    conns = active_conns.get(name, 0)
-    if conns > 0:
-        return _error_envelope(
-            error=_ERROR_ACTIVE_SESSIONS,
-            message=(
-                f"{name!r} has {conns} active connection(s); disconnect "
-                f"them and retry"
-            ),
-            status=409,
-            extra={"active_connections": conns, "agents": []},
-        )
-    workspace_path = Path(projects[name])
-    want_delete = (
-        req.rel_url.query.get("delete_workspace", "").lower()
-        in {"true", "1", "yes", "on"}
-    )
-    workspace_deleted = False
-    workspace_delete_skipped_reason: str | None = None
-    if want_delete:
-        if not _is_within_default_workspace(workspace_path):
-            workspace_delete_skipped_reason = (
-                f"workspace {workspace_path} resolves outside the default "
-                f"workspace parent; refusing recursive delete"
-            )
-        elif workspace_path.exists():
-            import shutil
-            try:
-                shutil.rmtree(workspace_path)
-                workspace_deleted = True
-            except OSError as e:
-                workspace_delete_skipped_reason = (
-                    f"rmtree({workspace_path}) failed: {e.strerror}"
-                )
-        else:
-            workspace_delete_skipped_reason = (
-                f"workspace {workspace_path} did not exist on disk"
-            )
-            workspace_deleted = True
-    # Stop the systemd unit + unregister from the registry. Mirror
-    # the legacy handler's order (unit-stop before registry delete).
-    _systemctl("stop", _unit_name(name, "backend"))
-    try:
-        _REGISTRY.unregister(name)
-    except KeyError:
-        pass  # idempotent
-    payload: dict = {
-        "unregistered": name,
-        "workspace_deleted": workspace_deleted,
-    }
-    if workspace_delete_skipped_reason is not None:
-        payload["workspace_delete_skipped_reason"] = workspace_delete_skipped_reason
-    return _success_envelope(payload)
 
 
-async def rest_rename_project_handler(req: web.Request) -> web.Response:
-    """POST /agent-mcp/api/projects/<name>/rename — rename with grace alias.
-
-    Body: ``{"new_name": "<slug>", "grace_days": int?}``. Mirrors the
-    legacy __rename handler's full-rename semantics (workspace move,
-    unit stop, token renames, registry rename with alias) but returns
-    the unified JSON envelope.
-    """
-    if SINGLE_TENANT_NAME is not None:
-        return _single_tenant_disabled_response()
-    old_name = req.match_info["name"]
-    body = await _parse_json_body(req)
-    new_name = (body.get("new_name") or "").strip()
-    grace_days_raw = body.get("grace_days", 30)
-    try:
-        grace_days = int(grace_days_raw)
-    except (TypeError, ValueError):
-        return _error_envelope(
-            error=_ERROR_INVALID_NAME,
-            message=f"grace_days must be an integer, got {grace_days_raw!r}",
-            status=400,
-        )
-
-    if not _SLUG_RE.match(old_name):
-        return _error_envelope(
-            error=_ERROR_INVALID_NAME,
-            message=f"old name {old_name!r} is not a valid slug",
-            status=400,
-        )
-    # _validate_name returns "already registered" for new_name when it's
-    # in `existing`; we want a discriminated error for that case here too.
-    err = _validate_name(new_name, _projects_dict())
-    if err is not None:
-        if "already" in err:
-            return _error_envelope(
-                error=_ERROR_NAME_TAKEN, message=err, status=409,
-            )
-        return _error_envelope(
-            error=_ERROR_INVALID_NAME, message=err, status=400,
-        )
-    if old_name == new_name:
-        return _error_envelope(
-            error=_ERROR_INVALID_NAME,
-            message="old and new names are identical",
-            status=400,
-        )
-
-    old_row = _REGISTRY.get(old_name)
-    if old_row is None:
-        return _error_envelope(
-            error=_ERROR_NOT_REGISTERED,
-            message=f"unknown project: {old_name!r}",
-            status=404,
-        )
-    if _REGISTRY.resolve_alias(new_name) is not None:
-        return _error_envelope(
-            error=_ERROR_ALIAS_COLLISION,
-            message=f"name {new_name!r} is an active alias",
-            status=409,
-        )
-    conns = active_conns.get(old_name, 0)
-    if conns > 0:
-        return _error_envelope(
-            error=_ERROR_ACTIVE_SESSIONS,
-            message=(
-                f"{old_name!r} has {conns} active connection(s); "
-                f"disconnect them and retry"
-            ),
-            status=409,
-            extra={"active_connections": conns, "agents": []},
-        )
-
-    # Side-effects (same order as legacy __rename).
-    _systemctl("stop", _unit_name(old_name, "backend"))
-    workspace = Path(old_row.get("workspace", ""))
-    new_workspace: Path | None = None
-    if workspace.name == old_name and workspace.exists():
-        new_workspace = workspace.with_name(new_name)
-        try:
-            os.rename(workspace, new_workspace)
-        except OSError as e:
-            return _error_envelope(
-                error=_ERROR_INTERNAL,
-                message=f"could not rename workspace dir: {e.strerror}",
-                status=500,
-            )
-    token_dir = (
-        Path(os.environ.get("AGENT_MCP_TOKENS_DIR", ""))
-        or (Path.home() / ".config" / "agent-mcp" / "tokens")
-    )
-    if token_dir.is_dir():
-        for tok in token_dir.glob(f"{old_name}--*.token"):
-            suffix = tok.name[len(old_name) + len("--"):]
-            try:
-                tok.rename(token_dir / f"{new_name}--{suffix}")
-            except OSError:
-                pass
-    try:
-        _REGISTRY.rename(old_name, new_name, grace_days=grace_days)
-    except (ValueError, KeyError) as e:
-        if new_workspace is not None and new_workspace.exists():
-            try:
-                os.rename(new_workspace, workspace)
-            except OSError:
-                pass
-        return _error_envelope(
-            error=_ERROR_INTERNAL,
-            message=f"registry rename failed: {e}",
-            status=500,
-        )
-
-    new_row = _REGISTRY.get(new_name)
-    alias_expires_at = ""
-    for entry in (new_row or {}).get("aliases", []) or []:
-        if entry.get("name") == old_name:
-            alias_expires_at = entry.get("expires_at", "")
-            break
-    return _success_envelope({
-        "renamed": {"from": old_name, "to": new_name},
-        "alias": {
-            "name": old_name,
-            "grace_days": grace_days,
-            "expires_at": alias_expires_at,
-        },
-    })
-
-
-async def rest_stop_project_handler(req: web.Request) -> web.Response:
-    """POST /agent-mcp/api/projects/<name>/stop — stop the project's backend.
-
-    No request body required (POST instead of GET because it's a
-    state-changing operation; idempotent stop is fine to repeat).
-    Active-session refusal mirrors the legacy handler.
-    """
-    name = req.match_info["name"]
-    if name not in _projects_dict():
-        return _error_envelope(
-            error=_ERROR_NOT_REGISTERED,
-            message=f"unknown project: {name!r}",
-            status=404,
-        )
-    conns = active_conns.get(name, 0)
-    if conns > 0:
-        return _error_envelope(
-            error=_ERROR_ACTIVE_SESSIONS,
-            message=(
-                f"{name!r} has {conns} active connection(s); disconnect "
-                f"them and retry"
-            ),
-            status=409,
-            extra={"active_connections": conns, "agents": []},
-        )
-    unit = _unit_name(name, "backend")
-    if _is_active(unit):
-        r = _systemctl("stop", unit)
-        if r.returncode != 0:
-            return _error_envelope(
-                error=_ERROR_INTERNAL,
-                message=f"systemctl stop {unit} failed: {r.stderr.strip()}",
-                status=500,
-            )
-    return _success_envelope({"stopped": name})
-
-
-async def create_handler(req: web.Request) -> web.StreamResponse:
-    """POST /agent-mcp/__create — register a new project.
-
-    Workspace location is fixed at the nix-managed
-    DEFAULT_WORKSPACE_PARENT — the caller picks the name only.
-    Any body-supplied 'workspace' field is silently ignored.
-
-    In single-tenant mode (Phase 3) this endpoint returns 410 with
-    ``endpoint_disabled_in_single_tenant_mode`` so the dashboard
-    overview can show the operator-facing 'unavailable' explanation.
-    """
-    if SINGLE_TENANT_NAME is not None:
-        return _single_tenant_disabled_response()
-    form = await req.post()
-    name = (form.get("name") or "").strip()
-
-    # Slug + length validation first — we don't want to even mkdir
-    # workspace for an invalid name. `_validate_name`'s third arm
-    # (already-registered check) is now redundant with
-    # `_REGISTRY.register()`'s own conflict detection, but keep it
-    # so the error surfaces as a 400 with a friendly message rather
-    # than as the registry's ValueError → 500.
-    err = _validate_name(name, _projects_dict())
-    if err is not None:
-        raise web.HTTPBadRequest(reason=err)
-
-    workspace = (DEFAULT_WORKSPACE_PARENT / name).expanduser().resolve()
-    try:
-        workspace.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        raise web.HTTPBadRequest(
-            reason=f"could not create workspace {workspace}: {e.strerror}"
-        )
-
-    # The race Candidate B targets lives here: previously
-    # `_read_projects()` and `_write_projects()` were separate calls
-    # with no lock between them, so two parallel POSTs to __create
-    # could both read an N-entry registry, both append, and the
-    # second write would clobber the first. `_REGISTRY.register()`
-    # does the read-modify-write under a single LOCK_EX so the worst
-    # case is now two serialised registrations rather than one lost
-    # entry. Idempotency is harmless here because we already
-    # rejected duplicate names above.
-    try:
-        _REGISTRY.register(name, str(workspace))
-    except ValueError as e:
-        # Lost the race against another __create with the same name —
-        # rare, but a real possibility after we released the snapshot
-        # we used for _validate_name.
-        raise web.HTTPBadRequest(reason=str(e))
-
-    # Auto-grant the creator membership in the project they just
-    # created — otherwise GET /agent-mcp/app/<name>/ 401s for them
-    # immediately after creation. The middleware stashes the resolved
-    # operator at request['user']; absent it (single-tenant bypass,
-    # internal callers) skip silently.
-    creator = req.get("user")
-    if creator and creator.get("user_id"):
-        from .identity import add_project_membership
-
-        try:
-            add_project_membership(creator["user_id"], name)
-        except Exception:
-            logger.exception(
-                "Failed to add project_membership for creator=%s project=%s",
-                creator.get("username"),
-                name,
-            )
-
-    raise web.HTTPSeeOther(
-        location="/agent-mcp/?" + urlencode({"created": name})
-    )
-
-
-async def stop_handler(req: web.Request) -> web.StreamResponse:
-    """POST /agent-mcp/__stop — stop a project's backend.
-
-    Refuses with 409 if the project still has active connections —
-    pulling the rug from under a live SSE session would surface as
-    a misleading "backend crash" to the connected client. The user
-    can either disconnect those clients first, or wait for the
-    idle reaper.
-    """
-    form = await req.post()
-    name = (form.get("name") or "").strip()
-    if not name:
-        raise web.HTTPBadRequest(reason="missing 'name'")
-    if name not in _projects_dict():
-        raise web.HTTPNotFound(reason=f"unknown project: {name!r}")
-
-    conns = active_conns.get(name, 0)
-    if conns > 0:
-        raise web.HTTPConflict(
-            reason=f"{name!r} has {conns} active connection(s); refusing to stop"
-        )
-
-    unit = _unit_name(name, "backend")
-    if _is_active(unit):
-        r = _systemctl("stop", unit)
-        if r.returncode != 0:
-            raise web.HTTPInternalServerError(
-                reason=f"systemctl stop {unit} failed: {r.stderr.strip()}"
-            )
-
-    wants_json = "application/json" in req.headers.get("Accept", "")
-    if wants_json:
-        return web.json_response(
-            {"stopped": name}, headers={"Cache-Control": "no-store"}
-        )
-    raise web.HTTPSeeOther(
-        location="/agent-mcp/?" + urlencode({"stopped": name})
-    )
-
-
-async def rename_handler(req: web.Request) -> web.StreamResponse:
-    """POST /agent-mcp/__rename — rename a project with a grace-period alias.
-
-    Form-encoded body: ``old_name``, ``new_name``, optional
-    ``grace_days`` (default 30). Plan decision #4 (locked) makes this
-    a *full* rename: the workspace dir is moved on disk, the systemd
-    unit name follows the new project name, per-agent token files
-    are moved, and the old name is parked as an alias of the new
-    name for ``grace_days`` days.
-
-    The order of operations matters: side-effects (stop unit + move
-    dir + move tokens) happen BEFORE the registry write so a partial
-    failure leaves the on-disk state in a recoverable place. If the
-    workspace path doesn't end in ``/<old_name>`` (operator-customised
-    layout), we skip the directory rename — the caller can rename
-    by hand.
-
-    Refusals:
-
-      * 400 if either name fails the slug regex.
-      * 409 if ``new_name`` is already a project or active alias.
-      * 409 if ``old_name`` has any in-flight MCP/REST connections,
-        with the active-connection count surfaced in the body so the
-        operator knows what's blocking them.
-      * 404 if ``old_name`` isn't registered.
-
-    In single-tenant mode (Phase 3) this endpoint returns 410 — the
-    sole project's name is configured statically by the operator's
-    home-manager profile, and there's no value in supporting rename
-    of an N=1 set.
-    """
-    if SINGLE_TENANT_NAME is not None:
-        return _single_tenant_disabled_response()
-    form = await req.post()
-    old_name = (form.get("old_name") or "").strip()
-    new_name = (form.get("new_name") or "").strip()
-    grace_raw = (form.get("grace_days") or "").strip()
-    try:
-        grace_days = int(grace_raw) if grace_raw else 30
-    except ValueError:
-        raise web.HTTPBadRequest(reason=f"grace_days must be an integer; got {grace_raw!r}")
-
-    if not _SLUG_RE.match(old_name):
-        raise web.HTTPBadRequest(
-            reason=f"old_name must match {_SLUG_RE.pattern}"
-        )
-    if not _SLUG_RE.match(new_name):
-        raise web.HTTPBadRequest(
-            reason=f"new_name must match {_SLUG_RE.pattern}"
-        )
-    if old_name == new_name:
-        raise web.HTTPBadRequest(reason="old_name and new_name are identical")
-
-    old_row = _REGISTRY.get(old_name)
-    if old_row is None:
-        raise web.HTTPNotFound(reason=f"unknown project: {old_name!r}")
-
-    # Conflict check before doing any side-effects. The registry's
-    # own `rename()` would catch this too, but doing it here keeps
-    # the error a 409 instead of a 500-out-of-ValueError.
-    if _REGISTRY.get(new_name) is not None:
-        raise web.HTTPConflict(
-            reason=f"project {new_name!r} is already registered",
-            text=json.dumps(
-                {
-                    "error": "name_taken",
-                    "reason": f"project {new_name!r} is already registered",
-                }
-            ),
-            content_type="application/json",
-        )
-    # Active alias collision check — `_REGISTRY.rename()` does this
-    # too, but again, we want a 409 not a 500.
-    if _REGISTRY.resolve_alias(new_name) is not None:
-        raise web.HTTPConflict(
-            reason=f"name {new_name!r} is an active alias",
-            text=json.dumps(
-                {
-                    "error": "alias_collision",
-                    "reason": f"name {new_name!r} is an active alias",
-                }
-            ),
-            content_type="application/json",
-        )
-
-    # In-flight session refusal. `active_conns` is the router's
-    # in-process per-(name) counter, incremented by `_track_connection`
-    # at proxy entry and decremented on exit. Note this does NOT
-    # cover sessions opened against the backend directly (bypassing
-    # the router), but for the deploy-shape the deployed router is
-    # the only ingress, so this counter is exhaustive.
-    conns = active_conns.get(old_name, 0)
-    if conns > 0:
-        raise web.HTTPConflict(
-            reason=(
-                f"{old_name!r} has {conns} active connection(s); "
-                f"refusing to rename"
-            ),
-            text=json.dumps(
-                {
-                    "error": "active_sessions",
-                    "active_connections": conns,
-                    "agents": [],  # per-agent attribution arrives in 1c
-                    "reason": (
-                        f"{old_name!r} has {conns} active connection(s); "
-                        f"disconnect them and retry"
-                    ),
-                }
-            ),
-            content_type="application/json",
-        )
-
-    # Side-effects, in order.
-    #
-    # 1) Stop the systemd unit for the old name. Idempotent: a
-    #    project that was never started just no-ops.
-    _systemctl("stop", _unit_name(old_name, "backend"))
-
-    # 2) Move the workspace dir if the path looks like .../<old_name>.
-    #    Custom layouts (operators who pointed a project at a path
-    #    that doesn't end in <old_name>) are left alone — they can
-    #    rename by hand.
-    workspace = Path(old_row.get("workspace", ""))
-    new_workspace: Path | None = None
-    if workspace.name == old_name and workspace.exists():
-        new_workspace = workspace.with_name(new_name)
-        try:
-            os.rename(workspace, new_workspace)
-        except OSError as e:
-            raise web.HTTPInternalServerError(
-                reason=f"could not rename workspace dir: {e.strerror}"
-            )
-
-    # 3) Move the per-agent token files. The on-disk naming follows
-    #    `<project>--<agent>.token`; we glob for the old prefix and
-    #    rename in place. Token dir lives at
-    #    ~/.config/agent-mcp/tokens; missing dir is fine (no agents).
-    token_dir = (
-        Path(os.environ.get("AGENT_MCP_TOKENS_DIR", ""))
-        or (Path.home() / ".config" / "agent-mcp" / "tokens")
-    )
-    if token_dir.is_dir():
-        for tok in token_dir.glob(f"{old_name}--*.token"):
-            suffix = tok.name[len(old_name) + len("--"):]
-            try:
-                tok.rename(token_dir / f"{new_name}--{suffix}")
-            except OSError as e:
-                log.warning(
-                    "rename: token rename %s → %s--%s failed: %s",
-                    tok, new_name, suffix, e.strerror,
-                )
-
-    # 4) Registry write last — if anything above raised, the on-disk
-    #    state still has the old registry entry pointing at a missing
-    #    workspace, which is a clear "rollback by hand" situation
-    #    rather than the silently-broken alternative.
-    try:
-        _REGISTRY.rename(old_name, new_name, grace_days=grace_days)
-    except (ValueError, KeyError) as e:
-        # Best-effort rollback: put the workspace dir back. We don't
-        # try to undo the unit stop (systemd will start on next
-        # request) or token renames (those are idempotent on retry).
-        if new_workspace is not None and new_workspace.exists():
-            try:
-                os.rename(new_workspace, workspace)
-            except OSError:
-                pass
-        raise web.HTTPInternalServerError(
-            reason=f"registry rename failed: {e}"
-        )
-
-    # Final response — the operator gets the alias's expiry so they
-    # know when to expect the alias to disappear.
-    new_row = _REGISTRY.get(new_name)
-    alias_expires_at = ""
-    for entry in (new_row or {}).get("aliases", []) or []:
-        if entry.get("name") == old_name:
-            alias_expires_at = entry.get("expires_at", "")
-            break
-
-    return web.json_response(
-        {
-            "renamed": True,
-            "old": old_name,
-            "new": new_name,
-            "alias_expires_at": alias_expires_at,
-        },
-        headers={"Cache-Control": "no-store"},
-    )
-
-
-_DELETE_WORKSPACE_TRUTHY = {"true", "1", "yes", "on"}
-
-
-def _form_truthy(form, key: str) -> bool:
-    raw = (form.get(key) or "").strip().lower()
-    return raw in _DELETE_WORKSPACE_TRUTHY
+# The legacy ``__create`` / ``__stop`` / ``__rename`` form-encoded
+# handlers were deleted in PR (ADR 0014). REST-shaped
+# equivalents live in ``agent_mcp.router.admin_api`` at
+#   POST  /api/router/projects                  (create)
+#   POST  /api/router/projects/<name>/stop      (stop)
+#   PATCH /api/router/projects/<name>           (rename)
 
 
 def _is_within_default_workspace(workspace_path: Path) -> bool:
@@ -2151,125 +1430,10 @@ def _is_within_default_workspace(workspace_path: Path) -> bool:
     return True
 
 
-async def unregister_handler(req: web.Request) -> web.StreamResponse:
-    """POST /agent-mcp/__unregister — drop a project.
-
-    Stops the systemd unit. By default does NOT touch the workspace
-    directory (the user's SQLite state lives there) nor any .mcp.json
-    on any host (the router didn't create those).
-
-    Phase 3.5b: the dashboard's two-tier safe-default remove modal
-    (D4) can request a hard ``rm -rf`` of the workspace files by
-    sending ``delete_workspace=true`` in the form body. The router
-    only honours this when the workspace path resolves inside
-    ``DEFAULT_WORKSPACE_PARENT`` (defence in depth — see
-    ``_is_within_default_workspace`` for why).
-
-    Phase 3.5b: refuse with 409 + a structured body listing active
-    connection count when the project has any in-flight router-
-    tracked sessions. The dashboard surfaces this list and asks the
-    operator to disconnect agents before retrying.
-
-    In single-tenant mode (Phase 3) this endpoint returns 410 — the
-    project is fixed at module-config time, can't be unregistered
-    over HTTP.
-    """
-    if SINGLE_TENANT_NAME is not None:
-        return _single_tenant_disabled_response()
-    form = await req.post()
-    name = (form.get("name") or "").strip()
-    if not name:
-        raise web.HTTPBadRequest(reason="missing 'name'")
-
-    # Take a snapshot for the existence check so we can return a 404
-    # for a missing name rather than silently no-op'ing.
-    # `_REGISTRY.unregister()` itself is idempotent-on-missing, which
-    # is the right semantics for the registry but the wrong UX here.
-    projects = _projects_dict()
-    if name not in projects:
-        raise web.HTTPNotFound(reason=f"unknown project: {name!r}")
-
-    # Active-session refusal — mirrors the same guard on __rename
-    # (Phase 1b). The dashboard's remove modal pre-fetches the active
-    # agent list and asks the operator to terminate them first, but
-    # we double-check here in case a session opened between modal-open
-    # and confirm-click.
-    conns = active_conns.get(name, 0)
-    if conns > 0:
-        raise web.HTTPConflict(
-            reason=(
-                f"{name!r} has {conns} active connection(s); "
-                f"refusing to unregister"
-            ),
-            text=json.dumps(
-                {
-                    "error": "active_sessions",
-                    "active_connections": conns,
-                    "agents": [],
-                    "reason": (
-                        f"{name!r} has {conns} active connection(s); "
-                        f"disconnect them and retry"
-                    ),
-                }
-            ),
-            content_type="application/json",
-        )
-
-    workspace_path = Path(projects[name])
-    want_delete = _form_truthy(form, "delete_workspace")
-
-    workspace_deleted = False
-    workspace_delete_skipped_reason: str | None = None
-    if want_delete:
-        if not _is_within_default_workspace(workspace_path):
-            workspace_delete_skipped_reason = (
-                f"workspace {workspace_path} resolves outside the "
-                f"default workspace parent; refusing recursive delete"
-            )
-            log.warning(
-                "unregister: %s — %s", name, workspace_delete_skipped_reason
-            )
-        elif workspace_path.exists():
-            import shutil
-            try:
-                shutil.rmtree(workspace_path)
-                workspace_deleted = True
-            except OSError as e:
-                workspace_delete_skipped_reason = (
-                    f"rmtree({workspace_path}) failed: {e.strerror}"
-                )
-                log.warning(
-                    "unregister: %s — %s",
-                    name, workspace_delete_skipped_reason,
-                )
-        else:
-            workspace_delete_skipped_reason = (
-                f"workspace {workspace_path} did not exist on disk"
-            )
-            # Treat as success — the operator's desired end-state is
-            # "no workspace dir", and they have it.
-            workspace_deleted = True
-
-    _REGISTRY.unregister(name)
-    _systemctl("stop", _unit_name(name, "backend"))
-
-    wants_json = "application/json" in req.headers.get("Accept", "")
-    if wants_json or want_delete:
-        # The delete-workspace flow always wants the structured body
-        # so the dashboard can surface partial-success (project gone
-        # but workspace skipped). Pure unregister callers without an
-        # explicit Accept header still get the legacy 303 redirect.
-        body = {
-            "unregistered": name,
-            "workspace_deleted": workspace_deleted,
-        }
-        if workspace_delete_skipped_reason is not None:
-            body["workspace_delete_skipped_reason"] = (
-                workspace_delete_skipped_reason
-            )
-        return web.json_response(body, headers={"Cache-Control": "no-store"})
-
-    raise web.HTTPSeeOther(location="/agent-mcp/")
+# The legacy ``__unregister`` form-handler was deleted in PR
+# (ADR 0014). The REST-shaped equivalent is
+# ``admin_api.delete_project_handler`` at
+# ``DELETE /agent-mcp/api/router/projects/<name>``.
 
 
 # ── Wiring helpers (client-config / installer) ───────────────────────
@@ -2336,116 +1500,10 @@ async def _resolve_agent_token(
     raise web.HTTPNotFound(reason=f"unknown agent {agent_id!r} on {name!r}")
 
 
-async def client_config_handler(req: web.Request) -> web.Response:
-    """GET /agent-mcp/__client-config/<name>.mcp.json[?agent=<id>]"""
-    name = req.match_info["name"]
-    if name not in _projects_dict():
-        raise web.HTTPNotFound(reason=f"unknown project: {name!r}")
-    agent_id = req.rel_url.query.get("agent")
-    token, _aid = await _resolve_agent_token(name, agent_id)
-    body = json.dumps(_mcp_json_for(name, token=token), indent=2) + "\n"
-    return web.Response(
-        body=body,
-        content_type="application/json",
-        headers={
-            "Content-Disposition": 'attachment; filename=".mcp.json"',
-            "Cache-Control": "no-store",
-        },
-    )
-
-
-async def client_installer_handler(req: web.Request) -> web.Response:
-    """GET /agent-mcp/__client-installer/<name>.sh[?agent=<id>]"""
-    name = req.match_info["name"]
-    if name not in _projects_dict():
-        raise web.HTTPNotFound(reason=f"unknown project: {name!r}")
-    agent_id = req.rel_url.query.get("agent")
-    token, _aid = await _resolve_agent_token(name, agent_id)
-    return web.Response(
-        text=_installer_script_for(name, token=token),
-        content_type="text/x-shellscript",
-        charset="utf-8",
-        headers={"Cache-Control": "no-store"},
-    )
-
-
-async def create_agent_handler(req: web.Request) -> web.StreamResponse:
-    """POST /agent-mcp/__create-agent
-
-    Form-encoded body: name=<project>&agent_id=<new-agent-id>.
-    Creates a worker agent via the existing MCP bridge (with
-    send_prompt:false so we don't spawn a tmux session) and
-    redirects back to the index page with the wiring panel
-    pre-selected on the new agent.
-    """
-    form = await req.post()
-    name = (form.get("name") or "").strip()
-    agent_id = (form.get("agent_id") or "").strip()
-    if not name:
-        raise web.HTTPBadRequest(reason="missing 'name'")
-    if not agent_id:
-        raise web.HTTPBadRequest(reason="missing 'agent_id'")
-    if name not in _projects_dict():
-        raise web.HTTPNotFound(reason=f"unknown project: {name!r}")
-    if not _SLUG_RE.match(agent_id):
-        raise web.HTTPBadRequest(
-            reason=f"agent_id must match {_SLUG_RE.pattern}"
-        )
-    # Upstream's create_agent requires a non-empty task_ids list. Seed
-    # an "agent: bootstrap" task and attach the new agent to it.
-    try:
-        seed = await _mcp_call_admin(
-            name,
-            "assign_task",
-            {
-                "task_title": f"agent {agent_id}: bootstrap",
-                "task_description": (
-                    "Auto-created so the agent has at least one task "
-                    "to attach to. Close or repurpose freely."
-                ),
-                "auto_suggest_parent": False,
-                "validate_agent_workload": False,
-                "override_rag": True,
-                "override_reason": "router create-agent helper",
-            },
-        )
-    except (asyncio.TimeoutError, Exception) as e:
-        raise web.HTTPBadGateway(reason=f"seed task failed: {e}")
-    seed_text = "\n".join(
-        p.get("text", "") for p in seed.get("content", []) or []
-    )
-    m = re.search(r"task_\d+", seed_text)
-    if not m:
-        raise web.HTTPBadGateway(
-            reason="seed task created but task_id not parseable"
-        )
-    seed_task_id = m.group(0)
-
-    try:
-        result = await _mcp_call_admin(
-            name,
-            "create_agent",
-            {
-                "agent_id": agent_id,
-                "task_ids": [seed_task_id],
-                "send_prompt": False,
-            },
-        )
-    except (asyncio.TimeoutError, Exception) as e:
-        raise web.HTTPBadGateway(reason=f"create_agent failed: {e}")
-    text = "\n".join(
-        p.get("text", "") for p in result.get("content", []) or []
-    )
-    if result.get("isError") or text.lstrip().lower().startswith("error"):
-        raise web.HTTPBadRequest(reason=text[:200] or "create_agent error")
-    # Invalidate token cache so the freshly-created agent shows up.
-    _agent_token_cache.pop(name, None)
-    raise web.HTTPSeeOther(
-        location=(
-            f"/agent-mcp/?{urlencode({'wiring': name, 'agent': agent_id})}"
-            f"#wiring-{quote(name)}"
-        )
-    )
+# Wiring helpers (client-config / installer / create-agent) live
+# in ``agent_mcp.router.admin_api`` (ADR 0014); they reuse
+# ``_mcp_url_for``, ``_mcp_json_for``, ``_installer_script_for``
+# and ``_resolve_agent_token`` defined above.
 
 
 # ── Index handler ────────────────────────────────────────────────────
@@ -2488,8 +1546,9 @@ def _service_descriptor() -> dict:
             # transport.
             "mcp": "/agent-mcp/mcp",
         },
-        "projects_url": "/agent-mcp/__projects",
-        "overview_url": "/agent-mcp/__overview",
+        "projects_url": "/agent-mcp/api/router/projects",
+        "overview_url": "/agent-mcp/api/router/overview",
+        "health_url": "/agent-mcp/api/router/health",
         "single_tenant_project": SINGLE_TENANT_NAME,
     }
 
@@ -2645,24 +1704,11 @@ def make_app(
         "/agent-mcp",
         lambda r: web.HTTPMovedPermanently(location="/agent-mcp/"),
     )
-    app.router.add_get("/agent-mcp/__projects", projects_handler)
-    app.router.add_get("/agent-mcp/__overview", overview_handler)
-    app.router.add_post("/agent-mcp/__create", create_handler)
-    app.router.add_post("/agent-mcp/__create-agent", create_agent_handler)
-    app.router.add_post("/agent-mcp/__stop", stop_handler)
-    app.router.add_post("/agent-mcp/__unregister", unregister_handler)
-    app.router.add_post("/agent-mcp/__rename", rename_handler)
-    # Alias management (Phase 3.5c).
-    app.router.add_get("/agent-mcp/__alias-usage", alias_usage_handler)
-    app.router.add_post("/agent-mcp/__remove-alias", remove_alias_handler)
-
-    # Client wiring helpers.
-    app.router.add_get(
-        "/agent-mcp/__client-config/{name}.mcp.json", client_config_handler
-    )
-    app.router.add_get(
-        "/agent-mcp/__client-installer/{name}.sh", client_installer_handler
-    )
+    # ADR 0014: every operator-facing endpoint that used to live at
+    # ``/agent-mcp/__*`` is now REST-shaped under
+    # ``/agent-mcp/api/router/...``. Wired below alongside the per-
+    # project ``/api/<name>/...`` proxy so the explicit admin paths
+    # win in aiohttp's source-order dispatcher.
 
     # Dashboard surface — PR-B Shape-3 rename. Three top-level prefixes:
     #
@@ -2717,28 +1763,13 @@ def make_app(
     # v5.0.0: the 30-day grace-window 308 redirect from the legacy
     # /agent-mcp/<name>/mcp path has been deleted. Old clients that
     # never updated their .mcp.json now 404.
-    # PR-C: REST resource shape for project lifecycle.
-    #
-    # Mounted BEFORE the catch-all /api/<name>/<rest> proxy so the
-    # explicit lifecycle paths win in aiohttp's match-by-source-order
-    # dispatcher. The Accept-header gate (PR-A) is enforced inside
-    # each handler via the same _accept_includes_strict_api_media
-    # helper. JSON request bodies, unified envelope responses (see
-    # _success_envelope / _error_envelope).
-    app.router.add_post(
-        "/agent-mcp/api/projects", _rest_gated(rest_create_project_handler)
-    )
-    app.router.add_delete(
-        "/agent-mcp/api/projects/{name}", _rest_gated(rest_delete_project_handler)
-    )
-    app.router.add_post(
-        "/agent-mcp/api/projects/{name}/rename",
-        _rest_gated(rest_rename_project_handler),
-    )
-    app.router.add_post(
-        "/agent-mcp/api/projects/{name}/stop",
-        _rest_gated(rest_stop_project_handler),
-    )
+    # Admin REST surface (ADR 0014) — every handler under
+    # ``/agent-mcp/api/router/...``. Mounted BEFORE the catch-all
+    # ``/api/<name>/<rest>`` proxy so the explicit admin paths win in
+    # aiohttp's source-order dispatcher. The Accept-header gate
+    # (PR-A) is applied per route inside ``register_admin_routes``.
+    from . import admin_api
+    admin_api.register_admin_routes(app)
 
     # Phase 1 PR C: login + setup-wizard routes. Registered AFTER the
     # /api routes so a project literally named "login" can't shadow

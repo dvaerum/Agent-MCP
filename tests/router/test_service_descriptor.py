@@ -123,8 +123,9 @@ async def test_index_returns_service_descriptor_for_json_client(
     assert eps["mcp"] == "/agent-mcp/mcp"
     # Discovery links the dashboard's two READ entry points so a plain
     # HTTP client can iterate projects without scraping HTML.
-    assert body["projects_url"] == "/agent-mcp/__projects"
-    assert body["overview_url"] == "/agent-mcp/__overview"
+    assert body["projects_url"] == "/agent-mcp/api/router/projects"
+    assert body["overview_url"] == "/agent-mcp/api/router/overview"
+    assert body["health_url"] == "/agent-mcp/api/router/health"
     assert body["single_tenant_project"] is None
 
 

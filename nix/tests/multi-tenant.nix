@@ -3,10 +3,10 @@
 # Boots a single-node VM with the router unit + a per-project backend
 # template, then drives the public HTTP surface:
 #
-#   1. POST __create twice (two projects).
-#   2. GET __projects lists both names.
+#   1. POST /api/router/projects twice (two projects, JSON body).
+#   2. GET  /api/router/projects lists both names.
 #   3. Deep-link into one project's dashboard returns 200 (the
-#      handler serves index.html for any /__dashboard/<name>/ path).
+#      handler serves index.html for any /app/<name>/ path).
 #   4. The retired SSE handshake URL returns 404 (Phase 6 deleted
 #      the transitional 410-Gone handlers; the URL now falls through
 #      to aiohttp's default 404, which is the new contract).
@@ -15,6 +15,9 @@
 # embedding pipeline against ollama would balloon the test runtime.
 # Phase 4's E2E in nixos-developer-system covers that path; this
 # test is the cheap CI-friendly half.
+#
+# ADR 0014: the admin surface lives at ``/api/router/...`` (was the
+# legacy ``__*`` namespace).
 #
 # Mirror counterpart: ./single-tenant.nix (same harness, opposite
 # toggle assertions).
@@ -94,9 +97,9 @@ pkgs.testers.nixosTest {
         AGENT_MCP_ROUTER_DB = "/home/testuser/.config/agent-mcp/router.db";
         # Phase 1 PR C: seed a sentinel operator via env-var bootstrap
         # so the empty-users redirect middleware is dormant — this
-        # test asserts routing behaviour (e.g. /__projects, /app/)
-        # that predates auth and shouldn't be wedged behind the
-        # first-boot wizard.
+        # test asserts routing behaviour (e.g. /api/router/projects,
+        # /app/) that predates auth and shouldn't be wedged behind
+        # the first-boot wizard.
         AGENT_MCP_BOOTSTRAP_USERNAME = "ci-sentinel";
         AGENT_MCP_BOOTSTRAP_PASSWORD = "ci-sentinel-pw";
         AGENT_MCP_SOCK_DIR = "/run/agent-mcp";
@@ -159,28 +162,36 @@ pkgs.testers.nixosTest {
         "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/login"
     )
 
-    # __projects starts empty. (Allow-listed for unauth callers so
-    # the project picker on the landing page works without a cookie;
-    # the cookie jar carries through anyway.)
+    # The router-admin surface (ADR 0014) lives at /api/router/...
+    # Every endpoint except /api/router/health requires an operator
+    # session cookie. The strict Accept header is required by PR-A.
+    accept_header = "-H 'Accept: application/vnd.agent-mcp.v1+json'"
+    json_header = (
+        "-H 'Accept: application/vnd.agent-mcp.v1+json' "
+        "-H 'Content-Type: application/json'"
+    )
+
+    # Project list starts empty.
     out = machine.succeed(
-        "curl -fsS -b /tmp/agent-mcp-cookies.txt "
-        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__projects"
+        f"curl -fsS -b /tmp/agent-mcp-cookies.txt {accept_header} "
+        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/api/router/projects"
     )
     assert '"projects": []' in out or '"projects":[]' in out, (
         f"expected empty project list; got: {out!r}"
     )
 
-    # 1. Register two projects via __create.
+    # 1. Register two projects via POST /api/router/projects.
     for name in ("alpha", "beta"):
         machine.succeed(
             f"curl -fsSL -b /tmp/agent-mcp-cookies.txt -o /dev/null "
-            f"-F name={name} "
-            f"http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__create"
+            f"{json_header} -X POST "
+            f"--data '{{\"name\": \"{name}\"}}' "
+            f"http://127.0.0.1:${toString ports.routerPort}/agent-mcp/api/router/projects"
         )
 
     out = machine.succeed(
-        "curl -fsS -b /tmp/agent-mcp-cookies.txt "
-        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__projects"
+        f"curl -fsS -b /tmp/agent-mcp-cookies.txt {accept_header} "
+        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/api/router/projects"
     )
     assert '"alpha"' in out and '"beta"' in out, (
         f"both alpha and beta should be listed; got: {out!r}"
@@ -199,23 +210,26 @@ pkgs.testers.nixosTest {
 
     # 3. Legacy SSE handshake URL → 404 (Phase 6: deleted the 410-
     # Gone handler; aiohttp's default 404 is now the contract).
-    # Allow-listed (/mcp/) so no cookie needed for this assertion.
+    # ADR 0014 dropped the `/__sse` exemption from `_UNAUTH_PREFIXES`
+    # along with the rest of the `__` namespace, so the cookie is now
+    # required to reach the 404 (middleware would otherwise 401 first).
     out_404 = machine.succeed(
-        "curl -s -o /dev/null -w '%{http_code}' "
+        "curl -s -b /tmp/agent-mcp-cookies.txt -o /dev/null -w '%{http_code}' "
         "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__sse/alpha"
     )
     assert out_404 == "404", f"expected 404 on legacy SSE; got {out_404}"
 
-    # 4. __create / __unregister / __rename are NOT 410 in multi-tenant
-    # mode — they're the documented multi-tenant write surface.
+    # 4. Create / delete / rename are NOT 410 in multi-tenant mode —
+    # they're the documented multi-tenant write surface.
     code_create = machine.succeed(
-        "curl -s -b /tmp/agent-mcp-cookies.txt "
-        "-o /dev/null -w '%{http_code}' "
-        "-F name=gamma "
-        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__create"
+        f"curl -s -b /tmp/agent-mcp-cookies.txt "
+        f"-o /dev/null -w '%{{http_code}}' "
+        f"{json_header} -X POST "
+        f"--data '{{\"name\": \"gamma\"}}' "
+        f"http://127.0.0.1:${toString ports.routerPort}/agent-mcp/api/router/projects"
     )
     assert code_create != "410", (
-        f"__create must not 410 in multi-tenant mode; got {code_create}"
+        f"create must not 410 in multi-tenant mode; got {code_create}"
     )
 
     # 5. Phase 4 runtime asset-prefix substitution: the dashboard build

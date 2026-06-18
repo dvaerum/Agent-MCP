@@ -1,9 +1,8 @@
-"""Tests for the alias management endpoints added in Phase 3.5c of
-the router-upstream plan (prancy-napping-pie).
+"""Tests for the alias management endpoints (ADR 0014).
 
 Two endpoints back the dashboard's alias-chip expansion panel:
 
-  ``GET  /agent-mcp/__alias-usage?alias=<name>``
+  ``GET  /agent-mcp/api/router/projects/<name>/aliases?alias=<a>``
       Returns ``{alias, project, expires_at, agents}`` where ``agents``
       is the list of agent_ids that have used the alias (from
       ``mcp_sessions.alias_used`` if the column exists; empty list
@@ -11,7 +10,7 @@ Two endpoints back the dashboard's alias-chip expansion panel:
       yet). Allows the operator to see "who's still on the old
       name" before deciding to expire the alias.
 
-  ``POST /agent-mcp/__remove-alias`` (form: ``name``, ``alias``)
+  ``DELETE /agent-mcp/api/router/projects/<name>/aliases/<alias>``
       Removes the alias entry immediately (skipping the grace
       reaper). Useful when an operator confirms no agent is still
       using the old name. Returns the updated alias list for the
@@ -33,7 +32,10 @@ import pytest
 pytestmark = pytest.mark.asyncio
 
 
-# ── __alias-usage ──────────────────────────────────────────────────
+_STRICT_ACCEPT = {"Accept": "application/vnd.agent-mcp.v1+json"}
+
+
+# ── GET .../<name>/aliases?alias=<a> ───────────────────────────────
 
 
 async def test_alias_usage_returns_empty_for_known_alias_no_db(
@@ -45,7 +47,10 @@ async def test_alias_usage_returns_empty_for_known_alias_no_db(
     router_module._REGISTRY.add_alias("real", "oldname")
     client = await aiohttp_client(router_app)
 
-    resp = await client.get("/agent-mcp/__alias-usage?alias=oldname")
+    resp = await client.get(
+        "/agent-mcp/api/router/projects/real/aliases?alias=oldname",
+        headers=_STRICT_ACCEPT,
+    )
 
     assert resp.status == 200
     body = await resp.json()
@@ -61,7 +66,10 @@ async def test_alias_usage_404s_for_unknown_alias(
     register_project("real")
     client = await aiohttp_client(router_app)
 
-    resp = await client.get("/agent-mcp/__alias-usage?alias=nope")
+    resp = await client.get(
+        "/agent-mcp/api/router/projects/real/aliases?alias=nope",
+        headers=_STRICT_ACCEPT,
+    )
 
     assert resp.status == 404
 
@@ -99,14 +107,17 @@ async def test_alias_usage_lists_agents_from_mcp_sessions(
     con.close()
 
     client = await aiohttp_client(router_app)
-    resp = await client.get("/agent-mcp/__alias-usage?alias=oldname")
+    resp = await client.get(
+        "/agent-mcp/api/router/projects/real/aliases?alias=oldname",
+        headers=_STRICT_ACCEPT,
+    )
 
     assert resp.status == 200
     body = await resp.json()
     assert sorted(body["agents"]) == ["agent-alpha", "agent-beta"]
 
 
-# ── __remove-alias ─────────────────────────────────────────────────
+# ── DELETE .../<name>/aliases/<alias> ──────────────────────────────
 
 
 async def test_remove_alias_drops_entry_immediately(
@@ -116,10 +127,9 @@ async def test_remove_alias_drops_entry_immediately(
     router_module._REGISTRY.add_alias("real", "oldname")
     client = await aiohttp_client(router_app)
 
-    resp = await client.post(
-        "/agent-mcp/__remove-alias",
-        data={"name": "real", "alias": "oldname"},
-        headers={"Accept": "application/json"},
+    resp = await client.delete(
+        "/agent-mcp/api/router/projects/real/aliases/oldname",
+        headers=_STRICT_ACCEPT,
     )
 
     assert resp.status == 200
@@ -131,14 +141,13 @@ async def test_remove_alias_drops_entry_immediately(
     assert router_module._REGISTRY.resolve_alias("oldname") is None
 
 
-async def test_remove_alias_400s_on_missing_project(
+async def test_remove_alias_404s_on_missing_project(
     aiohttp_client, router_app,
 ) -> None:
     client = await aiohttp_client(router_app)
-    resp = await client.post(
-        "/agent-mcp/__remove-alias",
-        data={"name": "ghost", "alias": "oldname"},
-        headers={"Accept": "application/json"},
+    resp = await client.delete(
+        "/agent-mcp/api/router/projects/ghost/aliases/oldname",
+        headers=_STRICT_ACCEPT,
     )
     assert resp.status == 404
 
@@ -150,8 +159,8 @@ async def test_remove_alias_disabled_in_single_tenant(
     app = router_module.make_app(single_tenant_name="only")
     client = await aiohttp_client(app)
 
-    resp = await client.post(
-        "/agent-mcp/__remove-alias",
-        data={"name": "only", "alias": "x"},
+    resp = await client.delete(
+        "/agent-mcp/api/router/projects/only/aliases/x",
+        headers=_STRICT_ACCEPT,
     )
     assert resp.status == 410

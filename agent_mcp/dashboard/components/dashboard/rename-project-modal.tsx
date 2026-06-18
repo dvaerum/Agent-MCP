@@ -1,8 +1,9 @@
 "use client"
 
 // Rename-project modal (Phase 3.5b — decision #4 + ADR-0010, alias-
-// with-grace-period rename). Posts to the existing
-// ``POST /agent-mcp/__rename`` endpoint added in Phase 1b.
+// with-grace-period rename). PATCHes the router-admin REST resource
+// at ``PATCH /agent-mcp/api/router/projects/<name>`` (ADR 0014); the
+// body's ``name`` field carries the new slug.
 //
 // Fields:
 //   * new_name   (required, slug)
@@ -18,7 +19,7 @@
 //   * 400 (anything else)   — show the router's reason text verbatim.
 
 import React, { useState } from "react"
-import { appUrl } from "@/lib/urls"
+import { appUrl, routerProjectUrl } from "@/lib/urls"
 import { Loader2, Pencil } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import {
@@ -82,15 +83,16 @@ export function RenameProjectModal({
     setSubmitting(true)
     setError(null)
     try {
-      // PR-C: POST /api/projects/<name>/rename with JSON body. The
-      // unified envelope's `message` field is the human-readable
-      // error string; `error` is the discriminator code.
+      // ADR 0014: PATCH /api/router/projects/<name> with JSON body
+      // {name, grace_days}. The unified envelope's ``message`` field
+      // is the human-readable error string; ``error`` is the
+      // discriminator code.
       const r = await fetch(
-        `/agent-mcp/api/projects/${encodeURIComponent(projectName)}/rename`,
+        routerProjectUrl(projectName),
         {
-          method: "POST",
+          method: "PATCH",
           body: JSON.stringify({
-            new_name: newName,
+            name: newName,
             grace_days: graceInt,
           }),
           headers: {

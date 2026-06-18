@@ -201,13 +201,16 @@ async def test_rsc_txt_response_has_sentinel_substituted(
 async def test_json_api_response_is_not_substituted(
     aiohttp_client, router_app,
 ) -> None:
-    """A JSON endpoint like ``/agent-mcp/__projects`` must not get its
-    body rewritten — JSON API consumers see exact bytes the handler
-    produced. We use the existing ``__projects`` route which always
-    returns JSON."""
+    """A JSON endpoint like ``/agent-mcp/api/router/projects`` must
+    not get its body rewritten — JSON API consumers see exact bytes
+    the handler produced. We use the admin projects route which
+    always returns JSON."""
     client = await aiohttp_client(router_app)
 
-    resp = await client.get("/agent-mcp/__projects")
+    resp = await client.get(
+        "/agent-mcp/api/router/projects",
+        headers={"Accept": "application/vnd.agent-mcp.v1+json"},
+    )
     assert resp.status == 200
     assert resp.headers["Content-Type"].startswith("application/json")
     body = await resp.text()

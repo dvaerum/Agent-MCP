@@ -8,9 +8,11 @@
 //   * workspace (optional)  — editable path; blank → router uses
 //                             DEFAULT_WORKSPACE_PARENT/<name>
 //
-// Posts as ``application/x-www-form-urlencoded`` to the existing
-// ``POST /agent-mcp/__create`` endpoint. On success we refresh the
-// overview store; on 4xx we surface the router's ``reason`` text.
+// POSTs a JSON body to the router-admin REST resource at
+// ``POST /agent-mcp/api/router/projects`` (ADR 0014). The session
+// cookie carries auth — the dashboard sends no token field. On
+// success we refresh the overview store; on 4xx we surface the
+// router's envelope ``message``.
 
 import React, { useState } from "react"
 import { Loader2, Plus } from "lucide-react"
@@ -26,6 +28,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useProjectsStore } from "@/lib/stores/projects-store"
+import { routerProjectsUrl } from "@/lib/urls"
 
 const SLUG_RE = /^[a-z](?:[a-z0-9-]*[a-z0-9])?$/
 
@@ -66,10 +69,7 @@ export function AddProjectModal({
     setSubmitting(true)
     setError(null)
     try {
-      // PR-C: POST /api/projects with JSON body. The legacy
-      // /__create endpoint still works for back-compat but the new
-      // shape is the canonical one — JSON in, unified envelope out.
-      const r = await fetch("/agent-mcp/api/projects", {
+      const r = await fetch(routerProjectsUrl(), {
         method: "POST",
         body: JSON.stringify({ name }),
         headers: {

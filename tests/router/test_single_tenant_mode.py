@@ -8,30 +8,26 @@ the multi-tenant write surface is disabled and any URL pointing at a
 project other than the configured one is W1-redirected to the same
 section path under the configured project.
 
-Five cases mirror the VM scaffolds added in the same PR:
-
-1. ``__create`` POSTs → 410 with the documented error body shape.
-2. ``__unregister`` POSTs → 410 with the documented error body shape.
-3. ``__rename`` POSTs → 410 with the documented error body shape.
-4. ``/__dashboard/<wrong-name>/<section>`` → 302 to
-   ``/__dashboard/<configured-name>/<section>`` (W1 redirect; preserves
-   the section path so the URL bar lands on the right page in the
-   single-tenant project).
-5. ``/<wrong-name>/mcp`` and ``/__api/<wrong-name>/{rest}`` → 302 to the
-   same path under the configured single-tenant project.
-
-Multi-tenant default behaviour is exercised by the rest of the suite;
-this file's fixtures construct a *second* app via
-``make_app(single_tenant_name=...)`` so we can assert the toggle's
-effect without re-importing the module.
+Five cases mirror the VM scaffolds added in the same PR. ADR 0014
+moved create/unregister/rename from form-encoded ``__*`` URLs to
+REST shapes under ``/api/router/...``; the single-tenant disabled
+behaviour now applies there.
 """
 
 from __future__ import annotations
+
+import json
 
 import pytest
 
 
 pytestmark = pytest.mark.asyncio
+
+
+_STRICT_ACCEPT = {
+    "Accept": "application/vnd.agent-mcp.v1+json",
+    "Content-Type": "application/json",
+}
 
 
 # ── Fixtures ────────────────────────────────────────────────────────
@@ -53,31 +49,17 @@ def single_tenant_app(router_module, register_project):
     )
 
 
-# ── 1. __create disabled ───────────────────────────────────────────
+# ── 1. create disabled ─────────────────────────────────────────────
 
 
 async def test_single_tenant_disables_create(
     aiohttp_client, single_tenant_app,
 ) -> None:
     client = await aiohttp_client(single_tenant_app)
-    resp = await client.post("/agent-mcp/__create", data={"name": "newproj"})
-    assert resp.status == 410
-    body = await resp.json()
-    assert body == {
-        "error": "endpoint_disabled_in_single_tenant_mode",
-        "single_tenant_name": "only-project",
-    }
-
-
-# ── 2. __unregister disabled ───────────────────────────────────────
-
-
-async def test_single_tenant_disables_unregister(
-    aiohttp_client, single_tenant_app,
-) -> None:
-    client = await aiohttp_client(single_tenant_app)
     resp = await client.post(
-        "/agent-mcp/__unregister", data={"name": "only-project"},
+        "/agent-mcp/api/router/projects",
+        data=json.dumps({"name": "newproj"}),
+        headers=_STRICT_ACCEPT,
     )
     assert resp.status == 410
     body = await resp.json()
@@ -87,16 +69,36 @@ async def test_single_tenant_disables_unregister(
     }
 
 
-# ── 3. __rename disabled ───────────────────────────────────────────
+# ── 2. delete disabled ─────────────────────────────────────────────
+
+
+async def test_single_tenant_disables_unregister(
+    aiohttp_client, single_tenant_app,
+) -> None:
+    client = await aiohttp_client(single_tenant_app)
+    resp = await client.delete(
+        "/agent-mcp/api/router/projects/only-project",
+        headers=_STRICT_ACCEPT,
+    )
+    assert resp.status == 410
+    body = await resp.json()
+    assert body == {
+        "error": "endpoint_disabled_in_single_tenant_mode",
+        "single_tenant_name": "only-project",
+    }
+
+
+# ── 3. rename disabled ─────────────────────────────────────────────
 
 
 async def test_single_tenant_disables_rename(
     aiohttp_client, single_tenant_app,
 ) -> None:
     client = await aiohttp_client(single_tenant_app)
-    resp = await client.post(
-        "/agent-mcp/__rename",
-        data={"old_name": "only-project", "new_name": "renamed"},
+    resp = await client.patch(
+        "/agent-mcp/api/router/projects/only-project",
+        data=json.dumps({"name": "renamed"}),
+        headers=_STRICT_ACCEPT,
     )
     assert resp.status == 410
     body = await resp.json()
@@ -113,9 +115,6 @@ async def test_single_tenant_dashboard_wrong_name_redirects(
     aiohttp_client, single_tenant_app,
 ) -> None:
     client = await aiohttp_client(single_tenant_app)
-    # Hit the dashboard URL for a project that is NOT the configured
-    # single-tenant project. Disable client-side redirect-follow so we
-    # observe the 302 itself rather than its target.
     resp = await client.get(
         "/agent-mcp/app/some-other-project/tasks/",
         allow_redirects=False,
@@ -152,12 +151,7 @@ async def test_single_tenant_mcp_wrong_name_redirects(
     aiohttp_client, single_tenant_app,
 ) -> None:
     """Wrong-project MCP URL → W1 redirect to the configured project's
-    MCP URL.
-
-    PR-D moved the MCP path from /agent-mcp/<name>/mcp to
-    /agent-mcp/mcp/<name>; this test uses the new shape. The W1
-    single-tenant substitution swaps the project name segment, which
-    in the new shape is the last segment."""
+    MCP URL."""
     client = await aiohttp_client(single_tenant_app)
     resp = await client.post(
         "/agent-mcp/mcp/some-other-project",
@@ -214,15 +208,15 @@ async def test_multi_tenant_default_still_allows_create(
 ) -> None:
     """Regression guard: the toggle defaults off, so a router built
     via the regular ``router_app`` fixture (which calls ``make_app()``
-    with no args) still accepts ``__create`` POSTs as before."""
+    with no args) still accepts create POSTs."""
     client = await aiohttp_client(router_app)
     resp = await client.post(
-        "/agent-mcp/__create",
-        data={"name": "fresh-project"},
+        "/agent-mcp/api/router/projects",
+        data=json.dumps({"name": "fresh-project"}),
+        headers=_STRICT_ACCEPT,
         allow_redirects=False,
     )
-    # __create returns 303 See Other on success (or 400 on validation
-    # error). 410 would mean we accidentally engaged single-tenant
-    # mode in the default router; assert we did not.
+    # 201 on success, 4xx on validation; 410 would mean we accidentally
+    # engaged single-tenant mode in the default router.
     assert resp.status != 410
-    assert resp.status in (303, 400)
+    assert resp.status in (201, 400, 409)

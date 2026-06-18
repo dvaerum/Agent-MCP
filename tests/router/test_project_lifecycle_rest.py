@@ -1,31 +1,25 @@
-"""PR-C — REST resource shape for project lifecycle.
+"""REST resource shape for project lifecycle (ADR 0014).
 
-Locked design (from /grill-me, PR plan):
-
-  Form-encoded                          →  JSON-bodied REST resource
+  Legacy URL                          →  REST resource (ADR 0014)
   ────────────────────────────────────────────────────────────────────
-  POST /__create               name=…   →  POST   /api/projects        {"name": "…"}
-  POST /__unregister           name=…   →  DELETE /api/projects/<name>  [?delete_workspace=true]
-  POST /__rename old=…&new=…&grace=…    →  POST   /api/projects/<name>/rename {"new_name": "…", "grace_days": N}
-  POST /__stop                 name=…   →  POST   /api/projects/<name>/stop
-  GET  /__alias-usage?alias=…           →  GET    /api/projects/<name>/aliases/<alias>
-  POST /__remove-alias       alias=…    →  DELETE /api/projects/<name>/aliases/<alias>
+  POST /__create               name=…   →  POST   /api/router/projects        {"name": "…"}
+  POST /__unregister           name=…   →  DELETE /api/router/projects/<name>  [?delete_workspace=true]
+  POST /__rename old=…&new=…&grace=…    →  PATCH  /api/router/projects/<name>  {"name": "…", "grace_days": N}
+  POST /__stop                 name=…   →  POST   /api/router/projects/<name>/stop
+  GET  /__alias-usage?alias=…           →  GET    /api/router/projects/<name>/aliases?alias=<a>
+  POST /__remove-alias       alias=…    →  DELETE /api/router/projects/<name>/aliases/<alias>
 
-All new endpoints:
+All endpoints:
   - Strictly Accept-header gated (PR-A): the v1 media type is required.
   - JSON request bodies (no form-encoded data).
   - JSON responses (no 303 redirects to the index page).
-  - One unified error envelope (audit §2.5 — picks the
-    _dispatch_through_tool shape since it already has the most
-    adoption):
-      {"success": false, "error": "<code>", "message": "<human>", "code": "<http-status>"}
+  - One unified error envelope (audit §2.5):
+      {"success": false, "error": "<code>", "message": "<human>"}
   - Success responses use the same envelope with success: true plus
     the resource-specific fields.
 
-Old endpoints are kept as-is (still form-encoded, still 303-redirect)
-so the dashboard's pre-PR-C modals keep working during the migration
-window. They're tagged DEPRECATED in comments; PR-F or a later major
-removes them.
+The legacy ``/__*`` URLs were retired in ADR 0014; the
+``test_router_admin_api`` module guards that retirement.
 """
 
 from __future__ import annotations
@@ -44,18 +38,18 @@ _STRICT_ACCEPT = {
 }
 
 
-# ── POST /api/projects — create ─────────────────────────────────────
+# ── POST /api/router/projects — create ─────────────────────────────────────
 
 
 async def test_create_project_via_json_post_returns_resource(
     aiohttp_client, router_app,
 ) -> None:
-    """``POST /api/projects`` with ``{"name": "<slug>"}`` JSON body
+    """``POST /api/router/projects`` with ``{"name": "<slug>"}`` JSON body
     creates the project. Response is JSON; no 303 redirect."""
     client = await aiohttp_client(router_app)
 
     resp = await client.post(
-        "/agent-mcp/api/projects",
+        "/agent-mcp/api/router/projects",
         data=json.dumps({"name": "freshly-minted"}),
         headers=_STRICT_ACCEPT,
         allow_redirects=False,
@@ -75,7 +69,7 @@ async def test_create_project_rejects_invalid_slug(
     client = await aiohttp_client(router_app)
 
     resp = await client.post(
-        "/agent-mcp/api/projects",
+        "/agent-mcp/api/router/projects",
         data=json.dumps({"name": "BAD-Slug"}),
         headers=_STRICT_ACCEPT,
     )
@@ -98,7 +92,7 @@ async def test_create_project_rejects_reserved_name(
     client = await aiohttp_client(router_app)
 
     resp = await client.post(
-        "/agent-mcp/api/projects",
+        "/agent-mcp/api/router/projects",
         data=json.dumps({"name": "api"}),
         headers=_STRICT_ACCEPT,
     )
@@ -118,7 +112,7 @@ async def test_create_project_rejects_duplicate(
     client = await aiohttp_client(router_app)
 
     resp = await client.post(
-        "/agent-mcp/api/projects",
+        "/agent-mcp/api/router/projects",
         data=json.dumps({"name": "taken"}),
         headers=_STRICT_ACCEPT,
     )
@@ -136,7 +130,7 @@ async def test_create_project_requires_strict_accept_header(
     client = await aiohttp_client(router_app)
 
     resp = await client.post(
-        "/agent-mcp/api/projects",
+        "/agent-mcp/api/router/projects",
         data=json.dumps({"name": "x"}),
         headers={"Content-Type": "application/json"},
     )
@@ -144,7 +138,7 @@ async def test_create_project_requires_strict_accept_header(
     assert resp.status == 406
 
 
-# ── DELETE /api/projects/<name> — unregister ────────────────────────
+# ── DELETE /api/router/projects/<name> — unregister ────────────────────────
 
 
 async def test_delete_project_returns_unregister_envelope(
@@ -154,7 +148,7 @@ async def test_delete_project_returns_unregister_envelope(
     client = await aiohttp_client(router_app)
 
     resp = await client.delete(
-        "/agent-mcp/api/projects/doomed",
+        "/agent-mcp/api/router/projects/doomed",
         headers=_STRICT_ACCEPT,
     )
 
@@ -185,7 +179,7 @@ async def test_delete_project_with_workspace_query_flag(
     client = await aiohttp_client(router_app)
 
     resp = await client.delete(
-        "/agent-mcp/api/projects/doomed?delete_workspace=true",
+        "/agent-mcp/api/router/projects/doomed?delete_workspace=true",
         headers=_STRICT_ACCEPT,
     )
 
@@ -202,7 +196,7 @@ async def test_delete_unknown_project_404(
     client = await aiohttp_client(router_app)
 
     resp = await client.delete(
-        "/agent-mcp/api/projects/never-existed",
+        "/agent-mcp/api/router/projects/never-existed",
         headers=_STRICT_ACCEPT,
     )
 
@@ -212,7 +206,7 @@ async def test_delete_unknown_project_404(
     assert body["error"] == "not_registered"
 
 
-# ── POST /api/projects/<name>/rename ────────────────────────────────
+# ── PATCH /api/router/projects/<name> — rename ────────────────────────────────
 
 
 async def test_rename_project_via_json_body(
@@ -221,9 +215,9 @@ async def test_rename_project_via_json_body(
     register_project("oldname")
     client = await aiohttp_client(router_app)
 
-    resp = await client.post(
-        "/agent-mcp/api/projects/oldname/rename",
-        data=json.dumps({"new_name": "newname", "grace_days": 7}),
+    resp = await client.patch(
+        "/agent-mcp/api/router/projects/oldname",
+        data=json.dumps({"name": "newname", "grace_days": 7}),
         headers=_STRICT_ACCEPT,
     )
 
@@ -241,9 +235,9 @@ async def test_rename_unknown_project_404(
 ) -> None:
     client = await aiohttp_client(router_app)
 
-    resp = await client.post(
-        "/agent-mcp/api/projects/ghost/rename",
-        data=json.dumps({"new_name": "irrelevant"}),
+    resp = await client.patch(
+        "/agent-mcp/api/router/projects/ghost",
+        data=json.dumps({"name": "irrelevant"}),
         headers=_STRICT_ACCEPT,
     )
 
@@ -258,9 +252,9 @@ async def test_rename_with_invalid_new_name_400(
     register_project("a")
     client = await aiohttp_client(router_app)
 
-    resp = await client.post(
-        "/agent-mcp/api/projects/a/rename",
-        data=json.dumps({"new_name": "_invalid"}),
+    resp = await client.patch(
+        "/agent-mcp/api/router/projects/a",
+        data=json.dumps({"name": "_invalid"}),
         headers=_STRICT_ACCEPT,
     )
 
@@ -269,7 +263,7 @@ async def test_rename_with_invalid_new_name_400(
     assert body["error"] == "invalid_name"
 
 
-# ── POST /api/projects/<name>/stop ──────────────────────────────────
+# ── POST /api/router/projects/<name>/stop ──────────────────────────────────
 
 
 async def test_stop_project_returns_envelope(
@@ -281,7 +275,7 @@ async def test_stop_project_returns_envelope(
     client = await aiohttp_client(router_app)
 
     resp = await client.post(
-        "/agent-mcp/api/projects/idle/stop",
+        "/agent-mcp/api/router/projects/idle/stop",
         data="{}",
         headers=_STRICT_ACCEPT,
     )
@@ -292,31 +286,7 @@ async def test_stop_project_returns_envelope(
     assert body["stopped"] == "idle"
 
 
-# ── Alias resources ────────────────────────────────────────────────
-#
-# Alias REST endpoints (GET/DELETE /api/projects/<name>/aliases/<alias>)
-# are intentionally OUT OF SCOPE for PR-C — they'd add ~200 LOC of
-# registry-aware handlers without the surface-area pressure that
-# motivates the other four. The pre-PR-C /__alias-usage and
-# /__remove-alias endpoints remain in use; PR-F can fold them in.
-
-
-# ── Legacy endpoints still work (back-compat for in-flight clients) ─
-
-
-async def test_legacy_form_create_still_works(
-    aiohttp_client, router_app,
-) -> None:
-    """The pre-PR-C form-encoded ``POST /__create`` is retained as
-    DEPRECATED — keeps the dashboard's modals working until they
-    migrate. PR-C doesn't remove it; a later major can."""
-    client = await aiohttp_client(router_app)
-
-    resp = await client.post(
-        "/agent-mcp/__create",
-        data={"name": "legacy-shape"},
-        allow_redirects=False,
-    )
-
-    # The legacy handler 303-redirects to the index on success.
-    assert resp.status == 303
+# Alias REST endpoints
+# (GET/DELETE /api/router/projects/<name>/aliases/<alias>) are
+# covered by ``test_alias_management.py``. ADR 0014 brought them
+# in as siblings to the rest of the admin surface.

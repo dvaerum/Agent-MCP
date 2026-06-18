@@ -16,6 +16,8 @@
 // declarations here will get trimmed.
 export * from './api-types.generated'
 
+import { loginUrl } from './urls'
+
 export interface Agent {
   agent_id: string
   status: 'pending' | 'running' | 'terminated' | 'failed'
@@ -353,10 +355,8 @@ class ApiClient {
           typeof window !== 'undefined' &&
           !window.location.pathname.endsWith('/agent-mcp/login')
         ) {
-          const nextParam = encodeURIComponent(
-            window.location.pathname + window.location.search,
-          )
-          window.location.assign(`/agent-mcp/login?next=${nextParam}`)
+          const next = window.location.pathname + window.location.search
+          window.location.assign(loginUrl(next))
           // Throw so the caller's `.catch` doesn't accidentally
           // surface stale data; the navigation will tear down the
           // page before this matters in practice.

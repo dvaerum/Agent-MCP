@@ -4,12 +4,14 @@
 // inline below a project card's alias badge when the user clicks the
 // chip. Surfaces:
 //
-//   * The list of agent_ids that have used the alias (from
-//     /agent-mcp/__alias-usage backed by mcp_sessions.alias_used).
-//   * A "Remove alias now" button calling /agent-mcp/__remove-alias.
+//   * The list of agent_ids that have used the alias, from
+//     ``GET /agent-mcp/api/router/projects/<name>/aliases?alias=<a>``
+//     (backed by mcp_sessions.alias_used).
+//   * A "Remove alias now" button calling
+//     ``DELETE /agent-mcp/api/router/projects/<name>/aliases/<a>``.
 //
 // "Extend grace" is intentionally NOT implemented here — extending an
-// alias is equivalent to issuing a new alias via __rename (which can
+// alias is equivalent to issuing a new alias via rename (which can
 // re-add the alias with a fresh expires_at). Operator workflow: if
 // the cutover needs more time, hit Rename and re-aim the project at
 // the same name with a longer grace_days. A dedicated extend-grace
@@ -19,6 +21,7 @@ import React, { useEffect, useState } from "react"
 import { Loader2, Trash2, Users, AlertCircle } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { useProjectsStore, type ProjectAlias } from "@/lib/stores/projects-store"
+import { projectAliasUrl, projectAliasesUrl } from "@/lib/urls"
 
 interface AliasUsage {
   alias: string
@@ -52,8 +55,11 @@ export function AliasChipPanel({
     setLoading(true)
     setError(null)
     fetch(
-      `/agent-mcp/__alias-usage?alias=${encodeURIComponent(alias.name)}`,
-      { cache: "no-store" },
+      projectAliasesUrl(projectName, alias.name),
+      {
+        cache: "no-store",
+        headers: { Accept: "application/vnd.agent-mcp.v1+json" },
+      },
     )
       .then(async (r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`)
@@ -77,13 +83,9 @@ export function AliasChipPanel({
     setRemoving(true)
     setError(null)
     try {
-      const body = new URLSearchParams()
-      body.set("name", projectName)
-      body.set("alias", alias.name)
-      const r = await fetch("/agent-mcp/__remove-alias", {
-        method: "POST",
-        body,
-        headers: { Accept: "application/json" },
+      const r = await fetch(projectAliasUrl(projectName, alias.name), {
+        method: "DELETE",
+        headers: { Accept: "application/vnd.agent-mcp.v1+json" },
       })
       if (!r.ok) {
         const text = await r.text().catch(() => "")

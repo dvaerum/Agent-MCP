@@ -28,7 +28,11 @@ import {
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { useProjectsStore } from "@/lib/stores/projects-store"
-import { internalRouterUrl, mcpUrl } from "@/lib/urls"
+import {
+  mcpUrl,
+  projectClientConfigUrl,
+  projectInstallerUrl,
+} from "@/lib/urls"
 
 interface ClientConfig {
   mcpServers: {
@@ -49,9 +53,10 @@ interface AdminTokenResult {
 const EXTERNAL_URL_SCRIPT_HINT = (
   // When the dashboard runs at https://host.tailnet.ts.net/agent-mcp/app/
   // we want the wiring URLs to use the same origin. The router
-  // doesn't surface its configured EXTERNAL_URL via /__overview today
-  // (kept out of this PR to avoid expanding the envelope shape),
-  // so we derive a sensible default from window.location.origin.
+  // doesn't surface its configured EXTERNAL_URL via the overview
+  // envelope today (kept out of this PR to avoid expanding the
+  // envelope shape), so we derive a sensible default from
+  // window.location.origin.
   ""
 )
 
@@ -72,9 +77,7 @@ function buildMcpJsonFor(projectName: string, token: string | null): ClientConfi
 }
 
 function buildInstallerOneliner(projectName: string): string {
-  const path = internalRouterUrl(
-    `__client-installer/${encodeURIComponent(projectName)}.sh`,
-  )
+  const path = projectInstallerUrl(projectName)
   return `curl -fsSL "${originBase()}${path}" | bash`
 }
 
@@ -117,10 +120,11 @@ function ProjectWiringPanel({
       // cheapest way to surface it without hitting the per-project
       // backend directly. It returns the .mcp.json JSON body.
       const r = await fetch(
-        internalRouterUrl(
-          `__client-config/${encodeURIComponent(projectName)}.mcp.json`,
-        ),
-        { cache: "no-store" },
+        projectClientConfigUrl(projectName),
+        {
+          cache: "no-store",
+          headers: { Accept: "application/vnd.agent-mcp.v1+json" },
+        },
       )
       if (!r.ok) throw new Error(`HTTP ${r.status}`)
       const body = (await r.json()) as ClientConfig
@@ -247,9 +251,7 @@ function ProjectWiringPanel({
               asChild
             >
               <a
-                href={internalRouterUrl(
-                  `__client-installer/${encodeURIComponent(projectName)}.sh`,
-                )}
+                href={projectInstallerUrl(projectName)}
                 target="_blank"
                 rel="noopener noreferrer"
               >

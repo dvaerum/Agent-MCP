@@ -1,7 +1,7 @@
 // Agent-MCP/agent_mcp/dashboard/lib/stores/projects-store.ts
 //
 // Cross-project overview store (Phase 3.5a). Backed by the router's
-// `GET /agent-mcp/__overview` endpoint added in the same phase.
+// `GET /agent-mcp/api/router/overview` endpoint (ADR 0014).
 //
 // Distinct from `useDataStore` (which fetches a single project's
 // agents / tasks / context via `/api/all-data`). The overview lives
@@ -22,7 +22,7 @@
 // for ~3s, so the round-trip on each page load is cheap.
 
 import { create } from 'zustand'
-import { internalRouterUrl } from '../urls'
+import { overviewUrl } from '../urls'
 
 export type ProjectStatus =
   | 'active'
@@ -63,7 +63,7 @@ interface ProjectsStore {
   reset: () => void
 }
 
-const OVERVIEW_ENDPOINT = internalRouterUrl('__overview')
+const OVERVIEW_ENDPOINT = overviewUrl()
 
 export const useProjectsStore = create<ProjectsStore>((set, get) => ({
   envelope: null,
@@ -77,7 +77,10 @@ export const useProjectsStore = create<ProjectsStore>((set, get) => ({
     if (get().loading) return
     set({ loading: true, error: null })
     try {
-      const r = await fetch(OVERVIEW_ENDPOINT, { cache: 'no-store' })
+      const r = await fetch(OVERVIEW_ENDPOINT, {
+        cache: 'no-store',
+        headers: { Accept: 'application/vnd.agent-mcp.v1+json' },
+      })
       if (!r.ok) {
         throw new Error(`overview endpoint returned HTTP ${r.status}`)
       }

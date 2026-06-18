@@ -149,18 +149,30 @@ pkgs.testers.nixosTest {
     machine.wait_for_unit("agent-mcp-router.service")
     machine.wait_for_open_port(${toString ports.routerPort})
 
-    # 1. Register a project so a backend gets lazy-spawned.
+    # Log in the sentinel operator (ADR 0014: admin REST surface is
+    # session-gated).
     machine.succeed(
-        "curl -fsSL -o /dev/null -F name=idle-test "
-        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__create"
+        "curl -fsS -c /tmp/agent-mcp-cookies.txt "
+        "-F username=ci-sentinel -F password=ci-sentinel-pw "
+        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/login"
+    )
+
+    # 1. Register a project so a backend gets lazy-spawned (ADR 0014:
+    # POST /api/router/projects with a JSON body).
+    machine.succeed(
+        "curl -fsSL -b /tmp/agent-mcp-cookies.txt -o /dev/null "
+        "-H 'Accept: application/vnd.agent-mcp.v1+json' "
+        "-H 'Content-Type: application/json' "
+        "-X POST --data '{\"name\": \"idle-test\"}' "
+        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/api/router/projects"
     )
 
     # 2. Force backend startup by hitting the dashboard endpoint —
-    # this routes to /agent-mcp/__dashboard/idle-test/ which spawns
-    # the per-project backend on first contact.
+    # this routes to /agent-mcp/app/idle-test/ which spawns the
+    # per-project backend on first contact.
     machine.succeed(
-        "curl -fsS -o /dev/null "
-        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__dashboard/idle-test/"
+        "curl -fsS -b /tmp/agent-mcp-cookies.txt -o /dev/null "
+        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/app/idle-test/"
     )
 
     # Wait for the per-project backend to come up and the sqlite DB

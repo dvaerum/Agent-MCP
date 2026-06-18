@@ -8,8 +8,8 @@ Bearer <admin_token>`` header (for agent-side traffic on ``/mcp/``).
 
 The legacy bearer path stays usable on ``/agent-mcp/mcp/...`` so
 spawned agents keep authenticating; it is NOT honoured on the
-dashboard's ``/api/...`` or ``/__*`` surfaces — the dashboard moves
-fully to cookies.
+dashboard's ``/api/...`` surface — the dashboard moves fully to
+cookies. ADR 0014 retired the ``/agent-mcp/__*`` shape entirely.
 
 Project-scoped paths (``/agent-mcp/api/<project>/...`` and
 ``/agent-mcp/app/<project>/...``) additionally verify the resolved
@@ -55,24 +55,17 @@ logger = logging.getLogger(__name__)
 #   * ``/agent-mcp/assets/``: Next.js static bundle. Public by design.
 #   * ``/agent-mcp/mcp/``: MCP transport. Agent-side bearer auth lives
 #     in ``backend_mcp_handler``; cookies don't apply.
-#   * ``/agent-mcp/__projects``: machine-readable project list used by
-#     the unauth landing page for the project picker. Read-only, no
-#     PII. Phase 3 may revisit.
+#   * ``/agent-mcp/api/router/health``: public service descriptor
+#     (ADR 0014). External monitors probe liveness without minting
+#     an operator session. The path is exact-prefixed because every
+#     other ``/api/router/...`` route falls into the session gate.
 _UNAUTH_PREFIXES = (
     "/agent-mcp/login",
     "/agent-mcp/logout",
     "/agent-mcp/setup",
     "/agent-mcp/assets/",
     "/agent-mcp/mcp/",
-    "/agent-mcp/__projects",
-    # Legacy MCP transport paths — exempt so the route layer can
-    # return its semantic 404 ('this URL shape is gone') instead of
-    # the middleware pre-empting with a 401. Agent-side auth on the
-    # live MCP path lives in backend_mcp_handler via the bearer
-    # token; cookies don't apply to MCP traffic.
-    "/agent-mcp/__sse",
-    "/agent-mcp/__messages",
-    "/agent-mcp/__mcp",
+    "/agent-mcp/api/router/health",
 )
 
 
@@ -97,9 +90,12 @@ _PROJECT_SCOPED_PATTERNS = (
 
 
 # Project-segment values under /api/ that are NOT projects (they're
-# router-level lifecycle endpoints). Membership-check skipped for
-# these; the global operator-session gate still applies.
-_NON_PROJECT_API_SEGMENTS = frozenset({"projects"})
+# router-level admin endpoints). Membership-check skipped for these;
+# the global operator-session gate still applies. ADR 0014: the
+# single ``router`` segment replaces the prior per-route ``projects``
+# entry — every admin endpoint lives at ``/api/router/...`` so this
+# is the only top-level segment we have to exempt.
+_NON_PROJECT_API_SEGMENTS = frozenset({"router"})
 
 
 # ── Helpers ────────────────────────────────────────────────────────
