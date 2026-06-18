@@ -1770,6 +1770,11 @@ def make_app(
     # (PR-A) is applied per route inside ``register_admin_routes``.
     from . import admin_api
     admin_api.register_admin_routes(app)
+    # Phase 3 Wave 1b (prancy-napping-pie): operator-facing CRUD for
+    # users, groups, and project memberships. Mounted alongside the
+    # existing admin routes so the same operator-session gate applies.
+    from . import admin_users_api
+    admin_users_api.register_admin_users_routes(app)
 
     # Phase 1 PR C: login + setup-wizard routes. Registered AFTER the
     # /api routes so a project literally named "login" can't shadow
