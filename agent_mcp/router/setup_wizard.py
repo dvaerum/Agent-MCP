@@ -63,11 +63,20 @@ def users_table_is_empty() -> bool:
 
 
 # Paths that must remain reachable while the users table is empty.
-# The /setup pair are obvious; /assets is exempt so the wizard's
-# stylesheet/fonts (none today, but a future PR may add them) load.
+# /setup is obvious; /assets is exempt so the wizard's CSS/fonts (none
+# today, but a future PR may add them) load. The /api/, /mcp/, and
+# /__-prefixed surfaces are exempt because they are machine-to-machine
+# (REST API, MCP transport, router-internal JSON like __projects /
+# __overview); redirecting them to an HTML wizard would break the
+# agent-side bearer flow and every pre-Phase-1 dashboard/CI
+# integration that hits the JSON API directly. The wizard is
+# HTML-targeted; only HTML-rendering paths need the bounce.
 _REDIRECT_EXEMPT_PREFIXES = (
     "/agent-mcp/setup",
     "/agent-mcp/assets/",
+    "/agent-mcp/api/",
+    "/agent-mcp/mcp/",
+    "/agent-mcp/__",
 )
 
 
@@ -76,7 +85,7 @@ async def empty_users_redirect_middleware(
     request: web.Request,
     handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
 ) -> web.StreamResponse:
-    """Bounce any /agent-mcp/* request to /setup when no users exist."""
+    """Bounce any /agent-mcp/* HTML request to /setup when no users exist."""
     path = request.path
     if not path.startswith("/agent-mcp"):
         return await handler(request)
