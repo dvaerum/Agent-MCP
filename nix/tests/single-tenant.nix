@@ -8,12 +8,12 @@
 #
 # Three assertions specific to single-tenant mode:
 #
-#   1. __create / __unregister / __rename all return 410 with the
-#      documented JSON body shape.
-#   2. /__dashboard/<wrong-name>/<section> → 302 Location:
-#      /__dashboard/only-project/<section>  (W1 redirect; decision #9).
-#   3. /__dashboard/only-project/ → 200 (sanity: the configured
-#      project's URL is unaffected).
+#   1. POST/DELETE/PATCH on /api/router/projects/... all return 410
+#      with the documented JSON body shape (ADR 0014).
+#   2. /app/<wrong-name>/<section> → 302 Location:
+#      /app/only-project/<section>  (W1 redirect; decision #9).
+#   3. /app/only-project/ → 200 (sanity: the configured project's
+#      URL is unaffected).
 { pkgs, lib, self, ... }:
 
 let
@@ -143,20 +143,27 @@ pkgs.testers.nixosTest {
     machine.wait_for_unit("agent-mcp-router.service")
     machine.wait_for_open_port(${toString ports.routerPort})
 
-    # 1. __create → 410.
+    # ADR 0014: admin REST surface lives at /api/router/...; the
+    # strict Accept header (PR-A) is required.
+    accept_header = (
+        "-H 'Accept: application/vnd.agent-mcp.v1+json' "
+        "-H 'Content-Type: application/json'"
+    )
+
+    # 1. POST /api/router/projects → 410 in single-tenant mode.
     code_create = machine.succeed(
-        "curl -s -o /dev/null -w '%{http_code}' "
-        "-F name=newproj "
-        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__create"
+        f"curl -s -o /dev/null -w '%{{http_code}}' "
+        f"{accept_header} -X POST --data '{{\"name\": \"newproj\"}}' "
+        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/api/router/projects"
     )
     assert code_create == "410", (
-        f"__create must 410 in single-tenant mode; got {code_create}"
+        f"create must 410 in single-tenant mode; got {code_create}"
     )
 
     # Body shape: {error, single_tenant_name}.
     body = machine.succeed(
-        "curl -s -F name=newproj "
-        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__create"
+        f"curl -s {accept_header} -X POST --data '{{\"name\": \"newproj\"}}' "
+        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/api/router/projects"
     )
     import json
     data = json.loads(body)
@@ -167,19 +174,18 @@ pkgs.testers.nixosTest {
         f"bad single_tenant_name in body: {data!r}"
     )
 
-    # 2. __unregister + __rename → 410.
-    for endpoint_data in (
-        ("__unregister", "name=${singleName}"),
-        ("__rename", "old_name=${singleName}&new_name=other"),
-    ):
-        endpoint, payload = endpoint_data
-        code = machine.succeed(
-            "curl -s -o /dev/null -w '%{http_code}' "
-            f"-X POST --data '{payload}' "
-            f"-H 'Content-Type: application/x-www-form-urlencoded' "
-            f"http://127.0.0.1:${toString ports.routerPort}/agent-mcp/{endpoint}"
+    # 2. DELETE + PATCH on /api/router/projects/<name> → 410.
+    for method in ("DELETE", "PATCH"):
+        body_arg = (
+            "--data '{\"name\": \"other\"}'" if method == "PATCH" else ""
         )
-        assert code == "410", f"{endpoint} must 410 single-tenant; got {code}"
+        code = machine.succeed(
+            f"curl -s -o /dev/null -w '%{{http_code}}' "
+            f"{accept_header} -X {method} {body_arg} "
+            "http://127.0.0.1:${toString ports.routerPort}"
+            "/agent-mcp/api/router/projects/${singleName}"
+        )
+        assert code == "410", f"{method} must 410 single-tenant; got {code}"
 
     # 3. W1 redirect on dashboard for a wrong project name.
     # PR-B Shape-3: dashboard pages now live at /agent-mcp/app/<name>/

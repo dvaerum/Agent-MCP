@@ -151,9 +151,19 @@ pkgs.testers.nixosTest {
     machine.wait_for_open_port(${toString ports.routerPort})
 
     # ── Bootstrap the project ────────────────────────────────────
+    # Log in the sentinel operator (ADR 0014: admin REST surface is
+    # session-gated) and create the project via the REST resource.
     machine.succeed(
-        "curl -fsSL -o /dev/null -F name=coord-test "
-        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/__create"
+        "curl -fsS -c /tmp/agent-mcp-cookies.txt "
+        "-F username=ci-sentinel -F password=ci-sentinel-pw "
+        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/login"
+    )
+    machine.succeed(
+        "curl -fsSL -b /tmp/agent-mcp-cookies.txt -o /dev/null "
+        "-H 'Accept: application/vnd.agent-mcp.v1+json' "
+        "-H 'Content-Type: application/json' "
+        "-X POST --data '{\"name\": \"coord-test\"}' "
+        "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/api/router/projects"
     )
 
     # Start the per-project backend explicitly. The router would
@@ -164,8 +174,9 @@ pkgs.testers.nixosTest {
 
     # Poll the backend's DB file until it exists (the unit's
     # "active" state can precede DB initialisation). The workspace
-    # path is what __create wrote to projects.local.json, which is
-    # AGENT_MCP_DEFAULT_WORKSPACE / <name> = /home/testuser/projects/coord-test.
+    # path is what the create handler wrote to projects.local.json,
+    # which is AGENT_MCP_DEFAULT_WORKSPACE / <name> =
+    # /home/testuser/projects/coord-test.
     db_path = "/home/testuser/projects/coord-test/.agent/mcp_state.db"
     machine.wait_until_succeeds(f"test -f {db_path}", timeout=60)
 
