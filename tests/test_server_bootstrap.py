@@ -57,13 +57,14 @@ def test_server_config_is_a_frozen_dataclass() -> None:
 
     # Field set covers everything the legacy CLI threaded through to
     # the runners — we lose a flag if this assertion drops.
+    # Phase 2 Wave 1b renamed ``admin_token_cli`` → ``system_token_cli``.
     field_names = {f.name for f in fields(ServerConfig)}
     for required in (
         "transport",
         "port",
         "uds",
         "project_dir",
-        "admin_token_cli",
+        "system_token_cli",
         "debug",
         "no_tui",
         "advanced",
@@ -87,12 +88,14 @@ def test_server_config_from_cli_args_builds_from_click_decoded_kwargs(
 
     project_dir = tmp_path / "p"
     project_dir.mkdir()
+    # Phase 2 Wave 1b: the canonical kwarg is ``system_token_cli``;
+    # ``admin_token_cli`` keeps working as an alias for one release.
     cfg = ServerConfig.from_cli_args(
         port=8080,
         uds=None,
         transport="sse",
         project_dir=str(project_dir),
-        admin_token_cli="abc123",
+        system_token_cli="abc123",
         debug=False,
         no_tui=True,
         advanced=False,
@@ -103,7 +106,7 @@ def test_server_config_from_cli_args_builds_from_click_decoded_kwargs(
     assert cfg.port == 8080
     assert cfg.uds is None
     assert cfg.project_dir == str(project_dir)
-    assert cfg.admin_token_cli == "abc123"
+    assert cfg.system_token_cli == "abc123"
     assert cfg.no_tui is True
 
 

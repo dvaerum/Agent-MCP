@@ -1,15 +1,16 @@
-"""view_project_context must not leak admin token to non-admin callers.
+"""view_project_context must not leak the system token to non-admin callers.
 
 UPSTREAM_ISSUES.md issue I: any agent with a valid token can call
-view_project_context and read `config_admin_token` (the project's
-admin credential). That's a direct worker→admin privilege
-escalation through the tool surface.
+view_project_context and read ``config_system_token`` (formerly
+``config_admin_token`` before the Phase 2 Wave 1b rename) — the
+project's router-internal authority bearer. That's a direct
+worker→system privilege escalation through the tool surface.
 
 Fix: filter rows whose context_key matches a sensitive pattern
-(config_*_token, config_*_secret, etc.) when caller is not admin.
-Admins continue to see everything.
+(``config_*_token``, ``config_*_secret``, etc.) when caller is not
+admin. Admins continue to see everything.
 
-Migrated to `tests/harness.py::mcp_session` (Candidate F from
+Migrated to ``tests/harness.py::mcp_session`` (Candidate F from
 architecture review 2026-06-02).
 """
 
@@ -31,35 +32,35 @@ def _seed(admin, *, key: str, value: str) -> None:
     assert r.status_code == 200, r.text
 
 
-async def test_admin_sees_config_admin_token(tmp_path) -> None:
-    """Admins must continue to see config_admin_token (baseline)."""
+async def test_admin_sees_config_system_token(tmp_path) -> None:
+    """Admins must continue to see config_system_token (baseline)."""
     async with mcp_session(tmp_path) as admin:
-        # Seed a fake secret-looking key (config_admin_token already exists
+        # Seed a fake secret-looking key (config_system_token already exists
         # from startup; we don't need to add it).
         result = await admin.call("view_project_context", {})
         text = result[0].text
-        assert "config_admin_token" in text, (
-            "admin should see config_admin_token in view_project_context "
+        assert "config_system_token" in text, (
+            "admin should see config_system_token in view_project_context "
             "output"
         )
 
 
-async def test_worker_does_not_see_config_admin_token(tmp_path) -> None:
-    """Workers must NOT see config_admin_token — privilege escalation
+async def test_worker_does_not_see_config_system_token(tmp_path) -> None:
+    """Workers must NOT see config_system_token — privilege escalation
     otherwise."""
     async with mcp_session(tmp_path) as admin:
         worker = await admin.create_worker("test-worker")
 
         result = await worker.call("view_project_context", {})
         text = result[0].text
-        assert "config_admin_token" not in text, (
-            "worker token can read config_admin_token via "
+        assert "config_system_token" not in text, (
+            "worker token can read config_system_token via "
             "view_project_context — privilege escalation (issue I). "
             "Got:\n" + text[:1000]
         )
-        # And the actual admin token value must not appear either.
+        # And the actual system token value must not appear either.
         assert admin.admin_token not in text, (
-            "worker can read the literal admin token value (issue I)"
+            "worker can read the literal system token value (issue I)"
         )
 
 

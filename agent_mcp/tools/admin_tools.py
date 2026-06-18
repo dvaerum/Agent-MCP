@@ -393,12 +393,18 @@ async def create_agent_tool_impl(
                     "MCP_WORKING_DIR": agent_working_dir_abs,
                 }
 
-                # Add admin token if this is an admin agent
+                # Add the system token if this is an admin agent.
+                # The env var is named MCP_SYSTEM_TOKEN (renamed from
+                # MCP_ADMIN_TOKEN in Phase 2 Wave 1b); the legacy
+                # MCP_ADMIN_TOKEN is also exported for one release so
+                # existing agent startup scripts (templates/agent_startup.sh
+                # and downstream variants) keep authenticating.
                 if (
                     agent_id.lower().startswith("admin")
-                    and new_agent_token == g.admin_token
+                    and new_agent_token == g.system_token
                 ):
-                    env_vars["MCP_ADMIN_TOKEN"] = g.admin_token
+                    env_vars["MCP_SYSTEM_TOKEN"] = g.system_token
+                    env_vars["MCP_ADMIN_TOKEN"] = g.system_token
 
                 # Create the tmux session (without immediate command)
                 if create_tmux_session(

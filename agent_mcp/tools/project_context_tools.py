@@ -1575,8 +1575,12 @@ async def delete_project_context_tool_impl(
             )
         ]
 
-    # Critical system keys that require force_delete
+    # Critical system keys that require force_delete. The legacy
+    # ``config_admin_token`` is kept alongside ``config_system_token``
+    # so an operator's force-delete on a pre-v5.0.62 DB (before the
+    # row was migrated) still trips the guard.
     critical_keys = [
+        "config_system_token",
         "config_admin_token",
         "server_startup",
         "database_version",
