@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import Boolean, Text, text
+from sqlalchemy import Boolean, CheckConstraint, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ..engine import Base
@@ -64,6 +64,27 @@ class Agent(Base):
     # "from the beginning".
     last_event_seen_at: Mapped[Optional[str]] = mapped_column(
         Text, nullable=True,
+    )
+    # Phase 2 Wave 1a: per-agent privilege tier. 'worker' (default) is
+    # the existing behaviour; 'manager' is introduced in Wave 2 as a
+    # supervisor tier that can edit subordinates + assign tasks but
+    # cannot mutate `config_*` keys or spawn new agents. The column
+    # exists in this PR but is not yet read by any code path — the
+    # @requires_role decorator that consumes it ships in Wave 2.
+    # Default to 'worker' so existing agents stay in the least-
+    # privileged tier; the CHECK constraint pins the domain.
+    agent_role: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="worker",
+        server_default=text("'worker'"),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "agent_role IN ('worker', 'manager')",
+            name="ck_agents_agent_role_domain",
+        ),
     )
 
     def __repr__(self) -> str:  # pragma: no cover — debug aid
