@@ -56,6 +56,7 @@ import { WiringSnippetsTab } from "./wiring-snippets-tab"
 // modal from the per-project dropdown.
 import { UsersDashboard } from "./users-dashboard"
 import { GroupsDashboard } from "./groups-dashboard"
+import { SsoDashboard } from "./sso-dashboard"
 import { ProjectMembershipsModal } from "./project-memberships-modal"
 
 const STATUS_VARIANT: Record<ProjectStatus, "default" | "secondary" | "destructive" | "outline"> = {
@@ -333,6 +334,7 @@ export function ProjectsOverviewDashboard(): React.ReactElement {
             <TabsTrigger value="projects">Projects</TabsTrigger>
             <TabsTrigger value="users">Users</TabsTrigger>
             <TabsTrigger value="groups">Groups</TabsTrigger>
+            <TabsTrigger value="sso">SSO</TabsTrigger>
             <TabsTrigger value="setup">Setup</TabsTrigger>
           </TabsList>
 
@@ -376,6 +378,12 @@ export function ProjectsOverviewDashboard(): React.ReactElement {
           <TabsContent value="groups">
             <div className="border rounded-md bg-card min-h-[400px]">
               <GroupsDashboard />
+            </div>
+          </TabsContent>
+
+          <TabsContent value="sso">
+            <div className="border rounded-md bg-card min-h-[400px]">
+              <SsoDashboard />
             </div>
           </TabsContent>
 
