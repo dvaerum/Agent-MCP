@@ -9,8 +9,7 @@
 //
 //   * checkbox "Also delete workspace files (irreversible)"
 //   * confirmation: must type the project name verbatim
-//   * sends ``delete_workspace=true`` to the existing __unregister
-//     endpoint (extended in this PR to honour the flag).
+//   * sends ``?delete_workspace=true`` on the DELETE to opt in.
 //
 // Refuse path: router returns 409 with
 // ``{error: "active_sessions", active_connections: N}`` when the
@@ -19,6 +18,7 @@
 
 import React, { useState } from "react"
 import { AlertTriangle, Loader2, Trash2 } from "lucide-react"
+import { routerProjectUrl } from "@/lib/urls"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -71,18 +71,17 @@ export function RemoveProjectModal({
     setError(null)
     setActiveConns(null)
     try {
-      // PR-C: DELETE /api/projects/<name>. Cascade signal is a
-      // query-string flag (?delete_workspace=true) not a body field,
-      // because browsers strip DELETE bodies on some Fetch
+      // ADR 0014: DELETE /api/router/projects/<name>. Cascade signal
+      // is a query-string flag (?delete_workspace=true) not a body
+      // field, because browsers strip DELETE bodies on some Fetch
       // implementations (audit §3.2).
-      const qs = deleteWorkspace ? "?delete_workspace=true" : ""
-      const r = await fetch(
-        `/agent-mcp/api/projects/${encodeURIComponent(projectName)}${qs}`,
-        {
-          method: "DELETE",
-          headers: { "Accept": "application/vnd.agent-mcp.v1+json" },
-        },
-      )
+      const url = deleteWorkspace
+        ? routerProjectUrl(projectName, "delete_workspace=true")
+        : routerProjectUrl(projectName)
+      const r = await fetch(url, {
+        method: "DELETE",
+        headers: { "Accept": "application/vnd.agent-mcp.v1+json" },
+      })
       const body = await r.json().catch(() => ({} as any))
       if (r.status === 409 && body.error === "active_sessions") {
         setActiveConns(

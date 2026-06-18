@@ -4,7 +4,8 @@
 // Lives at `/agent-mcp/app/` (no project segment, PR-B renamed from
 // /__dashboard/). Renders one card per registered project (R2 + S2 +
 // multi-line per the locked design table) backed by the
-// `/agent-mcp/__overview` router endpoint via `useProjectsStore`.
+// `/agent-mcp/api/router/overview` router endpoint (ADR 0014) via
+// `useProjectsStore`.
 //
 // Per-card layout (multi-line, ~2-3 visible lines + "Show details"
 // toggle):

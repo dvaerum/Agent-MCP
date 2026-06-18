@@ -1,46 +1,59 @@
 /**
- * Single source of URL truth for the dashboard (PR-B).
+ * Single source of URL truth for the dashboard.
  *
- * Before PR-B every dashboard file knew the router URL shape directly:
- * 14 files hard-coded `/agent-mcp/__dashboard/...` / `/agent-mcp/__api/...`
- * paths inline (see audit §5). PR-B's URL rename forced a touch in
- * every one of them. This module exists so the NEXT rename touches one
- * file plus the consumers that use the helpers, not every component
- * with a string template.
+ * Every dashboard URL — overview reads, project lifecycle mutations,
+ * wiring snippets, MCP transport, static assets — flows through one of
+ * the helpers below. Inline ``/agent-mcp/...`` strings are forbidden;
+ * the next URL rename touches this file and the consumers that use
+ * the helpers, not every component with a string template.
  *
- * Public surface (Shape 3, locked by /grill-me):
+ * Public surface (locked by ADR 0014):
  *
- *   /agent-mcp/                  — service descriptor (browsers: 302 → /app/)
- *   /agent-mcp/app/              — React overview (cross-project cards)
- *   /agent-mcp/app/<name>/       — per-project dashboard pages
- *   /agent-mcp/app/<name>/<sec>  — section deep-link (e.g. /tasks, /agents)
- *   /agent-mcp/api/<name>/<rest> — REST surface (strict Accept gate, PR-A)
- *   /agent-mcp/assets/<rest>     — Next.js static bundle (sentinel-substituted)
- *   /agent-mcp/mcp/<name>        — MCP transport (PR-D Shape-3 move)
- *
- * Direct router endpoints (NOT yet renamed in PR-B — PR-C folds them
- * into POST /api/projects):
- *
- *   /agent-mcp/__projects, /agent-mcp/__overview, /agent-mcp/__create,
- *   /agent-mcp/__rename, /agent-mcp/__unregister, /agent-mcp/__alias-usage,
- *   /agent-mcp/__remove-alias, /agent-mcp/__client-config/<n>.mcp.json,
- *   /agent-mcp/__client-installer/<n>.sh
- *
- * These are typed in the helpers below as `internalRouterUrl(op)` so
- * the call sites don't grow another flavour of hardcoded path.
+ *   /agent-mcp/                              service descriptor
+ *                                            (browsers: 302 → /app/)
+ *   /agent-mcp/app/                          React overview (cross-project)
+ *   /agent-mcp/app/<name>/                   per-project dashboard pages
+ *   /agent-mcp/app/<name>/<sec>              section deep-link
+ *   /agent-mcp/api/<name>/<rest>             per-project REST proxy
+ *                                            (strict Accept gate)
+ *   /agent-mcp/api/router/health             public service descriptor
+ *   /agent-mcp/api/router/projects           list / create
+ *   /agent-mcp/api/router/projects/<n>       PATCH / DELETE
+ *   /agent-mcp/api/router/projects/<n>/stop  stop backend
+ *   /agent-mcp/api/router/projects/<n>/client-config
+ *                                            JSON .mcp.json descriptor
+ *   /agent-mcp/api/router/projects/<n>/installer
+ *                                            text/x-shellscript installer
+ *   /agent-mcp/api/router/projects/<n>/aliases?alias=<a>
+ *                                            alias usage lookup
+ *   /agent-mcp/api/router/projects/<n>/aliases/<a>
+ *                                            DELETE — expire alias now
+ *   /agent-mcp/api/router/projects/<n>/agents
+ *                                            POST — admin create-agent
+ *   /agent-mcp/api/router/overview           cross-project envelope
+ *   /agent-mcp/assets/<rest>                 Next.js static bundle
+ *   /agent-mcp/mcp/<name>                    MCP transport
  */
 
 // ── Top-level path segments ─────────────────────────────────────────
-// Capitalised constants make accidental drift visible. Update one place
-// when the prefix changes; the next URL-rename PR rides on this file.
 const ROOT = "/agent-mcp"
 const APP = `${ROOT}/app`
 const API = `${ROOT}/api`
 const ASSETS = `${ROOT}/assets`
+const ROUTER_API = `${API}/router`
+const ROUTER_PROJECTS = `${ROUTER_API}/projects`
 
 /** Service descriptor URL — fetch for endpoint discovery. */
 export function descriptorUrl(): string {
   return `${ROOT}/`
+}
+
+/** Operator login page. Pass ``next`` to preserve the current path
+ *  across the bounce — the wizard reads it back as the post-login
+ *  redirect target. */
+export function loginUrl(next?: string): string {
+  if (next === undefined) return `${ROOT}/login`
+  return `${ROOT}/login?next=${encodeURIComponent(next)}`
 }
 
 /** React overview entry (cross-project cards). */
@@ -74,25 +87,81 @@ export function assetsUrl(path?: string): string {
   return `${ASSETS}/${path.replace(/^\/+/, "")}`
 }
 
-/** MCP transport URL for a project (PR-D Shape-3:
- *  /agent-mcp/mcp/<name>). Callers that build MCP-client config
- *  strings go through this helper so the URL shape is centralised. */
+/** MCP transport URL for a project. Callers that build MCP-client
+ *  config strings go through this helper so the URL shape is
+ *  centralised. */
 export function mcpUrl(projectName: string, origin: string = ""): string {
   return `${origin}${ROOT}/mcp/${encodeURIComponent(projectName)}`
 }
 
-/** Direct router-internal endpoints (not yet under /api/). PR-C will
- *  fold the project-lifecycle ones into REST resources; the others
- *  (__client-config, __client-installer) stay as router-only utilities
- *  because they're operator wiring tools, not API surface. */
-export function internalRouterUrl(op: string, query?: string): string {
-  // `op` is the segment after /agent-mcp/ (e.g. `__projects`,
-  // `__client-config/foo.mcp.json`).
-  const cleaned = op.replace(/^\/+/, "")
-  const base = `${ROOT}/${cleaned}`
+// ── Router admin surface (ADR 0014) ────────────────────────────────
+
+/** Public service descriptor / liveness probe. Reachable without an
+ *  operator session — every other ``/api/router/...`` route requires
+ *  one. */
+export function healthUrl(): string {
+  return `${ROUTER_API}/health`
+}
+
+/** Cross-project overview envelope (consumed by the React overview's
+ *  store). */
+export function overviewUrl(): string {
+  return `${ROUTER_API}/overview`
+}
+
+/** Collection URL — ``GET`` lists projects, ``POST`` creates one. */
+export function routerProjectsUrl(): string {
+  return ROUTER_PROJECTS
+}
+
+/** Per-project resource URL — ``PATCH`` to rename, ``DELETE`` to
+ *  unregister. The optional ``query`` is concatenated unescaped (the
+ *  caller is responsible for encoding); used for
+ *  ``?delete_workspace=true``. */
+export function routerProjectUrl(name: string, query?: string): string {
+  const base = `${ROUTER_PROJECTS}/${encodeURIComponent(name)}`
   if (query === undefined) return base
-  const sep = base.includes("?") ? "&" : "?"
-  return `${base}${sep}${query.replace(/^[?&]+/, "")}`
+  return `${base}?${query.replace(/^[?&]+/, "")}`
+}
+
+/** ``POST`` to stop a project's backend. */
+export function projectStopUrl(name: string): string {
+  return `${ROUTER_PROJECTS}/${encodeURIComponent(name)}/stop`
+}
+
+/** ``GET`` returns the project's ``.mcp.json`` body with the vendor
+ *  media type ``application/vnd.agent-mcp.client-config+json``. */
+export function projectClientConfigUrl(name: string): string {
+  return `${ROUTER_PROJECTS}/${encodeURIComponent(name)}/client-config`
+}
+
+/** ``GET`` returns the project's installer shell script with
+ *  ``Content-Type: text/x-shellscript``. */
+export function projectInstallerUrl(name: string): string {
+  return `${ROUTER_PROJECTS}/${encodeURIComponent(name)}/installer`
+}
+
+/** ``GET ...?alias=<a>`` returns the usage record for the alias
+ *  ``<a>`` against the project ``<name>``. */
+export function projectAliasesUrl(name: string, alias?: string): string {
+  const base = `${ROUTER_PROJECTS}/${encodeURIComponent(name)}/aliases`
+  if (alias === undefined) return base
+  return `${base}?alias=${encodeURIComponent(alias)}`
+}
+
+/** ``DELETE`` expires the alias immediately, skipping the reaper. */
+export function projectAliasUrl(name: string, alias: string): string {
+  return (
+    `${ROUTER_PROJECTS}/${encodeURIComponent(name)}` +
+    `/aliases/${encodeURIComponent(alias)}`
+  )
+}
+
+/** ``POST`` — router-admin create-agent wrapper. Distinct from the
+ *  per-project ``POST /api/<project>/agents`` (which the per-project
+ *  ``ApiClient`` reaches directly). */
+export function projectAgentsUrl(name: string): string {
+  return `${ROUTER_PROJECTS}/${encodeURIComponent(name)}/agents`
 }
 
 // ── URL pattern matchers (used by project-context.ts) ───────────────
