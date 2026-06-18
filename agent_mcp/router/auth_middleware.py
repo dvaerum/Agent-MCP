@@ -32,7 +32,6 @@ from typing import Awaitable, Callable
 
 from aiohttp import web
 
-from . import identity
 from .login import resolve_current_user
 
 
