@@ -2,11 +2,16 @@
 # Path B interactive sandbox VM — boots the multi-tenant stack like
 # nix/vm.nix but with two differences tailored for dashboard E2E work:
 #
-#   1. forwardPorts maps host:18080 → guest:1337 (the router port).
-#      The standard vm.nix uses host:5454 — this VM exists in parallel
-#      so a dev can have both running without port collisions, and
-#      so the Firefox-MCP smoke script in the prancy-napping-pie plan
-#      can target the documented localhost:18080 URL verbatim.
+#   1. forwardPorts maps host:18080 → guest:1337 (the router port)
+#      by default. 18080 is also the literal sentinel that
+#      nix/run-vm-dev.sh rewrites at launch time when
+#      AGENT_MCP_VM_DEV_HOST_PORT is set, so a developer whose host
+#      already binds :18080 (e.g. SeaweedFS) can pick another port
+#      without rebuilding the VM derivation. The standard vm.nix
+#      uses host:5454 — this VM exists in parallel so a dev can
+#      have both running without port collisions, and so the
+#      Firefox-MCP smoke script in the prancy-napping-pie plan can
+#      target the documented localhost:18080 URL verbatim.
 #
 #   2. A oneshot systemd unit seeds a "agent-select-dev" project with
 #      a known agent-roster (Admin pseudo-agent + one live worker +
@@ -35,8 +40,13 @@ in
   ];
 
   # Override the host-side port forwarding so the dev sandbox lives at
-  # host:18080 — orthogonal to the host:5454 forward in the default
-  # multi-tenant VM. The dev can run both simultaneously.
+  # host:18080 by default — orthogonal to the host:5454 forward in
+  # the default multi-tenant VM. The dev can run both simultaneously.
+  # nix/run-vm-dev.sh rewrites the literal "18080" in the generated
+  # qemu hostfwd rule at launch time when AGENT_MCP_VM_DEV_HOST_PORT
+  # is set, so callers can pick a different host port without
+  # rebuilding the VM derivation. Keep this value in sync with the
+  # sentinel sed pattern in run-vm-dev.sh if you ever change it.
   virtualisation.forwardPorts = lib.mkForce [
     {
       from = "host";
