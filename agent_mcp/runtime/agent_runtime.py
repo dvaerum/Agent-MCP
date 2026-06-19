@@ -94,6 +94,19 @@ def sanitize_session_name(name: str) -> str:
     return sanitized or "agent_session"
 
 
+def agent_setup_delay() -> float:
+    """Seconds to wait between tmux setup commands during agent launch.
+
+    Production defaults to 1.0s so each `send-keys` settles before the
+    next lands. Overridable via ``AGENT_MCP_AGENT_SETUP_DELAY`` — the
+    test suite sets it to 0 so create_agent / task-assignment tests
+    (which spin up real tmux sessions) don't pay ~6 × 1s of blocking
+    sleeps per call. Single source of truth for both admin_tools and
+    task_tools.
+    """
+    return float(os.environ.get("AGENT_MCP_AGENT_SETUP_DELAY", "1.0"))
+
+
 def create_tmux_session(
     session_name: str,
     working_dir: str,

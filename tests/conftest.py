@@ -27,6 +27,11 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DOTENV_PATH", "/dev/null")
     # Belt and suspenders against stray dashboard ports getting probed.
     monkeypatch.delenv("MCP_PROJECT_DIR", raising=False)
+    # create_agent spins up a real tmux session and sleeps 1s between
+    # ~6 setup commands (6s/test) in production. Tests don't need the
+    # settle delay — zero it so create_agent tests aren't dominated by
+    # blocking sleeps.
+    monkeypatch.setenv("AGENT_MCP_AGENT_SETUP_DELAY", "0")
 
 
 @pytest.fixture
