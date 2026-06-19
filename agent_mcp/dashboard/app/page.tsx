@@ -47,6 +47,8 @@ function DashboardPage() {
         return <MessagesDashboard />
       case 'settings':
         return <SettingsDashboard />
+      case 'system':
+        return <SystemDashboard />
       case 'prompts':
         return <PromptBookDashboard />
       default:

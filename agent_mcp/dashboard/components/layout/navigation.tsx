@@ -8,7 +8,8 @@ import {
   Brain,
   BookOpen,
   MessageSquare,
-  Settings
+  Settings,
+  Network
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -25,7 +26,7 @@ interface NavItem {
   // as a literal union here so a grep for the enum values lands on
   // this file too (the sidebar is where contributors reason about
   // "which menu items exist").
-  view: 'overview' | 'agents' | 'tasks' | 'memories' | 'messages' | 'settings' | 'prompts'
+  view: 'overview' | 'agents' | 'tasks' | 'memories' | 'messages' | 'settings' | 'system' | 'prompts'
   description?: string
   badge?: string
 }
@@ -66,6 +67,12 @@ const navigationItems: NavItem[] = [
     icon: Settings,
     view: "settings",
     description: "Per-project worker-permission policy toggles"
+  },
+  {
+    title: "System",
+    icon: Network,
+    view: "system",
+    description: "System architecture and real-time graph visualization"
   },
   {
     title: "Prompt Book",
