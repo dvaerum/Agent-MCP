@@ -19,13 +19,19 @@ jobs:
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
-        # No enable-cache: we don't ship a uv.lock; the setup-uv cache
-        # is keyed off uv.lock and 404s without one. uv pip install -e
-        # .[dev] is fast enough that cache wouldn't help much.
+        # v7 is the newest moving major tag astral publishes (v8 is
+        # release-only for now); both run on node24.
+        uses: astral-sh/setup-uv@v7
+        with:
+          # setup-uv v7 defaults enable-cache to "auto", which turns
+          # caching on — and the 3 matrix jobs then race to reserve the
+          # same key ("Unable to reserve cache ..."). We don't ship a
+          # uv.lock and `uv pip install -e .[dev]` is fast, so caching
+          # buys little; disable it explicitly to keep the logs clean.
+          enable-cache: false
 
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
@@ -55,10 +61,10 @@ jobs:
       run:
         working-directory: agent_mcp/dashboard
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "22"
           cache: npm
@@ -75,11 +81,42 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: DeterminateSystems/nix-installer-action@main
+      # Pinned to a release tag instead of the mutable @main for
+      # reproducible runs; v22 runs on node24.
+      - uses: DeterminateSystems/nix-installer-action@v22
+        with:
+          # Resilience: retry transient substituter/network hiccups
+          # before giving up, rather than failing the job on the first
+          # flaky download from cache.nixos.org. Pairs with --fallback
+          # on the build step below.
+          extra-conf: |
+            download-attempts = 3
+            connect-timeout = 10
 
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      # magic-nix-cache is sunset by Determinate Systems (it also spammed
+      # an "Unable to authenticate to FlakeHub" annotation on every run)
+      # and, when GitHub Actions Cache throttled it, disabled the
+      # substituter mid-build and hard-failed the job (HTTP 418 /
+      # ResourceExhausted). cache-nix-action save/restores /nix/store via
+      # the plain Actions cache API instead, with GC so we stay under the
+      # 10 GB per-repo cache budget. No external account or secret needed.
+      - name: Cache /nix/store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          # Save a fresh cache each run (unique run_id suffix) and restore
+          # the closest prior one sharing the flake/nix-input hash prefix.
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**') }}-${{ github.run_id }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**') }}-
+          # Trim the store before saving so the upload stays within budget.
+          gc-max-store-size-linux: 5G
+          # Keep the cache list bounded: drop older entries sharing our
+          # prefix, but never the key we're about to save.
+          purge: true
+          purge-prefixes: nix-${{ runner.os }}-
+          purge-created: 0
+          purge-primary-key: never
 
       - name: Build VM tests
         # Builds only the nixosTest VM checks (vm-single-tenant, vm-multi-tenant)
@@ -88,8 +125,13 @@ jobs:
         # the `python` and `dashboard` jobs above. The VM checks exercise the
         # full server boot + HTTP assertions (including the Path A asset-prefix
         # sentinel regression guard from #166) which nothing else covers.
-        # First run ~30 min; subsequent runs ~5-10 min via magic-nix-cache.
+        # First run ~30 min; subsequent runs ~5-10 min via cache-nix-action.
         run: |
+          # --fallback: if a binary-cache substitution fails (flaky
+          # cache.nixos.org), build that path from source instead of
+          # hard-failing the job. With download-attempts=3 above, this
+          # makes the job resilient to transient cache failures — the
+          # class of flake that sank the old magic-nix-cache setup.
           nix build .#checks.x86_64-linux.vm-single-tenant \
                     .#checks.x86_64-linux.vm-multi-tenant \
-                    -L --print-build-logs
+                    -L --print-build-logs --fallback
