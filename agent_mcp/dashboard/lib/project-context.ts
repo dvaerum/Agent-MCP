@@ -66,6 +66,16 @@ import {
 function derive(): {
   projectName: string | null
   isOverview: boolean
+  // True when the dashboard is served behind the always-on Python
+  // router at `/agent-mcp/app/<name>/...` (multi-tenant deployment).
+  // Distinct from `projectName !== null` only in that consumers reading
+  // this flag don't have to re-derive the standalone-mode case
+  // themselves. Used by DashboardWrapper to skip the "Connect to MCP
+  // Server" gating screen (the URL already names the project; the
+  // router already proxies to its backend; the gating UI is for
+  // standalone deployments only) and by ServerConnection to hide the
+  // localhost port scanner (cross-origin, useless in this mode).
+  isRouterServed: boolean
   baseUrl: string
   apiPrefix: string
 } {
@@ -76,6 +86,7 @@ function derive(): {
     return {
       projectName: null,
       isOverview: true,
+      isRouterServed: true,
       baseUrl: '',
       apiPrefix: '',
     }
@@ -86,6 +97,7 @@ function derive(): {
     return {
       projectName: match[1],
       isOverview: false,
+      isRouterServed: true,
       baseUrl: apiRoot,
       apiPrefix: apiRoot,
     }
@@ -95,6 +107,7 @@ function derive(): {
   return {
     projectName: null,
     isOverview: false,
+    isRouterServed: false,
     baseUrl: '/api',
     apiPrefix: '',
   }
@@ -148,11 +161,31 @@ if (
       store.updateServer(existing.id, { baseUrl })
       existing = useServerStore.getState().servers.find(s => s.name === name)
     }
-    if (
-      existing &&
-      useServerStore.getState().activeServerId !== existing.id
-    ) {
-      useServerStore.getState().setActiveServer(existing.id)
+    if (existing) {
+      // Router-served auto-connect. Skip `setActiveServer`'s health
+      // check — the router proxy is the source of truth for "is this
+      // backend reachable?", not a synchronous `GET /api/status` from
+      // the dashboard. A lazily-spawned backend takes ~10-15s to
+      // create its Unix socket; the health check's 10s timeout
+      // surfaces as `NS_BINDING_ABORTED` before the backend is up,
+      // and `setActiveServer` then permanently flags the server as
+      // `status: 'error'`. Every inner dashboard (Overview / Agents
+      // / Tasks / Memories / Messages) gates content rendering on
+      // `status === 'connected'` and so renders a dead "Connect to
+      // MCP Server" placeholder instead of the real UI.
+      //
+      // Mark connected directly. The transparent cold-start retry
+      // inside `ApiClient.request()` (5xx → exponential backoff)
+      // already handles the spawn delay for whichever request the
+      // dashboard makes first.
+      apiClient.setBaseUrl(baseUrl)
+      store.updateServer(existing.id, {
+        status: 'connected',
+        lastConnected: new Date().toISOString(),
+      })
+      if (useServerStore.getState().activeServerId !== existing.id) {
+        useServerStore.setState({ activeServerId: existing.id })
+      }
     }
   }
   if (useServerStore.persist.hasHydrated()) {

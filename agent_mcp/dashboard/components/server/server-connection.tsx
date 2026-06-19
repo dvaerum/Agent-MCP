@@ -9,6 +9,7 @@ import { useServerStore } from "@/lib/stores/server-store"
 import { ProjectPicker } from "./project-picker"
 import { ManualServerInput } from "./manual-server-input"
 import { config } from "@/lib/config"
+import { projectContext } from "@/lib/project-context"
 
 export function ServerConnection() {
   const { 
@@ -108,6 +109,7 @@ export function ServerConnection() {
                         <Button
                           variant="ghost"
                           size="sm"
+                          aria-label={`Delete ${server.name}`}
                           className="opacity-50 hover:opacity-100 text-destructive hover:text-destructive"
                           onClick={(e) => {
                             e.stopPropagation()
@@ -159,6 +161,7 @@ export function ServerConnection() {
                         <Button
                           variant="ghost"
                           size="sm"
+                          aria-label={`Delete ${server.name}`}
                           className="opacity-50 hover:opacity-100 text-destructive hover:text-destructive"
                           onClick={(e) => {
                             e.stopPropagation()
@@ -197,15 +200,27 @@ export function ServerConnection() {
             <p className="text-sm text-muted-foreground">
               No servers connected. Add a server above or check your connection settings.
             </p>
-            <Button
-              onClick={handleAutoDetect}
-              disabled={isDetecting}
-              variant="outline"
-              className="gap-2"
-            >
-              <RefreshCw className={`w-4 h-4 ${isDetecting ? 'animate-spin' : ''}`} />
-              {isDetecting ? 'Searching...' : 'Auto-detect Servers'}
-            </Button>
+            {/* Auto-detect probes a fixed list of `localhost:<port>/api/status`
+                URLs. Useful for standalone deployments where the operator
+                runs the MCP backend on an arbitrary local port; meaningless
+                under the multi-tenant router where every probe is
+                cross-origin from `/agent-mcp/...` and Firefox blocks them
+                with NS_ERROR_DOM_BAD_URI (50+ failures, ~52 console
+                errors, zero useful discovery). Hide the button in router-
+                served mode; the router already exposes
+                `/agent-mcp/api/router/projects` for discovery and the URL
+                path itself names the active project. */}
+            {!projectContext.isRouterServed && (
+              <Button
+                onClick={handleAutoDetect}
+                disabled={isDetecting}
+                variant="outline"
+                className="gap-2"
+              >
+                <RefreshCw className={`w-4 h-4 ${isDetecting ? 'animate-spin' : ''}`} />
+                {isDetecting ? 'Searching...' : 'Auto-detect Servers'}
+              </Button>
+            )}
           </div>
         )}
       </div>
