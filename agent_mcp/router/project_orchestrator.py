@@ -201,13 +201,25 @@ async def _ensure(name: str, role: str) -> Path:
                         f"{r.stderr.strip()}"
                     )
                 )
-            for _ in range(200):  # ≤20 s for the socket file to appear
+            # Poll for the socket file. Production waits up to ~20 s
+            # (200 × 0.1 s) for the unit to come up. The budget is
+            # env-overridable so unit tests — which stub systemctl and
+            # never spawn a real backend — can set
+            # AGENT_MCP_ENSURE_SOCKET_ATTEMPTS=1 and get the not-ready
+            # 504 in ~0.1 s instead of stalling 20 s per test.
+            attempts = int(
+                os.environ.get("AGENT_MCP_ENSURE_SOCKET_ATTEMPTS", "200")
+            )
+            for _ in range(attempts):  # ≤ attempts × 0.1 s
                 if sock.exists() and sock.is_socket():
                     break
                 await asyncio.sleep(0.1)
             else:
                 raise web.HTTPGatewayTimeout(
-                    reason=f"{unit} did not create {sock} within 20 s"
+                    reason=(
+                        f"{unit} did not create {sock} within "
+                        f"~{attempts * 0.1:.0f} s"
+                    )
                 )
         last_active[(name, role)] = time.time()
     return sock

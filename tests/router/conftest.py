@@ -126,6 +126,11 @@ def _apply_env(monkeypatch: pytest.MonkeyPatch, env: _RouterEnv) -> None:
     monkeypatch.setenv(
         "AGENT_MCP_ROUTER_DB", str(env.root / "router.db")
     )
+    # Unit tests stub systemctl and never spawn a real backend, so the
+    # socket never appears. Cap _ensure()'s readiness poll at a single
+    # attempt (~0.1 s) instead of the production 20 s — this is what
+    # made the router perm/proxy tests ~20 s each.
+    monkeypatch.setenv("AGENT_MCP_ENSURE_SOCKET_ATTEMPTS", "1")
 
 
 # ── systemctl stub ──────────────────────────────────────────────────
