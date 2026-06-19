@@ -17,6 +17,11 @@ Usage: nix run github:dvaerum/Agent-MCP -- [flags]
 Boots a self-contained NixOS VM running the agent-mcp deployment.
 The host can reach the VM at http://localhost:5454.
 
+On first boot the dashboard's identity store is empty, so the router
+redirects to /setup where you create the first operator. Subsequent
+boots land on /login. Projects are created from the dashboard UI
+after sign-in.
+
 Flags:
   --minimal             Single-tenant agent-mcp backend on guest:8080
                         (instead of router + template on guest:1337).
@@ -24,11 +29,6 @@ Flags:
                         Mutually exclusive with --persist.
   --persist DIR         Persistent state directory on the host.
                         Default: \$PWD/vm-persistent-data/
-  --project NAME        Name of the auto-created project in multi-
-                        tenant mode (default: e2e). Ignored for
-                        --minimal.
-  --no-auto-project     Skip the bootstrap; user POSTs
-                        /agent-mcp/__create explicitly. Multi only.
   --help, -h            Print this and exit.
 EOF
 }
@@ -36,8 +36,6 @@ EOF
 mode="multi"
 ephemeral=0
 persist_dir=""
-project="e2e"
-no_auto_project=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -46,10 +44,6 @@ while [[ $# -gt 0 ]]; do
     --persist)
       [[ $# -ge 2 ]] || { echo "agent-mcp: --persist needs a DIR" >&2; exit 2; }
       persist_dir="$2"; shift 2 ;;
-    --project)
-      [[ $# -ge 2 ]] || { echo "agent-mcp: --project needs a NAME" >&2; exit 2; }
-      project="$2"; shift 2 ;;
-    --no-auto-project) no_auto_project=1; shift ;;
     --help|-h) print_usage; exit 0 ;;
     --) shift; break ;;
     *) echo "agent-mcp: unknown flag: $1" >&2; print_usage >&2; exit 2 ;;
@@ -61,9 +55,6 @@ if [[ "$mode" == "multi" ]]; then
   vm_store="$MULTI_VM"
 else
   vm_store="$SINGLE_VM"
-  if [[ "$no_auto_project" == "1" || "$project" != "e2e" ]]; then
-    echo "agent-mcp: --project / --no-auto-project ignored in --minimal mode" >&2
-  fi
 fi
 
 # Persist dir resolution.
@@ -101,7 +92,9 @@ export USE_TMPDIR=1
 
 if [[ "$mode" == "multi" ]]; then
   echo "agent-mcp: booting multi-tenant VM"
-  echo "agent-mcp: dashboard will appear at http://localhost:5454/agent-mcp/__dashboard/${project}/"
+  echo "agent-mcp: dashboard will appear at http://localhost:5454/agent-mcp/"
+  echo "agent-mcp: first boot lands on /setup; create the first operator,"
+  echo "agent-mcp: then create projects from the dashboard UI."
 else
   echo "agent-mcp: booting single-tenant VM"
   echo "agent-mcp: backend reachable at http://localhost:5454/"

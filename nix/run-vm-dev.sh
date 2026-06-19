@@ -3,10 +3,16 @@
 #
 # Boots the same NixOS multi-tenant VM as `nix run .#` but forwards
 # the guest router port to host:18080 (by default) instead of
-# host:5454, and arranges a tiny seed dataset (Admin + one live +
-# one terminated agent) so the agent dropdown has meaningful content
-# immediately when Firefox-MCP drives the dashboard at
-# http://localhost:18080/agent-mcp/app/<seed-project>/.
+# host:5454, and pre-seeds a sentinel operator (dev / dev) via the
+# env-var bootstrap (AGENT_MCP_BOOTSTRAP_USERNAME/_PASSWORD wired on
+# agent-mcp-router.service in nix/vm-dev.nix) so Firefox-MCP can hit
+# /login immediately and drive the dashboard at
+# http://localhost:18080/agent-mcp/ without first having to walk
+# through /setup.
+#
+# Projects are NOT auto-created — the legacy bootstrap-via-/__create
+# path was retired with ADR 0014. The operator (or a driving script)
+# creates projects from the dashboard UI after sign-in.
 #
 # The host port can be overridden at launch time by setting
 # AGENT_MCP_VM_DEV_HOST_PORT — useful when something else on the
@@ -28,12 +34,11 @@
 #
 # The flake hard-substitutes @VM_DEV@ at build time with the absolute
 # store path of the dev VM derivation (which differs from vm-multi
-# in forwardPorts, the seed-data systemd unit, and the dev-mode SSH
-# stack).
+# in forwardPorts, the env-var operator seed on the router unit, and
+# the dev-mode SSH stack).
 set -euo pipefail
 
 VM_DEV="@VM_DEV@"
-PROJECT="agent-select-dev"
 DEFAULT_HOST_PORT=18080
 DEFAULT_SSH_PORT=18222
 
@@ -45,13 +50,14 @@ Boots the Path B interactive dashboard sandbox. Forwards the guest
 router port to host:${DEFAULT_HOST_PORT} by default. The dashboard
 is at:
 
-    http://localhost:\${HOST_PORT}/agent-mcp/app/${PROJECT}/?page=tasks
+    http://localhost:\${HOST_PORT}/agent-mcp/
 
 where HOST_PORT is ${DEFAULT_HOST_PORT} unless overridden.
 
-A seed dataset (Admin + one live worker + one terminated worker) is
-provisioned on first boot so the agent dropdown has meaningful
-content for Firefox-MCP acceptance testing.
+A sentinel operator (username \`dev\`, password \`dev\`) is seeded on
+first boot via the env-var bootstrap, so /login is reachable
+immediately. Projects are created through the dashboard UI after
+sign-in.
 
 Environment:
   AGENT_MCP_VM_DEV_HOST_PORT
@@ -182,9 +188,9 @@ fi
 
 cat <<INFO
 agent-mcp-vm-dev: booting Path B interactive sandbox
-agent-mcp-vm-dev: dashboard      http://localhost:${host_port}/agent-mcp/app/${PROJECT}/?page=tasks
+agent-mcp-vm-dev: dashboard      http://localhost:${host_port}/agent-mcp/
 agent-mcp-vm-dev: ssh access     ssh root@localhost -p ${ssh_port}  (no password — DEV-MODE)
-agent-mcp-vm-dev: seed project   ${PROJECT}
+agent-mcp-vm-dev: operator       dev / dev  (seeded via env-var bootstrap)
 agent-mcp-vm-dev: state dir      ${state_dir}
 agent-mcp-vm-dev: host port      ${host_port}$( [[ "$host_port" != "$DEFAULT_HOST_PORT" ]] && echo " (override via AGENT_MCP_VM_DEV_HOST_PORT)" )
 agent-mcp-vm-dev: ssh port       ${ssh_port}$( [[ "$ssh_port" != "$DEFAULT_SSH_PORT" ]] && echo " (override via AGENT_MCP_VM_DEV_SSH_PORT)" )

@@ -86,16 +86,21 @@ in {
         match the qemu hostfwd the wrapper script sets up.
       '';
     };
-
-    autoProject = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = "e2e";
-      description = ''
-        If non-null and mode == "multi", first-boot bootstrap POSTs
-        /agent-mcp/__create with this name. Set to null to skip.
-      '';
-    };
   };
+
+  # NOTE: A legacy `autoProject` option used to live here, backed by
+  # an `agent-mcp-bootstrap.service` oneshot that POSTed
+  # `/agent-mcp/__create` on first boot. The `__create` endpoint was
+  # deleted in ADR 0014 (see agent_mcp/router/app.py:1410-1415) and
+  # the REST replacement at `POST /api/router/projects` requires a
+  # session cookie that a oneshot can't have. The bootstrap unit was
+  # silently succeeding via curl -L following the empty-users
+  # redirect to /setup (HTTP 200), then touching its marker file
+  # without creating anything. Retired entirely — operators create
+  # projects via the dashboard UI after first login. The first-boot
+  # operator can still be auto-seeded by setting
+  # `AGENT_MCP_BOOTSTRAP_USERNAME` / `_PASSWORD` on the router
+  # service environment (see agent_mcp/router/identity.py).
 
   config = lib.mkIf cfg.enable (lib.mkMerge [
     {
@@ -190,43 +195,10 @@ in {
         };
       };
 
-      # ── First-boot project bootstrap ─────────────────────────────
-      systemd.services.agent-mcp-bootstrap = lib.mkIf (cfg.autoProject != null) {
-        description = "Create the default agent-mcp project on first boot";
-        after = [ "agent-mcp-router.service" ];
-        wants = [ "agent-mcp-router.service" ];
-        wantedBy = [ "multi-user.target" ];
-        path = [ pkgs.curl ];
-        serviceConfig = {
-          Type = "oneshot";
-          RemainAfterExit = true;
-          User = cfg.user;
-          Group = cfg.group;
-          # Marker file in stateDir means "already done"; idempotent
-          # across reboots without re-POSTing.
-          ExecStart = pkgs.writeShellScript "agent-mcp-bootstrap" ''
-            set -eu
-            marker="${cfg.stateDir}/.bootstrap-${cfg.autoProject}"
-            if [[ -e "$marker" ]]; then
-              echo "agent-mcp-bootstrap: marker exists, skipping"
-              exit 0
-            fi
-            # Wait up to 60s for the router to accept connections.
-            for i in $(seq 1 60); do
-              if ${pkgs.curl}/bin/curl -fsS -o /dev/null \
-                  "http://127.0.0.1:${toString cfg.routerPort}/agent-mcp/__projects"; then
-                break
-              fi
-              sleep 1
-            done
-            ${pkgs.curl}/bin/curl -fsSL -o /dev/null -F name=${cfg.autoProject} \
-              "http://127.0.0.1:${toString cfg.routerPort}/agent-mcp/__create" \
-              || ${pkgs.curl}/bin/curl -fsSL -o /dev/null -L -F name=${cfg.autoProject} \
-                  "http://127.0.0.1:${toString cfg.routerPort}/agent-mcp/__create"
-            touch "$marker"
-          '';
-        };
-      };
+      # First-boot project bootstrap retired — see the autoProject
+      # NOTE above. Operators create projects via the dashboard
+      # `POST /api/router/projects` (which requires session-cookie
+      # auth) after logging in.
     })
 
     # ── Single-tenant: one backend, no router ─────────────────────

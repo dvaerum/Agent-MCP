@@ -21,13 +21,15 @@ QEMU itself is brought in by the flake.
 ## Quick start
 
 ```sh
-# Multi-tenant (default): router + auto-created project "e2e".
+# Multi-tenant (default): router only — no projects auto-created.
 nix run github:dvaerum/Agent-MCP
 
-# Once the boot output stops scrolling:
-curl -fsS http://localhost:5454/agent-mcp/__projects
-# → {"projects": ["e2e"]}
-xdg-open http://localhost:5454/agent-mcp/__dashboard/e2e/
+# Once the boot output stops scrolling, open the dashboard:
+xdg-open http://localhost:5454/agent-mcp/
+# First boot lands on /setup — create the first operator. Subsequent
+# boots land on /login. Create projects from the dashboard UI after
+# signing in (the legacy `POST /agent-mcp/__create` form-encoded
+# endpoint was retired in ADR 0014).
 ```
 
 State persists to `./vm-persistent-data/` in the directory you ran
@@ -42,12 +44,10 @@ nix run github:dvaerum/Agent-MCP -- [flags]
 
 | Flag                  | Meaning                                                                                                       |
 |-----------------------|---------------------------------------------------------------------------------------------------------------|
-| (default)             | Multi-tenant router on guest:1337, auto-create project `e2e`, persistent storage at `./vm-persistent-data/`. |
+| (default)             | Multi-tenant router on guest:1337, no auto-created project, persistent storage at `./vm-persistent-data/`.    |
 | `--minimal`           | Single-tenant agent-mcp backend on guest:8080. No router, no `/agent-mcp/` path prefix.                       |
 | `--ephemeral`         | Use a tmpdir for state; everything dies with the VM. Mutually exclusive with `--persist`.                     |
 | `--persist DIR`       | Persistent state directory on the host (default `./vm-persistent-data/`).                                     |
-| `--project NAME`      | Rename the auto-created project. Multi-tenant only; default `e2e`.                                            |
-| `--no-auto-project`   | Skip auto-create; POST `/agent-mcp/__create` yourself once the router is up. Multi-tenant only.               |
 | `--help`, `-h`        | Print usage and exit.                                                                                         |
 
 The host always reaches the VM on `http://localhost:5454`. The
@@ -62,26 +62,17 @@ Mirrors the production `nixos-developer-system` deployment:
 
 - `agent-mcp-router.service` — always-on aiohttp proxy on `:1337`
   that fronts per-project backends and serves the static Next.js
-  dashboard under `/agent-mcp/__dashboard/<name>/`.
+  dashboard under `/agent-mcp/`.
 - `agent-mcp@<name>.service` — systemd template; one instance per
   registered project, listening on a UDS at
   `/run/agent-mcp/<name>/backend.sock`. Lazy-started by the router
   on first request, idle-reaped after 4 h.
-- `agent-mcp-bootstrap.service` — one-shot that POSTs
-  `/agent-mcp/__create -F name=<auto-project>` on first boot.
-  Idempotent (marker file in the state dir).
 
-URL convention (router-internal segments start with `__`):
-
-```
-http://localhost:5454/agent-mcp/                       # index
-http://localhost:5454/agent-mcp/__projects             # JSON list
-http://localhost:5454/agent-mcp/__create               # POST name=<n>
-http://localhost:5454/agent-mcp/__sse/<n>              # MCP SSE
-http://localhost:5454/agent-mcp/__messages/<n>/...     # MCP messages
-http://localhost:5454/agent-mcp/__api/<n>/...          # REST API
-http://localhost:5454/agent-mcp/__dashboard/<n>/       # dashboard
-```
+Project creation goes through the dashboard's authenticated REST API
+(`POST /api/router/projects`); see the post-Phase-1+2 router for the
+URL convention. The legacy `agent-mcp-bootstrap.service` that POSTed
+to `/agent-mcp/__create` on first boot was retired with ADR 0014 —
+the `__create` endpoint no longer exists.
 
 ### Single-tenant (`--minimal`)
 
@@ -110,8 +101,8 @@ directory:
 # Inside the VM:
 /var/lib/agent-mcp/                  # on disk.qcow2
 ├── projects.local.json              # {<name>: <path>} registry
-├── projects/<name>/                 # workspace (SQLite DB in .agent/)
-└── .bootstrap-<name>                # marker
+├── router.db                        # operator identity store (sqlite)
+└── projects/<name>/                 # workspace (SQLite DB in .agent/)
 /var/lib/ollama/                     # 9p bind to ./vm-persistent-data/ollama/
 └── models/                          # blobs/, manifests/
 ```
