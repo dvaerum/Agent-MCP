@@ -41,7 +41,6 @@
         specialArgs = {
           src = self;
           inherit mode;
-          autoProject = "e2e";
         };
         modules = [ ./nix/vm.nix ];
       }).config.system.build.vm;

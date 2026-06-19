@@ -1,4 +1,4 @@
-{ config, lib, pkgs, modulesPath, src ? null, mode ? "multi", autoProject ? "e2e", ... }:
+{ config, lib, pkgs, modulesPath, src ? null, mode ? "multi", ... }:
 # NixOS configuration consumed by `lib.nixosSystem`. The flake builds
 # one derivation per mode (`multi`, `single`). Storage is layered:
 #
@@ -14,9 +14,6 @@
 let
   inVmHostPort =
     if mode == "multi" then 1337 else 8080;
-
-  realAutoProject =
-    if mode == "multi" then autoProject else null;
 in
 {
   imports = [
@@ -99,7 +96,6 @@ in
     enable = true;
     mode = mode;
     src = src;
-    autoProject = realAutoProject;
     externalUrl = "http://localhost:5454";
     # /var/lib lives on the qcow2 disk, which the wrapper places in
     # the user's persist dir so it survives between runs.

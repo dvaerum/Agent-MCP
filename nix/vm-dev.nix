@@ -14,15 +14,17 @@
 #      Firefox-MCP smoke script in the prancy-napping-pie plan can
 #      target the documented localhost:18080 URL verbatim.
 #
-#   2. A oneshot systemd unit seeds a "agent-select-dev" project with
-#      a known agent-roster (Admin pseudo-agent + one live worker +
-#      one terminated worker) on first boot. This gives the
-#      <AgentSelect> dropdown meaningful content immediately so the
-#      acceptance script can verify:
-#         - Admin pinned at top
-#         - the live worker appears
-#         - the terminated worker does NOT appear
-#      without manually creating agents first.
+#   2. AGENT_MCP_BOOTSTRAP_USERNAME / _PASSWORD are seeded on the
+#      router systemd unit so the first-boot identity store comes up
+#      with a known operator already created (username/password both
+#      `dev`). That short-circuits the Phase-1 empty-users redirect
+#      to /setup — a developer opening the dashboard lands on /login
+#      and can sign in immediately, then create projects via the UI.
+#      No HTTP-call-at-boot bootstrap: ADR 0014 removed the legacy
+#      `/__create` form-encoded endpoint, and its REST replacement
+#      `POST /api/router/projects` requires a session cookie that a
+#      systemd oneshot can't have. Operator seeding via env vars is
+#      the only post-Phase-1+2 path that works at boot.
 #
 #   3. **DEV-MODE SSH IS WIDE OPEN.** OpenSSH is enabled with root
 #      login, empty passwords, and password auth all permitted, plus
@@ -40,17 +42,29 @@
 # inherited from the regular multi-tenant module. We import vm.nix
 # directly and patch the divergent attrs via lib.mkForce.
 
-let
-  project = "agent-select-dev";
-in
 {
   imports = [
     (import ./vm.nix {
       inherit config lib pkgs modulesPath src;
       mode = "multi";
-      autoProject = project;
     })
   ];
+
+  # ── First-boot operator seed ──────────────────────────────────────
+  # The Phase-1 empty-users middleware redirects every non-/setup,
+  # non-/login request to /setup until at least one operator exists.
+  # Seed a sentinel operator (dev / dev) via the env-var bootstrap so
+  # the developer can hit /login immediately. See
+  # agent_mcp/router/identity.py `init_router_db` for the contract:
+  # both vars must be set, both are stripped from os.environ after
+  # the bootstrap fires (whether or not it actually created a user),
+  # and the bootstrap no-ops when the users table is already populated.
+  # Safe for dev-mode only — the loopback-only port + open SSH +
+  # empty-password warnings on this VM already mark it as untrusted.
+  systemd.services.agent-mcp-router.environment = {
+    AGENT_MCP_BOOTSTRAP_USERNAME = "dev";
+    AGENT_MCP_BOOTSTRAP_PASSWORD = "dev";
+  };
 
   # Override the host-side port forwarding so the dev sandbox lives at
   # host:18080 by default — orthogonal to the host:5454 forward in
@@ -166,97 +180,18 @@ in
   };
   # ============================================================
 
-  # First-boot seed dataset: pre-create the two worker agents the
-  # acceptance script expects (one live, one terminated). Admin is
-  # auto-synthesised by the router. We use the dashboard's own REST
-  # endpoints so the seed dataset goes through the same code path a
-  # human would — there's no risk of drifting from the canonical
-  # agent-row shape. ConditionPathExists makes this idempotent across
-  # reboots without an extra state file: once the marker is laid down
-  # the unit no-ops.
-  systemd.services.agent-mcp-vm-dev-seed = {
-    description = "Seed dataset for the agent-select dev sandbox";
-    after = [ "agent-mcp-router.service" "network-online.target" ];
-    wants = [ "agent-mcp-router.service" "network-online.target" ];
-    wantedBy = [ "multi-user.target" ];
-    serviceConfig = {
-      Type = "oneshot";
-      RemainAfterExit = true;
-      # Marker so the unit only runs once per persistent state dir.
-      # The agent-mcp services place their state under /var/lib/agent-mcp
-      # which is on the qcow2 scratch disk in vm.nix.
-      ConditionPathExists = "!/var/lib/agent-mcp/.vm-dev-seeded";
-    };
-    path = with pkgs; [ curl jq coreutils ];
-    script = ''
-      set -euo pipefail
-
-      # Wait until the router answers — the agent-mcp services come
-      # up in parallel with us. 60 × 1s is generous; the router is
-      # usually live well before that on cold boot.
-      for i in $(seq 1 60); do
-        if curl --silent --fail --max-time 2 \
-            "http://127.0.0.1:1337/agent-mcp/__health" >/dev/null 2>&1; then
-          break
-        fi
-        sleep 1
-      done
-
-      # Discover the admin token from the seeded project's state.
-      # The agent-mcp-router auto-creates the ${project} project (via
-      # autoProject="${project}" in vm.nix) and writes the admin
-      # token into the project's state dir.
-      admin_token=""
-      for i in $(seq 1 30); do
-        if [ -f "/var/lib/agent-mcp/projects/${project}/admin_token" ]; then
-          admin_token="$(cat /var/lib/agent-mcp/projects/${project}/admin_token)"
-          break
-        fi
-        sleep 1
-      done
-
-      if [ -z "$admin_token" ]; then
-        echo "agent-mcp-vm-dev-seed: admin token not found after 30s; bailing" >&2
-        exit 0   # don't crash the unit; the dashboard still works without seeds
-      fi
-
-      base="http://127.0.0.1:1337/agent-mcp/app/${project}"
-
-      # Helper that POSTs JSON to the dashboard's create-agent endpoint.
-      create_agent() {
-        local agent_id="$1"
-        curl --silent --fail --max-time 10 \
-          -X POST "$base/api/create-agent" \
-          -H 'Content-Type: application/json' \
-          -H 'Accept: application/vnd.agent-mcp.v1+json' \
-          --data "$(jq -nc \
-              --arg t "$admin_token" \
-              --arg a "$agent_id" \
-              '{token:$t, agent_id:$a, capabilities:[], working_directory:"/tmp"}')" \
-          >/dev/null || echo "agent-mcp-vm-dev-seed: failed to create $agent_id (already exists?)" >&2
-      }
-
-      terminate_agent() {
-        local agent_id="$1"
-        curl --silent --fail --max-time 10 \
-          -X POST "$base/api/terminate-agent" \
-          -H 'Content-Type: application/json' \
-          -H 'Accept: application/vnd.agent-mcp.v1+json' \
-          --data "$(jq -nc \
-              --arg t "$admin_token" \
-              --arg a "$agent_id" \
-              '{token:$t, agent_id:$a}')" \
-          >/dev/null || echo "agent-mcp-vm-dev-seed: failed to terminate $agent_id" >&2
-      }
-
-      create_agent "worker-live"
-      create_agent "worker-ghost"
-      # Terminate the second one so the dropdown can verify it does
-      # NOT appear among the live agents.
-      terminate_agent "worker-ghost"
-
-      touch /var/lib/agent-mcp/.vm-dev-seeded
-      echo "agent-mcp-vm-dev-seed: seeded project=${project} live=worker-live terminated=worker-ghost"
-    '';
-  };
+  # NOTE: A legacy `agent-mcp-vm-dev-seed.service` used to live here.
+  # It waited for `/var/lib/agent-mcp/projects/agent-select-dev/admin_token`
+  # to appear and then POSTed `/api/create-agent` with that token as a
+  # bearer to pre-seed two worker agents. Both halves of that contract
+  # were retired in Phases 1+2: (a) the "all-powerful admin_token" file
+  # no longer exists — agent-side auth is per-agent worker/manager
+  # tokens minted at create-agent time, and (b) the project itself
+  # never got created at boot because the upstream bootstrap unit's
+  # `/__create` call was already broken (ADR 0014). The seed unit
+  # timed out at 30s on every boot with `admin token not found`.
+  # Retired entirely — the operator (seeded via the env-var bootstrap
+  # above) creates projects + agents through the dashboard UI, which
+  # is the same path a real user takes. verify-all drives that same
+  # UI via Firefox-MCP, so we don't need a back-door seed.
 }
