@@ -284,9 +284,27 @@ class ApiClient {
       ...options,
     }
 
-    // Add timeout support
+    // Add timeout support.
+    //
+    // Cold-start abort fix (P005, 2026-06-19): the per-request timeout
+    // must safely outlast the router's lazy-spawn socket-wait. The
+    // orchestrator (`agent_mcp/router/project_orchestrator.py`) waits
+    // up to 20 s for a freshly-started backend's Unix socket to appear
+    // before surfacing 504 Gateway Timeout. A request that lands while
+    // the backend is still spawning blocks inside the proxy until the
+    // socket exists. If the client's `AbortController` fires first,
+    // every in-flight per-project fetch on the dashboard's first paint
+    // is cancelled with `NS_BINDING_ABORTED` — the main panel renders
+    // empty because the 5xx-retry loop below never sees a status code,
+    // only a discarded promise.
+    //
+    // 30 s covers the orchestrator's 20 s socket budget plus the
+    // 200 ms + 400 ms retry backoff and HTTP round-trip overhead, so
+    // the first cold request either returns a real response (success
+    // or 504) or — far more likely — a 5xx the retry loop catches and
+    // retries against an already-warm backend.
     const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 10000) // 10 second timeout
+    const timeoutId = setTimeout(() => controller.abort(), 30000) // 30 second timeout
 
     try {
       // Transparent cold-start retry. A lazily-spawned backend takes
