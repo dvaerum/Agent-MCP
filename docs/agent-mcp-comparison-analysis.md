@@ -73,7 +73,7 @@ agent-mcp-node/
 | Aspect | Python | Node.js | Analysis |
 |--------|--------|---------|----------|
 | **Entry Point** | `__main__.py` + `cli.py` | `examples/server/agentMcpServer.ts` | Python uses standard module entry point, Node.js uses example-based approach |
-| **Language Features** | Python 3.10+ with type hints | TypeScript with strict typing | Both use strong typing, Node.js more explicit |
+| **Language Features** | Python 3.11+ with type hints | TypeScript with strict typing | Both use strong typing, Node.js more explicit |
 | **Project Organization** | Flat module structure | Nested src/ structure | Node.js follows conventional src/ pattern |
 | **Configuration** | `pyproject.toml` | `package.json` + `tsconfig.json` | Node.js has separate compile-time config |
 | **Build Process** | No build step (interpreted) | TypeScript compilation to dist/ | Node.js requires compilation step |
@@ -86,7 +86,7 @@ agent-mcp-node/
 
 **Key Details:**
 - **Version:** 2.5.0  
-- **Python Requirement:** >=3.10
+- **Python Requirement:** >=3.11
 - **Package Manager:** uv/rye (modern Python tooling)
 - **Dependencies:** 11 core dependencies including MCP SDK >=1.8.1
 - **Build System:** setuptools with modern configuration

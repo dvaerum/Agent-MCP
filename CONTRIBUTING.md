@@ -18,7 +18,7 @@ sha `13d98b2` if you want the generic OSS-onboarding view.
 
 Prerequisites:
 
-- **Python 3.10+** with [uv](https://github.com/astral-sh/uv)
+- **Python 3.11+** with [uv](https://github.com/astral-sh/uv)
 - **Node.js 22.x** (for the dashboard build)
 - **Ollama** with a small embedding model (`qwen3-embedding:0.6b`
   recommended; or any OpenAI-compatible embedding endpoint via

@@ -10,7 +10,7 @@ authors = [
     {name = "Luis Alejandro Rincon", email = "alejandro@rinconnect.com"},
 ]
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = {text = "MIT"}
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -131,7 +131,7 @@ addopts = "-n auto"
 
 [tool.black]
 line-length = 88
-target-version = ["py310"]
+target-version = ["py311"]
 
 [tool.isort]
 profile = "black"
