@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { Agent, Task, apiClient } from '../api'
+import { Agent, ApiError, Task, apiClient } from '../api'
 import type { PromptTemplate, PromptCategory } from '../prompt-book'
 import {
   normalizeAgentId,
@@ -172,7 +172,25 @@ export const useDataStore = create<DataStore>((set, get) => ({
       try {
         data = await apiClient.getAllData()
       } catch (err) {
-        // Fallback to fetching data from individual endpoints
+        // Fallback to fetching data from individual endpoints — but
+        // ONLY when the bulk endpoint is genuinely missing (HTTP 404
+        // from a legacy backend that pre-dates the `/all-data`
+        // surface). Any other failure (5xx, network abort,
+        // AbortController timeout, …) means the backend is unreachable
+        // or slow, NOT that the endpoint is absent — fanning out 4
+        // more parallel requests in that case just multiplies the
+        // pressure on the router proxy and turns one failed read into
+        // a 5-fetch cascade. P005 (2026-06-19): the cascade was the
+        // observed symptom when navigating to /agent-mcp/app/<proj>/
+        // against a cold-spawning backend — every queued fetch piled
+        // up behind the same per-project `_ensure_lock` and aborted
+        // client-side at the 30 s timeout. Re-raise non-404 errors so
+        // the outer catch records the failure and the UI surfaces an
+        // honest error instead of doubling down on the same broken
+        // upstream.
+        if (!(err instanceof ApiError) || err.status !== 404) {
+          throw err
+        }
         console.debug('All-data endpoint not available, using fallback...')
 
         const [agents, tasks, tokens, contextData] = await Promise.all([

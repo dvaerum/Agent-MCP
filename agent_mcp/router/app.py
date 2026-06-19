@@ -367,6 +367,12 @@ _NAME_MAX = 64
 last_active = _po.last_active
 active_conns = _po.active_conns
 ensure_locks = _po.ensure_locks
+# P005 cascade-fix re-export (2026-06-19). The orchestrator caches
+# recent ``_ensure`` failures here so a queued first-paint fan-out
+# doesn't pay N × socket-wait behind a backend that's failing to come
+# up. Tests reach for the dict directly via the router-module surface.
+ensure_failures = _po.ensure_failures
+_clear_ensure_failures = _po._clear_ensure_failures
 _ensure_lock = _po._ensure_lock
 _track_connection = _po._track_connection
 
