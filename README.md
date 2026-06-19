@@ -64,7 +64,7 @@ git clone https://github.com/rinadelph/Agent-MCP.git
 cd Agent-MCP
 
 # Check version requirements
-python --version  # Should be >=3.10
+python --version  # Should be >=3.11
 node --version    # Should be >=18.0.0
 npm --version     # Should be >=9.0.0
 
@@ -770,7 +770,7 @@ Watch your AI team work in real-time through the dashboard. Every action is logg
 
 ## System Requirements
 
-- **Python**: 3.10+ with pip or uv
+- **Python**: 3.11+ with pip or uv
 - **Node.js**: 18.0.0+ (recommended: 22.16.0)
 - **npm**: 9.0.0+ (recommended: 10.9.2)
 - **OpenAI API key** (for embeddings and RAG)
@@ -786,7 +786,7 @@ For consistent development environment:
 # Or manually check versions
 node --version  # Should be >=18.0.0
 npm --version   # Should be >=9.0.0
-python --version  # Should be >=3.10
+python --version  # Should be >=3.11
 ```
 
 ## Troubleshooting
