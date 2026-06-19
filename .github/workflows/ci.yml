@@ -19,10 +19,12 @@ jobs:
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
+        # v7 is the newest moving major tag astral publishes (v8 is
+        # release-only for now); both run on node24.
+        uses: astral-sh/setup-uv@v7
         # No enable-cache: we don't ship a uv.lock; the setup-uv cache
         # is keyed off uv.lock and 404s without one. uv pip install -e
         # .[dev] is fast enough that cache wouldn't help much.
@@ -55,10 +57,10 @@ jobs:
       run:
         working-directory: agent_mcp/dashboard
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "22"
           cache: npm
@@ -75,9 +77,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: DeterminateSystems/nix-installer-action@main
+      # Pinned to a release tag instead of the mutable @main for
+      # reproducible runs; v22 runs on node24.
+      - uses: DeterminateSystems/nix-installer-action@v22
 
       # magic-nix-cache is sunset by Determinate Systems (it also spammed
       # an "Unable to authenticate to FlakeHub" annotation on every run)
@@ -87,7 +91,7 @@ jobs:
       # the plain Actions cache API instead, with GC so we stay under the
       # 10 GB per-repo cache budget. No external account or secret needed.
       - name: Cache /nix/store
-        uses: nix-community/cache-nix-action@v6
+        uses: nix-community/cache-nix-action@v7
         with:
           # Save a fresh cache each run (unique run_id suffix) and restore
           # the closest prior one sharing the flake/nix-input hash prefix.
