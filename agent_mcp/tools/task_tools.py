@@ -39,6 +39,7 @@ from .agent_communication_tools import send_agent_message_tool_impl
 from ..core.auth import generate_token
 from ..core.config import AGENT_COLORS
 from ..runtime.agent_runtime import (
+    agent_setup_delay,
     create_tmux_session,
     send_prompt_async,
     send_command_to_session,
@@ -371,7 +372,7 @@ async def _launch_testing_agent_for_completed_task(
                 """Smart delay system - wait for command completion or timeout"""
                 time.sleep(delay)
 
-            setup_delay = 1.0  # 1 second delay between setup commands
+            setup_delay = agent_setup_delay()  # tests zero this
 
             # Welcome message
             welcome_message = f"echo '=== Testing Agent {testing_agent_id} initialization starting ==='"

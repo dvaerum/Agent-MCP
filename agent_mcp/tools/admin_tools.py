@@ -17,6 +17,7 @@ from ..utils.audit_utils import log_audit
 from ..utils.project_utils import generate_system_prompt  # For create_agent
 from ..runtime.agent_runtime import (
     is_tmux_available,
+    agent_setup_delay,
     create_tmux_session,
     kill_tmux_session,
     session_exists,
@@ -447,7 +448,9 @@ async def create_agent_tool_impl(
                         time.sleep(delay)
                         # Could add tmux pane monitoring here in future for true completion detection
 
-                    setup_delay = 1.0  # 1 second delay between setup commands
+                    # Delay between tmux setup commands (see
+                    # agent_setup_delay docstring); tests zero it.
+                    setup_delay = agent_setup_delay()
                     wait_for_command_completion(tmux_session_name, setup_delay)
 
                     # Verify we're in the correct working directory
