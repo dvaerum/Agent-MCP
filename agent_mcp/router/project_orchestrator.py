@@ -92,6 +92,41 @@ active_conns: dict[str, int] = defaultdict(int)
 # storm and a ~10 s window where requests 504.
 ensure_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
+# Recent-failure cache for ``_ensure`` (P005 cascade-fix, 2026-06-19).
+# Maps (name, role) → (monotonic_failed_at, reason). When ``_ensure``
+# fails to bring the backend's UDS up within the socket-wait budget,
+# we record the failure here. Subsequent calls within
+# ``ENSURE_FAILURE_COOLDOWN_SEC`` short-circuit with the same 504
+# instead of paying another full socket-wait. Without this cap, a
+# dashboard's first-paint fan-out (6 parallel reads, see the lock
+# comment above) serialises through ``ensure_locks`` and pays N × 20 s
+# behind a backend that's failing to come up — every per-project fetch
+# aborts client-side at 30 s and the page renders empty.
+#
+# Cooldown window is intentionally short so transient
+# systemctl-races recover quickly. The reaper (`_reaper_tick`) and
+# any successful `_ensure` evict the entry; tests can patch the
+# constant or call `_clear_ensure_failures()` to reset between
+# scenarios.
+ensure_failures: dict[tuple[str, str], tuple[float, str]] = {}
+
+# How long a failed ``_ensure`` stays cached. Read at every call so
+# tests can monkeypatch the module-level value mid-test without
+# re-importing.
+ENSURE_FAILURE_COOLDOWN_SEC: float = float(
+    os.environ.get("AGENT_MCP_ENSURE_FAILURE_COOLDOWN_SEC", "5")
+)
+
+
+def _clear_ensure_failures() -> None:
+    """Drop every cached ``_ensure`` failure. Test helper.
+
+    Production callers don't need this — the entry is auto-evicted on
+    the next successful ``_ensure`` or after the cooldown window
+    expires. Tests reset between scenarios.
+    """
+    ensure_failures.clear()
+
 
 # ── Backend lifecycle primitives ────────────────────────────────────
 
@@ -191,16 +226,45 @@ async def _ensure(name: str, role: str) -> Path:
 
     async with _ensure_lock(name, role):
         needs_start = not _is_active(unit) or not sock.exists()
+        # Recent-failure short-circuit (P005 cascade-fix). If the
+        # previous ``_ensure`` for this (name, role) raised within
+        # ``ENSURE_FAILURE_COOLDOWN_SEC`` AND the backend STILL isn't
+        # ready, re-raise the same 504 immediately instead of paying
+        # another full socket-wait. Without this, a dashboard's
+        # 6-request first-paint fan-out serialises through
+        # ``_ensure_lock`` and each queued caller pays a fresh 20 s
+        # wait behind a backend that's failing to come up — every
+        # per-project fetch aborts client-side at 30 s and the page
+        # renders empty.
+        #
+        # The check sits AFTER the freshness probe (``needs_start``)
+        # so a backend that recovered between the cached failure and
+        # this call (e.g. the operator restarted the systemd unit
+        # manually) does NOT inherit a phantom 504 for the rest of
+        # the cooldown window — the next caller observes the unit
+        # active + the socket present and falls through to the
+        # success path.
         if needs_start:
+            fail_entry = ensure_failures.get((name, role))
+            if fail_entry is not None:
+                failed_at, reason = fail_entry
+                if time.monotonic() - failed_at < ENSURE_FAILURE_COOLDOWN_SEC:
+                    raise web.HTTPGatewayTimeout(reason=reason)
+                # Cooldown elapsed — drop the stale entry so we retry.
+                ensure_failures.pop((name, role), None)
             action = "restart" if _is_active(unit) else "start"
             r = _systemctl(action, unit)
             if r.returncode != 0:
-                raise web.HTTPInternalServerError(
-                    reason=(
-                        f"systemctl {action} {unit} failed: "
-                        f"{r.stderr.strip()}"
-                    )
+                reason = (
+                    f"systemctl {action} {unit} failed: "
+                    f"{r.stderr.strip()}"
                 )
+                # Same cooldown applies to a hard systemctl failure
+                # — without it, the next queued request immediately
+                # invokes systemctl again, which loops on the same
+                # unit-file / permission / OOM condition.
+                ensure_failures[(name, role)] = (time.monotonic(), reason)
+                raise web.HTTPInternalServerError(reason=reason)
             # Poll for the socket file. Production waits up to ~20 s
             # (200 × 0.1 s) for the unit to come up. The budget is
             # env-overridable so unit tests — which stub systemctl and
@@ -215,12 +279,15 @@ async def _ensure(name: str, role: str) -> Path:
                     break
                 await asyncio.sleep(0.1)
             else:
-                raise web.HTTPGatewayTimeout(
-                    reason=(
-                        f"{unit} did not create {sock} within "
-                        f"~{attempts * 0.1:.0f} s"
-                    )
+                reason = (
+                    f"{unit} did not create {sock} within "
+                    f"~{attempts * 0.1:.0f} s"
                 )
+                ensure_failures[(name, role)] = (time.monotonic(), reason)
+                raise web.HTTPGatewayTimeout(reason=reason)
+        # Success — evict any stale failure entry so the next caller
+        # doesn't see a phantom cooldown for a now-healthy backend.
+        ensure_failures.pop((name, role), None)
         last_active[(name, role)] = time.time()
     return sock
 
