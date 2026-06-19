@@ -336,6 +336,61 @@ def test_cli_imports_server_bootstrap_module() -> None:
     )
 
 
+# --- startup banner consumer ------------------------------------------
+
+
+def test_print_startup_banner_does_not_raise_attribute_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Regression: ``_print_startup_banner`` MUST read the canonical
+    ``system_token_log`` attribute on ``ServerConfig``, not the legacy
+    ``admin_token_log`` name.
+
+    Phase 2 Wave 1b renamed ``admin_token_*`` to ``system_token_*`` on
+    ``ServerConfig`` but left a dangling consumer reference behind. The
+    result: every per-project ``agent-mcp@<proj>.service`` backend
+    crashed at startup with
+    ``AttributeError: 'ServerConfig' object has no attribute 'admin_token_log'``
+    before the UDS socket was created, leading to dashboard 504s. This
+    test pins the consumer side of the rename so a future revert is
+    caught here, not in production.
+    """
+    from agent_mcp.server_bootstrap import _print_startup_banner
+
+    cfg = _default_config(transport="sse", port=8080)
+
+    # MUST NOT raise AttributeError — the bug was a dangling
+    # ``config.admin_token_log`` read.
+    _print_startup_banner(cfg)
+
+    captured = capsys.readouterr()
+    # Sanity: the banner ran far enough to print the "running on port"
+    # line, i.e. it didn't bail before the gated token-log block.
+    assert "MCP Server" in captured.out
+
+
+def test_print_startup_banner_honours_system_token_log_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """When ``system_token_log=True``, the banner attempts to surface
+    the admin token. Stub the DB lookup so the test doesn't need a
+    real project on disk."""
+    from agent_mcp import server_bootstrap
+
+    monkeypatch.setattr(
+        server_bootstrap,
+        "get_admin_token_from_db",
+        lambda _project_dir: "test-token-abc",
+    )
+
+    cfg = _default_config(transport="sse", port=8080, system_token_log=True)
+    server_bootstrap._print_startup_banner(cfg)
+
+    captured = capsys.readouterr()
+    assert "test-token-abc" in captured.out
+
+
 # --- helpers ----------------------------------------------------------
 
 
