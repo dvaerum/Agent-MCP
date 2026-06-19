@@ -14,6 +14,13 @@
 # hostfwd rule in-place on a copy of the generated run script,
 # avoiding a full nix rebuild for what is purely a runtime concern.
 #
+# A guest:22 → host:18222 forward (overridable via
+# AGENT_MCP_VM_DEV_SSH_PORT) gives the dev SSH access into the
+# running VM for live diagnostics — `systemctl status`,
+# `journalctl -u`, /run/agent-mcp/, /var/lib/agent-mcp/, etc.
+# The VM is configured with empty-password root login (loopback only,
+# DEV-MODE — see nix/vm-dev.nix).
+#
 # Stays alive until Ctrl-C — distinct from `nix flake check` which
 # tears down after the test script exits. This is the
 # "interactive dev sandbox" framing Dennis confirmed in the
@@ -21,12 +28,14 @@
 #
 # The flake hard-substitutes @VM_DEV@ at build time with the absolute
 # store path of the dev VM derivation (which differs from vm-multi
-# only in forwardPorts and in the seed-data systemd unit).
+# in forwardPorts, the seed-data systemd unit, and the dev-mode SSH
+# stack).
 set -euo pipefail
 
 VM_DEV="@VM_DEV@"
 PROJECT="agent-select-dev"
 DEFAULT_HOST_PORT=18080
+DEFAULT_SSH_PORT=18222
 
 print_usage() {
   cat <<EOF
@@ -50,6 +59,12 @@ Environment:
                         dashboard forward. Default ${DEFAULT_HOST_PORT}.
                         Use this when something else on the host
                         already owns :${DEFAULT_HOST_PORT}.
+  AGENT_MCP_VM_DEV_SSH_PORT
+                        Override the host port qemu binds for the
+                        guest SSH forward. Default ${DEFAULT_SSH_PORT}.
+                        SSH into the VM with:
+                            ssh root@localhost -p \${SSH_PORT}
+                        (DEV-MODE: root + empty password — loopback only.)
 
 Flags:
   --ephemeral           Use a tmpdir for VM state; nothing survives.
@@ -90,6 +105,17 @@ if ! [[ "$host_port" =~ ^[0-9]+$ ]] || (( host_port < 1 || host_port > 65535 ));
   exit 2
 fi
 
+ssh_port="${AGENT_MCP_VM_DEV_SSH_PORT:-$DEFAULT_SSH_PORT}"
+if ! [[ "$ssh_port" =~ ^[0-9]+$ ]] || (( ssh_port < 1 || ssh_port > 65535 )); then
+  echo "agent-mcp-vm-dev: AGENT_MCP_VM_DEV_SSH_PORT must be 1..65535 (got '$ssh_port')" >&2
+  exit 2
+fi
+
+if (( ssh_port == host_port )); then
+  echo "agent-mcp-vm-dev: AGENT_MCP_VM_DEV_SSH_PORT and AGENT_MCP_VM_DEV_HOST_PORT must differ (both = $ssh_port)" >&2
+  exit 2
+fi
+
 cleanup=""
 if [[ "$ephemeral" == "1" ]]; then
   state_dir="$(mktemp -d --tmpdir agent-mcp-vm-dev.XXXXXXXX)"
@@ -110,24 +136,46 @@ export TMPDIR="$state_dir"
 export USE_TMPDIR=1
 
 # Materialise a runnable qemu launcher. When the user picked a non-
-# default host port, sed-substitute the sentinel hostfwd rule
-# (tcp:127.0.0.1:18080-:1337) so qemu binds the override port
-# instead. We refuse to launch if the sentinel isn't found —
-# silently exec'ing the unrewritten store binary would bind the
-# wrong port and contradict the banner.
+# default host port for either the dashboard or SSH, sed-substitute
+# the sentinel hostfwd rule(s) (tcp:127.0.0.1:18080-:1337 for the
+# dashboard, tcp:127.0.0.1:18222-:22 for SSH) so qemu binds the
+# override port(s) instead. We refuse to launch if a sentinel isn't
+# found — silently exec'ing the unrewritten store binary would bind
+# the wrong port and contradict the banner.
 vm_launcher="$VM_DEV/bin/run-agent-mcp-vm"
-if [[ "$host_port" != "$DEFAULT_HOST_PORT" ]]; then
+needs_rewrite=0
+[[ "$host_port" != "$DEFAULT_HOST_PORT" ]] && needs_rewrite=1
+[[ "$ssh_port"  != "$DEFAULT_SSH_PORT"  ]] && needs_rewrite=1
+
+if (( needs_rewrite == 1 )); then
   rewritten="$state_dir/run-agent-mcp-vm"
-  sentinel="tcp:127.0.0.1:${DEFAULT_HOST_PORT}-:1337"
-  if ! grep -q -F -- "$sentinel" "$vm_launcher"; then
-    echo "agent-mcp-vm-dev: cannot find hostfwd sentinel '$sentinel' in $vm_launcher" >&2
-    echo "agent-mcp-vm-dev: nix/vm-dev.nix and nix/run-vm-dev.sh have drifted; refusing to launch." >&2
-    exit 1
+  cp -- "$vm_launcher" "$rewritten"
+  chmod +w "$rewritten"
+
+  rewrite_sentinel() {
+    local sentinel="$1" replacement="$2" label="$3"
+    if ! grep -q -F -- "$sentinel" "$rewritten"; then
+      echo "agent-mcp-vm-dev: cannot find $label hostfwd sentinel '$sentinel' in $vm_launcher" >&2
+      echo "agent-mcp-vm-dev: nix/vm-dev.nix and nix/run-vm-dev.sh have drifted; refusing to launch." >&2
+      exit 1
+    fi
+    # In-place edit on the writable copy under state_dir.
+    sed -i "s|${sentinel}|${replacement}|g" "$rewritten"
+  }
+
+  if [[ "$host_port" != "$DEFAULT_HOST_PORT" ]]; then
+    rewrite_sentinel \
+      "tcp:127.0.0.1:${DEFAULT_HOST_PORT}-:1337" \
+      "tcp:127.0.0.1:${host_port}-:1337" \
+      "dashboard"
   fi
-  replacement="tcp:127.0.0.1:${host_port}-:1337"
-  # sed -i isn't safe across filesystems and the store is read-only,
-  # so write a fresh copy under state_dir.
-  sed "s|${sentinel}|${replacement}|g" "$vm_launcher" > "$rewritten"
+  if [[ "$ssh_port" != "$DEFAULT_SSH_PORT" ]]; then
+    rewrite_sentinel \
+      "tcp:127.0.0.1:${DEFAULT_SSH_PORT}-:22" \
+      "tcp:127.0.0.1:${ssh_port}-:22" \
+      "ssh"
+  fi
+
   chmod +x "$rewritten"
   vm_launcher="$rewritten"
 fi
@@ -135,9 +183,11 @@ fi
 cat <<INFO
 agent-mcp-vm-dev: booting Path B interactive sandbox
 agent-mcp-vm-dev: dashboard      http://localhost:${host_port}/agent-mcp/app/${PROJECT}/?page=tasks
+agent-mcp-vm-dev: ssh access     ssh root@localhost -p ${ssh_port}  (no password — DEV-MODE)
 agent-mcp-vm-dev: seed project   ${PROJECT}
 agent-mcp-vm-dev: state dir      ${state_dir}
 agent-mcp-vm-dev: host port      ${host_port}$( [[ "$host_port" != "$DEFAULT_HOST_PORT" ]] && echo " (override via AGENT_MCP_VM_DEV_HOST_PORT)" )
+agent-mcp-vm-dev: ssh port       ${ssh_port}$( [[ "$ssh_port" != "$DEFAULT_SSH_PORT" ]] && echo " (override via AGENT_MCP_VM_DEV_SSH_PORT)" )
 agent-mcp-vm-dev: Ctrl-C to shut down
 INFO
 
