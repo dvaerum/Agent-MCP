@@ -376,14 +376,18 @@ async def test_timeout_clamp_to_max(tmp_path: Path) -> None:
         # acquired and the impl progresses to the signal-wait slice.
         if float(timeout) < 0.5:
             return await original(awaitable, timeout)
-        # Close the un-awaited coroutine to avoid pytest's "coroutine
-        # was never awaited" warning, then raise TimeoutError so the
-        # impl returns its empty envelope quickly.
+        # First signal-wait slice captured — that's all this test
+        # asserts on. Close the un-awaited coroutine (avoids pytest's
+        # "coroutine was never awaited" warning) and return a synthetic
+        # event so the impl takes its "woken" path and returns after a
+        # SINGLE iteration. Raising TimeoutError here instead made the
+        # impl loop until its wall-clock deadline (the post-clamp 300s
+        # ceiling) — a ~300s busy-spin that dominated the whole suite.
         try:
             awaitable.close()
         except Exception:
             pass
-        raise asyncio.TimeoutError()
+        return {"type": "test-wake", "timestamp": "z"}
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")

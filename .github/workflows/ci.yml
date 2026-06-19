@@ -28,12 +28,14 @@ jobs:
         # release-only for now); both run on node24.
         uses: astral-sh/setup-uv@v7
         with:
-          # setup-uv v7 defaults enable-cache to "auto", which turns
-          # caching on — and the 3 matrix jobs then race to reserve the
-          # same key ("Unable to reserve cache ..."). We don't ship a
-          # uv.lock and `uv pip install -e .[dev]` is fast, so caching
-          # buys little; disable it explicitly to keep the logs clean.
-          enable-cache: false
+          # Cache uv's wheel/download store to cut the cold install.
+          # cache-suffix keys the cache per matrix Python so the four
+          # jobs don't race to reserve one shared key (setup-uv's
+          # default key omits the matrix version — that was the earlier
+          # "Unable to reserve cache" warning). Invalidates on
+          # pyproject.toml change via the default cache-dependency-glob.
+          enable-cache: true
+          cache-suffix: ${{ matrix.python-version }}
 
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
