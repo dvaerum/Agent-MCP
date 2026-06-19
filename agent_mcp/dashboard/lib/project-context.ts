@@ -66,6 +66,16 @@ import {
 function derive(): {
   projectName: string | null
   isOverview: boolean
+  // True when the dashboard is served behind the always-on Python
+  // router at `/agent-mcp/app/<name>/...` (multi-tenant deployment).
+  // Distinct from `projectName !== null` only in that consumers reading
+  // this flag don't have to re-derive the standalone-mode case
+  // themselves. Used by DashboardWrapper to skip the "Connect to MCP
+  // Server" gating screen (the URL already names the project; the
+  // router already proxies to its backend; the gating UI is for
+  // standalone deployments only) and by ServerConnection to hide the
+  // localhost port scanner (cross-origin, useless in this mode).
+  isRouterServed: boolean
   baseUrl: string
   apiPrefix: string
 } {
@@ -76,6 +86,7 @@ function derive(): {
     return {
       projectName: null,
       isOverview: true,
+      isRouterServed: true,
       baseUrl: '',
       apiPrefix: '',
     }
@@ -86,6 +97,7 @@ function derive(): {
     return {
       projectName: match[1],
       isOverview: false,
+      isRouterServed: true,
       baseUrl: apiRoot,
       apiPrefix: apiRoot,
     }
@@ -95,6 +107,7 @@ function derive(): {
   return {
     projectName: null,
     isOverview: false,
+    isRouterServed: false,
     baseUrl: '/api',
     apiPrefix: '',
   }
