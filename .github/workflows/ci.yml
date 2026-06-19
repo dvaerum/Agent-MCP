@@ -25,9 +25,13 @@ jobs:
         # v7 is the newest moving major tag astral publishes (v8 is
         # release-only for now); both run on node24.
         uses: astral-sh/setup-uv@v7
-        # No enable-cache: we don't ship a uv.lock; the setup-uv cache
-        # is keyed off uv.lock and 404s without one. uv pip install -e
-        # .[dev] is fast enough that cache wouldn't help much.
+        with:
+          # setup-uv v7 defaults enable-cache to "auto", which turns
+          # caching on — and the 3 matrix jobs then race to reserve the
+          # same key ("Unable to reserve cache ..."). We don't ship a
+          # uv.lock and `uv pip install -e .[dev]` is fast, so caching
+          # buys little; disable it explicitly to keep the logs clean.
+          enable-cache: false
 
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
@@ -82,6 +86,14 @@ jobs:
       # Pinned to a release tag instead of the mutable @main for
       # reproducible runs; v22 runs on node24.
       - uses: DeterminateSystems/nix-installer-action@v22
+        with:
+          # Resilience: retry transient substituter/network hiccups
+          # before giving up, rather than failing the job on the first
+          # flaky download from cache.nixos.org. Pairs with --fallback
+          # on the build step below.
+          extra-conf: |
+            download-attempts = 3
+            connect-timeout = 10
 
       # magic-nix-cache is sunset by Determinate Systems (it also spammed
       # an "Unable to authenticate to FlakeHub" annotation on every run)
@@ -115,6 +127,11 @@ jobs:
         # sentinel regression guard from #166) which nothing else covers.
         # First run ~30 min; subsequent runs ~5-10 min via cache-nix-action.
         run: |
+          # --fallback: if a binary-cache substitution fails (flaky
+          # cache.nixos.org), build that path from source instead of
+          # hard-failing the job. With download-attempts=3 above, this
+          # makes the job resilient to transient cache failures — the
+          # class of flake that sank the old magic-nix-cache setup.
           nix build .#checks.x86_64-linux.vm-single-tenant \
                     .#checks.x86_64-linux.vm-multi-tenant \
-                    -L --print-build-logs
+                    -L --print-build-logs --fallback
