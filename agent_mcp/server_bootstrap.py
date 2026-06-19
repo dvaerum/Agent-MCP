@@ -702,7 +702,7 @@ def _print_startup_banner(config: ServerConfig) -> None:
     # the dashboard's tokens view, --admin-token-out, or the TUI
     # (which the operator is actively staring at) are the supported
     # surfaces. Same gate as the application_startup log line.
-    if config.admin_token_log:
+    if config.system_token_log:
         admin_token = get_admin_token_from_db(config.project_dir)
         if admin_token:
             print(f"🔑 Admin Token: {admin_token}")
