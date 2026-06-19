@@ -161,11 +161,31 @@ if (
       store.updateServer(existing.id, { baseUrl })
       existing = useServerStore.getState().servers.find(s => s.name === name)
     }
-    if (
-      existing &&
-      useServerStore.getState().activeServerId !== existing.id
-    ) {
-      useServerStore.getState().setActiveServer(existing.id)
+    if (existing) {
+      // Router-served auto-connect. Skip `setActiveServer`'s health
+      // check — the router proxy is the source of truth for "is this
+      // backend reachable?", not a synchronous `GET /api/status` from
+      // the dashboard. A lazily-spawned backend takes ~10-15s to
+      // create its Unix socket; the health check's 10s timeout
+      // surfaces as `NS_BINDING_ABORTED` before the backend is up,
+      // and `setActiveServer` then permanently flags the server as
+      // `status: 'error'`. Every inner dashboard (Overview / Agents
+      // / Tasks / Memories / Messages) gates content rendering on
+      // `status === 'connected'` and so renders a dead "Connect to
+      // MCP Server" placeholder instead of the real UI.
+      //
+      // Mark connected directly. The transparent cold-start retry
+      // inside `ApiClient.request()` (5xx → exponential backoff)
+      // already handles the spawn delay for whichever request the
+      // dashboard makes first.
+      apiClient.setBaseUrl(baseUrl)
+      store.updateServer(existing.id, {
+        status: 'connected',
+        lastConnected: new Date().toISOString(),
+      })
+      if (useServerStore.getState().activeServerId !== existing.id) {
+        useServerStore.setState({ activeServerId: existing.id })
+      }
     }
   }
   if (useServerStore.persist.hasHydrated()) {
