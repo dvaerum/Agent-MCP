@@ -40,10 +40,11 @@ export type DashboardSection =
   | "memories"
   | "messages"
   | "settings"
+  | "system"
   | "prompts"
 
 const KNOWN_SECTIONS: ReadonlySet<DashboardSection> = new Set<DashboardSection>(
-  ["overview", "agents", "tasks", "memories", "messages", "settings", "prompts"],
+  ["overview", "agents", "tasks", "memories", "messages", "settings", "system", "prompts"],
 )
 
 const DEFAULT_SECTION: DashboardSection = "overview"
