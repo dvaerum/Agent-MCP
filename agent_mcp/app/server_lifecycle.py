@@ -92,50 +92,17 @@ def _drop_legacy_admin_token_row(
     )
 
 
-# Synthetic constants for the admin pseudo-agent row. Mirror the
-# values used by Alembic migration 0008 so the lifespan-startup
-# backstop converges to the same row the migration inserted.
+# Wave 4 (cleanup/wave-4-delete-admin-pseudo-agent): the synthetic
+# admin pseudo-agent row (agent_id='admin') and its lifespan-startup
+# backstop helper (`_ensure_admin_pseudo_agent_row`) were deleted
+# here as part of admin_token retirement. Migration 0014
+# (`0014_drop_admin_pseudo_agent`) drops the row and the FKs that
+# pinned it in place; `g.system_token` still surfaces as the actor
+# label "admin" via `get_agent_id()` but no longer requires an
+# agents-table row. The legacy helper / constants have been removed
+# so a `g.active_agents` filter against ``_ADMIN_PSEUDO_AGENT_ID``
+# below is no longer needed either.
 _ADMIN_PSEUDO_AGENT_ID = "admin"
-_ADMIN_PSEUDO_AGENT_TOKEN = "__admin_pseudo_agent__"
-
-
-def _ensure_admin_pseudo_agent_row() -> None:
-    """INSERT OR IGNORE the synthetic admin row into `agents`.
-
-    Idempotent on the `agent_id` UNIQUE constraint. Called from
-    `application_startup` so the row exists before any tool / route
-    handler runs — that's a prereq for the FK constraints added by
-    migration 0008 (agent_messages.{sender_id, recipient_id} and
-    mcp_sessions.agent_id all reference agents.agent_id).
-
-    Kept module-level + sync so it can be unit-tested without spinning
-    the full lifespan.
-    """
-    now = datetime.datetime.now().isoformat()
-    conn = get_db_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT OR IGNORE INTO agents
-                (token, agent_id, capabilities, created_at, status,
-                 working_directory, color, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                _ADMIN_PSEUDO_AGENT_TOKEN,
-                _ADMIN_PSEUDO_AGENT_ID,
-                "[]",
-                now,
-                "system",
-                "",
-                "#000000",
-                now,
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
 
 
 # This function encapsulates the logic originally in main() before server run.
@@ -257,26 +224,11 @@ async def application_startup(
             f"Error: Failed to apply Alembic migrations. Check logs."
         ) from e
 
-    # 3b. Ensure the synthetic 'admin' row exists in the `agents` table.
-    # The application treats `admin` as a first-class pseudo-agent
-    # (sends messages, opens MCP sessions, runs admin tools), but
-    # before migration 0008 there was no row for it — admin identity
-    # was enforced via `g.admin_token` alone. Migration 0008 adds FK
-    # constraints (agent_messages.{sender_id, recipient_id} and
-    # mcp_sessions.agent_id all -> agents.agent_id) that require the
-    # row to exist. We re-insert at every boot for defence in depth so
-    # an operator who accidentally deletes the row (or a DB that
-    # pre-dates 0008) self-heals on the next restart.
-    try:
-        _ensure_admin_pseudo_agent_row()
-    except Exception as e_admin_seed:
-        # Non-fatal: log + continue. The migration's INSERT OR IGNORE
-        # already ran at this point; this is the runtime backstop.
-        logger.warning(
-            f"Failed to seed admin pseudo-agent row in agents table: "
-            f"{e_admin_seed}. Continuing — FK violations may follow if "
-            f"the row is missing."
-        )
+    # 3b. (Wave 4) The synthetic 'admin' pseudo-agent row that lived
+    # here from migrations 0008 → 0013 has been retired. Migration
+    # 0014 deletes it and the FK constraints that previously required
+    # it; the system bearer no longer needs an agents-table parent.
+    # See migration 0014_drop_admin_pseudo_agent for the full rationale.
 
     # 4. Handle System Token Persistence (Original main.py:1977-2012;
     #    renamed from "Admin Token" in Phase 2 Wave 1b).
@@ -525,14 +477,14 @@ async def application_startup(
         conn_load_state = get_db_connection()
         cursor = conn_load_state.cursor()
 
-        # Load Active Agents (status != 'terminated'). Excludes the
-        # synthetic 'admin' pseudo-agent row (seeded above by
-        # `_ensure_admin_pseudo_agent_row`) — that row exists only to
-        # satisfy the post-#100 FK constraints; surfacing it in
-        # g.active_agents would cause `view_status`, /api/all-data
-        # (which falls back on this map for live tokens), and every
-        # other code path that iterates the active map to render a
-        # phantom 'admin' entry alongside the hardcoded 'Admin' UI row.
+        # Load Active Agents (status != 'terminated'). Wave 4: the
+        # synthetic 'admin' row is gone (migration 0014), so the
+        # earlier `agent_id != 'admin'` filter is redundant — a normal
+        # `status != 'terminated'` WHERE returns the right set on its
+        # own. Defence in depth: also exclude any leftover
+        # `agent_id='admin'` row from a DB that pre-dates 0014 but
+        # somehow survived (e.g. an INSERT OR IGNORE racing the
+        # migration on a partially-upgraded DB).
         active_agents_count = 0
         cursor.execute(
             """

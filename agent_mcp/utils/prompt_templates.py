@@ -32,15 +32,11 @@ Query the project knowledge graph to understand:
 Focus on component-based development with visual validation.
 
 AUTO --worker --playwright""",
-    "admin_agent": """You are the admin agent.
-
-Your role is to:
-- Coordinate all development work
-- Create and manage worker agents
-- Maintain project context
-- Assign tasks based on agent specializations
-
-Query the project RAG for current status and begin coordination.""",
+    # Wave 4 (cleanup/wave-4-delete-admin-pseudo-agent): the
+    # ``admin_agent`` template was retired. The system bearer is no
+    # longer modelled as an agent; there is no spawnable "admin
+    # agent" in the post-Wave-4 world. The template registry below
+    # likewise no longer advertises it.
     "custom": "{custom_prompt}",
     "testing_agent": """You are {agent_id} - a CRITICAL TESTING AGENT.
 Your Agent Token: {agent_token}
@@ -133,7 +129,6 @@ def get_available_templates() -> Dict[str, str]:
         "worker_with_rag": "Worker agent with RAG querying and critical thinking instructions",
         "basic_worker": "Standard worker agent with basic project querying",
         "frontend_worker": "Frontend-focused worker with UI/UX emphasis",
-        "admin_agent": "Admin agent for coordination and management",
         "custom": "Custom prompt template (requires custom_prompt parameter)",
         "testing_agent": "Critical testing agent that validates completed work with heavy criticism",
     }

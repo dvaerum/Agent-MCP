@@ -102,9 +102,9 @@ async def test_agents_filter_status_active_excludes_terminated(tmp_path) -> None
         r = admin.client.get("/api/agents?status=active")
         assert r.status_code == 200, r.text
         rows = r.json()
-        # The existing handler prepends a synthetic "Admin" row with
-        # status='system'; the status filter must drop it too (only rows
-        # whose status matches the filter survive).
+        # Wave 4 retired the synthetic 'Admin' row this endpoint used
+        # to prepend; the status filter no longer needs to drop it. Only
+        # real agent rows with status='active' should survive.
         ids = [row.get("agent_id") for row in rows]
         statuses = [row.get("status") for row in rows]
         assert "alice" in ids, ids
@@ -129,8 +129,11 @@ async def test_agents_filter_status_terminated_only(tmp_path) -> None:
 
 
 async def test_agents_no_filter_returns_all(tmp_path) -> None:
-    """No query params → backward-compatible behavior (everything, plus
-    the synthetic Admin row)."""
+    """No query params → every persisted (non-tombstone) agent row.
+
+    Wave 4 (cleanup/wave-4-delete-admin-pseudo-agent) retired the
+    synthetic 'Admin' row this endpoint used to prepend; it must not
+    surface here any more."""
     async with mcp_session(tmp_path) as admin:
         _seed_agent("alice", status="active")
         _seed_agent("zombie", status="terminated")
@@ -141,8 +144,10 @@ async def test_agents_no_filter_returns_all(tmp_path) -> None:
         ids = [row.get("agent_id") for row in rows]
         assert "alice" in ids, ids
         assert "zombie" in ids, ids
-        # Synthetic Admin row preserved for back-compat with dashboard.
-        assert "Admin" in ids, ids
+        # Wave 4: the synthetic 'Admin' row is gone.
+        assert "Admin" not in ids, (
+            f"synthetic 'Admin' row resurfaced post-Wave-4: {ids}"
+        )
 
 
 # ---------------------------------------------------------------------------

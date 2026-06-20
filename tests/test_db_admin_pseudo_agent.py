@@ -1,29 +1,37 @@
-"""Test suite for PR-G1 — admin pseudo-agent + the 3 deferred FKs.
+"""Wave 4 (cleanup/wave-4-delete-admin-pseudo-agent) — the admin
+pseudo-agent row is gone.
 
-PR #96 (migration 0007) shipped 4 of the 7 implicit FK constraints
-identified in the 2026-06-02 database review and deferred 3 others
-because they reference `agents.agent_id` and the `admin` identity
-has no row in `agents` — admin was previously enforced via
-`g.admin_token` alone.
+Background
+----------
+PR #100 (migration 0008) introduced the synthetic
+``agent_id='admin'`` row in the ``agents`` table so the three
+deferred FK constraints from the 2026-06-02 DB review could be
+declared:
 
-Migration 0008 closes that gap:
+  * ``agent_messages.sender_id`` → ``agents.agent_id``
+  * ``agent_messages.recipient_id`` → ``agents.agent_id``
+  * ``mcp_sessions.agent_id`` → ``agents.agent_id``
 
-  * Adds a synthetic `admin` row to `agents` (INSERT OR IGNORE).
-  * Drops/recreates any orphan rows on the three deferred columns.
-  * Adds the three deferred FK constraints.
+Wave 4 of the admin_token retirement (this PR) closes the loop the
+other way: the synthetic row is deleted by migration 0014, and the
+FK constraints that pinned it in place (including the two nullable
+FKs from 0007 — ``tasks.assigned_to`` and
+``claude_code_sessions.agent_id``) are dropped via the same
+``batch_alter_table`` rebuild mechanism that created them.
 
-`application_startup` also re-inserts the admin row at every boot
-for defence in depth, so an operator who wipes the row recovers on
-the next restart.
+Post-Wave-4 contract this file pins:
 
-Tests cover:
-  * The synthetic admin row is present after lifespan startup.
-  * The three deferred FK constraints are now declared.
-  * FK violations on agent_messages / mcp_sessions are rejected.
-  * Inserting agent_messages WITH sender_id='admin' succeeds (the
-    FK is satisfied by the synthetic row).
-  * `PRAGMA foreign_key_check` returns no rows after startup.
-  * The lifespan-startup helper is idempotent on its own.
+  * The ``agents`` table contains zero rows with
+    ``agent_id='admin'`` after a fresh DB init.
+  * The five FK constraints listed above are no longer declared on
+    their respective tables.
+  * Writes that previously required the admin parent row
+    (``agent_messages`` with ``sender_id='admin'`` or
+    ``recipient_id='admin'``; ``mcp_sessions`` with
+    ``agent_id='admin'``) succeed without any agents-table parent —
+    those columns are now durable labels, not relational pointers.
+  * ``PRAGMA foreign_key_check`` is clean after startup (no orphan
+    rows from the FK drop).
 """
 
 from __future__ import annotations
@@ -38,11 +46,13 @@ from tests.harness import mcp_session
 pytestmark = pytest.mark.asyncio
 
 
-# The three FKs we ship in PR-G1. Format mirrors test_db_foreign_keys.py.
-_NEWLY_REQUIRED_FKS = [
+# The FKs migration 0014 drops. Format: (table, column, ref_table, ref_col).
+_DROPPED_FKS = [
     ("agent_messages", "sender_id", "agents", "agent_id"),
     ("agent_messages", "recipient_id", "agents", "agent_id"),
     ("mcp_sessions", "agent_id", "agents", "agent_id"),
+    ("tasks", "assigned_to", "agents", "agent_id"),
+    ("claude_code_sessions", "agent_id", "agents", "agent_id"),
 ]
 
 
@@ -52,87 +62,59 @@ def _fk_list(conn: sqlite3.Connection, table: str) -> list[tuple]:
     return [(r[3], r[2], r[4]) for r in rows]
 
 
-async def test_admin_pseudo_agent_row_present_after_startup(tmp_path) -> None:
-    """Lifespan startup must seed the synthetic admin row."""
+async def test_fresh_project_has_no_admin_pseudo_agent(tmp_path) -> None:
+    """Wave 4: a freshly-initialised project must have zero rows in
+    ``agents`` with ``agent_id='admin'``."""
     from agent_mcp.core.config import get_db_path
 
     async with mcp_session(tmp_path):
         conn = sqlite3.connect(str(get_db_path()))
         try:
-            row = conn.execute(
-                "SELECT agent_id, status FROM agents WHERE agent_id = 'admin'"
-            ).fetchone()
+            count = conn.execute(
+                "SELECT COUNT(*) FROM agents WHERE agent_id = 'admin'"
+            ).fetchone()[0]
         finally:
             conn.close()
-        assert row is not None, "admin pseudo-agent row missing after startup"
-        assert row[0] == "admin"
-        assert row[1] == "system"
+        assert count == 0, (
+            f"Wave 4 deleted the admin pseudo-agent — expected zero "
+            f"rows, found {count}"
+        )
 
 
-async def test_deferred_fks_now_declared(tmp_path) -> None:
-    """The three deferred FK constraints are present after migration 0008."""
+async def test_admin_targeting_fks_are_dropped(tmp_path) -> None:
+    """The five FKs that targeted agents.agent_id and required the
+    pseudo-agent row must be gone after migration 0014."""
     from agent_mcp.core.config import get_db_path
 
     async with mcp_session(tmp_path):
         conn = sqlite3.connect(str(get_db_path()))
         try:
-            for table, col, ref_table, ref_col in _NEWLY_REQUIRED_FKS:
+            for table, col, ref_table, ref_col in _DROPPED_FKS:
                 fks = _fk_list(conn, table)
-                assert (col, ref_table, ref_col) in fks, (
-                    f"missing FK {table}.{col} -> {ref_table}.{ref_col}; "
-                    f"have {fks}"
+                assert (col, ref_table, ref_col) not in fks, (
+                    f"FK {table}.{col} -> {ref_table}.{ref_col} should have "
+                    f"been dropped by migration 0014, still present in: {fks}"
                 )
         finally:
             conn.close()
 
 
-async def test_fk_violation_on_agent_messages_rejected(tmp_path) -> None:
-    """Inserting agent_messages with a nonexistent sender_id must fail."""
+async def test_agent_messages_with_admin_sender_succeeds_without_parent(
+    tmp_path,
+) -> None:
+    """Inserting an agent_messages row with ``sender_id='admin'`` and
+    ``recipient_id='admin'`` must succeed without any agents-table
+    parent row — the FK is gone, the columns are now durable labels."""
     from agent_mcp.db.connection import get_db_connection
 
     async with mcp_session(tmp_path):
         conn = get_db_connection()
         try:
-            with pytest.raises(sqlite3.IntegrityError):
-                conn.execute(
-                    "INSERT INTO agent_messages "
-                    "(message_id, sender_id, recipient_id, message_content, "
-                    " timestamp) "
-                    "VALUES ('m1', 'no-such-agent', 'admin', 'x', 't')"
-                )
-        finally:
-            conn.close()
-
-
-async def test_fk_violation_on_mcp_sessions_rejected(tmp_path) -> None:
-    """Inserting mcp_sessions with a nonexistent agent_id must fail."""
-    from agent_mcp.db.connection import get_db_connection
-
-    async with mcp_session(tmp_path):
-        conn = get_db_connection()
-        try:
-            with pytest.raises(sqlite3.IntegrityError):
-                conn.execute(
-                    "INSERT INTO mcp_sessions "
-                    "(session_id, agent_id, opened_at, last_seen_at, "
-                    " bearer_token_hash) "
-                    "VALUES ('s1', 'no-such-agent', 't', 't', 'h')"
-                )
-        finally:
-            conn.close()
-
-
-async def test_agent_messages_with_admin_sender_succeeds(tmp_path) -> None:
-    """Inserting agent_messages with sender_id='admin' succeeds.
-
-    Proves the synthetic admin row actually satisfies the FK — this
-    is the whole point of PR-G1.
-    """
-    from agent_mcp.db.connection import get_db_connection
-
-    async with mcp_session(tmp_path):
-        conn = get_db_connection()
-        try:
+            # Sanity-check: no admin parent row exists.
+            row = conn.execute(
+                "SELECT 1 FROM agents WHERE agent_id='admin'"
+            ).fetchone()
+            assert row is None
             conn.execute(
                 "INSERT INTO agent_messages "
                 "(message_id, sender_id, recipient_id, message_content, "
@@ -140,21 +122,51 @@ async def test_agent_messages_with_admin_sender_succeeds(tmp_path) -> None:
                 "VALUES ('m-admin', 'admin', 'admin', 'hello', 't')"
             )
             conn.commit()
-            row = conn.execute(
+            content = conn.execute(
                 "SELECT message_content FROM agent_messages "
                 "WHERE message_id='m-admin'"
             ).fetchone()
-            assert row is not None and row[0] == "hello"
+            assert content is not None and content[0] == "hello"
+        finally:
+            conn.close()
+
+
+async def test_mcp_sessions_with_admin_agent_id_succeeds_without_parent(
+    tmp_path,
+) -> None:
+    """Inserting an mcp_sessions row with ``agent_id='admin'`` must
+    succeed without any agents-table parent row.
+
+    This is the dashboard's GET /mcp open path: the cookie-injected
+    system bearer resolves to ``agent_id='admin'`` inside the
+    backend's ``session_registry.register_session`` call. With the
+    FK gone, that no longer needs a synthetic parent."""
+    from agent_mcp.db.connection import get_db_connection
+
+    async with mcp_session(tmp_path):
+        conn = get_db_connection()
+        try:
+            conn.execute(
+                "INSERT INTO mcp_sessions "
+                "(session_id, agent_id, opened_at, last_seen_at, "
+                " bearer_token_hash) "
+                "VALUES ('s-admin', 'admin', 't', 't', 'h')"
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT agent_id FROM mcp_sessions WHERE session_id='s-admin'"
+            ).fetchone()
+            assert row is not None and row[0] == "admin"
         finally:
             conn.close()
 
 
 async def test_pragma_foreign_key_check_clean_after_startup(tmp_path) -> None:
-    """`PRAGMA foreign_key_check` must return no rows after startup.
+    """``PRAGMA foreign_key_check`` must return no rows after startup.
 
-    Anything else means the migration left orphans behind that violate
-    one of the now-declared FKs — that's a deploy-blocker.
-    """
+    The migration drops several FKs via batch_alter_table; if the
+    rebuild left any orphan or the env.py post-commit safety net
+    surfaces unexpected rows, this catches it."""
     from agent_mcp.core.config import get_db_path
 
     async with mcp_session(tmp_path):
@@ -166,22 +178,30 @@ async def test_pragma_foreign_key_check_clean_after_startup(tmp_path) -> None:
         assert rows == [], f"foreign_key_check returned orphans: {rows}"
 
 
-async def test_ensure_admin_pseudo_agent_row_is_idempotent(tmp_path) -> None:
-    """The lifespan-startup helper must be safe to call repeatedly."""
-    from agent_mcp.app.server_lifecycle import _ensure_admin_pseudo_agent_row
+async def test_other_fks_survive_the_migration(tmp_path) -> None:
+    """Wave 4 drops *only* the five admin-targeting FKs. Other FKs
+    on the rebuilt tables — particularly
+    ``agent_messages.parent_message_id -> agent_messages.message_id``
+    (migration 0012) and ``tasks.parent_task -> tasks.task_id``
+    (migration 0007) — must survive the rebuild.
+
+    Regression guard: a misconfigured batch_alter_table that doesn't
+    re-emit the surviving FKs would silently strip them."""
     from agent_mcp.core.config import get_db_path
 
     async with mcp_session(tmp_path):
-        # Lifespan already called it once. Call a few more times.
-        _ensure_admin_pseudo_agent_row()
-        _ensure_admin_pseudo_agent_row()
-        _ensure_admin_pseudo_agent_row()
-
         conn = sqlite3.connect(str(get_db_path()))
         try:
-            count = conn.execute(
-                "SELECT COUNT(*) FROM agents WHERE agent_id = 'admin'"
-            ).fetchone()[0]
+            tasks_fks = _fk_list(conn, "tasks")
+            assert ("parent_task", "tasks", "task_id") in tasks_fks, (
+                f"tasks.parent_task -> tasks.task_id FK was lost in the "
+                f"Wave 4 rebuild; got {tasks_fks}"
+            )
+            msg_fks = _fk_list(conn, "agent_messages")
+            assert ("parent_message_id", "agent_messages", "message_id") in msg_fks, (
+                f"agent_messages.parent_message_id -> agent_messages."
+                f"message_id FK was lost in the Wave 4 rebuild; got "
+                f"{msg_fks}"
+            )
         finally:
             conn.close()
-        assert count == 1, f"expected exactly 1 admin row, got {count}"

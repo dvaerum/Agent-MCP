@@ -127,7 +127,12 @@ async def test_agents_list_excludes_tombstone_rows(tmp_path) -> None:
         statuses = [r.get("status") for r in rows]
 
         assert "carol" in ids
-        assert "Admin" in ids
+        # Wave 4: the synthetic 'Admin' row was retired alongside the
+        # admin pseudo-agent. The endpoint must no longer surface it.
+        assert "Admin" not in ids, (
+            f"synthetic 'Admin' row resurfaced in /api/agents post-Wave-4: "
+            f"{ids}"
+        )
         assert "[deleted-phantom]" not in ids, (
             f"tombstone row leaked into /api/agents: {ids}"
         )

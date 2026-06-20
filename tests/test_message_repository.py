@@ -434,9 +434,11 @@ def test_bulk_send_writes_all_and_publishes_per_recipient(
         with _make_client(project_dir):
             from agent_mcp.repositories import message_repo
 
-            # NOTE: `admin` is the pseudo-agent seeded by migration
-            # 0008 (admin_pseudo_agent_and_fks); reuse it as the
-            # broadcast sender so we don't double-INSERT it.
+            # NOTE: `admin` is the system bearer's actor label
+            # (returned by ``get_agent_id(g.system_token)``). Wave 4
+            # dropped the FK constraint that previously required a
+            # corresponding agents-table row, so we can use it as a
+            # sender_id without any seeding.
             _seed_agent("bob")
             _seed_agent("carol")
 
@@ -933,16 +935,16 @@ def test_send_to_live_recipient_succeeds(project_dir, reset_globals):
         assert message_repo.get_by_id("msg_live") is not None
 
 
-def test_send_to_admin_pseudo_agent_succeeds(project_dir, reset_globals):
-    """``send`` accepts ``admin`` — the synthetic pseudo-agent seeded by
-    migration 0008 is a legitimate recipient (worker → admin handoffs)."""
+def test_send_to_admin_recipient_succeeds(project_dir, reset_globals):
+    """``send`` accepts ``recipient_id='admin'`` — worker→admin
+    handoffs remain a legitimate capability post-Wave-4. The recipient
+    column is now a free-form label (no FK constraint), so the message
+    lands without any agents-table parent."""
     with _make_client(project_dir):
         from agent_mcp.repositories import message_repo
 
         _seed_agent("worker-1")
 
-        # `admin` is seeded by application lifespan startup
-        # (`_ensure_admin_pseudo_agent_row`) — no _seed_agent call needed.
         entity = message_repo.send(
             message_id="msg_admin",
             sender_id="worker-1",
