@@ -84,7 +84,7 @@ async def test_all_data_excludes_tombstone_rows(tmp_path) -> None:
         await admin.create_worker("bob")
         _insert_tombstone("ghost")
 
-        resp = admin.client.get("/api/all-data")
+        resp = admin.get("/api/all-data")
         assert resp.status_code == 200, resp.text
         agents = resp.json().get("agents", [])
         ids = [a["agent_id"] for a in agents]
@@ -170,7 +170,7 @@ async def test_purge_drops_visible_agent_count_by_one(tmp_path) -> None:
     """
     async with mcp_session(tmp_path) as admin:
         before_total = len(
-            admin.client.get("/api/all-data").json()["agents"]
+            admin.get("/api/all-data").json()["agents"]
         )
 
         # 1. Deploy
@@ -184,7 +184,7 @@ async def test_purge_drops_visible_agent_count_by_one(tmp_path) -> None:
         )
         assert r.status_code == 200, r.text
         after_create = len(
-            admin.client.get("/api/all-data").json()["agents"]
+            admin.get("/api/all-data").json()["agents"]
         )
         assert after_create == before_total + 1, (
             f"create should add 1: before={before_total} after={after_create}"
@@ -200,7 +200,7 @@ async def test_purge_drops_visible_agent_count_by_one(tmp_path) -> None:
         )
         assert r.status_code == 200, r.text
         after_terminate = len(
-            admin.client.get("/api/all-data").json()["agents"]
+            admin.get("/api/all-data").json()["agents"]
         )
         assert after_terminate == after_create, (
             f"terminate is soft-delete; count must stay: "
@@ -215,7 +215,7 @@ async def test_purge_drops_visible_agent_count_by_one(tmp_path) -> None:
         )
         assert r.status_code == 200, r.text
         after_purge = len(
-            admin.client.get("/api/all-data").json()["agents"]
+            admin.get("/api/all-data").json()["agents"]
         )
         assert after_purge == after_terminate - 1, (
             f"purge must drop visible agent count by exactly 1 "
@@ -228,7 +228,7 @@ async def test_purge_drops_visible_agent_count_by_one(tmp_path) -> None:
         # tombstone row for it should be in the response.
         ids = [
             a["agent_id"]
-            for a in admin.client.get("/api/all-data").json()["agents"]
+            for a in admin.get("/api/all-data").json()["agents"]
         ]
         assert "spec-lifecycle-target" not in ids
         assert "[deleted-spec-lifecycle-target]" not in ids, (

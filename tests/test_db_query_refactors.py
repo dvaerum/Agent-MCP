@@ -56,7 +56,7 @@ async def test_all_data_applies_default_limit_per_section(tmp_path) -> None:
                 },
             )
 
-        resp = admin.client.get("/api/all-data")
+        resp = admin.get("/api/all-data")
         assert resp.status_code == 200
         body = resp.json()
         assert "tasks" in body
@@ -80,7 +80,7 @@ async def test_all_data_accepts_limit_query_param(tmp_path) -> None:
             )
             assert r.status_code == 200, r.text
 
-        resp = admin.client.get("/api/all-data?limit=3")
+        resp = admin.get("/api/all-data?limit=3")
         assert resp.status_code == 200
         body = resp.json()
         assert len(body["tasks"]) == 3
@@ -94,7 +94,7 @@ async def test_all_data_limit_clamped_to_safe_range(tmp_path) -> None:
     """
     MAX_LIMIT = 5000  # must match the constant in routes.py
     async with mcp_session(tmp_path) as admin:
-        resp = admin.client.get(f"/api/all-data?limit={MAX_LIMIT * 10}")
+        resp = admin.get(f"/api/all-data?limit={MAX_LIMIT * 10}")
         assert resp.status_code == 200
         # No way to verify the exact applied limit without seeding
         # MAX_LIMIT * 10 + 1 rows; rely on absence of error + body
@@ -105,7 +105,7 @@ async def test_all_data_limit_clamped_to_safe_range(tmp_path) -> None:
         assert isinstance(body["tasks"], list)
 
         # Negative limits should also be clamped.
-        resp = admin.client.get("/api/all-data?limit=-7")
+        resp = admin.get("/api/all-data?limit=-7")
         assert resp.status_code == 200
 
 
@@ -126,7 +126,7 @@ async def test_all_data_attaches_auth_token_to_every_known_agent(
         await admin.create_worker("alice")
         await admin.create_worker("bob")
 
-        resp = admin.client.get("/api/all-data")
+        resp = admin.get("/api/all-data")
         assert resp.status_code == 200
         agents = resp.json()["agents"]
 

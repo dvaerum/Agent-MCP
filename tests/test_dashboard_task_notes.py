@@ -244,9 +244,13 @@ def test_dashboard_edit_payload_with_notes_round_trips(client) -> None:
     """
     import json as _json
 
-    r = client.get("/api/tokens")
-    assert r.status_code == 200, r.text
-    token = r.json()["admin_token"]
+    # Wave 1 of prancy-napping-pie put `/api/tokens` behind
+    # `require_operator_session`; read the admin token from the
+    # in-process globals (populated by the lifespan, available as soon
+    # as the `client` TestClient context entered).
+    from agent_mcp.core import globals as g
+    token = g.admin_token
+    assert token, "admin token not populated by lifespan"
 
     r = client.post(
         "/api/tasks",
@@ -303,7 +307,8 @@ def test_dashboard_edit_payload_appends_multiple_notes(client) -> None:
     """
     import json as _json
 
-    token = client.get("/api/tokens").json()["admin_token"]
+    from agent_mcp.core import globals as g
+    token = g.admin_token
     task_id = client.post(
         "/api/tasks",
         json={"token": token, "task_title": "multi-note target"},
@@ -342,7 +347,8 @@ def test_dashboard_edit_payload_empty_notes_does_not_append(client) -> None:
     """
     import json as _json
 
-    token = client.get("/api/tokens").json()["admin_token"]
+    from agent_mcp.core import globals as g
+    token = g.admin_token
     task_id = client.post(
         "/api/tasks",
         json={"token": token, "task_title": "no-spam target"},

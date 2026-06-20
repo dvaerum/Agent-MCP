@@ -505,6 +505,26 @@ class AdminClient(WorkerSession):
         self.client = test_client
         self._mcp_app = None
 
+    # --- Authenticated GET helper for Wave-1+ REST routes ----------
+
+    def get(self, url: str, **kwargs: Any):
+        """Authenticated convenience wrapper around `self.client.get`.
+
+        Wave 1 of prancy-napping-pie put auth-less GET endpoints (notably
+        ``/api/tokens`` and ``/api/all-data``) behind
+        ``require_operator_session``. The dep accepts the admin bearer
+        as a legacy fallback (see ``agent_mcp/app/deps.py``), so
+        stamping the bearer here keeps test wire-shapes identical to
+        pre-Wave-1.
+
+        Tests can still call ``admin.client.get(url, ...)`` directly
+        when they want to assert the auth-less wire shape (e.g. the
+        Wave 1 RED tests).
+        """
+        headers = dict(kwargs.pop("headers", {}) or {})
+        headers.setdefault("Authorization", f"Bearer {self.admin_token}")
+        return self.client.get(url, headers=headers, **kwargs)
+
     # --- Lazy handler accessors (avoid importing main_app at module load) ---
 
     def _mcp_app_instance(self):
@@ -692,7 +712,17 @@ async def mcp_session(tmp_path: Path) -> AsyncIterator[AdminClient]:
         # via a helper closure executed in the outer finally block.
         stack.callback(_close)
 
-        admin_token = test_client.get("/api/tokens").json()["admin_token"]
+        # Read the admin token from the in-process globals rather than
+        # via an HTTP call. Wave 1 of prancy-napping-pie put
+        # `/api/tokens` behind `require_operator_session`, so an
+        # unauthenticated GET (which is what the harness's bootstrap
+        # call is — we don't have the token yet to bearer-authenticate
+        # with) now 401s. The lifespan startup has already populated
+        # `g.admin_token` by the time `TestClient.__enter__` returns;
+        # reading it directly is wire-equivalent and avoids the
+        # chicken-and-egg.
+        from agent_mcp.core import globals as g
+        admin_token = g.admin_token
 
         admin = AdminClient(admin_token=admin_token, test_client=test_client)
         yield admin

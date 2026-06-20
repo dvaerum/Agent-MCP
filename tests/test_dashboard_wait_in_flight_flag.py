@@ -38,7 +38,7 @@ async def test_all_data_agents_include_wait_in_flight_field(
         await admin.create_worker("alice")
         await admin.create_worker("bob")
 
-        resp = admin.client.get("/api/all-data")
+        resp = admin.get("/api/all-data")
         assert resp.status_code == 200, resp.text
         agents = resp.json().get("agents", [])
         assert agents, "expected at least one agent row"
@@ -62,7 +62,7 @@ async def test_wait_in_flight_defaults_false_when_no_lock_held(
         await admin.create_worker("alice")
         await admin.create_worker("bob")
 
-        resp = admin.client.get("/api/all-data")
+        resp = admin.get("/api/all-data")
         assert resp.status_code == 200, resp.text
         agents = resp.json().get("agents", [])
         in_flight = {
@@ -104,7 +104,7 @@ async def test_wait_in_flight_true_while_waiter_registered(
         # queue and leave it parked while we probe the API surface.
         waiter_queue = g.register_waiter("alice")
         try:
-            resp = admin.client.get("/api/all-data")
+            resp = admin.get("/api/all-data")
             assert resp.status_code == 200, resp.text
             agents = resp.json().get("agents", [])
             by_id = {a["agent_id"]: a for a in agents}
@@ -126,7 +126,7 @@ async def test_wait_in_flight_true_while_waiter_registered(
             # and multi-waiter cases.
             extra_queue = g.register_waiter("alice")
             try:
-                resp = admin.client.get("/api/all-data")
+                resp = admin.get("/api/all-data")
                 by_id = {
                     a["agent_id"]: a for a in resp.json().get("agents", [])
                 }
@@ -140,7 +140,7 @@ async def test_wait_in_flight_true_while_waiter_registered(
 
         # After every waiter unregisters the next /api/all-data call
         # sees the false state.
-        resp = admin.client.get("/api/all-data")
+        resp = admin.get("/api/all-data")
         assert resp.status_code == 200, resp.text
         agents = resp.json().get("agents", [])
         by_id = {a["agent_id"]: a for a in agents}
