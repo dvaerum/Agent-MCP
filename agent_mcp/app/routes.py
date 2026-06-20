@@ -54,6 +54,7 @@ import mcp.types as mcp_types # For handling the result from tool_impl
 from ..tools.registry import (
     dispatch_tool_call,
     operator_session_active,
+    operator_user_id as _cv_operator_user_id,
     request_auth_token,
 )
 from ..core.authorize import AuthRejected
@@ -80,6 +81,7 @@ async def _dispatch_through_tool(
     success_message: Optional[str] = None,
     extra_response: Optional[Dict[str, Any]] = None,
     operator_session: bool = False,
+    operator_user_id: Optional[str] = None,
 ) -> JSONResponse:
     """Run an MCP tool from a REST handler and translate the
     `list[TextContent]` result back into a dashboard-friendly JSON
@@ -90,6 +92,14 @@ async def _dispatch_through_tool(
     ContextVar so `dispatch_tool_call`'s Q6e fallback injects it into
     `arguments.token` if not already there — same path an HTTP middleware
     would take.
+
+    Wave 3 (prancy-napping-pie): callers can now pass
+    ``operator_session=True`` + ``operator_user_id=<username>`` instead
+    of ``bearer_token=g.admin_token``. The decorators in
+    ``agent_mcp/core/authorize.py`` admit the operator-session path
+    without needing the system bearer; the inner tool falls back to
+    ``operator_user_id`` for audit-log attribution when the bearer
+    path was the source of ``agent_id``.
 
     Error mapping (HTTP-shaped):
       * AuthRejected            → 403
@@ -104,6 +114,7 @@ async def _dispatch_through_tool(
     """
     cv_token = None
     cv_op_session = None
+    cv_op_user = None
     if bearer_token:
         cv_token = request_auth_token.set(bearer_token)
     # Phase 2 Wave 2a (v5.0.63): mark the dispatch as originating from
@@ -115,6 +126,8 @@ async def _dispatch_through_tool(
     # audit attribution and for future per-project membership checks.
     if operator_session:
         cv_op_session = operator_session_active.set(True)
+    if operator_user_id is not None:
+        cv_op_user = _cv_operator_user_id.set(operator_user_id)
     try:
         result = await dispatch_tool_call(tool_name, arguments)
     except AuthRejected as e:
@@ -145,6 +158,8 @@ async def _dispatch_through_tool(
             request_auth_token.reset(cv_token)
         if cv_op_session is not None:
             operator_session_active.reset(cv_op_session)
+        if cv_op_user is not None:
+            _cv_operator_user_id.reset(cv_op_user)
 
     text = _result_text(result)
     # Tool impls report errors as plain-text "Error: ..." blocks. Map
@@ -352,14 +367,14 @@ async def tokens_api_route(
     request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
-    """GET /api/tokens — dashboard's source of admin + agent bearer tokens.
+    """GET /api/tokens — dashboard's source of agent bearer tokens.
 
     Wave 1 (prancy-napping-pie): cookie-migrated. The dep accepts:
 
       * an ``agent_mcp_session`` cookie pointing at a live operator
         session (the new dashboard path), OR
-      * an ``Authorization: Bearer <admin_token>`` header (legacy admin
-        scripts / agent CLI), OR
+      * an ``Authorization: Bearer <system_token>`` header (legacy
+        admin scripts / agent CLI), OR
       * the same token in a body / query-string field (oldest
         backwards-compat path; nothing in the dashboard sends this).
 
@@ -368,16 +383,22 @@ async def tokens_api_route(
     bearer fails the dep's ``verify_token(..., "admin")`` and the
     request 401s before reaching this handler.
 
-    The ``admin_token`` field STAYS in the response for Wave 1: Wave 2
-    strips the frontend reads, Wave 3 then strips the field itself.
+    Wave 3 (prancy-napping-pie) dropped the legacy ``admin_token``
+    field from the response. The dashboard no longer reads it (Wave 2
+    stripped the frontend reads); the system bearer is internal-only
+    and must not flow to any external client. Out-of-tree admin
+    scripts that POST'd to this endpoint expecting an ``admin_token``
+    field will break — they can instead read the same value from the
+    ``--system-token-out`` startup flag (renamed from
+    ``--admin-token-out`` in Phase 2 Wave 1b) or the
+    ``MCP_SYSTEM_TOKEN`` env var on spawned agents.
     """
-    # // ... (implementation from previous response)
     try:
         agent_tokens_list = []
         for token, data in g.active_agents.items():
             if data.get("status") != "terminated":
                 agent_tokens_list.append({"agent_id": data.get("agent_id"), "token": token})
-        return JSONResponse({"admin_token": g.admin_token, "agent_tokens": agent_tokens_list})
+        return JSONResponse({"agent_tokens": agent_tokens_list})
     except Exception as e:
         logger.error(f"Error retrieving tokens for dashboard: {e}", exc_info=True)
         return JSONResponse({"error": f"Error retrieving tokens: {str(e)}"}, status_code=500)
@@ -547,12 +568,13 @@ async def create_agent_dashboard_api_route(
     """Dashboard API endpoint to create an agent. Calls the admin tool internally.
 
     PR D (prancy-napping-pie): auth via ``require_operator_session``.
-    The handler reuses the admin token for the inner
-    ``create_agent_tool_impl`` call (which still needs an admin
-    token to satisfy its own ``@requires("admin")`` decorator);
-    that's read from ``g.admin_token`` rather than the request
-    body so the dashboard's cookie path doesn't need to ferry the
-    token through.
+    Wave 3 (prancy-napping-pie): the inner
+    ``create_agent_tool_impl`` call no longer synthesises
+    ``g.admin_token`` as a bearer to satisfy the gate. We stamp the
+    operator-session ContextVars instead so the inner tool's
+    ``@requires_role("operator")`` decorator admits via the
+    operator-session path. The route's outer dep has already
+    validated the cookie / legacy bearer / body-token.
     """
     if request.method != 'POST':
         return JSONResponse({"error": "Method not allowed"}, status_code=405)
@@ -579,13 +601,12 @@ async def create_agent_dashboard_api_route(
                 )},
                 status_code=422,
             )
-        # The inner tool call still wants an admin token to satisfy
-        # its own decorator chain; the session-authenticated dashboard
-        # caller doesn't ferry one, so pull from the in-process
-        # admin token (defence-in-depth: the dep already validated
-        # the operator session, so synthesising the bearer here is
-        # privilege-preserving).
-        admin_auth_token = g.admin_token
+        # Wave 3 (prancy-napping-pie): no longer pull from
+        # ``g.admin_token`` here. ``create_agent_tool_impl`` is
+        # ``@requires_role("operator")``; the operator-session
+        # ContextVars are stamped on the dispatch below so the
+        # decorator admits without needing the system bearer in
+        # ``arguments["token"]``.
 
         if not agent_id:
             return JSONResponse({"message": "Agent ID is required"}, status_code=400)
@@ -601,9 +622,12 @@ async def create_agent_dashboard_api_route(
                 status_code=400,
             )
 
-        # Prepare arguments for the create_agent_tool_impl
+        # Prepare arguments for the create_agent_tool_impl.
+        # Wave 3 (prancy-napping-pie): the ``token`` arg is gone — the
+        # operator-session ContextVars set just below carry the auth
+        # decision into the tool's ``@requires_role("operator")``
+        # decorator.
         tool_args = {
-            "token": admin_auth_token, # The tool_impl will verify this again
             "agent_id": agent_id,
             "capabilities": capabilities,
             "working_directory": working_directory,
@@ -611,9 +635,18 @@ async def create_agent_dashboard_api_route(
             # which persists it via agent_repo.create(... agent_role=).
             "agent_role": agent_role,
         }
-        
-        # Call the already refactored tool implementation
-        result_list: List[mcp_types.TextContent] = await create_agent_tool_impl(tool_args)
+
+        # Stamp the operator-session ContextVars so
+        # ``create_agent_tool_impl``'s ``@requires_role("operator")``
+        # admits via the cookie / dep path rather than the legacy
+        # ``token = g.system_token`` synthesis.
+        cv_op_session = operator_session_active.set(True)
+        cv_op_user = _cv_operator_user_id.set(caller_identity(auth))
+        try:
+            result_list: List[mcp_types.TextContent] = await create_agent_tool_impl(tool_args)
+        finally:
+            operator_session_active.reset(cv_op_session)
+            _cv_operator_user_id.reset(cv_op_user)
         
         # Process the result from tool_impl to form a JSONResponse
         # The tool_impl returns a list of TextContent objects.
@@ -654,16 +687,19 @@ async def terminate_agent_dashboard_api_route(
     request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
-    """POST /api/terminate-agent — admin terminates an agent.
+    """POST /api/terminate-agent — operator terminates an agent.
 
-    Thin adapter over the ``terminate_agent`` MCP tool. The tool's
-    ``inputSchema`` enforces ``agent_id`` required + admin-only role
-    (via ``@requires("admin")``); this handler just translates the
-    HTTP request → tool call → JSON response.
+    Thin adapter over the ``terminate_agent`` MCP tool. The tool is
+    gated by ``@requires_role("operator")``; this handler just
+    translates the HTTP request → tool call → JSON response.
 
     PR D (prancy-napping-pie): auth via ``require_operator_session``.
-    The inner tool call still needs an admin bearer; synthesised
-    from ``g.admin_token`` (defence-in-depth, dep already gated us).
+    Wave 3 (prancy-napping-pie): the inner tool call no longer
+    synthesises ``g.admin_token`` as a bearer to satisfy the gate.
+    Instead, ``_dispatch_through_tool`` stamps ``operator_session=True``
+    on the dispatch — the decorator admits via the operator-session
+    ContextVar (the route's outer dep has already validated the
+    cookie / legacy bearer / body-token before we get here).
     """
     if request.method == 'OPTIONS':
         return await handle_options(request)
@@ -678,7 +714,9 @@ async def terminate_agent_dashboard_api_route(
     return await _dispatch_through_tool(
         "terminate_agent",
         {"agent_id": agent_id} if agent_id else {},
-        bearer_token=g.admin_token,
+        bearer_token=None,
+        operator_session=True,
+        operator_user_id=caller_identity(auth),
         success_message=(
             f"Agent '{agent_id}' terminated successfully via dashboard API."
             if agent_id else None
@@ -1302,8 +1340,12 @@ async def all_data_api_route(
     just like every other migrated route in this file; see
     ``app/deps.py`` for the legacy fallback rationale.
 
-    The ``admin_token`` field STAYS in the response for Wave 1; Wave 2
-    strips the frontend reads, Wave 3 then strips the field itself.
+    Wave 3 (prancy-napping-pie) dropped the legacy ``admin_token``
+    field from the response and the synthesised ``Admin`` pseudo-agent
+    row (which sourced ``auth_token`` from ``g.admin_token``). The
+    dashboard no longer reads the field (Wave 2). The synthesised row
+    will be replaced by the real ``admin`` row from the agents table
+    once Wave 4 drops the admin pseudo-agent entirely.
     """
     if request.method == 'OPTIONS':
         return await handle_options(request)
@@ -1384,22 +1426,20 @@ async def all_data_api_route(
             )
             agents_data.append(agent_dict)
 
-        # Add admin as special agent. The display label stays 'Admin'
-        # (capital A) because the entire dashboard frontend keys off
-        # `agent_id === 'Admin'` for special-case handling (no edit /
-        # terminate buttons, admin-token mapping, "always show" filter).
-        # The underlying DB row is `agent_id='admin'` lowercase — kept
-        # separate from this UI entry on purpose.
-        agents_data.insert(0, {
-            'agent_id': 'Admin',
-            'status': 'system',
-            'auth_token': g.admin_token,
-            'created_at': 'N/A',
-            'current_task': 'N/A',
-            # Admin never enters the wake loop — always FALSE so the
-            # dashboard renders a uniform shape for every row.
-            'wait_for_events_in_flight': False,
-        })
+        # Wave 3 (prancy-napping-pie): the synthesised 'Admin' agent
+        # row (which sourced ``auth_token`` from ``g.admin_token``) is
+        # gone. The dashboard's hardcoded ``agent_id === 'Admin'``
+        # defensive branches simply never match now — that's fine; they
+        # were defensive (skip edit/terminate buttons for the admin
+        # row), not load-bearing. Wave 4 deletes the underlying admin
+        # pseudo-agent in the agents table; until then, the real
+        # lowercase ``admin`` row is filtered out above (lines just
+        # above this block) so callers see a clean agents list.
+        #
+        # Out-of-tree consumers that relied on the synthesised
+        # 'Admin' row's ``auth_token`` field to harvest the system
+        # token should switch to the ``--system-token-out`` startup
+        # flag (or ``MCP_SYSTEM_TOKEN`` env var on spawned agents).
 
         cursor.execute(
             "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?",
@@ -1452,7 +1492,10 @@ async def all_data_api_route(
             "actions": actions_data,
             "file_metadata": file_metadata,
             "file_map": g.file_map,
-            "admin_token": g.admin_token,
+            # Wave 3 (prancy-napping-pie): ``admin_token`` removed from
+            # response. The dashboard no longer reads it (Wave 2); the
+            # system bearer is internal-only and must not flow to
+            # external clients.
             "timestamp": datetime.datetime.now().isoformat()
         }
         
@@ -1925,10 +1968,24 @@ async def delete_memory_api_route(
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
+    # Wave 3 (prancy-napping-pie): ``delete_project_context_tool_impl``
+    # is ``@requires("any")`` (not ``"operator"``) — the per-key
+    # ownership matrix inside the impl is the real gate. The
+    # decorator's ``"any"`` admit requires an agent token, so we
+    # cannot drop the bearer the way the operator-only routes did.
+    # Pass the system bearer so ``verify_token(..., "admin")`` inside
+    # the impl admits the operator-driven delete for any key
+    # (including the critical ``config_*`` keys the route always
+    # passes ``force_delete=True`` for). ``operator_session=True`` is
+    # set so per-action audit / future viewer-vs-operator gating
+    # still see the operator-session signal; ``operator_user_id`` is
+    # passed for audit-log attribution.
     return await _dispatch_through_tool(
         "delete_project_context",
         {"context_key": context_key, "force_delete": True},
-        bearer_token=g.admin_token,
+        bearer_token=g.system_token,
+        operator_session=True,
+        operator_user_id=caller_identity(auth),
         success_message=f"Memory '{context_key}' deleted successfully",
     )
 
@@ -2072,7 +2129,9 @@ async def delete_task_api_route(
     return await _dispatch_through_tool(
         "delete_task",
         {"task_id": task_id, "force_delete": True},
-        bearer_token=g.admin_token,
+        bearer_token=None,
+        operator_session=True,
+        operator_user_id=caller_identity(auth),
         success_message=f"Task '{task_id}' deleted successfully",
     )
 

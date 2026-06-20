@@ -7,7 +7,7 @@
 # - MCP_AGENT_TOKEN: The agent's authentication token
 # - MCP_SERVER_URL: The MCP server URL
 # - MCP_WORKING_DIR: The agent's working directory
-# - MCP_ADMIN_TOKEN: Admin token (if this is an admin agent)
+# - MCP_SYSTEM_TOKEN: System token (only set on the admin pseudo-agent)
 
 echo "=== Agent-MCP Agent Startup ==="
 echo "Agent ID: ${MCP_AGENT_ID:-not-set}"

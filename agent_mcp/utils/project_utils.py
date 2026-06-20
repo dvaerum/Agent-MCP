@@ -89,19 +89,18 @@ def init_agent_directory(project_dir_str: str) -> Optional[Path]:
     # Original main.py lines 902-914
     config_path = agent_dir / "config.json"
     if not config_path.exists():
-        # g.admin_token might not be initialized when this function is first called
-        # during server startup before admin token persistence logic.
-        # The original code in main.py:1040 used `admin_token` which was set earlier.
-        # We should pass the admin_token to this function if it's needed at this stage,
-        # or ensure g.admin_token is reliably set before this.
-        # For now, let's assume g.admin_token will be set by the time this is called in a meaningful way,
-        # or it will be None if called very early (e.g. initial setup).
-        current_admin_token = g.admin_token  # Get current global admin token
+        # Wave 3 (prancy-napping-pie): renamed the field from
+        # ``admin_token`` to ``system_token`` so downstream consumers
+        # (legacy CLI, deploy scripts) that still read the file get a
+        # ``KeyError`` rather than silently consuming stale data when
+        # the rename happens. ``g.system_token`` is the canonical
+        # storage; ``g.admin_token`` aliases to it.
+        current_system_token = g.system_token
 
         config_data = {
             "project_name": project_path.name,
             "created_at": datetime.datetime.now().isoformat(),
-            "admin_token": current_admin_token,  # Use the admin token available at call time
+            "system_token": current_system_token,
             "mcp_version": MCP_VERSION,
         }
         try:
@@ -148,7 +147,7 @@ def init_agent_directory(project_dir_str: str) -> Optional[Path]:
 
 # Original location: main.py lines 1206-1239 (generate_system_prompt)
 def generate_system_prompt(
-    agent_id: str, agent_token_for_prompt: str, admin_token_runtime: Optional[str]
+    agent_id: str, agent_token_for_prompt: str
 ) -> str:
     """
     Generate a system prompt for an agent.
@@ -156,6 +155,11 @@ def generate_system_prompt(
     PR-W2c: routed through AgentRepository.get_working_directory() so
     a cache miss falls through to the DB row instead of dropping to
     CWD silently.
+
+    Wave 3 (prancy-napping-pie) dropped the ``admin_token_runtime``
+    parameter. The "Admin" / "Worker" label in the rendered prompt
+    now comes from the agent's ``agent_role`` column ('manager' or
+    'worker') rather than a token-equality comparison.
     """
     # Determine working directory for the prompt
     # Fallback to CWD if agent_id is unknown to the repo, though it
@@ -186,27 +190,15 @@ Your goal is to complete tasks efficiently and collaboratively using a shared, p
 Your working directory is: {working_dir}
 """
 
-    # Determine agent type for the prompt
-    # (Original main.py line 1227: agent_details, and line 1210 for admin_token check)
-    agent_type = "Worker"
-    # The original logic in create_agent_tool (main.py:1134) passed `token` (which was the calling admin_token)
-    # as the third argument to generate_system_prompt if the agent_id started with "admin".
-    # So, `admin_token_runtime` here corresponds to that third argument.
-    # An agent is "Admin" type in the prompt if its own token IS the admin token.
-    if (
-        agent_id.lower().startswith("admin")
-        and agent_token_for_prompt == admin_token_runtime
-    ):
-        agent_type = "Admin"
-    # A simpler check might be if the agent_token_for_prompt itself is the known g.admin_token
-    # However, the original call structure was a bit specific.
-    # Let's refine: the prompt should reflect if this *specific agent instance* is an admin.
-    # This happens if its `agent_token_for_prompt` is the same as the system's `admin_token_runtime`.
-    # The `agent_id.lower().startswith("admin")` is a secondary check.
-    if (
-        agent_token_for_prompt == admin_token_runtime
-    ):  # Primary check: is this agent's token THE admin token?
-        agent_type = "Admin"
+    # Determine agent type for the prompt.
+    # Wave 3 (prancy-napping-pie): label comes from the agent's
+    # ``agent_role`` column ('worker' or 'manager') instead of a
+    # token-equality comparison against the system bearer. Manager
+    # agents render as "Admin" in the prompt for back-compat with the
+    # pre-Wave-3 wording — Wave 4 may revisit this label vocabulary.
+    agent_row = agent_repo.get_agent_by_id(agent_id) or {}
+    agent_role = agent_row.get("agent_role", "worker")
+    agent_type = "Admin" if agent_role == "manager" else "Worker"
 
     agent_details_str = f"""Agent ID: {agent_id}
 Agent Type: {agent_type}

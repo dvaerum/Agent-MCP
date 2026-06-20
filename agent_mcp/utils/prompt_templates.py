@@ -33,7 +33,6 @@ Focus on component-based development with visual validation.
 
 AUTO --worker --playwright""",
     "admin_agent": """You are the admin agent.
-Admin Token: {admin_token}
 
 Your role is to:
 - Coordinate all development work
@@ -175,7 +174,6 @@ def validate_template_variables(template_name: str, variables: Dict[str, Any]) -
 def build_agent_prompt(
     agent_id: str,
     agent_token: str,
-    admin_token: str,
     template_name: str = "basic_worker",
     custom_prompt: str = None,
     **extra_vars,
@@ -186,19 +184,21 @@ def build_agent_prompt(
     Args:
         agent_id: The agent's ID
         agent_token: The agent's token
-        admin_token: The admin token
         template_name: Name of the template to use
         custom_prompt: Custom prompt text (for custom template)
         **extra_vars: Additional variables for template substitution
 
     Returns:
         Complete formatted prompt or None if error
+
+    Wave 3 (prancy-napping-pie) dropped the ``admin_token`` parameter
+    — the ``admin_agent`` template no longer substitutes it, and no
+    spawned agent needs the system bearer in its prompt body.
     """
     # Prepare base variables
     variables = {
         "agent_id": agent_id,
         "agent_token": agent_token,
-        "admin_token": admin_token,
         **extra_vars,
     }
 

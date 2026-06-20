@@ -44,13 +44,15 @@ async def test_tokens_endpoint_unauthenticated_returns_401(
         )
 
 
-async def test_tokens_endpoint_with_admin_bearer_returns_admin_token(
+async def test_tokens_endpoint_with_admin_bearer_returns_200(
     tmp_path,
 ) -> None:
-    """Admin Authorization header → admin_token returned.
+    """Admin Authorization header → 200 with ``agent_tokens`` body.
 
     The dep's legacy-bearer fallback admits admin scripts that still
-    authenticate by bearer header.
+    authenticate by bearer header. Wave 3 dropped the ``admin_token``
+    field from the response body — see
+    ``tests/test_wave3_admin_token_removal.py``.
     """
     async with mcp_session(tmp_path) as admin:
         r = admin.client.get(
@@ -58,7 +60,12 @@ async def test_tokens_endpoint_with_admin_bearer_returns_admin_token(
             headers={"Authorization": f"Bearer {admin.admin_token}"},
         )
         assert r.status_code == 200, r.text
-        assert r.json()["admin_token"] == admin.admin_token
+        body = r.json()
+        assert "agent_tokens" in body
+        # Wave 3: admin_token must not leak anywhere in the response.
+        assert admin.admin_token not in r.text, (
+            "admin token must not appear anywhere in /api/tokens response"
+        )
 
 
 async def test_tokens_endpoint_with_worker_bearer_returns_401(tmp_path) -> None:

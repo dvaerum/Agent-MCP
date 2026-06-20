@@ -307,11 +307,11 @@ async def _launch_testing_agent_for_completed_task(
             connection=cursor,
         )
 
-        # 6. Build enriched prompt for testing agent
+        # 6. Build enriched prompt for testing agent.
+        # Wave 3 (prancy-napping-pie): dropped ``admin_token`` arg.
         prompt = build_agent_prompt(
             agent_id=testing_agent_id,
             agent_token=testing_token,
-            admin_token=g.admin_token,
             template_name="testing_agent",
             completed_by_agent=completed_by_agent,
             completed_task_id=completed_task_id,
@@ -323,14 +323,18 @@ async def _launch_testing_agent_for_completed_task(
             logger.error(f"Failed to build prompt for testing agent {testing_agent_id}")
             return False
 
-        # 7. Create tmux session for testing agent
-        def get_admin_token_suffix(admin_token: str) -> str:
-            """Extract last 4 chars from admin token for session naming."""
-            if not admin_token or len(admin_token) < 4:
+        # 7. Create tmux session for testing agent.
+        # Wave 3 (prancy-napping-pie): suffix comes from the testing
+        # agent's own token, not the system bearer. Per-agent suffixes
+        # are also more useful in tmux ls output — different agents
+        # now visibly differ instead of all sharing a single suffix.
+        def get_token_suffix(token: str) -> str:
+            """Extract last 4 chars from a token for session naming."""
+            if not token or len(token) < 4:
                 return "0000"
-            return admin_token[-4:].lower()
+            return token[-4:].lower()
 
-        suffix = get_admin_token_suffix(g.admin_token)
+        suffix = get_token_suffix(testing_token)
         clean_agent_id = sanitize_session_name(testing_agent_id)
         session_name = f"{clean_agent_id}-{suffix}"
 

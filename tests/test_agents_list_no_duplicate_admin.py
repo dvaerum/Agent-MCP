@@ -1,12 +1,11 @@
-"""Regression: /api/all-data must not surface BOTH the hardcoded 'Admin'
-display row AND the synthetic 'admin' row from the agents table.
+"""Regression: /api/all-data must not surface duplicate admin entries.
 
 Background
 ----------
 Before PR #100 ("db-review PR-G1"), admin identity was enforced via
 `g.admin_token` alone — there was no row in the `agents` table for
-admin. The dashboard's `/api/all-data` endpoint inserts a hardcoded
-``{'agent_id': 'Admin', ...}`` entry at index 0 so the Agents view has
+admin. The dashboard's `/api/all-data` endpoint inserted a hardcoded
+``{'agent_id': 'Admin', ...}`` entry at index 0 so the Agents view had
 something to render for the admin user.
 
 PR #100 added the synthetic ``agent_id='admin'`` row to the `agents`
@@ -16,21 +15,26 @@ agents.agent_id) had a target. After #100, /api/all-data started
 returning BOTH:
 
     [
-        {'agent_id': 'Admin', ...},   # hardcoded UI entry
+        {'agent_id': 'Admin', ...},   # hardcoded UI entry (synthesised)
         {'agent_id': 'admin', ...},   # PR #100 synthetic row
         ...real workers...
     ]
 
-The dashboard shows two Admin entries side-by-side.
+The dashboard then showed two Admin entries side-by-side.
 
-Fix: skip the synthetic 'admin' row when building the agents_data
-list in `/api/all-data` (and at startup load — see
-`test_state_load_skips_admin_pseudo_agent`). The hardcoded 'Admin'
-entry stays because the entire frontend keys off
-``agent_id === 'Admin'`` for special-case handling (no terminate
-button, no edit, special token mapping). The synthetic row remains in
-the database — it's still needed for the FKs — it just isn't
-surfaced to the UI.
+Wave 3 (prancy-napping-pie) closed the loop differently: the
+hardcoded ``Admin`` synthesis was the surface that leaked
+``g.admin_token`` via ``auth_token``. Removing it (and keeping the
+lowercase-``admin`` filter) means /api/all-data surfaces ZERO admin
+entries — the underlying pseudo-agent row stays in the DB for the
+FKs, but neither it nor a synthesised stand-in reaches the
+dashboard. Wave 4 will delete the pseudo-agent entirely.
+
+So the regression contract that survives this file is the
+zero/one-but-never-two rule: /api/all-data must not surface multiple
+agent entries whose ``agent_id`` matches ``admin`` case-insensitively.
+The post-Wave-3 count is zero; the original "must be exactly one"
+assertion no longer holds.
 """
 
 from __future__ import annotations
@@ -43,10 +47,14 @@ from tests.harness import mcp_session
 pytestmark = pytest.mark.asyncio
 
 
-async def test_all_data_returns_one_admin_entry(tmp_path) -> None:
-    """GET /api/all-data must return exactly one agent entry whose
-    agent_id is admin (case-insensitive). Before the fix, both 'Admin'
-    (hardcoded UI entry) and 'admin' (PR #100 synthetic row) appear."""
+async def test_all_data_returns_at_most_one_admin_entry(tmp_path) -> None:
+    """GET /api/all-data must return AT MOST one agent entry whose
+    agent_id is admin (case-insensitive). Pre-Wave-3 the count was
+    exactly one (the synthesised ``Admin`` row); Wave 3 dropped the
+    synthesis as part of admin_token retirement, so the count is now
+    zero. The invariant that this test pins is the "never two" rule —
+    the pre-PR-100 bug was a duplicate, and that must never come back
+    regardless of whether the synthesis exists or not."""
     async with mcp_session(tmp_path) as admin:
         resp = admin.get("/api/all-data")
         assert resp.status_code == 200, resp.text
@@ -56,35 +64,16 @@ async def test_all_data_returns_one_admin_entry(tmp_path) -> None:
             a for a in agents
             if str(a.get("agent_id", "")).lower() == "admin"
         ]
-        assert len(admin_like) == 1, (
-            f"Expected exactly one admin entry in /api/all-data, got "
+        assert len(admin_like) <= 1, (
+            f"Expected at most one admin entry in /api/all-data, got "
             f"{len(admin_like)}: {[a.get('agent_id') for a in admin_like]}"
         )
 
 
-async def test_all_data_admin_entry_uses_capital_A_label(tmp_path) -> None:
-    """The single admin entry must keep agent_id='Admin' (capital A)
-    so the frontend's many `agent_id === 'Admin'` special-case
-    branches continue to work."""
-    async with mcp_session(tmp_path) as admin:
-        resp = admin.get("/api/all-data")
-        assert resp.status_code == 200, resp.text
-        body = resp.json()
-        agents = body.get("agents", [])
-        admin_like = [
-            a for a in agents
-            if str(a.get("agent_id", "")).lower() == "admin"
-        ]
-        assert len(admin_like) == 1
-        assert admin_like[0]["agent_id"] == "Admin", (
-            f"Admin entry must use the 'Admin' (capital A) label; got "
-            f"{admin_like[0]['agent_id']!r}"
-        )
-
-
-async def test_all_data_with_workers_still_returns_one_admin(tmp_path) -> None:
-    """Adding real workers must not regress the de-dup — exactly one
-    admin entry regardless of how many workers exist."""
+async def test_all_data_with_workers_still_at_most_one_admin(tmp_path) -> None:
+    """Adding real workers must not regress the de-dup — at most one
+    admin entry regardless of how many workers exist (and zero
+    post-Wave-3, since the synthesis is gone)."""
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
         await admin.create_worker("bob")
@@ -97,9 +86,9 @@ async def test_all_data_with_workers_still_returns_one_admin(tmp_path) -> None:
             a for a in agents
             if str(a.get("agent_id", "")).lower() == "admin"
         ]
-        assert len(admin_like) == 1, (
-            f"With real workers present, still expected one admin entry; "
-            f"got {[a.get('agent_id') for a in admin_like]}"
+        assert len(admin_like) <= 1, (
+            f"With real workers present, must still have at most one "
+            f"admin entry; got {[a.get('agent_id') for a in admin_like]}"
         )
         # Workers themselves should still be present.
         worker_ids = {a.get("agent_id") for a in agents}
