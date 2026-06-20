@@ -212,7 +212,14 @@ async def live_server(tmp_path: Path) -> AsyncIterator[tuple[str, str]]:
         # uvicorn worker thread can serve socket connections before
         # `lifespan.startup` finishes; routes installed inside
         # `application_startup` (admin token, schema migration) need that
-        # to complete before /api/tokens returns 200.
+        # to complete before any /api/* route works.
+        #
+        # Wave 1 of prancy-napping-pie put `/api/tokens` behind
+        # `require_operator_session`. We poll without auth and treat 401
+        # as the "ready, but you need a bearer" signal (handler reached →
+        # lifespan finished). The admin_token then comes from
+        # `g.admin_token`, which the lifespan populates before the dep
+        # gate is reachable.
         async with httpx.AsyncClient(base_url=base_url, timeout=10.0) as bootstrap:
             deadline = time.monotonic() + 20
             admin_token = None
@@ -221,8 +228,11 @@ async def live_server(tmp_path: Path) -> AsyncIterator[tuple[str, str]]:
                 try:
                     r = await bootstrap.get("/api/tokens")
                     last_status = r.status_code
-                    if r.status_code == 200:
-                        admin_token = r.json().get("admin_token")
+                    # 200 = legacy (unauthenticated allowed) — still
+                    # accept; 401 = post-Wave-1 (dep reached, lifespan
+                    # done) — accept and read from g.
+                    if r.status_code in (200, 401):
+                        admin_token = g.admin_token
                         if admin_token:
                             break
                 except httpx.HTTPError:  # pragma: no cover - boot races
@@ -230,8 +240,7 @@ async def live_server(tmp_path: Path) -> AsyncIterator[tuple[str, str]]:
                 await asyncio.sleep(0.1)
             if not admin_token:
                 raise RuntimeError(
-                    f"/api/tokens never returned an admin_token "
-                    f"(last status: {last_status})"
+                    f"/api/tokens never reachable (last status: {last_status})"
                 )
 
         yield base_url, admin_token

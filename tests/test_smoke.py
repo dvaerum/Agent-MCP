@@ -19,9 +19,19 @@ pytestmark = pytest.mark.asyncio
 
 
 async def test_app_starts(tmp_path) -> None:
-    """create_app() + lifespan startup + a basic GET to /api/tokens."""
+    """create_app() + lifespan startup + a basic GET to /api/tokens.
+
+    Wave 1 of prancy-napping-pie put ``/api/tokens`` behind
+    ``require_operator_session``. We exercise the legacy admin-bearer
+    fallback path (the dep accepts it for backwards-compat with admin
+    scripts + tests like this one) so the smoke test still verifies
+    end-to-end app boot + a real handler returning a real payload.
+    """
     async with mcp_session(tmp_path) as admin:
-        response = admin.client.get("/api/tokens")
+        response = admin.client.get(
+            "/api/tokens",
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
 
         assert response.status_code == 200, response.text
 

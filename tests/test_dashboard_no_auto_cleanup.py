@@ -175,7 +175,7 @@ async def test_all_data_returns_old_idle_agent(tmp_path) -> None:
         finally:
             conn.close()
 
-        resp = admin.client.get("/api/all-data")
+        resp = admin.get("/api/all-data")
         assert resp.status_code == 200, resp.text
         body = resp.json()
         agents = body.get("agents", [])
@@ -251,7 +251,7 @@ async def test_no_server_side_idle_cleanup_endpoint(tmp_path) -> None:
 
         # And after a /api/all-data round trip the row's status is
         # unchanged — no implicit side-effect cleanup.
-        admin.client.get("/api/all-data")
+        admin.get("/api/all-data")
         conn = get_db_connection()
         try:
             cur = conn.cursor()

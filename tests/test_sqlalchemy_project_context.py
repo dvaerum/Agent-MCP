@@ -211,7 +211,7 @@ async def test_all_data_endpoint_returns_project_context(tmp_path) -> None:
             },
         )
 
-        all_data = admin.client.get("/api/all-data")
+        all_data = admin.get("/api/all-data")
         assert all_data.status_code == 200
         body = all_data.json()
         assert "context" in body

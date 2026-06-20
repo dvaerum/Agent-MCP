@@ -130,7 +130,12 @@ def test_token_still_present_as_optional_property() -> None:
 
 
 def _admin_token(client) -> str:
-    return client.get("/api/tokens").json()["admin_token"]
+    # Wave 1 of prancy-napping-pie put `/api/tokens` behind
+    # `require_operator_session`. The lifespan-populated value lives on
+    # `agent_mcp.core.globals.admin_token`; read it directly to keep the
+    # test independent of the dep's auth fallback chain.
+    from agent_mcp.core import globals as g
+    return g.admin_token
 
 
 async def _call_tool_via_framework(tool_name: str, arguments: dict):

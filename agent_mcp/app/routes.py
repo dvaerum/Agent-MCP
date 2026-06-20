@@ -23,7 +23,7 @@ from starlette.staticfiles import StaticFiles
 # Project-specific imports
 from ..core.config import logger
 from ..core import globals as g
-from ..core.auth import verify_token, get_agent_id as auth_get_agent_id
+from ..core.auth import get_agent_id as auth_get_agent_id
 from .deps import caller_identity, require_operator_session
 from ..utils.json_utils import get_sanitized_json_body
 from ..db.connection import get_db_connection
@@ -348,27 +348,31 @@ async def agents_list_api_route(request: Request) -> JSONResponse:
         if conn: conn.close()
     return JSONResponse(agents_list_data)
 
-async def tokens_api_route(request: Request) -> JSONResponse:
+async def tokens_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    """GET /api/tokens — dashboard's source of admin + agent bearer tokens.
+
+    Wave 1 (prancy-napping-pie): cookie-migrated. The dep accepts:
+
+      * an ``agent_mcp_session`` cookie pointing at a live operator
+        session (the new dashboard path), OR
+      * an ``Authorization: Bearer <admin_token>`` header (legacy admin
+        scripts / agent CLI), OR
+      * the same token in a body / query-string field (oldest
+        backwards-compat path; nothing in the dashboard sends this).
+
+    The manual ``Authorization: Bearer`` worker-rejection ladder that
+    used to live here is now superseded by the dep — any non-admin
+    bearer fails the dep's ``verify_token(..., "admin")`` and the
+    request 401s before reaching this handler.
+
+    The ``admin_token`` field STAYS in the response for Wave 1: Wave 2
+    strips the frontend reads, Wave 3 then strips the field itself.
+    """
     # // ... (implementation from previous response)
     try:
-        # Guard: if the caller presents an Authorization: Bearer header
-        # that resolves to a non-admin agent, refuse. This blocks the
-        # worker→admin HTTP-side escalation path (issue O — sibling
-        # of issue I via the REST surface).
-        #
-        # Unauthenticated callers still get the full response — that's
-        # consistent with the dashboard-as-admin design (anyone reaching
-        # the URL is implicitly admin; securing the URL is the
-        # deployer's job).
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.lower().startswith("bearer "):
-            bearer = auth_header[7:].strip()
-            if bearer and not verify_token(bearer, "admin"):
-                return JSONResponse(
-                    {"error": "Unauthorized: admin token required"},
-                    status_code=403,
-                )
-
         agent_tokens_list = []
         for token, data in g.active_agents.items():
             if data.get("status") != "terminated":
@@ -1285,8 +1289,22 @@ _ALL_DATA_DEFAULT_LIMIT = 500
 _ALL_DATA_MAX_LIMIT = 5000
 
 
-async def all_data_api_route(request: Request) -> JSONResponse:
-    """Get all data in one call for caching on frontend"""
+async def all_data_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    """Get all data in one call for caching on frontend.
+
+    Wave 1 (prancy-napping-pie): cookie-migrated. Before this PR the
+    endpoint had NO auth gate — anyone with network reach got the full
+    dashboard hydration blob (agents, tasks, context, admin_token) for
+    free. The dep accepts cookie / bearer / body-token / query-token
+    just like every other migrated route in this file; see
+    ``app/deps.py`` for the legacy fallback rationale.
+
+    The ``admin_token`` field STAYS in the response for Wave 1; Wave 2
+    strips the frontend reads, Wave 3 then strips the field itself.
+    """
     if request.method == 'OPTIONS':
         return await handle_options(request)
     

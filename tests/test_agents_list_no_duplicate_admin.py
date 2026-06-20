@@ -48,7 +48,7 @@ async def test_all_data_returns_one_admin_entry(tmp_path) -> None:
     agent_id is admin (case-insensitive). Before the fix, both 'Admin'
     (hardcoded UI entry) and 'admin' (PR #100 synthetic row) appear."""
     async with mcp_session(tmp_path) as admin:
-        resp = admin.client.get("/api/all-data")
+        resp = admin.get("/api/all-data")
         assert resp.status_code == 200, resp.text
         body = resp.json()
         agents = body.get("agents", [])
@@ -67,7 +67,7 @@ async def test_all_data_admin_entry_uses_capital_A_label(tmp_path) -> None:
     so the frontend's many `agent_id === 'Admin'` special-case
     branches continue to work."""
     async with mcp_session(tmp_path) as admin:
-        resp = admin.client.get("/api/all-data")
+        resp = admin.get("/api/all-data")
         assert resp.status_code == 200, resp.text
         body = resp.json()
         agents = body.get("agents", [])
@@ -89,7 +89,7 @@ async def test_all_data_with_workers_still_returns_one_admin(tmp_path) -> None:
         await admin.create_worker("alice")
         await admin.create_worker("bob")
 
-        resp = admin.client.get("/api/all-data")
+        resp = admin.get("/api/all-data")
         assert resp.status_code == 200, resp.text
         body = resp.json()
         agents = body.get("agents", [])
