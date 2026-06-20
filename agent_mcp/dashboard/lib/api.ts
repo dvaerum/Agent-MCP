@@ -477,9 +477,13 @@ class ApiClient {
     const agent = await this.getAgent(agentId)
     
     // Get tokens
+    // Wave 2 (cleanup-wave-2): the Admin pseudo-agent's auth_token used
+    // to fall back to ``tokens.admin_token``; Wave 3 will drop that
+    // field from the /api/tokens response entirely and Wave 4 deletes
+    // the Admin pseudo-agent. The dashboard runs as admin via cookie
+    // auth now (ADR-0003), so no admin-side bearer is needed in the UI.
     const tokens = await this.getTokens()
-    const agentToken = tokens.agent_tokens.find(t => t.agent_id === agentId)?.token || 
-                       (agentId === 'Admin' ? tokens.admin_token : undefined)
+    const agentToken = tokens.agent_tokens.find(t => t.agent_id === agentId)?.token
     
     // Get node details which includes actions and related tasks
     const nodeDetails = await this.getNodeDetails(`agent_${agentId}`)
@@ -709,8 +713,13 @@ class ApiClient {
   }
 
   // Token endpoints
+  //
+  // Wave 2 (cleanup-wave-2): ``admin_token`` is intentionally NOT
+  // declared on the return type even though the backend still ships
+  // it in the JSON payload. Wave 3 will drop it from the response
+  // entirely; until then, the type guarantees that no frontend
+  // consumer can read it (TypeScript will reject every access).
   async getTokens(): Promise<{
-    admin_token: string
     agent_tokens: Array<{ agent_id: string; token: string }>
   }> {
     return this.request('/tokens')
@@ -744,6 +753,12 @@ class ApiClient {
   }
 
   // All data endpoint for caching
+  //
+  // Wave 2 (cleanup-wave-2): ``admin_token`` is intentionally NOT
+  // declared on the return type even though the backend still ships
+  // it in the JSON payload. Wave 3 will drop it from the response
+  // entirely; until then, the type guarantees that no frontend
+  // consumer can read it (TypeScript will reject every access).
   async getAllData(): Promise<{
     agents: Agent[]
     tasks: Task[]
@@ -751,7 +766,6 @@ class ApiClient {
     actions: any[]
     file_metadata: any[]
     file_map: Record<string, any>
-    admin_token: string
     timestamp: string
   }> {
     return this.request('/all-data')
@@ -799,13 +813,18 @@ class ApiClient {
     }))
   }
 
+  // Memory endpoints. Wave 2 (cleanup-wave-2): the dashboard no
+  // longer threads an admin bearer into the request body — auth is
+  // carried by the operator session cookie that ``request()`` sends
+  // with ``credentials: 'include'``. The backend's
+  // ``require_operator_session`` dep admits cookie / bearer / body-
+  // token interchangeably, so omitting the body token is a no-op
+  // for non-cookie callers (legacy admin scripts).
   async createMemory(data: {
     context_key: string
     context_value: any
     description?: string
-    token: string
   }): Promise<{ success: boolean; message: string }> {
-    // This would need to be implemented as an MCP tool call
     return this.request('/memories', {
       method: 'POST',
       body: JSON.stringify(data)
@@ -815,28 +834,24 @@ class ApiClient {
   async updateMemory(context_key: string, data: {
     context_value: any
     description?: string
-    token: string
   }): Promise<{ success: boolean; message: string }> {
-    // This would need to be implemented as an MCP tool call
     return this.request(`/memories/${encodeURIComponent(context_key)}`, {
       method: 'PUT',
       body: JSON.stringify(data)
     })
   }
 
-  async deleteMemory(context_key: string, token: string): Promise<{ success: boolean; message: string }> {
-    // This would need to be implemented as an MCP tool call
+  async deleteMemory(context_key: string): Promise<{ success: boolean; message: string }> {
     return this.request(`/memories/${encodeURIComponent(context_key)}`, {
       method: 'DELETE',
-      body: JSON.stringify({ token })
+      body: JSON.stringify({})
     })
   }
 
-  async getMemoryHealth(token: string): Promise<MemoryHealthAnalysis> {
-    // This would need to be implemented as an MCP tool call
+  async getMemoryHealth(): Promise<MemoryHealthAnalysis> {
     return this.request('/memories/health', {
       method: 'POST',
-      body: JSON.stringify({ token, show_health_analysis: true })
+      body: JSON.stringify({ show_health_analysis: true })
     })
   }
 

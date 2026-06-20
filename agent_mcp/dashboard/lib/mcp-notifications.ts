@@ -32,18 +32,19 @@
  *
  * Auth
  * ----
- * `EventSource` cannot send custom headers, so it can't authenticate
- * with `Authorization: Bearer <token>` (the only auth scheme /mcp's
- * middleware accepts). We use `fetch()` + a ReadableStream reader
- * instead and parse SSE framing manually.
+ * `EventSource` cannot send custom headers and cannot carry cookies
+ * on cross-origin requests reliably; we use `fetch()` + a
+ * ReadableStream reader instead and parse SSE framing manually.
  *
- * Bearer token
- * ------------
- * The dashboard operates as admin (ADR-0003). The admin token is
- * exposed on `useDataStore.getState().data.admin_token` after the
- * first `fetchAllData()` completes. The subscription waits for that
- * via `useDataStore.subscribe(...)` and starts when the token first
- * appears.
+ * Wave 2 (cleanup-wave-2) migrated this client off bearer auth and
+ * onto cookie auth. The fetch opts into `credentials: "include"` so
+ * the `agent_mcp_session` cookie (set by /agent-mcp/login) is sent
+ * with the request. The router's `backend_mcp_handler` then validates
+ * the cookie + project membership and injects the project's admin
+ * token upstream so the backend `AuthHeaderMiddleware` (still
+ * bearer-only) sees a valid bearer. The dashboard never holds an
+ * admin token in JS memory anymore — the cookie is HttpOnly and
+ * never reaches the React tree.
  *
  * Resilience
  * ----------
@@ -217,9 +218,10 @@ const RECONNECT_BASE_DELAY_MS = 1000
 const RECONNECT_MAX_DELAY_MS = 30000
 
 /**
- * Start an MCP notification subscription against `/agent-mcp/<name>/mcp`
- * using the supplied bearer. Returns a handle whose `stop()` aborts
- * the in-flight stream and prevents further reconnects.
+ * Start an MCP notification subscription against `/agent-mcp/mcp/<name>`
+ * using the operator session cookie (Wave 2, cleanup-wave-2). Returns
+ * a handle whose `stop()` aborts the in-flight stream and prevents
+ * further reconnects.
  *
  * The loop schedules reconnects on disconnect (transport error or
  * stream end) with exponential backoff: `min(30000, 1000 * 2 **
@@ -227,7 +229,6 @@ const RECONNECT_MAX_DELAY_MS = 30000
  * transitions — see `subscribeMcpNotifications` for that wiring.
  */
 export function openMcpNotificationStream(
-  bearer: string,
   options: { url?: string } = {}
 ): SubscriptionHandle {
   const url = options.url ?? mcpUrlForProject()
@@ -256,15 +257,17 @@ export function openMcpNotificationStream(
       const res = await fetch(url, {
         method: "GET",
         headers: {
-          Authorization: `Bearer ${bearer}`,
           Accept: "text/event-stream",
         },
         signal: abortCtrl.signal,
         cache: "no-store",
-        // The MCP endpoint lives on the same origin; default cors mode
-        // is fine. Don't include cookies — bearer auth is the only
-        // accepted scheme.
-        credentials: "omit",
+        // Wave 2 (cleanup-wave-2): cookie auth. The
+        // ``agent_mcp_session`` cookie set by /agent-mcp/login is
+        // sent automatically; the router's backend_mcp_handler
+        // resolves it to the project's admin token and injects the
+        // bearer upstream so the backend's AuthHeaderMiddleware
+        // (still bearer-only) accepts the request.
+        credentials: "include",
       })
       if (!res.ok) {
         console.debug(
@@ -343,18 +346,19 @@ export function openMcpNotificationStream(
 }
 
 /**
- * Higher-level wiring: opens a subscription when `bearer` is non-empty,
- * closes it on document.hidden, reopens on document.visible, and tears
- * down on the returned `unsubscribe()`.
+ * Higher-level wiring: opens a subscription, closes it on
+ * document.hidden, reopens on document.visible, and tears down on the
+ * returned `unsubscribe()`.
+ *
+ * Wave 2 (cleanup-wave-2): no bearer argument — the MCP notifications
+ * fetch sends the operator session cookie via `credentials: "include"`.
  *
  * Returns a function that fully unsubscribes (stops the stream + drops
  * the visibility listener). Intended to be called from a React effect's
  * cleanup.
  */
-export function subscribeMcpNotifications(bearer: string): () => void {
-  if (!bearer) return () => {}
-
-  let handle: SubscriptionHandle | null = openMcpNotificationStream(bearer)
+export function subscribeMcpNotifications(): () => void {
+  let handle: SubscriptionHandle | null = openMcpNotificationStream()
 
   const onVisibility = (): void => {
     if (typeof document === "undefined") return
@@ -365,7 +369,7 @@ export function subscribeMcpNotifications(bearer: string): () => void {
       }
     } else {
       if (!handle) {
-        handle = openMcpNotificationStream(bearer)
+        handle = openMcpNotificationStream()
       }
     }
   }

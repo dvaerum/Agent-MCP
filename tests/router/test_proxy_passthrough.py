@@ -233,12 +233,22 @@ async def test_query_string_passes_through(
     assert fake_backend.records[-1]["query"] == {"stream": "1", "trace": "on"}
 
 
+@pytest.mark.no_auth_seed_session
 async def test_missing_bearer_returns_401(
     aiohttp_client, router_app, fake_backend,
 ) -> None:
-    """No Authorization header → 401 at the router edge, backend
-    never sees the request (auth pre-check shifts the failure one
-    hop closer to the client)."""
+    """No Authorization header AND no operator session cookie → 401
+    at the router edge, backend never sees the request (auth pre-check
+    shifts the failure one hop closer to the client).
+
+    Wave 2 (cleanup-wave-2, 2026-06-20): ``backend_mcp_handler`` also
+    admits a valid operator-session cookie now, so we have to opt out
+    of the auto-attached sentinel cookie via ``no_auth_seed_session``
+    to actually observe the no-auth code path. The cookie + bearer
+    paths are exercised by ``test_dashboard_session_auth.py``
+    (``test_mcp_route_with_operator_cookie_reaches_handler`` and
+    ``test_mcp_route_with_admin_bearer_still_works``).
+    """
     client = await aiohttp_client(router_app)
 
     resp = await client.post("/agent-mcp/mcp/proj", data=b"{}")

@@ -21,9 +21,9 @@ const MESSAGE_RETENTION_KEY = "config_message_retention_days"
 
 // Per-project worker-permission policies. Each lives in the
 // project_context store under a `config_*` key. The dashboard runs as
-// admin per ADR-0003 — we fetch the admin token via apiClient and
-// reuse it for the PUT /memories/<key> and POST /memories calls
-// (see lib/api.ts: createMemory / updateMemory).
+// admin per ADR-0003 — the PUT /memories/<key> and POST /memories
+// calls authenticate via the operator session cookie set on
+// /agent-mcp/login (see lib/api.ts: createMemory / updateMemory).
 interface PolicySpec {
   key: string
   title: string
@@ -93,12 +93,10 @@ interface PolicyState {
   pending: boolean  // true while a PUT/POST is in flight
 }
 
-// The admin token is fetched once and reused; same pattern as
-// messages-dashboard.tsx.
-async function adminToken(): Promise<string> {
-  const tokens = await apiClient.getTokens()
-  return tokens.admin_token
-}
+// Wave 2 (cleanup-wave-2): the ``adminToken()`` helper is gone.
+// Dashboard mutations authenticate via the operator session cookie
+// set on /agent-mcp/login — the browser attaches it to every
+// ``apiClient`` call automatically.
 
 // project_context stores values as JSON-serialised strings. Booleans
 // arrive as either the bare boolean `true` / `false`, the string
@@ -226,11 +224,9 @@ export function SettingsDashboard() {
     setRetention((s) => ({ ...s, pending: true }))
     setError(null)
     try {
-      const token = await adminToken()
       if (retention.exists) {
         await apiClient.updateMemory(MESSAGE_RETENTION_KEY, {
           context_value: next,
-          token,
         })
       } else {
         await apiClient.createMemory({
@@ -238,7 +234,6 @@ export function SettingsDashboard() {
           context_value: next,
           description:
             "Days of read agent_messages to keep before background pruner deletes them. 0 = disabled.",
-          token,
         })
       }
       setRetention({ saved: next, draft: String(next), exists: true, pending: false })
@@ -263,18 +258,15 @@ export function SettingsDashboard() {
     }))
     setError(null)
     try {
-      const token = await adminToken()
       if (prevState.exists) {
         await apiClient.updateMemory(policy.key, {
           context_value: nextValue,
-          token,
         })
       } else {
         await apiClient.createMemory({
           context_key: policy.key,
           context_value: nextValue,
           description: policy.title,
-          token,
         })
       }
       setState((s) => ({

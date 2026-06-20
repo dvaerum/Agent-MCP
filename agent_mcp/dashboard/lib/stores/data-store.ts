@@ -39,7 +39,10 @@ interface AllData {
   actions: any[]
   file_metadata: any[]
   file_map: Record<string, any>
-  admin_token: string
+  // Wave 2 (cleanup-wave-2): ``admin_token`` is no longer surfaced
+  // on this slice. Dashboard mutations authenticate via the operator
+  // session cookie (handled inside apiClient.request); the admin
+  // bearer fallback is dead for browser callers.
   timestamp: string
 }
 
@@ -71,7 +74,9 @@ interface DataStore {
   getAgentActions: (agentId: string) => any[]
   getTask: (taskId: string) => Task | undefined
   getContext: (contextKey: string) => any | undefined
-  getAdminToken: () => string | undefined
+  // Wave 2 (cleanup-wave-2): ``getAdminToken`` removed. The dashboard
+  // authenticates via the operator session cookie now (ADR-0003);
+  // no UI surface needs the bare admin token.
   getAgentToken: (agentId: string) => string | undefined
   getAgentTaskAnalysis: (agentId: string) => {
     assignedTasks: Task[]
@@ -200,13 +205,15 @@ export const useDataStore = create<DataStore>((set, get) => ({
           apiClient.getContextData()
         ])
         
-        // Merge tokens into agents
+        // Merge tokens into agents. Wave 2 (cleanup-wave-2): the
+        // Admin pseudo-agent no longer falls back to ``admin_token``
+        // (Wave 4 deletes that pseudo-agent entirely; in the
+        // meantime the dashboard authenticates via the cookie session).
         const agentsWithTokens = agents.map(agent => {
-          const token = tokens.agent_tokens.find(t => t.agent_id === agent.agent_id)?.token ||
-                        (agent.agent_id === 'Admin' ? tokens.admin_token : undefined)
+          const token = tokens.agent_tokens.find(t => t.agent_id === agent.agent_id)?.token
           return { ...agent, auth_token: token }
         })
-        
+
         data = {
           agents: agentsWithTokens,
           tasks,
@@ -214,7 +221,6 @@ export const useDataStore = create<DataStore>((set, get) => ({
           actions: [],
           file_metadata: [],
           file_map: {},
-          admin_token: tokens.admin_token,
           timestamp: new Date().toISOString()
         }
       }
@@ -337,10 +343,8 @@ export const useDataStore = create<DataStore>((set, get) => ({
     return state.data.context.find(c => c.context_key === cleanKey)
   },
 
-  getAdminToken: () => {
-    const state = get()
-    return state.data?.admin_token
-  },
+  // Wave 2 (cleanup-wave-2): ``getAdminToken`` removed. Dashboard
+  // mutations rely on the operator session cookie set by /agent-mcp/login.
 
   getAgentToken: (agentId: string) => {
     const agent = get().getAgent(agentId)

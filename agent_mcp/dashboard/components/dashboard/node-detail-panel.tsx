@@ -75,7 +75,7 @@ export function NodeDetailPanel({ nodeId, nodeType, isOpen, onClose, nodeData }:
   const [loading, setLoading] = useState(false)
   const [details, setDetails] = useState<NodeData | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const { data, fetchAllData, getAgent, getTask, getContext, getAdminToken } = useDataStore()
+  const { data, fetchAllData, getAgent, getTask, getContext } = useDataStore()
 
   useEffect(() => {
     if (!nodeId || !nodeType || !isOpen) return
@@ -99,12 +99,14 @@ export function NodeDetailPanel({ nodeId, nodeType, isOpen, onClose, nodeData }:
         } else if (nodeType === 'context') {
           detailData = getContext(nodeId)
         } else if (nodeType === 'admin') {
-          // Special handling for admin
+          // Special handling for admin. Wave 2 (cleanup-wave-2): no
+          // ``auth_token`` field — the dashboard authenticates via the
+          // operator session cookie, and Wave 4 will retire the Admin
+          // pseudo-agent entirely.
           detailData = {
             agent_id: 'Admin',
             name: 'System Administrator',
             status: 'active',
-            auth_token: getAdminToken(),
             capabilities: ['All permissions'],
             created_at: 'System'
           }
@@ -136,7 +138,7 @@ export function NodeDetailPanel({ nodeId, nodeType, isOpen, onClose, nodeData }:
     }
 
     loadDetails()
-  }, [nodeId, nodeType, isOpen, data, fetchAllData, getAgent, getTask, getContext, getAdminToken])
+  }, [nodeId, nodeType, isOpen, data, fetchAllData, getAgent, getTask, getContext])
 
   if (!isOpen) return null
 

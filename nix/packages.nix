@@ -119,7 +119,7 @@ let
     # Re-set whenever the dashboard's package-lock.json changes
     # upstream (rare). On hash mismatch, nix prints the correct
     # value; paste it here.
-    npmDepsHash = "sha256-VDyDHd90VNMIKLqSy/goQ7uj7d+2LkyS7cmYHGy8ojU=";
+    npmDepsHash = "sha256-ilzjM1HnVUuWV3m6pbAjZYyMcV7x7mLdRJvHG/k0D8Y=";
     NEXT_PUBLIC_AUTO_CONNECT = "false";
     NEXT_PUBLIC_DEFAULT_SERVER_HOST = "";
     NEXT_PUBLIC_DEFAULT_SERVER_PORT = "";
