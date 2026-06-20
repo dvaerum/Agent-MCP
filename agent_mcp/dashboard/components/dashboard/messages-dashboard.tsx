@@ -116,18 +116,23 @@ const BROADCAST = "__broadcast"
 // no URL state, matches the existing filter behavior.
 const PAGE_SIZE = 100
 
-// The admin token is fetched once and reused; the dashboard runs as
-// admin per ADR-0003. We don't display it.
-async function adminToken(): Promise<string> {
-  const tokens = await apiClient.getTokens()
-  return tokens.admin_token
-}
+// Wave 2 (cleanup-wave-2): the ``adminToken()`` helper is gone.
+// Dashboard mutations authenticate via the operator session cookie
+// set on /agent-mcp/login — the browser attaches it to every fetch
+// automatically (the apiClient helper and the local ``callMessages``
+// helper both opt into ``credentials: 'include'``).
 
-// Helper to call /api/messages* with the JSON-body token convention.
+// Helper to call /api/messages* under cookie auth.
 // Listing uses POST /api/messages/query because browsers strip bodies
 // from GET requests per the Fetch spec (this was the original bug).
 // Compose stays POST /api/messages; mark-read stays PATCH
 // /api/messages/<id>; delete is DELETE /api/messages/<id>.
+//
+// Wave 2 (cleanup-wave-2): ``credentials: "include"`` ensures the
+// ``agent_mcp_session`` cookie travels with the request even on the
+// dashboard's cross-origin-but-same-site dev URLs; the request body
+// no longer carries a bearer token, so missing the cookie would
+// surface as the backend's 401 login_required envelope.
 async function callMessages(
   method: "POST" | "PATCH" | "DELETE",
   pathSuffix: string,
@@ -142,6 +147,7 @@ async function callMessages(
       "Accept": "application/vnd.agent-mcp.v1+json",
     },
     body: JSON.stringify(body),
+    credentials: "include",
   })
   if (!res.ok) {
     const txt = await res.text().catch(() => "")
@@ -243,8 +249,7 @@ export function MessagesDashboard() {
 
   const loadParticipants = async () => {
     try {
-      const t = await adminToken()
-      const data = await callMessages("POST", "/participants", { token: t })
+      const data = await callMessages("POST", "/participants", {})
       const live = Array.isArray(data?.live) ? data.live : []
       setLiveParticipants(live)
     } catch {
@@ -284,12 +289,14 @@ export function MessagesDashboard() {
   // ``callMessages POST query`` flow with its own
   // useState/loading/error plumbing; now owned by ``usePagedQuery<T>``
   // (PR 5 of the 2026-06-09 architecture review). The hook handles
-  // POST body construction (``{token, limit, offset, ...filters}``),
+  // POST body construction (``{limit, offset, ...filters}``),
   // AbortController cancellation on filter/cursor change, and
   // surfaces ``data`` / ``total`` / ``loading`` / ``error`` /
-  // ``refresh`` directly. ``adminToken`` is an async producer so the
-  // tokens-fetch is deferred until the first request and re-runs on
-  // reload.
+  // ``refresh`` directly.
+  //
+  // Wave 2 (cleanup-wave-2): no ``token`` field threaded through —
+  // the operator session cookie carries auth via the hook's
+  // ``credentials: "include"`` opt-in.
   const {
     data: messages,
     total,
@@ -301,7 +308,6 @@ export function MessagesDashboard() {
     filters: queryFilters,
     limit: PAGE_SIZE,
     offset: currentOffset,
-    token: adminToken,
   })
 
   // Surface either an action error (compose / mark / delete) OR the
@@ -376,7 +382,6 @@ export function MessagesDashboard() {
     setComposing(true)
     setActionError(null)
     try {
-      const t = await adminToken()
       // BROADCAST sentinel maps to recipient_id="*" on the backend.
       const recipient =
         composeRecipient === BROADCAST ? "*" : composeRecipient
@@ -386,7 +391,6 @@ export function MessagesDashboard() {
       // the key entirely so the backend can pick suggest_subject /
       // truncated body.
       const body: Record<string, unknown> = {
-        token: t,
         recipient_id: recipient,
         message_content: composeContent,
         message_type: composeType,
@@ -425,9 +429,7 @@ export function MessagesDashboard() {
     setActionError(null)
     setSuggestHint(null)
     try {
-      const t = await adminToken()
       const data = await callMessages("POST", "/suggest-subject", {
-        token: t,
         content: composeContent,
       })
       if (data?.subject) {
@@ -463,10 +465,8 @@ export function MessagesDashboard() {
 
   const toggleRead = async (m: Message) => {
     try {
-      const t = await adminToken()
       const nextRead = !(m.read === 1 || m.read === true)
       await callMessages("PATCH", `/${m.message_id}`, {
-        token: t,
         read: nextRead,
       })
       // Live-lookup useDialog (Candidate D, 2026-06-02): no explicit
@@ -508,10 +508,9 @@ export function MessagesDashboard() {
     if (selectedIds.size === 0) return
     setActionError(null)
     try {
-      const t = await adminToken()
       await Promise.all(
         Array.from(selectedIds).map((id) =>
-          callMessages("PATCH", `/${id}`, { token: t, read })
+          callMessages("PATCH", `/${id}`, { read })
         )
       )
       await refresh()
@@ -524,10 +523,9 @@ export function MessagesDashboard() {
     if (selectedIds.size === 0) return
     setActionError(null)
     try {
-      const t = await adminToken()
       await Promise.all(
         Array.from(selectedIds).map((id) =>
-          callMessages("DELETE", `/${id}`, { token: t })
+          callMessages("DELETE", `/${id}`, {})
         )
       )
       await refresh()
@@ -555,8 +553,7 @@ export function MessagesDashboard() {
   const deleteOne = async (m: Message) => {
     setActionError(null)
     try {
-      const t = await adminToken()
-      await callMessages("DELETE", `/${m.message_id}`, { token: t })
+      await callMessages("DELETE", `/${m.message_id}`, {})
       // Close the detail modal if it was showing the deleted row, so
       // we don't strand the user on a record that no longer exists.
       if (detailDialog.data?.message_id === m.message_id) {

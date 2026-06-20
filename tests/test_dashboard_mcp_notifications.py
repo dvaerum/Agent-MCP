@@ -27,14 +27,19 @@ The `apiClient.createEventSource('/mcp')` helper would resolve to
 not expose. We therefore build the MCP URL separately from `baseUrl`
 (see `mcpUrlForProject()` in `lib/mcp-notifications.ts`).
 
-Auth headers
-------------
+Auth
+----
 
-`EventSource` (the browser primitive) cannot send custom headers, so
-the bearer token cannot ride along with the URL. The dashboard uses
-`fetch` + a ReadableStream reader instead, which supports both the
-`Authorization: Bearer <token>` header (required by /mcp's middleware)
-and SSE framing parsing.
+`EventSource` (the browser primitive) cannot send custom headers and
+won't carry cookies cross-origin reliably, so the dashboard uses
+`fetch` + a ReadableStream reader instead.
+
+Wave 2 (cleanup-wave-2, 2026-06-20) migrated the subscription off
+bearer auth onto cookie auth. The fetch sends `credentials: "include"`;
+the router's `backend_mcp_handler` validates the `agent_mcp_session`
+cookie + project membership and injects the project's admin token
+upstream so the backend's `AuthHeaderMiddleware` (still bearer-only)
+sees a valid bearer. No admin token ever lives in JS memory anymore.
 
 These tests are text-level (the fork has no jsdom/RTL infrastructure
 for behavioural dashboard tests). Runtime is verified by `npm run
@@ -72,27 +77,39 @@ def test_mcp_notifications_module_exists() -> None:
 # -- transport shape ------------------------------------------------------
 
 
-def test_uses_fetch_not_eventsource_for_auth_header() -> None:
-    """EventSource has no `headers` option, so the bearer token cannot
-    ride along. The subscription must use `fetch` (+ ReadableStream)
-    so it can send `Authorization: Bearer <token>`."""
+def test_uses_fetch_not_eventsource_for_cookie_auth() -> None:
+    """EventSource can't reliably ride a cross-origin cookie, so the
+    Wave-2 subscription uses `fetch` (+ ReadableStream) with
+    `credentials: "include"` to send the operator session cookie.
+
+    Wave 2 (cleanup-wave-2, 2026-06-20) replaced the bearer-header
+    construction with cookie auth — see lib/mcp-notifications.ts.
+    The router's `backend_mcp_handler` resolves the cookie to the
+    project's admin token and injects the bearer upstream so the
+    backend's `AuthHeaderMiddleware` (still bearer-only) accepts the
+    request.
+    """
     src = _read("lib/mcp-notifications.ts")
     assert "fetch(" in src, (
         "expected `fetch(` in lib/mcp-notifications.ts — EventSource "
-        "can't send custom Authorization headers"
+        "can't carry a cookie cross-origin reliably"
     )
     assert "getReader" in src or "ReadableStream" in src, (
         "expected a ReadableStream reader (`getReader()`) — the "
         "subscription consumes the response body as a stream and parses "
         "SSE frames manually"
     )
-    # The bearer must be sent as Authorization: Bearer <token>.
-    assert re.search(r"Authorization", src), (
-        "expected `Authorization` header set on the /mcp fetch — the "
-        "server's middleware gates GET /mcp on a valid bearer"
+    # Cookie auth: credentials: "include" must be set on the fetch.
+    assert re.search(r"credentials\s*:\s*['\"]include['\"]", src), (
+        "expected `credentials: \"include\"` on the /mcp fetch — the "
+        "operator session cookie carries auth post-Wave-2"
     )
-    assert "Bearer" in src, (
-        "expected `Bearer` token prefix in the Authorization header"
+    # And the legacy bearer construction must be gone — a stray
+    # `Authorization: Bearer ${...}` would re-leak the admin token
+    # back into JS memory and bypass the cookie path.
+    assert not re.search(r"Authorization\s*:\s*[`'\"]Bearer", src), (
+        "lib/mcp-notifications.ts must not construct an `Authorization: "
+        "Bearer` header — Wave 2 moved auth to the session cookie"
     )
 
 
@@ -232,10 +249,14 @@ def test_pauses_on_document_hidden() -> None:
 def test_wired_from_a_dashboard_provider() -> None:
     """The subscription has to be started somewhere. The natural seam
     is a client-side provider that boots on app mount (mirrors how
-    project-context-provider wires the path-prefix singleton). The
-    subscription needs an admin token, which lives in the data-store
-    `admin_token` field after the first `fetchAllData()` completes —
-    the provider waits for that and then starts the connection."""
+    project-context-provider wires the path-prefix singleton).
+
+    Wave 2 (cleanup-wave-2, 2026-06-20): the provider no longer needs
+    an admin token from the data-store — the operator session cookie
+    is sent automatically once the operator has logged in. The
+    provider just calls `subscribeMcpNotifications()` from a
+    useEffect on mount.
+    """
     # Either a dedicated provider or a hook called from layout. Accept
     # either pattern but pin that the wiring exists.
     candidates = list(
@@ -245,14 +266,14 @@ def test_wired_from_a_dashboard_provider() -> None:
     )
     if not candidates:
         # Fallback: maybe the subscription is auto-started by the
-        # module itself (an IIFE / module-load side effect that
-        # subscribes once the data-store has an admin_token). Accept
-        # that pattern by checking the module references useDataStore.
+        # module itself (an IIFE / module-load side effect). Accept
+        # that pattern by checking the module references its public
+        # entry point from somewhere reachable.
         src = _read("lib/mcp-notifications.ts")
-        assert "useDataStore" in src or "subscribe" in src, (
+        assert "subscribeMcpNotifications" in src, (
             "expected either a *notification*-named provider in "
-            "components/providers/ OR a self-bootstrapping module that "
-            "watches the data-store for an admin_token. Found neither."
+            "components/providers/ OR a self-bootstrapping module. "
+            "Found neither."
         )
         return
     # If there is a provider, it must be rendered from app/layout.tsx

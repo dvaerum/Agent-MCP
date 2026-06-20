@@ -74,7 +74,7 @@ let
     # Re-set on package-lock.json drift. Nix prints the correct value
     # on hash mismatch; paste it back here. Lockfile shipped with the
     # repo as of 2026-05-31 hashes to:
-    npmDepsHash = "sha256-VDyDHd90VNMIKLqSy/goQ7uj7d+2LkyS7cmYHGy8ojU=";
+    npmDepsHash = "sha256-ilzjM1HnVUuWV3m6pbAjZYyMcV7x7mLdRJvHG/k0D8Y=";
     NEXT_PUBLIC_AUTO_CONNECT = "false";
     NEXT_PUBLIC_DEFAULT_SERVER_HOST = "";
     NEXT_PUBLIC_DEFAULT_SERVER_PORT = "";

@@ -359,7 +359,7 @@ const EditMemoryModal = ({ memory, open, onOpenChange, onUpdateMemory }: {
 export function MemoriesDashboard() {
   const { servers, activeServerId } = useServerStore()
   const activeServer = servers.find(s => s.id === activeServerId)
-  const { data, loading, error, refreshData, getAdminToken } = useDataStore()
+  const { data, loading, error, refreshData } = useDataStore()
   const [searchTerm, setSearchTerm] = useState('')
   const [sortBy, setSortBy] = useState<string>('updated_at')
   
@@ -485,14 +485,12 @@ export function MemoriesDashboard() {
     editDialog.open(memory.context_key)
   }
 
+  // Wave 2 (cleanup-wave-2): all three mutation handlers authenticate
+  // via the operator session cookie (the apiClient.request helper
+  // attaches it with ``credentials: "include"``). No admin bearer is
+  // threaded through the call site anymore.
   const handleDelete = async (memory: Memory) => {
     if (!window.confirm(`Are you sure you want to delete the memory "${memory.context_key}"? This action cannot be undone.`)) {
-      return
-    }
-
-    const adminToken = getAdminToken()
-    if (!adminToken) {
-      setOperationError('No admin token available for delete operation')
       return
     }
 
@@ -500,7 +498,7 @@ export function MemoriesDashboard() {
     setOperationError(null)
 
     try {
-      await apiClient.deleteMemory(memory.context_key, adminToken)
+      await apiClient.deleteMemory(memory.context_key)
       await refreshData() // Refresh data after successful delete
       console.log('Memory deleted successfully:', memory.context_key)
     } catch (error) {
@@ -516,18 +514,12 @@ export function MemoriesDashboard() {
     context_value: any
     description?: string
   }) => {
-    const adminToken = getAdminToken()
-    if (!adminToken) {
-      throw new Error('No admin token available for create operation')
-    }
-
     await apiClient.createMemory({
       context_key: data.context_key,
       context_value: data.context_value,
       description: data.description,
-      token: adminToken
     })
-    
+
     await refreshData() // Refresh data after successful create
     console.log('Memory created successfully:', data.context_key)
   }
@@ -537,17 +529,11 @@ export function MemoriesDashboard() {
     context_value: any
     description?: string
   }) => {
-    const adminToken = getAdminToken()
-    if (!adminToken) {
-      throw new Error('No admin token available for update operation')
-    }
-
     await apiClient.updateMemory(data.context_key, {
       context_value: data.context_value,
       description: data.description,
-      token: adminToken
     })
-    
+
     await refreshData() // Refresh data after successful update
     editDialog.close()
     console.log('Memory updated successfully:', data.context_key)

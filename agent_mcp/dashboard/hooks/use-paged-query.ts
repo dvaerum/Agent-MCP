@@ -13,11 +13,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
  *
  *   * ``messages-dashboard.tsx`` — calls ``POST /api/messages/query``
  *     via a bespoke ``callMessages`` helper, builds the body inline
- *     (``{token, limit, offset, ...filters}``), threads four useState
+ *     (``{limit, offset, ...filters}``), threads four useState
  *     vars (``messages``, ``loading``, ``error``, ``total``), wires a
  *     refresh effect on ``[filters, currentOffset]``. The hook
  *     subsumes this 1:1 — its default POST path IS the
- *     ``/api/messages/query`` shape.
+ *     ``/api/messages/query`` shape. Wave 2 (cleanup-wave-2)
+ *     dropped the admin-token body field; auth is the operator
+ *     session cookie sent with ``credentials: "include"``.
  *
  *   * ``tasks-dashboard.tsx`` — wraps ``apiClient.getTasks()`` (GET
  *     ``/tasks``, no body, no pagination, no filter spread) in a
@@ -36,7 +38,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
  *     state without consolidating it. ``agents-dashboard.tsx`` is
  *     therefore intentionally out of scope for this PR.
  *
- * Default usage (messages-dashboard, the canonical POST-with-token shape):
+ * Default usage (messages-dashboard, the canonical cookie-auth shape):
  *
  *     const { data, total, loading, error, refresh, lastFetch } =
  *       usePagedQuery<Message>({
@@ -44,7 +46,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
  *         filters,                       // useFilters() snapshot
  *         limit: PAGE_SIZE,
  *         offset: currentOffset,
- *         token: adminToken,             // string OR async () => string
  *       })
  *
  * Escape-hatch usage (tasks-dashboard, GET /tasks via apiClient):
@@ -89,27 +90,27 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
  *     explicit index signature. ``object`` accepts both shapes; the
  *     per-row identity flows through the ``T[]`` return.
  *
- *   * ``fetchFn`` is the escape hatch for non-POST or non-token
- *     endpoints. It receives the ``AbortSignal`` and must return
+ *   * ``fetchFn`` is the escape hatch for non-POST endpoints. It
+ *     receives the ``AbortSignal`` and must return
  *     ``{data: T[], total: number}``. When ``fetchFn`` is supplied,
- *     ``endpoint`` / ``filters`` / ``limit`` / ``offset`` / ``token``
- *     are ignored — ``fetchFn`` owns the request entirely. This is
- *     how tasks-dashboard's ``apiClient.getTasks()`` (which returns a
+ *     ``endpoint`` / ``filters`` / ``limit`` / ``offset`` are ignored
+ *     — ``fetchFn`` owns the request entirely. This is how
+ *     tasks-dashboard's ``apiClient.getTasks()`` (which returns a
  *     bare ``Task[]`` with no envelope) plugs in.
  */
 export interface UsePagedQueryOptions<T extends object> {
   /**
    * Endpoint path appended to ``apiClient.getServerUrl()``. The hook
-   * POSTs ``{token, limit, offset, ...filters}`` as JSON. Ignored
-   * when ``fetchFn`` is supplied.
+   * POSTs ``{limit, offset, ...filters}`` as JSON with
+   * ``credentials: "include"`` (auth = operator session cookie).
+   * Ignored when ``fetchFn`` is supplied.
    */
   endpoint?: string
   /**
-   * Escape hatch for non-POST / non-token endpoints. Receives the
-   * AbortSignal so consumers can thread it into their own ``fetch``
-   * call. Must resolve to ``{data: T[], total: number}``. When
-   * present, ``endpoint`` / ``filters`` / ``limit`` / ``offset`` /
-   * ``token`` are ignored.
+   * Escape hatch for non-POST endpoints. Receives the AbortSignal
+   * so consumers can thread it into their own ``fetch`` call. Must
+   * resolve to ``{data: T[], total: number}``. When present,
+   * ``endpoint`` / ``filters`` / ``limit`` / ``offset`` are ignored.
    */
   fetchFn?: (signal: AbortSignal) => Promise<{ data: T[]; total: number }>
   /**
@@ -121,13 +122,6 @@ export interface UsePagedQueryOptions<T extends object> {
   limit?: number
   /** Page offset. Defaults to 0. */
   offset?: number
-  /**
-   * Admin token. Either a literal string or an async producer (the
-   * common shape — the dashboard fetches the token via
-   * ``apiClient.getTokens()`` on first use). Required for the default
-   * POST path; ignored when ``fetchFn`` is supplied.
-   */
-  token?: string | (() => Promise<string>)
   /**
    * Cache TTL on the last successful response, in ms. 0 = no caching
    * (default). Tasks-dashboard's pre-migration ``useTasksData`` ran
@@ -165,16 +159,17 @@ export interface UsePagedQueryResult<T extends object> {
  * Build the POST body matching the ``/api/messages/query`` contract.
  * Filters are spread last so they can override the framework keys
  * if a future endpoint redefines one (unlikely, but cheap to allow).
+ *
+ * Wave 2 (cleanup-wave-2): no ``token`` field — auth is carried by
+ * the operator session cookie, sent via ``credentials: "include"``
+ * on the fetch below.
  */
 function buildPostBody(opts: {
-  token: string
   limit?: number
   offset?: number
   filters?: object
 }): Record<string, unknown> {
-  const body: Record<string, unknown> = {
-    token: opts.token,
-  }
+  const body: Record<string, unknown> = {}
   if (typeof opts.limit === "number") body.limit = opts.limit
   if (typeof opts.offset === "number") body.offset = opts.offset
   if (opts.filters) Object.assign(body, opts.filters)
@@ -190,7 +185,6 @@ export function usePagedQuery<T extends object>(
     filters,
     limit,
     offset,
-    token,
     cacheMs = 0,
     deps,
   } = options
@@ -262,15 +256,7 @@ export function usePagedQuery<T extends object>(
               "usePagedQuery: either `endpoint` or `fetchFn` must be supplied",
             )
           }
-          // Resolve the token (string OR async producer).
-          let resolvedToken = ""
-          if (typeof opts.token === "function") {
-            resolvedToken = await opts.token()
-          } else if (typeof opts.token === "string") {
-            resolvedToken = opts.token
-          }
           const body = buildPostBody({
-            token: resolvedToken,
             limit: opts.limit,
             offset: opts.offset,
             filters: opts.filters,
@@ -279,6 +265,10 @@ export function usePagedQuery<T extends object>(
           // server URL. We import lazily so the hook stays standalone
           // (no top-level require — useful when tests stub the API
           // client). The endpoint string is appended verbatim.
+          //
+          // Wave 2 (cleanup-wave-2): ``credentials: "include"`` opts
+          // into sending the ``agent_mcp_session`` cookie that the
+          // backend's ``require_operator_session`` dep validates.
           const { apiClient } = await import("@/lib/api")
           const base = apiClient.getServerUrl()
           const res = await fetch(`${base}${opts.endpoint}`, {
@@ -289,6 +279,7 @@ export function usePagedQuery<T extends object>(
               "Accept": "application/vnd.agent-mcp.v1+json",
             },
             body: JSON.stringify(body),
+            credentials: "include",
             signal,
           })
           if (!res.ok) {

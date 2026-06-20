@@ -575,6 +575,7 @@ def _resolve_project_or_alias(name: str) -> tuple[str, dict | None]:
 async def _proxy_to_backend(
     req: web.Request, name: str, backend_path: str,
     *, alias_info: tuple[str, str] | None = None,
+    inject_bearer: str | None = None,
 ) -> web.StreamResponse:
     """Proxy `req` to the backend for `name`, asking it for `backend_path`.
 
@@ -588,6 +589,14 @@ async def _proxy_to_backend(
     no longer requires the SSE-handshake `data: /messages/` byte
     rewrite that this function used to do — the /mcp endpoint is
     URL-stable, so request and response are forwarded verbatim.
+
+    ``inject_bearer`` is the Wave 2 (cleanup-wave-2) hook for the
+    dashboard's cookie-authenticated SSE subscription: the cookie path
+    in ``backend_mcp_handler`` resolves to the project's admin token
+    here and we inject it as ``Authorization: Bearer`` upstream so the
+    backend's ``AuthHeaderMiddleware`` (still bearer-only) accepts the
+    request. Pre-existing ``Authorization`` headers from the caller
+    are NOT overwritten — bearer auth always wins.
     """
     sock = await _ensure(name, "backend")
     url = f"http://localhost{backend_path}"
@@ -600,6 +609,15 @@ async def _proxy_to_backend(
         k: v for k, v in req.headers.items()
         if k.lower() not in ("host", "content-length")
     }
+    if inject_bearer is not None:
+        # Strip any caller-supplied Authorization (case-insensitive)
+        # before injecting — the cookie path explicitly opts into
+        # the admin bearer; a stray lowercase ``authorization`` header
+        # must not shadow it.
+        for k in list(headers.keys()):
+            if k.lower() == "authorization":
+                headers.pop(k, None)
+        headers["Authorization"] = f"Bearer {inject_bearer}"
     # Phase 1b: if this request arrived on an alias URL, tell the
     # backend so it can later (Phase 1c) inject a deprecation warning
     # into the MCP `serverInfo.instructions` field. The header shape
@@ -727,27 +745,55 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
     request is independent. Backend restarts are invisible to clients
     beyond the in-flight request.
 
-    Auth pre-check at the router edge: when `Authorization: Bearer
-    <token>` is present, validate against the project's agent set
-    and 401 here rather than letting the backend reject downstream.
-    Missing header → 401 too (the backend's own
-    AuthHeaderMiddleware also gates /mcp; we just shift the bad-
-    token reject one hop closer to the client for a faster failure).
+    Auth modes admitted (first match wins):
+
+      1. ``Authorization: Bearer <token>`` matching an entry in the
+         project's agent-or-admin token map. The agent-side path that
+         every spawned worker uses; also the legacy admin-script path.
+      2. ``agent_mcp_session`` cookie pointing at a live operator
+         session whose user is a member of the project. The dashboard's
+         SSE subscription uses this path post-Wave 2 (cleanup-wave-2,
+         2026-06-20). When the cookie is the only auth that arrives,
+         the project's admin token is injected as
+         ``Authorization: Bearer`` upstream so the backend's own
+         ``AuthHeaderMiddleware`` — which still only understands the
+         bearer scheme — accepts the request.
+
+    Failure modes:
+
+      * No auth at all → 401.
+      * Bearer present but unknown → 401.
+      * Cookie present but unknown / expired / non-member → 401.
+
+    The cookie path runs INSIDE this handler rather than in
+    ``require_operator_session_middleware`` because ``/agent-mcp/mcp/``
+    is in the middleware's unauth allow-list (the agent-side bearer
+    path was the only auth scheme until Wave 2). Moving it out of the
+    allow-list would gate the agent path on cookie middleware that
+    doesn't apply.
     """
     name = req.match_info["name"]
     redirect = _maybe_single_tenant_redirect(req, name)
     if redirect is not None:
         return redirect
-    bearer = _extract_bearer(req)
-    if bearer is None:
-        raise _unauthorized()
     # Resolve alias → real project. The token map is fetched against
     # the *real* project because alias resolution is transparent;
     # tokens are not per-alias.
     real_name, alias_entry = _resolve_project_or_alias(name)
-    tokens = await _agent_token_map(real_name)
-    if bearer not in tokens:
-        raise _unauthorized()
+
+    bearer = _extract_bearer(req)
+    cookie_admin_bearer: str | None = None
+    if bearer is None:
+        # No bearer header — try the operator-session cookie. The
+        # dashboard's SSE subscription drops the bearer in favour of
+        # the cookie (Wave 2, cleanup/wave-2-strip-frontend-admin-token).
+        cookie_admin_bearer = await _admin_bearer_from_cookie(req, real_name)
+        if cookie_admin_bearer is None:
+            raise _unauthorized()
+    else:
+        tokens = await _agent_token_map(real_name)
+        if bearer not in tokens:
+            raise _unauthorized()
     alias_info: tuple[str, str] | None = None
     if alias_entry is not None:
         # Stash on the request too so downstream observers (Phase 1c
@@ -756,8 +802,56 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
         req["resolved_project"] = real_name
         alias_info = (name, alias_entry.get("expires_at", ""))
     return await _proxy_to_backend(
-        req, real_name, "/mcp", alias_info=alias_info,
+        req, real_name, "/mcp",
+        alias_info=alias_info,
+        inject_bearer=cookie_admin_bearer,
     )
+
+
+async def _admin_bearer_from_cookie(
+    req: web.Request, real_project_name: str,
+) -> str | None:
+    """If ``req`` carries a valid operator-session cookie AND that
+    operator is a member of ``real_project_name``, return the project's
+    admin token (so the caller can forward it as ``Authorization:
+    Bearer`` upstream). Otherwise return None.
+
+    Membership is checked via ``identity.is_project_member`` —
+    sysadmin bypass intentionally NOT applied here: an operator who is
+    not a project member should not be silently elevated by the
+    sysadmin flag on this transport. The dashboard never lands on this
+    code path for a project the operator isn't a member of (the
+    project picker only shows accessible projects).
+
+    Ordering matters: the cookie + membership check runs BEFORE
+    ``_agent_token_map`` so the no-cookie / non-member fast paths
+    don't poke the backend (the bare-401 wire shape from PR D's
+    proxy-passthrough test asserts the backend never sees an
+    unauthenticated request).
+    """
+    # Lazy imports — keep module import-time side-effect-free.
+    from .login import resolve_current_user
+    from . import identity
+
+    # Fast path: no cookie → no cookie auth. Skip both the session
+    # lookup and the token-map fetch.
+    if not req.cookies.get("agent_mcp_session", ""):
+        return None
+    user = resolve_current_user(req)
+    if user is None:
+        return None
+    try:
+        if not identity.is_project_member(user["user_id"], real_project_name):
+            return None
+    except Exception:  # pragma: no cover - defensive
+        return None
+    tokens = await _agent_token_map(real_project_name)
+    # _agent_token_map keys are tokens; values are agent_ids. The
+    # admin token is stored under value "Admin".
+    for token, agent_id in tokens.items():
+        if agent_id == "Admin":
+            return token
+    return None
 
 
 async def backend_api_handler(req: web.Request) -> web.StreamResponse:

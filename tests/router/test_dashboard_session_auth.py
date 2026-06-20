@@ -238,6 +238,73 @@ async def test_login_page_is_reachable_without_cookie(
     assert resp.status == 200, await resp.text()
 
 
+async def test_mcp_route_with_operator_cookie_reaches_handler(
+    aiohttp_client, router_app, register_project,
+) -> None:
+    """Wave 2 (cleanup-wave-2): the dashboard's MCP notifications
+    SSE subscription drops the bearer header and authenticates with
+    the ``agent_mcp_session`` cookie instead. The cookie path lives
+    inside ``backend_mcp_handler`` (NOT
+    ``require_operator_session_middleware``, which still allow-lists
+    ``/agent-mcp/mcp/`` so the agent-side bearer path keeps working).
+
+    Concretely:
+
+      * No cookie + no bearer → 401 (unchanged).
+      * Valid cookie + project membership → request reaches the
+        proxy. The backend isn't up in test, so we land on a 502/504,
+        NOT a 401. The bearer-validation 401 envelope ("invalid or
+        missing agent bearer token") would mean the cookie path
+        didn't trigger.
+      * Valid cookie + non-member → 401 from the cookie path.
+    """
+    import agent_mcp.router.app as router_module
+
+    register_project("delta")
+    # Seed the admin token in the cache so the router can resolve the
+    # bearer to inject upstream without standing up a backend just to
+    # serve /api/tokens.
+    router_module._agent_token_cache["delta"] = (
+        9.9e18, {"injected-admin-token": "Admin"},
+    )
+    # Seed two operators. The conftest's register_project already
+    # seeded the sentinel operator (so alice/bob are NOT the first
+    # user) — alice gets an explicit membership grant; bob stays
+    # outside ``project_membership`` to exercise the negative path.
+    alice_id = _seed_user("alice")
+    _seed_user("bob")
+    _identity_module().add_project_membership(alice_id, "delta")
+    client = await aiohttp_client(router_app)
+
+    # No auth at all → bearer-validation 401.
+    resp = await client.get("/agent-mcp/mcp/delta", allow_redirects=False)
+    assert resp.status == 401, await resp.text()
+
+    # Member cookie → request flows past the auth gate. The proxy
+    # then fails to reach the (un-spawned) backend with a 5xx — that
+    # proves the cookie path matched and we did NOT 401 here.
+    alice_cookie = await _login(client, "alice")
+    resp = await client.get(
+        "/agent-mcp/mcp/delta",
+        cookies={"agent_mcp_session": alice_cookie},
+        allow_redirects=False,
+    )
+    assert resp.status != 401, (
+        f"valid operator cookie should reach the proxy, got 401: "
+        f"{await resp.text()}"
+    )
+
+    # Non-member cookie → 401 from the cookie path inside
+    # backend_mcp_handler (bob has no project_membership row).
+    bob_cookie = await _login(client, "bob")
+    resp = await client.get(
+        "/agent-mcp/mcp/delta",
+        cookies={"agent_mcp_session": bob_cookie},
+        allow_redirects=False,
+    )
+    assert resp.status == 401, await resp.text()
+
+
 async def test_mcp_route_with_admin_bearer_still_works(
     aiohttp_client, router_app, register_project,
 ) -> None:
