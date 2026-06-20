@@ -60,6 +60,11 @@ async def test_tokens_endpoint_without_auth_returns_401(tmp_path) -> None:
 async def test_tokens_endpoint_with_admin_bearer_still_returns_200(tmp_path) -> None:
     """Legacy admin-bearer path stays valid (per ``app/deps.py`` Phase 1
     fallback). The dashboard never uses this path; admin scripts do.
+
+    Wave 3 stripped the legacy ``admin_token`` field from the response
+    body — see ``tests/test_wave3_admin_token_removal.py``. This test
+    pins only the auth-success path; the response-shape assertion lives
+    in the Wave 3 suite.
     """
     async with mcp_session(tmp_path) as admin:
         r = admin.client.get(
@@ -68,7 +73,8 @@ async def test_tokens_endpoint_with_admin_bearer_still_returns_200(tmp_path) -> 
         )
         assert r.status_code == 200, r.text
         body = r.json()
-        assert body["admin_token"] == admin.admin_token
+        # Wave 3: agent_tokens is the surviving shape; admin_token is gone.
+        assert "agent_tokens" in body
 
 
 async def test_tokens_endpoint_with_bogus_bearer_returns_401(tmp_path) -> None:
@@ -112,11 +118,11 @@ async def test_all_data_endpoint_with_admin_bearer_succeeds(tmp_path) -> None:
         )
         assert r.status_code == 200, r.text
         body = r.json()
-        # Sanity: response shape unchanged. Wave 2 strips admin_token;
-        # Wave 1 leaves it so the frontend still builds.
+        # Sanity: response shape. Wave 3 dropped ``admin_token``;
+        # the assertion that the field is GONE lives in
+        # ``tests/test_wave3_admin_token_removal.py``.
         assert "agents" in body
         assert "tasks" in body
-        assert "admin_token" in body
 
 
 async def test_all_data_endpoint_with_bogus_bearer_returns_401(tmp_path) -> None:

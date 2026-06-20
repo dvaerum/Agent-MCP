@@ -26,6 +26,9 @@ async def test_app_starts(tmp_path) -> None:
     fallback path (the dep accepts it for backwards-compat with admin
     scripts + tests like this one) so the smoke test still verifies
     end-to-end app boot + a real handler returning a real payload.
+
+    Wave 3 (prancy-napping-pie) dropped the ``admin_token`` field
+    from the response; only ``agent_tokens`` remains.
     """
     async with mcp_session(tmp_path) as admin:
         response = admin.client.get(
@@ -36,8 +39,5 @@ async def test_app_starts(tmp_path) -> None:
         assert response.status_code == 200, response.text
 
         payload = response.json()
-        assert "admin_token" in payload
-        assert isinstance(payload["admin_token"], str)
-        assert len(payload["admin_token"]) > 0
         assert "agent_tokens" in payload
         assert isinstance(payload["agent_tokens"], list)

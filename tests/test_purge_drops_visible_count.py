@@ -90,11 +90,13 @@ async def test_all_data_excludes_tombstone_rows(tmp_path) -> None:
         ids = [a["agent_id"] for a in agents]
         statuses = [a["status"] for a in agents]
 
-        # The two real workers + the synthetic Admin display row should
-        # be present.
+        # The two real workers should be present. Wave 3
+        # (prancy-napping-pie) dropped the synthesised ``Admin``
+        # display row as part of admin_token retirement, so the
+        # ``"Admin" in ids`` assertion no longer holds — Wave 4 will
+        # decide the post-pseudo-agent admin surface.
         assert "alice" in ids, ids
         assert "bob" in ids, ids
-        assert "Admin" in ids, ids
 
         # The tombstone row must NOT be in the response.
         assert "[deleted-ghost]" not in ids, (

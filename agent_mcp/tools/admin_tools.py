@@ -380,11 +380,12 @@ async def create_agent_tool_impl(
             },
         )
 
-        # Generate system prompt (main.py:1147)
-        # The original passed `token` (admin token) if agent_id started with "admin".
-        # `generate_system_prompt` now takes `admin_token_runtime`.
+        # Generate system prompt (main.py:1147).
+        # Wave 3 (prancy-napping-pie): ``generate_system_prompt`` no
+        # longer takes a ``admin_token_runtime`` — the Admin / Worker
+        # label is derived from ``agents.agent_role`` instead.
         system_prompt_str = generate_system_prompt(
-            agent_id, new_agent_token, g.admin_token
+            agent_id, new_agent_token
         )
 
         # Launch tmux session with Claude
@@ -393,8 +394,17 @@ async def create_agent_tool_impl(
 
         if is_tmux_available():
             try:
-                # Create sanitized session name
-                tmux_session_name = create_agent_session_name(agent_id, token)
+                # Create sanitized session name.
+                # Wave 3 (prancy-napping-pie): the session-name suffix
+                # is the new agent's own token's last 4 chars (not
+                # the calling admin token's, which used to flow in via
+                # ``arguments["token"]`` and is no longer passed via
+                # the REST seam). Per-agent suffix is also more useful
+                # in tmux ls output — different agents now visibly
+                # differ instead of all sharing the admin suffix.
+                tmux_session_name = create_agent_session_name(
+                    agent_id, new_agent_token
+                )
 
                 # Set up environment variables for the agent
                 env_vars = {
@@ -405,17 +415,19 @@ async def create_agent_tool_impl(
                 }
 
                 # Add the system token if this is an admin agent.
-                # The env var is named MCP_SYSTEM_TOKEN (renamed from
-                # MCP_ADMIN_TOKEN in Phase 2 Wave 1b); the legacy
-                # MCP_ADMIN_TOKEN is also exported for one release so
-                # existing agent startup scripts (templates/agent_startup.sh
-                # and downstream variants) keep authenticating.
+                # The env var is ``MCP_SYSTEM_TOKEN`` (renamed from
+                # ``MCP_ADMIN_TOKEN`` in Phase 2 Wave 1b).
+                # Wave 3 (prancy-napping-pie) dropped the legacy
+                # ``MCP_ADMIN_TOKEN`` export — nothing in this repo
+                # reads it back, and downstream agent startup scripts
+                # have had a release on the new name. Wave 4 will
+                # decide what happens to ``MCP_SYSTEM_TOKEN`` once
+                # the admin pseudo-agent is gone.
                 if (
                     agent_id.lower().startswith("admin")
                     and new_agent_token == g.system_token
                 ):
                     env_vars["MCP_SYSTEM_TOKEN"] = g.system_token
-                    env_vars["MCP_ADMIN_TOKEN"] = g.system_token
 
                 # Create the tmux session (without immediate command)
                 if create_tmux_session(
@@ -531,11 +543,13 @@ async def create_agent_tool_impl(
                     prompt_status = ""
                     if send_prompt:
                         try:
-                            # Build the prompt using the template system
+                            # Build the prompt using the template system.
+                            # Wave 3 (prancy-napping-pie): dropped the
+                            # ``admin_token`` arg; no template still
+                            # substitutes ``{admin_token}``.
                             agent_prompt = build_agent_prompt(
                                 agent_id=agent_id,
                                 agent_token=new_agent_token,
-                                admin_token=g.admin_token,
                                 template_name=prompt_template,
                                 custom_prompt=custom_prompt,
                             )
@@ -1115,7 +1129,6 @@ async def relaunch_agent_tool_impl(
     Only works for agents with status: terminated, completed, failed, cancelled.
     Sends /clear to reset the session and sends a new prompt.
     """
-    admin_token = arguments.get("token")
     agent_id = arguments.get("agent_id")
     generate_new_token = arguments.get("generate_new_token", False)
     custom_prompt = arguments.get("custom_prompt")
@@ -1207,12 +1220,23 @@ async def relaunch_agent_tool_impl(
             agent_id, "status", "active", connection=cursor,
         )
 
-        # Build and send new prompt
+        # Build and send new prompt.
+        # Wave 3 (prancy-napping-pie): pass the relaunched agent's
+        # own token + agent_id; the previous code passed
+        # ``(prompt_template, admin_token)`` positionally, which was
+        # a long-standing bug — the function takes keyword args
+        # ``agent_id, agent_token, template_name`` and the positional
+        # pair landed on the wrong parameters. Fixed in-place.
         try:
             if custom_prompt:
                 prompt_to_send = custom_prompt
             else:
-                prompt_to_send = build_agent_prompt(prompt_template, admin_token)
+                prompt_to_send = build_agent_prompt(
+                    agent_id=agent_id,
+                    agent_token=agent_token,
+                    template_name=prompt_template,
+                    custom_prompt=custom_prompt,
+                )
 
             # Send the new prompt to restart the agent
             send_prompt_async(session_name, prompt_to_send, delay_seconds=2)

@@ -11,10 +11,20 @@ module wires it up as three MCP tools:
     delete_task_note(note_id)
 
 Authoring contract (matches the dashboard agent-actions log
-convention): only the note's author or admin may edit/delete it.
-The `requires` decorator only gates "can this token call the tool
-at all?"; the per-note ownership check happens inside the impl
-against `task_notes_db.edit_note` / `delete_note`.
+convention): only the note's author or a manager-tier+ caller may
+edit/delete it. Manager-tier admits the system bearer OR an agent
+token whose row has ``agent_role='manager'`` — see
+``verify_token(token, "manager")`` (Phase 2 Wave 2a). The
+``requires`` decorator only gates "can this token call the tool at
+all?"; the per-note ownership check happens inside the impl against
+``task_notes_db.edit_note`` / ``delete_note``, which still takes
+the historical ``is_admin`` boolean (now sourced from the
+manager-tier check).
+
+Wave 3 (prancy-napping-pie) migrated the ``is_admin`` source from
+the raw ``token == g.admin_token`` comparison to
+``verify_token(token, "manager")`` so a manager-role agent can
+moderate worker notes without holding the system bearer.
 
 The existing append-only writers in `task_tools.py` (the bulk
 add_note operation, the inline notes append in
@@ -29,19 +39,28 @@ from typing import Any, Dict, List
 
 import mcp.types as mcp_types
 
-from ..core import globals as g
 from ..core.auth import get_agent_id, verify_token
 from ..db.actions import task_notes_db
 from .registry import register_tool
 
 
 def _resolve_caller(arguments: Dict[str, Any]) -> tuple[str, str, bool]:
-    """Pull token out of `arguments` and resolve (token, agent_id, is_admin).
+    """Pull token out of `arguments` and resolve
+    (token, agent_id, is_manager_or_above).
 
     Mirrors the auth pattern used by the other task tools: tokens
     may arrive via `token` arg or, when run through the MCP stream
     that already verified the Authorization header, are surfaced as
     `_bearer_token`. Returns `("", "", False)` if neither is set.
+
+    Wave 3 (prancy-napping-pie) migrated the "is admin" boolean from
+    ``token == g.admin_token`` (system bearer only) to
+    ``verify_token(token, "manager")`` (system bearer OR an agent
+    token whose row has ``agent_role='manager'``). The variable name
+    stays ``is_admin`` because that's what downstream
+    ``task_notes_db.edit_note`` / ``delete_note`` accept — the
+    semantic widening (manager agents can now moderate) is captured
+    in the docstring above.
     """
     token = (
         arguments.get("_bearer_token")
@@ -49,7 +68,7 @@ def _resolve_caller(arguments: Dict[str, Any]) -> tuple[str, str, bool]:
         or ""
     )
     agent_id = get_agent_id(token) or ""
-    is_admin = bool(token) and token == g.admin_token
+    is_admin = verify_token(token, required_role="manager")
     return token, agent_id, is_admin
 
 
