@@ -452,15 +452,19 @@ class MessageRepository:
         *,
         connection: Any = None,
     ) -> bool:
-        """Return True iff ``recipient_id`` resolves to an ``agents`` row.
+        """Return True iff ``recipient_id`` is a legitimate message
+        recipient: a live agent row, a tombstone row
+        (``[deleted-<id>]`` with ``status='tombstone'``), or the
+        special ``'admin'`` label.
 
-        Used by :meth:`send` to enforce the recipient-existence
-        contract. Tombstones are real agents rows
-        (``status='tombstone'`` — see
-        :meth:`AgentRepository.insert_tombstone`), and ``admin`` is
-        seeded by lifespan startup, so a single existence check
-        covers all three legitimate recipient classes (live, admin,
-        tombstone) and rejects typos.
+        Wave 4 (migration 0014) deleted the synthetic ``agent_id=
+        'admin'`` row from the ``agents`` table — before Wave 4 the
+        admin recipient resolved via a normal SELECT against agents,
+        which is no longer true. The ``'admin'`` label is kept as a
+        legitimate destination so worker→admin escalation messages
+        continue to be sendable; the database doesn't enforce a
+        parent row for it, so this method has to short-circuit on
+        the literal value.
 
         Three connection shapes tolerated so the check works on every
         path :meth:`send` is reachable from:
@@ -472,6 +476,12 @@ class MessageRepository:
         """
         if not isinstance(recipient_id, str) or not recipient_id:
             return False
+
+        # Wave 4: the 'admin' actor label has no agents-table parent.
+        # Treat it as a valid recipient unconditionally — the dashboard
+        # surfaces these via the operator messages feed.
+        if recipient_id == "admin":
+            return True
 
         # sqlite3 cursor path.
         if connection is not None and not hasattr(connection, "query"):
@@ -766,19 +776,21 @@ class MessageRepository:
         The threading-policy decision (Ollama-suggested vs. truncated
         body vs. explicit) is owned by the *caller*.
 
-        Raises ``LookupError`` if ``recipient_id`` doesn't resolve to
-        an existing ``agents`` row. VM e2e on 2026-06-16 surfaced that
+        Raises ``LookupError`` if ``recipient_id`` is neither a live
+        agent row, a tombstone row (``[deleted-<id>]``), nor the
+        literal ``'admin'`` label. VM e2e on 2026-06-16 surfaced that
         ``send_agent_message`` to a typo'd recipient silently succeeded
         ("Message stored; recipient has no active session"), bypassing
-        the PR #138 FK contract. The check covers live agents, the
-        ``admin`` pseudo-agent (migration 0008), and tombstone rows
-        ``[deleted-<id>]`` — they're all rows in ``agents``, so a
-        single existence check preserves audit-message semantics while
-        rejecting typos.
+        the PR #138 FK contract. Wave 4 (migration 0014) deleted the
+        admin pseudo-agent row from ``agents``; the ``'admin'``
+        recipient label survives as a special-cased valid destination
+        (worker→admin escalations), but the underlying FK constraint
+        is gone — :meth:`_recipient_exists` short-circuits on the
+        literal value to preserve that capability.
         """
-        # VM e2e fix 2026-06-16: recipient must exist in agents table.
-        # Live agents, the admin pseudo-agent, and tombstones all
-        # qualify (they're all agent rows); typos / unknown IDs do not.
+        # VM e2e fix 2026-06-16: recipient must be a legitimate
+        # destination. Wave 4 special-cases the 'admin' label; all
+        # other recipients are validated against the agents table.
         # Raise BEFORE any DB write so no partial state is left behind
         # in the caller's wider transaction.
         if not self._recipient_exists(recipient_id, connection=connection):

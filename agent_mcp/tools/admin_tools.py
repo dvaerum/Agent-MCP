@@ -1365,12 +1365,11 @@ def register_admin_tools():
                 },
                 "prompt_template": {
                     "type": "string",
-                    "description": "Prompt template to use ('worker_with_rag', 'basic_worker', 'frontend_worker', 'admin_agent', 'custom')",
+                    "description": "Prompt template to use ('worker_with_rag', 'basic_worker', 'frontend_worker', 'custom'). The 'admin_agent' template was retired in Wave 4 (cleanup/wave-4-delete-admin-pseudo-agent) — there is no admin agent to spawn any more.",
                     "enum": [
                         "worker_with_rag",
                         "basic_worker",
                         "frontend_worker",
-                        "admin_agent",
                         "custom",
                     ],
                     "default": "worker_with_rag",

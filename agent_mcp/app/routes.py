@@ -35,7 +35,10 @@ from ..features.dashboard.api import (
     fetch_graph_data_logic,
     fetch_task_tree_data_logic
 )
-from ..features.dashboard.styles import get_node_style
+# Wave 4: ``get_node_style`` was only used to colour the synthetic
+# 'Admin' row that ``agents_list_api_route`` prepended; that
+# synthesis is gone (the admin pseudo-agent has been retired) so
+# the import is no longer needed.
 
 # Import tool implementations that the dashboard APIs which still
 # call directly (vs. dispatch through MCP) need. `create_agent` stays
@@ -309,21 +312,26 @@ async def node_details_api_route(request: Request) -> JSONResponse:
 async def agents_list_api_route(request: Request) -> JSONResponse:
     # GET /api/agents[?status=<status>]
     #
-    # Without a `status` query param, returns every non-tombstone
-    # agent row plus the synthetic "Admin" row used by the dashboard
-    # graph (back-compat). Tombstone rows (status='tombstone',
-    # agent_id like '[deleted-<original>]') are FK-target artefacts
-    # of the purge cascade and never belong in user-facing output —
-    # see all_data_api_route for the same filter rationale.
+    # Returns every non-tombstone agent row. Tombstone rows
+    # (status='tombstone', agent_id like '[deleted-<original>]') are
+    # FK-target artefacts of the purge cascade and never belong in
+    # user-facing output — see all_data_api_route for the same filter
+    # rationale.
+    #
+    # Wave 4 (cleanup/wave-4-delete-admin-pseudo-agent): the
+    # hardcoded synthetic ``{'agent_id': 'Admin', 'status': 'system'}``
+    # entry previously prepended here is gone. The underlying admin
+    # pseudo-agent row has been deleted from the ``agents`` table
+    # (migration 0014); rendering a UI-only stand-in for it would
+    # contradict the retirement. Out-of-tree consumers that depended
+    # on the synthesised row should stop relying on it.
     #
     # With `status=<value>`, returns only agent rows whose status
     # matches exactly, EXCEPT `status=tombstone` which always
     # returns the empty list (tombstone is an internal DB state,
-    # not an operator-queryable agent status). The synthetic Admin
-    # row (status='system') is also filtered out under any
-    # `status=<value>` filter — only rows whose status equals the
-    # filter value survive. This shape replaces the router's
-    # `list_agents` synthetic tool (Phase 7c, Q7.2 in plan).
+    # not an operator-queryable agent status). This shape replaces
+    # the router's `list_agents` synthetic tool (Phase 7c, Q7.2 in
+    # plan).
     status_filter: Optional[str] = request.query_params.get('status')
     agents_list_data: List[Dict[str, Any]] = []
     conn = None
@@ -336,11 +344,6 @@ async def agents_list_api_route(request: Request) -> JSONResponse:
         conn = get_db_connection()
         cursor = conn.cursor()
         if status_filter is None:
-            admin_style = get_node_style('admin')
-            agents_list_data.append({
-                'agent_id': 'Admin', 'status': 'system', 'color': admin_style.get('color', '#607D8B'),
-                'created_at': 'N/A', 'current_task': 'N/A'
-            })
             # WHERE status != 'tombstone' filters the cascade-tombstone
             # rows out at the DB layer.
             cursor.execute(
@@ -1384,13 +1387,11 @@ async def all_data_api_route(
         agents_data = []
         for row in cursor.fetchall():
             agent_dict = dict(row)
-            # Skip the synthetic 'admin' pseudo-agent row (seeded by
-            # migration 0008 / `_ensure_admin_pseudo_agent_row` so the
-            # post-PR #100 FK constraints have a target). The row stays
-            # in the DB — it's still load-bearing for FKs — but we
-            # don't surface it in the agents list, otherwise it shows
-            # up alongside the hardcoded 'Admin' display entry inserted
-            # below and the dashboard renders two Admin rows.
+            # Defensive skip for the legacy 'admin' pseudo-agent row.
+            # Wave 4 (migration 0014) deletes it; this filter remains
+            # so a partially-upgraded DB (or one with the
+            # AGENT_MCP_FK_BYPASS_ORPHAN_CLEANUP escape hatch leaving
+            # the row behind) doesn't suddenly surface a stale entry.
             if agent_dict.get('agent_id') == 'admin':
                 continue
             # Skip purge-cascade tombstone rows (status='tombstone',

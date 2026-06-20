@@ -9,15 +9,29 @@ The other three (agent_messages.sender_id, agent_messages.recipient_id,
 mcp_sessions.agent_id) were initially deferred — production data
 showed all their orphans had agent_id='admin', the admin pseudo-agent
 identity that lives in `g.admin_token` but had no row in the agents
-table. PR-G1 (migration 0008) seeds that row and ships the deferred
+table. PR-G1 (migration 0008) seeded that row and shipped the deferred
 FKs; coverage for those moved to `test_db_admin_pseudo_agent.py`.
 
+Wave 4 of the admin_token retirement (migration 0014) reverses both
+0007's agents-targeting FKs and all of 0008. The synthetic admin
+pseudo-agent row is deleted; ``agents.agent_id`` ceases to be a FK
+target for ``tasks.assigned_to``, ``claude_code_sessions.agent_id``,
+``agent_messages.{sender_id,recipient_id}``, and
+``mcp_sessions.agent_id``. The two FKs that target other tables
+(``agents.current_task -> tasks.task_id`` and
+``tasks.parent_task -> tasks.task_id``) are untouched and remain
+declared post-Wave-4 — they have nothing to do with the admin
+pseudo-agent.
+
 Tests cover:
-- All 4 FK constraints visible via `PRAGMA foreign_key_list(<table>)`
-  after lifespan startup.
-- Insert that violates a shipped FK is rejected when `foreign_keys=ON`.
+- The two surviving FKs are declared after lifespan startup.
+- The five Wave-4-dropped FKs are NOT declared (regression guard
+  against accidentally re-adding them).
+- Insert that violates a surviving FK is rejected when
+  `foreign_keys=ON`.
 - Pre-existing orphans on nullable FK columns are NULL-cleaned by the
-  migration.
+  migration; orphans on the now-defunct FK targets are likewise
+  cleaned by Wave 4's pre-rebuild orphan sweep.
 - The cleanup can be bypassed via
   `AGENT_MCP_FK_BYPASS_ORPHAN_CLEANUP=1` env var (safety hatch for
   operators who want to inspect orphans first); follow-on FK
@@ -42,19 +56,23 @@ from tests.harness import mcp_session
 pytestmark = pytest.mark.asyncio
 
 
-# (table, column, referenced_table, referenced_column) — the four
-# FKs this migration ships (subset of the seven in the review; see
-# module docstring for why the other three are deferred).
+# (table, column, referenced_table, referenced_column) — the FKs
+# that SURVIVE Wave 4. Migration 0007 declared four FKs; Wave 4
+# drops the two that targeted agents.agent_id
+# (tasks.assigned_to, claude_code_sessions.agent_id) so only the
+# two self-/cross-references to tasks.task_id remain.
 _REQUIRED_FKS = [
     ("agents", "current_task", "tasks", "task_id"),
     ("tasks", "parent_task", "tasks", "task_id"),
-    ("tasks", "assigned_to", "agents", "agent_id"),
-    ("claude_code_sessions", "agent_id", "agents", "agent_id"),
 ]
 
-# The three FKs explicitly deferred to a follow-up PR — proven not
-# present here so the deferral remains documented.
-_DEFERRED_FKS = [
+# FKs that DO NOT exist post-Wave-4. Migration 0007 declared two of
+# these (tasks.assigned_to, claude_code_sessions.agent_id) and
+# migration 0008 declared the other three (agent_messages.*,
+# mcp_sessions.agent_id); Wave 4 drops all five.
+_DROPPED_FKS = [
+    ("tasks", "assigned_to", "agents", "agent_id"),
+    ("claude_code_sessions", "agent_id", "agents", "agent_id"),
     ("agent_messages", "sender_id", "agents", "agent_id"),
     ("agent_messages", "recipient_id", "agents", "agent_id"),
     ("mcp_sessions", "agent_id", "agents", "agent_id"),
@@ -86,40 +104,42 @@ async def test_shipped_fk_constraints_declared(tmp_path) -> None:
             conn.close()
 
 
-async def test_previously_deferred_fks_now_shipped(tmp_path) -> None:
-    """The three admin-implicated FKs are now declared (PR-G1, migration 0008).
+async def test_wave4_dropped_fks_are_gone(tmp_path) -> None:
+    """The five FKs that targeted ``agents.agent_id`` and required the
+    admin pseudo-agent are gone after migration 0014.
 
-    Originally PR-2 (0007) deferred these three FKs because the
-    application treated `admin` as a pseudo-agent with no row in
-    `agents`. PR-G1 (0008) seeded that row and shipped the deferred
-    FKs. This test guards against accidental regression that would
-    re-remove them.
+    Wave 4 dropped them because the system bearer is no longer
+    modelled as an agent. The columns themselves remain (audit /
+    session durability depends on them); only the FK constraints go.
 
-    Detailed coverage (FK violation rejection + admin-row seeding +
-    `PRAGMA foreign_key_check` clean) lives in
-    `test_db_admin_pseudo_agent.py`.
+    Detailed coverage of the post-drop write paths lives in
+    ``test_db_admin_pseudo_agent.py``.
     """
     from agent_mcp.core.config import get_db_path
 
     async with mcp_session(tmp_path):
         conn = sqlite3.connect(str(get_db_path()))
         try:
-            for table, col, ref_table, ref_col in _DEFERRED_FKS:
+            for table, col, ref_table, ref_col in _DROPPED_FKS:
                 fks = _fk_list(conn, table)
-                assert (col, ref_table, ref_col) in fks, (
-                    f"deferred FK {table}.{col} -> {ref_table}.{ref_col} "
-                    f"should now be present after PR-G1; have {fks}"
+                assert (col, ref_table, ref_col) not in fks, (
+                    f"FK {table}.{col} -> {ref_table}.{ref_col} should "
+                    f"have been dropped by Wave 4 migration 0014; "
+                    f"still present in {fks}"
                 )
         finally:
             conn.close()
 
 
 async def test_fk_violation_is_rejected(tmp_path) -> None:
-    """With `foreign_keys=ON`, an orphan insert must fail.
+    """With `foreign_keys=ON`, an orphan insert into a surviving FK
+    column must fail.
 
-    Uses `claude_code_sessions.agent_id` because the brand-new DB has
-    zero rows in `agents`, so any agent_id we invent is an orphan and
-    the FK should reject the insert.
+    Wave 4 dropped the agents-targeting FKs, so the previous version
+    of this test (which seeded ``claude_code_sessions.agent_id`` with
+    a bogus id) would now succeed. Use the surviving
+    ``tasks.parent_task -> tasks.task_id`` FK instead: a task that
+    points at a nonexistent parent must be rejected at INSERT time.
     """
     from agent_mcp.db.connection import get_db_connection
 
@@ -128,10 +148,11 @@ async def test_fk_violation_is_rejected(tmp_path) -> None:
         try:
             with pytest.raises(sqlite3.IntegrityError):
                 conn.execute(
-                    "INSERT INTO claude_code_sessions "
-                    "(session_id, pid, parent_pid, first_detected, "
-                    " last_activity, agent_id) "
-                    "VALUES ('s', 100, 1, 't', 't', 'no-such-agent')"
+                    "INSERT INTO tasks "
+                    "(task_id, title, created_by, status, priority, "
+                    " created_at, updated_at, parent_task) "
+                    "VALUES ('t-orphan', 'x', 'admin', 'pending', "
+                    " 'low', 't', 't', 'no-such-parent')"
                 )
         finally:
             conn.close()
@@ -355,11 +376,20 @@ async def test_migration_cleans_up_orphans_by_default(tmp_path) -> None:
     # FK constraints in place
     conn = sqlite3.connect(str(db_path))
     try:
-        # All FKs declared
+        # The surviving FKs are declared
         for table, col, ref_table, ref_col in _REQUIRED_FKS:
             fks = _fk_list(conn, table)
             assert (col, ref_table, ref_col) in fks, (
                 f"missing FK {table}.{col} -> {ref_table}.{ref_col} after migration"
+            )
+
+        # The Wave-4-dropped FKs are NOT declared (regression guard).
+        for table, col, ref_table, ref_col in _DROPPED_FKS:
+            fks = _fk_list(conn, table)
+            assert (col, ref_table, ref_col) not in fks, (
+                f"FK {table}.{col} -> {ref_table}.{ref_col} should have "
+                f"been dropped by Wave 4 migration 0014; still present "
+                f"in {fks}"
             )
 
         # Real, non-orphan rows still present
@@ -370,12 +400,9 @@ async def test_migration_cleans_up_orphans_by_default(tmp_path) -> None:
             "SELECT 1 FROM tasks WHERE task_id='task-real'"
         ).fetchone()
 
-        # Orphans on the 4 shipped FKs: all four columns are nullable,
-        # so the migration NULLs the dangling pointer and keeps the
-        # row. The deferred FKs' orphan rows (agent_messages,
-        # mcp_sessions with bogus admin-ish agent_ids) are intentionally
-        # left untouched — they'll be addressed in the follow-up that
-        # seeds the admin pseudo-agent.
+        # Orphans on the surviving FKs (0007's two self-/cross-task
+        # references): both columns are nullable, so the migration
+        # NULLs the dangling pointer and keeps the row.
         orph_agent = conn.execute(
             "SELECT current_task FROM agents WHERE agent_id='orph'"
         ).fetchone()
@@ -388,6 +415,14 @@ async def test_migration_cleans_up_orphans_by_default(tmp_path) -> None:
         assert orph_parent is not None, "orphan-parent task row should be kept"
         assert orph_parent[0] is None, "tasks.parent_task orphan should be NULLed"
 
+        # Orphans on the dropped agents-targeting FKs: 0007's
+        # ``tasks.assigned_to`` orphan gets NULLed by 0007's own
+        # orphan sweep, then survives Wave 4's drop of that FK.
+        # 0008's NOT-NULL FK orphans (``agent_messages.{sender_id,
+        # recipient_id}`` and ``mcp_sessions.agent_id`` pointing at
+        # 'bogus-*' agent_ids) are DELETEd by 0008's orphan sweep
+        # before Wave 4 drops those constraints. Their absence below
+        # asserts the 0008 cleanup behaviour, NOT a Wave 4 effect.
         orph_assign = conn.execute(
             "SELECT assigned_to FROM tasks WHERE task_id='task-orph-assign'"
         ).fetchone()
@@ -400,11 +435,6 @@ async def test_migration_cleans_up_orphans_by_default(tmp_path) -> None:
         assert ccs is not None
         assert ccs[0] is None
 
-        # Previously-deferred FK orphan rows are now DELETEd by
-        # migration 0008 (PR-G1). The agent_messages and mcp_sessions
-        # orphans seeded above reference 'bogus-sender' /
-        # 'bogus-recipient' / 'bogus-agent' — none of those are
-        # 'admin', so they don't survive the NOT NULL FK cleanup.
         assert (
             conn.execute(
                 "SELECT COUNT(*) FROM agent_messages "
@@ -418,12 +448,13 @@ async def test_migration_cleans_up_orphans_by_default(tmp_path) -> None:
             ).fetchone()[0]
             == 0
         )
-        # The synthetic admin row is seeded by migration 0008.
+        # The synthetic admin row was seeded by 0008 and then deleted
+        # by Wave 4 (0014). Post-migration count is zero.
         assert (
             conn.execute(
                 "SELECT COUNT(*) FROM agents WHERE agent_id='admin'"
             ).fetchone()[0]
-            == 1
+            == 0
         )
     finally:
         conn.close()
