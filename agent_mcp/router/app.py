@@ -413,11 +413,27 @@ _agent_token_cache: dict[str, tuple[float, dict[str, str]]] = {}
 async def _agent_token_map(name: str) -> dict[str, str]:
     """{token: agent_id} for project `name`, freshly cached.
 
-    Includes the Admin token under agent_id "Admin". Reads the
-    backend's own /api/tokens via the project UDS — same code path
-    the bridge handler uses internally. Returns {} on backend error
-    rather than raising; callers are expected to treat that as
-    "no auth available, refuse" via the empty mapping.
+    Includes the per-project system token under agent_id "Admin".
+    Two sources, joined here:
+
+      * Per-agent worker tokens: backend's ``GET /api/tokens`` over
+        the project UDS — same code path the bridge handler uses
+        internally. Wave 3 (PR #205) restricted this response to
+        ``{"agent_tokens": [...]}`` — the legacy ``admin_token`` field
+        is gone.
+      * System (a.k.a. admin) token: read from the
+        orchestrator-state channel
+        (``<sock_dir>/<name>/system_token``) the launcher writes via
+        ``--system-token-out`` at backend spawn time. F015 regression
+        fix (2026-06-22) — before this, the router sourced the system
+        token from the now-removed ``admin_token`` field, so the
+        cookie→bearer path in ``backend_mcp_handler`` could never
+        resolve the upstream admin bearer and every dashboard SSE
+        subscription 401'd.
+
+    Returns {} on backend error rather than raising; callers are
+    expected to treat that as "no auth available, refuse" via the
+    empty mapping.
     """
     cached = _agent_token_cache.get(name)
     now = time.time()
@@ -438,9 +454,13 @@ async def _agent_token_map(name: str) -> dict[str, str]:
     except Exception:
         return {}
     mapping: dict[str, str] = {}
-    admin = body.get("admin_token")
-    if admin:
-        mapping[admin] = "Admin"
+    # System token is sourced from the orchestrator-state file the
+    # backend wrote at spawn time, NOT from /api/tokens (Wave 3 dropped
+    # that field). The router and backend run as the same user; the
+    # token file is mode 0600 next to the backend's UDS.
+    system_token = _po.read_system_token(name)
+    if system_token:
+        mapping[system_token] = "Admin"
     for row in body.get("agent_tokens", []) or []:
         tok = row.get("token")
         aid = row.get("agent_id")
