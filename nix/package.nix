@@ -131,9 +131,17 @@ let
     mkdir -p "$sock_dir"
     sock="$sock_dir/backend.sock"
     rm -f "$sock"
+    # Orchestrator-state channel for the router's cookie→bearer path.
+    # The backend writes its resolved system token here at startup
+    # (mode 0600); the router reads it inside ``_agent_token_map``
+    # to populate the per-project ``"Admin"`` mapping entry. F015 fix
+    # — Wave 3 (PR #205) removed ``admin_token`` from ``GET /api/tokens``
+    # so the router has no backend-side channel left.
+    system_token_out="$sock_dir/system_token"
     exec ${agentMcpBackendWrapper}/bin/agent-mcp-backend \
       --uds "$sock" \
       --project-dir "$path" \
+      --system-token-out "$system_token_out" \
       --no-tui
   '';
 
