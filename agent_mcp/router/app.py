@@ -806,10 +806,12 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
       * No auth at all → 401.
       * Bearer present but unknown → 401.
       * Cookie present but unknown / expired / non-member → 401.
-      * Cookie valid but the per-project HMAC key isn't loaded yet
-        (raced backend spawn) → 401. The next retry hits a populated
-        key (``_ensure`` writes the key file BEFORE the systemctl
-        start) so this is at most a single-request flake.
+      * Cookie valid but the backend systemd unit refused to spawn
+        (unknown project, broken unit file, spawn timeout) → 401.
+        ``_forwarding_header_from_cookie`` explicitly triggers
+        ``_ensure`` so the unit's ExecStartPre writes the HMAC key
+        BEFORE the key is read; on a cold backend the cookie path is
+        self-sufficient and does not depend on prior bearer traffic.
 
     The cookie path runs INSIDE this handler rather than in
     ``require_operator_session_middleware`` because ``/agent-mcp/mcp/``
@@ -874,15 +876,36 @@ async def _forwarding_header_from_cookie(
       * No ``agent_mcp_session`` cookie.
       * Cookie not resolvable to a live operator session.
       * Operator is not a member of the project.
-      * The per-project HMAC key isn't loaded yet (the cookie request
-        raced backend spawn — at most one flake; ``_ensure`` writes
-        the key file BEFORE ``systemctl start``).
+      * The per-project HMAC key isn't on disk even after ``_ensure``
+        completed (vanishingly rare; would imply the unit's
+        ExecStartPre didn't run or didn't write the file).
+
+    Raises ``web.HTTPException`` (propagated as 4xx/5xx by aiohttp)
+    when ``_ensure`` rejects the spawn — unknown project (404), bad
+    unit file (500), spawn timeout (504). These are real upstream
+    errors and must NOT be masked as a generic 401: an authenticated
+    operator hitting an un-spawnable backend deserves the same
+    status the bearer path would surface when ``_proxy_to_backend``
+    calls ``_ensure`` itself.
 
     The returned tuple is fed into ``_proxy_to_backend``'s
     ``inject_header`` parameter; the backend's ``AuthHeaderMiddleware``
     verifies the HMAC against ``g.forwarding_hmac_key`` (same per-
     project key the router-side ``_po.get_forwarding_hmac_key``
     returns).
+
+    F015 v5 (this commit): the cookie path explicitly calls
+    ``_ensure`` BEFORE reading the HMAC key. F015 v4 (PR #214) moved
+    key generation out of the router and into the systemd unit's
+    ExecStartPre — but ExecStartPre only runs when ``systemctl
+    start`` runs, and ``systemctl start`` only runs from inside
+    ``_ensure``. The pre-v4 code path implicitly assumed ``_ensure``
+    had already populated the key file by the time the cookie path
+    ran; post-v4 that's only true if SOMETHING triggered ``_ensure``
+    first. On a cold backend (no agent-side bearer traffic, dashboard
+    is the first caller), nothing triggers it and every cookie
+    request 401s in a tight loop. Spawning here makes the cookie
+    path self-sufficient.
     """
     # Lazy imports — keep module import-time side-effect-free.
     from .login import resolve_current_user
@@ -901,13 +924,30 @@ async def _forwarding_header_from_cookie(
             return None
     except Exception:  # pragma: no cover - defensive
         return None
+    # Ensure the backend systemd unit is started so its ExecStartPre
+    # has run and written ``/run/agent-mcp/<name>/forwarding_hmac``.
+    # ``_ensure`` is idempotent (no-op if already active); the same
+    # function ``_proxy_to_backend`` calls a few frames down. We
+    # invoke it here so the HMAC key file is guaranteed present
+    # BEFORE ``get_forwarding_hmac_key`` reads it — F015 v5.
+    #
+    # ``_ensure`` raises ``web.HTTPException`` (404/500/504) on real
+    # spawn failures; we DON'T swallow them. Letting them bubble
+    # preserves the contract the bearer path already exposes (the
+    # bearer path's ``_proxy_to_backend`` makes the same call and
+    # raises the same exceptions). Masking them as 401 here would
+    # be a regression — an authenticated operator on a broken
+    # backend should see the real 5xx, not a misleading auth error.
+    await _ensure(real_project_name, "backend")
     key = _po.get_forwarding_hmac_key(real_project_name)
     if key is None:
-        # Backend isn't spawned yet — the cookie path can't sign a
-        # forwarding header without the per-project HMAC. Fall through
-        # to 401; the dashboard will retry and ``_ensure`` writes the
-        # key file BEFORE ``systemctl start``, so the next request
-        # hits a populated key.
+        # Backend spawn completed but the HMAC file still isn't on
+        # disk. Pre-v5 this was the normal "haven't spawned yet"
+        # case; post-v5 we've already called ``_ensure`` above, so
+        # reaching this branch means the systemd unit's ExecStartPre
+        # didn't write the file. That's a deployment-side bug
+        # (missing/broken nix module hook); falling through to 401
+        # is the correct user-visible signal.
         return None
     operator_id = str(user["user_id"])
     signed = _fh.sign(operator_id, key)
