@@ -102,13 +102,23 @@ async def test_state_load_skips_admin_pseudo_agent(tmp_path) -> None:
     appear there — otherwise `view_status` (which iterates
     g.active_agents) surfaces it alongside everything else, and any
     other code path that treats g.active_agents as "agents the dashboard
-    can talk to" gets a phantom admin entry."""
-    from agent_mcp.core import globals as g
+    can talk to" gets a phantom admin entry.
 
-    async with mcp_session(tmp_path):
-        # admin pseudo-agent row must exist in the DB (migration 0008
-        # / startup backstop), but must NOT be loaded into the
-        # in-memory active map.
+    retire-system-token Wave 1: the harness re-seeds a real 'admin'
+    per-agent row in the agents table (for the post-Wave-1 principal),
+    which lifespan-replay would then load into active_agents. So this
+    test runs lifespan BARE (without the harness's seeding) to
+    exercise just the lifespan's own behaviour."""
+    from agent_mcp.core import globals as g
+    from agent_mcp.app.main_app import create_app
+    from starlette.testclient import TestClient
+
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    app = create_app(project_dir=str(project_dir))
+    with TestClient(app):
+        # No harness seeding — just the lifespan's own active_agents
+        # population path.
         active_ids = {
             data.get("agent_id") for data in g.active_agents.values()
         }

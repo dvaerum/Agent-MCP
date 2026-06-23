@@ -80,12 +80,17 @@ async def test_requires_admin_rejects_worker_token(reset_globals) -> None:
 
 
 @pytest.mark.asyncio
-async def test_requires_admin_allows_admin_token(reset_globals) -> None:
-    """@requires("admin") passes the call through when the admin token wins."""
-    from agent_mcp.core import globals as g
-    from agent_mcp.core.authorize import requires
+async def test_requires_admin_allows_operator_session(reset_globals) -> None:
+    """@requires("admin") passes when ``operator_session_active`` is set.
 
-    g.admin_token = "admin-token-xyz"
+    retire-system-token Wave 1: the god-key bearer that previously
+    satisfied ``@requires("admin")`` is gone. The surviving admit path
+    is an operator session (set by the REST seam / the harness when a
+    request authenticates via cookie or signed forwarding header).
+    """
+    from agent_mcp.core.authorize import requires
+    from agent_mcp.tools.registry import operator_session_active
+
     called = {"hit": False}
 
     @requires("admin")
@@ -93,7 +98,11 @@ async def test_requires_admin_allows_admin_token(reset_globals) -> None:
         called["hit"] = True
         return [mcp_types.TextContent(type="text", text="ran")]
 
-    result = await my_tool({"token": "admin-token-xyz"})
+    cv = operator_session_active.set(True)
+    try:
+        result = await my_tool({"token": "anything-ignored-on-this-branch"})
+    finally:
+        operator_session_active.reset(cv)
     assert called["hit"]
     assert result[0].text == "ran"
 
@@ -138,18 +147,27 @@ async def test_requires_any_rejects_garbage(reset_globals) -> None:
 
 @pytest.mark.asyncio
 async def test_requires_policy_admin_always_allowed(reset_globals) -> None:
-    """Admin bypasses the policy check entirely."""
-    from agent_mcp.core import globals as g
-    from agent_mcp.core.authorize import requires_policy
+    """Admin bypasses the policy check entirely.
 
-    g.admin_token = "admin-token-xyz"
+    retire-system-token Wave 1: the god-key admit path is gone;
+    ``@requires_policy``'s admin branch now consults
+    ``verify_token(token, "admin")`` which only returns True when
+    the ``operator_session_active`` ContextVar is set. Stamp that
+    on the test's context to take the admin branch.
+    """
+    from agent_mcp.core.authorize import requires_policy
+    from agent_mcp.tools.registry import operator_session_active
 
     @requires_policy("config_some_toggle", default=False)
     async def my_tool(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
         return [mcp_types.TextContent(type="text", text="admin in")]
 
-    # Even with the toggle defaulting false, admin still gets through.
-    result = await my_tool({"token": "admin-token-xyz"})
+    cv = operator_session_active.set(True)
+    try:
+        # Even with the toggle defaulting false, admin still gets through.
+        result = await my_tool({"token": "anything"})
+    finally:
+        operator_session_active.reset(cv)
     assert result[0].text == "admin in"
 
 

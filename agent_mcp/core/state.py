@@ -50,7 +50,47 @@ active_agents: Dict[str, Dict[str, Any]] = {}
 # module-class swap at the bottom of this file. Every existing call
 # site (``g.admin_token = ...`` and ``g.admin_token`` reads) keeps
 # working unchanged; new code should prefer ``g.system_token``.
+#
+# retire-system-token Wave 1 (this PR): the value is still computed
+# and stored here (Wave 3 will delete the global + the persistence
+# row), but it is NO LONGER accepted as a bearer credential. See
+# ``agent_mcp.core.auth.verify_token`` and
+# ``agent_mcp.app.main_app.AuthHeaderMiddleware`` for the auth-side
+# removal. Operator identity now flows in via the signed forwarding
+# header (``g.forwarding_hmac_key`` below).
 system_token: Optional[str] = None
+
+# Per-project HMAC key for verifying the signed forwarding header the
+# router (Wave 2) attaches to operator-cookie requests before proxying
+# them to the per-project backend. Format + sign/verify logic live in
+# ``agent_mcp.app.forwarding_header``.
+#
+# Lifecycle (post-Wave-3):
+#   * Launcher writes 32 random bytes to a per-project file at backend
+#     spawn (``/run/agent-mcp/<proj>/forwarding_hmac``, mode 0600).
+#   * Backend's ``--forwarding-hmac-in <path>`` flag reads that file at
+#     startup and assigns the bytes to ``g.forwarding_hmac_key``.
+#   * Router holds the same key (it wrote it) and uses it to sign the
+#     ``X-Agent-MCP-Forwarded-Operator`` header on every proxied
+#     dashboard / cookie request.
+#
+# Wave 1 transitional state: the flag is shipped (this PR) but the
+# launcher write side is not (Wave 3). When ``g.forwarding_hmac_key``
+# is ``None``, the middleware silently skips the forwarding-header
+# check and the agents-table bearer path is the only working auth.
+# This keeps spawned agents working while the router catches up.
+forwarding_hmac_key: Optional[bytes] = None
+
+# Request-scoped operator identity, stamped by ``AuthHeaderMiddleware``
+# when a request authenticated via the forwarding-header path. Read by
+# downstream handlers (audit logs, operator-attributed mutations) that
+# want to know "which operator did this".
+#
+# Reset to ``None`` on every request entry — the middleware writes the
+# operator_id parsed from the verified header, or leaves it ``None``
+# when the request authenticated via a per-agent bearer (in which
+# case ``get_agent_id(token)`` is the authoritative caller identity).
+current_operator: Optional[str] = None
 
 # Task ID -> Task data (in-memory cache of tasks).
 tasks: Dict[str, Dict[str, Any]] = {}

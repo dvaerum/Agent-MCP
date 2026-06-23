@@ -114,8 +114,14 @@ async def send_agent_message_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
     if len(message_content) > 4000:  # Reasonable message size limit
         return [mcp_types.TextContent(type="text", text="Error: Message too long (max 4000 characters)")]
     
-    # Admin-only check for stop commands
-    is_admin = verify_token(sender_token, "admin")
+    # Admin-only check for stop commands.
+    # retire-system-token Wave 1: ``verify_token(.., "admin")`` now
+    # consults the operator-session ContextVar (set by the REST seam
+    # or forwarding-header middleware), NOT the bearer's role. Fall
+    # back to the agent-id-is-"admin" label so an admin bearer that
+    # didn't come through the operator-session path (e.g. an MCP
+    # call carrying a per-agent admin token) still resolves as admin.
+    is_admin = verify_token(sender_token, "admin") or sender_id == "admin"
     if message_type == "stop_command" and not is_admin:
         return [mcp_types.TextContent(type="text", text="Error: Only admin can send stop commands")]
     

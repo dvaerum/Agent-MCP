@@ -57,20 +57,33 @@ async def test_dispatch_does_not_overwrite_explicit_arguments_token(
     tmp_path,
 ) -> None:
     """If arguments already has a `token`, the contextvar must NOT
-    overwrite it. The explicit value is authoritative."""
-    from agent_mcp.tools.registry import dispatch_tool_call, request_auth_token
+    overwrite it. The explicit value is authoritative.
+
+    retire-system-token Wave 1: the harness stamps
+    ``operator_session_active=True`` by default so admin-tier tools
+    admit without a token. Clear it here so the test exercises the
+    token-only path the test name describes."""
+    from agent_mcp.tools.registry import (
+        dispatch_tool_call,
+        request_auth_token,
+        operator_session_active,
+    )
 
     async with mcp_session(tmp_path):
-        request_auth_token.set("override-this-token-should-not-be-used")
-
-        # Pass an obviously-wrong token in arguments. Should be rejected
-        # (not silently replaced with the contextvar's "valid" token).
+        cv = operator_session_active.set(False)
         try:
-            await dispatch_tool_call("view_status", {"token": "wrong" * 8})
-        except Exception:
-            # The auth-failure raise (issue H fix) is the expected
-            # behavior with a wrong explicit token.
-            return
+            request_auth_token.set("override-this-token-should-not-be-used")
+
+            # Pass an obviously-wrong token in arguments. Should be rejected
+            # (not silently replaced with the contextvar's "valid" token).
+            try:
+                await dispatch_tool_call("view_status", {"token": "wrong" * 8})
+            except Exception:
+                # The auth-failure raise (issue H fix) is the expected
+                # behavior with a wrong explicit token.
+                return
+        finally:
+            operator_session_active.reset(cv)
         raise AssertionError(
             "dispatch_tool_call swallowed the wrong explicit token; "
             "the contextvar must not override what the caller provided"
@@ -80,12 +93,23 @@ async def test_dispatch_does_not_overwrite_explicit_arguments_token(
 async def test_dispatch_without_contextvar_and_without_token_returns_auth_failure(
     tmp_path,
 ) -> None:
-    """No arguments.token and no contextvar → auth fails normally."""
-    from agent_mcp.tools.registry import dispatch_tool_call, request_auth_token
+    """No arguments.token and no contextvar → auth fails normally.
+
+    retire-system-token Wave 1: clear the harness's stamped
+    ``operator_session_active`` so the auth gate actually fires."""
+    from agent_mcp.tools.registry import (
+        dispatch_tool_call,
+        request_auth_token,
+        operator_session_active,
+    )
 
     async with mcp_session(tmp_path):
-        # Make sure the contextvar is empty for this test.
-        request_auth_token.set(None)
+        cv = operator_session_active.set(False)
+        try:
+            # Make sure the contextvar is empty for this test.
+            request_auth_token.set(None)
 
-        with pytest.raises(Exception):
-            await dispatch_tool_call("view_status", {})
+            with pytest.raises(Exception):
+                await dispatch_tool_call("view_status", {})
+        finally:
+            operator_session_active.reset(cv)

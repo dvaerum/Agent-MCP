@@ -63,11 +63,29 @@ def _fk_list(conn: sqlite3.Connection, table: str) -> list[tuple]:
 
 
 async def test_fresh_project_has_no_admin_pseudo_agent(tmp_path) -> None:
-    """Wave 4: a freshly-initialised project must have zero rows in
-    ``agents`` with ``agent_id='admin'``."""
-    from agent_mcp.core.config import get_db_path
+    """Wave 4: a freshly-initialised project — i.e. after migrations
+    run but BEFORE any application-side row inserts — must have zero
+    rows in ``agents`` with ``agent_id='admin'``.
 
-    async with mcp_session(tmp_path):
+    retire-system-token Wave 1 (the harness's principal is now a real
+    per-agent row with ``agent_id='admin'``) means we can't query
+    inside an open ``mcp_session``: the harness re-inserts the row
+    immediately after migrations run, masking the assertion. Run
+    migrations via a barebones startup path that DOESN'T go through
+    the harness, then query the freshly-migrated DB."""
+    from agent_mcp.db.schema import init_database
+
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    import os
+    os.environ["MCP_PROJECT_DIR"] = str(project_dir)
+    try:
+        # init_database runs the Alembic upgrade chain (which includes
+        # 0014's DELETE of the synthetic admin row) without going
+        # through application_startup / the harness.
+        init_database()
+        from agent_mcp.core.config import get_db_path
+
         conn = sqlite3.connect(str(get_db_path()))
         try:
             count = conn.execute(
@@ -79,6 +97,8 @@ async def test_fresh_project_has_no_admin_pseudo_agent(tmp_path) -> None:
             f"Wave 4 deleted the admin pseudo-agent — expected zero "
             f"rows, found {count}"
         )
+    finally:
+        os.environ.pop("MCP_PROJECT_DIR", None)
 
 
 async def test_admin_targeting_fks_are_dropped(tmp_path) -> None:
@@ -104,13 +124,21 @@ async def test_agent_messages_with_admin_sender_succeeds_without_parent(
 ) -> None:
     """Inserting an agent_messages row with ``sender_id='admin'`` and
     ``recipient_id='admin'`` must succeed without any agents-table
-    parent row — the FK is gone, the columns are now durable labels."""
+    parent row — the FK is gone, the columns are now durable labels.
+
+    retire-system-token Wave 1: the harness re-seeds an admin row for
+    its principal; DELETE that row first so we exercise the
+    no-parent-row case the migration's FK-drop is meant to allow."""
     from agent_mcp.db.connection import get_db_connection
 
     async with mcp_session(tmp_path):
         conn = get_db_connection()
         try:
-            # Sanity-check: no admin parent row exists.
+            # Wipe the harness's admin row so the test exercises the
+            # post-Wave-4 "label without parent" path the migration
+            # is meant to allow.
+            conn.execute("DELETE FROM agents WHERE agent_id='admin'")
+            conn.commit()
             row = conn.execute(
                 "SELECT 1 FROM agents WHERE agent_id='admin'"
             ).fetchone()
@@ -140,12 +168,17 @@ async def test_mcp_sessions_with_admin_agent_id_succeeds_without_parent(
     This is the dashboard's GET /mcp open path: the cookie-injected
     system bearer resolves to ``agent_id='admin'`` inside the
     backend's ``session_registry.register_session`` call. With the
-    FK gone, that no longer needs a synthetic parent."""
+    FK gone, that no longer needs a synthetic parent.
+
+    retire-system-token Wave 1: harness re-seeds the admin row; we
+    DELETE it first to exercise the FK-gone path."""
     from agent_mcp.db.connection import get_db_connection
 
     async with mcp_session(tmp_path):
         conn = get_db_connection()
         try:
+            conn.execute("DELETE FROM agents WHERE agent_id='admin'")
+            conn.commit()
             conn.execute(
                 "INSERT INTO mcp_sessions "
                 "(session_id, agent_id, opened_at, last_seen_at, "

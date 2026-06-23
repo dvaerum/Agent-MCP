@@ -22,19 +22,18 @@ async def test_app_starts(tmp_path) -> None:
     """create_app() + lifespan startup + a basic GET to /api/tokens.
 
     Wave 1 of prancy-napping-pie put ``/api/tokens`` behind
-    ``require_operator_session``. We exercise the legacy admin-bearer
-    fallback path (the dep accepts it for backwards-compat with admin
-    scripts + tests like this one) so the smoke test still verifies
-    end-to-end app boot + a real handler returning a real payload.
+    ``require_operator_session``. retire-system-token Wave 1 removed
+    the legacy admin-bearer fallback from that dep; the surviving
+    auth surfaces are (a) operator-session cookie and (b) signed
+    forwarding header. The harness's ``admin.get`` helper attaches a
+    signed forwarding header on every call, so the smoke test still
+    verifies end-to-end boot + a real handler.
 
     Wave 3 (prancy-napping-pie) dropped the ``admin_token`` field
     from the response; only ``agent_tokens`` remains.
     """
     async with mcp_session(tmp_path) as admin:
-        response = admin.client.get(
-            "/api/tokens",
-            headers={"Authorization": f"Bearer {admin.admin_token}"},
-        )
+        response = admin.get("/api/tokens")
 
         assert response.status_code == 200, response.text
 

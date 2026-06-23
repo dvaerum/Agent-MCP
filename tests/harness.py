@@ -73,6 +73,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as _dt
+import os
 import secrets
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -306,11 +307,19 @@ class WorkerSession:
     `request_auth_token` set to this session's token — mirroring the
     contextvar an HTTP request would set via the Authorization-header
     middleware in production.
+
+    ``is_admin_caller`` toggles the harness's operator-session stamping
+    on the registry contextvars during ``.call`` / ``.list_tools``.
+    Set by :meth:`AdminClient.create_admin_agent` (and the AdminClient
+    itself) so admin-side tool calls satisfy
+    ``@requires_role("operator")`` after retire-system-token Wave 1
+    removed the system-bearer god-key from ``verify_token``.
     """
 
     token: str
     agent_id: str
     _admin: "AdminClient"
+    is_admin_caller: bool = False
 
     # --- Low-level call surface ---
 
@@ -323,8 +332,24 @@ class WorkerSession:
         `request_auth_token` so the dispatcher's Q6e fallback fills
         `arguments.token` if absent. Returns the raw content blocks;
         use the `assert_*` helpers for wire-isError semantics.
+
+        retire-system-token Wave 1: when invoked through the
+        :class:`AdminClient` (i.e. this session represents the
+        harness's manager-role admin agent), the call also stamps
+        ``operator_session_active=True`` and the operator user_id on
+        the registry contextvars. Without it,
+        ``@requires_role("operator")``-gated tools would reject the
+        call because the system-bearer fallback that previously
+        admitted operator-tier callers is gone. The harness operator
+        identity mirrors what the REST seam (``routes.py``) does for
+        cookie-authenticated dashboard mutations.
         """
-        from agent_mcp.tools.registry import request_auth_token
+        from agent_mcp.tools.registry import (
+            request_auth_token,
+            operator_session_active,
+            operator_user_id,
+            operator_project_name,
+        )
 
         handler = self._admin._call_tool_handler()
         req = mcp_types.CallToolRequest(
@@ -334,10 +359,29 @@ class WorkerSession:
             ),
         )
         cv_token = request_auth_token.set(self.token)
+        # The harness sets ``operator_session_active=True`` for the
+        # whole session by default (so per-tool admin gates admit by
+        # default — matching the pre-Wave-1 god-key behaviour). For a
+        # worker session, we explicitly clear the contextvars before
+        # dispatch so the role-based filters see a worker request,
+        # not an operator one.
+        cv_op_session = None
+        cv_op_user = None
+        cv_op_project = None
+        if not (self.is_admin_caller or self is self._admin):
+            cv_op_session = operator_session_active.set(False)
+            cv_op_user = operator_user_id.set(None)
+            cv_op_project = operator_project_name.set(None)
         try:
             server_result = await handler(req)
         finally:
             request_auth_token.reset(cv_token)
+            if cv_op_session is not None:
+                operator_session_active.reset(cv_op_session)
+            if cv_op_user is not None:
+                operator_user_id.reset(cv_op_user)
+            if cv_op_project is not None:
+                operator_project_name.reset(cv_op_project)
 
         inner = (
             server_result.root
@@ -350,16 +394,42 @@ class WorkerSession:
 
     async def list_tools(self) -> List[mcp_types.Tool]:
         """`tools/list` as this bearer sees it (admin or worker filter
-        per PR #55)."""
-        from agent_mcp.tools.registry import request_auth_token
+        per PR #55).
+
+        retire-system-token Wave 1: when invoked through the
+        :class:`AdminClient`, the call stamps
+        ``operator_session_active=True`` so the admin-tier branch of
+        the visibility filter (which now reads the operator-session
+        contextvar instead of ``verify_token(.., "admin")`` on the
+        system bearer) takes effect.
+        """
+        from agent_mcp.tools.registry import (
+            request_auth_token,
+            operator_session_active,
+            operator_user_id,
+            operator_project_name,
+        )
 
         handler = self._admin._list_tools_handler()
         req = mcp_types.ListToolsRequest(method="tools/list")
         cv_token = request_auth_token.set(self.token)
+        cv_op_session = None
+        cv_op_user = None
+        cv_op_project = None
+        if not (self.is_admin_caller or self is self._admin):
+            cv_op_session = operator_session_active.set(False)
+            cv_op_user = operator_user_id.set(None)
+            cv_op_project = operator_project_name.set(None)
         try:
             result = await handler(req)
         finally:
             request_auth_token.reset(cv_token)
+            if cv_op_session is not None:
+                operator_session_active.reset(cv_op_session)
+            if cv_op_user is not None:
+                operator_user_id.reset(cv_op_user)
+            if cv_op_project is not None:
+                operator_project_name.reset(cv_op_project)
         inner = result.root if hasattr(result, "root") else result
         return list(getattr(inner, "tools", []) or [])
 
@@ -493,17 +563,153 @@ class WorkerSession:
         )
 
 
+#: Operator id the harness signs the forwarding header for. Stable
+#: across the test suite so audit-log assertions can name the actor
+#: explicitly.
+_HARNESS_OPERATOR_ID = "test-harness-operator"
+
+#: agent_id of the manager-role agent the harness seeds at startup.
+#: Pre-Wave-1 the harness used ``g.system_token`` as the bearer and
+#: ``get_agent_id(g.system_token)`` returned the literal string
+#: ``"admin"`` as the principal's id (used to attribute messages,
+#: tasks, audit-log rows). retire-system-token Wave 1 dropped that
+#: code path, so the harness now seeds a real per-agent row in the
+#: ``agents`` table — but the agent_id stays ``"admin"`` so the rest
+#: of the codebase (~50 callsites that special-case the literal
+#: ``"admin"`` for routing, filtering, ownership checks) keeps
+#: working unchanged.
+#:
+#: Migration 0014 deletes the synthetic ``admin`` row at startup; the
+#: harness re-inserts a fresh row inside ``mcp_session`` so the
+#: principal has a real DB row. The
+#: ``test_db_admin_pseudo_agent.py`` suite (which pins the
+#: zero-rows-after-fresh-init invariant) queries before the harness
+#: seeds so its assertions stay valid.
+_HARNESS_ADMIN_AGENT_ID = "admin"
+
+
+def _seed_harness_admin_agent() -> str:
+    """Insert a manager-role agent row + return its bearer token.
+
+    The harness's ``AdminClient`` uses this token for MCP tool calls
+    that drop through ``request_auth_token`` into a real
+    ``verify_token`` chain. Manager-role tokens satisfy
+    ``verify_token(.., "manager")`` and the agent path of
+    ``verify_token(.., "agent")``; operator-tier tools are gated
+    separately via the ``operator_session_active`` contextvar (which
+    the REST seam and harness REST helpers stamp).
+
+    Idempotent on agent_id: a re-seed within the same test process
+    returns the previously-inserted token. Each call to
+    :func:`mcp_session` runs inside a fresh tmp DB, so the
+    cross-test concern is bounded by the engine-cache reset.
+    """
+    from agent_mcp.core import globals as g
+    from agent_mcp.db.connection import get_db_connection
+
+    now = _dt.datetime.now().isoformat()
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT token FROM agents WHERE agent_id = ?",
+            (_HARNESS_ADMIN_AGENT_ID,),
+        )
+        existing = cursor.fetchone()
+        if existing and existing["token"]:
+            token = existing["token"]
+        else:
+            token = secrets.token_hex(16)
+            cursor.execute(
+                "INSERT INTO agents (token, agent_id, capabilities, "
+                "created_at, status, working_directory, color, "
+                "updated_at, agent_role) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    token,
+                    _HARNESS_ADMIN_AGENT_ID,
+                    "[]",
+                    now,
+                    "active",
+                    "/tmp",
+                    "#888",
+                    now,
+                    "manager",
+                ),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+    # Also surface the agent in the in-memory cache so ``verify_token(..,
+    # "agent")`` admits without a DB roundtrip on the hot path.
+    g.active_agents[token] = {
+        "agent_id": _HARNESS_ADMIN_AGENT_ID,
+        "status": "active",
+        "created_at": now,
+        "capabilities": [],
+        "agent_role": "manager",
+    }
+    return token
+
+
 class AdminClient(WorkerSession):
     """The session yielded by `mcp_session`. Adds factory methods
     for spawning worker / admin-agent sessions and exposes the
     underlying TestClient for REST assertions.
+
+    retire-system-token Wave 1: the harness no longer authenticates
+    by handing out ``g.system_token`` (the god-key is gone). Instead
+    we mint a real per-agent manager-role token for MCP tool calls
+    AND configure the forwarding-header HMAC key on app startup so
+    REST helper calls (``.get`` / ``.post`` etc.) attach a signed
+    ``X-Agent-MCP-Forwarded-Operator`` header — the same path the
+    router will use post-Wave-2.
+
+    ``self.admin_token`` is preserved as an attribute and still
+    points at a credential the test suite can use for ``token=...``
+    body fields and ``request_auth_token``-fallback MCP calls. Its
+    value is now the per-agent manager bearer (not ``g.system_token``).
     """
 
-    def __init__(self, admin_token: str, test_client: Any) -> None:
-        super().__init__(token=admin_token, agent_id="admin", _admin=self)
+    def __init__(
+        self,
+        admin_token: str,
+        test_client: Any,
+        forwarding_hmac_key: bytes,
+    ) -> None:
+        super().__init__(
+            token=admin_token,
+            agent_id=_HARNESS_ADMIN_AGENT_ID,
+            _admin=self,
+            is_admin_caller=True,
+        )
         self.admin_token = admin_token
         self.client = test_client
         self._mcp_app = None
+        self._forwarding_hmac_key = forwarding_hmac_key
+
+    # --- Forwarding-header helpers ---------------------------------
+
+    def forwarding_header(
+        self, operator_id: str = _HARNESS_OPERATOR_ID
+    ) -> dict[str, str]:
+        """Return a one-shot signed forwarding header for ``operator_id``.
+
+        Wraps ``agent_mcp.app.forwarding_header.sign`` against the
+        per-test HMAC key the harness stamped on
+        ``g.forwarding_hmac_key`` at startup. Tests that need to
+        authenticate against backend REST routes via the router
+        path (cookie → signed header) use this helper to build the
+        header on each call.
+        """
+        from agent_mcp.app import forwarding_header as _fh
+
+        return {
+            _fh.HEADER_NAME: _fh.sign(
+                operator_id, self._forwarding_hmac_key, ttl_sec=30
+            )
+        }
 
     # --- Authenticated GET helper for Wave-1+ REST routes ----------
 
@@ -512,18 +718,43 @@ class AdminClient(WorkerSession):
 
         Wave 1 of prancy-napping-pie put auth-less GET endpoints (notably
         ``/api/tokens`` and ``/api/all-data``) behind
-        ``require_operator_session``. The dep accepts the admin bearer
-        as a legacy fallback (see ``agent_mcp/app/deps.py``), so
-        stamping the bearer here keeps test wire-shapes identical to
-        pre-Wave-1.
+        ``require_operator_session``. retire-system-token Wave 1
+        removed the system-bearer legacy fallback from the dep; we
+        now authenticate via the signed forwarding header (the same
+        path the router will use post-Wave-2).
 
         Tests can still call ``admin.client.get(url, ...)`` directly
         when they want to assert the auth-less wire shape (e.g. the
-        Wave 1 RED tests).
+        RED 401 tests).
         """
         headers = dict(kwargs.pop("headers", {}) or {})
-        headers.setdefault("Authorization", f"Bearer {self.admin_token}")
+        # Forwarding header authenticates as the harness operator.
+        for k, v in self.forwarding_header().items():
+            headers.setdefault(k, v)
         return self.client.get(url, headers=headers, **kwargs)
+
+    def post(self, url: str, **kwargs: Any):
+        """Authenticated convenience wrapper around ``client.post``.
+
+        Mirrors :meth:`get` — attaches a signed forwarding header so
+        REST mutation routes guarded by ``require_operator_session``
+        pass auth.
+        """
+        headers = dict(kwargs.pop("headers", {}) or {})
+        for k, v in self.forwarding_header().items():
+            headers.setdefault(k, v)
+        return self.client.post(url, headers=headers, **kwargs)
+
+    def request(self, method: str, url: str, **kwargs: Any):
+        """Authenticated convenience wrapper around ``client.request``.
+
+        Same forwarding-header attach pattern as :meth:`get` /
+        :meth:`post`, for tests that drive PUT / DELETE / PATCH.
+        """
+        headers = dict(kwargs.pop("headers", {}) or {})
+        for k, v in self.forwarding_header().items():
+            headers.setdefault(k, v)
+        return self.client.request(method, url, headers=headers, **kwargs)
 
     # --- Lazy handler accessors (avoid importing main_app at module load) ---
 
@@ -604,7 +835,10 @@ class AdminClient(WorkerSession):
             "capabilities": ["admin"],
         }
         return WorkerSession(
-            token=self.admin_token, agent_id=agent_id, _admin=self
+            token=self.admin_token,
+            agent_id=agent_id,
+            _admin=self,
+            is_admin_caller=True,
         )
 
     # --- Builder helpers for common project_context shapes ---
@@ -667,9 +901,7 @@ async def mcp_session(tmp_path: Path) -> AsyncIterator[AdminClient]:
     # Env isolation — match `conftest.py::_isolate_env` so the harness
     # works equally well from tests that don't use the autouse fixture
     # (e.g. callers that supply their own `tmp_path` without
-    # `conftest.py`'s injection).
-    import os
-
+    # `conftest.py`'s injection). ``os`` is imported at module top.
     env_snapshot = {
         "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY"),
         "DOTENV_PATH": os.environ.get("DOTENV_PATH"),
@@ -712,20 +944,57 @@ async def mcp_session(tmp_path: Path) -> AsyncIterator[AdminClient]:
         # via a helper closure executed in the outer finally block.
         stack.callback(_close)
 
-        # Read the admin token from the in-process globals rather than
-        # via an HTTP call. Wave 1 of prancy-napping-pie put
-        # `/api/tokens` behind `require_operator_session`, so an
-        # unauthenticated GET (which is what the harness's bootstrap
-        # call is — we don't have the token yet to bearer-authenticate
-        # with) now 401s. The lifespan startup has already populated
-        # `g.admin_token` by the time `TestClient.__enter__` returns;
-        # reading it directly is wire-equivalent and avoids the
-        # chicken-and-egg.
+        # retire-system-token Wave 1: the harness no longer hands
+        # out ``g.system_token`` as the bearer (it's no longer
+        # accepted). Instead:
+        #   1. Stamp a fresh per-test HMAC key on
+        #      ``g.forwarding_hmac_key`` so REST helpers can sign a
+        #      forwarding header.
+        #   2. Mint a real manager-role agent row in the agents table
+        #      so MCP tool calls that need a bearer get a valid
+        #      per-agent token.
+        #   3. Stamp ``operator_session_active=True`` for the lifetime
+        #      of the harness session so per-tool admin gates (which
+        #      now consult the contextvar instead of a system-bearer
+        #      check) admit by default — every test running under the
+        #      harness is "the operator at the dashboard" unless it
+        #      explicitly resets the var to drive a worker call.
         from agent_mcp.core import globals as g
-        admin_token = g.admin_token
+        from agent_mcp.tools.registry import (
+            operator_session_active,
+            operator_user_id,
+            operator_project_name,
+        )
 
-        admin = AdminClient(admin_token=admin_token, test_client=test_client)
-        yield admin
+        g.forwarding_hmac_key = os.urandom(32)
+
+        admin_token = _seed_harness_admin_agent()
+
+        # ContextVar resets MUST happen in the same Context the
+        # ``.set()`` was made in. The ExitStack teardown runs via
+        # ``asyncio.to_thread`` (so the synchronous TestClient lifespan
+        # shutdown doesn't block the event loop), which is a different
+        # Context — calling ``contextvar.reset(token)`` from there
+        # raises ``ValueError: Token was created in a different Context``.
+        # So we manage the reset in this async generator's try/finally
+        # rather than on the stack.
+        cv_op_session = operator_session_active.set(True)
+        cv_op_user = operator_user_id.set(_HARNESS_OPERATOR_ID)
+        cv_op_project = operator_project_name.set("harness")
+
+        admin = AdminClient(
+            admin_token=admin_token,
+            test_client=test_client,
+            forwarding_hmac_key=g.forwarding_hmac_key,
+        )
+        try:
+            yield admin
+        finally:
+            # Reset contextvars in the same context they were set in
+            # (this coroutine), BEFORE the to_thread stack.close.
+            operator_project_name.reset(cv_op_project)
+            operator_user_id.reset(cv_op_user)
+            operator_session_active.reset(cv_op_session)
     finally:
         # Restore env vars first; teardown of app comes via the stack.
         for k, v in env_snapshot.items():
