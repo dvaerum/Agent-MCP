@@ -109,6 +109,18 @@ authenticate with the project admin token via the
 `Authorization: Bearer` header. Only the dashboard surface migrates
 to cookie sessions.
 
+> **Note (2026-06-23, `retire-system-token` Waves 1–3, PRs #208 / #209 /
+> #210):** the project-wide `admin_token` / `system_token` no longer
+> exists. The references to "admin token" elsewhere in this guide
+> (server-startup log line, environment-variable table, "Your First
+> Multi-Agent Project" walkthrough, troubleshooting tips) reflect the
+> pre-retirement contract and will be revised in the Wave 5 sweep.
+> For external MCP clients (Claude Code, IDE plugins, ad-hoc scripts),
+> the operator-facing migration guide is
+> [`docs/external-mcp-client.md`](./external-mcp-client.md): provision a
+> per-agent worker (or manager) agent in the dashboard and use that
+> agent's `token` as the bearer.
+
 Pick the bootstrap path that matches your deploy shape:
 
 ### Wizard (browser, easiest)

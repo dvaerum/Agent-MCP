@@ -114,3 +114,26 @@ deploys upgrade without losing access.
 - Related: ADR-0008 (single-tenant URL parity) — single-tenant mode
   still works under the operator-login regime; the bootstrap is the
   same.
+
+## Addendum (2026-06-23) — `admin_token` paths superseded
+
+Waves 1–3 of the `retire-system-token` plan (PRs #208, #209, #210)
+removed the `admin_token` / `system_token` entirely. The text above
+documents the contract as it stood at Phase 1 of operator-login;
+several specifics have since changed:
+
+- The backend's `AuthHeaderMiddleware` no longer accepts
+  `Authorization: Bearer <admin_token>` on any route (PR #208).
+- The body-token field documented in the Decision section is gone.
+- The legacy admin-token-bearer fallback for `/agent-mcp/mcp/<project>`
+  is also gone. Spawned agents and out-of-tree MCP clients
+  authenticate exclusively with per-agent bearer tokens drawn from
+  the `agents` table.
+- The dashboard's cookie path now reaches the backend via a
+  router-signed `X-Agent-MCP-Forwarded-Operator` header (PR #209)
+  rather than via the router translating the cookie into an admin
+  bearer.
+
+The "implicit admin retirement" decision and the operator-login
+machinery are unchanged. For the external-client migration story,
+see [`docs/external-mcp-client.md`](../external-mcp-client.md).

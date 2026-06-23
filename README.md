@@ -124,6 +124,15 @@ SameSite=Lax, scoped to `/agent-mcp/`. Agent-side MCP traffic
 `Authorization: Bearer <admin_token>` header — agents don't need to
 be aware of the operator login.
 
+> **Note (2026-06-23):** the `admin_token` / `system_token` was fully
+> retired in PRs #208 / #209 / #210. External MCP clients
+> (Claude Code, IDE plugins, ad-hoc scripts) must now authenticate
+> with **per-agent bearer tokens** drawn from the `agents` table.
+> See [docs/external-mcp-client.md](./docs/external-mcp-client.md)
+> for the operator-facing migration guide. The README sections below
+> that still reference an "admin token" workflow will be revised in
+> the `retire-system-token` Wave 5 sweep.
+
 ## MCP Integration Guide
 
 ### What is MCP?
@@ -811,6 +820,7 @@ Run memory garbage collection through the dashboard or restart with `--refresh-m
 ## Documentation
 
 - [Getting Started Guide](./docs/getting-started.md) - Complete walkthrough with examples
+- [Connecting external MCP clients](./docs/external-mcp-client.md) - Migration guide for Claude Code / IDE plugins / scripts after the `system_token` retirement
 - [MCD Creation Guide](./docs/mcd-guide.md) - Write effective project blueprints
 - [Theoretical Foundation](./docs/chapter-1-cognitive-empathy.md) - Understanding AI cognition
 - [Architecture Overview](./docs/architecture.md) - System design and components
