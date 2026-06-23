@@ -14,13 +14,14 @@ per-project HMAC key.
 Architecture under test
 -----------------------
 
-1.  Router writes the per-project HMAC key to
-    ``<sock_dir>/<name>/forwarding_hmac`` BEFORE invoking
-    ``systemctl start`` (``project_orchestrator.ensure_forwarding_hmac_key``).
-    The fixture skips the spawn dance and writes the key directly,
-    matching the production lifecycle: the launcher reads the same
-    file via ``--forwarding-hmac-in`` and the backend's bootstrap
-    loads it into ``g.forwarding_hmac_key``.
+1.  Per-project HMAC key lives at
+    ``<sock_dir>/<name>/forwarding_hmac``. F015 v4 moved key
+    generation from the router into the systemd unit's
+    ExecStartPre (see ``nix/module.nix``). The router only READS;
+    ``project_orchestrator.ensure_forwarding_hmac_key`` is a
+    cache-front for that read. The fixture writes the file directly
+    (simulating what the unit's ExecStartPre does in production),
+    then lets the router pick it up through the normal reader path.
 2.  Cookie-authenticated request lands on ``backend_mcp_handler``.
     ``_forwarding_header_from_cookie`` validates the cookie, checks
     project membership, then signs the header with the per-project
@@ -161,22 +162,28 @@ async def _start_backend_on_uds(
 async def wave2_backend(router_module, router_env, systemctl_stub):
     """Stand up the Wave-2 backend for project ``demo``.
 
-    Pre-populates the per-project HMAC key on disk the way
-    ``project_orchestrator.ensure_forwarding_hmac_key`` would at
-    spawn time, and stashes it on the fake backend so the verify path
-    uses the same key the router will sign with.
+    Pre-populates the per-project HMAC key on disk the way the
+    systemd unit's ExecStartPre would in production (F015 v4), then
+    lets the router's reader pick it up off disk.
     """
+    import os
+    import secrets
+
     from agent_mcp.router import project_orchestrator as _po
 
     name = "demo"
     router_module._REGISTRY.register(name, str(router_env.root / "ws"))
     sock = router_env.sock_dir / name / "backend.sock"
 
-    # Mirror the production lifecycle: HMAC key written BEFORE backend
-    # spawn. We can call the production helper directly — it's idempotent
-    # and writes the same file the launcher would point ``--forwarding-hmac-in``
-    # at.
-    hmac_key = _po.ensure_forwarding_hmac_key(name)
+    # Mirror the production lifecycle: systemd unit's ExecStartPre
+    # writes the HMAC key BEFORE the launcher starts the backend.
+    # This test bypasses systemd and writes the file directly.
+    hmac_key = secrets.token_bytes(32)
+    key_path = _po._forwarding_hmac_path(name)
+    key_path.write_bytes(hmac_key)
+    os.chmod(key_path, 0o600)
+    # Warm the router's reader cache off the on-disk file.
+    assert _po.ensure_forwarding_hmac_key(name) == hmac_key
 
     backend = _Wave2Backend(hmac_key=hmac_key)
     runner = await _start_backend_on_uds(backend, sock)

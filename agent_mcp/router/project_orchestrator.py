@@ -46,7 +46,6 @@ import asyncio
 import contextlib
 import logging
 import os
-import secrets
 import subprocess
 import time
 from collections import defaultdict
@@ -146,148 +145,98 @@ def _sock_path(name: str, role: str) -> Path:
 # ``g.forwarding_hmac_key`` at backend bootstrap via the
 # ``--forwarding-hmac-in`` flag.
 #
-# The router OWNS this key: generated at backend spawn time, written
-# to ``<sock_dir>/<name>/forwarding_hmac`` (mode 0600) so the
-# launcher can hand the path to the backend, and stashed in this
-# in-memory map so signing on every request doesn't pay a disk read.
+# F015 v4: ownership of the on-disk key INVERTED. PRs #208-#213 had
+# the router generate + write the file before invoking ``systemctl
+# start``, then self-heal on cache hits. That model broke in the
+# live VM because systemd's ``Restart=on-failure`` reactivates the
+# unit autonomously after a crash — bypassing the router entirely.
+# The unit hit a 9569-deep restart loop (counter visible in
+# ``journalctl -u agent-mcp@demo-proj.service``) because none of
+# those restarts went through the router's write logic.
 #
-# The dict is cleared per-(name) on backend stop so a project that's
-# re-spawned after a workspace teardown rotates the key cleanly.
+# New ownership (see ``nix/module.nix`` ``agent-mcp@`` unit):
+#
+#   * The systemd unit's ExecStartPre writes the file (32 random
+#     bytes, mode 0600) if it doesn't already exist. EVERY path that
+#     starts the unit — manual ``systemctl start``, on-failure
+#     restart, boot-time activation — guarantees the file is on disk
+#     before the backend's ``--forwarding-hmac-in`` validator runs.
+#   * The router READS the file on demand and caches the bytes for
+#     fast HMAC signing on every request. The router NEVER writes.
+#   * The cache is purely a perf optimisation; cache miss falls back
+#     to a disk read.
+#
+# Operators who want to rotate the key delete
+# ``/run/agent-mcp/<name>/forwarding_hmac`` and restart the unit;
+# the next ExecStartPre regenerates.
 
-# {project_name: HMAC key bytes (32 bytes of os.urandom)}
+# {project_name: HMAC key bytes (32 bytes of os.urandom, written by
+# the systemd unit's ExecStartPre)}
 forwarding_hmac_keys: dict[str, bytes] = {}
 
 
 def _forwarding_hmac_path(name: str) -> Path:
-    """Path the router writes the per-project HMAC key to.
+    """Path the systemd unit writes the per-project HMAC key to.
 
     Same directory as the backend's UDS so the launcher's
-    ``$AGENT_MCP_SOCK_DIR/$name/`` mkdir covers both files in one
-    step and a project teardown drops the key alongside the socket
-    — no stale key file surviving a backend rebuild.
+    ``$AGENT_MCP_SOCK_DIR/$name/`` covers both files in one step.
+    The router only READS this path (F015 v4).
     """
     d = SOCK_DIR / name
     d.mkdir(parents=True, exist_ok=True)
     return d / "forwarding_hmac"
 
 
-def ensure_forwarding_hmac_key(name: str) -> bytes:
-    """Return the per-project HMAC key, generating + persisting if needed.
+def ensure_forwarding_hmac_key(name: str) -> bytes | None:
+    """Return the per-project HMAC key, reading from disk if needed.
 
-    Idempotent: if a key file already exists on disk (e.g. the router
-    crashed mid-spawn and restarted, or a stale file is left over from
-    a previous backend instance), the on-disk value wins so the
-    already-spawned backend's loaded key stays compatible. The in-
-    memory cache is populated on first use so subsequent calls within
-    the same router process are pure dict lookups.
+    Read-only as of F015 v4: NEVER generates a new key, NEVER writes
+    to disk. The systemd unit's ExecStartPre owns key generation
+    (see ``nix/module.nix`` — ``test -f $RUNTIME_DIRECTORY/forwarding_hmac
+    || head -c 32 /dev/urandom > ...``). Putting the write there
+    means the file is guaranteed by the unit lifecycle, not by the
+    router — autonomous systemd restarts (``Restart=on-failure``)
+    also get a key, which PRs #208-#213 did not.
 
-    The file is written with mode 0600 (router-only readable). The
-    launcher passes the path to the backend via
-    ``--forwarding-hmac-in``; the backend reads it once at startup
-    into ``g.forwarding_hmac_key``.
-
-    Called eagerly from ``_ensure`` BEFORE the systemctl start so the
-    file is on disk by the time the backend's bootstrap reads it.
-
-    Self-healing on cache hit (F015 v3): if the in-memory cache has
-    the key but the on-disk file is gone, re-write the cached bytes.
-    The systemd unit declares ``RuntimeDirectory=agent-mcp/%i`` with
-    ``RuntimeDirectoryPreserve=no`` (the systemd default), so every
-    ``systemctl stop`` wipes ``/run/agent-mcp/<name>/`` — including
-    this key file. When the idle reaper stops a backend without
-    popping the cache, the next spawn would call us, see the cache
-    hit, return the bytes, and let ``_ensure`` invoke ``systemctl
-    start``; the backend launcher then exits 2 because click's
-    ``--forwarding-hmac-in File()`` validator can't find the file.
-    The self-heal branch re-creates the file with the same bytes so
-    the spawn succeeds. We do NOT rotate here — any backend already
-    loaded with the cached key would fail HMAC verify against a new
-    one.
-    """
-    path = _forwarding_hmac_path(name)
-    cached = forwarding_hmac_keys.get(name)
-    if cached is not None:
-        if not path.exists():
-            # Out-of-band deletion (most commonly systemd
-            # RuntimeDirectory teardown between stop + restart).
-            # Re-write the cached bytes; mode 0600 to match the
-            # generate branch's invariant.
-            fd = os.open(
-                str(path),
-                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-                0o600,
-            )
-            try:
-                os.write(fd, cached)
-            finally:
-                os.close(fd)
-        return cached
-    # If a key file already exists on disk, adopt it. Defends the
-    # router-restart scenario: a backend that's already running was
-    # spawned with whatever key the previous router process wrote —
-    # generating a new key here would silently break HMAC verification
-    # for every cookie-authenticated request until the backend is
-    # restarted. The router-restart case (orphaned backend with a
-    # known key file) is handled by ``reconcile_on_startup``'s
-    # adoption pass; this branch covers the in-flight readers.
-    try:
-        existing = path.read_bytes()
-    except FileNotFoundError:
-        existing = None
-    except OSError as exc:  # pragma: no cover - defensive
-        log.warning(
-            "Failed to read existing HMAC key for project %r at %s: %s",
-            name, path, exc,
-        )
-        existing = None
-    if existing:
-        forwarding_hmac_keys[name] = existing
-        return existing
-    # Fresh spawn — generate 32 random bytes and persist.
-    key = secrets.token_bytes(32)
-    # Atomic-ish write: open with O_CREAT|O_EXCL|O_TRUNC + 0600 so a
-    # racing reader never sees a half-written key. We don't need a
-    # tmpfile + rename here because the file is single-writer (the
-    # router process) and the launcher always reads AFTER the
-    # systemctl start completes (sequenced via ``_ensure``).
-    fd = os.open(
-        str(path),
-        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-        0o600,
-    )
-    try:
-        os.write(fd, key)
-    finally:
-        os.close(fd)
-    forwarding_hmac_keys[name] = key
-    return key
-
-
-def get_forwarding_hmac_key(name: str) -> bytes | None:
-    """Return the cached per-project HMAC key, or None if not set.
-
-    Read-only: never generates a new key. Used by the router's
-    ``_forwarding_header_from_cookie`` path; if the key isn't loaded
-    yet (e.g. the cookie request raced backend spawn), the cookie
-    path returns None and the caller 401s.
+    Lookup order:
+      1. In-memory cache hit → return cached bytes (no disk I/O).
+      2. Cache miss → read the file; if present, populate the cache
+         and return the bytes.
+      3. Cache miss + file missing → return ``None``. The caller
+         decides how to react; ``_ensure`` calls this BEFORE
+         ``systemctl start`` so a ``None`` simply means "the unit
+         hasn't run its ExecStartPre yet", which is fine — we go on
+         to invoke systemctl, the ExecStartPre writes the file, and
+         the next cookie-path call to ``get_forwarding_hmac_key``
+         picks it up off disk.
     """
     cached = forwarding_hmac_keys.get(name)
     if cached is not None:
         return cached
-    # Fallback: read off disk in case ``_ensure`` ran in a different
-    # process or before the in-memory cache was populated. This
-    # mirrors ``ensure_forwarding_hmac_key``'s adopt-existing branch
-    # but never writes a new key.
     try:
         existing = _forwarding_hmac_path(name).read_bytes()
     except FileNotFoundError:
         return None
-    except OSError:  # pragma: no cover - defensive
+    except OSError as exc:  # pragma: no cover - defensive
+        log.warning(
+            "Failed to read HMAC key for project %r: %s", name, exc,
+        )
         return None
-    if existing:
-        forwarding_hmac_keys[name] = existing
-        return existing
-    return None
+    if not existing:
+        return None
+    forwarding_hmac_keys[name] = existing
+    return existing
+
+
+def get_forwarding_hmac_key(name: str) -> bytes | None:
+    """Alias of :func:`ensure_forwarding_hmac_key` for callers that
+    want to spell their intent as "read, don't ensure".
+
+    Both functions are read-only as of F015 v4; the name distinction
+    is preserved so the call sites in ``router/app.py`` (cookie path)
+    and ``_ensure`` (spawn path) stay self-documenting.
+    """
+    return ensure_forwarding_hmac_key(name)
 
 
 def _unit_name(name: str, role: str) -> str:
@@ -405,14 +354,15 @@ async def _ensure(name: str, role: str) -> Path:
                     raise web.HTTPGatewayTimeout(reason=reason)
                 # Cooldown elapsed — drop the stale entry so we retry.
                 ensure_failures.pop((name, role), None)
-            # retire-system-token Wave 2: ensure the forwarding-header
-            # HMAC key file exists BEFORE the backend starts. The
-            # backend's ``--forwarding-hmac-in`` bootstrap reads the
-            # file at startup; if it isn't present yet, the cookie
-            # path silently degrades to "key not loaded" (Wave 1
-            # dormant fallback) and every cookie request 401s. Sits
-            # inside ``_ensure_lock`` so concurrent ``_ensure`` calls
-            # don't race on file creation.
+            # F015 v4: file creation moved to the systemd unit's
+            # ExecStartPre (see ``nix/module.nix``). The call below
+            # is now purely a cache warm-up: if a previous _ensure
+            # already read the file off disk, the cached bytes are
+            # ready for the cookie path's signing. A ``None`` return
+            # is FINE here — it just means the unit hasn't been
+            # started yet, which we're about to do; the next reader
+            # (``get_forwarding_hmac_key`` from the cookie path)
+            # will pick up the bytes ExecStartPre wrote.
             ensure_forwarding_hmac_key(name)
             action = "restart" if _is_active(unit) else "start"
             r = _systemctl(action, unit)
@@ -484,20 +434,16 @@ async def _reaper_tick() -> None:
         if now - last_active[key] > IDLE_SEC:
             _systemctl("stop", _unit_name(*key))
             last_active.pop(key, None)
-            # Cache symmetry with ``ProjectOrchestrator.stop()`` (see
-            # the ``forwarding_hmac_keys.pop`` at line ~648). Without
-            # this, the reaper-driven stop path leaves the in-memory
-            # HMAC cache populated while systemd's RuntimeDirectory
-            # teardown wipes the on-disk key file. The next spawn
-            # then either (a) reuses a key the backend can no longer
-            # produce on disk — caught by the self-heal branch in
-            # ``ensure_forwarding_hmac_key`` — or (b) rotates cleanly
-            # if we pop here. We prefer (b): cache symmetry between
-            # the REST stop path and the reaper stop path keeps the
-            # two paths reasoning-equivalent.
-            name, role = key
-            if role == "backend":
-                forwarding_hmac_keys.pop(name, None)
+            # F015 v4: no HMAC-cache pop here. The on-disk key file
+            # is owned by the systemd unit (RuntimeDirectoryPreserve
+            # keeps it across stop; ExecStartPre regenerates if
+            # missing), so the router's cache can stay populated
+            # across the reaper's stop with no consistency risk —
+            # the file the backend reloaded on the next start is the
+            # same bytes the router cached. The previous (F015 v3)
+            # cache-pop was symmetry plumbing for the router-as-
+            # writer model; F015 v4's read-only router doesn't need
+            # it.
 
 
 # ── Alias-grace reaper (ADR-0010) ───────────────────────────────────
@@ -682,12 +628,14 @@ class ProjectOrchestrator:
                     "message": r.stderr.strip(),
                 }
         last_active.pop((name, "backend"), None)
-        # Drop the in-memory HMAC key so the next spawn rotates. The
-        # file on disk is left in place — the next ``_ensure`` will
-        # adopt it via ``ensure_forwarding_hmac_key`` (idempotent
-        # against the existing file), so an in-flight cookie request
-        # racing the stop+restart cycle still verifies. Operators
-        # who want a hard rotation delete the project's sock dir.
+        # F015 v4: drop the in-memory HMAC cache entry so the next
+        # spawn re-reads from disk. The on-disk file is owned by the
+        # systemd unit (ExecStartPre regenerates if missing,
+        # RuntimeDirectoryPreserve=yes keeps it otherwise), so the
+        # bytes the next ``_ensure`` reads are whatever the next
+        # unit start guarantees. No functional change vs leaving the
+        # cache populated — but popping keeps the router's view in
+        # sync with the on-disk source-of-truth (cleaner reasoning).
         forwarding_hmac_keys.pop(name, None)
         return {"stopped": True}
 
