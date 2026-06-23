@@ -188,11 +188,40 @@ def ensure_forwarding_hmac_key(name: str) -> bytes:
 
     Called eagerly from ``_ensure`` BEFORE the systemctl start so the
     file is on disk by the time the backend's bootstrap reads it.
+
+    Self-healing on cache hit (F015 v3): if the in-memory cache has
+    the key but the on-disk file is gone, re-write the cached bytes.
+    The systemd unit declares ``RuntimeDirectory=agent-mcp/%i`` with
+    ``RuntimeDirectoryPreserve=no`` (the systemd default), so every
+    ``systemctl stop`` wipes ``/run/agent-mcp/<name>/`` — including
+    this key file. When the idle reaper stops a backend without
+    popping the cache, the next spawn would call us, see the cache
+    hit, return the bytes, and let ``_ensure`` invoke ``systemctl
+    start``; the backend launcher then exits 2 because click's
+    ``--forwarding-hmac-in File()`` validator can't find the file.
+    The self-heal branch re-creates the file with the same bytes so
+    the spawn succeeds. We do NOT rotate here — any backend already
+    loaded with the cached key would fail HMAC verify against a new
+    one.
     """
+    path = _forwarding_hmac_path(name)
     cached = forwarding_hmac_keys.get(name)
     if cached is not None:
+        if not path.exists():
+            # Out-of-band deletion (most commonly systemd
+            # RuntimeDirectory teardown between stop + restart).
+            # Re-write the cached bytes; mode 0600 to match the
+            # generate branch's invariant.
+            fd = os.open(
+                str(path),
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o600,
+            )
+            try:
+                os.write(fd, cached)
+            finally:
+                os.close(fd)
         return cached
-    path = _forwarding_hmac_path(name)
     # If a key file already exists on disk, adopt it. Defends the
     # router-restart scenario: a backend that's already running was
     # spawned with whatever key the previous router process wrote —
@@ -455,6 +484,20 @@ async def _reaper_tick() -> None:
         if now - last_active[key] > IDLE_SEC:
             _systemctl("stop", _unit_name(*key))
             last_active.pop(key, None)
+            # Cache symmetry with ``ProjectOrchestrator.stop()`` (see
+            # the ``forwarding_hmac_keys.pop`` at line ~648). Without
+            # this, the reaper-driven stop path leaves the in-memory
+            # HMAC cache populated while systemd's RuntimeDirectory
+            # teardown wipes the on-disk key file. The next spawn
+            # then either (a) reuses a key the backend can no longer
+            # produce on disk — caught by the self-heal branch in
+            # ``ensure_forwarding_hmac_key`` — or (b) rotates cleanly
+            # if we pop here. We prefer (b): cache symmetry between
+            # the REST stop path and the reaper stop path keeps the
+            # two paths reasoning-equivalent.
+            name, role = key
+            if role == "backend":
+                forwarding_hmac_keys.pop(name, None)
 
 
 # ── Alias-grace reaper (ADR-0010) ───────────────────────────────────
