@@ -1,17 +1,11 @@
 """TUI display loop — lifted out of ``cli.py`` into its own module.
 
 The display loop is a long-running anyio task that paints the server-
-status / next-steps / admin-token view to the operator's terminal
-while the MCP backend is running. It used to be defined as a nested
-function inside ``server_cmd`` in ``cli.py``; pulling it out here lets
-both transport runners in ``server_bootstrap`` share the same loop
-and keeps ``cli.py`` a thin click adapter.
-
-The loop is kept verbatim from the legacy implementation modulo:
-  * The ``get_admin_token_from_db`` helper now lives on
-    ``server_bootstrap`` (so we don't pull the click adapter as a
-    side-effect import).
-  * Docstrings updated to reflect the new home.
+status / next-steps view to the operator's terminal while the MCP
+backend is running. It used to be defined as a nested function inside
+``server_cmd`` in ``cli.py``; pulling it out here lets both transport
+runners in ``server_bootstrap`` share the same loop and keeps
+``cli.py`` a thin click adapter.
 """
 
 from __future__ import annotations
@@ -21,7 +15,6 @@ from typing import Any
 import anyio
 
 from ..core.config import logger
-from ..server_bootstrap import get_admin_token_from_db
 from .colors import TUITheme
 from .display import TUIDisplay
 
@@ -109,13 +102,6 @@ async def tui_display_loop(
             tui.clear_line()
             print(f"MCP Port: {TUITheme.info(str(cli_port))}")
             current_row += 1
-
-            admin_token = get_admin_token_from_db(cli_project_dir)
-            if admin_token:
-                tui.move_cursor(current_row, 1)
-                tui.clear_line()
-                print(f"Admin Token: {TUITheme.info(admin_token)}")
-                current_row += 1
 
             current_row += 2
 

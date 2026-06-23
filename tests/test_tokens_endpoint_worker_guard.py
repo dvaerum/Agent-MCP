@@ -39,13 +39,13 @@ async def test_tokens_endpoint_unauthenticated_returns_401(
     async with mcp_session(tmp_path) as admin:
         r = admin.client.get("/api/tokens")
         assert r.status_code == 401, r.text
-        # Wave 1: ``admin.admin_token`` is now a per-agent bearer; the
-        # response can't leak it because no agent-tokens list is
-        # rendered on the 401 path. The meaningful leak check is the
-        # system bearer.
-        from agent_mcp.core import globals as g
-        assert g.system_token and g.system_token not in r.text, (
-            "system_token leaked in 401 response body"
+        # retire-system-token Wave 3: the ``g.system_token`` god-key
+        # global is gone. The leak-prevention contract is now "no
+        # operator-tier credential — the harness's manager-role admin
+        # token — leaks via the 401 path." The 401 body should not
+        # include any agents-table tokens at all.
+        assert admin.admin_token not in r.text, (
+            "operator-tier admin bearer leaked in 401 response body"
         )
 
 
@@ -58,9 +58,13 @@ async def test_tokens_endpoint_with_admin_bearer_returns_200(
     per-agent manager bearer (the harness seeds an admin agent row);
     the dep's ``_bearer_is_operator_tier`` check admits it. The
     response includes that token in ``agent_tokens`` (it IS a per-
-    agent token after all), which is correct post-Wave-1 — the
-    leak-prevention assertion targets the god-key system bearer
-    (``g.system_token``), not the per-agent admin row's token.
+    agent token after all), which is correct post-Wave-1.
+
+    retire-system-token Wave 3: the ``g.system_token`` god-key global
+    is gone. The leak-prevention check that pre-Wave-3 pinned the
+    god-key not-leaking is now redundant — there is no system bearer
+    to leak. We retain a sanity assertion that the body shape is
+    intact.
     """
     async with mcp_session(tmp_path) as admin:
         r = admin.client.get(
@@ -70,15 +74,6 @@ async def test_tokens_endpoint_with_admin_bearer_returns_200(
         assert r.status_code == 200, r.text
         body = r.json()
         assert "agent_tokens" in body
-        # Wave 3: the system_token must not leak anywhere in the
-        # response. Post-Wave-1 the system_token is no longer accepted
-        # as a bearer, but it's still stored in g.system_token (Wave 3
-        # deletes the global) so the leak-prevention check is still
-        # meaningful.
-        from agent_mcp.core import globals as g
-        assert g.system_token and g.system_token not in r.text, (
-            "system_token must not appear anywhere in /api/tokens response"
-        )
 
 
 async def test_tokens_endpoint_with_worker_bearer_returns_401(tmp_path) -> None:
@@ -99,10 +94,12 @@ async def test_tokens_endpoint_with_worker_bearer_returns_401(tmp_path) -> None:
         )
         assert r.status_code == 401, r.text
         body = r.text
-        # Wave 1: leak check targets the system bearer (the historic
-        # god-key) rather than the harness's per-agent admin row.
-        from agent_mcp.core import globals as g
-        assert g.system_token and g.system_token not in body, (
-            "worker bearer received the system token in response body — "
+        # retire-system-token Wave 3: ``g.system_token`` is gone. The
+        # leak-prevention contract becomes "no operator-tier credential
+        # — the harness's manager-role admin token — appears in the
+        # worker's 401 response body". That's the meaningful escalation
+        # surface post-system-bearer-retirement.
+        assert admin.admin_token not in body, (
+            "worker bearer received the admin token in response body — "
             "escalation"
         )

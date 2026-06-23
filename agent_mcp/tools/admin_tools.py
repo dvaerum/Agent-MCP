@@ -414,20 +414,9 @@ async def create_agent_tool_impl(
                     "MCP_WORKING_DIR": agent_working_dir_abs,
                 }
 
-                # Add the system token if this is an admin agent.
-                # The env var is ``MCP_SYSTEM_TOKEN`` (renamed from
-                # ``MCP_ADMIN_TOKEN`` in Phase 2 Wave 1b).
-                # Wave 3 (prancy-napping-pie) dropped the legacy
-                # ``MCP_ADMIN_TOKEN`` export — nothing in this repo
-                # reads it back, and downstream agent startup scripts
-                # have had a release on the new name. Wave 4 will
-                # decide what happens to ``MCP_SYSTEM_TOKEN`` once
-                # the admin pseudo-agent is gone.
-                if (
-                    agent_id.lower().startswith("admin")
-                    and new_agent_token == g.system_token
-                ):
-                    env_vars["MCP_SYSTEM_TOKEN"] = g.system_token
+                # retire-system-token Wave 3: the spawned agent uses
+                # its per-agent token (``MCP_AGENT_TOKEN`` above). No
+                # process-wide system token is exported anymore.
 
                 # Create the tmux session (without immediate command)
                 if create_tmux_session(

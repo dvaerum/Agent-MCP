@@ -516,30 +516,8 @@ def test_agent_startup_template_does_not_mention_mcp_admin_token() -> None:
     )
 
 
-def test_config_json_writeback_uses_system_token_field() -> None:
-    """``init_agent_directory`` writes ``.agent/config.json`` with the
-    current system token under the field name ``system_token`` (renamed
-    from ``admin_token``)."""
-    import json
-    import tempfile
-
-    from agent_mcp.core import globals as g
-    from agent_mcp.utils.project_utils import init_agent_directory
-
-    prev = g.system_token
-    g.system_token = "fake-system-token-for-test"
-    try:
-        with tempfile.TemporaryDirectory() as td:
-            agent_dir = init_agent_directory(td)
-            assert agent_dir is not None
-            cfg = json.loads((agent_dir / "config.json").read_text())
-            assert "admin_token" not in cfg, (
-                f"config.json must not write the legacy 'admin_token' key; "
-                f"got {list(cfg.keys())}"
-            )
-            assert cfg.get("system_token") == "fake-system-token-for-test", (
-                f"config.json must write the system token under "
-                f"'system_token'; got {cfg!r}"
-            )
-    finally:
-        g.system_token = prev
+# retire-system-token Wave 3: ``test_config_json_writeback_uses_system_token_field``
+# was deleted. The ``.agent/config.json`` writeback path that synthesised
+# a ``system_token`` field is gone — ``init_agent_directory`` no longer
+# writes a config.json, and the ``g.system_token`` global the test pinned
+# has been deleted along with the rest of the system-bearer plumbing.

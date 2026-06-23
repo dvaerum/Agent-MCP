@@ -17,13 +17,11 @@ This module is the only sanctioned read/write surface for
 
 Author check semantics: only the author of a note or a
 manager-tier+ caller may edit/delete it. The boolean ``is_admin``
-is determined upstream — Wave 3 (prancy-napping-pie) migrated the
-source from ``token == g.admin_token`` to
-``verify_token(token, "manager")`` so manager-role agents can
-moderate worker notes without holding the system bearer. The
-parameter name stays ``is_admin`` for back-compat with the rest
-of the call chain; the semantic widening is captured in the
-upstream docstring at ``task_notes_tools._resolve_caller``.
+is determined upstream via ``verify_token(token, "manager")`` so
+manager-role agents can moderate worker notes. The parameter
+name stays ``is_admin`` for back-compat with the rest of the
+call chain; the semantic widening is captured in the upstream
+docstring at ``task_notes_tools._resolve_caller``.
 """
 
 from __future__ import annotations

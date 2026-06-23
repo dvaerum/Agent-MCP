@@ -201,24 +201,17 @@ let
     # sock path under both deployment shapes.
     sock_root="''${AGENT_MCP_SOCK_DIR:-''${XDG_RUNTIME_DIR}/agent-mcp}"
     sock="$sock_root/$name/backend.sock"
-    # Orchestrator-state channel for the router's cookie→bearer path.
-    # The backend writes its resolved system token here at startup
-    # (mode 0600); the router reads it inside ``_agent_token_map``
-    # to populate the per-project ``"Admin"`` mapping entry. F015 fix
-    # — Wave 3 (PR #205) removed ``admin_token`` from ``GET /api/tokens``
-    # so the router has no backend-side channel left.
-    system_token_out="$sock_root/$name/system_token"
-    # retire-system-token Wave 2: per-project HMAC key the router
+    # retire-system-token Wave 2/3: per-project HMAC key the router
     # signs the forwarding header with, written by the router BEFORE
     # invoking ``systemctl start``. See package.nix for the longer
-    # explanation; Wave 3 will delete ``--system-token-out`` once
-    # external clients are migrated.
+    # explanation. Wave 3 deleted the parallel ``--system-token-out``
+    # plumbing — the forwarding HMAC is the only remaining
+    # router→backend auth channel.
     forwarding_hmac_in="$sock_root/$name/forwarding_hmac"
     mkdir -p "$(dirname "$sock")"
     exec ${agentMcpBackendWrapper}/bin/agent-mcp-backend \
       --uds "$sock" \
       --project-dir "$path" \
-      --system-token-out "$system_token_out" \
       --forwarding-hmac-in "$forwarding_hmac_in" \
       --no-tui
   '';

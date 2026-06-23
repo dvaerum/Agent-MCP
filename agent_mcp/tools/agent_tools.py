@@ -1,11 +1,10 @@
 # Agent-MCP/mcp_template/mcp_server_src/tools/agent_tools.py
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 import mcp.types as mcp_types # Assuming this is your mcp.types path
 
 from .registry import register_tool
 from ..core.config import logger
-from ..core import globals as g
 from ..core.auth import get_agent_id # verify_token not strictly needed here
 from ..core.authorize import requires
 from ..utils.audit_utils import log_audit
@@ -20,21 +19,13 @@ async def get_system_prompt_tool_impl(arguments: Dict[str, Any]) -> List[mcp_typ
     # @requires("any") guaranteed entry; resolve id for prompt generation.
     requesting_agent_id = get_agent_id(agent_auth_token)
 
-    # The original code (main.py:1359-1365) tried to find the agent_token again from active_agents
-    # if it wasn't the admin token. This is redundant if `agent_auth_token` is already the agent's token.
-    # `generate_system_prompt` needs the agent's specific token for the connection snippet.
-    # It also needs the runtime admin_token to determine if the agent IS the admin.
-
-    # The `generate_system_prompt` function from `project_utils` now takes:
-    # (agent_id: str, agent_token_for_prompt: str, admin_token_runtime: Optional[str])
-    # `agent_auth_token` is the `agent_token_for_prompt`.
-    # `g.admin_token` is the `admin_token_runtime`.
-    
+    # `generate_system_prompt` takes the agent_id and the agent's own
+    # token (for the connection snippet); the "Admin" vs "Worker" label
+    # is derived from the agent's ``agent_role`` column.
     system_prompt_str = generate_system_prompt(
         agent_id=requesting_agent_id,
-        agent_token_for_prompt=agent_auth_token, # Pass the agent's own token
-        admin_token_runtime=g.admin_token # Pass the current global admin token
-    ) # main.py:1368-1373 (call to generate_system_prompt)
+        agent_token_for_prompt=agent_auth_token,
+    )
 
     log_audit(requesting_agent_id, "get_system_prompt", {}) # main.py:1375
     

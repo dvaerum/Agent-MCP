@@ -186,8 +186,15 @@ async def test_requires_role_manager_rejects_system_token(app_with_db) -> None:
     """retire-system-token Wave 1: the system bearer NO LONGER passes
     manager gates. The god-key admit was removed from ``verify_token``;
     the surviving manager-tier admits are (a) operator session and
-    (b) a per-agent token whose row has ``agent_role='manager'``."""
-    from agent_mcp.core import globals as g
+    (b) a per-agent token whose row has ``agent_role='manager'``.
+
+    retire-system-token Wave 3 deleted the ``g.system_token`` global.
+    A fresh random hex bearer (an unrelated 32-char token, structurally
+    indistinguishable from the former god-key) stands in to pin the
+    contract that arbitrary bearers without an ``agents`` row do not
+    pass the manager gate."""
+    import secrets as _secrets
+
     from agent_mcp.core.authorize import requires_role, AuthRejected
 
     @requires_role("manager")
@@ -196,8 +203,9 @@ async def test_requires_role_manager_rejects_system_token(app_with_db) -> None:
     ) -> List[mcp_types.TextContent]:  # pragma: no cover
         return [mcp_types.TextContent(type="text", text="should-not-run")]
 
+    bogus_bearer = _secrets.token_hex(16)
     with pytest.raises(AuthRejected):
-        await my_tool({"token": g.system_token})
+        await my_tool({"token": bogus_bearer})
 
 
 # --- @requires_role("operator") --------------------------------------------
@@ -228,8 +236,15 @@ async def test_requires_role_operator_rejects_system_token(app_with_db) -> None:
     callers must prove identity via operator session (cookie or
     signed forwarding header). Tests that previously passed
     ``token=g.system_token`` here must now stamp
-    ``operator_session_active`` instead."""
-    from agent_mcp.core import globals as g
+    ``operator_session_active`` instead.
+
+    retire-system-token Wave 3 deleted the ``g.system_token`` global.
+    A fresh random hex bearer (an unrelated 32-char token, structurally
+    indistinguishable from the former god-key) stands in to pin the
+    contract that arbitrary bearers without an ``agents`` row do not
+    pass the operator gate."""
+    import secrets as _secrets
+
     from agent_mcp.core.authorize import requires_role, AuthRejected
 
     @requires_role("operator")
@@ -238,8 +253,9 @@ async def test_requires_role_operator_rejects_system_token(app_with_db) -> None:
     ) -> List[mcp_types.TextContent]:  # pragma: no cover
         return [mcp_types.TextContent(type="text", text="should-not-run")]
 
+    bogus_bearer = _secrets.token_hex(16)
     with pytest.raises(AuthRejected):
-        await my_tool({"token": g.system_token})
+        await my_tool({"token": bogus_bearer})
 
 
 @pytest.mark.asyncio

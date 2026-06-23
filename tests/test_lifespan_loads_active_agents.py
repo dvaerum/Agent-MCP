@@ -60,7 +60,7 @@ async def _run_application_startup(project_dir: Path) -> None:
     from agent_mcp.app.server_lifecycle import application_startup
 
     await application_startup(
-        project_dir_path_str=str(project_dir), admin_token_param=None
+        project_dir_path_str=str(project_dir)
     )
 
 

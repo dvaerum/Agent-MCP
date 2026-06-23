@@ -57,18 +57,20 @@ async def test_api_route_rejects_system_token_bearer(tmp_path) -> None:
     branch admitted ``g.system_token``. The branch is gone; the only
     bearer paths now accepted are (a) a per-agent token via the
     agents-table or (b) the signed forwarding header (covered below).
+
+    retire-system-token Wave 3 removed the ``g.system_token`` global
+    itself. The contract this test pins is "an unrelated 32-char hex
+    bearer is rejected" — i.e. only real agents-table rows or the
+    signed forwarding header authenticate. We use a fresh random
+    bearer here to stand in for the former god-key.
     """
     async with mcp_session(tmp_path) as admin:
-        from agent_mcp.core import globals as g
+        import secrets as _secrets
 
-        # ``g.system_token`` is still populated by the lifespan
-        # (Wave 3 removes the global itself). Wave 1 only severs the
-        # *authentication* edge — the value still exists internally.
-        assert g.system_token, "lifespan should still populate g.system_token"
-
+        bogus_bearer = _secrets.token_hex(16)
         r = admin.client.get(
             "/api/tokens",
-            headers={"Authorization": f"Bearer {g.system_token}"},
+            headers={"Authorization": f"Bearer {bogus_bearer}"},
         )
         assert r.status_code == 401, r.text
 
@@ -150,15 +152,20 @@ async def test_mcp_rejects_system_token_bearer(tmp_path) -> None:
     re-admits the god-key.
     """
     async with mcp_session(tmp_path) as admin:
-        from agent_mcp.core import globals as g
+        import secrets as _secrets
 
+        # retire-system-token Wave 3: ``g.system_token`` is gone. Use a
+        # fresh random bearer to stand in for the former god-key — the
+        # contract being pinned is "an unrelated 32-char hex bearer is
+        # rejected at the /mcp gate".
+        bogus_bearer = _secrets.token_hex(16)
         r = admin.client.post(
             "/mcp",
             json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
             headers={
                 "Content-Type": "application/json",
                 "Accept": "application/json, text/event-stream",
-                "Authorization": f"Bearer {g.system_token}",
+                "Authorization": f"Bearer {bogus_bearer}",
             },
         )
         assert r.status_code == 401, r.text

@@ -38,10 +38,10 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def reset_globals() -> Iterator[None]:
     """Reset agent_mcp.core.globals state between tests.
 
-    agent-mcp uses a module-level singleton (g.admin_token,
-    g.openai_client_instance, in-memory task/agent caches, etc.). Tests
-    that build their own app instances must reset these or state leaks
-    across tests in surprising ways.
+    agent-mcp uses a module-level singleton (g.openai_client_instance,
+    in-memory task/agent caches, etc.). Tests that build their own app
+    instances must reset these or state leaks across tests in
+    surprising ways.
 
     Also resets `agent_mcp.db.write_queue._global_write_queue` — that
     singleton gets stopped during lifespan shutdown, and the next test
@@ -77,7 +77,11 @@ def reset_globals() -> Iterator[None]:
     snapshot = {
         "connections": dict(g.connections),
         "active_agents": dict(g.active_agents),
-        "admin_token": g.admin_token,
+        # retire-system-token Wave 3: ``g.admin_token`` is deleted as a
+        # declared global. The conftest ``client`` fixture still sets it
+        # dynamically as an attribute (see fixture docstring); capture
+        # defensively so the snapshot survives when no test has set it.
+        "admin_token": getattr(g, "admin_token", None),
         "tasks": dict(g.tasks),
         "file_map": dict(g.file_map),
         "agent_working_dirs": dict(g.agent_working_dirs),
@@ -93,7 +97,14 @@ def reset_globals() -> Iterator[None]:
     g.connections.update(snapshot["connections"])
     g.active_agents.clear()
     g.active_agents.update(snapshot["active_agents"])
-    g.admin_token = snapshot["admin_token"]
+    # retire-system-token Wave 3: only restore admin_token if a prior
+    # test (via the ``client`` fixture) dynamically set it; otherwise
+    # leave the attr absent so reads via ``getattr(g, "admin_token", ...)``
+    # behave consistently across tests.
+    if snapshot["admin_token"] is not None:
+        g.admin_token = snapshot["admin_token"]
+    elif hasattr(g, "admin_token"):
+        delattr(g, "admin_token")
     g.tasks.clear()
     g.tasks.update(snapshot["tasks"])
     g.file_map.clear()
@@ -152,11 +163,20 @@ def client(app):
     retire-system-token Wave 1: pre-Wave-1, tests using this fixture
     passed ``g.admin_token`` (the system bearer) as ``body['token']``
     on REST mutation routes, and the dep admitted via the god-key
-    check. That check is gone; we re-seat ``g.admin_token`` to point
-    at a real per-agent manager-role row (seeded post-lifespan) so
-    the body-token path through ``_bearer_is_operator_tier`` admits
-    via ``verify_token(token, "manager")`` — same wire shape, real
+    check. That check is gone; we seed a real per-agent manager-role
+    row (post-lifespan) so the body-token path through
+    ``_bearer_is_operator_tier`` admits via
+    ``verify_token(token, "manager")`` — same wire shape, real
     per-principal credential.
+
+    retire-system-token Wave 3: ``g.admin_token`` is deleted as a
+    declared global in ``agent_mcp.core.state``. This fixture still
+    assigns ``g.admin_token = token`` dynamically (Python attribute
+    assignment works on the state module without prior declaration) so
+    the many tests that read ``g.admin_token`` as their operator-tier
+    bearer continue to function without per-callsite edits. The
+    snapshot/restore plumbing in ``reset_globals`` reads it
+    defensively via ``getattr``.
     """
     import datetime as _dt
     import secrets as _secrets

@@ -175,7 +175,10 @@ async def live_server(tmp_path: Path) -> AsyncIterator[tuple[str, str]]:
     snapshot = {
         "connections": dict(g.connections),
         "active_agents": dict(g.active_agents),
-        "admin_token": g.admin_token,
+        # retire-system-token Wave 3: ``g.admin_token`` is deleted as
+        # a declared global. Capture defensively in case an earlier
+        # test set it as a dynamic attribute.
+        "admin_token": getattr(g, "admin_token", None),
         "tasks": dict(g.tasks),
         "file_map": dict(g.file_map),
         "agent_working_dirs": dict(g.agent_working_dirs),
@@ -215,30 +218,31 @@ async def live_server(tmp_path: Path) -> AsyncIterator[tuple[str, str]]:
         # to complete before any /api/* route works.
         #
         # Wave 1 of prancy-napping-pie put `/api/tokens` behind
-        # `require_operator_session`. We poll without auth and treat 401
-        # as the "ready, but you need a bearer" signal (handler reached →
-        # lifespan finished). The admin_token then comes from
-        # `g.admin_token`, which the lifespan populates before the dep
-        # gate is reachable.
+        # `require_operator_session`. We poll without auth and treat
+        # 401 as the "ready, but you need a bearer" signal (handler
+        # reached → lifespan finished). retire-system-token Wave 3
+        # deleted ``g.admin_token`` so we use the 401 status alone as
+        # the readiness signal — the per-agent admin bearer is minted
+        # below.
         async with httpx.AsyncClient(base_url=base_url, timeout=10.0) as bootstrap:
             deadline = time.monotonic() + 20
-            admin_token = None
             last_status = None
+            ready = False
             while time.monotonic() < deadline:
                 try:
                     r = await bootstrap.get("/api/tokens")
                     last_status = r.status_code
-                    # 200 = legacy (unauthenticated allowed) — still
-                    # accept; 401 = post-Wave-1 (dep reached, lifespan
-                    # done) — accept and read from g.
+                    # 200 = legacy (unauthenticated allowed); 401 =
+                    # post-Wave-1 (dep reached, lifespan done). Either
+                    # indicates the handler is wired and lifespan is
+                    # complete.
                     if r.status_code in (200, 401):
-                        admin_token = g.admin_token
-                        if admin_token:
-                            break
+                        ready = True
+                        break
                 except httpx.HTTPError:  # pragma: no cover - boot races
                     pass
                 await asyncio.sleep(0.1)
-            if not admin_token:
+            if not ready:
                 raise RuntimeError(
                     f"/api/tokens never reachable (last status: {last_status})"
                 )
@@ -285,6 +289,9 @@ async def live_server(tmp_path: Path) -> AsyncIterator[tuple[str, str]]:
             "capabilities": [],
             "agent_role": "manager",
         }
+        # retire-system-token Wave 3: ``g.admin_token`` is no longer
+        # a declared global. Still assigned dynamically for tests that
+        # read it via ``g.admin_token`` for back-compat.
         g.admin_token = admin_token
 
         yield base_url, admin_token
@@ -295,7 +302,13 @@ async def live_server(tmp_path: Path) -> AsyncIterator[tuple[str, str]]:
         g.connections.update(snapshot["connections"])
         g.active_agents.clear()
         g.active_agents.update(snapshot["active_agents"])
-        g.admin_token = snapshot["admin_token"]
+        # retire-system-token Wave 3: restore admin_token only if a
+        # prior caller had set the dynamic attribute; otherwise drop
+        # the attribute to leave the module clean.
+        if snapshot["admin_token"] is not None:
+            g.admin_token = snapshot["admin_token"]
+        elif hasattr(g, "admin_token"):
+            delattr(g, "admin_token")
         g.tasks.clear()
         g.tasks.update(snapshot["tasks"])
         g.file_map.clear()

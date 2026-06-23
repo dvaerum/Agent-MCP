@@ -82,17 +82,8 @@ def get_agent_id(token: str) -> Optional[str]:
     """
     Get agent ID from token.
 
-    retire-system-token Wave 1: this helper resolves identity for
-    audit-log attribution and per-tool ownership checks — it is NOT
-    an auth gate. Wave 1 removed the god-key bearer admit from
-    ``verify_token`` and ``AuthHeaderMiddleware``; here we KEEP the
-    ``token == g.system_token → "admin"`` short-circuit so any
-    in-process REST seam that still passes the system bearer
-    (e.g. the dashboard's REST handlers calling MCP tools via
-    ``_dispatch_through_tool``) keeps surfacing the principal as
-    ``"admin"`` for audit logs. Wave 3 will delete the global +
-    the seam in one move; until then, identity attribution and
-    auth-gate semantics diverge intentionally.
+    Resolves identity for audit-log attribution and per-tool ownership
+    checks — NOT an auth gate.
 
     Migrated to ``agent_repo.get_agent_by_token`` in PR-W2c so a token
     for a row that's only in the DB (e.g. just restored by a peer
@@ -102,13 +93,6 @@ def get_agent_id(token: str) -> Optional[str]:
     """
     if not token: # Added a check for empty/None token
         return None
-    if token == g.system_token:
-        # Identity-resolution short-circuit only — the auth gate
-        # (verify_token / middleware) has already rejected this token
-        # as a bearer by the time we reach this caller. Surviving
-        # call sites are in-process REST seams that pass the system
-        # bearer to MCP tools for backwards-compat (Wave 3 sweep).
-        return "admin"
     # Local import to keep the legacy module-load contract: callers
     # that only want verify_token/get_agent_id shouldn't pay the cost
     # of loading the SQLAlchemy engine until the first DB-miss path.

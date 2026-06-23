@@ -138,55 +138,6 @@ def _sock_path(name: str, role: str) -> Path:
     return d / f"{role}.sock"
 
 
-def _system_token_path(name: str) -> Path:
-    """Path where the per-project backend writes its system token.
-
-    The router-side counterpart of ``--system-token-out`` plumbing in
-    the systemd launcher. The launcher passes this path to the backend
-    on spawn; the backend writes the resolved system token (newline-
-    terminated, mode 0600) on its first ``--system-token-out`` step
-    inside ``initialize_system_token``. The router reads it lazily
-    inside ``_agent_token_map`` to populate the ``"Admin"`` mapping
-    entry without asking the backend (Wave 3 dropped ``admin_token``
-    from ``/api/tokens`` — there's no backend-side channel left).
-
-    Same directory as the UDS so the launcher's ``$AGENT_MCP_SOCK_DIR/
-    $name/`` mkdir covers both files in one step and a project
-    teardown (``stop`` + UDS-dir wipe) drops the token alongside the
-    socket — no stale token surviving a backend rebuild.
-    """
-    d = SOCK_DIR / name
-    d.mkdir(parents=True, exist_ok=True)
-    return d / "system_token"
-
-
-def read_system_token(name: str) -> str | None:
-    """Return the system token the backend wrote to its ``--system-token-out``
-    path, or None if the file is missing / unreadable / empty.
-
-    Returns None rather than raising so callers (``_agent_token_map``)
-    can degrade to "no admin auth available" cleanly. The file is
-    written by the backend with mode 0600; the router runs as the same
-    user and reads with the trailing newline stripped.
-
-    Re-read on every call — the file is tiny and the cache around
-    ``_agent_token_map`` (3 s TTL) already protects against per-request
-    hot reads. If the operator rotates the system token (currently
-    only via ``--system-token-in`` + restart) the next cache tick
-    picks up the new value.
-    """
-    try:
-        return _system_token_path(name).read_text().strip() or None
-    except FileNotFoundError:
-        return None
-    except OSError as exc:  # pragma: no cover - defensive
-        log.warning(
-            "Failed to read system token for project %r at %s: %s",
-            name, _system_token_path(name), exc,
-        )
-        return None
-
-
 # ── Forwarding-header HMAC key (retire-system-token Wave 2) ────────
 # The router signs an ``X-Agent-MCP-Forwarded-Operator`` header on
 # every cookie-authenticated request that proxies to a per-project

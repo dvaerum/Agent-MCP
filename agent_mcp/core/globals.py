@@ -4,8 +4,7 @@
 The canonical home for process-wide mutable state is now
 ``agent_mcp.core.state``. This module exists so every existing
 ``from agent_mcp.core import globals as g`` import keeps resolving to
-the same state - including writes (``g.admin_token = ...``,
-``g.server_running = False``).
+the same state - including writes (``g.server_running = False``).
 
 How the alias works
 -------------------
@@ -40,7 +39,6 @@ from agent_mcp.core import state as _state
 # statically benefit from explicit names.)
 from agent_mcp.core.state import (  # noqa: F401
     active_agents,
-    admin_token,
     agent_color_index,
     agent_event_locks,
     agent_event_queues,
@@ -76,7 +74,6 @@ from agent_mcp.core.state import (  # noqa: F401
     session_registry_pruner_task_scope,
     signal_for,
     startup_complete_event,
-    system_token,
     tasks,
     unregister_waiter,
     waiter_count,
@@ -92,7 +89,6 @@ from agent_mcp.core.state import (  # noqa: F401
 # instead of the swap.
 __all__ = [
     "active_agents",
-    "admin_token",
     "agent_color_index",
     "agent_event_locks",
     "agent_event_queues",
@@ -128,7 +124,6 @@ __all__ = [
     "session_registry_pruner_task_scope",
     "signal_for",
     "startup_complete_event",
-    "system_token",
     "tasks",
     "unregister_waiter",
     "waiter_count",
@@ -138,9 +133,8 @@ __all__ = [
 
 # Swap this module entry in sys.modules with the state module so that
 # every subsequent ``from agent_mcp.core import globals as g`` resolves
-# to the same module object as ``agent_mcp.core.state``. Critically,
-# this means ``g.admin_token = X`` writes land on ``state.admin_token``
-# - there's no diverged copy.
+# to the same module object as ``agent_mcp.core.state``. There's no
+# diverged copy of state.
 #
 # This must happen AFTER the explicit re-exports above so import-time
 # name resolution succeeds (the explicit imports run against this

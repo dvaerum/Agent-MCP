@@ -33,10 +33,15 @@ def _seed(admin, *, key: str, value: str) -> None:
 
 
 async def test_admin_sees_config_system_token(tmp_path) -> None:
-    """Admins must continue to see config_system_token (baseline)."""
+    """Admins must continue to see config_*_token rows (baseline).
+
+    retire-system-token Wave 3 deleted the startup write of
+    ``config_system_token`` (the row is gone with the global). Seed a
+    representative ``config_*_token`` row directly so the redaction
+    contract still has a target to assert against.
+    """
     async with mcp_session(tmp_path) as admin:
-        # Seed a fake secret-looking key (config_system_token already exists
-        # from startup; we don't need to add it).
+        _seed(admin, key="config_system_token", value="sentinel-system-token")
         result = await admin.call("view_project_context", {})
         text = result[0].text
         assert "config_system_token" in text, (
@@ -49,6 +54,7 @@ async def test_worker_does_not_see_config_system_token(tmp_path) -> None:
     """Workers must NOT see config_system_token — privilege escalation
     otherwise."""
     async with mcp_session(tmp_path) as admin:
+        _seed(admin, key="config_system_token", value="sentinel-system-token")
         worker = await admin.create_worker("test-worker")
 
         result = await worker.call("view_project_context", {})
@@ -58,8 +64,8 @@ async def test_worker_does_not_see_config_system_token(tmp_path) -> None:
             "view_project_context — privilege escalation (issue I). "
             "Got:\n" + text[:1000]
         )
-        # And the actual system token value must not appear either.
-        assert admin.admin_token not in text, (
+        # And the seeded value must not appear either.
+        assert "sentinel-system-token" not in text, (
             "worker can read the literal system token value (issue I)"
         )
 

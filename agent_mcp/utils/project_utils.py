@@ -5,24 +5,10 @@ import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
-from ..core import globals as g
 from ..core.config import (
     logger,
     get_project_dir,
-)  # Import get_project_dir for MCP_VERSION if needed
-
-# __version__ was in mcp_template/__init__.py.
-# If MCP_VERSION is needed here, it should ideally be sourced from a single place.
-# For now, let's assume it might come from the main package's __init__ or a dedicated version file.
-# We can hardcode it temporarily or make it configurable.
-try:
-    # Attempt to get version from the root __init__.py of agent-mcp
-    from agent_mcp import __version__ as MCP_VERSION
-except ImportError:
-    logger.warning(
-        "Could not import __version__ from agent_mcp. Using default '0.1.0'."
-    )
-    MCP_VERSION = "0.1.0"  # Fallback, matches original main.py:1041
+)
 
 
 # Original location: main.py lines 876-929 (init_agent_directory)
@@ -84,36 +70,6 @@ def init_agent_directory(project_dir_str: str) -> Optional[Path]:
     except OSError as e:
         logger.error(f"Failed to create .agent directory structure in {agent_dir}: {e}")
         return None  # Indicate failure
-
-    # Create initial config file if it doesn't exist
-    # Original main.py lines 902-914
-    config_path = agent_dir / "config.json"
-    if not config_path.exists():
-        # Wave 3 (prancy-napping-pie): renamed the field from
-        # ``admin_token`` to ``system_token`` so downstream consumers
-        # (legacy CLI, deploy scripts) that still read the file get a
-        # ``KeyError`` rather than silently consuming stale data when
-        # the rename happens. ``g.system_token`` is the canonical
-        # storage; ``g.admin_token`` aliases to it.
-        current_system_token = g.system_token
-
-        config_data = {
-            "project_name": project_path.name,
-            "created_at": datetime.datetime.now().isoformat(),
-            "system_token": current_system_token,
-            "mcp_version": MCP_VERSION,
-        }
-        try:
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(config_data, f, indent=2)
-        except IOError as e:
-            logger.error(f"Failed to write initial config.json to {config_path}: {e}")
-            return None  # Indicate failure
-        except Exception as e:
-            logger.error(
-                f"Unexpected error writing initial config.json: {e}", exc_info=True
-            )
-            return None
 
     # Create initial daily logs file if it doesn't exist
     # Original main.py lines 917-926
