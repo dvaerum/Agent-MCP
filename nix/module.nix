@@ -217,8 +217,13 @@ in {
           # autonomous restarts. Generating the key here makes the
           # file a unit-lifecycle invariant: present whenever the
           # unit is starting, regardless of who triggered the start.
+          # F015 v6: coreutils does NOT ship `sh` — the original v4
+          # interpolation (``${pkgs.coreutils}/bin/sh``) failed with
+          # ``status=203/EXEC`` on every backend start. ``runtimeShell``
+          # resolves to the bash/dash/POSIX shell appropriate for the
+          # platform. ``head`` and ``chmod`` ARE in coreutils.
           ExecStartPre = [
-            "${pkgs.coreutils}/bin/sh -c 'test -f \"$RUNTIME_DIRECTORY/forwarding_hmac\" || { ${pkgs.coreutils}/bin/head -c 32 /dev/urandom > \"$RUNTIME_DIRECTORY/forwarding_hmac\" && ${pkgs.coreutils}/bin/chmod 600 \"$RUNTIME_DIRECTORY/forwarding_hmac\"; }'"
+            "${pkgs.runtimeShell} -c 'test -f \"$RUNTIME_DIRECTORY/forwarding_hmac\" || { ${pkgs.coreutils}/bin/head -c 32 /dev/urandom > \"$RUNTIME_DIRECTORY/forwarding_hmac\" && ${pkgs.coreutils}/bin/chmod 600 \"$RUNTIME_DIRECTORY/forwarding_hmac\"; }'"
             "${pkgs.coreutils}/bin/rm -f ${cfg.runtimeDir}/%i/backend.sock"
           ];
           ExecStart = "${pkgs'.agentMcpLauncher}/bin/agent-mcp-launcher %i";

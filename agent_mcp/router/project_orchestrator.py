@@ -367,16 +367,26 @@ async def _ensure(name: str, role: str) -> Path:
             action = "restart" if _is_active(unit) else "start"
             r = _systemctl(action, unit)
             if r.returncode != 0:
-                reason = (
-                    f"systemctl {action} {unit} failed: "
-                    f"{r.stderr.strip()}"
-                )
+                # F015 v6: aiohttp's HTTPException rejects ``reason``
+                # values containing CR/LF (per RFC 7230 status-line
+                # framing). systemctl's stderr for a failed start often
+                # spans multiple lines (e.g. "Failed at step EXEC..."
+                # + "Job for X failed..."). Collapse newlines BEFORE
+                # building the reason so the router returns a clean
+                # 500 instead of crashing with ``ValueError: Reason
+                # cannot contain \r or \n``. Full stderr is kept for
+                # the cooldown cache and the body via ``text=``.
+                full_stderr = r.stderr.strip()
+                single_line = " ".join(full_stderr.split())[:300]
+                reason = f"systemctl {action} {unit} failed: {single_line}"
                 # Same cooldown applies to a hard systemctl failure
                 # — without it, the next queued request immediately
                 # invokes systemctl again, which loops on the same
                 # unit-file / permission / OOM condition.
                 ensure_failures[(name, role)] = (time.monotonic(), reason)
-                raise web.HTTPInternalServerError(reason=reason)
+                raise web.HTTPInternalServerError(
+                    reason=reason, text=f"{reason}\n\n{full_stderr}"
+                )
             # Poll for the socket file. Production waits up to ~20 s
             # (200 × 0.1 s) for the unit to come up. The budget is
             # env-overridable so unit tests — which stub systemctl and
