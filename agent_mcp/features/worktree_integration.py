@@ -75,17 +75,20 @@ class WorktreeManager:
     def create_agent_worktree(
         self,
         agent_id: str,
-        admin_token_suffix: str,
+        token_suffix: str,
         config: WorktreeConfig
     ) -> Dict[str, Any]:
         """
         Create a worktree for an agent.
-        
+
         Args:
             agent_id: Agent identifier
-            admin_token_suffix: Last 4 characters of admin token
+            token_suffix: Last 4 characters of the agent's per-agent
+                token (see ``runtime.agent_runtime.get_token_suffix``).
+                Was named ``admin_token_suffix`` before retire-system-
+                token Wave 5.
             config: Worktree configuration
-            
+
         Returns:
             Result dictionary with worktree details
         """
@@ -94,10 +97,10 @@ class WorktreeManager:
                 "success": False,
                 "error": "Worktree support not enabled"
             }
-        
+
         try:
             # Generate paths and names
-            worktree_path = generate_worktree_path(agent_id, admin_token_suffix)
+            worktree_path = generate_worktree_path(agent_id, token_suffix)
             branch_name = generate_branch_name(agent_id, config.branch_name)
             
             logger.info(f"Creating worktree for agent {agent_id}: {worktree_path}")
@@ -263,21 +266,23 @@ def is_worktree_enabled() -> bool:
 
 def create_agent_worktree(
     agent_id: str,
-    admin_token_suffix: str,
+    token_suffix: str,
     config: WorktreeConfig
 ) -> Dict[str, Any]:
     """
     Create a worktree for an agent using the global manager.
-    
+
     Args:
         agent_id: Agent identifier
-        admin_token_suffix: Last 4 characters of admin token
+        token_suffix: Last 4 characters of the agent's per-agent token
+            (see ``runtime.agent_runtime.get_token_suffix``). Was named
+            ``admin_token_suffix`` before retire-system-token Wave 5.
         config: Worktree configuration
-        
+
     Returns:
         Result dictionary with worktree details
     """
-    return worktree_manager.create_agent_worktree(agent_id, admin_token_suffix, config)
+    return worktree_manager.create_agent_worktree(agent_id, token_suffix, config)
 
 
 def cleanup_agent_worktree(agent_id: str, force: bool = False) -> Dict[str, Any]:

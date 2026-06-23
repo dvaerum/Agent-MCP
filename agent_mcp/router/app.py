@@ -423,10 +423,8 @@ async def _agent_token_map(name: str) -> dict[str, str]:
     string ``"Admin"`` is GONE. The cookie-authenticated dashboard
     path no longer needs an admin bearer to forward upstream — it
     signs a per-request ``X-Agent-MCP-Forwarded-Operator`` header
-    instead (see ``_forwarding_header_from_cookie``). The token file
-    that PR #207 introduced as the F015 patch is still written by
-    the backend's ``--system-token-out`` flag (Wave 3 deletes it),
-    but the router no longer reads it.
+    instead (see ``_forwarding_header_from_cookie``). Wave 3 deleted
+    the per-project system-token file the router used to read.
 
     Returns {} on backend error rather than raising; callers are
     expected to treat that as "no auth available, refuse" via the
@@ -948,143 +946,15 @@ async def backend_api_handler(req: web.Request) -> web.StreamResponse:
     )
 
 
-# ── Admin-as-Admin MCP call (create-agent helper only) ───────────────
-#
-# `_mcp_call_admin` is the last remaining piece of router-side MCP
-# protocol manipulation. It opens a short-lived SSE session as Admin
-# and issues a single tools/call, exclusively for the `__create-agent`
-# form handler (which needs to seed a task via `assign_task` and then
-# `create_agent` with that task_id). Upstream's `POST /api/create-agent`
-# REST endpoint requires the admin token and a pre-existing task_ids
-# list — and `assign_task` has no REST counterpart — so retiring this
-# helper would need either an upstream `POST /api/tasks` endpoint or
-# a `create-agent-with-seed-task` REST endpoint. Both are
-# nice-to-haves; not in the critical path for 7f.
-# FOLLOW-UP: upstream a `POST /api/tasks` route on the fork, then
-# replace this with two `aiohttp` REST calls.
-
-
-async def _mcp_call_admin(
-    name: str, tool: str, arguments: dict, *, timeout: float = 20
-) -> dict:
-    """Open an SSE session as Admin and issue a single tools/call.
-
-    Returns the raw `result` dict from the JSON-RPC response. Raises
-    on transport/initialise failure so the caller can map to a 5xx.
-
-    Only `create_agent_handler` calls this today; see the section
-    header comment for the follow-up to retire it.
-    """
-    sock = await _ensure(name, "backend")
-    timeout_obj = ClientTimeout(total=None, sock_read=None)
-    connector = UnixConnector(path=str(sock))
-    async with ClientSession(connector=connector, timeout=timeout_obj) as sess:
-        # 1) fetch admin token from the backend's own REST.
-        async with sess.get("http://localhost/api/tokens") as r:
-            if r.status != 200:
-                raise RuntimeError(f"GET /api/tokens → {r.status}")
-            admin_token = (await r.json()).get("admin_token")
-        if not admin_token:
-            raise RuntimeError("backend did not return admin_token")
-
-        # 2) open SSE, harvest endpoint URL + session_id.
-        async with sess.get(
-            "http://localhost/sse",
-            headers={"Accept": "text/event-stream"},
-        ) as sse:
-            if sse.status != 200:
-                raise RuntimeError(f"GET /sse → {sse.status}")
-            messages_path: str | None = None
-            inbox: dict[int, dict] = {}
-            endpoint_ready = asyncio.Event()
-            response_ready = asyncio.Event()
-
-            async def reader() -> None:
-                event = None
-                data_lines: list[str] = []
-                while True:
-                    raw = await sse.content.readline()
-                    if not raw:
-                        return
-                    s = raw.rstrip(b"\r\n").decode()
-                    if s == "":
-                        if event == "endpoint" and data_lines:
-                            nonlocal_assign(data_lines[0])
-                        elif event == "message" and data_lines:
-                            try:
-                                j = json.loads(data_lines[0])
-                                rid = j.get("id")
-                                if rid is not None:
-                                    inbox[rid] = j
-                                    if rid == 2:
-                                        response_ready.set()
-                            except json.JSONDecodeError:
-                                pass
-                        event = None
-                        data_lines = []
-                        continue
-                    if s.startswith(":"):
-                        continue
-                    if s.startswith("event:"):
-                        event = s[6:].strip()
-                    elif s.startswith("data:"):
-                        data_lines.append(s[5:].lstrip())
-
-            def nonlocal_assign(d: str) -> None:
-                nonlocal messages_path
-                messages_path = d
-                endpoint_ready.set()
-
-            reader_task = asyncio.create_task(reader())
-            try:
-                await asyncio.wait_for(endpoint_ready.wait(), timeout=timeout)
-                msg_url = f"http://localhost{messages_path}"
-
-                # 3) initialise (id=1) — fire-and-forget, then tools/call (id=2).
-                init = {
-                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                    "params": {
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {},
-                        "clientInfo": {"name": "router-bridge", "version": "0.1"},
-                    },
-                }
-                async with sess.post(msg_url, json=init) as r:
-                    if r.status not in (200, 202):
-                        raise RuntimeError(f"initialize → {r.status}")
-                # Brief wait so the server registers us before
-                # tools/call lands.
-                await asyncio.sleep(0.2)
-                async with sess.post(
-                    msg_url,
-                    json={
-                        "jsonrpc": "2.0", "method": "notifications/initialized",
-                        "params": {},
-                    },
-                ) as r:
-                    pass
-                args_with_token = {"token": admin_token, **arguments}
-                async with sess.post(
-                    msg_url,
-                    json={
-                        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                        "params": {"name": tool, "arguments": args_with_token},
-                    },
-                ) as r:
-                    if r.status not in (200, 202):
-                        raise RuntimeError(f"tools/call {tool} → {r.status}")
-                await asyncio.wait_for(response_ready.wait(), timeout=timeout)
-                result = inbox[2].get("result", {})
-            finally:
-                reader_task.cancel()
-                try:
-                    await reader_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-    return result
-
-
 # ── Dashboard static handler ─────────────────────────────────────────
+#
+# retire-system-token Wave 5 (2026-06-23) removed ``_mcp_call_admin``
+# (the router-side helper that opened an SSE session as Admin to seed
+# tasks + create agents) along with ``router/admin_api.py``'s
+# ``create_agent_handler`` that wrapped it. Both paths fetched an
+# ``admin_token`` field from ``/api/tokens`` that Wave 3 removed; the
+# helper was dead-on-arrival post-Wave-3 and had no other callers (the
+# dashboard hits ``/api/agents`` on the per-project backend directly).
 
 
 _DASHBOARD_ROOT = Path(DASHBOARD_DIR).resolve()

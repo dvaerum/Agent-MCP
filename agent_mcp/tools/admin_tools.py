@@ -25,42 +25,16 @@ from ..runtime.agent_runtime import (
     list_tmux_sessions,
     send_prompt_async,
     send_command_to_session,
+    # retire-system-token Wave 5: ``get_admin_token_suffix`` and
+    # ``create_agent_session_name`` used to be duplicated here
+    # verbatim. They're sourced from the canonical runtime module
+    # now — ``create_agent_session_name`` is just
+    # ``generate_agent_session_name`` under its older name.
+    generate_agent_session_name as create_agent_session_name,
 )
 from ..utils.prompt_templates import build_agent_prompt
 from ..db.connection import get_db_connection, execute_db_write
 from ..db.actions.agent_actions_db import log_agent_action_to_db  # For DB logging
-
-
-def get_admin_token_suffix(admin_token: str) -> str:
-    """
-    Extract the last 4 characters from admin token for session naming.
-
-    Args:
-        admin_token: The admin authentication token
-
-    Returns:
-        Last 4 characters of the token in lowercase
-    """
-    if not admin_token or len(admin_token) < 4:
-        return "0000"  # Fallback for invalid tokens
-    return admin_token[-4:].lower()
-
-
-def create_agent_session_name(agent_id: str, admin_token: str) -> str:
-    """
-    Create agent session name in format: agent_id-suffix
-    where suffix is the last 4 characters of the admin token.
-
-    Args:
-        agent_id: The agent identifier
-        admin_token: The admin authentication token
-
-    Returns:
-        Session name in format "agent_id-def2" where def2 is from admin token
-    """
-    suffix = get_admin_token_suffix(admin_token)
-    clean_agent_id = sanitize_session_name(agent_id)
-    return f"{clean_agent_id}-{suffix}"
 
 
 # --- create_agent tool ---

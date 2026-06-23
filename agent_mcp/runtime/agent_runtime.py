@@ -29,9 +29,11 @@ What this module owns:
   interface (``send_prompt`` / ``discover_active`` / ``is_alive`` /
   ``cleanup`` / ``create_worktree``) that callers should reach for.
 * The naming policy (``generate_agent_session_name`` /
-  ``parse_agent_session_name`` / ``get_admin_token_suffix``) — kept
+  ``parse_agent_session_name`` / ``get_token_suffix``) — kept
   module-level because both the class methods and the legacy shim
-  re-exports need them.
+  re-exports need them. ``get_admin_token_suffix`` is a back-compat
+  alias for ``get_token_suffix`` (the parameter has been a per-agent
+  token, not an admin token, since Wave 3 of prancy-napping-pie).
 
 What stays in :mod:`agent_mcp.utils`:
 
@@ -452,23 +454,37 @@ def cleanup_agent_sessions(active_agent_ids: List[str]) -> int:
 # ---------------------------------------------------------------------------
 
 
-def get_admin_token_suffix(admin_token: str) -> str:
-    """Get the last 4 characters of the admin token for session naming."""
-    if not admin_token or len(admin_token) < 4:
+def get_token_suffix(token: str) -> str:
+    """Get the last 4 characters of an agent token for session naming.
+
+    retire-system-token Wave 5 renamed the parameter from
+    ``admin_token`` — the suffix is always derived from the agent's
+    own per-agent token now (see ``admin_tools.create_agent_session_name``
+    callsite). The old name predates Wave 3 of the prancy-napping-pie
+    retirement, which switched the session-name suffix to the new
+    agent's own token. ``get_admin_token_suffix`` is kept as a back-
+    compat alias for the ``utils.tmux_utils`` shim.
+    """
+    if not token or len(token) < 4:
         return "0000"
-    return admin_token[-4:].lower()
+    return token[-4:].lower()
 
 
-def generate_agent_session_name(agent_id: str, admin_token: str) -> str:
+# Back-compat alias kept so the ``utils.tmux_utils`` re-export shim
+# (and any external callers that imported the old name) keep working.
+get_admin_token_suffix = get_token_suffix
+
+
+def generate_agent_session_name(agent_id: str, token: str) -> str:
     """Generate a smart tmux session name in the format ``<agent_id>-<suffix>``."""
-    suffix = get_admin_token_suffix(admin_token)
+    suffix = get_token_suffix(token)
     clean_agent_id = sanitize_session_name(agent_id)
     return f"{clean_agent_id}-{suffix}"
 
 
-def parse_agent_session_name(session_name: str, admin_token: str) -> Optional[str]:
+def parse_agent_session_name(session_name: str, token: str) -> Optional[str]:
     """Parse an agent session name to extract the agent ID."""
-    suffix = get_admin_token_suffix(admin_token)
+    suffix = get_token_suffix(token)
 
     if not session_name.endswith(f"-{suffix}"):
         return None
@@ -481,18 +497,18 @@ def parse_agent_session_name(session_name: str, admin_token: str) -> Optional[st
     return agent_id
 
 
-def discover_active_agents_from_tmux(admin_token: str) -> List[Dict[str, Any]]:
+def discover_active_agents_from_tmux(token: str) -> List[Dict[str, Any]]:
     """Discover active agents by scanning tmux sessions for our naming pattern."""
     discovered_agents: List[Dict[str, Any]] = []
 
     try:
         sessions = list_tmux_sessions()
-        suffix = get_admin_token_suffix(admin_token)
+        suffix = get_token_suffix(token)
 
         for session in sessions:
             session_name = session["name"]
 
-            agent_id = parse_agent_session_name(session_name, admin_token)
+            agent_id = parse_agent_session_name(session_name, token)
 
             if agent_id:
                 discovered_agents.append(
@@ -519,9 +535,9 @@ def discover_active_agents_from_tmux(admin_token: str) -> List[Dict[str, Any]]:
     return discovered_agents
 
 
-def sync_agents_from_tmux(admin_token: str) -> Dict[str, Any]:
+def sync_agents_from_tmux(token: str) -> Dict[str, Any]:
     """Synchronize agent tracking by discovering active agents from tmux sessions."""
-    discovered_agents = discover_active_agents_from_tmux(admin_token)
+    discovered_agents = discover_active_agents_from_tmux(token)
 
     # Import here to avoid circular imports
     from ..core import globals as g
@@ -943,10 +959,16 @@ def run_setup_commands(
 
 
 def generate_worktree_path(
-    agent_id: str, admin_token_suffix: str, base_path: str = "../agents"
+    agent_id: str, token_suffix: str, base_path: str = "../agents"
 ) -> str:
-    """Generate a standardized worktree path for an agent."""
-    worktree_dir = f"{agent_id}-{admin_token_suffix}"
+    """Generate a standardized worktree path for an agent.
+
+    ``token_suffix`` is the last 4 chars of the agent's own per-agent
+    token (see ``get_token_suffix``). Was named ``admin_token_suffix``
+    before retire-system-token Wave 5 — the suffix has been per-agent,
+    not per-admin, since Wave 3 of prancy-napping-pie.
+    """
+    worktree_dir = f"{agent_id}-{token_suffix}"
     return os.path.abspath(os.path.join(base_path, worktree_dir))
 
 
@@ -1026,9 +1048,9 @@ class AgentRuntime:
 
     # --- discovery -------------------------------------------------------
 
-    def discover_active(self, admin_token: str) -> List[Dict[str, Any]]:
-        """Discover active agents by scanning tmux for the admin-token suffix."""
-        return discover_active_agents_from_tmux(admin_token)
+    def discover_active(self, token: str) -> List[Dict[str, Any]]:
+        """Discover active agents by scanning tmux for the per-agent-token suffix."""
+        return discover_active_agents_from_tmux(token)
 
     # --- liveness --------------------------------------------------------
 
@@ -1109,7 +1131,8 @@ __all__ = [
     "send_prompt_async",
     "cleanup_agent_sessions",
     # Naming policy
-    "get_admin_token_suffix",
+    "get_token_suffix",
+    "get_admin_token_suffix",  # back-compat alias for get_token_suffix
     "generate_agent_session_name",
     "parse_agent_session_name",
     "discover_active_agents_from_tmux",

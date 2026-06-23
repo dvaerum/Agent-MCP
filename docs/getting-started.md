@@ -104,22 +104,18 @@ npm run dev
 
 As of v5.0.59 the dashboard requires operator login (Phase 1 of the
 operator-login plan; ADR-0013). The agent-side MCP transport
-(`/agent-mcp/mcp/<project>`) is unchanged — agents still
-authenticate with the project admin token via the
-`Authorization: Bearer` header. Only the dashboard surface migrates
-to cookie sessions.
+(`/agent-mcp/mcp/<project>`) is unchanged — agents authenticate with
+their per-agent token via the `Authorization: Bearer` header. Only
+the dashboard surface uses cookie sessions.
 
-> **Note (2026-06-23, `retire-system-token` Waves 1–3, PRs #208 / #209 /
-> #210):** the project-wide `admin_token` / `system_token` no longer
-> exists. The references to "admin token" elsewhere in this guide
-> (server-startup log line, environment-variable table, "Your First
-> Multi-Agent Project" walkthrough, troubleshooting tips) reflect the
-> pre-retirement contract and will be revised in the Wave 5 sweep.
-> For external MCP clients (Claude Code, IDE plugins, ad-hoc scripts),
-> the operator-facing migration guide is
-> [`docs/external-mcp-client.md`](./external-mcp-client.md): provision a
-> per-agent worker (or manager) agent in the dashboard and use that
-> agent's `token` as the bearer.
+> **Note (2026-06-23, `retire-system-token` complete after Wave 5,
+> PRs #208 / #209 / #210 / #211 / Wave 5):** the project-wide
+> `admin_token` / `system_token` no longer exists. External MCP
+> clients (Claude Code, IDE plugins, ad-hoc scripts) must
+> **provision a per-agent worker or manager agent in the dashboard
+> and use that agent's `token` as the bearer.** See
+> [`docs/external-mcp-client.md`](./external-mcp-client.md) for the
+> walkthrough.
 
 Pick the bootstrap path that matches your deploy shape:
 
@@ -185,19 +181,21 @@ following are required.
 | `MCP_PROJECT_DIR`                 | (set by `--project-dir`)         | **Advanced.** The CLI sets this from `--project-dir`. Only export manually for cases like running Alembic migrations outside the CLI (see `agent_mcp/db/README.md`). |
 
 Pre-v5.0.53 wirings used a `.env.example` checked into the repo
-referencing `MCP_SERVER_URL` and `MCP_ADMIN_TOKEN`. Those are
-**deprecated / removed** — `MCP_SERVER_URL` is no longer read, and
-the admin token is now surfaced via the new CLI flags:
+referencing `MCP_SERVER_URL` and `MCP_ADMIN_TOKEN`. Both are
+**removed**: `MCP_SERVER_URL` is no longer read, and the project-wide
+"admin token" was retired entirely (`retire-system-token`,
+PRs #208 / #209 / #210 / #211 / Wave 5). Per-agent bearer tokens
+have taken its place — provision a worker or manager agent in the
+dashboard ("Create Agent" panel) and use that row's `token` to
+authenticate external MCP clients. See
+[`docs/external-mcp-client.md`](./external-mcp-client.md) for the
+walkthrough.
 
-| Flag                              | Purpose |
-| --------------------------------- | ------- |
-| `--admin-token-out PATH`          | Write the resolved admin token to PATH (mode 0600). |
-| `--admin-token-format raw\|env`   | Output format for `--admin-token-out`. |
-| `--admin-token-in PATH`           | Read the admin token from PATH at startup (overrides the stored DB token). |
-| `--admin-token-log`               | Log the admin token to stdout/log on startup. |
-
-The default behavior is silent — operators read the token from the
-TUI display, the dashboard, or `--admin-token-out` plumbing.
+A handful of legacy `--admin-token-*` / `--system-token-*` CLI flags
+existed transitionally between Phase 2 Wave 1b and `retire-system-
+token` Wave 3; they're all gone. Spawned agents receive their token
+via the `MCP_AGENT_TOKEN` env var stamped into the tmux session by
+`create_agent` — no global token file is written anywhere.
 
 ---
 
@@ -390,13 +388,16 @@ my-task-manager/
 - Interface is fully responsive
 ```
 
-### Step 3: Initialize Admin Agent
+### Step 3: Provision a Manager Agent and Initialize It
 
-In your AI assistant (Claude Code/Cursor), use your admin token:
+In the dashboard's **Create Agent** panel, create an agent with the
+role `manager` (call it `mgr` or similar). Copy its `token` from the
+agents list. In your AI assistant (Claude Code/Cursor), use that
+token to initialize the manager session:
 
 ```
-You are the admin agent for the Task Manager project.
-Admin Token: "your_admin_token_from_server_startup"
+You are the manager agent for the Task Manager project.
+Agent Token: "<your_manager_token_from_the_dashboard>"
 
 TASK: Add the entire MCD to project context - every detail, don't summarize anything.
 
@@ -405,13 +406,18 @@ TASK: Add the entire MCD to project context - every detail, don't summarize anyt
 After adding context, create a worker agent to start implementation.
 ```
 
+See [`docs/external-mcp-client.md`](./external-mcp-client.md) for
+the full client-config setup (downloading `.mcp.json`, headers,
+multi-tenant vs single-tenant URL shape).
+
 ### Step 4: Create Worker Agent
 
-When the admin agent creates a worker, initialize it in a new window:
+When the manager agent creates a worker, copy that worker's `token`
+from the dashboard's agents list and initialize it in a new window:
 
 ```
 You are frontend-worker agent.
-Your Admin Token: "worker_token_from_admin_response"
+Your Agent Token: "<worker_token_from_the_dashboard>"
 
 Look at your assigned tasks and ask the project RAG agent 5-7 critical questions to understand:
 - What exactly needs to be implemented

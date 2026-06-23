@@ -120,18 +120,17 @@ paths:
 After first boot, navigate to `http://localhost:5454/agent-mcp/login`
 to authenticate. The session cookie is HttpOnly + Secure +
 SameSite=Lax, scoped to `/agent-mcp/`. Agent-side MCP traffic
-(`/agent-mcp/mcp/<project>`) continues to use the legacy
-`Authorization: Bearer <admin_token>` header — agents don't need to
-be aware of the operator login.
+(`/agent-mcp/mcp/<project>`) uses an `Authorization: Bearer
+<agent_token>` header sourced from the `agents` table — agents don't
+need to be aware of the operator login.
 
-> **Note (2026-06-23):** the `admin_token` / `system_token` was fully
-> retired in PRs #208 / #209 / #210. External MCP clients
-> (Claude Code, IDE plugins, ad-hoc scripts) must now authenticate
-> with **per-agent bearer tokens** drawn from the `agents` table.
-> See [docs/external-mcp-client.md](./docs/external-mcp-client.md)
-> for the operator-facing migration guide. The README sections below
-> that still reference an "admin token" workflow will be revised in
-> the `retire-system-token` Wave 5 sweep.
+> **Note (2026-06-23):** the project-wide `admin_token` / `system_token`
+> was fully retired in PRs #208 / #209 / #210 / #211 / Wave 5.
+> External MCP clients (Claude Code, IDE plugins, ad-hoc scripts)
+> authenticate with **per-agent bearer tokens** drawn from the
+> `agents` table. See
+> [docs/external-mcp-client.md](./docs/external-mcp-client.md) for
+> the operator-facing migration guide.
 
 ## MCP Integration Guide
 
@@ -435,10 +434,16 @@ Each agent focuses on their linear chain. No confusion. No context pollution. Ju
 
 ## The 5-Step Workflow
 
-### 1. Initialize Admin Agent
+### 1. Provision a Manager Agent
+
+Log into the dashboard, create a `manager`-role agent for yourself
+(the "Create Agent" panel takes an `agent_id` + role), and copy its
+`token` from the agents list. Use that token to initialize the
+manager session in your AI client:
+
 ```
-You are the admin agent.
-Admin Token: "your_admin_token_from_server"
+You are the manager agent.
+Agent Token: "<your_manager_agent_token_from_the_dashboard>"
 
 Your role is to:
 - Coordinate all development work
@@ -446,6 +451,11 @@ Your role is to:
 - Maintain project context
 - Assign tasks based on agent specializations
 ```
+
+The per-agent bearer is what authenticates you to the MCP server;
+see [docs/external-mcp-client.md](./docs/external-mcp-client.md) for
+the full external-client setup (client-config download, headers,
+single-tenant vs router shapes).
 
 ### 2. Load Your Project Blueprint (MCD)
 ```
@@ -481,7 +491,7 @@ Each agent specializes in their domain, leading to higher quality implementation
 ```
 # In new window for each worker:
 You are [worker-name] agent.
-Your Admin Token: "worker_token_from_admin"
+Your Agent Token: "<worker_token_from_the_dashboard_agents_list>"
 
 Query the project knowledge graph to understand:
 1. Overall system architecture

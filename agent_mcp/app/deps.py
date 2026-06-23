@@ -153,11 +153,18 @@ async def require_operator_session(request: Request) -> dict[str, Any]:
 
     On success returns a dict shaped like::
 
-        {"kind": "session", "user": <user-row>}        # cookie path
-        {"kind": "forwarding", "operator_id": <str>}   # signed-header
-        {"kind": "admin_token", "user": None}          # bearer / body / qs
+        {"kind": "session", "user": <user-row>}             # cookie path
+        {"kind": "forwarding", "operator_id": <str>}        # signed-header
+        {"kind": "operator_bearer", "user": None}           # bearer / body / qs
 
     On failure raises HTTPException(401).
+
+    The ``"operator_bearer"`` discriminator was named ``"admin_token"``
+    before retire-system-token Wave 5; it never carried a god-key
+    admin token after Wave 1 (it admits per-agent manager-role tokens
+    via ``_bearer_is_operator_tier``), so the legacy name was
+    misleading. The discriminator is internal — no handler branches on
+    it post-Wave-3.
 
     Handlers that want just "did this caller authenticate?" don't
     need to inspect the return value; they can wire the dep via
@@ -195,18 +202,18 @@ async def require_operator_session(request: Request) -> dict[str, Any]:
     if auth.lower().startswith("bearer "):
         bearer = auth[7:].strip()
         if bearer and _bearer_is_operator_tier(bearer):
-            return {"kind": "admin_token", "user": None}
+            return {"kind": "operator_bearer", "user": None}
 
     # 4. Body-token path — backwards-compat (the JSON body's
     #    "token" field). Same operator-tier gate as the bearer path.
     body_token = await _legacy_body_token(request)
     if body_token and _bearer_is_operator_tier(body_token):
-        return {"kind": "admin_token", "user": None}
+        return {"kind": "operator_bearer", "user": None}
 
     # 5. Query-string ``?token=<>`` path — same shape, same gate.
     query_token = request.query_params.get("token") if request.query_params else None
     if query_token and _bearer_is_operator_tier(query_token):
-        return {"kind": "admin_token", "user": None}
+        return {"kind": "operator_bearer", "user": None}
 
     raise HTTPException(
         status_code=401,

@@ -104,24 +104,25 @@ def _check_role(role: str, token: Optional[str]) -> None:
     the call originates from a logged-in operator's session cookie)
     in addition to the static token verification.
 
-    Role semantics (Phase 2 Wave 2a):
+    Role semantics (Phase 2 Wave 2a, updated by retire-system-token
+    Wave 1 — the system-bearer branch is gone; only operator-session
+    and per-agent tokens admit):
 
     * ``"operator"`` (and legacy alias ``"admin"``) — admits operator
-      session OR the system bearer. Agent tokens — including
-      ``agent_role='manager'`` — are rejected. This is the strictest
-      gate; reserved for spawn/terminate-agent, mutate ``config_*``,
+      session only. Agent tokens — including ``agent_role='manager'``
+      — are rejected. This is the strictest gate; reserved for
+      spawn/terminate-agent, mutate ``config_*``,
       ``broadcast_admin_message``, backup-context, and RAG-index
       rebuild.
-    * ``"manager"`` — admits operator session OR system bearer OR
-      agent token whose row has ``agent_role='manager'``. The
-      supervision-tier gate: assign-task to peers, edit subordinate
-      agent metadata.
-    * ``"any"`` — any active agent token (worker, manager, or the
-      system bearer acting as an agent). Operator session does NOT
-      satisfy ``"any"`` on its own because ``"any"`` is about
-      agent-side identity (audit-log attribution needs an agent_id);
-      operator-session callers always set ``token=g.system_token``
-      via the REST seam so they pass via the system-bearer branch.
+    * ``"manager"`` — admits operator session OR agent token whose
+      row has ``agent_role='manager'``. The supervision-tier gate:
+      assign-task to peers, edit subordinate agent metadata.
+    * ``"any"`` — any active agent token (worker or manager).
+      Operator session does NOT satisfy ``"any"`` on its own because
+      ``"any"`` is about agent-side identity (audit-log attribution
+      needs an agent_id); operator-session callers that need to
+      invoke an ``"any"``-gated tool must explicitly pass a per-agent
+      token in ``arguments["token"]``.
     """
     # Lazy import — avoid an import cycle (registry imports authorize
     # transitively via tool implementations' @requires decorators).

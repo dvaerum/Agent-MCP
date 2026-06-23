@@ -33,31 +33,6 @@
   ],
   "prompts": [
     {
-      "id": "admin-init",
-      "title": "Admin Agent Initialization",
-      "description": "Initialize an admin agent with authentication token and context setup",
-      "category": "initialization",
-      "template": "Initialize as an admin agent with this token: {{ADMIN_TOKEN}}\nPlease add the MCD.md file to the project context. Don't summarize it.",
-      "variables": [
-        {
-          "name": "ADMIN_TOKEN",
-          "description": "The admin authentication token from the MCP database",
-          "placeholder": "admin_token_here",
-          "required": true
-        }
-      ],
-      "usage": "Use this prompt to set up the main admin agent that will coordinate other agents and manage the project.",
-      "examples": [
-        "Initialize as an admin agent with this token: abc123def456\nPlease add the MCD.md file to the project context. Don't summarize it."
-      ],
-      "tags": [
-        "admin",
-        "initialization",
-        "setup",
-        "auth"
-      ]
-    },
-    {
       "id": "worker-init",
       "title": "Worker Agent Initialization",
       "description": "Initialize a worker agent with specific role and autonomous behavior",
