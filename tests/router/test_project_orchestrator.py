@@ -480,6 +480,7 @@ async def test_systemctl_honors_agent_mcp_systemctl_mode_env_var(
 # ── Regression: URL dispatch through the router still resolves aliases ──
 
 
+@pytest.mark.no_auth_seed_session
 async def test_url_dispatch_proxy_resolves_alias_via_orchestrator(
     aiohttp_client, router_module, router_env, monkeypatch,
 ):
@@ -488,6 +489,16 @@ async def test_url_dispatch_proxy_resolves_alias_via_orchestrator(
     (the project exists but no token) rather than 404'd. Tests that
     the orchestrator's alias resolution is wired into the router's
     backend handler post-split.
+
+    F015 v5: marked ``no_auth_seed_session`` to opt out of the
+    conftest's auto-login. Without this, the test client carries
+    the sentinel operator's cookie (sysadmin + member of every
+    registered project), so the cookie path inside
+    ``backend_mcp_handler`` would now invoke ``_ensure`` and raise
+    504/500 from the stubbed systemctl path instead of returning
+    the 401 this test is asserting on. The test's intent is "URL
+    dispatch resolves the alias and reaches the auth gate"; no
+    cookie + no bearer is the cleanest way to land at the gate.
     """
     name = "omikron"
     ws = router_env.root / "ws" / name
