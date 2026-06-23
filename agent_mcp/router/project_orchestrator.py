@@ -46,6 +46,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import secrets
 import subprocess
 import time
 from collections import defaultdict
@@ -186,6 +187,129 @@ def read_system_token(name: str) -> str | None:
         return None
 
 
+# ── Forwarding-header HMAC key (retire-system-token Wave 2) ────────
+# The router signs an ``X-Agent-MCP-Forwarded-Operator`` header on
+# every cookie-authenticated request that proxies to a per-project
+# backend. Backend's ``AuthHeaderMiddleware`` (Wave 1) verifies the
+# signature against the same HMAC key, loaded into
+# ``g.forwarding_hmac_key`` at backend bootstrap via the
+# ``--forwarding-hmac-in`` flag.
+#
+# The router OWNS this key: generated at backend spawn time, written
+# to ``<sock_dir>/<name>/forwarding_hmac`` (mode 0600) so the
+# launcher can hand the path to the backend, and stashed in this
+# in-memory map so signing on every request doesn't pay a disk read.
+#
+# The dict is cleared per-(name) on backend stop so a project that's
+# re-spawned after a workspace teardown rotates the key cleanly.
+
+# {project_name: HMAC key bytes (32 bytes of os.urandom)}
+forwarding_hmac_keys: dict[str, bytes] = {}
+
+
+def _forwarding_hmac_path(name: str) -> Path:
+    """Path the router writes the per-project HMAC key to.
+
+    Same directory as the backend's UDS so the launcher's
+    ``$AGENT_MCP_SOCK_DIR/$name/`` mkdir covers both files in one
+    step and a project teardown drops the key alongside the socket
+    — no stale key file surviving a backend rebuild.
+    """
+    d = SOCK_DIR / name
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "forwarding_hmac"
+
+
+def ensure_forwarding_hmac_key(name: str) -> bytes:
+    """Return the per-project HMAC key, generating + persisting if needed.
+
+    Idempotent: if a key file already exists on disk (e.g. the router
+    crashed mid-spawn and restarted, or a stale file is left over from
+    a previous backend instance), the on-disk value wins so the
+    already-spawned backend's loaded key stays compatible. The in-
+    memory cache is populated on first use so subsequent calls within
+    the same router process are pure dict lookups.
+
+    The file is written with mode 0600 (router-only readable). The
+    launcher passes the path to the backend via
+    ``--forwarding-hmac-in``; the backend reads it once at startup
+    into ``g.forwarding_hmac_key``.
+
+    Called eagerly from ``_ensure`` BEFORE the systemctl start so the
+    file is on disk by the time the backend's bootstrap reads it.
+    """
+    cached = forwarding_hmac_keys.get(name)
+    if cached is not None:
+        return cached
+    path = _forwarding_hmac_path(name)
+    # If a key file already exists on disk, adopt it. Defends the
+    # router-restart scenario: a backend that's already running was
+    # spawned with whatever key the previous router process wrote —
+    # generating a new key here would silently break HMAC verification
+    # for every cookie-authenticated request until the backend is
+    # restarted. The router-restart case (orphaned backend with a
+    # known key file) is handled by ``reconcile_on_startup``'s
+    # adoption pass; this branch covers the in-flight readers.
+    try:
+        existing = path.read_bytes()
+    except FileNotFoundError:
+        existing = None
+    except OSError as exc:  # pragma: no cover - defensive
+        log.warning(
+            "Failed to read existing HMAC key for project %r at %s: %s",
+            name, path, exc,
+        )
+        existing = None
+    if existing:
+        forwarding_hmac_keys[name] = existing
+        return existing
+    # Fresh spawn — generate 32 random bytes and persist.
+    key = secrets.token_bytes(32)
+    # Atomic-ish write: open with O_CREAT|O_EXCL|O_TRUNC + 0600 so a
+    # racing reader never sees a half-written key. We don't need a
+    # tmpfile + rename here because the file is single-writer (the
+    # router process) and the launcher always reads AFTER the
+    # systemctl start completes (sequenced via ``_ensure``).
+    fd = os.open(
+        str(path),
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
+    )
+    try:
+        os.write(fd, key)
+    finally:
+        os.close(fd)
+    forwarding_hmac_keys[name] = key
+    return key
+
+
+def get_forwarding_hmac_key(name: str) -> bytes | None:
+    """Return the cached per-project HMAC key, or None if not set.
+
+    Read-only: never generates a new key. Used by the router's
+    ``_forwarding_header_from_cookie`` path; if the key isn't loaded
+    yet (e.g. the cookie request raced backend spawn), the cookie
+    path returns None and the caller 401s.
+    """
+    cached = forwarding_hmac_keys.get(name)
+    if cached is not None:
+        return cached
+    # Fallback: read off disk in case ``_ensure`` ran in a different
+    # process or before the in-memory cache was populated. This
+    # mirrors ``ensure_forwarding_hmac_key``'s adopt-existing branch
+    # but never writes a new key.
+    try:
+        existing = _forwarding_hmac_path(name).read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError:  # pragma: no cover - defensive
+        return None
+    if existing:
+        forwarding_hmac_keys[name] = existing
+        return existing
+    return None
+
+
 def _unit_name(name: str, role: str) -> str:
     if role == "backend":
         return f"agent-mcp@{name}.service"
@@ -301,6 +425,15 @@ async def _ensure(name: str, role: str) -> Path:
                     raise web.HTTPGatewayTimeout(reason=reason)
                 # Cooldown elapsed — drop the stale entry so we retry.
                 ensure_failures.pop((name, role), None)
+            # retire-system-token Wave 2: ensure the forwarding-header
+            # HMAC key file exists BEFORE the backend starts. The
+            # backend's ``--forwarding-hmac-in`` bootstrap reads the
+            # file at startup; if it isn't present yet, the cookie
+            # path silently degrades to "key not loaded" (Wave 1
+            # dormant fallback) and every cookie request 401s. Sits
+            # inside ``_ensure_lock`` so concurrent ``_ensure`` calls
+            # don't race on file creation.
+            ensure_forwarding_hmac_key(name)
             action = "restart" if _is_active(unit) else "start"
             r = _systemctl(action, unit)
             if r.returncode != 0:
@@ -555,6 +688,13 @@ class ProjectOrchestrator:
                     "message": r.stderr.strip(),
                 }
         last_active.pop((name, "backend"), None)
+        # Drop the in-memory HMAC key so the next spawn rotates. The
+        # file on disk is left in place — the next ``_ensure`` will
+        # adopt it via ``ensure_forwarding_hmac_key`` (idempotent
+        # against the existing file), so an in-flight cookie request
+        # racing the stop+restart cycle still verifies. Operators
+        # who want a hard rotation delete the project's sock dir.
+        forwarding_hmac_keys.pop(name, None)
         return {"stopped": True}
 
     # ── list_active ───────────────────────────────────────────────

@@ -241,12 +241,20 @@ async def test_login_page_is_reachable_without_cookie(
 async def test_mcp_route_with_operator_cookie_reaches_handler(
     aiohttp_client, router_app, register_project,
 ) -> None:
-    """Wave 2 (cleanup-wave-2): the dashboard's MCP notifications
-    SSE subscription drops the bearer header and authenticates with
-    the ``agent_mcp_session`` cookie instead. The cookie path lives
-    inside ``backend_mcp_handler`` (NOT
-    ``require_operator_session_middleware``, which still allow-lists
-    ``/agent-mcp/mcp/`` so the agent-side bearer path keeps working).
+    """The dashboard's MCP notifications SSE subscription drops the
+    bearer header and authenticates with the ``agent_mcp_session``
+    cookie instead. The cookie path lives inside
+    ``backend_mcp_handler`` (NOT ``require_operator_session_middleware``,
+    which still allow-lists ``/agent-mcp/mcp/`` so the agent-side
+    bearer path keeps working).
+
+    retire-system-token Wave 2 (2026-06-23): the cookie path no
+    longer translates to an admin bearer; the router signs a
+    ``X-Agent-MCP-Forwarded-Operator`` header from the per-project
+    HMAC key. We pre-seed the key the way
+    ``ensure_forwarding_hmac_key`` would at backend spawn time so
+    ``_forwarding_header_from_cookie`` can sign without standing up
+    a real backend.
 
     Concretely:
 
@@ -258,15 +266,15 @@ async def test_mcp_route_with_operator_cookie_reaches_handler(
         didn't trigger.
       * Valid cookie + non-member → 401 from the cookie path.
     """
-    import agent_mcp.router.app as router_module
+    from agent_mcp.router import project_orchestrator as _po
 
     register_project("delta")
-    # Seed the admin token in the cache so the router can resolve the
-    # bearer to inject upstream without standing up a backend just to
-    # serve /api/tokens.
-    router_module._agent_token_cache["delta"] = (
-        9.9e18, {"injected-admin-token": "Admin"},
-    )
+    # retire-system-token Wave 2: the cookie path needs the per-
+    # project HMAC key to sign the forwarding header. Pre-seed it the
+    # way ``_ensure``'s spawn-time hook would. Skipping the systemd
+    # start ourselves keeps the test focused on the auth-gate
+    # decision (the 5xx after the gate is still observed below).
+    _po.ensure_forwarding_hmac_key("delta")
     # Seed two operators. The conftest's register_project already
     # seeded the sentinel operator (so alice/bob are NOT the first
     # user) — alice gets an explicit membership grant; bob stays
