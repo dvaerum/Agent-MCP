@@ -138,10 +138,21 @@ let
     # — Wave 3 (PR #205) removed ``admin_token`` from ``GET /api/tokens``
     # so the router has no backend-side channel left.
     system_token_out="$sock_dir/system_token"
+    # retire-system-token Wave 2: the router writes the per-project
+    # forwarding-header HMAC key to this file BEFORE invoking
+    # ``systemctl start`` (see ``project_orchestrator.ensure_forwarding_hmac_key``);
+    # the backend's bootstrap reads it once at startup into
+    # ``g.forwarding_hmac_key`` so its ``AuthHeaderMiddleware`` can
+    # verify cookie-authenticated requests proxied via the router.
+    # Wave 3 will delete the parallel ``--system-token-out`` plumbing
+    # once external clients have been migrated to per-agent bearer
+    # tokens (Wave 4); both flags coexist during the transition.
+    forwarding_hmac_in="$sock_dir/forwarding_hmac"
     exec ${agentMcpBackendWrapper}/bin/agent-mcp-backend \
       --uds "$sock" \
       --project-dir "$path" \
       --system-token-out "$system_token_out" \
+      --forwarding-hmac-in "$forwarding_hmac_in" \
       --no-tui
   '';
 
