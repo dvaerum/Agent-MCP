@@ -344,13 +344,20 @@ def _load_forwarding_hmac_key(path: Optional[str]) -> None:
         )
         g.forwarding_hmac_key = None
         return
-    # Allow the file to carry a trailing newline (text-editor friendly)
-    # without weakening the secret. Treat all-whitespace as empty.
-    data = data.strip()
+    # F015 v7: do NOT ``.strip()`` raw HMAC bytes. The file is binary
+    # (32 bytes of /dev/urandom written by the systemd unit's
+    # ExecStartPre) and any of those bytes can legitimately be ASCII
+    # whitespace (``\n``, ``\r``, `` ``, ``\t`` etc.). The router
+    # (``router/project_orchestrator.py::ensure_forwarding_hmac_key``)
+    # does NOT strip — it signs with the full bytes. Backend stripping
+    # silently shortens the key, every HMAC verify fails, every
+    # cookie-authenticated request 401s. The first observed live VM
+    # key was 0x0a (\n) leading, exhibiting exactly this. Reject
+    # empty; accept everything else as-is.
     if not data:
         logger.warning(
-            "Forwarding-hmac key file %s is empty after strip(); "
-            "forwarding-header auth stays dormant.",
+            "Forwarding-hmac key file %s is empty; forwarding-header "
+            "auth stays dormant.",
             path,
         )
         g.forwarding_hmac_key = None

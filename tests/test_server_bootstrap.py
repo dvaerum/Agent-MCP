@@ -353,3 +353,67 @@ def _default_config(**overrides: Any):
         no_index=overrides.pop("no_index", False),
         **overrides,
     )
+
+
+# ─── F015 v7 regression: HMAC key loader must not strip raw bytes ───
+# Pre-fix `_load_forwarding_hmac_key` called `data.strip()` on a
+# binary HMAC key blob written by the systemd unit's ExecStartPre
+# (`head -c 32 /dev/urandom > $RUNTIME_DIRECTORY/forwarding_hmac`).
+# When /dev/urandom produced a key starting OR ending with bytes
+# that happen to be ASCII whitespace (\n=0x0a, \r=0x0d, space=0x20,
+# \t=0x09, \v=0x0b, \f=0x0c), the loaded key was shorter than 32
+# bytes; the router (which does NOT strip) signed with the full
+# 32 bytes; every HMAC verify failed; every cookie-authenticated
+# /mcp request 401'd.
+
+def test_load_forwarding_hmac_key_preserves_leading_whitespace_byte(tmp_path):
+    """A 32-byte key whose first byte is \\n must load as 32 bytes,
+    not 31. Stripping any byte would have shortened the key and broken
+    HMAC verify against the unchanged router-side bytes.
+    """
+    from agent_mcp.server_bootstrap import _load_forwarding_hmac_key
+    from agent_mcp.core import globals as g
+
+    key = b"\n" + bytes(range(31))  # 32 bytes, first is \n (0x0a)
+    keyfile = tmp_path / "forwarding_hmac"
+    keyfile.write_bytes(key)
+
+    g.forwarding_hmac_key = None  # ensure clean slate
+    _load_forwarding_hmac_key(str(keyfile))
+
+    assert g.forwarding_hmac_key == key, (
+        "Loader must preserve leading whitespace byte; "
+        f"got {len(g.forwarding_hmac_key)} bytes "
+        f"({g.forwarding_hmac_key[:4]!r}), expected 32 ({key[:4]!r})"
+    )
+
+
+def test_load_forwarding_hmac_key_preserves_trailing_whitespace_byte(tmp_path):
+    """Same defence for trailing \\n / \\r etc."""
+    from agent_mcp.server_bootstrap import _load_forwarding_hmac_key
+    from agent_mcp.core import globals as g
+
+    key = bytes(range(31)) + b"\n"  # 32 bytes, last is \n
+    keyfile = tmp_path / "forwarding_hmac"
+    keyfile.write_bytes(key)
+
+    g.forwarding_hmac_key = None
+    _load_forwarding_hmac_key(str(keyfile))
+
+    assert g.forwarding_hmac_key == key
+    assert len(g.forwarding_hmac_key) == 32
+
+
+def test_load_forwarding_hmac_key_empty_file_is_dormant(tmp_path):
+    """Empty file still leaves the key None (forwarding-header auth
+    dormant). The strip() removal must not regress this safety net."""
+    from agent_mcp.server_bootstrap import _load_forwarding_hmac_key
+    from agent_mcp.core import globals as g
+
+    keyfile = tmp_path / "forwarding_hmac"
+    keyfile.write_bytes(b"")
+
+    g.forwarding_hmac_key = b"prior-value"
+    _load_forwarding_hmac_key(str(keyfile))
+
+    assert g.forwarding_hmac_key is None
