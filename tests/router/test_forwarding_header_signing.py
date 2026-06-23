@@ -380,3 +380,63 @@ async def test_per_agent_bearer_path_does_not_inject_forwarding_header(
     # The bearer itself does pass through (so the backend's
     # AuthHeaderMiddleware can read it from Authorization).
     assert rec["headers"].get("Authorization") == "Bearer agent-token-1"
+
+
+async def test_client_supplied_forwarding_header_is_stripped_on_bearer_path(
+    aiohttp_client, router_app, wave2_backend, router_module,
+) -> None:
+    """Defense-in-depth: a client attaching its own
+    ``X-Agent-MCP-Forwarded-Operator`` header to a bearer-authenticated
+    request must NOT have that header reach the backend.
+
+    Two failure modes the strip defends against:
+
+      1. DoS — the backend's ``AuthHeaderMiddleware`` rejects a
+         present-but-invalid header (defaults-secure Wave 1 behaviour).
+         A client attaching a garbage header to every bearer request
+         would 401 the entire agent-side path.
+      2. Key-compromise amplifier — if the per-project HMAC key ever
+         leaked, an attacker could forge a forwarding header and
+         attach it to a bearer request to re-attribute the operator
+         identity stamped on ``g.current_operator``.
+
+    The strip is unconditional in ``_proxy_to_backend`` (the router
+    is the only authoritative signer); this test pins it.
+    """
+    from agent_mcp.app import forwarding_header as _fh
+
+    router_module._agent_token_cache["demo"] = (
+        9.9e18, {"agent-token-1": "worker-1"},
+    )
+    client = await aiohttp_client(router_app)
+    _seed_user("alice")
+
+    # Attach BOTH a valid bearer AND a forged forwarding header.
+    resp = await client.post(
+        "/agent-mcp/mcp/demo",
+        data=b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+        headers={
+            "Authorization": "Bearer agent-token-1",
+            _fh.HEADER_NAME: "attacker.99999999999.deadbeef" * 4,
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        },
+        allow_redirects=False,
+    )
+    # The fake backend rejects without forwarding header (it's cookie-
+    # only), so this resp 401s. The contract under test is the upstream
+    # request shape.
+    assert resp.status == 401, await resp.text()
+
+    posts = [r for r in wave2_backend.records if r["path"] == "/mcp"]
+    assert len(posts) == 1, (
+        f"bearer path should reach the backend; got {posts!r}"
+    )
+    rec = posts[0]
+    assert _fh.HEADER_NAME not in rec["headers"], (
+        f"forged forwarding header from the client survived proxying: "
+        f"{rec['headers'].get(_fh.HEADER_NAME)!r}. The router must "
+        f"strip this unconditionally; the backend's defense relies on "
+        f"the router being the only authoritative signer."
+    )
+    assert rec["headers"].get("Authorization") == "Bearer agent-token-1"

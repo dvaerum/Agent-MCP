@@ -622,9 +622,21 @@ async def _proxy_to_backend(
     # a ContextVar and injects into arguments.token when the JSON-RPC
     # body doesn't include one. Without forwarding the header, the
     # upstream fallback never triggers.
+    #
+    # Strip the forwarding-header name unconditionally: the router is
+    # the ONLY authoritative source of this header's value, and the
+    # backend's middleware treats a present-but-invalid header as
+    # 401-worthy. A client-attached value that survives proxying would
+    # both (a) DoS legitimate bearer-only requests (the backend 401s
+    # the bad HMAC before even reading Authorization) and (b) — in a
+    # key-compromise scenario — let an attacker re-attribute requests
+    # through the bearer path. Defense-in-depth: strip first, optionally
+    # re-inject below when ``inject_header`` is set.
+    from ..app import forwarding_header as _fh
+    _forwarding_header_lower = _fh.HEADER_NAME.lower()
     headers = {
         k: v for k, v in req.headers.items()
-        if k.lower() not in ("host", "content-length")
+        if k.lower() not in ("host", "content-length", _forwarding_header_lower)
     }
     if inject_bearer is not None:
         # Strip any caller-supplied Authorization (case-insensitive)
@@ -636,11 +648,13 @@ async def _proxy_to_backend(
                 headers.pop(k, None)
         headers["Authorization"] = f"Bearer {inject_bearer}"
     if inject_header is not None:
-        # The router OWNS this header — any caller-supplied value is
-        # stripped before signing so an upstream attacker can't smuggle
-        # a tampered forwarding header through by setting it client-
-        # side. The HMAC the backend verifies must always be the one
-        # the router just signed.
+        # The router OWNS the forwarding header. Any client-supplied
+        # value was already stripped during the headers-dict
+        # construction above; here we just attach the router-signed
+        # value. We do NOT re-strip by inject_header[0] because the
+        # initial copy already removed every header that could carry
+        # the name (case-insensitive), but defensively pop anyway in
+        # case a future caller passes a different inject_header name.
         h_name, h_value = inject_header
         wanted_lower = h_name.lower()
         for k in list(headers.keys()):
