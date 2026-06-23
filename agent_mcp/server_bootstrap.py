@@ -56,9 +56,7 @@ the test contract pins that calling it twice does not raise.
 
 from __future__ import annotations
 
-import json
 import os
-import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,16 +92,6 @@ class ServerConfig:
     port: int
     project_dir: str
     uds: Optional[str] = None
-    # Phase 2 Wave 1b: renamed from admin_token_*. The legacy attribute
-    # names are NOT preserved on this frozen dataclass — internal
-    # callers were updated in the same PR. External constructors get
-    # the migration via the ``admin_token_*`` kwargs on ``from_cli_args``
-    # below.
-    system_token_cli: Optional[str] = None
-    system_token_out_path: Optional[str] = None
-    system_token_out_format: str = "raw"
-    system_token_in_path: Optional[str] = None
-    system_token_log: bool = False
     # retire-system-token Wave 1: path to the per-project HMAC key
     # file the router uses to sign the forwarding header. The backend
     # reads the raw bytes at boot and stamps them onto
@@ -137,20 +125,7 @@ class ServerConfig:
         advanced: bool,
         git: bool,
         no_index: bool,
-        system_token_cli: Optional[str] = None,
-        system_token_out_path: Optional[str] = None,
-        system_token_out_format: str = "raw",
-        system_token_in_path: Optional[str] = None,
-        system_token_log: bool = False,
         forwarding_hmac_in_path: Optional[str] = None,
-        # Phase 2 Wave 1b: legacy ``admin_token_*`` aliases kept for
-        # one release so external callers (deploy scripts, third-party
-        # integrations) keep working. New name wins on collision.
-        admin_token_cli: Optional[str] = None,
-        admin_token_out_path: Optional[str] = None,
-        admin_token_out_format: Optional[str] = None,
-        admin_token_in_path: Optional[str] = None,
-        admin_token_log: Optional[bool] = None,
     ) -> "ServerConfig":
         """Build a config from the keyword set the click ``server``
         subcommand passes to its callback.
@@ -160,33 +135,13 @@ class ServerConfig:
         hook does this) still resolve the right ``.agent`` directory.
         Validation happens via ``__post_init__`` so callers always
         catch bad input synchronously.
-
-        Accepts both ``system_token_*`` (canonical) and ``admin_token_*``
-        (deprecated alias) kwargs; the canonical name wins when both
-        are supplied.
         """
-        if system_token_cli is None and admin_token_cli is not None:
-            system_token_cli = admin_token_cli
-        if system_token_out_path is None and admin_token_out_path is not None:
-            system_token_out_path = admin_token_out_path
-        if system_token_out_format == "raw" and admin_token_out_format is not None:
-            system_token_out_format = admin_token_out_format
-        if system_token_in_path is None and admin_token_in_path is not None:
-            system_token_in_path = admin_token_in_path
-        if system_token_log is False and admin_token_log is True:
-            system_token_log = True
-
         resolved_project = str(Path(project_dir).resolve())
         return cls(
             transport=transport.lower(),
             port=int(port),
             project_dir=resolved_project,
             uds=uds,
-            system_token_cli=system_token_cli,
-            system_token_out_path=system_token_out_path,
-            system_token_out_format=system_token_out_format,
-            system_token_in_path=system_token_in_path,
-            system_token_log=bool(system_token_log),
             forwarding_hmac_in_path=forwarding_hmac_in_path,
             debug=bool(debug),
             no_tui=bool(no_tui),
@@ -344,60 +299,6 @@ def apply_runtime_flags(config: ServerConfig) -> None:
         logger.info("Git worktree support disabled (use --git to enable).")
 
 
-# --- admin-token DB helper (read-only) -------------------------------
-
-
-def get_system_token_from_db(project_dir: str) -> Optional[str]:
-    """Read the persisted system token out of the project DB.
-
-    Phase 2 Wave 1b rename of ``get_admin_token_from_db``. Reads the
-    canonical ``config_system_token`` row first, falling back to the
-    legacy ``config_admin_token`` row so a fresh-after-upgrade boot
-    (before ``application_startup`` migrates the row) still surfaces
-    the right value to the TUI / startup banner.
-
-    Used by the TUI display loop + the startup banner to print the
-    actual token a freshly booted server is using. Returns ``None`` if
-    the DB is absent or both rows are missing — both are normal on first
-    boot, before ``application_startup`` has written the token.
-
-    Lives here (rather than in ``cli.py``) so the TUI runtime can
-    import it without pulling the click adapter as a side effect.
-    """
-    try:
-        db_path = Path(project_dir).resolve() / ".agent" / "mcp_state.db"
-        if not db_path.exists():
-            return None
-        conn = sqlite3.connect(str(db_path))
-        try:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            for key in ("config_system_token", "config_admin_token"):
-                cursor.execute(
-                    "SELECT value FROM project_context WHERE context_key = ?",
-                    (key,),
-                )
-                row = cursor.fetchone()
-                if row and row["value"]:
-                    try:
-                        token = json.loads(row["value"])
-                        if isinstance(token, str) and token:
-                            return token
-                    except json.JSONDecodeError:
-                        continue
-        finally:
-            conn.close()
-        return None
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.error("Error reading system token from database: %s", exc)
-        return None
-
-
-# Phase 2 Wave 1b: legacy alias kept for one release so external
-# callers (Nix module, third-party tools) keep importing the old name.
-get_admin_token_from_db = get_system_token_from_db
-
-
 # --- forwarding-header HMAC key loader -------------------------------
 
 
@@ -480,7 +381,7 @@ def bootstrap_server(
 
       1. ``apply_runtime_flags(config)`` — flips ``core.config``
          knobs + the ``MCP_DEBUG`` env var.
-      2. (sse only) ``create_app(project_dir, admin_token_cli)``
+      2. (sse only) ``create_app(project_dir)``
          constructs the Starlette app. Starlette's lifespan kicks off
          ``application_startup`` on first request — we DON'T pre-run
          it here, because lifespan ordering is the contract that the
@@ -521,11 +422,6 @@ def bootstrap_server(
 
         app = create_app(
             project_dir=config.project_dir,
-            system_token_cli=config.system_token_cli,
-            system_token_out_path=config.system_token_out_path,
-            system_token_out_format=config.system_token_out_format,
-            system_token_in_path=config.system_token_in_path,
-            system_token_log=config.system_token_log,
         )
 
     teardown_state = {"called": False}
@@ -699,11 +595,6 @@ async def _run_stdio(config: ServerConfig, tui_active: bool) -> None:
     try:
         await application_startup(
             project_dir_path_str=config.project_dir,
-            system_token_param=config.system_token_cli,
-            system_token_out_path=config.system_token_out_path,
-            system_token_out_format=config.system_token_out_format,
-            system_token_in_path=config.system_token_in_path,
-            system_token_log=config.system_token_log,
         )
 
         async with anyio.create_task_group() as tg:
@@ -778,16 +669,6 @@ def _print_startup_banner(config: ServerConfig) -> None:
         print(f"🚀 MCP Server running on port {config.port}")
         print(f"📁 Project: {config.project_dir}")
 
-    # The startup banner only surfaces the admin token when the
-    # operator opted in via --admin-token-log. Default is silent —
-    # the dashboard's tokens view, --admin-token-out, or the TUI
-    # (which the operator is actively staring at) are the supported
-    # surfaces. Same gate as the application_startup log line.
-    if config.system_token_log:
-        admin_token = get_admin_token_from_db(config.project_dir)
-        if admin_token:
-            print(f"🔑 Admin Token: {admin_token}")
-
     print()
     if config.transport != "stdio":
         print("Next steps:")
@@ -819,7 +700,6 @@ __all__ = [
     "ServerConfig",
     "apply_runtime_flags",
     "bootstrap_server",
-    "get_admin_token_from_db",
     "load_project_dotenv",
     "run_server",
 ]

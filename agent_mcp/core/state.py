@@ -38,28 +38,6 @@ connections: Dict[str, Any] = {}
 # Agent Token -> Agent data.
 active_agents: Dict[str, Dict[str, Any]] = {}
 
-# Runtime system token (the router-internal authority bearer that
-# agent-side bearer auth uses). Initialization logic (generate / load)
-# lives in server startup.
-#
-# Phase 2 Wave 1b renamed this from ``admin_token`` to ``system_token``
-# to free the word "admin" for the upcoming operator-vs-agent
-# vocabulary (operator = human, manager = elevated agent, worker =
-# narrow agent). The legacy attribute name ``admin_token`` is kept as
-# a backwards-compatible read/write alias for one release via the
-# module-class swap at the bottom of this file. Every existing call
-# site (``g.admin_token = ...`` and ``g.admin_token`` reads) keeps
-# working unchanged; new code should prefer ``g.system_token``.
-#
-# retire-system-token Wave 1 (this PR): the value is still computed
-# and stored here (Wave 3 will delete the global + the persistence
-# row), but it is NO LONGER accepted as a bearer credential. See
-# ``agent_mcp.core.auth.verify_token`` and
-# ``agent_mcp.app.main_app.AuthHeaderMiddleware`` for the auth-side
-# removal. Operator identity now flows in via the signed forwarding
-# header (``g.forwarding_hmac_key`` below).
-system_token: Optional[str] = None
-
 # Per-project HMAC key for verifying the signed forwarding header the
 # router (Wave 2) attaches to operator-cookie requests before proxying
 # them to the per-project backend. Format + sign/verify logic live in
@@ -630,56 +608,3 @@ def wake_for_flag_recheck(agent_id: str) -> None:
         pass
 
 
-# --- admin_token <-> system_token alias machinery ----------------------
-# Phase 2 Wave 1b: ``admin_token`` was renamed to ``system_token``. We
-# keep the old attribute name as a perfect read/write alias for one
-# release so every existing call site (``g.admin_token = ...``,
-# ``if token == g.admin_token: ...``) keeps working without edits and
-# downstream consumers (Nix module, third-party tools) get a
-# deprecation window.
-#
-# Implementation: swap this module's class for a tiny ModuleType
-# subclass whose ``__getattr__`` / ``__setattr__`` redirect every
-# ``admin_token`` access to ``system_token``. Module-level ``__getattr__``
-# (PEP 562) only handles missing-attribute READS; we need both read
-# AND write to be aliased so a legacy ``g.admin_token = X`` write still
-# lands on the canonical ``system_token`` storage. The cleanest portable
-# way to override ``__setattr__`` on a module is to assign a custom
-# class to ``module.__class__`` (CPython has supported this since 3.5).
-import types as _types  # noqa: E402 — late import, end-of-module setup
-
-
-class _StateModule(_types.ModuleType):
-    """Module class that aliases ``admin_token`` ↔ ``system_token``.
-
-    Read of either name returns the canonical ``system_token`` storage;
-    write to either name lands on ``system_token``. Every other
-    attribute access falls through to normal module semantics so the
-    100+ other names in this module behave unchanged.
-    """
-
-    _ADMIN_TOKEN_ALIAS = "admin_token"
-    _SYSTEM_TOKEN_CANONICAL = "system_token"
-
-    def __getattr__(self, name: str):  # type: ignore[override]
-        # __getattr__ runs only on missing attributes. ``system_token``
-        # is always present (defined at module top); ``admin_token`` is
-        # NOT — accessing it lands here and we redirect to system_token.
-        if name == self._ADMIN_TOKEN_ALIAS:
-            return self.__dict__.get(self._SYSTEM_TOKEN_CANONICAL)
-        raise AttributeError(name)
-
-    def __setattr__(self, name: str, value) -> None:  # type: ignore[override]
-        if name == self._ADMIN_TOKEN_ALIAS:
-            name = self._SYSTEM_TOKEN_CANONICAL
-        super().__setattr__(name, value)
-
-
-# Promote this module to the alias-aware class. Doing this AFTER all
-# top-level definitions so the rest of the module loads with vanilla
-# ModuleType semantics. The class switch is one-shot — Python imports
-# the module exactly once, and the swap persists for the lifetime of
-# the interpreter.
-import sys as _sys  # noqa: E402
-
-_sys.modules[__name__].__class__ = _StateModule

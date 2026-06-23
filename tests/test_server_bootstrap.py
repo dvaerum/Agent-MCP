@@ -57,14 +57,12 @@ def test_server_config_is_a_frozen_dataclass() -> None:
 
     # Field set covers everything the legacy CLI threaded through to
     # the runners — we lose a flag if this assertion drops.
-    # Phase 2 Wave 1b renamed ``admin_token_cli`` → ``system_token_cli``.
     field_names = {f.name for f in fields(ServerConfig)}
     for required in (
         "transport",
         "port",
         "uds",
         "project_dir",
-        "system_token_cli",
         "debug",
         "no_tui",
         "advanced",
@@ -88,14 +86,11 @@ def test_server_config_from_cli_args_builds_from_click_decoded_kwargs(
 
     project_dir = tmp_path / "p"
     project_dir.mkdir()
-    # Phase 2 Wave 1b: the canonical kwarg is ``system_token_cli``;
-    # ``admin_token_cli`` keeps working as an alias for one release.
     cfg = ServerConfig.from_cli_args(
         port=8080,
         uds=None,
         transport="sse",
         project_dir=str(project_dir),
-        system_token_cli="abc123",
         debug=False,
         no_tui=True,
         advanced=False,
@@ -106,7 +101,6 @@ def test_server_config_from_cli_args_builds_from_click_decoded_kwargs(
     assert cfg.port == 8080
     assert cfg.uds is None
     assert cfg.project_dir == str(project_dir)
-    assert cfg.system_token_cli == "abc123"
     assert cfg.no_tui is True
 
 
@@ -123,7 +117,6 @@ def test_server_config_validates_transport_value(tmp_path: Path) -> None:
             uds=None,
             transport="bogus",  # neither 'sse' nor 'stdio'
             project_dir=str(project_dir),
-            admin_token_cli=None,
             debug=False,
             no_tui=False,
             advanced=False,
@@ -141,15 +134,11 @@ def test_server_config_normalizes_project_dir_to_absolute(tmp_path: Path) -> Non
 
     project_dir = tmp_path / "p"
     project_dir.mkdir()
-    # Build with a relative-ish path (the click decorator already
-    # resolves, but the dataclass shouldn't trust its callers — defence
-    # in depth).
     cfg = ServerConfig.from_cli_args(
         port=8080,
         uds=None,
         transport="sse",
         project_dir=str(project_dir),
-        admin_token_cli=None,
         debug=False,
         no_tui=True,
         advanced=False,
@@ -159,7 +148,7 @@ def test_server_config_normalizes_project_dir_to_absolute(tmp_path: Path) -> Non
     assert Path(cfg.project_dir).is_absolute()
 
 
-# --- .env discovery + admin token loading -----------------------------
+# --- .env discovery ---------------------------------------------------
 
 
 def test_load_dotenv_walks_parent_chain(tmp_path: Path, monkeypatch) -> None:
@@ -303,21 +292,6 @@ def test_bootstrap_server_stdio_does_not_build_starlette(
     assert callable(teardown)
 
 
-# --- Public re-export sanity ------------------------------------------
-
-
-def test_get_admin_token_from_db_is_exported(tmp_path: Path) -> None:
-    """The TUI display loop reads the admin token from the project DB
-    via this helper; moving it from ``cli.py`` to the bootstrap module
-    must keep it discoverable by the TUI runtime."""
-    from agent_mcp.server_bootstrap import get_admin_token_from_db
-
-    # No DB → None, no exception.
-    project_dir = tmp_path / "p"
-    project_dir.mkdir()
-    assert get_admin_token_from_db(str(project_dir)) is None
-
-
 def test_cli_imports_server_bootstrap_module() -> None:
     """The thin-adapter ``cli.py`` MUST delegate to the bootstrap module
     — if a future refactor accidentally inlines the boot logic back
@@ -339,56 +313,20 @@ def test_cli_imports_server_bootstrap_module() -> None:
 # --- startup banner consumer ------------------------------------------
 
 
-def test_print_startup_banner_does_not_raise_attribute_error(
+def test_print_startup_banner_does_not_raise(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Regression: ``_print_startup_banner`` MUST read the canonical
-    ``system_token_log`` attribute on ``ServerConfig``, not the legacy
-    ``admin_token_log`` name.
-
-    Phase 2 Wave 1b renamed ``admin_token_*`` to ``system_token_*`` on
-    ``ServerConfig`` but left a dangling consumer reference behind. The
-    result: every per-project ``agent-mcp@<proj>.service`` backend
-    crashed at startup with
-    ``AttributeError: 'ServerConfig' object has no attribute 'admin_token_log'``
-    before the UDS socket was created, leading to dashboard 504s. This
-    test pins the consumer side of the rename so a future revert is
-    caught here, not in production.
-    """
+    """``_print_startup_banner`` runs cleanly against a default
+    ServerConfig. retire-system-token Wave 3 deleted the system-token
+    log branch from the banner entirely."""
     from agent_mcp.server_bootstrap import _print_startup_banner
 
     cfg = _default_config(transport="sse", port=8080)
-
-    # MUST NOT raise AttributeError — the bug was a dangling
-    # ``config.admin_token_log`` read.
     _print_startup_banner(cfg)
 
     captured = capsys.readouterr()
-    # Sanity: the banner ran far enough to print the "running on port"
-    # line, i.e. it didn't bail before the gated token-log block.
+    # Sanity: the banner ran far enough to print the "running on port" line.
     assert "MCP Server" in captured.out
-
-
-def test_print_startup_banner_honours_system_token_log_gate(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """When ``system_token_log=True``, the banner attempts to surface
-    the admin token. Stub the DB lookup so the test doesn't need a
-    real project on disk."""
-    from agent_mcp import server_bootstrap
-
-    monkeypatch.setattr(
-        server_bootstrap,
-        "get_admin_token_from_db",
-        lambda _project_dir: "test-token-abc",
-    )
-
-    cfg = _default_config(transport="sse", port=8080, system_token_log=True)
-    server_bootstrap._print_startup_banner(cfg)
-
-    captured = capsys.readouterr()
-    assert "test-token-abc" in captured.out
 
 
 # --- helpers ----------------------------------------------------------
@@ -408,7 +346,6 @@ def _default_config(**overrides: Any):
         uds=overrides.pop("uds", None),
         transport=overrides.pop("transport", "sse"),
         project_dir=project_dir,
-        admin_token_cli=overrides.pop("admin_token_cli", None),
         debug=overrides.pop("debug", False),
         no_tui=overrides.pop("no_tui", True),
         advanced=overrides.pop("advanced", False),

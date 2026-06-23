@@ -178,7 +178,6 @@ def _snapshot_and_reset_globals(stack: ExitStack) -> None:
     snapshot = {
         "connections": dict(g.connections),
         "active_agents": dict(g.active_agents),
-        "admin_token": g.admin_token,
         "tasks": dict(g.tasks),
         "file_map": dict(g.file_map),
         "agent_working_dirs": dict(g.agent_working_dirs),
@@ -194,7 +193,6 @@ def _snapshot_and_reset_globals(stack: ExitStack) -> None:
         g.connections.update(snapshot["connections"])
         g.active_agents.clear()
         g.active_agents.update(snapshot["active_agents"])
-        g.admin_token = snapshot["admin_token"]
         g.tasks.clear()
         g.tasks.update(snapshot["tasks"])
         g.file_map.clear()
@@ -569,15 +567,10 @@ class WorkerSession:
 _HARNESS_OPERATOR_ID = "test-harness-operator"
 
 #: agent_id of the manager-role agent the harness seeds at startup.
-#: Pre-Wave-1 the harness used ``g.system_token`` as the bearer and
-#: ``get_agent_id(g.system_token)`` returned the literal string
-#: ``"admin"`` as the principal's id (used to attribute messages,
-#: tasks, audit-log rows). retire-system-token Wave 1 dropped that
-#: code path, so the harness now seeds a real per-agent row in the
-#: ``agents`` table — but the agent_id stays ``"admin"`` so the rest
-#: of the codebase (~50 callsites that special-case the literal
-#: ``"admin"`` for routing, filtering, ownership checks) keeps
-#: working unchanged.
+#: The harness seeds a real per-agent row in the ``agents`` table —
+#: the agent_id stays ``"admin"`` so the rest of the codebase
+#: (~50 callsites that special-case the literal ``"admin"`` for
+#: routing, filtering, ownership checks) keeps working unchanged.
 #:
 #: Migration 0014 deletes the synthetic ``admin`` row at startup; the
 #: harness re-inserts a fresh row inside ``mcp_session`` so the

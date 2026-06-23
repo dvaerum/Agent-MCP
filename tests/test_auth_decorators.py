@@ -45,10 +45,7 @@ async def test_authrejected_is_exported() -> None:
 @pytest.mark.asyncio
 async def test_requires_admin_rejects_no_token(reset_globals) -> None:
     """@requires("admin") raises AuthRejected when no token is supplied."""
-    from agent_mcp.core import globals as g
     from agent_mcp.core.authorize import requires, AuthRejected
-
-    g.admin_token = "admin-token-xyz"
 
     @requires("admin")
     async def my_tool(
@@ -66,7 +63,6 @@ async def test_requires_admin_rejects_worker_token(reset_globals) -> None:
     from agent_mcp.core import globals as g
     from agent_mcp.core.authorize import requires, AuthRejected
 
-    g.admin_token = "admin-token-xyz"
     g.active_agents["worker-token"] = {"agent_id": "worker_a"}
 
     @requires("admin")
@@ -113,7 +109,6 @@ async def test_requires_any_allows_worker(reset_globals) -> None:
     from agent_mcp.core import globals as g
     from agent_mcp.core.authorize import requires
 
-    g.admin_token = "admin-token-xyz"
     g.active_agents["worker-token"] = {"agent_id": "worker_a"}
 
     @requires("any")
@@ -127,10 +122,7 @@ async def test_requires_any_allows_worker(reset_globals) -> None:
 @pytest.mark.asyncio
 async def test_requires_any_rejects_garbage(reset_globals) -> None:
     """@requires("any") still rejects unknown tokens."""
-    from agent_mcp.core import globals as g
     from agent_mcp.core.authorize import requires, AuthRejected
-
-    g.admin_token = "admin-token-xyz"
 
     @requires("any")
     async def my_tool(

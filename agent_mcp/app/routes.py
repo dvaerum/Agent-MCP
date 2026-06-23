@@ -96,13 +96,12 @@ async def _dispatch_through_tool(
     `arguments.token` if not already there — same path an HTTP middleware
     would take.
 
-    Wave 3 (prancy-napping-pie): callers can now pass
-    ``operator_session=True`` + ``operator_user_id=<username>`` instead
-    of ``bearer_token=g.admin_token``. The decorators in
-    ``agent_mcp/core/authorize.py`` admit the operator-session path
-    without needing the system bearer; the inner tool falls back to
-    ``operator_user_id`` for audit-log attribution when the bearer
-    path was the source of ``agent_id``.
+    Wave 3 (prancy-napping-pie): callers pass
+    ``operator_session=True`` + ``operator_user_id=<username>`` to
+    admit operator-tier dispatches without a bearer token. The
+    decorators in ``agent_mcp/core/authorize.py`` admit the
+    operator-session path; the inner tool uses ``operator_user_id``
+    for audit-log attribution.
 
     Error mapping (HTTP-shaped):
       * AuthRejected            → 403
@@ -1965,26 +1964,25 @@ async def delete_memory_api_route(
     context_key = path_parts[-1]
 
     try:
-        _ = await get_sanitized_json_body(request)
+        body = await get_sanitized_json_body(request)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-    # Wave 3 (prancy-napping-pie): ``delete_project_context_tool_impl``
-    # is ``@requires("any")`` (not ``"operator"``) — the per-key
-    # ownership matrix inside the impl is the real gate. The
-    # decorator's ``"any"`` admit requires an agent token, so we
-    # cannot drop the bearer the way the operator-only routes did.
-    # Pass the system bearer so ``verify_token(..., "admin")`` inside
-    # the impl admits the operator-driven delete for any key
-    # (including the critical ``config_*`` keys the route always
-    # passes ``force_delete=True`` for). ``operator_session=True`` is
-    # set so per-action audit / future viewer-vs-operator gating
-    # still see the operator-session signal; ``operator_user_id`` is
-    # passed for audit-log attribution.
+    # retire-system-token Wave 3: drop the synthesized system-bearer.
+    # ``delete_project_context_tool_impl`` is ``@requires("any")``, so
+    # the dispatch needs an agent-shaped bearer for the decorator to
+    # admit. The outer ``require_operator_session`` dep has already
+    # verified the operator credential (cookie / forwarding header /
+    # body-token); when the operator passed a body-token, forward it
+    # as the bearer so the tool's ``@requires("any")`` gate resolves
+    # the caller via ``get_agent_id``. ``operator_session=True`` also
+    # propagates the operator-session ContextVar for per-key audit /
+    # ownership matrix attribution inside the impl.
+    body_token = (body or {}).get("token") if isinstance(body, dict) else None
     return await _dispatch_through_tool(
         "delete_project_context",
         {"context_key": context_key, "force_delete": True},
-        bearer_token=g.system_token,
+        bearer_token=body_token,
         operator_session=True,
         operator_user_id=caller_identity(auth),
         success_message=f"Memory '{context_key}' deleted successfully",

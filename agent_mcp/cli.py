@@ -15,8 +15,6 @@ What used to live here and now lives in dedicated modules:
   promotion, transport branching, uvicorn config, anyio task-group
   setup → ``agent_mcp.server_bootstrap``.
 * TUI display loop → ``agent_mcp.tui.runtime``.
-* DB admin-token reader (used by the TUI + startup banner) →
-  ``agent_mcp.server_bootstrap.get_admin_token_from_db``.
 
 What stays here on purpose:
 
@@ -105,7 +103,6 @@ import click  # noqa: E402
 
 from .server_bootstrap import (  # noqa: E402
     ServerConfig,
-    get_admin_token_from_db,
     run_server,
 )
 
@@ -182,71 +179,6 @@ def cli(ctx: click.Context) -> None:
     help="Project directory. The .agent folder will be created/used here. Defaults to current directory.",
 )
 @click.option(
-    "--system-token",
-    "--admin-token",
-    "system_token_cli",
-    type=str,
-    default=None,
-    help=(
-        "System token (router-internal authority bearer) used for "
-        "agent-side ``Authorization: Bearer`` auth. If not provided, "
-        "one will be loaded from DB or generated. ``--admin-token`` is "
-        "a deprecated alias kept for one release."
-    ),
-)
-@click.option(
-    "--system-token-out",
-    "--admin-token-out",
-    "system_token_out_path",
-    type=click.Path(dir_okay=False, resolve_path=True),
-    default=None,
-    help=(
-        "Write the resolved system token to this file on startup "
-        "(mode 0600). Use --system-token-format to pick raw vs "
-        "MCP_SYSTEM_TOKEN=<token> output. ``--admin-token-out`` is a "
-        "deprecated alias kept for one release."
-    ),
-)
-@click.option(
-    "--system-token-format",
-    "--admin-token-format",
-    "system_token_out_format",
-    type=click.Choice(["raw", "env"], case_sensitive=False),
-    default="raw",
-    show_default=True,
-    help=(
-        "Format for --system-token-out: 'raw' writes just the token; "
-        "'env' writes MCP_SYSTEM_TOKEN=<token>. No effect without "
-        "--system-token-out. ``--admin-token-format`` is a deprecated "
-        "alias kept for one release."
-    ),
-)
-@click.option(
-    "--system-token-in",
-    "--admin-token-in",
-    "system_token_in_path",
-    type=click.Path(dir_okay=False, resolve_path=True, exists=True),
-    default=None,
-    help=(
-        "Read the system token from this file at startup. Overrides "
-        "any token stored in the DB and any --system-token value. "
-        "``--admin-token-in`` is a deprecated alias kept for one release."
-    ),
-)
-@click.option(
-    "--system-token-log",
-    "--admin-token-log",
-    "system_token_log",
-    is_flag=True,
-    default=False,
-    help=(
-        "Log the system token to stdout/log on startup (opt-in; the "
-        "default is silent — operators read the token from the TUI, "
-        "the dashboard, or via --system-token-out). "
-        "``--admin-token-log`` is a deprecated alias kept for one release."
-    ),
-)
-@click.option(
     "--forwarding-hmac-in",
     "forwarding_hmac_in_path",
     type=click.Path(dir_okay=False, resolve_path=True, exists=True),
@@ -296,11 +228,6 @@ def server_cmd(
     uds: Optional[str],
     transport: str,
     project_dir: str,
-    system_token_cli: Optional[str],
-    system_token_out_path: Optional[str],
-    system_token_out_format: str,
-    system_token_in_path: Optional[str],
-    system_token_log: bool,
     forwarding_hmac_in_path: Optional[str],
     debug: bool,
     no_tui: bool,
@@ -325,75 +252,11 @@ def server_cmd(
 
     Switching between modes will require re-indexing all content.
     """
-    # Validate the system-token output / input / log flags. At most one
-    # of out/in/log may be set; --system-token-format only makes sense
-    # with --system-token-out. Caught at CLI time so the lifecycle code
-    # never has to defend against a contradictory combination.
-    sinks = sum(
-        1
-        for v in (system_token_out_path, system_token_in_path, system_token_log)
-        if v
-    )
-    if sinks > 1:
-        raise click.UsageError(
-            "--system-token-out, --system-token-in, and --system-token-log "
-            "are mutually exclusive — pick at most one."
-        )
-    # Click defaults --system-token-format to "raw"; only error if the
-    # operator explicitly passed a value AND no -out sink. We detect
-    # "explicit" by looking at sys.argv (Click's get_current_context
-    # would also work but argv is simpler here). Both the new and the
-    # legacy spellings count as "explicit" so the alias warning fires
-    # via the same code path.
-    if (
-        system_token_out_format
-        and system_token_out_format.lower() != "raw"
-        and not system_token_out_path
-    ):
-        raise click.UsageError(
-            "--system-token-format requires --system-token-out."
-        )
-    if (
-        ("--system-token-format" in sys.argv or "--admin-token-format" in sys.argv)
-        and not system_token_out_path
-    ):
-        raise click.UsageError(
-            "--system-token-format requires --system-token-out."
-        )
-
-    # Phase 2 Wave 1b deprecation notice: warn once when an operator
-    # passes any of the legacy ``--admin-token-*`` flags. The flag
-    # itself keeps working (Click aliases route the value through);
-    # this just nudges deploy scripts towards the new spelling.
-    legacy_flags_in_argv = [
-        a for a in sys.argv if a in (
-            "--admin-token",
-            "--admin-token-out",
-            "--admin-token-in",
-            "--admin-token-log",
-            "--admin-token-format",
-        )
-    ]
-    if legacy_flags_in_argv:
-        # Use Click's echo so the warning shows up alongside other CLI
-        # output (logging may not be configured at this point).
-        click.echo(
-            "warning: " + ", ".join(legacy_flags_in_argv) +
-            " is deprecated; use the --system-token-* spelling instead. "
-            "The legacy flag(s) will be removed in a future release.",
-            err=True,
-        )
-
     config = ServerConfig.from_cli_args(
         port=port,
         uds=uds,
         transport=transport,
         project_dir=project_dir,
-        system_token_cli=system_token_cli,
-        system_token_out_path=system_token_out_path,
-        system_token_out_format=system_token_out_format.lower(),
-        system_token_in_path=system_token_in_path,
-        system_token_log=system_token_log,
         forwarding_hmac_in_path=forwarding_hmac_in_path,
         debug=debug,
         no_tui=no_tui,
@@ -728,7 +591,6 @@ _TOP_LEVEL_FLAGS_THAT_NOW_BELONG_TO_SERVER = {
     "--uds",
     "--transport",
     "--project-dir",
-    "--admin-token",
     "--debug",
     "--no-tui",
     "--advanced",
@@ -839,13 +701,9 @@ def main() -> None:
 main_cli = main
 
 
-# Re-export ``get_admin_token_from_db`` from this module too so any
-# external script that imported it from ``agent_mcp.cli`` pre-PR-E
-# keeps working. The canonical home is ``server_bootstrap``.
 __all__ = [
     "backup_cmd",
     "cli",
-    "get_admin_token_from_db",
     "main",
     "main_cli",
     "router_cmd",

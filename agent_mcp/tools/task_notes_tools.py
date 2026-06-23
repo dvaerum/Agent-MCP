@@ -21,10 +21,8 @@ all?"; the per-note ownership check happens inside the impl against
 the historical ``is_admin`` boolean (now sourced from the
 manager-tier check).
 
-Wave 3 (prancy-napping-pie) migrated the ``is_admin`` source from
-the raw ``token == g.admin_token`` comparison to
-``verify_token(token, "manager")`` so a manager-role agent can
-moderate worker notes without holding the system bearer.
+The ``is_admin`` source is ``verify_token(token, "manager")`` so a
+manager-role agent can moderate worker notes.
 
 The existing append-only writers in `task_tools.py` (the bulk
 add_note operation, the inline notes append in
@@ -53,14 +51,11 @@ def _resolve_caller(arguments: Dict[str, Any]) -> tuple[str, str, bool]:
     that already verified the Authorization header, are surfaced as
     `_bearer_token`. Returns `("", "", False)` if neither is set.
 
-    Wave 3 (prancy-napping-pie) migrated the "is admin" boolean from
-    ``token == g.admin_token`` (system bearer only) to
-    ``verify_token(token, "manager")`` (system bearer OR an agent
-    token whose row has ``agent_role='manager'``). The variable name
-    stays ``is_admin`` because that's what downstream
-    ``task_notes_db.edit_note`` / ``delete_note`` accept — the
-    semantic widening (manager agents can now moderate) is captured
-    in the docstring above.
+    The "is admin" boolean is sourced from
+    ``verify_token(token, "manager")`` (agent tokens whose row has
+    ``agent_role='manager'``). The variable name stays ``is_admin``
+    because that's what downstream ``task_notes_db.edit_note`` /
+    ``delete_note`` accept.
     """
     token = (
         arguments.get("_bearer_token")
