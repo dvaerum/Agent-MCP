@@ -104,6 +104,13 @@ class ServerConfig:
     system_token_out_format: str = "raw"
     system_token_in_path: Optional[str] = None
     system_token_log: bool = False
+    # retire-system-token Wave 1: path to the per-project HMAC key
+    # file the router uses to sign the forwarding header. The backend
+    # reads the raw bytes at boot and stamps them onto
+    # ``g.forwarding_hmac_key`` so ``AuthHeaderMiddleware`` can verify
+    # the header. When unset, the forwarding-header path is dormant
+    # (Wave 2/3 transitional state).
+    forwarding_hmac_in_path: Optional[str] = None
     debug: bool = False
     no_tui: bool = False
     advanced: bool = False
@@ -135,6 +142,7 @@ class ServerConfig:
         system_token_out_format: str = "raw",
         system_token_in_path: Optional[str] = None,
         system_token_log: bool = False,
+        forwarding_hmac_in_path: Optional[str] = None,
         # Phase 2 Wave 1b: legacy ``admin_token_*`` aliases kept for
         # one release so external callers (deploy scripts, third-party
         # integrations) keep working. New name wins on collision.
@@ -179,6 +187,7 @@ class ServerConfig:
             system_token_out_format=system_token_out_format,
             system_token_in_path=system_token_in_path,
             system_token_log=bool(system_token_log),
+            forwarding_hmac_in_path=forwarding_hmac_in_path,
             debug=bool(debug),
             no_tui=bool(no_tui),
             advanced=bool(advanced),
@@ -389,6 +398,70 @@ def get_system_token_from_db(project_dir: str) -> Optional[str]:
 get_admin_token_from_db = get_system_token_from_db
 
 
+# --- forwarding-header HMAC key loader -------------------------------
+
+
+def _load_forwarding_hmac_key(path: Optional[str]) -> None:
+    """Read the per-project HMAC key file and stamp it onto
+    ``g.forwarding_hmac_key``.
+
+    Called once from ``bootstrap_server`` before the app is built.
+    Used by ``AuthHeaderMiddleware`` to verify the
+    ``X-Agent-MCP-Forwarded-Operator`` header the router (Wave 2)
+    will attach to operator-cookie requests.
+
+    Behaviour:
+      * ``path is None`` — clear the global (None). The middleware
+        treats the forwarding-header path as dormant; per-agent
+        bearer tokens are the only working auth.
+      * ``path`` set, file readable — read raw bytes, stamp on the
+        global. Empty / whitespace-only files leave the global at
+        None and log a warning (an empty HMAC key is the worst
+        possible value — all signatures would verify with the empty
+        key trivially because hmac.compare_digest of two empty
+        strings returns True if both empty, etc.).
+      * ``path`` set, file unreadable — log error, leave the global
+        at None. Wave 1 is transitional and an unreadable key
+        file should not crash boot.
+
+    Wave 3 will tighten this contract once the launcher reliably
+    writes the file at spawn.
+    """
+    from .core import globals as g
+
+    if not path:
+        g.forwarding_hmac_key = None
+        return
+    try:
+        data = Path(path).read_bytes()
+    except OSError as exc:
+        logger.error(
+            "Failed to read forwarding-hmac key file %s: %s. "
+            "Forwarding-header auth will be dormant.",
+            path,
+            exc,
+        )
+        g.forwarding_hmac_key = None
+        return
+    # Allow the file to carry a trailing newline (text-editor friendly)
+    # without weakening the secret. Treat all-whitespace as empty.
+    data = data.strip()
+    if not data:
+        logger.warning(
+            "Forwarding-hmac key file %s is empty after strip(); "
+            "forwarding-header auth stays dormant.",
+            path,
+        )
+        g.forwarding_hmac_key = None
+        return
+    g.forwarding_hmac_key = data
+    logger.info(
+        "Loaded forwarding-header HMAC key from %s (%d bytes).",
+        path,
+        len(data),
+    )
+
+
 # --- bootstrap_server -------------------------------------------------
 
 
@@ -423,6 +496,14 @@ def bootstrap_server(
     from starlette.applications import Starlette  # noqa: F401 — type only
 
     apply_runtime_flags(config)
+
+    # retire-system-token Wave 1: load the forwarding-header HMAC key
+    # before ``create_app`` so the middleware sees a populated
+    # ``g.forwarding_hmac_key`` on the very first request. When the
+    # flag isn't set, leave the global at its default ``None`` so the
+    # middleware's dormant-fallback path stays in effect (per-agent
+    # bearers are the only working auth).
+    _load_forwarding_hmac_key(config.forwarding_hmac_in_path)
 
     logger.info(
         "bootstrap_server: transport=%s port=%d project_dir=%s",

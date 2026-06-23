@@ -247,6 +247,21 @@ def cli(ctx: click.Context) -> None:
     ),
 )
 @click.option(
+    "--forwarding-hmac-in",
+    "forwarding_hmac_in_path",
+    type=click.Path(dir_okay=False, resolve_path=True, exists=True),
+    default=None,
+    help=(
+        "Read the per-project HMAC key (raw bytes) for verifying the "
+        "router's signed ``X-Agent-MCP-Forwarded-Operator`` header. "
+        "Wave 1 of retire-system-token ships only the read side; "
+        "Wave 3 will wire the launcher to write the key file at "
+        "spawn. When unset, the forwarding-header verification path "
+        "is dormant and the per-agent bearer is the only working "
+        "auth on backend routes."
+    ),
+)
+@click.option(
     "--debug",
     is_flag=True,
     default=os.environ.get("MCP_DEBUG", "false").lower() == "true",
@@ -286,6 +301,7 @@ def server_cmd(
     system_token_out_format: str,
     system_token_in_path: Optional[str],
     system_token_log: bool,
+    forwarding_hmac_in_path: Optional[str],
     debug: bool,
     no_tui: bool,
     advanced: bool,
@@ -378,6 +394,7 @@ def server_cmd(
         system_token_out_format=system_token_out_format.lower(),
         system_token_in_path=system_token_in_path,
         system_token_log=system_token_log,
+        forwarding_hmac_in_path=forwarding_hmac_in_path,
         debug=debug,
         no_tui=no_tui,
         advanced=advanced,

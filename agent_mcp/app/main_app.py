@@ -182,9 +182,15 @@ def _build_unauthorized_response(token: str):
         {
             "error": "invalid_bearer",
             "message": (
-                "Bearer token does not match the admin token or any "
-                "active agent. Send Authorization: Bearer "
-                "<admin-or-agent-token> on POST /mcp."
+                # retire-system-token Wave 1: the system_token god-key
+                # is no longer accepted as a bearer on any backend
+                # route. The valid surfaces are now (a) a per-agent
+                # token from the agents table, or (b) the router's
+                # signed forwarding header.
+                "Bearer token does not match any active agent. Send "
+                "Authorization: Bearer <per-agent-token> on POST /mcp, "
+                "or route the request through the router so it can "
+                "attach the signed forwarding header."
             ),
         },
         status_code=401,
@@ -194,7 +200,7 @@ def _build_unauthorized_response(token: str):
 class AuthHeaderMiddleware(BaseHTTPMiddleware):
     """Capture Authorization: Bearer into request_auth_token + gate /mcp.
 
-    Three responsibilities:
+    Four responsibilities:
 
     1. Bind any incoming `Authorization: Bearer <tok>` value to the
        `request_auth_token` ContextVar so tool dispatch can fall back
@@ -202,19 +208,32 @@ class AuthHeaderMiddleware(BaseHTTPMiddleware):
        is the same fallback the prior SSE transport relied on; the
        Streamable HTTP transport reads from the same ContextVar.
 
-    2. Gate `/mcp` at the HTTP layer. POST/GET/DELETE on `/mcp` MUST
-       carry a valid bearer (admin token or active-agent token). An
-       MCP-protocol JSON-RPC error inside a 200 response is the wrong
-       shape for an *unauthenticated* request — there isn't a JSON-RPC
-       envelope to wrap, the caller hasn't even authenticated to the
-       transport yet. We reject with 401 + a tiny JSON body so the
-       client knows immediately what to fix.
+    2. retire-system-token Wave 1 — verify the signed forwarding
+       header (``X-Agent-MCP-Forwarded-Operator``) if present and the
+       per-project HMAC key has been loaded into
+       ``g.forwarding_hmac_key``. On success, the resolved operator_id
+       is stamped onto ``g.current_operator`` for downstream handlers
+       + audit logs. On a present-but-invalid header (wrong HMAC,
+       expired, malformed), the request is rejected with 401 — we
+       never silently fall through to the bearer-token path when a
+       tampered forwarding header is present, otherwise the tampered
+       header could mask a per-agent bearer's identity.
 
-       Note: per-tool role checks (admin vs worker) still happen
-       inside the tool layer via `@requires`/`@requires_policy`. This
-       middleware only enforces "is this *any* valid token?".
+    3. Gate `/mcp` at the HTTP layer. POST/GET/DELETE on `/mcp` MUST
+       carry either (a) a per-agent bearer token that
+       ``verify_token(.., "agent")`` accepts, OR (b) a verified
+       forwarding header.
 
-    3. Phase 1c: parse `X-Agent-MCP-Alias` if present and stash the
+       The system_token god-key branch that used to satisfy this gate
+       was removed in retire-system-token Wave 1 — there is no
+       process-wide bearer that admits any caller anymore.
+
+       Note: per-tool role checks (operator vs manager vs worker)
+       still happen inside the tool layer via
+       ``@requires_role(...)``. This middleware only enforces "is
+       this *any* valid caller identity?".
+
+    4. Phase 1c: parse `X-Agent-MCP-Alias` if present and stash the
        `(alias_name, expires_at)` tuple on `request.scope` plus the
        `request_alias_info` ContextVar. The ContextVar is what the
        MCP server's `create_initialization_options` override reads to
@@ -225,6 +244,20 @@ class AuthHeaderMiddleware(BaseHTTPMiddleware):
     """
 
     async def dispatch(self, request, call_next):
+        # Local imports — the middleware module loads at app
+        # construction time; deferring these keeps the import graph
+        # cheap for unit tests that import ``main_app`` for non-HTTP
+        # introspection (route shape, etc.).
+        from . import forwarding_header as _fh
+        from ..core import globals as _g
+
+        # Reset request-scoped state. ``current_operator`` is a
+        # process-wide global by storage shape; we treat it as
+        # request-scoped by clearing on entry so a previous request's
+        # operator_id never leaks into a request that authenticates
+        # via a per-agent bearer.
+        _g.current_operator = None
+
         auth = request.headers.get("Authorization", "")
         token = ""
         if auth.lower().startswith("bearer "):
@@ -243,16 +276,59 @@ class AuthHeaderMiddleware(BaseHTTPMiddleware):
             request.scope["agent_mcp_alias"] = alias_info
             request_alias_info.set(alias_info)
 
+        # retire-system-token Wave 1 — signed forwarding header path.
+        # Dormant when the per-project HMAC key isn't loaded yet
+        # (Wave 2/3 wire the launcher write side); active when it is.
+        from ..tools.registry import (
+            operator_session_active as _op_session_cv,
+            operator_user_id as _op_user_cv,
+        )
+
+        forwarding_raw = request.headers.get(_fh.HEADER_NAME)
+        forwarding_operator: Optional[str] = None
+        if forwarding_raw is not None:
+            if _g.forwarding_hmac_key:
+                forwarding_operator = _fh.verify(
+                    forwarding_raw, _g.forwarding_hmac_key
+                )
+                if forwarding_operator is None:
+                    # Present-but-invalid header: reject hard. Falling
+                    # through to the bearer path would let a tampered
+                    # header silently downgrade auth to "whatever bearer
+                    # was attached", which is the wrong defaults-secure
+                    # behaviour.
+                    return _build_unauthorized_response(token)
+                _g.current_operator = forwarding_operator
+                # Stamp the operator-session contextvars so
+                # downstream tool gates (``@requires_role("operator")``
+                # and inline ``verify_token(..., "admin")`` checks)
+                # admit the call. The REST seam (``routes.py``) does
+                # the same for cookie-authenticated dashboard
+                # mutations; the forwarding-header path follows the
+                # same shape so behavior is uniform regardless of
+                # which auth surface admitted the request.
+                _op_session_cv.set(True)
+                _op_user_cv.set(forwarding_operator)
+            else:
+                # Key not loaded yet — Wave 1 dormant fallback. The
+                # header is ignored (no operator identity established)
+                # but we do NOT reject, so an agent bearer + a
+                # speculatively-set header still authenticates via
+                # the bearer path. This is the transitional contract
+                # the plan calls out so Wave 1 ships before Wave 2/3.
+                forwarding_operator = None
+
         path = request.url.path
         # Gate the MCP transport endpoint. We match exact `/mcp` and
         # `/mcp/...` so a future sub-path doesn't accidentally bypass
         # auth. `/api/*` and the dashboard routes keep their own
         # per-route token handling.
         if path == "/mcp" or path.startswith("/mcp/"):
-            if not token or not (
-                verify_token(token, required_role="admin")
-                or verify_token(token, required_role="agent")
-            ):
+            authenticated = bool(forwarding_operator) or (
+                bool(token)
+                and verify_token(token, required_role="agent")
+            )
+            if not authenticated:
                 return _build_unauthorized_response(token)
 
         return await call_next(request)
@@ -314,13 +390,17 @@ def _bearer_has_wake_loop_enabled() -> bool:
         from ..tools import access as _access
         from ..db.connection import get_db_connection
 
-        # Admin bearer should not get the wake-loop instructions —
-        # admins are coordinators, not workers.
-        if verify_token(bearer, required_role="admin"):
-            return False
-
         agent_id = get_agent_id(bearer)
         if not agent_id:
+            return False
+
+        # Admin bearer should not get the wake-loop instructions —
+        # admins are coordinators, not workers. retire-system-token
+        # Wave 1: ``verify_token(.., "admin")`` now consults the
+        # operator-session ContextVar, not the bearer's role, so we
+        # check ``agent_id == "admin"`` directly (the literal label
+        # the harness + production code use for the admin principal).
+        if agent_id == "admin":
             return False
 
         global_on = _access._get_config_bool(
@@ -418,11 +498,19 @@ def _caller_role() -> str:
     if not bearer:
         return "anonymous"
     try:
-        from ..core.auth import verify_token, get_agent_id
+        from ..core.auth import get_agent_id
 
-        if verify_token(bearer, "admin"):
+        # retire-system-token Wave 1: ``verify_token(.., "admin")``
+        # now consults the operator-session ContextVar, not the
+        # bearer's role. Resolve the bearer to an agent_id and check
+        # the literal ``"admin"`` label directly so the visibility
+        # filter sees the same "admin vs worker" distinction it used
+        # to (which was driven by ``get_agent_id(g.system_token) ==
+        # "admin"``).
+        agent_id = get_agent_id(bearer)
+        if agent_id == "admin":
             return "admin"
-        if get_agent_id(bearer):
+        if agent_id:
             return "worker"
     except Exception as e:
         logger.warning(

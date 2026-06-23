@@ -148,10 +148,64 @@ def client(app):
 
     Using it as a context manager triggers lifespan startup/shutdown.
     Routes are reachable as `client.get("/api/tokens")` etc.
+
+    retire-system-token Wave 1: pre-Wave-1, tests using this fixture
+    passed ``g.admin_token`` (the system bearer) as ``body['token']``
+    on REST mutation routes, and the dep admitted via the god-key
+    check. That check is gone; we re-seat ``g.admin_token`` to point
+    at a real per-agent manager-role row (seeded post-lifespan) so
+    the body-token path through ``_bearer_is_operator_tier`` admits
+    via ``verify_token(token, "manager")`` — same wire shape, real
+    per-principal credential.
     """
+    import datetime as _dt
+    import secrets as _secrets
+
     from starlette.testclient import TestClient
 
     with TestClient(app) as test_client:
+        # Seed a manager-role agent row that the dep's
+        # ``_bearer_is_operator_tier`` admits, and re-point
+        # ``g.admin_token`` at that row's token so existing tests
+        # (which dereference ``g.admin_token`` as their operator-tier
+        # bearer / body-token credential) keep working without per-
+        # callsite edits.
+        from agent_mcp.core import globals as g
+        from agent_mcp.db.connection import get_db_connection
+
+        token = _secrets.token_hex(16)
+        now = _dt.datetime.now().isoformat()
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR IGNORE INTO agents (token, agent_id, "
+                "capabilities, created_at, status, working_directory, "
+                "color, updated_at, agent_role) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    token,
+                    "admin",
+                    "[]",
+                    now,
+                    "active",
+                    "/tmp",
+                    "#888",
+                    now,
+                    "manager",
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        g.active_agents[token] = {
+            "agent_id": "admin",
+            "status": "active",
+            "created_at": now,
+            "capabilities": [],
+            "agent_role": "manager",
+        }
+        g.admin_token = token
         yield test_client
 
 

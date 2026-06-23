@@ -84,30 +84,37 @@ def test_setting_admin_token_reads_back_on_system_token_alias() -> None:
 # ── verify_token role alias ──────────────────────────────────────────
 
 
-def test_verify_token_accepts_system_role() -> None:
-    """``verify_token(token, "system")`` is the new canonical role check."""
+def test_verify_token_system_role_no_longer_accepts_god_key() -> None:
+    """retire-system-token Wave 1: ``verify_token(token, "system")``
+    no longer returns True for ``g.system_token``. The god-key is gone;
+    no bearer authenticates the system role anymore."""
     from agent_mcp.core import auth
     from agent_mcp.core import globals as g
 
     prev = g.admin_token
     try:
         g.admin_token = "sys-tok-xyz"
-        assert auth.verify_token("sys-tok-xyz", "system") is True
+        # Was True pre-Wave-1; now False — the branch was removed.
+        assert auth.verify_token("sys-tok-xyz", "system") is False
         assert auth.verify_token("not-the-token", "system") is False
         assert auth.verify_token(None, "system") is False
     finally:
         g.admin_token = prev
 
 
-def test_verify_token_admin_role_still_works_as_alias() -> None:
-    """The legacy ``"admin"`` role MUST keep behaving as ``"system"``."""
+def test_verify_token_admin_role_no_longer_accepts_god_key() -> None:
+    """retire-system-token Wave 1: the legacy ``"admin"`` alias also
+    stops admitting ``g.system_token``. Both the canonical name
+    (``"system"``) and the alias (``"admin"``) return False for the
+    system bearer post-Wave-1."""
     from agent_mcp.core import auth
     from agent_mcp.core import globals as g
 
     prev = g.admin_token
     try:
         g.admin_token = "sys-tok-legacy-alias"
-        assert auth.verify_token("sys-tok-legacy-alias", "admin") is True
+        # Was True pre-Wave-1 via the deprecated alias; now False.
+        assert auth.verify_token("sys-tok-legacy-alias", "admin") is False
         assert auth.verify_token("not-the-token", "admin") is False
     finally:
         g.admin_token = prev

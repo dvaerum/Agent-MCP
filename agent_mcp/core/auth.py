@@ -16,39 +16,56 @@ def verify_token(token: str, required_role: str = "agent") -> bool:
     """
     Verify if a token is valid and has the required role.
 
-    Uses globals ``g.system_token`` (the router-internal authority
-    bearer, formerly known as ``admin_token``) and ``g.active_agents``.
-
     Roles:
 
-    * ``"system"`` — only the router-internal authority bearer is
-      accepted. This is the canonical role name introduced by Phase 2
-      Wave 1b's rename.
-    * ``"admin"`` — deprecated alias for ``"system"``. Kept for one
-      release so existing per-tool ``verify_token(token, "admin")``
-      sites continue to work; new code should use ``"system"``.
-    * ``"manager"`` — Phase 2 Wave 2a (v5.0.63). Accepts the system
-      bearer OR an agent token whose row in ``agents`` has
-      ``agent_role == 'manager'``. Worker-role agent tokens are
-      rejected. Used by ``@requires_role("manager")`` to gate
-      supervision-tier tools (assign-task to other agents, edit
-      subordinate agent metadata) without granting operator-tier
-      powers (spawn/terminate agents, mutate ``config_*`` keys).
-    * ``"agent"`` — any currently-active agent token, or the system
-      bearer (which can act as an agent).
+    * ``"system"`` / ``"admin"`` — historically satisfied by
+      ``g.system_token`` (the god-key bearer). retire-system-token
+      Wave 1 (this PR) removed that branch entirely. No bearer token
+      satisfies these roles anymore; the function returns True iff the
+      ``operator_session_active`` ContextVar is set on the current
+      request — i.e. the caller proved operator identity at the HTTP
+      layer (via session cookie or signed forwarding header). The
+      ``token`` argument is ignored on this branch. The legacy
+      ``"admin"`` alias is kept so the boolean-return contract is
+      preserved for the transition; new code should consult
+      ``operator_session_active`` directly.
+    * ``"manager"`` — Phase 2 Wave 2a (v5.0.63). After Wave 1 of
+      retire-system-token, the system-bearer fallback here is gone;
+      only agent tokens whose row in ``agents`` has
+      ``agent_role == 'manager'`` are accepted. Worker-role agent
+      tokens are rejected.
+    * ``"agent"`` — any currently-active agent token. The
+      system-bearer-can-act-as-an-agent fallback has been removed.
     """
-    if not token: # Added a check for empty/None token
+    # "system" / "admin" used to admit ``g.system_token``; that branch
+    # is gone (retire-system-token Wave 1). Per-request operator
+    # identity now flows in via the ``operator_session_active``
+    # ContextVar (set by the REST seam in ``routes.py`` and by the
+    # tool-call helper in ``tests/harness.py`` when the call
+    # originated from an operator session or a verified forwarding
+    # header). When that contextvar is set we admit the role — the
+    # caller has already proved operator-tier identity at the HTTP
+    # layer, and a per-tool ``verify_token(token, "admin")`` check
+    # is downstream of that proof.
+    if required_role in ("system", "admin"):
+        # Lazy import — registry imports this module transitively
+        # through authorize.py, so a top-level import would create
+        # a cycle at startup.
+        try:
+            from ..tools.registry import operator_session_active
+
+            if operator_session_active.get():
+                return True
+        except Exception:  # pragma: no cover - defensive
+            pass
         return False
-    # Treat "admin" as a deprecated alias for "system" — see docstring.
-    if required_role in ("system", "admin") and token == g.system_token:
-        return True
-    # "manager" — system bearer OR an agent token whose row has
-    # agent_role='manager'. Read via agent_repo so a freshly-restored
-    # row missing from the in-memory cache still resolves. (Same
-    # cache-first contract as get_agent_id; see PR-W2c.)
+    if not token:  # Added a check for empty/None token
+        return False
+    # "manager" — agent token whose row has agent_role='manager'.
+    # Read via agent_repo so a freshly-restored row missing from the
+    # in-memory cache still resolves. (Same cache-first contract as
+    # get_agent_id; see PR-W2c.)
     if required_role == "manager":
-        if token == g.system_token:
-            return True
         from .repositories import agent_repo
 
         row = agent_repo.get_agent_by_token(token)
@@ -58,18 +75,24 @@ def verify_token(token: str, required_role: str = "agent") -> bool:
     # Check active_agents only if it's not None and token is a key
     if required_role == "agent" and g.active_agents and token in g.active_agents:
         return True
-    # Allow the system bearer to be used for agent roles as well.
-    if required_role == "agent" and token == g.system_token:
-        return True  # The system bearer can act as an agent.
     return False
 
 # Original location: main.py, lines 868-873
 def get_agent_id(token: str) -> Optional[str]:
     """
     Get agent ID from token.
-    Uses global ``g.system_token`` (Phase 2 Wave 1b rename of the
-    legacy ``admin_token``) and the AgentRepository (cache-first
-    lookup; falls through to the DB on miss).
+
+    retire-system-token Wave 1: this helper resolves identity for
+    audit-log attribution and per-tool ownership checks — it is NOT
+    an auth gate. Wave 1 removed the god-key bearer admit from
+    ``verify_token`` and ``AuthHeaderMiddleware``; here we KEEP the
+    ``token == g.system_token → "admin"`` short-circuit so any
+    in-process REST seam that still passes the system bearer
+    (e.g. the dashboard's REST handlers calling MCP tools via
+    ``_dispatch_through_tool``) keeps surfacing the principal as
+    ``"admin"`` for audit logs. Wave 3 will delete the global +
+    the seam in one move; until then, identity attribution and
+    auth-gate semantics diverge intentionally.
 
     Migrated to ``agent_repo.get_agent_by_token`` in PR-W2c so a token
     for a row that's only in the DB (e.g. just restored by a peer
@@ -80,7 +103,12 @@ def get_agent_id(token: str) -> Optional[str]:
     if not token: # Added a check for empty/None token
         return None
     if token == g.system_token:
-        return "admin" # 'admin' is a special agent_id for the system bearer's actions
+        # Identity-resolution short-circuit only — the auth gate
+        # (verify_token / middleware) has already rejected this token
+        # as a bearer by the time we reach this caller. Surviving
+        # call sites are in-process REST seams that pass the system
+        # bearer to MCP tools for backwards-compat (Wave 3 sweep).
+        return "admin"
     # Local import to keep the legacy module-load contract: callers
     # that only want verify_token/get_agent_id shouldn't pay the cost
     # of loading the SQLAlchemy engine until the first DB-miss path.

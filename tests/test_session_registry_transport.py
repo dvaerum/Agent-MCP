@@ -243,6 +243,50 @@ async def live_server(tmp_path: Path) -> AsyncIterator[tuple[str, str]]:
                     f"/api/tokens never reachable (last status: {last_status})"
                 )
 
+        # retire-system-token Wave 1: the system_token bearer no
+        # longer authenticates ``/mcp``; mint a real per-agent
+        # manager-role token (the new operator-tier bearer surface)
+        # so the test's ``Authorization: Bearer <admin_token>``
+        # calls keep working.
+        import datetime as _dt
+        import secrets as _secrets
+
+        from agent_mcp.db.connection import get_db_connection
+
+        admin_token = _secrets.token_hex(16)
+        now = _dt.datetime.now().isoformat()
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR IGNORE INTO agents (token, agent_id, "
+                "capabilities, created_at, status, working_directory, "
+                "color, updated_at, agent_role) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    admin_token,
+                    "admin",
+                    "[]",
+                    now,
+                    "active",
+                    "/tmp",
+                    "#888",
+                    now,
+                    "manager",
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        g.active_agents[admin_token] = {
+            "agent_id": "admin",
+            "status": "active",
+            "created_at": now,
+            "capabilities": [],
+            "agent_role": "manager",
+        }
+        g.admin_token = admin_token
+
         yield base_url, admin_token
     finally:
         server.stop()

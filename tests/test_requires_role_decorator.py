@@ -182,22 +182,22 @@ async def test_requires_role_manager_rejects_worker_agent(app_with_db) -> None:
 
 
 @pytest.mark.asyncio
-async def test_requires_role_manager_admits_system_token(app_with_db) -> None:
-    """The system bearer (g.system_token) passes manager gates.
-
-    Phase 2 reserves the system token for router-internal calls but
-    keeps it valid for any tool gate so legacy admin scripts continue
-    to work during the migration window.
-    """
+async def test_requires_role_manager_rejects_system_token(app_with_db) -> None:
+    """retire-system-token Wave 1: the system bearer NO LONGER passes
+    manager gates. The god-key admit was removed from ``verify_token``;
+    the surviving manager-tier admits are (a) operator session and
+    (b) a per-agent token whose row has ``agent_role='manager'``."""
     from agent_mcp.core import globals as g
-    from agent_mcp.core.authorize import requires_role
+    from agent_mcp.core.authorize import requires_role, AuthRejected
 
     @requires_role("manager")
-    async def my_tool(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
-        return [mcp_types.TextContent(type="text", text="sys-ok")]
+    async def my_tool(
+        arguments: Dict[str, Any],
+    ) -> List[mcp_types.TextContent]:  # pragma: no cover
+        return [mcp_types.TextContent(type="text", text="should-not-run")]
 
-    result = await my_tool({"token": g.system_token})
-    assert result[0].text == "sys-ok"
+    with pytest.raises(AuthRejected):
+        await my_tool({"token": g.system_token})
 
 
 # --- @requires_role("operator") --------------------------------------------
@@ -222,17 +222,24 @@ async def test_requires_role_operator_admits_operator_session(app_with_db) -> No
 
 
 @pytest.mark.asyncio
-async def test_requires_role_operator_admits_system_token(app_with_db) -> None:
-    """The system bearer passes the operator gate (legacy admin scripts)."""
+async def test_requires_role_operator_rejects_system_token(app_with_db) -> None:
+    """retire-system-token Wave 1: the system bearer NO LONGER passes
+    the operator gate. The god-key admit was removed; operator-tier
+    callers must prove identity via operator session (cookie or
+    signed forwarding header). Tests that previously passed
+    ``token=g.system_token`` here must now stamp
+    ``operator_session_active`` instead."""
     from agent_mcp.core import globals as g
-    from agent_mcp.core.authorize import requires_role
+    from agent_mcp.core.authorize import requires_role, AuthRejected
 
     @requires_role("operator")
-    async def my_tool(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
-        return [mcp_types.TextContent(type="text", text="op-sys-ok")]
+    async def my_tool(
+        arguments: Dict[str, Any],
+    ) -> List[mcp_types.TextContent]:  # pragma: no cover
+        return [mcp_types.TextContent(type="text", text="should-not-run")]
 
-    result = await my_tool({"token": g.system_token})
-    assert result[0].text == "op-sys-ok"
+    with pytest.raises(AuthRejected):
+        await my_tool({"token": g.system_token})
 
 
 @pytest.mark.asyncio
@@ -279,20 +286,25 @@ async def test_requires_role_operator_rejects_worker_agent(app_with_db) -> None:
 
 @pytest.mark.asyncio
 async def test_legacy_requires_admin_still_works(app_with_db) -> None:
-    """``@requires("admin")`` continues to authorise the system bearer.
+    """``@requires("admin")`` continues to authorise an operator session.
 
-    The legacy decorator is preserved for one release as an alias for
-    ``@requires_role("operator")`` so existing per-tool decorators keep
-    working until Wave 3 sweeps through and replaces them.
+    retire-system-token Wave 1: the legacy alias is preserved, but the
+    god-key bearer that previously admitted it is gone. The surviving
+    admit path is an operator session (stamped by the REST seam, the
+    forwarding-header middleware path, or the test harness).
     """
-    from agent_mcp.core import globals as g
     from agent_mcp.core.authorize import requires
+    from agent_mcp.tools.registry import operator_session_active
 
     @requires("admin")
     async def my_tool(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
         return [mcp_types.TextContent(type="text", text="legacy-ok")]
 
-    result = await my_tool({"token": g.system_token})
+    cv = operator_session_active.set(True)
+    try:
+        result = await my_tool({"token": "anything-ignored"})
+    finally:
+        operator_session_active.reset(cv)
     assert result[0].text == "legacy-ok"
 
 

@@ -304,12 +304,22 @@ def requires_policy(
             token = _extract_token(arguments)
 
             # Admin path: always permitted, no toggle read needed.
+            # retire-system-token Wave 1: ``verify_token(.., "admin")``
+            # now consults the operator-session ContextVar (set by
+            # the REST seam / forwarding-header middleware). Fall back
+            # to the agent-id-is-"admin" label so an admin-row token
+            # arriving via the bearer-only MCP path also takes the
+            # admin branch (the harness's admin-row token IS the
+            # post-Wave-1 admin bearer surface).
             if verify_token(token, "admin"):
                 return await func(arguments)
 
             # Worker path: must resolve to an active agent first.
-            if not get_agent_id(token):
+            caller_agent_id = get_agent_id(token)
+            if not caller_agent_id:
                 raise AuthRejected("Unauthorized: Valid token required")
+            if caller_agent_id == "admin":
+                return await func(arguments)
 
             # Lazy import: the access module pulls in DB helpers we
             # don't want to load at module-import time (keeps
