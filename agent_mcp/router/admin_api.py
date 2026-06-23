@@ -540,88 +540,18 @@ async def remove_alias_handler(req: web.Request) -> web.Response:
     )
 
 
-# ── Admin create-agent wrapper ──────────────────────────────────────
-
-
-async def create_agent_handler(req: web.Request) -> web.Response:
-    """``POST /agent-mcp/api/router/projects/<name>/agents``.
-
-    Router-level admin wrapper that proxies via ``_mcp_call_admin``
-    to seed a bootstrap task and create the agent on the per-project
-    backend. Distinct from the per-project ``POST /api/<project>/agents``
-    in ``agent_mcp/app/routes.py`` — that one is the direct create
-    from within a project's MCP session; this one is the router-side
-    "wire a new agent into this project" admin operation.
-
-    JSON body: ``{"agent_id": "<slug>"}``. Returns the seed task_id
-    and the new agent_id on success.
-    """
-    from . import app as _app
-    import asyncio
-    import re
-
-    name = req.match_info["name"]
-    body = await _app._parse_json_body(req)
-    agent_id = (body.get("agent_id") or "").strip()
-    if not agent_id:
-        raise web.HTTPBadRequest(reason="missing 'agent_id'")
-    if name not in _app._projects_dict():
-        raise web.HTTPNotFound(reason=f"unknown project: {name!r}")
-    if not _app._SLUG_RE.match(agent_id):
-        raise web.HTTPBadRequest(
-            reason=f"agent_id must match {_app._SLUG_RE.pattern}"
-        )
-    try:
-        seed = await _app._mcp_call_admin(
-            name,
-            "assign_task",
-            {
-                "task_title": f"agent {agent_id}: bootstrap",
-                "task_description": (
-                    "Auto-created so the agent has at least one task "
-                    "to attach to. Close or repurpose freely."
-                ),
-                "auto_suggest_parent": False,
-                "validate_agent_workload": False,
-                "override_rag": True,
-                "override_reason": "router create-agent helper",
-            },
-        )
-    except (asyncio.TimeoutError, Exception) as e:
-        raise web.HTTPBadGateway(reason=f"seed task failed: {e}")
-    seed_text = "\n".join(
-        p.get("text", "") for p in seed.get("content", []) or []
-    )
-    m = re.search(r"task_\d+", seed_text)
-    if not m:
-        raise web.HTTPBadGateway(
-            reason="seed task created but task_id not parseable"
-        )
-    seed_task_id = m.group(0)
-    try:
-        result = await _app._mcp_call_admin(
-            name,
-            "create_agent",
-            {
-                "agent_id": agent_id,
-                "task_ids": [seed_task_id],
-                "send_prompt": False,
-            },
-        )
-    except (asyncio.TimeoutError, Exception) as e:
-        raise web.HTTPBadGateway(reason=f"create_agent failed: {e}")
-    text = "\n".join(
-        p.get("text", "") for p in result.get("content", []) or []
-    )
-    if result.get("isError") or text.lstrip().lower().startswith("error"):
-        raise web.HTTPBadRequest(reason=text[:200] or "create_agent error")
-    # Invalidate token cache so the freshly-created agent shows up.
-    _app._agent_token_cache.pop(name, None)
-    return _app._success_envelope({
-        "agent_id": agent_id,
-        "seed_task_id": seed_task_id,
-        "project": name,
-    }, status=201)
+# ── Admin create-agent wrapper (retired) ────────────────────────────
+#
+# retire-system-token Wave 5 (2026-06-23) deleted ``create_agent_handler``
+# and the route registration for ``POST /agent-mcp/api/router/projects/
+# <name>/agents``. The handler proxied through ``_mcp_call_admin``,
+# which Wave 3 broke (the helper fetched an ``admin_token`` field that
+# the backend no longer returns). The dashboard never called this
+# router-level endpoint — it hits the per-project ``POST /api/agents``
+# in ``agent_mcp/app/routes.py`` directly — and no test pinned the
+# behaviour, so removing it is safe. Callers who need to programmatically
+# create agents should use the per-project REST surface; the bootstrap
+# task can be created with a separate ``assign_task`` call.
 
 
 # ── Route registration ──────────────────────────────────────────────
@@ -690,10 +620,10 @@ def register_admin_routes(app: web.Application) -> None:
         "/agent-mcp/api/router/projects/{name}/aliases/{alias}",
         gated(remove_alias_handler),
     )
-    app.router.add_post(
-        "/agent-mcp/api/router/projects/{name}/agents",
-        gated(create_agent_handler),
-    )
+    # retire-system-token Wave 5: the router-level admin create-agent
+    # endpoint (``POST .../{name}/agents``) was deleted along with its
+    # broken ``_mcp_call_admin`` helper. The dashboard's "Create Agent"
+    # flow hits the per-project ``POST /api/agents`` directly.
 
 
 __all__ = ["register_admin_routes"]

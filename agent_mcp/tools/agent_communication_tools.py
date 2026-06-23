@@ -505,7 +505,11 @@ async def broadcast_admin_message_tool_impl(arguments: Dict[str, Any]) -> List[m
     """
     Admin-only tool to broadcast a message to all active agents.
     """
-    admin_token = arguments.get("token")
+    # retire-system-token Wave 5: parameter renamed from
+    # ``admin_token`` — the value is a manager-tier per-agent token (or
+    # the operator session passes via the @requires_role gate without
+    # needing a token here). It was never the god-key after Wave 1.
+    caller_token = arguments.get("token")
     message_content = arguments.get("message")
     message_type = arguments.get("message_type", "broadcast")
     priority = arguments.get("priority", "high")
@@ -535,7 +539,7 @@ async def broadcast_admin_message_tool_impl(arguments: Dict[str, Any]) -> List[m
             try:
                 # Use the send message function
                 fanout_args: Dict[str, Any] = {
-                    "token": admin_token,
+                    "token": caller_token,
                     "recipient_id": recipient_id,
                     "message": message_content,
                     "message_type": message_type,

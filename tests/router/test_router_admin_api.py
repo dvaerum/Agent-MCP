@@ -19,7 +19,7 @@ URL map (legacy → new):
     GET    /__client-installer/<n>.sh           → GET    /api/router/projects/<name>/installer
     GET    /__alias-usage                       → GET    /api/router/projects/<name>/aliases
     POST   /__remove-alias                      → DELETE /api/router/projects/<name>/aliases/<alias>
-    POST   /__create-agent                      → POST   /api/router/projects/<name>/agents
+    POST   /__create-agent                      → POST   /api/router/projects/<name>/agents  (RETIRED — Wave 5)
     (new)                                       → GET    /api/router/health  (public)
 
 Each section has a positive test (new URL + method + body returns 2xx
@@ -419,15 +419,36 @@ async def test_legacy_remove_alias_url_returns_404(
 async def test_legacy_create_agent_url_returns_404(
     aiohttp_client, router_app, register_project,
 ) -> None:
-    """The router-admin create-agent endpoint (a wrapper that proxies
-    via _mcp_call_admin to seed a bootstrap task) moves to the new URL.
-    The legacy ``__create-agent`` shape is gone."""
+    """The legacy ``__create-agent`` shape is gone. retire-system-token
+    Wave 5 (2026-06-23) also deleted the post-rename
+    ``POST /api/router/projects/<name>/agents`` wrapper — see
+    ``test_router_admin_create_agent_endpoint_removed`` below."""
     register_project("alpha")
     client = await aiohttp_client(router_app)
 
     resp = await client.post(
         "/agent-mcp/__create-agent",
         data={"name": "alpha", "agent_id": "worker-1"},
+    )
+
+    assert resp.status == 404
+
+
+async def test_router_admin_create_agent_endpoint_removed(
+    aiohttp_client, router_app, register_project,
+) -> None:
+    """retire-system-token Wave 5: ``POST /agent-mcp/api/router/
+    projects/<name>/agents`` was a thin wrapper around the now-deleted
+    ``_mcp_call_admin`` helper. The dashboard never called it — agent
+    creation goes through ``POST /api/agents`` on the per-project
+    backend directly. The route is gone; the path 404s."""
+    register_project("alpha")
+    client = await aiohttp_client(router_app)
+
+    resp = await client.post(
+        "/agent-mcp/api/router/projects/alpha/agents",
+        headers=_STRICT_ACCEPT,
+        data=json.dumps({"agent_id": "worker-1"}),
     )
 
     assert resp.status == 404

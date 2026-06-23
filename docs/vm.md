@@ -81,7 +81,7 @@ One backend on guest TCP `:8080` with no router and no path prefix:
 ```
 http://localhost:5454/sse                              # MCP SSE
 http://localhost:5454/messages/<id>                    # MCP messages
-http://localhost:5454/api/tokens                       # admin_token
+http://localhost:5454/api/tokens                       # per-agent bearer tokens
 ```
 
 This is the lowest-overhead path to smoke-test the agent-mcp HTTP

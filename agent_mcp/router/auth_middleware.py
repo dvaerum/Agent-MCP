@@ -3,13 +3,15 @@
 PR C shipped the login + setup-wizard routes that create a session
 cookie. PR D closes the dashboard surface: every ``/agent-mcp/...``
 request that isn't an explicit unauth allow-list path must carry a
-valid ``agent_mcp_session`` cookie OR a legacy ``Authorization:
-Bearer <admin_token>`` header (for agent-side traffic on ``/mcp/``).
+valid ``agent_mcp_session`` cookie OR an ``Authorization: Bearer
+<agent_token>`` header (for agent-side traffic on ``/mcp/``).
 
-The legacy bearer path stays usable on ``/agent-mcp/mcp/...`` so
-spawned agents keep authenticating; it is NOT honoured on the
-dashboard's ``/api/...`` surface — the dashboard moves fully to
-cookies. ADR 0014 retired the ``/agent-mcp/__*`` shape entirely.
+The bearer path stays usable on ``/agent-mcp/mcp/...`` so spawned
+agents keep authenticating with their per-agent token; it is NOT
+honoured on the dashboard's ``/api/...`` surface — the dashboard
+moves fully to cookies. ADR 0014 retired the ``/agent-mcp/__*`` shape
+entirely. retire-system-token Wave 1 (PR #208) removed the
+``admin_token`` god-key bearer; only per-agent tokens are accepted.
 
 Project-scoped paths (``/agent-mcp/api/<project>/...`` and
 ``/agent-mcp/app/<project>/...``) additionally verify the resolved

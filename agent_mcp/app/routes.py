@@ -375,25 +375,24 @@ async def tokens_api_route(
 
       * an ``agent_mcp_session`` cookie pointing at a live operator
         session (the new dashboard path), OR
-      * an ``Authorization: Bearer <system_token>`` header (legacy
-        admin scripts / agent CLI), OR
+      * an ``Authorization: Bearer <manager-agent-token>`` header
+        (operator-tier per-agent bearer; legacy admin-scripts and the
+        agent CLI), OR
       * the same token in a body / query-string field (oldest
         backwards-compat path; nothing in the dashboard sends this).
 
     The manual ``Authorization: Bearer`` worker-rejection ladder that
-    used to live here is now superseded by the dep — any non-admin
-    bearer fails the dep's ``verify_token(..., "admin")`` and the
-    request 401s before reaching this handler.
+    used to live here is now superseded by the dep — any non-operator-
+    tier bearer fails ``_bearer_is_operator_tier`` and the request
+    401s before reaching this handler.
 
     Wave 3 (prancy-napping-pie) dropped the legacy ``admin_token``
     field from the response. The dashboard no longer reads it (Wave 2
-    stripped the frontend reads); the system bearer is internal-only
-    and must not flow to any external client. Out-of-tree admin
-    scripts that POST'd to this endpoint expecting an ``admin_token``
-    field will break — they can instead read the same value from the
-    ``--system-token-out`` startup flag (renamed from
-    ``--admin-token-out`` in Phase 2 Wave 1b) or the
-    ``MCP_SYSTEM_TOKEN`` env var on spawned agents.
+    stripped the frontend reads). Out-of-tree clients that POST'd to
+    this endpoint expecting an ``admin_token`` field must migrate to
+    per-agent bearer tokens; see ``docs/external-mcp-client.md`` for
+    the provisioning walkthrough. retire-system-token Wave 3 deleted
+    the underlying god-key; there is no equivalent value to surface.
     """
     try:
         agent_tokens_list = []
@@ -1431,15 +1430,14 @@ async def all_data_api_route(
         # gone. The dashboard's hardcoded ``agent_id === 'Admin'``
         # defensive branches simply never match now — that's fine; they
         # were defensive (skip edit/terminate buttons for the admin
-        # row), not load-bearing. Wave 4 deletes the underlying admin
-        # pseudo-agent in the agents table; until then, the real
-        # lowercase ``admin`` row is filtered out above (lines just
-        # above this block) so callers see a clean agents list.
+        # row), not load-bearing. Wave 4 deleted the underlying admin
+        # pseudo-agent row entirely (migration 0014).
         #
         # Out-of-tree consumers that relied on the synthesised
         # 'Admin' row's ``auth_token`` field to harvest the system
-        # token should switch to the ``--system-token-out`` startup
-        # flag (or ``MCP_SYSTEM_TOKEN`` env var on spawned agents).
+        # token must migrate to per-agent bearer tokens — see
+        # ``docs/external-mcp-client.md``. retire-system-token Wave 3
+        # deleted the system token; there is no equivalent value.
 
         cursor.execute(
             "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?",
@@ -1493,9 +1491,10 @@ async def all_data_api_route(
             "file_metadata": file_metadata,
             "file_map": g.file_map,
             # Wave 3 (prancy-napping-pie): ``admin_token`` removed from
-            # response. The dashboard no longer reads it (Wave 2); the
-            # system bearer is internal-only and must not flow to
-            # external clients.
+            # response. The dashboard no longer reads it (Wave 2).
+            # retire-system-token Wave 3 deleted the underlying god-key;
+            # external clients use per-agent bearers (see
+            # docs/external-mcp-client.md).
             "timestamp": datetime.datetime.now().isoformat()
         }
         
