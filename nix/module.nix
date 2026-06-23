@@ -183,6 +183,19 @@ in {
           Group = cfg.group;
           RuntimeDirectory = "agent-mcp/%i";
           RuntimeDirectoryMode = "0750";
+          # F015 v3 (defence-in-depth): without this, systemd's default
+          # ``RuntimeDirectoryPreserve=no`` wipes ``/run/agent-mcp/%i/``
+          # on every ``systemctl stop`` — including the router-owned
+          # ``forwarding_hmac`` key file the backend's
+          # ``--forwarding-hmac-in`` flag points at. When the router's
+          # idle reaper stops a backend and the next request triggers
+          # a restart, the backend launcher exits 2 because click's
+          # ``File()`` validator can't find the (just-deleted) key.
+          # Preserving the runtime dir across restarts keeps the file
+          # alive between stop/start cycles. The router's
+          # ``ensure_forwarding_hmac_key`` is also self-healing as the
+          # primary fix; this is belt-and-braces.
+          RuntimeDirectoryPreserve = "yes";
           Environment = [
             "AGENT_MCP_PROJECTS_FILE=${cfg.stateDir}/projects.local.json"
             "AGENT_MCP_SOCK_DIR=${cfg.runtimeDir}"
