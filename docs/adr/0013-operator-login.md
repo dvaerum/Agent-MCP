@@ -136,4 +136,4 @@ several specifics have since changed:
 
 The "implicit admin retirement" decision and the operator-login
 machinery are unchanged. For the external-client migration story,
-see [`docs/external-mcp-client.md`](../external-mcp-client.md).
+see [`docs/integrations/external-mcp-client.md`](../integrations/external-mcp-client.md).

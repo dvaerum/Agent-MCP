@@ -49,10 +49,15 @@ uv venv && uv pip install -e .
 uv run -m agent_mcp.cli --project-dir /path/to/your/project
 
 # You'll see output like:
-# 🤖 Admin Token: abc123def456...
 # 📡 Server running on http://localhost:8080
 # 📊 Dashboard: Start with 'cd agent_mcp/dashboard && npm run dev'
 ```
+
+> The project-wide "admin token" that used to be printed at
+> startup was retired in PRs #208–#211. External MCP clients
+> authenticate with a per-agent bearer token provisioned from
+> the dashboard — see
+> [`docs/integrations/external-mcp-client.md`](../integrations/external-mcp-client.md).
 
 ### 3. Configure Multi-Agent File Locking
 
@@ -85,18 +90,25 @@ npm run dev
 ```
 
 ### 5. Connect AI Assistant
-**For Claude Code**, add to your `mcp.json`:
+
+After provisioning a per-agent token from the dashboard (see
+[`docs/integrations/external-mcp-client.md`](../integrations/external-mcp-client.md)),
+add to your `mcp.json`:
+
 ```json
 {
   "mcpServers": {
     "Agent-MCP": {
-      "url": "http://localhost:8080/sse"
+      "url": "http://localhost:5454/agent-mcp/mcp/<project>",
+      "headers": {
+        "Authorization": "Bearer <per-agent-token>"
+      }
     }
   }
 }
 ```
 
-**🎉 You're ready!** The server is running and your AI assistant can connect.
+**You're ready!** The server is running and your AI assistant can connect.
 
 ---
 
@@ -114,7 +126,7 @@ the dashboard surface uses cookie sessions.
 > clients (Claude Code, IDE plugins, ad-hoc scripts) must
 > **provision a per-agent worker or manager agent in the dashboard
 > and use that agent's `token` as the bearer.** See
-> [`docs/external-mcp-client.md`](./external-mcp-client.md) for the
+> [`docs/integrations/external-mcp-client.md`](../integrations/external-mcp-client.md) for the
 > walkthrough.
 
 Pick the bootstrap path that matches your deploy shape:
@@ -188,7 +200,7 @@ PRs #208 / #209 / #210 / #211 / Wave 5). Per-agent bearer tokens
 have taken its place — provision a worker or manager agent in the
 dashboard ("Create Agent" panel) and use that row's `token` to
 authenticate external MCP clients. See
-[`docs/external-mcp-client.md`](./external-mcp-client.md) for the
+[`docs/integrations/external-mcp-client.md`](../integrations/external-mcp-client.md) for the
 walkthrough.
 
 A handful of legacy `--admin-token-*` / `--system-token-*` CLI flags
@@ -406,7 +418,7 @@ TASK: Add the entire MCD to project context - every detail, don't summarize anyt
 After adding context, create a worker agent to start implementation.
 ```
 
-See [`docs/external-mcp-client.md`](./external-mcp-client.md) for
+See [`docs/integrations/external-mcp-client.md`](../integrations/external-mcp-client.md) for
 the full client-config setup (downloading `.mcp.json`, headers,
 multi-tenant vs single-tenant URL shape).
 
@@ -459,25 +471,28 @@ Use the dashboard to:
 4. **Join Community** - Share your experience and learn from others
 
 ### Next Steps
-1. **[The Complete MCD Guide](./mcd-guide.md)** - Master MCD creation
-2. **[Agent Coordination Patterns](./agent-patterns.md)** - Learn advanced workflows
-3. **[Example MCDs](./example-mcds/README.md)** - Study real-world examples
+1. **[The Complete MCD Guide](../mcd-example/mcd-guide.md)** - Master MCD creation
+2. **[Example MCD](../mcd-example/README.md)** - Study a worked example
+3. **[Connecting external MCP clients](../integrations/external-mcp-client.md)** - Wire Claude Code / IDE plugins / scripts to a project
 
 ---
 
 ## 🔧 Troubleshooting Common Issues
 
-### ❌ "Cannot find admin token"
-**Solution**: Check the MCP server startup logs in your terminal. The token is displayed when the server starts.
+### "Cannot find admin token"
+**Solution**: The project-wide admin token was retired in PRs
+#208–#211. Provision a per-agent token from the dashboard
+instead — see
+[`docs/integrations/external-mcp-client.md`](../integrations/external-mcp-client.md).
 
-### ❌ "Agent can't access project context"  
-**Solution**: Make sure the admin agent successfully added the MCD to project context. Check the dashboard's Memory section.
+### "Agent can't access project context"
+**Solution**: Make sure the manager agent successfully added the MCD to project context. Check the dashboard's Memory section.
 
-### ❌ "Worker agent doesn't understand tasks"
+### "Worker agent doesn't understand tasks"
 **Solution**: Your MCD might be too vague. Add more specific implementation details and acceptance criteria.
 
-### ❌ "Agents are not coordinating"
-**Solution**: Ensure you're using the correct tokens (admin vs worker) and that the --worker flag is included in worker initialization.
+### "Agents are not coordinating"
+**Solution**: Ensure each agent is initialized with its own per-agent token from the dashboard's `agents` table and the `--worker` flag is included in worker initialization.
 
 ### ❌ "Dashboard won't load"
 **Solution**: 
@@ -541,10 +556,10 @@ npm run dev
 ### Stay Connected
 - **[Discord Community](https://discord.gg/7Jm7nrhjGn)** - Daily discussions and support
 - **[GitHub](https://github.com/rinadelph/Agent-MCP)** - Source code and issue tracking
-- **[Documentation](./README.md)** - Comprehensive guides and references
+- **[Documentation](../README.md)** - Comprehensive guides and references
 
 ---
 
 **Congratulations! You've successfully set up Agent-MCP and completed your first multi-agent project. You're now ready to build amazing things with coordinated AI intelligence.**
 
-**[Continue with The Complete MCD Guide →](./mcd-guide.md)**
+**[Continue with The Complete MCD Guide →](../mcd-example/mcd-guide.md)**
