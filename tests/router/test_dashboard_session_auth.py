@@ -251,8 +251,9 @@ async def test_mcp_route_with_operator_cookie_reaches_handler(
     retire-system-token Wave 2 (2026-06-23): the cookie path no
     longer translates to an admin bearer; the router signs a
     ``X-Agent-MCP-Forwarded-Operator`` header from the per-project
-    HMAC key. We pre-seed the key the way
-    ``ensure_forwarding_hmac_key`` would at backend spawn time so
+    HMAC key. F015 v4 (2026-06-23): the systemd unit's ExecStartPre
+    owns the on-disk key; we pre-seed it directly here, mirroring
+    what the unit does in production, so
     ``_forwarding_header_from_cookie`` can sign without standing up
     a real backend.
 
@@ -266,15 +267,22 @@ async def test_mcp_route_with_operator_cookie_reaches_handler(
         didn't trigger.
       * Valid cookie + non-member → 401 from the cookie path.
     """
+    import os
+    import secrets
+
     from agent_mcp.router import project_orchestrator as _po
 
     register_project("delta")
-    # retire-system-token Wave 2: the cookie path needs the per-
-    # project HMAC key to sign the forwarding header. Pre-seed it the
-    # way ``_ensure``'s spawn-time hook would. Skipping the systemd
-    # start ourselves keeps the test focused on the auth-gate
-    # decision (the 5xx after the gate is still observed below).
-    _po.ensure_forwarding_hmac_key("delta")
+    # F015 v4: the on-disk HMAC key is owned by the systemd unit's
+    # ExecStartPre in production. Bypass systemd in this unit test
+    # and write the key directly so ``_forwarding_header_from_cookie``
+    # has bytes to sign with. Skipping the real systemctl start keeps
+    # the test focused on the cookie auth-gate decision (the 5xx
+    # after the gate is still observed below).
+    key_path = _po._forwarding_hmac_path("delta")
+    key_path.write_bytes(secrets.token_bytes(32))
+    os.chmod(key_path, 0o600)
+    assert _po.ensure_forwarding_hmac_key("delta") is not None
     # Seed two operators. The conftest's register_project already
     # seeded the sentinel operator (so alice/bob are NOT the first
     # user) — alice gets an explicit membership grant; bob stays

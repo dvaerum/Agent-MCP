@@ -131,15 +131,17 @@ let
     mkdir -p "$sock_dir"
     sock="$sock_dir/backend.sock"
     rm -f "$sock"
-    # retire-system-token Wave 2/3: the router writes the per-project
-    # forwarding-header HMAC key to this file BEFORE invoking
-    # ``systemctl start`` (see ``project_orchestrator.ensure_forwarding_hmac_key``);
-    # the backend's bootstrap reads it once at startup into
-    # ``g.forwarding_hmac_key`` so its ``AuthHeaderMiddleware`` can
-    # verify cookie-authenticated requests proxied via the router.
-    # Wave 3 deleted the parallel ``--system-token-out`` plumbing — the
-    # forwarding HMAC is the only remaining router→backend auth
-    # channel.
+    # retire-system-token Wave 2/3: the per-project forwarding-header
+    # HMAC key lives at $sock_dir/forwarding_hmac. F015 v4 moved key
+    # generation from the router into the systemd unit's ExecStartPre
+    # (see ``nix/module.nix`` — the ``agent-mcp@`` template); the
+    # router only READS the file via
+    # ``project_orchestrator.ensure_forwarding_hmac_key``. The backend
+    # reads it here once at startup into ``g.forwarding_hmac_key`` so
+    # its ``AuthHeaderMiddleware`` can verify cookie-authenticated
+    # requests proxied via the router. Wave 3 deleted the parallel
+    # ``--system-token-out`` plumbing — the forwarding HMAC is the
+    # only remaining router→backend auth channel.
     forwarding_hmac_in="$sock_dir/forwarding_hmac"
     exec ${agentMcpBackendWrapper}/bin/agent-mcp-backend \
       --uds "$sock" \

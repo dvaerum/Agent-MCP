@@ -177,6 +177,15 @@ in {
         description = "Agent-MCP backend — project %i (UDS)";
         after = [ "network.target" "ollama.service" ];
         # Never auto-started; router lazy-spawns on first request.
+        # F015 v4: lift systemd's default start-rate-limit (5 starts /
+        # 10 s) so the unit can keep restarting through a transient
+        # failure without the unit getting wedged by
+        # ``Failed to schedule restart job: Start request repeated
+        # too quickly``. StartLimit* live in [Unit], not [Service]
+        # (per ``man systemd.unit``); NixOS exposes them as top-level
+        # options on ``systemd.services.<name>``.
+        startLimitBurst = 100;
+        startLimitIntervalSec = 300;
         serviceConfig = {
           Type = "simple";
           User = cfg.user;
@@ -185,22 +194,33 @@ in {
           RuntimeDirectoryMode = "0750";
           # F015 v3 (defence-in-depth): without this, systemd's default
           # ``RuntimeDirectoryPreserve=no`` wipes ``/run/agent-mcp/%i/``
-          # on every ``systemctl stop`` — including the router-owned
+          # on every ``systemctl stop`` — including the
           # ``forwarding_hmac`` key file the backend's
-          # ``--forwarding-hmac-in`` flag points at. When the router's
-          # idle reaper stops a backend and the next request triggers
-          # a restart, the backend launcher exits 2 because click's
-          # ``File()`` validator can't find the (just-deleted) key.
-          # Preserving the runtime dir across restarts keeps the file
-          # alive between stop/start cycles. The router's
-          # ``ensure_forwarding_hmac_key`` is also self-healing as the
-          # primary fix; this is belt-and-braces.
+          # ``--forwarding-hmac-in`` flag points at. Preserving the
+          # runtime dir across restarts keeps the file alive between
+          # stop/start cycles.
           RuntimeDirectoryPreserve = "yes";
           Environment = [
             "AGENT_MCP_PROJECTS_FILE=${cfg.stateDir}/projects.local.json"
             "AGENT_MCP_SOCK_DIR=${cfg.runtimeDir}"
           ];
-          ExecStartPre = "${pkgs.coreutils}/bin/rm -f ${cfg.runtimeDir}/%i/backend.sock";
+          # F015 v4: generate the per-project HMAC key in the unit
+          # ExecStartPre (not the router) so EVERY path that starts
+          # the unit guarantees the file exists. The router (PRs
+          # #208-#213) wrote the key before invoking systemctl, but
+          # systemd's ``Restart=on-failure`` loop reactivates the unit
+          # autonomously after a crash — bypassing the router entirely.
+          # The live VM hit a 9569-deep restart loop because the
+          # backend crashed once (key missing for whatever reason),
+          # systemd kept restarting it, and the router-side self-heal
+          # in ``ensure_forwarding_hmac_key`` never ran on those
+          # autonomous restarts. Generating the key here makes the
+          # file a unit-lifecycle invariant: present whenever the
+          # unit is starting, regardless of who triggered the start.
+          ExecStartPre = [
+            "${pkgs.coreutils}/bin/sh -c 'test -f \"$RUNTIME_DIRECTORY/forwarding_hmac\" || { ${pkgs.coreutils}/bin/head -c 32 /dev/urandom > \"$RUNTIME_DIRECTORY/forwarding_hmac\" && ${pkgs.coreutils}/bin/chmod 600 \"$RUNTIME_DIRECTORY/forwarding_hmac\"; }'"
+            "${pkgs.coreutils}/bin/rm -f ${cfg.runtimeDir}/%i/backend.sock"
+          ];
           ExecStart = "${pkgs'.agentMcpLauncher}/bin/agent-mcp-launcher %i";
           Restart = "on-failure";
           RestartSec = 5;
