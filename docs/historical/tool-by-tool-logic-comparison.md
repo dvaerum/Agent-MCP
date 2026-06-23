@@ -1,5 +1,10 @@
 # Agent-MCP Tool-by-Tool Logic Comparison & Misalignment Analysis
 
+> **Historical snapshot.** This document predates the
+> `retire-system-token` waves (PRs #208–#211, 2026-06). It uses
+> the `admin_token` parameter naming that no longer exists. Kept
+> for reference only.
+
 **Analysis Date:** August 2025  
 **Purpose:** Detailed comparison of individual tool logic between Python and Node.js implementations  
 **Focus:** Logic misalignments, behavioral inconsistencies, and parameter handling differences

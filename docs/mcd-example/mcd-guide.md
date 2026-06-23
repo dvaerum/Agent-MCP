@@ -4,7 +4,7 @@
 
 ## What is an MCD?
 
-A **Main Context Document (MCD)** is the cornerstone of effective AI collaboration. Based on the theoretical foundation established in our [Context chapter](./chapter-2-context-foundation.md), the MCD serves as a comprehensive operational blueprint that bridges the gap between human intent and AI execution.
+A **Main Context Document (MCD)** is the cornerstone of effective AI collaboration. Based on the theoretical foundation established in our [Context chapter](../theory/chapter-2-context-foundation.md), the MCD serves as a comprehensive operational blueprint that bridges the gap between human intent and AI execution.
 
 ### Why MCDs Matter
 - ✅ **Eliminates ambiguity** that causes AI hallucinations

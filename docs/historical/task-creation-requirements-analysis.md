@@ -1,5 +1,10 @@
 # Task Creation Requirements Analysis: Python vs Node.js Agent-MCP
 
+> **Historical snapshot.** This document predates the
+> `retire-system-token` waves (PRs #208–#211, 2026-06). The
+> `admin_token` / `system_token` model it references no longer
+> exists. Kept for reference only.
+
 **Analysis Date:** August 2025  
 **Focus:** Detailed examination of task creation requirements and validation logic differences  
 **Critical Finding:** Node.js enforces stricter task orchestration rules than Python

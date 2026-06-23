@@ -79,7 +79,7 @@ uv pip install -e .
 # (Optional) point at OpenAI cloud instead of the bundled local
 # Ollama default. With OPENAI_API_KEY unset, the server falls back
 # to http://127.0.0.1:11434/v1 (qwen3:1.7b) automatically — see
-# docs/getting-started.md for the full env-var reference.
+# docs/operator/getting-started.md for the full env-var reference.
 # export OPENAI_API_KEY="sk-..."
 
 # Start the server
@@ -129,7 +129,7 @@ need to be aware of the operator login.
 > External MCP clients (Claude Code, IDE plugins, ad-hoc scripts)
 > authenticate with **per-agent bearer tokens** drawn from the
 > `agents` table. See
-> [docs/external-mcp-client.md](./docs/external-mcp-client.md) for
+> [docs/integrations/external-mcp-client.md](./docs/integrations/external-mcp-client.md) for
 > the operator-facing migration guide.
 
 ## MCP Integration Guide
@@ -140,127 +140,38 @@ The **Model Context Protocol (MCP)** is an open standard that enables AI assista
 
 ### Running Agent-MCP as an MCP Server
 
-Agent-MCP can function as an MCP server, exposing its multi-agent capabilities to MCP-compatible clients like Claude Desktop, Cline, and other AI coding assistants.
+Agent-MCP exposes its multi-agent surface as an MCP server.
+External clients (Claude Code, Claude Desktop, Cline, IDE plugins,
+ad-hoc scripts) authenticate with a per-agent bearer token
+provisioned from the dashboard.
 
-#### Quick MCP Setup
+The full client-config story — endpoint shape, headers,
+single-tenant vs router URL forms, how to provision the bearer,
+and what to do when a token is lost — lives in
+[`docs/integrations/external-mcp-client.md`](./docs/integrations/external-mcp-client.md).
 
-```bash
-# 1. Install Agent-MCP
-uv venv
-uv install
+The REST admin surface (`/agent-mcp/api/<project>/…`) requires
+an explicit version-pinned `Accept` header — see
+[`docs/integrations/api-versioning.md`](./docs/integrations/api-versioning.md).
 
-# 2. Start the MCP server
-uv run -m agent_mcp.cli --port 8080
+#### Tools at a glance
 
-# 3. Configure your MCP client to connect to:
-# HTTP: http://localhost:8000/mcp
-# WebSocket: ws://localhost:8000/mcp/ws
-```
+Once a manager agent is connected, these MCP tools are the most
+common entry points. The dashboard's Tools tab is the canonical
+inventory (descriptions and arg schemas are generated from
+`agent_mcp/tools/*`).
 
-#### MCP Server Configuration
+**Agent management** — `create_agent`, `list_agents`, `terminate_agent`.
 
-Create an MCP configuration file (`mcp_config.json`):
+**Task orchestration** — `assign_task`, `view_tasks`, `update_task_status`.
 
-```json
-{
-  "server": {
-    "name": "agent-mcp",
-    "version": "1.0.0"
-  },
-  "tools": [
-    {
-      "name": "create_agent",
-      "description": "Create a new specialized AI agent"
-    },
-    {
-      "name": "assign_task", 
-      "description": "Assign tasks to specific agents"
-    },
-    {
-      "name": "query_project_context",
-      "description": "Query the shared knowledge graph"
-    },
-    {
-      "name": "manage_agent_communication",
-      "description": "Handle inter-agent messaging"
-    }
-  ],
-  "resources": [
-    {
-      "name": "agent_status",
-      "description": "Real-time agent status and activity"
-    },
-    {
-      "name": "project_memory",
-      "description": "Persistent project knowledge graph"
-    }
-  ]
-}
-```
+**Knowledge management** — `ask_project_rag`, `update_project_context`, `view_project_context`.
 
-#### Using Agent-MCP with Claude Desktop
+**Communication** — `send_agent_message`, `broadcast_message`,
+`request_assistance`.
 
-1. **Add to Claude Desktop Config**:
-   
-   Open `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or equivalent:
-   
-   ```json
-   {
-     "mcpServers": {
-       "agent-mcp": {
-         "command": "uv",
-         "args": ["run", "-m", "agent_mcp.cli", "--port", "8080"],
-         "env": {
-           "OPENAI_API_KEY": "your-openai-api-key"
-         }
-       }
-     }
-   }
-   ```
+#### Environment variables (most common)
 
-2. **Restart Claude Desktop** to load the MCP server
-
-3. **Verify Connection**: Claude should show "🔌 agent-mcp" in the conversation
-
-#### MCP Tools Available
-
-Once connected, you can use these MCP tools directly in Claude:
-
-**Agent Management**
-- `create_agent` - Spawn specialized agents (backend, frontend, testing, etc.)
-- `list_agents` - View all active agents and their status
-- `terminate_agent` - Safely shut down agents
-
-**Task Orchestration**  
-- `assign_task` - Delegate work to specific agents
-- `view_tasks` - Monitor task progress and dependencies
-- `update_task_status` - Track completion and blockers
-
-**Knowledge Management**
-- `ask_project_rag` - Query the persistent knowledge graph
-- `update_project_context` - Add architectural decisions and patterns
-- `view_project_context` - Access stored project information
-
-**Communication**
-- `send_agent_message` - Direct messaging between agents
-- `broadcast_message` - Send updates to all agents
-- `request_assistance` - Escalate complex issues
-
-#### Advanced MCP Configuration
-
-**Custom Transport Options**:
-```bash
-# HTTP with custom port
-uv run -m agent_mcp.cli --port 8080
-
-# WebSocket with authentication
-uv run -m agent_mcp.cli --port 8080 --auth-token your-secret-token
-
-# Unix socket (Linux/macOS)
-uv run -m agent_mcp.cli --port 8080
-```
-
-**Environment Variables**:
 ```bash
 # OpenAI / Ollama wiring (defaults to local Ollama when unset):
 # export OPENAI_API_KEY="sk-..."                    # Switch to OpenAI cloud
@@ -268,108 +179,12 @@ uv run -m agent_mcp.cli --port 8080
 # export OPENAI_MODEL="qwen3:1.7b"
 # export AGENT_MCP_EMBEDDING_MODEL="qwen3-embedding:0.6b"
 # export AGENT_MCP_EMBEDDING_DIMENSION="1024"
-
-# Project directory — normally set by `--project-dir`. Only export
-# manually for advanced use cases (Alembic migrations outside the CLI;
-# see agent_mcp/db/README.md).
-# export MCP_PROJECT_DIR=/your/project
-```
-See `docs/getting-started.md` for the full reference.
-
-### MCP Client Examples
-
-#### Python Client
-```python
-import asyncio
-from mcp import Client
-
-async def main():
-    async with Client("http://localhost:8000/mcp") as client:
-        # Create a backend agent
-        result = await client.call_tool("create_agent", {
-            "role": "backend",
-            "specialization": "API development"
-        })
-        
-        # Assign a task
-        await client.call_tool("assign_task", {
-            "agent_id": result["agent_id"],
-            "task": "Implement user authentication endpoints"
-        })
-        
-        # Query project context
-        context = await client.call_tool("ask_project_rag", {
-            "query": "What's our current database schema?"
-        })
-        print(context)
-
-asyncio.run(main())
 ```
 
-#### JavaScript Client
-```javascript
-import { MCPClient } from '@modelcontextprotocol/client';
-
-const client = new MCPClient('http://localhost:8000/mcp');
-
-async function createAgent() {
-  await client.connect();
-  
-  const agent = await client.callTool('create_agent', {
-    role: 'frontend',
-    specialization: 'React components'
-  });
-  
-  console.log('Created agent:', agent.agent_id);
-  
-  await client.disconnect();
-}
-
-createAgent().catch(console.error);
-```
-
-### Troubleshooting MCP Connection
-
-**Connection Issues**:
-```bash
-# Check if MCP server is running
-curl http://localhost:8000/mcp/health
-
-# Verify WebSocket connection
-wscat -c ws://localhost:8000/mcp/ws
-
-# Check server logs
-uv run -m agent_mcp.cli --port 8080 --log-level DEBUG
-```
-
-**Common Issues**:
-- **Port conflicts**: Change port with `--port` flag
-- **Permission errors**: Ensure OpenAI API key is set
-- **Client timeout**: Increase timeout in client configuration
-- **Agent limit reached**: Check active agent count with `list_agents`
-
-### Integration Examples
-
-**VS Code with MCP**:
-Use the MCP extension to integrate Agent-MCP directly into your editor workflow.
-
-**Terminal Usage**:
-```bash
-# Quick task assignment via curl
-curl -X POST http://localhost:8000/mcp/tools/assign_task \
-  -H "Content-Type: application/json" \
-  -d '{"task": "Add error handling to API endpoints", "agent_role": "backend"}'
-```
-
-**CI/CD Integration**:
-```yaml
-# GitHub Actions example
-- name: Run Agent-MCP Code Review
-  run: |
-    uv run -m agent_mcp.cli --port 8080 --daemon
-    curl -X POST localhost:8000/mcp/tools/assign_task \
-      -d '{"task": "Review PR for security issues", "agent_role": "security"}'
-```
+See [`docs/operator/getting-started.md`](./docs/operator/getting-started.md)
+for the full reference (including `MCP_PROJECT_DIR` and the
+bootstrap env vars `AGENT_MCP_BOOTSTRAP_USERNAME` /
+`AGENT_MCP_BOOTSTRAP_PASSWORD`).
 
 ## How It Works: Breaking Complexity into Simple Steps
 
@@ -453,7 +268,7 @@ Your role is to:
 ```
 
 The per-agent bearer is what authenticates you to the MCP server;
-see [docs/external-mcp-client.md](./docs/external-mcp-client.md) for
+see [docs/integrations/external-mcp-client.md](./docs/integrations/external-mcp-client.md) for
 the full external-client setup (client-config download, headers,
 single-tenant vs router shapes).
 
@@ -461,7 +276,7 @@ single-tenant vs router shapes).
 ```
 Add this MCD (Main Context Document) to project context:
 
-[paste your MCD here - see docs/mcd-guide.md for structure]
+[paste your MCD here - see docs/mcd-example/mcd-guide.md for structure]
 
 Store every detail in the knowledge graph. This becomes the single source of truth for all agents.
 ```
@@ -472,7 +287,7 @@ The MCD (Main Context Document) is your project's comprehensive blueprint - thin
 - UI component hierarchies and workflows
 - Task breakdowns with clear dependencies
 
-See our [MCD Guide](./docs/mcd-guide.md) for detailed examples and templates.
+See our [MCD Guide](./docs/mcd-example/mcd-guide.md) for detailed examples and templates.
 
 ### 3. Deploy Your Agent Team
 ```
@@ -810,11 +625,14 @@ python --version  # Should be >=3.11
 
 ## Troubleshooting
 
-**"Admin token not found"**  
-Check the server startup logs - token is displayed when MCP server starts.
+**"Admin token not found"**
+The project-wide admin token was retired in PRs #208–#211.
+Provision a per-agent bearer from the dashboard instead — see
+[docs/integrations/external-mcp-client.md](./docs/integrations/external-mcp-client.md).
 
-**"Worker can't access tasks"**  
-Ensure you're using the worker token (not admin token) when initializing workers.
+**"Worker can't access tasks"**
+Ensure you're initializing each worker with its own per-agent
+token from the dashboard's `agents` table — not a shared token.
 
 **"Agents overwriting each other"**  
 Verify all workers are initialized with the `--worker` flag for proper coordination.
@@ -829,12 +647,16 @@ Run memory garbage collection through the dashboard or restart with `--refresh-m
 
 ## Documentation
 
-- [Getting Started Guide](./docs/getting-started.md) - Complete walkthrough with examples
-- [Connecting external MCP clients](./docs/external-mcp-client.md) - Migration guide for Claude Code / IDE plugins / scripts after the `system_token` retirement
-- [MCD Creation Guide](./docs/mcd-guide.md) - Write effective project blueprints
-- [Theoretical Foundation](./docs/chapter-1-cognitive-empathy.md) - Understanding AI cognition
-- [Architecture Overview](./docs/architecture.md) - System design and components
-- [API Reference](./docs/api-reference.md) - Complete technical documentation
+The `docs/` tree is organised by audience. Start at
+[`docs/README.md`](./docs/README.md) for the full index, or jump
+straight to the most common entry points:
+
+- [Operator setup](./docs/operator/getting-started.md) — install, first-boot, env vars, your first multi-agent project
+- [Connecting external MCP clients](./docs/integrations/external-mcp-client.md) — per-agent bearer tokens for Claude Code / IDE plugins / scripts (post-`system_token` retirement)
+- [REST API versioning](./docs/integrations/api-versioning.md) — required `Accept` header and the version negotiation contract
+- [MCD Creation Guide](./docs/mcd-example/mcd-guide.md) — write effective project blueprints
+- [Architecture decisions (ADRs)](./docs/adr/) — operator-login, single-tenant URL parity, event-driven coordination, SSO, etc.
+- [Theoretical foundation](./docs/theory/) — chapters on cognitive empathy, context, tools, and intelligent judgement
 
 ## Community and Support
 

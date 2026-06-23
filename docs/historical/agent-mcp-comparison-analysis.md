@@ -1,5 +1,12 @@
 # Agent-MCP Implementation Comparison: Python vs Node.js
 
+> **Historical snapshot.** This document predates the
+> `retire-system-token` waves (PRs #208–#211, 2026-06). It
+> references the project-wide `admin_token` / `system_token`
+> model that no longer exists. Kept for reference only — for
+> current external-client auth, see
+> [`docs/integrations/external-mcp-client.md`](../integrations/external-mcp-client.md).
+
 **Analysis Date:** August 2025  
 **Purpose:** Comprehensive file-by-file comparison between Python and Node.js Agent-MCP implementations  
 **Goal:** Identify implementation differences, logic issues, and architectural patterns

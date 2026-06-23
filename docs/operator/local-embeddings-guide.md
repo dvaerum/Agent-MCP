@@ -511,7 +511,7 @@ Once your local embeddings are working:
 ## Additional Resources
 
 - **Ollama Documentation**: https://ollama.ai/docs
-- **Agent-MCP README**: [README.md](README.md)
+- **Agent-MCP README**: [README.md](../../README.md)
 - **Discord Community**: [Join for help](https://discord.gg/agent-mcp) *(check README for link)*
 
 ---
