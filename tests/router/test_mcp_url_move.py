@@ -109,3 +109,78 @@ def test_mcp_url_for_helper_returns_new_shape(router_module) -> None:
     assert "/proj/mcp" not in url, (
         f"old shape leaked into _mcp_url_for: {url!r}"
     )
+
+
+# ── Wrong-HTTP-method hygiene (verify-all-v4 MUTATING #2 follow-up) ─
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH", "OPTIONS"])
+async def test_unsupported_methods_return_405_not_500(
+    aiohttp_client, router_app, router_module, method,
+) -> None:
+    """The MCP JSON-RPC transport is POST-only (with GET reserved for
+    bearer-auth SSE notifications and DELETE for session termination,
+    per MCP Streamable HTTP spec rev 2025-03-26). PUT/PATCH/OPTIONS
+    have no meaning on this endpoint and MUST be rejected at the
+    router with 405 Method Not Allowed — never reach the upstream
+    backend and never surface as 5xx.
+
+    Surfaced by verify-all-v4 MUTATING #2 (wrong-HTTP-method
+    full-catalog probe): the previous behaviour fell through to the
+    backend's ``_handle_get``/manager and produced 500
+    ``session_registry_no_agent`` for GET via cookie auth. This guard
+    short-circuits every non-spec verb cleanly so the catalog-probe
+    hygiene matches the other 14 endpoints (which all 4xx cleanly).
+    """
+    router_module._REGISTRY.register("proj", "/tmp/ws-method-guard-test")
+    client = await aiohttp_client(router_app)
+
+    resp = await client.request(
+        method,
+        "/agent-mcp/mcp/proj",
+        headers={"Authorization": "Bearer whatever"},
+    )
+
+    assert resp.status == 405, (
+        f"expected 405 Method Not Allowed for {method} on /mcp/<name>; "
+        f"got {resp.status}"
+    )
+    # Defence in depth: never 5xx for a wrong-verb probe.
+    assert resp.status < 500, (
+        f"{method} on /mcp/<name> returned {resp.status}; the wrong-"
+        f"verb probe must always be 4xx, never 5xx"
+    )
+
+
+async def test_get_without_bearer_returns_4xx_not_500(
+    aiohttp_client, router_app, router_module,
+) -> None:
+    """GET on the MCP transport is a legitimate verb ONLY for
+    bearer-authenticated callers (the SSE notification stream — the
+    bearer is what the backend's ``_handle_get`` uses to resolve
+    ``agent_id`` for ``session_registry``). A GET that authenticates
+    via the operator-session cookie path has no derivable agent_id
+    and used to fall through to the backend, where
+    ``_handle_get`` returned 500 ``session_registry_no_agent``.
+
+    Router-side guard: GET without a bearer header returns 405 (the
+    cookie path simply does not support the notification stream).
+    Asserts the response stays 4xx — verify-all-v4 MUTATING #2
+    hygiene fix.
+    """
+    router_module._REGISTRY.register("proj", "/tmp/ws-get-bearer-test")
+    client = await aiohttp_client(router_app)  # auto-logs-in sentinel op
+
+    # No Authorization header — the request rides the sentinel-op
+    # cookie alone. This is the exact shape verify-all-v4 hit.
+    resp = await client.get("/agent-mcp/mcp/proj")
+
+    assert resp.status < 500, (
+        f"GET /mcp/<name> via cookie auth returned {resp.status}; "
+        f"the bug we're fixing is exactly the 500 fall-through to "
+        f"backend ``_handle_get`` ``session_registry_no_agent``"
+    )
+    assert resp.status == 405, (
+        f"expected 405 Method Not Allowed for cookie-only GET on "
+        f"/mcp/<name>; got {resp.status}"
+    )

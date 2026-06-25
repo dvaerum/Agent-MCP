@@ -257,6 +257,12 @@ async def test_mcp_route_with_operator_cookie_reaches_handler(
     ``_forwarding_header_from_cookie`` can sign without standing up
     a real backend.
 
+    Verb choice: the cookie path admits POST (JSON-RPC request/
+    response). GET is gated to bearer-only callers since v5.0.72 —
+    the backend's ``_handle_get`` derives ``agent_id`` from the
+    bearer for ``session_registry`` fan-out and cookie-only GETs
+    have no derivable agent_id (verify-all-v4 MUTATING #2 follow-up).
+
     Concretely:
 
       * No cookie + no bearer → 401 (unchanged).
@@ -292,16 +298,26 @@ async def test_mcp_route_with_operator_cookie_reaches_handler(
     _identity_module().add_project_membership(alice_id, "delta")
     client = await aiohttp_client(router_app)
 
+    _MCP_BODY = b'{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+    _MCP_HEADERS = {"Content-Type": "application/json"}
+
     # No auth at all → bearer-validation 401.
-    resp = await client.get("/agent-mcp/mcp/delta", allow_redirects=False)
+    resp = await client.post(
+        "/agent-mcp/mcp/delta",
+        data=_MCP_BODY,
+        headers=_MCP_HEADERS,
+        allow_redirects=False,
+    )
     assert resp.status == 401, await resp.text()
 
     # Member cookie → request flows past the auth gate. The proxy
     # then fails to reach the (un-spawned) backend with a 5xx — that
     # proves the cookie path matched and we did NOT 401 here.
     alice_cookie = await _login(client, "alice")
-    resp = await client.get(
+    resp = await client.post(
         "/agent-mcp/mcp/delta",
+        data=_MCP_BODY,
+        headers=_MCP_HEADERS,
         cookies={"agent_mcp_session": alice_cookie},
         allow_redirects=False,
     )
@@ -313,8 +329,10 @@ async def test_mcp_route_with_operator_cookie_reaches_handler(
     # Non-member cookie → 401 from the cookie path inside
     # backend_mcp_handler (bob has no project_membership row).
     bob_cookie = await _login(client, "bob")
-    resp = await client.get(
+    resp = await client.post(
         "/agent-mcp/mcp/delta",
+        data=_MCP_BODY,
+        headers=_MCP_HEADERS,
         cookies={"agent_mcp_session": bob_cookie},
         allow_redirects=False,
     )

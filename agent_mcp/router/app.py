@@ -830,6 +830,43 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
     real_name, alias_entry = _resolve_project_or_alias(name)
 
     bearer = _extract_bearer(req)
+    # Method whitelist — verify-all-v4 MUTATING #2 follow-up. The MCP
+    # Streamable HTTP transport (spec rev 2025-03-26) defines only
+    # three verbs:
+    #
+    #   POST   /mcp   — JSON-RPC request/response (the hot path)
+    #   GET    /mcp   — long-lived SSE for server-initiated
+    #                   notifications; requires a per-agent bearer
+    #                   because the backend's ``_handle_get`` derives
+    #                   ``agent_id`` from the bearer to fan out from
+    #                   ``session_registry``. Cookie-only callers have
+    #                   no derivable agent_id and would crash there as
+    #                   500 ``session_registry_no_agent`` — surfaced by
+    #                   verify-all-v4 MUTATING #2 wrong-HTTP-method
+    #                   full-catalog probe.
+    #   DELETE /mcp   — session termination (the SDK returns 405 in
+    #                   stateless mode; we forward and let it decide).
+    #
+    # PUT/PATCH/OPTIONS/HEAD/etc. have no meaning here. Short-circuit
+    # them with a clean 405 instead of letting them fall through to
+    # the backend's SDK manager (which would produce an ugly 500-via-
+    # internal-exception response that leaks no info but offends
+    # wrong-status hygiene).
+    if req.method == "GET" and bearer is None:
+        # Cookie-only GET: spec verb but cookie path can't carry it.
+        # Return 405 instead of proxying — saves a backend round-trip
+        # AND avoids the ``session_registry_no_agent`` 500.
+        raise web.HTTPMethodNotAllowed(
+            method=req.method,
+            allowed_methods=["POST"],
+            reason="GET on /mcp requires a per-agent bearer token",
+        )
+    if req.method not in ("POST", "GET", "DELETE"):
+        raise web.HTTPMethodNotAllowed(
+            method=req.method,
+            allowed_methods=["POST", "GET", "DELETE"],
+            reason=f"/mcp/{name} accepts only POST/GET/DELETE",
+        )
     forwarding_header: tuple[str, str] | None = None
     if bearer is None:
         # No bearer header — try the operator-session cookie. The
