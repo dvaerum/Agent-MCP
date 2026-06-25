@@ -1931,23 +1931,40 @@ async def delete_memory_api_route(
     request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
-    """DELETE /api/memories/<context_key> — admin deletes a memory.
+    """DELETE /api/memories/<context_key> — operator deletes a memory.
 
-    Thin adapter over the ``delete_project_context`` MCP tool
-    (Candidate C, 2026-06-02 architecture review). The tool's
-    ``inputSchema`` requires ``context_key`` (or ``context_keys``),
-    auth is gated by the tool's own per-key creator-ownership matrix
-    (``@requires("any")``; admins pass through unconditionally).
+    Writes the DB directly via SQLAlchemy, mirroring the sibling
+    CREATE (``create_memory_api_route``) and UPDATE
+    (``update_memory_api_route``) handlers above. Auth: the outer
+    ``require_operator_session`` dep accepts cookie / signed
+    forwarding-header / operator-tier bearer; if we reached the
+    handler the caller is authorised.
 
-    The MCP tool refuses to delete "critical" keys (``config_*``,
-    ``server_*``, ``mcp_*``, ``database_*``, ``system_*``) without
-    ``force_delete=true``. The legacy REST handler had no such guard,
-    so we pass ``force_delete=true`` to preserve wire compatibility —
-    the dashboard never sent this flag and would otherwise start
-    seeing 400s on system keys it could delete before. Wire-shape
-    parity is pinned by tests/test_rest_mcp_tool_parity.py.
+    F005 (verify-all-v4) fix — 2026-06-25
+    -----------------------------------------
+    This route previously dispatched through the
+    ``delete_project_context`` MCP tool via ``_dispatch_through_tool``.
+    That tool is gated by ``@requires("any")``, whose ``_check_role``
+    branch intentionally rejects operator-session callers that don't
+    carry a per-agent token (audit attribution needs an
+    ``agent_id``; see ``agent_mcp/core/authorize.py:120-125``).
+    The dashboard's DELETE body is ``{}`` (no token field; cf.
+    ``agent_mcp/dashboard/lib/api.ts:844-849``) and the cookie path
+    intentionally doesn't synthesise a god-key bearer post
+    retire-system-token Wave 1 — so the dispatch returned
+    ``Unauthorized: Valid token required`` (403) for every
+    cookie-authenticated operator.
 
-    PR D (prancy-napping-pie): auth via ``require_operator_session``.
+    The CREATE and UPDATE siblings never had this regression because
+    they write the project_context table directly after the
+    ``require_operator_session`` gate; this handler now follows the
+    same shape. The MCP tool keeps its own ``@requires("any")`` guard
+    for non-REST callers — untouched. ``force_delete=true`` semantics
+    are preserved by virtue of the REST layer never enforcing the
+    critical-keys guard (it never did; the comment that lived here
+    before explained that we passed ``force_delete=true`` to the tool
+    to preserve that legacy behavior). Wire-shape parity is pinned by
+    ``tests/test_rest_mcp_tool_parity.py``.
     """
     if request.method == 'OPTIONS':
         return await handle_options(request)
@@ -1962,30 +1979,67 @@ async def delete_memory_api_route(
 
     context_key = path_parts[-1]
 
+    # Consume the JSON body if present (validates that it parses, and
+    # — historically — gave the dep the body-token. We no longer act
+    # on it here; the dep has already authorised the caller.)
     try:
-        body = await get_sanitized_json_body(request)
+        await get_sanitized_json_body(request)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-    # retire-system-token Wave 3: drop the synthesized system-bearer.
-    # ``delete_project_context_tool_impl`` is ``@requires("any")``, so
-    # the dispatch needs an agent-shaped bearer for the decorator to
-    # admit. The outer ``require_operator_session`` dep has already
-    # verified the operator credential (cookie / forwarding header /
-    # body-token); when the operator passed a body-token, forward it
-    # as the bearer so the tool's ``@requires("any")`` gate resolves
-    # the caller via ``get_agent_id``. ``operator_session=True`` also
-    # propagates the operator-session ContextVar for per-key audit /
-    # ownership matrix attribution inside the impl.
-    body_token = (body or {}).get("token") if isinstance(body, dict) else None
-    return await _dispatch_through_tool(
-        "delete_project_context",
-        {"context_key": context_key, "force_delete": True},
-        bearer_token=body_token,
-        operator_session=True,
-        operator_user_id=caller_identity(auth),
-        success_message=f"Memory '{context_key}' deleted successfully",
-    )
+    requesting_admin_id = caller_identity(auth)
+
+    session = None
+    try:
+        session = SessionLocal()
+
+        row = (
+            session.query(ProjectContext)
+            .filter(ProjectContext.context_key == context_key)
+            .one_or_none()
+        )
+        if row is None:
+            return JSONResponse(
+                {
+                    "success": False,
+                    "error": f"Memory '{context_key}' not found",
+                    "message": f"Memory '{context_key}' not found",
+                },
+                status_code=404,
+            )
+
+        session.delete(row)
+        session.flush()
+
+        # Audit attribution. Same shape as CREATE/UPDATE — log through
+        # the session's raw connection so it lands in the same
+        # transaction as the row delete.
+        raw_conn = session.connection().connection
+        cursor = raw_conn.cursor()
+        log_agent_action_to_db(
+            cursor,
+            requesting_admin_id,
+            "deleted_memory",
+            details={"context_key": context_key},
+        )
+        session.commit()
+
+        return JSONResponse({
+            "success": True,
+            "message": f"Memory '{context_key}' deleted successfully",
+        })
+
+    except Exception as e:
+        if session is not None:
+            session.rollback()
+        logger.error(f"Error deleting memory: {e}", exc_info=True)
+        return JSONResponse(
+            {"error": f"Failed to delete memory: {str(e)}"},
+            status_code=500,
+        )
+    finally:
+        if session is not None:
+            session.close()
 
 # --- Task CRUD endpoints (UPSTREAM_ISSUES.md issue C) ---
 # Tasks already have GET /api/tasks (list) and POST /api/update-task-dashboard

@@ -253,6 +253,62 @@ async def test_delete_memory_rejects_no_auth(tmp_path) -> None:
         assert r.status_code == 401, r.text
 
 
+async def test_delete_memory_via_operator_session_succeeds(tmp_path) -> None:
+    """DELETE /api/memories/<k> — operator-session path (no body token,
+    no Authorization header) must succeed.
+
+    This is the path the dashboard takes after retire-system-token Wave 2:
+    the browser holds an ``agent_mcp_session`` cookie, the router
+    translates it into a signed ``X-Agent-MCP-Forwarded-Operator``
+    header, and the backend's ``require_operator_session`` admits via
+    the forwarding-header branch. The DELETE body is ``{}`` — no token.
+
+    F005 (verify-all-v4) regression: the route used to dispatch
+    through the ``delete_project_context`` MCP tool, which is gated
+    by ``@requires("any")``. The ``"any"`` branch needs a per-agent
+    token to resolve an ``agent_id`` (audit attribution), so an
+    operator-session call with no bearer hit ``Unauthorized: Valid
+    token required`` 403. Sibling CREATE/UPDATE routes write the
+    DB directly via SQLAlchemy and didn't share the regression.
+
+    ``admin.request(...)`` (not ``admin.client.request``) attaches the
+    signed forwarding header that the router would attach in
+    production — closest in-process simulation of the cookie path.
+    """
+    async with mcp_session(tmp_path) as admin:
+        # Create the memory via the same operator-session path so we
+        # also pin the sibling-route parity (CREATE works; DELETE must
+        # too).
+        r_create = admin.request(
+            "POST",
+            "/api/memories",
+            json={"context_key": "f005-mem", "context_value": "hello"},
+        )
+        assert r_create.status_code == 200, r_create.text
+
+        # The bug: DELETE with operator-session + no body token + no
+        # Authorization header → 403 "Valid token required".
+        r = admin.request(
+            "DELETE", "/api/memories/f005-mem", json={}
+        )
+        assert r.status_code == 200, r.text
+
+        # Confirm the row is actually gone (not just a 200 envelope).
+        from agent_mcp.db.engine import SessionLocal
+        from agent_mcp.db.models import ProjectContext
+
+        sess = SessionLocal()
+        try:
+            row = (
+                sess.query(ProjectContext)
+                .filter(ProjectContext.context_key == "f005-mem")
+                .one_or_none()
+            )
+            assert row is None, "DELETE must remove the row"
+        finally:
+            sess.close()
+
+
 async def _seed_task(admin, task_id: str) -> None:
     """Seed a task row via direct SQL insert.
 
