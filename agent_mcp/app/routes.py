@@ -2069,7 +2069,7 @@ async def create_task_api_route(
     conn = None
     try:
         data = await get_sanitized_json_body(request)
-        title = data.get('task_title')
+        raw_title = data.get('task_title')
         description = data.get('task_description', '')
         priority = data.get('priority', 'medium')
         assigned_to = data.get('assigned_to')  # nullable
@@ -2083,9 +2083,31 @@ async def create_task_api_route(
         # The repo (task_repo.create) handles json.dumps internally.
         _norm_caps = normalize_capabilities(data.get('required_capabilities'))
 
-        if not title:
+        # F004 (verify-all-v6 MUTATING #3): distinguish an absent field
+        # from one whose content was stripped to empty by the JSON-input
+        # sanitizer (utils/json_utils.py removes NULL/control bytes and
+        # zero-width Unicode BEFORE the JSON parse — a body like
+        # ``{"task_title":"\x00\x01"}`` arrives here as
+        # ``{"task_title":""}``). Conflating the two emits
+        # "task_title is required" for a title that *was* sent, pointing
+        # the operator at the wrong remediation. Whitespace-only titles
+        # are also rejected here (previously they slipped through as a
+        # truthy string and created a task named "   ").
+        if raw_title is None:
             return JSONResponse(
                 {"error": "task_title is required"}, status_code=400
+            )
+        title = raw_title.strip() if isinstance(raw_title, str) else ""
+        if not title:
+            return JSONResponse(
+                {
+                    "error": "task_title_empty_after_strip",
+                    "message": (
+                        "task_title contains only whitespace or "
+                        "non-printable characters after sanitization"
+                    ),
+                },
+                status_code=400,
             )
 
         requesting_admin_id = caller_identity(auth)

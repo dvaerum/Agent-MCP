@@ -64,13 +64,65 @@ async def test_post_tasks_rejects_bad_token(tmp_path) -> None:
 
 
 async def test_post_tasks_rejects_missing_title(tmp_path) -> None:
-    """POST /api/tasks with no title returns 400."""
+    """POST /api/tasks with no title returns 400 + the legacy
+    'task_title is required' error (legitimate missing-field signal,
+    unchanged by F004)."""
     async with mcp_session(tmp_path) as admin:
         r = admin.client.post(
             "/api/tasks",
             json={"token": admin.admin_token, "task_description": "no title"},
         )
         assert r.status_code == 400, r.text
+        assert r.json().get("error") == "task_title is required", r.json()
+
+
+async def test_post_tasks_rejects_whitespace_only_title(tmp_path) -> None:
+    """F004: a title that was sent but contains only whitespace returns
+    400 with the distinct ``task_title_empty_after_strip`` error — not
+    the misleading 'task_title is required' message that implies the
+    field was omitted entirely (verify-all-v6 MUTATING #3)."""
+    async with mcp_session(tmp_path) as admin:
+        r = admin.client.post(
+            "/api/tasks",
+            json={
+                "token": admin.admin_token,
+                "task_title": "   ",
+                "task_description": "whitespace only",
+            },
+        )
+        assert r.status_code == 400, r.text
+        body = r.json()
+        assert body.get("error") == "task_title_empty_after_strip", body
+
+
+async def test_post_tasks_rejects_control_chars_only_title(tmp_path) -> None:
+    """F004 v6 case: literal NULL/control bytes in the JSON body get
+    stripped by the input sanitizer (utils/json_utils.py step 3),
+    leaving an empty string. The handler must still distinguish this
+    from a missing field so the operator sees the right remediation
+    hint.
+
+    Bearer auth (not body-token) because the auth dep parses the body
+    with strict ``json.loads`` which rejects literal control bytes —
+    we want the auth path to admit, then exercise the
+    sanitised-body path inside the handler.
+    """
+    async with mcp_session(tmp_path) as admin:
+        # Raw bytes — control chars in the JSON literal trigger the
+        # sanitizer's control-char stripping (step 3 in
+        # utils/json_utils.py::sanitize_json_input) BEFORE JSON parsing.
+        body = b'{"task_title":"\x00\x01","task_description":"ctrl"}'
+        r = admin.client.post(
+            "/api/tasks",
+            content=body,
+            headers={
+                "content-type": "application/json",
+                "Authorization": f"Bearer {admin.admin_token}",
+            },
+        )
+        assert r.status_code == 400, r.text
+        payload = r.json()
+        assert payload.get("error") == "task_title_empty_after_strip", payload
 
 
 async def test_delete_tasks_removes_task_with_admin_token(tmp_path) -> None:
