@@ -502,6 +502,25 @@ in {
           # (= $XDG_RUNTIME_DIR/agent-mcp/<name>/) — tmpfs, 0700.
           RuntimeDirectory = "agent-mcp/%i";
           RuntimeDirectoryMode = "0700";
+          Environment = [
+            # Backend MUST point at the same router.db as the router
+            # unit below. agent_mcp.app.deps._resolve_session_user lazily
+            # `from ..router import identity` and calls
+            # identity.get_session(...), which opens the path returned
+            # by agent_mcp.router.migrations_runner.get_router_db_path()
+            # — that helper honours AGENT_MCP_ROUTER_DB and otherwise
+            # falls back to /var/lib/agent-mcp/router.db (the system-mode
+            # default). User-mode units cannot read that path, the open
+            # raises PermissionError, the bare ``except Exception`` in
+            # _resolve_session_user logs "treating as anonymous", and
+            # every operator-only endpoint 401s.
+            #
+            # Same drift pattern as PR #223 (router unit got the var)
+            # and PR #224 (forwarding_hmac ExecStartPre). The value
+            # below MUST stay identical to the router unit's
+            # AGENT_MCP_ROUTER_DB — both processes open the same file.
+            "AGENT_MCP_ROUTER_DB=${config.xdg.dataHome}/agent-mcp/router.db"
+          ];
           # F015 v4/v6/v7 port from nix/module.nix (PRs #214, #216,
           # #217). The system-mode NixOS module gained these
           # ExecStartPre lines; the home-manager template here was
