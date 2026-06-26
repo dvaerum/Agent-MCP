@@ -1,9 +1,111 @@
 """
 String utility functions for the MCP server.
 
-This module provides various string manipulation functions that can be used 
+This module provides various string manipulation functions that can be used
 throughout the MCP server application.
 """
+
+import re
+
+
+# --- Unsafe-Unicode validator (F005 verify-all-v6 MUTATING #3) -------------
+#
+# Identifier-like fields (e.g. ``project_context.context_key``) are
+# displayed back to operators in the dashboard and quoted into shell
+# tooling / log lines. Unicode control characters, bidirectional
+# overrides, and invisible/format characters in those fields are a
+# spoofing + tooling-corruption attack surface:
+#
+#   * U+0000 NULL terminates C-style strings → truncates audit
+#     records, breaks ``grep``/``find`` pipelines.
+#   * U+202E RIGHT-TO-LEFT OVERRIDE flips display order — a key
+#     stored as ``config<U+202E>drowssap`` renders as
+#     ``configpassword`` in the UI but searches/stores as the
+#     original. Classic homoglyph-substitute attack vector.
+#   * U+FEFF BOM / U+200B ZERO-WIDTH SPACE / U+2060 WORD JOINER and
+#     friends are invisible — two keys that "look" identical can
+#     differ by an invisible char, defeating uniqueness checks for
+#     human reviewers.
+#
+# verify-all-v6 MUTATING #3 surfaced this by POSTing
+# ``{"context_key": "u‮ ﻿\U0001F680key", ...}`` to
+# ``/api/memories`` and getting a 200 — the row landed in the DB
+# with raw NULL / RTL / BOM bytes in the primary-key field.
+#
+# Emoji (e.g. U+1F680 ROCKET) are intentionally NOT rejected — they
+# render predictably across renderers and don't carry the
+# spoofing/control semantics that the ranges below do.
+
+# Pre-compiled regex matching any disallowed-in-identifiers character:
+#   U+0000-U+001F : ASCII C0 controls (NULL, BELL, ESC, …)
+#   U+007F        : DEL
+#   U+200B-U+200F : zero-width space/non-joiner/joiner, LRM, RLM
+#   U+2028-U+2029 : line separator, paragraph separator
+#   U+202A-U+202E : PDF/LRO/RLO/LRE/RLE bidi overrides
+#   U+2060-U+2064 : word joiner, function-application, inv-times, etc.
+#   U+2066-U+2069 : LRI, RLI, FSI, PDI bidi isolates
+#   U+206A-U+206F : deprecated bidi controls (shape selectors)
+#   U+FEFF        : BOM / zero-width no-break space
+_DISALLOWED_KEY_CHAR_RE = re.compile(
+    r"[\x00-\x1F\x7F"
+    r"​-‏"
+    r" - "
+    r"‪-‮"
+    r"⁠-⁤"
+    r"⁦-⁩"
+    r"⁪-⁯"
+    r"﻿"
+    r"]"
+)
+
+
+def has_unsafe_unicode_for_identifier(value: str) -> bool:
+    """Return True if ``value`` contains a Unicode codepoint that we
+    refuse in identifier-like fields (memory keys, etc.).
+
+    See module-level comment for the rationale and ranges.
+
+    Args:
+        value: The candidate identifier string.
+
+    Returns:
+        True if the string contains a disallowed control / bidi /
+        invisible character; False otherwise.
+
+    Examples:
+        >>> has_unsafe_unicode_for_identifier("normal_key")
+        False
+        >>> has_unsafe_unicode_for_identifier("café.config")
+        False
+        >>> has_unsafe_unicode_for_identifier("emoji.\U0001F680.key")
+        False
+        >>> has_unsafe_unicode_for_identifier("a\\x00b")
+        True
+        >>> has_unsafe_unicode_for_identifier("config‮drowssap")
+        True
+    """
+    if not isinstance(value, str):
+        return False
+    return _DISALLOWED_KEY_CHAR_RE.search(value) is not None
+
+
+# Reusable error envelope for handlers that reject an unsafe key.
+# Keeping the message in one place means the test + the handler +
+# any future REST surface (PUT, MCP-tool wrapper) speak with one
+# voice. ``error`` is the machine code; ``message`` is the human
+# explanation. The envelope matches the existing ``{"error": ...}``
+# shape that other 400-rejecting handlers in ``routes.py`` use.
+UNSAFE_KEY_ERROR = {
+    "error": "invalid_key_character",
+    "message": (
+        "Memory key contains a disallowed character "
+        "(Unicode control / bidi-override / invisible). "
+        "Allowed: printable Unicode except "
+        "U+0000-U+001F, U+007F, "
+        "U+200B-U+200F, U+2028-U+2029, U+202A-U+202E, "
+        "U+2060-U+2064, U+2066-U+2069, U+206A-U+206F, U+FEFF."
+    ),
+}
 
 
 def camel_to_snake_case(camel_string: str) -> str:
