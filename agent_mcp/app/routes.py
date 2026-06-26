@@ -26,6 +26,10 @@ from ..core import globals as g
 from ..core.auth import get_agent_id as auth_get_agent_id
 from .deps import caller_identity, require_operator_session
 from ..utils.json_utils import get_sanitized_json_body
+from ..utils.string_utils import (
+    UNSAFE_KEY_ERROR,
+    has_unsafe_unicode_for_identifier,
+)
 from ..db.connection import get_db_connection
 from ..db.engine import SessionLocal
 from ..db.models import ProjectContext
@@ -1779,6 +1783,17 @@ async def create_memory_api_route(
         if not context_key:
             return JSONResponse({"error": "context_key is required"}, status_code=400)
 
+        # F005 verify-all-v6 MUTATING #3: reject keys containing
+        # Unicode control / bidi-override / invisible characters.
+        # See ``agent_mcp/utils/string_utils.py`` for the rationale —
+        # short version: a key like ``config<U+202E>drowssap``
+        # renders in the dashboard as ``configpassword`` (the RTL
+        # override flips display order) but stores/searches as the
+        # original, which is a real spoofing vector for any operator
+        # reviewing memory keys.
+        if has_unsafe_unicode_for_identifier(context_key):
+            return JSONResponse(UNSAFE_KEY_ERROR, status_code=400)
+
         requesting_admin_id = caller_identity(auth)
 
         session = SessionLocal()
@@ -1859,6 +1874,16 @@ async def update_memory_api_route(
         return JSONResponse({"error": "context_key is required in URL"}, status_code=400)
 
     context_key = path_parts[-1]
+
+    # F005 verify-all-v6 MUTATING #3: reject keys with Unicode
+    # control / bidi-override / invisible chars. Matches the
+    # CREATE-handler check above so update can't backdoor a
+    # spoofing-prone key (and so PUT to a URL-encoded unsafe key
+    # returns 400 — the actionable rejection — rather than 404
+    # "not found", which leaks the same information after the
+    # decoder has already let the unsafe payload in).
+    if has_unsafe_unicode_for_identifier(context_key):
+        return JSONResponse(UNSAFE_KEY_ERROR, status_code=400)
 
     session = None
     try:
