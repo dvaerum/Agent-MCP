@@ -531,6 +531,19 @@ in {
             "AGENT_MCP_IDLE_SEC=${toString cfg.router.idleSec}"
             "AGENT_MCP_README_HTML=${resolvedPkgs.readmeHtml}"
             "AGENT_MCP_INSTALLER_TEMPLATE=${resolvedPkgs.installerTemplate}"
+            # Router DB lives under XDG_DATA_HOME (default
+            # ~/.local/share/agent-mcp/router.db). Without this, the
+            # python default in agent_mcp.router.migrations_runner
+            # (_DEFAULT_ROUTER_DB = /var/lib/agent-mcp/router.db) kicks
+            # in — and user-mode systemd units cannot write there, so
+            # the router restart-loops with
+            # `PermissionError: [Errno 13] Permission denied:
+            # '/var/lib/agent-mcp'`. The NixOS module uses
+            # /var/lib/agent-mcp/ which works for its system-mode user;
+            # user-mode home-manager units need an XDG path. The
+            # migrations_runner already mkdirs the parent so no
+            # tmpfiles equivalent is required.
+            "AGENT_MCP_ROUTER_DB=${config.xdg.dataHome}/agent-mcp/router.db"
           ]
           # Phase 3 Wave 3 (prancy-napping-pie): SSO env vars are
           # appended conditionally. OIDC and proxy-header are
