@@ -502,9 +502,52 @@ in {
           # (= $XDG_RUNTIME_DIR/agent-mcp/<name>/) — tmpfs, 0700.
           RuntimeDirectory = "agent-mcp/%i";
           RuntimeDirectoryMode = "0700";
-          # Defensive: kill any stale socket file before launching so the
-          # backend's bind() can succeed cleanly.
-          ExecStartPre = "${pkgs.coreutils}/bin/rm -f %t/agent-mcp/%i/backend.sock";
+          # F015 v4/v6/v7 port from nix/module.nix (PRs #214, #216,
+          # #217). The system-mode NixOS module gained these
+          # ExecStartPre lines; the home-manager template here was
+          # never updated, so real user-mode deploys hit:
+          #
+          #   agent-mcp-launcher: Error: Invalid value for
+          #     '--forwarding-hmac-in':
+          #     File '/run/user/1000/agent-mcp/<name>/forwarding_hmac'
+          #     does not exist.
+          #   systemd: agent-mcp@<name>.service: Main process exited,
+          #     code=exited, status=2/INVALIDARGUMENT
+          #   systemd: Scheduled restart job, restart counter is at 630.
+          #
+          # The launcher passes ``--forwarding-hmac-in
+          # $XDG_RUNTIME_DIR/agent-mcp/<name>/forwarding_hmac`` to the
+          # backend; without an ExecStartPre to materialise that file,
+          # the unit crash-loops forever.
+          #
+          # Rationale (per PR #214): the router (Python) used to write
+          # the key, but systemd's ``Restart=on-failure`` reactivates
+          # the unit without going through the router. Owning key
+          # generation in the unit ExecStartPre guarantees the file
+          # exists on EVERY start path (manual ``systemctl --user
+          # start``, on-failure restart, login activation).
+          #
+          # Notes on the shell + binaries:
+          # - ``pkgs.runtimeShell`` (PR #216 / F015 v6): coreutils
+          #   does NOT ship ``sh``; the original v4 used
+          #   ``${pkgs.coreutils}/bin/sh`` and every start failed with
+          #   ``status=203/EXEC``.
+          # - 32 raw bytes (PR #217 / F015 v7): bytes are binary; the
+          #   router's reader does NOT ``.strip()`` them. Use ``head
+          #   -c 32 /dev/urandom`` directly into the file.
+          # - Idempotent (``test -f … || { … ; }``): the router caches
+          #   the bytes in-memory and a re-spawn must not rotate the
+          #   key — see commit 862e594 (cache + file consistency).
+          # - ``$RUNTIME_DIRECTORY``: set by systemd when
+          #   ``RuntimeDirectory=`` is declared; resolves to
+          #   ``$XDG_RUNTIME_DIR/agent-mcp/<instance>``.
+          #
+          # Defensive socket cleanup retained as the second
+          # ExecStartPre (was the only entry before this fix).
+          ExecStartPre = [
+            "${pkgs.runtimeShell} -c 'test -f \"$RUNTIME_DIRECTORY/forwarding_hmac\" || { ${pkgs.coreutils}/bin/head -c 32 /dev/urandom > \"$RUNTIME_DIRECTORY/forwarding_hmac\" && ${pkgs.coreutils}/bin/chmod 600 \"$RUNTIME_DIRECTORY/forwarding_hmac\"; }'"
+            "${pkgs.coreutils}/bin/rm -f %t/agent-mcp/%i/backend.sock"
+          ];
           ExecStart = "${resolvedPkgs.agentMcpLauncher}/bin/agent-mcp-launcher %i";
           Restart = "on-failure";
           RestartSec = 5;
