@@ -537,26 +537,22 @@ export function PromptBookDashboard() {
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             <div className="flex items-center gap-2 text-sm">
               <Badge variant="secondary" className="text-xs">1</Badge>
-              <span>Initialize Admin Agent</span>
-            </div>
-            <div className="flex items-center gap-2 text-sm">
-              <Badge variant="secondary" className="text-xs">2</Badge>
               <span>Add Project Context</span>
             </div>
             <div className="flex items-center gap-2 text-sm">
-              <Badge variant="secondary" className="text-xs">3</Badge>
+              <Badge variant="secondary" className="text-xs">2</Badge>
               <span>Create Worker Agents</span>
             </div>
             <div className="flex items-center gap-2 text-sm">
-              <Badge variant="secondary" className="text-xs">4</Badge>
+              <Badge variant="secondary" className="text-xs">3</Badge>
               <span>Initialize Workers</span>
             </div>
             <div className="flex items-center gap-2 text-sm">
-              <Badge variant="secondary" className="text-xs">5</Badge>
+              <Badge variant="secondary" className="text-xs">4</Badge>
               <span>Assign Tasks</span>
             </div>
             <div className="flex items-center gap-2 text-sm">
-              <Badge variant="secondary" className="text-xs">6</Badge>
+              <Badge variant="secondary" className="text-xs">5</Badge>
               <span>Monitor & Debug</span>
             </div>
           </div>

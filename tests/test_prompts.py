@@ -162,13 +162,17 @@ async def test_prompts_get_renders_template_with_variables(
 async def test_prompts_get_leaves_unsupplied_variables_blank(
     tmp_path: Path,
 ) -> None:
-    """Missing arguments for OPTIONAL variables substitute as empty
-    strings; the unfilled placeholder MUST NOT leak through."""
+    """Missing arguments substitute as empty strings; the unfilled
+    placeholder MUST NOT leak through.
+
+    Uses `debug-task-flow` (the smallest remaining catalog entry —
+    one required variable). The debug-agent-status fixture this test
+    used to lean on was deleted in the prompt-book cleanup PR
+    (duplicated the Agents dashboard page)."""
     from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
-        # `debug-agent-status` has only optional variables.
-        result = await _get_prompt(admin, "debug-agent-status", {})
+        result = await _get_prompt(admin, "debug-task-flow", {})
         text = ""
         for m in result.messages or []:
             content = getattr(m, "content", None)
@@ -177,6 +181,114 @@ async def test_prompts_get_leaves_unsupplied_variables_blank(
                 text += t
         assert "{{" not in text, (
             f"unfilled placeholder leaked: {text!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Regression guards — added in the prompt-book cleanup PR.
+#
+# 1. Two prompts were deleted (admin-token-vestige + status-dashboard
+#    duplicate) — these tests fail loudly if either ever re-appears.
+# 2. The "admin agent" wording was retired in favour of "operator MCP
+#    session" (the admin pseudo-agent itself is gone post-Wave-4, see
+#    PR #206 / migration 0014). Catalog descriptions and usage strings
+#    must not teach the retired concept.
+# 3. The wake-loop instructions used to reference tools that don't
+#    exist in the registry (`view_messages`, `view_task` singular). The
+#    correct names are `get_agent_messages` and `view_tasks`.
+# ---------------------------------------------------------------------------
+
+
+def test_deleted_prompts_stay_deleted() -> None:
+    """`worker-init-legacy` and `debug-agent-status` were removed in
+    the prompt-book cleanup; they must not be re-introduced.
+
+    - `worker-init-legacy` taught the retired `{{ADMIN_TOKEN}}`
+      pseudo-agent flow (PRs #203-#212 retired admin_token; PR #206 /
+      migration 0014 retired the admin pseudo-agent row itself).
+    - `debug-agent-status` duplicated the live Agents dashboard page
+      and wasn't worth the maintenance.
+    """
+    from agent_mcp.prompts import load_catalog
+
+    ids = {p["id"] for p in load_catalog().get("prompts", [])}
+    assert "worker-init-legacy" not in ids, (
+        "worker-init-legacy teaches the retired {{ADMIN_TOKEN}} flow; "
+        "do not re-add"
+    )
+    assert "debug-agent-status" not in ids, (
+        "debug-agent-status duplicates the Agents dashboard page; "
+        "do not re-add"
+    )
+
+
+def test_no_prompt_teaches_admin_agent_concept() -> None:
+    """No prompt's `description` or `usage` field may mention the
+    retired "admin agent" concept (case-insensitive).
+
+    Post-Wave-4 there is no admin pseudo-agent — humans operate the
+    server through their own MCP session (the "operator MCP session"
+    in the new wording).
+    """
+    from agent_mcp.prompts import load_catalog
+
+    leaks: list[str] = []
+    for p in load_catalog().get("prompts", []):
+        for field in ("description", "usage"):
+            value = p.get(field, "") or ""
+            if "admin agent" in value.lower():
+                leaks.append(f"{p['id']}.{field}: {value!r}")
+    assert not leaks, (
+        "prompts still reference the retired 'admin agent' concept; "
+        "use 'operator MCP session' instead. Offenders:\n  - "
+        + "\n  - ".join(leaks)
+    )
+
+
+def test_wake_loop_prompt_uses_real_tool_names() -> None:
+    """The `agent-mcp-enter-event-loop` prompt must reference tools
+    that actually exist in the registry.
+
+    `view_messages` was never registered; the real tool is
+    `get_agent_messages` (agent_mcp/tools/agent_communication_tools.py).
+    `view_task` (singular) was never registered either; the real tool
+    is `view_tasks` (plural, agent_mcp/tools/task_tools.py).
+
+    Workers that paste the prompt and try to call the non-existent
+    tools get an immediate registry error — broken onboarding.
+    """
+    import re
+
+    from agent_mcp.prompts import get_prompt
+    from agent_mcp.app.event_loop_instructions import WAKE_LOOP_INSTRUCTIONS
+
+    entry = get_prompt("agent-mcp-enter-event-loop")
+    assert entry is not None, "wake-loop catalog entry vanished"
+    template = entry["template"]
+
+    # The two consumers (catalog + python constant) MUST stay in sync;
+    # check both copies independently.
+    for label, text in (
+        ("catalog.json template", template),
+        ("WAKE_LOOP_INSTRUCTIONS constant", WAKE_LOOP_INSTRUCTIONS),
+    ):
+        assert "get_agent_messages" in text, (
+            f"{label} missing get_agent_messages"
+        )
+        assert "view_tasks" in text, f"{label} missing view_tasks"
+        assert "view_messages" not in text, (
+            f"{label} still references non-existent view_messages tool"
+        )
+        # `view_task,` (with trailing comma) catches the singular form
+        # without false-positive on `view_tasks`.
+        assert "view_task," not in text, (
+            f"{label} still references non-existent view_task "
+            "(singular) tool"
+        )
+        # Also catch `view_task ` (trailing space) and `view_task)`.
+        assert not re.search(r"view_task(?![s_])", text), (
+            f"{label} still references non-existent view_task "
+            "(singular) tool"
         )
 
 

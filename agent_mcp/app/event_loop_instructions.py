@@ -34,7 +34,7 @@ WAKE_LOOP_INSTRUCTIONS = (
     "AGENT WAKE LOOP: On session start AND after recovery from any "
     "wait_for_events error: first call fetch_events_since(your_last_cursor) "
     "to drain anything missed since you were last connected. Handle each "
-    "returned event (call view_messages or view_task to fetch full content "
+    "returned event (call get_agent_messages or view_tasks to fetch full content "
     "for skinny events). Then enter a loop where you call wait_for_events(); "
     "when it returns events, handle each, then call wait_for_events() again. "
     "If you receive a {type: \"stop_listening\"} event, exit the loop and "
