@@ -42,7 +42,7 @@ and the dashboard polish shipped alongside this ADR in PR-3.
 | Per-agent toggle | `agents.auto_event_loop BOOLEAN NOT NULL DEFAULT 1`. Greyed out (with note) in the per-agent edit modal when global is OFF. |
 | Stop notification | Flows through `wait_for_events` return as `{type: "stop_listening", reason: "..."}` |
 | Reconnect catch-up | Push+pull: `agents.last_event_seen_at TEXT NULL` (ISO cursor) + `fetch_events_since(cursor)` tool. Wake-loop instructions cover both session-start and reconnect catch-up. |
-| Event payload | Hybrid: **fat** for `new_message` + `task_assigned`; **skinny** for `unassigned_task_appeared` (title + priority + required_capabilities only; agent calls `view_task` for full body) |
+| Event payload | Hybrid: **fat** for `new_message` + `task_assigned`; **skinny** for `unassigned_task_appeared` (title + priority + required_capabilities only; agent calls `view_tasks` for full body) |
 | Concurrent `wait_for_events` per agent | Reject second with HTTP 409 analog (`{"error": "another_wait_in_flight"}`) via per-agent `asyncio.Lock` (`g.lock_for(agent_id)`) |
 | Shutdown drain | Already shipped (PR #125 v5.0.8 — `on_shutdown` cancels in-flight waits cleanly) |
 
@@ -145,7 +145,7 @@ silent design pivot.
 ## Alternatives considered
 
 - **Pure periodic polling.** Each idle hour costs roughly 90k tokens
-  (a `view_messages` call every ~40s plus the model's framing tokens)
+  (a `get_agent_messages` call every ~40s plus the model's framing tokens)
   versus roughly 12k with 60s long-poll waits. Long-poll also
   delivers messages within the wake latency (~ms after `signal.set()`)
   instead of one polling interval. Rejected on cost and latency.

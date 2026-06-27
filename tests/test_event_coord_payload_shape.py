@@ -76,7 +76,7 @@ async def test_message_event_keeps_fat_data_shape(tmp_path: Path) -> None:
 
 async def test_unassigned_task_event_is_skinny(tmp_path: Path) -> None:
     """`unassigned_task_appeared` payload must NOT include
-    `description` (the spec's reason: workers call `view_task` if
+    `description` (the spec's reason: workers call `view_tasks` if
     they're interested, keeping the wake event small)."""
     from tests.harness import mcp_session
     from agent_mcp.tools.task_tools import assign_task_tool_impl
