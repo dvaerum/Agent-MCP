@@ -46,24 +46,34 @@ interface VisGraphProps {
   onClosePanel?: () => void
 }
 
-// Physics options with better spacing and clustering
+// Physics options tuned for quick convergence. The original
+// -12000 gravitational + 0.02 spring + 0.2 damping combo left the
+// simulator oscillating against the pinned outer rings (context @
+// radius 400, tasks @ radius 600±100) forever — ~99% CPU at ~23fps.
+// Stronger springs + heavier damping + a velocity cap let the
+// layout settle in <1s; the 200-iteration stabilization budget is
+// sufficient for typical project sizes (~80 nodes, ~100 edges).
+//
+// Pairs with the stop-on-stabilize handler in the init effect:
+// damping alone would still tick forever in steady state, so we
+// also freeze physics once stabilizationIterationsDone fires.
 const physicsOptions = {
   physics: {
     enabled: true,
     barnesHut: {
-      gravitationalConstant: -12000,
-      centralGravity: 0.05,
+      gravitationalConstant: -3000,
+      centralGravity: 0.3,
       springLength: 250,
-      springConstant: 0.02,
-      damping: 0.2,
+      springConstant: 0.08,
+      damping: 0.5,
       avoidOverlap: 1
     },
-    maxVelocity: 50,
+    maxVelocity: 25,
     minVelocity: 0.1,
     solver: 'barnesHut',
     stabilization: {
       enabled: true,
-      iterations: 1000,
+      iterations: 200,
       updateInterval: 25,
       fit: true
     },
@@ -610,6 +620,32 @@ export default function VisNetworkLoader({
       if (layoutMode === 'physics') {
         network.startSimulation()
       }
+
+      // Freeze physics once layout stabilizes (paired with the
+      // dampened physicsOptions above). The barnesHut simulator
+      // never reaches true rest with our pinned-ring layout (admin
+      // centred + context/task rings fixed) — the mobile agent
+      // nodes oscillate against the immovable outer ring forever
+      // without an explicit stop. Re-enable on drag so the user
+      // can still rearrange nodes interactively; freeze again once
+      // the post-drag wobble settles.
+      const freezePhysics = () => {
+        network.setOptions({ physics: { enabled: false } })
+      }
+      const thawPhysics = () => {
+        network.setOptions({ physics: { enabled: true } })
+      }
+      network.on('stabilizationIterationsDone', freezePhysics)
+      network.on('dragStart', thawPhysics)
+      network.on('dragEnd', () => {
+        // After a drag, re-stabilize then freeze again.
+        const onceStabilized = () => {
+          freezePhysics()
+          network.off('stabilized', onceStabilized)
+        }
+        network.on('stabilized', onceStabilized)
+        network.stabilize()
+      })
 
       // Add resize observer for responsive sizing
       const resizeObserver = new ResizeObserver((entries) => {
