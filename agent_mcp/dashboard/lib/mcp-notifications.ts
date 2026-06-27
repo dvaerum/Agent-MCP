@@ -346,45 +346,47 @@ export function openMcpNotificationStream(
 }
 
 /**
- * Higher-level wiring: opens a subscription, closes it on
- * document.hidden, reopens on document.visible, and tears down on the
- * returned `unsubscribe()`.
+ * Higher-level wiring entry point used by ``McpNotificationsProvider``.
  *
- * Wave 2 (cleanup-wave-2): no bearer argument — the MCP notifications
- * fetch sends the operator session cookie via `credentials: "include"`.
+ * No-op as of verify-all-v8 (2026-06-27). The router's
+ * ``backend_mcp_handler`` rejects ``GET /agent-mcp/mcp/<project>`` from
+ * cookie-only callers with 405 (PR #220, F015 fix) because the
+ * backend's ``_handle_get`` derives ``agent_id`` from a per-agent
+ * bearer that the cookie path can't carry. Wave 2 (cleanup-wave-2)
+ * removed the router-side cookie→admin-bearer translation that
+ * previously let this subscription proceed, so every reconnect
+ * attempt now produces a 405 in the user's browser network tab.
  *
- * Returns a function that fully unsubscribes (stops the stream + drops
- * the visibility listener). Intended to be called from a React effect's
- * cleanup.
+ * Before this no-op was introduced, the dashboard generated 60+ ``GET
+ * /agent-mcp/mcp/<project> => 405`` lines within seconds of any
+ * project page load (user reproduction on
+ * https://nixos-developer-system.tailfdae0.ts.net/agent-mcp/app/
+ * washing-brothers/?page=memories surfaced this as "login errors").
+ * PR #220's bg-agent report explicitly flagged the subscription as
+ * "silently failing" — turning it into a no-op closes the spam loop.
+ *
+ * The dispatch glue (``dispatchNotification``) and the per-URL stream
+ * opener (``openMcpNotificationStream``) remain exported so a future
+ * cookie-authenticated SSE notification endpoint — e.g.
+ * ``/agent-mcp/api/<name>/notifications`` accepting the operator
+ * session cookie — can wire back in without rewriting the JSON-RPC →
+ * store invalidation glue. When that endpoint exists, this function
+ * should resume opening a stream against it (with the
+ * visibility/reconnect lifecycle that lived here previously) and the
+ * ``tests/mcp-notifications-no-poll.test.ts`` contract should be
+ * updated to assert the new endpoint shape.
+ *
+ * Returns a no-op cleanup function so the calling React effect's
+ * ``useEffect(() => subscribe(), [])`` shape stays identical and a
+ * future re-wire is a one-function-body change.
  */
 export function subscribeMcpNotifications(): () => void {
-  let handle: SubscriptionHandle | null = openMcpNotificationStream()
-
-  const onVisibility = (): void => {
-    if (typeof document === "undefined") return
-    if (document.hidden) {
-      if (handle) {
-        handle.stop()
-        handle = null
-      }
-    } else {
-      if (!handle) {
-        handle = openMcpNotificationStream()
-      }
-    }
-  }
-
-  if (typeof document !== "undefined") {
-    document.addEventListener("visibilitychange", onVisibility)
-  }
-
+  // Intentionally empty — see the function comment above. No fetch
+  // fires; no visibility listener attaches; the returned cleanup is a
+  // no-op. The shape of the function (parameterless, returns a void
+  // thunk) is preserved so re-enabling the stream against a real
+  // cookie-authenticated endpoint is a body-only edit.
   return () => {
-    if (typeof document !== "undefined") {
-      document.removeEventListener("visibilitychange", onVisibility)
-    }
-    if (handle) {
-      handle.stop()
-      handle = null
-    }
+    /* no-op */
   }
 }
