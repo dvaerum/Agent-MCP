@@ -346,6 +346,19 @@ async def logout_handler(request: web.Request) -> web.StreamResponse:
     raise response
 
 
+async def logout_get_handler(request: web.Request) -> web.StreamResponse:
+    """GET /agent-mcp/logout — bounce to /login (NEVER logout on GET).
+
+    Logout itself stays POST-only as a CSRF defense: a cross-site image
+    or link tag must not be able to force a session drop. But a user who
+    visits /logout via a stale bookmark or a typed URL should land on a
+    useful page, not the framework's plain-text "405: Method Not
+    Allowed". The /login page already 303s logged-in users back to the
+    dashboard, so this redirect is the right landing for both states.
+    """
+    raise web.HTTPSeeOther(location="/agent-mcp/login")
+
+
 # ── Wire-up ────────────────────────────────────────────────────────
 
 
@@ -359,3 +372,4 @@ def register_login_routes(app: web.Application) -> None:
     app.router.add_get("/agent-mcp/login", login_get_handler)
     app.router.add_post("/agent-mcp/login", login_post_handler)
     app.router.add_post("/agent-mcp/logout", logout_handler)
+    app.router.add_get("/agent-mcp/logout", logout_get_handler)

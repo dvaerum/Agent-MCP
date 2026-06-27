@@ -166,6 +166,75 @@ async def test_logout_clears_cookie(aiohttp_client, router_app) -> None:
     assert parsed.get("Max-Age") == "0"
 
 
+# ── GET /logout: bounce to /login (U002) ───────────────────────────
+
+
+async def test_get_logout_redirects_to_login_303(
+    aiohttp_client, router_app,
+) -> None:
+    """U002: GET /logout must 303 to /login, not 405 plain text.
+
+    A user with a stale /logout bookmark must land on the login form,
+    not see "405: Method Not Allowed". POST-only logout is the right
+    CSRF defense; GET should be a pure redirect.
+    """
+    client = await aiohttp_client(router_app)
+    resp = await client.get("/agent-mcp/logout", allow_redirects=False)
+    assert resp.status == 303, await resp.text()
+    assert resp.headers.get("Location") == "/agent-mcp/login"
+
+
+async def test_get_logout_does_not_clear_session_cookie(
+    aiohttp_client, router_app,
+) -> None:
+    """U002 follow-up: GET /logout must NOT clear the session cookie.
+
+    Performing logout on GET would re-introduce CSRF risk (cross-site
+    image tag could force-logout). GET /logout is a pure redirect.
+    The cookie-clearing only happens on the explicit POST.
+    """
+    _seed_user(username="liam", password="liampw")
+    client = await aiohttp_client(router_app)
+    login = await client.post(
+        "/agent-mcp/login",
+        data={"username": "liam", "password": "liampw"},
+        allow_redirects=False,
+    )
+    assert login.status == 303
+
+    resp = await client.get("/agent-mcp/logout", allow_redirects=False)
+    assert resp.status == 303
+    # No Set-Cookie on GET — or if one is somehow present, it must not be
+    # the session-clearing one. Both shapes are acceptable.
+    set_cookie = resp.headers.get("Set-Cookie", "")
+    assert "Max-Age=0" not in set_cookie, (
+        "GET /logout must not clear session (CSRF defense)"
+    )
+
+
+async def test_post_logout_still_works_after_get_handler_added(
+    aiohttp_client, router_app,
+) -> None:
+    """U002 regression guard: POST /logout still 303s + clears cookie.
+
+    Adding the GET handler must not break the POST path; the POST is the
+    only one that actually drops the session and clears the cookie.
+    """
+    _seed_user(username="mona", password="monapw")
+    client = await aiohttp_client(router_app)
+    login = await client.post(
+        "/agent-mcp/login",
+        data={"username": "mona", "password": "monapw"},
+        allow_redirects=False,
+    )
+    assert login.status == 303
+
+    resp = await client.post("/agent-mcp/logout", allow_redirects=False)
+    assert resp.status == 303
+    assert resp.headers.get("Location") == "/agent-mcp/login"
+    assert "Max-Age=0" in resp.headers.get("Set-Cookie", "")
+
+
 # ── Cookie attribute coverage ──────────────────────────────────────
 
 
