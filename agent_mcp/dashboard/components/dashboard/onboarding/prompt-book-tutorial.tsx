@@ -216,12 +216,11 @@ const tutorialSteps: TutorialStep[] = [
           
           <div className="space-y-2">
             {[
-              { step: 1, title: "Admin Initialization", desc: "Set up your admin agent with the token" },
-              { step: 2, title: "Add Project Context", desc: "Load your MCD and project documentation" },
-              { step: 3, title: "Create Worker Agents", desc: "Spawn specialized workers for different tasks" },
-              { step: 4, title: "Initialize Workers", desc: "Set up each worker with their specific role" },
-              { step: 5, title: "Assign Tasks", desc: "Delegate work to the appropriate agents" },
-              { step: 6, title: "Monitor & Debug", desc: "Track progress and troubleshoot issues" }
+              { step: 1, title: "Add Project Context", desc: "Load your MCD and project documentation" },
+              { step: 2, title: "Create Worker Agents", desc: "Spawn specialized workers for different tasks" },
+              { step: 3, title: "Initialize Workers", desc: "Set up each worker with their specific role" },
+              { step: 4, title: "Assign Tasks", desc: "Delegate work to the appropriate agents" },
+              { step: 5, title: "Monitor & Debug", desc: "Track progress and troubleshoot issues" }
             ].map(({ step, title, desc }) => (
               <div key={step} className="flex items-center gap-3 p-2 border rounded-lg">
                 <div className="w-6 h-6 bg-primary text-primary-foreground rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0">
@@ -273,7 +272,7 @@ const tutorialSteps: TutorialStep[] = [
               <span className="font-medium text-sm">Try a Quick Start</span>
             </div>
             <p className="text-xs text-muted-foreground">
-              Use the admin initialization prompt to set up your first agent
+              Use the create-worker prompt to spawn your first worker agent
             </p>
           </div>
           <div className="p-3 border rounded-lg bg-primary/5 border-primary/20">
