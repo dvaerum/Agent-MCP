@@ -228,18 +228,66 @@ def test_subscribes_with_reconnect_and_backoff() -> None:
     )
 
 
-def test_pauses_on_document_hidden() -> None:
-    """When the tab is backgrounded, hold the SSE connection open is
-    wasteful (and the browser may throttle timers anyway). Close on
-    visibilitychange→hidden, reopen on visibilitychange→visible."""
+def test_subscribe_entry_point_is_a_noop_until_cookie_sse_endpoint() -> None:
+    """The Wave-2 cookie-auth subscription was disabled in
+    verify-all-v8 (2026-06-27) after PR #220 (F015) made
+    ``GET /agent-mcp/mcp/<project>`` return 405 for cookie-only
+    callers. The dashboard's reconnect loop turned that 405 into a
+    60+-line spam in the browser network tab on every project page
+    load (real user reproduction on
+    nixos-developer-system.tailfdae0.ts.net surfaced it as "login
+    errors").
+
+    Until a cookie-authenticated SSE notification endpoint exists,
+    ``subscribeMcpNotifications`` must NOT open a stream and must
+    NOT attach a visibilitychange listener (the listener only made
+    sense as a battery saver for an active stream).
+
+    The lower-level ``openMcpNotificationStream`` is intentionally
+    kept exported with its cookie+fetch+backoff shape — that's the
+    test_subscribes_with_reconnect_and_backoff /
+    test_uses_fetch_not_eventsource_for_cookie_auth contract — so a
+    re-enable against a future cookie-auth endpoint is a body-only
+    edit inside ``subscribeMcpNotifications``.
+    """
     src = _read("lib/mcp-notifications.ts")
-    assert "visibilitychange" in src, (
-        "expected a `visibilitychange` listener that pauses + resumes "
-        "the subscription based on document visibility"
+
+    # Pin the no-op body shape: an empty function body or a body that
+    # only returns a no-op cleanup. We do that by asserting the
+    # ``subscribeMcpNotifications`` function body does NOT open a
+    # stream (no ``openMcpNotificationStream(`` call inside it) and
+    # does NOT register a visibilitychange listener.
+    fn_match = re.search(
+        r"export\s+function\s+subscribeMcpNotifications\s*\("
+        r"[^)]*\)\s*:\s*\(\)\s*=>\s*void\s*\{(.*?)\n\}",
+        src,
+        re.DOTALL,
     )
-    assert "document.hidden" in src or "visibilityState" in src, (
-        "expected `document.hidden` or `document.visibilityState` check "
-        "inside the visibility handler"
+    assert fn_match is not None, (
+        "expected `export function subscribeMcpNotifications(): () => void"
+        " { ... }` declaration in lib/mcp-notifications.ts"
+    )
+    body = fn_match.group(1)
+    assert "openMcpNotificationStream(" not in body, (
+        "subscribeMcpNotifications must not open a stream — there is no "
+        "cookie-authenticated SSE notification endpoint right now and "
+        "every GET /mcp attempt returns 405 (see PR #220). Body:\n"
+        + body
+    )
+    assert "visibilitychange" not in body, (
+        "subscribeMcpNotifications must not attach a visibilitychange "
+        "listener — without an active stream there is nothing to pause "
+        "or resume. Body:\n" + body
+    )
+
+    # Belt-and-braces: the per-URL opener IS still exported (its
+    # cookie+backoff shape is exercised by the two regression tests
+    # above; keeping it lets a future endpoint plug back in without
+    # rewriting the run loop).
+    assert "export function openMcpNotificationStream" in src, (
+        "expected openMcpNotificationStream to remain exported so a "
+        "future cookie-authenticated SSE notification endpoint can "
+        "wire back in without re-implementing the run loop"
     )
 
 
