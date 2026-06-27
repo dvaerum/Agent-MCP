@@ -31,6 +31,7 @@ import logging
 import re
 import sqlite3
 from typing import Awaitable, Callable
+from urllib.parse import quote
 
 from aiohttp import web
 
@@ -255,6 +256,69 @@ def _unauth_response(message: str = "login_required") -> web.Response:
     )
 
 
+def _wants_html(request: web.Request) -> bool:
+    """Return True iff the caller is a browser asking for HTML.
+
+    The bug this guards against: a browser user with no session who
+    visits ``/agent-mcp/`` was getting raw JSON splattered into the
+    viewport (``{"error": "login_required", ...}``) and reading it
+    as a system error. Browsers don't auto-follow a ``login_url``
+    field in a JSON body — only fetch-based clients do — so we have
+    to emit an HTTP-level redirect for them.
+
+    Detection is Accept-header-only and deliberately conservative:
+
+      * ``text/html`` must appear in ``Accept``.
+      * The FIRST media type in the list must not be a JSON type.
+        Browsers send ``Accept: text/html,...`` (HTML first); API
+        clients send ``Accept: application/json...`` or
+        ``Accept: application/vnd.agent-mcp.v1+json`` (JSON first).
+      * No Accept header at all → False (safe default for non-browser
+        tooling like ``curl`` with no flags).
+
+    Anything ambiguous (no Accept, ``*/*``, JSON-first) falls through
+    to the existing 401 JSON behaviour so we don't break programmatic
+    callers.
+    """
+    accept = request.headers.get("accept", "")
+    if "text/html" not in accept:
+        return False
+    first = accept.split(",", 1)[0].strip().lower()
+    # Both ``application/json`` and vendor-suffixed JSON
+    # (``application/vnd.*+json``) are JSON to us.
+    if "json" in first:
+        return False
+    return True
+
+
+def _login_redirect_response(request: web.Request) -> web.Response:
+    """Return a 303 to ``/agent-mcp/login`` that preserves the deep link.
+
+    The original path + query is URL-encoded into ``?next=`` so the
+    login handler's existing ``_safe_next`` validation (login.py:
+    ``_safe_next``) bounces the operator back to where they started
+    after a successful login. ``_safe_next`` already requires the
+    target to live under ``/agent-mcp/``, so an attacker can't smuggle
+    an external redirect in via the next parameter.
+
+    Implementation note: we build a bare ``web.Response`` with an
+    explicit ``Location`` header rather than ``web.HTTPSeeOther``.
+    ``HTTPSeeOther`` (via yarl) re-parses the location, decoding
+    ``%3F`` back to ``?`` because ``?`` is technically legal inside a
+    query value — which then makes the login handler's
+    ``request.rel_url.query.get("next")`` truncate at the first
+    embedded ``?``, losing everything after it (e.g. ``?page=memories``
+    on a deep-linked dashboard URL). Setting the header directly keeps
+    the percent-encoded bytes verbatim across the wire.
+    """
+    # ``request.path_qs`` is the raw "path?query" string the client
+    # sent; ``quote`` with default ``safe="/"`` percent-encodes the
+    # ``?`` and ``=`` so the login form sees one opaque next-value.
+    next_target = quote(request.path_qs)
+    location = f"/agent-mcp/login?next={next_target}"
+    return web.Response(status=303, headers={"Location": location})
+
+
 # ── Middleware ─────────────────────────────────────────────────────
 
 
@@ -310,6 +374,13 @@ async def require_operator_session_middleware(
         # the wiring.
         user = _try_proxy_header_identity(request)
         if user is None:
+            # Browser callers get an HTML 303 to the login form so
+            # they don't see a raw JSON envelope splattered into the
+            # viewport. API callers keep the 401 JSON contract (the
+            # dashboard's ApiClient redirects on the
+            # ``error: "login_required"`` discriminator).
+            if _wants_html(request):
+                return _login_redirect_response(request)
             return _unauth_response("session cookie missing or invalid")
 
     # Phase 3 Wave 2: sysadmin bypasses the project-membership check

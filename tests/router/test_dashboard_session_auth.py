@@ -382,3 +382,113 @@ async def test_mcp_route_with_admin_bearer_still_works(
     assert "login_required" not in body, (
         "MCP route 401 should be bearer-validation, not cookie-gate"
     )
+
+
+# ── Browser HTML redirect vs API JSON 401 ──────────────────────────
+#
+# Reproducer for the user-reported "i am still getting logibg errors"
+# UX gap (2026-06-26): a browser user with no session hitting
+# https://nixos-developer-system.tailfdae0.ts.net/agent-mcp got a raw
+# JSON envelope splattered into the viewport instead of being bounced
+# to the login form:
+#
+#   $ curl -sS .../agent-mcp -i
+#   HTTP/2 401
+#   content-type: application/json; charset=utf-8
+#   {"error": "login_required", "message": "session cookie missing or
+#    invalid", "login_url": "/agent-mcp/login"}
+#
+# The JSON does carry the right ``login_url`` field, but browsers
+# don't auto-follow a hint inside a JSON body — only fetch-based
+# clients do. The fix: content-negotiate the 401 — emit an HTML 303
+# to ``/agent-mcp/login?next=<orig>`` when ``Accept: text/html`` is
+# present, keep the 401 JSON envelope for API callers.
+
+
+async def test_no_cookie_html_request_redirects_to_login(
+    aiohttp_client, router_app,
+) -> None:
+    """A browser-shaped GET (``Accept: text/html,*/*;q=0.8``) to the
+    dashboard root with no session cookie redirects to the login
+    form instead of returning JSON.
+
+    Reproduces the user-reported "i am still getting logibg errors"
+    UX gap where the raw JSON 401 envelope was being rendered into
+    the browser viewport.
+    """
+    _seed_user("alice")
+    client = await aiohttp_client(router_app)
+    resp = await client.get(
+        "/agent-mcp/",
+        headers={"Accept": "text/html,*/*;q=0.8"},
+        allow_redirects=False,
+    )
+    assert resp.status == 303, await resp.text()
+    assert resp.headers["Location"] == "/agent-mcp/login?next=/agent-mcp/"
+
+
+async def test_no_cookie_html_request_preserves_path_and_query(
+    aiohttp_client, router_app,
+) -> None:
+    """A browser deep-link with a query string redirects to login
+    with the original path + query URL-encoded into ``?next=`` so the
+    operator lands back on the same view after authenticating.
+
+    The login handler's ``_safe_next`` (login.py) already constrains
+    the next target to ``/agent-mcp/...``, so the redirect is safe
+    even though the path is operator-supplied.
+    """
+    _seed_user("alice")
+    client = await aiohttp_client(router_app)
+    resp = await client.get(
+        "/agent-mcp/app/washing-brothers/?page=memories",
+        headers={"Accept": "text/html,*/*"},
+        allow_redirects=False,
+    )
+    assert resp.status == 303, await resp.text()
+    assert resp.headers["Location"] == (
+        "/agent-mcp/login"
+        "?next=/agent-mcp/app/washing-brothers/%3Fpage%3Dmemories"
+    )
+
+
+async def test_no_cookie_json_api_request_still_returns_401_json(
+    aiohttp_client, router_app, register_project,
+) -> None:
+    """Regression guard: API clients that ask for JSON still get the
+    401 JSON envelope. The dashboard's ApiClient depends on the
+    ``error: "login_required"`` discriminator to drive its own
+    in-browser redirect; flipping ALL 401s to 303s would break it.
+    """
+    register_project("alpha")
+    _seed_user("alice")
+    client = await aiohttp_client(router_app)
+    resp = await client.get(
+        "/agent-mcp/api/alpha/memories",
+        headers={"Accept": "application/vnd.agent-mcp.v1+json"},
+        allow_redirects=False,
+    )
+    assert resp.status == 401, await resp.text()
+    body = await resp.json()
+    assert body.get("error") == "login_required"
+
+
+async def test_no_cookie_no_accept_header_returns_401_json(
+    aiohttp_client, router_app,
+) -> None:
+    """Non-browser tooling without an explicit ``Accept`` header (or
+    with ``*/*`` only) falls through to the legacy 401 JSON path.
+
+    Safe default: only redirect when the caller has explicitly asked
+    for HTML.
+    """
+    _seed_user("alice")
+    client = await aiohttp_client(router_app)
+    resp = await client.get(
+        "/agent-mcp/app/",
+        headers={"Accept": "*/*"},
+        allow_redirects=False,
+    )
+    assert resp.status == 401, await resp.text()
+    body = await resp.json()
+    assert body.get("error") == "login_required"
