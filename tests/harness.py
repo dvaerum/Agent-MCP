@@ -873,6 +873,88 @@ class AdminClient(WorkerSession):
 # --- Public entry point ---
 
 
+@contextlib.contextmanager
+def with_principal(principal):
+    """Stamp a :class:`agent_mcp.core.principal.Principal` on the
+    legacy ContextVars for the duration of the ``with`` block.
+
+    Wave 6 PR 0 — the new test-side helper for the Principal value
+    type. The harness's per-session contextvar stamping (set up
+    inside :func:`mcp_session`) deprecated in favour of this; the
+    older approach still works for now (the bridge in
+    ``dispatch_tool_call`` falls back to ContextVars when no
+    Principal is in hand), so existing tests don't need to migrate
+    in this PR.
+
+    Usage::
+
+        from agent_mcp.core.principal import Principal
+        from tests.harness import with_principal
+
+        p = Principal(
+            kind="operator_session",
+            user_id="alice",
+            agent_id=None,
+            sysadmin=False,
+            project_name="proj-a",
+            project_role="operator",
+            agent_role=None,
+            can_wake_loop=False,
+            source_token=None,
+        )
+        with with_principal(p):
+            ... # in-process tool calls that consult ContextVars / dispatch
+            ... # see p as the calling Principal
+
+    For ``operator_session`` and ``forwarding_header`` kinds, stamps
+    ``operator_session_active=True`` so legacy decorators that read
+    the ContextVar admit. For ``agent_bearer`` kinds, stamps
+    ``request_auth_token`` from ``principal.source_token`` so
+    bearer-based gates see the right agent.
+
+    Resets in LIFO order on block exit. Safe to nest; each nested
+    use returns a fresh handle that resets its own scope.
+
+    .. deprecated:: 6.0
+       The older per-session contextvar stamping in
+       :func:`mcp_session` continues to work for the legacy bridge;
+       new tests should use :func:`with_principal`. The shim helper
+       deletes in Wave 6 PR 6 alongside the ContextVars themselves.
+    """
+    from agent_mcp.tools.registry import (
+        operator_session_active,
+        operator_user_id,
+        operator_project_name,
+        request_auth_token,
+    )
+
+    cv_op_session = None
+    cv_op_user = None
+    cv_op_project = None
+    cv_token = None
+    try:
+        if principal.kind in ("operator_session", "forwarding_header"):
+            cv_op_session = operator_session_active.set(True)
+            if principal.user_id is not None:
+                cv_op_user = operator_user_id.set(principal.user_id)
+            if principal.project_name is not None:
+                cv_op_project = operator_project_name.set(principal.project_name)
+        elif principal.kind == "agent_bearer":
+            cv_op_session = operator_session_active.set(False)
+            if principal.source_token:
+                cv_token = request_auth_token.set(principal.source_token)
+        yield principal
+    finally:
+        if cv_token is not None:
+            request_auth_token.reset(cv_token)
+        if cv_op_project is not None:
+            operator_project_name.reset(cv_op_project)
+        if cv_op_user is not None:
+            operator_user_id.reset(cv_op_user)
+        if cv_op_session is not None:
+            operator_session_active.reset(cv_op_session)
+
+
 @contextlib.asynccontextmanager
 async def mcp_session(tmp_path: Path) -> AsyncIterator[AdminClient]:
     """Build the app, run lifespan, yield an AdminClient.

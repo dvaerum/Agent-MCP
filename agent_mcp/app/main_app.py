@@ -197,6 +197,108 @@ def _build_unauthorized_response(token: str):
     )
 
 
+def _build_principal_from_request(
+    *,
+    request,
+    bearer_token: str,
+    forwarding_operator: Optional[str],
+):
+    """Construct the per-request :class:`Principal` for the per-project backend.
+
+    Wave 6 PR 0 — built once at the outermost seam that knows the
+    forwarding-header + bearer state, then stashed on
+    ``request.state.principal``. Tool dispatch threads it through
+    instead of re-deriving identity via ContextVars.
+
+    Resolution order:
+
+    * If the signed forwarding header verified, the caller is an
+      operator who arrived via the router. Build a
+      ``forwarding_header`` Principal naming that operator. We do
+      NOT resolve the operator's project role here — the per-project
+      backend has no router.db handle, so the project-role gate
+      remains the router middleware's job. ``project_role`` is None;
+      the in-process ``has_role`` check uses ``kind`` for the
+      operator-tier admit.
+    * If a per-agent bearer authenticated, build an ``agent_bearer``
+      Principal sourcing ``agent_id`` + ``agent_role`` from the
+      agents table (via the in-memory cache). ``can_wake_loop``
+      mirrors the eligibility check ``_bearer_has_wake_loop_enabled``
+      runs today (the wake-loop instructions in the initialize
+      response will eventually consult ``Principal.can_wake_loop``
+      instead — that's a follow-up PR).
+    * If neither admitted (auth-less route or an unauth-required
+      path), return None — the bridge falls back to the legacy
+      ContextVar path.
+
+    Failures are defensive: any exception returns None so a buggy
+    Principal-build path can never block a request the legacy path
+    would have admitted.
+    """
+    try:
+        from ..core.principal import Principal
+
+        if forwarding_operator:
+            return Principal(
+                kind="forwarding_header",
+                user_id=forwarding_operator,
+                agent_id=None,
+                sysadmin=False,
+                project_name=None,
+                project_role=None,
+                agent_role=None,
+                can_wake_loop=False,
+                source_token=None,
+            )
+        if bearer_token:
+            agent_id = get_agent_id(bearer_token)
+            if agent_id:
+                from ..core import globals as _g
+                row = _g.active_agents.get(bearer_token) or {}
+                agent_role = row.get("agent_role")
+                normalized_role = (
+                    agent_role
+                    if agent_role in ("worker", "manager")
+                    else None
+                )
+                # Wake-loop eligibility mirrors the inline check in
+                # `_bearer_has_wake_loop_enabled` (kept for the
+                # transition; a follow-up PR will consume
+                # ``Principal.can_wake_loop`` directly).
+                can_wake_loop = False
+                if agent_id != "admin":
+                    try:
+                        from ..tools import access as _access
+                        global_on = _access._get_config_bool(
+                            "config_auto_event_loop_global", default=True,
+                        )
+                        if global_on and bool(row.get("auto_event_loop", True)):
+                            # The in-memory cache may not include the
+                            # auto_event_loop column for old rows;
+                            # default to True (matches the DB default).
+                            can_wake_loop = True
+                    except Exception:  # pragma: no cover - defensive
+                        can_wake_loop = False
+                return Principal(
+                    kind="agent_bearer",
+                    user_id=None,
+                    agent_id=agent_id,
+                    sysadmin=False,
+                    project_name=None,
+                    project_role=None,
+                    agent_role=normalized_role,
+                    can_wake_loop=can_wake_loop,
+                    source_token=bearer_token,
+                )
+        return None
+    except Exception:  # pragma: no cover - defensive
+        logger.exception(
+            "Principal construction failed in AuthHeaderMiddleware; "
+            "falling back to ContextVar path",
+        )
+        return None
+
+
 class AuthHeaderMiddleware(BaseHTTPMiddleware):
     """Capture Authorization: Bearer into request_auth_token + gate /mcp.
 
@@ -330,6 +432,30 @@ class AuthHeaderMiddleware(BaseHTTPMiddleware):
             )
             if not authenticated:
                 return _build_unauthorized_response(token)
+
+        # Wave 6 PR 0: stash a Principal on the request once auth
+        # has been admitted. The legacy ContextVar stamping above
+        # stays — the bridge in ``tools.registry.dispatch_tool_call``
+        # falls back to ContextVars when ``request.state.principal``
+        # is missing, so this is purely additive during the
+        # migration window. PR 6 deletes the ContextVar path once
+        # PRs 1-5 migrate every tool.
+        principal = _build_principal_from_request(
+            request=request,
+            bearer_token=token,
+            forwarding_operator=forwarding_operator,
+        )
+        if principal is not None:
+            request.state.principal = principal
+            # For an MCP-session-scoped request (POST /mcp), cache
+            # the Principal on the session registry by-session so
+            # subsequent in-flight tool calls (and the GET-stream
+            # fan-out) read the same identity without re-deriving.
+            # The session id isn't available here on a POST (the SDK
+            # mints it inside ``handle_request``); for the GET path
+            # the bearer-resolved cache lives in
+            # ``session_registry.attach_principal`` called from
+            # ``_McpAsgiApp._handle_get``.
 
         return await call_next(request)
 
@@ -662,8 +788,21 @@ async def mcp_call_tool_handler(name: str, arguments: dict) -> List[mcp_types.Te
     integer-as-string). See `_clean_arguments_for_schema` in
     `tools/registry.py` and the tolerance suite in
     `tests/test_call_tool_argument_tolerance.py`.
+
+    Wave 6 PR 0 — ``dispatch_tool_call`` now returns
+    :data:`agent_mcp.core.tool_result.ToolResult`; render back to
+    the legacy ``list[TextContent]`` MCP wire shape via
+    :func:`render_as_text_content`. The Principal threaded through
+    dispatch is picked up from the ContextVars
+    (``request_auth_token`` set by :class:`AuthHeaderMiddleware`)
+    via the bridge fallback in ``dispatch_tool_call``; no explicit
+    Principal kwarg needed on the MCP wire path during the
+    migration window.
     """
-    return await dispatch_tool_call(name, arguments)
+    from ..core.tool_result import render_as_text_content
+
+    result = await dispatch_tool_call(name, arguments)
+    return render_as_text_content(result)
 
 
 # --- Streamable HTTP transport (spec rev 2025-03-26) --------------
@@ -772,6 +911,26 @@ class _McpAsgiApp:
             bearer_token=bearer,
             alias_used=alias_name,
         )
+        # Wave 6 PR 0: cache the Principal alongside the runtime
+        # queue so the per-tool-call dispatcher (which runs in a
+        # task spawned past the middleware return) can read identity
+        # without re-deriving from ContextVars. The Principal is
+        # built fresh here against the same bearer that opened the
+        # stream — it lives until the session dies in the cleanup
+        # finally below.
+        try:
+            principal = _build_principal_from_request(
+                request=type("scope", (), {"state": type("S", (), {})()})(),
+                bearer_token=bearer,
+                forwarding_operator=None,
+            )
+            if principal is not None:
+                session_registry.attach_principal(session_id, principal)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "session_registry: failed to cache principal for session=%s",
+                session_id,
+            )
         # The queue size is intentionally bounded — if a client's
         # consumption falls behind by more than this many notifications
         # we drop oldest and log. 256 fits a worker that's been

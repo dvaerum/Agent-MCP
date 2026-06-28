@@ -59,6 +59,7 @@ from typing import Any, Iterable, List, Optional
 from sqlalchemy import delete as _sa_delete, select as _sa_select
 
 from .config import logger
+from .principal import Principal
 from ..db.engine import get_session
 from ..db.models import McpSession as _McpSession
 
@@ -72,6 +73,21 @@ class SessionHandle:
     surfaces (operator inspection, audit log) so a caller doesn't
     have to round-trip the DB again to know whose subscription it
     was about to push to.
+
+    Wave 6 PR 0 added ``principal`` — the cached
+    :class:`agent_mcp.core.principal.Principal` for this MCP session.
+    Built once by ``AuthHeaderMiddleware`` when the GET /mcp stream
+    opens and cached via :func:`attach_principal`; reads from
+    :func:`get_principal` so the dispatcher can thread the same
+    Principal through every tool call that runs against this
+    bearer-bound stream without re-deriving identity on each request.
+    None when no Principal has been attached yet (e.g. handles
+    returned by :func:`sessions_for_agent` / :func:`all_sessions`
+    which read from the DB only — the Principal is in-memory by
+    design and dies with the process). Handles minted via
+    :func:`register_session` start with None too; the attach happens
+    explicitly so callers without a Principal in hand don't
+    accidentally insert a half-built one.
     """
 
     session_id: str
@@ -79,12 +95,21 @@ class SessionHandle:
     opened_at: str
     last_seen_at: str
     bearer_token_hash: str
+    principal: Optional[Principal] = None
 
 
 # In-memory map: session_id → queue used by emitters to push payloads
 # at the live SSE writer. NOT persisted on purpose — see module
 # docstring's "Runtime layer" note.
 _runtime_queues: dict[str, asyncio.Queue[Any]] = {}
+
+# Wave 6 PR 0: in-memory map session_id → Principal. The Principal
+# is built once by ``AuthHeaderMiddleware`` at MCP stream open and
+# cached here so the per-request dispatcher can thread the same
+# Principal through every tool call without re-deriving identity.
+# Cleared in :func:`detach_runtime_queue` and :func:`unregister_session`
+# so a session id can't outlive its principal.
+_runtime_principals: dict[str, Principal] = {}
 
 
 def _now_utc_iso() -> str:
@@ -158,8 +183,10 @@ def unregister_session(session_id: str) -> None:
             _sa_delete(_McpSession).where(_McpSession.session_id == session_id)
         )
         session.commit()
-    # Drop the runtime queue too — keeps the two layers in lockstep.
+    # Drop the runtime queue + cached Principal too — keeps the
+    # in-memory layers in lockstep with the DB row.
     _runtime_queues.pop(session_id, None)
+    _runtime_principals.pop(session_id, None)
 
 
 def touch_session(session_id: str) -> None:
@@ -266,12 +293,31 @@ def attach_runtime_queue(session_id: str, queue: asyncio.Queue[Any]) -> None:
 
 
 def detach_runtime_queue(session_id: str) -> None:
-    """Drop the runtime queue for `session_id`. Idempotent."""
+    """Drop the runtime queue + cached principal for `session_id`. Idempotent."""
     _runtime_queues.pop(session_id, None)
+    _runtime_principals.pop(session_id, None)
 
 
 def get_runtime_queue(session_id: str) -> Optional[asyncio.Queue[Any]]:
     return _runtime_queues.get(session_id)
+
+
+def attach_principal(session_id: str, principal: Principal) -> None:
+    """Cache ``principal`` against ``session_id``.
+
+    Called from the MCP stream's auth seam right after the bearer
+    is verified, so the per-request tool dispatcher can pull the
+    same Principal back out without re-deriving identity on each
+    request. Cleared in :func:`detach_runtime_queue` /
+    :func:`unregister_session` so a session id never outlives its
+    principal.
+    """
+    _runtime_principals[session_id] = principal
+
+
+def get_principal(session_id: str) -> Optional[Principal]:
+    """Return the cached :class:`Principal` for ``session_id`` if any."""
+    return _runtime_principals.get(session_id)
 
 
 def _enqueue_to(handles: Iterable[SessionHandle], payload: Any) -> List[str]:

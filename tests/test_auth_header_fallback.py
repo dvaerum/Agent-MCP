@@ -47,7 +47,12 @@ async def test_dispatch_uses_contextvar_token_when_arguments_token_missing(
                 f"got: {e}"
             )
 
-        text = result[0].text
+        # Wave 6 PR 0 — dispatch returns ToolResult; the bridge
+        # wraps a legacy ``list[TextContent]`` success as
+        # ``Ok(message=concatenated_text)``. Pull message back out.
+        from agent_mcp.core.tool_result import Ok
+        assert isinstance(result, Ok), f"expected Ok, got {result!r}"
+        text = result.message or ""
         assert "Unauthorized" not in text, (
             f"contextvar token not injected (issue Q6e): {text}"
         )

@@ -449,7 +449,63 @@ async def require_operator_session_middleware(
     # per-route policy) can use them without re-resolving.
     request["user"] = user
     request["is_sysadmin"] = is_sysadmin
+
+    # Wave 6 PR 0: build a Principal once, here, at the outermost
+    # seam that has identity + project + sysadmin in hand. Downstream
+    # tool calls thread the same Principal through every gate
+    # instead of re-deriving "who is this caller?" from ContextVars.
+    # Lazy import — Principal is a leaf module but importing here
+    # avoids a top-level dependency between the router package and
+    # the per-project core package.
+    try:
+        from ..core.principal import Principal
+
+        request["principal"] = Principal(
+            kind="operator_session",
+            user_id=str(user.get("user_id")) if user.get("user_id") is not None else None,
+            agent_id=None,
+            sysadmin=is_sysadmin,
+            project_name=project if project is not None and _project_exists(project) else None,
+            project_role=(
+                None
+                if is_sysadmin or project is None or not _project_exists(project)
+                else _safe_resolve_role(user.get("user_id"), project)
+            ),
+            agent_role=None,
+            can_wake_loop=False,
+            source_token=None,
+        )
+    except Exception:  # pragma: no cover - defensive
+        # Principal stash is additive; if construction fails for any
+        # reason the legacy ContextVar path still admits the request.
+        # The bridge in dispatch_tool_call falls back to ContextVars
+        # when ``request["principal"]`` is missing.
+        logger.exception(
+            "Principal construction failed for user=%r; falling back "
+            "to ContextVar path",
+            user.get("username"),
+        )
     return await handler(request)
+
+
+def _safe_resolve_role(user_id: object, project: str) -> str | None:
+    """Best-effort ``resolve_user_project_role`` that never raises.
+
+    Wave 6 PR 0 — used when building the operator-session Principal
+    for non-sysadmin callers. Mirrors the resolver chain the
+    primary gate already walked above (so we don't pay for a second
+    DB round-trip on the happy path the resolver above already
+    cached results from); failures collapse to ``None`` so the
+    Principal still gets stashed and the bridge has something to
+    consume.
+    """
+    if user_id is None:
+        return None
+    try:
+        from . import group_resolver
+        return group_resolver.resolve_user_project_role(str(user_id), project)
+    except Exception:  # pragma: no cover - defensive
+        return None
 
 
 __all__ = [
