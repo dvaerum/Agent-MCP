@@ -1,33 +1,55 @@
 # Agent-MCP/mcp_template/mcp_server_src/tools/file_management_tools.py
+"""File-claim / file-status MCP tools.
+
+Wave 6 PR 1 migration — both tools take a :class:`Principal` and
+return :data:`ToolResult`. Admission stays agent-only
+(``principal.kind == "agent_bearer"``), matching the legacy
+``@requires("any")`` decorator that required a resolvable agent
+token. Operator-session callers are not admitted because the file
+map is keyed on agent identity (claim / release / lookup are all
+per-agent verbs) and an operator session doesn't have an
+``agent_id``.
+"""
 import os
 import datetime
-from typing import List, Dict, Any
-
-import mcp.types as mcp_types # Assuming this is your mcp.types path
+from typing import Any, Dict, Optional
 
 from .registry import register_tool
 from ..core.config import logger
 from ..core import globals as g
-from ..core.auth import get_agent_id # verify_token not strictly needed here if get_agent_id implies valid token
-from ..core.authorize import requires
+from ..core.principal import Principal
 from ..core.repositories import agent_repo
+from ..core.tool_result import (
+    Conflict,
+    Invalid,
+    Ok,
+    PermissionDenied,
+    ToolResult,
+)
 from ..utils.audit_utils import log_audit
 # No DB interactions for these specific tools as they manage in-memory state (g.file_map)
 
 # --- check_file_status tool ---
-# Original logic from main.py: lines 1774-1801 (check_file_status_tool function)
-@requires("any")
-async def check_file_status_tool_impl(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
-    agent_auth_token = arguments.get("token")
+async def check_file_status_tool_impl(
+    arguments: Dict[str, Any],
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    if principal is None or principal.kind != "agent_bearer":
+        return PermissionDenied(
+            reason="agent token required to check file status"
+        )
+
     filepath_arg = arguments.get("filepath")
-
-    # @requires("any") guaranteed entry; resolve id for working-dir lookup.
-    requesting_agent_id = get_agent_id(agent_auth_token)
-
     if not filepath_arg or not isinstance(filepath_arg, str):
-        return [mcp_types.TextContent(type="text", text="Error: filepath is required and must be a string.")]
+        return Invalid(
+            field="filepath",
+            message="filepath is required and must be a string.",
+        )
 
-    # Resolve the filepath to absolute path (main.py:1781-1785)
+    requesting_agent_id = principal.agent_id or ""
+
+    # Resolve the filepath to absolute path.
     # PR-W2c: routed through AgentRepository.get_working_directory()
     # so a cache miss falls through to the DB row instead of silently
     # falling back to server CWD.
@@ -35,112 +57,215 @@ async def check_file_status_tool_impl(arguments: Dict[str, Any]) -> List[mcp_typ
         agent_wd = agent_repo.get_working_directory(requesting_agent_id)
         if not agent_wd:
             # This case should ideally not happen if agent is properly initialized
-            logger.warning(f"Agent '{requesting_agent_id}' has no working directory recorded. Using current server CWD as fallback for path resolution.")
+            logger.warning(
+                f"Agent '{requesting_agent_id}' has no working directory "
+                f"recorded. Using current server CWD as fallback for path "
+                f"resolution."
+            )
             agent_wd = os.getcwd()
         resolved_abs_filepath = os.path.abspath(os.path.join(agent_wd, filepath_arg))
     else:
         resolved_abs_filepath = os.path.abspath(filepath_arg)
 
-    # Log the file status check (main.py:1788)
-    log_audit(requesting_agent_id, "check_file_status", {"filepath": resolved_abs_filepath, "original_path": filepath_arg})
-    
-    # Check if file is in the file map (main.py:1791-1799)
+    log_audit(
+        requesting_agent_id,
+        "check_file_status",
+        {"filepath": resolved_abs_filepath, "original_path": filepath_arg},
+    )
+
     if resolved_abs_filepath in g.file_map:
         file_info = g.file_map[resolved_abs_filepath]
-        status_message: str
         if file_info.get("agent_id") == requesting_agent_id:
-            status_message = (
+            message = (
                 f"File '{filepath_arg}' (resolved: {resolved_abs_filepath}) is currently "
                 f"being used by YOU ({requesting_agent_id}) since {file_info.get('timestamp', 'N/A')}. "
                 f"Status: {file_info.get('status', 'unknown')}"
             )
         else:
-            status_message = (
+            message = (
                 f"File '{filepath_arg}' (resolved: {resolved_abs_filepath}) is currently "
                 f"being used by agent '{file_info.get('agent_id', 'unknown')}' "
                 f"since {file_info.get('timestamp', 'N/A')}. Status: {file_info.get('status', 'unknown')}"
             )
-        return [mcp_types.TextContent(type="text", text=status_message)]
-    else:
-        return [mcp_types.TextContent(
-            type="text",
-            text=f"File '{filepath_arg}' (resolved: {resolved_abs_filepath}) is not currently being used by any agent according to the file map."
-        )]
+        return Ok(
+            data={
+                "filepath": resolved_abs_filepath,
+                "original_path": filepath_arg,
+                "in_use": True,
+                "agent_id": file_info.get("agent_id"),
+                "status": file_info.get("status"),
+                "timestamp": file_info.get("timestamp"),
+            },
+            message=message,
+        )
+    # Free files surface as Ok(in_use=False) rather than NotFound —
+    # NotFound is reserved for "the named resource doesn't exist",
+    # but here the resource (the path) is well-formed and the
+    # information being asked for ("is anyone holding it?") has a
+    # definitive negative answer.
+    return Ok(
+        data={
+            "filepath": resolved_abs_filepath,
+            "original_path": filepath_arg,
+            "in_use": False,
+        },
+        message=(
+            f"File '{filepath_arg}' (resolved: {resolved_abs_filepath}) is "
+            f"not currently being used by any agent according to the file map."
+        ),
+    )
 
 # --- update_file_status tool ---
-# Original logic from main.py: lines 1804-1849 (update_file_status_tool function)
-@requires("any")
-async def update_file_status_tool_impl(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
-    agent_auth_token = arguments.get("token")
+async def update_file_status_tool_impl(
+    arguments: Dict[str, Any],
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    if principal is None or principal.kind != "agent_bearer":
+        return PermissionDenied(
+            reason="agent token required to update file status"
+        )
+
     filepath_arg = arguments.get("filepath")
-    new_status = arguments.get("status") # e.g., "editing", "reading", "released"
+    new_status = arguments.get("status")  # e.g., "editing", "reading", "released"
 
-    # @requires("any") guaranteed entry; resolve id for working-dir lookup.
-    requesting_agent_id = get_agent_id(agent_auth_token)
+    if not filepath_arg or not isinstance(filepath_arg, str):
+        return Invalid(
+            field="filepath",
+            message="filepath is required and must be a string.",
+        )
+    if not new_status or not isinstance(new_status, str):
+        return Invalid(
+            field="status",
+            message="status is required and must be a string.",
+        )
 
-    if not filepath_arg or not isinstance(filepath_arg, str) or \
-       not new_status or not isinstance(new_status, str):
-        return [mcp_types.TextContent(type="text", text="Error: filepath and status are required and must be strings.")]
+    requesting_agent_id = principal.agent_id or ""
 
-    # Resolve the filepath to absolute path (main.py:1812-1816)
+    # Resolve the filepath to absolute path.
     # PR-W2c: routed through AgentRepository.get_working_directory().
     if not os.path.isabs(filepath_arg):
         agent_wd = agent_repo.get_working_directory(requesting_agent_id)
         if not agent_wd:
-            logger.warning(f"Agent '{requesting_agent_id}' has no working directory recorded. Using CWD for path resolution.")
+            logger.warning(
+                f"Agent '{requesting_agent_id}' has no working directory "
+                f"recorded. Using CWD for path resolution."
+            )
             agent_wd = os.getcwd()
         resolved_abs_filepath = os.path.abspath(os.path.join(agent_wd, filepath_arg))
     else:
         resolved_abs_filepath = os.path.abspath(filepath_arg)
 
-    # Validate status (main.py:1819-1823)
     valid_statuses = ["editing", "reading", "reviewing", "released"]
     if new_status not in valid_statuses:
-        return [mcp_types.TextContent(
-            type="text",
-            text=f"Invalid status: '{new_status}'. Must be one of: {', '.join(valid_statuses)}"
-        )]
+        return Invalid(
+            field="status",
+            message=(
+                f"Invalid status: '{new_status}'. Must be one of: "
+                f"{', '.join(valid_statuses)}"
+            ),
+        )
 
-    # Check if file is already in use by another agent (main.py:1826-1831)
-    if resolved_abs_filepath in g.file_map and \
-       g.file_map[resolved_abs_filepath].get("agent_id") != requesting_agent_id and \
-       new_status != "released": # Can always release, even if map is out of sync.
-        current_holder_agent_id = g.file_map[resolved_abs_filepath].get("agent_id", "another agent")
-        return [mcp_types.TextContent(
-            type="text",
-            text=f"File '{filepath_arg}' (resolved: {resolved_abs_filepath}) is already being used by agent '{current_holder_agent_id}'. Cannot claim it with status '{new_status}'."
-        )]
+    # Check if file is already in use by another agent.
+    if (
+        resolved_abs_filepath in g.file_map
+        and g.file_map[resolved_abs_filepath].get("agent_id") != requesting_agent_id
+        and new_status != "released"  # Can always release, even if map is out of sync.
+    ):
+        current_holder_agent_id = g.file_map[resolved_abs_filepath].get(
+            "agent_id", "another agent"
+        )
+        # Another agent holds the claim. Conflict (HTTP 409) rather
+        # than PermissionDenied — the caller's principal is fine,
+        # the state of the file map blocks the operation.
+        return Conflict(
+            reason=(
+                f"File '{filepath_arg}' (resolved: {resolved_abs_filepath}) "
+                f"is already being used by agent "
+                f"'{current_holder_agent_id}'. Cannot claim it with status "
+                f"'{new_status}'."
+            )
+        )
 
     # Update the file map (g.file_map)
-    if new_status == "released": # main.py:1834-1841
+    if new_status == "released":
         if resolved_abs_filepath in g.file_map:
-            # Only the agent holding the file or an admin should ideally release it.
-            # The original code allowed any agent to release if they knew the path and it was in file_map.
-            # For 1-to-1, we keep this behavior. A stricter check would be:
-            # if g.file_map[resolved_abs_filepath].get("agent_id") == requesting_agent_id or verify_token(agent_auth_token, "admin"):
+            # The original code allowed any agent to release if they knew
+            # the path and it was in file_map. For 1-to-1, we keep this
+            # behavior.
             del g.file_map[resolved_abs_filepath]
-            log_audit(requesting_agent_id, "release_file", {"filepath": resolved_abs_filepath, "original_path": filepath_arg})
-            logger.info(f"Agent '{requesting_agent_id}' released file '{resolved_abs_filepath}'.")
-            return [mcp_types.TextContent(type="text", text=f"File '{filepath_arg}' (resolved: {resolved_abs_filepath}) has been released.")]
-        else:
-            # File was not in map, so it's already considered released from map's perspective.
-            log_audit(requesting_agent_id, "attempt_release_unmapped_file", {"filepath": resolved_abs_filepath, "original_path": filepath_arg})
-            return [mcp_types.TextContent(
-                type="text",
-                text=f"File '{filepath_arg}' (resolved: {resolved_abs_filepath}) was not found in the active file map (already considered released or never tracked)."
-            )]
-    else: # For "editing", "reading", "reviewing" (main.py:1842-1847)
-        g.file_map[resolved_abs_filepath] = {
+            log_audit(
+                requesting_agent_id,
+                "release_file",
+                {"filepath": resolved_abs_filepath, "original_path": filepath_arg},
+            )
+            logger.info(
+                f"Agent '{requesting_agent_id}' released file "
+                f"'{resolved_abs_filepath}'."
+            )
+            return Ok(
+                data={
+                    "filepath": resolved_abs_filepath,
+                    "original_path": filepath_arg,
+                    "status": "released",
+                },
+                message=(
+                    f"File '{filepath_arg}' (resolved: "
+                    f"{resolved_abs_filepath}) has been released."
+                ),
+            )
+        # File was not in map — the original surfaced this as an
+        # informational success ("already considered released or
+        # never tracked"), not an error, because releasing an
+        # untracked path is idempotent from the caller's point of
+        # view. Preserve that semantic with Ok(in_use=False).
+        log_audit(
+            requesting_agent_id,
+            "attempt_release_unmapped_file",
+            {"filepath": resolved_abs_filepath, "original_path": filepath_arg},
+        )
+        return Ok(
+            data={
+                "filepath": resolved_abs_filepath,
+                "original_path": filepath_arg,
+                "in_use": False,
+            },
+            message=(
+                f"File '{filepath_arg}' (resolved: "
+                f"{resolved_abs_filepath}) was not found in the active "
+                f"file map (already considered released or never "
+                f"tracked)."
+            ),
+        )
+
+    # For "editing", "reading", "reviewing":
+    g.file_map[resolved_abs_filepath] = {
+        "agent_id": requesting_agent_id,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "status": new_status,
+    }
+    log_audit(
+        requesting_agent_id,
+        f"claim_file_{new_status}",
+        {"filepath": resolved_abs_filepath, "original_path": filepath_arg},
+    )
+    logger.info(
+        f"Agent '{requesting_agent_id}' updated file "
+        f"'{resolved_abs_filepath}' status to '{new_status}'."
+    )
+    return Ok(
+        data={
+            "filepath": resolved_abs_filepath,
+            "original_path": filepath_arg,
             "agent_id": requesting_agent_id,
-            "timestamp": datetime.datetime.now().isoformat(),
-            "status": new_status
-        }
-        log_audit(requesting_agent_id, f"claim_file_{new_status}", {"filepath": resolved_abs_filepath, "original_path": filepath_arg})
-        logger.info(f"Agent '{requesting_agent_id}' updated file '{resolved_abs_filepath}' status to '{new_status}'.")
-        return [mcp_types.TextContent(
-            type="text",
-            text=f"File '{filepath_arg}' (resolved: {resolved_abs_filepath}) is now registered to agent '{requesting_agent_id}' with status '{new_status}'."
-        )]
+            "status": new_status,
+        },
+        message=(
+            f"File '{filepath_arg}' (resolved: {resolved_abs_filepath}) "
+            f"is now registered to agent '{requesting_agent_id}' with "
+            f"status '{new_status}'."
+        ),
+    )
 
 # --- Register file management tools ---
 def register_file_management_tools():

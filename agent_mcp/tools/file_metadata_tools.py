@@ -1,18 +1,39 @@
 # Agent-MCP/mcp_template/mcp_server_src/tools/file_metadata_tools.py
+"""File-metadata MCP tools.
+
+Wave 6 PR 1 migration — both tools take a :class:`Principal` and
+return :data:`ToolResult`. The legacy decorators are gone; the
+admission moves into the impl:
+
+* ``view_file_metadata`` — agent_bearer only (matches the legacy
+  ``@requires("any")``).
+* ``update_file_metadata`` — operator-tier only (matches the legacy
+  ``@requires_role("operator")`` and the ``visibility="operator"``
+  declaration on registration).
+
+Operator-session callers calling ``view_file_metadata`` are not
+admitted today because the metadata read had no use case for the
+dashboard pre-Wave-6; PR 6 (or a UI-driven PR) can widen if needed.
+"""
 import json
 import datetime
 import sqlite3
 import os
 from pathlib import Path
-from typing import List, Dict, Any, Optional
-
-import mcp.types as mcp_types
+from typing import Any, Dict, Optional
 
 from .registry import register_tool
 from ..core.config import logger
-from ..core.auth import get_agent_id, verify_token
-from ..core.authorize import requires, requires_role
+from ..core.principal import Principal
 from ..core.repositories import agent_repo
+from ..core.tool_result import (
+    Failed,
+    Invalid,
+    NotFound,
+    Ok,
+    PermissionDenied,
+    ToolResult,
+)
 from ..utils.audit_utils import log_audit
 from ..db.connection import get_db_connection
 from ..db.actions.agent_actions_db import log_agent_action_to_db
@@ -46,28 +67,26 @@ def _normalize_filepath(filepath_arg: str, agent_id_for_wd: Optional[str]) -> st
 
 
 # --- view_file_metadata tool ---
-# Original logic from main.py: lines 1503-1533 (view_file_metadata_tool function)
-@requires("any")
 async def view_file_metadata_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
-    agent_auth_token = arguments.get("token")
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    if principal is None or principal.kind != "agent_bearer":
+        return PermissionDenied(
+            reason="agent token required to view file metadata"
+        )
+
     filepath_arg = arguments.get("filepath")
-
-    # @requires("any") guaranteed entry; resolve id for working-dir lookup + audit.
-    requesting_agent_id = get_agent_id(agent_auth_token)
-
     if not filepath_arg or not isinstance(filepath_arg, str):
-        return [
-            mcp_types.TextContent(
-                type="text", text="Error: filepath is required and must be a string."
-            )
-        ]
+        return Invalid(
+            field="filepath",
+            message="filepath is required and must be a string.",
+        )
 
-    # Resolve and normalize path (main.py:1509-1515)
+    requesting_agent_id = principal.agent_id or ""
     normalized_filepath_str = _normalize_filepath(filepath_arg, requesting_agent_id)
 
-    # Log audit (main.py:1517)
     log_audit(
         requesting_agent_id,
         "view_file_metadata",
@@ -75,114 +94,103 @@ async def view_file_metadata_tool_impl(
     )
 
     conn = None
-    response_message: str = ""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        # main.py:1521
         cursor.execute(
             "SELECT metadata, updated_by, last_updated, content_hash FROM file_metadata WHERE filepath = ?",
             (normalized_filepath_str,),
         )
         row = cursor.fetchone()
-        if row:  # main.py:1523-1525
-            try:
-                metadata_parsed = json.loads(
-                    row["metadata"]
-                )  # Metadata is stored as JSON string
-            except json.JSONDecodeError:
-                logger.warning(
-                    f"Failed to parse JSON metadata for file '{normalized_filepath_str}'. Raw: {row['metadata']}"
-                )
-                metadata_parsed = {
-                    "error": "Could not parse stored metadata string.",
-                    "raw_value": row["metadata"],
-                }
-
-            response_data = {
-                "filepath": normalized_filepath_str,
-                "metadata": metadata_parsed,
-                "last_updated_by": row["updated_by"],
-                "last_updated_at": row["last_updated"],
-                "content_hash": (
-                    row["content_hash"] if "content_hash" in row.keys() else "N/A"
-                ),  # content_hash was added later
+        if row is None:
+            return NotFound(
+                resource="file metadata",
+                identifier=normalized_filepath_str,
+            )
+        try:
+            metadata_parsed = json.loads(row["metadata"])
+        except json.JSONDecodeError:
+            logger.warning(
+                f"Failed to parse JSON metadata for file "
+                f"'{normalized_filepath_str}'. Raw: {row['metadata']}"
+            )
+            metadata_parsed = {
+                "error": "Could not parse stored metadata string.",
+                "raw_value": row["metadata"],
             }
-            response_message = f"Metadata for file '{filepath_arg}' (normalized: {normalized_filepath_str}):\n\n{json.dumps(response_data, indent=2, ensure_ascii=False)}"
-        else:  # main.py:1527
-            response_message = f"No metadata found for file '{filepath_arg}' (normalized: {normalized_filepath_str})."
 
-    except sqlite3.Error as e_sql:  # main.py:1529
+        response_data = {
+            "filepath": normalized_filepath_str,
+            "metadata": metadata_parsed,
+            "last_updated_by": row["updated_by"],
+            "last_updated_at": row["last_updated"],
+            "content_hash": (
+                row["content_hash"] if "content_hash" in row.keys() else "N/A"
+            ),
+        }
+        message = (
+            f"Metadata for file '{filepath_arg}' (normalized: "
+            f"{normalized_filepath_str}):\n\n"
+            f"{json.dumps(response_data, indent=2, ensure_ascii=False)}"
+        )
+        return Ok(data=response_data, message=message)
+    except sqlite3.Error as e_sql:
         logger.error(
-            f"Database error viewing file metadata for '{normalized_filepath_str}': {e_sql}",
+            f"Database error viewing file metadata for "
+            f"'{normalized_filepath_str}': {e_sql}",
             exc_info=True,
         )
-        response_message = f"Database error viewing file metadata: {e_sql}"
-    except (
-        json.JSONDecodeError
-    ) as e_json:  # Should be caught per-item, but as fallback (main.py:1532)
-        logger.error(
-            f"Error decoding JSON from file_metadata table for '{normalized_filepath_str}': {e_json}",
-            exc_info=True,
-        )
-        response_message = f"Error decoding stored file metadata."
+        return Failed(message=f"Database error viewing file metadata: {e_sql}")
     except Exception as e:
         logger.error(
-            f"Unexpected error viewing file metadata for '{normalized_filepath_str}': {e}",
+            f"Unexpected error viewing file metadata for "
+            f"'{normalized_filepath_str}': {e}",
             exc_info=True,
         )
-        response_message = f"An unexpected error occurred: {e}"
+        return Failed(message=f"An unexpected error occurred: {e}")
     finally:
         if conn:
             conn.close()
 
-    return [mcp_types.TextContent(type="text", text=response_message)]
-
 
 # --- update_file_metadata tool ---
-# Original logic from main.py: lines 1536-1569 (update_file_metadata_tool function)
-#
-# Note: access.py classifies this as "any" (workers see it in tools/list)
-# but the impl gates admin-only. We preserve current enforcement and decorate
-# with @requires_role("operator") — workers calling it directly get AuthRejected.
-# (The access.py mismatch is a pre-existing visibility quirk; tightening
-# tools/list would be a separate behavior-change PR.)
-@requires_role("operator")
+# Access table classifies this as "any" (workers see it in tools/list)
+# but the impl gates operator-only. We preserve current enforcement
+# (the access.py mismatch is a pre-existing visibility quirk;
+# tightening tools/list would be a separate behavior-change PR).
 async def update_file_metadata_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
-    admin_auth_token = arguments.get("token")
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    if principal is None or not principal.has_role("operator"):
+        return PermissionDenied(
+            reason="operator-tier authorization required to update file metadata"
+        )
+
     filepath_arg = arguments.get("filepath")
     metadata_to_set = arguments.get("metadata")  # This is a Dict[str, Any]
 
-    requesting_admin_id = get_agent_id(admin_auth_token)  # main.py:1542
-    if not requesting_admin_id:  # Should be "admin"
-        logger.error(
-            "Admin token verified but could not get admin_id. This is unexpected."
+    if not filepath_arg or not isinstance(filepath_arg, str):
+        return Invalid(
+            field="filepath",
+            message="filepath is required and must be a string.",
         )
-        return [
-            mcp_types.TextContent(type="text", text="Internal authorization error.")
-        ]
+    if metadata_to_set is None or not isinstance(metadata_to_set, dict):
+        return Invalid(
+            field="metadata",
+            message="metadata is required and must be a dictionary.",
+        )
 
-    if (
-        not filepath_arg
-        or not isinstance(filepath_arg, str)
-        or metadata_to_set is None
-        or not isinstance(metadata_to_set, dict)
-    ):
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text="Error: filepath (string) and metadata (dictionary) are required.",
-            )
-        ]
+    # Operator-tier callers attribute via user_id; if a manager-role
+    # agent ever satisfies has_role("operator") in a future widening,
+    # principal.agent_id would slot in via the same actor_label call.
+    requesting_admin_id = principal.actor_label()
 
-    # Resolve and normalize path (main.py:1545-1549)
     normalized_filepath_str = _normalize_filepath(
-        filepath_arg, requesting_admin_id
-    )  # Use admin's context for WD if needed
+        filepath_arg, principal.agent_id
+    )
 
-    # Log audit (main.py:1551)
     log_audit(
         requesting_admin_id,
         "update_file_metadata",
@@ -193,35 +201,29 @@ async def update_file_metadata_tool_impl(
         },
     )
 
-    conn = None
     try:
-        # Ensure metadata is JSON serializable (main.py:1555-1558)
         metadata_json_str = json.dumps(metadata_to_set)
     except TypeError as e_type:
         logger.error(
-            f"Metadata provided for file '{normalized_filepath_str}' is not JSON serializable: {e_type}"
+            f"Metadata provided for file '{normalized_filepath_str}' is "
+            f"not JSON serializable: {e_type}"
         )
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text=f"Error: Provided metadata is not JSON serializable: {e_type}",
-            )
-        ]
+        return Invalid(
+            field="metadata",
+            message=f"Provided metadata is not JSON serializable: {e_type}",
+        )
 
+    conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         updated_at_iso = datetime.datetime.now().isoformat()
 
-        # The original did not explicitly handle content_hash here.
-        # If metadata updates should also update/clear content_hash, that logic would be added.
-        # For now, it only updates metadata, last_updated, updated_by.
-        # (main.py:1561-1565)
         cursor.execute(
             """
             INSERT OR REPLACE INTO file_metadata (filepath, metadata, last_updated, updated_by)
             VALUES (?, ?, ?, ?)
-        """,
+            """,
             (
                 normalized_filepath_str,
                 metadata_json_str,
@@ -239,39 +241,40 @@ async def update_file_metadata_tool_impl(
         conn.commit()
 
         logger.info(
-            f"File metadata for '{normalized_filepath_str}' updated by '{requesting_admin_id}'."
+            f"File metadata for '{normalized_filepath_str}' updated by "
+            f"'{requesting_admin_id}'."
         )
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text=f"File metadata updated successfully for '{filepath_arg}' (normalized: {normalized_filepath_str}).",
-            )
-        ]
+        return Ok(
+            data={
+                "filepath": normalized_filepath_str,
+                "original_path": filepath_arg,
+                "updated_by": requesting_admin_id,
+                "last_updated": updated_at_iso,
+            },
+            message=(
+                f"File metadata updated successfully for "
+                f"'{filepath_arg}' (normalized: {normalized_filepath_str})."
+            ),
+        )
 
-    except sqlite3.Error as e_sql:  # main.py:1566
+    except sqlite3.Error as e_sql:
         if conn:
             conn.rollback()
         logger.error(
-            f"Database error updating file metadata for '{normalized_filepath_str}': {e_sql}",
+            f"Database error updating file metadata for "
+            f"'{normalized_filepath_str}': {e_sql}",
             exc_info=True,
         )
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Database error updating file metadata: {e_sql}"
-            )
-        ]
+        return Failed(message=f"Database error updating file metadata: {e_sql}")
     except Exception as e:
         if conn:
             conn.rollback()
         logger.error(
-            f"Unexpected error updating file metadata for '{normalized_filepath_str}': {e}",
+            f"Unexpected error updating file metadata for "
+            f"'{normalized_filepath_str}': {e}",
             exc_info=True,
         )
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Unexpected error updating file metadata: {e}"
-            )
-        ]
+        return Failed(message=f"Unexpected error updating file metadata: {e}")
     finally:
         if conn:
             conn.close()
@@ -320,11 +323,11 @@ def register_file_metadata_tools():
             "additionalProperties": False,
         },
         implementation=update_file_metadata_tool_impl,
-        # @requires_role("operator") on the impl gates call-time; the old
-        # hand-maintained TOOL_ACCESS classified this "any" (a
-        # pre-existing visibility quirk: workers saw it in tools/list
-        # but the call always failed). PR-W1c aligns visibility with
-        # call-time enforcement — strictly an improvement.
+        # Operator-only at call-time (impl checks principal.has_role
+        # ("operator")); the old hand-maintained TOOL_ACCESS classified
+        # this "any" (a pre-existing visibility quirk: workers saw it
+        # in tools/list but the call always failed). PR-W1c aligns
+        # visibility with call-time enforcement.
         visibility="operator",
     )
 

@@ -438,15 +438,17 @@ async def _add_note(token: str, task_id: str, text: str) -> int:
 
 
 async def _edit_note(token: str, note_id: int, new_text: str) -> str:
-    """Wave 6 PR 0 — ``edit_task_note`` is unmigrated; the bridge
-    auto-wraps its legacy ``list[TextContent]`` return as
-    ``Ok(message=...)``. Pull the message out so callers continue
-    to see the same prose they did pre-Wave-6.
+    """Wave 6 PR 1 — ``edit_task_note`` is now migrated; the return
+    is a typed :data:`ToolResult` variant. Render it through the MCP
+    text-content renderer so the helper returns the same wire-shape
+    prose an MCP client would see, regardless of variant. That keeps
+    the existing assertion sites (``"updated"`` substring match,
+    etc.) valid while admitting the new typed paths.
     """
     from agent_mcp.tools.registry import (
         dispatch_tool_call, request_auth_token,
     )
-    from agent_mcp.core.tool_result import Ok
+    from agent_mcp.core.tool_result import render_as_text_content
 
     cv = request_auth_token.set(token)
     try:
@@ -456,9 +458,8 @@ async def _edit_note(token: str, note_id: int, new_text: str) -> str:
         )
     finally:
         request_auth_token.reset(cv)
-    if isinstance(result, Ok):
-        return result.message or ""
-    return ""
+    blocks = render_as_text_content(result)
+    return blocks[0].text if blocks else ""
 
 
 async def test_edit_task_note_admits_system_bearer(tmp_path) -> None:
@@ -501,10 +502,14 @@ async def test_edit_task_note_rejects_worker_non_author(tmp_path) -> None:
 
         intruder = await admin.create_worker("note-intruder-3")
         result = await _edit_note(intruder.token, note_id, "v2-by-intruder")
-        # Failure case: error text from task_notes_db.edit_note (not the
-        # decorator's "Unauthorized: …" wrap, because the tool itself is
-        # @requires("any") — the per-note ownership check is what fails).
-        assert "error" in result.lower() or "permitted" in result.lower(), (
+        # Failure case: Wave 6 PR 1 surfaces the ownership failure as a
+        # typed :class:`PermissionDenied`, which the MCP renderer
+        # formats as ``"Unauthorized: Note N is owned by 'alice'; …"``.
+        # The pre-PR-1 prose ("Error: Note …") came from the legacy
+        # bridge-wrap; both wordings name the author so we accept either
+        # the "unauthorized" prefix or the ownership clue.
+        lower = result.lower()
+        assert "unauthorized" in lower or "only the author" in lower, (
             f"worker non-author must NOT be able to edit; got {result!r}"
         )
 
