@@ -182,9 +182,14 @@ _EXPECTED_CONSUMERS = {
     "components/dashboard/messages-dashboard.tsx": [
         "detailDialog",
     ],
-    "components/dashboard/overview-dashboard.tsx": [
-        "nodeDialog",
-    ],
+    # NOTE: overview-dashboard.tsx no longer carries a ``nodeDialog``
+    # consumer. The mobile-load PR (#232) replaced the page's
+    # ``<VisGraph>`` + ``<NodeDetailPanel>`` pair with summary stat
+    # cards + a "View Collaboration Network" link to the System page
+    # (which still owns the graph + its own node-detail interaction).
+    # Removing the entry here keeps the audit map honest without
+    # weakening the contract — the System page graph still routes
+    # node clicks through its own ``useDialog`` consumer.
     "components/dashboard/prompt-book-dashboard.tsx": [
         "builderDialog",
     ],

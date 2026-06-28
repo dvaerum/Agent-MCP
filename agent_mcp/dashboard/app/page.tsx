@@ -1,19 +1,82 @@
 "use client"
 
 import { Suspense } from "react"
+import dynamic from "next/dynamic"
 import { MainLayout } from "@/components/layout/main-layout"
 import { DashboardWrapper } from "@/components/dashboard/dashboard-wrapper"
-import { OverviewDashboard } from "@/components/dashboard/overview-dashboard"
-import { ProjectsOverviewDashboard } from "@/components/dashboard/projects-overview-dashboard"
-import { AgentsDashboard } from "@/components/dashboard/agents-dashboard"
-import { TasksDashboard } from "@/components/dashboard/tasks-dashboard"
-import { MemoriesDashboard } from "@/components/dashboard/memories-dashboard"
-import { MessagesDashboard } from "@/components/dashboard/messages-dashboard"
-import { SettingsDashboard } from "@/components/dashboard/settings-dashboard"
-import { PromptBookDashboard } from "@/components/dashboard/prompt-book-dashboard"
-import { SystemDashboard } from "@/components/dashboard/system-dashboard"
+import { Skeleton } from "@/components/ui/skeleton"
 import { useSectionRoute } from "@/lib/use-section-route"
 import { projectContext } from "@/lib/project-context"
+
+// Per-section code-splitting — each section dashboard ships in its own
+// JS chunk and is fetched on demand when the user lands on (or
+// navigates to) that section. The previous static imports pulled all
+// nine section trees into the `/page-*.js` initial bundle (~321 KB),
+// which dominated mobile cold-load parse time. After this split the
+// first-load bundle only carries the layout shell + the section the
+// user actually opened; switching sections pays a one-time ~100 ms
+// chunk fetch — the standard SPA trade.
+//
+// `ssr: false` keeps the static-export build honest: every section
+// already uses `"use client"` (zustand stores, browser-only APIs), so
+// there is no SSR value to preserve, and the prerender step would
+// otherwise drag the trees back into the server bundle.
+//
+// `loading: () => <SectionSkeleton />` reuses the project's shared
+// `Skeleton` primitive (components/ui/skeleton.tsx) — same animation,
+// same theme tokens — so the placeholder doesn't fight the section
+// chrome the user is about to see.
+
+function SectionSkeleton() {
+  return (
+    <div className="w-full p-4 sm:p-6 space-y-4 sm:space-y-6 flex flex-col h-full">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 shrink-0">
+        <div className="space-y-2">
+          <Skeleton className="h-8 w-48" />
+          <Skeleton className="h-4 w-72" />
+        </div>
+      </div>
+      <Skeleton className="flex-1 min-h-[400px] rounded-lg" />
+    </div>
+  )
+}
+
+const OverviewDashboard = dynamic(
+  () => import("@/components/dashboard/overview-dashboard").then(m => m.OverviewDashboard),
+  { ssr: false, loading: () => <SectionSkeleton /> },
+)
+const ProjectsOverviewDashboard = dynamic(
+  () => import("@/components/dashboard/projects-overview-dashboard").then(m => m.ProjectsOverviewDashboard),
+  { ssr: false, loading: () => <SectionSkeleton /> },
+)
+const AgentsDashboard = dynamic(
+  () => import("@/components/dashboard/agents-dashboard").then(m => m.AgentsDashboard),
+  { ssr: false, loading: () => <SectionSkeleton /> },
+)
+const TasksDashboard = dynamic(
+  () => import("@/components/dashboard/tasks-dashboard").then(m => m.TasksDashboard),
+  { ssr: false, loading: () => <SectionSkeleton /> },
+)
+const MemoriesDashboard = dynamic(
+  () => import("@/components/dashboard/memories-dashboard").then(m => m.MemoriesDashboard),
+  { ssr: false, loading: () => <SectionSkeleton /> },
+)
+const MessagesDashboard = dynamic(
+  () => import("@/components/dashboard/messages-dashboard").then(m => m.MessagesDashboard),
+  { ssr: false, loading: () => <SectionSkeleton /> },
+)
+const SettingsDashboard = dynamic(
+  () => import("@/components/dashboard/settings-dashboard").then(m => m.SettingsDashboard),
+  { ssr: false, loading: () => <SectionSkeleton /> },
+)
+const PromptBookDashboard = dynamic(
+  () => import("@/components/dashboard/prompt-book-dashboard").then(m => m.PromptBookDashboard),
+  { ssr: false, loading: () => <SectionSkeleton /> },
+)
+const SystemDashboard = dynamic(
+  () => import("@/components/dashboard/system-dashboard").then(m => m.SystemDashboard),
+  { ssr: false, loading: () => <SectionSkeleton /> },
+)
 
 function DashboardPage() {
   // URL-driven section routing — `?page=<section>` is the source of

@@ -688,14 +688,32 @@ export default function VisNetworkLoader({
     }
   }, [layoutMode, isMounted, onNodeSelect])
 
-  // Fetch data on mount and handle auto-refresh
+  // Initial fetch — guarded by a ref so the cold-load path runs once
+  // per real mount. Two failure modes this guard closes:
+  //   1. React 18+ StrictMode double-mounts every effect in dev
+  //      (mount → cleanup → mount), so the naive `fetchGraphData(true)`
+  //      fired twice and the dashboard's `/graph-data` endpoint was
+  //      hit twice on every cold page load (~50 KB + 25 ms wasted).
+  //   2. `fetchGraphData` is a useCallback that depends on `nodeCount`.
+  //      When the first response lands and `setNodeCount` runs, the
+  //      callback identity changes — without the ref this effect
+  //      would re-fire and trigger a third fetch.
+  // Auto-refresh is split into its own effect below so it doesn't share
+  // the once-per-mount guard.
+  const initialFetchRef = useRef(false)
   useEffect(() => {
-    fetchGraphData(true) // Initial load
+    if (initialFetchRef.current) return
+    initialFetchRef.current = true
+    fetchGraphData(true)
+  }, [fetchGraphData])
 
-    if (autoRefresh) {
-      const interval = setInterval(() => fetchGraphData(false), 30000) // 30 seconds, non-initial load
-      return () => clearInterval(interval)
-    }
+  // Auto-refresh — independent of the initial-fetch guard so toggling
+  // `autoRefresh` on/off rebuilds the interval without re-firing the
+  // cold-load fetch.
+  useEffect(() => {
+    if (!autoRefresh) return
+    const interval = setInterval(() => fetchGraphData(false), 30000)
+    return () => clearInterval(interval)
   }, [fetchGraphData, autoRefresh])
 
   // Handle layout mode change

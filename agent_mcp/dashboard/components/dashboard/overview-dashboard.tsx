@@ -1,51 +1,176 @@
 "use client"
 
-import React, { useCallback, useEffect } from "react"
-import { RefreshCw, Server } from "lucide-react"
+import React, { useEffect, useMemo } from "react"
+import {
+  Activity,
+  ArrowRight,
+  Brain,
+  CheckCircle2,
+  Cpu,
+  ListTodo,
+  Network,
+  RefreshCw,
+  Server,
+} from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent } from "@/components/ui/card"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { useServerStore } from "@/lib/stores/server-store"
 import { useDataStore } from "@/lib/stores/data-store"
-import { useDialog } from "@/hooks/use-dialog"
-import { VisGraph } from "./vis-graph-simple"
-import { NodeDetailPanel } from "./node-detail-panel"
+import { useSectionRoute } from "@/lib/use-section-route"
 import { CORSDiagnostic } from "../debug/cors-diagnostic"
 
-type SelectedNode = {
-  id: string
-  type: 'agent' | 'task' | 'context' | 'file' | 'admin'
-  data: unknown
+// Render an ISO timestamp as a coarse relative-time string ("5m ago",
+// "2h ago"). The Overview uses this for the recent-activity feed and
+// the per-card "last added" hints. Falls back to the raw value if the
+// timestamp can't be parsed.
+function relativeTime(iso: string | undefined | null): string {
+  if (!iso) return "—"
+  const t = Date.parse(iso)
+  if (Number.isNaN(t)) return iso
+  const deltaSec = Math.max(1, Math.round((Date.now() - t) / 1000))
+  if (deltaSec < 60) return `${deltaSec}s ago`
+  const min = Math.round(deltaSec / 60)
+  if (min < 60) return `${min}m ago`
+  const hr = Math.round(min / 60)
+  if (hr < 24) return `${hr}h ago`
+  const day = Math.round(hr / 24)
+  return `${day}d ago`
+}
+
+// Stat-card primitive — title, big number, optional sub-line, and an
+// icon. The mobile-load PR replaced the full vis-network graph on this
+// page with a handful of these so the cold-load doesn't drag in the
+// 617 KB vis chunk just to render the landing page. The full graph
+// still lives behind the System page link below.
+function StatCard({
+  title,
+  icon: Icon,
+  primary,
+  sub,
+}: {
+  title: string
+  icon: React.ComponentType<{ className?: string }>
+  primary: React.ReactNode
+  sub?: React.ReactNode
+}) {
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+        <CardTitle className="text-sm font-medium text-muted-foreground">
+          {title}
+        </CardTitle>
+        <Icon className="h-4 w-4 text-muted-foreground" />
+      </CardHeader>
+      <CardContent>
+        <div className="text-2xl font-semibold tabular-nums">{primary}</div>
+        {sub != null && (
+          <p className="text-xs text-muted-foreground mt-1">{sub}</p>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+// Action shape returned in AllData.actions. Kept loose because the
+// backend payload includes optional task/agent linkage fields whose
+// exact name varies by action type.
+interface ActionRow {
+  action_id?: string
+  agent_id?: string
+  action_type?: string | null
+  task_id?: string | null
+  timestamp?: string
+  details?: unknown
 }
 
 export function OverviewDashboard() {
   const { servers, activeServerId } = useServerStore()
   const activeServer = servers.find(s => s.id === activeServerId)
   const { data, loading, fetchAllData, isRefreshing } = useDataStore()
-  
-  // Node-detail panel state. The "key" here is the SelectedNode
-  // itself — the graph's onNodeSelect callback already passes the
-  // full {id, type, data} tuple and there is no separate live source
-  // to look it up from (the data is computed by vis.js on click, not
-  // stored in zustand). So the selector is identity. Live-lookup
-  // useDialog (Candidate D, 2026-06-02) requires a selector argument
-  // even when the source has no separate row store.
-  const nodeIdentitySelector = useCallback(
-    (node: SelectedNode | null) => node,
-    [],
-  )
-  const nodeDialog = useDialog<SelectedNode, SelectedNode>(nodeIdentitySelector)
-  
+  const { setSection } = useSectionRoute()
+
   useEffect(() => {
-    // Fetch data on mount
     if (activeServerId && activeServer?.status === 'connected') {
       fetchAllData()
     }
   }, [activeServerId, activeServer?.status, fetchAllData])
-  
+
   const isConnected = !!activeServerId && activeServer?.status === 'connected'
 
-  // Show connection prompt if no server is selected
+  // Derived stat-card numbers. Memoised so the recent-activity feed
+  // below doesn't recompute these on its own re-renders.
+  const stats = useMemo(() => {
+    if (!data) {
+      return {
+        agentsTotal: 0,
+        agentsActive: 0,
+        tasksTotal: 0,
+        tasksInProgress: 0,
+        tasksCompleted: 0,
+        memoriesTotal: 0,
+        memoriesLastUpdated: undefined as string | undefined,
+        actionsTotal: 0,
+        actionsRecent: 0,
+      }
+    }
+    const agents = data.agents ?? []
+    const tasks = data.tasks ?? []
+    const context = data.context ?? []
+    const actions = (data.actions ?? []) as ActionRow[]
+
+    const agentsActive = agents.filter(
+      a => a.status === 'running' || a.status === 'pending',
+    ).length
+    const tasksInProgress = tasks.filter(t => t.status === 'in_progress').length
+    const tasksCompleted = tasks.filter(t => t.status === 'completed').length
+
+    const memoriesLastUpdated = context
+      .map((c: { updated_at?: string }) => c.updated_at)
+      .filter((ts): ts is string => typeof ts === 'string' && ts.length > 0)
+      .sort()
+      .pop()
+
+    // "Recent" = actions inside the last hour. Cheap heuristic — the
+    // exact threshold doesn't matter for the sub-line; it just gives
+    // operators a sense of whether the system is doing anything right
+    // now vs. cold-stored history.
+    const oneHourAgo = Date.now() - 60 * 60 * 1000
+    const actionsRecent = actions.filter(a => {
+      if (!a.timestamp) return false
+      const t = Date.parse(a.timestamp)
+      return !Number.isNaN(t) && t >= oneHourAgo
+    }).length
+
+    return {
+      agentsTotal: agents.length,
+      agentsActive,
+      tasksTotal: tasks.length,
+      tasksInProgress,
+      tasksCompleted,
+      memoriesTotal: context.length,
+      memoriesLastUpdated,
+      actionsTotal: actions.length,
+      actionsRecent,
+    }
+  }, [data])
+
+  // Recent-activity feed — last 10 actions, newest first. The
+  // `agent_actions` table is included in `getAllData` so we don't add
+  // a new API call. Each row renders the action verb + the agent +
+  // the task id if present + relative time.
+  const recentActivity = useMemo<ActionRow[]>(() => {
+    const actions = (data?.actions ?? []) as ActionRow[]
+    return [...actions]
+      .filter(a => a.timestamp)
+      .sort((a, b) => {
+        const ta = Date.parse(a.timestamp ?? '')
+        const tb = Date.parse(b.timestamp ?? '')
+        return tb - ta
+      })
+      .slice(0, 10)
+  }, [data?.actions])
+
   if (!isConnected) {
     return (
       <div className="h-full flex items-center justify-center p-4">
@@ -70,19 +195,15 @@ export function OverviewDashboard() {
     )
   }
 
-  const handleClosePanel = () => {
-    nodeDialog.close()
-  }
-
   return (
-    /* CC-8/CC-16/CC-19/CC-26 audit 2026-06-02: plain Tailwind spacing,
-       h1 sizing, drop animate-pulse, shorten H1 wrap. */
-    <div className="w-full p-4 sm:p-6 space-y-4 sm:space-y-6 flex flex-col h-full">
+    <div className="w-full p-4 sm:p-6 space-y-4 sm:space-y-6 flex flex-col h-full overflow-y-auto">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 shrink-0">
         <div>
-          <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight text-foreground">Collaboration Network</h1>
-          <p className="text-muted-foreground text-sm sm:text-base mt-1">Real-time visualization of agent-task relationships</p>
+          <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight text-foreground">Overview</h1>
+          <p className="text-muted-foreground text-sm sm:text-base mt-1">
+            Snapshot of the agents, tasks, memories, and recent activity in this project.
+          </p>
         </div>
         <div className="flex flex-wrap items-center gap-2 sm:gap-3">
           <Badge variant="outline" className="text-xs bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30 font-medium">
@@ -107,29 +228,118 @@ export function OverviewDashboard() {
         </div>
       </div>
 
-      {/* Graph Container — CC-9 partial / overview-specific fix: was
-          `style={{ height: 'calc(100vh - 280px)' }}` (magic px offset
-          that broke when the header wrapped to multiple rows at narrow
-          viewports). Now uses `flex-1 min-h-[400px]` so it expands to
-          fill whatever space remains inside the page flex column. */}
-      <div className="bg-card border border-border rounded-lg overflow-hidden flex-1 min-h-[400px]">
-        <VisGraph
-          fullscreen
-          onNodeSelect={(nodeId, nodeType, nodeData) => {
-            nodeDialog.open({ id: nodeId, type: nodeType, data: nodeData })
-          }}
+      {/* Stat cards */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+        <StatCard
+          title="Agents"
+          icon={Cpu}
+          primary={stats.agentsTotal}
+          sub={`${stats.agentsActive} active`}
+        />
+        <StatCard
+          title="Tasks"
+          icon={ListTodo}
+          primary={stats.tasksTotal}
+          sub={
+            <>
+              {stats.tasksInProgress} in progress · {stats.tasksCompleted} completed
+            </>
+          }
+        />
+        <StatCard
+          title="Memories"
+          icon={Brain}
+          primary={stats.memoriesTotal}
+          sub={
+            stats.memoriesLastUpdated
+              ? `last added ${relativeTime(stats.memoriesLastUpdated)}`
+              : "none yet"
+          }
+        />
+        <StatCard
+          title="Activity"
+          icon={Activity}
+          primary={stats.actionsTotal}
+          sub={`${stats.actionsRecent} in the last hour`}
         />
       </div>
 
-      
-      {/* Node Detail Panel - Fixed positioned */}
-      <NodeDetailPanel
-        nodeId={nodeDialog.data?.id ?? null}
-        nodeType={nodeDialog.data?.type ?? null}
-        nodeData={(nodeDialog.data?.data ?? null) as any}
-        isOpen={nodeDialog.isOpen}
-        onClose={handleClosePanel}
-      />
+      {/* Recent activity feed + System link */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 sm:gap-6 flex-1 min-h-0">
+        <Card className="lg:col-span-2 flex flex-col">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base">Recent activity</CardTitle>
+          </CardHeader>
+          <CardContent className="flex-1 overflow-y-auto">
+            {recentActivity.length === 0 ? (
+              <div className="text-sm text-muted-foreground py-8 text-center">
+                No agent activity recorded yet.
+              </div>
+            ) : (
+              <ul className="space-y-2.5">
+                {recentActivity.map((action, idx) => {
+                  const verb = (action.action_type ?? 'action').replace(/_/g, ' ')
+                  const agent = action.agent_id ?? 'unknown'
+                  const task = action.task_id
+                  const isCompletion =
+                    action.action_type === 'task_completed' ||
+                    action.action_type === 'complete_task'
+                  return (
+                    <li
+                      key={action.action_id ?? `${action.timestamp ?? ''}-${idx}`}
+                      className="flex items-start gap-3 text-sm border-l-2 pl-3 py-1 border-muted hover:border-primary/50 transition-colors"
+                    >
+                      {isCompletion ? (
+                        <CheckCircle2 className="h-4 w-4 text-emerald-500 shrink-0 mt-0.5" />
+                      ) : (
+                        <Activity className="h-4 w-4 text-muted-foreground shrink-0 mt-0.5" />
+                      )}
+                      <div className="flex-1 min-w-0">
+                        <div className="flex flex-wrap items-baseline gap-x-2">
+                          <span className="font-medium text-foreground truncate">{agent}</span>
+                          <span className="text-muted-foreground">{verb}</span>
+                          {task && (
+                            <code className="text-xs bg-muted px-1 py-0.5 rounded truncate max-w-[12rem]">
+                              {task}
+                            </code>
+                          )}
+                        </div>
+                        <span className="text-xs text-muted-foreground tabular-nums">
+                          {relativeTime(action.timestamp)}
+                        </span>
+                      </div>
+                    </li>
+                  )
+                })}
+              </ul>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card className="flex flex-col">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base flex items-center gap-2">
+              <Network className="h-4 w-4 text-muted-foreground" />
+              Collaboration network
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="flex-1 flex flex-col justify-between gap-4">
+            <p className="text-sm text-muted-foreground">
+              The interactive agent / task / memory graph lives on the System page.
+              Open it to inspect relationships and click through to node details.
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="self-start"
+              onClick={() => setSection('system')}
+            >
+              View Collaboration Network
+              <ArrowRight className="h-3.5 w-3.5 ml-1.5" />
+            </Button>
+          </CardContent>
+        </Card>
+      </div>
     </div>
   )
 }
