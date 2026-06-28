@@ -1,49 +1,73 @@
 # Agent-MCP/mcp_template/mcp_server_src/tools/rag_tools.py
-from typing import List, Dict, Any
+"""RAG-query MCP tool surface.
 
-import mcp.types as mcp_types # Assuming this is your mcp.types path
+Wave 6 PR 1 migrated the lone tool here (`ask_project_rag`) to the
+Principal + ToolResult signature. The legacy ``@requires("any")``
+decorator is gone — the tool itself rejects non-agent principals via
+``principal.kind == "agent_bearer"``, matching the pre-migration
+admission ("active agent token required"). Operator-session callers
+(dashboard) are still rejected because no current call site needs the
+widening; PR 6 (or a later UX-driven PR) can broaden if needed.
+"""
+
+from typing import Any, Dict, Optional
 
 from .registry import register_tool
 from ..core.config import logger
-# No direct use of g (globals) here, auth and RAG core logic handle that.
-from ..core.auth import get_agent_id # Corrected
-from ..core.authorize import requires
-from ..utils.audit_utils import log_audit # Corrected
+from ..core.principal import Principal
+from ..core.tool_result import Failed, Invalid, Ok, PermissionDenied, ToolResult
+from ..utils.audit_utils import log_audit
 # Import the core RAG querying logic
-from ..features.rag.query import query_rag_system # Corrected
+from ..features.rag.query import query_rag_system
+
 
 # --- ask_project_rag tool ---
-# Original logic for the tool part from main.py: lines 1572-1578 (ask_project_rag_tool function shell)
-# The core RAG execution is in features/rag/query.py's query_rag_system.
-@requires("any")
-async def ask_project_rag_tool_impl(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
-    agent_auth_token = arguments.get("token")
+async def ask_project_rag_tool_impl(
+    arguments: Dict[str, Any],
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    if principal is None or principal.kind != "agent_bearer":
+        return PermissionDenied(
+            reason="agent token required to query project RAG"
+        )
+
     query_text = arguments.get("query")
-
-    # @requires("any") guaranteed entry; resolve id for audit.
-    requesting_agent_id = get_agent_id(agent_auth_token)
-
     if not query_text or not isinstance(query_text, str):
-        return [mcp_types.TextContent(type="text", text="Error: query text is required and must be a string.")]
+        return Invalid(
+            field="query",
+            message="query text is required and must be a string.",
+        )
 
-    # Log audit (main.py:1578)
+    requesting_agent_id = principal.agent_id or ""
     log_audit(requesting_agent_id, "ask_project_rag", {"query": query_text})
-    
-    logger.info(f"Agent '{requesting_agent_id}' is asking project RAG: '{query_text[:100]}...'")
+
+    logger.info(
+        f"Agent '{requesting_agent_id}' is asking project RAG: "
+        f"'{query_text[:100]}...'"
+    )
 
     try:
-        # Call the core RAG system function from features/rag/query.py
-        # This function (query_rag_system) handles all the complex RAG logic.
+        # query_rag_system handles its own errors and always returns
+        # a string (possibly an error-prose string). Pass through as
+        # the human-facing message; data carries the same text so
+        # REST consumers can read it programmatically too.
         answer_text = await query_rag_system(query_text)
-        
-        # The query_rag_system already handles internal errors and returns a string.
-        return [mcp_types.TextContent(type="text", text=answer_text)]
-        
+        return Ok(data={"answer": answer_text}, message=answer_text)
     except Exception as e:
-        # This catch block is for unexpected errors specifically within this tool_impl wrapper,
-        # not for errors within query_rag_system itself, as those are handled internally by it.
-        logger.error(f"Unexpected error in ask_project_rag_tool_impl for agent '{requesting_agent_id}': {e}", exc_info=True)
-        return [mcp_types.TextContent(type="text", text=f"An unexpected error occurred while processing your RAG query: {str(e)}")]
+        # Defensive — query_rag_system catches its own errors; this
+        # arm only fires for unexpected exceptions in the wrapper.
+        logger.error(
+            f"Unexpected error in ask_project_rag_tool_impl for agent "
+            f"'{requesting_agent_id}': {e}",
+            exc_info=True,
+        )
+        return Failed(
+            message=(
+                f"An unexpected error occurred while processing your RAG "
+                f"query: {e}"
+            )
+        )
 
 
 # --- Register RAG tools ---

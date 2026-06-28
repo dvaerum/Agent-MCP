@@ -12,36 +12,35 @@ module wires it up as three MCP tools:
 
 Authoring contract (matches the dashboard agent-actions log
 convention): only the note's author or a manager-tier+ caller may
-edit/delete it. Manager-tier admits the system bearer OR an agent
-token whose row has ``agent_role='manager'`` — see
-``verify_token(token, "manager")`` (Phase 2 Wave 2a). The
-``requires`` decorator only gates "can this token call the tool at
-all?"; the per-note ownership check happens inside the impl against
+edit/delete it. Manager-tier admits any operator-tier
+:class:`Principal` (operator session or forwarding header) OR an
+agent token whose row has ``agent_role='manager'``. The per-note
+ownership check happens inside the impl against
 ``task_notes_db.edit_note`` / ``delete_note``, which still takes
-the historical ``is_admin`` boolean (now sourced from the
-manager-tier check).
-
-The ``is_admin`` source is ``verify_token(token, "manager")`` so a
-manager-role agent can moderate worker notes.
+the historical ``is_admin`` boolean (now sourced from
+``principal.has_role("manager")``).
 
 The existing append-only writers in `task_tools.py` (the bulk
 add_note operation, the inline notes append in
 update_task_status_tool_impl, the initial-note inserts) still
 mutate the legacy `tasks.notes` JSON column for the deprecation
 window. A follow-up PR flips those over and drops the JSON column.
+
+Wave 6 PR 1 — all three tools are now on the Principal +
+ToolResult signature. The author/requester is sourced from
+``principal.agent_id or principal.user_id`` so both bearer-authed
+agents and operator-session callers attribute correctly.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-import mcp.types as mcp_types
-
-from ..core.auth import get_agent_id, verify_token
 from ..core.principal import Principal
 from ..core.tool_result import (
     Failed,
     Invalid,
+    NotFound,
     Ok,
     PermissionDenied,
     ToolResult,
@@ -50,29 +49,28 @@ from ..db.actions import task_notes_db
 from .registry import register_tool
 
 
-def _resolve_caller(arguments: Dict[str, Any]) -> tuple[str, str, bool]:
-    """Pull token out of `arguments` and resolve
-    (token, agent_id, is_manager_or_above).
+def _classify_db_error(err: str, note_id: int) -> ToolResult:
+    """Map ``task_notes_db.edit_note`` / ``delete_note`` error
+    strings onto the typed :data:`ToolResult` variants.
 
-    Mirrors the auth pattern used by the other task tools: tokens
-    may arrive via `token` arg or, when run through the MCP stream
-    that already verified the Authorization header, are surfaced as
-    `_bearer_token`. Returns `("", "", False)` if neither is set.
+    The DB layer returns ``(False, free_form_error_string)``; we
+    text-match on stable substrings to produce typed results:
 
-    The "is admin" boolean is sourced from
-    ``verify_token(token, "manager")`` (agent tokens whose row has
-    ``agent_role='manager'``). The variable name stays ``is_admin``
-    because that's what downstream ``task_notes_db.edit_note`` /
-    ``delete_note`` accept.
+    * ``"not found"`` → :class:`NotFound` (REST → 404)
+    * ``"owned by"`` (ownership failure) →
+      :class:`PermissionDenied` (REST → 403)
+    * anything else (DB error) → :class:`Failed` (REST → 500)
+
+    Centralised so the two callers (edit, delete) classify
+    consistently and the contract with the DB layer is documented
+    in one place.
     """
-    token = (
-        arguments.get("_bearer_token")
-        or arguments.get("token")
-        or ""
-    )
-    agent_id = get_agent_id(token) or ""
-    is_admin = verify_token(token, required_role="manager")
-    return token, agent_id, is_admin
+    low = err.lower()
+    if "not found" in low:
+        return NotFound(resource="task note", identifier=str(note_id))
+    if "owned by" in low:
+        return PermissionDenied(reason=err)
+    return Failed(message=err)
 
 
 async def add_task_note_tool_impl(
@@ -80,15 +78,7 @@ async def add_task_note_tool_impl(
     *,
     principal: Optional[Principal] = None,
 ) -> ToolResult:
-    """E2E migration demo for Wave 6 PR 0.
-
-    First tool to take a typed :class:`Principal` and return a
-    :class:`ToolResult`. The bridge in ``dispatch_tool_call``
-    synthesizes a Principal from ContextVars when one isn't passed
-    (every pre-Wave-6 call site), so this signature is back-compat
-    with the unmigrated dispatcher path during PRs 1-5. PR 6
-    flips ``principal`` to a required kwarg and removes the
-    fallback.
+    """Wave 6 PR 0 demo + PR 1 family.
 
     Policy: any authenticated principal can author a note. Operator
     sessions count (the dashboard adds notes on the operator's
@@ -135,85 +125,98 @@ async def add_task_note_tool_impl(
 
 async def edit_task_note_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
-    token, agent_id, is_admin = _resolve_caller(arguments)
-    if not verify_token(token, required_role="agent"):
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text="Error: Unauthorized. Valid agent or admin token required.",
-            )
-        ]
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    """Edit a task note.
+
+    Policy: any authenticated principal may attempt; ``is_admin``
+    governs whether the per-note ownership check is bypassed.
+    Manager-tier callers (operator session, forwarding header, or
+    manager-role agent) get ``is_admin=True`` and can moderate
+    worker-authored notes. Worker agents must be the original
+    author.
+    """
+    if principal is None or (
+        principal.kind != "agent_bearer"
+        and not principal.has_role("operator")
+    ):
+        return PermissionDenied(
+            reason="agent or operator token required to edit a task note"
+        )
 
     note_id_raw = arguments.get("note_id")
     new_text = arguments.get("text")
-    if note_id_raw is None or not new_text:
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text="Error: Both `note_id` and `text` are required.",
-            )
-        ]
+    if note_id_raw is None:
+        return Invalid(field="note_id", message="`note_id` is required.")
+    if not new_text:
+        return Invalid(field="text", message="`text` is required.")
     try:
         note_id = int(note_id_raw)
     except (TypeError, ValueError):
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text=f"Error: `note_id` must be an integer, got {note_id_raw!r}.",
-            )
-        ]
+        return Invalid(
+            field="note_id",
+            message=f"`note_id` must be an integer, got {note_id_raw!r}.",
+        )
+
+    # Requester for the per-note ownership check + is_admin source.
+    # Manager-tier (operators or manager-role agents) bypass the
+    # author check via is_admin=True; workers must be the author.
+    requester = principal.agent_id or principal.user_id or ""
+    is_admin = principal.has_role("manager")
 
     ok, err = task_notes_db.edit_note(
         note_id=note_id,
-        requester=agent_id,
+        requester=requester,
         new_text=new_text,
         is_admin=is_admin,
     )
     if not ok:
-        return [mcp_types.TextContent(type="text", text=f"Error: {err}")]
-    return [
-        mcp_types.TextContent(type="text", text=f"Note {note_id} updated.")
-    ]
+        return _classify_db_error(err, note_id)
+    return Ok(
+        data={"note_id": note_id},
+        message=f"Note {note_id} updated.",
+    )
 
 
 async def delete_task_note_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
-    token, agent_id, is_admin = _resolve_caller(arguments)
-    if not verify_token(token, required_role="agent"):
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text="Error: Unauthorized. Valid agent or admin token required.",
-            )
-        ]
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    """Delete a task note. Same ownership/moderation contract as
+    :func:`edit_task_note_tool_impl`."""
+    if principal is None or (
+        principal.kind != "agent_bearer"
+        and not principal.has_role("operator")
+    ):
+        return PermissionDenied(
+            reason="agent or operator token required to delete a task note"
+        )
 
     note_id_raw = arguments.get("note_id")
     if note_id_raw is None:
-        return [
-            mcp_types.TextContent(
-                type="text", text="Error: `note_id` is required.",
-            )
-        ]
+        return Invalid(field="note_id", message="`note_id` is required.")
     try:
         note_id = int(note_id_raw)
     except (TypeError, ValueError):
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text=f"Error: `note_id` must be an integer, got {note_id_raw!r}.",
-            )
-        ]
+        return Invalid(
+            field="note_id",
+            message=f"`note_id` must be an integer, got {note_id_raw!r}.",
+        )
+
+    requester = principal.agent_id or principal.user_id or ""
+    is_admin = principal.has_role("manager")
 
     ok, err = task_notes_db.delete_note(
-        note_id=note_id, requester=agent_id, is_admin=is_admin,
+        note_id=note_id, requester=requester, is_admin=is_admin,
     )
     if not ok:
-        return [mcp_types.TextContent(type="text", text=f"Error: {err}")]
-    return [
-        mcp_types.TextContent(type="text", text=f"Note {note_id} deleted.")
-    ]
+        return _classify_db_error(err, note_id)
+    return Ok(
+        data={"note_id": note_id},
+        message=f"Note {note_id} deleted.",
+    )
 
 
 def register_task_notes_tools() -> None:
