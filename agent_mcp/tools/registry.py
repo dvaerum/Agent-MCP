@@ -1,4 +1,5 @@
 # Agent-MCP/mcp_template/mcp_server_src/tools/registry.py
+import inspect as _inspect
 from dataclasses import dataclass as _dataclass
 from typing import List, Dict, Any, Callable, Awaitable, Optional, Union
 import mcp.types as mcp_types # Assuming this is the correct import for your mcp.types
@@ -16,6 +17,18 @@ from ..core.authorize import AuthRejected
 # below are kept as backwards-compatible mirrors so the dozens of
 # tests + downstream consumers that import them keep working.
 from ..core.registry import Registry, RegistryEntry
+# Wave 6 PR 0 — Principal + ToolResult are the new dispatch
+# vocabulary. The bridge below lets old-style tools
+# (``list[TextContent]`` returns, no ``principal`` kwarg) coexist
+# with new-style tools (``ToolResult`` returns, take ``principal``)
+# during PRs 1-5; PR 6 removes the bridge once every tool has
+# been migrated.
+from ..core.principal import Principal as _Principal
+from ..core.tool_result import (
+    Ok as _Ok,
+    ToolResult as _ToolResult,
+    render_as_text_content as _render_as_text_content,
+)
 
 # Tool implementations will be imported here once they are created.
 # For now, we'll define placeholders for the functions they will call.
@@ -451,13 +464,196 @@ class ToolInputValidationError(Exception):
     """
 
 
+def _derive_principal_from_contextvars() -> Optional[_Principal]:
+    """Bridge fallback: synthesize a Principal from existing ContextVars.
+
+    Wave 6 PR 0 — when the dispatcher is invoked without an explicit
+    ``principal=`` (any old-style call site that pre-dates Wave 6),
+    reconstruct one from the legacy ContextVars
+    (``operator_session_active``, ``operator_user_id``,
+    ``operator_project_name``, ``request_auth_token``) so old-style
+    tool impls keep seeing the same identity they would have seen
+    before this PR. PR 6 deletes this helper alongside the
+    ContextVars themselves.
+
+    Resolution order — bearer wins over operator_session when both
+    are stamped (the harness path: AdminClient.call sets the admin
+    bearer on ``request_auth_token`` while ``mcp_session``'s
+    top-level setup also stamps ``operator_session_active=True``).
+    Bearer is the more specific identity (it identifies a particular
+    agent row, not just "some operator"), and audit-log attribution
+    needs that specificity. In production code paths the two never
+    both get stamped — the REST seam stamps op_session only (no
+    bearer post-Wave-1 of retire-system-token); the MCP wire stamps
+    bearer only.
+
+    1. If ``request_auth_token`` resolves to an active agent
+       row → agent_bearer Principal sourcing ``agent_role`` from
+       the in-memory cache.
+    2. Else if ``operator_session_active`` is set, the caller
+       arrived via the REST seam as a logged-in operator →
+       operator_session Principal naming ``operator_user_id``.
+    3. Else None — the caller is anonymous; let the per-tool
+       decorator's existing checks reject if appropriate.
+    """
+    try:
+        bearer = request_auth_token.get()
+    except LookupError:
+        bearer = None
+    if bearer:
+        try:
+            from ..core.auth import get_agent_id as _get_agent_id
+            from ..core import globals as _g
+
+            agent_id = _get_agent_id(bearer)
+            if agent_id:
+                row = _g.active_agents.get(bearer) or {}
+                agent_role = row.get("agent_role")
+                normalized_role = (
+                    agent_role
+                    if agent_role in ("worker", "manager")
+                    else None
+                )
+                return _Principal(
+                    kind="agent_bearer",
+                    user_id=None,
+                    agent_id=agent_id,
+                    sysadmin=False,
+                    project_name=None,
+                    project_role=None,
+                    agent_role=normalized_role,
+                    can_wake_loop=False,
+                    source_token=bearer,
+                )
+        except Exception:  # pragma: no cover - defensive
+            return None
+
+    try:
+        op_session = bool(operator_session_active.get())
+    except LookupError:
+        op_session = False
+    if op_session:
+        try:
+            uid = operator_user_id.get()
+        except LookupError:
+            uid = None
+        try:
+            project = operator_project_name.get()
+        except LookupError:
+            project = None
+        return _Principal(
+            kind="operator_session",
+            user_id=str(uid) if uid is not None else None,
+            agent_id=None,
+            sysadmin=False,
+            project_name=str(project) if project is not None else None,
+            project_role=None,
+            agent_role=None,
+            can_wake_loop=False,
+            source_token=None,
+        )
+
+    return None
+
+
+def _tool_accepts_principal(func: Callable) -> bool:
+    """Return True iff ``func`` declares a ``principal`` kwarg.
+
+    Wave 6 PR 0 bridge — distinguishes migrated (PRs 1-5) tools
+    from unmigrated ones. Inspected once per call (cheap on the
+    hot path; tool implementations are stable for a process'
+    lifetime). PR 6 deletes this helper alongside the bridge.
+    """
+    try:
+        sig = _inspect.signature(func)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return False
+    return "principal" in sig.parameters
+
+
+def _wrap_legacy_result_as_ok(
+    result: Any,
+) -> _ToolResult:
+    """Bridge: wrap an old-style ``list[TextContent]`` return as ``Ok``.
+
+    Wave 6 PR 0 — unmigrated tools still return the legacy shape;
+    the dispatcher wraps the concatenated text into an
+    ``Ok(message=...)`` so a single downstream consumer (the REST
+    adapter, MCP renderer) reads a uniform ``ToolResult``.
+
+    Already-new-style returns (``ToolResult`` variants) pass
+    through unchanged.
+    """
+    if isinstance(result, (_Ok,)):
+        return result
+    # Use a runtime isinstance against the variant tuple via the
+    # render module so we don't reach across to every variant
+    # symbol here. Importing each by name keeps the check explicit.
+    from ..core.tool_result import (
+        NotFound as _NotFound,
+        PermissionDenied as _PermissionDenied,
+        Invalid as _Invalid,
+        Conflict as _Conflict,
+        Failed as _Failed,
+    )
+    if isinstance(result, (_NotFound, _PermissionDenied, _Invalid, _Conflict, _Failed)):
+        return result
+    # Legacy ``list[TextContent]`` shape — concatenate text and
+    # return as Ok(message=...). Empty list → Ok with no message.
+    if isinstance(result, list):
+        parts: List[str] = []
+        for block in result:
+            text = getattr(block, "text", None)
+            if isinstance(text, str):
+                parts.append(text)
+        message = "\n".join(parts) if parts else None
+        return _Ok(message=message)
+    # Anything else is a tool author bug; surface as Failed so the
+    # error reaches a human eventually rather than being silently
+    # rendered as a string blob.
+    return _Failed(
+        message=(
+            f"tool returned unexpected type {type(result).__name__}; "
+            f"expected list[TextContent] or ToolResult"
+        )
+    )
+
+
 async def dispatch_tool_call(
     tool_name: str,
-    raw_arguments: Union[Dict[str, Any], List[Dict[str, Any]]] # Original accepted list or dict
-) -> List[mcp_types.TextContent]:
+    raw_arguments: Union[Dict[str, Any], List[Dict[str, Any]]], # Original accepted list or dict
+    *,
+    principal: Optional[_Principal] = None,
+) -> _ToolResult:
     """
     Handles a tool call by dispatching to the appropriate implementation.
     This replaces the logic from `@app.call_tool()` in main.py (lines 1861-1931).
+
+    Wave 6 PR 0 — return type is now :data:`ToolResult` (the typed
+    sum-type at ``agent_mcp.core.tool_result``). Two consumers:
+
+      * REST adapter (``app/routes._dispatch_through_tool``) ``match``-es
+        on the variant and maps to an HTTP status code.
+      * MCP wire renderer (``app/main_app.mcp_call_tool_handler``)
+        calls :func:`agent_mcp.core.tool_result.render_as_text_content`
+        to convert back to the legacy ``list[TextContent]`` shape MCP
+        clients consume.
+
+    The dispatcher uses the **bridge** during the Wave 6 migration:
+
+      * If ``principal`` is None, derive one from the legacy
+        ContextVars so old-style call sites that haven't been
+        updated keep working (PRs 1-5 sweep them).
+      * If the tool implementation declares a ``principal`` kwarg,
+        pass the Principal through; otherwise call the legacy
+        signature ``func(arguments)``.
+      * If the tool returns a ``list[TextContent]`` (unmigrated),
+        wrap it as ``Ok(message=concatenated_text)``.
+      * If the tool returns a :data:`ToolResult` variant, pass it
+        through unchanged.
+
+    PR 6 deletes the bridge: ``principal`` becomes required, and
+    every tool returns :data:`ToolResult` directly.
     """
     # Sanitize arguments input (main.py:1863-1877)
     sanitized_arguments: Any
@@ -508,10 +704,12 @@ async def dispatch_tool_call(
 
     except ValueError as e:
         logger.error(f"Invalid input arguments for tool '{tool_name}': {e}")
-        return [mcp_types.TextContent(type="text", text=f"Invalid input arguments: {str(e)}")]
+        from ..core.tool_result import Invalid as _Invalid
+        return _Invalid(field=None, message=f"Invalid input arguments: {str(e)}")
     except Exception as e: # Catch any other sanitization errors
         logger.error(f"Error sanitizing arguments for tool '{tool_name}': {e}", exc_info=True)
-        return [mcp_types.TextContent(type="text", text=f"Error processing tool arguments: {str(e)}")]
+        from ..core.tool_result import Failed as _Failed
+        return _Failed(message=f"Error processing tool arguments: {str(e)}")
 
 
     # Dispatch to the correct tool implementation (main.py:1879 onwards)
@@ -598,7 +796,24 @@ async def dispatch_tool_call(
                 if header_token:
                     sanitized_arguments = {**sanitized_arguments, "token": header_token}
 
-            result = await implementation_func(sanitized_arguments)
+            # Wave 6 PR 0 bridge — derive Principal from ContextVars
+            # when the caller didn't pass one (every pre-Wave-6 call
+            # site). PR 6 makes the kwarg required and deletes this
+            # fallback.
+            effective_principal = principal
+            if effective_principal is None:
+                effective_principal = _derive_principal_from_contextvars()
+
+            # Bridge: thread Principal through only when the tool
+            # impl declares it. Migrated (PRs 1-5) tools take it as a
+            # keyword-only arg; legacy tools don't, and would
+            # ``TypeError`` if we always passed it.
+            if _tool_accepts_principal(implementation_func):
+                raw_result = await implementation_func(
+                    sanitized_arguments, principal=effective_principal
+                )
+            else:
+                raw_result = await implementation_func(sanitized_arguments)
 
             # Issue H is now handled by the @requires / @requires_policy
             # decorators in agent_mcp/core/authorize.py: they raise
@@ -610,7 +825,12 @@ async def dispatch_tool_call(
             # text response, it will silently regress to isError=False
             # and tests/test_auth_decorators.py will catch the
             # _AUTH_FAILURE_RE re-introduction.
-            return result
+
+            # Bridge: wrap legacy ``list[TextContent]`` returns as
+            # ``Ok(message=...)``; pass ``ToolResult`` variants
+            # through unchanged. PR 6 deletes this — every tool
+            # will return ``ToolResult`` directly.
+            return _wrap_legacy_result_as_ok(raw_result)
 
         except AuthRejected as e:
             # Decorator-raised auth failure (architecture review
@@ -644,7 +864,8 @@ async def dispatch_tool_call(
         logger.warning(f"Unknown tool called: {tool_name}")
         # Original main.py:1930 (raise ValueError(f"Unknown tool: {name}"))
         # Returning an error message is friendlier for an API.
-        return [mcp_types.TextContent(type="text", text=f"Error: Unknown tool '{tool_name}'.")]
+        from ..core.tool_result import NotFound as _NotFound
+        return _NotFound(resource="tool", identifier=tool_name)
 
 # The actual tool schemas and implementations will be populated by calls to `register_tool`
 # from each of the specific tool modules (e.g., admin_tools.py, task_tools.py, etc.)

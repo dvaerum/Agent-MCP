@@ -66,6 +66,15 @@ from ..tools.registry import (
 )
 from ..core.authorize import AuthRejected
 from ..tools.registry import ToolInputValidationError
+# Wave 6 PR 0 — ToolResult variants the REST adapter matches against.
+from ..core.tool_result import (
+    Ok as _Ok,
+    NotFound as _NotFound,
+    PermissionDenied as _PermissionDenied,
+    Invalid as _Invalid,
+    Conflict as _Conflict,
+    Failed as _Failed,
+)
 
 
 def _result_text(result: List[mcp_types.TextContent]) -> str:
@@ -167,16 +176,91 @@ async def _dispatch_through_tool(
         if cv_op_user is not None:
             _cv_operator_user_id.reset(cv_op_user)
 
-    text = _result_text(result)
-    # Tool impls report errors as plain-text "Error: ..." blocks. Map
-    # those onto HTTP status codes so the dashboard sees the same shape
-    # the legacy direct-DB handlers produced. We also catch the
-    # without-"Error:"-prefix wording some tool impls use
-    # (`terminate_agent` says "Agent 'x' not found or already
-    # terminated."; `delete_project_context` says "None of the
-    # specified keys exist..."). Treating any "not found" / "does not
-    # exist" / "Cannot delete" sentence as a non-2xx keeps the
-    # adapter's HTTP shape identical to the legacy REST endpoints.
+    # Wave 6 PR 0 — ``dispatch_tool_call`` now returns a typed
+    # ``ToolResult``. Map each variant to the HTTP shape the
+    # dashboard's ApiClient already understands. New-style tools
+    # (PRs 1-5 migrate them) return non-Ok variants directly;
+    # old-style tools still go through the bridge's
+    # ``Ok(message=concatenated_text)`` wrap, and the legacy
+    # text-matching block below preserves the historical 4xx/5xx
+    # behavior for callers that haven't been migrated yet.
+    if isinstance(result, _NotFound):
+        text = f"{result.resource} {result.identifier!r} not found."
+        return JSONResponse(
+            {
+                "success": False,
+                "error": "not_found",
+                "resource": result.resource,
+                "identifier": result.identifier,
+                "message": text,
+            },
+            status_code=404,
+        )
+    if isinstance(result, _PermissionDenied):
+        return JSONResponse(
+            {
+                "success": False,
+                "error": "permission_denied",
+                "reason": result.reason,
+                "message": result.reason,
+            },
+            status_code=403,
+        )
+    if isinstance(result, _Invalid):
+        return JSONResponse(
+            {
+                "success": False,
+                "error": "invalid",
+                "field": result.field,
+                "message": result.message,
+            },
+            status_code=400,
+        )
+    if isinstance(result, _Conflict):
+        return JSONResponse(
+            {
+                "success": False,
+                "error": "conflict",
+                "reason": result.reason,
+                "message": result.reason,
+            },
+            status_code=409,
+        )
+    if isinstance(result, _Failed):
+        return JSONResponse(
+            {
+                "success": False,
+                "error": "failed",
+                "message": result.message,
+            },
+            status_code=500,
+        )
+
+    # ``Ok`` — success. Two sub-cases:
+    #   * Ok(data=...) (new-style tool) — return data as the JSON
+    #     body, 200 by default or 201 for create_* operations.
+    #   * Ok(message=...) only (legacy bridge wrap) — fall through
+    #     to the legacy text-matching block below for back-compat
+    #     with unmigrated tools whose prose may indicate an error
+    #     ("Cannot ..." refusals, etc.).
+    if isinstance(result, _Ok) and result.data is not None:
+        payload: Dict[str, Any] = {
+            "success": True,
+            "message": success_message or (result.message or ""),
+            "data": result.data,
+        }
+        if extra_response:
+            payload.update(extra_response)
+        # 201 heuristic: create_* tools naming convention. Refine if
+        # a future tool needs different semantics.
+        status = 201 if tool_name.startswith("create_") else 200
+        return JSONResponse(payload, status_code=status)
+
+    # TODO Wave 6 PR 6: delete the rest of this function once all
+    # tools return ToolResult variants (no Ok(message=...)-only
+    # results from the bridge). This block fires only on the
+    # bridge-wrap path for legacy ``list[TextContent]`` returns.
+    text = (result.message or "") if isinstance(result, _Ok) else ""
     lower = text.lower().lstrip()
     is_error_prefix = (
         lower.startswith("error:") or lower.startswith("unauthorized")
@@ -199,7 +283,7 @@ async def _dispatch_through_tool(
             status_code=status,
         )
 
-    payload: Dict[str, Any] = {
+    payload = {
         "success": True,
         "message": success_message or text,
     }

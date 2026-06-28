@@ -33,11 +33,19 @@ window. A follow-up PR flips those over and drops the JSON column.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import mcp.types as mcp_types
 
 from ..core.auth import get_agent_id, verify_token
+from ..core.principal import Principal
+from ..core.tool_result import (
+    Failed,
+    Invalid,
+    Ok,
+    PermissionDenied,
+    ToolResult,
+)
 from ..db.actions import task_notes_db
 from .registry import register_tool
 
@@ -69,42 +77,60 @@ def _resolve_caller(arguments: Dict[str, Any]) -> tuple[str, str, bool]:
 
 async def add_task_note_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
-    token, agent_id, _is_admin = _resolve_caller(arguments)
-    if not verify_token(token, required_role="agent"):
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text="Error: Unauthorized. Valid agent or admin token required.",
-            )
-        ]
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    """E2E migration demo for Wave 6 PR 0.
+
+    First tool to take a typed :class:`Principal` and return a
+    :class:`ToolResult`. The bridge in ``dispatch_tool_call``
+    synthesizes a Principal from ContextVars when one isn't passed
+    (every pre-Wave-6 call site), so this signature is back-compat
+    with the unmigrated dispatcher path during PRs 1-5. PR 6
+    flips ``principal`` to a required kwarg and removes the
+    fallback.
+
+    Policy: any authenticated principal can author a note. Operator
+    sessions count (the dashboard adds notes on the operator's
+    behalf); any agent_bearer counts (workers + managers).
+    """
+    if principal is None or (
+        principal.kind != "agent_bearer"
+        and not principal.has_role("operator")
+    ):
+        return PermissionDenied(
+            reason="agent or operator token required to add a task note"
+        )
 
     task_id = arguments.get("task_id")
     text = arguments.get("text")
-    if not task_id or not text:
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text="Error: Both `task_id` and `text` are required.",
-            )
-        ]
+    if not task_id:
+        return Invalid(
+            field="task_id",
+            message="`task_id` is required.",
+        )
+    if not text:
+        return Invalid(
+            field="text",
+            message="`text` is required.",
+        )
+
+    # Author attribution: agent_bearer → agent_id; operator path →
+    # user_id (the operator's username from the session row). The
+    # task_notes_db.add_note column is a free-form string already, so
+    # the operator label slots in next to legacy agent_id entries
+    # without a schema change.
+    author = principal.agent_id or principal.user_id
 
     note_id = task_notes_db.add_note(
-        task_id=task_id, author=agent_id or None, text=text,
+        task_id=task_id, author=author, text=text,
     )
     if note_id is None:
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text=f"Error: Failed to add note to task '{task_id}'.",
-            )
-        ]
-    return [
-        mcp_types.TextContent(
-            type="text",
-            text=f"Note {note_id} added to task '{task_id}'.",
-        )
-    ]
+        return Failed(message=f"Failed to add note to task '{task_id}'.")
+    return Ok(
+        data={"note_id": note_id, "task_id": task_id},
+        message=f"Note {note_id} added to task '{task_id}'.",
+    )
 
 
 async def edit_task_note_tool_impl(

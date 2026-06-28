@@ -411,10 +411,18 @@ async def _seed_manager_agent(agent_id: str) -> str:
 
 
 async def _add_note(token: str, task_id: str, text: str) -> int:
-    """Add a note via the MCP tool and return its note_id."""
+    """Add a note via the MCP tool and return its note_id.
+
+    Wave 6 PR 0 — ``dispatch_tool_call`` now returns
+    :data:`agent_mcp.core.tool_result.ToolResult`; ``add_task_note``
+    is the first tool to ship the migrated signature returning
+    ``Ok(data={"note_id": ..., "task_id": ...}, ...)``. Pull the
+    note_id from ``Ok.data`` rather than re-parsing the message.
+    """
     from agent_mcp.tools.registry import (
         dispatch_tool_call, request_auth_token,
     )
+    from agent_mcp.core.tool_result import Ok
 
     cv = request_auth_token.set(token)
     try:
@@ -424,19 +432,21 @@ async def _add_note(token: str, task_id: str, text: str) -> int:
         )
     finally:
         request_auth_token.reset(cv)
-    text_out = result[0].text if result else ""
-    # Expected: "Note <id> added to task '<task_id>'."
-    import re
-
-    m = re.search(r"Note (\d+) added", text_out)
-    assert m, f"unexpected add_task_note response: {text_out!r}"
-    return int(m.group(1))
+    assert isinstance(result, Ok), f"unexpected add_task_note result: {result!r}"
+    note_id = result.data["note_id"]
+    return int(note_id)
 
 
 async def _edit_note(token: str, note_id: int, new_text: str) -> str:
+    """Wave 6 PR 0 — ``edit_task_note`` is unmigrated; the bridge
+    auto-wraps its legacy ``list[TextContent]`` return as
+    ``Ok(message=...)``. Pull the message out so callers continue
+    to see the same prose they did pre-Wave-6.
+    """
     from agent_mcp.tools.registry import (
         dispatch_tool_call, request_auth_token,
     )
+    from agent_mcp.core.tool_result import Ok
 
     cv = request_auth_token.set(token)
     try:
@@ -446,7 +456,9 @@ async def _edit_note(token: str, note_id: int, new_text: str) -> str:
         )
     finally:
         request_auth_token.reset(cv)
-    return result[0].text if result else ""
+    if isinstance(result, Ok):
+        return result.message or ""
+    return ""
 
 
 async def test_edit_task_note_admits_system_bearer(tmp_path) -> None:

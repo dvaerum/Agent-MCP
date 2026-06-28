@@ -35,8 +35,16 @@ async def test_dispatch_tool_call_raises_on_unauthorized_response() -> None:
 
 @pytest.mark.asyncio
 async def test_dispatch_tool_call_passes_through_normal_success() -> None:
-    """A tool returning regular content must still pass through (no false positives)."""
+    """A tool returning regular content must still pass through (no false positives).
+
+    Wave 6 PR 0 — ``dispatch_tool_call`` now returns
+    :data:`agent_mcp.core.tool_result.ToolResult`; the bridge
+    wraps an unmigrated tool's ``list[TextContent]`` return as
+    ``Ok(message=...)``. The successful-tool path therefore
+    surfaces as ``Ok``, not a list.
+    """
     from agent_mcp.tools.registry import dispatch_tool_call
+    from agent_mcp.core.tool_result import Ok
 
     # The simplest "always works" tool: `test` (no auth required per upstream).
     # If it doesn't exist on this build, fall back to no-op.
@@ -44,6 +52,5 @@ async def test_dispatch_tool_call_passes_through_normal_success() -> None:
         result = await dispatch_tool_call("test", {})
     except KeyError:
         pytest.skip("no `test` tool registered on this build")
-    # Just assert no exception + result is list of content.
-    assert isinstance(result, list)
-    assert all(hasattr(c, "text") for c in result)
+    # Just assert no exception + result is a success ToolResult.
+    assert isinstance(result, Ok), f"expected Ok, got {result!r}"
