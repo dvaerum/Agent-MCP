@@ -4,15 +4,32 @@ import datetime
 import subprocess  # For launching Cursor (will be commented out)
 import os
 import sqlite3
-from typing import List, Dict, Any, Optional
-
-import mcp.types as mcp_types  # Assuming this is your mcp.types path
+from typing import Dict, Any, Optional
 
 from .registry import register_tool
 from ..core.config import logger, AGENT_COLORS  # AGENT_COLORS for create_agent
 from ..core import globals as g
 from ..core.auth import generate_token  # For create_agent, terminate_agent
-from ..core.authorize import requires_role  # @requires_role("operator") gates entry
+# Wave 6 PR 5 — migrated to Principal + ToolResult. The
+# ``@requires_role("operator")`` decorator is replaced by an inline
+# ``principal.has_role("operator")`` check at the top of each tool
+# (the decorator's wrapper signature locks the inner function to
+# ``(arguments) -> list[TextContent]`` and can't forward the
+# Principal kwarg the dispatcher passes to migrated tools). Tool
+# visibility in ``tools/list`` is still gated by the
+# ``visibility="operator"`` kwarg on each ``register_tool(...)``
+# call below — that's the source of truth read by
+# ``tools/access._derive_access_level`` once the decorator is gone.
+from ..core.principal import Principal
+from ..core.tool_result import (
+    Conflict,
+    Failed,
+    Invalid,
+    NotFound,
+    Ok,
+    PermissionDenied,
+    ToolResult,
+)
 from ..utils.audit_utils import log_audit
 from ..utils.project_utils import generate_system_prompt  # For create_agent
 from ..runtime.agent_runtime import (
@@ -37,13 +54,44 @@ from ..db.connection import get_db_connection, execute_db_write
 from ..db.actions.agent_actions_db import log_agent_action_to_db  # For DB logging
 
 
+_OPERATOR_REQUIRED_REASON = (
+    "Operator session or system token required for admin tools."
+)
+
+
+def _require_operator(principal: Optional[Principal]) -> Optional[PermissionDenied]:
+    """Return PermissionDenied iff the caller's principal isn't operator-tier.
+
+    Wave 6 PR 5 — every tool in this module is operator-only (matches the
+    pre-migration ``@requires_role("operator")`` decorator). Centralised
+    here so the inline check at the top of each tool reads as one line
+    and the failure wording stays uniform across the module.
+    """
+    if principal is None or not principal.has_role("operator"):
+        return PermissionDenied(reason=_OPERATOR_REQUIRED_REASON)
+    return None
+
+
 # --- create_agent tool ---
 # Original logic from main.py: lines 1060-1203 (create_agent_tool function)
-@requires_role("operator")
 async def create_agent_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
-    token = arguments.get("token")
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    """Create a new agent — operator-only.
+
+    Wave 6 PR 5 — migrated to take a typed :class:`Principal` and
+    return a :class:`ToolResult`. The "new-token return path" is
+    preserved: callers (REST adapter + MCP wire) get the new bearer
+    via ``Ok(data={"agent_id": ..., "token": ..., "agent_role": ...},
+    message=...)`` so the REST adapter no longer has to string-parse
+    the human message for ``"Token: <bearer>"``.
+    """
+    denied = _require_operator(principal)
+    if denied is not None:
+        return denied
+
     agent_id = arguments.get("agent_id")
     capabilities = arguments.get("capabilities")  # This was List[str]
     task_ids = arguments.get("task_ids")  # Required list of task IDs
@@ -66,27 +114,24 @@ async def create_agent_tool_impl(
     prompt_delay = arguments.get("prompt_delay", 5)  # Default 5 second delay
 
     if not agent_id or not isinstance(agent_id, str):
-        return [
-            mcp_types.TextContent(
-                type="text", text="Error: agent_id is required and must be a string."
-            )
-        ]
+        return Invalid(
+            field="agent_id",
+            message="`agent_id` is required and must be a string.",
+        )
 
     # Forbid `[` and `]` in agent_id. The purge cascade rewrites
     # references to a deleted agent as the literal `[deleted-<id>]`;
     # allowing brackets in real agent_ids would create unparseable /
     # ambiguous tombstones.
     if "[" in agent_id or "]" in agent_id:
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text=(
-                    f"Error: invalid agent_id {agent_id!r}: `[` and `]` are "
-                    "reserved characters (used by the purge-cascade "
-                    "tombstone format `[deleted-<id>]`)."
-                ),
-            )
-        ]
+        return Invalid(
+            field="agent_id",
+            message=(
+                f"invalid agent_id {agent_id!r}: `[` and `]` are "
+                "reserved characters (used by the purge-cascade "
+                "tombstone format `[deleted-<id>]`)."
+            ),
+        )
 
     # Validate task_ids parameter.
     #
@@ -102,31 +147,27 @@ async def create_agent_tool_impl(
         task_ids = []
 
     if not isinstance(task_ids, list):
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text="Error: task_ids must be a list of task IDs (or omitted).",
-            )
-        ]
+        return Invalid(
+            field="task_ids",
+            message="`task_ids` must be a list of task IDs (or omitted).",
+        )
 
     # Validate each task_id is a string
     for task_id in task_ids:
         if not isinstance(task_id, str):
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text=f"Error: All task IDs must be strings. Found: {type(task_id).__name__}",
-                )
-            ]
+            return Invalid(
+                field="task_ids",
+                message=(
+                    f"all task IDs must be strings. "
+                    f"Found: {type(task_id).__name__}"
+                ),
+            )
 
     # Check in-memory map first (main.py:1072)
     if agent_id in g.agent_working_dirs:
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text=f"Agent '{agent_id}' already exists (in active memory).",
-            )
-        ]
+        return Conflict(
+            reason=f"Agent '{agent_id}' already exists (in active memory).",
+        )
 
     conn = None
     try:
@@ -136,12 +177,9 @@ async def create_agent_tool_impl(
         # Double check in DB (main.py:1077-1081)
         cursor.execute("SELECT agent_id FROM agents WHERE agent_id = ?", (agent_id,))
         if cursor.fetchone():
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text=f"Agent '{agent_id}' already exists (in database).",
-                )
-            ]
+            return Conflict(
+                reason=f"Agent '{agent_id}' already exists (in database).",
+            )
 
         # Validate task existence and availability
         for task_id in task_ids:
@@ -151,33 +189,29 @@ async def create_agent_tool_impl(
             )
             task_row = cursor.fetchone()
             if not task_row:
-                return [
-                    mcp_types.TextContent(
-                        type="text",
-                        text=f"Error: Task '{task_id}' not found in database.",
-                    )
-                ]
+                return NotFound(resource="task", identifier=task_id)
 
             task_data = dict(task_row)
 
             # Check if task is already assigned
             if task_data.get("assigned_to") is not None:
-                return [
-                    mcp_types.TextContent(
-                        type="text",
-                        text=f"Error: Task '{task_id}' is already assigned to agent '{task_data['assigned_to']}'.",
-                    )
-                ]
+                return Conflict(
+                    reason=(
+                        f"Task '{task_id}' is already assigned to agent "
+                        f"'{task_data['assigned_to']}'."
+                    ),
+                )
 
             # Check if task is in a valid state for assignment
             task_status = task_data.get("status", "").lower()
             if task_status not in ["created", "unassigned"]:
-                return [
-                    mcp_types.TextContent(
-                        type="text",
-                        text=f"Error: Task '{task_id}' has status '{task_status}' and cannot be assigned. Only tasks with status 'created' or 'unassigned' can be assigned.",
-                    )
-                ]
+                return Conflict(
+                    reason=(
+                        f"Task '{task_id}' has status '{task_status}' and "
+                        "cannot be assigned. Only tasks with status "
+                        "'created' or 'unassigned' can be assigned."
+                    ),
+                )
 
         # Generate token and prepare data (main.py:1089-1092)
         new_agent_token = generate_token()
@@ -203,12 +237,9 @@ async def create_agent_tool_impl(
             logger.error(
                 "MCP_PROJECT_DIR environment variable not set. Cannot determine agent working directory."
             )
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text="Server configuration error: MCP_PROJECT_DIR not set.",
-                )
-            ]
+            return Failed(
+                message="Server configuration error: MCP_PROJECT_DIR not set.",
+            )
 
         # All agents work in the same shared directory with file-level locking
         agent_working_dir_abs = os.path.abspath(project_dir_env)
@@ -220,11 +251,7 @@ async def create_agent_tool_impl(
             logger.error(
                 f"Failed to create working directory {agent_working_dir_abs} for agent {agent_id}: {e}"
             )
-            return [
-                mcp_types.TextContent(
-                    type="text", text=f"Error creating working directory: {e}"
-                )
-            ]
+            return Failed(message=f"Error creating working directory: {e}")
 
         # PR 6: agent INSERT goes through agent_repo with the caller's
         # cursor so the agent row lands in the same transaction as the
@@ -255,12 +282,7 @@ async def create_agent_tool_impl(
                 conn.rollback()
             except Exception:
                 pass
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text=f"Error: {ve}",
-                )
-            ]
+            return Invalid(field="agent_id", message=str(ve))
 
         # Log action to agent_actions table (main.py:1119)
         log_agent_action_to_db(
@@ -578,19 +600,36 @@ async def create_agent_tool_impl(
         )
         print(console_output)  # For direct CLI feedback
 
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text=f"Agent '{agent_id}' created successfully.\n"
-                f"Token: {new_agent_token}\n"
-                f"Assigned Color: {agent_color}\n"
-                f"Working Directory: {agent_working_dir_abs}\n"
-                f"Assigned Tasks: {', '.join(assigned_tasks)}\n"
-                f"Current Task: {assigned_tasks[0] if assigned_tasks else 'None'}\n"
-                f"{launch_status}\n\n"
-                f"System Prompt:\n{system_prompt_str}",
-            )
-        ]
+        # Wave 6 PR 5 — preserve the new-token return path. The
+        # human-readable message KEEPS the "Token: <bearer>" line
+        # verbatim for MCP wire callers that scrape it; the typed
+        # ``data`` payload carries the same value so the REST adapter
+        # can pull from a dict instead of regex-matching the message
+        # (PR 6 of Wave 6 removes the legacy string-split entirely).
+        success_message = (
+            f"Agent '{agent_id}' created successfully.\n"
+            f"Token: {new_agent_token}\n"
+            f"Assigned Color: {agent_color}\n"
+            f"Working Directory: {agent_working_dir_abs}\n"
+            f"Assigned Tasks: {', '.join(assigned_tasks)}\n"
+            f"Current Task: {assigned_tasks[0] if assigned_tasks else 'None'}\n"
+            f"{launch_status}\n\n"
+            f"System Prompt:\n{system_prompt_str}"
+        )
+        return Ok(
+            data={
+                "agent_id": agent_id,
+                "token": new_agent_token,
+                "agent_role": agent_role,
+                "status": status,
+                "color": agent_color,
+                "working_directory": agent_working_dir_abs,
+                "assigned_tasks": assigned_tasks,
+                "current_task": assigned_tasks[0] if assigned_tasks else None,
+                "tmux_session": tmux_session_name,
+            },
+            message=success_message,
+        )
 
     except sqlite3.Error as e_sql:
         if conn:
@@ -598,20 +637,12 @@ async def create_agent_tool_impl(
         logger.error(
             f"Database error creating agent {agent_id}: {e_sql}", exc_info=True
         )
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Database error creating agent: {e_sql}"
-            )
-        ]
+        return Failed(message=f"Database error creating agent: {e_sql}")
     except Exception as e:
         if conn:
             conn.rollback()
         logger.error(f"Unexpected error creating agent {agent_id}: {e}", exc_info=True)
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Unexpected error creating agent: {e}"
-            )
-        ]
+        return Failed(message=f"Unexpected error creating agent: {e}")
     finally:
         if conn:
             conn.close()
@@ -619,10 +650,16 @@ async def create_agent_tool_impl(
 
 # --- view_status tool ---
 # Original logic from main.py: lines 1242-1268 (view_status_tool function)
-@requires_role("operator")
 async def view_status_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    """Report active agents + server status — operator-only."""
+    denied = _require_operator(principal)
+    if denied is not None:
+        return denied
+
     log_audit("admin", "view_status", {})  # main.py:1249
 
     # Build agent status from g.active_agents and g.agent_working_dirs (main.py:1251-1259)
@@ -697,27 +734,33 @@ async def view_status_tool_impl(
         status_json = json.dumps(status_payload, indent=2)
     except TypeError as e:
         logger.error(f"Error serializing server status to JSON: {e}")
-        status_json = f"Error creating status JSON: {e}"
+        return Failed(message=f"Error creating status JSON: {e}")
 
-    return [
-        mcp_types.TextContent(type="text", text=f"MCP Server Status:\n{status_json}")
-    ]
+    return Ok(
+        data=status_payload,
+        message=f"MCP Server Status:\n{status_json}",
+    )
 
 
 # --- terminate_agent tool ---
 # Original logic from main.py: lines 1270-1316 (terminate_agent_tool function)
-@requires_role("operator")
 async def terminate_agent_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    """Soft-terminate an agent (flips status) — operator-only."""
+    denied = _require_operator(principal)
+    if denied is not None:
+        return denied
+
     agent_id_to_terminate = arguments.get("agent_id")
 
     if not agent_id_to_terminate or not isinstance(agent_id_to_terminate, str):
-        return [
-            mcp_types.TextContent(
-                type="text", text="Error: agent_id to terminate is required."
-            )
-        ]
+        return Invalid(
+            field="agent_id",
+            message="`agent_id` to terminate is required.",
+        )
 
     # Find agent token from in-memory map (main.py:1279-1283)
     found_agent_token: Optional[str] = None
@@ -745,12 +788,10 @@ async def terminate_agent_tool_impl(
                 )
                 # We don't have its token to remove from g.active_agents if it's not there.
             else:
-                return [
-                    mcp_types.TextContent(
-                        type="text",
-                        text=f"Agent '{agent_id_to_terminate}' not found or already terminated.",
-                    )
-                ]
+                return NotFound(
+                    resource="agent",
+                    identifier=agent_id_to_terminate,
+                )
 
         # PR 6: terminate UPDATE goes through agent_repo with the
         # caller's cursor so it stays atomic with the agent_actions
@@ -764,12 +805,10 @@ async def terminate_agent_tool_impl(
         if (
             not ok and not found_agent_token
         ):  # If DB check didn't find it initially and update affected 0 rows
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text=f"Agent '{agent_id_to_terminate}' not found in DB or already terminated.",
-                )
-            ]
+            return NotFound(
+                resource="agent",
+                identifier=agent_id_to_terminate,
+            )
 
         log_agent_action_to_db(
             cursor,
@@ -831,12 +870,14 @@ async def terminate_agent_tool_impl(
             "admin", "terminate_agent", {"agent_id": agent_id_to_terminate}
         )  # main.py:1313
         logger.info(f"Agent '{agent_id_to_terminate}' terminated successfully.")
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text=f"Agent '{agent_id_to_terminate}' terminated.{tmux_kill_status}",
-            )
-        ]
+        return Ok(
+            data={
+                "agent_id": agent_id_to_terminate,
+                "status": "terminated",
+                "tmux_killed": bool(tmux_kill_status),
+            },
+            message=f"Agent '{agent_id_to_terminate}' terminated.{tmux_kill_status}",
+        )
 
     except sqlite3.Error as e_sql:
         if conn:
@@ -845,11 +886,7 @@ async def terminate_agent_tool_impl(
             f"Database error terminating agent {agent_id_to_terminate}: {e_sql}",
             exc_info=True,
         )
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Database error terminating agent: {e_sql}"
-            )
-        ]
+        return Failed(message=f"Database error terminating agent: {e_sql}")
     except Exception as e:
         if conn:
             conn.rollback()
@@ -857,11 +894,7 @@ async def terminate_agent_tool_impl(
             f"Unexpected error terminating agent {agent_id_to_terminate}: {e}",
             exc_info=True,
         )
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Unexpected error terminating agent: {e}"
-            )
-        ]
+        return Failed(message=f"Unexpected error terminating agent: {e}")
     finally:
         if conn:
             conn.close()
@@ -869,10 +902,16 @@ async def terminate_agent_tool_impl(
 
 # --- view_audit_log tool ---
 # Original logic from main.py: lines 1387-1408 (view_audit_log_tool function)
-@requires_role("operator")
 async def view_audit_log_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    """Read recent audit-log entries — operator-only."""
+    denied = _require_operator(principal)
+    if denied is not None:
+        return denied
+
     filter_agent_id = arguments.get("agent_id")  # Optional filter
     filter_action = arguments.get("action")  # Optional filter
     limit = arguments.get("limit", 50)  # Default limit 50
@@ -929,25 +968,39 @@ async def view_audit_log_tool_impl(
         log_json = json.dumps(limited_log_entries, indent=2)
     except TypeError as e:
         logger.error(f"Error serializing audit log to JSON: {e}")
-        log_json = f"Error creating audit log JSON: {e}"
+        return Failed(message=f"Error creating audit log JSON: {e}")
 
-    return [
-        mcp_types.TextContent(
-            type="text",
-            text=f"Audit Log ({len(limited_log_entries)} entries displayed, filtered by agent: {filter_agent_id or 'Any'}, action: {filter_action or 'Any'}):\n{log_json}",
-        )
-    ]
+    return Ok(
+        data={
+            "entries": limited_log_entries,
+            "count": len(limited_log_entries),
+            "filter_agent_id": filter_agent_id,
+            "filter_action": filter_action,
+            "limit": limit,
+        },
+        message=(
+            f"Audit Log ({len(limited_log_entries)} entries displayed, "
+            f"filtered by agent: {filter_agent_id or 'Any'}, action: "
+            f"{filter_action or 'Any'}):\n{log_json}"
+        ),
+    )
 
 
 # --- get_agent_tokens tool ---
-@requires_role("operator")
 async def get_agent_tokens_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
     """
     Retrieve agent tokens with advanced filtering capabilities.
-    Supports filtering by status, agent_id pattern, creation date range, and more.
+    Supports filtering by status, agent_id pattern, creation date range,
+    and more. Operator-only.
     """
+    denied = _require_operator(principal)
+    if denied is not None:
+        return denied
+
     # Extract and validate filter parameters
     filter_status = arguments.get(
         "filter_status"
@@ -1057,48 +1110,54 @@ async def get_agent_tokens_tool_impl(
             response_json = json.dumps(response_data, indent=2)
         except TypeError as e:
             logger.error(f"Error serializing agent tokens response to JSON: {e}")
-            response_json = f"Error creating response JSON: {e}"
+            return Failed(message=f"Error creating response JSON: {e}")
 
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text=f"Agent Tokens ({len(agents_data)} of {total_count} total):\n{response_json}",
-            )
-        ]
+        return Ok(
+            data=response_data,
+            message=(
+                f"Agent Tokens ({len(agents_data)} of {total_count} "
+                f"total):\n{response_json}"
+            ),
+        )
 
     except sqlite3.Error as e_sql:
         logger.error(f"Database error retrieving agent tokens: {e_sql}", exc_info=True)
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Database error retrieving agent tokens: {e_sql}"
-            )
-        ]
+        return Failed(message=f"Database error retrieving agent tokens: {e_sql}")
     except Exception as e:
         logger.error(f"Unexpected error retrieving agent tokens: {e}", exc_info=True)
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Unexpected error retrieving agent tokens: {e}"
-            )
-        ]
+        return Failed(message=f"Unexpected error retrieving agent tokens: {e}")
 
 
 # --- relaunch_agent tool ---
-@requires_role("operator")
 async def relaunch_agent_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
     """
     Relaunch an existing agent by reusing its tmux session.
     Only works for agents with status: terminated, completed, failed, cancelled.
-    Sends /clear to reset the session and sends a new prompt.
+    Sends /clear to reset the session and sends a new prompt. Operator-only.
+
+    Wave 6 PR 5 — when ``generate_new_token=True``, the success result
+    preserves the new-token path: the rotated bearer rides in
+    ``Ok.data["token"]`` AND in the human message (``Token: <bearer>``)
+    so MCP wire callers can scrape it and REST adapters can read the
+    typed field.
     """
+    denied = _require_operator(principal)
+    if denied is not None:
+        return denied
+
     agent_id = arguments.get("agent_id")
     generate_new_token = arguments.get("generate_new_token", False)
     custom_prompt = arguments.get("custom_prompt")
     prompt_template = arguments.get("prompt_template", "worker_with_rag")
 
     if not agent_id:
-        return [mcp_types.TextContent(type="text", text="Error: agent_id is required")]
+        return Invalid(
+            field="agent_id", message="`agent_id` is required",
+        )
 
     conn = None
     try:
@@ -1109,9 +1168,7 @@ async def relaunch_agent_tool_impl(
         cursor.execute("SELECT * FROM agents WHERE agent_id = ?", (agent_id,))
         agent_row = cursor.fetchone()
         if not agent_row:
-            return [
-                mcp_types.TextContent(type="text", text=f"Agent '{agent_id}' not found")
-            ]
+            return NotFound(resource="agent", identifier=agent_id)
 
         agent_data = dict(agent_row)
         current_status = agent_data.get("status")
@@ -1119,42 +1176,39 @@ async def relaunch_agent_tool_impl(
         # Only allow relaunch for certain statuses
         allowed_statuses = ["terminated", "completed", "failed", "cancelled"]
         if current_status not in allowed_statuses:
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text=f"Cannot relaunch agent with status '{current_status}'. Allowed statuses: {', '.join(allowed_statuses)}",
-                )
-            ]
+            return Conflict(
+                reason=(
+                    f"Cannot relaunch agent with status '{current_status}'. "
+                    f"Allowed statuses: {', '.join(allowed_statuses)}"
+                ),
+            )
 
         # Check if tmux session still exists
         if agent_id not in g.agent_tmux_sessions:
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text=f"Agent '{agent_id}' has no active tmux session to relaunch. Use create_agent instead.",
-                )
-            ]
+            return Conflict(
+                reason=(
+                    f"Agent '{agent_id}' has no active tmux session to "
+                    "relaunch. Use create_agent instead."
+                ),
+            )
 
         session_name = g.agent_tmux_sessions[agent_id]
         if not session_exists(session_name):
             # Clean up the dead session reference
             del g.agent_tmux_sessions[agent_id]
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text=f"Tmux session '{session_name}' for agent '{agent_id}' no longer exists. Use create_agent instead.",
-                )
-            ]
+            return Conflict(
+                reason=(
+                    f"Tmux session '{session_name}' for agent '{agent_id}' "
+                    "no longer exists. Use create_agent instead."
+                ),
+            )
 
         # Send /clear command to reset the session
         clear_success = send_command_to_session(session_name, "/clear")
         if not clear_success:
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text=f"Failed to send /clear command to session '{session_name}'",
-                )
-            ]
+            return Failed(
+                message=f"Failed to send /clear command to session '{session_name}'",
+            )
 
         # Generate new token if requested
         agent_token = agent_data.get("token")
@@ -1211,11 +1265,7 @@ async def relaunch_agent_tool_impl(
                 agent_id, "status", current_status, connection=cursor,
             )
             conn.commit()
-            return [
-                mcp_types.TextContent(
-                    type="text", text=f"Failed to send restart prompt: {e_prompt}"
-                )
-            ]
+            return Failed(message=f"Failed to send restart prompt: {e_prompt}")
 
         # Update in-memory state
         if agent_token in g.active_agents:
@@ -1266,11 +1316,26 @@ async def relaunch_agent_tool_impl(
         ]
 
         if generate_new_token:
+            # Preserve the "Token: <bearer>" line so MCP wire callers
+            # that scrape it (legacy admin scripts) still get the
+            # rotated bearer in the human-readable message. The typed
+            # ``data["token"]`` carries the same value for REST callers.
+            response_parts.append(f"Token: {agent_token}")
             response_parts.append(f"New token generated: {agent_token}")
         else:
             response_parts.append(f"Using existing token: {agent_token}")
 
-        return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
+        return Ok(
+            data={
+                "agent_id": agent_id,
+                "token": agent_token,
+                "session_name": session_name,
+                "previous_status": current_status,
+                "status": "active",
+                "new_token_generated": bool(generate_new_token),
+            },
+            message="\n".join(response_parts),
+        )
 
     except sqlite3.Error as e_sql:
         if conn:
@@ -1278,22 +1343,14 @@ async def relaunch_agent_tool_impl(
         logger.error(
             f"Database error relaunching agent {agent_id}: {e_sql}", exc_info=True
         )
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Database error relaunching agent: {e_sql}"
-            )
-        ]
+        return Failed(message=f"Database error relaunching agent: {e_sql}")
     except Exception as e:
         if conn:
             conn.rollback()
         logger.error(
             f"Unexpected error relaunching agent {agent_id}: {e}", exc_info=True
         )
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Unexpected error relaunching agent: {e}"
-            )
-        ]
+        return Failed(message=f"Unexpected error relaunching agent: {e}")
     finally:
         if conn:
             conn.close()

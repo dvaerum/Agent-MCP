@@ -30,26 +30,36 @@ async def test_dispatch_uses_contextvar_token_when_arguments_token_missing(
     tmp_path,
 ) -> None:
     """When arguments has no 'token' and the request_auth_token contextvar
-    is set, dispatch_tool_call injects it before calling the tool.
+    is set, dispatch_tool_call resolves the bearer (Q6e). After Wave 6
+    PR 0/5 the resolution happens via the principal bridge:
+    ``_derive_principal_from_contextvars`` reads ``request_auth_token``
+    and produces an ``agent_bearer`` principal that downstream tools
+    consume directly — the dispatcher's legacy ``arguments["token"]``
+    injection still happens too, for unmigrated tools that read the
+    token field by hand.
+
+    Uses ``view_tasks`` instead of ``view_status``: ``view_tasks`` is
+    an ``"any"``-tier tool that admits any agent bearer, which is what
+    the contextvar fallback produces. ``view_status`` is operator-tier
+    post-Wave-6-PR-5 — a bearer alone no longer satisfies its
+    inline check; that's the migration's intent, not a regression in
+    the Q6e injection.
     """
     from agent_mcp.tools.registry import dispatch_tool_call, request_auth_token
 
     async with mcp_session(tmp_path) as admin:
         request_auth_token.set(admin.admin_token)
 
-        # view_status requires admin. With token injected from contextvar,
-        # it should succeed (not return Unauthorized → no raise).
+        # view_tasks admits any agent_bearer. With the bearer
+        # resolved via the contextvar, dispatch must succeed.
         try:
-            result = await dispatch_tool_call("view_status", {})  # no `token`
+            result = await dispatch_tool_call("view_tasks", {})  # no `token`
         except Exception as e:
             raise AssertionError(
-                f"dispatch_tool_call should inject token from contextvar; "
+                f"dispatch_tool_call should resolve bearer from contextvar; "
                 f"got: {e}"
             )
 
-        # Wave 6 PR 0 — dispatch returns ToolResult; the bridge
-        # wraps a legacy ``list[TextContent]`` success as
-        # ``Ok(message=concatenated_text)``. Pull message back out.
         from agent_mcp.core.tool_result import Ok
         assert isinstance(result, Ok), f"expected Ok, got {result!r}"
         text = result.message or ""
@@ -67,12 +77,21 @@ async def test_dispatch_does_not_overwrite_explicit_arguments_token(
     retire-system-token Wave 1: the harness stamps
     ``operator_session_active=True`` by default so admin-tier tools
     admit without a token. Clear it here so the test exercises the
-    token-only path the test name describes."""
+    token-only path the test name describes.
+
+    Wave 6 PR 5: ``view_status`` is migrated to ToolResult — an
+    auth-rejection now returns :class:`PermissionDenied` instead of
+    raising. The point of this test is to pin that the contextvar
+    does NOT silently replace an explicit ``arguments["token"]``;
+    asserting on a denial-shaped return is equivalent to the
+    pre-migration assertion on an auth-failure raise.
+    """
     from agent_mcp.tools.registry import (
         dispatch_tool_call,
         request_auth_token,
         operator_session_active,
     )
+    from agent_mcp.core.tool_result import Ok, PermissionDenied
 
     async with mcp_session(tmp_path):
         cv = operator_session_active.set(False)
@@ -81,18 +100,18 @@ async def test_dispatch_does_not_overwrite_explicit_arguments_token(
 
             # Pass an obviously-wrong token in arguments. Should be rejected
             # (not silently replaced with the contextvar's "valid" token).
-            try:
-                await dispatch_tool_call("view_status", {"token": "wrong" * 8})
-            except Exception:
-                # The auth-failure raise (issue H fix) is the expected
-                # behavior with a wrong explicit token.
-                return
+            result = await dispatch_tool_call(
+                "view_status", {"token": "wrong" * 8}
+            )
+            assert isinstance(result, PermissionDenied), (
+                "dispatch_tool_call swallowed the wrong explicit token; "
+                "the contextvar must not override what the caller provided"
+            )
+            assert not isinstance(result, Ok), (
+                "view_status should not succeed with a wrong explicit token"
+            )
         finally:
             operator_session_active.reset(cv)
-        raise AssertionError(
-            "dispatch_tool_call swallowed the wrong explicit token; "
-            "the contextvar must not override what the caller provided"
-        )
 
 
 async def test_dispatch_without_contextvar_and_without_token_returns_auth_failure(
@@ -101,12 +120,18 @@ async def test_dispatch_without_contextvar_and_without_token_returns_auth_failur
     """No arguments.token and no contextvar → auth fails normally.
 
     retire-system-token Wave 1: clear the harness's stamped
-    ``operator_session_active`` so the auth gate actually fires."""
+    ``operator_session_active`` so the auth gate actually fires.
+
+    Wave 6 PR 5: post-migration, the gate's failure surfaces as a
+    returned :class:`PermissionDenied` rather than a raised
+    ``AuthRejected``.
+    """
     from agent_mcp.tools.registry import (
         dispatch_tool_call,
         request_auth_token,
         operator_session_active,
     )
+    from agent_mcp.core.tool_result import PermissionDenied
 
     async with mcp_session(tmp_path):
         cv = operator_session_active.set(False)
@@ -114,7 +139,38 @@ async def test_dispatch_without_contextvar_and_without_token_returns_auth_failur
             # Make sure the contextvar is empty for this test.
             request_auth_token.set(None)
 
-            with pytest.raises(Exception):
-                await dispatch_tool_call("view_status", {})
+            result = await dispatch_tool_call("view_status", {})
+            assert isinstance(result, PermissionDenied)
         finally:
             operator_session_active.reset(cv)
+
+
+async def test_dispatch_admits_view_status_with_operator_session_contextvar(
+    tmp_path,
+) -> None:
+    """When ``operator_session_active=True`` is set AND no bearer is
+    present, the bridge derives an ``operator_session`` Principal
+    that satisfies the operator-tier inline check on ``view_status``.
+
+    Wave 6 PR 5 regression guard: this is the production REST seam's
+    code path — ``_dispatch_through_tool`` stamps op_session and the
+    migrated tool admits via the typed Principal."""
+    from agent_mcp.tools.registry import (
+        dispatch_tool_call,
+        request_auth_token,
+        operator_session_active,
+        operator_user_id,
+    )
+    from agent_mcp.core.tool_result import Ok
+
+    async with mcp_session(tmp_path):
+        request_auth_token.set(None)
+        cv_op = operator_session_active.set(True)
+        cv_user = operator_user_id.set("op")
+        try:
+            result = await dispatch_tool_call("view_status", {})
+        finally:
+            operator_user_id.reset(cv_user)
+            operator_session_active.reset(cv_op)
+
+        assert isinstance(result, Ok), f"expected Ok, got {result!r}"

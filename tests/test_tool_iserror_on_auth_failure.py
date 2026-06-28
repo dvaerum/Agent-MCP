@@ -5,11 +5,15 @@ garbage token by returning `TextContent(text="Unauthorized: Admin
 token required")` with `isError=False`. Naive clients keying off
 isError treat the failure as success.
 
-Fix: when a tool returns a text content whose body matches an
-auth-failure pattern (Unauthorized/Invalid token/Admin token
-required), `dispatch_tool_call` raises an exception. The MCP
-framework catches and wraps it into a CallToolResult with
-isError=True (per mcp/server/lowlevel/server.py `_make_error_result`).
+Pre-Wave-6 fix: when a tool returned auth-failure text,
+`dispatch_tool_call` raised an exception (the framework's
+`_make_error_result` then set isError=True). With Wave 6 PR 5's
+migration of admin tools to :class:`ToolResult`, the typed
+:class:`PermissionDenied` variant carries that signal at the type
+level — no text-matching, no raise. The REST adapter maps it to
+403; the MCP wire renderer turns it into ``"Unauthorized: ..."``
+text which the harness's ``assert_unauthorized`` helper / dashboard
+client both recognise as a denied call.
 """
 
 from __future__ import annotations
@@ -18,19 +22,29 @@ import pytest
 
 
 @pytest.mark.asyncio
-async def test_dispatch_tool_call_raises_on_unauthorized_response() -> None:
-    """A tool that returns Unauthorized text must cause dispatch_tool_call
-    to raise — the framework then sets isError=True automatically."""
-    from agent_mcp.tools.registry import dispatch_tool_call
+async def test_dispatch_tool_call_returns_permission_denied_on_bad_token() -> None:
+    """A tool that's gated by an operator-only check returns
+    :class:`PermissionDenied` when the caller has no operator
+    principal — even if a (wrong) token is supplied in arguments.
 
-    # view_status is admin-only; with a garbage token it returns the
-    # "Unauthorized" text payload. Pre-fix: returns text + isError stays
-    # false. Post-fix: raises.
-    with pytest.raises(Exception):
-        await dispatch_tool_call(
-            "view_status",
-            {"token": "deadbeef" * 4},
-        )
+    Wave 6 PR 5: ``view_status`` is migrated to take a
+    :class:`Principal` and return a :class:`ToolResult`. The bridge
+    in ``dispatch_tool_call`` derives a Principal from the
+    legacy ContextVars; outside ``mcp_session``, no contextvar is
+    set, so the derived principal is None and the inline
+    operator check returns :class:`PermissionDenied`.
+    """
+    from agent_mcp.tools.registry import dispatch_tool_call
+    from agent_mcp.core.tool_result import PermissionDenied
+
+    result = await dispatch_tool_call(
+        "view_status",
+        {"token": "deadbeef" * 4},
+    )
+    assert isinstance(result, PermissionDenied), (
+        f"expected PermissionDenied for unauthenticated view_status; "
+        f"got {result!r}"
+    )
 
 
 @pytest.mark.asyncio

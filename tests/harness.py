@@ -341,13 +341,86 @@ class WorkerSession:
         admitted operator-tier callers is gone. The harness operator
         identity mirrors what the REST seam (``routes.py``) does for
         cookie-authenticated dashboard mutations.
+
+        Wave 6 PR 5: for admin-caller sessions calling a tool whose
+        declared visibility is ``"operator"`` AND whose impl has
+        been migrated to take a :class:`Principal` kwarg, bypass the
+        MCP framework handler and call :func:`dispatch_tool_call`
+        directly with an explicit operator-session Principal. The
+        bridge's contextvar derivation would otherwise prefer the
+        admin bearer (more specific identity for audit attribution)
+        and return ``agent_bearer`` — which fails the migrated
+        tool's inline ``principal.has_role("operator")`` check. The
+        explicit principal kwarg short-circuits the bridge so the
+        operator-tier tool sees the operator identity. Tools whose
+        declared visibility is ``"any"`` / ``"manager"`` /
+        ``"worker-if-toggled:..."`` still flow through the framework
+        handler with bridge-derived ``agent_bearer`` — preserving
+        the bridge's audit-attribution contract (PR 0's add_task_note
+        demo expects ``author="admin"`` from the agent_bearer path).
+        Legacy (unmigrated) tools also use the framework handler so
+        their ``@requires_role`` decorators keep reading the
+        ContextVars unchanged.
         """
         from agent_mcp.tools.registry import (
             request_auth_token,
             operator_session_active,
             operator_user_id,
             operator_project_name,
+            dispatch_tool_call,
+            tool_implementations,
         )
+        from agent_mcp.core.tool_result import render_as_text_content
+        from agent_mcp.tools.access import TOOL_ACCESS as _TOOL_ACCESS
+
+        # Wave 6 PR 5 — operator-tool short-circuit for admin caller.
+        # Only triggers when ALL three conditions hold:
+        #   1. This session represents the harness's admin (the
+        #      pre-Wave-6 surface that stood in for "operator").
+        #   2. The tool's declared visibility is ``"operator"`` —
+        #      we leave ``"any"`` / ``"manager"`` tools on the
+        #      bridge-derived path so PR 0's agent_bearer attribution
+        #      contract holds.
+        #   3. The tool impl is migrated (accepts a ``principal``
+        #      kwarg) — same predicate the bridge uses. Skipping
+        #      unmigrated tools keeps their decorator-based
+        #      ContextVar gates unchanged.
+        if self.is_admin_caller:
+            access_level = _TOOL_ACCESS.get(tool_name)
+            if access_level == "operator":
+                impl = tool_implementations.get(tool_name)
+                tool_takes_principal = False
+                if impl is not None:
+                    try:
+                        import inspect as _inspect
+                        tool_takes_principal = (
+                            "principal" in _inspect.signature(impl).parameters
+                        )
+                    except (TypeError, ValueError):  # pragma: no cover
+                        tool_takes_principal = False
+                if tool_takes_principal:
+                    from agent_mcp.core.principal import Principal
+
+                    principal = Principal(
+                        kind="operator_session",
+                        user_id=_HARNESS_OPERATOR_ID,
+                        agent_id=None,
+                        sysadmin=False,
+                        project_name="harness",
+                        project_role="operator",
+                        agent_role=None,
+                        can_wake_loop=False,
+                        source_token=None,
+                    )
+                    cv_token = request_auth_token.set(self.token)
+                    try:
+                        result = await dispatch_tool_call(
+                            tool_name, arguments, principal=principal,
+                        )
+                    finally:
+                        request_auth_token.reset(cv_token)
+                    self._last_is_error = False
+                    return render_as_text_content(result)
 
         handler = self._admin._call_tool_handler()
         req = mcp_types.CallToolRequest(

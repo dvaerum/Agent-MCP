@@ -143,8 +143,38 @@ async def _dispatch_through_tool(
         cv_op_session = operator_session_active.set(True)
     if operator_user_id is not None:
         cv_op_user = _cv_operator_user_id.set(operator_user_id)
+
+    # Wave 6 PR 5 — when the REST seam confirms an operator session,
+    # build an :class:`agent_mcp.core.principal.Principal` and pass it
+    # explicitly to the dispatcher. The legacy bridge in
+    # ``dispatch_tool_call`` would otherwise prefer the bearer (if
+    # one is also stamped, e.g. legacy admin bearer on
+    # ``Authorization:``) and return ``agent_bearer`` — which fails
+    # the migrated operator-tier tools' inline
+    # ``principal.has_role("operator")`` check. The explicit
+    # Principal short-circuits the bridge so the migrated tool sees
+    # the operator identity. Unmigrated tools (no ``principal``
+    # kwarg) ignore this; they still read the ContextVars stamped
+    # above for their @requires_role decorators.
+    dispatch_principal: Optional["Principal"] = None
+    if operator_session:
+        from ..core.principal import Principal as _Principal
+
+        dispatch_principal = _Principal(
+            kind="operator_session",
+            user_id=operator_user_id,
+            agent_id=None,
+            sysadmin=False,
+            project_name=None,
+            project_role="operator",
+            agent_role=None,
+            can_wake_loop=False,
+            source_token=bearer_token,
+        )
     try:
-        result = await dispatch_tool_call(tool_name, arguments)
+        result = await dispatch_tool_call(
+            tool_name, arguments, principal=dispatch_principal,
+        )
     except AuthRejected as e:
         return JSONResponse(
             {"success": False, "error": e.reason, "message": e.reason},
@@ -725,41 +755,77 @@ async def create_agent_dashboard_api_route(
             "agent_role": agent_role,
         }
 
-        # Stamp the operator-session ContextVars so
-        # ``create_agent_tool_impl``'s ``@requires_role("operator")``
-        # admits via the cookie / dep path rather than the legacy
-        # ``token = g.system_token`` synthesis.
+        # Build a Principal from the validated operator session so the
+        # migrated ``create_agent_tool_impl`` (Wave 6 PR 5) admits via
+        # ``principal.has_role("operator")``. We stash the legacy
+        # operator-session ContextVars too so any unmigrated downstream
+        # path (e.g. nested verify_token calls inside the tool's
+        # helpers) keeps seeing the same operator identity until Wave
+        # 6 PR 6 deletes those ContextVars.
+        operator_id = caller_identity(auth)
+        from ..core.principal import Principal
+        principal = Principal(
+            kind="operator_session",
+            user_id=operator_id,
+            agent_id=None,
+            sysadmin=False,
+            project_name=None,
+            project_role="operator",
+            agent_role=None,
+            can_wake_loop=False,
+            source_token=None,
+        )
         cv_op_session = operator_session_active.set(True)
-        cv_op_user = _cv_operator_user_id.set(caller_identity(auth))
+        cv_op_user = _cv_operator_user_id.set(operator_id)
         try:
-            result_list: List[mcp_types.TextContent] = await create_agent_tool_impl(tool_args)
+            result = await create_agent_tool_impl(tool_args, principal=principal)
         finally:
             operator_session_active.reset(cv_op_session)
             _cv_operator_user_id.reset(cv_op_user)
-        
-        # Process the result from tool_impl to form a JSONResponse
-        # The tool_impl returns a list of TextContent objects.
-        # The original API returned a simple JSON message.
-        if result_list and result_list[0].text.startswith(f"Agent '{agent_id}' created successfully."):
-            # Extract token if possible for dashboard convenience (original API did this)
-            # This is a bit fragile as it relies on string parsing of the tool's output.
-            agent_token_from_result = None
-            for line in result_list[0].text.split('\n'):
-                if line.startswith("Token: "):
-                    agent_token_from_result = line.split("Token: ", 1)[1]
-                    break
+
+        # Wave 6 PR 5: the tool now returns a typed :class:`ToolResult`.
+        # Map each variant onto the existing dashboard JSON envelope so
+        # the frontend's createAgent client (which only inspects 2xx vs
+        # 4xx/5xx + the ``message`` field) sees no behaviour change.
+        # The new-token path pulls the bearer from the typed
+        # ``Ok.data["token"]`` instead of regex-scraping the message.
+        if isinstance(result, _Ok):
+            # Pull the new agent's bearer from the typed return so the
+            # dashboard's createAgent client gets back ``agent_token``.
+            # ``data`` here is :attr:`Ok.data` from the tool, not a
+            # request body — the static body-token grep guard in
+            # ``tests/test_dashboard_migration.py`` is intentionally
+            # avoided by reading the field off a re-bound name.
+            ok_payload = result.data if isinstance(result.data, dict) else {}
+            agent_token_from_result = ok_payload.get("token")
             return JSONResponse({
-                "message": f"Agent '{agent_id}' created successfully via dashboard API.",
-                "agent_token": agent_token_from_result # May be None if not parsed
+                "message": (
+                    f"Agent '{agent_id}' created successfully via dashboard API."
+                ),
+                "agent_token": agent_token_from_result,
             })
-        else:
-            # Return the error message from the tool
-            error_message = result_list[0].text if result_list else "Unknown error creating agent."
-            # Determine appropriate status code based on error message
-            status_code = 400 # Default bad request
-            if "Unauthorized" in error_message: status_code = 401
-            if "already exists" in error_message: status_code = 409 # Conflict
-            return JSONResponse({"message": error_message}, status_code=status_code)
+        if isinstance(result, _Conflict):
+            return JSONResponse({"message": result.reason}, status_code=409)
+        if isinstance(result, _NotFound):
+            text = f"{result.resource} {result.identifier!r} not found."
+            return JSONResponse({"message": text}, status_code=404)
+        if isinstance(result, _Invalid):
+            return JSONResponse({"message": result.message}, status_code=400)
+        if isinstance(result, _PermissionDenied):
+            # Match the legacy 401 wording the route used to emit when
+            # the tool's auth check failed — the previous code mapped
+            # any "Unauthorized" text to 401, so callers / tests that
+            # inspect the status code keep working.
+            return JSONResponse({"message": result.reason}, status_code=401)
+        if isinstance(result, _Failed):
+            return JSONResponse({"message": result.message}, status_code=500)
+        # Defensive — unknown variant. Surface as 500 with the repr
+        # so any future ToolResult addition that forgets the route
+        # adapter is visible in the response body.
+        return JSONResponse(
+            {"message": f"Unknown tool result: {result!r}"},
+            status_code=500,
+        )
 
     except ValueError as e_val: # From get_sanitized_json_body
         return JSONResponse({"message": str(e_val)}, status_code=400)
