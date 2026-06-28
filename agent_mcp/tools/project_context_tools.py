@@ -121,20 +121,165 @@ def _creator_mismatch_error(context_key: str, creator: str) -> str:
         f"'{creator}'; only its creator or admin can modify it"
     )
 
-import mcp.types as mcp_types
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from .registry import register_tool
-from ..core.authorize import requires, requires_role
 from ..core.config import logger
 from ..core import globals as g  # Not directly used here, but auth uses it
-from ..core.auth import get_agent_id, verify_token
+from ..core.principal import Principal
+from ..core.tool_result import (
+    Failed,
+    Invalid,
+    NotFound,
+    Ok,
+    PermissionDenied,
+    ToolResult,
+)
 from ..utils.audit_utils import log_audit
 from ..db.connection import get_db_connection
 from ..db.engine import SessionLocal, get_session
 from ..db.models import ProjectContext
 from ..db.actions.agent_actions_db import log_agent_action_to_db
+
+
+# ── Wave 6 PR 3 helpers ──────────────────────────────────────────────
+
+
+def _actor_label(principal: Optional[Principal]) -> str:
+    """Best-effort audit-attribution label for a Principal.
+
+    Mirrors :meth:`Principal.actor_label` with a defensive fallback to
+    ``"unknown"`` if the principal is None or carries no identity. The
+    pre-Wave-6 code passed ``get_agent_id(token)`` which would return
+    ``None`` for an empty/invalid token; this helper guarantees a
+    non-empty string so downstream audit-log INSERTs always have an
+    ``agent_id`` value.
+    """
+    if principal is None:
+        return "unknown"
+    return principal.actor_label() or "unknown"
+
+
+def _is_admin_principal(principal: Optional[Principal]) -> bool:
+    """Operator-tier check with a narrowly scoped bridge-era fallback.
+
+    Wave 6 PR 3 — the canonical operator-tier check is
+    :meth:`Principal.has_role` with ``"admin"``. Production code
+    paths reach this helper with a Principal that already answers
+    correctly:
+
+    * REST seam → ``operator_session`` Principal →
+      ``has_role("admin")`` True.
+    * MCP wire (any agent) → ``agent_bearer`` Principal →
+      ``has_role("admin")`` False; the worker/manager distinction
+      doesn't matter at this gate.
+
+    The harness, by contrast, stamps BOTH a manager-role bearer AND
+    ``operator_session_active=True`` for ``AdminClient.call`` — the
+    bridge in ``tools/registry._derive_principal_from_contextvars``
+    picks bearer first, so the harness's admin call surfaces here as
+    an ``agent_bearer`` Principal whose ``agent_role`` is
+    ``"manager"``. That Principal correctly does NOT satisfy
+    ``has_role("admin")`` (a real manager-role worker agent
+    shouldn't bypass operator-only gates), but the harness's intent
+    is "operator at the dashboard" — the manager-role bearer is a
+    workaround for legacy ``@requires("any")`` decorators that need
+    ``arguments.token`` filled by the Q6e fallback.
+
+    The fallback below admits in exactly that narrow case:
+    ``agent_bearer`` + ``agent_role == "manager"`` +
+    ``operator_session_active`` is set. Production never combines
+    those — REST stamps op_session only, MCP wire stamps bearer
+    only — so the fallback never fires for production workloads.
+    Tests that build an explicit worker-role Principal are NOT
+    admitted by this branch even if a harness leak left
+    ``operator_session_active`` set.
+
+    ``principal is None`` consults the ContextVar unconditionally so
+    legacy callers that pre-date Wave 6 (no Principal kwarg, no
+    bridge derivation) still behave like the pre-migration
+    ``verify_token(.., "admin")`` did.
+
+    PR 6 of Wave 6 deletes this helper alongside the
+    ``operator_session_active`` ContextVar itself.
+    """
+    if principal is None:
+        try:
+            from .registry import operator_session_active
+
+            if operator_session_active.get():
+                return True
+        except Exception:  # pragma: no cover - defensive
+            pass
+        return False
+
+    if principal.has_role("admin"):
+        return True
+
+    # Harness-only fallback — see docstring. Only an agent_bearer
+    # whose agent_role is ``"manager"`` AND with ``operator_session_active``
+    # set qualifies. This combination is unreachable in production but
+    # is exactly what ``AdminClient.call`` produces in the test harness.
+    if (
+        principal.kind == "agent_bearer"
+        and principal.agent_role == "manager"
+    ):
+        try:
+            from .registry import operator_session_active
+
+            if operator_session_active.get():
+                return True
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    return False
+
+
+def _requires_authenticated_caller(
+    principal: Optional[Principal],
+) -> Optional[PermissionDenied]:
+    """Mirror ``@requires("any")`` semantics in the migrated tools.
+
+    Returns ``PermissionDenied`` (a :data:`ToolResult` variant) when
+    no caller identity is in hand. Admits:
+
+    * any ``agent_bearer`` Principal (the legacy ``@requires("any")``
+      gate which checked ``get_agent_id(token)`` admitted exactly
+      these);
+    * any operator-tier Principal (``operator_session`` /
+      ``forwarding_header``), so the migrated tools are also callable
+      from the REST seam if a future handler decides to dispatch
+      through here instead of writing the table directly;
+    * any sysadmin caller (no project membership required).
+
+    The `principal.has_role("admin")` branch covers operator and
+    sysadmin in one check (see Principal docstring). The combined
+    gate matches what the Wave 6 PR 0 demo tool (``add_task_note``)
+    uses, so the per-tool authorization vocabulary stays consistent.
+    """
+    if principal is None:
+        # Same bridge fallback as :func:`_is_admin_principal` for the
+        # None case: legacy call sites that pre-date Wave 6 might
+        # not have had a Principal derived (no bearer, no op_session
+        # in the bridge's view) but still have ``operator_session_active``
+        # stamped via the REST seam's ``_dispatch_through_tool``.
+        if _is_admin_principal(principal):
+            return None
+        return PermissionDenied(
+            reason="Valid token or operator session required"
+        )
+    if principal.kind == "agent_bearer":
+        return None
+    if principal.has_role("admin"):
+        return None
+    # Bridge fallback — see :func:`_is_admin_principal` for the
+    # narrow harness case (agent_bearer + manager + op_session_active).
+    if _is_admin_principal(principal):
+        return None
+    return PermissionDenied(
+        reason="Valid token or operator session required"
+    )
 
 
 def _analyze_context_health(context_entries: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -333,11 +478,24 @@ def _create_context_backup(session, backup_name: str = None) -> Dict[str, Any]:
 
 # --- view_project_context tool ---
 # Original logic from main.py: lines 1411-1465 (view_project_context_tool function)
-@requires("any")
 async def view_project_context_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
-    agent_auth_token = arguments.get("token")
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    """Wave 6 PR 3 — Principal + ToolResult migration.
+
+    Policy: was ``@requires("any")`` — any authenticated caller
+    admits. Now expressed via :func:`_requires_authenticated_caller`
+    which admits agent bearers + operator-tier callers. The
+    admin-vs-worker secret-key redaction below now consults
+    :func:`_is_admin_principal` instead of
+    ``verify_token(.., "admin")``.
+    """
+    denied = _requires_authenticated_caller(principal)
+    if denied is not None:
+        return denied
+
     context_key_filter = arguments.get("context_key")  # Optional specific key
     search_query_filter = arguments.get("search_query")  # Optional search query
 
@@ -357,9 +515,10 @@ async def view_project_context_tool_impl(
     if sort_by == "last_updated":
         sort_by = "updated_at"
 
-    # @requires("any") guaranteed entry; resolve id for audit + the
-    # admin-vs-worker secret-key redaction below (issue I).
-    requesting_agent_id = get_agent_id(agent_auth_token)
+    # Wave 6 PR 3: identity for audit + the admin-vs-worker
+    # secret-key redaction below (issue I) comes from the Principal,
+    # not a ``get_agent_id(token)`` resolve.
+    requesting_agent_id = _actor_label(principal)
 
     # Log audit (main.py:1417)
     log_audit(
@@ -422,8 +581,12 @@ async def view_project_context_tool_impl(
 
         # Redact secret-looking keys for non-admin callers (issue I).
         # Admins continue to see everything; workers see everything
-        # EXCEPT keys matching _SECRET_KEY_RE.
-        if not verify_token(agent_auth_token, "admin"):
+        # EXCEPT keys matching _SECRET_KEY_RE. Wave 6 PR 3:
+        # ``verify_token(.., "admin")`` → :func:`_is_admin_principal`
+        # which prefers the Principal's typed role and falls back to
+        # the legacy ``operator_session_active`` ContextVar during
+        # the bridge window.
+        if not _is_admin_principal(principal):
             rows = [r for r in rows if not _SECRET_KEY_RE.search(r.context_key)]
 
         # Process results with enhanced information
@@ -609,7 +772,10 @@ async def view_project_context_tool_impl(
         logger.error(
             f"Database error viewing project context: {e_sql}", exc_info=True
         )  # main.py:1462
-        response_message = f"Database error viewing project context: {e_sql}"
+        session.close()
+        return Failed(
+            message=f"Database error viewing project context: {e_sql}"
+        )
     except (
         json.JSONDecodeError
     ) as e_json:  # Should be caught per-item, but as a fallback
@@ -617,14 +783,35 @@ async def view_project_context_tool_impl(
             f"Error decoding JSON from project_context table during bulk view: {e_json}",
             exc_info=True,
         )  # main.py:1465
-        response_message = f"Error decoding stored project context value(s)."
+        session.close()
+        return Failed(
+            message="Error decoding stored project context value(s)."
+        )
     except Exception as e:
         logger.error(f"Unexpected error viewing project context: {e}", exc_info=True)
-        response_message = f"An unexpected error occurred: {e}"
+        session.close()
+        return Failed(message=f"An unexpected error occurred: {e}")
     finally:
+        # The early-return branches above already close the session;
+        # this finally handles the success path. Calling .close()
+        # twice on a SQLAlchemy session is harmless (no-op if already
+        # closed).
         session.close()
 
-    return [mcp_types.TextContent(type="text", text=response_message)]
+    return Ok(
+        data={
+            "entries": results_list,
+            "count": len(results_list),
+            "filters": {
+                "context_key": context_key_filter,
+                "search_query": search_query_filter,
+                "show_stale_entries": show_stale_entries,
+                "sort_by": sort_by,
+                "max_results": max_results,
+            },
+        },
+        message=response_message,
+    )
 
 
 # --- update_project_context tool ---
@@ -706,13 +893,20 @@ async def _handle_single_context_update(
     description_for_context: Optional[str] = None,
     *,
     is_admin: bool,
-) -> List[mcp_types.TextContent]:
+) -> ToolResult:
     """Handle single context update operation.
 
     Phase 7b: authorizes the write per-key. Admins always pass; workers
     pass only if the key is non-`config_*` and either new or self-owned.
     On insert, stamps `created_at` / `created_by`; on update, leaves
     those untouched and refreshes `updated_at` / `updated_by`.
+
+    Wave 6 PR 3 — returns :data:`ToolResult` instead of legacy
+    ``list[TextContent]``. The authorisation-error path returns
+    :class:`PermissionDenied` (which the REST adapter maps to 403 and
+    the MCP renderer renders as ``Unauthorized: ...``); the JSON-
+    serialisation path returns :class:`Invalid` (400); DB errors
+    return :class:`Failed` (500).
     """
     log_audit(
         requesting_agent_id,
@@ -730,12 +924,12 @@ async def _handle_single_context_update(
         logger.error(
             f"Value provided for project context key '{context_key_to_update}' is not JSON serializable: {e_type}"
         )
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text=f"Error: Provided context_value is not JSON serializable: {e_type}",
-            )
-        ]
+        return Invalid(
+            field="context_value",
+            message=(
+                f"Provided context_value is not JSON serializable: {e_type}"
+            ),
+        )
 
     try:
         err = _single_update_inline(
@@ -750,36 +944,36 @@ async def _handle_single_context_update(
             f"Database error updating project context for key '{context_key_to_update}': {e_sql}",
             exc_info=True,
         )
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Database error updating project context: {e_sql}"
-            )
-        ]
+        return Failed(message=f"Database error updating project context: {e_sql}")
     except Exception as e:
         logger.error(
             f"Unexpected error updating project context for key '{context_key_to_update}': {e}",
             exc_info=True,
         )
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Unexpected error updating project context: {e}"
-            )
-        ]
+        return Failed(message=f"Unexpected error updating project context: {e}")
 
     if err is not None:
-        return [mcp_types.TextContent(type="text", text=err)]
+        # ``_single_update_inline`` returns the formatted
+        # "Unauthorized: ..." string from ``_check_write_authorization``
+        # — strip the "Unauthorized: " prefix so the renderer doesn't
+        # double-stamp it (PermissionDenied → "Unauthorized: {reason}").
+        reason = err
+        if reason.lower().startswith("unauthorized:"):
+            reason = reason[len("Unauthorized:"):].lstrip()
+        return PermissionDenied(reason=reason)
 
     # Phase 4: notify subscribers when a worker-policy toggle flips.
     # The helper is best-effort and safe outside a request context.
     if _is_worker_policy_toggle(context_key_to_update):
         await _emit_tools_list_changed(context_key_to_update)
 
-    return [
-        mcp_types.TextContent(
-            type="text",
-            text=f"Project context updated successfully for key '{context_key_to_update}'.",
-        )
-    ]
+    return Ok(
+        data={"context_key": context_key_to_update},
+        message=(
+            f"Project context updated successfully for key "
+            f"'{context_key_to_update}'."
+        ),
+    )
 
 
 async def _handle_bulk_context_update(
@@ -787,7 +981,7 @@ async def _handle_bulk_context_update(
     updates_list: List[Dict[str, Any]],
     *,
     is_admin: bool,
-) -> List[mcp_types.TextContent]:
+) -> ToolResult:
     """Handle bulk context update operations atomically.
 
     Phase 7b: every entry is authorized before any write lands. If a
@@ -796,6 +990,11 @@ async def _handle_bulk_context_update(
 
     Routes through the shared inline helper for the same loop-affinity
     reason described in `bulk_update_project_context_tool_impl`.
+
+    Wave 6 PR 3 — returns :data:`ToolResult`. The ownership-error
+    path returns :class:`PermissionDenied`; the data payload on
+    success carries the per-entry results list so REST callers see
+    structured "what landed and what didn't" information.
     """
     log_audit(
         requesting_agent_id,
@@ -809,20 +1008,15 @@ async def _handle_bulk_context_update(
         )
     except (sqlite3.Error, SQLAlchemyError) as e_sql:
         logger.error(f"Database error in bulk context update: {e_sql}", exc_info=True)
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Database error in bulk update: {e_sql}"
-            )
-        ]
+        return Failed(message=f"Database error in bulk update: {e_sql}")
     except Exception as e:
         logger.error(f"Unexpected error in bulk context update: {e}", exc_info=True)
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Unexpected error in bulk update: {e}"
-            )
-        ]
+        return Failed(message=f"Unexpected error in bulk update: {e}")
     if err is not None:
-        return [mcp_types.TextContent(type="text", text=err)]
+        reason = err
+        if reason.lower().startswith("unauthorized:"):
+            reason = reason[len("Unauthorized:"):].lstrip()
+        return PermissionDenied(reason=reason)
 
     # Phase 4: if the bulk write touched any worker-policy toggle,
     # emit a single tools/list_changed notification — workers care
@@ -834,14 +1028,33 @@ async def _handle_bulk_context_update(
     ):
         await _emit_tools_list_changed("__bulk__")
 
-    return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
+    return Ok(
+        data={
+            "updates_attempted": len(updates_list),
+            "summary_lines": response_parts,
+        },
+        message="\n".join(response_parts),
+    )
 
 
-@requires("any")
 async def update_project_context_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
-    auth_token = arguments.get("token")
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    """Wave 6 PR 3 — Principal + ToolResult migration.
+
+    The decorator was ``@requires("any")``; the gate now lives in
+    :func:`_requires_authenticated_caller`. The per-key
+    creator-ownership matrix uses :func:`_is_admin_principal` (with
+    the bridge-era ContextVar fallback) for ``is_admin`` so the
+    behaviour matches the pre-migration legacy
+    ``verify_token(token, "admin")`` semantics during the Wave 6
+    window.
+    """
+    denied = _requires_authenticated_caller(principal)
+    if denied is not None:
+        return denied
 
     # Support both single and bulk operations
     context_key_to_update = arguments.get("context_key")
@@ -849,35 +1062,31 @@ async def update_project_context_tool_impl(
     description_for_context = arguments.get("description")
     updates_list = arguments.get("updates")  # For bulk operations
 
-    # @requires("any") guaranteed entry; resolve id + admin flag for the
-    # per-key creator-ownership matrix (PR #52 — admins write anything,
-    # workers only their own non-`config_*` keys).
-    requesting_agent_id = get_agent_id(auth_token)
-    is_admin = verify_token(auth_token, "admin")
+    requesting_agent_id = _actor_label(principal)
+    is_admin = _is_admin_principal(principal)
 
     # Determine operation mode
     is_bulk_operation = updates_list is not None
 
     if is_bulk_operation:
         if not isinstance(updates_list, list) or len(updates_list) == 0:
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text="Error: updates must be a non-empty list for bulk operations.",
-                )
-            ]
+            return Invalid(
+                field="updates",
+                message="updates must be a non-empty list for bulk operations.",
+            )
         return await _handle_bulk_context_update(
             requesting_agent_id, updates_list, is_admin=is_admin
         )
     else:
         # Single operation (backward compatibility)
         if not context_key_to_update or context_value_to_set is None:
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text="Error: context_key and context_value are required for single updates.",
-                )
-            ]
+            return Invalid(
+                field="context_key" if not context_key_to_update else "context_value",
+                message=(
+                    "context_key and context_value are required for "
+                    "single updates."
+                ),
+            )
         return await _handle_single_context_update(
             requesting_agent_id,
             context_key_to_update,
@@ -1000,10 +1209,11 @@ def _bulk_update_inline(
         session.close()
 
 
-@requires("any")
 async def bulk_update_project_context_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
     """Public-facing bulk-update entry point (inline, no write queue).
 
     The MCP framework dispatcher runs tools on arbitrary asyncio loops
@@ -1013,41 +1223,41 @@ async def bulk_update_project_context_tool_impl(
     via a SQLAlchemy session, sharing the ownership + atomicity logic
     with the queued surface (`_handle_bulk_context_update`) through
     `_bulk_update_inline`.
-    """
-    auth_token = arguments.get("token")
-    updates = arguments.get("updates", [])  # List of update operations
 
-    # @requires("any") guaranteed entry; resolve id for the per-key
-    # ownership matrix below.
-    requesting_agent_id = get_agent_id(auth_token)
+    Wave 6 PR 3 — Principal + ToolResult migration. Authentication
+    gate moves from ``@requires("any")`` to
+    :func:`_requires_authenticated_caller`; ``is_admin`` resolved
+    from :func:`_is_admin_principal`.
+    """
+    denied = _requires_authenticated_caller(principal)
+    if denied is not None:
+        return denied
+
+    updates = arguments.get("updates", [])  # List of update operations
+    requesting_agent_id = _actor_label(principal)
 
     if not updates or not isinstance(updates, list):
-        return [
-            mcp_types.TextContent(type="text", text="Error: updates array is required.")
-        ]
+        return Invalid(
+            field="updates", message="updates array is required."
+        )
 
     # Validate each update operation
     for i, update in enumerate(updates):
         if not isinstance(update, dict):
-            return [
-                mcp_types.TextContent(
-                    type="text", text=f"Error: Update {i} must be an object."
-                )
-            ]
+            return Invalid(
+                field=f"updates[{i}]",
+                message=f"Update {i} must be an object.",
+            )
         if "context_key" not in update:
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text=f"Error: Update {i} missing required 'context_key'.",
-                )
-            ]
+            return Invalid(
+                field=f"updates[{i}].context_key",
+                message=f"Update {i} missing required 'context_key'.",
+            )
         if "context_value" not in update:
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text=f"Error: Update {i} missing required 'context_value'.",
-                )
-            ]
+            return Invalid(
+                field=f"updates[{i}].context_value",
+                message=f"Update {i} missing required 'context_value'.",
+            )
 
     log_audit(
         requesting_agent_id,
@@ -1055,25 +1265,20 @@ async def bulk_update_project_context_tool_impl(
         {"update_count": len(updates)},
     )
 
-    is_admin = verify_token(auth_token, "admin")
+    is_admin = _is_admin_principal(principal)
     try:
         err, response_parts = _bulk_update_inline(
             requesting_agent_id, updates, is_admin=is_admin
         )
     except (sqlite3.Error, SQLAlchemyError) as e_sql:
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Database error in bulk update: {e_sql}"
-            )
-        ]
+        return Failed(message=f"Database error in bulk update: {e_sql}")
     except Exception as e:
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Unexpected error in bulk update: {e}"
-            )
-        ]
+        return Failed(message=f"Unexpected error in bulk update: {e}")
     if err is not None:
-        return [mcp_types.TextContent(type="text", text=err)]
+        reason = err
+        if reason.lower().startswith("unauthorized:"):
+            reason = reason[len("Unauthorized:"):].lstrip()
+        return PermissionDenied(reason=reason)
 
     # Phase 4: emit tools/list_changed once if any update was a
     # worker-policy toggle.
@@ -1083,22 +1288,41 @@ async def bulk_update_project_context_tool_impl(
     ):
         await _emit_tools_list_changed("__bulk__")
 
-    return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
+    return Ok(
+        data={
+            "updates_attempted": len(updates),
+            "summary_lines": response_parts,
+        },
+        message="\n".join(response_parts),
+    )
 
 
 # --- backup_project_context tool ---
-@requires_role("operator")
 async def backup_project_context_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
-    auth_token = arguments.get("token")
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    """Wave 6 PR 3 — Principal + ToolResult migration.
+
+    Policy: was ``@requires_role("operator")`` — operator-only. Now
+    expressed via :func:`_is_admin_principal` (admits operator
+    sessions + sysadmins; rejects worker / manager-tier agents). The
+    `visibility="operator"` kwarg on the register_tool() call below
+    keeps the tools/list filter aligned so worker / manager bearers
+    don't even see this tool in their catalogue.
+    """
+    if not _is_admin_principal(principal):
+        return PermissionDenied(
+            reason="Operator session required to back up project context"
+        )
+
     backup_name = arguments.get("backup_name")  # Optional custom backup name
     include_health_report = arguments.get(
         "include_health_report", True
     )  # Include health analysis in backup
 
-    # @requires_role("operator") guaranteed entry; admin id is always "admin".
-    requesting_agent_id = get_agent_id(auth_token)
+    requesting_agent_id = _actor_label(principal)
 
     log_audit(
         requesting_agent_id, "backup_project_context", {"backup_name": backup_name}
@@ -1181,25 +1405,41 @@ async def backup_project_context_tool_impl(
         )
         session.commit()
 
-        return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
+        return Ok(
+            data={
+                "backup_name": backup_data["backup_name"],
+                "backup_path": backup_path,
+                "total_entries": backup_data["total_entries"],
+                "created_at": backup_data["created_at"],
+                "health_report": backup_data.get("health_report"),
+            },
+            message="\n".join(response_parts),
+        )
 
     except Exception as e:
         session.rollback()
         logger.error(f"Error creating context backup: {e}", exc_info=True)
-        return [mcp_types.TextContent(type="text", text=f"Error creating backup: {e}")]
+        return Failed(message=f"Error creating backup: {e}")
     finally:
         session.close()
 
 
 # --- validate_context_consistency tool ---
-@requires("any")
 async def validate_context_consistency_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
-    auth_token = arguments.get("token")
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    """Wave 6 PR 3 — Principal + ToolResult migration.
 
-    # @requires("any") guaranteed entry; resolve id for audit only.
-    requesting_agent_id = get_agent_id(auth_token)
+    Gate: was ``@requires("any")``. Behaviour preserved via
+    :func:`_requires_authenticated_caller`.
+    """
+    denied = _requires_authenticated_caller(principal)
+    if denied is not None:
+        return denied
+
+    requesting_agent_id = _actor_label(principal)
 
     # Log audit
     log_audit(requesting_agent_id, "validate_context_consistency", {})
@@ -1218,11 +1458,10 @@ async def validate_context_consistency_tool_impl(
         all_entries = [_row_to_dict(r) for r in all_rows]
 
         if not all_entries:
-            return [
-                mcp_types.TextContent(
-                    type="text", text="No project context entries found."
-                )
-            ]
+            return Ok(
+                data={"total_entries": 0, "issues": [], "warnings": []},
+                message="No project context entries found.",
+            )
 
         # Check 1: Invalid JSON values
         for entry in all_entries:
@@ -1312,26 +1551,25 @@ async def validate_context_consistency_tool_impl(
                     "- Consider using delete_project_context for unused entries"
                 )
 
-        return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
+        return Ok(
+            data={
+                "total_entries": len(all_entries),
+                "issues": issues,
+                "warnings": warnings,
+            },
+            message="\n".join(response_parts),
+        )
 
     except SQLAlchemyError as e_sql:
         logger.error(
             f"Database error validating context consistency: {e_sql}", exc_info=True
         )
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Database error validating context: {e_sql}"
-            )
-        ]
+        return Failed(message=f"Database error validating context: {e_sql}")
     except Exception as e:
         logger.error(
             f"Unexpected error validating context consistency: {e}", exc_info=True
         )
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Unexpected error validating context: {e}"
-            )
-        ]
+        return Failed(message=f"Unexpected error validating context: {e}")
     finally:
         session.close()
 
@@ -1540,26 +1778,33 @@ def register_project_context_tools():
     )
 
 
-@requires("any")
 async def delete_project_context_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
     """Delete project context entries permanently.
 
     Phase 7b: per-key creator-ownership check applies (admins can delete
     anything; workers can delete only entries they themselves created
     and which are not `config_*`). The `force_delete` safety net on
     "critical" system keys is preserved as belt-and-suspenders.
+
+    Wave 6 PR 3 — Principal + ToolResult migration. Gate moves from
+    ``@requires("any")`` to :func:`_requires_authenticated_caller`;
+    ``is_admin`` for the per-key creator-ownership matrix resolved
+    via :func:`_is_admin_principal`.
     """
-    auth_token = arguments.get("token")
+    denied = _requires_authenticated_caller(principal)
+    if denied is not None:
+        return denied
+
     context_keys = arguments.get("context_keys", [])
     context_key = arguments.get("context_key")
     force_delete = arguments.get("force_delete", False)
 
-    # @requires("any") guaranteed entry; resolve id + admin flag for the
-    # per-key creator-ownership matrix in _check_write_authorization.
-    requesting_agent_id = get_agent_id(auth_token)
-    is_admin = verify_token(auth_token, required_role="admin")
+    requesting_agent_id = _actor_label(principal)
+    is_admin = _is_admin_principal(principal)
 
     # Prepare list of keys to delete
     keys_to_delete = []
@@ -1569,11 +1814,10 @@ async def delete_project_context_tool_impl(
         keys_to_delete.extend(context_keys)
 
     if not keys_to_delete:
-        return [
-            mcp_types.TextContent(
-                type="text", text="Error: No context keys specified for deletion"
-            )
-        ]
+        return Invalid(
+            field="context_key",
+            message="No context keys specified for deletion",
+        )
 
     # Critical system keys that require force_delete. The legacy
     # ``config_admin_token`` is kept alongside ``config_system_token``
@@ -1600,12 +1844,13 @@ async def delete_project_context_tool_impl(
                 break
 
     if critical_keys_found and not force_delete:
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text=f"Error: Cannot delete critical system keys without force_delete=true: {critical_keys_found}",
-            )
-        ]
+        return Invalid(
+            field="force_delete",
+            message=(
+                f"Cannot delete critical system keys without "
+                f"force_delete=true: {critical_keys_found}"
+            ),
+        )
 
     session = SessionLocal()
     try:
@@ -1615,7 +1860,10 @@ async def delete_project_context_tool_impl(
                 session, requesting_agent_id, key, is_admin=is_admin
             )
             if err is not None:
-                return [mcp_types.TextContent(type="text", text=err)]
+                reason = err
+                if reason.lower().startswith("unauthorized:"):
+                    reason = reason[len("Unauthorized:"):].lstrip()
+                return PermissionDenied(reason=reason)
 
         # Fetch existing rows up front so we know what's actually there.
         existing_rows = (
@@ -1626,12 +1874,10 @@ async def delete_project_context_tool_impl(
         existing_map = {r.context_key: r for r in existing_rows}
 
         if not existing_map:
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text=f"Error: None of the specified keys exist in project context: {keys_to_delete}",
-                )
-            ]
+            return NotFound(
+                resource="project_context",
+                identifier=", ".join(keys_to_delete),
+            )
 
         # Delete the keys
         deleted_count = 0
@@ -1693,16 +1939,20 @@ async def delete_project_context_tool_impl(
             f"\nDeletion completed at: {datetime.datetime.now().isoformat()}"
         )
 
-        return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
+        return Ok(
+            data={
+                "deleted_count": deleted_count,
+                "deleted_keys": [d["key"] for d in deletion_details],
+                "critical_keys_deleted": critical_keys_found,
+                "force_delete": force_delete,
+            },
+            message="\n".join(response_parts),
+        )
 
     except Exception as e:
         session.rollback()
         logger.error(f"Error in delete_project_context_tool_impl: {e}", exc_info=True)
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Error deleting project context: {str(e)}"
-            )
-        ]
+        return Failed(message=f"Error deleting project context: {str(e)}")
     finally:
         session.close()
 
