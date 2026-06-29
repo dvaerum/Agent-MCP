@@ -15,7 +15,7 @@ import { Switch } from "@/components/ui/switch"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { apiClient, Agent, Task } from "@/lib/api"
+import { apiClient, Agent, Task, agentPresence, type AgentPresence } from "@/lib/api"
 import { toastError, toastSuccess } from "@/components/ui/toast"
 import { projectContext } from "@/lib/project-context"
 import { mcpUrl } from "@/lib/urls"
@@ -30,18 +30,21 @@ import { EmptyState } from "@/components/dashboard/shared/empty-state"
 import { AgentsMobileList } from "@/components/dashboard/agents-mobile-list"
 
 
-const StatusDot = React.memo(({ status }: { status: Agent['status'] }) => {
-  const config = {
-    running: "bg-primary shadow-primary/50 shadow-md",
+// Wave 7 PR 2: presence-driven dot. The legacy `Agent['status']`
+// values (running / pending / terminated / failed) were spawn-
+// lifecycle artefacts. The coordinator model surfaces live MCP
+// presence instead: see `agentPresence()` in `lib/api.ts`.
+const StatusDot = React.memo(({ presence }: { presence: AgentPresence }) => {
+  const config: Record<AgentPresence, string> = {
+    online: "bg-primary shadow-primary/50 shadow-md",
     pending: "bg-warning shadow-warning/50 shadow-md animate-pulse",
+    offline: "bg-muted-foreground shadow-muted-foreground/50 shadow-md",
     terminated: "bg-muted-foreground shadow-muted-foreground/50 shadow-md",
-    failed: "bg-destructive shadow-destructive/50 shadow-md animate-pulse",
   }
-  
   return (
     <div className={cn(
       "w-2.5 h-2.5 rounded-full",
-      config[status] || config.pending
+      config[presence],
     )} />
   )
 })
@@ -70,6 +73,9 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, op
 }) => {
   const { getAgentTasks } = useDataStore()
   
+  // Wave 7 PR 2 — presence drives the row badge.
+  const presence = agentPresence(agent)
+
   // Check if agent is new (less than 10 minutes old)
   const isNewAgent = () => {
     if (agent.agent_id === 'Admin' || agent.created_at === 'N/A') return false
@@ -129,7 +135,7 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, op
     >
       <TableCell className="py-3">
         <div className="flex items-center gap-3">
-          <StatusDot status={agent.status} />
+          <StatusDot presence={presence} />
           <AgentTypeIcon agentId={agent.agent_id} />
           <div className="min-w-0 flex-1">
             <div className="font-medium text-sm text-foreground truncate">{agent.agent_id}</div>
@@ -137,20 +143,38 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, op
           </div>
         </div>
       </TableCell>
-      
+
       <TableCell className="py-3">
         <div className="flex items-center gap-2">
-          <Badge 
-            variant="outline" 
+          {/* Wave 7 PR 2 (coordinator transition): presence badge.
+              Derived from the new `online` + `last_mcp_connection`
+              fields served by the backend (sourced from
+              `core/session_registry.py`) — NOT from the row's
+              `status` column, which used to be a spawn-lifecycle
+              artefact ('created' / 'pending' / 'failed') that's no
+              longer meaningful now agent-mcp doesn't own the
+              process. `agentPresence()` collapses the inputs into a
+              single 4-state enum the UI keys off of. */}
+          <Badge
+            variant="outline"
+            title={
+              presence === 'pending'
+                ? 'Registered but no MCP session yet. Paste the snippet into the user’s claude .mcp.json to bring this agent online.'
+                : presence === 'offline'
+                  ? `No live MCP stream. Last seen: ${agent.last_mcp_connection ?? 'unknown'}`
+                  : presence === 'online'
+                    ? 'Live MCP stream attached.'
+                    : 'Soft-deleted via the Terminate action. Restore or Purge from the row actions.'
+            }
             className={cn(
               "text-xs font-semibold border-0 px-3 py-1.5 rounded-md",
-              agent.status === 'running' && "bg-primary/15 text-primary ring-1 ring-primary/20",
-              agent.status === 'pending' && "bg-warning/15 text-warning ring-1 ring-warning/20",
-              agent.status === 'terminated' && "bg-muted/50 text-muted-foreground ring-1 ring-border",
-              agent.status === 'failed' && "bg-destructive/15 text-destructive ring-1 ring-destructive/20"
+              presence === 'online' && "bg-primary/15 text-primary ring-1 ring-primary/20",
+              presence === 'pending' && "bg-warning/15 text-warning ring-1 ring-warning/20",
+              presence === 'offline' && "bg-muted/50 text-muted-foreground ring-1 ring-border",
+              presence === 'terminated' && "bg-muted/50 text-muted-foreground ring-1 ring-border",
             )}
           >
-            {agent.status.toUpperCase()}
+            {presence.toUpperCase()}
           </Badge>
           {isNewAgent() && (
             <Badge variant="outline" className="text-xs bg-blue-500/15 text-blue-600 border-blue-500/30 font-medium">
@@ -1588,6 +1612,10 @@ const AgentDetailDialog = ({
     (t) => t.task_id === agent.current_task,
   )
 
+  // Wave 7 PR 2 — presence drives the "Status" badge in the detail
+  // header; same derivation as the agents-list row.
+  const presence = agentPresence(agent)
+
   const formatRelative = (iso: string) => {
     if (!iso || iso === 'N/A') return 'unknown'
     const d = new Date(iso)
@@ -1645,8 +1673,10 @@ const AgentDetailDialog = ({
               Agent {agent.agent_id}
             </span>
             <div className="flex items-center gap-2 flex-shrink-0 pt-0.5">
+              {/* Wave 7 PR 2 — presence badge mirrors the agents
+                  list row. Hover for the rationale string. */}
               <Badge variant="outline" className="text-xs">
-                {agent.status}
+                {presence}
               </Badge>
             </div>
           </DialogTitle>
@@ -1691,7 +1721,12 @@ const AgentDetailDialog = ({
                 Status
               </Label>
               <div>
-                <Badge variant="outline">{agent.status}</Badge>
+                {/* Wave 7 PR 2 — presence badge (derived). The
+                    underlying row.status is shown below as
+                    "Lifecycle" so the operator can still see the
+                    legacy spawn-lifecycle column when it matters
+                    (terminated rows, mostly). */}
+                <Badge variant="outline">{presence}</Badge>
               </div>
             </div>
             <div className="space-y-1">
@@ -1703,6 +1738,33 @@ const AgentDetailDialog = ({
                   ? `${new Date(agent.created_at).toLocaleString()} (${formatRelative(agent.created_at)})`
                   : 'N/A'}
               </div>
+            </div>
+          </div>
+
+          {/* Wave 7 PR 2 — last MCP connection. ISO from
+              session_registry.sessions_for_agent's most recent
+              last_seen_at. Null when the agent has never opened a
+              /mcp stream in this backend process (i.e. the operator
+              registered the agent but hasn't pasted the snippet
+              into the user's claude config yet). */}
+          <div className="space-y-1">
+            <Label className="text-xs text-muted-foreground uppercase tracking-wider">
+              Last MCP connection
+            </Label>
+            <div className="text-sm [overflow-wrap:anywhere]">
+              {agent.last_mcp_connection ? (
+                <>
+                  {new Date(agent.last_mcp_connection).toLocaleString()}{' '}
+                  <span className="text-muted-foreground">
+                    ({formatRelative(agent.last_mcp_connection)})
+                  </span>
+                </>
+              ) : (
+                <span className="text-muted-foreground italic">
+                  never connected — paste the .mcp.json snippet into
+                  the user’s claude config to bring this agent online
+                </span>
+              )}
             </div>
           </div>
 
@@ -2040,15 +2102,25 @@ export function AgentsDashboard() {
   const filteredAgents = agents.filter(agent => {
     const matchesSearch = agent.agent_id.toLowerCase().includes(searchTerm.toLowerCase()) ||
                          (agent.current_task && agent.current_task.toLowerCase().includes(searchTerm.toLowerCase()))
-    const matchesStatus = statusFilter === 'all' || agent.status === statusFilter
+    // Wave 7 PR 2: filter on derived presence ('online' / 'offline'
+    // / 'pending' / 'terminated') instead of the spawn-lifecycle
+    // status column. The dropdown values below match
+    // `AgentPresence`.
+    const matchesStatus = statusFilter === 'all' || agentPresence(agent) === statusFilter
     return matchesSearch && matchesStatus
   })
 
+  // Wave 7 PR 2 — stats reflect derived presence, matching the
+  // badge + filter. "Online" = live MCP stream; "Pending" =
+  // registered but never connected; "Offline" = was connected
+  // previously, not now. "Total" still counts all visible rows
+  // (active + terminated together) so the header lines up.
+  const presenceOf = (a: Agent) => agentPresence(a)
   const stats = {
     total: agents.length,
-    running: agents.filter(a => a.status === 'running').length,
-    pending: agents.filter(a => a.status === 'pending').length,
-    failed: agents.filter(a => a.status === 'failed').length,
+    online: agents.filter(a => presenceOf(a) === 'online').length,
+    pending: agents.filter(a => presenceOf(a) === 'pending').length,
+    offline: agents.filter(a => presenceOf(a) === 'offline').length,
     totalInSystem: allAgents.length,
   }
 
@@ -2199,35 +2271,39 @@ export function AgentsDashboard() {
         </div>
       </div>
 
-      {/* Stats */}
+      {/* Stats — Wave 7 PR 2: presence-driven counters. "Online"
+          replaces the legacy "Running"; "Pending" now means
+          "registered but no MCP session yet" (paste the snippet to
+          bring it online); "Offline" replaces "Failed" (was
+          previously connected). */}
       <div className="grid gap-3 sm:gap-4 grid-cols-2 sm:grid-cols-4">
-        <StatsCard 
-          icon={Users} 
-          label="Total" 
-          value={stats.total} 
-          change={stats.total > 0 ? `${stats.running} active` : undefined}
+        <StatsCard
+          icon={Users}
+          label="Total"
+          value={stats.total}
+          change={stats.total > 0 ? `${stats.online} online` : undefined}
           trend="neutral"
         />
-        <StatsCard 
-          icon={CheckCircle2} 
-          label="Running" 
-          value={stats.running} 
-          change={stats.total > 0 ? `${Math.round((stats.running/stats.total)*100)}%` : "0%"}
+        <StatsCard
+          icon={CheckCircle2}
+          label="Online"
+          value={stats.online}
+          change={stats.total > 0 ? `${Math.round((stats.online/stats.total)*100)}%` : "0%"}
           trend="up"
         />
-        <StatsCard 
-          icon={Clock} 
-          label="Pending" 
-          value={stats.pending} 
-          change={stats.pending > 0 ? "Waiting" : "None"}
+        <StatsCard
+          icon={Clock}
+          label="Pending"
+          value={stats.pending}
+          change={stats.pending > 0 ? "Awaiting paste" : "None"}
           trend="neutral"
         />
-        <StatsCard 
-          icon={AlertCircle} 
-          label="Failed" 
-          value={stats.failed} 
-          change={stats.failed > 0 ? "Need attention" : "All good"}
-          trend={stats.failed > 0 ? "down" : "neutral"}
+        <StatsCard
+          icon={AlertCircle}
+          label="Offline"
+          value={stats.offline}
+          change={stats.offline > 0 ? "Idle/disconnected" : "All connected"}
+          trend={stats.offline > 0 ? "neutral" : "neutral"}
         />
       </div>
 
@@ -2246,12 +2322,14 @@ export function AgentsDashboard() {
           <SelectTrigger className="w-full sm:w-32 bg-background border-border text-foreground">
             <SelectValue />
           </SelectTrigger>
+          {/* Wave 7 PR 2 — filter on derived presence. Matches
+              `AgentPresence` in `lib/api.ts`. */}
           <SelectContent className="bg-background border-border">
             <SelectItem value="all">All Status</SelectItem>
-            <SelectItem value="running">Running</SelectItem>
+            <SelectItem value="online">Online</SelectItem>
             <SelectItem value="pending">Pending</SelectItem>
+            <SelectItem value="offline">Offline</SelectItem>
             <SelectItem value="terminated">Terminated</SelectItem>
-            <SelectItem value="failed">Failed</SelectItem>
           </SelectContent>
         </Select>
       </div>

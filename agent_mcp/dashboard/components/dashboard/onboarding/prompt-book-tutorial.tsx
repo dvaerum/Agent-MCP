@@ -214,12 +214,18 @@ const tutorialSteps: TutorialStep[] = [
             Agent-MCP works best when you follow a structured workflow. Here's the typical sequence:
           </p>
           
+          {/* Wave 7 PR 2 — coordinator transition. agent-mcp mints
+              tokens + ready-to-paste .mcp.json snippets; the user
+              owns the claude process. The step copy was rewritten
+              from "Spawn workers / Initialize workers" to "Register
+              + paste snippet / Start workers" to match the new
+              dashboard New Agent flow. */}
           <div className="space-y-2">
             {[
               { step: 1, title: "Add Project Context", desc: "Load your MCD and project documentation" },
-              { step: 2, title: "Create Worker Agents", desc: "Spawn specialized workers for different tasks" },
-              { step: 3, title: "Initialize Workers", desc: "Set up each worker with their specific role" },
-              { step: 4, title: "Assign Tasks", desc: "Delegate work to the appropriate agents" },
+              { step: 2, title: "Register Worker Agents", desc: "Click New Agent — agent-mcp mints a token + .mcp.json snippet" },
+              { step: 3, title: "Start Workers Locally", desc: "Paste the snippet into the user’s claude .mcp.json and start claude" },
+              { step: 4, title: "Assign Tasks", desc: "Delegate work to the appropriate agents from the dashboard" },
               { step: 5, title: "Monitor & Debug", desc: "Track progress and troubleshoot issues" }
             ].map(({ step, title, desc }) => (
               <div key={step} className="flex items-center gap-3 p-2 border rounded-lg">
@@ -271,8 +277,12 @@ const tutorialSteps: TutorialStep[] = [
               <BookOpen className="h-4 w-4 text-primary" />
               <span className="font-medium text-sm">Try a Quick Start</span>
             </div>
+            {/* Wave 7 PR 2 — coordinator transition. The prompt copy
+                used to say "spawn your first worker"; agent-mcp
+                doesn't spawn claude anymore. The flow is: register
+                an agent → paste snippet → start claude yourself. */}
             <p className="text-xs text-muted-foreground">
-              Use the create-worker prompt to spawn your first worker agent
+              Use the create-worker prompt to register your first worker agent — paste the snippet into claude’s .mcp.json to bring it online
             </p>
           </div>
           <div className="p-3 border rounded-lg bg-primary/5 border-primary/20">

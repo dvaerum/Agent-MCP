@@ -161,7 +161,11 @@ common entry points. The dashboard's Tools tab is the canonical
 inventory (descriptions and arg schemas are generated from
 `agent_mcp/tools/*`).
 
-**Agent management** — `create_agent`, `list_agents`, `terminate_agent`.
+**Agent management** — `register_agent` (mints a token + `.mcp.json`
+snippet to paste into the user's own claude — agent-mcp no longer
+spawns claude itself, see "Worker agents" below), `list_agents`,
+`terminate_agent` (revokes the token; does NOT stop the user's
+claude process).
 
 **Task orchestration** — `assign_task`, `view_tasks`, `update_task_status`.
 
@@ -251,10 +255,11 @@ Each agent focuses on their linear chain. No confusion. No context pollution. Ju
 
 ### 1. Provision a Manager Agent
 
-Log into the dashboard, create a `manager`-role agent for yourself
-(the "Create Agent" panel takes an `agent_id` + role), and copy its
-`token` from the agents list. Use that token to initialize the
-manager session in your AI client:
+Log into the dashboard, click **Register Agent** on the Agents page
+and pick the `manager` role. The dashboard mints a bearer token and
+hands you a ready-to-paste `.mcp.json` snippet. Paste it into your
+AI client's MCP config and copy the bearer token into your manager
+session prompt:
 
 ```
 You are the manager agent.
@@ -289,24 +294,55 @@ The MCD (Main Context Document) is your project's comprehensive blueprint - thin
 
 See our [MCD Guide](./docs/mcd-example/mcd-guide.md) for detailed examples and templates.
 
-### 3. Deploy Your Agent Team
-```
-Create specialized agents for parallel development:
+### 3. Register Your Agent Team
 
-- backend-worker: API endpoints, database operations, business logic
-- frontend-worker: UI components, state management, user interactions
-- integration-worker: API connections, data flow, system integration
-- test-worker: Unit tests, integration tests, validation
-- devops-worker: Deployment, CI/CD, infrastructure
+> **Wave 7 (2026-06-29): agent-mcp is the coordinator, not the spawner.**
+> agent-mcp mints agent identities (DB row + bearer token) and gives
+> the operator a ready-to-paste `.mcp.json` snippet. The user owns
+> their own claude session — agent-mcp never starts or stops
+> claude processes. Terminate in the dashboard revokes the token;
+> the user closes their own claude when they're done.
+
+From the dashboard's **Agents** page, click **Register Agent** for
+each specialized worker. Each registration returns a snippet shaped
+like:
+
+```json
+{
+  "mcpServers": {
+    "agent-mcp-<project>": {
+      "type": "http",
+      "url": "https://<host>/agent-mcp/mcp/<project>",
+      "headers": {"Authorization": "Bearer <agent_token>"}
+    }
+  }
+}
 ```
 
-Each agent specializes in their domain, leading to higher quality implementations and faster development.
+Suggested specializations:
 
-### 4. Initialize and Deploy Workers
+- `backend-worker` — API endpoints, database operations, business logic
+- `frontend-worker` — UI components, state management, user interactions
+- `integration-worker` — API connections, data flow, system integration
+- `test-worker` — Unit tests, integration tests, validation
+- `devops-worker` — Deployment, CI/CD, infrastructure
+
+### 4. Start Your Workers Locally
+
+Paste each agent's snippet into the **user's own `.mcp.json`** (one
+per worker — `agent-mcp-<project>` server keys are unique per
+project, but the `name` field of each agent is part of the same
+server entry so use one project's snippet at a time). Then start
+claude in the project directory:
+
 ```
-# In new window for each worker:
+# In a new shell for each worker, after pasting the snippet into
+# .mcp.json (project-scope) or ~/.claude.json (user-scope):
+claude
+
+# Then in claude:
 You are [worker-name] agent.
-Your Agent Token: "<worker_token_from_the_dashboard_agents_list>"
+Your Agent Token: "<worker_token_from_the_registration_snippet>"
 
 Query the project knowledge graph to understand:
 1. Overall system architecture
@@ -319,6 +355,11 @@ Begin implementation following the established patterns.
 
 AUTO --worker --memory
 ```
+
+Once a worker connects, the dashboard's agents list switches it from
+"PENDING" (registered but never connected) to "ONLINE" — that's the
+signal the worker's claude is wired up and the bearer is being
+honoured by the MCP server.
 
 **Important: Setting Agent Modes**
 

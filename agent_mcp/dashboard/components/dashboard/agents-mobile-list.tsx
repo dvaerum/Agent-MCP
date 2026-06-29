@@ -7,7 +7,7 @@ import {
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { cn } from "@/lib/utils"
-import type { Agent } from "@/lib/api"
+import { agentPresence, type Agent, type AgentPresence } from "@/lib/api"
 
 /**
  * Mobile card-list rendering of the agents table (CC-7 audit 2026-06-02).
@@ -21,11 +21,13 @@ import type { Agent } from "@/lib/api"
  * show Edit + Terminate; terminated agents show Restore + Purge.
  */
 
-const STATUS_TONE: Record<string, string> = {
-  running: "bg-primary/15 text-primary ring-1 ring-primary/20",
+// Wave 7 PR 2 — presence-driven tone. Replaces the spawn-lifecycle
+// `status` keys ('running' / 'pending' / 'terminated' / 'failed').
+const PRESENCE_TONE: Record<AgentPresence, string> = {
+  online: "bg-primary/15 text-primary ring-1 ring-primary/20",
   pending: "bg-amber-500/15 text-amber-600 dark:text-amber-400 ring-1 ring-amber-500/20",
+  offline: "bg-muted text-muted-foreground ring-1 ring-border",
   terminated: "bg-muted text-muted-foreground ring-1 ring-border",
-  failed: "bg-destructive/15 text-destructive ring-1 ring-destructive/20",
 }
 
 interface AgentsMobileListProps {
@@ -50,6 +52,7 @@ export function AgentsMobileList({
       {agents.map((agent) => {
         const isAdmin = agent.agent_id === "Admin"
         const isTerminated = agent.status === "terminated"
+        const presence = agentPresence(agent)
         return (
           <li
             key={agent.agent_id}
@@ -69,10 +72,10 @@ export function AgentsMobileList({
                 variant="outline"
                 className={cn(
                   "shrink-0 text-[10px] font-semibold border-0 px-2 py-0.5 rounded-md uppercase tracking-wider",
-                  STATUS_TONE[agent.status] ?? STATUS_TONE.pending,
+                  PRESENCE_TONE[presence],
                 )}
               >
-                {agent.status}
+                {presence}
               </Badge>
             </div>
 

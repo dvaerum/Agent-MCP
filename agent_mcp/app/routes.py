@@ -34,6 +34,12 @@ from ..db.connection import get_db_connection
 from ..db.engine import SessionLocal
 from ..db.models import ProjectContext
 from ..db.actions.agent_actions_db import log_agent_action_to_db
+# Wave 7 PR 2 — coordinator transition. The agents list + per-agent
+# detail panel surface a derived "online/offline/pending" presence
+# instead of the legacy spawn-lifecycle status. Source of truth is
+# the MCP session registry: "is this agent's bearer currently
+# subscribed to a live /mcp stream?"
+from ..core import session_registry
 
 from ..features.dashboard.api import (
     fetch_graph_data_logic,
@@ -400,6 +406,52 @@ async def node_details_api_route(request: Request) -> JSONResponse:
         if conn: conn.close()
     return JSONResponse(details)
 
+def _mcp_presence_for(agent_id: str) -> Dict[str, Any]:
+    """Return ``{"online": bool, "last_mcp_connection": str | None}``
+    for ``agent_id`` derived from :mod:`agent_mcp.core.session_registry`.
+
+    Wave 7 PR 2 — coordinator transition. The dashboard's agents list
+    no longer surfaces spawn metadata ("tmux session active") — the
+    register-only flow doesn't spawn anything. Presence is now a live
+    signal: ``online`` iff this agent has at least one live MCP stream
+    subscribed, ``last_mcp_connection`` reflects the most recent
+    ``last_seen_at`` across that agent's sessions (or ``None`` if the
+    agent has never opened a stream since the backend booted).
+
+    Returns the most-recent-handle's ``last_seen_at`` because session
+    rows have no explicit ``ever_connected`` flag — a row exists iff a
+    stream has been opened at some point in this process's lifetime,
+    so "any handle present" is the strongest signal we have. When no
+    handles exist, ``last_mcp_connection`` is ``None`` and the
+    dashboard renders the "Pending — paste snippet" state.
+    """
+    try:
+        handles = session_registry.sessions_for_agent(agent_id)
+    except Exception:
+        # Defensive: a DB hiccup here must not 500 the agents list;
+        # treat it as "no presence data" so the UI degrades to the
+        # legacy status pill instead of erroring out the page.
+        logger.exception(
+            "session_registry lookup failed for agent_id=%r", agent_id,
+        )
+        return {"online": False, "last_mcp_connection": None}
+    if not handles:
+        return {"online": False, "last_mcp_connection": None}
+    # ``last_seen_at`` is the ISO-UTC timestamp the transport bumps
+    # on every heartbeat; the max across handles is the most recent
+    # liveness signal. "Online" means at least one runtime queue is
+    # currently attached for one of the agent's handles — i.e. the
+    # transport layer believes the SSE writer is still draining
+    # payloads. Without a runtime queue the row is stale (the backend
+    # restarted, the client hasn't reconnected yet).
+    last_seen = max(h.last_seen_at for h in handles)
+    online = any(
+        session_registry.get_runtime_queue(h.session_id) is not None
+        for h in handles
+    )
+    return {"online": online, "last_mcp_connection": last_seen}
+
+
 async def agents_list_api_route(request: Request) -> JSONResponse:
     # GET /api/agents[?status=<status>]
     #
@@ -449,7 +501,12 @@ async def agents_list_api_route(request: Request) -> JSONResponse:
                 "ORDER BY created_at DESC",
                 (status_filter,),
             )
-        for row in cursor.fetchall(): agents_list_data.append(dict(row))
+        for row in cursor.fetchall():
+            agent_dict = dict(row)
+            # Wave 7 PR 2: presence signal sourced from the MCP
+            # session registry (see _mcp_presence_for docstring).
+            agent_dict.update(_mcp_presence_for(agent_dict['agent_id']))
+            agents_list_data.append(agent_dict)
     except Exception as e:
         logger.error(f"Error fetching agents list: {e}", exc_info=True)
         return JSONResponse({'error': f'Failed to fetch agents list: {str(e)}'}, status_code=500)
@@ -1664,6 +1721,12 @@ async def all_data_api_route(
             agent_dict['wait_for_events_in_flight'] = bool(
                 g.waiter_count(agent_dict['agent_id']) > 0
             )
+            # Wave 7 PR 2 — coordinator transition. Surface presence
+            # (online + last_mcp_connection) for the dashboard agents
+            # list so the badge can switch from spawn-lifecycle status
+            # to live MCP-connection status. Same source as the
+            # GET /api/agents endpoint.
+            agent_dict.update(_mcp_presence_for(agent_dict['agent_id']))
             agents_data.append(agent_dict)
 
         # Wave 3 (prancy-napping-pie): the synthesised 'Admin' agent
