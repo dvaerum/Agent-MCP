@@ -28,7 +28,14 @@ from pathlib import Path
 
 DASHBOARD = Path("agent_mcp/dashboard/components/dashboard/tasks-dashboard.tsx")
 API = Path("agent_mcp/dashboard/lib/api.ts")
-ROUTES = Path("agent_mcp/app/routes.py")
+# Wave 8 PR 1 moved ``update_task_details_api_route`` (with its
+# EDITABLE_KEYS allowlist + notes-append branch) from
+# ``agent_mcp/app/routes.py`` into the composition router file.
+# Its URL is ``/api/update-task-dashboard`` which doesn't match
+# the tasks router's ``/api/tasks`` prefix, so it landed on the
+# composition router rather than the tasks router. The static
+# greps below follow the handler to its new home.
+ROUTES = Path("agent_mcp/app/routers/composition.py")
 
 
 def _src(p: Path) -> str:
