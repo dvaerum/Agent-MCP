@@ -118,14 +118,20 @@ def test_create_agent_modal_submit_button_says_add_agent() -> None:
 
 def test_empty_state_copy_says_add_your_first() -> None:
     """The empty-state shown when no agents exist must invite the user
-    to ``Add your first agent`` — not ``Deploy your first agent``."""
+    to ``Add your first agent`` — not ``Deploy your first agent``.
+
+    Wave 7 PR 0 (coordinator transition) added the
+    :class:`RegisterAgentModal` above the existing
+    :class:`CreateAgentModal`, pushing the empty-state's line number
+    down. The assertion is now a file-wide substring check rather than
+    a fixed line slice so the next layout shift doesn't trip the pin.
+    """
     src = _read(AGENTS_TSX)
-    region = _slice_lines(src, 2000, 2050)
-    assert "Add your first agent to get started." in region, (
+    assert "Add your first agent to get started." in src, (
         "Empty-state copy must say 'Add your first agent to get "
         "started.' (was 'Deploy your first agent ...')"
     )
-    assert "Deploy your first agent to get started." not in region, (
+    assert "Deploy your first agent to get started." not in src, (
         "Empty-state still says 'Deploy your first agent ...' — "
         "rename to 'Add'"
     )
