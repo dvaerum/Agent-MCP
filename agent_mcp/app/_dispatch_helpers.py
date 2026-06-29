@@ -1,0 +1,292 @@
+"""Shared REST→tool dispatch helpers for the per-resource APIRouters.
+
+Wave 8 PR 1 of prancy-napping-pie lifted these helpers out of
+``agent_mcp/app/routes.py`` so the per-resource router modules under
+``agent_mcp/app/routers/`` can share them without depending on the
+shrinking back-compat shim. Bodies are unchanged from their previous
+home in ``routes.py``; only the import path moved.
+
+Exports:
+  * :func:`_dispatch_through_tool` — wrap an MCP tool call as a
+    dashboard JSON response, with the typed-ToolResult → HTTP mapping
+    the dashboard's ApiClient already consumes.
+  * :func:`_build_route_principal` — construct the Principal the REST
+    seam threads into the dispatcher (operator-session OR agent-bearer
+    shapes).
+  * :func:`_result_text` — concatenate the text blocks from a
+    tool-call result (legacy helper kept for the few handlers that
+    still consult it).
+  * :func:`handle_options` — CORS preflight reply used by handlers
+    that include ``OPTIONS`` in their methods list.
+
+The PR 2 cleanup will delete ``routes.py``; this module survives
+because the routers genuinely share it.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from starlette.requests import Request
+
+from ..core.auth import get_agent_id as auth_get_agent_id
+from ..core.authorize import AuthRejected
+from ..core import globals as g
+from ..core.config import logger
+from ..core.principal import Principal
+from ..core.tool_result import (
+    Conflict as _Conflict,
+    Failed as _Failed,
+    Invalid as _Invalid,
+    NotFound as _NotFound,
+    PermissionDenied as _PermissionDenied,
+)
+from ..tools.registry import (
+    ToolInputValidationError,
+    dispatch_tool_call,
+    request_auth_token,
+)
+
+import mcp.types as mcp_types  # For handling the result from tool_impl
+
+
+def _result_text(result: List[mcp_types.TextContent]) -> str:
+    """Concatenate text blocks from a tool-call result."""
+    if not result:
+        return ""
+    parts: List[str] = []
+    for block in result:
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            parts.append(text)
+    return "\n".join(parts)
+
+
+async def _dispatch_through_tool(
+    tool_name: str,
+    arguments: Dict[str, Any],
+    *,
+    bearer_token: Optional[str],
+    success_message: Optional[str] = None,
+    extra_response: Optional[Dict[str, Any]] = None,
+    operator_session: bool = False,
+    operator_user_id: Optional[str] = None,
+) -> JSONResponse:
+    """Run an MCP tool from a REST handler and translate the typed
+    :data:`ToolResult` back into a dashboard-friendly JSON response.
+
+    Auth: the dashboard sends the admin token in the JSON body, not as
+    an Authorization header. We bind it on the ``request_auth_token``
+    ContextVar so the dispatcher's Q6e fallback injects it into
+    ``arguments.token`` if not already there — same path an HTTP
+    middleware would take.
+
+    Callers pass ``operator_session=True`` + ``operator_user_id=<username>``
+    to admit operator-tier dispatches without a bearer token. We build
+    a ``Principal`` from those values and thread it to the dispatcher;
+    when neither is set, the bearer is expected to carry an
+    ``agent_bearer`` Principal (built locally from the row).
+
+    Wave 6 PR 6: the legacy ContextVar stamp block (which set the
+    deleted ``operator_session_active`` / ``operator_user_id`` vars
+    so unmigrated decorators could read them) is gone. The Principal
+    is the single carrier of caller identity; tool decorators read
+    it directly.
+
+    Error mapping (HTTP-shaped):
+      * AuthRejected            → 403
+      * ToolInputValidationError → 400
+      * NotFound                → 404
+      * PermissionDenied        → 403
+      * Invalid                 → 400
+      * Conflict                → 409
+      * Failed / Unexpected     → 500
+
+    Success payload mirrors the legacy REST endpoints'
+    ``{"success": true, "message": "...", ...extras}`` shape so the
+    dashboard's ApiClient doesn't have to change.
+    """
+    cv_token = None
+    if bearer_token:
+        cv_token = request_auth_token.set(bearer_token)
+
+    dispatch_principal = _build_route_principal(
+        bearer_token=bearer_token,
+        operator_session=operator_session,
+        operator_user_id=operator_user_id,
+    )
+    try:
+        result = await dispatch_tool_call(
+            tool_name, arguments, principal=dispatch_principal,
+        )
+    except AuthRejected as e:
+        return JSONResponse(
+            {"success": False, "error": e.reason, "message": e.reason},
+            status_code=403,
+        )
+    except ToolInputValidationError as e:
+        return JSONResponse(
+            {"success": False, "error": str(e), "message": str(e)},
+            status_code=400,
+        )
+    except Exception as e:
+        logger.error(
+            f"Unexpected error dispatching tool {tool_name!r}: {e}",
+            exc_info=True,
+        )
+        return JSONResponse(
+            {
+                "success": False,
+                "error": f"Tool dispatch failed: {e}",
+                "message": f"Tool dispatch failed: {e}",
+            },
+            status_code=500,
+        )
+    finally:
+        if cv_token is not None:
+            request_auth_token.reset(cv_token)
+
+    if isinstance(result, _NotFound):
+        text = f"{result.resource} {result.identifier!r} not found."
+        return JSONResponse(
+            {
+                "success": False,
+                "error": "not_found",
+                "resource": result.resource,
+                "identifier": result.identifier,
+                "message": text,
+            },
+            status_code=404,
+        )
+    if isinstance(result, _PermissionDenied):
+        return JSONResponse(
+            {
+                "success": False,
+                "error": "permission_denied",
+                "reason": result.reason,
+                "message": result.reason,
+            },
+            status_code=403,
+        )
+    if isinstance(result, _Invalid):
+        return JSONResponse(
+            {
+                "success": False,
+                "error": "invalid",
+                "field": result.field,
+                "message": result.message,
+            },
+            status_code=400,
+        )
+    if isinstance(result, _Conflict):
+        return JSONResponse(
+            {
+                "success": False,
+                "error": "conflict",
+                "reason": result.reason,
+                "message": result.reason,
+            },
+            status_code=409,
+        )
+    if isinstance(result, _Failed):
+        return JSONResponse(
+            {
+                "success": False,
+                "error": "failed",
+                "message": result.message,
+            },
+            status_code=500,
+        )
+
+    # ``Ok`` — success. ``Ok.data`` (when set) is the JSON body the
+    # dashboard consumes; ``Ok.message`` provides a human-readable
+    # summary the success-banner reads when the caller didn't supply
+    # one via ``success_message``.
+    ok_payload: Dict[str, Any] = {
+        "success": True,
+        "message": success_message or (result.message or ""),
+    }
+    if result.data is not None:
+        ok_payload["data"] = result.data
+    if extra_response:
+        ok_payload.update(extra_response)
+    # 201 heuristic: create_* tools naming convention. Refine if a
+    # future tool needs different semantics.
+    status = 201 if (
+        tool_name.startswith("create_") and result.data is not None
+    ) else 200
+    return JSONResponse(ok_payload, status_code=status)
+
+
+def _build_route_principal(
+    *,
+    bearer_token: Optional[str],
+    operator_session: bool,
+    operator_user_id: Optional[str],
+) -> Optional[Principal]:
+    """Construct the Principal the REST seam threads into the dispatcher.
+
+    Three shapes:
+
+    * ``operator_session=True`` → ``operator_session`` Principal
+      naming the operator (the dashboard / forwarding-header path).
+    * Bearer present, no operator session → ``agent_bearer`` Principal
+      sourced from the row in ``agents``.
+    * Neither → None (the dispatcher will reject downstream).
+    """
+    if operator_session:
+        return Principal(
+            kind="operator_session",
+            user_id=operator_user_id,
+            agent_id=None,
+            sysadmin=False,
+            project_name=None,
+            project_role="operator",
+            agent_role=None,
+            can_wake_loop=False,
+            source_token=bearer_token,
+        )
+    if bearer_token:
+        agent_id = auth_get_agent_id(bearer_token)
+        if agent_id:
+            row = g.active_agents.get(bearer_token) or {}
+            agent_role = row.get("agent_role")
+            normalized_role = (
+                agent_role
+                if agent_role in ("worker", "manager")
+                else None
+            )
+            return Principal(
+                kind="agent_bearer",
+                user_id=None,
+                agent_id=agent_id,
+                sysadmin=False,
+                project_name=None,
+                project_role=None,
+                agent_role=normalized_role,
+                can_wake_loop=False,
+                source_token=bearer_token,
+            )
+    return None
+
+
+async def handle_options(request: Request) -> Response:
+    """Handle OPTIONS requests for CORS preflight."""
+    return PlainTextResponse(
+        '',
+        headers={
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+            'Access-Control-Allow-Headers': '*',
+            'Access-Control-Max-Age': '86400',
+        }
+    )
+
+
+__all__ = [
+    "_dispatch_through_tool",
+    "_build_route_principal",
+    "_result_text",
+    "handle_options",
+]

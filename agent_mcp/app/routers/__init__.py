@@ -7,20 +7,21 @@ official "Bigger Applications" pattern and mirrors the per-resource
 convention already used under ``agent_mcp/router/`` for the aiohttp
 admin surface.
 
-**Scaffold status (PR 0 of 3)**: this module exports the registration
-entrypoint and the six per-resource ``APIRouter`` objects, each with
-its prefix + router-level ``Depends(require_operator_session)``
-already wired. Handler bodies still live in ``app/routes.py`` and
-``register_routers`` is **not** called from ``main_app.create_app``
-yet — ``register_routes`` continues to own live route registration
-through PR 1. PR 2 swaps the call site in ``main_app`` and deletes
-the ``routes.py`` shim.
+**PR 1 status (handlers migrated)**: every dashboard REST handler
+has moved from ``app/routes.py`` to its target per-resource router
+module here. ``app/routes.py`` is now a thin back-compat shim that
+re-exports ``_dispatch_through_tool`` (for tests) and forwards
+``register_routes(app)`` to :func:`register_routers`. PR 2 swaps
+``main_app.create_app`` to call ``register_routers`` directly and
+deletes the shim.
 
-The include order below is alphabetical by router module name; the
-order is not load-bearing because each router declares a disjoint
-URL prefix, so resolution is deterministic regardless of registration
-sequence. Keeping it alphabetical keeps the diff stable when a future
-PR adds a seventh router.
+The registration order is **not** purely alphabetical: ``settings``
+ships LAST because it owns the ``/api/{path:path}`` OPTIONS catch-all
+that mirrors the legacy ``_dashboard_route_specs`` tail. With
+first-match-wins routing, registering ``settings`` after every other
+``/api``-prefixed router (notably ``tasks``) keeps the per-resource
+OPTIONS registrations intact — the catch-all only fires for unknown
+``/api/<...>`` paths.
 """
 
 from __future__ import annotations
@@ -38,18 +39,32 @@ from .tasks import router as tasks_router
 def register_routers(app: FastAPI) -> None:
     """Mount each per-resource ``APIRouter`` on ``app``.
 
-    Called from :func:`agent_mcp.app.main_app.create_app` starting in
-    PR 2 of Wave 8 (replacing the legacy ``register_routes`` call).
-    PR 0 + PR 1 leave the live registration on ``register_routes``;
-    this function exists from PR 0 so the import surface is stable
-    and tests can verify the subpackage compiles cleanly.
+    Called from :func:`agent_mcp.app.main_app.create_app` via the
+    ``register_routes`` shim in ``app/routes.py`` (PR 1) until PR 2
+    of Wave 8 swaps the call site and deletes the shim.
+
+    Order is deliberate: ``settings`` is registered last because it
+    owns the catch-all OPTIONS handler at ``/api/{path:path}``.
+    With first-match-wins routing the per-resource OPTIONS routes
+    (registered earlier) win for their specific paths; the catch-all
+    only fires for paths that no concrete route matched.
     """
     app.include_router(agents_router)
     app.include_router(composition_router)
     app.include_router(memories_router)
     app.include_router(messages_router)
-    app.include_router(settings_router)
     app.include_router(tasks_router)
+    # settings registers LAST because it owns the catch-all OPTIONS
+    # handler; see module docstring + register_routers docstring.
+    app.include_router(settings_router)
 
 
-__all__ = ["register_routers"]
+__all__ = [
+    "agents_router",
+    "composition_router",
+    "memories_router",
+    "messages_router",
+    "register_routers",
+    "settings_router",
+    "tasks_router",
+]

@@ -72,15 +72,28 @@ def test_per_resource_module_imports(
 ) -> None:
     """Each per-resource module imports + exposes the expected router.
 
-    Verifies three things per file:
+    Verifies per file:
 
     1. The module imports without ImportError (catches typos in the
        deps import path, missing files, etc.).
     2. It exposes a module-level ``router`` symbol.
     3. The router is a ``fastapi.APIRouter`` instance with the
-       prefix locked in by the Wave 8 plan and at least one
-       router-level dependency (the
-       ``require_operator_session`` gate).
+       prefix locked in by the Wave 8 plan.
+
+    Wave 8 PR 1 update (2026-06-29): the router-level
+    ``Depends(require_operator_session)`` assertion was dropped
+    here. PR 0 added the dep at router level under the design
+    assumption that all 28 handlers carried the dep at the handler
+    level today — but ~9 of them are currently open
+    (``GET /api/agents``, ``GET /api/tasks``,
+    ``GET /api/prompts/catalog``, ``GET /api/context-data``, etc.).
+    Hoisting the gate to the router level in PR 1 would silently
+    flip those endpoints from "open" to "auth-required", which is a
+    behavior change PR 1's URL-stability constraint explicitly
+    forbids ("PR 1 is a refactor, not a behavior change"). A
+    follow-up PR that explicitly tightens auth on the open
+    endpoints can re-introduce the router-level dep alongside test
+    updates for the unauthenticated-GET probes.
     """
     module = importlib.import_module(f"agent_mcp.app.routers.{module_suffix}")
     router = getattr(module, "router", None)
@@ -94,10 +107,6 @@ def test_per_resource_module_imports(
     assert router.prefix == expected_prefix, (
         f"agent_mcp.app.routers.{module_suffix}.router.prefix must be "
         f"{expected_prefix!r}, got {router.prefix!r}"
-    )
-    assert router.dependencies, (
-        f"agent_mcp.app.routers.{module_suffix}.router must declare at least "
-        "one router-level dependency (require_operator_session)"
     )
 
 
