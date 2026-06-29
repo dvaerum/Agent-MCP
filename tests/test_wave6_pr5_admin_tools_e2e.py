@@ -478,7 +478,7 @@ async def test_dispatch_create_agent_via_rest_adapter_returns_ok_with_data(
     data is identical either way (``agent_id`` + ``token`` in
     ``body["data"]``).
     """
-    from agent_mcp.app.routes import _dispatch_through_tool
+    from agent_mcp.app._dispatch_helpers import _dispatch_through_tool
 
     async with mcp_session(tmp_path) as admin:  # noqa: F841 (lifespan)
         response = await _dispatch_through_tool(

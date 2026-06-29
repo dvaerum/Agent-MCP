@@ -21,7 +21,7 @@ import mcp.types as mcp_types
 from ..core.config import logger
 from ..core.auth import get_agent_id, query_agent_status
 from ..core import session_registry
-from .routes import register_routes
+from .routers import register_routers
 from .server_lifecycle import application_startup, application_shutdown
 from ..tools.registry import (
     list_available_tools,
@@ -1132,10 +1132,12 @@ def create_app(
         debug=os.environ.get("MCP_DEBUG", "false").lower() == "true",
     )
 
-    # Dashboard REST handlers register themselves via the FastAPI
-    # ``add_api_route`` API after the app exists. See
-    # :func:`agent_mcp.app.routes.register_routes` for the spec table.
-    register_routes(app)
+    # Dashboard REST handlers live in per-resource ``APIRouter``
+    # modules under :mod:`agent_mcp.app.routers`. See
+    # :func:`agent_mcp.app.routers.register_routers` for the mount
+    # order (settings ships last because it owns the ``/api`` OPTIONS
+    # catch-all).
+    register_routers(app)
 
     logger.info("FastAPI application instance created with routes and lifecycle events.")
     return app
