@@ -255,10 +255,17 @@ def requires_role(role: str) -> Callable[[ToolImpl], ToolImpl]:
         @functools.wraps(func)
         async def wrapper(
             arguments: Dict[str, Any],
+            **kwargs: Any,
         ) -> List[mcp_types.TextContent]:
+            # Wave 6 PR 0: forward **kwargs so the dispatcher can
+            # thread ``principal=`` through to migrated impls. The
+            # ``functools.wraps`` chain keeps the original signature
+            # visible to ``inspect.signature(..., follow_wrapped=True)``,
+            # so ``registry._tool_accepts_principal`` correctly detects
+            # whether the underlying impl declares ``principal``.
             token = _extract_token(arguments)
             _check_role(role, token)
-            return await func(arguments)
+            return await func(arguments, **kwargs)
 
         # PR-W1c (2026-06-05): expose the role on the wrapper for the
         # derived `agent_mcp.tools.access.TOOL_ACCESS` map. The
@@ -301,7 +308,10 @@ def requires_policy(
         @functools.wraps(func)
         async def wrapper(
             arguments: Dict[str, Any],
+            **kwargs: Any,
         ) -> List[mcp_types.TextContent]:
+            # Wave 6 PR 0: forward **kwargs so the dispatcher can
+            # thread ``principal=`` through to migrated impls.
             token = _extract_token(arguments)
 
             # Admin path: always permitted, no toggle read needed.
@@ -313,14 +323,14 @@ def requires_policy(
             # admin branch (the harness's admin-row token IS the
             # post-Wave-1 admin bearer surface).
             if verify_token(token, "admin"):
-                return await func(arguments)
+                return await func(arguments, **kwargs)
 
             # Worker path: must resolve to an active agent first.
             caller_agent_id = get_agent_id(token)
             if not caller_agent_id:
                 raise AuthRejected("Unauthorized: Valid token required")
             if caller_agent_id == "admin":
-                return await func(arguments)
+                return await func(arguments, **kwargs)
 
             # Lazy import: the access module pulls in DB helpers we
             # don't want to load at module-import time (keeps
@@ -330,7 +340,7 @@ def requires_policy(
 
             for key in config_keys:
                 if _get_config_bool(key, default):
-                    return await func(arguments)
+                    return await func(arguments, **kwargs)
 
             joined = ", ".join(config_keys)
             raise AuthRejected(

@@ -7,14 +7,22 @@ import sqlite3  # For database operations
 from pathlib import Path  # For request_assistance
 from typing import List, Dict, Any, Optional
 
-import mcp.types as mcp_types
-
 from .registry import register_tool
 from . import access as _access  # Canonical home for _get_config_bool
 from ..core.config import logger, ENABLE_TASK_PLACEMENT_RAG, ALLOW_RAG_OVERRIDE
 from ..core import globals as g
 from ..core.auth import verify_token, get_agent_id
 from ..core.authorize import requires, requires_policy, requires_role
+from ..core.principal import Principal
+from ..core.tool_result import (
+    Conflict,
+    Failed,
+    Invalid,
+    NotFound,
+    Ok,
+    PermissionDenied,
+    ToolResult,
+)
 from ..utils.audit_utils import log_audit
 from ..db.connection import get_db_connection, execute_db_write
 from ..db.actions.agent_actions_db import log_agent_action_to_db
@@ -54,23 +62,27 @@ def _authorize_assign_task(
     target_agent_token: Optional[str],
     task_ids: Optional[List[str]],
     arguments: Dict[str, Any],
+    principal: Optional[Principal] = None,
 ) -> Optional[str]:
     """Authorize a call to `assign_task_tool_impl`.
 
     Returns `None` if the call is permitted; otherwise returns the
     error message string to surface to the caller (the caller wraps
-    it in a `TextContent` so this helper stays unit-testable).
+    it in a `PermissionDenied(reason=...)` so this helper stays
+    unit-testable).
+
+    Wave 6 PR 4: now accepts a typed :class:`Principal` kwarg. When
+    set, the role checks use ``principal.has_role(...)``; when None
+    (in-process callers that bypass the dispatcher), the legacy
+    ``verify_token`` chain still runs.
 
     Permission matrix:
 
-    - admin (system) token → always permitted (no further checks).
+    - admin (operator-session / sysadmin) → always permitted.
     - manager-role agent token → always permitted (Phase 2 Wave 3,
       plan §2c: managers can assign tasks to other agents — the
       supervision-tier feature that distinguishes manager from
-      worker). Treated like the system bearer for this gate, but the
-      tool's downstream code paths still attribute the creator to the
-      manager's agent_id (not "admin") because `verify_token(token,
-      "admin")` remains False.
+      worker).
     - worker token + no `target_agent_token` (Mode 0, file
       unassigned) → gated by `config_allow_worker_create_unassigned`
       (default true). Tags `arguments["_worker_created_by"]` so the
@@ -83,24 +95,23 @@ def _authorize_assign_task(
       rejected; the supported worker self-claim flow is Mode 3.
     - worker token + `target_agent_token != own token` → always
       rejected. Worker→worker delegation is operator/manager-only.
-
-    Kept as a free function so the matrix is testable in isolation
-    and so the diff against the call site stays one line; this also
-    minimises merge conflict surface with sibling PR 7d which edits
-    the admin-side `agent_id` alternative path below.
     """
-    if verify_token(admin_auth_token, "admin"):
+    if principal is not None:
+        is_admin_or_manager = (
+            principal.has_role("admin") or principal.has_role("manager")
+        )
+        worker_id = (
+            principal.agent_id if principal.kind == "agent_bearer" else None
+        )
+    else:
+        is_admin_or_manager = verify_token(
+            admin_auth_token, "admin"
+        ) or verify_token(admin_auth_token, "manager")
+        worker_id = get_agent_id(admin_auth_token)
+
+    if is_admin_or_manager:
         return None
 
-    # Phase 2 Wave 3 (plan §2c): manager-role agents can assign tasks
-    # to peers. `verify_token(.., "manager")` returns True for the
-    # system bearer (already handled above) OR an agent token whose
-    # row has `agent_role='manager'` — so the worker → "self-only"
-    # branch below is reached only for actual worker-role agents.
-    if verify_token(admin_auth_token, "manager"):
-        return None
-
-    worker_id = get_agent_id(admin_auth_token)
     if not worker_id:
         return "Unauthorized: Admin token required"
 
@@ -643,7 +654,7 @@ async def _update_single_task(
 
 async def _create_unassigned_tasks(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
+) -> ToolResult:
     """Mode 0: Create unassigned tasks (assigned_to = NULL)"""
     task_title = arguments.get("task_title")
     task_description = arguments.get("task_description")
@@ -840,16 +851,12 @@ async def _create_unassigned_tasks(
             "\n💡 Use assign_task with task_ids parameter to assign these tasks to agents."
         )
 
-        return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
+        return Ok(message="\n".join(response_parts))
 
     except ValueError as e:
-        return [mcp_types.TextContent(type="text", text=str(e))]
+        return Invalid(message=str(e))
     except Exception as e:
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Error creating unassigned tasks: {e}"
-            )
-        ]
+        return Failed(message=f"Error creating unassigned tasks: {e}")
 
 
 async def _assign_to_existing_tasks(
@@ -858,7 +865,7 @@ async def _assign_to_existing_tasks(
     task_ids: List[str],
     validate_agent_workload: bool,
     coordination_notes: str,
-) -> List[mcp_types.TextContent]:
+) -> ToolResult:
     """Mode 3: Assign agent to existing unassigned tasks"""
     conn = None
     try:
@@ -876,12 +883,7 @@ async def _assign_to_existing_tasks(
         if len(found_tasks) != len(task_ids):
             found_ids = [task["task_id"] for task in found_tasks]
             missing_ids = [tid for tid in task_ids if tid not in found_ids]
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text=f"Error: Tasks not found: {', '.join(missing_ids)}",
-                )
-            ]
+            return NotFound(resource="task", identifier=", ".join(missing_ids))
 
         # Check for already assigned tasks
         assigned_tasks = [
@@ -892,23 +894,16 @@ async def _assign_to_existing_tasks(
                 f"{task['task_id']} (assigned to {task['assigned_to']})"
                 for task in assigned_tasks
             ]
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text=f"Error: Some tasks are already assigned: {', '.join(assigned_list)}",
-                )
-            ]
+            return Conflict(
+                reason=f"some tasks are already assigned: {', '.join(assigned_list)}"
+            )
 
         # Validate agent exists
         cursor.execute(
             "SELECT agent_id FROM agents WHERE agent_id = ?", (target_agent_id,)
         )
         if not cursor.fetchone():
-            return [
-                mcp_types.TextContent(
-                    type="text", text=f"Error: Agent '{target_agent_id}' not found."
-                )
-            ]
+            return NotFound(resource="agent", identifier=target_agent_id)
 
         # PR 6: task assignment UPDATEs go through task_repo with the
         # caller's cursor so they're atomic with the audit-log
@@ -975,13 +970,13 @@ async def _assign_to_existing_tasks(
         if coordination_notes:
             response_parts.append(f"\n📋 **Coordination Notes:** {coordination_notes}")
 
-        return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
+        return Ok(message="\n".join(response_parts))
 
     except Exception as e:
         if conn:
             conn.rollback()
         logger.error(f"Error assigning existing tasks: {e}", exc_info=True)
-        return [mcp_types.TextContent(type="text", text=f"Error assigning tasks: {e}")]
+        return Failed(message=f"Error assigning tasks: {e}")
     finally:
         if conn:
             conn.close()
@@ -994,7 +989,7 @@ async def _create_and_assign_multiple_tasks(
     auto_suggest_parent: bool,
     validate_agent_workload: bool,
     coordination_notes: str,
-) -> List[mcp_types.TextContent]:
+) -> ToolResult:
     """Mode 2: Create multiple tasks and assign to agent"""
     conn = None
     try:
@@ -1006,11 +1001,7 @@ async def _create_and_assign_multiple_tasks(
             "SELECT agent_id FROM agents WHERE agent_id = ?", (target_agent_id,)
         )
         if not cursor.fetchone():
-            return [
-                mcp_types.TextContent(
-                    type="text", text=f"Error: Agent '{target_agent_id}' not found."
-                )
-            ]
+            return NotFound(resource="agent", identifier=target_agent_id)
 
         created_tasks = []
         created_at = datetime.datetime.now().isoformat()
@@ -1107,17 +1098,13 @@ async def _create_and_assign_multiple_tasks(
         if coordination_notes:
             response_parts.append(f"\n📋 **Coordination Notes:** {coordination_notes}")
 
-        return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
+        return Ok(message="\n".join(response_parts))
 
     except Exception as e:
         if conn:
             conn.rollback()
         logger.error(f"Error creating multiple tasks: {e}", exc_info=True)
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Error creating multiple tasks: {e}"
-            )
-        ]
+        return Failed(message=f"Error creating multiple tasks: {e}")
     finally:
         if conn:
             conn.close()
@@ -1137,10 +1124,28 @@ async def _create_and_assign_multiple_tasks(
 )
 async def assign_task_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
     admin_auth_token = arguments.get("token")
     target_agent_token = arguments.get("agent_token")
     target_agent_id_alias = arguments.get("agent_id")
+
+    # Wave 6 PR 4: derive permission flags from the typed Principal
+    # when present, falling back to verify_token for in-process
+    # callers that bypass the dispatcher. ``is_admin_request`` here
+    # admits both operator-tier callers AND manager-role agents —
+    # consistent with the legacy ``_authorize_assign_task`` matrix
+    # which already widens "admin" to include manager-role agents
+    # for the assign_task surface.
+    if principal is not None:
+        is_admin_request = (
+            principal.has_role("admin") or principal.has_role("manager")
+        )
+    else:
+        is_admin_request = verify_token(
+            admin_auth_token, "admin"
+        ) or verify_token(admin_auth_token, "manager")
 
     # Admin-only `agent_id` alternative (Phase 7d). Resolves to the
     # agent's token server-side so admins can target an agent by their
@@ -1157,16 +1162,13 @@ async def assign_task_tool_impl(
     # arbitrary agent_id and impersonate the admin-side resolution
     # path.
     if target_agent_id_alias and not target_agent_token:
-        if not verify_token(admin_auth_token, "admin"):
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text=(
-                        "Unauthorized: agent_id parameter is admin-only; "
-                        "workers must pass agent_token (their own token)"
-                    ),
+        if not is_admin_request:
+            return PermissionDenied(
+                reason=(
+                    "agent_id parameter is admin-only; "
+                    "workers must pass agent_token (their own token)"
                 )
-            ]
+            )
         # PR 6: routed through agent_repo (drops raw cursor that only
         # did a PK lookup). disable_cache to force a DB read — the
         # cache shape (state.active_agents) is token-keyed and the
@@ -1176,12 +1178,13 @@ async def assign_task_tool_impl(
         with agent_repo.disable_cache():
             row = agent_repo.get_by_id(target_agent_id_alias)
         if not row:
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text=f"Unknown agent_id: '{target_agent_id_alias}'",
-                )
-            ]
+            # Use Invalid with the legacy "Unknown agent_id" wording so
+            # the rendered wire text continues to contain that prefix
+            # (callers + tests grep for it).
+            return Invalid(
+                field="agent_id",
+                message=f"Unknown agent_id: '{target_agent_id_alias}'",
+            )
         target_agent_token = row["token"]
 
     # Mode 1: Single task creation (existing behavior)
@@ -1220,9 +1223,10 @@ async def assign_task_tool_impl(
         target_agent_token=target_agent_token,
         task_ids=task_ids,
         arguments=arguments,
+        principal=principal,
     )
     if auth_error is not None:
-        return [mcp_types.TextContent(type="text", text=auth_error)]
+        return PermissionDenied(reason=auth_error.removeprefix("Unauthorized: "))
 
     # Handle unassigned task creation (agent_token is optional)
     if not target_agent_token:
@@ -1236,66 +1240,59 @@ async def assign_task_tool_impl(
     from ..repositories import agent_repo
     agent_row = agent_repo.get_by_token(target_agent_token)
     if not agent_row:
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text="Error: Agent token not found. Agent may not exist or token is invalid.",
-            )
-        ]
+        return NotFound(
+            resource="agent_token",
+            identifier="(invalid or unknown)",
+        )
 
     target_agent_id = agent_row["agent_id"]
 
     # Prevent admin agents from being assigned tasks
     if target_agent_id.lower().startswith("admin"):
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text="Error: Admin agents cannot be assigned tasks. Admin agents are for coordination and management only.",
+        return Conflict(
+            reason=(
+                "admin agents cannot be assigned tasks. Admin agents are "
+                "for coordination and management only."
             )
-        ]
+        )
 
     # Determine operation mode and validate parameters (when agent_token provided)
     if task_ids:
         # Mode 3: Assign to existing tasks
         operation_mode = "existing"
         if not isinstance(task_ids, list) or not task_ids:
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text="Error: task_ids must be a non-empty list of task IDs.",
-                )
-            ]
+            return Invalid(
+                field="task_ids",
+                message="task_ids must be a non-empty list of task IDs.",
+            )
     elif tasks:
         # Mode 2: Create multiple tasks + assign
         operation_mode = "multiple"
         if not isinstance(tasks, list) or not tasks:
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text="Error: tasks must be a non-empty list of task objects.",
-                )
-            ]
+            return Invalid(
+                field="tasks",
+                message="tasks must be a non-empty list of task objects.",
+            )
         # Validate each task object
         for i, task in enumerate(tasks):
             if not isinstance(task, dict) or not all(
                 [task.get("title"), task.get("description")]
             ):
-                return [
-                    mcp_types.TextContent(
-                        type="text",
-                        text=f"Error: Task {i+1} must have 'title' and 'description' fields.",
-                    )
-                ]
+                return Invalid(
+                    field="tasks",
+                    message=f"Task {i+1} must have 'title' and 'description' fields.",
+                )
     else:
         # Mode 1: Single task creation (existing behavior)
         operation_mode = "single"
         if not all([task_title, task_description]):
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text="Error: task_title and task_description are required for single task creation, or provide 'tasks' array for multiple tasks, or 'task_ids' for existing task assignment.",
-                )
-            ]
+            return Invalid(
+                message=(
+                    "task_title and task_description are required for single task "
+                    "creation, or provide 'tasks' array for multiple tasks, or "
+                    "'task_ids' for existing task assignment."
+                ),
+            )
 
     # Route to appropriate handler based on operation mode
     if operation_mode == "existing":
@@ -1391,16 +1388,19 @@ async def assign_task_tool_impl(
 
             conn.close()
 
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text=f"ERROR: Cannot create task without parent. {root_count} root task(s) already exist: {root_ids}\n\n"
-                    f"You MUST specify a parent_task_id. Every task except the first must have a parent.\n"
+            return Conflict(
+                reason=(
+                    f"Cannot create task without parent. {root_count} root "
+                    f"task(s) already exist: {root_ids}\n\n"
+                    f"You MUST specify a parent_task_id. Every task except "
+                    f"the first must have a parent.\n"
                     f"{suggestion_text}\n"
-                    f"💡 Use auto_suggest_parent=true for smarter suggestions based on task content.\n"
-                    f"Use 'view_tasks' for complete task list, or use one of the suggestions above.",
+                    f"💡 Use auto_suggest_parent=true for smarter suggestions "
+                    f"based on task content.\n"
+                    f"Use 'view_tasks' for complete task list, or use one of "
+                    f"the suggestions above."
                 )
-            ]
+            )
 
         conn.close()
 
@@ -1425,12 +1425,7 @@ async def assign_task_tool_impl(
             )
             row = cursor.fetchone()
             if not row:
-                return [
-                    mcp_types.TextContent(
-                        type="text",
-                        text=f"Agent '{target_agent_id}' not found or is terminated.",
-                    )
-                ]
+                return NotFound(resource="agent", identifier=target_agent_id)
             # Agent exists in DB but not memory, can still assign task.
             logger.warning(
                 f"Assigning task to agent {target_agent_id} found in DB but not active memory."
@@ -1455,12 +1450,13 @@ async def assign_task_tool_impl(
                 logger.error(
                     f"Attempt to create second root task. Existing root: {existing_root_id}"
                 )
-                return [
-                    mcp_types.TextContent(
-                        type="text",
-                        text=f"ERROR: Cannot create root task. A root task already exists ({existing_root_id}). All new tasks must have a parent.",
+                return Conflict(
+                    reason=(
+                        f"Cannot create root task. A root task already "
+                        f"exists ({existing_root_id}). All new tasks must "
+                        f"have a parent."
                     )
-                ]
+                )
 
         # Smart workload validation
         workload_analysis = None
@@ -1512,12 +1508,12 @@ async def assign_task_tool_impl(
 
             # For denied status, block creation unless override is allowed
             if validation_result["status"] == "denied" and not ALLOW_RAG_OVERRIDE:
-                return [
-                    mcp_types.TextContent(
-                        type="text",
-                        text=f"Task creation BLOCKED by RAG validation:\n{suggestion_message}",
+                return PermissionDenied(
+                    reason=(
+                        f"Task creation BLOCKED by RAG validation:\n"
+                        f"{suggestion_message}"
                     )
-                ]
+                )
 
             # Process suggestions - always apply them unless explicitly overridden
             if validation_result["status"] != "approved":
@@ -1744,7 +1740,7 @@ async def assign_task_tool_impl(
         if coordination_notes:
             response_parts.append("• Coordination context captured for team awareness")
 
-        return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
+        return Ok(message="\n".join(response_parts))
 
     except sqlite3.Error as e_sql:
         if conn:
@@ -1753,11 +1749,7 @@ async def assign_task_tool_impl(
             f"Database error assigning task to agent {target_agent_id}: {e_sql}",
             exc_info=True,
         )
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Database error assigning task: {e_sql}"
-            )
-        ]
+        return Failed(message=f"Database error assigning task: {e_sql}")
     except Exception as e:
         if conn:
             conn.rollback()
@@ -1765,11 +1757,7 @@ async def assign_task_tool_impl(
             f"Unexpected error assigning task to agent {target_agent_id}: {e}",
             exc_info=True,
         )
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Unexpected error assigning task: {e}"
-            )
-        ]
+        return Failed(message=f"Unexpected error assigning task: {e}")
     finally:
         if conn:
             conn.close()
@@ -1780,7 +1768,9 @@ async def assign_task_tool_impl(
 @requires("any")
 async def create_self_task_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
     agent_auth_token = arguments.get("token")
     task_title = arguments.get("task_title")
     task_description = arguments.get("task_description")
@@ -1788,15 +1778,20 @@ async def create_self_task_tool_impl(
     depends_on_tasks_list = arguments.get("depends_on_tasks")
     parent_task_id_arg = arguments.get("parent_task_id")
 
-    # @requires("any") guarantees a valid token; resolve to id for use below.
-    requesting_agent_id = get_agent_id(agent_auth_token)
+    # Wave 6 PR 4: derive requesting_agent_id from the typed Principal
+    # when present, falling back to verify_token for in-process callers.
+    # @requires("any") guarantees a valid agent token at the decorator
+    # layer; we still resolve the id locally for the ownership / parent
+    # checks below.
+    if principal is not None and principal.agent_id:
+        requesting_agent_id = principal.agent_id
+    else:
+        requesting_agent_id = get_agent_id(agent_auth_token)
 
     if not all([task_title, task_description]):
-        return [
-            mcp_types.TextContent(
-                type="text", text="Error: task_title and task_description are required."
-            )
-        ]
+        return Invalid(
+            message="task_title and task_description are required.",
+        )
 
     # Determine actual parent task ID (main.py:1419-1423)
     actual_parent_task_id = parent_task_id_arg
@@ -1817,7 +1812,7 @@ async def create_self_task_tool_impl(
             # Find a suitable parent task for the agent
             cursor.execute(
                 """
-                SELECT task_id, title FROM tasks 
+                SELECT task_id, title FROM tasks
                 WHERE assigned_to = ? OR created_by = ?
                 ORDER BY created_at DESC LIMIT 1
             """,
@@ -1829,12 +1824,12 @@ async def create_self_task_tool_impl(
             if suggested_parent:
                 suggestion_text = f"\nSuggested parent: {suggested_parent['task_id']} ({suggested_parent['title']})"
 
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text=f"ERROR: Agents cannot create root tasks. Every task must have a parent.{suggestion_text}\nPlease specify a parent_task_id.",
+            return Conflict(
+                reason=(
+                    f"Agents cannot create root tasks. Every task must have "
+                    f"a parent.{suggestion_text}\nPlease specify a parent_task_id."
                 )
-            ]
+            )
 
         # Additional check for single root rule even for admin
         if actual_parent_task_id is None:
@@ -1849,12 +1844,13 @@ async def create_self_task_tool_impl(
                 logger.error(
                     f"Attempt to create second root task. Existing root: {existing_root_id}"
                 )
-                return [
-                    mcp_types.TextContent(
-                        type="text",
-                        text=f"ERROR: Cannot create root task. A root task already exists ({existing_root_id}). All new tasks must have a parent.",
+                return Conflict(
+                    reason=(
+                        f"Cannot create root task. A root task already "
+                        f"exists ({existing_root_id}). All new tasks must "
+                        f"have a parent."
                     )
-                ]
+                )
 
         # Generate task ID and timestamps first
         new_task_id = _generate_task_id()
@@ -1882,12 +1878,12 @@ async def create_self_task_tool_impl(
 
             # Check for denial
             if validation_result["status"] == "denied":
-                return [
-                    mcp_types.TextContent(
-                        type="text",
-                        text=f"Task creation BLOCKED by RAG validation:\n{suggestion_message}",
+                return PermissionDenied(
+                    reason=(
+                        f"Task creation BLOCKED by RAG validation:\n"
+                        f"{suggestion_message}"
                     )
-                ]
+                )
 
             # Process validation results
             if validation_result["status"] != "approved":
@@ -1999,7 +1995,7 @@ async def create_self_task_tool_impl(
         if validation_message:
             response_text += validation_message
 
-        return [mcp_types.TextContent(type="text", text=response_text)]
+        return Ok(message=response_text)
 
     except sqlite3.Error as e_sql:
         if conn:
@@ -2008,11 +2004,7 @@ async def create_self_task_tool_impl(
             f"Database error creating self task for agent {requesting_agent_id}: {e_sql}",
             exc_info=True,
         )
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Database error creating self task: {e_sql}"
-            )
-        ]
+        return Failed(message=f"Database error creating self task: {e_sql}")
     except Exception as e:
         if conn:
             conn.rollback()
@@ -2020,11 +2012,7 @@ async def create_self_task_tool_impl(
             f"Unexpected error creating self task for agent {requesting_agent_id}: {e}",
             exc_info=True,
         )
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Unexpected error creating self task: {e}"
-            )
-        ]
+        return Failed(message=f"Unexpected error creating self task: {e}")
     finally:
         if conn:
             conn.close()
@@ -2035,7 +2023,9 @@ async def create_self_task_tool_impl(
 @requires_policy("config_allow_worker_update_own_status", default=True)
 async def update_task_status_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
     agent_auth_token = arguments.get("token")
     task_id_to_update = arguments.get("task_id")
     task_ids_bulk = arguments.get(
@@ -2062,9 +2052,21 @@ async def update_task_status_tool_impl(
         "validate_dependencies", True
     )  # Validate dependency constraints
 
-    # @requires_policy guaranteed entry; resolve id for per-task ownership
-    # checks below (workers can only update their OWN tasks; admins anyone).
-    requesting_agent_id = get_agent_id(agent_auth_token)
+    # Wave 6 PR 4: derive permission flags from the typed Principal.
+    # ``is_admin_request`` here admits operator-tier OR manager-role
+    # agents (preserves the admin harness's manager-bearer path AND
+    # widens admin-only fields to manager-role agents, consistent
+    # with `_authorize_assign_task` which already does this).
+    if principal is not None:
+        is_admin_request = (
+            principal.has_role("admin") or principal.has_role("manager")
+        )
+        requesting_agent_id = (
+            principal.agent_id or principal.user_id or "admin"
+        )
+    else:
+        is_admin_request = verify_token(agent_auth_token, "admin")
+        requesting_agent_id = get_agent_id(agent_auth_token)
 
     # Determine if this is bulk or single operation
     task_ids_to_process = []
@@ -2073,25 +2075,17 @@ async def update_task_status_tool_impl(
     elif task_id_to_update:
         task_ids_to_process = [task_id_to_update]
     else:
-        return [
-            mcp_types.TextContent(
-                type="text", text="Error: Either task_id or task_ids is required."
-            )
-        ]
+        return Invalid(message="Either task_id or task_ids is required.")
 
     if not new_status:
-        return [mcp_types.TextContent(type="text", text="Error: status is required.")]
+        return Invalid(field="status", message="status is required.")
 
     valid_statuses = ["pending", "in_progress", "completed", "cancelled", "failed"]
     if new_status not in valid_statuses:
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text=f"Invalid status: {new_status}. Valid: {', '.join(valid_statuses)}",
-            )
-        ]
-
-    is_admin_request = verify_token(agent_auth_token, "admin")
+        return Invalid(
+            field="status",
+            message=f"Invalid status: {new_status}. Valid: {', '.join(valid_statuses)}",
+        )
 
     conn = None
     try:
@@ -2345,26 +2339,40 @@ async def update_task_status_tool_impl(
             },
         )
 
-        return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
+        # Single-task case: if the only failure is an unauthorized
+        # one, surface as PermissionDenied so the rendered wire text
+        # starts with "Unauthorized:" (consistent with the typed-error
+        # vocabulary of Wave 6). Bulk callers keep the aggregated
+        # response shape for backward compat.
+        if (
+            len(task_ids_to_process) == 1
+            and failed_updates
+            and not successful_updates
+        ):
+            err_text = (failed_updates[0].get("error") or "").lower()
+            if err_text.startswith("unauthorized"):
+                return PermissionDenied(
+                    reason=failed_updates[0]["error"].removeprefix(
+                        "Unauthorized: "
+                    )
+                )
+            if "not found" in err_text:
+                return NotFound(
+                    resource="task", identifier=task_ids_to_process[0],
+                )
+
+        return Ok(message="\n".join(response_parts))
 
     except sqlite3.Error as e_sql:
         if conn:
             conn.rollback()
         logger.error(f"Database error updating tasks: {e_sql}", exc_info=True)
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Database error updating tasks: {e_sql}"
-            )
-        ]
+        return Failed(message=f"Database error updating tasks: {e_sql}")
     except Exception as e:
         if conn:
             conn.rollback()
         logger.error(f"Unexpected error updating tasks: {e}", exc_info=True)
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Unexpected error updating tasks: {e}"
-            )
-        ]
+        return Failed(message=f"Unexpected error updating tasks: {e}")
     finally:
         if conn:
             conn.close()
@@ -2375,7 +2383,9 @@ async def update_task_status_tool_impl(
 @requires("any")
 async def view_tasks_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
     agent_auth_token = arguments.get("token")
     filter_agent_id = arguments.get("agent_id")  # Optional agent_id to filter by
     filter_status = arguments.get("status")  # Optional status to filter by
@@ -2420,11 +2430,22 @@ async def view_tasks_tool_impl(
         "sort_by", "created_at"
     )  # Sort by: created_at, updated_at, priority, status
 
-    # @requires("any") guarantees a valid token; resolve id + admin flag
-    # for the per-row filtering below (workers see only their own tasks
-    # unless filter_agent_id matches their id; admins see anyone's).
-    requesting_agent_id = get_agent_id(agent_auth_token)
-    is_admin_request = verify_token(agent_auth_token, "admin")
+    # Wave 6 PR 4: derive permission flags from the typed Principal.
+    # @requires("any") guarantees a valid agent token at the decorator
+    # layer; we still resolve the id + admin flag locally for the
+    # per-row filtering below (workers see only their own tasks unless
+    # filter_agent_id matches their id; admins see anyone's). Admins
+    # here include operator-tier callers AND manager-role agents.
+    if principal is not None:
+        is_admin_request = (
+            principal.has_role("admin") or principal.has_role("manager")
+        )
+        requesting_agent_id = (
+            principal.agent_id or principal.user_id or "admin"
+        )
+    else:
+        is_admin_request = verify_token(agent_auth_token, "admin")
+        requesting_agent_id = get_agent_id(agent_auth_token)
 
     # Permission check
     target_agent_id_for_filter = filter_agent_id
@@ -2432,12 +2453,12 @@ async def view_tasks_tool_impl(
         if filter_agent_id is None:
             target_agent_id_for_filter = requesting_agent_id
         elif filter_agent_id != requesting_agent_id:
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text="Unauthorized: Non-admin agents can only view their own tasks or all tasks assigned to them if no agent_id filter is specified.",
+            return PermissionDenied(
+                reason=(
+                    "Non-admin agents can only view their own tasks or all "
+                    "tasks assigned to them if no agent_id filter is specified."
                 )
-            ]
+            )
 
     # Delegate filter/sort/dependency-analysis to the engine — the
     # handler stays an adapter (parse args -> query -> presentation).
@@ -2630,7 +2651,7 @@ async def view_tasks_tool_impl(
         "view_tasks",
         {"filter_agent_id": filter_agent_id, "filter_status": filter_status},
     )
-    return [mcp_types.TextContent(type="text", text=response_text)]
+    return Ok(message=response_text)
 
 
 def _format_task_summary(task: Dict[str, Any]) -> str:
@@ -2933,21 +2954,31 @@ def _suggest_optimal_parent_task(
 @requires("any")
 async def request_assistance_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
     agent_auth_token = arguments.get("token")
     parent_task_id = arguments.get("task_id")  # Task ID needing assistance
     assistance_description = arguments.get("description")
 
-    # @requires("any") guaranteed a valid token; resolve id for ownership.
-    requesting_agent_id = get_agent_id(agent_auth_token)
+    # Wave 6 PR 4: derive permission flags from the typed Principal.
+    # @requires("any") guaranteed a valid agent token at the decorator
+    # layer; we resolve id locally for ownership checks below.
+    if principal is not None:
+        is_admin_request = (
+            principal.has_role("admin") or principal.has_role("manager")
+        )
+        requesting_agent_id = (
+            principal.agent_id or principal.user_id or "admin"
+        )
+    else:
+        is_admin_request = verify_token(agent_auth_token, "admin")
+        requesting_agent_id = get_agent_id(agent_auth_token)
 
     if not parent_task_id or not assistance_description:
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text="Error: task_id (for parent) and description are required.",
-            )
-        ]
+        return Invalid(
+            message="task_id (for parent) and description are required.",
+        )
 
     # Fetch parent task data (original used in-memory g.tasks, main.py:1674)
     # For robustness, let's fetch from DB, then update g.tasks.
@@ -2969,26 +3000,23 @@ async def request_assistance_tool_impl(
         _read_conn.close()
 
     if not parent_task_db_row:
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Parent task '{parent_task_id}' not found."
-            )
-        ]
+        return NotFound(resource="task", identifier=parent_task_id)
 
     parent_task_current_data = dict(parent_task_db_row)
 
-    # Verify ownership or admin (main.py:1688-1691)
-    is_admin_request = verify_token(agent_auth_token, "admin")
+    # Verify ownership or admin (main.py:1688-1691) — the per-task
+    # ownership gate now sources is_admin_request from the principal
+    # block above; assignee can always request, admins/managers always.
     if (
         parent_task_current_data.get("assigned_to") != requesting_agent_id
         and not is_admin_request
     ):
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text="Unauthorized: You can only request assistance for tasks assigned to you, or use an admin token.",
+        return PermissionDenied(
+            reason=(
+                "You can only request assistance for tasks assigned to "
+                "you, or use an admin token."
             )
-        ]
+        )
 
     try:
         # Create child assistance task (main.py:1694-1696)
@@ -3180,12 +3208,18 @@ async def request_assistance_tool_impl(
         logger.info(
             f"Agent '{requesting_agent_id}' requested assistance for task '{parent_task_id}'. Child task '{child_task_id}' created."
         )
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text=f"Assistance requested for task {parent_task_id}. Child assistance task {child_task_id} created. Admin notified via file notification and direct message.",
-            )
-        ]
+        return Ok(
+            message=(
+                f"Assistance requested for task {parent_task_id}. Child "
+                f"assistance task {child_task_id} created. Admin notified "
+                f"via file notification and direct message."
+            ),
+            data={
+                "parent_task_id": parent_task_id,
+                "child_task_id": child_task_id,
+                "notification_id": notification_id,
+            },
+        )
 
     except sqlite3.Error as e_sql:
         # atomic_with_audit already rolled back + closed before re-raising.
@@ -3193,47 +3227,45 @@ async def request_assistance_tool_impl(
             f"Database error requesting assistance for task {parent_task_id}: {e_sql}",
             exc_info=True,
         )
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Database error requesting assistance: {e_sql}"
-            )
-        ]
+        return Failed(message=f"Database error requesting assistance: {e_sql}")
     except Exception as e:
         logger.error(
             f"Unexpected error requesting assistance for task {parent_task_id}: {e}",
             exc_info=True,
         )
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Unexpected error requesting assistance: {e}"
-            )
-        ]
+        return Failed(message=f"Unexpected error requesting assistance: {e}")
 
 
 # --- bulk_task_operations tool ---
 @requires("any")
 async def bulk_task_operations_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
     agent_auth_token = arguments.get("token")
     operations = arguments.get("operations", [])  # List of operation objects
 
-    # @requires("any") guaranteed entry; admin gets full control, workers
-    # are restricted per-op (own-task only) by the in-loop ownership
-    # check below. tools/list classifies this as admin (access.py) so
-    # workers don't see it in their catalogue; direct callers still get
-    # the per-op gate.
-    requesting_agent_id = get_agent_id(agent_auth_token)
+    # Wave 6 PR 4: derive permission flags from the typed Principal.
+    # @requires("any") guaranteed a valid agent token at the decorator
+    # layer; admin gets full control, workers are restricted per-op
+    # (own-task only) by the in-loop ownership check below.
+    if principal is not None:
+        is_admin_request = (
+            principal.has_role("admin") or principal.has_role("manager")
+        )
+        requesting_agent_id = (
+            principal.agent_id or principal.user_id or "admin"
+        )
+    else:
+        is_admin_request = verify_token(agent_auth_token, "admin")
+        requesting_agent_id = get_agent_id(agent_auth_token)
 
     if not operations or not isinstance(operations, list):
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text="Error: operations list is required and must be a non-empty array",
-            )
-        ]
-
-    is_admin_request = verify_token(agent_auth_token, "admin")
+        return Invalid(
+            field="operations",
+            message="operations list is required and must be a non-empty array",
+        )
 
     # Process operations in a single transaction. PR A (round 2): the
     # whole "open conn → loop writes → log audit → commit → close"
@@ -3483,48 +3515,50 @@ async def bulk_task_operations_tool_impl(
             "bulk_task_operations",
             {"operations_count": len(operations)},
         )
-        return [mcp_types.TextContent(type="text", text=response_text)]
+        return Ok(message=response_text)
 
     except sqlite3.Error as e_sql:
         # `atomic_with_audit` already rolled back + closed before
         # re-raising; we just translate to a user-facing error.
         logger.error(f"Database error in bulk task operations: {e_sql}", exc_info=True)
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Database error in bulk operations: {e_sql}"
-            )
-        ]
+        return Failed(message=f"Database error in bulk operations: {e_sql}")
     except Exception as e:
         logger.error(f"Unexpected error in bulk task operations: {e}", exc_info=True)
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"Unexpected error in bulk operations: {e}"
-            )
-        ]
+        return Failed(message=f"Unexpected error in bulk operations: {e}")
 
 
 # --- search_tasks tool ---
 @requires("any")
 async def search_tasks_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
     agent_auth_token = arguments.get("token")
     search_query = arguments.get("search_query")
     status_filter = arguments.get("status_filter")
     max_results = arguments.get("max_results", 20)
     include_notes = arguments.get("include_notes", True)
 
+    # Wave 6 PR 4: derive permission flags from the typed Principal.
     # @requires("any") guaranteed entry; admin sees all tasks, workers
     # only see their own (per-row filter below).
-    requesting_agent_id = get_agent_id(agent_auth_token)
+    if principal is not None:
+        is_admin_request = (
+            principal.has_role("admin") or principal.has_role("manager")
+        )
+        requesting_agent_id = (
+            principal.agent_id or principal.user_id or "admin"
+        )
+    else:
+        is_admin_request = verify_token(agent_auth_token, "admin")
+        requesting_agent_id = get_agent_id(agent_auth_token)
 
     # `search_query` is optional as of v5.0.22 — callers may supply
     # only `status_filter` to list tasks by status without text
     # scoring (filter-only mode). When both are absent, the response
     # surfaces a guidance error rather than crashing.
     has_query = bool(search_query and search_query.strip())
-
-    is_admin_request = verify_token(agent_auth_token, "admin")
 
     # Prepare search terms (only when a query is present)
     search_terms: List[str] = []
@@ -3535,30 +3569,22 @@ async def search_tasks_tool_impl(
             if len(term.strip()) > 2
         ]
         if not search_terms:
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text=(
-                        "Error: Search query must contain terms longer "
-                        "than 2 characters."
-                    ),
-                )
-            ]
+            return Invalid(
+                field="search_query",
+                message="Search query must contain terms longer than 2 characters.",
+            )
 
     # Guidance error: with neither a usable query nor a filter, there
     # is no implicit "everything" semantic — ask the caller to narrow.
     # `view_tasks` is the right tool for unbounded listing.
     if not has_query and not status_filter:
-        return [
-            mcp_types.TextContent(
-                type="text",
-                text=(
-                    "Error: search_tasks requires either a search_query "
-                    "or a status_filter. For an unfiltered listing of "
-                    "tasks, use view_tasks instead."
-                ),
+        return Invalid(
+            message=(
+                "search_tasks requires either a search_query or a "
+                "status_filter. For an unfiltered listing of tasks, "
+                "use view_tasks instead."
             )
-        ]
+        )
 
     # Get tasks user can see
     candidate_tasks = []
@@ -3574,11 +3600,7 @@ async def search_tasks_tool_impl(
         candidate_tasks.append(task_data)
 
     if not candidate_tasks:
-        return [
-            mcp_types.TextContent(
-                type="text", text="No tasks found matching the criteria."
-            )
-        ]
+        return Ok(message="No tasks found matching the criteria.")
 
     # Filter-only path: no query, only filters. Skip the scoring loop
     # and return the candidate tasks ordered by (updated_at DESC).
@@ -3645,7 +3667,7 @@ async def search_tasks_tool_impl(
                 "results": len(truncated),
             },
         )
-        return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
+        return Ok(message="\n".join(response_parts))
 
     # Score tasks by relevance
     scored_results = []
@@ -3694,11 +3716,7 @@ async def search_tasks_tool_impl(
             scored_results.append((task, score, matched_fields))
 
     if not scored_results:
-        return [
-            mcp_types.TextContent(
-                type="text", text=f"No tasks found containing '{search_query}'."
-            )
-        ]
+        return Ok(message=f"No tasks found containing '{search_query}'.")
 
     # Sort by relevance (score descending, then by updated_at descending)
     scored_results.sort(key=lambda x: (x[1], x[0].get("updated_at", "")), reverse=True)
@@ -3760,7 +3778,7 @@ async def search_tasks_tool_impl(
         "search_tasks",
         {"query": search_query, "results": len(scored_results)},
     )
-    return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
+    return Ok(message="\n".join(response_parts))
 
 
 # --- Register all task tools ---
@@ -4318,7 +4336,9 @@ def register_task_tools():
 @requires_role("operator")
 async def delete_task_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
     """
     Delete a task permanently with cascade handling for related tasks.
     Admin-only operation with comprehensive safety checks.
@@ -4327,7 +4347,7 @@ async def delete_task_tool_impl(
     force_delete = arguments.get("force_delete", False)
 
     if not task_id:
-        return [mcp_types.TextContent(type="text", text="Error: task_id is required")]
+        return Invalid(field="task_id", message="task_id is required")
 
     conn = None
     try:
@@ -4339,26 +4359,29 @@ async def delete_task_tool_impl(
         task_row = cursor.fetchone()
 
         if not task_row:
-            return [
-                mcp_types.TextContent(
-                    type="text", text=f"Error: Task '{task_id}' not found"
-                )
-            ]
+            return NotFound(resource="task", identifier=task_id)
 
         task_data = dict(task_row)
 
-        # Parse relationships
-        child_tasks = json.loads(task_data.get("child_tasks", "[]"))
-        depends_on_tasks = json.loads(task_data.get("depends_on_tasks", "[]"))
+        # Parse relationships. The columns are nullable in the schema;
+        # ``dict.get(.., "[]")`` returns the stored value (None) when
+        # the key exists, so we need ``or "[]"`` to handle BOTH absent
+        # keys AND NULL column values. Pre-Wave-6 this TypeError was
+        # masked by a lax text-matching adapter; the typed-Failed
+        # variant correctly surfaces it as 500, exposing the bug.
+        child_tasks = json.loads(task_data.get("child_tasks") or "[]")
+        depends_on_tasks = json.loads(
+            task_data.get("depends_on_tasks") or "[]"
+        )
 
         # Check for child tasks
         if child_tasks and not force_delete:
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text=f"Error: Task '{task_id}' has {len(child_tasks)} child tasks: {child_tasks}. Use force_delete=true to cascade delete.",
+            return Conflict(
+                reason=(
+                    f"Task '{task_id}' has {len(child_tasks)} child tasks: "
+                    f"{child_tasks}. Use force_delete=true to cascade delete."
                 )
-            ]
+            )
 
         # Check for tasks that depend on this one
         cursor.execute(
@@ -4371,12 +4394,12 @@ async def delete_task_tool_impl(
             dependent_list = [
                 f"{row['task_id']} ({row['title']})" for row in dependent_tasks
             ]
-            return [
-                mcp_types.TextContent(
-                    type="text",
-                    text=f"Error: {len(dependent_tasks)} tasks depend on '{task_id}': {dependent_list}. Use force_delete=true to cascade delete.",
+            return Conflict(
+                reason=(
+                    f"{len(dependent_tasks)} tasks depend on '{task_id}': "
+                    f"{dependent_list}. Use force_delete=true to cascade delete."
                 )
-            ]
+            )
 
         # Begin cascade deletion operations
         cascade_operations = []
@@ -4446,11 +4469,7 @@ async def delete_task_tool_impl(
         cursor.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
 
         if cursor.rowcount == 0:
-            return [
-                mcp_types.TextContent(
-                    type="text", text=f"Error: Failed to delete task '{task_id}'"
-                )
-            ]
+            return Failed(message=f"Failed to delete task '{task_id}'")
 
         # Log the deletion action
         log_agent_action_to_db(
@@ -4481,15 +4500,13 @@ async def delete_task_tool_impl(
             f"\nDeletion completed at: {datetime.datetime.now().isoformat()}"
         )
 
-        return [mcp_types.TextContent(type="text", text="\n".join(response_parts))]
+        return Ok(message="\n".join(response_parts))
 
     except Exception as e:
         if conn:
             conn.rollback()
         logger.error(f"Error in delete_task_tool_impl: {e}", exc_info=True)
-        return [
-            mcp_types.TextContent(type="text", text=f"Error deleting task: {str(e)}")
-        ]
+        return Failed(message=f"Error deleting task: {str(e)}")
     finally:
         if conn:
             conn.close()

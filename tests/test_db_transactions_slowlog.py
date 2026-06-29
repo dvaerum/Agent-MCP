@@ -107,8 +107,13 @@ async def test_assign_existing_tasks_commits_once(tmp_path) -> None:
             task_tools_mod, "get_db_connection", side_effect=spy_get_conn
         ):
             from agent_mcp.tools.task_tools import assign_task_tool_impl
+            from agent_mcp.core.tool_result import Ok
 
             commit_count["n"] = 0  # reset after seeding's own commits
+            # Wave 6 PR 4: assign_task_tool_impl returns ToolResult
+            # (Ok/Conflict/Failed/...) rather than list[TextContent].
+            # Success here is the Ok variant carrying the human-readable
+            # message; pre-migration this was a TextContent block.
             result = await assign_task_tool_impl(
                 {
                     "token": admin.admin_token,
@@ -116,9 +121,12 @@ async def test_assign_existing_tasks_commits_once(tmp_path) -> None:
                     "task_ids": task_ids,
                 }
             )
-            assert "✅" in result[0].text or "Tasks Assigned" in result[0].text, (
-                f"assign_task failed: {result[0].text!r}"
+            assert isinstance(result, Ok), (
+                f"assign_task failed: {result!r}"
             )
+            assert "✅" in (result.message or "") or "Tasks Assigned" in (
+                result.message or ""
+            ), f"assign_task succeeded but message unexpected: {result.message!r}"
 
         # One commit for the whole bulk assign; today's pre-refactor
         # baseline also commits once (sqlite3 default isolation), so
