@@ -181,7 +181,6 @@ def _snapshot_and_reset_globals(stack: ExitStack) -> None:
         "tasks": dict(g.tasks),
         "file_map": dict(g.file_map),
         "agent_working_dirs": dict(g.agent_working_dirs),
-        "agent_tmux_sessions": dict(g.agent_tmux_sessions),
         "audit_log": list(g.audit_log),
         "openai_client_instance": g.openai_client_instance,
         "global_vss_load_tested": g.global_vss_load_tested,
@@ -199,8 +198,6 @@ def _snapshot_and_reset_globals(stack: ExitStack) -> None:
         g.file_map.update(snapshot["file_map"])
         g.agent_working_dirs.clear()
         g.agent_working_dirs.update(snapshot["agent_working_dirs"])
-        g.agent_tmux_sessions.clear()
-        g.agent_tmux_sessions.update(snapshot["agent_tmux_sessions"])
         g.audit_log.clear()
         g.audit_log.extend(snapshot["audit_log"])
         g.openai_client_instance = snapshot["openai_client_instance"]

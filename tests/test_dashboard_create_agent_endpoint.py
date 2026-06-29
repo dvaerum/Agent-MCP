@@ -133,44 +133,45 @@ async def test_post_api_agents_rejects_bad_token(tmp_path) -> None:
         assert _row("agents", "agent_id = ?", ("bad-token-attempt",)) is None
 
 
-# -------------------- frontend: api.ts createAgent ---------------------
+# -------------------- frontend: api.ts registerAgent ------------------
 
 
-# NOTE: the historical ``test_api_client_create_agent_includes_admin_token``
-# guard lived here. PR D (prancy-napping-pie) reverses its assertion —
-# createAgent must NOT include ``token: tokens.admin_token`` in the
-# POST body now that the operator-session cookie carries auth. The
-# new guard lives in ``tests/test_dashboard_migration.py::
-# test_dashboard_api_client_strips_token_field_from_payloads``.
+def test_api_client_register_agent_targets_post_agents_register() -> None:
+    """registerAgent must POST to ``/agents/register`` (the sole
+    agent-creation endpoint post-Wave-7-PR-3).
 
-
-def test_api_client_create_agent_targets_post_agents() -> None:
-    """createAgent must POST to /agents (the modern path-style URL the
-    dashboard already expects in its router) — NOT to a relative URL
-    that doesn't match a registered route.
+    Wave 7 PR 3 (coordinator transition): ``apiClient.createAgent``
+    and the legacy ``/api/agents`` POST / ``/api/create-agent`` alias
+    were deleted. The dashboard registers agents exclusively through
+    the spawnless register endpoint.
     """
     src = API_FILE.read_text(encoding="utf-8")
-    import re
 
-    match = re.search(
-        r"async\s+createAgent\s*\([^)]*\)[^{]*\{(.*?)\n  \}",
-        src,
-        re.DOTALL,
+    # Locate the registerAgent method by name; slice until the next
+    # method declaration starts (avoids the noisy Promise return-type
+    # spanning multiple lines).
+    start = src.find("async registerAgent")
+    assert start != -1, "apiClient.registerAgent went missing."
+    next_async = src.find("\n  async ", start + 1)
+    next_method = (
+        next_async if next_async != -1 else start + 2000
     )
-    assert match, "createAgent rename?"
-    body = match.group(1)
+    body = src[start:next_method]
+
     assert "method: 'POST'" in body or 'method: "POST"' in body, (
-        "createAgent must be a POST."
+        "registerAgent must be a POST."
     )
-    # Either the modern '/agents' shape (which the backend POST handler
-    # accepts post-fix) or the legacy '/create-agent' alias is OK; pin
-    # one of them so a typo doesn't drift the URL.
     assert (
-        "'/agents'" in body
-        or '"/agents"' in body
-        or "'/create-agent'" in body
-        or '"/create-agent"' in body
+        "'/agents/register'" in body
+        or '"/agents/register"' in body
     ), (
-        "createAgent must POST to /agents (modern) or /create-agent "
-        "(back-compat alias)."
+        "registerAgent must POST to /agents/register (the spawnless "
+        "register endpoint)."
+    )
+
+    # Negative pin: the legacy createAgent method must not have crept
+    # back into the client.
+    assert "async createAgent" not in src, (
+        "apiClient.createAgent was deleted in Wave 7 PR 3 (coordinator "
+        "transition) — the spawn-via-tmux endpoint is gone."
     )

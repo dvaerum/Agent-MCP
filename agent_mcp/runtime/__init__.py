@@ -1,38 +1,21 @@
 # Agent-MCP/agent_mcp/runtime/__init__.py
-"""Agent runtime package — the named home of the "boot, prompt, discover,
-tear-down an agent" concept.
+"""Agent runtime package — homes the git-worktree primitives that
+support :mod:`agent_mcp.features.worktree_integration`.
 
-Round 1 (PRs #146–#155) promoted module-of-functions repositories to
-the class-based ``TaskRepository`` / ``AgentRepository`` /
-``MessageRepository``. PR #156 (round 2 PR A) did the same for the
-atomic-write seam.  This package (round 2 PR B) does the same for
-what was hiding inside ``utils/tmux_utils.py`` (564 lines) and
-``utils/worktree_utils.py`` (576 lines): the agent runtime.
+Wave 7 PR 3 (coordinator transition, 2026-06-29) deleted the
+spawn-claude-via-tmux module that used to live alongside the worktree
+helpers. agent-mcp no longer owns user-side claude processes — the
+user owns them; agent-mcp mints tokens via
+``register_agent_tool_impl`` (operator-only, dashboard surface).
 
-Import pattern at call sites::
+Surviving public surface::
 
-    from agent_mcp.runtime import agent_runtime
-    rt = agent_runtime.get_runtime()
-    rt.send_prompt(session_name, prompt)
-    rt.cleanup(session_name)
-
-Or for ad-hoc use of the free-function primitives (e.g.
-``sanitize_session_name``, ``generate_agent_session_name``)::
-
-    from agent_mcp.runtime.agent_runtime import sanitize_session_name
-
-The legacy ``agent_mcp.utils.tmux_utils`` and
-``agent_mcp.utils.worktree_utils`` modules remain as ~40-line
-re-export shims so existing call sites keep working unchanged (same
-canonical shim shape as ``agent_mcp.db.actions.task_db`` post-PR-#153).
+    from agent_mcp.runtime.worktree import cleanup_git_worktree
 """
 from __future__ import annotations
 
-from . import agent_runtime
-from .agent_runtime import AgentRuntime, get_runtime
+from . import worktree
 
 __all__ = [
-    "AgentRuntime",
-    "agent_runtime",
-    "get_runtime",
+    "worktree",
 ]

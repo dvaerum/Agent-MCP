@@ -191,51 +191,29 @@ def test_create_agent_handler_uses_toast_error() -> None:
     )
 
 
-def test_create_agent_modal_keeps_dialog_open_on_error() -> None:
-    """``CreateAgentModal.handleSubmit`` must await the submit and
-    only call ``setOpen(false)`` after a successful resolution — on
-    error the dialog stays open so the user doesn't lose their typed
-    input. Pre-fix the handler closed the dialog unconditionally
-    before the request had even started.
+def test_register_agent_modal_keeps_dialog_open_on_error() -> None:
+    """``RegisterAgentModal.handleSubmit`` (Wave 7 PR 3 made it the
+    sole agent-creation surface; the legacy ``CreateAgentModal`` is
+    gone) must await its submit and only call ``setOpen(false)``
+    after a successful resolution — on error the dialog stays open
+    so the user doesn't lose their typed input.
     """
     src = _read(AGENTS_TSX)
-    # Locate the CreateAgentModal block.
+    # Locate the RegisterAgentModal block.
     m = re.search(
-        r"const\s+CreateAgentModal\s*=.*?\n\}\n", src, re.DOTALL,
+        r"const\s+RegisterAgentModal\s*=.*?\n\}\n", src, re.DOTALL,
     )
-    assert m, "Could not locate CreateAgentModal in agents-dashboard.tsx"
+    assert m, "Could not locate RegisterAgentModal in agents-dashboard.tsx"
     modal = m.group(0)
-    # The submit handler must be async (so it can await onCreateAgent)
-    # — sync handlers can't gate setOpen on the request outcome.
+    # The submit handler must be async so it can await the API call.
     assert re.search(r"const\s+handleSubmit\s*=\s*async\b", modal), (
-        "CreateAgentModal.handleSubmit must be async so it can await "
-        "the create call and only close on success"
+        "RegisterAgentModal.handleSubmit must be async so it can await "
+        "the register call and only close on success"
     )
-    # The submit handler must await onCreateAgent (otherwise the
-    # setOpen(false) below races the request).
-    assert re.search(r"await\s+onCreateAgent\b", modal), (
-        "CreateAgentModal.handleSubmit must ``await onCreateAgent(...)``"
-        " so dialog state can react to success vs failure"
-    )
-
-
-def test_create_agent_handler_propagates_errors() -> None:
-    """``handleCreateAgent`` in agents-dashboard.tsx must re-throw
-    after surfacing the toast so ``CreateAgentModal`` can decide
-    whether to keep the dialog open. The pre-fix swallow-and-log
-    pattern hid every failure from the caller."""
-    src = _read(AGENTS_TSX)
-    # Locate handleCreateAgent (small, stable signature).
-    m = re.search(
-        r"const\s+handleCreateAgent\s*=\s*async[^{]*\{(?P<body>.*?)\n  \}\n",
-        src,
-        re.DOTALL,
-    )
-    assert m, "Could not locate handleCreateAgent in agents-dashboard.tsx"
-    body = m.group("body")
-    assert "throw" in body, (
-        "handleCreateAgent must re-throw after the toastError call so "
-        "the modal can keep itself open on failure (was silent "
-        "console.error which both hid the error AND let the modal "
-        "close)"
+    # The submit handler must await the apiClient.registerAgent call
+    # (otherwise the success-pane render races the request).
+    assert re.search(r"await\s+apiClient\.registerAgent\b", modal), (
+        "RegisterAgentModal.handleSubmit must ``await "
+        "apiClient.registerAgent(...)`` so dialog state can react to "
+        "success vs failure"
     )

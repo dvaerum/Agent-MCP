@@ -353,192 +353,18 @@ const StatsCard = ({ icon: Icon, label, value, change, trend }: {
   </div>
 )
 
-interface CreateAgentData {
-  agent_id: string;
-  capabilities?: string[];
-  working_directory?: string;
-  // Phase 2 Wave 2b (plan §2e): role tier. 'worker' (default) keeps
-  // legacy behaviour; 'manager' opts the agent into the manager
-  // privileges that Wave 3 enforces on tool calls.
-  agent_role?: 'worker' | 'manager';
-}
-
-const CreateAgentModal = ({ onCreateAgent }: { onCreateAgent: (data: CreateAgentData) => Promise<void> }) => {
-  const [open, setOpen] = useState(false)
-  const [submitting, setSubmitting] = useState(false)
-  const [formData, setFormData] = useState<{
-    agent_id: string
-    capabilities: string
-    working_directory: string
-    agent_role: 'worker' | 'manager'
-  }>({
-    agent_id: '',
-    capabilities: '',
-    working_directory: '',
-    // Wave 2b: default to worker so existing operator muscle-memory
-    // (Add Agent → type name → click Add) keeps producing a worker.
-    agent_role: 'worker'
-  })
-
-  // Pre-PR (silent-error UX bug surfaced by Firefox-MCP click-through
-  // on 2026-06-17 against v5.0.47): this handler was sync, fired
-  // ``onCreateAgent`` without awaiting, and then immediately called
-  // ``setOpen(false)`` + reset the form. The submit button always
-  // appeared to "work" — even when the server returned 400 with a
-  // clear ``{message: ...}`` body explaining what was wrong. The
-  // dialog vanished and the user's typed input was wiped along with
-  // it.
-  //
-  // The fix: ``await`` the call, only close + reset on success. On
-  // failure the upstream ``handleCreateAgent`` has already shown a
-  // toast with the server's exact message; keep the modal open with
-  // the user's input intact so they can adjust and retry.
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!formData.agent_id.trim() || submitting) return
-
-    const capabilities = formData.capabilities
-      .split(',')
-      .map(c => c.trim())
-      .filter(c => c.length > 0)
-
-    setSubmitting(true)
-    try {
-      await onCreateAgent({
-        agent_id: formData.agent_id.trim(),
-        capabilities: capabilities.length > 0 ? capabilities : undefined,
-        working_directory: formData.working_directory.trim() || undefined,
-        agent_role: formData.agent_role
-      })
-      // Success path only: clear the form & close the dialog.
-      setFormData({ agent_id: '', capabilities: '', working_directory: '', agent_role: 'worker' })
-      setOpen(false)
-    } catch {
-      // ``handleCreateAgent`` already surfaced the toast — re-throw is
-      // unnecessary here; just leave the dialog open with the user's
-      // input so they can adjust and retry.
-    } finally {
-      setSubmitting(false)
-    }
-  }
-
-  return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
-        <Button size="sm" className="bg-primary hover:bg-primary/90 text-primary-foreground shadow-lg hover:shadow-primary/25 transition-all duration-200">
-          <Plus className="h-4 w-4 mr-1.5" />
-          Add Agent
-        </Button>
-      </DialogTrigger>
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground">
-        <DialogHeader>
-          <DialogTitle className="text-lg">Add Agent</DialogTitle>
-          <DialogDescription className="text-muted-foreground">
-            Register a new agent. The agent process is started separately.
-          </DialogDescription>
-        </DialogHeader>
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
-              Agent ID
-            </label>
-            <Input
-              value={formData.agent_id}
-              onChange={(e) => setFormData(prev => ({ ...prev, agent_id: e.target.value }))}
-              placeholder="worker-analytics-01"
-              className="bg-background border-border text-foreground"
-              required
-            />
-          </div>
-          <div>
-            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
-              Capabilities
-            </label>
-            <Textarea
-              value={formData.capabilities}
-              onChange={(e) => setFormData(prev => ({ ...prev, capabilities: e.target.value }))}
-              placeholder="data-analysis, file-ops, web-search"
-              className="bg-background border-border text-foreground h-20 resize-none"
-            />
-          </div>
-          <div>
-            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
-              Working Directory
-            </label>
-            <Input
-              value={formData.working_directory}
-              onChange={(e) => setFormData(prev => ({ ...prev, working_directory: e.target.value }))}
-              placeholder="/workspace/analytics"
-              className="bg-background border-border text-foreground font-mono text-sm"
-            />
-          </div>
-          {/*
-            Phase 2 Wave 2b (plan §2e): Role dropdown. Default
-            'worker' matches the agents.agent_role column default
-            shipped by Wave 1a (v5.0.61, PR #182). 'manager' opts the
-            agent into the manager-tier privileges Wave 3 enforces
-            (assign tasks to peers, edit subordinate agents); it is
-            still rejected from any operator-only tool (config_*
-            writes, create_agent, etc.).
-          */}
-          <div>
-            <label
-              htmlFor="create-agent-role"
-              className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2"
-            >
-              Role
-            </label>
-            <Select
-              value={formData.agent_role}
-              onValueChange={(value) => setFormData(prev => ({
-                ...prev,
-                agent_role: value as 'worker' | 'manager',
-              }))}
-            >
-              <SelectTrigger
-                id="create-agent-role"
-                className="bg-background border-border text-foreground"
-              >
-                <SelectValue placeholder="Select role" />
-              </SelectTrigger>
-              <SelectContent className="bg-background border-border">
-                <SelectItem value="worker">Worker</SelectItem>
-                <SelectItem value="manager">Manager</SelectItem>
-              </SelectContent>
-            </Select>
-            <p className="text-[10px] text-muted-foreground mt-1">
-              Workers run assigned tasks. Managers also supervise
-              subordinates (assign tasks, edit agent fields).
-            </p>
-          </div>
-          <DialogFooter className="gap-2">
-            <Button type="button" variant="outline" onClick={() => setOpen(false)} size="sm" disabled={submitting}>
-              Cancel
-            </Button>
-            <Button type="submit" size="sm" className="bg-primary hover:bg-primary/90 shadow-lg hover:shadow-primary/25 transition-all" disabled={submitting}>
-              {submitting ? 'Adding...' : 'Add Agent'}
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-// Wave 7 PR 0 — coordinator transition (`prancy-napping-pie.md` § Wave 7).
+// Wave 7 coordinator transition (`prancy-napping-pie.md` § Wave 7).
 //
-// Two-pane modal for the new register-only flow. Pane 1 collects
+// Two-pane modal for the register-only flow. Pane 1 collects
 // `name` + `role`; submit calls `apiClient.registerAgent` (which hits
 // POST /api/agents/register on the backend). Pane 2 shows the minted
 // agent_id + bearer token + ready-to-paste .mcp.json snippet, with a
 // "Copy snippet" button.
 //
-// Differs from `CreateAgentModal` (legacy spawn path) in that
 // agent-mcp does NOT start a claude process; the operator hands the
 // snippet to the user, who pastes it into their own `.mcp.json` and
-// runs claude themselves. PR 0 ships both modals so the existing
-// spawn workflow stays available; PR 3 deletes the legacy modal once
-// the test fixtures migrate.
+// runs claude themselves. The legacy `CreateAgentModal` (spawn path)
+// was deleted in Wave 7 PR 3.
 interface RegisterAgentResult {
   agent_id: string
   agent_token: string
@@ -2124,23 +1950,11 @@ export function AgentsDashboard() {
     totalInSystem: allAgents.length,
   }
 
-  // Pre-PR (silent-error UX bug surfaced by Firefox-MCP click-through
-  // on 2026-06-17 against v5.0.47): every mutation handler in this
-  // file caught its API error, called ``console.error``, and
-  // returned undefined — the failure was completely invisible to the
-  // user. The fix surfaces the server's ``message`` via toastError
-  // (api.ts already prefers the JSON body's ``message`` field) and
-  // re-throws so callers like ``CreateAgentModal.handleSubmit`` can
-  // gate their dialog-close logic on success.
-  const handleCreateAgent = async (data: CreateAgentData) => {
-    try {
-      await apiClient.createAgent(data)
-      toastSuccess(`Agent "${data.agent_id}" added.`)
-    } catch (error) {
-      toastError(error, 'Failed to add agent')
-      throw error
-    }
-  }
+  // Wave 7 PR 3 (coordinator transition): ``handleCreateAgent`` is
+  // gone. The dashboard registers agents through ``RegisterAgentModal``
+  // which calls ``apiClient.registerAgent`` directly and renders the
+  // minted token + .mcp.json snippet inline; there is no shared
+  // mutation handler any more.
 
   const handleTerminateAgent = async (agentId: string) => {
     try {
@@ -2262,12 +2076,10 @@ export function AgentsDashboard() {
             <RefreshCw className={cn("h-3.5 w-3.5 mr-1.5", loading && "animate-spin")} />
             Refresh
           </Button>
-          {/* Wave 7 PR 0 (coordinator transition): the register-only
-              modal is the recommended flow. The legacy spawn-via-tmux
-              CreateAgentModal stays mounted in PR 0 so existing
-              workflows keep working; PR 3 removes it. */}
+          {/* Wave 7 coordinator transition: register-only modal is
+              the sole agent-creation surface. The legacy
+              spawn-via-tmux ``CreateAgentModal`` was deleted in PR 3. */}
           <RegisterAgentModal />
-          <CreateAgentModal onCreateAgent={handleCreateAgent} />
         </div>
       </div>
 
@@ -2353,11 +2165,10 @@ export function AgentsDashboard() {
               agents.length === 0
                 ? (
                     <div className="flex flex-col sm:flex-row gap-2">
-                      {/* Wave 7 PR 0: register-only modal first; legacy
-                          spawn modal still mounted for back-compat
-                          (PR 3 removes it). */}
+                      {/* Wave 7 PR 3: register-only modal is the sole
+                          creation surface; the legacy spawn modal is
+                          gone. */}
                       <RegisterAgentModal />
-                      <CreateAgentModal onCreateAgent={handleCreateAgent} />
                     </div>
                   )
                 : undefined

@@ -582,18 +582,21 @@ def test_generate_system_prompt_signature_drops_admin_token_runtime() -> None:
     )
 
 
-def test_agent_startup_template_does_not_mention_mcp_admin_token() -> None:
-    """The agent startup script template must not advertise
-    ``MCP_ADMIN_TOKEN`` — Wave 3 stops exporting it on spawn, and the
-    comment block in the template is the public contract for what
-    env-vars to expect."""
+def test_agent_startup_template_is_gone() -> None:
+    """The agent startup script template is deleted entirely as of
+    Wave 7 PR 3 (coordinator transition).
+
+    Wave 3 had this guard pin that the template did not export
+    ``MCP_ADMIN_TOKEN``. Under the Wave 7 coordinator model agent-mcp
+    no longer spawns any process — the operator pastes a ``.mcp.json``
+    snippet into the user's claude config and the user owns their own
+    session. The template has no caller; the file is gone."""
     from pathlib import Path
 
-    template = Path(
-        "agent_mcp/templates/agent_startup.sh"
-    ).read_text()
-    assert "MCP_ADMIN_TOKEN" not in template, (
-        "Wave 3: agent startup template must not mention MCP_ADMIN_TOKEN"
+    template = Path("agent_mcp/templates/agent_startup.sh")
+    assert not template.exists(), (
+        "Wave 7 PR 3: agent_startup.sh was deleted with the rest of "
+        "the spawn machinery — agent-mcp no longer launches claude."
     )
 
 

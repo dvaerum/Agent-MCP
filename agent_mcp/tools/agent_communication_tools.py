@@ -24,7 +24,6 @@ from ..core.tool_result import (
 from ..features.aoe_notify import notify_aoe as _aoe_notify
 from ..utils.audit_utils import log_audit
 from ..db.connection import get_db_connection
-from ..runtime.agent_runtime import send_prompt_async, session_exists, sanitize_session_name
 
 
 # ── Wave 6 PR 6 helpers ────────────────────────────────────────────────
@@ -214,7 +213,13 @@ async def send_agent_message_tool_impl(
     message_content = arguments.get("message")
     message_type = arguments.get("message_type", "text")  # text, assistance_request, task_update
     priority = arguments.get("priority", "normal")  # low, normal, high, urgent
-    deliver_method = arguments.get("deliver_method", "tmux")  # tmux, store, both
+    # Wave 7 PR 3 (coordinator transition): ``deliver_method`` is kept
+    # in the schema for back-compat but the value is ignored — every
+    # message is stored in the DB and delivered via
+    # ``wait_for_events`` / ``get_agent_messages``. agent-mcp no
+    # longer owns the recipient's claude session, so there is no tmux
+    # pane to push the formatted message into.
+    arguments.get("deliver_method")
     # v5.0.22 (message threads + subjects). Both optional:
     #   * explicit_subject — caller-provided one-liner; persisted
     #     verbatim. Replies (parent_message_id set) ignore it.
@@ -336,70 +341,12 @@ async def send_agent_message_tool_impl(
                 connection=cursor,
             )
 
-            # Attempt delivery based on method
+            # Wave 7 PR 3 (coordinator transition): every message is
+            # stored in the DB. Recipients pick it up via
+            # ``wait_for_events`` / ``get_agent_messages`` — agent-mcp
+            # no longer owns the recipient's claude session and so
+            # cannot push directly to a tmux pane.
             delivery_status = "stored"
-
-            if deliver_method in ["tmux", "both"]:
-                # Try to deliver to recipient's tmux session
-                if recipient_id in g.agent_tmux_sessions:
-                    session_name = g.agent_tmux_sessions[recipient_id]
-                    if session_exists(session_name):
-                        # Handle stop commands differently
-                        if message_type == "stop_command":
-                            # Send control sequence to interrupt the agent
-                            try:
-                                import subprocess
-                                clean_session_name = sanitize_session_name(session_name)
-
-                                # Send Escape 4 times with 1 second intervals to stop current operation
-                                import time
-                                success = True
-                                for i in range(4):
-                                    result = subprocess.run(['tmux', 'send-keys', '-t', clean_session_name, 'Escape'],
-                                                          capture_output=True, text=True, timeout=5)
-                                    if result.returncode != 0:
-                                        success = False
-                                        break
-                                    logger.debug(f"Sent Escape {i+1}/4 to agent {recipient_id}")
-                                    if i < 3:  # Don't sleep after the last one
-                                        time.sleep(1)
-
-                                if success:
-                                    delivery_status = "delivered_stop_command"
-                                    logger.info(f"Stop command (4x Escape) sent to agent {recipient_id} in session {session_name}")
-                                else:
-                                    delivery_status = "stop_command_failed"
-                                    logger.error(f"Failed to send stop command: {result.stderr}")
-
-                                # PR 6: mark_delivered via repo with caller's cursor.
-                                _msg_repo.mark_delivered(
-                                    message_id, bool(success), connection=cursor,
-                                )
-
-                            except Exception as e:
-                                logger.error(f"Failed to send stop command to tmux session '{session_name}': {e}")
-                                delivery_status = "stop_command_failed"
-                        else:
-                            # Format regular message for delivery
-                            formatted_message = f"\n💬 Message from {sender_id} ({priority}): {message_content}\n"
-
-                            # Send message to tmux session
-                            try:
-                                send_prompt_async(session_name, formatted_message, delay_seconds=1)
-                                delivery_status = "delivered_tmux"
-
-                                # PR 6: mark_delivered via repo with caller's cursor.
-                                _msg_repo.mark_delivered(
-                                    message_id, True, connection=cursor,
-                                )
-
-                            except Exception as e:
-                                logger.error(f"Failed to deliver message to tmux session '{session_name}': {e}")
-                                delivery_status = "delivery_failed"
-                    else:
-                        delivery_status = "session_not_found"
-                else:
-                    delivery_status = "no_session"
 
             # Mutate the audit-details dict in place; `atomic_with_audit`
             # reads it at block exit, so the final delivery_status lands
@@ -444,15 +391,11 @@ async def send_agent_message_tool_impl(
             "message_id": message_id
         })
         
-        # Build response
+        # Build response. Wave 7 PR 3: stop_command and regular text
+        # both land on the "stored" outcome — the recipient's
+        # ``wait_for_events`` long-poll surfaces them on the next wake.
         status_messages = {
             "stored": "Message stored for recipient",
-            "delivered_tmux": "Message delivered to recipient's session",
-            "delivery_failed": "Message stored but delivery failed",
-            "session_not_found": "Message stored; recipient session not active",
-            "no_session": "Message stored; recipient has no active session",
-            "delivered_stop_command": "Stop command sent to recipient's session",
-            "stop_command_failed": "Stop command failed to send"
         }
 
         response_text = (
@@ -460,8 +403,7 @@ async def send_agent_message_tool_impl(
             f"{status_messages.get(delivery_status, 'Unknown status')}"
         )
 
-        if delivery_status not in ["delivered_tmux", "delivered_stop_command"]:
-            response_text += f" (Message ID: {message_id})"
+        response_text += f" (Message ID: {message_id})"
 
         return Ok(
             data={
@@ -1451,9 +1393,15 @@ def register_agent_communication_tools():
                 },
                 "deliver_method": {
                     "type": "string",
-                    "description": "How to deliver the message",
+                    "description": (
+                        "Vestigial since Wave 7 (coordinator transition). "
+                        "Every message is stored in the DB and surfaced via "
+                        "wait_for_events / get_agent_messages — agent-mcp "
+                        "no longer pushes to a tmux session. Accepted for "
+                        "back-compat; the value is ignored."
+                    ),
                     "enum": ["tmux", "store", "both"],
-                    "default": "tmux"
+                    "default": "store"
                 },
                 "subject": {
                     "type": ["string", "null"],

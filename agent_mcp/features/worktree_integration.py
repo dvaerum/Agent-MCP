@@ -11,7 +11,7 @@ import logging
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 
-from ..runtime.agent_runtime import (
+from ..runtime.worktree import (
     is_git_repository,
     validate_worktree_requirements,
     create_git_worktree,
@@ -84,7 +84,7 @@ class WorktreeManager:
         Args:
             agent_id: Agent identifier
             token_suffix: Last 4 characters of the agent's per-agent
-                token (see ``runtime.agent_runtime.get_token_suffix``).
+                token (see ``runtime.worktree.generate_worktree_path``).
                 Was named ``admin_token_suffix`` before retire-system-
                 token Wave 5.
             config: Worktree configuration
@@ -275,7 +275,7 @@ def create_agent_worktree(
     Args:
         agent_id: Agent identifier
         token_suffix: Last 4 characters of the agent's per-agent token
-            (see ``runtime.agent_runtime.get_token_suffix``). Was named
+            (see ``runtime.worktree.generate_worktree_path``). Was named
             ``admin_token_suffix`` before retire-system-token Wave 5.
         config: Worktree configuration
 

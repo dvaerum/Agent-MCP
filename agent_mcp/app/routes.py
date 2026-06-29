@@ -56,7 +56,7 @@ from ..features.dashboard.api import (
 # tool-driven agent creation), but the dashboard's "Create Agent"
 # modal creates agents without preassigned tasks — going through the
 # dispatcher would surface as a 400 instead of the current 200.
-from ..tools.admin_tools import create_agent_tool_impl, register_agent_tool_impl
+from ..tools.admin_tools import register_agent_tool_impl
 import mcp.types as mcp_types # For handling the result from tool_impl
 
 # Thin-adapter plumbing (Candidate C, 2026-06-02 architecture review).
@@ -710,156 +710,17 @@ async def update_task_details_api_route(
 
 # --- ADDED: Dashboard-specific Agent Management API Endpoints ---
 
-# Original: main.py lines 2022-2058 (create_agent_api function)
-async def create_agent_dashboard_api_route(
-    request: Request,
-    auth: dict = Depends(require_operator_session),
-) -> JSONResponse:
-    """Dashboard API endpoint to create an agent. Calls the admin tool internally.
-
-    PR D (prancy-napping-pie): auth via ``require_operator_session``.
-    Wave 3 (prancy-napping-pie): the inner
-    ``create_agent_tool_impl`` call no longer synthesises
-    ``g.admin_token`` as a bearer to satisfy the gate. We stamp the
-    operator-session ContextVars instead so the inner tool's
-    ``@requires_role("operator")`` decorator admits via the
-    operator-session path. The route's outer dep has already
-    validated the cookie / legacy bearer / body-token.
-    """
-    if request.method != 'POST':
-        return JSONResponse({"error": "Method not allowed"}, status_code=405)
-    try:
-        data = await get_sanitized_json_body(request)
-        agent_id = data.get("agent_id")
-        capabilities = data.get("capabilities", []) # Optional
-        working_directory = data.get("working_directory") # Optional
-        # Phase 2 Wave 2b (plan §2e): dashboard's Role dropdown ships
-        # ``agent_role`` ∈ {worker, manager}. Default ``'worker'``
-        # mirrors the column default added by Wave 1a (v5.0.61, PR
-        # #182) so legacy callers (and the back-compat
-        # /api/create-agent alias) keep behaving identically. Reject
-        # any other value at the API boundary with 422 — the CHECK
-        # constraint would also catch it at the DB layer, but bubbling
-        # an IntegrityError as a 500 would be a worse operator
-        # experience than a clean validation message.
-        agent_role = data.get("agent_role", "worker")
-        if agent_role not in ("worker", "manager"):
-            return JSONResponse(
-                {"message": (
-                    f"Invalid agent_role {agent_role!r}: must be "
-                    "'worker' or 'manager'."
-                )},
-                status_code=422,
-            )
-        # Wave 3 (prancy-napping-pie): no longer pull from
-        # ``g.admin_token`` here. ``create_agent_tool_impl`` is
-        # ``@requires_role("operator")``; the operator-session
-        # ContextVars are stamped on the dispatch below so the
-        # decorator admits without needing the system bearer in
-        # ``arguments["token"]``.
-
-        if not agent_id:
-            return JSONResponse({"message": "Agent ID is required"}, status_code=400)
-
-        # Forbid `[` and `]` in agent_id — reserved for the purge
-        # cascade tombstone format `[deleted-<id>]`. Defense-in-depth:
-        # the underlying tool rejects too, but doing it here lets us
-        # respond with a clean 400 instead of bubbling a tool error.
-        if "[" in agent_id or "]" in agent_id:
-            return JSONResponse(
-                {"message": f"Invalid agent_id {agent_id!r}: `[` and `]` "
-                            "are reserved (purge-cascade tombstone format)."},
-                status_code=400,
-            )
-
-        # Prepare arguments for the create_agent_tool_impl.
-        # Wave 3 (prancy-napping-pie): the ``token`` arg is gone — the
-        # operator-session ContextVars set just below carry the auth
-        # decision into the tool's ``@requires_role("operator")``
-        # decorator.
-        tool_args = {
-            "agent_id": agent_id,
-            "capabilities": capabilities,
-            "working_directory": working_directory,
-            # Wave 2b: thread the validated role into the tool impl,
-            # which persists it via agent_repo.create(... agent_role=).
-            "agent_role": agent_role,
-        }
-
-        # Build a Principal from the validated operator session so
-        # ``create_agent_tool_impl`` admits via
-        # ``principal.has_role("operator")``.
-        operator_id = caller_identity(auth)
-        principal = Principal(
-            kind="operator_session",
-            user_id=operator_id,
-            agent_id=None,
-            sysadmin=False,
-            project_name=None,
-            project_role="operator",
-            agent_role=None,
-            can_wake_loop=False,
-            source_token=None,
-        )
-        result = await create_agent_tool_impl(tool_args, principal=principal)
-
-        # Wave 6 PR 5: the tool now returns a typed :class:`ToolResult`.
-        # Map each variant onto the existing dashboard JSON envelope so
-        # the frontend's createAgent client (which only inspects 2xx vs
-        # 4xx/5xx + the ``message`` field) sees no behaviour change.
-        # The new-token path pulls the bearer from the typed
-        # ``Ok.data["token"]`` instead of regex-scraping the message.
-        if isinstance(result, _Ok):
-            # Pull the new agent's bearer from the typed return so the
-            # dashboard's createAgent client gets back ``agent_token``.
-            # ``data`` here is :attr:`Ok.data` from the tool, not a
-            # request body — the static body-token grep guard in
-            # ``tests/test_dashboard_migration.py`` is intentionally
-            # avoided by reading the field off a re-bound name.
-            ok_payload = result.data if isinstance(result.data, dict) else {}
-            agent_token_from_result = ok_payload.get("token")
-            return JSONResponse({
-                "message": (
-                    f"Agent '{agent_id}' created successfully via dashboard API."
-                ),
-                "agent_token": agent_token_from_result,
-            })
-        if isinstance(result, _Conflict):
-            return JSONResponse({"message": result.reason}, status_code=409)
-        if isinstance(result, _NotFound):
-            text = f"{result.resource} {result.identifier!r} not found."
-            return JSONResponse({"message": text}, status_code=404)
-        if isinstance(result, _Invalid):
-            return JSONResponse({"message": result.message}, status_code=400)
-        if isinstance(result, _PermissionDenied):
-            # Match the legacy 401 wording the route used to emit when
-            # the tool's auth check failed — the previous code mapped
-            # any "Unauthorized" text to 401, so callers / tests that
-            # inspect the status code keep working.
-            return JSONResponse({"message": result.reason}, status_code=401)
-        if isinstance(result, _Failed):
-            return JSONResponse({"message": result.message}, status_code=500)
-        # Defensive — unknown variant. Surface as 500 with the repr
-        # so any future ToolResult addition that forgets the route
-        # adapter is visible in the response body.
-        return JSONResponse(
-            {"message": f"Unknown tool result: {result!r}"},
-            status_code=500,
-        )
-
-    except ValueError as e_val: # From get_sanitized_json_body
-        return JSONResponse({"message": str(e_val)}, status_code=400)
-    except Exception as e:
-        logger.error(f"Error in create_agent_dashboard_api_route: {e}", exc_info=True)
-        return JSONResponse({"message": f"Error creating agent via dashboard API: {str(e)}"}, status_code=500)
+# Wave 7 PR 3 (coordinator transition, 2026-06-29): the legacy
+# ``create_agent_dashboard_api_route`` (which dispatched the spawn-
+# claude-via-tmux ``create_agent_tool_impl``) is gone. The dashboard
+# uses ``register_agent_dashboard_api_route`` below; the back-compat
+# ``/api/create-agent`` alias route is dropped at the same time.
 
 # ── Wave 7 PR 0: register-only flow (coordinator transition) ──
 #
-# Sibling of ``create_agent_dashboard_api_route`` that calls the new
-# ``register_agent_tool_impl`` — register-only, no spawning. The
-# legacy spawn route (above) stays in PR 0 so the existing modal
-# keeps working; PR 1 migrates test fixtures off the spawn path,
-# PR 3 deletes both the spawn block and this back-compat route.
+# Calls ``register_agent_tool_impl`` — register-only, no spawning.
+# This is the only agent-creation route now that PR 3 has removed
+# the legacy spawn surfaces.
 #
 # Shape: POST /api/agents/register with body
 #   {"name": "<id>", "role": "worker"|"manager", "project_name": "...",
@@ -1949,18 +1810,10 @@ _dashboard_route_specs: list[tuple[str, Callable, list[str], str]] = [
     ('/api/task-tree-data', task_tree_data_api_route, ['GET', 'OPTIONS'], "task_tree_data_api"),
     ('/api/node-details', node_details_api_route, ['GET', 'OPTIONS'], "node_details_api"),
     ('/api/agents', agents_list_api_route, ['GET', 'OPTIONS'], "agents_list_api"),
-    # Modern POST shape — mirrors /api/agents/<id>/restore, /edit,
-    # /purge-preview, etc. The dashboard's apiClient.createAgent has
-    # always called this URL; pre-fix it 405'd because only GET was
-    # registered (Deploy button was silently broken since the
-    # dashboard was introduced). The handler is the same one the
-    # back-compat /api/create-agent alias below routes to.
-    ('/api/agents', create_agent_dashboard_api_route, ['POST'], "create_agent_api"),
-    # Wave 7 PR 0 (coordinator transition): register-only sibling of
-    # the legacy POST /api/agents. Returns the minted token + a
-    # ready-to-paste .mcp.json snippet WITHOUT spawning any claude
-    # process. PR 3 deletes the legacy route once test fixtures and
-    # the dashboard modal cut over.
+    # Wave 7 PR 3 (coordinator transition): POST /api/agents (spawn) and
+    # the /api/create-agent back-compat alias are both gone. The
+    # register-only endpoint below is the sole creation surface; agent-
+    # mcp never spawns claude processes any more.
     (
         '/api/agents/register',
         register_agent_dashboard_api_route,
@@ -1971,8 +1824,6 @@ _dashboard_route_specs: list[tuple[str, Callable, list[str], str]] = [
     ('/api/tasks', all_tasks_api_route, ['GET', 'OPTIONS'], "all_tasks_api"),
     ('/api/update-task-dashboard', update_task_details_api_route, ['POST', 'OPTIONS'], "update_task_dashboard_api"),
 
-    # Added back for 1-to-1 dashboard compatibility
-    ('/api/create-agent', create_agent_dashboard_api_route, ['POST', 'OPTIONS'], "create_agent_dashboard_api"),
     ('/api/terminate-agent', terminate_agent_dashboard_api_route, ['POST', 'OPTIONS'], "terminate_agent_dashboard_api"),
 
     # Restore + Purge. Path-style routes so the agent_id is part of the
