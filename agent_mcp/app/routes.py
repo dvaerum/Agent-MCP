@@ -50,7 +50,7 @@ from ..features.dashboard.api import (
 # tool-driven agent creation), but the dashboard's "Create Agent"
 # modal creates agents without preassigned tasks — going through the
 # dispatcher would surface as a 400 instead of the current 200.
-from ..tools.admin_tools import create_agent_tool_impl
+from ..tools.admin_tools import create_agent_tool_impl, register_agent_tool_impl
 import mcp.types as mcp_types # For handling the result from tool_impl
 
 # Thin-adapter plumbing (Candidate C, 2026-06-02 architecture review).
@@ -795,6 +795,130 @@ async def create_agent_dashboard_api_route(
     except Exception as e:
         logger.error(f"Error in create_agent_dashboard_api_route: {e}", exc_info=True)
         return JSONResponse({"message": f"Error creating agent via dashboard API: {str(e)}"}, status_code=500)
+
+# ── Wave 7 PR 0: register-only flow (coordinator transition) ──
+#
+# Sibling of ``create_agent_dashboard_api_route`` that calls the new
+# ``register_agent_tool_impl`` — register-only, no spawning. The
+# legacy spawn route (above) stays in PR 0 so the existing modal
+# keeps working; PR 1 migrates test fixtures off the spawn path,
+# PR 3 deletes both the spawn block and this back-compat route.
+#
+# Shape: POST /api/agents/register with body
+#   {"name": "<id>", "role": "worker"|"manager", "project_name": "...",
+#    "host": "https://<dashboard origin>"}
+# Returns 200 with
+#   {"message": "...", "agent_id": "...", "agent_token": "...",
+#    "mcp_snippet": "<json>"}
+async def register_agent_dashboard_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    """POST /api/agents/register — operator mints an agent identity.
+
+    Wave 7 PR 0 (coordinator transition). Calls
+    ``register_agent_tool_impl`` and surfaces the typed result the
+    same way :func:`create_agent_dashboard_api_route` does — the
+    dashboard's modal gets back a ``mcp_snippet`` it can render in
+    the success pane.
+    """
+    if request.method == 'OPTIONS':
+        return await handle_options(request)
+    if request.method != 'POST':
+        return JSONResponse({"error": "Method not allowed"}, status_code=405)
+
+    try:
+        data = await get_sanitized_json_body(request)
+    except ValueError as e_val:
+        return JSONResponse({"message": str(e_val)}, status_code=400)
+
+    # Accept both the new ``name`` field (Wave 7 plan) and the legacy
+    # ``agent_id`` shape so the existing dashboard request body still
+    # works while the modal lands.
+    name = data.get("name") or data.get("agent_id")
+    role = data.get("role") or data.get("agent_role") or "worker"
+    project_name = data.get("project_name")
+    host = data.get("host")
+
+    if not name:
+        return JSONResponse(
+            {"message": "`name` (agent_id) is required."},
+            status_code=400,
+        )
+    if role not in ("worker", "manager"):
+        return JSONResponse(
+            {"message": (
+                f"Invalid role {role!r}: must be 'worker' or 'manager'."
+            )},
+            status_code=422,
+        )
+
+    operator_id = caller_identity(auth)
+    principal = Principal(
+        kind="operator_session",
+        user_id=operator_id,
+        agent_id=None,
+        sysadmin=False,
+        # The frontend supplies ``project_name`` explicitly — the
+        # per-project backend doesn't yet derive its own project
+        # name from the request. The Principal field is best-effort
+        # plumbing; the tool's snippet builder reads
+        # ``arguments["project_name"]`` first either way.
+        project_name=project_name if isinstance(project_name, str) else None,
+        project_role="operator",
+        agent_role=None,
+        can_wake_loop=False,
+        source_token=None,
+    )
+
+    tool_args = {
+        "name": name,
+        "role": role,
+    }
+    if isinstance(project_name, str) and project_name:
+        tool_args["project_name"] = project_name
+    if isinstance(host, str) and host:
+        tool_args["host"] = host
+
+    try:
+        result = await register_agent_tool_impl(
+            tool_args, principal=principal,
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        logger.error(
+            "Error in register_agent_dashboard_api_route: %s", e,
+            exc_info=True,
+        )
+        return JSONResponse(
+            {"message": f"Error registering agent: {e}"}, status_code=500,
+        )
+
+    if isinstance(result, _Ok):
+        payload = result.data if isinstance(result.data, dict) else {}
+        return JSONResponse({
+            "message": result.message
+            or f"Agent '{name}' registered.",
+            "agent_id": payload.get("agent_id"),
+            "agent_token": payload.get("token"),
+            "agent_role": payload.get("agent_role"),
+            "mcp_snippet": payload.get("mcp_snippet"),
+            "project_name": payload.get("project_name"),
+        })
+    if isinstance(result, _Conflict):
+        return JSONResponse({"message": result.reason}, status_code=409)
+    if isinstance(result, _NotFound):
+        text = f"{result.resource} {result.identifier!r} not found."
+        return JSONResponse({"message": text}, status_code=404)
+    if isinstance(result, _Invalid):
+        return JSONResponse({"message": result.message}, status_code=400)
+    if isinstance(result, _PermissionDenied):
+        return JSONResponse({"message": result.reason}, status_code=401)
+    if isinstance(result, _Failed):
+        return JSONResponse({"message": result.message}, status_code=500)
+    return JSONResponse(
+        {"message": f"Unknown tool result: {result!r}"}, status_code=500,
+    )
+
 
 # Thin adapter (Candidate C, 2026-06-02 architecture review): dispatch
 # through the `terminate_agent` MCP tool so validation +
@@ -1769,6 +1893,17 @@ _dashboard_route_specs: list[tuple[str, Callable, list[str], str]] = [
     # dashboard was introduced). The handler is the same one the
     # back-compat /api/create-agent alias below routes to.
     ('/api/agents', create_agent_dashboard_api_route, ['POST'], "create_agent_api"),
+    # Wave 7 PR 0 (coordinator transition): register-only sibling of
+    # the legacy POST /api/agents. Returns the minted token + a
+    # ready-to-paste .mcp.json snippet WITHOUT spawning any claude
+    # process. PR 3 deletes the legacy route once test fixtures and
+    # the dashboard modal cut over.
+    (
+        '/api/agents/register',
+        register_agent_dashboard_api_route,
+        ['POST', 'OPTIONS'],
+        "register_agent_api",
+    ),
     ('/api/tokens', tokens_api_route, ['GET', 'OPTIONS'], "tokens_api"),
     ('/api/tasks', all_tasks_api_route, ['GET', 'OPTIONS'], "all_tasks_api"),
     ('/api/update-task-dashboard', update_task_details_api_route, ['POST', 'OPTIONS'], "update_task_dashboard_api"),

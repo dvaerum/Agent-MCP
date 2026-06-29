@@ -501,6 +501,251 @@ const CreateAgentModal = ({ onCreateAgent }: { onCreateAgent: (data: CreateAgent
   )
 }
 
+// Wave 7 PR 0 — coordinator transition (`prancy-napping-pie.md` § Wave 7).
+//
+// Two-pane modal for the new register-only flow. Pane 1 collects
+// `name` + `role`; submit calls `apiClient.registerAgent` (which hits
+// POST /api/agents/register on the backend). Pane 2 shows the minted
+// agent_id + bearer token + ready-to-paste .mcp.json snippet, with a
+// "Copy snippet" button.
+//
+// Differs from `CreateAgentModal` (legacy spawn path) in that
+// agent-mcp does NOT start a claude process; the operator hands the
+// snippet to the user, who pastes it into their own `.mcp.json` and
+// runs claude themselves. PR 0 ships both modals so the existing
+// spawn workflow stays available; PR 3 deletes the legacy modal once
+// the test fixtures migrate.
+interface RegisterAgentResult {
+  agent_id: string
+  agent_token: string
+  mcp_snippet: string
+  message: string
+}
+
+const RegisterAgentModal = () => {
+  const [open, setOpen] = useState(false)
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [result, setResult] = useState<RegisterAgentResult | null>(null)
+  const [formData, setFormData] = useState<{
+    name: string
+    role: 'worker' | 'manager'
+  }>({ name: '', role: 'worker' })
+  const [copyState, setCopyState] = useState<string | null>(null)
+
+  const reset = () => {
+    setFormData({ name: '', role: 'worker' })
+    setResult(null)
+    setError(null)
+    setSubmitting(false)
+  }
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!formData.name.trim() || submitting) return
+    setSubmitting(true)
+    setError(null)
+    try {
+      // The backend's snippet builder needs both the project name
+      // (which the per-project backend can't derive after the router
+      // proxy strips Host) and the public origin. The dashboard knows
+      // both, so we send them explicitly.
+      const projectName = projectContext.projectName
+      const host = typeof window !== 'undefined' ? window.location.origin : ''
+      const res = await apiClient.registerAgent({
+        name: formData.name.trim(),
+        role: formData.role,
+        project_name: projectName,
+        host: host || undefined,
+      })
+      if (!res.agent_id || !res.agent_token || !res.mcp_snippet) {
+        throw new Error('Backend response missing required fields')
+      }
+      setResult({
+        agent_id: res.agent_id,
+        agent_token: res.agent_token,
+        mcp_snippet: res.mcp_snippet,
+        message: res.message,
+      })
+      toastSuccess(`Agent "${res.agent_id}" registered.`)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      setError(msg)
+      toastError(err, 'Failed to register agent')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const copy = async (text: string, label: string) => {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopyState(label)
+      setTimeout(
+        () => setCopyState((cur) => (cur === label ? null : cur)),
+        1500,
+      )
+    } catch {
+      // navigator.clipboard can fail on insecure origins; silent —
+      // the snippet is still selectable from the rendered <pre>.
+    }
+  }
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(v) => {
+        setOpen(v)
+        if (!v) reset()
+      }}
+    >
+      <DialogTrigger asChild>
+        <Button
+          size="sm"
+          variant="outline"
+          className="border-primary/40 text-primary hover:bg-primary/10"
+        >
+          <Plus className="h-4 w-4 mr-1.5" />
+          Register Agent
+        </Button>
+      </DialogTrigger>
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-lg bg-card border-border text-card-foreground">
+        <DialogHeader>
+          <DialogTitle className="text-lg">
+            {result ? 'Agent registered' : 'Register Agent'}
+          </DialogTitle>
+          <DialogDescription className="text-muted-foreground">
+            {result
+              ? "Paste the snippet below into the user's claude .mcp.json. agent-mcp doesn't start the claude process for you — the user does."
+              : 'Mint an agent identity (DB row + bearer token) and get back a ready-to-paste .mcp.json snippet. Wave 7 coordinator model: agent-mcp never spawns claude.'}
+          </DialogDescription>
+        </DialogHeader>
+
+        {/* Pane 1 — input */}
+        {!result && (
+          <form onSubmit={handleSubmit} className="space-y-4">
+            <div>
+              <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
+                Agent ID
+              </label>
+              <Input
+                value={formData.name}
+                onChange={(e) =>
+                  setFormData((prev) => ({ ...prev, name: e.target.value }))
+                }
+                placeholder="worker-analytics-01"
+                className="bg-background border-border text-foreground"
+                required
+              />
+            </div>
+            <div>
+              <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
+                Role
+              </label>
+              <Select
+                value={formData.role}
+                onValueChange={(v) =>
+                  setFormData((prev) => ({
+                    ...prev,
+                    role: v as 'worker' | 'manager',
+                  }))
+                }
+              >
+                <SelectTrigger className="bg-background border-border text-foreground">
+                  <SelectValue placeholder="Select role" />
+                </SelectTrigger>
+                <SelectContent className="bg-background border-border">
+                  <SelectItem value="worker">Worker</SelectItem>
+                  <SelectItem value="manager">Manager</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            {error && (
+              <div className="text-sm text-destructive">{error}</div>
+            )}
+            <DialogFooter className="gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setOpen(false)}
+                size="sm"
+                disabled={submitting}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="submit"
+                size="sm"
+                className="bg-primary hover:bg-primary/90"
+                disabled={submitting || !formData.name.trim()}
+              >
+                {submitting ? 'Registering...' : 'Register'}
+              </Button>
+            </DialogFooter>
+          </form>
+        )}
+
+        {/* Pane 2 — output snippet */}
+        {result && (
+          <div className="space-y-4">
+            <div className="text-sm">
+              <div className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-1">
+                Agent ID
+              </div>
+              <code className="font-mono">{result.agent_id}</code>
+            </div>
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <div className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+                  .mcp.json snippet
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => copy(result.mcp_snippet, 'snippet')}
+                >
+                  <Copy className="h-3.5 w-3.5 mr-1.5" />
+                  {copyState === 'snippet' ? 'Copied' : 'Copy snippet'}
+                </Button>
+              </div>
+              <pre className="bg-muted/40 border border-border rounded-md p-3 text-xs font-mono overflow-x-auto max-h-72">
+{result.mcp_snippet}
+              </pre>
+            </div>
+            <div className="text-xs text-muted-foreground">
+              Paste this into the user&apos;s <code>.mcp.json</code>, then
+              ask them to start <code>claude</code> with the matching
+              project. The token can be revoked any time via the
+              Terminate button on this agent&apos;s row.
+            </div>
+            <DialogFooter className="gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => reset()}
+              >
+                Register another
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                onClick={() => {
+                  setOpen(false)
+                  reset()
+                }}
+              >
+                Done
+              </Button>
+            </DialogFooter>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 // Performance profiling callback
 const onRender = (id: string, phase: "mount" | "update" | "nested-update", actualDuration: number, baseDuration: number, startTime: number, commitTime: number) => {
   if (process.env.NODE_ENV === 'development') {
@@ -1945,6 +2190,11 @@ export function AgentsDashboard() {
             <RefreshCw className={cn("h-3.5 w-3.5 mr-1.5", loading && "animate-spin")} />
             Refresh
           </Button>
+          {/* Wave 7 PR 0 (coordinator transition): the register-only
+              modal is the recommended flow. The legacy spawn-via-tmux
+              CreateAgentModal stays mounted in PR 0 so existing
+              workflows keep working; PR 3 removes it. */}
+          <RegisterAgentModal />
           <CreateAgentModal onCreateAgent={handleCreateAgent} />
         </div>
       </div>
@@ -2023,7 +2273,15 @@ export function AgentsDashboard() {
             }
             action={
               agents.length === 0
-                ? <CreateAgentModal onCreateAgent={handleCreateAgent} />
+                ? (
+                    <div className="flex flex-col sm:flex-row gap-2">
+                      {/* Wave 7 PR 0: register-only modal first; legacy
+                          spawn modal still mounted for back-compat
+                          (PR 3 removes it). */}
+                      <RegisterAgentModal />
+                      <CreateAgentModal onCreateAgent={handleCreateAgent} />
+                    </div>
+                  )
                 : undefined
             }
           />

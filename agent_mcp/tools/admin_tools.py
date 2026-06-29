@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional
 from .registry import register_tool
 from ..core.config import logger, AGENT_COLORS  # AGENT_COLORS for create_agent
 from ..core import globals as g
-from ..core.auth import generate_token  # For create_agent, terminate_agent
+from ..core.auth import generate_token  # For create_agent, terminate_agent, register_agent
 # Wave 6 PR 5 — migrated to Principal + ToolResult. The
 # ``@requires_role("operator")`` decorator is replaced by an inline
 # ``principal.has_role("operator")`` check at the top of each tool
@@ -648,6 +648,361 @@ async def create_agent_tool_impl(
             conn.close()
 
 
+# --- register_agent tool (Wave 7 PR 0 — coordinator transition) ---
+#
+# The register-only sibling of :func:`create_agent_tool_impl`. Mints an
+# agent identity (DB row + bearer token) WITHOUT spawning a claude
+# process. The plan calls this the "coordinator" shape: agent-mcp stops
+# owning user-side claude processes; the user owns them; agent-mcp
+# mints the token and hands the operator a ready-to-paste ``.mcp.json``
+# snippet they drop into the user's claude config.
+#
+# Co-existence: PR 0 ships ``register_agent`` ALONGSIDE the legacy
+# ``create_agent`` (which still spawns via tmux). PR 1 migrates test
+# fixtures to register-only; PR 3 deletes the spawn block + the
+# ``agent_mcp/runtime/agent_runtime.py`` module entirely.
+#
+# Architectural directive: ``feedback_agent_mcp_coordinator_not_spawner``
+# in user memory. Future fixes to runtime code must follow this shape.
+
+_DEFAULT_REGISTER_AGENT_URL_BASE = (
+    # Last-resort host used when neither the operator's request body
+    # nor ``$AGENT_MCP_EXTERNAL_URL`` told us where this deployment is
+    # reachable from. Marked obviously fake so an operator who pastes
+    # the snippet realises they need to substitute the real host
+    # before it works.
+    "https://REPLACE_WITH_YOUR_AGENT_MCP_HOST"
+)
+
+
+def _resolve_snippet_host(arguments: Dict[str, Any]) -> str:
+    """Pick the public base URL the ``.mcp.json`` snippet should embed.
+
+    Resolution order (most-specific first):
+
+    1. ``arguments["host"]`` — the dashboard knows its own
+       ``window.location.origin`` and ships it explicitly. This is
+       the production happy path.
+    2. ``$AGENT_MCP_EXTERNAL_URL`` — set on the router service by the
+       nix module. The per-project backend doesn't currently read it,
+       but if a deployment chooses to thread it through (single-tenant
+       mode, future env-plumbing), the snippet builder picks it up.
+    3. The placeholder constant — surfaces clearly in copy-paste form
+       that the host needs filling in.
+
+    Returns a string without a trailing slash so URL concatenation in
+    :func:`_build_mcp_config_snippet` is unambiguous.
+    """
+    raw = arguments.get("host")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip().rstrip("/")
+    env_host = os.environ.get("AGENT_MCP_EXTERNAL_URL", "").strip()
+    if env_host:
+        return env_host.rstrip("/")
+    return _DEFAULT_REGISTER_AGENT_URL_BASE
+
+
+def _resolve_snippet_project(
+    arguments: Dict[str, Any],
+    principal: Optional[Principal],
+) -> Optional[str]:
+    """Pick the project name to use in the snippet's URL + key.
+
+    Resolution order:
+
+    1. ``arguments["project_name"]`` — explicit override from the
+       dashboard route adapter. The frontend reads this from
+       ``projectContext.projectName`` (derived from
+       ``window.location.pathname``).
+    2. ``principal.project_name`` — set by the router's
+       :class:`AuthHeaderMiddleware` when a request arrives via the
+       router proxy with a recognised project segment.
+    3. None — caller is responsible for treating the snippet as
+       project-less (the URL will use a placeholder).
+
+    Returns the project name verbatim (no sanitisation here — the
+    upstream router already validated against the project-name
+    slug regex before admitting the request).
+    """
+    raw = arguments.get("project_name")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    if principal is not None and principal.project_name:
+        return principal.project_name
+    return None
+
+
+def _build_mcp_config_snippet(
+    *,
+    project: Optional[str],
+    token: str,
+    host: str,
+) -> str:
+    """Return the JSON ``.mcp.json`` snippet operators paste into
+    their user's claude config.
+
+    Shape (matches the router's ``_mcp_json_for`` helper at
+    ``agent_mcp/router/app.py``, with the addition of a per-project
+    server key so multiple Agent-MCP deployments can coexist in one
+    ``.mcp.json``)::
+
+        {
+          "mcpServers": {
+            "agent-mcp-<project>": {
+              "type": "http",
+              "url": "<host>/agent-mcp/mcp/<project>",
+              "headers": {"Authorization": "Bearer <token>"}
+            }
+          }
+        }
+
+    Standalone (no router / single-tenant) deployments where the
+    backend is reached directly without a project segment fall back
+    to ``agent-mcp`` as the server key and an URL without the
+    project component.
+
+    The result is pretty-printed JSON (indent=2) so the modal can
+    drop it straight into a ``<pre>`` block.
+    """
+    if project:
+        server_key = f"agent-mcp-{project}"
+        url = f"{host}/agent-mcp/mcp/{project}"
+    else:
+        server_key = "agent-mcp"
+        url = f"{host}/mcp"
+    snippet = {
+        "mcpServers": {
+            server_key: {
+                "type": "http",
+                "url": url,
+                "headers": {"Authorization": f"Bearer {token}"},
+            }
+        }
+    }
+    return json.dumps(snippet, indent=2)
+
+
+async def register_agent_tool_impl(
+    arguments: Dict[str, Any],
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    """Register an agent identity — operator-only. No spawning.
+
+    Inserts a fresh ``agents`` row + mints a bearer token, then
+    returns the token alongside a ready-to-paste ``.mcp.json``
+    snippet the operator hands to the user. The user is responsible
+    for starting their own claude session and pointing it at the
+    snippet — agent-mcp never owns the claude process.
+
+    Wave 7 PR 0 (coordinator transition). The legacy
+    :func:`create_agent_tool_impl` (which spawns via tmux) stays in
+    this PR to keep old tests / old workflows working; PR 3 deletes
+    the spawn block + the runtime module entirely.
+
+    Arguments:
+        name: agent_id for the new row. Required. Same slug regex
+            ``create_agent`` uses (enforced by ``agent_repo.create``).
+            ``agent_id`` is accepted as a back-compat alias so the
+            dashboard's existing modal can flip with a one-field
+            rename rather than a coordinated frontend+backend change.
+        role: ``worker`` or ``manager``. Defaults to ``worker``.
+        project_name: project the snippet should point at. Optional;
+            falls back to ``principal.project_name`` and finally to a
+            placeholder.
+        host: public base URL the user's claude reaches the
+            deployment at (e.g. ``https://host.tailnet.ts.net``).
+            Optional; falls back to ``$AGENT_MCP_EXTERNAL_URL`` and
+            then to a placeholder constant.
+    """
+    denied = _require_operator(principal)
+    if denied is not None:
+        return denied
+
+    # Accept both the new ``name`` shape (per the Wave 7 plan) and
+    # the legacy ``agent_id`` field so the dashboard's existing
+    # request body can flow through unchanged during the PR-0 /
+    # PR-1 coordination window.
+    name = arguments.get("name") or arguments.get("agent_id")
+    if not isinstance(name, str) or not name.strip():
+        return Invalid(
+            field="name",
+            message="`name` (agent_id) is required and must be a non-empty string.",
+        )
+    agent_id = name.strip()
+
+    role = arguments.get("role") or arguments.get("agent_role") or "worker"
+    if role not in ("worker", "manager"):
+        return Invalid(
+            field="role",
+            message="`role` must be 'worker' or 'manager'.",
+        )
+
+    # Mirror create_agent_tool_impl's defence-in-depth tombstone-
+    # bracket guard. The repo would also catch this via its slug
+    # regex; returning a clean Invalid here gives the operator a
+    # precise reason instead of a generic regex-mismatch.
+    if "[" in agent_id or "]" in agent_id:
+        return Invalid(
+            field="name",
+            message=(
+                f"invalid name {agent_id!r}: `[` and `]` are reserved "
+                "characters (used by the purge-cascade tombstone format "
+                "`[deleted-<id>]`)."
+            ),
+        )
+
+    # Refuse to clobber an existing agent. Mirrors create_agent's
+    # in-memory + DB checks so both surfaces give the operator the
+    # same wording when they try to re-register a name in use.
+    if agent_id in g.agent_working_dirs:
+        return Conflict(
+            reason=f"Agent '{agent_id}' already exists (in active memory).",
+        )
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT agent_id FROM agents WHERE agent_id = ?", (agent_id,)
+        )
+        if cursor.fetchone():
+            return Conflict(
+                reason=f"Agent '{agent_id}' already exists (in database).",
+            )
+
+        new_agent_token = generate_token()
+        created_at_iso = datetime.datetime.now().isoformat()
+
+        # Working directory mirrors create_agent's "all agents share
+        # the project dir" semantics. Wave 7's coordinator model
+        # doesn't actually run an agent process here — the
+        # working_directory column is informational metadata for
+        # dashboards / audit logs.
+        project_dir_env = os.environ.get("MCP_PROJECT_DIR")
+        if not project_dir_env:
+            logger.error(
+                "MCP_PROJECT_DIR not set; register_agent cannot resolve "
+                "the working directory for agent %r.",
+                agent_id,
+            )
+            return Failed(
+                message="Server configuration error: MCP_PROJECT_DIR not set.",
+            )
+        agent_working_dir_abs = os.path.abspath(project_dir_env)
+
+        agent_color = AGENT_COLORS[g.agent_color_index % len(AGENT_COLORS)]
+        g.agent_color_index += 1
+
+        from ..repositories import agent_repo
+
+        try:
+            agent_repo.create(
+                token=new_agent_token,
+                agent_id=agent_id,
+                capabilities=[],
+                status="created",
+                current_task=None,
+                working_directory=agent_working_dir_abs,
+                color=agent_color,
+                agent_role=role,
+                connection=cursor,
+            )
+        except ValueError as ve:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return Invalid(field="name", message=str(ve))
+
+        log_agent_action_to_db(
+            cursor,
+            principal.actor_label() if principal else "operator",
+            "registered_agent",
+            details={
+                "agent_id": agent_id,
+                "role": role,
+            },
+        )
+        conn.commit()
+
+        # Post-commit cache reconciliation through the repo (mirrors
+        # create_agent's pattern — keeps cache + DB in lockstep).
+        agent_repo.upsert_cache({
+            "token": new_agent_token,
+            "agent_id": agent_id,
+            "capabilities": [],
+            "created_at": created_at_iso,
+            "status": "created",
+            "current_task": None,
+            "color": agent_color,
+            "working_directory": agent_working_dir_abs,
+            "terminated_at": None,
+            "updated_at": created_at_iso,
+            "agent_role": role,
+        })
+
+        log_audit(
+            principal.actor_label() if principal else "operator",
+            "register_agent",
+            {
+                "agent_id": agent_id,
+                "role": role,
+            },
+        )
+
+        project_for_snippet = _resolve_snippet_project(arguments, principal)
+        host_for_snippet = _resolve_snippet_host(arguments)
+        snippet = _build_mcp_config_snippet(
+            project=project_for_snippet,
+            token=new_agent_token,
+            host=host_for_snippet,
+        )
+
+        logger.info(
+            "Agent %r registered via register_agent (role=%s). No claude "
+            "spawned — operator hands the snippet to the user.",
+            agent_id, role,
+        )
+
+        return Ok(
+            data={
+                "agent_id": agent_id,
+                "token": new_agent_token,
+                "agent_role": role,
+                "mcp_snippet": snippet,
+                "project_name": project_for_snippet,
+            },
+            message=(
+                f"Agent '{agent_id}' registered. Paste the snippet into "
+                "the user's claude .mcp.json — agent-mcp no longer "
+                "spawns the claude session itself."
+            ),
+        )
+
+    except sqlite3.Error as e_sql:
+        if conn:
+            conn.rollback()
+        logger.error(
+            "Database error registering agent %s: %s",
+            agent_id, e_sql, exc_info=True,
+        )
+        return Failed(message=f"Database error registering agent: {e_sql}")
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(
+            "Unexpected error registering agent %s: %s",
+            agent_id, e, exc_info=True,
+        )
+        return Failed(message=f"Unexpected error registering agent: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
 # --- view_status tool ---
 # Original logic from main.py: lines 1242-1268 (view_status_tool function)
 async def view_status_tool_impl(
@@ -837,34 +1192,18 @@ async def terminate_agent_tool_impl(
                 f"Released {files_released_count} files held by terminated agent {agent_id_to_terminate}."
             )
 
-        # Kill tmux session if it exists
-        tmux_kill_status = ""
+        # Wave 7 PR 0 (coordinator transition): we no longer
+        # ``kill_tmux_session`` on terminate. agent-mcp never owned
+        # the user's claude process under the coordinator model —
+        # terminate is JUST "revoke the token + flip status". The
+        # user's local claude session keeps running until they close
+        # it themselves. The tmux-session tracking is left in place
+        # so legacy in-prod agents (registered via the spawn path
+        # before this PR landed) don't desync; PR 3 deletes the
+        # tmux plumbing entirely.
         if agent_id_to_terminate in g.agent_tmux_sessions:
-            session_name = g.agent_tmux_sessions[agent_id_to_terminate]
-            if kill_tmux_session(session_name):
-                tmux_kill_status = f" Killed tmux session '{session_name}'."
-                logger.info(
-                    f"Killed tmux session '{session_name}' for agent '{agent_id_to_terminate}'"
-                )
-            else:
-                tmux_kill_status = f" Failed to kill tmux session '{session_name}'."
-                logger.warning(
-                    f"Failed to kill tmux session '{session_name}' for agent '{agent_id_to_terminate}'"
-                )
-
-            # Remove from tracking regardless of kill success
+            # Drop the tracking entry without invoking kill — see above.
             del g.agent_tmux_sessions[agent_id_to_terminate]
-        else:
-            # Try to kill session by agent_id in case tracking is out of sync
-            sanitized_name = sanitize_session_name(agent_id_to_terminate)
-            if session_exists(sanitized_name):
-                if kill_tmux_session(sanitized_name):
-                    tmux_kill_status = (
-                        f" Killed orphaned tmux session '{sanitized_name}'."
-                    )
-                    logger.info(
-                        f"Killed orphaned tmux session '{sanitized_name}' for agent '{agent_id_to_terminate}'"
-                    )
 
         log_audit(
             "admin", "terminate_agent", {"agent_id": agent_id_to_terminate}
@@ -874,9 +1213,16 @@ async def terminate_agent_tool_impl(
             data={
                 "agent_id": agent_id_to_terminate,
                 "status": "terminated",
-                "tmux_killed": bool(tmux_kill_status),
+                # Wave 7 PR 0: kept for back-compat with REST callers
+                # that read the field; always False now since terminate
+                # no longer touches tmux. PR 3 drops the field entirely.
+                "tmux_killed": False,
             },
-            message=f"Agent '{agent_id_to_terminate}' terminated.{tmux_kill_status}",
+            message=(
+                f"Agent '{agent_id_to_terminate}' terminated. The token "
+                "is revoked, but your local claude session is still "
+                "running — close it manually if you want it to stop."
+            ),
         )
 
     except sqlite3.Error as e_sql:
@@ -1415,6 +1761,72 @@ def register_admin_tools():
             "additionalProperties": False,
         },
         implementation=create_agent_tool_impl,
+        visibility="operator",
+    )
+
+    # Wave 7 PR 0 — coordinator transition. ``register_agent`` is the
+    # spawn-less sibling of ``create_agent``: same role table + token
+    # mint, but agent-mcp never starts a claude process. Operator
+    # pastes the returned ``mcp_snippet`` into the user's
+    # ``.mcp.json`` and the user owns their own claude session. The
+    # legacy ``create_agent`` stays registered for PR 0; PR 3 deletes
+    # it once test fixtures migrate.
+    register_tool(
+        name="register_agent",
+        description=(
+            "Register a new agent identity (DB row + bearer token) WITHOUT "
+            "spawning a claude process. Returns the token alongside a "
+            "ready-to-paste .mcp.json snippet. Operator-only."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "agent_id for the new row.",
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": (
+                        "Back-compat alias for `name`. Either field works; "
+                        "if both are present, `name` wins."
+                    ),
+                },
+                "role": {
+                    "type": "string",
+                    "description": "Agent role: 'worker' or 'manager'.",
+                    "enum": ["worker", "manager"],
+                    "default": "worker",
+                },
+                "agent_role": {
+                    "type": "string",
+                    "description": "Back-compat alias for `role`.",
+                    "enum": ["worker", "manager"],
+                },
+                "project_name": {
+                    "type": "string",
+                    "description": (
+                        "Project the .mcp.json snippet should point at. "
+                        "Optional; falls back to principal.project_name."
+                    ),
+                },
+                "host": {
+                    "type": "string",
+                    "description": (
+                        "Public base URL the user's claude reaches the "
+                        "deployment at (e.g. https://host.tailnet.ts.net). "
+                        "Optional; falls back to $AGENT_MCP_EXTERNAL_URL."
+                    ),
+                },
+            },
+            # `name` OR `agent_id` is required — the impl rejects with
+            # ``Invalid(field="name", ...)`` when both are absent. Not
+            # expressing that as a JSON-schema ``anyOf`` because the
+            # back-compat alias is a transient (PR-0 / PR-1) shape.
+            "required": [],
+            "additionalProperties": False,
+        },
+        implementation=register_agent_tool_impl,
         visibility="operator",
     )
 

@@ -524,6 +524,37 @@ class ApiClient {
     })
   }
 
+  // Wave 7 PR 0 (coordinator transition). Register an agent identity
+  // WITHOUT spawning a claude process: the backend mints a token + a
+  // ready-to-paste .mcp.json snippet that the operator hands to the
+  // user. The user owns their own claude session.
+  //
+  // Distinct from `createAgent` (legacy, spawn-via-tmux) which stays
+  // on this client through PR 0 so the existing modal keeps working;
+  // PR 3 deletes the legacy method once the modal cuts over.
+  async registerAgent(data: {
+    name: string
+    role?: 'worker' | 'manager'
+    // The frontend supplies these so the backend's snippet builder
+    // doesn't have to derive them from request headers (which the
+    // per-project backend gets after the router proxy strips Host).
+    project_name?: string | null
+    host?: string
+  }): Promise<{
+    success?: boolean
+    message: string
+    agent_id?: string
+    agent_token?: string
+    agent_role?: string
+    mcp_snippet?: string
+    project_name?: string | null
+  }> {
+    return this.request('/agents/register', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    })
+  }
+
   // Restore + Purge for terminated agents. `restoreAgent` flips the
   // soft-delete back; `getPurgePreview` returns blast-radius counts
   // and samples for the confirmation modal; `purgeAgent` runs the
