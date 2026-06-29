@@ -629,7 +629,7 @@ async def test_rest_adapter_maps_not_found_to_404(tmp_path) -> None:
     """``_dispatch_through_tool`` maps :class:`NotFound` to 404
     with the resource + identifier in the envelope, replacing the
     legacy ``"none of the specified keys exist"`` regex path."""
-    from agent_mcp.app.routes import _dispatch_through_tool
+    from agent_mcp.app._dispatch_helpers import _dispatch_through_tool
 
     async with mcp_session(tmp_path) as admin:  # noqa: F841 (lifespan)
         response = await _dispatch_through_tool(
@@ -652,7 +652,7 @@ async def test_rest_adapter_maps_invalid_to_400_with_field(tmp_path) -> None:
     """``Invalid(field=...)`` from delete surfaces as 400 with
     the field name in the JSON body — same shape PR 0 demoed for
     ``add_task_note``."""
-    from agent_mcp.app.routes import _dispatch_through_tool
+    from agent_mcp.app._dispatch_helpers import _dispatch_through_tool
 
     async with mcp_session(tmp_path) as admin:  # noqa: F841
         response = await _dispatch_through_tool(
@@ -676,7 +676,7 @@ async def test_rest_adapter_maps_ok_data_to_200_with_payload(
     """A successful update routes through the REST adapter as
     200 with the ``data`` payload echoed back. Same shape that
     Wave 7 will let the dashboard rely on for typed responses."""
-    from agent_mcp.app.routes import _dispatch_through_tool
+    from agent_mcp.app._dispatch_helpers import _dispatch_through_tool
 
     async with mcp_session(tmp_path) as admin:  # noqa: F841
         response = await _dispatch_through_tool(

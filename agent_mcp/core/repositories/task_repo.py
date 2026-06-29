@@ -307,8 +307,8 @@ def delete_task_from_cache(task_id: str) -> None:
     """Evict a task from the in-memory cache.
 
     The SQL DELETE is still owned by the caller because the legacy
-    purge-cascade in :mod:`agent_mcp.app.routes` deletes the row
-    alongside agent_actions / agent_messages / task_notes in one
+    purge-cascade in :mod:`agent_mcp.app.routers.agents` deletes the
+    row alongside agent_actions / agent_messages / task_notes in one
     transaction. This helper exists so the routes can replace
     ``del state.tasks[task_id]`` with a named call without changing
     the cascade semantics.

@@ -125,7 +125,7 @@ async def test_rest_adapter_maps_ok_with_data_to_200(tmp_path) -> None:
     is the path the dashboard would take if it had a REST route
     for add_task_note.
     """
-    from agent_mcp.app.routes import _dispatch_through_tool
+    from agent_mcp.app._dispatch_helpers import _dispatch_through_tool
 
     async with mcp_session(tmp_path) as admin:  # noqa: F841 (lifespan)
         _insert_task("wave6-demo-rest-1")
@@ -156,7 +156,7 @@ async def test_rest_adapter_maps_invalid_to_400(tmp_path) -> None:
     :class:`Invalid` return rather than the upstream jsonschema
     ``ToolInputValidationError`` path.
     """
-    from agent_mcp.app.routes import _dispatch_through_tool
+    from agent_mcp.app._dispatch_helpers import _dispatch_through_tool
 
     async with mcp_session(tmp_path) as admin:  # noqa: F841
         _insert_task("wave6-demo-rest-invalid")

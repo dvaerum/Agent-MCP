@@ -36,9 +36,10 @@ The :class:`MessageRepository` exposes two interfaces deliberately:
    route handlers will write messages once PR 6 migrates them.
 2. **The query surface** — ``query(filters)`` and ``count_unread``.
    ``query`` exposes the rich filter shape today spelled inline in
-   :func:`agent_mcp.app.routes.list_messages_api_route` (Candidate 3
-   folding from the architecture review): one entry point for both
-   the dashboard query route AND the MCP ``get_agent_messages`` tool.
+   :func:`agent_mcp.app.routers.messages.list_messages_api_route`
+   (Candidate 3 folding from the architecture review): one entry
+   point for both the dashboard query route AND the MCP
+   ``get_agent_messages`` tool.
 
 Co-existence with PR #137 module-of-functions:
 
@@ -1201,9 +1202,9 @@ class MessageRepository:
         """Rewrite ``sender_id`` and ``recipient_id`` from ``old_id`` to ``new_id``.
 
         Used by the agent purge-cascade in
-        :func:`agent_mcp.app.routes.purge_agent_api_route` to tombstone
-        the rows that reference a deleted agent. Returns the total
-        count of rows touched across both columns.
+        :func:`agent_mcp.app.routers.agents.purge_agent_api_route` to
+        tombstone the rows that reference a deleted agent. Returns
+        the total count of rows touched across both columns.
 
         ``connection`` is the transaction-aware seam: when the caller
         already holds an open SQLAlchemy ``Session`` (or a
@@ -1309,7 +1310,8 @@ class MessageRepository:
         agents.
 
         Replaces the inline raw-SQL in
-        :func:`agent_mcp.app.routes.list_participants_api_route` 1:1.
+        :func:`agent_mcp.app.routers.messages.list_participants_api_route`
+        1:1.
 
         Returns ``{"live": [...], "tombstones": [...]}``. On DB error
         returns ``{"live": [], "tombstones": []}`` and logs at error.

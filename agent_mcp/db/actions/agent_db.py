@@ -11,7 +11,7 @@
 
    * ``agent_mcp.cli`` — TUI snapshot reads
    * ``agent_mcp.core.auth`` — token-based auth hot path
-   * ``agent_mcp.app.routes`` — lifespan hydrate-cache reads
+   * ``agent_mcp.app.server_lifecycle`` — lifespan hydrate-cache reads
    * ``agent_mcp.core.repositories.agent_repo`` — the older
      module-of-functions repo
    * Tests that pin the read-side ORM cutover

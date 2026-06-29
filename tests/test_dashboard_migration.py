@@ -2,15 +2,21 @@
 
 Asserts that:
 
-  * Mutation handlers in ``agent_mcp/app/routes.py`` no longer read
-    ``body['token']`` / ``data.get('token')`` to authenticate (auth
-    moved to the ``require_operator_session`` dependency). Reads in
-    the dep itself are allow-listed.
+  * Mutation handlers in the per-resource router modules under
+    ``agent_mcp/app/routers/`` no longer read ``body['token']`` /
+    ``data.get('token')`` to authenticate (auth moved to the
+    ``require_operator_session`` dependency). Reads in the dep
+    itself are allow-listed.
   * The dashboard's ``agent_mcp/dashboard/lib/api.ts`` no longer
     splices ``token: tokens.admin_token`` into mutation payloads —
     the session cookie is what authenticates.
   * No leftover ``TODO(prancy-napping-pie PR D)`` markers remain in
     the source tree (PR D's sweep is complete).
+
+Wave 8 PR 2 rewire: the single ``agent_mcp/app/routes.py`` file was
+deleted; the same invariant must now hold across every per-resource
+``agent_mcp/app/routers/*.py`` module the handlers moved to. The test
+scans the whole subpackage instead of a single file.
 
 These tests are intentionally grep-style + structural. The wire
 contract is exercised by ``tests/test_dashboard_session_auth.py``.
@@ -24,7 +30,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ROUTES_FILE = REPO_ROOT / "agent_mcp" / "app" / "routes.py"
+ROUTERS_DIR = REPO_ROOT / "agent_mcp" / "app" / "routers"
 ROUTER_APP_FILE = REPO_ROOT / "agent_mcp" / "router" / "app.py"
 API_TS_FILE = REPO_ROOT / "agent_mcp" / "dashboard" / "lib" / "api.ts"
 
@@ -72,8 +78,8 @@ def _scan(text: str, patterns: list[re.Pattern]) -> list[tuple[int, str]]:
 
 
 def test_routes_py_does_not_read_token_from_body_in_mutation_handlers() -> None:
-    """``agent_mcp/app/routes.py`` handlers must not authenticate
-    via ``data.get('token')`` / ``body['token']``.
+    """Per-resource router handlers under ``agent_mcp/app/routers/``
+    must not authenticate via ``data.get('token')`` / ``body['token']``.
 
     PR D moves auth into the ``require_operator_session`` FastAPI
     dependency. Each per-handler ``admin_token = data.get('token')``
@@ -81,12 +87,21 @@ def test_routes_py_does_not_read_token_from_body_in_mutation_handlers() -> None:
 
     The dep itself + the legacy ``verify_token`` helper are allowed —
     they're imports of the auth surface, not handler-local reads.
+
+    Wave 8 PR 2 rewire: the legacy single-file ``agent_mcp/app/routes.py``
+    is gone; the same invariant is now enforced across every per-resource
+    router module the handlers moved to.
     """
-    text = _read(ROUTES_FILE)
-    hits = _scan(text, _TOKEN_BODY_PATTERNS)
-    assert hits == [], (
-        "Found legacy body-token reads in agent_mcp/app/routes.py:\n  "
-        + "\n  ".join(f"{n}: {ln}" for n, ln in hits)
+    all_hits: list[tuple[Path, int, str]] = []
+    for path in sorted(ROUTERS_DIR.glob("*.py")):
+        text = _read(path)
+        for n, ln in _scan(text, _TOKEN_BODY_PATTERNS):
+            all_hits.append((path, n, ln))
+    assert all_hits == [], (
+        "Found legacy body-token reads in agent_mcp/app/routers/:\n  "
+        + "\n  ".join(
+            f"{p.relative_to(REPO_ROOT)}:{n}: {ln}" for p, n, ln in all_hits
+        )
     )
 
 

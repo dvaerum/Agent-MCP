@@ -216,11 +216,17 @@ def test_legacy_create_agent_routes_are_not_registered() -> None:
     """The dashboard's spawn-using endpoints (``POST /api/agents`` and
     its back-compat ``/api/create-agent`` alias) are gone. Only the
     register-only ``POST /api/agents/register`` survives."""
-    from agent_mcp.app.routes import _dashboard_route_specs
+    # Wave 8 PR 2: the legacy ``_dashboard_route_specs`` literal in
+    # ``agent_mcp.app.routes`` was retired with the shim. The
+    # equivalent post-shim entry point is
+    # :func:`agent_mcp.app.routers.iter_route_specs`, which walks
+    # every wired router and yields the same
+    # ``(path, endpoint, methods, name)`` 4-tuple shape.
+    from agent_mcp.app.routers import iter_route_specs
 
     # Routes entries are 4-tuples (path, handler, methods, name).
     by_path_methods = [
-        (entry[0], tuple(entry[2])) for entry in _dashboard_route_specs
+        (entry[0], tuple(entry[2])) for entry in iter_route_specs()
     ]
 
     # GET /api/agents is fine (list endpoint). POST /api/agents must be gone.
