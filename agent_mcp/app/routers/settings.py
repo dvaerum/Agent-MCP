@@ -7,10 +7,10 @@ buckets, but all share the "router-config-shaped, non-CRUD" shape
 (Wave 8 design decision; see `prancy-napping-pie.md` — open item:
 split if any of the three grows).
 
-The router uses the bare ``/api/{project}`` prefix (rather than a
+The router uses the bare ``/api`` prefix (rather than a
 per-resource sub-prefix) and each handler will register its own
 full path (e.g. ``@router.get("/aoe/health")`` → mounted at
-``/api/{project}/aoe/health``).
+``/api/aoe/health``).
 
 Wave 8 PR 0 scaffold: the ``APIRouter`` is declared with the bare
 prefix + router-level ``Depends(require_operator_session)``; no
@@ -26,7 +26,7 @@ from ..deps import require_operator_session
 
 
 router = APIRouter(
-    prefix="/api/{project}",
+    prefix="/api",
     dependencies=[Depends(require_operator_session)],
     tags=["settings"],
 )

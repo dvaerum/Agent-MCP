@@ -5,9 +5,9 @@ tasks + memory) to shape one payload for the dashboard UI:
 ``simple_status``, ``graph_data``, ``task_tree_data``,
 ``node_details``, ``all_data``. They don't fit cleanly under a
 single per-resource prefix, so the router uses the bare
-``/api/{project}`` prefix and each handler will register its own
+``/api`` prefix and each handler will register its own
 full path (e.g. ``@router.get("/all-data")`` → mounted at
-``/api/{project}/all-data``).
+``/api/all-data``).
 
 Wave 8 PR 0 scaffold: the ``APIRouter`` is declared with the bare
 prefix + router-level ``Depends(require_operator_session)``; no
@@ -23,7 +23,7 @@ from ..deps import require_operator_session
 
 
 router = APIRouter(
-    prefix="/api/{project}",
+    prefix="/api",
     dependencies=[Depends(require_operator_session)],
     tags=["composition"],
 )

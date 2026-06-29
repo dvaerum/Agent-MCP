@@ -38,12 +38,12 @@ from fastapi import APIRouter
 
 _PER_RESOURCE_MODULES: list[tuple[str, str]] = [
     # (module suffix under agent_mcp.app.routers, expected APIRouter prefix)
-    ("agents", "/api/{project}/agents"),
-    ("tasks", "/api/{project}/tasks"),
-    ("memories", "/api/{project}/memories"),
-    ("messages", "/api/{project}/messages"),
-    ("composition", "/api/{project}"),
-    ("settings", "/api/{project}"),
+    ("agents", "/api/agents"),
+    ("tasks", "/api/tasks"),
+    ("memories", "/api/memories"),
+    ("messages", "/api/messages"),
+    ("composition", "/api"),
+    ("settings", "/api"),
 ]
 
 

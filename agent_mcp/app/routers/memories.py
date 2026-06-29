@@ -1,4 +1,4 @@
-"""Memories resource router — ``/api/{project}/memories/...``.
+"""Memories resource router — ``/api/memories/...``.
 
 Wave 8 PR 0 scaffold: the ``APIRouter`` is declared with the right
 prefix + router-level ``Depends(require_operator_session)``; no
@@ -15,7 +15,7 @@ from ..deps import require_operator_session
 
 
 router = APIRouter(
-    prefix="/api/{project}/memories",
+    prefix="/api/memories",
     dependencies=[Depends(require_operator_session)],
     tags=["memories"],
 )

@@ -1,4 +1,4 @@
-"""Messages resource router — ``/api/{project}/messages/...``.
+"""Messages resource router — ``/api/messages/...``.
 
 Wave 8 PR 0 scaffold: the ``APIRouter`` is declared with the right
 prefix + router-level ``Depends(require_operator_session)``; no
@@ -16,7 +16,7 @@ from ..deps import require_operator_session
 
 
 router = APIRouter(
-    prefix="/api/{project}/messages",
+    prefix="/api/messages",
     dependencies=[Depends(require_operator_session)],
     tags=["messages"],
 )
