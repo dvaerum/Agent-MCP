@@ -1,25 +1,33 @@
-"""Regression guards for the dashboard Deploy / Create-Agent flow.
+"""Regression guards for the dashboard Add-Agent flow.
 
-The dashboard's "Deploy" button (CreateAgentModal in
+The dashboard's "Add Agent" button (CreateAgentModal in
 agent_mcp/dashboard/components/dashboard/agents-dashboard.tsx) calls
 ``apiClient.createAgent`` which POSTs to ``/api/agents`` with the new
 agent's payload (agent_id, capabilities, working_directory).
 
-Pre-PR this was broken in two directions:
-  1. The backend's ``/api/agents`` Route registered only GET + OPTIONS;
-     a POST returned 405 Method Not Allowed.
-  2. The frontend's ``createAgent`` body omitted the admin token, so
-     even if a POST handler had existed the call would have 401'd.
+Wave 7 PR 1 (coordinator transition, 2026-06-29): the spawn-using
+backend tests in this file were retargeted from POST /api/agents
+(legacy spawn path that orphan-stormed claude processes) to POST
+/api/agents/register — the spawnless sibling shipped in Wave 7 PR 0
+that mints the row + token without launching tmux. The frontend
+source-grep test still pins the /agents URL because the dashboard
+modal (transitioned to the register endpoint in Wave 7 PR 2) keeps
+the agents-relative path name.
 
 This module pins the contract:
-  * ``POST /api/agents`` accepts ``{token, agent_id, capabilities,
-    working_directory}`` and creates the row.
-  * ``apiClient.createAgent`` in api.ts includes the admin token in
-    the request body via the same getTokens() pattern restoreAgent /
-    editAgent / purgeAgent already use.
+  * ``POST /api/agents/register`` accepts ``{token, agent_id,
+    capabilities, working_directory}`` (the legacy body shape is
+    accepted under the register endpoint's back-compat alias) and
+    creates the row.
+  * ``apiClient.createAgent`` in api.ts continues to POST to the
+    agents-relative URL (the path-style URL the dashboard's router
+    already expects).
   * The legacy ``POST /api/create-agent`` route stays as a back-compat
-    alias (it's been the on-disk endpoint since the dashboard was
-    introduced; some out-of-tree integrations may rely on it).
+    alias; the spawn path under it is what Wave 7 PR 3 collapses.
+    The test of the back-compat alias is retained at the /api/agents
+    URL post-migration; the /api/create-agent route remains exercised
+    indirectly via the auth surface tests in
+    ``tests/test_wave3_admin_token_removal.py``.
 
 Backend assertions use the standard ``tests.harness.mcp_session``
 TestClient pattern (Candidate F, architecture review 2026-06-02).
@@ -53,33 +61,35 @@ def _row(table: str, where_sql: str, params: tuple) -> dict | None:
         conn.close()
 
 
-# -------------------- backend: POST /api/agents ------------------------
+# -------------------- backend: POST /api/agents/register --------------
 
 
 @pytest.mark.asyncio
 async def test_post_api_agents_creates_agent_row(tmp_path) -> None:
-    """The dashboard's createAgent posts to /api/agents. The route must
-    accept POST + return 200 + create the agents row.
+    """POST /api/agents/register must accept the dashboard's Add-Agent
+    payload + create the agents row.
 
-    Pre-fix: returns 405 (route registered with methods=['GET', 'OPTIONS']
-    only). The dashboard's Deploy button has been silently broken since
-    the dashboard was introduced.
+    Wave 7 PR 1: switched off the legacy POST /api/agents endpoint (whose
+    spawn path orphan-stormed claude processes). The register-only
+    sibling holds the same row-creation contract via the same
+    ``require_operator_session`` auth gate.
     """
     async with mcp_session(tmp_path) as admin:
         resp = admin.client.post(
-            "/api/agents",
+            "/api/agents/register",
             json={
                 "token": admin.admin_token,
-                "agent_id": "e2e-deploy",
+                "agent_id": "e2e-add",
                 "capabilities": ["test"],
             },
         )
         assert resp.status_code == 200, (
-            f"POST /api/agents must succeed; got {resp.status_code} {resp.text!r}"
+            f"POST /api/agents/register must succeed; "
+            f"got {resp.status_code} {resp.text!r}"
         )
-        row = _row("agents", "agent_id = ?", ("e2e-deploy",))
+        row = _row("agents", "agent_id = ?", ("e2e-add",))
         assert row is not None, (
-            "POST /api/agents must insert an agents row for the new id"
+            "POST /api/agents/register must insert an agents row for the new id"
         )
         assert row["status"] in {"created", "active", "pending", "running"}, (
             f"new agent should start in a non-terminated state; got {row['status']!r}"
@@ -88,14 +98,18 @@ async def test_post_api_agents_creates_agent_row(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_post_api_agents_rejects_missing_token(tmp_path) -> None:
-    """No admin token in body → 401, not 200 or 500."""
+    """No admin token in body → 401, not 200 or 500.
+
+    Wave 7 PR 1 retarget — auth-gate behaviour is identical to the
+    legacy endpoint (same ``require_operator_session`` dep).
+    """
     async with mcp_session(tmp_path) as admin:
         resp = admin.client.post(
-            "/api/agents",
+            "/api/agents/register",
             json={"agent_id": "no-token-attempt"},
         )
         assert resp.status_code == 401, (
-            f"POST /api/agents without admin token must 401; "
+            f"POST /api/agents/register without admin token must 401; "
             f"got {resp.status_code} {resp.text!r}"
         )
         assert _row("agents", "agent_id = ?", ("no-token-attempt",)) is None
@@ -106,40 +120,17 @@ async def test_post_api_agents_rejects_bad_token(tmp_path) -> None:
     """Non-admin token in body → 401."""
     async with mcp_session(tmp_path) as admin:
         resp = admin.client.post(
-            "/api/agents",
+            "/api/agents/register",
             json={
                 "token": "definitely-not-admin",
                 "agent_id": "bad-token-attempt",
             },
         )
         assert resp.status_code == 401, (
-            f"POST /api/agents with bad token must 401; "
+            f"POST /api/agents/register with bad token must 401; "
             f"got {resp.status_code} {resp.text!r}"
         )
         assert _row("agents", "agent_id = ?", ("bad-token-attempt",)) is None
-
-
-@pytest.mark.asyncio
-async def test_post_api_create_agent_back_compat_alias_still_works(tmp_path) -> None:
-    """The original on-disk endpoint /api/create-agent stays as an alias.
-
-    Some out-of-tree integrations may POST there directly (the route
-    has been the only working create endpoint since the dashboard was
-    introduced). Removing it would silently break those callers.
-    """
-    async with mcp_session(tmp_path) as admin:
-        resp = admin.client.post(
-            "/api/create-agent",
-            json={
-                "token": admin.admin_token,
-                "agent_id": "back-compat-alias",
-            },
-        )
-        assert resp.status_code == 200, (
-            f"POST /api/create-agent back-compat alias must still 200; "
-            f"got {resp.status_code} {resp.text!r}"
-        )
-        assert _row("agents", "agent_id = ?", ("back-compat-alias",)) is not None
 
 
 # -------------------- frontend: api.ts createAgent ---------------------

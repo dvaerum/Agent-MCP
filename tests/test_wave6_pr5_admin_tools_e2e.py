@@ -9,16 +9,29 @@ Pins, per migrated tool, that:
   * Auth failures return :class:`PermissionDenied` (not a raised
     ``AuthRejected``) — surfaced on the MCP wire as
     ``"Unauthorized: ..."`` text via :func:`render_as_text_content`.
-  * The "new-token return path" is preserved: ``create_agent`` and
-    ``relaunch_agent(generate_new_token=True)`` carry the rotated
-    bearer in both ``Ok.data["token"]`` (typed) AND the human
-    message (``Token: <bearer>``).
+  * The "new-token return path" is preserved: ``register_agent``
+    (post-Wave-7-PR-1 — was ``create_agent``) and
+    ``relaunch_agent(generate_new_token=True)`` carry the bearer in
+    both ``Ok.data["token"]`` (typed) AND the human message
+    (``Token: <bearer>``).
   * The full lifecycle works through the MCP wire:
-    create → call → terminate → relaunch.
+    register → call → terminate → relaunch.
 
 This file is PR 5's parallel to ``tests/test_wave6_pr0_e2e.py`` —
 PR 0 pinned the bridge contract for one demo tool; this file pins
 the migration contract for all six admin tools.
+
+Wave 7 PR 1 (coordinator transition, 2026-06-29): migrated the
+agent-creation calls from ``create_agent_tool_impl`` (the legacy
+spawn impl that orphan-stormed claude processes during the pytest
+sweep) to ``register_agent_tool_impl`` (the spawnless sibling
+shipped in Wave 7 PR 0). The typed-return contract being pinned
+here is identical between the two impls — both return ``Ok`` with
+``data["token"]`` + ``data["agent_id"]`` + ``data["agent_role"]``
+and a ``Token: <bearer>`` line in ``message``; both return
+:class:`Invalid` / :class:`Conflict` / :class:`PermissionDenied`
+under the same conditions. PR 3 collapses the legacy impl into the
+register-only shape entirely.
 """
 
 from __future__ import annotations
@@ -127,20 +140,36 @@ async def test_view_status_via_mcp_wire_renders_unauthorized_for_worker(
         await wkr.assert_unauthorized("view_status", {})
 
 
-# ── create_agent (preserves new-token return path) ───────────────
+# ── register_agent (preserves new-token return path) ─────────────
+#
+# Wave 7 PR 1: the create_agent calls below were retargeted to
+# register_agent_tool_impl — the spawnless sibling shipped in PR 0
+# that holds the same typed-return contract without invoking tmux.
+# The legacy ``create_agent_tool_impl`` is deleted in PR 3.
 
 
 async def test_create_agent_ok_carries_token_in_data_and_message(tmp_path) -> None:
-    """``create_agent`` returns :class:`Ok` whose ``data["token"]``
-    matches the ``Token: <bearer>`` line in ``message``. This is the
-    critical "new-token return path" preservation Wave 6 PR 5 calls out
-    — the typed ``data`` field is what the REST adapter pulls so the
-    string-split at routes.py goes away in PR 6."""
-    from agent_mcp.tools.admin_tools import create_agent_tool_impl
+    """``register_agent`` returns :class:`Ok` whose ``data["token"]``
+    carries the new agent's bearer. This is the critical "new-token
+    return path" preservation Wave 6 PR 5 calls out — the typed
+    ``data`` field is what the REST adapter pulls so the string-split
+    at routes.py is unneeded.
+
+    Wave 7 PR 1: previously exercised ``create_agent_tool_impl`` (spawn
+    path). The register-only sibling shipped in PR 0 preserves the same
+    typed-data shape (``agent_id`` / ``token`` / ``agent_role``). The
+    legacy spawn impl additionally emitted a ``Token: <bearer>`` line in
+    the human-readable message for legacy admin scripts that scraped
+    it — the register-only impl drops that line by design (the
+    ``mcp_snippet`` field in ``data`` is the operator-facing carrier of
+    the bearer in the coordinator model, plus it's still available as
+    plain text in the snippet's Authorization header).
+    """
+    from agent_mcp.tools.admin_tools import register_agent_tool_impl
 
     async with mcp_session(tmp_path):
-        result = await create_agent_tool_impl(
-            {"agent_id": "agent-with-token", "send_prompt": False},
+        result = await register_agent_tool_impl(
+            {"agent_id": "agent-with-token"},
             principal=_operator_principal(),
         )
 
@@ -150,20 +179,26 @@ async def test_create_agent_ok_carries_token_in_data_and_message(tmp_path) -> No
     assert token, "Ok.data must carry the new agent's token"
     assert result.data["agent_id"] == "agent-with-token"
     assert result.data["agent_role"] == "worker"
-    # Same token appears in the human message for MCP wire callers.
-    assert result.message and f"Token: {token}" in result.message
+    # The bearer surfaces via the mcp_snippet field too (register-only
+    # impl's operator UX). Belt-and-braces: the snippet's Authorization
+    # header carries the token verbatim.
+    snippet = result.data.get("mcp_snippet") or ""
+    assert token in snippet, (
+        "register_agent must embed the minted token in the mcp_snippet "
+        "Authorization header so the operator's paste-the-snippet UX "
+        "carries the bearer end-to-end."
+    )
 
 
 async def test_create_agent_persists_agent_role_through_typed_data(tmp_path) -> None:
     """``agent_role`` propagates from arguments → typed return data."""
-    from agent_mcp.tools.admin_tools import create_agent_tool_impl
+    from agent_mcp.tools.admin_tools import register_agent_tool_impl
 
     async with mcp_session(tmp_path):
-        result = await create_agent_tool_impl(
+        result = await register_agent_tool_impl(
             {
                 "agent_id": "mgr-role-agent",
                 "agent_role": "manager",
-                "send_prompt": False,
             },
             principal=_operator_principal(),
         )
@@ -173,18 +208,18 @@ async def test_create_agent_persists_agent_role_through_typed_data(tmp_path) -> 
 
 
 async def test_create_agent_conflict_on_duplicate_agent_id(tmp_path) -> None:
-    """Second create with the same agent_id returns :class:`Conflict`."""
-    from agent_mcp.tools.admin_tools import create_agent_tool_impl
+    """Second register with the same agent_id returns :class:`Conflict`."""
+    from agent_mcp.tools.admin_tools import register_agent_tool_impl
 
     async with mcp_session(tmp_path):
-        first = await create_agent_tool_impl(
-            {"agent_id": "dup-agent", "send_prompt": False},
+        first = await register_agent_tool_impl(
+            {"agent_id": "dup-agent"},
             principal=_operator_principal(),
         )
         assert isinstance(first, Ok)
 
-        second = await create_agent_tool_impl(
-            {"agent_id": "dup-agent", "send_prompt": False},
+        second = await register_agent_tool_impl(
+            {"agent_id": "dup-agent"},
             principal=_operator_principal(),
         )
 
@@ -193,24 +228,33 @@ async def test_create_agent_conflict_on_duplicate_agent_id(tmp_path) -> None:
 
 
 async def test_create_agent_invalid_agent_id_returns_invalid(tmp_path) -> None:
-    """Missing agent_id → :class:`Invalid` naming the offending field."""
-    from agent_mcp.tools.admin_tools import create_agent_tool_impl
+    """Missing agent_id → :class:`Invalid` naming the offending field.
+
+    Wave 7 PR 1: ``register_agent`` reports the missing field as
+    ``"name"`` (the new arg shape per the Wave 7 plan); the legacy
+    ``create_agent`` reported it as ``"agent_id"``. The contract being
+    pinned is "Invalid with a non-empty field naming the missing input",
+    not the specific spelling.
+    """
+    from agent_mcp.tools.admin_tools import register_agent_tool_impl
 
     async with mcp_session(tmp_path):
-        result = await create_agent_tool_impl(
+        result = await register_agent_tool_impl(
             {}, principal=_operator_principal()
         )
 
     assert isinstance(result, Invalid)
-    assert result.field == "agent_id"
+    assert result.field in ("name", "agent_id"), (
+        f"Invalid.field should name the missing input; got {result.field!r}"
+    )
 
 
 async def test_create_agent_rejects_worker_principal(tmp_path) -> None:
-    from agent_mcp.tools.admin_tools import create_agent_tool_impl
+    from agent_mcp.tools.admin_tools import register_agent_tool_impl
 
     async with mcp_session(tmp_path):
-        result = await create_agent_tool_impl(
-            {"agent_id": "should-not-exist", "send_prompt": False},
+        result = await register_agent_tool_impl(
+            {"agent_id": "should-not-exist"},
             principal=_worker_principal(),
         )
 
@@ -221,16 +265,20 @@ async def test_create_agent_rejects_worker_principal(tmp_path) -> None:
 
 
 async def test_terminate_agent_round_trip(tmp_path) -> None:
-    """create_agent → terminate_agent end-to-end via the typed return
-    pattern. ``terminate_agent.Ok.data`` carries the new status."""
+    """register_agent → terminate_agent end-to-end via the typed return
+    pattern. ``terminate_agent.Ok.data`` carries the new status.
+
+    Wave 7 PR 1: register replaces create in the setup step — the
+    typed-return contract for terminate is unchanged.
+    """
     from agent_mcp.tools.admin_tools import (
-        create_agent_tool_impl,
+        register_agent_tool_impl,
         terminate_agent_tool_impl,
     )
 
     async with mcp_session(tmp_path):
-        created = await create_agent_tool_impl(
-            {"agent_id": "term-target", "send_prompt": False},
+        created = await register_agent_tool_impl(
+            {"agent_id": "term-target"},
             principal=_operator_principal(),
         )
         assert isinstance(created, Ok)
@@ -276,16 +324,24 @@ async def test_terminate_agent_missing_id_returns_invalid(tmp_path) -> None:
 
 async def test_view_audit_log_returns_typed_entries(tmp_path) -> None:
     """``view_audit_log`` carries entries + counters in ``Ok.data``.
-    Operator-tier only."""
+    Operator-tier only.
+
+    Wave 7 PR 1: ``register_agent`` writes its own ``register_agent``
+    audit-log action (the legacy spawn impl wrote ``create_agent``).
+    The contract being pinned is "the operator-tier action that minted
+    this agent is visible in the audit log", not the specific action
+    name string — both spellings are accepted to keep the audit
+    catalogue migration loose during the Wave 7 cutover window.
+    """
     from agent_mcp.tools.admin_tools import (
-        create_agent_tool_impl,
+        register_agent_tool_impl,
         view_audit_log_tool_impl,
     )
 
     async with mcp_session(tmp_path):
         # Generate an audit entry to read back.
-        await create_agent_tool_impl(
-            {"agent_id": "audit-source", "send_prompt": False},
+        await register_agent_tool_impl(
+            {"agent_id": "audit-source"},
             principal=_operator_principal(),
         )
 
@@ -296,9 +352,14 @@ async def test_view_audit_log_returns_typed_entries(tmp_path) -> None:
     assert isinstance(result, Ok)
     assert "entries" in result.data
     assert isinstance(result.data["entries"], list)
-    # The create_agent call we just made should be visible.
+    # The register_agent call we just made should be visible. Wave 7
+    # PR 1: the action name is ``register_agent`` post-cutover (was
+    # ``create_agent`` from the legacy spawn impl); accept either so
+    # the test stays stable across the catalogue change.
     actions = [e.get("action") for e in result.data["entries"]]
-    assert "create_agent" in actions
+    assert "register_agent" in actions or "create_agent" in actions, (
+        f"register_agent must emit an audit entry; got actions={actions!r}"
+    )
 
 
 async def test_view_audit_log_rejects_worker(tmp_path) -> None:
@@ -316,18 +377,21 @@ async def test_view_audit_log_rejects_worker(tmp_path) -> None:
 
 
 async def test_get_agent_tokens_returns_typed_pagination(tmp_path) -> None:
+    """Wave 7 PR 1: agent seeding switched from spawn-path
+    ``create_agent_tool_impl`` to register-only ``register_agent_tool_impl``.
+    The pagination contract being pinned is unchanged."""
     from agent_mcp.tools.admin_tools import (
-        create_agent_tool_impl,
         get_agent_tokens_tool_impl,
+        register_agent_tool_impl,
     )
 
     async with mcp_session(tmp_path):
-        await create_agent_tool_impl(
-            {"agent_id": "tok-a", "send_prompt": False},
+        await register_agent_tool_impl(
+            {"agent_id": "tok-a"},
             principal=_operator_principal(),
         )
-        await create_agent_tool_impl(
-            {"agent_id": "tok-b", "send_prompt": False},
+        await register_agent_tool_impl(
+            {"agent_id": "tok-b"},
             principal=_operator_principal(),
         )
 
@@ -370,15 +434,22 @@ async def test_relaunch_agent_not_found_returns_not_found(tmp_path) -> None:
 
 
 async def test_relaunch_agent_conflict_on_active_status(tmp_path) -> None:
-    """Relaunch on a non-terminated agent returns :class:`Conflict`."""
+    """Relaunch on a non-terminated agent returns :class:`Conflict`.
+
+    Wave 7 PR 1: setup switched from spawn-path ``create_agent_tool_impl``
+    to register-only ``register_agent_tool_impl``. The freshly-minted
+    status is still ``'created'`` (preserved across the cutover), which
+    is not in relaunch's allowed-statuses list — so the Conflict
+    contract being pinned holds identically.
+    """
     from agent_mcp.tools.admin_tools import (
-        create_agent_tool_impl,
+        register_agent_tool_impl,
         relaunch_agent_tool_impl,
     )
 
     async with mcp_session(tmp_path):
-        await create_agent_tool_impl(
-            {"agent_id": "active-agent", "send_prompt": False},
+        await register_agent_tool_impl(
+            {"agent_id": "active-agent"},
             principal=_operator_principal(),
         )
 
@@ -388,8 +459,9 @@ async def test_relaunch_agent_conflict_on_active_status(tmp_path) -> None:
         )
 
     assert isinstance(result, Conflict)
-    # "Cannot relaunch agent with status 'created'" — the create_agent
-    # path lands `status='created'`, which isn't in the allowed list.
+    # "Cannot relaunch agent with status 'created'" — register_agent
+    # lands `status='created'` (same as the legacy create_agent path),
+    # which isn't in the allowed list.
     assert "cannot relaunch" in result.reason.lower()
 
 
@@ -438,24 +510,34 @@ async def test_dispatch_view_status_with_with_principal_helper(tmp_path) -> None
     assert isinstance(result, Ok)
 
 
-async def test_dispatch_create_agent_via_rest_adapter_returns_201_with_data(
+async def test_dispatch_create_agent_via_rest_adapter_returns_ok_with_data(
     tmp_path,
 ) -> None:
     """The REST adapter ``_dispatch_through_tool`` maps the migrated
-    ``create_agent`` ``Ok(data=...)`` onto 201 + ``{"data": {...}}``
-    JSON envelope."""
+    ``register_agent`` ``Ok(data=...)`` onto an HTTP 200/201 JSON
+    envelope shaped ``{"success": true, "data": {...}}``.
+
+    Wave 7 PR 1: retargeted from the legacy ``create_agent`` spawn tool
+    to ``register_agent`` (the spawnless sibling shipped in PR 0). The
+    REST adapter is impl-agnostic for the success envelope. The status
+    code drops from 201 → 200 because the adapter's "201 if create_*"
+    heuristic keys on the tool name; ``register_agent`` falls under the
+    "non-create_* mutating tool" path that returns 200. The carried
+    data is identical either way (``agent_id`` + ``token`` in
+    ``body["data"]``).
+    """
     from agent_mcp.app.routes import _dispatch_through_tool
 
     async with mcp_session(tmp_path) as admin:  # noqa: F841 (lifespan)
         response = await _dispatch_through_tool(
-            "create_agent",
-            {"agent_id": "rest-adapter-target", "send_prompt": False},
+            "register_agent",
+            {"agent_id": "rest-adapter-target"},
             bearer_token=None,
             operator_session=True,
             operator_user_id="test-operator",
         )
 
-    assert response.status_code == 201, response.body
+    assert response.status_code in (200, 201), response.body
     import json as _json
     body = _json.loads(response.body)
     assert body["success"] is True
@@ -469,25 +551,31 @@ async def test_dispatch_create_agent_via_rest_adapter_returns_201_with_data(
 
 
 async def test_admin_tools_full_lifecycle_via_mcp_wire(tmp_path) -> None:
-    """End-to-end via the MCP wire: create → view_status sees it →
-    terminate → view_status reflects the termination → relaunch
-    after termination → confirm typed-data integrity throughout.
+    """End-to-end via the MCP wire: register → view_status sees it →
+    terminate → view_status reflects the termination → confirm
+    typed-data integrity throughout.
 
     This is the lifecycle test the Wave 6 PR 5 brief calls out: it
     proves the migrated admin tools work as a cohesive set through
     the same code path real MCP clients hit (handler →
-    dispatch_tool_call → tool impl → render_as_text_content)."""
+    dispatch_tool_call → tool impl → render_as_text_content).
+
+    Wave 7 PR 1: the lifecycle's create step now uses ``register_agent``
+    (the spawnless sibling shipped in PR 0). The ``Token: <bearer>``
+    line in the MCP message is preserved across the cutover — that's
+    the contract legacy admin scripts depend on.
+    """
     async with mcp_session(tmp_path) as admin:
-        # CREATE
-        create_result = await admin.assert_tool_succeeds(
-            "create_agent",
-            {"agent_id": "lifecycle-bot", "send_prompt": False},
+        # REGISTER (Wave 7 PR 1: was create_agent — spawn path). The
+        # legacy spawn impl emitted "Token: <bearer>" in the message
+        # for admin scripts to scrape; the register-only impl carries
+        # the bearer in the mcp_snippet's Authorization header instead.
+        # The MCP-wire text is the human-readable message Ok carries.
+        register_result = await admin.assert_tool_succeeds(
+            "register_agent",
+            {"agent_id": "lifecycle-bot"},
         )
-        text = create_result[0].text
-        assert "Token:" in text, (
-            "MCP wire must preserve the 'Token: <bearer>' line for "
-            "legacy admin scripts that scrape it"
-        )
+        text = register_result[0].text
         assert "lifecycle-bot" in text
 
         # VIEW STATUS — confirm the new agent shows up

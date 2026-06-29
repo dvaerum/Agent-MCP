@@ -106,26 +106,37 @@ def _seed_context_key(key: str, value: str) -> None:
 
 
 async def test_create_agent_rejects_worker(tmp_path) -> None:
-    """Worker token calling ``create_agent`` → Unauthorized."""
+    """Worker token calling ``register_agent`` → Unauthorized.
+
+    Wave 7 PR 1 (coordinator transition): the permission-matrix row
+    that pinned ``create_agent`` (the spawn tool that orphan-stormed
+    claude processes) is preserved verbatim on ``register_agent`` —
+    the spawnless sibling shipped in PR 0. Both tools are
+    operator-tier; the worker gate is identical.
+    """
     async with mcp_session(tmp_path) as admin:
-        wkr = await admin.create_worker("wkr-spawn")
+        wkr = await admin.create_worker("wkr-register")
         await wkr.assert_unauthorized(
-            "create_agent",
+            "register_agent",
             {"agent_id": "should-not-be-created"},
         )
 
 
 async def test_create_agent_rejects_manager(tmp_path) -> None:
-    """Manager-role token calling ``create_agent`` → Unauthorized.
+    """Manager-role token calling ``register_agent`` → Unauthorized.
 
-    Operator-tier tools (spawn/terminate/etc.) must reject managers;
+    Operator-tier tools (register/terminate/etc.) must reject managers;
     that is the load-bearing distinction between manager + operator.
+
+    Wave 7 PR 1: retargeted from ``create_agent`` to ``register_agent``
+    for the same reason as the worker test above — same operator-tier
+    gate, no tmux spawn.
     """
     async with mcp_session(tmp_path) as admin:
-        mgr = await admin.create_worker("mgr-spawn")
+        mgr = await admin.create_worker("mgr-register")
         _set_agent_role(mgr.token, "manager")
         await mgr.assert_unauthorized(
-            "create_agent",
+            "register_agent",
             {"agent_id": "should-not-be-created"},
         )
 
@@ -133,23 +144,23 @@ async def test_create_agent_rejects_manager(tmp_path) -> None:
 async def test_create_agent_admits_operator(tmp_path) -> None:
     """System bearer (operator equivalent) is NOT rejected by the auth gate.
 
-    The tool may still fail downstream (e.g. tmux not available in
-    CI), but the auth gate is what this matrix row pins. We assert on
-    the auth-failure shape only.
+    Wave 7 PR 1: retargeted from ``create_agent`` (spawn path) to
+    ``register_agent`` (register-only). The legacy assertion noted "the
+    tool may still fail downstream (e.g. tmux not available in CI)";
+    that caveat is gone with register — it just mints a DB row + token
+    and returns Ok. We assert on the auth-success shape (no
+    Unauthorized prefix) — same matrix row, same auth contract.
     """
     from tests.harness import _first_text, _is_unauthorized
 
     async with mcp_session(tmp_path) as admin:
         result = await admin.call(
-            "create_agent",
-            {
-                "agent_id": "spawned-by-operator",
-                "send_prompt": False,
-            },
+            "register_agent",
+            {"agent_id": "registered-by-operator"},
         )
         text = _first_text(result)
         assert not _is_unauthorized(text), (
-            f"create_agent must not be Unauthorized for operator; got {text!r}"
+            f"register_agent must not be Unauthorized for operator; got {text!r}"
         )
 
 
