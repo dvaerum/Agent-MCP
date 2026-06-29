@@ -71,106 +71,91 @@ async def test_dispatch_uses_contextvar_token_when_arguments_token_missing(
 async def test_dispatch_does_not_overwrite_explicit_arguments_token(
     tmp_path,
 ) -> None:
-    """If arguments already has a `token`, the contextvar must NOT
+    """If arguments already has a ``token``, the contextvar must NOT
     overwrite it. The explicit value is authoritative.
 
-    retire-system-token Wave 1: the harness stamps
-    ``operator_session_active=True`` by default so admin-tier tools
-    admit without a token. Clear it here so the test exercises the
-    token-only path the test name describes.
-
-    Wave 6 PR 5: ``view_status`` is migrated to ToolResult — an
-    auth-rejection now returns :class:`PermissionDenied` instead of
-    raising. The point of this test is to pin that the contextvar
-    does NOT silently replace an explicit ``arguments["token"]``;
-    asserting on a denial-shaped return is equivalent to the
-    pre-migration assertion on an auth-failure raise.
+    Wave 6 PR 6: pass no Principal so the dispatcher's
+    arguments-token fallback synthesizes one from the (wrong) token;
+    ``view_status`` returns :class:`PermissionDenied`.
     """
     from agent_mcp.tools.registry import (
         dispatch_tool_call,
         request_auth_token,
-        operator_session_active,
     )
     from agent_mcp.core.tool_result import Ok, PermissionDenied
 
     async with mcp_session(tmp_path):
-        cv = operator_session_active.set(False)
-        try:
-            request_auth_token.set("override-this-token-should-not-be-used")
+        request_auth_token.set("override-this-token-should-not-be-used")
 
-            # Pass an obviously-wrong token in arguments. Should be rejected
-            # (not silently replaced with the contextvar's "valid" token).
-            result = await dispatch_tool_call(
-                "view_status", {"token": "wrong" * 8}
-            )
-            assert isinstance(result, PermissionDenied), (
-                "dispatch_tool_call swallowed the wrong explicit token; "
-                "the contextvar must not override what the caller provided"
-            )
-            assert not isinstance(result, Ok), (
-                "view_status should not succeed with a wrong explicit token"
-            )
-        finally:
-            operator_session_active.reset(cv)
+        # Pass an obviously-wrong token in arguments. Should be rejected
+        # (not silently replaced with the contextvar's "valid" token).
+        result = await dispatch_tool_call(
+            "view_status", {"token": "wrong" * 8}
+        )
+        assert isinstance(result, PermissionDenied), (
+            "dispatch_tool_call swallowed the wrong explicit token; "
+            "the contextvar must not override what the caller provided"
+        )
+        assert not isinstance(result, Ok), (
+            "view_status should not succeed with a wrong explicit token"
+        )
 
 
 async def test_dispatch_without_contextvar_and_without_token_returns_auth_failure(
     tmp_path,
 ) -> None:
-    """No arguments.token and no contextvar → auth fails normally.
+    """No ``arguments.token`` and no bearer ContextVar → auth fails.
 
-    retire-system-token Wave 1: clear the harness's stamped
-    ``operator_session_active`` so the auth gate actually fires.
-
-    Wave 6 PR 5: post-migration, the gate's failure surfaces as a
-    returned :class:`PermissionDenied` rather than a raised
-    ``AuthRejected``.
+    Wave 6 PR 6: no Principal is supplied and the dispatcher's
+    arguments-token fallback finds none, so the migrated tool
+    receives ``principal=None`` and surfaces
+    :class:`PermissionDenied`.
     """
     from agent_mcp.tools.registry import (
         dispatch_tool_call,
         request_auth_token,
-        operator_session_active,
     )
     from agent_mcp.core.tool_result import PermissionDenied
 
     async with mcp_session(tmp_path):
-        cv = operator_session_active.set(False)
-        try:
-            # Make sure the contextvar is empty for this test.
-            request_auth_token.set(None)
+        # Make sure the contextvar is empty for this test.
+        request_auth_token.set(None)
 
-            result = await dispatch_tool_call("view_status", {})
-            assert isinstance(result, PermissionDenied)
-        finally:
-            operator_session_active.reset(cv)
+        result = await dispatch_tool_call("view_status", {})
+        assert isinstance(result, PermissionDenied)
 
 
 async def test_dispatch_admits_view_status_with_operator_session_contextvar(
     tmp_path,
 ) -> None:
-    """When ``operator_session_active=True`` is set AND no bearer is
-    present, the bridge derives an ``operator_session`` Principal
-    that satisfies the operator-tier inline check on ``view_status``.
+    """An explicit operator-session :class:`Principal` admits
+    ``view_status``.
 
-    Wave 6 PR 5 regression guard: this is the production REST seam's
-    code path — ``_dispatch_through_tool`` stamps op_session and the
-    migrated tool admits via the typed Principal."""
+    Wave 6 PR 6 regression guard: this is the production REST seam's
+    code path — ``_dispatch_through_tool`` builds the Principal and
+    the migrated tool admits via the typed Principal."""
     from agent_mcp.tools.registry import (
         dispatch_tool_call,
         request_auth_token,
-        operator_session_active,
-        operator_user_id,
     )
+    from agent_mcp.core.principal import Principal
     from agent_mcp.core.tool_result import Ok
 
     async with mcp_session(tmp_path):
         request_auth_token.set(None)
-        cv_op = operator_session_active.set(True)
-        cv_user = operator_user_id.set("op")
-        try:
-            result = await dispatch_tool_call("view_status", {})
-        finally:
-            operator_user_id.reset(cv_user)
-            operator_session_active.reset(cv_op)
+        principal = Principal(
+            kind="operator_session",
+            user_id="op",
+            agent_id=None,
+            sysadmin=False,
+            project_name=None,
+            project_role="operator",
+            agent_role=None,
+            can_wake_loop=False,
+            source_token=None,
+        )
+        result = await dispatch_tool_call(
+            "view_status", {}, principal=principal,
+        )
 
         assert isinstance(result, Ok), f"expected Ok, got {result!r}"

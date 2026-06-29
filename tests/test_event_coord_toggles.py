@@ -132,45 +132,39 @@ async def test_global_off_returns_stop_listening(tmp_path: Path) -> None:
 async def test_server_info_instructions_gated_by_flags(
     tmp_path: Path,
 ) -> None:
-    """The `_patched_create_initialization_options` injection only
-    appends the wake-loop bootstrap text when BOTH flags are ON.
-
-    Tested by directly calling the gating helper with a ContextVar
-    bind for the bearer — same context-flow as the SDK's
-    initialize handler.
+    """The wake-loop bootstrap text is appended only when BOTH flags
+    are ON. Wave 6 PR 6: the eligibility chain folds into
+    :attr:`Principal.can_wake_loop` at middleware build time; the
+    contributor reads that bit directly.
     """
     from tests.harness import mcp_session
-    from agent_mcp.app.main_app import _bearer_has_wake_loop_enabled
-    from agent_mcp.tools.registry import request_auth_token
+    from agent_mcp.app.main_app import _build_principal_from_request
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
 
         # Default: both flags ON → True.
-        token = request_auth_token.set(alice.token)
-        try:
-            assert _bearer_has_wake_loop_enabled() is True, (
-                "default state should enable wake-loop"
-            )
-        finally:
-            request_auth_token.reset(token)
+        p = _build_principal_from_request(
+            request=None, bearer_token=alice.token, forwarding_operator=None,
+        )
+        assert p is not None and p.can_wake_loop is True, (
+            "default state should enable wake-loop"
+        )
 
         # Per-agent OFF → False.
         _set_per_agent_flag("alice", False)
-        token = request_auth_token.set(alice.token)
-        try:
-            assert _bearer_has_wake_loop_enabled() is False
-        finally:
-            request_auth_token.reset(token)
+        p = _build_principal_from_request(
+            request=None, bearer_token=alice.token, forwarding_operator=None,
+        )
+        assert p is not None and p.can_wake_loop is False
 
         # Per-agent back ON, global OFF → False.
         _set_per_agent_flag("alice", True)
         _set_global_flag(False)
-        token = request_auth_token.set(alice.token)
-        try:
-            assert _bearer_has_wake_loop_enabled() is False
-        finally:
-            request_auth_token.reset(token)
+        p = _build_principal_from_request(
+            request=None, bearer_token=alice.token, forwarding_operator=None,
+        )
+        assert p is not None and p.can_wake_loop is False
 
 
 async def test_admin_bearer_does_not_get_wake_loop(tmp_path: Path) -> None:
@@ -178,14 +172,14 @@ async def test_admin_bearer_does_not_get_wake_loop(tmp_path: Path) -> None:
     The eligibility check returns False for the admin token even with
     both flags ON."""
     from tests.harness import mcp_session
-    from agent_mcp.app.main_app import _bearer_has_wake_loop_enabled
-    from agent_mcp.tools.registry import request_auth_token
+    from agent_mcp.app.main_app import _build_principal_from_request
 
     async with mcp_session(tmp_path) as admin:
-        token = request_auth_token.set(admin.admin_token)
-        try:
-            assert _bearer_has_wake_loop_enabled() is False, (
-                "admin bearer should NOT trigger wake-loop injection"
-            )
-        finally:
-            request_auth_token.reset(token)
+        p = _build_principal_from_request(
+            request=None,
+            bearer_token=admin.admin_token,
+            forwarding_operator=None,
+        )
+        assert p is not None and p.can_wake_loop is False, (
+            "admin bearer should NOT trigger wake-loop injection"
+        )

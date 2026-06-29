@@ -162,12 +162,10 @@ def _actor_label(principal: Optional[Principal]) -> str:
 
 
 def _is_admin_principal(principal: Optional[Principal]) -> bool:
-    """Operator-tier check with a narrowly scoped bridge-era fallback.
+    """Operator-tier check using :meth:`Principal.has_role`.
 
-    Wave 6 PR 3 — the canonical operator-tier check is
-    :meth:`Principal.has_role` with ``"admin"``. Production code
-    paths reach this helper with a Principal that already answers
-    correctly:
+    Production code paths reach this helper with a Principal that
+    already answers correctly:
 
     * REST seam → ``operator_session`` Principal →
       ``has_role("admin")`` True.
@@ -175,65 +173,13 @@ def _is_admin_principal(principal: Optional[Principal]) -> bool:
       ``has_role("admin")`` False; the worker/manager distinction
       doesn't matter at this gate.
 
-    The harness, by contrast, stamps BOTH a manager-role bearer AND
-    ``operator_session_active=True`` for ``AdminClient.call`` — the
-    bridge in ``tools/registry._derive_principal_from_contextvars``
-    picks bearer first, so the harness's admin call surfaces here as
-    an ``agent_bearer`` Principal whose ``agent_role`` is
-    ``"manager"``. That Principal correctly does NOT satisfy
-    ``has_role("admin")`` (a real manager-role worker agent
-    shouldn't bypass operator-only gates), but the harness's intent
-    is "operator at the dashboard" — the manager-role bearer is a
-    workaround for legacy ``@requires("any")`` decorators that need
-    ``arguments.token`` filled by the Q6e fallback.
-
-    The fallback below admits in exactly that narrow case:
-    ``agent_bearer`` + ``agent_role == "manager"`` +
-    ``operator_session_active`` is set. Production never combines
-    those — REST stamps op_session only, MCP wire stamps bearer
-    only — so the fallback never fires for production workloads.
-    Tests that build an explicit worker-role Principal are NOT
-    admitted by this branch even if a harness leak left
-    ``operator_session_active`` set.
-
-    ``principal is None`` consults the ContextVar unconditionally so
-    legacy callers that pre-date Wave 6 (no Principal kwarg, no
-    bridge derivation) still behave like the pre-migration
-    ``verify_token(.., "admin")`` did.
-
-    PR 6 of Wave 6 deletes this helper alongside the
-    ``operator_session_active`` ContextVar itself.
+    Wave 6 PR 6 retired the legacy ``operator_session_active``
+    ContextVar fallback. Callers that bypassed the dispatcher (None
+    principal) are simply not admitted as admin.
     """
     if principal is None:
-        try:
-            from .registry import operator_session_active
-
-            if operator_session_active.get():
-                return True
-        except Exception:  # pragma: no cover - defensive
-            pass
         return False
-
-    if principal.has_role("admin"):
-        return True
-
-    # Harness-only fallback — see docstring. Only an agent_bearer
-    # whose agent_role is ``"manager"`` AND with ``operator_session_active``
-    # set qualifies. This combination is unreachable in production but
-    # is exactly what ``AdminClient.call`` produces in the test harness.
-    if (
-        principal.kind == "agent_bearer"
-        and principal.agent_role == "manager"
-    ):
-        try:
-            from .registry import operator_session_active
-
-            if operator_session_active.get():
-                return True
-        except Exception:  # pragma: no cover - defensive
-            pass
-
-    return False
+    return principal.has_role("admin")
 
 
 def _requires_authenticated_caller(
@@ -253,29 +199,16 @@ def _requires_authenticated_caller(
       through here instead of writing the table directly;
     * any sysadmin caller (no project membership required).
 
-    The `principal.has_role("admin")` branch covers operator and
-    sysadmin in one check (see Principal docstring). The combined
-    gate matches what the Wave 6 PR 0 demo tool (``add_task_note``)
-    uses, so the per-tool authorization vocabulary stays consistent.
+    The ``principal.has_role("admin")`` branch covers operator and
+    sysadmin in one check (see Principal docstring).
     """
     if principal is None:
-        # Same bridge fallback as :func:`_is_admin_principal` for the
-        # None case: legacy call sites that pre-date Wave 6 might
-        # not have had a Principal derived (no bearer, no op_session
-        # in the bridge's view) but still have ``operator_session_active``
-        # stamped via the REST seam's ``_dispatch_through_tool``.
-        if _is_admin_principal(principal):
-            return None
         return PermissionDenied(
             reason="Valid token or operator session required"
         )
     if principal.kind == "agent_bearer":
         return None
     if principal.has_role("admin"):
-        return None
-    # Bridge fallback — see :func:`_is_admin_principal` for the
-    # narrow harness case (agent_bearer + manager + op_session_active).
-    if _is_admin_principal(principal):
         return None
     return PermissionDenied(
         reason="Valid token or operator session required"

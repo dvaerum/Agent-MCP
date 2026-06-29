@@ -331,96 +331,21 @@ class WorkerSession:
         `arguments.token` if absent. Returns the raw content blocks;
         use the `assert_*` helpers for wire-isError semantics.
 
-        retire-system-token Wave 1: when invoked through the
-        :class:`AdminClient` (i.e. this session represents the
-        harness's manager-role admin agent), the call also stamps
-        ``operator_session_active=True`` and the operator user_id on
-        the registry contextvars. Without it,
-        ``@requires_role("operator")``-gated tools would reject the
-        call because the system-bearer fallback that previously
-        admitted operator-tier callers is gone. The harness operator
-        identity mirrors what the REST seam (``routes.py``) does for
-        cookie-authenticated dashboard mutations.
-
-        Wave 6 PR 5: for admin-caller sessions calling a tool whose
-        declared visibility is ``"operator"`` AND whose impl has
-        been migrated to take a :class:`Principal` kwarg, bypass the
-        MCP framework handler and call :func:`dispatch_tool_call`
-        directly with an explicit operator-session Principal. The
-        bridge's contextvar derivation would otherwise prefer the
-        admin bearer (more specific identity for audit attribution)
-        and return ``agent_bearer`` — which fails the migrated
-        tool's inline ``principal.has_role("operator")`` check. The
-        explicit principal kwarg short-circuits the bridge so the
-        operator-tier tool sees the operator identity. Tools whose
-        declared visibility is ``"any"`` / ``"manager"`` /
-        ``"worker-if-toggled:..."`` still flow through the framework
-        handler with bridge-derived ``agent_bearer`` — preserving
-        the bridge's audit-attribution contract (PR 0's add_task_note
-        demo expects ``author="admin"`` from the agent_bearer path).
-        Legacy (unmigrated) tools also use the framework handler so
-        their ``@requires_role`` decorators keep reading the
-        ContextVars unchanged.
+        Wave 6 PR 6: the harness mints a typed :class:`Principal` per
+        session (operator-tier for the admin / admin-caller, worker
+        for everyone else) and stamps it on
+        :data:`tools.registry.request_principal` — the same ContextVar
+        the AuthHeaderMiddleware sets in production. The MCP framework
+        handler reads it back and threads it through the dispatcher;
+        the legacy ``operator_session_active`` ContextVar plumbing is
+        gone.
         """
         from agent_mcp.tools.registry import (
             request_auth_token,
-            operator_session_active,
-            operator_user_id,
-            operator_project_name,
-            dispatch_tool_call,
-            tool_implementations,
+            request_principal,
         )
-        from agent_mcp.core.tool_result import render_as_text_content
-        from agent_mcp.tools.access import TOOL_ACCESS as _TOOL_ACCESS
 
-        # Wave 6 PR 5 — operator-tool short-circuit for admin caller.
-        # Only triggers when ALL three conditions hold:
-        #   1. This session represents the harness's admin (the
-        #      pre-Wave-6 surface that stood in for "operator").
-        #   2. The tool's declared visibility is ``"operator"`` —
-        #      we leave ``"any"`` / ``"manager"`` tools on the
-        #      bridge-derived path so PR 0's agent_bearer attribution
-        #      contract holds.
-        #   3. The tool impl is migrated (accepts a ``principal``
-        #      kwarg) — same predicate the bridge uses. Skipping
-        #      unmigrated tools keeps their decorator-based
-        #      ContextVar gates unchanged.
-        if self.is_admin_caller:
-            access_level = _TOOL_ACCESS.get(tool_name)
-            if access_level == "operator":
-                impl = tool_implementations.get(tool_name)
-                tool_takes_principal = False
-                if impl is not None:
-                    try:
-                        import inspect as _inspect
-                        tool_takes_principal = (
-                            "principal" in _inspect.signature(impl).parameters
-                        )
-                    except (TypeError, ValueError):  # pragma: no cover
-                        tool_takes_principal = False
-                if tool_takes_principal:
-                    from agent_mcp.core.principal import Principal
-
-                    principal = Principal(
-                        kind="operator_session",
-                        user_id=_HARNESS_OPERATOR_ID,
-                        agent_id=None,
-                        sysadmin=False,
-                        project_name="harness",
-                        project_role="operator",
-                        agent_role=None,
-                        can_wake_loop=False,
-                        source_token=None,
-                    )
-                    cv_token = request_auth_token.set(self.token)
-                    try:
-                        result = await dispatch_tool_call(
-                            tool_name, arguments, principal=principal,
-                        )
-                    finally:
-                        request_auth_token.reset(cv_token)
-                    self._last_is_error = False
-                    return render_as_text_content(result)
+        principal = self._principal()
 
         handler = self._admin._call_tool_handler()
         req = mcp_types.CallToolRequest(
@@ -430,29 +355,12 @@ class WorkerSession:
             ),
         )
         cv_token = request_auth_token.set(self.token)
-        # The harness sets ``operator_session_active=True`` for the
-        # whole session by default (so per-tool admin gates admit by
-        # default — matching the pre-Wave-1 god-key behaviour). For a
-        # worker session, we explicitly clear the contextvars before
-        # dispatch so the role-based filters see a worker request,
-        # not an operator one.
-        cv_op_session = None
-        cv_op_user = None
-        cv_op_project = None
-        if not (self.is_admin_caller or self is self._admin):
-            cv_op_session = operator_session_active.set(False)
-            cv_op_user = operator_user_id.set(None)
-            cv_op_project = operator_project_name.set(None)
+        cv_principal = request_principal.set(principal)
         try:
             server_result = await handler(req)
         finally:
+            request_principal.reset(cv_principal)
             request_auth_token.reset(cv_token)
-            if cv_op_session is not None:
-                operator_session_active.reset(cv_op_session)
-            if cv_op_user is not None:
-                operator_user_id.reset(cv_op_user)
-            if cv_op_project is not None:
-                operator_project_name.reset(cv_op_project)
 
         inner = (
             server_result.root
@@ -463,44 +371,91 @@ class WorkerSession:
         self._last_is_error = bool(getattr(inner, "isError", False))
         return list(getattr(inner, "content", None) or [])
 
+    def _principal(self):
+        """Build the :class:`Principal` for this session.
+
+        Admin-caller sessions surface as an ``agent_bearer`` Principal
+        with ``agent_id="admin"`` AND ``sysadmin=True`` so they
+        simultaneously:
+
+          * satisfy ``@requires("any")`` (agent_bearer kind),
+          * satisfy ``@requires_role("operator")`` /
+            ``@requires_role("manager")`` (sysadmin override),
+          * supply ``agent_id="admin"`` for audit attribution (matches
+            the pre-Wave-6 bridge contract where tests expect
+            ``created_by="admin"``).
+
+        Plain worker sessions surface as plain ``agent_bearer``. The
+        harness stamps this on :data:`request_principal` before
+        driving the MCP framework handler so the wire path sees the
+        same identity a real HTTP request would.
+        """
+        from agent_mcp.core.principal import Principal
+
+        if self.is_admin_caller:
+            return Principal(
+                kind="agent_bearer",
+                user_id=_HARNESS_OPERATOR_ID,
+                agent_id=self.agent_id,
+                sysadmin=True,
+                project_name="harness",
+                project_role="operator",
+                agent_role="manager",
+                can_wake_loop=False,
+                source_token=self.token,
+            )
+        # Resolve the worker's actual agent_role from the in-memory
+        # cache (tests like ``test_assign_task_admits_manager_targeting_other``
+        # promote a worker to manager via direct DB mutation; the
+        # Principal must reflect that or downstream role checks
+        # silently treat the agent as worker-only).
+        from agent_mcp.core import globals as _g
+        row = _g.active_agents.get(self.token) or {}
+        cached_role = row.get("agent_role")
+        if cached_role not in ("worker", "manager"):
+            from agent_mcp.core.repositories import agent_repo as _agent_repo
+            db_row = _agent_repo.get_agent_by_token(self.token)
+            if isinstance(db_row, dict):
+                cached_role = db_row.get("agent_role")
+        normalized_role = (
+            cached_role if cached_role in ("worker", "manager") else None
+        )
+        return Principal(
+            kind="agent_bearer",
+            user_id=None,
+            agent_id=self.agent_id,
+            sysadmin=False,
+            project_name=None,
+            project_role=None,
+            agent_role=normalized_role,
+            can_wake_loop=False,
+            source_token=self.token,
+        )
+
     async def list_tools(self) -> List[mcp_types.Tool]:
         """`tools/list` as this bearer sees it (admin or worker filter
         per PR #55).
 
-        retire-system-token Wave 1: when invoked through the
-        :class:`AdminClient`, the call stamps
-        ``operator_session_active=True`` so the admin-tier branch of
-        the visibility filter (which now reads the operator-session
-        contextvar instead of ``verify_token(.., "admin")`` on the
-        system bearer) takes effect.
+        Wave 6 PR 6: stamps the typed Principal on
+        :data:`request_principal` so the list-tools handler's
+        visibility filter reads the same role surface a real HTTP
+        request would.
         """
         from agent_mcp.tools.registry import (
             request_auth_token,
-            operator_session_active,
-            operator_user_id,
-            operator_project_name,
+            request_principal,
         )
 
+        principal = self._principal()
         handler = self._admin._list_tools_handler()
         req = mcp_types.ListToolsRequest(method="tools/list")
         cv_token = request_auth_token.set(self.token)
-        cv_op_session = None
-        cv_op_user = None
-        cv_op_project = None
-        if not (self.is_admin_caller or self is self._admin):
-            cv_op_session = operator_session_active.set(False)
-            cv_op_user = operator_user_id.set(None)
-            cv_op_project = operator_project_name.set(None)
+        cv_principal = request_principal.set(principal)
         try:
             result = await handler(req)
         finally:
+            request_principal.reset(cv_principal)
             request_auth_token.reset(cv_token)
-            if cv_op_session is not None:
-                operator_session_active.reset(cv_op_session)
-            if cv_op_user is not None:
-                operator_user_id.reset(cv_op_user)
-            if cv_op_project is not None:
-                operator_project_name.reset(cv_op_project)
         inner = result.root if hasattr(result, "root") else result
         return list(getattr(inner, "tools", []) or [])
 
@@ -949,15 +904,14 @@ class AdminClient(WorkerSession):
 @contextlib.contextmanager
 def with_principal(principal):
     """Stamp a :class:`agent_mcp.core.principal.Principal` on the
-    legacy ContextVars for the duration of the ``with`` block.
+    request ContextVars for the duration of the ``with`` block.
 
-    Wave 6 PR 0 — the new test-side helper for the Principal value
-    type. The harness's per-session contextvar stamping (set up
-    inside :func:`mcp_session`) deprecated in favour of this; the
-    older approach still works for now (the bridge in
-    ``dispatch_tool_call`` falls back to ContextVars when no
-    Principal is in hand), so existing tests don't need to migrate
-    in this PR.
+    Wave 6 PR 6: the helper stamps :data:`request_principal` (the
+    canonical carrier the dispatcher / MCP handler reads) and
+    :data:`request_auth_token` (for the Q6e bearer-injection
+    fallback). The legacy operator-session ContextVars are gone, so
+    in-process tool calls that go through the dispatcher see the
+    Principal directly.
 
     Usage::
 
@@ -976,56 +930,26 @@ def with_principal(principal):
             source_token=None,
         )
         with with_principal(p):
-            ... # in-process tool calls that consult ContextVars / dispatch
-            ... # see p as the calling Principal
-
-    For ``operator_session`` and ``forwarding_header`` kinds, stamps
-    ``operator_session_active=True`` so legacy decorators that read
-    the ContextVar admit. For ``agent_bearer`` kinds, stamps
-    ``request_auth_token`` from ``principal.source_token`` so
-    bearer-based gates see the right agent.
+            ... # in-process tool calls see p as the calling Principal
 
     Resets in LIFO order on block exit. Safe to nest; each nested
     use returns a fresh handle that resets its own scope.
-
-    .. deprecated:: 6.0
-       The older per-session contextvar stamping in
-       :func:`mcp_session` continues to work for the legacy bridge;
-       new tests should use :func:`with_principal`. The shim helper
-       deletes in Wave 6 PR 6 alongside the ContextVars themselves.
     """
     from agent_mcp.tools.registry import (
-        operator_session_active,
-        operator_user_id,
-        operator_project_name,
+        request_principal,
         request_auth_token,
     )
 
-    cv_op_session = None
-    cv_op_user = None
-    cv_op_project = None
+    cv_principal = request_principal.set(principal)
     cv_token = None
+    if principal.source_token:
+        cv_token = request_auth_token.set(principal.source_token)
     try:
-        if principal.kind in ("operator_session", "forwarding_header"):
-            cv_op_session = operator_session_active.set(True)
-            if principal.user_id is not None:
-                cv_op_user = operator_user_id.set(principal.user_id)
-            if principal.project_name is not None:
-                cv_op_project = operator_project_name.set(principal.project_name)
-        elif principal.kind == "agent_bearer":
-            cv_op_session = operator_session_active.set(False)
-            if principal.source_token:
-                cv_token = request_auth_token.set(principal.source_token)
         yield principal
     finally:
         if cv_token is not None:
             request_auth_token.reset(cv_token)
-        if cv_op_project is not None:
-            operator_project_name.reset(cv_op_project)
-        if cv_op_user is not None:
-            operator_user_id.reset(cv_op_user)
-        if cv_op_session is not None:
-            operator_session_active.reset(cv_op_session)
+        request_principal.reset(cv_principal)
 
 
 @contextlib.asynccontextmanager
@@ -1101,48 +1025,26 @@ async def mcp_session(tmp_path: Path) -> AsyncIterator[AdminClient]:
         #   2. Mint a real manager-role agent row in the agents table
         #      so MCP tool calls that need a bearer get a valid
         #      per-agent token.
-        #   3. Stamp ``operator_session_active=True`` for the lifetime
-        #      of the harness session so per-tool admin gates (which
-        #      now consult the contextvar instead of a system-bearer
-        #      check) admit by default — every test running under the
-        #      harness is "the operator at the dashboard" unless it
-        #      explicitly resets the var to drive a worker call.
+        #
+        # Wave 6 PR 6: per-session operator-ContextVar stamping is
+        # gone — the harness builds a Principal per :meth:`call` /
+        # :meth:`list_tools` via :meth:`WorkerSession._principal` and
+        # stamps :data:`request_principal` for the duration of that
+        # call. Tests that need to assert against a specific
+        # Principal in in-process tool calls can wrap with
+        # :func:`with_principal`.
         from agent_mcp.core import globals as g
-        from agent_mcp.tools.registry import (
-            operator_session_active,
-            operator_user_id,
-            operator_project_name,
-        )
 
         g.forwarding_hmac_key = os.urandom(32)
 
         admin_token = _seed_harness_admin_agent()
-
-        # ContextVar resets MUST happen in the same Context the
-        # ``.set()`` was made in. The ExitStack teardown runs via
-        # ``asyncio.to_thread`` (so the synchronous TestClient lifespan
-        # shutdown doesn't block the event loop), which is a different
-        # Context — calling ``contextvar.reset(token)`` from there
-        # raises ``ValueError: Token was created in a different Context``.
-        # So we manage the reset in this async generator's try/finally
-        # rather than on the stack.
-        cv_op_session = operator_session_active.set(True)
-        cv_op_user = operator_user_id.set(_HARNESS_OPERATOR_ID)
-        cv_op_project = operator_project_name.set("harness")
 
         admin = AdminClient(
             admin_token=admin_token,
             test_client=test_client,
             forwarding_hmac_key=g.forwarding_hmac_key,
         )
-        try:
-            yield admin
-        finally:
-            # Reset contextvars in the same context they were set in
-            # (this coroutine), BEFORE the to_thread stack.close.
-            operator_project_name.reset(cv_op_project)
-            operator_user_id.reset(cv_op_user)
-            operator_session_active.reset(cv_op_session)
+        yield admin
     finally:
         # Restore env vars first; teardown of app comes via the stack.
         for k, v in env_snapshot.items():

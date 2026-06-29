@@ -73,6 +73,11 @@ class InitContext:
         ``AuthHeaderMiddleware`` when the upstream router proxied a
         request from an alias URL, or ``None`` for the canonical-URL
         hot path.
+      principal: the typed :class:`agent_mcp.core.principal.Principal`
+        for the calling request (Wave 6 PR 6). Used by
+        :func:`_wake_loop_contributor` to read
+        ``principal.can_wake_loop`` directly instead of re-deriving
+        the eligibility chain from a bearer.
 
     Extending: when a new contributor needs a new fact, add a new
     field here with a sensible default (so existing call-sites that
@@ -83,6 +88,7 @@ class InitContext:
 
     bearer: Optional[str]
     alias_info: Optional[tuple[str, str]]
+    principal: Optional[object] = None
 
 
 InstructionsContributor = Callable[[InitContext], Optional[str]]
@@ -159,18 +165,14 @@ def _alias_warning_contributor(ctx: InitContext) -> Optional[str]:
 def _wake_loop_contributor(ctx: InitContext) -> Optional[str]:
     """ADR-0011 / event-coord wake-loop bootstrap.
 
-    Migrated from ``main_app._patched_create_initialization_options``
-    pre-PR-W1b. Gating logic (admin bearers skipped, global flag,
-    per-agent flag) is unchanged and still lives in
-    ``_bearer_has_wake_loop_enabled`` for backwards compat — the
-    eligibility check has its own targeted test suite in
-    ``tests/test_event_coord_toggles.py`` we don't want to disturb.
+    Wave 6 PR 6: the eligibility chain (admin agents skipped, global
+    flag, per-agent flag) is resolved once at the middleware seam and
+    surfaces here as :attr:`Principal.can_wake_loop`. The contributor
+    reads that bit directly — no DB hop, no re-deriving identity.
     """
-    # Same import-cycle reasoning as above: main_app owns the
-    # eligibility helper, this module is imported by main_app.
-    from .main_app import _bearer_has_wake_loop_enabled
-
-    if not _bearer_has_wake_loop_enabled():
+    if ctx.principal is None:
+        return None
+    if not getattr(ctx.principal, "can_wake_loop", False):
         return None
     from .event_loop_instructions import WAKE_LOOP_INSTRUCTIONS
 

@@ -409,10 +409,10 @@ async def test_fetch_events_since_returns_ok_envelope(tmp_path) -> None:
 async def test_with_principal_helper_works_for_send_message(
     tmp_path,
 ) -> None:
-    """Tests using :func:`with_principal` see the bridge derive the
-    matching Principal so the tool gets the right identity even when
-    called via the legacy dispatcher path without explicit
-    ``principal=``.
+    """Wave 6 PR 6: :func:`with_principal` stamps
+    :data:`request_principal` for surfaces that consult it; the
+    dispatcher itself takes ``principal=`` explicitly. Pass it
+    through and confirm the tool sees the operator identity.
     """
     from agent_mcp.tools.registry import dispatch_tool_call
 
@@ -427,6 +427,7 @@ async def test_with_principal_helper_works_for_send_message(
                     "message": "via with_principal",
                     "deliver_method": "store",
                 },
+                principal=p,
             )
 
     assert isinstance(result, Ok)

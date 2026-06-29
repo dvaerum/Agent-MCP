@@ -131,21 +131,29 @@ def _seed_agent(token: str, agent_id: str, *, agent_role: str) -> None:
 async def test_requires_role_manager_admits_operator_session(app_with_db) -> None:
     """An operator-session caller can invoke a manager-gated tool.
 
-    The REST seam sets ``operator_session_active`` to True on the
-    ``request_auth_token`` ContextVar's sibling before dispatching.
+    Wave 6 PR 6: identity flows through the typed Principal kwarg;
+    the REST seam / forwarding-header middleware builds it and the
+    dispatcher threads it into the wrapper.
     """
     from agent_mcp.core.authorize import requires_role
-    from agent_mcp.tools.registry import operator_session_active
+    from agent_mcp.core.principal import Principal
 
     @requires_role("manager")
     async def my_tool(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
         return [mcp_types.TextContent(type="text", text="manager-ok")]
 
-    token = operator_session_active.set(True)
-    try:
-        result = await my_tool({})
-    finally:
-        operator_session_active.reset(token)
+    p = Principal(
+        kind="operator_session",
+        user_id="alice",
+        agent_id=None,
+        sysadmin=False,
+        project_name=None,
+        project_role="operator",
+        agent_role=None,
+        can_wake_loop=False,
+        source_token=None,
+    )
+    result = await my_tool({}, principal=p)
     assert result[0].text == "manager-ok"
 
 
@@ -215,17 +223,24 @@ async def test_requires_role_manager_rejects_system_token(app_with_db) -> None:
 async def test_requires_role_operator_admits_operator_session(app_with_db) -> None:
     """Operator session passes the operator gate."""
     from agent_mcp.core.authorize import requires_role
-    from agent_mcp.tools.registry import operator_session_active
+    from agent_mcp.core.principal import Principal
 
     @requires_role("operator")
     async def my_tool(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
         return [mcp_types.TextContent(type="text", text="op-ok")]
 
-    token = operator_session_active.set(True)
-    try:
-        result = await my_tool({})
-    finally:
-        operator_session_active.reset(token)
+    p = Principal(
+        kind="operator_session",
+        user_id="alice",
+        agent_id=None,
+        sysadmin=False,
+        project_name=None,
+        project_role="operator",
+        agent_role=None,
+        can_wake_loop=False,
+        source_token=None,
+    )
+    result = await my_tool({}, principal=p)
     assert result[0].text == "op-ok"
 
 
@@ -304,23 +319,29 @@ async def test_requires_role_operator_rejects_worker_agent(app_with_db) -> None:
 async def test_legacy_requires_admin_still_works(app_with_db) -> None:
     """``@requires("admin")`` continues to authorise an operator session.
 
-    retire-system-token Wave 1: the legacy alias is preserved, but the
-    god-key bearer that previously admitted it is gone. The surviving
-    admit path is an operator session (stamped by the REST seam, the
-    forwarding-header middleware path, or the test harness).
+    Wave 6 PR 6: identity flows through the typed Principal kwarg
+    the wrapper accepts. The legacy alias resolves to the same
+    operator-tier check as ``@requires_role("operator")``.
     """
     from agent_mcp.core.authorize import requires
-    from agent_mcp.tools.registry import operator_session_active
+    from agent_mcp.core.principal import Principal
 
     @requires("admin")
     async def my_tool(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
         return [mcp_types.TextContent(type="text", text="legacy-ok")]
 
-    cv = operator_session_active.set(True)
-    try:
-        result = await my_tool({"token": "anything-ignored"})
-    finally:
-        operator_session_active.reset(cv)
+    p = Principal(
+        kind="operator_session",
+        user_id="alice",
+        agent_id=None,
+        sysadmin=False,
+        project_name=None,
+        project_role="operator",
+        agent_role=None,
+        can_wake_loop=False,
+        source_token=None,
+    )
+    result = await my_tool({"token": "anything-ignored"}, principal=p)
     assert result[0].text == "legacy-ok"
 
 

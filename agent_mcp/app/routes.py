@@ -60,10 +60,9 @@ import mcp.types as mcp_types # For handling the result from tool_impl
 # — rather than being re-implemented per surface.
 from ..tools.registry import (
     dispatch_tool_call,
-    operator_session_active,
-    operator_user_id as _cv_operator_user_id,
     request_auth_token,
 )
+from ..core.principal import Principal
 from ..core.authorize import AuthRejected
 from ..tools.registry import ToolInputValidationError
 # Wave 6 PR 0 — ToolResult variants the REST adapter matches against.
@@ -99,78 +98,49 @@ async def _dispatch_through_tool(
     operator_session: bool = False,
     operator_user_id: Optional[str] = None,
 ) -> JSONResponse:
-    """Run an MCP tool from a REST handler and translate the
-    `list[TextContent]` result back into a dashboard-friendly JSON
-    response.
+    """Run an MCP tool from a REST handler and translate the typed
+    :data:`ToolResult` back into a dashboard-friendly JSON response.
 
     Auth: the dashboard sends the admin token in the JSON body, not as
-    an Authorization header. We bind it on the `request_auth_token`
-    ContextVar so `dispatch_tool_call`'s Q6e fallback injects it into
-    `arguments.token` if not already there — same path an HTTP middleware
-    would take.
+    an Authorization header. We bind it on the ``request_auth_token``
+    ContextVar so the dispatcher's Q6e fallback injects it into
+    ``arguments.token`` if not already there — same path an HTTP
+    middleware would take.
 
-    Wave 3 (prancy-napping-pie): callers pass
-    ``operator_session=True`` + ``operator_user_id=<username>`` to
-    admit operator-tier dispatches without a bearer token. The
-    decorators in ``agent_mcp/core/authorize.py`` admit the
-    operator-session path; the inner tool uses ``operator_user_id``
-    for audit-log attribution.
+    Callers pass ``operator_session=True`` + ``operator_user_id=<username>``
+    to admit operator-tier dispatches without a bearer token. We build
+    a ``Principal`` from those values and thread it to the dispatcher;
+    when neither is set, the bearer is expected to carry an
+    ``agent_bearer`` Principal (built locally from the row).
+
+    Wave 6 PR 6: the legacy ContextVar stamp block (which set the
+    deleted ``operator_session_active`` / ``operator_user_id`` vars
+    so unmigrated decorators could read them) is gone. The Principal
+    is the single carrier of caller identity; tool decorators read
+    it directly.
 
     Error mapping (HTTP-shaped):
       * AuthRejected            → 403
       * ToolInputValidationError → 400
-      * Tool result starting with "Error: ... not found" / "not found" → 404
-      * Other tool-error text   → 400 (caller-error semantics)
-      * Unexpected exception    → 500
+      * NotFound                → 404
+      * PermissionDenied        → 403
+      * Invalid                 → 400
+      * Conflict                → 409
+      * Failed / Unexpected     → 500
 
     Success payload mirrors the legacy REST endpoints'
     ``{"success": true, "message": "...", ...extras}`` shape so the
     dashboard's ApiClient doesn't have to change.
     """
     cv_token = None
-    cv_op_session = None
-    cv_op_user = None
     if bearer_token:
         cv_token = request_auth_token.set(bearer_token)
-    # Phase 2 Wave 2a (v5.0.63): mark the dispatch as originating from
-    # a logged-in operator session so @requires_role("operator") /
-    # @requires_role("manager") gates can distinguish "operator at the
-    # dashboard" from "script holding the raw system token". Both
-    # currently pass operator-tier gates (the system bearer is
-    # accepted on the legacy path), but the distinction matters for
-    # audit attribution and for future per-project membership checks.
-    if operator_session:
-        cv_op_session = operator_session_active.set(True)
-    if operator_user_id is not None:
-        cv_op_user = _cv_operator_user_id.set(operator_user_id)
 
-    # Wave 6 PR 5 — when the REST seam confirms an operator session,
-    # build an :class:`agent_mcp.core.principal.Principal` and pass it
-    # explicitly to the dispatcher. The legacy bridge in
-    # ``dispatch_tool_call`` would otherwise prefer the bearer (if
-    # one is also stamped, e.g. legacy admin bearer on
-    # ``Authorization:``) and return ``agent_bearer`` — which fails
-    # the migrated operator-tier tools' inline
-    # ``principal.has_role("operator")`` check. The explicit
-    # Principal short-circuits the bridge so the migrated tool sees
-    # the operator identity. Unmigrated tools (no ``principal``
-    # kwarg) ignore this; they still read the ContextVars stamped
-    # above for their @requires_role decorators.
-    dispatch_principal: Optional["Principal"] = None
-    if operator_session:
-        from ..core.principal import Principal as _Principal
-
-        dispatch_principal = _Principal(
-            kind="operator_session",
-            user_id=operator_user_id,
-            agent_id=None,
-            sysadmin=False,
-            project_name=None,
-            project_role="operator",
-            agent_role=None,
-            can_wake_loop=False,
-            source_token=bearer_token,
-        )
+    dispatch_principal = _build_route_principal(
+        bearer_token=bearer_token,
+        operator_session=operator_session,
+        operator_user_id=operator_user_id,
+    )
     try:
         result = await dispatch_tool_call(
             tool_name, arguments, principal=dispatch_principal,
@@ -201,19 +171,7 @@ async def _dispatch_through_tool(
     finally:
         if cv_token is not None:
             request_auth_token.reset(cv_token)
-        if cv_op_session is not None:
-            operator_session_active.reset(cv_op_session)
-        if cv_op_user is not None:
-            _cv_operator_user_id.reset(cv_op_user)
 
-    # Wave 6 PR 0 — ``dispatch_tool_call`` now returns a typed
-    # ``ToolResult``. Map each variant to the HTTP shape the
-    # dashboard's ApiClient already understands. New-style tools
-    # (PRs 1-5 migrate them) return non-Ok variants directly;
-    # old-style tools still go through the bridge's
-    # ``Ok(message=concatenated_text)`` wrap, and the legacy
-    # text-matching block below preserves the historical 4xx/5xx
-    # behavior for callers that haven't been migrated yet.
     if isinstance(result, _NotFound):
         text = f"{result.resource} {result.identifier!r} not found."
         return JSONResponse(
@@ -266,60 +224,76 @@ async def _dispatch_through_tool(
             status_code=500,
         )
 
-    # ``Ok`` — success. Two sub-cases:
-    #   * Ok(data=...) (new-style tool) — return data as the JSON
-    #     body, 200 by default or 201 for create_* operations.
-    #   * Ok(message=...) only (legacy bridge wrap) — fall through
-    #     to the legacy text-matching block below for back-compat
-    #     with unmigrated tools whose prose may indicate an error
-    #     ("Cannot ..." refusals, etc.).
-    if isinstance(result, _Ok) and result.data is not None:
-        payload: Dict[str, Any] = {
-            "success": True,
-            "message": success_message or (result.message or ""),
-            "data": result.data,
-        }
-        if extra_response:
-            payload.update(extra_response)
-        # 201 heuristic: create_* tools naming convention. Refine if
-        # a future tool needs different semantics.
-        status = 201 if tool_name.startswith("create_") else 200
-        return JSONResponse(payload, status_code=status)
-
-    # TODO Wave 6 PR 6: delete the rest of this function once all
-    # tools return ToolResult variants (no Ok(message=...)-only
-    # results from the bridge). This block fires only on the
-    # bridge-wrap path for legacy ``list[TextContent]`` returns.
-    text = (result.message or "") if isinstance(result, _Ok) else ""
-    lower = text.lower().lstrip()
-    is_error_prefix = (
-        lower.startswith("error:") or lower.startswith("unauthorized")
-    )
-    is_not_found_phrase = (
-        " not found" in lower
-        or lower.startswith("not found")
-        or "does not exist" in lower
-        or "none of the specified keys exist" in lower
-    )
-    is_refusal_phrase = lower.startswith("cannot ")
-    if is_error_prefix or is_not_found_phrase or is_refusal_phrase:
-        status = 400
-        if is_not_found_phrase:
-            status = 404
-        if "unauthorized" in lower:
-            status = 403
-        return JSONResponse(
-            {"success": False, "error": text, "message": text},
-            status_code=status,
-        )
-
-    payload = {
+    # ``Ok`` — success. ``Ok.data`` (when set) is the JSON body the
+    # dashboard consumes; ``Ok.message`` provides a human-readable
+    # summary the success-banner reads when the caller didn't supply
+    # one via ``success_message``.
+    ok_payload: Dict[str, Any] = {
         "success": True,
-        "message": success_message or text,
+        "message": success_message or (result.message or ""),
     }
+    if result.data is not None:
+        ok_payload["data"] = result.data
     if extra_response:
-        payload.update(extra_response)
-    return JSONResponse(payload)
+        ok_payload.update(extra_response)
+    # 201 heuristic: create_* tools naming convention. Refine if a
+    # future tool needs different semantics.
+    status = 201 if (
+        tool_name.startswith("create_") and result.data is not None
+    ) else 200
+    return JSONResponse(ok_payload, status_code=status)
+
+
+def _build_route_principal(
+    *,
+    bearer_token: Optional[str],
+    operator_session: bool,
+    operator_user_id: Optional[str],
+) -> Optional[Principal]:
+    """Construct the Principal the REST seam threads into the dispatcher.
+
+    Three shapes:
+
+    * ``operator_session=True`` → ``operator_session`` Principal
+      naming the operator (the dashboard / forwarding-header path).
+    * Bearer present, no operator session → ``agent_bearer`` Principal
+      sourced from the row in ``agents``.
+    * Neither → None (the dispatcher will reject downstream).
+    """
+    if operator_session:
+        return Principal(
+            kind="operator_session",
+            user_id=operator_user_id,
+            agent_id=None,
+            sysadmin=False,
+            project_name=None,
+            project_role="operator",
+            agent_role=None,
+            can_wake_loop=False,
+            source_token=bearer_token,
+        )
+    if bearer_token:
+        agent_id = auth_get_agent_id(bearer_token)
+        if agent_id:
+            row = g.active_agents.get(bearer_token) or {}
+            agent_role = row.get("agent_role")
+            normalized_role = (
+                agent_role
+                if agent_role in ("worker", "manager")
+                else None
+            )
+            return Principal(
+                kind="agent_bearer",
+                user_id=None,
+                agent_id=agent_id,
+                sysadmin=False,
+                project_name=None,
+                project_role=None,
+                agent_role=normalized_role,
+                can_wake_loop=False,
+                source_token=bearer_token,
+            )
+    return None
 
 
 # --- Dashboard and API Endpoints ---
@@ -755,15 +729,10 @@ async def create_agent_dashboard_api_route(
             "agent_role": agent_role,
         }
 
-        # Build a Principal from the validated operator session so the
-        # migrated ``create_agent_tool_impl`` (Wave 6 PR 5) admits via
-        # ``principal.has_role("operator")``. We stash the legacy
-        # operator-session ContextVars too so any unmigrated downstream
-        # path (e.g. nested verify_token calls inside the tool's
-        # helpers) keeps seeing the same operator identity until Wave
-        # 6 PR 6 deletes those ContextVars.
+        # Build a Principal from the validated operator session so
+        # ``create_agent_tool_impl`` admits via
+        # ``principal.has_role("operator")``.
         operator_id = caller_identity(auth)
-        from ..core.principal import Principal
         principal = Principal(
             kind="operator_session",
             user_id=operator_id,
@@ -775,13 +744,7 @@ async def create_agent_dashboard_api_route(
             can_wake_loop=False,
             source_token=None,
         )
-        cv_op_session = operator_session_active.set(True)
-        cv_op_user = _cv_operator_user_id.set(operator_id)
-        try:
-            result = await create_agent_tool_impl(tool_args, principal=principal)
-        finally:
-            operator_session_active.reset(cv_op_session)
-            _cv_operator_user_id.reset(cv_op_user)
+        result = await create_agent_tool_impl(tool_args, principal=principal)
 
         # Wave 6 PR 5: the tool now returns a typed :class:`ToolResult`.
         # Map each variant onto the existing dashboard JSON envelope so

@@ -1,9 +1,9 @@
 """Per-tool authorization decorators (architecture review 2026-06-01,
-candidate A).
+candidate A; Principal-only since Wave 6 PR 6).
 
 This module is the single, auditable surface for Agent-MCP tool
-authorisation. Before this PR, every tool in ``agent_mcp/tools/*.py``
-opened with its own ``verify_token(...)`` block, returning a magic
+authorisation. Before retire-system-token Wave 6, every tool opened
+with its own ``verify_token(...)`` block, returning a magic
 ``"Unauthorized: ..."`` ``TextContent``; the dispatcher then used
 ``_AUTH_FAILURE_RE`` to text-match those payloads back into an
 exception so the MCP framework would set ``isError=True``. That left
@@ -13,38 +13,51 @@ stay in sync with each tool's exact wording.
 The replacement is three decorators + one typed exception:
 
 * :func:`requires` wraps a tool entry point and raises
-  :class:`AuthRejected` when the supplied ``token`` (taken from
-  ``arguments["token"]`` *and* the bearer-header fallback already
-  injected by ``dispatch_tool_call`` — see Q6e in the plan) does not
-  satisfy the requested role (``"admin"`` or ``"any"``).
+  :class:`AuthRejected` when the calling Principal (threaded through
+  by ``dispatch_tool_call``) does not satisfy the requested role
+  (``"admin"`` or ``"any"``).
 
 * :func:`requires_policy` is the toggle-gated variant for tools that
   admin can always call but workers can only reach when at least one
-  listed ``config_*`` key in ``project_context`` evaluates truthy. The
-  per-key default — used when the row is absent — matches what each
-  tool's own impl previously passed to ``_get_config_bool`` and is
-  centralised in :data:`agent_mcp.tools.access._TOGGLE_DEFAULTS`.
+  listed ``config_*`` key in ``project_context`` evaluates truthy.
 
 * :class:`AuthRejected` propagates through ``dispatch_tool_call`` to
   the MCP framework's ``_make_error_result`` (see
   ``mcp/server/lowlevel/server.py:584``) which sets ``isError=True``.
   No text matching, no regex.
 
-Tools that need ``is_admin`` for *branching* logic (e.g.
-``view_project_context`` redacts secret keys for workers,
-``update_task_status`` permits admins to edit fields workers can't)
-keep their internal ``verify_token`` call. Only the *gating* call —
-the leading "reject if not admin" — gets replaced by a decorator.
+Wave 6 PR 6 retired the ContextVar / ``verify_token`` plumbing the
+decorators used to consult. The wrappers now read the calling
+:class:`agent_mcp.core.principal.Principal` from a keyword-only
+``principal`` argument the dispatcher always supplies, and consult
+``principal.has_role(...)`` / ``principal.kind`` / sysadmin flags
+directly.
 """
 
 from __future__ import annotations
 
 import functools
+import inspect
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import mcp.types as mcp_types
 
-from .auth import verify_token, get_agent_id
+from .principal import Principal
+
+
+def _func_accepts_principal(func: Callable) -> bool:
+    """True iff ``func`` declares a ``principal`` keyword parameter.
+
+    Inspected once per decorator construction so the wrapper can skip
+    passing ``principal=`` to legacy / test-fixture impls that don't
+    take it. ``functools.wraps`` keeps ``inspect.signature`` reading
+    through to the underlying impl.
+    """
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return False
+    return "principal" in sig.parameters
 
 
 class AuthRejected(Exception):
@@ -63,29 +76,9 @@ class AuthRejected(Exception):
 
 
 # Tool entry points all share this signature: a single dict of
-# arguments → list of TextContent. Hoisting the alias keeps the
+# arguments → typed ToolResult variant. Hoisting the alias keeps the
 # decorator bodies readable.
-ToolImpl = Callable[[Dict[str, Any]], Awaitable[List[mcp_types.TextContent]]]
-
-
-def _extract_token(arguments: Dict[str, Any]) -> Optional[str]:
-    """Best-effort token extraction.
-
-    ``dispatch_tool_call`` already injects the ``Authorization: Bearer``
-    header (when one is present) into ``arguments["token"]`` before
-    handing off (Q6e fallback in ``tools/registry.py``), so by the
-    time a decorator runs there is exactly one place to look.
-    """
-    raw = arguments.get("token")
-    if raw is None:
-        return None
-    if isinstance(raw, str):
-        return raw
-    # Defensive: schema rejects non-strings, but a caller bypassing
-    # the dispatcher (tests, in-process bridges) could still send a
-    # weird type. Treat anything non-string as missing rather than
-    # crashing on the eventual verify_token comparison.
-    return None
+ToolImpl = Callable[..., Awaitable[Any]]
 
 
 #: Roles accepted by :func:`requires_role`. The legacy ``"admin"`` is a
@@ -95,117 +88,160 @@ def _extract_token(arguments: Dict[str, Any]) -> Optional[str]:
 _VALID_ROLES = frozenset({"operator", "manager", "any", "admin"})
 
 
-def _check_role(role: str, token: Optional[str]) -> None:
-    """Run the role gate. Raise :class:`AuthRejected` on rejection.
+def _synthesize_principal_from_arguments(
+    arguments: Dict[str, Any],
+) -> Optional[Principal]:
+    """Build an ``agent_bearer`` Principal from a bearer in ``arguments``.
 
-    Centralises the role → check mapping so :func:`requires` and
-    :func:`requires_role` share one implementation. The function
-    consults ``operator_session_active`` (set by the REST seam when
-    the call originates from a logged-in operator's session cookie)
-    in addition to the static token verification.
+    Convenience fallback for direct in-process / unit-test calls into
+    a ``@requires`` / ``@requires_role`` / ``@requires_policy`` wrapper
+    that don't supply ``principal=`` explicitly. The production path
+    (``dispatch_tool_call``) always supplies one — this fallback only
+    fires for tests / scripts that call the wrapped impl directly with
+    just ``arguments``.
 
-    Role semantics (Phase 2 Wave 2a, updated by retire-system-token
-    Wave 1 — the system-bearer branch is gone; only operator-session
-    and per-agent tokens admit):
-
-    * ``"operator"`` (and legacy alias ``"admin"``) — admits operator
-      session only. Agent tokens — including ``agent_role='manager'``
-      — are rejected. This is the strictest gate; reserved for
-      spawn/terminate-agent, mutate ``config_*``,
-      ``broadcast_admin_message``, backup-context, and RAG-index
-      rebuild.
-    * ``"manager"`` — admits operator session OR agent token whose
-      row has ``agent_role='manager'``. The supervision-tier gate:
-      assign-task to peers, edit subordinate agent metadata.
-    * ``"any"`` — any active agent token (worker or manager).
-      Operator session does NOT satisfy ``"any"`` on its own because
-      ``"any"`` is about agent-side identity (audit-log attribution
-      needs an agent_id); operator-session callers that need to
-      invoke an ``"any"``-gated tool must explicitly pass a per-agent
-      token in ``arguments["token"]``.
+    Resolves the bearer via :func:`agent_mcp.core.auth.get_agent_id`
+    and reads the row's ``agent_role`` from the in-memory cache when
+    present, so the synthesized Principal carries the same
+    discriminators the production seam would have produced.
+    Returns None when no usable bearer is in hand; the wrapper then
+    falls through to the role's reject path.
     """
-    # Lazy import — avoid an import cycle (registry imports authorize
-    # transitively via tool implementations' @requires decorators).
-    from ..tools.registry import (
-        operator_session_active,
-        operator_user_id,
-        operator_project_name,
+    raw_token = arguments.get("token")
+    if not isinstance(raw_token, str) or not raw_token:
+        return None
+    from .auth import get_agent_id
+    from . import globals as _g
+    agent_id = get_agent_id(raw_token)
+    if not agent_id:
+        return None
+    row = _g.active_agents.get(raw_token) or {}
+    agent_role = row.get("agent_role")
+    normalized_role = (
+        agent_role if agent_role in ("worker", "manager") else None
+    )
+    return Principal(
+        kind="agent_bearer",
+        user_id=None,
+        agent_id=agent_id,
+        sysadmin=False,
+        project_name=None,
+        project_role=None,
+        agent_role=normalized_role,
+        can_wake_loop=False,
+        source_token=raw_token,
     )
 
-    op_session = bool(operator_session_active.get())
 
-    # Phase 3 Wave 2 (v5.0.69): when the REST seam stamps an
-    # operator's user_id + the targeted project on the contextvars,
-    # consult ``resolve_user_project_role`` so a viewer-tier
-    # operator can't reach an ``"operator"``-gated tool. This is the
-    # defence-in-depth gate; the router's
-    # ``require_operator_session_middleware`` is the primary one
-    # (rejects viewer mutations before they reach the backend), but
-    # the decorator stays as a backstop for in-process callers that
-    # bypass the REST seam.
-    def _viewer_blocked() -> bool:
-        if not op_session:
-            return False
-        uid = operator_user_id.get()
-        proj = operator_project_name.get()
-        if not uid or not proj:
-            return False
+def _viewer_blocked(principal: Principal) -> bool:
+    """Defence-in-depth viewer gate for operator-tier decorators.
+
+    Phase 3 Wave 2: a viewer-tier operator (read-only project member)
+    must NOT bypass an ``@requires_role("operator")`` /
+    ``@requires_role("manager")`` decorator just because they hold a
+    valid session cookie. The router middleware
+    (``require_operator_session_middleware``) is the primary gate —
+    it 403s viewer mutations before they reach the per-project
+    backend — but the decorator backstops in-process call sites that
+    bypass the REST seam (tests, batch jobs).
+
+    Returns True iff the principal is an operator-path caller with a
+    resolved project membership of ``"viewer"``. Sysadmins are
+    exempt. ``agent_bearer`` principals never have a project_role and
+    fall through this check (False).
+    """
+    if principal.kind not in ("operator_session", "forwarding_header"):
+        return False
+    if principal.sysadmin:
+        return False
+    # Prefer the Principal's own project_role when set (the REST seam
+    # / dashboard handlers fill it from ``resolve_user_project_role``).
+    if principal.project_role == "viewer":
+        return True
+    # Forwarding-header path doesn't carry project_role yet — the
+    # router-side middleware filled it on its own auth surface and
+    # the per-project backend has no router.db handle. Re-resolve
+    # here so the decorator's defence-in-depth still works for
+    # cookie-only forwards without an explicit project_role.
+    if (
+        principal.kind == "forwarding_header"
+        and principal.user_id
+        and principal.project_name
+        and principal.project_role is None
+    ):
         try:
             from ..router import group_resolver
-            # Sysadmin always admits regardless of project role.
-            if group_resolver.resolve_user_is_sysadmin(uid):
+            if group_resolver.resolve_user_is_sysadmin(principal.user_id):
                 return False
-            resolved = group_resolver.resolve_user_project_role(uid, proj)
+            resolved = group_resolver.resolve_user_project_role(
+                principal.user_id, principal.project_name,
+            )
         except Exception:  # pragma: no cover - defensive
-            # Resolver failure → don't double-restrict; the
-            # middleware already gated the call.
             return False
-        # No row → no membership; fall through to "blocked" because
-        # the static role gates below would otherwise admit on
-        # op_session alone. The middleware would have rejected this
-        # case already; defence in depth.
         if resolved is None:
             return True
         return resolved == "viewer"
+    return False
 
+
+def _check_role_principal(role: str, principal: Principal) -> None:
+    """Run the role gate against the typed Principal.
+
+    Raise :class:`AuthRejected` on rejection.
+
+    Role semantics (Wave 6 PR 6 — Principal-only):
+
+    * ``"operator"`` (legacy alias ``"admin"``) — admits any
+      operator-tier caller (cookie-session, forwarding-header, or
+      sysadmin). Agent tokens — including ``agent_role='manager'``
+      — are rejected. Reserved for spawn/terminate-agent, mutate
+      ``config_*``, broadcast-admin-message, backup-context, RAG
+      rebuild.
+    * ``"manager"`` — admits operator-tier OR agents whose row has
+      ``agent_role='manager'``.
+    * ``"any"`` — admits any ``agent_bearer`` principal (worker or
+      manager). Operator paths do NOT satisfy ``"any"`` on their
+      own — the gate is about "an active agent in
+      ``g.active_agents``" because audit-log attribution needs an
+      agent_id.
+    """
     if role in ("operator", "admin"):
-        # Operator session is sufficient — no token needed (the REST
-        # seam still passes the system token, but a hypothetical
-        # operator-only path that doesn't could authorise here).
-        if op_session:
-            if _viewer_blocked():
+        if principal.has_role("operator"):
+            if _viewer_blocked(principal):
                 raise AuthRejected(
                     "Unauthorized: viewer-tier operator cannot perform "
                     "this operator-only action"
                 )
             return
-        # System bearer is sufficient (legacy admin scripts, the
-        # REST seam's standard path).
-        if verify_token(token, "system"):
-            return
-        raise AuthRejected("Unauthorized: Operator session or system token required")
+        raise AuthRejected(
+            "Unauthorized: Operator session or system token required"
+        )
 
     if role == "manager":
-        if op_session:
-            if _viewer_blocked():
+        if principal.has_role("manager"):
+            if _viewer_blocked(principal):
                 raise AuthRejected(
                     "Unauthorized: viewer-tier operator cannot perform "
                     "this manager-or-above action"
                 )
             return
-        # Manager-tier check accepts the system bearer OR an agent
-        # whose row has agent_role='manager'.
-        if verify_token(token, "manager"):
-            return
-        raise AuthRejected("Unauthorized: Manager role or operator session required")
+        raise AuthRejected(
+            "Unauthorized: Manager role or operator session required"
+        )
 
     if role == "any":
-        if not get_agent_id(token):
-            raise AuthRejected("Unauthorized: Valid token required")
-        return
+        if principal.kind == "agent_bearer":
+            return
+        # Operator-tier callers (cookie-session, forwarding-header,
+        # sysadmin) admit too: the legacy contract was "any active
+        # caller identity"; the typed Principal's operator path is
+        # an identity the gate had no way to express pre-Wave-6.
+        if principal.has_role("admin"):
+            return
+        raise AuthRejected("Unauthorized: Valid token required")
 
     raise ValueError(  # pragma: no cover — guarded at decorator construction
-        f"_check_role: unknown role {role!r}"
+        f"_check_role_principal: unknown role {role!r}"
     )
 
 
@@ -252,19 +288,26 @@ def requires_role(role: str) -> Callable[[ToolImpl], ToolImpl]:
         )
 
     def decorator(func: ToolImpl) -> ToolImpl:
+        forward_principal = _func_accepts_principal(func)
+
         @functools.wraps(func)
         async def wrapper(
             arguments: Dict[str, Any],
+            *,
+            principal: Optional[Principal] = None,
             **kwargs: Any,
-        ) -> List[mcp_types.TextContent]:
-            # Wave 6 PR 0: forward **kwargs so the dispatcher can
-            # thread ``principal=`` through to migrated impls. The
-            # ``functools.wraps`` chain keeps the original signature
-            # visible to ``inspect.signature(..., follow_wrapped=True)``,
-            # so ``registry._tool_accepts_principal`` correctly detects
-            # whether the underlying impl declares ``principal``.
-            token = _extract_token(arguments)
-            _check_role(role, token)
+        ) -> Any:
+            # Wave 6 PR 6: the dispatcher always supplies ``principal``
+            # — but direct in-process / unit-test calls may not. Fall
+            # back to synthesizing one from ``arguments["token"]`` so
+            # the wrapper stays usable as a callable in isolation.
+            if principal is None:
+                principal = _synthesize_principal_from_arguments(arguments)
+            if principal is None:
+                raise AuthRejected("Unauthorized: Valid token required")
+            _check_role_principal(role, principal)
+            if forward_principal:
+                return await func(arguments, principal=principal, **kwargs)
             return await func(arguments, **kwargs)
 
         # PR-W1c (2026-06-05): expose the role on the wrapper for the
@@ -305,32 +348,38 @@ def requires_policy(
         )
 
     def decorator(func: ToolImpl) -> ToolImpl:
+        forward_principal = _func_accepts_principal(func)
+
+        async def _call(arguments: Dict[str, Any], principal: Principal, kwargs: Dict[str, Any]):
+            if forward_principal:
+                return await func(arguments, principal=principal, **kwargs)
+            return await func(arguments, **kwargs)
+
         @functools.wraps(func)
         async def wrapper(
             arguments: Dict[str, Any],
+            *,
+            principal: Optional[Principal] = None,
             **kwargs: Any,
-        ) -> List[mcp_types.TextContent]:
-            # Wave 6 PR 0: forward **kwargs so the dispatcher can
-            # thread ``principal=`` through to migrated impls.
-            token = _extract_token(arguments)
-
-            # Admin path: always permitted, no toggle read needed.
-            # retire-system-token Wave 1: ``verify_token(.., "admin")``
-            # now consults the operator-session ContextVar (set by
-            # the REST seam / forwarding-header middleware). Fall back
-            # to the agent-id-is-"admin" label so an admin-row token
-            # arriving via the bearer-only MCP path also takes the
-            # admin branch (the harness's admin-row token IS the
-            # post-Wave-1 admin bearer surface).
-            if verify_token(token, "admin"):
-                return await func(arguments, **kwargs)
-
-            # Worker path: must resolve to an active agent first.
-            caller_agent_id = get_agent_id(token)
-            if not caller_agent_id:
+        ) -> Any:
+            # Wave 6 PR 6: dispatcher supplies principal; tests that
+            # call the wrapped impl directly may not — fall back to
+            # synthesizing one from ``arguments["token"]``.
+            if principal is None:
+                principal = _synthesize_principal_from_arguments(arguments)
+            if principal is None:
                 raise AuthRejected("Unauthorized: Valid token required")
-            if caller_agent_id == "admin":
-                return await func(arguments, **kwargs)
+            # Operator-tier callers (and the harness's
+            # ``agent_id == "admin"`` label that historically stood in
+            # for "operator at the dashboard") bypass the toggle check.
+            if principal.has_role("admin"):
+                return await _call(arguments, principal, kwargs)
+
+            # Agent path: a worker / manager bearer is required.
+            if principal.kind != "agent_bearer" or not principal.agent_id:
+                raise AuthRejected("Unauthorized: Valid token required")
+            if principal.agent_id == "admin":
+                return await _call(arguments, principal, kwargs)
 
             # Lazy import: the access module pulls in DB helpers we
             # don't want to load at module-import time (keeps
@@ -340,7 +389,7 @@ def requires_policy(
 
             for key in config_keys:
                 if _get_config_bool(key, default):
-                    return await func(arguments, **kwargs)
+                    return await _call(arguments, principal, kwargs)
 
             joined = ", ".join(config_keys)
             raise AuthRejected(

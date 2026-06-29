@@ -87,20 +87,27 @@ async def test_decorator_and_kwarg_admin_only_blocks_worker() -> None:
         with pytest.raises(AuthRejected):
             await _fake_impl({"token": "definitely-not-admin"})
 
-        # Admin bearer → succeeds. retire-system-token Wave 1 removed
-        # the ``token == g.admin_token`` god-key admit from
-        # ``verify_token``; the surviving admit path is an operator
-        # session (set by the REST seam / forwarding-header
-        # middleware). Stamp ``operator_session_active`` for the
-        # duration of this assertion.
-        from agent_mcp.tools.registry import operator_session_active
+        # Operator-session Principal → succeeds. Wave 6 PR 6:
+        # identity flows through the typed Principal kwarg; the
+        # surviving operator-tier admit path is an operator session
+        # (cookie / forwarding-header / sysadmin).
+        from agent_mcp.core.principal import Principal
 
-        cv = operator_session_active.set(True)
-        try:
-            result = await _fake_impl({"token": "anything-ignored"})
-            assert result[0].text == "ok"
-        finally:
-            operator_session_active.reset(cv)
+        operator = Principal(
+            kind="operator_session",
+            user_id="alice",
+            agent_id=None,
+            sysadmin=False,
+            project_name=None,
+            project_role="operator",
+            agent_role=None,
+            can_wake_loop=False,
+            source_token=None,
+        )
+        result = await _fake_impl(
+            {"token": "anything-ignored"}, principal=operator,
+        )
+        assert result[0].text == "ok"
     finally:
         # Clean up registry state to avoid polluting other tests.
         _purge_tool("_test_admin_dec_and_kwarg")
