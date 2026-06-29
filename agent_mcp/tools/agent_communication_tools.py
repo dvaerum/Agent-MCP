@@ -5,22 +5,123 @@ import datetime
 import secrets
 import sqlite3
 from typing import List, Dict, Any, Optional
-from pathlib import Path
 import os
-
-import mcp.types as mcp_types
 
 from .registry import register_tool
 from . import access as _access  # Canonical home for _get_config_bool
 from ..core.config import logger
 from ..core import globals as g
-from ..core.auth import verify_token, get_agent_id
-from ..core.authorize import requires, requires_policy, requires_role
+from ..core.auth import get_agent_id
+from ..core.principal import Principal
+from ..core.tool_result import (
+    Failed,
+    Invalid,
+    NotFound,
+    Ok,
+    PermissionDenied,
+    ToolResult,
+)
 from ..features.aoe_notify import notify_aoe as _aoe_notify
 from ..utils.audit_utils import log_audit
 from ..db.connection import get_db_connection
-from ..db.actions.agent_actions_db import log_agent_action_to_db
-from ..runtime.agent_runtime import send_prompt_async, session_exists, sanitize_session_name, send_command_to_session
+from ..runtime.agent_runtime import send_prompt_async, session_exists, sanitize_session_name
+
+
+# ── Wave 6 PR 2 helpers ────────────────────────────────────────────────
+#
+# The PR 0 bridge in ``tools/registry.dispatch_tool_call`` synthesises a
+# Principal from ContextVars when one isn't passed explicitly. But every
+# direct call site in this repo (a couple dozen tests, plus
+# ``broadcast_admin_message_tool_impl`` fanning out to
+# ``send_agent_message_tool_impl``) invokes the impl as a plain Python
+# function — no ContextVar stamping. To keep those callers working
+# without a sweep of every test, the helper below derives a Principal
+# from ContextVars first (the same source the bridge consults), then
+# falls back to ``arguments["token"]`` if neither contextvar fired.
+# PR 6 will remove this fallback once the bridge is gone and every
+# caller passes ``principal=`` explicitly.
+
+
+def _resolve_principal(
+    arguments: Dict[str, Any],
+    principal: Optional[Principal],
+) -> Optional[Principal]:
+    """Return the effective Principal for this call.
+
+    Order:
+
+    1. ``principal`` kwarg (post-PR-0 dispatcher path — the dispatcher
+       passes the bridge-derived Principal here).
+    2. ContextVar derivation via the registry bridge (covers direct
+       impl calls made *inside* ``mcp_session`` where the harness has
+       stamped the operator-session ContextVars).
+    3. ``arguments["token"]`` resolved to an active agent row (covers
+       the legacy direct-impl test pattern where the test seeds
+       ``token=<bearer>`` in the args dict without touching any
+       ContextVar).
+
+    Returns ``None`` if no identity can be derived; the calling tool
+    surfaces that as :class:`PermissionDenied` per the new contract.
+    """
+    if principal is not None:
+        return principal
+
+    from .registry import _derive_principal_from_contextvars
+
+    derived = _derive_principal_from_contextvars()
+    # The ContextVar fallback may have returned an operator_session
+    # Principal with no agent_id (the dashboard / harness operator
+    # path). If the caller also supplied a real per-agent bearer in
+    # ``arguments["token"]``, prefer that — audit-log + sender-id
+    # attribution downstream needs the specific agent identity, not
+    # just "some operator".
+    token = arguments.get("token")
+    if token:
+        agent_id = get_agent_id(token)
+        if agent_id:
+            row = g.active_agents.get(token) or {}
+            agent_role = row.get("agent_role")
+            normalized_role = (
+                agent_role if agent_role in ("worker", "manager") else None
+            )
+            return Principal(
+                kind="agent_bearer",
+                user_id=None,
+                agent_id=agent_id,
+                sysadmin=False,
+                project_name=None,
+                project_role=None,
+                agent_role=normalized_role,
+                can_wake_loop=False,
+                source_token=token,
+            )
+
+    return derived
+
+
+def _is_operator_tier(principal: Principal) -> bool:
+    """Treat the legacy ``"admin"`` pseudo-agent as operator-tier.
+
+    Production post-Wave-4 has no ``agents.agent_id='admin'`` row so
+    this collapses to ``principal.has_role("operator")``. The harness
+    (``tests/harness.py``) seeds a manager-role row labelled ``admin``
+    and the bearer-wins bridge rule yields an ``agent_bearer``
+    Principal whose ``agent_id == "admin"`` — recognising that label
+    as operator-tier preserves the harness's pre-Wave-6 contract.
+    """
+    return principal.has_role("operator") or principal.agent_id == "admin"
+
+
+def _sender_label(principal: Principal) -> str:
+    """Pick the sender attribution string for an outgoing message.
+
+    Mirrors the spec from the Wave 6 PR 2 brief: ``principal.agent_id
+    or "operator"`` is the headline form. For operator-session callers
+    without an agent_id, we prefer the operator's user_id (audit-log
+    attribution stays specific) and only fall back to the literal
+    ``"operator"`` when neither is set.
+    """
+    return principal.agent_id or principal.user_id or "operator"
 
 
 def _generate_message_id() -> str:
@@ -80,13 +181,53 @@ def _can_agents_communicate(sender_id: str, recipient_id: str, is_admin: bool) -
     return False, "Communication not permitted between these agents"
 
 
-@requires_policy("config_allow_worker_to_worker", default=False)
-async def send_agent_message_tool_impl(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
+async def send_agent_message_tool_impl(
+    arguments: Dict[str, Any],
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
     """
     Send a message from one agent to another with permission checks.
     Messages can be delivered via tmux session or stored for later retrieval.
+
+    Wave 6 PR 2: migrated to the Principal + ToolResult contract.
+    Replaces the prior ``@requires_policy("config_allow_worker_to_worker",
+    default=False)`` decorator with an inline gate driven by the
+    Principal: operator-tier (operator session, sysadmin, or the legacy
+    ``"admin"`` agent label per :func:`_is_operator_tier`) always passes;
+    agent-bearer workers pass iff the worker-to-worker toggle is on. The
+    sender attribution captured on the message row comes from
+    :func:`_sender_label`.
     """
-    sender_token = arguments.get("token")
+    principal = _resolve_principal(arguments, principal)
+    if principal is None:
+        return PermissionDenied(
+            reason="Valid token or operator session required"
+        )
+
+    sender_id = _sender_label(principal)
+    is_admin = _is_operator_tier(principal)
+
+    # Auth gate (formerly @requires_policy("config_allow_worker_to_worker"))
+    # Admin / operator: always permitted, no toggle read needed.
+    # Agent-bearer (worker or manager): gated on the project toggle.
+    # Note: pre-Wave-6 the decorator treated agent-role 'manager' as a
+    # worker for this gate too (the check was `verify_token(token,
+    # "admin")` which is operator-tier-only), so we preserve that.
+    if not is_admin:
+        if principal.kind != "agent_bearer":
+            return PermissionDenied(reason="Valid token required")
+        if not _access._get_config_bool(
+            "config_allow_worker_to_worker", default=False
+        ):
+            return PermissionDenied(
+                reason=(
+                    "worker access denied by project policy "
+                    "(config_allow_worker_to_worker is off). Ask admin "
+                    "to enable it in dashboard Settings."
+                )
+            )
+
     recipient_id = arguments.get("recipient_id")
     message_content = arguments.get("message")
     message_type = arguments.get("message_type", "text")  # text, assistance_request, task_update
@@ -100,36 +241,39 @@ async def send_agent_message_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
     explicit_subject = arguments.get("subject")
     parent_message_id = arguments.get("parent_message_id")
 
-    # The @requires_policy decorator already guaranteed `sender_token`
-    # resolves to either admin or a worker permitted under
-    # config_allow_worker_to_worker. We still need `sender_id` (and
-    # `is_admin` below) for the message metadata and the per-pair
-    # delivery rules in `_can_agents_communicate`.
-    sender_id = get_agent_id(sender_token)
-
     # Validation
-    if not recipient_id or not message_content:
-        return [mcp_types.TextContent(type="text", text="Error: recipient_id and message are required")]
-    
+    if not recipient_id:
+        return Invalid(
+            field="recipient_id",
+            message="recipient_id is required",
+        )
+    if not message_content:
+        return Invalid(
+            field="message",
+            message="message is required",
+        )
+
     if len(message_content) > 4000:  # Reasonable message size limit
-        return [mcp_types.TextContent(type="text", text="Error: Message too long (max 4000 characters)")]
-    
-    # Admin-only check for stop commands.
-    # retire-system-token Wave 1: ``verify_token(.., "admin")`` now
-    # consults the operator-session ContextVar (set by the REST seam
-    # or forwarding-header middleware), NOT the bearer's role. Fall
-    # back to the agent-id-is-"admin" label so an admin bearer that
-    # didn't come through the operator-session path (e.g. an MCP
-    # call carrying a per-agent admin token) still resolves as admin.
-    is_admin = verify_token(sender_token, "admin") or sender_id == "admin"
+        return Invalid(
+            field="message",
+            message="Message too long (max 4000 characters)",
+        )
+
+    # Admin-only check for stop commands. Operator-tier (or the legacy
+    # "admin" pseudo-agent) is the only caller permitted to send a
+    # stop_command; bridge-derived workers are rejected even if the
+    # worker-to-worker toggle is on.
     if message_type == "stop_command" and not is_admin:
-        return [mcp_types.TextContent(type="text", text="Error: Only admin can send stop commands")]
-    
-    # Permission check
-    can_communicate, reason = _can_agents_communicate(sender_id, recipient_id, is_admin)
-    
+        return PermissionDenied(reason="Only admin can send stop commands")
+
+    # Per-pair delivery rules — admin bypass + worker-to-worker active
+    # set + admin recipient label.
+    can_communicate, reason = _can_agents_communicate(
+        sender_id, recipient_id, is_admin
+    )
+
     if not can_communicate:
-        return [mcp_types.TextContent(type="text", text=f"Communication denied: {reason}")]
+        return PermissionDenied(reason=f"Communication denied: {reason}")
     
     # Create message data
     message_id = _generate_message_id()
@@ -328,13 +472,28 @@ async def send_agent_message_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
             "delivered_stop_command": "Stop command sent to recipient's session",
             "stop_command_failed": "Stop command failed to send"
         }
-        
-        response_text = f"Message sent to {recipient_id}. {status_messages.get(delivery_status, 'Unknown status')}"
-        
+
+        response_text = (
+            f"Message sent to {recipient_id}. "
+            f"{status_messages.get(delivery_status, 'Unknown status')}"
+        )
+
         if delivery_status not in ["delivered_tmux", "delivered_stop_command"]:
             response_text += f" (Message ID: {message_id})"
-        
-        return [mcp_types.TextContent(type="text", text=response_text)]
+
+        return Ok(
+            data={
+                "message_id": message_id,
+                "sender": sender_id,
+                "recipient_id": recipient_id,
+                "message_type": message_type,
+                "priority": priority,
+                "delivery_status": delivery_status,
+                "subject": effective_subject,
+                "parent_message_id": parent_message_id,
+            },
+            message=response_text,
+        )
 
     except LookupError as e:
         # Repository rejected an unknown recipient (VM e2e fix
@@ -342,33 +501,47 @@ async def send_agent_message_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
         # message INSERT + audit row. Surface the repo's message
         # verbatim — it explains live / admin / tombstone semantics.
         logger.warning(f"send_agent_message rejected: {e}")
-        return [mcp_types.TextContent(type="text", text=f"Error: {e}")]
+        return NotFound(resource="agent", identifier=str(recipient_id))
     except sqlite3.Error as e:
         # `atomic_with_audit` already rolled back + closed the conn
         # before re-raising; nothing left for us to do but report.
         logger.error(f"Database error sending message: {e}", exc_info=True)
-        return [mcp_types.TextContent(type="text", text=f"Database error sending message: {e}")]
+        return Failed(message=f"Database error sending message: {e}")
     except Exception as e:
         logger.error(f"Unexpected error sending message: {e}", exc_info=True)
-        return [mcp_types.TextContent(type="text", text=f"Unexpected error sending message: {e}")]
+        return Failed(message=f"Unexpected error sending message: {e}")
 
 
-@requires("any")
-async def get_agent_messages_tool_impl(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
+async def get_agent_messages_tool_impl(
+    arguments: Dict[str, Any],
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
     """
     Retrieve messages for an agent.
+
+    Wave 6 PR 2: migrated to the Principal + ToolResult contract.
+    The pre-migration ``@requires("any")`` gate admitted any
+    valid-agent token; we keep that intent by requiring the Principal
+    to identify an agent (either via ``agent_bearer`` or via a legacy
+    operator caller carrying a per-agent bearer in
+    ``arguments["token"]`` — the latter is resolved by
+    :func:`_resolve_principal`'s token fallback).
     """
-    agent_token = arguments.get("token")
+    principal = _resolve_principal(arguments, principal)
+    if principal is None or not principal.agent_id:
+        return PermissionDenied(
+            reason="Valid agent token required to retrieve messages"
+        )
+
+    agent_id = principal.agent_id
+
     include_sent = arguments.get("include_sent", False)
     include_received = arguments.get("include_received", True)
     mark_as_read = arguments.get("mark_as_read", True)
     limit = arguments.get("limit", 20)
     message_type_filter = arguments.get("message_type")
     unread_only = arguments.get("unread_only", False)
-
-    # @requires("any") guaranteed agent_token resolves; we still need
-    # the id for filtering & audit.
-    agent_id = get_agent_id(agent_token)
 
     # Validation
     try:
@@ -397,8 +570,11 @@ async def get_agent_messages_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
             query_conditions.append("sender_id = ?")
             query_params.append(agent_id)
         else:
-            return [mcp_types.TextContent(type="text", text="Error: Must include sent or received messages")]
-        
+            return Invalid(
+                field=None,
+                message="Must include sent or received messages",
+            )
+
         if message_type_filter:
             query_conditions.append("message_type = ?")
             query_params.append(message_type_filter)
@@ -451,11 +627,15 @@ async def get_agent_messages_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
         
         # Format response
         if not messages:
-            return [mcp_types.TextContent(type="text", text="No messages found")]
-        
+            return Ok(
+                data={"agent_id": agent_id, "messages": [], "count": 0},
+                message="No messages found",
+            )
+
         response_lines = [f"Messages for {agent_id} (showing {len(messages)} of max {limit}):"]
         response_lines.append("")
-        
+
+        rows_for_payload: List[Dict[str, Any]] = []
         for msg in messages:
             direction = "➡️" if msg["sender_id"] == agent_id else "⬅️"
             other_agent = msg["recipient_id"] if msg["sender_id"] == agent_id else msg["sender_id"]
@@ -480,36 +660,73 @@ async def get_agent_messages_tool_impl(arguments: Dict[str, Any]) -> List[mcp_ty
                 response_lines.append(f"   ↳ reply to: {parent_id}")
             response_lines.append(f"   {msg['message_content']}")
             response_lines.append("")
-        
+            rows_for_payload.append({
+                "message_id": msg["message_id"],
+                "sender_id": msg["sender_id"],
+                "recipient_id": msg["recipient_id"],
+                "message_content": msg["message_content"],
+                "message_type": msg["message_type"],
+                "priority": msg["priority"],
+                "timestamp": msg["timestamp"],
+                "delivered": bool(msg["delivered"]),
+                "read": bool(msg["read"]),
+                "subject": subj,
+                "parent_message_id": parent_id,
+            })
+
         log_audit(agent_id, "get_agent_messages", {
             "messages_retrieved": len(messages),
             "include_sent": include_sent,
             "include_received": include_received
         })
-        
-        return [mcp_types.TextContent(type="text", text="\n".join(response_lines))]
-        
+
+        return Ok(
+            data={
+                "agent_id": agent_id,
+                "count": len(rows_for_payload),
+                "messages": rows_for_payload,
+            },
+            message="\n".join(response_lines),
+        )
+
     except sqlite3.Error as e:
         logger.error(f"Database error retrieving messages: {e}", exc_info=True)
-        return [mcp_types.TextContent(type="text", text=f"Database error retrieving messages: {e}")]
+        return Failed(message=f"Database error retrieving messages: {e}")
     except Exception as e:
         logger.error(f"Unexpected error retrieving messages: {e}", exc_info=True)
-        return [mcp_types.TextContent(type="text", text=f"Unexpected error retrieving messages: {e}")]
+        return Failed(message=f"Unexpected error retrieving messages: {e}")
     finally:
         if conn:
             conn.close()
 
 
-@requires_role("operator")
-async def broadcast_admin_message_tool_impl(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
+async def broadcast_admin_message_tool_impl(
+    arguments: Dict[str, Any],
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
     """
     Admin-only tool to broadcast a message to all active agents.
+
+    Wave 6 PR 2: migrated to the Principal + ToolResult contract.
+    The pre-migration ``@requires_role("operator")`` gate is replaced
+    with an inline :func:`_is_operator_tier` check (operator session,
+    sysadmin, or the legacy ``"admin"`` agent label — see the helper's
+    docstring for why the label is treated as operator-tier in the
+    harness). Each fan-out call to
+    :func:`send_agent_message_tool_impl` carries the SAME principal,
+    so sender-id attribution stays consistent across the broadcast.
     """
     # retire-system-token Wave 5: parameter renamed from
     # ``admin_token`` — the value is a manager-tier per-agent token (or
     # the operator session passes via the @requires_role gate without
     # needing a token here). It was never the god-key after Wave 1.
-    caller_token = arguments.get("token")
+    principal = _resolve_principal(arguments, principal)
+    if principal is None or not _is_operator_tier(principal):
+        return PermissionDenied(
+            reason="Operator role required to broadcast"
+        )
+
     message_content = arguments.get("message")
     message_type = arguments.get("message_type", "broadcast")
     priority = arguments.get("priority", "high")
@@ -520,26 +737,29 @@ async def broadcast_admin_message_tool_impl(arguments: Dict[str, Any]) -> List[m
     explicit_subject = arguments.get("subject")
 
     if not message_content:
-        return [mcp_types.TextContent(type="text", text="Error: message is required")]
-    
+        return Invalid(field="message", message="message is required")
+
     # Get all active agents
     active_agents = list(g.active_agents.keys())
     if not active_agents:
-        return [mcp_types.TextContent(type="text", text="No active agents to broadcast to")]
-    
+        return Ok(
+            data={"sent_count": 0, "failed_count": 0, "recipients": []},
+            message="No active agents to broadcast to",
+        )
+
     # Send to each agent
     sent_count = 0
     failed_count = 0
-    
+    recipients: List[str] = []
+
     for agent_token in active_agents:
         agent_data = g.active_agents[agent_token]
         recipient_id = agent_data.get("agent_id")
-        
+
         if recipient_id and recipient_id != "admin":  # Don't send to admin itself
             try:
                 # Use the send message function
                 fanout_args: Dict[str, Any] = {
-                    "token": caller_token,
                     "recipient_id": recipient_id,
                     "message": message_content,
                     "message_type": message_type,
@@ -548,23 +768,43 @@ async def broadcast_admin_message_tool_impl(arguments: Dict[str, Any]) -> List[m
                 }
                 if explicit_subject is not None:
                     fanout_args["subject"] = explicit_subject
-                result = await send_agent_message_tool_impl(fanout_args)
-                sent_count += 1
+                # Forward the caller's Principal so sender attribution
+                # stays consistent (the fan-out send derives sender_id
+                # from the same identity instead of re-deriving from
+                # ContextVars on each call).
+                result = await send_agent_message_tool_impl(
+                    fanout_args, principal=principal,
+                )
+                if isinstance(result, Ok):
+                    sent_count += 1
+                    recipients.append(recipient_id)
+                else:
+                    failed_count += 1
+                    logger.warning(
+                        "broadcast fan-out to %s returned %r",
+                        recipient_id, result,
+                    )
             except Exception as e:
                 logger.error(f"Failed to send broadcast to {recipient_id}: {e}")
                 failed_count += 1
-    
-    log_audit("admin", "broadcast_message", {
+
+    log_audit(_sender_label(principal), "broadcast_message", {
         "message_type": message_type,
         "priority": priority,
         "sent_count": sent_count,
         "failed_count": failed_count
     })
-    
-    return [mcp_types.TextContent(
-        type="text", 
-        text=f"Broadcast sent to {sent_count} agents. {failed_count} failed."
-    )]
+
+    return Ok(
+        data={
+            "sent_count": sent_count,
+            "failed_count": failed_count,
+            "recipients": recipients,
+            "message_type": message_type,
+            "priority": priority,
+        },
+        message=f"Broadcast sent to {sent_count} agents. {failed_count} failed.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -735,21 +975,30 @@ def _collect_events_for(
 
 def _envelope(
     events: List[Dict[str, Any]], since: Optional[str]
-) -> List[mcp_types.TextContent]:
+) -> Ok:
     """Wrap collected events into the standard response envelope.
 
     `next_cursor` advances to the max timestamp seen, or stays at
     `since` if the call timed out with no activity (preserving the
     caller's progress through the timeline).
+
+    Wave 6 PR 2: returns :class:`Ok` so the MCP wire renderer
+    serializes the payload as a JSON text-content block (the
+    historical wire shape) while REST consumers see the data field
+    directly. The ``message`` field carries the JSON-encoded
+    envelope so :func:`render_as_text_content` produces the same
+    wire bytes existing clients (``wait_for_events`` / inbox readers)
+    already parse.
     """
     if events:
         next_cursor = max((e.get("timestamp") or "") for e in events) or (since or "")
     else:
         next_cursor = since or ""
     payload = {"events": events, "next_cursor": next_cursor}
-    return [mcp_types.TextContent(
-        type="text", text=json.dumps(payload, ensure_ascii=False)
-    )]
+    return Ok(
+        data=payload,
+        message=json.dumps(payload, ensure_ascii=False),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -955,11 +1204,17 @@ def _collect_unassigned_task_events_for(
     return events
 
 
-@requires("any")
 async def wait_for_events_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
     """Long-poll for new events for the calling agent.
+
+    Wave 6 PR 2: migrated to the Principal + ToolResult contract.
+    The pre-migration ``@requires("any")`` gate admitted any valid
+    agent token; we keep that intent by requiring the resolved
+    Principal to identify an agent (``principal.agent_id`` set).
 
     Returns immediately with any events newer than `since`; otherwise
     blocks until `signal_for(agent_id).set()` fires or
@@ -985,22 +1240,19 @@ async def wait_for_events_tool_impl(
         write is idempotent (max-timestamp converges) and SQLite
         serializes the row update under the write queue.
     """
-    token = arguments.get("token")
-    agent_id = get_agent_id(token)
-    if not agent_id:
-        # `@requires("any")` should have caught this, but be defensive
-        # against contextvar-bridged invocations.
-        return [mcp_types.TextContent(
-            type="text",
-            text="Unauthorized: token does not resolve to an agent",
-        )]
+    principal = _resolve_principal(arguments, principal)
+    if principal is None or not principal.agent_id:
+        return PermissionDenied(
+            reason="Valid agent token required to long-poll events"
+        )
+    agent_id = principal.agent_id
 
     since = arguments.get("since")
     if since is not None and not isinstance(since, str):
-        return [mcp_types.TextContent(
-            type="text",
-            text="Error: since must be an ISO-UTC timestamp string",
-        )]
+        return Invalid(
+            field="since",
+            message="since must be an ISO-UTC timestamp string",
+        )
 
     raw_timeout = arguments.get(
         "timeout_seconds", WAIT_FOR_EVENTS_DEFAULT_TIMEOUT
@@ -1122,10 +1374,11 @@ async def wait_for_events_tool_impl(
         g.unregister_waiter(agent_id, waiter_queue)
 
 
-@requires("any")
 async def fetch_events_since_tool_impl(
     arguments: Dict[str, Any],
-) -> List[mcp_types.TextContent]:
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
     """Pure-DB catch-up: return events newer than `cursor` without
     blocking.
 
@@ -1138,21 +1391,23 @@ async def fetch_events_since_tool_impl(
     When `cursor` is None, falls back to the persisted
     `agents.last_event_seen_at`. The returned `cursor` advances to the
     max timestamp seen (or the input cursor if no events).
+
+    Wave 6 PR 2: migrated to the Principal + ToolResult contract.
+    Same agent-identity gate as :func:`wait_for_events_tool_impl`.
     """
-    token = arguments.get("token")
-    agent_id = get_agent_id(token)
-    if not agent_id:
-        return [mcp_types.TextContent(
-            type="text",
-            text="Unauthorized: token does not resolve to an agent",
-        )]
+    principal = _resolve_principal(arguments, principal)
+    if principal is None or not principal.agent_id:
+        return PermissionDenied(
+            reason="Valid agent token required to fetch events"
+        )
+    agent_id = principal.agent_id
 
     cursor = arguments.get("cursor")
     if cursor is not None and not isinstance(cursor, str):
-        return [mcp_types.TextContent(
-            type="text",
-            text="Error: cursor must be an ISO-UTC timestamp string or null",
-        )]
+        return Invalid(
+            field="cursor",
+            message="cursor must be an ISO-UTC timestamp string or null",
+        )
 
     if cursor is None:
         cursor = _read_last_event_seen_at(agent_id)
@@ -1173,9 +1428,10 @@ async def fetch_events_since_tool_impl(
         new_cursor = cursor or ""
 
     body = {"events": events, "cursor": new_cursor}
-    return [mcp_types.TextContent(
-        type="text", text=json.dumps(body, ensure_ascii=False)
-    )]
+    return Ok(
+        data=body,
+        message=json.dumps(body, ensure_ascii=False),
+    )
 
 
 def register_agent_communication_tools():
