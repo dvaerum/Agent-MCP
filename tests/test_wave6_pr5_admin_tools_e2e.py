@@ -98,7 +98,10 @@ async def test_view_status_returns_ok_with_typed_data_for_operator(tmp_path) -> 
     assert isinstance(result.data, dict)
     assert "active_agents_count" in result.data
     assert "agents_details" in result.data
-    assert "tmux_info" in result.data
+    # Wave 7 PR 3 (coordinator transition) dropped the ``tmux_info``
+    # block — agent-mcp no longer owns user-side claude sessions,
+    # so liveness is derived from the MCP session registry instead.
+    assert "tmux_info" not in result.data
     assert result.message and "MCP Server Status:" in result.message
 
 
@@ -417,64 +420,13 @@ async def test_get_agent_tokens_rejects_worker(tmp_path) -> None:
     assert isinstance(result, PermissionDenied)
 
 
-# ── relaunch_agent (preserves new-token path) ────────────────────
-
-
-async def test_relaunch_agent_not_found_returns_not_found(tmp_path) -> None:
-    from agent_mcp.tools.admin_tools import relaunch_agent_tool_impl
-
-    async with mcp_session(tmp_path):
-        result = await relaunch_agent_tool_impl(
-            {"agent_id": "never-was"},
-            principal=_operator_principal(),
-        )
-
-    assert isinstance(result, NotFound)
-    assert result.resource == "agent"
-
-
-async def test_relaunch_agent_conflict_on_active_status(tmp_path) -> None:
-    """Relaunch on a non-terminated agent returns :class:`Conflict`.
-
-    Wave 7 PR 1: setup switched from spawn-path ``create_agent_tool_impl``
-    to register-only ``register_agent_tool_impl``. The freshly-minted
-    status is still ``'created'`` (preserved across the cutover), which
-    is not in relaunch's allowed-statuses list — so the Conflict
-    contract being pinned holds identically.
-    """
-    from agent_mcp.tools.admin_tools import (
-        register_agent_tool_impl,
-        relaunch_agent_tool_impl,
-    )
-
-    async with mcp_session(tmp_path):
-        await register_agent_tool_impl(
-            {"agent_id": "active-agent"},
-            principal=_operator_principal(),
-        )
-
-        result = await relaunch_agent_tool_impl(
-            {"agent_id": "active-agent"},
-            principal=_operator_principal(),
-        )
-
-    assert isinstance(result, Conflict)
-    # "Cannot relaunch agent with status 'created'" — register_agent
-    # lands `status='created'` (same as the legacy create_agent path),
-    # which isn't in the allowed list.
-    assert "cannot relaunch" in result.reason.lower()
-
-
-async def test_relaunch_agent_missing_id_returns_invalid(tmp_path) -> None:
-    from agent_mcp.tools.admin_tools import relaunch_agent_tool_impl
-
-    async with mcp_session(tmp_path):
-        result = await relaunch_agent_tool_impl(
-            {}, principal=_operator_principal(),
-        )
-
-    assert isinstance(result, Invalid)
-    assert result.field == "agent_id"
+# Wave 7 PR 3 (coordinator transition): ``relaunch_agent_tool_impl`` was
+# deleted with the rest of the spawn machinery — it relied on the
+# ``send_command_to_session`` / ``send_prompt_async`` tmux helpers
+# that have no surviving home. The relaunch concept has no analogue
+# under the coordinator model (the user starts and stops their own
+# claude session). The three contract tests that pinned its NotFound /
+# Conflict / Invalid wording moved out with it.
 
 
 # ── Bridge (dispatch_tool_call) end-to-end ───────────────────────

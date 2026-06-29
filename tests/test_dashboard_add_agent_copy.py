@@ -1,27 +1,19 @@
-"""Pin the user-facing copy for the create-agent flow.
+"""Pin the user-facing copy for the agent-creation flow.
 
-Bug surfaced by Dennis's critical review on 2026-06-17 against v5.0.48:
+Originally surfaced by Dennis's critical review on 2026-06-17 (against
+v5.0.48): the Agents tab had a "Deploy" button + "Deploy Agent" modal
+title that did NOT actually deploy anything — the underlying tool only
+registered a row + token. The fix renamed the labels to "Add".
 
-  The Agents tab exposed a prominent "Deploy" button + "Deploy Agent"
-  modal title that, on click-through, *do not actually deploy anything*.
-  ``agent_mcp/tools/admin_tools.py::create_agent_tool_impl`` calls
-  ``agent_repo.create(...)`` + writes an audit log entry and returns a
-  token. There is no ``subprocess``, no ``tmux launch``, no process
-  spawn — the dashboard registers an agent record, period. Calling that
-  flow "Deploy" misleads operators into believing a worker has been
-  started; spawning the worker is a separate, manual step.
-
-The fix renames the label sites in the create-agent flow from "Deploy"
-to "Add" (verb) / "Add Agent" (button + modal title). Code-level
-identifiers (function names, route names, internal handler names) are
-deliberately *not* renamed — only user-visible strings change. Code
-comments that refer to "path-prefix deployments" or "Standalone
-deployments" of the agent-mcp service itself are also intentionally
-preserved (different + correct meaning of "deploy").
-
-The grep-style file inspection pattern matches
-``test_dashboard_api_error_toast.py`` (no jsdom in this repo; behaviour
-verified via ``npm run build`` plus Firefox-MCP e2e against the VM).
+Wave 7 PR 3 (coordinator transition, 2026-06-29) deleted the legacy
+``CreateAgentModal`` and the spawn-via-tmux ``create_agent_tool_impl``
+that backed it. The sole agent-creation surface is now
+:class:`RegisterAgentModal`, whose trigger + dialog title both read
+"Register Agent" — distinct from the original "Add" copy because the
+register-only flow now hands back a snippet the operator pastes into
+the user's claude config (the operator's action genuinely is "register
+this agent on the backend", not just "add a row"). The "no-Deploy"
+copy guard from the original review still applies.
 """
 
 from __future__ import annotations
@@ -37,79 +29,34 @@ def _read(p: Path) -> str:
     return p.read_text(encoding="utf-8")
 
 
-def _slice_lines(src: str, start: int, end: int) -> str:
-    """1-indexed inclusive line slice for region-bounded assertions."""
-    return "\n".join(src.splitlines()[start - 1 : end])
+# ---------- RegisterAgentModal: trigger + submit copy -----------------
 
 
-# ---------- CreateAgentModal: trigger button + title + description -----
-
-
-def test_create_agent_modal_trigger_button_says_add_agent() -> None:
-    """The dashboard header button that opens the create-agent dialog
-    must read ``Add Agent`` — pre-fix it said ``Deploy`` which was
-    misleading copy (the flow only registers an agent record + token,
-    it does not start a worker process)."""
+def test_register_agent_modal_trigger_button_says_register_agent() -> None:
+    """The Agents-tab header button that opens the agent-creation
+    dialog must read ``Register Agent``."""
     src = _read(AGENTS_TSX)
-    # Bound to the CreateAgentModal region so the test doesn't trip on
-    # the unrelated "path-prefix deployments" code comments further
-    # down the file.
-    region = _slice_lines(src, 380, 500)
-    assert ">\n          Add Agent\n        </Button>" in region or (
-        "Add Agent" in region and "Plus" in region
-    ), (
-        "CreateAgentModal trigger button must render the label "
-        "'Add Agent' (was 'Deploy')"
+    assert "Register Agent" in src, (
+        "RegisterAgentModal trigger button must render the label "
+        "'Register Agent'."
     )
-    assert ">\n          Deploy\n        </Button>" not in region, (
-        "CreateAgentModal trigger button still renders the misleading "
-        "label 'Deploy' — rename to 'Add Agent'"
+    # Bound the negative check to the dialog regions (the file
+    # otherwise contains correct uses of 'deployment' in code
+    # comments about path-prefix deployments).
+    assert "Deploy Agent" not in src, (
+        "Dashboard has resurrected the misleading 'Deploy Agent' "
+        "modal copy — rename to 'Register Agent'."
     )
 
 
-def test_create_agent_modal_title_says_add_agent() -> None:
-    """The modal's ``DialogTitle`` must read ``Add Agent``. The create
-    flow makes a DB row + token; there is no deployment step, so
-    calling the modal "Deploy Agent" is wrong copy."""
+def test_register_agent_modal_does_not_use_deploy_submit_copy() -> None:
+    """RegisterAgentModal's submit copy must not regress to the
+    misleading ``Deploy`` / ``Deploying...`` strings."""
     src = _read(AGENTS_TSX)
-    region = _slice_lines(src, 380, 500)
-    assert "<DialogTitle" in region and "Add Agent" in region, (
-        "CreateAgentModal DialogTitle must say 'Add Agent'"
-    )
-    assert "Deploy Agent" not in region, (
-        "CreateAgentModal DialogTitle still says 'Deploy Agent' — "
-        "rename to 'Add Agent'"
-    )
-
-
-def test_create_agent_modal_description_does_not_say_deployment() -> None:
-    """The modal description must not imply a deployment is happening.
-    Pre-fix it read 'Configure a new agent for deployment.' which made
-    the same false promise as the button label."""
-    src = _read(AGENTS_TSX)
-    region = _slice_lines(src, 380, 500)
-    assert "Configure a new agent for deployment." not in region, (
-        "CreateAgentModal description still claims a deployment "
-        "happens — rename to make clear the worker is started "
-        "separately"
-    )
-    assert "<DialogDescription" in region, (
-        "CreateAgentModal must keep a DialogDescription for "
-        "accessibility"
-    )
-
-
-def test_create_agent_modal_submit_button_says_add_agent() -> None:
-    """The submit button inside the modal footer must read ``Add Agent``
-    (and the pending state must not say 'Deploying...')."""
-    src = _read(AGENTS_TSX)
-    region = _slice_lines(src, 380, 500)
-    assert "Add Agent" in region, (
-        "CreateAgentModal submit button must say 'Add Agent'"
-    )
-    assert "'Deploying...'" not in region and "'Deploy'" not in region, (
-        "CreateAgentModal submit button still uses the 'Deploy' / "
-        "'Deploying...' copy — rename to 'Add Agent' / 'Adding...'"
+    assert "'Deploying...'" not in src and "'Deploy'" not in src, (
+        "Dashboard still uses the 'Deploy' / 'Deploying...' submit "
+        "copy somewhere — the agent-creation flow does not deploy "
+        "anything; rename to 'Register' / 'Registering...'."
     )
 
 
@@ -118,14 +65,7 @@ def test_create_agent_modal_submit_button_says_add_agent() -> None:
 
 def test_empty_state_copy_says_add_your_first() -> None:
     """The empty-state shown when no agents exist must invite the user
-    to ``Add your first agent`` — not ``Deploy your first agent``.
-
-    Wave 7 PR 0 (coordinator transition) added the
-    :class:`RegisterAgentModal` above the existing
-    :class:`CreateAgentModal`, pushing the empty-state's line number
-    down. The assertion is now a file-wide substring check rather than
-    a fixed line slice so the next layout shift doesn't trip the pin.
-    """
+    to ``Add your first agent`` — not ``Deploy your first agent``."""
     src = _read(AGENTS_TSX)
     assert "Add your first agent to get started." in src, (
         "Empty-state copy must say 'Add your first agent to get "
@@ -133,5 +73,5 @@ def test_empty_state_copy_says_add_your_first() -> None:
     )
     assert "Deploy your first agent to get started." not in src, (
         "Empty-state still says 'Deploy your first agent ...' — "
-        "rename to 'Add'"
+        "rename to 'Add'."
     )

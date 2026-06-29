@@ -1,11 +1,11 @@
-"""Wave 7 PR 0 — register-only flow (coordinator transition) E2E coverage.
+"""Wave 7 PR 0 + PR 3 — register-only flow (coordinator transition) E2E coverage.
 
-The new ``register_agent`` tool is the spawn-less sibling of
-``create_agent`` (which lives on through PR 0 as the legacy back-compat
-path). It mints an agent identity (DB row + bearer token) and returns a
-ready-to-paste ``.mcp.json`` snippet that the operator hands to the
-user — agent-mcp NEVER starts a claude process under the coordinator
-model. See the Wave 7 section of
+The ``register_agent`` tool mints an agent identity (DB row + bearer
+token) and returns a ready-to-paste ``.mcp.json`` snippet that the
+operator hands to the user — agent-mcp NEVER starts a claude process
+under the coordinator model. PR 3 deleted the legacy ``create_agent``
+tool, the runtime tmux helpers, and the dashboard ``CreateAgentModal``
+that drove the spawn path. See the Wave 7 section of
 ``/home/dennis/.claude/plans/prancy-napping-pie.md``.
 
 This file pins, per the plan's "TDD discipline" section:
@@ -15,9 +15,10 @@ This file pins, per the plan's "TDD discipline" section:
   2. The minted token authenticates as the new agent end-to-end — a
      ``WorkerSession`` built around the returned token can invoke a
      bearer-gated tool (``view_tasks``) and the call succeeds.
-  3. ``terminate_agent`` flips the row to ``terminated`` AND no longer
-     calls ``kill_tmux_session`` (Wave 7 PR 0 dropped that call). The
-     row is marked terminated; the token can no longer authenticate.
+  3. ``terminate_agent`` flips the row to ``terminated`` AND never
+     touches a tmux session (PR 3 deleted ``kill_tmux_session``
+     entirely along with the ``agent_runtime`` module). The row is
+     marked terminated; the token can no longer authenticate.
   4. ``register_agent`` requires an operator-tier principal — calling
      it with an ``agent_bearer`` worker Principal returns
      ``PermissionDenied``.
@@ -26,7 +27,6 @@ This file pins, per the plan's "TDD discipline" section:
 from __future__ import annotations
 
 import json
-from unittest.mock import patch
 
 import pytest
 
@@ -195,17 +195,33 @@ async def test_terminate_marks_row_terminated_and_revokes_token(
     the token from the in-memory active_agents cache, so the bearer no
     longer authenticates.
 
-    Plus: ``terminate_agent_tool_impl`` MUST NOT call
-    ``kill_tmux_session`` under the Wave 7 coordinator model. The
-    mock-and-assert pinning is what protects the "agent-mcp never
-    owned the process" architectural invariant against future
-    regressions.
+    Plus (Wave 7 coordinator-model invariant): the spawn-era
+    ``kill_tmux_session`` helper is GONE from the codebase. PR 0
+    dropped the *call*; PR 3 deleted the helper itself along with the
+    whole ``agent_runtime`` module. The negative-import assertion
+    below pins the architectural contract — agent-mcp must never
+    re-grow a tmux-killing surface in ``admin_tools``.
     """
+    import importlib
+
     from agent_mcp.core import globals as g
     from agent_mcp.tools.admin_tools import (
         register_agent_tool_impl,
         terminate_agent_tool_impl,
     )
+
+    # Negative-import assertion — the spawn-era helper that used to
+    # live at ``agent_mcp.runtime.agent_runtime.kill_tmux_session``
+    # has no surviving home. ``admin_tools`` doesn't re-export it,
+    # and the runtime submodule doesn't exist any more. Loading the
+    # module-attr (or the absent submodule) raises.
+    admin_tools_mod = importlib.import_module("agent_mcp.tools.admin_tools")
+    assert not hasattr(admin_tools_mod, "kill_tmux_session"), (
+        "Wave 7 PR 3 deleted kill_tmux_session entirely; "
+        "admin_tools should not re-export it."
+    )
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("agent_mcp.runtime.agent_runtime")
 
     async with mcp_session(tmp_path):
         register_result = await register_agent_tool_impl(
@@ -217,29 +233,14 @@ async def test_terminate_marks_row_terminated_and_revokes_token(
         # Sanity: token is in the in-memory cache before terminate.
         assert token in g.active_agents
 
-        # Patch the spawn-era kill_tmux_session helper at its import
-        # site in admin_tools and assert it's never called. The Wave 7
-        # contract says terminate is now JUST "revoke token + flip
-        # status"; the user's local claude session stays running.
-        with patch(
-            "agent_mcp.tools.admin_tools.kill_tmux_session"
-        ) as kill_mock:
-            term_result = await terminate_agent_tool_impl(
-                {"agent_id": "wave7-pr0-terminate"},
-                principal=_operator_principal(),
-            )
+        term_result = await terminate_agent_tool_impl(
+            {"agent_id": "wave7-pr0-terminate"},
+            principal=_operator_principal(),
+        )
 
         assert isinstance(term_result, Ok)
         assert term_result.data["agent_id"] == "wave7-pr0-terminate"
         assert term_result.data["status"] == "terminated"
-        # Architectural invariant — agent-mcp never owned the process,
-        # so it can't kill it on terminate. Future regressions of this
-        # line are the Wave 7 directive bleeding back into the code.
-        assert kill_mock.call_count == 0, (
-            "Wave 7 PR 0 dropped the kill_tmux_session call from "
-            "terminate_agent_tool_impl; the coordinator model says "
-            "the user owns the claude process."
-        )
 
         # Token is evicted from the active-agents cache, so the
         # bearer-injection path used by the harness can't resurrect

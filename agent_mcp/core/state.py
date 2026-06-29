@@ -82,11 +82,6 @@ file_map: Dict[str, Dict[str, Any]] = {}
 agent_working_dirs: Dict[str, str] = {}
 
 
-# --- Tmux Session Management --------------------------------------------
-# agent_id -> tmux_session_name.
-agent_tmux_sessions: Dict[str, str] = {}
-
-
 # --- Auditing and Agent Management --------------------------------------
 # In-memory audit log for the current session. Persistent log is
 # `agent_audit.log`.

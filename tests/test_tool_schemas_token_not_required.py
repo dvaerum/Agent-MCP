@@ -98,9 +98,11 @@ def test_token_still_present_as_optional_property() -> None:
         "update_file_status",
         "ask_project_rag",
         "get_system_prompt",
-        "create_agent",
+        # Wave 7 PR 3 (coordinator transition): ``create_agent`` +
+        # ``relaunch_agent`` deleted with the spawn machinery. The
+        # ``register_agent`` schema deliberately omits ``token`` (its
+        # auth is the operator-session cookie, not a body bearer).
         "terminate_agent",
-        "relaunch_agent",
         "restore_agent",
         "purge_agent",
     }

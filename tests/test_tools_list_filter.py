@@ -68,13 +68,17 @@ def test_every_registered_tool_has_access_classification() -> None:
 
 # --- Filter behavior: admin sees everything, worker sees subset ---
 
+# Wave 7 PR 3 (coordinator transition): ``create_agent`` (spawn) and
+# ``relaunch_agent`` (tmux send-keys to an existing session) are
+# gone. ``register_agent`` is the sole agent-creation surface; relaunch
+# has no analogue under the coordinator model (the user starts and
+# stops their own claude session).
 ADMIN_ONLY = {
-    "create_agent",
+    "register_agent",
     "view_status",
     "terminate_agent",
     "view_audit_log",
     "get_agent_tokens",
-    "relaunch_agent",
     "broadcast_admin_message",
     "bulk_task_operations",
     "delete_task",

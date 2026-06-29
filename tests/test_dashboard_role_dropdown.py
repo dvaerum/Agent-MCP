@@ -1,16 +1,20 @@
 """Dashboard test for the Role dropdown on Add Agent / Edit Agent.
 
-Phase 2 Wave 2b (prancy-napping-pie §2e). The dashboard's
-``CreateAgentModal`` and ``EditAgentDialog`` (both in
-``agent_mcp/dashboard/components/dashboard/agents-dashboard.tsx``) gain
-a Role dropdown bound to ``agent_role`` with options worker / manager
-and default ``'worker'``.
+Phase 2 Wave 2b (prancy-napping-pie §2e) wired the dashboard's role
+dropdown so operators can choose ``worker`` (default) or ``manager``
+when creating or editing an agent.
+
+Wave 7 PR 3 (coordinator transition, 2026-06-29) deleted the legacy
+``CreateAgentModal`` along with the spawn-via-tmux
+``create_agent_tool_impl``. The sole agent-creation surface is now
+``RegisterAgentModal`` (Wave 7 PR 0), which carries its own role
+dropdown. Edit-agent flow keeps its role dropdown. The
+``apiClient.createAgent`` typing pin retires with the legacy method;
+``editAgent`` still carries ``agent_role?:``.
 
 The repo has no jsdom; behaviour is verified via ``npm run build``
 plus Firefox-MCP e2e against the VM. The tests here are source-grep
-guards (matches ``test_dashboard_add_agent_copy.py`` / friends) — they
-pin that the Select primitive is wired in with the right values and
-that the createAgent / editAgent payload typings carry the field.
+guards (matches ``test_dashboard_add_agent_copy.py`` / friends).
 """
 
 from __future__ import annotations
@@ -27,26 +31,23 @@ def _read(p: Path) -> str:
     return p.read_text(encoding="utf-8")
 
 
-# ---------- CreateAgentModal: Role dropdown + form state ---------------
+# ---------- RegisterAgentModal: Role dropdown + form state -------------
 
 
-def test_create_agent_modal_state_has_agent_role_field() -> None:
-    """The form state object initialised in ``CreateAgentModal`` must
-    carry an ``agent_role`` field with default ``'worker'`` so the
+def test_register_agent_modal_state_has_role_field() -> None:
+    """The form state object initialised in ``RegisterAgentModal`` must
+    carry a ``role`` field with default ``'worker'`` so the
     submit handler can read it back."""
     src = _read(AGENTS_TSX)
-    # The initial useState for formData must include agent_role: 'worker'.
-    assert "agent_role: 'worker'" in src or 'agent_role: "worker"' in src, (
-        "CreateAgentModal form state must default agent_role to 'worker'"
+    assert "role: 'worker'" in src or 'role: "worker"' in src, (
+        "RegisterAgentModal form state must default role to 'worker'"
     )
 
 
-def test_create_agent_modal_renders_role_select() -> None:
+def test_register_agent_modal_renders_role_select() -> None:
     """The Add Agent dialog must render a Select with manager + worker
-    options bound to the form's agent_role field."""
+    options bound to the form's role field."""
     src = _read(AGENTS_TSX)
-    # Both option values must appear; the literal SelectItem tags pin
-    # both — worker and manager.
     assert 'value="worker"' in src or "value='worker'" in src, (
         "Role dropdown must offer 'worker' as a SelectItem value"
     )
@@ -55,16 +56,16 @@ def test_create_agent_modal_renders_role_select() -> None:
     )
 
 
-def test_create_agent_modal_submit_includes_agent_role() -> None:
-    """The submit handler must forward ``agent_role`` to the onCreateAgent
+def test_register_agent_modal_submit_includes_role() -> None:
+    """The submit handler must forward ``role`` to the registerAgent
     payload — otherwise the dropdown is decorative and the backend never
     sees it."""
     src = _read(AGENTS_TSX)
-    # `agent_role: formData.agent_role` is the literal we expect inside
-    # the onCreateAgent({...}) call. Allow whitespace tolerance.
-    assert "agent_role: formData.agent_role" in src, (
-        "CreateAgentModal must pass agent_role: formData.agent_role to "
-        "onCreateAgent"
+    # ``registerAgent({ name: ..., role: formData.role, ... })`` is the
+    # literal shape the modal builds. Pin on the substring.
+    assert "role: formData.role" in src, (
+        "RegisterAgentModal must pass role: formData.role to "
+        "apiClient.registerAgent"
     )
 
 
@@ -87,8 +88,6 @@ def test_edit_agent_dialog_diffs_agent_role_into_updates() -> None:
     current role — matches the diff pattern used for capabilities /
     color / working_directory / aoe_session_id / auto_event_loop."""
     src = _read(AGENTS_TSX)
-    # The updates object literal must declare agent_role?: string so
-    # the editAgent call's typing accepts it.
     assert "updates.agent_role" in src, (
         "EditAgentDialog must assign updates.agent_role when the role "
         "field has changed"
@@ -98,26 +97,15 @@ def test_edit_agent_dialog_diffs_agent_role_into_updates() -> None:
 # ---------- api.ts client typings carry agent_role --------------------
 
 
-def test_api_client_create_agent_typing_includes_agent_role() -> None:
-    """``apiClient.createAgent`` argument type must declare optional
-    ``agent_role``. Pre-PR the type was {agent_id, capabilities?,
-    working_directory?} — extending it is mandatory so the
-    CreateAgentModal call typechecks."""
-    src = _read(API_TS)
-    # The createAgent signature spans multiple lines; pin the literal.
-    assert "agent_role?:" in src, (
-        "apiClient.createAgent argument type must declare optional "
-        "agent_role?: string (or 'worker' | 'manager')"
-    )
-
-
 def test_api_client_edit_agent_typing_includes_agent_role() -> None:
-    """Likewise for ``apiClient.editAgent``: the ``updates`` arg type
-    must accept ``agent_role`` so the EditAgentDialog can pass it."""
+    """``apiClient.editAgent``'s ``updates`` arg type must accept
+    ``agent_role`` so the EditAgentDialog can pass it.
+
+    Wave 7 PR 3 deleted ``apiClient.createAgent`` (legacy spawn path);
+    the equivalent typing pin for ``createAgent`` retired with it.
+    """
     src = _read(API_TS)
-    # Two occurrences expected (createAgent + editAgent). Pin both via
-    # a count >= 2 to surface accidental single-call typing fix.
-    assert src.count("agent_role?:") >= 2, (
+    assert "agent_role?:" in src, (
         "apiClient.editAgent updates type must declare optional "
-        "agent_role?: (in addition to createAgent's same field)"
+        "agent_role?: (worker | manager)"
     )

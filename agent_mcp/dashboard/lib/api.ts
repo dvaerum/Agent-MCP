@@ -530,25 +530,9 @@ class ApiClient {
     }
   }
 
-  async createAgent(data: {
-    agent_id: string
-    capabilities?: string[]
-    working_directory?: string
-    // Phase 2 Wave 2b (plan §2e): role tier for the new agent.
-    // 'worker' (default) keeps legacy behaviour; 'manager' opts the
-    // agent into the manager-tier privileges that ship in Wave 3.
-    agent_role?: 'worker' | 'manager'
-  }): Promise<{ success: boolean; message: string }> {
-    // PR D (prancy-napping-pie): the operator session cookie carries
-    // auth — no body-token field. Browsers attach the cookie
-    // automatically. The 401-handling redirect in this.request
-    // bounces the operator to /agent-mcp/login if the cookie has
-    // expired between page-load and click.
-    return this.request('/agents', {
-      method: 'POST',
-      body: JSON.stringify(data),
-    })
-  }
+  // Wave 7 PR 3 (coordinator transition): ``createAgent`` (POST
+  // /api/agents — the spawn-via-tmux path) is gone. ``registerAgent``
+  // below is the sole agent-creation surface.
 
   async terminateAgent(agentId: string): Promise<{ success: boolean; message: string }> {
     // PR D: cookie auth, no body-token field.
@@ -558,14 +542,10 @@ class ApiClient {
     })
   }
 
-  // Wave 7 PR 0 (coordinator transition). Register an agent identity
+  // Wave 7 coordinator transition. Register an agent identity
   // WITHOUT spawning a claude process: the backend mints a token + a
   // ready-to-paste .mcp.json snippet that the operator hands to the
   // user. The user owns their own claude session.
-  //
-  // Distinct from `createAgent` (legacy, spawn-via-tmux) which stays
-  // on this client through PR 0 so the existing modal keeps working;
-  // PR 3 deletes the legacy method once the modal cuts over.
   async registerAgent(data: {
     name: string
     role?: 'worker' | 'manager'
