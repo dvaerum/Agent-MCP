@@ -404,8 +404,18 @@ async def _track_proxy_task(app: web.Application):
 
 
 # Per-project agent-token cache. Keyed by project name, value is
-# (expires_at, {token → agent_id}). The MCP messages handler hits
-# this on every POST so a 3-second TTL is plenty.
+# (expires_at, {token → agent_id}). Sole remaining consumer is
+# ``_resolve_agent_token`` — the operator-facing dashboard wiring
+# endpoints (client-config / installer) need to look up "what token
+# does agent X have?" so they can bake it into the .mcp.json snippet
+# they hand back. A 3-second TTL is plenty for that interactive
+# dashboard click path.
+#
+# The MCP transport's ``backend_mcp_handler`` used to consult this
+# cache to pre-validate per-agent bearers; F015 removed that check
+# because the backend's ``AuthHeaderMiddleware`` (which gates ``/mcp``
+# against ``g.active_agents``) is the authoritative source of "is this
+# bearer live?". See ``backend_mcp_handler`` for the full rationale.
 _token_cache_ttl_sec = 3.0
 _agent_token_cache: dict[str, tuple[float, dict[str, str]]] = {}
 
@@ -426,8 +436,13 @@ async def _agent_token_map(name: str) -> dict[str, str]:
     instead (see ``_forwarding_header_from_cookie``). Wave 3 deleted
     the per-project system-token file the router used to read.
 
+    F015 (this commit): the MCP transport handler no longer consults
+    this map — ``g.active_agents`` is the single source of truth for
+    bearer validity. Sole remaining caller is ``_resolve_agent_token``
+    for the dashboard wiring/installer endpoints.
+
     Returns {} on backend error rather than raising; callers are
-    expected to treat that as "no auth available, refuse" via the
+    expected to treat that as "no agent token found" via the
     empty mapping.
     """
     cached = _agent_token_cache.get(name)
@@ -788,13 +803,16 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
 
     Auth modes admitted (first match wins):
 
-      1. ``Authorization: Bearer <token>`` matching an entry in the
-         project's per-agent token map. Wave 1 removed the system
-         bearer; only real per-agent worker / manager tokens
-         authenticate this path now.
+      1. ``Authorization: Bearer <token>`` — forwarded verbatim to
+         the backend, which validates it against ``g.active_agents``
+         via :class:`AuthHeaderMiddleware`. The router does NOT
+         pre-check the bearer; the backend's cache is the single
+         source of truth for "is this token live right now?". See
+         the inline comment below for why the router used to
+         pre-check and why that's gone.
       2. ``agent_mcp_session`` cookie pointing at a live operator
          session whose user is a member of the project. retire-system-
-         token Wave 2 (2026-06-23): the router now signs a
+         token Wave 2 (2026-06-23): the router signs a
          ``X-Agent-MCP-Forwarded-Operator`` header here and the
          backend's ``AuthHeaderMiddleware`` (Wave 1) verifies it
          against the per-project HMAC key. The legacy cookie→admin-
@@ -803,9 +821,12 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
 
     Failure modes:
 
-      * No auth at all → 401.
-      * Bearer present but unknown → 401.
-      * Cookie present but unknown / expired / non-member → 401.
+      * No auth at all → 401 (router).
+      * Bearer present but unknown → 401 (backend's
+        ``AuthHeaderMiddleware``; router forwards unconditionally).
+      * Cookie present but unknown / expired / non-member → 401
+        (router; the cookie path resolves identity before forwarding
+        so the operator never reaches the backend).
       * Cookie valid but the backend systemd unit refused to spawn
         (unknown project, broken unit file, spawn timeout) → 401.
         ``_forwarding_header_from_cookie`` explicitly triggers
@@ -875,10 +896,31 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
         forwarding_header = await _forwarding_header_from_cookie(req, real_name)
         if forwarding_header is None:
             raise _unauthorized()
-    else:
-        tokens = await _agent_token_map(real_name)
-        if bearer not in tokens:
-            raise _unauthorized()
+    # When ``bearer`` is set, the request is forwarded to the backend
+    # WITHOUT a router-side validity check. The backend's
+    # ``AuthHeaderMiddleware`` (see ``agent_mcp.app.main_app``) gates
+    # every ``/mcp`` request against ``g.active_agents`` (the
+    # in-process cache of non-terminated agent rows) — that's the
+    # single source of truth for "is this bearer live right now?".
+    #
+    # The router used to call ``_agent_token_map`` here as an extra
+    # gate, but that introduced two problems:
+    #
+    #   1. ``_agent_token_map`` fetches the backend's
+    #      ``GET /api/tokens`` over the project UDS with NO
+    #      ``Authorization`` header. PR #203 (prancy-napping-pie Wave
+    #      1, 2026-06-20) added ``Depends(require_operator_session)``
+    #      to that endpoint, so the router's unauthenticated probe now
+    #      always 401s and the map is always empty — every per-agent
+    #      bearer at ``/agent-mcp/mcp/<project>`` was rejected as
+    #      "invalid or missing agent bearer token".
+    #   2. Even when ``_agent_token_map`` worked, its 3-second cache
+    #      kept terminated tokens admissible for up to 3 s post-
+    #      revoke — the backend's ``g.active_agents`` cache (synchronous
+    #      with the terminate write) is strictly fresher.
+    #
+    # Forwarding the bearer verbatim makes ``g.active_agents`` the
+    # single source of truth and fixes both problems in one move.
     alias_info: tuple[str, str] | None = None
     if alias_entry is not None:
         # Stash on the request too so downstream observers (Phase 1c
