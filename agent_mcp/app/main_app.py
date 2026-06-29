@@ -19,11 +19,16 @@ import mcp.types as mcp_types
 
 # Project-specific imports
 from ..core.config import logger
-from ..core.auth import verify_token, get_agent_id, query_agent_status
+from ..core.auth import get_agent_id, query_agent_status
 from ..core import session_registry
 from .routes import register_routes
 from .server_lifecycle import application_startup, application_shutdown
-from ..tools.registry import list_available_tools, dispatch_tool_call, request_auth_token
+from ..tools.registry import (
+    list_available_tools,
+    dispatch_tool_call,
+    request_auth_token,
+    request_principal,
+)
 
 
 # --- Migration response for the retired SSE transport endpoints ----
@@ -205,10 +210,11 @@ def _build_principal_from_request(
 ):
     """Construct the per-request :class:`Principal` for the per-project backend.
 
-    Wave 6 PR 0 — built once at the outermost seam that knows the
-    forwarding-header + bearer state, then stashed on
-    ``request.state.principal``. Tool dispatch threads it through
-    instead of re-deriving identity via ContextVars.
+    Built once at the outermost seam that knows the forwarding-header
+    + bearer state, then stashed on ``request.state.principal`` AND
+    on the :data:`tools.registry.request_principal` ContextVar (so
+    the MCP wire handler, which has no Request handle, can thread it
+    into :func:`dispatch_tool_call`).
 
     Resolution order:
 
@@ -223,13 +229,10 @@ def _build_principal_from_request(
     * If a per-agent bearer authenticated, build an ``agent_bearer``
       Principal sourcing ``agent_id`` + ``agent_role`` from the
       agents table (via the in-memory cache). ``can_wake_loop``
-      mirrors the eligibility check ``_bearer_has_wake_loop_enabled``
-      runs today (the wake-loop instructions in the initialize
-      response will eventually consult ``Principal.can_wake_loop``
-      instead — that's a follow-up PR).
+      mirrors the wake-loop instructions' eligibility check (consumed
+      by ``_wake_loop_contributor``).
     * If neither admitted (auth-less route or an unauth-required
-      path), return None — the bridge falls back to the legacy
-      ContextVar path.
+      path), return None.
 
     Failures are defensive: any exception returns None so a buggy
     Principal-build path can never block a request the legacy path
@@ -261,22 +264,36 @@ def _build_principal_from_request(
                     if agent_role in ("worker", "manager")
                     else None
                 )
-                # Wake-loop eligibility mirrors the inline check in
-                # `_bearer_has_wake_loop_enabled` (kept for the
-                # transition; a follow-up PR will consume
-                # ``Principal.can_wake_loop`` directly).
+                # Wake-loop eligibility — admin agents coordinate
+                # and don't run the worker wake loop; non-admin
+                # agents qualify when the global toggle is on AND
+                # their per-agent flag is on (default True). The
+                # per-agent flag is sourced from the DB rather than
+                # the in-memory cache so an operator who flipped the
+                # flag via REST in the current session sees the
+                # change reflected on the next request.
                 can_wake_loop = False
                 if agent_id != "admin":
                     try:
                         from ..tools import access as _access
+                        from ..db.connection import get_db_connection
                         global_on = _access._get_config_bool(
                             "config_auto_event_loop_global", default=True,
                         )
-                        if global_on and bool(row.get("auto_event_loop", True)):
-                            # The in-memory cache may not include the
-                            # auto_event_loop column for old rows;
-                            # default to True (matches the DB default).
-                            can_wake_loop = True
+                        if global_on:
+                            conn = get_db_connection()
+                            try:
+                                cursor = conn.cursor()
+                                cursor.execute(
+                                    "SELECT auto_event_loop FROM agents "
+                                    "WHERE agent_id = ?",
+                                    (agent_id,),
+                                )
+                                db_row = cursor.fetchone()
+                            finally:
+                                conn.close()
+                            if db_row is not None and bool(db_row["auto_event_loop"]):
+                                can_wake_loop = True
                     except Exception:  # pragma: no cover - defensive
                         can_wake_loop = False
                 return Principal(
@@ -293,8 +310,7 @@ def _build_principal_from_request(
         return None
     except Exception:  # pragma: no cover - defensive
         logger.exception(
-            "Principal construction failed in AuthHeaderMiddleware; "
-            "falling back to ContextVar path",
+            "Principal construction failed in AuthHeaderMiddleware",
         )
         return None
 
@@ -304,45 +320,38 @@ class AuthHeaderMiddleware(BaseHTTPMiddleware):
 
     Four responsibilities:
 
-    1. Bind any incoming `Authorization: Bearer <tok>` value to the
-       `request_auth_token` ContextVar so tool dispatch can fall back
-       to it when JSON-RPC arguments don't carry a `token` field. This
-       is the same fallback the prior SSE transport relied on; the
-       Streamable HTTP transport reads from the same ContextVar.
+    1. Bind any incoming ``Authorization: Bearer <tok>`` value to the
+       ``request_auth_token`` ContextVar so tool dispatch can fall
+       back to it when JSON-RPC arguments don't carry a ``token``
+       field. The Streamable HTTP transport reads from the same
+       ContextVar.
 
-    2. retire-system-token Wave 1 — verify the signed forwarding
-       header (``X-Agent-MCP-Forwarded-Operator``) if present and the
+    2. Verify the signed forwarding header
+       (``X-Agent-MCP-Forwarded-Operator``) if present and the
        per-project HMAC key has been loaded into
-       ``g.forwarding_hmac_key``. On success, the resolved operator_id
+       ``g.forwarding_hmac_key``. On success the resolved operator_id
        is stamped onto ``g.current_operator`` for downstream handlers
        + audit logs. On a present-but-invalid header (wrong HMAC,
-       expired, malformed), the request is rejected with 401 — we
-       never silently fall through to the bearer-token path when a
-       tampered forwarding header is present, otherwise the tampered
-       header could mask a per-agent bearer's identity.
+       expired, malformed) the request is rejected with 401 — we
+       never silently fall through to the bearer-token path.
 
-    3. Gate `/mcp` at the HTTP layer. POST/GET/DELETE on `/mcp` MUST
-       carry either (a) a per-agent bearer token that
-       ``verify_token(.., "agent")`` accepts, OR (b) a verified
-       forwarding header.
+    3. Gate ``/mcp`` at the HTTP layer. POST/GET/DELETE on ``/mcp``
+       must carry either (a) a per-agent bearer that resolves to an
+       active agent row, OR (b) a verified forwarding header.
 
-       The system_token god-key branch that used to satisfy this gate
-       was removed in retire-system-token Wave 1 — there is no
-       process-wide bearer that admits any caller anymore.
+       Per-tool role checks (operator vs manager vs worker) still
+       happen at the dispatcher / decorator layer via
+       :func:`agent_mcp.core.authorize.requires_role`; this middleware
+       only enforces "is this *any* valid caller identity?".
 
-       Note: per-tool role checks (operator vs manager vs worker)
-       still happen inside the tool layer via
-       ``@requires_role(...)``. This middleware only enforces "is
-       this *any* valid caller identity?".
+    4. Stamp the typed Principal on the request AND on the
+       :data:`tools.registry.request_principal` ContextVar so the MCP
+       wire handler (which has no Request handle) can thread it into
+       :func:`dispatch_tool_call`.
 
-    4. Phase 1c: parse `X-Agent-MCP-Alias` if present and stash the
-       `(alias_name, expires_at)` tuple on `request.scope` plus the
-       `request_alias_info` ContextVar. The ContextVar is what the
-       MCP server's `create_initialization_options` override reads to
-       decide whether to append the deprecation warning to
-       `instructions`; the scope copy is kept around for downstream
-       handlers (e.g. the GET /mcp opener that writes
-       `mcp_sessions.alias_used`).
+    5. Phase 1c: parse ``X-Agent-MCP-Alias`` if present and stash the
+       ``(alias_name, expires_at)`` tuple on ``request.scope`` plus
+       the ``request_alias_info`` ContextVar.
     """
 
     async def dispatch(self, request, call_next):
@@ -378,14 +387,9 @@ class AuthHeaderMiddleware(BaseHTTPMiddleware):
             request.scope["agent_mcp_alias"] = alias_info
             request_alias_info.set(alias_info)
 
-        # retire-system-token Wave 1 — signed forwarding header path.
-        # Dormant when the per-project HMAC key isn't loaded yet
-        # (Wave 2/3 wire the launcher write side); active when it is.
-        from ..tools.registry import (
-            operator_session_active as _op_session_cv,
-            operator_user_id as _op_user_cv,
-        )
-
+        # Signed forwarding header path. Dormant when the per-project
+        # HMAC key isn't loaded yet (Wave 2/3 wire the launcher write
+        # side); active when it is.
         forwarding_raw = request.headers.get(_fh.HEADER_NAME)
         forwarding_operator: Optional[str] = None
         if forwarding_raw is not None:
@@ -401,23 +405,12 @@ class AuthHeaderMiddleware(BaseHTTPMiddleware):
                     # behaviour.
                     return _build_unauthorized_response(token)
                 _g.current_operator = forwarding_operator
-                # Stamp the operator-session contextvars so
-                # downstream tool gates (``@requires_role("operator")``
-                # and inline ``verify_token(..., "admin")`` checks)
-                # admit the call. The REST seam (``routes.py``) does
-                # the same for cookie-authenticated dashboard
-                # mutations; the forwarding-header path follows the
-                # same shape so behavior is uniform regardless of
-                # which auth surface admitted the request.
-                _op_session_cv.set(True)
-                _op_user_cv.set(forwarding_operator)
             else:
-                # Key not loaded yet — Wave 1 dormant fallback. The
-                # header is ignored (no operator identity established)
-                # but we do NOT reject, so an agent bearer + a
+                # Key not loaded yet — dormant fallback. The header
+                # is ignored (no operator identity established) but
+                # we do NOT reject, so an agent bearer + a
                 # speculatively-set header still authenticates via
-                # the bearer path. This is the transitional contract
-                # the plan calls out so Wave 1 ships before Wave 2/3.
+                # the bearer path.
                 forwarding_operator = None
 
         path = request.url.path
@@ -426,20 +419,21 @@ class AuthHeaderMiddleware(BaseHTTPMiddleware):
         # auth. `/api/*` and the dashboard routes keep their own
         # per-route token handling.
         if path == "/mcp" or path.startswith("/mcp/"):
+            # Cache-only check (no DB roundtrip) so a terminated
+            # agent's token (which the repo would happily resolve
+            # against the DB row + re-populate the cache as a
+            # side effect) cleanly fails auth — the cache holds only
+            # non-terminated rows.
             authenticated = bool(forwarding_operator) or (
-                bool(token)
-                and verify_token(token, required_role="agent")
+                bool(token) and token in _g.active_agents
             )
             if not authenticated:
                 return _build_unauthorized_response(token)
 
-        # Wave 6 PR 0: stash a Principal on the request once auth
-        # has been admitted. The legacy ContextVar stamping above
-        # stays — the bridge in ``tools.registry.dispatch_tool_call``
-        # falls back to ContextVars when ``request.state.principal``
-        # is missing, so this is purely additive during the
-        # migration window. PR 6 deletes the ContextVar path once
-        # PRs 1-5 migrate every tool.
+        # Build a Principal once at the seam that admitted the
+        # request. Stashed on request.state for FastAPI deps AND on
+        # request_principal so the MCP wire handler reads the same
+        # identity (it has no Request handle to read request.state).
         principal = _build_principal_from_request(
             request=request,
             bearer_token=token,
@@ -447,15 +441,7 @@ class AuthHeaderMiddleware(BaseHTTPMiddleware):
         )
         if principal is not None:
             request.state.principal = principal
-            # For an MCP-session-scoped request (POST /mcp), cache
-            # the Principal on the session registry by-session so
-            # subsequent in-flight tool calls (and the GET-stream
-            # fan-out) read the same identity without re-deriving.
-            # The session id isn't available here on a POST (the SDK
-            # mints it inside ``handle_request``); for the GET path
-            # the bearer-resolved cache lives in
-            # ``session_registry.attach_principal`` called from
-            # ``_McpAsgiApp._handle_get``.
+            request_principal.set(principal)
 
         return await call_next(request)
 
@@ -492,69 +478,6 @@ def _build_alias_warning(alias_name: str, expires_at: str) -> str:
     )
 
 
-def _bearer_has_wake_loop_enabled() -> bool:
-    """Check the calling bearer's wake-loop eligibility.
-
-    Returns True iff:
-      * `request_auth_token` resolves to an active agent (not admin —
-        admins coordinate, they don't run the worker wake loop), AND
-      * `project_context.config_auto_event_loop_global` is truthy
-        (default TRUE), AND
-      * `agents.auto_event_loop` is truthy for that agent (default TRUE).
-
-    Returns False on any failure path (no bearer, lookup error, etc.)
-    so a degraded environment doesn't accidentally inject the
-    instructions when we can't verify the flags.
-    """
-    try:
-        bearer = request_auth_token.get()
-    except LookupError:
-        bearer = None
-    if not bearer:
-        return False
-    try:
-        from ..tools import access as _access
-        from ..db.connection import get_db_connection
-
-        agent_id = get_agent_id(bearer)
-        if not agent_id:
-            return False
-
-        # Admin bearer should not get the wake-loop instructions —
-        # admins are coordinators, not workers. retire-system-token
-        # Wave 1: ``verify_token(.., "admin")`` now consults the
-        # operator-session ContextVar, not the bearer's role, so we
-        # check ``agent_id == "admin"`` directly (the literal label
-        # the harness + production code use for the admin principal).
-        if agent_id == "admin":
-            return False
-
-        global_on = _access._get_config_bool(
-            "config_auto_event_loop_global", default=True,
-        )
-        if not global_on:
-            return False
-
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT auto_event_loop FROM agents WHERE agent_id = ?",
-                (agent_id,),
-            )
-            row = cursor.fetchone()
-        finally:
-            conn.close()
-        if row is None:
-            return False
-        return bool(row["auto_event_loop"])
-    except Exception as e:  # pragma: no cover - defensive
-        logger.warning(
-            "wake-loop bootstrap eligibility check failed: %s", e,
-        )
-        return False
-
-
 def _patched_create_initialization_options(self, *args, **kwargs):
     """Wrap ``Server.create_initialization_options`` so registered
     ``InstructionsContributor`` callables can append text onto the
@@ -582,9 +505,11 @@ def _patched_create_initialization_options(self, *args, **kwargs):
         bearer = request_auth_token.get()
     except LookupError:
         bearer = None
+    principal = request_principal.get()
     ctx = InitContext(
         bearer=bearer or None,
         alias_info=request_alias_info.get(),
+        principal=principal,
     )
     extra = render_all(ctx)
     if not extra:
@@ -606,44 +531,53 @@ MCPLowLevelServer.create_initialization_options = (  # type: ignore[assignment]
 @mcp_app_instance.list_tools()
 async def mcp_list_tools_handler() -> List[mcp_types.Tool]:
     """MCP endpoint to list available tools."""
-    return await list_available_tools()
+    principal = request_principal.get()
+    if principal is None:
+        # Fallback for in-process / test callers that haven't stamped
+        # request_principal but did stamp request_auth_token: build an
+        # agent_bearer Principal locally so the visibility filter
+        # resolves the same role label production would.
+        try:
+            bearer = request_auth_token.get()
+        except LookupError:
+            bearer = None
+        if bearer:
+            principal = _build_principal_from_request(
+                request=None,
+                bearer_token=bearer,
+                forwarding_operator=None,
+            )
+    return await list_available_tools(principal=principal)
 
 
-def _caller_role() -> str:
-    """Resolve the calling bearer's role for visibility filtering.
+def _principal_role() -> str:
+    """Resolve the calling Principal's role for visibility filtering.
 
-    Mirrors the resolver in `tools.registry.list_available_tools` —
-    extracted here so the prompts + tools handlers stay in lockstep
-    on what "admin" vs "worker" vs "anonymous" mean. Failures fall
-    back to "anonymous" (most conservative).
+    Returns ``"admin"`` for operator-tier callers, ``"worker"`` for
+    any agent bearer, ``"anonymous"`` when no Principal is in flight.
+
+    Falls back to a synthesized ``agent_bearer`` Principal built from
+    :data:`request_auth_token` for in-process callers (tests, scripts)
+    that haven't stamped :data:`request_principal` directly.
     """
-    try:
-        bearer = request_auth_token.get()
-    except LookupError:
-        bearer = None
-    if not bearer:
+    principal = request_principal.get()
+    if principal is None:
+        try:
+            bearer = request_auth_token.get()
+        except LookupError:
+            bearer = None
+        if bearer:
+            from ..core import globals as _g
+            agent_id = get_agent_id(bearer)
+            if agent_id == "admin":
+                return "admin"
+            if agent_id:
+                return "worker"
         return "anonymous"
-    try:
-        from ..core.auth import get_agent_id
-
-        # retire-system-token Wave 1: ``verify_token(.., "admin")``
-        # now consults the operator-session ContextVar, not the
-        # bearer's role. Resolve the bearer to an agent_id and check
-        # the literal ``"admin"`` label directly so the visibility
-        # filter sees the same "admin vs worker" distinction it used
-        # to (which was driven by ``get_agent_id(g.system_token) ==
-        # "admin"``).
-        agent_id = get_agent_id(bearer)
-        if agent_id == "admin":
-            return "admin"
-        if agent_id:
-            return "worker"
-    except Exception as e:
-        logger.warning(
-            "prompts/list: failed to resolve bearer to role (%s); "
-            "treating as anonymous.",
-            e,
-        )
+    if principal.has_role("admin"):
+        return "admin"
+    if principal.kind == "agent_bearer":
+        return "worker"
     return "anonymous"
 
 
@@ -659,7 +593,7 @@ async def mcp_list_prompts_handler() -> List[mcp_types.Prompt]:
     """
     from ..prompts import prompt_registry
 
-    role = _caller_role()
+    role = _principal_role()
     prompts: List[mcp_types.Prompt] = []
     for entry in prompt_registry.list_visible(role):
         args = []
@@ -698,7 +632,7 @@ async def mcp_get_prompt_handler(
     """
     from ..prompts import prompt_registry
 
-    role = _caller_role()
+    role = _principal_role()
     entry = prompt_registry.get(name)
     if entry is None:
         raise ValueError(f"Unknown prompt: {name}")
@@ -780,28 +714,41 @@ async def mcp_read_resource_handler(uri):
 async def mcp_call_tool_handler(name: str, arguments: dict) -> List[mcp_types.TextContent]:
     """MCP endpoint to call a specific tool.
 
-    `validate_input=False` disables the framework's automatic
-    `jsonschema.validate(arguments, tool.inputSchema)` step
+    ``validate_input=False`` disables the framework's automatic
+    ``jsonschema.validate(arguments, tool.inputSchema)`` step
     (mcp/server/lowlevel/server.py:497). We re-run validation inside
-    `dispatch_tool_call` *after* cleaning arguments for the real-world
-    shapes LLM clients produce (`token: null`, leaked `_meta`,
-    integer-as-string). See `_clean_arguments_for_schema` in
-    `tools/registry.py` and the tolerance suite in
-    `tests/test_call_tool_argument_tolerance.py`.
+    :func:`dispatch_tool_call` *after* cleaning arguments for the
+    real-world shapes LLM clients produce (``token: null``, leaked
+    ``_meta``, integer-as-string). See ``_clean_arguments_for_schema``
+    in ``tools/registry.py`` and the tolerance suite in
+    ``tests/test_call_tool_argument_tolerance.py``.
 
-    Wave 6 PR 0 — ``dispatch_tool_call`` now returns
-    :data:`agent_mcp.core.tool_result.ToolResult`; render back to
-    the legacy ``list[TextContent]`` MCP wire shape via
-    :func:`render_as_text_content`. The Principal threaded through
-    dispatch is picked up from the ContextVars
-    (``request_auth_token`` set by :class:`AuthHeaderMiddleware`)
-    via the bridge fallback in ``dispatch_tool_call``; no explicit
-    Principal kwarg needed on the MCP wire path during the
-    migration window.
+    Wave 6 PR 6: the Principal is read from the
+    :data:`tools.registry.request_principal` ContextVar (stamped by
+    :class:`AuthHeaderMiddleware` on every authenticated request) and
+    threaded explicitly into the dispatcher. The legacy ContextVar
+    bridge in ``dispatch_tool_call`` is gone — ``principal`` is now
+    a required kwarg.
     """
     from ..core.tool_result import render_as_text_content
 
-    result = await dispatch_tool_call(name, arguments)
+    principal = request_principal.get()
+    if principal is None:
+        # Fallback for in-process / test callers that haven't stamped
+        # request_principal but did stamp request_auth_token: build a
+        # Principal from the bearer so the dispatcher / per-tool
+        # decorator sees the same identity production would.
+        try:
+            bearer = request_auth_token.get()
+        except LookupError:
+            bearer = None
+        if bearer:
+            principal = _build_principal_from_request(
+                request=None,
+                bearer_token=bearer,
+                forwarding_operator=None,
+            )
+    result = await dispatch_tool_call(name, arguments, principal=principal)
     return render_as_text_content(result)
 
 
@@ -911,16 +858,15 @@ class _McpAsgiApp:
             bearer_token=bearer,
             alias_used=alias_name,
         )
-        # Wave 6 PR 0: cache the Principal alongside the runtime
-        # queue so the per-tool-call dispatcher (which runs in a
-        # task spawned past the middleware return) can read identity
-        # without re-deriving from ContextVars. The Principal is
-        # built fresh here against the same bearer that opened the
-        # stream — it lives until the session dies in the cleanup
-        # finally below.
+        # Cache the Principal alongside the runtime queue so the
+        # per-tool-call dispatcher (which runs in a task spawned
+        # past the middleware return) can read identity without
+        # re-deriving. The Principal is built fresh here against the
+        # same bearer that opened the stream — it lives until the
+        # session dies in the cleanup finally below.
         try:
             principal = _build_principal_from_request(
-                request=type("scope", (), {"state": type("S", (), {})()})(),
+                request=None,
                 bearer_token=bearer,
                 forwarding_operator=None,
             )

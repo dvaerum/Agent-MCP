@@ -27,19 +27,15 @@ from ..db.connection import get_db_connection
 from ..runtime.agent_runtime import send_prompt_async, session_exists, sanitize_session_name
 
 
-# ── Wave 6 PR 2 helpers ────────────────────────────────────────────────
+# ── Wave 6 PR 6 helpers ────────────────────────────────────────────────
 #
-# The PR 0 bridge in ``tools/registry.dispatch_tool_call`` synthesises a
-# Principal from ContextVars when one isn't passed explicitly. But every
-# direct call site in this repo (a couple dozen tests, plus
-# ``broadcast_admin_message_tool_impl`` fanning out to
-# ``send_agent_message_tool_impl``) invokes the impl as a plain Python
-# function — no ContextVar stamping. To keep those callers working
-# without a sweep of every test, the helper below derives a Principal
-# from ContextVars first (the same source the bridge consults), then
-# falls back to ``arguments["token"]`` if neither contextvar fired.
-# PR 6 will remove this fallback once the bridge is gone and every
-# caller passes ``principal=`` explicitly.
+# The production dispatcher always supplies an explicit ``principal=``
+# kwarg. Direct in-process / test call sites (a couple dozen tests,
+# plus ``broadcast_admin_message_tool_impl`` fanning out to
+# ``send_agent_message_tool_impl``) invoke the impl as a plain Python
+# function and may not have one in scope; the helper below derives a
+# Principal from ``arguments["token"]`` (a per-agent bearer) so those
+# callers keep working without an explicit kwarg.
 
 
 def _resolve_principal(
@@ -50,15 +46,10 @@ def _resolve_principal(
 
     Order:
 
-    1. ``principal`` kwarg (post-PR-0 dispatcher path — the dispatcher
-       passes the bridge-derived Principal here).
-    2. ContextVar derivation via the registry bridge (covers direct
-       impl calls made *inside* ``mcp_session`` where the harness has
-       stamped the operator-session ContextVars).
-    3. ``arguments["token"]`` resolved to an active agent row (covers
-       the legacy direct-impl test pattern where the test seeds
-       ``token=<bearer>`` in the args dict without touching any
-       ContextVar).
+    1. ``principal`` kwarg (the dispatcher path).
+    2. ``arguments["token"]`` resolved to an active agent row (covers
+       direct-impl test calls that seed ``token=<bearer>`` in the
+       args dict).
 
     Returns ``None`` if no identity can be derived; the calling tool
     surfaces that as :class:`PermissionDenied` per the new contract.
@@ -66,15 +57,6 @@ def _resolve_principal(
     if principal is not None:
         return principal
 
-    from .registry import _derive_principal_from_contextvars
-
-    derived = _derive_principal_from_contextvars()
-    # The ContextVar fallback may have returned an operator_session
-    # Principal with no agent_id (the dashboard / harness operator
-    # path). If the caller also supplied a real per-agent bearer in
-    # ``arguments["token"]``, prefer that — audit-log + sender-id
-    # attribution downstream needs the specific agent identity, not
-    # just "some operator".
     token = arguments.get("token")
     if token:
         agent_id = get_agent_id(token)
@@ -96,7 +78,7 @@ def _resolve_principal(
                 source_token=token,
             )
 
-    return derived
+    return None
 
 
 def _is_operator_tier(principal: Principal) -> bool:

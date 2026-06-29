@@ -167,16 +167,25 @@ def test_byte_identical_wake_loop_output() -> None:
     re-test the gating logic (covered in test_event_coord_toggles.py).
     """
     from agent_mcp.app import instructions_contributors as ic
-    from agent_mcp.app import main_app
     from agent_mcp.app.event_loop_instructions import WAKE_LOOP_INSTRUCTIONS
+    from agent_mcp.core.principal import Principal
 
-    original_gate = main_app._bearer_has_wake_loop_enabled
-    main_app._bearer_has_wake_loop_enabled = lambda: True
-    try:
-        ctx = ic.InitContext(bearer="anything", alias_info=None)
-        assert ic._wake_loop_contributor(ctx) == WAKE_LOOP_INSTRUCTIONS
-    finally:
-        main_app._bearer_has_wake_loop_enabled = original_gate
+    # Wave 6 PR 6: the contributor reads ``principal.can_wake_loop``
+    # directly. Build a Principal with the bit on and pass it via
+    # the ``InitContext``; no monkeypatching needed.
+    p = Principal(
+        kind="agent_bearer",
+        user_id=None,
+        agent_id="alice",
+        sysadmin=False,
+        project_name=None,
+        project_role=None,
+        agent_role="worker",
+        can_wake_loop=True,
+        source_token="anything",
+    )
+    ctx = ic.InitContext(bearer="anything", alias_info=None, principal=p)
+    assert ic._wake_loop_contributor(ctx) == WAKE_LOOP_INSTRUCTIONS
 
 
 @pytest.mark.asyncio

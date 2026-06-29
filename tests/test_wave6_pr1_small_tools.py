@@ -618,29 +618,18 @@ async def test_migrated_tools_reject_anonymous_principal(
     tool_name: str,
     arguments: Dict[str, Any],
 ) -> None:
-    """Every migrated tool rejects an explicit ``principal=None``.
+    """Every migrated tool rejects an anonymous caller.
 
-    The bridge in ``dispatch_tool_call`` derives a Principal from
-    ContextVars when one isn't passed; this test bypasses the
-    bridge by stamping a no-bearer / no-operator context, so the
-    derived principal is None and the tool's own policy gate is
-    what we observe.
+    Wave 6 PR 6: the legacy ContextVar bridge is gone. The dispatcher
+    falls back to synthesizing an ``agent_bearer`` Principal from
+    ``arguments["token"]`` when no explicit Principal is supplied; we
+    omit the token here so the fallback also returns None and the
+    tool's policy gate is what we observe.
     """
-    from agent_mcp.tools.registry import (
-        dispatch_tool_call,
-        request_auth_token,
-        operator_session_active,
-    )
+    from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path):
-        # Clear the harness's defaults so the bridge derives None.
-        cv_op = operator_session_active.set(False)
-        cv_token = request_auth_token.set(None)
-        try:
-            result = await dispatch_tool_call(tool_name, arguments)
-        finally:
-            request_auth_token.reset(cv_token)
-            operator_session_active.reset(cv_op)
+        result = await dispatch_tool_call(tool_name, arguments)
 
         # Most tools surface PermissionDenied; ``ask_project_rag``'s
         # query_rag_system on the no-OpenAI mock returns an error
@@ -648,7 +637,7 @@ async def test_migrated_tools_reject_anonymous_principal(
         # would mask a missing auth check — assert PermissionDenied
         # uniformly to pin the explicit principal-is-None gate.
         assert isinstance(result, PermissionDenied), (
-            f"{tool_name}: expected PermissionDenied for principal=None, "
+            f"{tool_name}: expected PermissionDenied for anonymous caller, "
             f"got {result!r}"
         )
 

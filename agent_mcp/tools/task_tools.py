@@ -11,7 +11,7 @@ from .registry import register_tool
 from . import access as _access  # Canonical home for _get_config_bool
 from ..core.config import logger, ENABLE_TASK_PLACEMENT_RAG, ALLOW_RAG_OVERRIDE
 from ..core import globals as g
-from ..core.auth import verify_token, get_agent_id
+from ..core.auth import get_agent_id
 from ..core.authorize import requires, requires_policy, requires_role
 from ..core.principal import Principal
 from ..core.tool_result import (
@@ -62,7 +62,7 @@ def _authorize_assign_task(
     target_agent_token: Optional[str],
     task_ids: Optional[List[str]],
     arguments: Dict[str, Any],
-    principal: Optional[Principal] = None,
+    principal: Principal,
 ) -> Optional[str]:
     """Authorize a call to `assign_task_tool_impl`.
 
@@ -96,18 +96,12 @@ def _authorize_assign_task(
     - worker token + `target_agent_token != own token` → always
       rejected. Worker→worker delegation is operator/manager-only.
     """
-    if principal is not None:
-        is_admin_or_manager = (
-            principal.has_role("admin") or principal.has_role("manager")
-        )
-        worker_id = (
-            principal.agent_id if principal.kind == "agent_bearer" else None
-        )
-    else:
-        is_admin_or_manager = verify_token(
-            admin_auth_token, "admin"
-        ) or verify_token(admin_auth_token, "manager")
-        worker_id = get_agent_id(admin_auth_token)
+    is_admin_or_manager = (
+        principal.has_role("admin") or principal.has_role("manager")
+    )
+    worker_id = (
+        principal.agent_id if principal.kind == "agent_bearer" else None
+    )
 
     if is_admin_or_manager:
         return None
@@ -1138,14 +1132,9 @@ async def assign_task_tool_impl(
     # consistent with the legacy ``_authorize_assign_task`` matrix
     # which already widens "admin" to include manager-role agents
     # for the assign_task surface.
-    if principal is not None:
-        is_admin_request = (
-            principal.has_role("admin") or principal.has_role("manager")
-        )
-    else:
-        is_admin_request = verify_token(
-            admin_auth_token, "admin"
-        ) or verify_token(admin_auth_token, "manager")
+    is_admin_request = (
+        principal.has_role("admin") or principal.has_role("manager")
+    )
 
     # Admin-only `agent_id` alternative (Phase 7d). Resolves to the
     # agent's token server-side so admins can target an agent by their
@@ -1778,15 +1767,9 @@ async def create_self_task_tool_impl(
     depends_on_tasks_list = arguments.get("depends_on_tasks")
     parent_task_id_arg = arguments.get("parent_task_id")
 
-    # Wave 6 PR 4: derive requesting_agent_id from the typed Principal
-    # when present, falling back to verify_token for in-process callers.
-    # @requires("any") guarantees a valid agent token at the decorator
-    # layer; we still resolve the id locally for the ownership / parent
-    # checks below.
-    if principal is not None and principal.agent_id:
-        requesting_agent_id = principal.agent_id
-    else:
-        requesting_agent_id = get_agent_id(agent_auth_token)
+    # @requires("any") guarantees a valid agent token at the
+    # decorator layer; principal.agent_id is therefore set.
+    requesting_agent_id = principal.agent_id
 
     if not all([task_title, task_description]):
         return Invalid(
@@ -2057,16 +2040,12 @@ async def update_task_status_tool_impl(
     # agents (preserves the admin harness's manager-bearer path AND
     # widens admin-only fields to manager-role agents, consistent
     # with `_authorize_assign_task` which already does this).
-    if principal is not None:
-        is_admin_request = (
-            principal.has_role("admin") or principal.has_role("manager")
-        )
-        requesting_agent_id = (
-            principal.agent_id or principal.user_id or "admin"
-        )
-    else:
-        is_admin_request = verify_token(agent_auth_token, "admin")
-        requesting_agent_id = get_agent_id(agent_auth_token)
+    is_admin_request = (
+        principal.has_role("admin") or principal.has_role("manager")
+    )
+    requesting_agent_id = (
+        principal.agent_id or principal.user_id or "admin"
+    )
 
     # Determine if this is bulk or single operation
     task_ids_to_process = []
@@ -2436,16 +2415,12 @@ async def view_tasks_tool_impl(
     # per-row filtering below (workers see only their own tasks unless
     # filter_agent_id matches their id; admins see anyone's). Admins
     # here include operator-tier callers AND manager-role agents.
-    if principal is not None:
-        is_admin_request = (
-            principal.has_role("admin") or principal.has_role("manager")
-        )
-        requesting_agent_id = (
-            principal.agent_id or principal.user_id or "admin"
-        )
-    else:
-        is_admin_request = verify_token(agent_auth_token, "admin")
-        requesting_agent_id = get_agent_id(agent_auth_token)
+    is_admin_request = (
+        principal.has_role("admin") or principal.has_role("manager")
+    )
+    requesting_agent_id = (
+        principal.agent_id or principal.user_id or "admin"
+    )
 
     # Permission check
     target_agent_id_for_filter = filter_agent_id
@@ -2964,16 +2939,12 @@ async def request_assistance_tool_impl(
     # Wave 6 PR 4: derive permission flags from the typed Principal.
     # @requires("any") guaranteed a valid agent token at the decorator
     # layer; we resolve id locally for ownership checks below.
-    if principal is not None:
-        is_admin_request = (
-            principal.has_role("admin") or principal.has_role("manager")
-        )
-        requesting_agent_id = (
-            principal.agent_id or principal.user_id or "admin"
-        )
-    else:
-        is_admin_request = verify_token(agent_auth_token, "admin")
-        requesting_agent_id = get_agent_id(agent_auth_token)
+    is_admin_request = (
+        principal.has_role("admin") or principal.has_role("manager")
+    )
+    requesting_agent_id = (
+        principal.agent_id or principal.user_id or "admin"
+    )
 
     if not parent_task_id or not assistance_description:
         return Invalid(
@@ -3250,16 +3221,12 @@ async def bulk_task_operations_tool_impl(
     # @requires("any") guaranteed a valid agent token at the decorator
     # layer; admin gets full control, workers are restricted per-op
     # (own-task only) by the in-loop ownership check below.
-    if principal is not None:
-        is_admin_request = (
-            principal.has_role("admin") or principal.has_role("manager")
-        )
-        requesting_agent_id = (
-            principal.agent_id or principal.user_id or "admin"
-        )
-    else:
-        is_admin_request = verify_token(agent_auth_token, "admin")
-        requesting_agent_id = get_agent_id(agent_auth_token)
+    is_admin_request = (
+        principal.has_role("admin") or principal.has_role("manager")
+    )
+    requesting_agent_id = (
+        principal.agent_id or principal.user_id or "admin"
+    )
 
     if not operations or not isinstance(operations, list):
         return Invalid(
@@ -3543,16 +3510,12 @@ async def search_tasks_tool_impl(
     # Wave 6 PR 4: derive permission flags from the typed Principal.
     # @requires("any") guaranteed entry; admin sees all tasks, workers
     # only see their own (per-row filter below).
-    if principal is not None:
-        is_admin_request = (
-            principal.has_role("admin") or principal.has_role("manager")
-        )
-        requesting_agent_id = (
-            principal.agent_id or principal.user_id or "admin"
-        )
-    else:
-        is_admin_request = verify_token(agent_auth_token, "admin")
-        requesting_agent_id = get_agent_id(agent_auth_token)
+    is_admin_request = (
+        principal.has_role("admin") or principal.has_role("manager")
+    )
+    requesting_agent_id = (
+        principal.agent_id or principal.user_id or "admin"
+    )
 
     # `search_query` is optional as of v5.0.22 — callers may supply
     # only `status_filter` to list tasks by status without text

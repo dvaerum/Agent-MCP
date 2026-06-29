@@ -40,7 +40,7 @@ from agent_mcp.core.tool_result import (
     Ok,
     PermissionDenied,
 )
-from tests.harness import mcp_session, with_principal
+from tests.harness import mcp_session
 
 pytestmark = pytest.mark.asyncio
 
@@ -204,26 +204,16 @@ async def test_view_project_context_worker_redacts_secret_keys(
 
 async def test_view_project_context_anonymous_rejected(tmp_path) -> None:
     """A None Principal at the dispatch boundary surfaces as
-    :class:`PermissionDenied` — same shape the bridge would
-    produce when a tool is called outside any authenticated
-    context. Defence-in-depth: the per-tool gate matches the
-    legacy ``@requires("any")`` rejection at the wire level."""
-    from agent_mcp.tools.registry import dispatch_tool_call
+    :class:`PermissionDenied`. Defence-in-depth: the per-tool gate
+    matches the legacy ``@requires("any")`` rejection at the wire
+    level. Wave 6 PR 6: with no bearer in arguments and no explicit
+    principal, the dispatcher's arguments-token synthesis also
+    returns None, so the tool's own gate fires.
+    """
+    from agent_mcp.tools.registry import dispatch_tool_call, request_auth_token
 
     async with mcp_session(tmp_path):
-        # Clear the harness-stamped ContextVars so the bridge
-        # fallback can't derive an operator_session Principal.
-        from agent_mcp.tools.registry import (
-            operator_session_active,
-            operator_user_id as _cv_user,
-            operator_project_name as _cv_project,
-            request_auth_token,
-        )
-
-        cv1 = operator_session_active.set(False)
-        cv2 = _cv_user.set(None)
-        cv3 = _cv_project.set(None)
-        cv4 = request_auth_token.set(None)
+        cv_token = request_auth_token.set(None)
         try:
             result = await dispatch_tool_call(
                 "view_project_context",
@@ -231,10 +221,7 @@ async def test_view_project_context_anonymous_rejected(tmp_path) -> None:
                 principal=None,
             )
         finally:
-            request_auth_token.reset(cv4)
-            _cv_project.reset(cv3)
-            _cv_user.reset(cv2)
-            operator_session_active.reset(cv1)
+            request_auth_token.reset(cv_token)
 
     assert isinstance(result, PermissionDenied), (
         f"anonymous caller must surface as PermissionDenied; got {result!r}"
@@ -605,40 +592,32 @@ async def test_backup_project_context_operator_returns_ok(tmp_path) -> None:
 # ── Bridge fallback — old-style call works on migrated tools ──────
 
 
-async def test_bridge_derives_operator_principal_for_rest_path(
+async def test_explicit_operator_principal_admits_config_write(
     tmp_path,
 ) -> None:
-    """When no explicit ``principal=`` is passed, the bridge
-    derives one from the ContextVars. With ``with_principal``
-    stamping an operator-session Principal and no bearer, the
-    derived Principal admits :func:`_is_admin_principal` and the
-    config_* write succeeds.
+    """An explicit operator-session :class:`Principal` admits
+    :func:`_is_admin_principal` and the config_* write succeeds.
+
+    Wave 6 PR 6: the ContextVar bridge is gone — callers thread the
+    Principal explicitly. This pins the contract that an operator
+    Principal still satisfies the operator-tier gate on the
+    migrated ``update_project_context`` impl.
     """
-    from agent_mcp.tools.registry import (
-        dispatch_tool_call,
-        request_auth_token,
-    )
+    from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path):
         op = _operator_principal(user_id="bridge-tester")
-        # Clear the harness's bearer for this scope so the
-        # bridge's "bearer wins" branch doesn't override our
-        # explicit operator-session stamp.
-        cv_token = request_auth_token.set(None)
-        try:
-            with with_principal(op):
-                result = await dispatch_tool_call(
-                    "update_project_context",
-                    {
-                        "context_key": "config_pr3_bridge_op",
-                        "context_value": "via-bridge",
-                    },
-                )
-        finally:
-            request_auth_token.reset(cv_token)
+        result = await dispatch_tool_call(
+            "update_project_context",
+            {
+                "context_key": "config_pr3_bridge_op",
+                "context_value": "via-bridge",
+            },
+            principal=op,
+        )
 
     assert isinstance(result, Ok), (
-        f"bridge-derived operator must admit config_* write; "
+        f"explicit operator must admit config_* write; "
         f"got {result!r}"
     )
 

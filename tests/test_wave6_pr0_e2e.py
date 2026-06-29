@@ -224,27 +224,25 @@ async def test_add_task_note_worker_bearer_admits_as_agent(tmp_path) -> None:
 # ── Bridge: unmigrated tool still works ──────────────────────────
 
 
-async def test_unmigrated_tool_returns_ok_message_via_bridge(tmp_path) -> None:
-    """``edit_task_note`` is unmigrated (still returns
-    ``list[TextContent]``). The bridge in ``dispatch_tool_call``
-    auto-wraps that as ``Ok(message=concatenated_text)`` so a single
-    downstream consumer sees a uniform ``ToolResult`` regardless of
-    whether the tool has been migrated yet. PRs 1-5 migrate the
-    remaining tools; this test pins the bridge contract so a tool
-    that *hasn't* been migrated keeps working without breaking
-    callers.
+async def test_migrated_edit_task_note_returns_ok_through_renderer(tmp_path) -> None:
+    """The migrated ``edit_task_note`` returns :class:`Ok`; the
+    renderer at :func:`render_as_text_content` converts the
+    ``Ok(message=...)`` back into the legacy ``list[TextContent]``
+    shape MCP clients consume. Wave 6 PR 6: the legacy
+    ``list[TextContent]`` bridge is gone — every tool returns a
+    typed :data:`ToolResult` and the renderer is the sole conversion
+    surface for the MCP wire.
 
     Drives through the MCP-wire path (admin.call) so the bearer
-    flows through the existing Q6e fallback into the legacy tool's
+    flows through the existing Q6e fallback into the tool's
     ``arguments["token"]``; this is the same path real MCP clients
-    take. The result we inspect is the rendered text-content (the
-    renderer derives from the bridge-wrapped ``Ok(message=...)``).
+    take.
     """
     from agent_mcp.db.actions import task_notes_db
 
     async with mcp_session(tmp_path) as admin:
         _insert_task("wave6-demo-bridge-1")
-        # Seed a note via the migrated path.
+        # Seed a note.
         seed = await admin.assert_tool_succeeds(
             "add_task_note",
             {"task_id": "wave6-demo-bridge-1", "text": "v1"},
@@ -253,17 +251,14 @@ async def test_unmigrated_tool_returns_ok_message_via_bridge(tmp_path) -> None:
         notes = task_notes_db.list_notes_for_task("wave6-demo-bridge-1")
         note_id = notes[0]["note_id"]
 
-        # Exercise the UNMIGRATED edit_task_note via the same MCP
-        # wire — the bridge wraps its legacy return as Ok(message),
-        # the renderer turns it back into a TextContent the test sees.
         result = await admin.assert_tool_succeeds(
             "edit_task_note",
             {"note_id": note_id, "text": "v2"},
         )
 
         assert "updated" in result[0].text.lower(), result[0].text
-        # Re-fetch (still inside mcp_session) to confirm the legacy
-        # tool actually performed its update.
+        # Re-fetch (still inside mcp_session) to confirm the tool
+        # actually performed its update.
         updated = task_notes_db.get_note(note_id)
         assert updated is not None and updated["text"] == "v2"
 
@@ -271,13 +266,18 @@ async def test_unmigrated_tool_returns_ok_message_via_bridge(tmp_path) -> None:
 # ── with_principal harness helper ────────────────────────────────
 
 
-async def test_with_principal_helper_stamps_contextvars(tmp_path) -> None:
-    """The new ``with_principal()`` helper stamps the legacy
-    ContextVars so the bridge derives the matching Principal.
-    Demonstrates the migration path for tests that haven't been
-    rewritten to pass Principal explicitly.
+async def test_with_principal_helper_stamps_request_principal(tmp_path) -> None:
+    """The ``with_principal()`` helper stamps the
+    :data:`request_principal` ContextVar so any in-process surface
+    that reads it (e.g. the MCP-wire handler) sees the same identity.
+
+    Wave 6 PR 6: ``dispatch_tool_call`` requires an explicit
+    ``principal=`` kwarg; the helper now stamps
+    :data:`request_principal` for surfaces that derive identity from
+    the request context, but the dispatcher itself never reads from
+    a ContextVar fallback.
     """
-    from agent_mcp.tools.registry import dispatch_tool_call
+    from agent_mcp.tools.registry import dispatch_tool_call, request_principal
 
     from agent_mcp.db.actions import task_notes_db
 
@@ -296,11 +296,15 @@ async def test_with_principal_helper_stamps_contextvars(tmp_path) -> None:
             source_token=None,
         )
         with with_principal(p):
-            # No explicit principal= → bridge derives from ContextVars
-            # that with_principal just stamped.
+            # The helper stamps request_principal — surfaces that
+            # consult it (the MCP handler) see ``bob`` as the caller.
+            assert request_principal.get() is p
+            # The dispatcher itself requires explicit principal — no
+            # ContextVar bridge in PR 6 — so we pass it through.
             result = await dispatch_tool_call(
                 "add_task_note",
                 {"task_id": "wave6-demo-helper-1", "text": "from bob"},
+                principal=p,
             )
 
         assert isinstance(result, Ok)

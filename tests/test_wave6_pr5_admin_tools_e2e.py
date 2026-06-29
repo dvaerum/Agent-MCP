@@ -423,15 +423,17 @@ async def test_dispatch_view_status_with_explicit_principal(tmp_path) -> None:
 
 
 async def test_dispatch_view_status_with_with_principal_helper(tmp_path) -> None:
-    """``with_principal()`` stamps the legacy ContextVars so the bridge
-    derives the same Principal — confirming the migration path for
-    tests that haven't been rewritten to pass principal explicitly."""
+    """``with_principal()`` stamps ``request_principal`` so the surfaces
+    that read it see the operator. The dispatcher itself requires
+    explicit ``principal=`` post-PR-6 — pass it through."""
     from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path):
         p = _operator_principal("op-via-helper")
         with with_principal(p):
-            result = await dispatch_tool_call("view_status", {})
+            result = await dispatch_tool_call(
+                "view_status", {}, principal=p,
+            )
 
     assert isinstance(result, Ok)
 

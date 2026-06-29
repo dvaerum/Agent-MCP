@@ -77,15 +77,14 @@ async def test_requires_admin_rejects_worker_token(reset_globals) -> None:
 
 @pytest.mark.asyncio
 async def test_requires_admin_allows_operator_session(reset_globals) -> None:
-    """@requires("admin") passes when ``operator_session_active`` is set.
+    """``@requires("admin")`` admits an operator-session Principal.
 
-    retire-system-token Wave 1: the god-key bearer that previously
-    satisfied ``@requires("admin")`` is gone. The surviving admit path
-    is an operator session (set by the REST seam / the harness when a
-    request authenticates via cookie or signed forwarding header).
+    Wave 6 PR 6: identity flows through the typed Principal kwarg
+    the wrapper accepts; the operator-tier admit takes the cookie /
+    forwarding-header path.
     """
     from agent_mcp.core.authorize import requires
-    from agent_mcp.tools.registry import operator_session_active
+    from agent_mcp.core.principal import Principal
 
     called = {"hit": False}
 
@@ -94,11 +93,18 @@ async def test_requires_admin_allows_operator_session(reset_globals) -> None:
         called["hit"] = True
         return [mcp_types.TextContent(type="text", text="ran")]
 
-    cv = operator_session_active.set(True)
-    try:
-        result = await my_tool({"token": "anything-ignored-on-this-branch"})
-    finally:
-        operator_session_active.reset(cv)
+    p = Principal(
+        kind="operator_session",
+        user_id="alice",
+        agent_id=None,
+        sysadmin=False,
+        project_name=None,
+        project_role="operator",
+        agent_role=None,
+        can_wake_loop=False,
+        source_token=None,
+    )
+    result = await my_tool({"token": "anything-ignored"}, principal=p)
     assert called["hit"]
     assert result[0].text == "ran"
 
@@ -141,25 +147,30 @@ async def test_requires_any_rejects_garbage(reset_globals) -> None:
 async def test_requires_policy_admin_always_allowed(reset_globals) -> None:
     """Admin bypasses the policy check entirely.
 
-    retire-system-token Wave 1: the god-key admit path is gone;
-    ``@requires_policy``'s admin branch now consults
-    ``verify_token(token, "admin")`` which only returns True when
-    the ``operator_session_active`` ContextVar is set. Stamp that
-    on the test's context to take the admin branch.
+    Wave 6 PR 6: identity flows through the typed Principal kwarg;
+    the operator-tier admit takes the cookie / forwarding-header
+    path without consulting the policy toggle.
     """
     from agent_mcp.core.authorize import requires_policy
-    from agent_mcp.tools.registry import operator_session_active
+    from agent_mcp.core.principal import Principal
 
     @requires_policy("config_some_toggle", default=False)
     async def my_tool(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
         return [mcp_types.TextContent(type="text", text="admin in")]
 
-    cv = operator_session_active.set(True)
-    try:
-        # Even with the toggle defaulting false, admin still gets through.
-        result = await my_tool({"token": "anything"})
-    finally:
-        operator_session_active.reset(cv)
+    p = Principal(
+        kind="operator_session",
+        user_id="alice",
+        agent_id=None,
+        sysadmin=False,
+        project_name=None,
+        project_role="operator",
+        agent_role=None,
+        can_wake_loop=False,
+        source_token=None,
+    )
+    # Even with the toggle defaulting false, operator still gets through.
+    result = await my_tool({"token": "anything"}, principal=p)
     assert result[0].text == "admin in"
 
 

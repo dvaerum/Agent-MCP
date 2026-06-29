@@ -1,26 +1,28 @@
 # Agent-MCP/mcp_template/mcp_server_src/tools/utility_tools.py
-from typing import List, Dict, Any
-
-import mcp.types as mcp_types # Assuming this is your mcp.types path
+from typing import Dict, Any, Optional
 
 from .registry import register_tool
 from ..core.config import logger
-# No other specific project imports needed for this simple tool.
+from ..core.principal import Principal
+from ..core.tool_result import Ok, ToolResult
+
 
 # --- test_tool ---
 # Original logic from main.py: lines 1933-1938 (test_tool function)
 # This tool did not take any arguments in the original `handle_tool` dispatch.
-async def test_tool_impl(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
+async def test_tool_impl(
+    arguments: Dict[str, Any],
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
     """
     Simple test tool that returns a success message.
     It does not require any arguments.
     """
-    # `arguments` parameter is present for consistency with the dispatcher, but not used.
+    # `arguments` + ``principal`` are present for dispatcher
+    # consistency, but not used.
     logger.info("Executing test_tool_impl.")
-    return [mcp_types.TextContent(
-        type="text",
-        text="Tool is working! 🎉" # Identical to main.py:1936-1937
-    )]
+    return Ok(message="Tool is working!")
 
 
 # --- Register utility tools ---

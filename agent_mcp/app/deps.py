@@ -15,33 +15,18 @@ We still re-validate the cookie at the FastAPI layer for two reasons:
   2. Per-agent bearers (workers / managers) still POST to the backend
      directly and need to authenticate.
 
-retire-system-token Wave 1 (this PR) removed the god-key bearer
-paths through this dep. The dep now admits:
+The dep admits:
 
   * A valid ``agent_mcp_session`` cookie pointing at a live operator
     session in ``router.db`` (the dashboard path), OR
   * A verified ``X-Agent-MCP-Forwarded-Operator`` header carrying a
     signed operator identity (the router proxies cookie requests
-    with this header attached — Wave 2 wires the router side; Wave 1
-    ships only the backend verify), OR
+    with this header attached), OR
   * A per-agent ``Authorization: Bearer <token>`` whose row has
-    ``agent_role IN ('manager', 'admin')`` — the post-Wave-1 stand-
-    in for the old "admin bearer" admit. Worker tokens are still
+    ``agent_role IN ('manager', 'admin')`` — Worker tokens are
     rejected (no privilege escalation from worker to operator-tier
     REST surface; ``tests/test_tokens_endpoint_worker_guard.py``
     pins this).
-
-The previous behaviour was ``verify_token(bearer, "admin")``, which
-matched ``token == g.system_token``. That god-key branch is gone;
-the surviving "operator-tier bearer" surface is the per-agent
-manager-role token, which is a real per-principal credential that
-the test harness mints and external admin scripts can mint by
-creating a manager agent via ``create_agent``.
-
-The legacy ``body['token']`` / ``?token=<>`` paths still resolve
-through ``verify_token`` — they admit the same per-agent manager
-bearers, since ``verify_token`` itself is the single source of
-truth on "is this a privileged token".
 """
 
 from __future__ import annotations
@@ -52,8 +37,6 @@ from typing import Any
 
 from fastapi import HTTPException, Request
 
-from ..core.auth import verify_token
-
 
 logger = logging.getLogger(__name__)
 
@@ -61,35 +44,28 @@ logger = logging.getLogger(__name__)
 SESSION_COOKIE_NAME = "agent_mcp_session"
 
 
-def _bearer_is_operator_tier(token: str) -> bool:
-    """Post-Wave-1 operator-tier bearer check.
+#: Agent rows whose ``agent_role`` is treated as operator-tier for
+#: the bearer / body-token / query-string admit paths below. The
+#: post-Wave-1 ``manager`` role is the canonical credential; the
+#: legacy ``admin`` role is kept for pre-Wave-4 rows still in the wild.
+_OPERATOR_TIER_AGENT_ROLES = frozenset({"manager", "admin"})
 
-    Previously this was ``verify_token(token, "admin")``, which
-    matched the god-key ``g.system_token`` bearer. retire-system-token
-    Wave 1 dropped that branch from ``verify_token``, so the surviving
-    operator-tier bearer surface is the per-agent manager-role
-    (or, historically, admin-role) token in the ``agents`` table.
 
-    Returns True iff ``token`` resolves to a row whose ``agent_role``
-    is operator-tier. Worker-role tokens return False (no escalation
-    to operator-only REST routes via a worker bearer).
+def _is_operator_tier_bearer(token: str) -> bool:
+    """Return True iff ``token`` resolves to an operator-tier agent row.
+
+    Direct DB / cache lookup against ``agent_role`` — Wave 6 PR 6
+    retired the ``verify_token`` indirection. Worker-role tokens
+    return False (no escalation from worker to operator-tier REST
+    routes via a worker bearer).
     """
     if not token:
         return False
-    # ``manager`` role: real per-principal operator-tier credential
-    # the harness + ``create_agent`` mint.
-    if verify_token(token, "manager"):
-        return True
-    # Legacy ``admin`` role: pre-Wave-4 agents-table rows still in
-    # the wild. ``verify_token(.., "agent")`` admits any active row;
-    # we additionally check the role string so we don't grant
-    # operator-tier privilege to worker rows.
-    from .. import core
-    g = core.globals  # type: ignore[attr-defined]
-    row = g.active_agents.get(token)
-    if isinstance(row, dict) and row.get("agent_role") == "admin":
-        return True
-    return False
+    from ..core.repositories import agent_repo
+    row = agent_repo.get_agent_by_token(token)
+    if not isinstance(row, dict):
+        return False
+    return row.get("agent_role") in _OPERATOR_TIER_AGENT_ROLES
 
 
 # ── Resolution helpers ────────────────────────────────────────────
@@ -162,7 +138,7 @@ async def require_operator_session(request: Request) -> dict[str, Any]:
     The ``"operator_bearer"`` discriminator was named ``"admin_token"``
     before retire-system-token Wave 5; it never carried a god-key
     admin token after Wave 1 (it admits per-agent manager-role tokens
-    via ``_bearer_is_operator_tier``), so the legacy name was
+    via ``_is_operator_tier_bearer``), so the legacy name was
     misleading. The discriminator is internal — no handler branches on
     it post-Wave-3.
 
@@ -172,7 +148,7 @@ async def require_operator_session(request: Request) -> dict[str, Any]:
 
     retire-system-token Wave 1 removed the god-key bearer paths;
     the bearer / body-token / query-string admits now consult
-    ``_bearer_is_operator_tier`` which checks for a per-agent
+    ``_is_operator_tier_bearer`` which checks for a per-agent
     manager-role row in the ``agents`` table. Worker tokens are
     rejected here — see ``tests/test_tokens_endpoint_worker_guard.py``.
     """
@@ -201,18 +177,18 @@ async def require_operator_session(request: Request) -> dict[str, Any]:
     auth = request.headers.get("Authorization", "")
     if auth.lower().startswith("bearer "):
         bearer = auth[7:].strip()
-        if bearer and _bearer_is_operator_tier(bearer):
+        if bearer and _is_operator_tier_bearer(bearer):
             return {"kind": "operator_bearer", "user": None}
 
     # 4. Body-token path — backwards-compat (the JSON body's
     #    "token" field). Same operator-tier gate as the bearer path.
     body_token = await _legacy_body_token(request)
-    if body_token and _bearer_is_operator_tier(body_token):
+    if body_token and _is_operator_tier_bearer(body_token):
         return {"kind": "operator_bearer", "user": None}
 
     # 5. Query-string ``?token=<>`` path — same shape, same gate.
     query_token = request.query_params.get("token") if request.query_params else None
-    if query_token and _bearer_is_operator_tier(query_token):
+    if query_token and _is_operator_tier_bearer(query_token):
         return {"kind": "operator_bearer", "user": None}
 
     raise HTTPException(
