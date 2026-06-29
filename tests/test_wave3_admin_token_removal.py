@@ -132,11 +132,18 @@ async def test_all_data_response_agents_section_no_admin_token(
 
 
 async def test_create_agent_via_admin_bearer_still_works(tmp_path) -> None:
-    """POST /api/agents must still work via the legacy admin-bearer
-    fallback path (backwards compat for admin CLI scripts)."""
+    """POST /api/agents/register must work via the legacy admin-bearer
+    fallback path (backwards compat for admin CLI scripts).
+
+    Wave 7 PR 1 (coordinator transition): migrated from POST /api/agents
+    (legacy spawn path) to POST /api/agents/register — same auth-gate
+    contract via ``require_operator_session``, no tmux spawn. The
+    legacy spawn path's auth gate is wholly preserved on the
+    register-only endpoint (same dep, same admit/reject branches).
+    """
     async with mcp_session(tmp_path) as admin:
         r = admin.client.post(
-            "/api/agents",
+            "/api/agents/register",
             json={"agent_id": "via-admin-bearer", "capabilities": []},
             headers={"Authorization": f"Bearer {admin.admin_token}"},
         )
@@ -144,16 +151,17 @@ async def test_create_agent_via_admin_bearer_still_works(tmp_path) -> None:
 
 
 async def test_create_agent_rejects_worker_bearer(tmp_path) -> None:
-    """POST /api/agents must reject worker-bearer auth with 401.
+    """POST /api/agents/register must reject worker-bearer auth with 401.
 
     The route's outer dep is ``require_operator_session`` (admin-only).
-    Wave 3's self-RPC rewrite must preserve this rejection — a worker
-    bearer must never reach the inner ``create_agent_tool_impl``.
+    A worker bearer must never reach the inner tool impl — the
+    spawn-vs-register cutover (Wave 7) doesn't relax the gate; the
+    same operator-tier check sits on the register-only endpoint.
     """
     async with mcp_session(tmp_path) as admin:
         worker = await admin.create_worker("worker-creator")
         r = admin.client.post(
-            "/api/agents",
+            "/api/agents/register",
             json={"agent_id": "should-not-create", "capabilities": []},
             headers={"Authorization": f"Bearer {worker.token}"},
         )
@@ -161,10 +169,10 @@ async def test_create_agent_rejects_worker_bearer(tmp_path) -> None:
 
 
 async def test_create_agent_rejects_no_auth(tmp_path) -> None:
-    """POST /api/agents must 401 with no auth at all."""
+    """POST /api/agents/register must 401 with no auth at all."""
     async with mcp_session(tmp_path) as admin:
         r = admin.client.post(
-            "/api/agents",
+            "/api/agents/register",
             json={"agent_id": "no-auth-create", "capabilities": []},
         )
         assert r.status_code == 401, r.text

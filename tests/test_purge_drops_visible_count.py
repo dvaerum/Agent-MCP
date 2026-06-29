@@ -169,20 +169,23 @@ async def test_purge_drops_visible_agent_count_by_one(tmp_path) -> None:
     """The full create → terminate → purge flow that Dennis's spec
     actually pins: count BEFORE purge minus count AFTER purge == 1.
 
-    Uses the same REST surface the dashboard does (POST /api/agents,
-    POST /api/terminate-agent, DELETE /api/agents/<id>?cascade=true),
-    then re-fetches /api/all-data and asserts the agent count drops
-    by exactly 1 — NOT zero (the tombstone-leak bug) and NOT more
-    than one (would imply a cascade glitch removing siblings).
+    Uses the dashboard's REST surface: POST /api/agents/register (the
+    Wave 7 PR 1 register-only sibling — pre-cutover this hit POST
+    /api/agents and orphan-stormed claude processes via the spawn
+    impl), POST /api/terminate-agent, DELETE
+    /api/agents/<id>?cascade=true. Re-fetches /api/all-data and
+    asserts the agent count drops by exactly 1 — NOT zero (the
+    tombstone-leak bug) and NOT more than one (would imply a cascade
+    glitch removing siblings).
     """
     async with mcp_session(tmp_path) as admin:
         before_total = len(
             admin.get("/api/all-data").json()["agents"]
         )
 
-        # 1. Deploy
+        # 1. Register (Wave 7 PR 1: was POST /api/agents — spawn path).
         r = admin.client.post(
-            "/api/agents",
+            "/api/agents/register",
             json={
                 "token": admin.admin_token,
                 "agent_id": "spec-lifecycle-target",

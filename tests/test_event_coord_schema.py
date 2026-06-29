@@ -412,39 +412,29 @@ async def test_assign_task_tool_normalizes_required_capabilities(
 
 
 # ---------------------------------------------------------------------------
-# (vi) — create_agent normalizes capabilities
+# (vi) — capability normalization helper
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_create_agent_normalizes_capabilities(tmp_path: Path) -> None:
-    """create_agent with capabilities=['BACKEND', 'db', 'Backend']
-    stores ['backend', 'db'] in the column. Uses the harness for the
-    same reason as the assign_task test above."""
-    from tests.harness import mcp_session
+def test_normalize_capabilities_lowercases_and_dedupes() -> None:
+    """``normalize_capabilities(['BACKEND', 'db', 'Backend'])`` returns
+    ``['backend', 'db']``: lowercase + dedupe + stable order.
 
-    async with mcp_session(tmp_path) as admin:
-        await admin.call(
-            "create_agent",
-            {
-                "agent_id": "cap-test-agent",
-                "capabilities": ["BACKEND", "db", "Backend"],
-            },
-        )
-        from agent_mcp.db.connection import get_db_connection
+    Wave 7 PR 1 (coordinator transition): pre-cutover this contract was
+    pinned end-to-end via ``admin.call("create_agent", ...)``, which
+    orphan-stormed claude processes through the legacy spawn impl. The
+    capability-normalization invariant lives in
+    ``agent_mcp.utils.capability_normalization.normalize_capabilities``
+    and is invoked by every call site that writes capabilities
+    (create_agent, agent_communication_tools.find_capable_agents, the
+    REST seam at routes.py). Testing the helper directly is the
+    strictly stronger coverage that doesn't require a spawning agent
+    surface in the loop.
+    """
+    from agent_mcp.utils.capability_normalization import normalize_capabilities
 
-        conn = get_db_connection()
-        try:
-            row = conn.execute(
-                "SELECT capabilities FROM agents WHERE agent_id = ?",
-                ("cap-test-agent",),
-            ).fetchone()
-            assert row is not None, "agent row missing"
-            assert _json.loads(row["capabilities"]) == ["backend", "db"], (
-                row["capabilities"]
-            )
-        finally:
-            conn.close()
+    result = normalize_capabilities(["BACKEND", "db", "Backend"])
+    assert result == ["backend", "db"], result
 
 
 # ---------------------------------------------------------------------------

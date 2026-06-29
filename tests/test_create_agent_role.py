@@ -1,19 +1,26 @@
-"""Backend tests for the ``agent_role`` field on POST /api/agents.
+"""Backend tests for the ``agent_role`` field on POST /api/agents/register.
 
 Phase 2 Wave 2b (prancy-napping-pie §2e). Wave 1a (v5.0.61, PR #182)
 added the ``agents.agent_role TEXT NOT NULL DEFAULT 'worker'`` column
 with a CHECK constraint admitting ``'worker'`` or ``'manager'`` only.
-This PR wires the dashboard's Create-Agent endpoint to accept
+Wave 2b wired the dashboard's Create-Agent endpoint to accept
 ``agent_role`` and persist it.
 
+Wave 7 PR 1 (coordinator transition): migrated from POST /api/agents
+(legacy spawn path that orphan-stormed claude processes) to POST
+/api/agents/register — same agent-row + token semantics, NO tmux
+spawn. The register-only endpoint accepts the role under both the
+new ``role`` field (Wave 7 plan) and the legacy ``agent_role`` alias
+(back-compat), and surfaces 422 for unknown values either way.
+
 Contract pinned here:
-  * POST /api/agents with ``agent_role='manager'`` → agent created with
-    ``agent_role='manager'``.
-  * POST /api/agents with ``agent_role='worker'`` → agent created with
-    ``agent_role='worker'``.
-  * POST /api/agents with the field omitted → defaults to
+  * POST /api/agents/register with ``agent_role='manager'`` → agent
+    created with ``agent_role='manager'``.
+  * POST /api/agents/register with ``agent_role='worker'`` → agent
+    created with ``agent_role='worker'``.
+  * POST /api/agents/register with the field omitted → defaults to
     ``'worker'`` (matches Wave 1a's column default).
-  * POST /api/agents with ``agent_role='invalid'`` → 422
+  * POST /api/agents/register with ``agent_role='invalid'`` → 422
     (rejected at the API boundary before any DB write).
 
 Manager-vs-worker privilege enforcement is Wave 3's responsibility;
@@ -47,7 +54,7 @@ async def test_create_agent_persists_manager_role(tmp_path) -> None:
     """``agent_role='manager'`` round-trips into the agents row."""
     async with mcp_session(tmp_path) as admin:
         resp = admin.client.post(
-            "/api/agents",
+            "/api/agents/register",
             json={
                 "token": admin.admin_token,
                 "agent_id": "mgr-one",
@@ -55,7 +62,7 @@ async def test_create_agent_persists_manager_role(tmp_path) -> None:
             },
         )
         assert resp.status_code == 200, (
-            f"create with agent_role=manager must succeed; "
+            f"register with agent_role=manager must succeed; "
             f"got {resp.status_code} {resp.text!r}"
         )
         row = _row("agents", "agent_id = ?", ("mgr-one",))
@@ -69,7 +76,7 @@ async def test_create_agent_persists_worker_role_explicit(tmp_path) -> None:
     """``agent_role='worker'`` (explicit) round-trips into the row."""
     async with mcp_session(tmp_path) as admin:
         resp = admin.client.post(
-            "/api/agents",
+            "/api/agents/register",
             json={
                 "token": admin.admin_token,
                 "agent_id": "worker-one",
@@ -77,7 +84,7 @@ async def test_create_agent_persists_worker_role_explicit(tmp_path) -> None:
             },
         )
         assert resp.status_code == 200, (
-            f"create with agent_role=worker must succeed; "
+            f"register with agent_role=worker must succeed; "
             f"got {resp.status_code} {resp.text!r}"
         )
         row = _row("agents", "agent_id = ?", ("worker-one",))
@@ -91,14 +98,14 @@ async def test_create_agent_defaults_to_worker_role(tmp_path) -> None:
     """
     async with mcp_session(tmp_path) as admin:
         resp = admin.client.post(
-            "/api/agents",
+            "/api/agents/register",
             json={
                 "token": admin.admin_token,
                 "agent_id": "default-worker",
             },
         )
         assert resp.status_code == 200, (
-            f"create without agent_role must succeed and default; "
+            f"register without agent_role must succeed and default; "
             f"got {resp.status_code} {resp.text!r}"
         )
         row = _row("agents", "agent_id = ?", ("default-worker",))
@@ -119,7 +126,7 @@ async def test_create_agent_rejects_invalid_role(tmp_path) -> None:
     """
     async with mcp_session(tmp_path) as admin:
         resp = admin.client.post(
-            "/api/agents",
+            "/api/agents/register",
             json={
                 "token": admin.admin_token,
                 "agent_id": "bad-role",

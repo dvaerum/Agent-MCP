@@ -462,30 +462,41 @@ async def test_purge_404_for_missing_agent(tmp_path) -> None:
     "[deleted-alice]",
     "team[1]worker",
 ])
-async def test_create_agent_rejects_brackets(tmp_path, bad_id: str) -> None:
-    """create_agent must reject any agent_id containing [ or ] so the
-    cascade tombstone literal `[deleted-<id>]` stays unambiguous."""
-    async with mcp_session(tmp_path) as admin:
-        # create a placeholder task we can claim — required by create_agent.
-        _insert_task("task_placeholder", "ph", created_by="admin",
-                     assigned_to=None)
+async def test_register_agent_rejects_brackets(tmp_path, bad_id: str) -> None:
+    """register_agent must reject any agent_id containing [ or ] so the
+    cascade tombstone literal `[deleted-<id>]` stays unambiguous.
 
+    Wave 7 PR 1 (coordinator transition): migrated from the
+    ``create_agent`` MCP tool (legacy spawn path that orphan-stormed
+    claude processes) to ``register_agent`` (the spawnless sibling
+    shipped in Wave 7 PR 0). The bracket guard is preserved verbatim
+    in ``register_agent_tool_impl`` — same defence-in-depth wording
+    as the legacy impl.
+    """
+    async with mcp_session(tmp_path) as admin:
         result = await admin.call(
-            "create_agent",
-            {"agent_id": bad_id, "task_ids": ["task_placeholder"]},
+            "register_agent",
+            {"agent_id": bad_id},
         )
         text = result[0].text.lower()
-        assert "error" in text or "invalid" in text, (
-            f"create_agent should reject agent_id '{bad_id}' with [ or ]; "
+        assert "error" in text or "invalid" in text or "reserved" in text, (
+            f"register_agent should reject agent_id '{bad_id}' with [ or ]; "
             f"got: {text!r}"
         )
 
 
-async def test_create_agent_dashboard_api_rejects_brackets(tmp_path) -> None:
-    """The dashboard REST shim also rejects brackets, before delegating
-    to the admin tool (defense in depth, and clearer error code)."""
+async def test_register_agent_dashboard_api_rejects_brackets(tmp_path) -> None:
+    """The dashboard REST shim also rejects brackets, before / via the
+    tool impl (defense in depth, and clearer error code).
+
+    Wave 7 PR 1: migrated from POST /api/create-agent (back-compat
+    alias of the legacy spawn endpoint) to POST /api/agents/register
+    (the register-only sibling shipped in Wave 7 PR 0). The route
+    adapter surfaces the tool's :class:`Invalid` as a 400 — same
+    status code, same operator experience.
+    """
     async with mcp_session(tmp_path) as admin:
-        resp = admin.client.post("/api/create-agent", json={
+        resp = admin.client.post("/api/agents/register", json={
             "token": admin.admin_token,
             "agent_id": "[bad]",
         })
