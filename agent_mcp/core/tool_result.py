@@ -28,9 +28,13 @@ Variant semantics
 * :class:`Ok` — the operation succeeded. ``data`` carries
   whatever payload the caller wants (typically a dict; the REST
   adapter JSON-serializes it). ``message`` is an optional
-  human-readable summary; the MCP wire renderer prefers it over
-  ``data`` when set, since MCP clients display text-content
-  blocks to a human/LLM viewer.
+  human-readable summary. When both are set the MCP wire renderer
+  emits TWO ``TextContent`` blocks (message first as the
+  human-readable summary; data second as its JSON serialisation)
+  so MCP clients see both the prose AND the actionable payload —
+  the prior "message wins, data dropped" behaviour silently lost
+  the token + snippet that ``register_agent`` returns over the
+  MCP wire.
 * :class:`NotFound` — the named resource doesn't exist. The
   REST adapter maps this to 404.
 * :class:`PermissionDenied` — the caller's principal doesn't
@@ -131,11 +135,29 @@ def render_as_text_content(result: ToolResult) -> List[mcp_types.TextContent]:
     wire which only speaks text-content blocks.
 
     Success rendering:
-        * ``message`` wins when set — that's what the tool author
-          chose to surface to a human/LLM.
-        * Otherwise ``data`` is JSON-serialized. If ``data`` is
-          itself a string, it's passed through verbatim.
-        * If neither is set, an empty status block is emitted.
+        * When BOTH ``message`` and ``data`` are set, emit TWO
+          ``TextContent`` blocks — the message first (prose
+          summary for the human/LLM reader) and the JSON-serialised
+          data second (the actionable payload). MCP rev 2025-03-26
+          allows a tools/call response to carry multiple content
+          blocks (``content: [TextContent, ...]``); MCP clients
+          treat the array as the full response and render both.
+        * When only ``message`` is set, emit one block with the
+          message.
+        * When only ``data`` is set, emit one block with the JSON
+          serialisation (string ``data`` is passed through
+          verbatim, never double-encoded).
+        * When neither is set, emit one empty-text block (the
+          legacy "no output" shape, preserved so tools that
+          deliberately return ``Ok()`` keep the same wire shape).
+
+    The pre-fix behaviour treated ``message`` as winner-takes-all
+    and silently dropped ``data`` whenever a tool set both. This
+    is why ``register_agent`` over the MCP wire surfaced the prose
+    summary but not the agent token + ``.mcp.json`` snippet that
+    operators need to wire the agent into a claude session. The
+    REST adapter already emits both correctly — only the MCP wire
+    renderer lost the data field.
 
     Error rendering:
         ``"Error: <variant_label>: <detail>"`` — the framework's
@@ -145,19 +167,37 @@ def render_as_text_content(result: ToolResult) -> List[mcp_types.TextContent]:
         strings tool impls produced before this PR.
     """
     if isinstance(result, Ok):
-        if result.message is not None:
-            text = result.message
-        elif result.data is None:
-            text = ""
-        elif isinstance(result.data, str):
-            text = result.data
-        else:
+        # Render ``data`` as a string for the second-block path
+        # (or the single-block "data-only" path). String ``data``
+        # passes through verbatim — JSON-encoding a string would
+        # wrap it in extra quotes and waste a parse on the client.
+        def _data_to_text(d: Any) -> str:
+            if isinstance(d, str):
+                return d
             try:
-                text = json.dumps(result.data, default=str)
+                return json.dumps(d, default=str)
             except (TypeError, ValueError):
                 # Defensive — exotic types fall back to str(); never
                 # crash the renderer on a tool's well-typed return.
-                text = str(result.data)
+                return str(d)
+
+        if result.message is not None and result.data is not None:
+            # Both set — emit message + data as two blocks so the
+            # MCP client sees the actionable payload alongside the
+            # prose summary. See module docstring for the
+            # register_agent bug this fixes.
+            return [
+                mcp_types.TextContent(type="text", text=result.message),
+                mcp_types.TextContent(
+                    type="text", text=_data_to_text(result.data),
+                ),
+            ]
+        if result.message is not None:
+            text = result.message
+        elif result.data is not None:
+            text = _data_to_text(result.data)
+        else:
+            text = ""
         return [mcp_types.TextContent(type="text", text=text)]
 
     if isinstance(result, NotFound):

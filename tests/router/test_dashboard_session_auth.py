@@ -342,18 +342,21 @@ async def test_mcp_route_with_operator_cookie_reaches_handler(
 async def test_mcp_route_with_admin_bearer_still_works(
     aiohttp_client, router_app, register_project,
 ) -> None:
-    """The legacy ``Authorization: Bearer <admin_token>`` path stays
-    valid on ``/agent-mcp/mcp/<name>`` — agents that authenticate
-    with the project admin token must keep working.
+    """The legacy ``Authorization: Bearer <token>`` path stays valid
+    on ``/agent-mcp/mcp/<name>`` — the cookie middleware MUST NOT
+    bounce a bearer-authenticated request to the login flow.
 
     The dep does NOT gate ``/mcp/`` paths; those routes have their
     own bearer-validation in ``backend_mcp_handler``. We only assert
-    that the cookie middleware doesn't 401 a bearer-only request to
-    the MCP route. (We don't have a real project admin token in the
-    fixture without spinning up a backend, so we send a bogus bearer
-    and check that the failure mode is bearer-validation 401 rather
-    than the middleware's "no cookie" 401 — the wire shape differs:
-    bearer-mode 401 carries no Set-Cookie or login-redirect hint.)
+    that the cookie middleware doesn't intercept a bearer-only
+    request. We don't have a real project admin token in the fixture
+    without spinning up a backend; F015 removed the router-side
+    bearer pre-check (the backend's ``AuthHeaderMiddleware`` is now
+    the single source of truth for bearer validity), so the request
+    instead falls through to ``_ensure``, which times out trying to
+    spawn a non-existent backend (504). What we're pinning is the
+    DISCRIMINATOR: the response is NOT a "login_required" JSON
+    envelope — the cookie middleware let the request through.
     """
     register_project("gamma")
     _seed_user("alice")  # Seed a user so the empty-users middleware
@@ -370,17 +373,22 @@ async def test_mcp_route_with_admin_bearer_still_works(
         data=b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
         allow_redirects=False,
     )
-    # backend_mcp_handler 401s a bad bearer (we don't have a real
-    # token) — that's fine. The KEY assertion is that we got the
-    # bearer-validation 401 (no Set-Cookie/Location), not the
-    # middleware's "redirect to login" 401.
-    assert resp.status == 401, await resp.text()
-    # Middleware-style 401 would surface a JSON envelope keyed on
-    # ``login_required``; bearer 401 from backend_mcp_handler does
-    # not. Smoke-test the discriminator:
+    # Whatever the wire-level failure mode (504 because the backend
+    # never spawns in this fixture, or some future variant), it must
+    # NOT be a cookie-middleware bounce. The discriminator is the
+    # "login_required" JSON envelope the middleware emits — a bearer
+    # path post-F015 falls through to ``_ensure`` and returns a
+    # backend-spawn error, never a middleware 401.
     body = await resp.text()
     assert "login_required" not in body, (
-        "MCP route 401 should be bearer-validation, not cookie-gate"
+        f"MCP route bearer auth was intercepted by the cookie "
+        f"middleware; got {resp.status}: {body!r}"
+    )
+    # And the status is decisively NOT a 302 with the login-redirect
+    # shape — anything that ends up there means the middleware claimed
+    # the request.
+    assert resp.status != 302, (
+        "MCP route bearer auth got redirected by the cookie middleware"
     )
 
 
