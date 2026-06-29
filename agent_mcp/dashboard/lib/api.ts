@@ -53,6 +53,40 @@ export interface Agent {
   // any legacy row that pre-dates Wave 1a's migration. 'manager'
   // grants the manager-tier privileges Wave 3 enforces on tool calls.
   agent_role?: 'worker' | 'manager'
+  // Wave 7 PR 2 — coordinator transition. Live MCP-session presence
+  // derived server-side from `agent_mcp/core/session_registry.py`:
+  // - `online: true` iff this agent's bearer is currently subscribed
+  //   to a live /mcp stream (runtime queue attached).
+  // - `last_mcp_connection`: ISO-UTC `last_seen_at` of the most
+  //   recent MCP session this agent opened in the current backend
+  //   process (NULL when no stream has ever been opened — the
+  //   "Pending — paste snippet into claude .mcp.json" case).
+  // Replaces spawn-lifecycle badges in the agents list. Old clients
+  // that don't read these fields stay on the legacy `status` field
+  // (which is still surfaced, just not the source of the badge).
+  online?: boolean
+  last_mcp_connection?: string | null
+}
+
+/** Wave 7 PR 2 — derived presence kind for the agents list / detail
+ *  panel. Sourced from the new `online` + `last_mcp_connection`
+ *  fields plus the existing `status` column (terminated takes
+ *  precedence so a terminated agent never shows "Online" even
+ *  during the brief window before its bearer's MCP stream tears
+ *  down on the wire).
+ *
+ *  - `terminated`: row's status column is `terminated`.
+ *  - `online`: live MCP stream attached.
+ *  - `offline`: registered + previously connected, no live stream.
+ *  - `pending`: registered + never connected (the operator hasn't
+ *    pasted the snippet into the user's claude yet). */
+export type AgentPresence = 'online' | 'offline' | 'pending' | 'terminated'
+
+export function agentPresence(agent: Agent): AgentPresence {
+  if (agent.status === 'terminated') return 'terminated'
+  if (agent.online) return 'online'
+  if (agent.last_mcp_connection) return 'offline'
+  return 'pending'
 }
 
 export interface Task {

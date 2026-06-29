@@ -534,6 +534,10 @@ export function PromptBookDashboard() {
           </CardDescription>
         </CardHeader>
         <CardContent>
+          {/* Wave 7 PR 2 — coordinator transition. Step copy
+              rewritten to match the register-only flow: agent-mcp
+              mints the token + ready-to-paste .mcp.json snippet,
+              the user owns the claude process. */}
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             <div className="flex items-center gap-2 text-sm">
               <Badge variant="secondary" className="text-xs">1</Badge>
@@ -541,11 +545,11 @@ export function PromptBookDashboard() {
             </div>
             <div className="flex items-center gap-2 text-sm">
               <Badge variant="secondary" className="text-xs">2</Badge>
-              <span>Create Worker Agents</span>
+              <span>Register Worker Agents</span>
             </div>
             <div className="flex items-center gap-2 text-sm">
               <Badge variant="secondary" className="text-xs">3</Badge>
-              <span>Initialize Workers</span>
+              <span>Paste snippet &amp; start workers</span>
             </div>
             <div className="flex items-center gap-2 text-sm">
               <Badge variant="secondary" className="text-xs">4</Badge>
@@ -553,7 +557,7 @@ export function PromptBookDashboard() {
             </div>
             <div className="flex items-center gap-2 text-sm">
               <Badge variant="secondary" className="text-xs">5</Badge>
-              <span>Monitor & Debug</span>
+              <span>Monitor &amp; Debug</span>
             </div>
           </div>
         </CardContent>
