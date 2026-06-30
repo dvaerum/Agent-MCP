@@ -801,6 +801,19 @@ class AdminClient(WorkerSession):
         siblings). Returns a `WorkerSession` bound to a fresh
         per-agent token; subsequent `.call`/`.list_tools` on the
         returned session run with the worker role.
+
+        Wave 9 PR 1: the cache dict now carries ``agent_role: "worker"``
+        explicitly so :func:`agent_mcp.core.capabilities.resolve_capabilities`
+        picks the worker bundle (``mcp.connect``, ``tasks.view``,
+        ``tasks.create`` …). Pre-Wave-9 the cache row omitted the field
+        — the legacy ``@requires("any")`` decorator admitted any
+        ``agent_bearer`` regardless of role, so the under-specified
+        cache was invisible. ``_check_role_principal("any", ...)`` now
+        reads the cap set (``has_capability("mcp.connect")``) so a
+        missing role resolves to empty caps and the check rejects.
+        The DB INSERT is left at the schema default (``"worker"`` per
+        migration 0013) — the in-memory cache mirror is what
+        ``agent_repo.get_agent_by_token`` returns cache-first.
         """
         from agent_mcp.core import globals as g
         from agent_mcp.db.connection import get_db_connection
@@ -833,6 +846,7 @@ class AdminClient(WorkerSession):
             "status": "active",
             "created_at": now,
             "capabilities": [],
+            "agent_role": "worker",
         }
         return WorkerSession(
             token=worker_token, agent_id=agent_id, _admin=self
