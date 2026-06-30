@@ -18,8 +18,9 @@ The contract:
     :attr:`Principal.can_wake_loop`.
   * ``app/main_app._caller_role`` — deleted; ``_principal_role()``
     reads from the typed Principal.
-  * ``core/authorize._check_role`` — deleted; replaced by
-    :func:`_check_role_principal` which takes a Principal.
+  * ``core/authorize._check_role`` — deleted; the Wave-6 replacement
+    ``_check_role_principal`` was itself deleted by Wave 9 PR 6 once
+    every caller migrated to ``@requires_capability``.
   * ``dispatch_tool_call``'s ``list[TextContent]`` auto-wrap — deleted;
     every tool returns :data:`ToolResult` directly.
 
@@ -90,13 +91,14 @@ def test_bridge_helpers_are_not_importable() -> None:
         )
 
 
-def test_check_role_helper_is_not_importable() -> None:
-    """``core.authorize._check_role`` is gone; the replacement is
-    :func:`_check_role_principal` which takes a Principal."""
+def test_check_role_helpers_are_not_importable() -> None:
+    """``core.authorize._check_role`` is gone; the Wave-6 replacement
+    ``_check_role_principal`` was itself deleted by Wave 9 PR 6 once
+    every caller migrated to ``@requires_capability``."""
     with pytest.raises(ImportError):
         from agent_mcp.core.authorize import _check_role  # noqa: F401
-    # The replacement is present.
-    from agent_mcp.core.authorize import _check_role_principal  # noqa: F401
+    with pytest.raises(ImportError):
+        from agent_mcp.core.authorize import _check_role_principal  # noqa: F401
 
 
 def test_bearer_is_operator_tier_helper_is_renamed() -> None:

@@ -6,15 +6,12 @@ user / group / project-membership CRUD routes behind a permissive
 ``@require_sysadmin`` wrapper this module owned exclusively until
 Wave 9 PR 4 replaced it.
 
-Wave 9 PR 4 (prancy-napping-pie) supersedes ``@require_sysadmin``
+Wave 9 PR 4 (prancy-napping-pie) superseded ``@require_sysadmin``
 with :func:`require_capability` — a capability-shaped decorator
 that consults the per-request :class:`Principal` built by
-``require_operator_session_middleware`` (Wave 6 PR 0). The router-
-admin route file (``admin_api``, ``admin_users_api``,
-``admin_sso_api``) migrated to ``require_capability`` in the same
-PR; ``require_sysadmin`` is kept as a deprecated bridge for one
-cycle so any caller missed by the sweep still works. Wave 9 PR 6
-deletes ``require_sysadmin`` once the bridge is no longer reachable.
+``require_operator_session_middleware`` (Wave 6 PR 0). Wave 9 PR 6
+deleted ``require_sysadmin``; :func:`require_capability` is now the
+only route-level gate this module exposes.
 
 WHY a separate module from ``auth_middleware``? The middleware owns
 the global "do we have a session at all?" gate; this module owns
@@ -33,69 +30,7 @@ from typing import Awaitable, Callable
 from aiohttp import web
 
 
-__all__ = ["require_capability", "require_sysadmin"]
-
-
-def require_sysadmin(
-    handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
-) -> Callable[[web.Request], Awaitable[web.StreamResponse]]:
-    """Reject the request with 403 unless the caller is a sysadmin.
-
-    Relies on ``require_operator_session_middleware`` having already
-    resolved the session cookie and stamped
-    ``request['is_sysadmin']`` (Phase 3 Wave 2). If the flag is
-    missing — which happens only for paths that bypass the middleware
-    entirely (the unauth allow-list) — the wrapper fails closed: a
-    sysadmin-gated handler MUST run behind the auth middleware.
-
-    Returns the standard error envelope shape used by the
-    ``admin_users_api`` module so the dashboard's ApiClient can
-    discriminate this 403 from a generic "operation failed". Keeping
-    the wire shape identical to the other handler errors means the
-    UI doesn't need a special case for "you're an operator but not a
-    sysadmin".
-
-    Wave 9 PR 4 (prancy-napping-pie) DEPRECATED — use
-    :func:`require_capability` with a ``system.*.manage`` cap
-    instead. The function is kept for one PR cycle so any caller
-    missed by the migration sweep still works; PR 6 deletes it.
-    """
-
-    @functools.wraps(handler)
-    async def wrapper(request: web.Request) -> web.StreamResponse:
-        # Single-tenant mode (ADR-0008) pins the deploy to a single
-        # operator-owned host and bypasses operator-session auth
-        # entirely in ``require_operator_session_middleware``. In
-        # that mode every caller IS the implicit sysadmin — fall
-        # through to the handler unchanged so the legacy 410 /
-        # validation responses for single-tenant-disabled routes
-        # surface in their natural place rather than being
-        # pre-empted by a 403.
-        try:
-            from . import app as _app
-            if _app.SINGLE_TENANT_NAME is not None:
-                return await handler(request)
-        except Exception:  # pragma: no cover - defensive
-            pass
-
-        if not request.get("is_sysadmin"):
-            user = request.get("user") or {}
-            username = user.get("username", "<unknown>")
-            return web.json_response(
-                {
-                    "success": False,
-                    "error": "forbidden",
-                    "message": (
-                        f"operator {username!r} is not a sysadmin; "
-                        "this action requires sysadmin privileges"
-                    ),
-                },
-                status=403,
-                headers={"Cache-Control": "no-store"},
-            )
-        return await handler(request)
-
-    return wrapper
+__all__ = ["require_capability"]
 
 
 def require_capability(
@@ -106,11 +41,9 @@ def require_capability(
 ]:
     """Reject the request with 403 unless the caller carries ``cap``.
 
-    Wave 9 PR 4 of prancy-napping-pie. The capability-shaped
-    successor to :func:`require_sysadmin`. The two coexist during
-    the Wave 9 migration window; PR 6 deletes ``require_sysadmin``
-    once every router-admin route has moved to a
-    ``require_capability`` grant.
+    Wave 9 PR 4 of prancy-napping-pie. The capability-shaped gate for
+    router-admin routes; Wave 9 PR 6 deleted the legacy
+    ``require_sysadmin`` wrapper this function replaced.
 
     Reads the per-request :class:`agent_mcp.core.principal.Principal`
     that ``require_operator_session_middleware`` stashes at
@@ -122,20 +55,15 @@ def require_capability(
     resolved capability set (project-role bundle ∪ group-capability
     grants) contains ``cap``.
 
-    Mirrors the single-tenant fall-through of
-    :func:`require_sysadmin` so a single-tenant deploy keeps
-    behaving identically: the route handler runs unchanged because
-    the auth middleware itself bypasses the gate in that mode.
+    Single-tenant mode (ADR-0008) bypasses the gate so the deploy is
+    pinned to one operator-owned host. The legacy 410 / validation
+    responses for single-tenant-disabled routes surface in their
+    natural place rather than being pre-empted by a 403.
 
-    Returns the same JSON error envelope shape as
-    :func:`require_sysadmin` (``success: False``, ``error:
-    "forbidden"``, ``message`` naming the missing cap and the
-    caller). The dashboard's ApiClient keys off the status code
-    (403) plus the ``error`` discriminator — keeping the wire shape
-    identical means the UI doesn't need to special-case the
-    capability-vs-sysadmin discriminator. The exact message text
-    differs (cap name vs "is not a sysadmin") so log-grep and UX
-    debugging surfaces remain distinct.
+    Returns a JSON error envelope (``success: False``,
+    ``error: "forbidden"``, ``message`` naming the missing cap and
+    the caller) on reject. The dashboard's ApiClient keys off the
+    status code (403) plus the ``error`` discriminator.
 
     Fail-closed: when ``request['principal']`` is missing — which
     happens only if a route is mounted in front of a path that
@@ -152,10 +80,9 @@ def require_capability(
 
         @functools.wraps(handler)
         async def wrapper(request: web.Request) -> web.StreamResponse:
-            # Single-tenant mode (ADR-0008): same fall-through as
-            # ``require_sysadmin``. See its docstring for the
-            # justification — the deploy is pinned to one operator
-            # box; there's no audience to gate against here.
+            # Single-tenant mode (ADR-0008): the deploy is pinned to
+            # one operator box; there's no audience to gate against
+            # here.
             try:
                 from . import app as _app
                 if _app.SINGLE_TENANT_NAME is not None:

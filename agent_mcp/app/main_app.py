@@ -589,6 +589,11 @@ def _principal_role() -> str:
     Falls back to a synthesized ``agent_bearer`` Principal built from
     :data:`request_auth_token` for in-process callers (tests, scripts)
     that haven't stamped :data:`request_principal` directly.
+
+    Wave 9 PR 6: the operator-tier check is the typed Principal's own
+    discriminators (``sysadmin`` flag or operator-kind seam) rather
+    than the deleted ``has_role("admin")`` bridge. Same admit shape;
+    no behaviour change.
     """
     principal = request_principal.get()
     if principal is None:
@@ -604,7 +609,9 @@ def _principal_role() -> str:
             if agent_id:
                 return "worker"
         return "anonymous"
-    if principal.has_role("admin"):
+    if principal.sysadmin or principal.kind in (
+        "operator_session", "forwarding_header",
+    ):
         return "admin"
     if principal.kind == "agent_bearer":
         return "worker"

@@ -2,12 +2,10 @@
 verify_token(...) gates from agent_mcp/tools/*.py into a single,
 auditable surface in agent_mcp/core/authorize.py.
 
-Three decorators, one custom exception:
+Post Wave 9 PR 6 the public decorator surface is:
 
-* @requires("admin") — admin token only; AuthRejected on miss.
-* @requires("any")   — any active agent token (admin OK too); AuthRejected
-  on no/garbage token.
-* @requires_policy(*config_keys, default=...) — admin always allowed;
+* @requires_capability(cap) — admit iff principal.has_capability(cap).
+* @requires_policy(*config_keys, default=...) — operator always allowed;
   worker allowed iff ANY listed project_context key is truthy. Both the
   per-key default (when the row is absent) and the per-key
   enable/disable live in agent_mcp.tools.access._TOGGLE_DEFAULTS /
@@ -17,7 +15,8 @@ AuthRejected propagates through dispatch_tool_call → the MCP framework
 wrapper sets isError=True on the resulting CallToolResult, replacing
 the old `_AUTH_FAILURE_RE` text-matching shim.
 
-Architecture review 2026-06-01 candidate A.
+Architecture review 2026-06-01 candidate A; Wave 9 PR 6 deleted the
+legacy ``@requires`` / ``@requires_role`` decorators tested here.
 """
 
 from __future__ import annotations
@@ -42,118 +41,12 @@ async def test_authrejected_is_exported() -> None:
     assert err.reason == "nope"
 
 
-@pytest.mark.asyncio
-async def test_requires_admin_rejects_no_token(reset_globals) -> None:
-    """@requires("admin") raises AuthRejected when no token is supplied."""
-    from agent_mcp.core.authorize import requires, AuthRejected
-
-    @requires("admin")
-    async def my_tool(
-        arguments: Dict[str, Any],
-    ) -> List[mcp_types.TextContent]:  # pragma: no cover
-        return [mcp_types.TextContent(type="text", text="ran")]
-
-    with pytest.raises(AuthRejected):
-        await my_tool({})
-
-
-@pytest.mark.asyncio
-async def test_requires_admin_rejects_worker_token(reset_globals) -> None:
-    """@requires("admin") raises when a non-admin (worker) token is supplied."""
-    from agent_mcp.core import globals as g
-    from agent_mcp.core.authorize import requires, AuthRejected
-
-    g.active_agents["worker-token"] = {"agent_id": "worker_a"}
-
-    @requires("admin")
-    async def my_tool(
-        arguments: Dict[str, Any],
-    ) -> List[mcp_types.TextContent]:  # pragma: no cover
-        return [mcp_types.TextContent(type="text", text="ran")]
-
-    with pytest.raises(AuthRejected):
-        await my_tool({"token": "worker-token"})
-
-
-@pytest.mark.asyncio
-async def test_requires_admin_allows_operator_session(reset_globals) -> None:
-    """``@requires("admin")`` admits an operator-session Principal.
-
-    Wave 6 PR 6: identity flows through the typed Principal kwarg
-    the wrapper accepts; the operator-tier admit takes the cookie /
-    forwarding-header path.
-    """
-    from agent_mcp.core.authorize import requires
-    from agent_mcp.core.principal import Principal
-
-    called = {"hit": False}
-
-    @requires("admin")
-    async def my_tool(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
-        called["hit"] = True
-        return [mcp_types.TextContent(type="text", text="ran")]
-
-    p = Principal(
-        kind="operator_session",
-        user_id="alice",
-        agent_id=None,
-        sysadmin=False,
-        project_name=None,
-        project_role="operator",
-        agent_role=None,
-        can_wake_loop=False,
-        source_token=None,
-    )
-    result = await my_tool({"token": "anything-ignored"}, principal=p)
-    assert called["hit"]
-    assert result[0].text == "ran"
-
-
-@pytest.mark.asyncio
-async def test_requires_any_allows_worker(reset_globals) -> None:
-    """@requires("any") admits any active agent token."""
-    from agent_mcp.core import globals as g
-    from agent_mcp.core.authorize import requires
-
-    # Wave 9 PR 1: the cap resolver reads ``agent_role`` from the
-    # cache row to pick the AGENT_ROLE_BUNDLES bundle. A row that
-    # omits the key resolves to an empty cap set, which would fail
-    # ``has_capability("mcp.connect")`` even though the test's intent
-    # is a healthy worker token.
-    g.active_agents["worker-token"] = {
-        "agent_id": "worker_a",
-        "agent_role": "worker",
-    }
-
-    @requires("any")
-    async def my_tool(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
-        return [mcp_types.TextContent(type="text", text="ok")]
-
-    result = await my_tool({"token": "worker-token"})
-    assert result[0].text == "ok"
-
-
-@pytest.mark.asyncio
-async def test_requires_any_rejects_garbage(reset_globals) -> None:
-    """@requires("any") still rejects unknown tokens."""
-    from agent_mcp.core.authorize import requires, AuthRejected
-
-    @requires("any")
-    async def my_tool(
-        arguments: Dict[str, Any],
-    ) -> List[mcp_types.TextContent]:  # pragma: no cover
-        return [mcp_types.TextContent(type="text", text="ran")]
-
-    with pytest.raises(AuthRejected):
-        await my_tool({"token": "deadbeef" * 4})
-
-
 # --- @requires_policy: toggle-gated worker access ---------------------------
 
 
 @pytest.mark.asyncio
 async def test_requires_policy_admin_always_allowed(reset_globals) -> None:
-    """Admin bypasses the policy check entirely.
+    """Operator-tier callers bypass the policy check entirely.
 
     Wave 6 PR 6: identity flows through the typed Principal kwarg;
     the operator-tier admit takes the cookie / forwarding-header

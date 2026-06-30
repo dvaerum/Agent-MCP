@@ -1,8 +1,9 @@
 """Principal — the typed identity of "who is making this call".
 
 Wave 6 PR 0 of 7 (retire-system-token follow-up). See the Wave 6
-section of ``/home/dennis/.claude/plans/prancy-napping-pie.md`` for
-the full design context.
+and Wave 9 sections of
+``/home/dennis/.claude/plans/prancy-napping-pie.md`` for the full
+design context.
 
 Why this exists
 ---------------
@@ -11,22 +12,22 @@ places (``router/auth_middleware.py``, ``app/main_app.py``,
 ``app/deps.py``, ``app/routes.py``, ``core/authorize.py``) by
 walking ContextVars and re-running ``verify_token`` / ``get_agent_id``
 chains. Each surface invents the same answer slightly differently;
-the policy decisions ("is this caller manager-tier?") read from the
-shape of who-is-calling rather than asking it directly.
+the policy decisions ("is this caller allowed to assign tasks?")
+read from the shape of who-is-calling rather than asking it
+directly.
 
 ``Principal`` collapses those five derivations into one: every
 middleware that has enough information to identify the caller
 builds a ``Principal`` once, stashes it on the request, and the
 tool dispatcher threads it through to every tool implementation.
 Per-tool authorization becomes a method call on the Principal
-(``principal.has_role("manager")``) instead of a magic
-``verify_token(token, "manager")`` that reads ContextVars.
+(``principal.has_capability("tasks.assign")``).
 
-The bridge in ``tools/registry.dispatch_tool_call`` lets the old
-ContextVar-based path coexist during the migration window so this
-PR doesn't have to touch all 30+ tools at once. PR 6 of Wave 6
-deletes the bridge once PRs 1-5 have migrated every tool to take
-``principal: Principal`` and return :class:`ToolResult`.
+Wave 9 PR 6 deleted the legacy ``has_role()`` bridge and the
+deprecated ``@requires`` / ``@requires_role`` decorators; the
+capability vocabulary (:meth:`Principal.has_capability` consulting
+:data:`agent_mcp.core.capabilities.KNOWN_CAPABILITIES`) is now the
+single authorization surface.
 """
 
 from __future__ import annotations
@@ -182,64 +183,6 @@ class Principal:
         if cap.startswith("system."):
             return True
         return self.project_role is not None or self.kind == "agent_bearer"
-
-    def has_role(self, required: str) -> bool:
-        """Return True iff this principal satisfies the named role.
-
-        Wave 9 PR 0 — DEPRECATED bridge. The capability vocabulary
-        (:meth:`has_capability`) is the canonical surface; this
-        method exists for the duration of the Wave 9 migration window
-        so existing ``has_role(...)`` call sites in tests + un-migrated
-        decorators / handlers keep admitting/denying the same shapes.
-        Wave 9 PR 6 deletes this method (and the ``ROLE_TO_CAPS``
-        bridge map it consults) after PRs 1-5 migrate the seven
-        ``has_role`` call sites to ``has_capability``.
-
-        Encodes the role table that ``core/authorize._check_role``
-        spells out longhand today (after the bridge is deleted in
-        Wave 6 PR 6, that function disappears entirely):
-
-        * ``"admin"`` / ``"system"`` / ``"operator"`` — any
-          operator-tier caller. True for ``operator_session`` and
-          ``forwarding_header`` (which carries a verified operator
-          identity) and for any sysadmin. False for
-          ``agent_bearer`` regardless of ``agent_role`` — operator
-          intent is human; an agent is not an operator even if it
-          happens to be manager-role.
-        * ``"manager"`` — operator-tier OR an agent whose row has
-          ``agent_role == "manager"``. The supervision-tier gate
-          (assign-task, edit subordinate's note).
-        * ``"agent"`` / ``"any"`` — any ``agent_bearer``. Worker
-          and manager roles both admit. Operator paths do NOT
-          satisfy ``"agent"`` on their own because the role's
-          contract is "an active agent in ``g.active_agents``" —
-          operator-only callers have no ``agent_id`` to attribute
-          actions to.
-        * ``"operator"`` is treated as ``"admin"``. The two names
-          are interchangeable in the policy layer; the surrounding
-          code uses both historically and a single rename pass is
-          out of scope for PR 0.
-
-        Anything else returns False (defensive — unknown role
-        strings shouldn't silently admit). Callers that want to
-        loudly diagnose typos should compare the role string to a
-        known set before calling ``has_role``.
-        """
-        if required in ("admin", "system", "operator"):
-            if self.sysadmin:
-                return True
-            return self.kind in ("operator_session", "forwarding_header")
-        if required == "manager":
-            if self.sysadmin:
-                return True
-            if self.kind in ("operator_session", "forwarding_header"):
-                return True
-            if self.kind == "agent_bearer" and self.agent_role == "manager":
-                return True
-            return False
-        if required in ("agent", "any"):
-            return self.kind == "agent_bearer"
-        return False
 
     # ── Audit-log attribution helper ─────────────────────────────
 
