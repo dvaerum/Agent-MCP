@@ -6,17 +6,24 @@ import mcp.types as mcp_types # Assuming this is your mcp.types path
 from .registry import register_tool
 from ..core.config import logger
 from ..core.auth import get_agent_id # verify_token not strictly needed here
-from ..core.authorize import requires
+from ..core.authorize import requires_capability
 from ..utils.audit_utils import log_audit
 from ..utils.project_utils import generate_system_prompt # The core logic
 
 # --- get_system_prompt tool ---
 # Original logic from main.py: lines 1352-1384 (get_system_prompt_tool function)
-@requires("any")
+# Wave 9 PR 2: @requires("any") → @requires_capability("mcp.connect").
+# The system-prompt fetch is the fundamental "you can use the MCP wire"
+# capability — every authenticated agent (worker / manager) carries
+# ``mcp.connect`` via :data:`AGENT_ROLE_BUNDLES`, and sysadmin
+# wildcards admit operator paths the same way the legacy "any" gate
+# did via ``has_role("admin")``.
+@requires_capability("mcp.connect")
 async def get_system_prompt_tool_impl(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
     agent_auth_token = arguments.get("token") # This is the agent's own token
 
-    # @requires("any") guaranteed entry; resolve id for prompt generation.
+    # @requires_capability("mcp.connect") guaranteed entry; resolve id for
+    # prompt generation.
     requesting_agent_id = get_agent_id(agent_auth_token)
 
     # `generate_system_prompt` takes the agent_id and the agent's own

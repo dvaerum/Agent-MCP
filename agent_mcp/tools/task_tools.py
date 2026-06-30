@@ -12,7 +12,7 @@ from . import access as _access  # Canonical home for _get_config_bool
 from ..core.config import logger, ENABLE_TASK_PLACEMENT_RAG, ALLOW_RAG_OVERRIDE
 from ..core import globals as g
 from ..core.auth import get_agent_id
-from ..core.authorize import requires, requires_policy, requires_role
+from ..core.authorize import requires_capability, requires_policy
 from ..core.principal import Principal
 from ..core.tool_result import (
     Conflict,
@@ -1446,7 +1446,11 @@ async def assign_task_tool_impl(
 
 # --- create_self_task tool ---
 # Original logic from main.py: lines 1409-1474 (create_self_task_tool function)
-@requires("any")
+# Wave 9 PR 2: @requires("any") → @requires_capability("tasks.create").
+# Workers + managers carry ``tasks.create`` via
+# :data:`AGENT_ROLE_BUNDLES`; operator-tier callers carry it via
+# :data:`PROJECT_ROLE_BUNDLES["operator"]`; sysadmins wildcard-admit.
+@requires_capability("tasks.create")
 async def create_self_task_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -1459,8 +1463,9 @@ async def create_self_task_tool_impl(
     depends_on_tasks_list = arguments.get("depends_on_tasks")
     parent_task_id_arg = arguments.get("parent_task_id")
 
-    # @requires("any") guarantees a valid agent token at the
-    # decorator layer; principal.agent_id is therefore set.
+    # @requires_capability("tasks.create") guarantees a valid caller
+    # principal at the decorator layer; principal.agent_id is therefore
+    # set for agent_bearer callers.
     requesting_agent_id = principal.agent_id
 
     if not all([task_title, task_description]):
@@ -2026,7 +2031,11 @@ async def update_task_status_tool_impl(
 
 # --- view_tasks tool ---
 # Original logic from main.py: lines 1586-1655 (view_tasks_tool function)
-@requires("any")
+# Wave 9 PR 2: @requires("any") → @requires_capability("tasks.view").
+# Workers + managers carry ``tasks.view`` via
+# :data:`AGENT_ROLE_BUNDLES`; viewer + operator project roles carry
+# it via :data:`PROJECT_ROLE_BUNDLES`; sysadmins wildcard-admit.
+@requires_capability("tasks.view")
 async def view_tasks_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -2590,7 +2599,12 @@ def _suggest_optimal_parent_task(
 # --- request_assistance tool ---
 # Original logic from main.py: lines 1658-1763 (request_assistance_tool function)
 # This tool had file-based notification system. We'll replicate that for 1-to-1.
-@requires("any")
+# Wave 9 PR 2: @requires("any") → @requires_capability("coordination.assist").
+# Workers + managers carry ``coordination.assist`` via
+# :data:`AGENT_ROLE_BUNDLES`; sysadmins wildcard-admit. The verb is
+# coordination-shaped (an agent flagging a task it can't finish for
+# another agent / human to pick up), not a task mutation.
+@requires_capability("coordination.assist")
 async def request_assistance_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -2872,7 +2886,15 @@ async def request_assistance_tool_impl(
 
 
 # --- bulk_task_operations tool ---
-@requires("any")
+# Wave 9 PR 2: @requires("any") → @requires_capability("tasks.update").
+# The bulk surface fans out to update_status / update_priority /
+# add_note (all ``tasks.update`` operations); the ``reassign`` op is
+# gated by an in-body ``is_admin_request`` check that PR 3 will
+# migrate to ``has_capability("tasks.assign")``. Workers + managers
+# carry ``tasks.update`` via :data:`AGENT_ROLE_BUNDLES`; operator-
+# tier callers carry it via :data:`PROJECT_ROLE_BUNDLES`; sysadmins
+# wildcard-admit.
+@requires_capability("tasks.update")
 async def bulk_task_operations_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -3158,7 +3180,12 @@ async def bulk_task_operations_tool_impl(
 
 
 # --- search_tasks tool ---
-@requires("any")
+# Wave 9 PR 2: @requires("any") → @requires_capability("tasks.view").
+# Same shape as ``view_tasks`` — the verb is read-shaped (full-text
+# search across the task corpus). Workers + managers carry
+# ``tasks.view``; viewer + operator project roles carry it; sysadmins
+# wildcard-admit.
+@requires_capability("tasks.view")
 async def search_tasks_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -3924,10 +3951,11 @@ def register_task_tools():
             "additionalProperties": False,
         },
         implementation=bulk_task_operations_tool_impl,
-        # @requires("any") on the impl (admin gets full control; per-op
-        # ownership check rejects worker writes on non-owned tasks),
-        # but the tool's purpose is admin-orchestrated batch — workers
-        # have no use case that justifies tools/list advertisement.
+        # @requires_capability("tasks.update") on the impl (admin gets
+        # full control; per-op ownership check rejects worker writes on
+        # non-owned tasks), but the tool's purpose is admin-orchestrated
+        # batch — workers have no use case that justifies tools/list
+        # advertisement.
         visibility="operator",
     )
 
@@ -3959,7 +3987,13 @@ def register_task_tools():
     )
 
 
-@requires_role("operator")
+# Wave 9 PR 2: @requires_role("operator") → @requires_capability("tasks.delete").
+# Operator-tier callers carry ``tasks.delete`` via
+# :data:`PROJECT_ROLE_BUNDLES["operator"]`; sysadmins wildcard-admit.
+# Workers / viewers / agent-role bearers do NOT carry it and are
+# rejected at the decorator layer — same admit/deny matrix the
+# legacy operator gate enforced.
+@requires_capability("tasks.delete")
 async def delete_task_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -3967,7 +4001,7 @@ async def delete_task_tool_impl(
 ) -> ToolResult:
     """
     Delete a task permanently with cascade handling for related tasks.
-    Admin-only operation with comprehensive safety checks.
+    Operator-only operation with comprehensive safety checks.
     """
     task_id = arguments.get("task_id")
     force_delete = arguments.get("force_delete", False)

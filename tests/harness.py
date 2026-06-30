@@ -801,6 +801,19 @@ class AdminClient(WorkerSession):
         siblings). Returns a `WorkerSession` bound to a fresh
         per-agent token; subsequent `.call`/`.list_tools` on the
         returned session run with the worker role.
+
+        Wave 9 PR 2: the cache dict carries ``agent_role: "worker"``
+        explicitly so :func:`agent_mcp.core.capabilities.resolve_capabilities`
+        gets the worker bundle (``mcp.connect``, ``tasks.view``,
+        ``tasks.create``, ``coordination.assist`` …). Pre-Wave-9 the
+        cache omitted the field — the DB default of ``"worker"``
+        backfilled on cache miss, but ``WorkerSession._principal()``
+        reads cache-first and resolved to ``agent_role=None``. The
+        legacy ``@requires("any")`` decorator admitted any
+        agent_bearer regardless of role, so the under-specified cache
+        was invisible. Cap migration in PR 2 surfaced it because
+        ``has_capability("tasks.create")`` checks the cap-set the
+        role-bundle resolves to.
         """
         from agent_mcp.core import globals as g
         from agent_mcp.db.connection import get_db_connection
@@ -812,8 +825,9 @@ class AdminClient(WorkerSession):
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO agents (token, agent_id, capabilities, "
-            "created_at, status, working_directory, color, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "created_at, status, working_directory, color, "
+            "updated_at, agent_role) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 worker_token,
                 agent_id,
@@ -823,6 +837,7 @@ class AdminClient(WorkerSession):
                 "/tmp",
                 "#888",
                 now,
+                "worker",
             ),
         )
         conn.commit()
@@ -833,6 +848,7 @@ class AdminClient(WorkerSession):
             "status": "active",
             "created_at": now,
             "capabilities": [],
+            "agent_role": "worker",
         }
         return WorkerSession(
             token=worker_token, agent_id=agent_id, _admin=self
