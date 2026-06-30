@@ -3,6 +3,7 @@ import json
 import datetime
 import re
 import sqlite3
+from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
 # Keys that hold project-level secrets. view_project_context filters
@@ -1298,7 +1299,30 @@ async def backup_project_context_tool_impl(
         os.makedirs(backup_dir, exist_ok=True)
 
         backup_filename = f"{backup_data['backup_name']}.json"
-        backup_path = os.path.join(backup_dir, backup_filename)
+        # VULN-003 defense-in-depth: resolve the candidate backup path
+        # and verify it stays inside the backup directory before we
+        # open() it for write. The tool-schema `pattern` on backup_name
+        # is the primary gate (rejects anything outside
+        # ``[A-Za-z0-9._-]{1,128}``, so `../`, absolute paths, NUL bytes
+        # etc. never reach the impl); this check is a belt-and-suspenders
+        # second layer for in-process callers that bypass schema
+        # validation (direct impl invocation in tests, future internal
+        # callers). Path traversal here matters under
+        # stolen-operator-cookie + the VULN-001 CORS exploit vector,
+        # where an attacker who has reached this tool could otherwise
+        # write arbitrary JSON anywhere the server process can write.
+        backup_path_resolved = Path(backup_dir, backup_filename).resolve()
+        backup_dir_resolved = Path(backup_dir).resolve()
+        try:
+            backup_path_resolved.relative_to(backup_dir_resolved)
+        except ValueError:
+            return Invalid(
+                field="backup_name",
+                message=(
+                    "backup_name resolves outside the backup directory"
+                ),
+            )
+        backup_path = str(backup_path_resolved)
 
         with open(backup_path, "w", encoding="utf-8") as f:
             json.dump(backup_data, f, indent=2, ensure_ascii=False)
@@ -1667,7 +1691,20 @@ def register_project_context_tools():
                 },
                 "backup_name": {
                     "type": "string",
-                    "description": "Optional custom backup name (auto-generated if not provided)",
+                    # VULN-003: pattern rejects path-traversal payloads
+                    # (`../`, absolute paths, NUL bytes, shell
+                    # metacharacters) at the dispatcher's jsonschema
+                    # validation step — anything not matching
+                    # ``[A-Za-z0-9._-]{1,128}`` never reaches the impl.
+                    # Paired with the resolve()/relative_to() check in
+                    # ``backup_project_context_tool_impl`` as defense in
+                    # depth for in-process callers that bypass schema.
+                    "pattern": "^[A-Za-z0-9._-]{1,128}$",
+                    "description": (
+                        "Optional custom backup name "
+                        "(auto-generated if not provided). Slug — "
+                        "alphanumeric plus . _ - only, max 128 chars."
+                    ),
                 },
                 "include_health_report": {
                     "type": "boolean",
