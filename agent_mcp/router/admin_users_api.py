@@ -1089,7 +1089,7 @@ def register_admin_users_routes(app: web.Application) -> None:
     applies as for the projects collection.
 
     Phase 3 Wave 2 (v5.0.69): every mutating handler in this module
-    is additionally wrapped with ``require_sysadmin``. The system
+    is additionally wrapped with a system-perm gate. The system
     perm matrix reserves user CRUD, group CRUD, and project-
     membership management for sysadmins; non-sysadmin operators
     fall through to a 403 with the standard envelope shape.
@@ -1098,11 +1098,27 @@ def register_admin_users_routes(app: web.Application) -> None:
     dashboard's user / group / membership browse panes still
     render — operators need to *see* the matrix to ask their
     sysadmin for changes, even if they can't mutate it.
+
+    Wave 9 PR 4 (prancy-napping-pie): each mutating route moved
+    from ``require_sysadmin`` to a capability-shaped gate. The
+    cap per resource family:
+
+      * user CRUD → ``system.users.manage``
+      * group CRUD + group-member CRUD → ``system.groups.manage``
+      * project-membership CRUD → ``system.projects.manage``
+
+    Sysadmins still admit unconditionally (their cap set is the
+    wildcard); the cap shape ALSO lets a sysadmin grant the cap to
+    a delegated group via the Wave 9 PR 5 dashboard UI without
+    promoting the operator to sysadmin.
     """
     from . import app as _app
-    from .perm_gates import require_sysadmin
+    from .perm_gates import require_capability
 
     gated = _app._rest_gated
+    users_gate = require_capability("system.users.manage")
+    groups_gate = require_capability("system.groups.manage")
+    projects_gate = require_capability("system.projects.manage")
 
     # Users
     app.router.add_get(
@@ -1110,15 +1126,15 @@ def register_admin_users_routes(app: web.Application) -> None:
     )
     app.router.add_post(
         "/agent-mcp/api/router/users",
-        gated(require_sysadmin(create_user_handler)),
+        gated(users_gate(create_user_handler)),
     )
     app.router.add_patch(
         "/agent-mcp/api/router/users/{user_id}",
-        gated(require_sysadmin(edit_user_handler)),
+        gated(users_gate(edit_user_handler)),
     )
     app.router.add_delete(
         "/agent-mcp/api/router/users/{user_id}",
-        gated(require_sysadmin(delete_user_handler)),
+        gated(users_gate(delete_user_handler)),
     )
 
     # Groups
@@ -1127,15 +1143,15 @@ def register_admin_users_routes(app: web.Application) -> None:
     )
     app.router.add_post(
         "/agent-mcp/api/router/groups",
-        gated(require_sysadmin(create_group_handler)),
+        gated(groups_gate(create_group_handler)),
     )
     app.router.add_patch(
         "/agent-mcp/api/router/groups/{group_id}",
-        gated(require_sysadmin(edit_group_handler)),
+        gated(groups_gate(edit_group_handler)),
     )
     app.router.add_delete(
         "/agent-mcp/api/router/groups/{group_id}",
-        gated(require_sysadmin(delete_group_handler)),
+        gated(groups_gate(delete_group_handler)),
     )
 
     # Group members
@@ -1145,11 +1161,11 @@ def register_admin_users_routes(app: web.Application) -> None:
     )
     app.router.add_post(
         "/agent-mcp/api/router/groups/{group_id}/members",
-        gated(require_sysadmin(add_group_member_handler)),
+        gated(groups_gate(add_group_member_handler)),
     )
     app.router.add_delete(
         "/agent-mcp/api/router/groups/{group_id}/members/{member_id}",
-        gated(require_sysadmin(remove_group_member_handler)),
+        gated(groups_gate(remove_group_member_handler)),
     )
 
     # Project memberships
@@ -1159,15 +1175,15 @@ def register_admin_users_routes(app: web.Application) -> None:
     )
     app.router.add_post(
         "/agent-mcp/api/router/projects/{name}/memberships",
-        gated(require_sysadmin(add_project_membership_handler)),
+        gated(projects_gate(add_project_membership_handler)),
     )
     app.router.add_patch(
         "/agent-mcp/api/router/projects/{name}/memberships/{membership_id}",
-        gated(require_sysadmin(change_project_membership_role_handler)),
+        gated(projects_gate(change_project_membership_role_handler)),
     )
     app.router.add_delete(
         "/agent-mcp/api/router/projects/{name}/memberships/{membership_id}",
-        gated(require_sysadmin(delete_project_membership_handler)),
+        gated(projects_gate(delete_project_membership_handler)),
     )
 
 

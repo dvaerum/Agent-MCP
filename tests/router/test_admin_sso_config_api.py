@@ -10,9 +10,10 @@ and its operator-visible knobs. Two access cases matter:
     sysadmin-gate error envelope.
 
 The config-introspection endpoint itself is small; the gate is
-inherited from ``perm_gates.require_sysadmin``, but we still
-exercise the wiring end-to-end so a future refactor that misses
-the gate registration trips a red flag.
+inherited from ``perm_gates.require_capability("system.sso.configure")``
+(Wave 9 PR 4 supersedes the prior ``require_sysadmin`` wrapper),
+but we still exercise the wiring end-to-end so a future refactor
+that misses the gate registration trips a red flag.
 """
 
 from __future__ import annotations
@@ -101,7 +102,13 @@ async def test_sso_config_endpoint_rejects_non_sysadmin(
     assert resp.status == 403, await resp.text()
     body = await resp.json()
     assert body["success"] is False
-    assert "sysadmin" in body["message"].lower()
+    # Wave 9 PR 4: the gate is now require_capability("system.sso.configure"),
+    # so the envelope's ``message`` names the missing cap rather than
+    # the prior "is not a sysadmin" phrasing. The status code +
+    # ``error`` discriminator are unchanged (the dashboard's ApiClient
+    # keys off those).
+    assert body["error"] == "forbidden"
+    assert "system.sso.configure" in body["message"]
 
 
 async def test_sso_config_endpoint_reports_builtin_when_off(
