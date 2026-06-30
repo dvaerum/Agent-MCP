@@ -322,6 +322,71 @@ def requires_role(role: str) -> Callable[[ToolImpl], ToolImpl]:
     return decorator
 
 
+def requires_capability(cap: str) -> Callable[[ToolImpl], ToolImpl]:
+    """Authorise a tool entry point against a single capability.
+
+    Wave 9 PR 0 — new decorator alongside the existing
+    :func:`requires` / :func:`requires_role`. The capability vocabulary
+    (see :data:`agent_mcp.core.capabilities.KNOWN_CAPABILITIES`)
+    replaces the legacy role tiers; PRs 1-5 migrate every existing
+    ``@requires(...)`` / ``@requires_role(...)`` call site to this
+    decorator. PR 6 deletes the deprecated decorators once the
+    migration completes.
+
+    Single capability per decorator: a tool that needs two caps in a
+    real either-or sense is a sign the cap vocabulary needs a coarser
+    parent — the design decision (Wave 9 grilling 2026-06-30) is to
+    keep one cap per decorator and surface in-body branching for the
+    rare conditional case. ``cap`` must be a member of
+    :data:`KNOWN_CAPABILITIES`; the decorator validates at
+    construction time so a typo'd cap string fails at import rather
+    than admitting silently at runtime.
+
+    Raises :class:`AuthRejected` on miss. Mirrors the bearer-
+    synthesis fallback from :func:`requires_role` so direct in-process
+    / unit-test calls that don't supply ``principal=`` keep working
+    via ``arguments["token"]``.
+    """
+    from .capabilities import KNOWN_CAPABILITIES
+
+    if cap not in KNOWN_CAPABILITIES:
+        raise ValueError(
+            f"@requires_capability(cap={cap!r}) — cap must be a member of "
+            f"agent_mcp.core.capabilities.KNOWN_CAPABILITIES"
+        )
+
+    def decorator(func: ToolImpl) -> ToolImpl:
+        forward_principal = _func_accepts_principal(func)
+
+        @functools.wraps(func)
+        async def wrapper(
+            arguments: Dict[str, Any],
+            *,
+            principal: Optional[Principal] = None,
+            **kwargs: Any,
+        ) -> Any:
+            if principal is None:
+                principal = _synthesize_principal_from_arguments(arguments)
+            if principal is None:
+                raise AuthRejected("Unauthorized: Valid token required")
+            if not principal.has_capability(cap):
+                raise AuthRejected(
+                    f"Unauthorized: capability {cap!r} required"
+                )
+            if forward_principal:
+                return await func(arguments, principal=principal, **kwargs)
+            return await func(arguments, **kwargs)
+
+        # Expose the cap on the wrapper so the visibility map in
+        # ``agent_mcp.tools.access`` can rebuild "this tool requires
+        # cap X" without re-parsing the source. Mirrors the
+        # ``_required_role`` attribute requires_role sets.
+        wrapper._required_capability = cap  # type: ignore[attr-defined]
+        return wrapper
+
+    return decorator
+
+
 def requires_policy(
     *config_keys: str,
     default: bool,

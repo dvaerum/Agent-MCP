@@ -458,22 +458,45 @@ async def require_operator_session_middleware(
     # avoids a top-level dependency between the router package and
     # the per-project core package.
     try:
+        from ..core.capabilities import resolve_capabilities
         from ..core.principal import Principal
 
-        request["principal"] = Principal(
-            kind="operator_session",
-            user_id=str(user.get("user_id")) if user.get("user_id") is not None else None,
+        principal_user_id = (
+            str(user.get("user_id"))
+            if user.get("user_id") is not None
+            else None
+        )
+        principal_project_name = (
+            project
+            if project is not None and _project_exists(project)
+            else None
+        )
+        principal_project_role = (
+            None
+            if is_sysadmin or project is None or not _project_exists(project)
+            else _safe_resolve_role(user.get("user_id"), project)
+        )
+        # Wave 9 PR 0: capabilities resolved at the seam; threaded into
+        # Principal once.
+        principal_capabilities = resolve_capabilities(
+            user_id=principal_user_id,
             agent_id=None,
             sysadmin=is_sysadmin,
-            project_name=project if project is not None and _project_exists(project) else None,
-            project_role=(
-                None
-                if is_sysadmin or project is None or not _project_exists(project)
-                else _safe_resolve_role(user.get("user_id"), project)
-            ),
+            agent_role=None,
+            project_role=principal_project_role,
+            kind="operator_session",
+        )
+        request["principal"] = Principal(
+            kind="operator_session",
+            user_id=principal_user_id,
+            agent_id=None,
+            sysadmin=is_sysadmin,
+            project_name=principal_project_name,
+            project_role=principal_project_role,
             agent_role=None,
             can_wake_loop=False,
             source_token=None,
+            capabilities=principal_capabilities,
         )
     except Exception:  # pragma: no cover - defensive
         # Principal stash is additive; if construction fails for any
