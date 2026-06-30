@@ -369,14 +369,13 @@ async def all_data_api_route(
             "timestamp": datetime.datetime.now().isoformat()
         }
 
-        return JSONResponse(
-            response_data,
-            headers={
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'GET, OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type'
-            }
-        )
+        # VULN-001 (security audit 2026-06-29): static
+        # ``Access-Control-Allow-Origin: *`` headers were dropped from
+        # this credentialed endpoint. CORSMiddleware (configured in
+        # :func:`agent_mcp.app.main_app.create_app`) now owns CORS
+        # response headers and emits the correct per-origin reply
+        # against the shared :data:`ALLOWED_ORIGINS` allowlist.
+        return JSONResponse(response_data)
 
     except Exception as e:
         logger.error(f"Error fetching all data: {e}", exc_info=True)
@@ -419,14 +418,10 @@ async def context_data_api_route(request: Request) -> JSONResponse:
                 for r in rows
             ]
 
-        return JSONResponse(
-            context_data,
-            headers={
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'GET, OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type'
-            }
-        )
+        # VULN-001 (security audit 2026-06-29): see /all-data above —
+        # static wildcard CORS headers dropped; CORSMiddleware owns
+        # the response shape now.
+        return JSONResponse(context_data)
 
     except Exception as e:
         logger.error(f"Error fetching context data: {e}", exc_info=True)
