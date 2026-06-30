@@ -1247,6 +1247,7 @@ def register_admin_users_routes(app: web.Application) -> None:
     gated = _app._rest_gated
     users_gate = require_capability("system.users.manage")
     groups_gate = require_capability("system.groups.manage")
+    group_caps_gate = require_capability("system.groups.capabilities.manage")
     projects_gate = require_capability("system.projects.manage")
 
     # Users
@@ -1297,23 +1298,21 @@ def register_admin_users_routes(app: web.Application) -> None:
         gated(groups_gate(remove_group_member_handler)),
     )
 
-    # Group capabilities — Wave 9 PR 5
-    # Both GET and PUT are sysadmin-only. The capability gated is
-    # ``system.groups.capabilities.manage``; until Wave 9 PR 4 lands
-    # an aiohttp-shaped ``@requires_capability`` decorator (today the
-    # decorator lives on MCP tool entry points only), we use
-    # ``require_sysadmin`` — functionally equivalent because the cap
-    # ``system.groups.capabilities.manage`` is granted exclusively to
-    # sysadmins per the Wave 9 bundle table (it is NOT in
-    # ``PROJECT_ROLE_BUNDLES['operator']``). When PR 4 ships, swap
-    # both wrappers to ``@requires_capability("system.groups.capabilities.manage")``.
+    # Group capabilities — Wave 9 PR 5 (gated by the matching cap
+    # ``system.groups.capabilities.manage``). PR 5 originally inlined
+    # ``require_sysadmin`` here with a TODO to swap to the cap-shaped
+    # decorator once Wave 9 PR 4 landed. PR 4 has landed (the
+    # ``require_capability`` aiohttp wrapper is the canonical
+    # router-side gate now) so we use the cap directly — sysadmins
+    # still admit via the wildcard short-circuit in
+    # :meth:`Principal.has_capability`.
     app.router.add_get(
         "/agent-mcp/api/router/groups/{group_id}/capabilities",
-        gated(require_sysadmin(list_group_capabilities_handler)),
+        gated(group_caps_gate(list_group_capabilities_handler)),
     )
     app.router.add_put(
         "/agent-mcp/api/router/groups/{group_id}/capabilities",
-        gated(require_sysadmin(replace_group_capabilities_handler)),
+        gated(group_caps_gate(replace_group_capabilities_handler)),
     )
 
     # Project memberships
