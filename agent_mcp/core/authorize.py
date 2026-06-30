@@ -1,5 +1,6 @@
 """Per-tool authorization decorators (architecture review 2026-06-01,
-candidate A; Principal-only since Wave 6 PR 6).
+candidate A; Principal-only since Wave 6 PR 6; capability-driven
+since Wave 9 PR 1).
 
 This module is the single, auditable surface for Agent-MCP tool
 authorisation. Before retire-system-token Wave 6, every tool opened
@@ -30,8 +31,18 @@ Wave 6 PR 6 retired the ContextVar / ``verify_token`` plumbing the
 decorators used to consult. The wrappers now read the calling
 :class:`agent_mcp.core.principal.Principal` from a keyword-only
 ``principal`` argument the dispatcher always supplies, and consult
-``principal.has_role(...)`` / ``principal.kind`` / sysadmin flags
-directly.
+``principal.has_capability(...)`` / ``principal.kind`` / sysadmin
+flags directly.
+
+Wave 9 PR 1 migrated the four ``has_role(...)`` call sites inside
+:func:`_check_role_principal` to ``has_capability(...)`` via the
+:func:`_role_marker_cap` helper. Each legacy role string admits when
+the principal carries a single *marker cap* that uniquely identifies
+the tier — ``system.config.write`` for operator/admin,
+``tasks.assign`` for manager, ``mcp.connect`` for any. The
+``has_role`` bridge stays alive on the Principal until Wave 9 PR 6
+deletes it alongside the deprecated ``requires`` / ``requires_role``
+decorators.
 """
 
 from __future__ import annotations
@@ -184,29 +195,84 @@ def _viewer_blocked(principal: Principal) -> bool:
     return False
 
 
+def _role_marker_cap(role: str) -> str:
+    """Return the single capability whose presence asserts the role tier.
+
+    Wave 9 PR 1 — collapses :func:`_check_role_principal`'s legacy
+    role-name dispatch into a one-line capability lookup. Each marker
+    cap is the cap that uniquely identifies the tier in the bundle
+    table at :mod:`agent_mcp.core.capabilities`:
+
+    * ``"operator"`` / ``"admin"`` → ``"system.config.write"``.
+      The cap appears only in
+      ``PROJECT_ROLE_BUNDLES["operator"]`` — NOT in viewer, NOT in
+      any agent bundle — so it cleanly distinguishes operator-tier
+      from every other admit. Sysadmins admit via the
+      ``has_capability`` wildcard short-circuit.
+    * ``"manager"`` → ``"tasks.assign"``. The cap appears in both
+      ``PROJECT_ROLE_BUNDLES["operator"]`` and
+      ``AGENT_ROLE_BUNDLES["manager"]``, encoding the legacy
+      "operator-tier OR manager-role agent" contract in a single
+      cap.
+    * ``"any"`` → ``"mcp.connect"``. Baseline cap every
+      ``agent_bearer`` carries via ``AGENT_ROLE_BUNDLES``;
+      sysadmins still admit via the wildcard. Operator-tier
+      non-sysadmin callers are admitted via a kind-based fallback
+      in :func:`_check_role_principal` (the bundle intentionally
+      doesn't grant ``mcp.connect`` to operator-tier — that's an
+      MCP-wire cap, not an REST cap — so the fallback preserves
+      the pre-Wave-9 contract documented in the function's old
+      "any" inline comment).
+
+    Wave 9 PR 6 deletes this helper alongside the legacy
+    ``"operator"`` / ``"manager"`` / ``"any"`` vocabulary itself
+    (every call site moves to ``@requires_capability("<cap>")``
+    directly).
+    """
+    if role in ("operator", "admin"):
+        return "system.config.write"
+    if role == "manager":
+        return "tasks.assign"
+    if role == "any":
+        return "mcp.connect"
+    raise ValueError(  # pragma: no cover — guarded at decorator construction
+        f"_role_marker_cap: unknown role {role!r}"
+    )
+
+
 def _check_role_principal(role: str, principal: Principal) -> None:
     """Run the role gate against the typed Principal.
 
     Raise :class:`AuthRejected` on rejection.
 
-    Role semantics (Wave 6 PR 6 — Principal-only):
+    Wave 9 PR 1 migrated the four ``has_role(...)`` call sites to
+    ``has_capability(...)`` via the :func:`_role_marker_cap` helper.
+    External contract (admit/reject for ``"operator"`` / ``"manager"``
+    / ``"any"`` role strings) is preserved — the only change is the
+    internal check switching from role-name bridge to direct
+    capability lookup.
+
+    Role semantics:
 
     * ``"operator"`` (legacy alias ``"admin"``) — admits any
       operator-tier caller (cookie-session, forwarding-header, or
-      sysadmin). Agent tokens — including ``agent_role='manager'``
-      — are rejected. Reserved for spawn/terminate-agent, mutate
-      ``config_*``, broadcast-admin-message, backup-context, RAG
-      rebuild.
+      sysadmin) that carries ``system.config.write``. Agent tokens —
+      including ``agent_role='manager'`` — are rejected (no agent
+      bundle grants the operator-only marker cap). Reserved for
+      spawn/terminate-agent, mutate ``config_*``,
+      broadcast-admin-message, backup-context, RAG rebuild.
     * ``"manager"`` — admits operator-tier OR agents whose row has
-      ``agent_role='manager'``.
-    * ``"any"`` — admits any ``agent_bearer`` principal (worker or
-      manager). Operator paths do NOT satisfy ``"any"`` on their
-      own — the gate is about "an active agent in
-      ``g.active_agents``" because audit-log attribution needs an
-      agent_id.
+      ``agent_role='manager'`` (both bundles include
+      ``tasks.assign``).
+    * ``"any"`` — admits any ``agent_bearer`` (worker or manager via
+      ``mcp.connect``) OR any operator-tier caller (kind-based
+      fallback; the bundle deliberately doesn't grant
+      ``mcp.connect`` to operator-tier so the fallback preserves the
+      pre-Wave-9 admit semantics for the cookie / forwarding-header
+      paths).
     """
     if role in ("operator", "admin"):
-        if principal.has_role("operator"):
+        if principal.has_capability(_role_marker_cap(role)):
             if _viewer_blocked(principal):
                 raise AuthRejected(
                     "Unauthorized: viewer-tier operator cannot perform "
@@ -218,7 +284,7 @@ def _check_role_principal(role: str, principal: Principal) -> None:
         )
 
     if role == "manager":
-        if principal.has_role("manager"):
+        if principal.has_capability(_role_marker_cap(role)):
             if _viewer_blocked(principal):
                 raise AuthRejected(
                     "Unauthorized: viewer-tier operator cannot perform "
@@ -230,13 +296,17 @@ def _check_role_principal(role: str, principal: Principal) -> None:
         )
 
     if role == "any":
-        if principal.kind == "agent_bearer":
+        if principal.has_capability(_role_marker_cap(role)):
             return
         # Operator-tier callers (cookie-session, forwarding-header,
         # sysadmin) admit too: the legacy contract was "any active
         # caller identity"; the typed Principal's operator path is
         # an identity the gate had no way to express pre-Wave-6.
-        if principal.has_role("admin"):
+        # The bundles deliberately don't grant ``mcp.connect`` to
+        # operator-tier (the cap is the MCP-wire baseline, not a
+        # REST admit), so a kind-based fallback preserves the
+        # pre-Wave-9 contract that the cap-only check would tighten.
+        if principal.kind in ("operator_session", "forwarding_header"):
             return
         raise AuthRejected("Unauthorized: Valid token required")
 
