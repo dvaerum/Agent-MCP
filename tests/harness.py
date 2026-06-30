@@ -898,6 +898,49 @@ class AdminClient(WorkerSession):
 # --- Public entry point ---
 
 
+def with_capabilities(*caps: str):
+    """Construct a test :class:`Principal` carrying exactly ``caps``.
+
+    Wave 9 PR 0 — convenience helper for tests that want to assert on
+    capability gates (:meth:`Principal.has_capability` /
+    ``@requires_capability``) without setting up a full identity +
+    middleware resolution chain. The returned Principal is
+    ``operator_session`` shaped with ``project_role="operator"`` so
+    the non-``system.*`` cap gate's project-membership requirement
+    admits; ``capabilities`` is the exact frozenset passed in
+    (overriding the auto-resolve from identity fields that
+    :class:`Principal.__post_init__` would otherwise perform).
+
+    Pass :data:`agent_mcp.core.capabilities.SYSADMIN_WILDCARD` to
+    model a sysadmin (``has_capability`` short-circuits on the
+    wildcard).
+
+    Usage::
+
+        from tests.harness import with_capabilities
+        p = with_capabilities("tasks.assign", "memories.update")
+        assert p.has_capability("tasks.assign")
+        assert not p.has_capability("system.users.manage")
+
+    Returns the Principal directly (not a context manager) — for
+    ContextVar-stamping, wrap in :func:`with_principal`.
+    """
+    from agent_mcp.core.principal import Principal
+
+    return Principal(
+        kind="operator_session",
+        user_id="harness-operator",
+        agent_id=None,
+        sysadmin=False,
+        project_name="harness",
+        project_role="operator",
+        agent_role=None,
+        can_wake_loop=False,
+        source_token=None,
+        capabilities=frozenset(caps),
+    )
+
+
 @contextlib.contextmanager
 def with_principal(principal):
     """Stamp a :class:`agent_mcp.core.principal.Principal` on the

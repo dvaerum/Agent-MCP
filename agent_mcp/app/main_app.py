@@ -239,9 +239,25 @@ def _build_principal_from_request(
     would have admitted.
     """
     try:
+        from ..core.capabilities import resolve_capabilities
         from ..core.principal import Principal
 
         if forwarding_operator:
+            # Wave 9 PR 0: capabilities resolved at the seam; threaded
+            # into Principal once. The per-project backend has no
+            # router.db handle so the group-cap overlay returns empty
+            # here — the router middleware (which DOES have router.db)
+            # has already resolved + admitted the operator via the
+            # cookie path, so the forwarding-header Principal here is
+            # purely the in-process restatement of that admit.
+            caps = resolve_capabilities(
+                user_id=forwarding_operator,
+                agent_id=None,
+                sysadmin=False,
+                agent_role=None,
+                project_role=None,
+                kind="forwarding_header",
+            )
             return Principal(
                 kind="forwarding_header",
                 user_id=forwarding_operator,
@@ -252,6 +268,7 @@ def _build_principal_from_request(
                 agent_role=None,
                 can_wake_loop=False,
                 source_token=None,
+                capabilities=caps,
             )
         if bearer_token:
             agent_id = get_agent_id(bearer_token)
@@ -296,6 +313,18 @@ def _build_principal_from_request(
                                 can_wake_loop = True
                     except Exception:  # pragma: no cover - defensive
                         can_wake_loop = False
+                # Wave 9 PR 0: capabilities resolved at the seam;
+                # threaded into Principal once. Agent-bearer caps come
+                # from AGENT_ROLE_BUNDLES[agent_role] alone — group
+                # caps don't apply (they're operator-shaped).
+                caps = resolve_capabilities(
+                    user_id=None,
+                    agent_id=agent_id,
+                    sysadmin=False,
+                    agent_role=normalized_role,
+                    project_role=None,
+                    kind="agent_bearer",
+                )
                 return Principal(
                     kind="agent_bearer",
                     user_id=None,
@@ -306,6 +335,7 @@ def _build_principal_from_request(
                     agent_role=normalized_role,
                     can_wake_loop=can_wake_loop,
                     source_token=bearer_token,
+                    capabilities=caps,
                 )
         return None
     except Exception:  # pragma: no cover - defensive

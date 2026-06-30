@@ -31,12 +31,20 @@ deletes the bridge once PRs 1-5 have migrated every tool to take
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 
 PrincipalKind = Literal["operator_session", "agent_bearer", "forwarding_header"]
 AgentRole = Literal["worker", "manager"]
+
+
+# Sentinel used to distinguish "caller did not pass capabilities="
+# from "caller passed an explicitly empty set". Module-private; never
+# stored on a Principal. Wave 9 PR 0 — when the migration window
+# closes in PR 6 the dataclass switches to a required field and the
+# sentinel disappears.
+_CAPS_UNSET: frozenset[str] = frozenset({"__capabilities_unset_sentinel__"})
 
 
 @dataclass(frozen=True)
@@ -99,11 +107,93 @@ class Principal:
     agent_role: Optional[AgentRole]
     can_wake_loop: bool
     source_token: Optional[str]
+    # Wave 9 PR 0: capability set resolved at middleware time. Default
+    # is the ``_CAPS_UNSET`` sentinel so ``__post_init__`` can detect
+    # "caller did not supply" and back-fill via
+    # ``resolve_capabilities`` from the identity fields. Pre-Wave-9
+    # construction sites (~30 places across tests, app routers, and
+    # in-process synthesis) keep working unchanged — they get the
+    # capabilities their identity shape implies. Explicit
+    # ``capabilities=frozenset(...)`` overrides the back-fill so the
+    # auth middleware can pass the result of ``resolve_capabilities``
+    # (which also consults group caps from router.db) verbatim.
+    capabilities: frozenset[str] = field(default=_CAPS_UNSET)
+
+    def __post_init__(self) -> None:
+        """Back-fill ``capabilities`` from identity fields when unset.
+
+        Wave 9 PR 0 — bridge: pre-Wave-9 Principal construction sites
+        don't yet pass ``capabilities=``. Rather than touch every one
+        of them in PR 0 (the scope is foundation + bridge, not call-
+        site migration), we resolve from the identity shape here. The
+        production middleware path already calls
+        :func:`resolve_capabilities` with the full identity + group
+        context and passes the result explicitly, so this back-fill
+        only fires for in-process synthesis (tests, dispatcher
+        fallbacks).
+        """
+        if self.capabilities is _CAPS_UNSET:
+            from .capabilities import resolve_capabilities
+            object.__setattr__(
+                self,
+                "capabilities",
+                resolve_capabilities(
+                    user_id=self.user_id,
+                    agent_id=self.agent_id,
+                    sysadmin=self.sysadmin,
+                    agent_role=self.agent_role,
+                    project_role=self.project_role,
+                    kind=self.kind,
+                ),
+            )
 
     # ── Authorization helpers ────────────────────────────────────
 
+    def has_capability(self, cap: str) -> bool:
+        """Return True iff this principal carries ``cap``.
+
+        Wave 9 PR 0 — the new capability gate. Per the plan's
+        pseudocode:
+
+        * Sysadmin short-circuit: a ``SYSADMIN_WILDCARD`` in
+          ``self.capabilities`` admits ANY cap unconditionally. The
+          wildcard is how :func:`resolve_capabilities` encodes
+          sysadmin — one sentinel instead of materialising all 27 caps
+          onto every sysadmin Principal.
+        * Otherwise the cap must be in ``self.capabilities``.
+        * For non-``system.*`` caps, additionally require the caller
+          to have a project membership (``project_role is not None``)
+          OR be an ``agent_bearer``. ``system.*`` caps are
+          router-admin verbs and don't belong to any one project —
+          they admit on cap-set membership alone.
+
+        Returns False for any cap not in the in-memory set, including
+        unknown / typo'd cap strings — default-deny matches the
+        plan's design (typos surface at code-review via the
+        :data:`agent_mcp.core.capabilities.KNOWN_CAPABILITIES`
+        smoke test, not at runtime).
+        """
+        from .capabilities import SYSADMIN_WILDCARD
+
+        if SYSADMIN_WILDCARD in self.capabilities:
+            return True
+        if cap not in self.capabilities:
+            return False
+        if cap.startswith("system."):
+            return True
+        return self.project_role is not None or self.kind == "agent_bearer"
+
     def has_role(self, required: str) -> bool:
         """Return True iff this principal satisfies the named role.
+
+        Wave 9 PR 0 — DEPRECATED bridge. The capability vocabulary
+        (:meth:`has_capability`) is the canonical surface; this
+        method exists for the duration of the Wave 9 migration window
+        so existing ``has_role(...)`` call sites in tests + un-migrated
+        decorators / handlers keep admitting/denying the same shapes.
+        Wave 9 PR 6 deletes this method (and the ``ROLE_TO_CAPS``
+        bridge map it consults) after PRs 1-5 migrate the seven
+        ``has_role`` call sites to ``has_capability``.
 
         Encodes the role table that ``core/authorize._check_role``
         spells out longhand today (after the bridge is deleted in
@@ -168,4 +258,4 @@ class Principal:
         return self.kind
 
 
-__all__ = ["Principal", "PrincipalKind", "AgentRole"]
+__all__ = ["AgentRole", "Principal", "PrincipalKind"]
