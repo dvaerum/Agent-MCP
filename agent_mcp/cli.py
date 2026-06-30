@@ -68,11 +68,16 @@ for _parent_level in range(3):
     if _env_path.exists():
         print(f"Found .env at: {_env_path}")
         _env_vars = dotenv_values(str(_env_path))
-        print(f"Loaded variables: {list(_env_vars.keys())}")
-        # Avoid printing secrets in plaintext while still confirming
-        # they're present.
-        _printable_key = _env_vars.get("OPENAI_API_KEY", "NOT FOUND") or "NOT FOUND"
-        print(f"OPENAI_API_KEY from file: {_printable_key[:10]}...")
+        # VULN-002: don't enumerate the loaded variable names. The
+        # .env typically holds OPENAI_API_KEY alongside other secret-
+        # bearing names (AUTH_*, SMTP_*, OIDC_*); logging the set
+        # gives a journal reader the inventory of what's worth stealing.
+        # Count-only keeps the "we loaded something" signal.
+        print(f"Loaded {len(_env_vars)} environment variable(s) from .env")
+        # VULN-002: never log a prefix of OPENAI_API_KEY — see
+        # __main__.py for the rationale. Presence-only.
+        _printable_key = _env_vars.get("OPENAI_API_KEY") or ""
+        print(f"OPENAI_API_KEY from file: {'present' if _printable_key else 'NOT FOUND'}")
         for _key, _value in _env_vars.items():
             if _value is not None:
                 os.environ[_key] = _value
