@@ -271,15 +271,52 @@ def _build_route_principal(
     return None
 
 
+# VULN-001 (security audit 2026-06-29): allowed browser origins for the
+# dashboard + API surface. Single source of truth shared between the
+# CORSMiddleware in :mod:`agent_mcp.app.main_app` and the per-route
+# :func:`handle_options` fallback below.
+#
+# Wildcard (``*``) is intentionally absent — pairing it with
+# ``Access-Control-Allow-Credentials: true`` makes any browser at any
+# origin able to issue credentialed requests, which lets a logged-in
+# operator be CSRF'd from an attacker-controlled page.
+ALLOWED_ORIGINS: frozenset[str] = frozenset({
+    'http://localhost:3847',
+    'http://127.0.0.1:3847',
+    'http://localhost:3000',
+    'http://localhost:3001',
+})
+
+
 async def handle_options(request: Request) -> Response:
-    """Handle OPTIONS requests for CORS preflight."""
+    """Handle OPTIONS requests for CORS preflight.
+
+    Falls through for origins not in :data:`ALLOWED_ORIGINS`: returns
+    an empty 200 with no ``Access-Control-Allow-*`` headers so the
+    browser rejects the preflight. The previous wildcard reply paired
+    with ``Allow-Credentials: true`` on the surrounding middleware
+    let attacker origins satisfy preflight for credentialed requests
+    (VULN-001).
+
+    In normal operation Starlette's CORSMiddleware short-circuits
+    preflight for allowed origins before the request reaches this
+    handler — this code path is the fallback for non-allowed origins
+    and for routes that opt into ``OPTIONS`` in their methods list.
+    """
+    origin = request.headers.get('origin', '')
+    if origin not in ALLOWED_ORIGINS:
+        # Don't echo CORS headers for non-allowed origins; browser
+        # will reject preflight, which is the desired outcome.
+        return PlainTextResponse('')
     return PlainTextResponse(
         '',
         headers={
-            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Origin': origin,
+            'Access-Control-Allow-Credentials': 'true',
             'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
             'Access-Control-Allow-Headers': '*',
             'Access-Control-Max-Age': '86400',
+            'Vary': 'Origin',
         }
     )
 
@@ -289,4 +326,5 @@ __all__ = [
     "_build_route_principal",
     "_result_text",
     "handle_options",
+    "ALLOWED_ORIGINS",
 ]

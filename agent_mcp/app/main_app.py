@@ -21,6 +21,7 @@ import mcp.types as mcp_types
 from ..core.config import logger
 from ..core.auth import get_agent_id, query_agent_status
 from ..core import session_registry
+from ._dispatch_helpers import ALLOWED_ORIGINS
 from .routers import register_routers
 from .server_lifecycle import application_startup, application_shutdown
 from ..tools.registry import (
@@ -1130,13 +1131,17 @@ def create_app(
         Middleware(AuthHeaderMiddleware),
         Middleware(
             CORSMiddleware,
-            allow_origins=[
-                'http://localhost:3847',
-                'http://127.0.0.1:3847',
-                'http://localhost:3000',
-                'http://localhost:3001',
-                '*',
-            ],
+            # VULN-001 (security audit 2026-06-29): the wildcard ``*``
+            # entry was removed. Browsers treat
+            # ``Access-Control-Allow-Origin: *`` paired with
+            # ``Access-Control-Allow-Credentials: true`` as a CSRF
+            # vector — any attacker-controlled origin could issue
+            # credentialed requests against this server using a
+            # logged-in operator's session cookie. The allowlist is
+            # now sourced from :data:`ALLOWED_ORIGINS` so the
+            # CORSMiddleware and the per-route ``handle_options``
+            # fallback share a single source of truth.
+            allow_origins=sorted(ALLOWED_ORIGINS),
             allow_credentials=True,
             allow_methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'HEAD', 'PATCH'],
             allow_headers=['*'],
