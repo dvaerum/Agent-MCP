@@ -567,17 +567,26 @@ def register_admin_routes(app: web.Application) -> None:
     JSON envelope and unversioned ones get the v1-required error.
 
     Phase 3 Wave 2 (v5.0.69): project create / delete / rename are
-    additionally wrapped with ``require_sysadmin`` — the system
+    additionally wrapped with the project-lifecycle gate — the system
     perm matrix reserves project lifecycle (and the rename, which
     is a re-key with grace-alias semantics) for sysadmins.
     ``stop`` stays operator-tier because it doesn't change the
     project's identity or membership; an operator with mutation
     access to a project may bounce its backend.
+
+    Wave 9 PR 4 (prancy-napping-pie): the lifecycle gate moved from
+    ``require_sysadmin`` to
+    ``require_capability("system.projects.manage")``. Sysadmins still
+    admit unconditionally (their cap set is the wildcard); the new
+    shape ALSO lets a sysadmin grant the cap to a delegated group
+    via the Wave 9 PR 5 dashboard UI without promoting the operator
+    to sysadmin.
     """
     from . import app as _app
-    from .perm_gates import require_sysadmin
+    from .perm_gates import require_capability
 
     gated = _app._rest_gated
+    project_lifecycle_gate = require_capability("system.projects.manage")
 
     app.router.add_get(
         "/agent-mcp/api/router/health", gated(health_handler),
@@ -587,18 +596,18 @@ def register_admin_routes(app: web.Application) -> None:
     )
     app.router.add_post(
         "/agent-mcp/api/router/projects",
-        gated(require_sysadmin(create_project_handler)),
+        gated(project_lifecycle_gate(create_project_handler)),
     )
     app.router.add_get(
         "/agent-mcp/api/router/overview", gated(overview_handler),
     )
     app.router.add_patch(
         "/agent-mcp/api/router/projects/{name}",
-        gated(require_sysadmin(rename_project_handler)),
+        gated(project_lifecycle_gate(rename_project_handler)),
     )
     app.router.add_delete(
         "/agent-mcp/api/router/projects/{name}",
-        gated(require_sysadmin(delete_project_handler)),
+        gated(project_lifecycle_gate(delete_project_handler)),
     )
     app.router.add_post(
         "/agent-mcp/api/router/projects/{name}/stop",

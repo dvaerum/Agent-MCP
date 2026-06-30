@@ -97,16 +97,24 @@ def register_admin_sso_routes(app: web.Application) -> None:
 
     Same envelope conventions as ``admin_users_api`` — the
     operator-session middleware handles auth at the path-prefix
-    level, and ``require_sysadmin`` is applied per handler so a non-
+    level, and a system-perm gate is applied per handler so a non-
     sysadmin operator gets a clean 403 instead of seeing the IdP
     settings.
+
+    Wave 9 PR 4 (prancy-napping-pie): the gate moved from
+    ``require_sysadmin`` to
+    ``require_capability("system.sso.configure")``. Sysadmins still
+    admit unconditionally (their cap set is the wildcard); the cap
+    shape ALSO lets a sysadmin delegate SSO configuration to a group
+    without promoting members to sysadmin.
     """
     from . import app as _app
-    from .perm_gates import require_sysadmin
+    from .perm_gates import require_capability
 
     gated = _app._rest_gated
+    sso_gate = require_capability("system.sso.configure")
 
     app.router.add_get(
         "/agent-mcp/api/router/sso/config",
-        gated(require_sysadmin(get_sso_config_handler)),
+        gated(sso_gate(get_sso_config_handler)),
     )
