@@ -312,8 +312,8 @@ def is_visible_to_role(tool_name: str, role: str) -> bool:
         logger.warning(
             "tools/list filter: tool %r has no access classification; "
             "defaulting to visible. Add a `visibility=` kwarg to its "
-            "register_tool() call (and `@requires_role(...)` if the "
-            "policy is more restrictive than 'any').",
+            "register_tool() call (and `@requires_capability(...)` if "
+            "the policy is more restrictive than 'any').",
             tool_name,
         )
         return True

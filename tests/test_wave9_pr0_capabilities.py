@@ -2,7 +2,7 @@
 
 Wave 9 PR 0 of 7 in ``prancy-napping-pie.md``. Pins:
 
-* The :data:`KNOWN_CAPABILITIES` set is exactly the 27-element
+* The :data:`KNOWN_CAPABILITIES` set is exactly the 28-element
   vocabulary the plan locks; the per-resource × verb regex shape
   ``^[a-z]+(\\.[a-z_]+)+$`` holds for every cap.
 * :data:`PROJECT_ROLE_BUNDLES` and :data:`AGENT_ROLE_BUNDLES` are
@@ -11,13 +11,12 @@ Wave 9 PR 0 of 7 in ``prancy-napping-pie.md``. Pins:
 * :meth:`Principal.has_capability` honours the sysadmin wildcard
   short-circuit, the per-cap presence check, AND the project-
   membership gate for non-``system.*`` caps.
-* The legacy bridge (:meth:`Principal.has_role`) keeps admitting /
-  denying the same shapes pre-Wave-9 — operator-session admits
-  ``"admin"`` / ``"operator"``, manager-role agent admits
-  ``"manager"``, etc. This is the "zero behaviour change in PR 0"
-  guarantee.
 * :func:`tests.harness.with_capabilities` produces a Principal whose
   cap set matches the helper's input verbatim.
+
+Wave 9 PR 6 deleted the legacy ``has_role()`` bridge + the
+``ROLE_TO_CAPS`` bridge map, so the bridge-preservation tests this
+file used to carry are gone — capabilities are the single surface.
 """
 from __future__ import annotations
 
@@ -29,7 +28,6 @@ from agent_mcp.core.capabilities import (
     AGENT_ROLE_BUNDLES,
     KNOWN_CAPABILITIES,
     PROJECT_ROLE_BUNDLES,
-    ROLE_TO_CAPS,
     SYSADMIN_WILDCARD,
     resolve_capabilities,
 )
@@ -241,108 +239,6 @@ def test_has_capability_denies_resource_cap_without_project_role():
     )
     assert "agents.register" in p.capabilities
     assert not p.has_capability("agents.register")
-
-
-# ── Bridge: has_role still works (PR 0 preserves existing tests) ───
-
-
-def test_has_role_admin_admits_operator_session():
-    """The bridge: an operator-session Principal STILL admits
-    ``has_role("admin")`` post-Wave-9-PR-0. Proves PR 0 doesn't break
-    existing ``has_role("admin")`` call sites in tests or in the
-    un-migrated decorator layer."""
-    p = Principal(
-        kind="operator_session",
-        user_id="alice",
-        agent_id=None,
-        sysadmin=False,
-        project_name="proj-a",
-        project_role="operator",
-        agent_role=None,
-        can_wake_loop=False,
-        source_token=None,
-    )
-    assert p.has_role("admin")
-    assert p.has_role("operator")
-    assert p.has_role("system")
-
-
-def test_has_role_manager_admits_agent_with_role_manager():
-    """The bridge: an agent_bearer with agent_role='manager' STILL
-    admits ``has_role("manager")``. Proves the manager-tier gate
-    keeps working for spawn/terminate-task call sites that still
-    use ``has_role``."""
-    p = Principal(
-        kind="agent_bearer",
-        user_id=None,
-        agent_id="alice-mgr",
-        sysadmin=False,
-        project_name=None,
-        project_role=None,
-        agent_role="manager",
-        can_wake_loop=False,
-        source_token="tok",
-    )
-    assert p.has_role("manager")
-    # Worker-tier agent does NOT admit manager.
-    worker = Principal(
-        kind="agent_bearer",
-        user_id=None,
-        agent_id="bob-wkr",
-        sysadmin=False,
-        project_name=None,
-        project_role=None,
-        agent_role="worker",
-        can_wake_loop=False,
-        source_token="tok",
-    )
-    assert not worker.has_role("manager")
-
-
-def test_has_role_any_admits_agent_bearer_worker():
-    """The bridge: ``has_role("any")`` keeps admitting any
-    agent_bearer (the legacy "any active agent" gate). PRs 1-5
-    migrate the call sites to ``has_capability("mcp.connect")``
-    explicitly."""
-    p = Principal(
-        kind="agent_bearer",
-        user_id=None,
-        agent_id="worker-1",
-        sysadmin=False,
-        project_name=None,
-        project_role=None,
-        agent_role="worker",
-        can_wake_loop=False,
-        source_token="tok",
-    )
-    assert p.has_role("any")
-    assert p.has_role("agent")
-
-
-# ── ROLE_TO_CAPS bridge constants ──────────────────────────────────
-
-
-def test_role_to_caps_admin_is_operator_bundle():
-    """ROLE_TO_CAPS['admin'] equals PROJECT_ROLE_BUNDLES['operator'].
-    PR 1 will migrate ``has_role("admin")`` to look up this map."""
-    assert ROLE_TO_CAPS["admin"] == PROJECT_ROLE_BUNDLES["operator"]
-    assert ROLE_TO_CAPS["operator"] == PROJECT_ROLE_BUNDLES["operator"]
-    assert ROLE_TO_CAPS["system"] == PROJECT_ROLE_BUNDLES["operator"]
-
-
-def test_role_to_caps_any_is_mcp_connect_only():
-    """ROLE_TO_CAPS['any'] is the minimum cap any authenticated agent
-    has. PRs 1-5 migrate ``@requires("any")`` to
-    ``@requires_capability("mcp.connect")``."""
-    assert ROLE_TO_CAPS["any"] == frozenset({"mcp.connect"})
-    assert ROLE_TO_CAPS["agent"] == frozenset({"mcp.connect"})
-
-
-def test_role_to_caps_manager_covers_both_paths():
-    """ROLE_TO_CAPS['manager'] admits an operator OR a manager-role
-    agent — the legacy manager-tier contract."""
-    assert PROJECT_ROLE_BUNDLES["operator"] <= ROLE_TO_CAPS["manager"]
-    assert AGENT_ROLE_BUNDLES["manager"] <= ROLE_TO_CAPS["manager"]
 
 
 # ── resolve_capabilities resolution chain ──────────────────────────

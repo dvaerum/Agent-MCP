@@ -26,12 +26,6 @@ What lives here
   :meth:`Principal.has_capability` short-circuits on. Stored exactly
   once per sysadmin Principal instead of expanding to every known cap;
   the wildcard semantics live in the method, not the resolver.
-* :data:`ROLE_TO_CAPS` — the Wave-9-PR-0 BRIDGE map that translates
-  legacy role names (``"admin"`` / ``"operator"`` / ``"manager"`` /
-  ``"any"`` etc.) into the equivalent capability set. Consumed by
-  :meth:`Principal.has_role` so the legacy decorators continue to
-  admit/deny the same shapes they did pre-Wave-9. Deleted by PR 6
-  alongside ``has_role`` itself.
 * :func:`resolve_capabilities` — the resolution function called at
   middleware time. Returns the frozenset attached to the per-request
   :class:`Principal`. Defensive against router-DB-not-initialised
@@ -199,41 +193,6 @@ AGENT_ROLE_BUNDLES: dict[str, frozenset[str]] = {
 SYSADMIN_WILDCARD: str = "*"
 
 
-# ── Legacy-role bridge (Wave 9 PR 0 → deleted in PR 6) ──────────────
-
-
-#: Map from legacy role name → capability set whose presence implies
-#: the legacy role admits. Consumed by :meth:`Principal.has_role`
-#: during the Wave 9 migration window. Each value is the BUNDLE the
-#: corresponding role grants in production today; the bridge admits
-#: when the caller's capability set intersects the bundle. ``"any"``
-#: maps to ``{"mcp.connect"}`` — the minimum cap any authenticated
-#: agent has — so the legacy ``@requires("any")`` keeps admitting
-#: ``agent_bearer`` callers without admitting plain operator-only
-#: paths that have no MCP wire access.
-#:
-#: Bridge deleted by Wave 9 PR 6 alongside ``has_role`` itself; PRs
-#: 1-5 migrate every existing ``has_role(...)``/``@requires(...)``
-#: call site to the explicit capability vocabulary.
-ROLE_TO_CAPS: dict[str, frozenset[str]] = {
-    # Operator-tier admit: any cap in the operator bundle satisfies.
-    "admin": PROJECT_ROLE_BUNDLES["operator"],
-    "operator": PROJECT_ROLE_BUNDLES["operator"],
-    "system": PROJECT_ROLE_BUNDLES["operator"],
-    # Manager-tier admit: operator bundle ∪ agent-manager bundle.
-    # (Operator OR manager-role agent satisfies the legacy
-    # has_role("manager") contract.)
-    "manager": frozenset(
-        PROJECT_ROLE_BUNDLES["operator"] | AGENT_ROLE_BUNDLES["manager"]
-    ),
-    # Agent-baseline admit: any agent_bearer carries mcp.connect via
-    # AGENT_ROLE_BUNDLES; operator paths do NOT carry it, matching the
-    # legacy "any active agent in g.active_agents" contract.
-    "any": frozenset({"mcp.connect"}),
-    "agent": frozenset({"mcp.connect"}),
-}
-
-
 # ── Resolution ──────────────────────────────────────────────────────
 
 
@@ -309,7 +268,6 @@ __all__ = [
     "AGENT_ROLE_BUNDLES",
     "KNOWN_CAPABILITIES",
     "PROJECT_ROLE_BUNDLES",
-    "ROLE_TO_CAPS",
     "SYSADMIN_WILDCARD",
     "resolve_capabilities",
 ]
