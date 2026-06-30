@@ -12,7 +12,12 @@ print(f"Looking for .env at: {env_file}")
 if env_file.exists():
     print(f"Loading .env from: {env_file}")
     load_dotenv(dotenv_path=str(env_file))
-    print(f"OPENAI_API_KEY in environment: {os.environ.get('OPENAI_API_KEY', 'NOT FOUND')[:20]}...")
+    # VULN-002: never log a prefix of OPENAI_API_KEY — the journal /
+    # stdout trust boundary is wider than the in-process secret store,
+    # so even a 20-char head is enough to fingerprint the org's key.
+    # Presence-only check keeps the operator signal without the leak.
+    _has_key = bool(os.environ.get('OPENAI_API_KEY'))
+    print(f"OPENAI_API_KEY in environment: {'present' if _has_key else 'NOT FOUND'}")
 else:
     print(f"No .env file found at {env_file}")
     load_dotenv()  # Try default locations
