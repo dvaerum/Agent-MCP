@@ -84,13 +84,24 @@ def _is_operator_tier(principal: Principal) -> bool:
     """Treat the legacy ``"admin"`` pseudo-agent as operator-tier.
 
     Production post-Wave-4 has no ``agents.agent_id='admin'`` row so
-    this collapses to ``principal.has_role("operator")``. The harness
-    (``tests/harness.py``) seeds a manager-role row labelled ``admin``
-    and the bearer-wins bridge rule yields an ``agent_bearer``
-    Principal whose ``agent_id == "admin"`` — recognising that label
-    as operator-tier preserves the harness's pre-Wave-6 contract.
+    this collapses to the operator-tier capability check. Wave 9 PR 3:
+    uses ``has_capability("system.config.write")`` — the per-project
+    operator write marker present in
+    ``PROJECT_ROLE_BUNDLES["operator"]`` and short-circuited by the
+    sysadmin wildcard. Replaces the legacy ``has_role("operator")``
+    which was a strictly looser identity check (admitted viewer-tier
+    operator-session callers too).
+
+    The harness (``tests/harness.py``) seeds a manager-role row
+    labelled ``admin`` and the bearer-wins bridge rule yields an
+    ``agent_bearer`` Principal whose ``agent_id == "admin"`` —
+    recognising that label as operator-tier preserves the harness's
+    pre-Wave-6 contract.
     """
-    return principal.has_role("operator") or principal.agent_id == "admin"
+    return (
+        principal.has_capability("system.config.write")
+        or principal.agent_id == "admin"
+    )
 
 
 def _sender_label(principal: Principal) -> str:

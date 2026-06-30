@@ -162,24 +162,34 @@ def _actor_label(principal: Optional[Principal]) -> str:
 
 
 def _is_admin_principal(principal: Optional[Principal]) -> bool:
-    """Operator-tier check using :meth:`Principal.has_role`.
+    """Operator-tier check using :meth:`Principal.has_capability`.
 
-    Production code paths reach this helper with a Principal that
-    already answers correctly:
+    Wave 9 PR 3: gates on ``system.config.write`` — the per-project
+    operator write marker present in
+    ``PROJECT_ROLE_BUNDLES["operator"]`` and short-circuited by the
+    sysadmin wildcard. Replaces the legacy ``has_role("admin")``
+    bridge call. The new check is strictly tighter than the bridge:
 
-    * REST seam → ``operator_session`` Principal →
-      ``has_role("admin")`` True.
-    * MCP wire (any agent) → ``agent_bearer`` Principal →
-      ``has_role("admin")`` False; the worker/manager distinction
-      doesn't matter at this gate.
+    * REST seam → ``operator_session`` Principal with
+      ``project_role="operator"`` → has the cap → admitted.
+    * REST seam → ``operator_session`` Principal with
+      ``project_role="viewer"`` → does NOT have the cap → denied.
+      Viewers shouldn't bypass the secret-redaction filter or
+      override the per-key creator-ownership matrix on writes; the
+      bridge admitted them by accident (``has_role("admin")`` was
+      identity-only and ignored ``project_role``).
+    * MCP wire (any agent) → ``agent_bearer`` Principal → no
+      ``system.config.write`` in either agent-role bundle → denied;
+      the worker/manager distinction doesn't matter at this gate.
+    * Sysadmin → wildcard short-circuit → admitted regardless of
+      ``project_role``.
 
-    Wave 6 PR 6 retired the legacy ``operator_session_active``
-    ContextVar fallback. Callers that bypassed the dispatcher (None
-    principal) are simply not admitted as admin.
+    Callers that bypassed the dispatcher (None principal) are simply
+    not admitted as admin.
     """
     if principal is None:
         return False
-    return principal.has_role("admin")
+    return principal.has_capability("system.config.write")
 
 
 def _requires_authenticated_caller(
@@ -193,14 +203,22 @@ def _requires_authenticated_caller(
     * any ``agent_bearer`` Principal (the legacy ``@requires("any")``
       gate which checked ``get_agent_id(token)`` admitted exactly
       these);
-    * any operator-tier Principal (``operator_session`` /
+    * any operator-path Principal (``operator_session`` /
       ``forwarding_header``), so the migrated tools are also callable
       from the REST seam if a future handler decides to dispatch
-      through here instead of writing the table directly;
-    * any sysadmin caller (no project membership required).
+      through here instead of writing the table directly. Includes
+      viewer-tier operators (read-only project members) — the gate
+      here is "do we have an authenticated identity?", per-key
+      authorization happens further down via
+      :func:`_is_admin_principal`.
+    * any sysadmin caller.
 
-    The ``principal.has_role("admin")`` branch covers operator and
-    sysadmin in one check (see Principal docstring).
+    Wave 9 PR 3: the operator branch is an identity check on
+    ``principal.kind`` (not a capability check) — per the Wave 9
+    plan's mapping, "any caller?" questions stay as identity checks
+    rather than back-fitting a capability. ``_is_admin_principal``
+    (the per-key admin override) is what migrated to a cap; this
+    helper's contract is broader.
     """
     if principal is None:
         return PermissionDenied(
@@ -208,7 +226,7 @@ def _requires_authenticated_caller(
         )
     if principal.kind == "agent_bearer":
         return None
-    if principal.has_role("admin"):
+    if principal.kind in ("operator_session", "forwarding_header"):
         return None
     return PermissionDenied(
         reason="Valid token or operator session required"

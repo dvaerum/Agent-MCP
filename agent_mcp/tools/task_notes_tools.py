@@ -17,8 +17,10 @@ edit/delete it. Manager-tier admits any operator-tier
 agent token whose row has ``agent_role='manager'``. The per-note
 ownership check happens inside the impl against
 ``task_notes_db.edit_note`` / ``delete_note``, which still takes
-the historical ``is_admin`` boolean (now sourced from
-``principal.has_role("manager")``).
+the historical ``is_admin`` boolean (Wave 9 PR 3: sourced from
+``principal.has_capability("tasks.assign")`` — the manager-tier
+marker present in both ``PROJECT_ROLE_BUNDLES["operator"]`` and
+``AGENT_ROLE_BUNDLES["manager"]``).
 
 The existing append-only writers in `task_tools.py` (the bulk
 add_note operation, the inline notes append in
@@ -86,7 +88,7 @@ async def add_task_note_tool_impl(
     """
     if principal is None or (
         principal.kind != "agent_bearer"
-        and not principal.has_role("operator")
+        and not principal.has_capability("system.config.write")
     ):
         return PermissionDenied(
             reason="agent or operator token required to add a task note"
@@ -139,7 +141,7 @@ async def edit_task_note_tool_impl(
     """
     if principal is None or (
         principal.kind != "agent_bearer"
-        and not principal.has_role("operator")
+        and not principal.has_capability("system.config.write")
     ):
         return PermissionDenied(
             reason="agent or operator token required to edit a task note"
@@ -163,7 +165,12 @@ async def edit_task_note_tool_impl(
     # Manager-tier (operators or manager-role agents) bypass the
     # author check via is_admin=True; workers must be the author.
     requester = principal.agent_id or principal.user_id or ""
-    is_admin = principal.has_role("manager")
+    # Wave 9 PR 3: ``tasks.assign`` is the manager-tier marker —
+    # present in PROJECT_ROLE_BUNDLES["operator"] AND
+    # AGENT_ROLE_BUNDLES["manager"], short-circuited by the sysadmin
+    # wildcard. Replaces ``has_role("manager")``; same admit set
+    # (operator + sysadmin + manager-role agent) in the cap model.
+    is_admin = principal.has_capability("tasks.assign")
 
     ok, err = task_notes_db.edit_note(
         note_id=note_id,
@@ -188,7 +195,7 @@ async def delete_task_note_tool_impl(
     :func:`edit_task_note_tool_impl`."""
     if principal is None or (
         principal.kind != "agent_bearer"
-        and not principal.has_role("operator")
+        and not principal.has_capability("system.config.write")
     ):
         return PermissionDenied(
             reason="agent or operator token required to delete a task note"
@@ -206,7 +213,12 @@ async def delete_task_note_tool_impl(
         )
 
     requester = principal.agent_id or principal.user_id or ""
-    is_admin = principal.has_role("manager")
+    # Wave 9 PR 3: ``tasks.assign`` is the manager-tier marker —
+    # present in PROJECT_ROLE_BUNDLES["operator"] AND
+    # AGENT_ROLE_BUNDLES["manager"], short-circuited by the sysadmin
+    # wildcard. Replaces ``has_role("manager")``; same admit set
+    # (operator + sysadmin + manager-role agent) in the cap model.
+    is_admin = principal.has_capability("tasks.assign")
 
     ok, err = task_notes_db.delete_note(
         note_id=note_id, requester=requester, is_admin=is_admin,

@@ -11,14 +11,19 @@ from ..core import globals as g
 from ..core.auth import generate_token  # For register_agent, terminate_agent
 # Wave 6 PR 5 — migrated to Principal + ToolResult. The
 # ``@requires_role("operator")`` decorator is replaced by an inline
-# ``principal.has_role("operator")`` check at the top of each tool
-# (the decorator's wrapper signature locks the inner function to
+# capability check at the top of each tool (the decorator's wrapper
+# signature locks the inner function to
 # ``(arguments) -> list[TextContent]`` and can't forward the
-# Principal kwarg the dispatcher passes to migrated tools). Tool
-# visibility in ``tools/list`` is still gated by the
-# ``visibility="operator"`` kwarg on each ``register_tool(...)``
-# call below — that's the source of truth read by
-# ``tools/access._derive_access_level`` once the decorator is gone.
+# Principal kwarg the dispatcher passes to migrated tools). Wave 9
+# PR 3 narrows the check from the role-tier ``has_role("operator")``
+# bridge to the per-action capability the tool actually performs
+# (``agents.register``, ``agents.terminate``, ``agents.view``,
+# ``system.view``) — each tool declares its cap at the call site so
+# the gate names the action. Tool visibility in ``tools/list`` is
+# still gated by the ``visibility="operator"`` kwarg on each
+# ``register_tool(...)`` call below — that's the source of truth
+# read by ``tools/access._derive_access_level`` once the decorator
+# is gone.
 from ..core.principal import Principal
 from ..core.tool_result import (
     Conflict,
@@ -39,15 +44,21 @@ _OPERATOR_REQUIRED_REASON = (
 )
 
 
-def _require_operator(principal: Optional[Principal]) -> Optional[PermissionDenied]:
-    """Return PermissionDenied iff the caller's principal isn't operator-tier.
+def _require_capability(
+    principal: Optional[Principal],
+    cap: str,
+) -> Optional[PermissionDenied]:
+    """Return PermissionDenied iff the caller's principal lacks ``cap``.
 
-    Wave 6 PR 5 — every tool in this module is operator-only (matches the
-    pre-migration ``@requires_role("operator")`` decorator). Centralised
-    here so the inline check at the top of each tool reads as one line
-    and the failure wording stays uniform across the module.
+    Wave 9 PR 3 — every tool in this module is operator-tier, but the
+    Wave 9 capability vocabulary lets each tool name the specific
+    action it performs. The helper centralises the failure wording so
+    the inline check at the top of each tool reads as one line. Pass
+    the action-specific cap (``agents.register``, ``agents.terminate``,
+    ``agents.view``, ``system.view``) — the sysadmin wildcard
+    short-circuits ``has_capability`` so a sysadmin admits every cap.
     """
-    if principal is None or not principal.has_role("operator"):
+    if principal is None or not principal.has_capability(cap):
         return PermissionDenied(reason=_OPERATOR_REQUIRED_REASON)
     return None
 
@@ -220,7 +231,7 @@ async def register_agent_tool_impl(
             Optional; falls back to ``$AGENT_MCP_EXTERNAL_URL`` and
             then to a placeholder constant.
     """
-    denied = _require_operator(principal)
+    denied = _require_capability(principal, "agents.register")
     if denied is not None:
         return denied
 
@@ -416,7 +427,7 @@ async def view_status_tool_impl(
     principal: Optional[Principal] = None,
 ) -> ToolResult:
     """Report active agents + server status — operator-only."""
-    denied = _require_operator(principal)
+    denied = _require_capability(principal, "system.view")
     if denied is not None:
         return denied
 
@@ -492,7 +503,7 @@ async def terminate_agent_tool_impl(
     principal: Optional[Principal] = None,
 ) -> ToolResult:
     """Soft-terminate an agent (flips status) — operator-only."""
-    denied = _require_operator(principal)
+    denied = _require_capability(principal, "agents.terminate")
     if denied is not None:
         return denied
 
@@ -632,7 +643,7 @@ async def view_audit_log_tool_impl(
     principal: Optional[Principal] = None,
 ) -> ToolResult:
     """Read recent audit-log entries — operator-only."""
-    denied = _require_operator(principal)
+    denied = _require_capability(principal, "system.view")
     if denied is not None:
         return denied
 
@@ -721,7 +732,7 @@ async def get_agent_tokens_tool_impl(
     Supports filtering by status, agent_id pattern, creation date range,
     and more. Operator-only.
     """
-    denied = _require_operator(principal)
+    denied = _require_capability(principal, "agents.view")
     if denied is not None:
         return denied
 

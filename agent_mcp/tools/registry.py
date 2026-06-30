@@ -327,9 +327,16 @@ async def list_available_tools(
     and got isError=true (PR #15) — wasting tokens and confusing the
     model.
     """
+    # Wave 9 PR 3: the operator-tier label admits any caller carrying
+    # ``system.config.write`` — the operator bundle's write marker,
+    # short-circuited by the sysadmin wildcard. Viewer-tier operators
+    # (read-only) lack the cap and fall through to the
+    # ``agent_bearer`` branch (not relevant for them) and end up as
+    # ``"anonymous"`` for the visibility filter — which correctly
+    # hides operator-only tools from a viewer's tools/list.
     role = "anonymous"
     if principal is not None:
-        if principal.has_role("admin"):
+        if principal.has_capability("system.config.write"):
             role = "admin"
         elif principal.kind == "agent_bearer":
             role = "worker"

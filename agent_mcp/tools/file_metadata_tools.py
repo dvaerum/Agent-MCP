@@ -163,7 +163,13 @@ async def update_file_metadata_tool_impl(
     *,
     principal: Optional[Principal] = None,
 ) -> ToolResult:
-    if principal is None or not principal.has_role("operator"):
+    # Wave 9 PR 3: gate on the operator-tier capability marker.
+    # ``system.config.write`` is present in
+    # PROJECT_ROLE_BUNDLES["operator"] and short-circuited by the
+    # sysadmin wildcard; viewer-tier operators (read-only) lack the
+    # cap and are correctly denied. Replaces the legacy
+    # ``has_role("operator")`` which over-broadly admitted viewers.
+    if principal is None or not principal.has_capability("system.config.write"):
         return PermissionDenied(
             reason="operator-tier authorization required to update file metadata"
         )
@@ -183,8 +189,9 @@ async def update_file_metadata_tool_impl(
         )
 
     # Operator-tier callers attribute via user_id; if a manager-role
-    # agent ever satisfies has_role("operator") in a future widening,
-    # principal.agent_id would slot in via the same actor_label call.
+    # agent ever carries ``system.config.write`` (e.g. via a group
+    # cap grant in a future widening), principal.agent_id would slot
+    # in via the same actor_label call.
     requesting_admin_id = principal.actor_label()
 
     normalized_filepath_str = _normalize_filepath(
@@ -323,11 +330,12 @@ def register_file_metadata_tools():
             "additionalProperties": False,
         },
         implementation=update_file_metadata_tool_impl,
-        # Operator-only at call-time (impl checks principal.has_role
-        # ("operator")); the old hand-maintained TOOL_ACCESS classified
-        # this "any" (a pre-existing visibility quirk: workers saw it
-        # in tools/list but the call always failed). PR-W1c aligns
-        # visibility with call-time enforcement.
+        # Operator-only at call-time (impl checks
+        # ``principal.has_capability("system.config.write")``); the
+        # old hand-maintained TOOL_ACCESS classified this "any" (a
+        # pre-existing visibility quirk: workers saw it in tools/list
+        # but the call always failed). PR-W1c aligns visibility with
+        # call-time enforcement.
         visibility="operator",
     )
 

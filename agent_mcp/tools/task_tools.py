@@ -66,18 +66,21 @@ def _authorize_assign_task(
     it in a `PermissionDenied(reason=...)` so this helper stays
     unit-testable).
 
-    Wave 6 PR 4: now accepts a typed :class:`Principal` kwarg. When
-    set, the role checks use ``principal.has_role(...)``; when None
-    (in-process callers that bypass the dispatcher), the legacy
-    ``verify_token`` chain still runs.
+    Wave 9 PR 3: the manager-tier admit (operator-session, sysadmin,
+    or manager-role agent) is gated by ``has_capability("tasks.assign")``
+    — the capability marker present in both ``PROJECT_ROLE_BUNDLES["operator"]``
+    and ``AGENT_ROLE_BUNDLES["manager"]`` (and short-circuited by the
+    sysadmin wildcard). Replaces the legacy
+    ``has_role("admin") or has_role("manager")`` per the Wave 9 design.
 
     Permission matrix:
 
-    - admin (operator-session / sysadmin) → always permitted.
+    - admin (operator-session / sysadmin) → always permitted (carries
+      ``tasks.assign`` via the operator bundle or wildcard).
     - manager-role agent token → always permitted (Phase 2 Wave 3,
       plan §2c: managers can assign tasks to other agents — the
       supervision-tier feature that distinguishes manager from
-      worker).
+      worker; ``tasks.assign`` is the manager-role bundle's marker).
     - worker token + no `target_agent_token` (Mode 0, file
       unassigned) → gated by `config_allow_worker_create_unassigned`
       (default true). Tags `arguments["_worker_created_by"]` so the
@@ -91,9 +94,7 @@ def _authorize_assign_task(
     - worker token + `target_agent_token != own token` → always
       rejected. Worker→worker delegation is operator/manager-only.
     """
-    is_admin_or_manager = (
-        principal.has_role("admin") or principal.has_role("manager")
-    )
+    is_admin_or_manager = principal.has_capability("tasks.assign")
     worker_id = (
         principal.agent_id if principal.kind == "agent_bearer" else None
     )
@@ -817,16 +818,15 @@ async def assign_task_tool_impl(
     target_agent_token = arguments.get("agent_token")
     target_agent_id_alias = arguments.get("agent_id")
 
-    # Wave 6 PR 4: derive permission flags from the typed Principal
-    # when present, falling back to verify_token for in-process
-    # callers that bypass the dispatcher. ``is_admin_request`` here
-    # admits both operator-tier callers AND manager-role agents —
-    # consistent with the legacy ``_authorize_assign_task`` matrix
-    # which already widens "admin" to include manager-role agents
-    # for the assign_task surface.
-    is_admin_request = (
-        principal.has_role("admin") or principal.has_role("manager")
-    )
+    # Wave 9 PR 3: ``is_admin_request`` admits the supervision-tier
+    # (operator-session / sysadmin / manager-role agent) via the
+    # ``tasks.assign`` capability — the cap is granted by both
+    # ``PROJECT_ROLE_BUNDLES["operator"]`` and
+    # ``AGENT_ROLE_BUNDLES["manager"]`` and short-circuited by the
+    # sysadmin wildcard. Workers (and viewer-tier operators) lack the
+    # cap and continue to fall through to the per-mode arbitration in
+    # ``_authorize_assign_task``.
+    is_admin_request = principal.has_capability("tasks.assign")
 
     # Admin-only `agent_id` alternative (Phase 7d). Resolves to the
     # agent's token server-side so admins can target an agent by their
@@ -1727,14 +1727,12 @@ async def update_task_status_tool_impl(
         "validate_dependencies", True
     )  # Validate dependency constraints
 
-    # Wave 6 PR 4: derive permission flags from the typed Principal.
-    # ``is_admin_request`` here admits operator-tier OR manager-role
-    # agents (preserves the admin harness's manager-bearer path AND
-    # widens admin-only fields to manager-role agents, consistent
-    # with `_authorize_assign_task` which already does this).
-    is_admin_request = (
-        principal.has_role("admin") or principal.has_role("manager")
-    )
+    # Wave 9 PR 3: ``is_admin_request`` admits the supervision-tier
+    # via ``tasks.assign`` (operator bundle + manager-role bundle +
+    # sysadmin wildcard). Worker-role agents (and viewer-tier
+    # operators) lack the cap and get the per-row ownership gate
+    # applied via ``_update_single_task``.
+    is_admin_request = principal.has_capability("tasks.assign")
     requesting_agent_id = (
         principal.agent_id or principal.user_id or "admin"
     )
@@ -2078,15 +2076,12 @@ async def view_tasks_tool_impl(
         "sort_by", "created_at"
     )  # Sort by: created_at, updated_at, priority, status
 
-    # Wave 6 PR 4: derive permission flags from the typed Principal.
-    # @requires("any") guarantees a valid agent token at the decorator
-    # layer; we still resolve the id + admin flag locally for the
-    # per-row filtering below (workers see only their own tasks unless
-    # filter_agent_id matches their id; admins see anyone's). Admins
-    # here include operator-tier callers AND manager-role agents.
-    is_admin_request = (
-        principal.has_role("admin") or principal.has_role("manager")
-    )
+    # Wave 9 PR 3: per-row filter sources ``is_admin_request`` from
+    # ``tasks.assign`` (supervision-tier marker shared by operator +
+    # manager-role bundles + sysadmin wildcard). Workers (and
+    # viewer-tier operators) lack the cap and see only the rows the
+    # ownership filter below admits.
+    is_admin_request = principal.has_capability("tasks.assign")
     requesting_agent_id = (
         principal.agent_id or principal.user_id or "admin"
     )
@@ -2605,12 +2600,12 @@ async def request_assistance_tool_impl(
     parent_task_id = arguments.get("task_id")  # Task ID needing assistance
     assistance_description = arguments.get("description")
 
-    # Wave 6 PR 4: derive permission flags from the typed Principal.
-    # @requires("any") guaranteed a valid agent token at the decorator
-    # layer; we resolve id locally for ownership checks below.
-    is_admin_request = (
-        principal.has_role("admin") or principal.has_role("manager")
-    )
+    # Wave 9 PR 3: ``is_admin_request`` admits the supervision-tier
+    # via ``tasks.assign`` (operator + manager-role bundles +
+    # sysadmin wildcard). The per-task ownership gate below admits
+    # the assignee always and admins/managers always; workers can
+    # only request assistance on tasks they own.
+    is_admin_request = principal.has_capability("tasks.assign")
     requesting_agent_id = (
         principal.agent_id or principal.user_id or "admin"
     )
@@ -2886,13 +2881,12 @@ async def bulk_task_operations_tool_impl(
     agent_auth_token = arguments.get("token")
     operations = arguments.get("operations", [])  # List of operation objects
 
-    # Wave 6 PR 4: derive permission flags from the typed Principal.
-    # @requires("any") guaranteed a valid agent token at the decorator
-    # layer; admin gets full control, workers are restricted per-op
-    # (own-task only) by the in-loop ownership check below.
-    is_admin_request = (
-        principal.has_role("admin") or principal.has_role("manager")
-    )
+    # Wave 9 PR 3: ``is_admin_request`` admits the supervision-tier
+    # via ``tasks.assign`` (operator + manager-role bundles +
+    # sysadmin wildcard). Workers (and viewer-tier operators) lack
+    # the cap and stay constrained by the per-op ownership check in
+    # the loop below.
+    is_admin_request = principal.has_capability("tasks.assign")
     requesting_agent_id = (
         principal.agent_id or principal.user_id or "admin"
     )
@@ -3176,12 +3170,12 @@ async def search_tasks_tool_impl(
     max_results = arguments.get("max_results", 20)
     include_notes = arguments.get("include_notes", True)
 
-    # Wave 6 PR 4: derive permission flags from the typed Principal.
-    # @requires("any") guaranteed entry; admin sees all tasks, workers
-    # only see their own (per-row filter below).
-    is_admin_request = (
-        principal.has_role("admin") or principal.has_role("manager")
-    )
+    # Wave 9 PR 3: per-row filter sources ``is_admin_request`` from
+    # ``tasks.assign`` (supervision-tier marker shared by operator +
+    # manager-role bundles + sysadmin wildcard). Workers (and
+    # viewer-tier operators) lack the cap and only see their own
+    # rows.
+    is_admin_request = principal.has_capability("tasks.assign")
     requesting_agent_id = (
         principal.agent_id or principal.user_id or "admin"
     )
