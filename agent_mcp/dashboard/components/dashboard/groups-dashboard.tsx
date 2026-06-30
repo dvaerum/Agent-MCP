@@ -35,8 +35,14 @@ import {
 import {
   routerGroupsUrl, routerGroupUrl,
   routerGroupMembersUrl, routerGroupMemberUrl,
+  routerGroupCapabilitiesUrl,
   routerUsersUrl,
 } from "@/lib/urls"
+import {
+  CAPABILITY_DESCRIPTIONS,
+  CAPABILITY_RESOURCE_LABELS,
+  groupCapabilitiesByResource,
+} from "@/lib/capability-descriptions"
 
 const STRICT_HEADERS = {
   Accept: "application/vnd.agent-mcp.v1+json",
@@ -98,6 +104,15 @@ async function fetchUsers(): Promise<UserRow[]> {
   })
   if (!r.ok) throw new Error(`HTTP ${r.status}`)
   return (await r.json()).users || []
+}
+
+async function fetchGroupCapabilities(groupId: string): Promise<string[]> {
+  const r = await fetch(routerGroupCapabilitiesUrl(groupId), {
+    headers: { Accept: STRICT_HEADERS.Accept },
+    credentials: "include",
+  })
+  if (!r.ok) throw new Error(`HTTP ${r.status}`)
+  return (await r.json()).capabilities || []
 }
 
 
@@ -378,6 +393,284 @@ function GroupCard({
               await onMembersChange()
             }}
           />
+          <GroupCapabilitiesSection
+            groupId={group.group_id}
+            groupName={group.name}
+          />
+        </div>
+      )}
+    </div>
+  )
+}
+
+
+// ── Capabilities (Wave 9 PR 5) ──────────────────────────────────────
+
+
+function GroupCapabilitiesSection({
+  groupId,
+  groupName,
+}: {
+  groupId: string
+  groupName: string
+}): React.ReactElement {
+  // Three load states:
+  //   * ``loaded``    GET succeeded → render the checklist.
+  //   * ``forbidden`` GET returned 403 → we are not sysadmin; show
+  //                   the read-only / disabled message (plan: "show
+  //                   but don't allow edit; tooltip 'requires sysadmin'").
+  //   * ``loading`` / ``error`` — transient banners.
+  const [loaded, setLoaded] = React.useState<string[] | null>(null)
+  const [selected, setSelected] = React.useState<Set<string>>(new Set())
+  const [loading, setLoading] = React.useState(true)
+  const [forbidden, setForbidden] = React.useState(false)
+  const [error, setError] = React.useState<string | null>(null)
+  const [saving, setSaving] = React.useState(false)
+  const [toast, setToast] = React.useState<string | null>(null)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    setForbidden(false)
+    setToast(null)
+    try {
+      const r = await fetch(routerGroupCapabilitiesUrl(groupId), {
+        headers: { Accept: STRICT_HEADERS.Accept },
+        credentials: "include",
+      })
+      if (r.status === 403) {
+        setForbidden(true)
+        setLoaded([])
+        setSelected(new Set())
+        return
+      }
+      if (!r.ok) {
+        const body = (await r.json().catch(() => ({}))) as ErrorResponse
+        throw new Error(body.message || `HTTP ${r.status}`)
+      }
+      const body = (await r.json()) as { capabilities?: string[] }
+      const caps = body.capabilities ?? []
+      setLoaded(caps)
+      setSelected(new Set(caps))
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLoading(false)
+    }
+  }, [groupId])
+
+  useEffect(() => {
+    void load()
+  }, [load])
+
+  const dirty = React.useMemo(() => {
+    if (loaded === null) return false
+    if (loaded.length !== selected.size) return true
+    for (const cap of loaded) {
+      if (!selected.has(cap)) return true
+    }
+    return false
+  }, [loaded, selected])
+
+  const toggleCap = (cap: string) => {
+    setSelected((cur) => {
+      const next = new Set(cur)
+      if (next.has(cap)) next.delete(cap)
+      else next.add(cap)
+      return next
+    })
+  }
+
+  const cancel = () => {
+    if (loaded !== null) {
+      setSelected(new Set(loaded))
+    }
+    setError(null)
+    setToast(null)
+  }
+
+  const save = async () => {
+    setSaving(true)
+    setError(null)
+    setToast(null)
+    try {
+      const r = await fetch(routerGroupCapabilitiesUrl(groupId), {
+        method: "PUT",
+        headers: STRICT_HEADERS,
+        credentials: "include",
+        body: JSON.stringify({ capabilities: [...selected] }),
+      })
+      if (r.status === 403) {
+        setForbidden(true)
+        throw new Error(
+          "requires sysadmin — group capabilities are sysadmin-only",
+        )
+      }
+      const body = (await r.json().catch(() => ({}))) as
+        | (ErrorResponse & { unknown?: string[] })
+        | { success: true; capabilities: string[] }
+      if (!r.ok || (body as ErrorResponse).success === false) {
+        throw new Error(
+          (body as ErrorResponse).message ||
+            (body as ErrorResponse).error ||
+            `HTTP ${r.status}`,
+        )
+      }
+      const newCaps = (body as { capabilities: string[] }).capabilities ?? []
+      setLoaded(newCaps)
+      setSelected(new Set(newCaps))
+      setToast(
+        `Saved — ${groupName} now has ${newCaps.length} capabilit${
+          newCaps.length === 1 ? "y" : "ies"
+        }`,
+      )
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const grouped = React.useMemo(() => {
+    // Render every KNOWN cap (sourced from the description registry —
+    // the build-time test ``capability-descriptions-complete`` keeps
+    // it in lockstep with ``core/capabilities.py::KNOWN_CAPABILITIES``).
+    // We bucket by resource so the UI matches the mental model
+    // operators have when reading the bundle table.
+    const allKnown = Object.keys(CAPABILITY_DESCRIPTIONS)
+    return groupCapabilitiesByResource(allKnown)
+  }, [])
+
+  return (
+    <div className="border-t pt-3 mt-3 space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="text-xs font-semibold text-muted-foreground uppercase flex items-center gap-2">
+          <Shield className="h-3 w-3" /> Capabilities
+        </div>
+        {dirty && !forbidden && (
+          <div className="flex items-center gap-1">
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={cancel}
+              disabled={saving}
+            >
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              onClick={save}
+              disabled={saving}
+            >
+              {saving && <Loader2 className="h-3 w-3 mr-1 animate-spin" />}
+              Save
+            </Button>
+          </div>
+        )}
+      </div>
+      <p className="text-xs text-muted-foreground italic">
+        Capabilities here are added on top of what each user&apos;s project
+        role already grants. To remove a baseline capability, change
+        PROJECT_ROLE_BUNDLES in source.
+      </p>
+      {loading && (
+        <div className="flex items-center gap-2 text-muted-foreground text-sm">
+          <Loader2 className="h-3 w-3 animate-spin" /> Loading capabilities…
+        </div>
+      )}
+      {error && (
+        <div className="text-destructive text-sm">{error}</div>
+      )}
+      {toast && (
+        <div className="text-green-700 dark:text-green-400 text-sm">
+          {toast}
+        </div>
+      )}
+      {forbidden && !loading && (
+        <div
+          className="text-sm text-muted-foreground bg-muted/40 rounded px-2 py-1"
+          title="requires sysadmin"
+        >
+          Requires sysadmin to view or edit capabilities for this group.
+        </div>
+      )}
+      {!loading && !forbidden && (
+        <div className="space-y-1">
+          {grouped.map(({ resource, caps }) => (
+            <CapabilityResourceSection
+              key={resource}
+              resource={resource}
+              caps={caps}
+              selected={selected}
+              disabled={saving}
+              onToggle={toggleCap}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+
+function CapabilityResourceSection({
+  resource,
+  caps,
+  selected,
+  disabled,
+  onToggle,
+}: {
+  resource: string
+  caps: string[]
+  selected: Set<string>
+  disabled: boolean
+  onToggle: (cap: string) => void
+}): React.ReactElement {
+  const [open, setOpen] = useState(true)
+  const label = CAPABILITY_RESOURCE_LABELS[resource] ?? resource
+  const onCount = caps.filter((c) => selected.has(c)).length
+  return (
+    <div className="border rounded bg-background">
+      <button
+        type="button"
+        className="w-full flex items-center justify-between px-2 py-1 text-left text-sm"
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span className="flex items-center gap-1 font-medium">
+          {open ? (
+            <ChevronDown className="h-3 w-3" />
+          ) : (
+            <ChevronRight className="h-3 w-3" />
+          )}
+          {label}
+        </span>
+        <Badge variant="secondary" className="text-xs">
+          {onCount} / {caps.length}
+        </Badge>
+      </button>
+      {open && (
+        <div className="px-3 py-2 space-y-1 border-t">
+          {caps.map((cap) => (
+            <label
+              key={cap}
+              className="flex items-start gap-2 text-xs cursor-pointer"
+              title={CAPABILITY_DESCRIPTIONS[cap]}
+            >
+              <input
+                type="checkbox"
+                checked={selected.has(cap)}
+                disabled={disabled}
+                onChange={() => onToggle(cap)}
+                className="mt-0.5"
+              />
+              <span className="flex-1">
+                <code className="font-mono text-[11px] mr-1">{cap}</code>
+                <span className="text-muted-foreground">
+                  {CAPABILITY_DESCRIPTIONS[cap]}
+                </span>
+              </span>
+            </label>
+          ))}
         </div>
       )}
     </div>

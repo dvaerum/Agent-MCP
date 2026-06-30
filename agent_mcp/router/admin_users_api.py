@@ -40,6 +40,14 @@ auto-increment PK — it's keyed on (project_name, user_id) or
 so callers can address either kind of row without an extra "is
 this a user or group row?" query param. The prefix is parsed in
 ``_split_membership_id``.
+
+Wave 9 PR 5 (prancy-napping-pie) adds two more group-scoped
+endpoints — ``GET`` / ``PUT`` ``/api/router/groups/<id>/capabilities``
+— that read and atomically replace the cap grants for a group.
+Both are sysadmin-gated (the cap
+``system.groups.capabilities.manage`` is exclusively in the
+sysadmin set per the Wave 9 bundle table). Unknown cap strings on
+``PUT`` fail closed with a 400 ``unknown_capability`` error.
 """
 
 from __future__ import annotations
@@ -1021,6 +1029,127 @@ async def change_project_membership_role_handler(
     return _success({"membership": out})
 
 
+async def list_group_capabilities_handler(
+    req: web.Request,
+) -> web.Response:
+    """``GET /agent-mcp/api/router/groups/<group_id>/capabilities``.
+
+    Wave 9 PR 5 — sysadmin-facing UI lists the capabilities currently
+    granted to ``<group_id>``. Reads through
+    :func:`agent_mcp.repositories.group_capability_repository.fetch`
+    so the wire shape matches what the resolver actually sees when it
+    rolls a Principal up to a capability set.
+
+    Response: ``{"success": true, "capabilities": ["tasks.create", ...]}``.
+    The list is alphabetically sorted to give the dashboard a stable
+    render order without needing a second sort pass on the client.
+    """
+    _ensure_wave1a_schema()
+    group_id = req.match_info["group_id"]
+    conn = _connect()
+    try:
+        existing = conn.execute(
+            "SELECT 1 FROM groups WHERE group_id = ?", (group_id,),
+        ).fetchone()
+        if existing is None:
+            return _error(
+                error=_ERROR_NOT_FOUND,
+                message=f"unknown group_id: {group_id!r}",
+                status=404,
+            )
+    finally:
+        conn.close()
+
+    from ..repositories import group_capability_repository as _gcap
+
+    caps = sorted(_gcap.fetch(group_id))
+    return _success({"capabilities": caps})
+
+
+async def replace_group_capabilities_handler(
+    req: web.Request,
+) -> web.Response:
+    """``PUT /agent-mcp/api/router/groups/<group_id>/capabilities``.
+
+    Wave 9 PR 5 — sysadmin sets the COMPLETE new cap list for the
+    group. Body shape: ``{"capabilities": ["tasks.create", ...]}``.
+    The handler validates every cap string is a member of
+    :data:`agent_mcp.core.capabilities.KNOWN_CAPABILITIES` BEFORE
+    touching the DB; unknown caps fail closed with a 400 carrying
+    the ``unknown_capability`` error code so the dashboard can
+    surface "this cap string isn't real, did you typo it?".
+
+    The replace is atomic (DELETE-then-INSERT inside one transaction
+    per :func:`group_capability_repository.replace`); a malformed
+    body never leaves the group in a half-written state.
+    """
+    _ensure_wave1a_schema()
+    group_id = req.match_info["group_id"]
+    conn = _connect()
+    try:
+        existing = conn.execute(
+            "SELECT 1 FROM groups WHERE group_id = ?", (group_id,),
+        ).fetchone()
+        if existing is None:
+            return _error(
+                error=_ERROR_NOT_FOUND,
+                message=f"unknown group_id: {group_id!r}",
+                status=404,
+            )
+    finally:
+        conn.close()
+
+    body = await _json_body(req)
+    raw_caps = body.get("capabilities")
+    if not isinstance(raw_caps, list):
+        return _error(
+            error=_ERROR_VALIDATION,
+            message="body must be {\"capabilities\": [...]} with a JSON array",
+            status=400,
+        )
+    # Validate types + drop duplicates (preserving caller order so the
+    # error message in the unknown-cap case quotes the first offender
+    # the operator typed).
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for entry in raw_caps:
+        if not isinstance(entry, str):
+            return _error(
+                error=_ERROR_VALIDATION,
+                message=(
+                    f"capabilities entries must be strings; got "
+                    f"{type(entry).__name__}"
+                ),
+                status=400,
+            )
+        if entry in seen:
+            continue
+        seen.add(entry)
+        ordered.append(entry)
+
+    from ..core.capabilities import KNOWN_CAPABILITIES
+
+    unknown = [c for c in ordered if c not in KNOWN_CAPABILITIES]
+    if unknown:
+        return _error(
+            error="unknown_capability",
+            message=(
+                f"unknown capability string(s): "
+                f"{', '.join(repr(c) for c in unknown)}"
+            ),
+            status=400,
+            extra={"unknown": unknown},
+        )
+
+    from ..repositories import group_capability_repository as _gcap
+
+    _gcap.replace(group_id, frozenset(ordered))
+    # Re-read so the response body matches what a subsequent GET would
+    # return (sorted, de-duped) — the dashboard uses this to confirm
+    # the round-trip.
+    return _success({"capabilities": sorted(_gcap.fetch(group_id))})
+
+
 async def delete_project_membership_handler(
     req: web.Request,
 ) -> web.Response:
@@ -1166,6 +1295,25 @@ def register_admin_users_routes(app: web.Application) -> None:
     app.router.add_delete(
         "/agent-mcp/api/router/groups/{group_id}/members/{member_id}",
         gated(groups_gate(remove_group_member_handler)),
+    )
+
+    # Group capabilities — Wave 9 PR 5
+    # Both GET and PUT are sysadmin-only. The capability gated is
+    # ``system.groups.capabilities.manage``; until Wave 9 PR 4 lands
+    # an aiohttp-shaped ``@requires_capability`` decorator (today the
+    # decorator lives on MCP tool entry points only), we use
+    # ``require_sysadmin`` — functionally equivalent because the cap
+    # ``system.groups.capabilities.manage`` is granted exclusively to
+    # sysadmins per the Wave 9 bundle table (it is NOT in
+    # ``PROJECT_ROLE_BUNDLES['operator']``). When PR 4 ships, swap
+    # both wrappers to ``@requires_capability("system.groups.capabilities.manage")``.
+    app.router.add_get(
+        "/agent-mcp/api/router/groups/{group_id}/capabilities",
+        gated(require_sysadmin(list_group_capabilities_handler)),
+    )
+    app.router.add_put(
+        "/agent-mcp/api/router/groups/{group_id}/capabilities",
+        gated(require_sysadmin(replace_group_capabilities_handler)),
     )
 
     # Project memberships
