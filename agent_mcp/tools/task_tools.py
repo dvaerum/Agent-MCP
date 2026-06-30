@@ -895,6 +895,14 @@ async def assign_task_tool_impl(
         "coordination_notes"
     )  # Optional coordination context
     estimated_hours = arguments.get("estimated_hours")  # Optional workload estimation
+    # VULN-004: explicit opt-in to apply validator-suggested
+    # parent_task / dependencies. Default False — when the validator
+    # returns suggestions, surface them as text instead of silently
+    # mutating the request. The validator's RAG corpus includes
+    # project_context entries any agent can write, so an
+    # attacker-poisoned entry could otherwise jailbreak the validator
+    # into rerouting a victim's task to an attacker-chosen parent.
+    accept_suggestions = bool(arguments.get("accept_suggestions", False))
 
     # Auth: admin can always call. Workers may call in a narrow set
     # of modes, each gated by its own per-project toggle. See
@@ -1187,7 +1195,11 @@ async def assign_task_tool_impl(
                 validation_result, parent_task_id_arg, depends_on_tasks_list
             )
 
-            # For denied status, block creation unless override is allowed
+            # For denied status, block creation unless override is allowed.
+            # This is an admin-tier kill switch — runs before the
+            # accept_suggestions opt-in, because an operator with
+            # ALLOW_RAG_OVERRIDE=False is telling the system "never
+            # apply a denied-status suggestion, period".
             if validation_result["status"] == "denied" and not ALLOW_RAG_OVERRIDE:
                 return PermissionDenied(
                     reason=(
@@ -1196,12 +1208,30 @@ async def assign_task_tool_impl(
                     )
                 )
 
-            # Process suggestions - always apply them unless explicitly overridden
             if validation_result["status"] != "approved":
-                validation_message = f"\nRAG Validation ({validation_result['status']}):\n{suggestion_message}\n"
-
-                # Apply suggestions by default (agent should see this behavior)
                 suggestions = validation_result["suggestions"]
+                if not accept_suggestions:
+                    # VULN-004: surface suggestions as text instead of
+                    # mutating the request. The validator's RAG corpus
+                    # can be poisoned via project_context entries, so
+                    # any LLM-driven suggestion must be the caller's
+                    # explicit decision — not an implicit auto-apply.
+                    return Invalid(
+                        field=None,
+                        message=(
+                            "Task placement validator suggests changes. "
+                            "Re-submit with accept_suggestions=true to "
+                            "apply them, or adjust your request based "
+                            f"on these suggestions:\n\n{suggestion_message}"
+                        ),
+                    )
+
+                # accept_suggestions=True: caller explicitly consented
+                # to apply the validator's suggested parent / deps.
+                validation_message = (
+                    f"\nRAG Validation ({validation_result['status']}):\n"
+                    f"{suggestion_message}\n"
+                )
                 if suggestions.get("parent_task") is not None:
                     final_parent_task_id = suggestions["parent_task"]
                     validation_message += (
@@ -1214,7 +1244,8 @@ async def assign_task_tool_impl(
                     )
 
                 logger.info(
-                    f"RAG suggestions automatically applied for task {new_task_id}"
+                    f"RAG suggestions applied (explicitly accepted) "
+                    f"for task {new_task_id}"
                 )
             else:
                 validation_message = "\n✓ RAG validation approved placement\n"
@@ -1462,6 +1493,11 @@ async def create_self_task_tool_impl(
     priority = arguments.get("priority", "medium")
     depends_on_tasks_list = arguments.get("depends_on_tasks")
     parent_task_id_arg = arguments.get("parent_task_id")
+    # VULN-004: explicit opt-in to apply validator-suggested
+    # parent_task / dependencies. See note in assign_task_tool_impl —
+    # same prompt-injection vector applies here (in fact more directly,
+    # since this is the agent-driven path).
+    accept_suggestions = bool(arguments.get("accept_suggestions", False))
 
     # @requires_capability("tasks.create") guarantees a valid caller
     # principal at the decorator layer; principal.agent_id is therefore
@@ -1556,7 +1592,8 @@ async def create_self_task_tool_impl(
                 validation_result, actual_parent_task_id, depends_on_tasks_list
             )
 
-            # Check for denial
+            # Check for denial — agent path always blocks; there is no
+            # ALLOW_RAG_OVERRIDE escape for self-task creation.
             if validation_result["status"] == "denied":
                 return PermissionDenied(
                     reason=(
@@ -1565,12 +1602,29 @@ async def create_self_task_tool_impl(
                     )
                 )
 
-            # Process validation results
             if validation_result["status"] != "approved":
-                validation_message = f"\nRAG Validation ({validation_result['status']}):\n{suggestion_message}\n"
-
-                # For agents, always accept suggestions automatically
                 suggestions = validation_result["suggestions"]
+                if not accept_suggestions:
+                    # VULN-004: surface suggestions as text instead of
+                    # mutating the request. The validator's RAG corpus
+                    # can be poisoned via project_context entries, so
+                    # any LLM-driven suggestion must be the caller's
+                    # explicit decision — not an implicit auto-apply.
+                    return Invalid(
+                        field=None,
+                        message=(
+                            "Task placement validator suggests changes. "
+                            "Re-submit with accept_suggestions=true to "
+                            "apply them, or adjust your request based "
+                            f"on these suggestions:\n\n{suggestion_message}"
+                        ),
+                    )
+
+                # accept_suggestions=True: caller explicitly consented.
+                validation_message = (
+                    f"\nRAG Validation ({validation_result['status']}):\n"
+                    f"{suggestion_message}\n"
+                )
                 if suggestions.get("parent_task") is not None:
                     final_parent_task_id = suggestions["parent_task"]
                     validation_message += (
@@ -1583,7 +1637,8 @@ async def create_self_task_tool_impl(
                     )
 
                 logger.info(
-                    f"Agent {requesting_agent_id} automatically accepted RAG suggestions"
+                    f"Agent {requesting_agent_id} explicitly accepted "
+                    f"RAG suggestions for task {new_task_id}"
                 )
 
                 # Check if escalation is needed
@@ -3567,6 +3622,19 @@ def register_task_tools():
                     "description": "Optional workload estimation in hours for capacity planning",
                 },
                 # RAG validation options
+                "accept_suggestions": {
+                    "type": "boolean",
+                    "description": (
+                        "When validator returns suggestions, auto-apply "
+                        "them. Default false: suggestions surface as text "
+                        "for caller to evaluate before re-submitting. "
+                        "VULN-004: this defaults to false because the "
+                        "validator's RAG corpus is writeable by any "
+                        "agent (via project_context), so silent "
+                        "auto-application is a prompt-injection vector."
+                    ),
+                    "default": False,
+                },
                 "override_rag": {
                     "type": "boolean",
                     "description": "Override RAG validation suggestions (optional, defaults to false - accepts suggestions)",
@@ -3616,6 +3684,19 @@ def register_task_tools():
                 "parent_task_id": {
                     "type": "string",
                     "description": "ID of the parent task (defaults to agent's current task if not specified, but MUST have a parent)",
+                },
+                "accept_suggestions": {
+                    "type": "boolean",
+                    "description": (
+                        "When validator returns suggestions, auto-apply "
+                        "them. Default false: suggestions surface as text "
+                        "for caller to evaluate before re-submitting. "
+                        "VULN-004: this defaults to false because the "
+                        "validator's RAG corpus is writeable by any "
+                        "agent (via project_context), so silent "
+                        "auto-application is a prompt-injection vector."
+                    ),
+                    "default": False,
                 },
             },
             "required": ["task_title", "task_description"],
