@@ -115,7 +115,15 @@ async def test_requires_any_allows_worker(reset_globals) -> None:
     from agent_mcp.core import globals as g
     from agent_mcp.core.authorize import requires
 
-    g.active_agents["worker-token"] = {"agent_id": "worker_a"}
+    # Wave 9 PR 1: the cap resolver reads ``agent_role`` from the
+    # cache row to pick the AGENT_ROLE_BUNDLES bundle. A row that
+    # omits the key resolves to an empty cap set, which would fail
+    # ``has_capability("mcp.connect")`` even though the test's intent
+    # is a healthy worker token.
+    g.active_agents["worker-token"] = {
+        "agent_id": "worker_a",
+        "agent_role": "worker",
+    }
 
     @requires("any")
     async def my_tool(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
