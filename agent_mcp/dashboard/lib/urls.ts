@@ -202,6 +202,12 @@ export function routerGroupMemberUrl(
   )
 }
 
+/** Per-group capability grants. ``GET`` returns the cap list;
+ *  ``PUT`` atomically replaces it (Wave 9 PR 5). Sysadmin-only. */
+export function routerGroupCapabilitiesUrl(groupId: string): string {
+  return `${ROUTER_API}/groups/${encodeURIComponent(groupId)}/capabilities`
+}
+
 /** Per-project memberships collection (``GET`` list, ``POST`` add). */
 export function projectMembershipsUrl(name: string): string {
   return `${ROUTER_PROJECTS}/${encodeURIComponent(name)}/memberships`
