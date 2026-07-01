@@ -902,7 +902,15 @@ async def assign_task_tool_impl(
     # project_context entries any agent can write, so an
     # attacker-poisoned entry could otherwise jailbreak the validator
     # into rerouting a victim's task to an attacker-chosen parent.
-    accept_suggestions = bool(arguments.get("accept_suggestions", False))
+    #
+    # Defense-in-depth (audit-A INFO-001): use ``is True`` rather than
+    # ``bool()`` so any non-True value — including the strings
+    # ``"true"``/``"false"`` and integer ``1`` — is rejected. Real MCP
+    # clients are protected by the registry's jsonschema validation
+    # (``"type": "boolean"``), but in-process callers that bypass the
+    # dispatcher would trip ``bool("false") == True`` otherwise.
+    _raw_accept = arguments.get("accept_suggestions", False)
+    accept_suggestions = _raw_accept is True
 
     # Auth: admin can always call. Workers may call in a narrow set
     # of modes, each gated by its own per-project toggle. See
@@ -1496,8 +1504,11 @@ async def create_self_task_tool_impl(
     # VULN-004: explicit opt-in to apply validator-suggested
     # parent_task / dependencies. See note in assign_task_tool_impl —
     # same prompt-injection vector applies here (in fact more directly,
-    # since this is the agent-driven path).
-    accept_suggestions = bool(arguments.get("accept_suggestions", False))
+    # since this is the agent-driven path). Defense-in-depth (audit-A
+    # INFO-001): use ``is True`` so non-True values from in-process
+    # callers that bypass the registry's jsonschema check are rejected.
+    _raw_accept = arguments.get("accept_suggestions", False)
+    accept_suggestions = _raw_accept is True
 
     # @requires_capability("tasks.create") guarantees a valid caller
     # principal at the decorator layer; principal.agent_id is therefore

@@ -25,6 +25,7 @@ because the routers genuinely share it.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Optional
 
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
@@ -280,12 +281,58 @@ def _build_route_principal(
 # ``Access-Control-Allow-Credentials: true`` makes any browser at any
 # origin able to issue credentialed requests, which lets a logged-in
 # operator be CSRF'd from an attacker-controlled page.
-ALLOWED_ORIGINS: frozenset[str] = frozenset({
+_DEFAULT_ALLOWED_ORIGINS: frozenset[str] = frozenset({
     'http://localhost:3847',
     'http://127.0.0.1:3847',
     'http://localhost:3000',
     'http://localhost:3001',
 })
+
+
+def _load_extra_origins() -> frozenset[str]:
+    """Read ``MCP_DASHBOARD_EXTRA_ORIGINS`` and return the parsed set.
+
+    Audit-A INFO-003 (2026-06-30): operators serving the dashboard
+    behind a reverse proxy (tailnet, custom domain) need a way to
+    extend the CORS allowlist without editing the source. The env-var
+    accepts a comma-separated list of full origins (scheme included):
+
+        MCP_DASHBOARD_EXTRA_ORIGINS="https://dashboard.example.com,\
+        https://ops.internal"
+
+    Explicit ``'*'`` is rejected at load time — the whole point of the
+    VULN-001 fix was that ``allow_credentials=True`` paired with a
+    wildcard is CSRF-shaped. Refusing the wildcard here prevents an
+    operator hitting a CORS error under pressure and "fixing" it by
+    setting the env-var to ``*``.
+
+    Missing scheme is also rejected (``evil.com`` → ValueError). Full
+    origins have to be spelled out so there's no ambiguity between
+    matching ``http://evil.com`` and ``https://evil.com``.
+    """
+    raw = os.environ.get("MCP_DASHBOARD_EXTRA_ORIGINS", "")
+    if not raw:
+        return frozenset()
+    origins = frozenset(o.strip() for o in raw.split(",") if o.strip())
+    for origin in origins:
+        if origin == "*":
+            raise ValueError(
+                "MCP_DASHBOARD_EXTRA_ORIGINS does not accept '*' — "
+                "wildcard CORS with credentials is a security "
+                "vulnerability (VULN-001). List explicit origins "
+                "instead."
+            )
+        if not (origin.startswith("http://") or origin.startswith("https://")):
+            raise ValueError(
+                f"MCP_DASHBOARD_EXTRA_ORIGINS entry {origin!r} must be "
+                "a full origin including scheme (http:// or https://)."
+            )
+    return origins
+
+
+ALLOWED_ORIGINS: frozenset[str] = (
+    _DEFAULT_ALLOWED_ORIGINS | _load_extra_origins()
+)
 
 
 async def handle_options(request: Request) -> Response:

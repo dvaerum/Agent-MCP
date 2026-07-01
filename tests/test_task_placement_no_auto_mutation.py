@@ -423,3 +423,182 @@ async def test_create_self_task_with_accept_suggestions_applies_them(
         assert attacker_target_id in deps, (
             f"expected suggested dependency to be applied; got {deps}"
         )
+
+
+# --- Defense-in-depth: `is True` rejects non-True truthy values ------------
+#
+# INFO-001 (audit-A, 2026-06-30 follow-up): real MCP clients are
+# protected by the registry's jsonschema check (``"type": "boolean"``),
+# which coerces ``"true"``/``"false"``/``1``/``0`` to a bool before the
+# impl runs — so ``bool()`` at the impl seam is defensively equivalent
+# for wire callers.
+#
+# The gap is in-process callers that skip the dispatcher (custom
+# scripts, migrations, integration harnesses that reach around the
+# registry). ``bool("false") is True`` in Python: a legacy consumer
+# passing a stringified ``"false"`` would silently opt in. The fix
+# uses ``arguments.get("accept_suggestions", False) is True`` — the
+# comparison admits only the actual singleton, so string/int/None/
+# any truthy object all coerce to False (i.e. no consent).
+#
+# These tests hit the impl directly (bypassing the schema check) with
+# the "true"/1 shapes an in-process caller might pass and assert the
+# mutation is NOT applied.
+
+
+async def test_assign_task_impl_rejects_string_accept_suggestions(
+    tmp_path, monkeypatch,
+) -> None:
+    """Calling the impl directly with ``accept_suggestions="true"``
+    (string, not bool) must NOT apply validator suggestions —
+    ``is True`` correctly rejects the string.
+
+    Real MCP clients hit the jsonschema gate first so they never see
+    this path, but in-process callers can bypass the dispatcher; this
+    pins the defense-in-depth behaviour at the impl seam.
+    """
+    from agent_mcp.tools.task_tools import assign_task_tool_impl
+
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        legit_parent_id, attacker_target_id = await _seed_two_tasks(
+            admin, alice.token
+        )
+
+        monkeypatch.setattr(
+            "agent_mcp.tools.task_tools.validate_task_placement",
+            _make_validator_mock(
+                suggested_parent=attacker_target_id,
+                suggested_deps=[attacker_target_id],
+                status="suggest_changes",
+            ),
+        )
+
+        bob = await admin.create_worker("bob")
+        victim_title = "victim task with string 'true' consent"
+        result = await assign_task_tool_impl(
+            {
+                "token": admin.admin_token,
+                "agent_token": bob.token,
+                "task_title": victim_title,
+                "task_description": "in-process caller passed string 'true'",
+                "parent_task_id": legit_parent_id,
+                # A string — NOT the True singleton. ``bool("true")``
+                # is True, but the impl uses ``is True`` so the string
+                # is rejected and no consent is inferred.
+                "accept_suggestions": "true",
+            },
+        )
+
+        # Result must NOT be Ok (that would mean the mutation happened);
+        # extract text from whichever typed variant we got.
+        text = getattr(result, "message", None) or (
+            result[0].text if isinstance(result, list) else str(result)
+        )
+
+        # Response should surface the opt-in hint (same as default
+        # unopted path) — because the string is treated as no consent.
+        assert "accept_suggestions=true" in text, (
+            f"impl should treat string 'true' as no-consent; got: {text}"
+        )
+
+        # And no task must have been persisted with the attacker's
+        # suggested parent.
+        from agent_mcp.db.connection import get_db_connection
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM tasks WHERE title = ?",
+                (victim_title,),
+            )
+            n_victim = cur.fetchone()["n"]
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM tasks WHERE parent_task = ?",
+                (attacker_target_id,),
+            )
+            n_under_attacker = cur.fetchone()["n"]
+        finally:
+            conn.close()
+        assert n_victim == 0, (
+            "in-process caller passing accept_suggestions='true' "
+            "(string) must NOT trigger the mutation — the impl's "
+            "`is True` guard is what enforces this; "
+            f"found {n_victim} rows"
+        )
+        assert n_under_attacker == 0, (
+            f"no task should have been silently re-parented under the "
+            f"attacker's target ({attacker_target_id}) via string "
+            f"consent; found {n_under_attacker} rows"
+        )
+
+
+async def test_create_self_task_impl_rejects_int_accept_suggestions(
+    tmp_path, monkeypatch,
+) -> None:
+    """Same guarantee on the agent self-task path: integer ``1``
+    (or any non-True truthy value) must NOT be treated as consent.
+    """
+    from agent_mcp.tools.task_tools import create_self_task_tool_impl
+
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        legit_parent_id, attacker_target_id = await _seed_two_tasks(
+            admin, alice.token
+        )
+
+        monkeypatch.setattr(
+            "agent_mcp.tools.task_tools.validate_task_placement",
+            _make_validator_mock(
+                suggested_parent=attacker_target_id,
+                suggested_deps=[attacker_target_id],
+                status="suggest_changes",
+            ),
+        )
+
+        victim_title = "alice self-task with int 1 consent"
+        result = await create_self_task_tool_impl(
+            {
+                "token": alice.token,
+                "task_title": victim_title,
+                "task_description": "in-process caller passed int 1",
+                "parent_task_id": legit_parent_id,
+                # Integer ``1`` is truthy under ``bool()`` but is
+                # not the True singleton — ``is True`` rejects it.
+                "accept_suggestions": 1,
+            },
+        )
+
+        text = getattr(result, "message", None) or (
+            result[0].text if isinstance(result, list) else str(result)
+        )
+        assert "accept_suggestions=true" in text, (
+            f"impl should treat int 1 as no-consent; got: {text}"
+        )
+
+        from agent_mcp.db.connection import get_db_connection
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM tasks WHERE title = ?",
+                (victim_title,),
+            )
+            n_victim = cur.fetchone()["n"]
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM tasks WHERE parent_task = ?",
+                (attacker_target_id,),
+            )
+            n_under_attacker = cur.fetchone()["n"]
+        finally:
+            conn.close()
+        assert n_victim == 0, (
+            "in-process caller passing accept_suggestions=1 (int) "
+            "must NOT trigger the mutation; "
+            f"found {n_victim} rows"
+        )
+        assert n_under_attacker == 0, (
+            f"self-task path must NOT silently re-parent under "
+            f"attacker choice ({attacker_target_id}) via int consent; "
+            f"found {n_under_attacker} rows"
+        )
