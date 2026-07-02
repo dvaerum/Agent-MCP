@@ -221,12 +221,15 @@ def _build_principal_from_request(
 
     * If the signed forwarding header verified, the caller is an
       operator who arrived via the router. Build a
-      ``forwarding_header`` Principal naming that operator. We do
-      NOT resolve the operator's project role here — the per-project
-      backend has no router.db handle, so the project-role gate
-      remains the router middleware's job. ``project_role`` is None;
-      the in-process ``has_role`` check uses ``kind`` for the
-      operator-tier admit.
+      ``forwarding_header`` Principal naming that operator. The
+      per-project backend has no router.db handle, so group-cap
+      overlays don't apply here — but the operator still carries
+      ``project_role="operator"`` so :func:`resolve_capabilities`
+      back-fills the operator bundle and ``has_capability`` admits
+      the operator-tier caps (parity with the REST path in
+      ``routers/agents.py``). Wave 9 PR 6 deleted the legacy
+      ``has_role`` bridge, so the capability set — not ``kind`` — is
+      now what gates admin tools and tool visibility.
     * If a per-agent bearer authenticated, build an ``agent_bearer``
       Principal sourcing ``agent_id`` + ``agent_role`` from the
       agents table (via the in-memory cache). ``can_wake_loop``
@@ -251,12 +254,23 @@ def _build_principal_from_request(
             # has already resolved + admitted the operator via the
             # cookie path, so the forwarding-header Principal here is
             # purely the in-process restatement of that admit.
+            #
+            # project_role="operator" back-fills the operator bundle
+            # (agents.register / terminate, system.config.write, …). It
+            # is required, not optional: has_capability's project-
+            # membership gate rejects every non-system cap when
+            # project_role is None, and resolve_capabilities only unions
+            # PROJECT_ROLE_BUNDLES[project_role] when it's set — so
+            # without it a cookie operator has zero caps over the MCP
+            # wire. Mirrors the REST path (routers/agents.py), which
+            # hard-codes project_role="operator" for the identical
+            # cookie-operator admin action.
             caps = resolve_capabilities(
                 user_id=forwarding_operator,
                 agent_id=None,
                 sysadmin=False,
                 agent_role=None,
-                project_role=None,
+                project_role="operator",
                 kind="forwarding_header",
             )
             return Principal(
@@ -265,7 +279,7 @@ def _build_principal_from_request(
                 agent_id=None,
                 sysadmin=False,
                 project_name=None,
-                project_role=None,
+                project_role="operator",
                 agent_role=None,
                 can_wake_loop=False,
                 source_token=None,
