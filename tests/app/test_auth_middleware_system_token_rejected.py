@@ -108,7 +108,12 @@ async def test_api_route_accepts_signed_forwarding_header(tmp_path) -> None:
         )
         headers = _sign_header("alice", g.forwarding_hmac_key)
 
-        r = admin.client.get("/api/tokens", headers=headers)
+        # Probe an operator-gated GET that still returns 200 for the
+        # forwarding path. (``/api/tokens`` now 403s a forwarding caller
+        # per the token-disclosure fix — a forwarding caller's tier is
+        # unverifiable in the backend — so it no longer works as a
+        # "did auth pass?" 200-probe.)
+        r = admin.client.get("/api/all-data", headers=headers)
         assert r.status_code == 200, r.text
 
 

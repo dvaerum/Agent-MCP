@@ -19,24 +19,27 @@ pytestmark = pytest.mark.asyncio
 
 
 async def test_app_starts(tmp_path) -> None:
-    """create_app() + lifespan startup + a basic GET to /api/tokens.
+    """create_app() + lifespan startup + a basic GET to /api/all-data.
 
-    Wave 1 of prancy-napping-pie put ``/api/tokens`` behind
-    ``require_operator_session``. retire-system-token Wave 1 removed
-    the legacy admin-bearer fallback from that dep; the surviving
-    auth surfaces are (a) operator-session cookie and (b) signed
-    forwarding header. The harness's ``admin.get`` helper attaches a
-    signed forwarding header on every call, so the smoke test still
-    verifies end-to-end boot + a real handler.
+    Wave 1 of prancy-napping-pie put the operator-gated GET routes
+    behind ``require_operator_session``; the surviving auth surfaces
+    are (a) operator-session cookie and (b) signed forwarding header.
+    The harness's ``admin.get`` helper attaches a signed forwarding
+    header on every call, so the smoke test verifies end-to-end boot
+    + a real operator-gated handler.
 
-    Wave 3 (prancy-napping-pie) dropped the ``admin_token`` field
-    from the response; only ``agent_tokens`` remains.
+    The probe endpoint used to be ``/api/tokens``, but the token-
+    disclosure fix (2026-07) restricts that endpoint to CONFIRMED
+    operator-tier bearers (a forwarding/session caller's tier is
+    unverifiable in the backend and could be a viewer). ``/api/all-data``
+    still returns 200 for the forwarding path, so it is the right
+    boot-smoke probe now.
     """
     async with mcp_session(tmp_path) as admin:
-        response = admin.get("/api/tokens")
+        response = admin.get("/api/all-data")
 
         assert response.status_code == 200, response.text
 
         payload = response.json()
-        assert "agent_tokens" in payload
-        assert isinstance(payload["agent_tokens"], list)
+        assert "agents" in payload
+        assert isinstance(payload["agents"], list)

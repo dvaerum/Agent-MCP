@@ -24,6 +24,7 @@ from starlette.requests import Request
 
 from .._dispatch_helpers import handle_options
 from ..deps import require_operator_session
+from .composition import is_confirmed_operator_tier
 from ...core.config import logger
 from ...core import globals as g
 
@@ -66,6 +67,26 @@ async def tokens_api_route(
     """
     if request.method == 'OPTIONS':
         return await handle_options(request)
+    # SECURITY: this endpoint returns the full agent bearer-token list.
+    # ``require_operator_session`` admits viewer-tier operators via the
+    # cookie/forwarding path on GET (the router only gates mutations on
+    # tier, and the backend cannot resolve the caller's project role),
+    # so a read-only viewer could otherwise harvest every agent's bearer
+    # and replay it to escalate to write. Only a CONFIRMED operator-tier
+    # bearer may read the list; everything else gets 403. See
+    # ``is_confirmed_operator_tier``.
+    if not is_confirmed_operator_tier(auth):
+        return JSONResponse(
+            {
+                "error": "forbidden",
+                "message": (
+                    "Agent bearer tokens are operator-tier only. Use an "
+                    "operator-tier bearer (agent CLI / admin script) to "
+                    "read this endpoint."
+                ),
+            },
+            status_code=403,
+        )
     try:
         agent_tokens_list = []
         for token, data in g.active_agents.items():

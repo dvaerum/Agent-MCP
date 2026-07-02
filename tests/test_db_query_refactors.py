@@ -121,12 +121,22 @@ async def test_all_data_attaches_auth_token_to_every_known_agent(
 
     The dict-based optimization mustn't drop the side effect — we
     verify it for at least one created worker.
+
+    Token-disclosure fix (2026-07): per-agent ``auth_token`` is now
+    only attached for CONFIRMED operator-tier callers (the operator-
+    bearer path), never the forwarding/session path (whose tier is
+    unverifiable in the backend and could be a viewer). So this test
+    exercises the operator-bearer path — the O(1) dict-lookup side
+    effect still applies there.
     """
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
         await admin.create_worker("bob")
 
-        resp = admin.get("/api/all-data")
+        resp = admin.client.get(
+            "/api/all-data",
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
         assert resp.status_code == 200
         agents = resp.json()["agents"]
 
