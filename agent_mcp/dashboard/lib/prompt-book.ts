@@ -29,6 +29,17 @@ export interface PromptTemplate {
     description: string
     placeholder: string
     required: boolean
+    // Optional UX-01 picker hints. Absent ⇒ plain <Input> (the
+    // historical behavior — fully backward compatible with catalog
+    // entries and localStorage custom prompts that predate this).
+    //   source: bind the variable to a live entity picker. 'agent'
+    //     renders <AgentSelect>; 'agent-token' auto-fills from the
+    //     chosen sibling agent's token; 'task' reserved for a future
+    //     task picker.
+    //   type:'enum' + options: render a fixed-choice <Select>.
+    source?: 'agent' | 'agent-token' | 'task'
+    type?: 'enum'
+    options?: string[]
   }>
   usage: string
   examples?: string[]
