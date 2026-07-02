@@ -95,6 +95,7 @@ Configuration (all via environment variables):
 
 import asyncio
 import contextlib
+import ipaddress
 import json
 import logging
 import os
@@ -1771,6 +1772,112 @@ async def _init_router_identity_on_startup(app: web.Application) -> None:
     init_router_db()
 
 
+# ── Fail-closed startup guards (deployment-contract enforcement) ────
+
+
+def _resolve_bind_host() -> str:
+    """Return the host the router will bind, mirroring the entrypoints.
+
+    Both ``main()`` and the CLI's ``router_cmd`` resolve the bind host
+    from ``AGENT_MCP_ROUTER_HOST`` (default ``127.0.0.1``). ``make_app``
+    reads the SAME env var so the fail-closed guard sees exactly what
+    ``web.run_app`` will bind, regardless of which entrypoint built the
+    app.
+    """
+    return os.environ.get("AGENT_MCP_ROUTER_HOST", "127.0.0.1").strip()
+
+
+def _host_is_loopback(host: str) -> bool:
+    """True iff ``host`` binds only the loopback interface (or a UDS).
+
+    An empty host / a unix-socket path (``unix:...`` or an absolute
+    path) is treated as loopback-equivalent — it isn't a network
+    listener. A hostname that isn't a bare IP (e.g. ``localhost``) is
+    resolved conservatively: only the literal ``localhost`` counts.
+    """
+    if not host:
+        return True
+    if host.startswith("unix:") or host.startswith("/"):
+        return True
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        # Not a bare IP and not a known loopback name — treat as a
+        # network bind (fail-closed: better to refuse than to assume
+        # a hostname is loopback).
+        return False
+
+
+def _env_truthy(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _assert_startup_safe(single_tenant_name: str | None) -> None:
+    """Refuse to start on an unsafe bind + mode combination.
+
+    Two landmines the internet-hardening audit flagged:
+
+      1. Single-tenant mode (ADR-0008) disables ALL operator-session
+         auth under ``/agent-mcp`` — the whole surface is open. That is
+         safe ONLY on a loopback / UDS bind fronted by a trusted proxy.
+         Binding a public interface in single-tenant mode publishes an
+         unauthenticated admin dashboard, so we refuse to start.
+
+         Escape hatch for known-isolated non-loopback binds (e.g. a
+         qemu user-mode guest where ``0.0.0.0`` is reachable only via
+         host port-forwarding): ``AGENT_MCP_ALLOW_INSECURE_BIND=1``.
+
+      2. Secure-cookie enforcement. When
+         ``AGENT_MCP_REQUIRE_SECURE_COOKIES`` is set the cookie helpers
+         fail closed (always ``Secure``). If instead the bind is
+         non-loopback with NEITHER that flag NOR an HTTPS external URL,
+         we emit a loud warning (not a refusal — plain-HTTP behind a
+         TLS-terminating proxy is a legitimate shape).
+    """
+    host = _resolve_bind_host()
+    loopback = _host_is_loopback(host)
+    allow_insecure = _env_truthy(
+        os.environ.get("AGENT_MCP_ALLOW_INSECURE_BIND")
+    )
+
+    if single_tenant_name is not None and not loopback and not allow_insecure:
+        raise RuntimeError(
+            "Refusing to start: single-tenant mode disables operator "
+            f"authentication, but the router is binding a non-loopback "
+            f"host ({host!r}). This would publish an unauthenticated "
+            "admin dashboard to the network. Fix one of:\n"
+            "  * bind loopback (unset AGENT_MCP_ROUTER_HOST or set it "
+            "to 127.0.0.1) and front the router with a trusted "
+            "reverse proxy, OR\n"
+            "  * run in multi-tenant mode (drop --single-tenant) so "
+            "the operator-session gate is enforced, OR\n"
+            "  * if this bind is genuinely isolated (e.g. a qemu guest "
+            "reachable only via host port-forwarding), set "
+            "AGENT_MCP_ALLOW_INSECURE_BIND=1 to acknowledge the risk."
+        )
+
+    if not loopback:
+        require_secure = _env_truthy(
+            os.environ.get("AGENT_MCP_REQUIRE_SECURE_COOKIES")
+        )
+        external_url = os.environ.get("AGENT_MCP_EXTERNAL_URL", "")
+        https_signal = external_url.lower().startswith("https://")
+        if not require_secure and not https_signal:
+            log.warning(
+                "Router is binding a non-loopback host (%r) with no TLS "
+                "signal: AGENT_MCP_REQUIRE_SECURE_COOKIES is unset and "
+                "AGENT_MCP_EXTERNAL_URL is not https. Session cookies "
+                "will be set WITHOUT the Secure flag. If this deploy is "
+                "internet-facing, terminate TLS upstream and set "
+                "AGENT_MCP_REQUIRE_SECURE_COOKIES=1.",
+                host,
+            )
+
+
 def make_app(
     *,
     single_tenant_name: str | None = None,
@@ -1809,17 +1916,38 @@ def make_app(
     from .login import register_login_routes
     from .setup_wizard import register_setup_routes
     from .auth_middleware import require_operator_session_middleware
+    from .security_headers import security_headers_middleware
+    from . import rate_limit
 
-    # Middleware order matters: empty-users-redirect fires FIRST so a
-    # fresh deploy with no operator account 303s to /setup before the
-    # session-cookie gate has anything to gate. Once an operator
-    # exists, the redirect middleware no-ops and the session gate
-    # takes over.
+    # Fail-closed deployment-contract guards. These raise at
+    # construction time (which aborts startup) when the resolved bind
+    # host + mode combination would expose an auth-disabled surface to
+    # the network. See ``_assert_startup_safe``.
+    _assert_startup_safe(single_tenant_name)
+
+    # Middleware order matters (outermost first):
+    #   1. security-headers — wraps everything so even 429/401/redirect
+    #      responses carry the headers.
+    #   2. rate-limit — reject floods BEFORE the argon2 verify / auth
+    #      work runs.
+    #   3. empty-users-redirect — a fresh deploy with no operator
+    #      account 303s to /setup before the session gate.
+    #   4. session gate — the operator-session enforcement.
     app = web.Application(
         middlewares=[
+            security_headers_middleware,
+            rate_limit.rate_limit_middleware,
             empty_users_redirect_middleware,
             require_operator_session_middleware,
         ],
+    )
+    # Load rate-limit config + limiter instances onto the app. The
+    # middleware (in the list above) reads them at request time.
+    _rl_cfg = rate_limit.attach(app)
+    log.info(
+        "rate limiting: enabled=%s auth=%d/%ds global=%d/%ds",
+        _rl_cfg.enabled, _rl_cfg.auth_max, _rl_cfg.auth_window,
+        _rl_cfg.global_max, _rl_cfg.global_window,
     )
     # Eagerly allocate the proxy-task tracking set so `_track_proxy_task`
     # never writes to a frozen/started app dict (aiohttp emits a

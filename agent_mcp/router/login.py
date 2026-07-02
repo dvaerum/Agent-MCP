@@ -44,6 +44,7 @@ added. Detection via ``X-Forwarded-Proto`` first, then
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -87,18 +88,41 @@ def _render(template: str, **ctx: Any) -> str:
 # ── Cookie helpers ─────────────────────────────────────────────────
 
 
-def cookie_secure_flag(request: web.Request) -> bool:
-    """Return True iff the request arrived over HTTPS.
+def _require_secure_cookies() -> bool:
+    """True iff the deployment demands ``Secure`` cookies unconditionally.
 
-    Honours ``X-Forwarded-Proto`` first — production deploys terminate
-    TLS at nginx / tailscale and forward plain HTTP to the router via
-    a Unix socket / loopback. Falls back to ``request.url.scheme`` so
-    a direct HTTPS hit (no proxy) also gets the flag.
+    Set ``AGENT_MCP_REQUIRE_SECURE_COOKIES=1`` on an internet-facing
+    deploy: the cookie helpers then fail closed, always marking the
+    session cookie ``Secure`` regardless of the request's apparent
+    scheme. Over plain HTTP the browser will simply refuse to store /
+    send the cookie — which is the point: a non-secure session cookie
+    must never be issued when this flag is on.
+    """
+    value = os.environ.get("AGENT_MCP_REQUIRE_SECURE_COOKIES")
+    if value is None:
+        return False
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def cookie_secure_flag(request: web.Request) -> bool:
+    """Return True iff the session cookie should carry ``Secure``.
+
+    Fail-closed override first: when
+    ``AGENT_MCP_REQUIRE_SECURE_COOKIES`` is set the flag is always
+    True (see ``_require_secure_cookies``).
+
+    Otherwise honours ``X-Forwarded-Proto`` first — production deploys
+    terminate TLS at nginx / tailscale and forward plain HTTP to the
+    router via a Unix socket / loopback. Falls back to
+    ``request.url.scheme`` so a direct HTTPS hit (no proxy) also gets
+    the flag.
 
     Defaults to False so the plain-HTTP VM smoke + local-dev flows
     can still set the cookie; the operator-facing production deploy
-    always sets the forwarded-proto header.
+    always sets the forwarded-proto header (or the require-secure flag).
     """
+    if _require_secure_cookies():
+        return True
     forwarded = request.headers.get("X-Forwarded-Proto", "").lower()
     if forwarded == "https":
         return True

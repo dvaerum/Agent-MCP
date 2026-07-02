@@ -91,6 +91,12 @@ pkgs.testers.nixosTest {
         AGENT_MCP_DEFAULT_WORKSPACE = "/home/testuser/projects";
         AGENT_MCP_ROUTER_PORT = toString ports.routerPort;
         AGENT_MCP_ROUTER_HOST = "0.0.0.0";
+        # Single-tenant mode disables operator-session auth, so the
+        # internet-hardening startup guard refuses a non-loopback bind
+        # by default. This 0.0.0.0 bind is safe here: qemu user-mode
+        # networking makes the guest reachable ONLY via host port-
+        # forwarding, never from a real network. Acknowledge that.
+        AGENT_MCP_ALLOW_INSECURE_BIND = "1";
         AGENT_MCP_IDLE_SEC = "14400";
         AGENT_MCP_README_HTML = "${packagedPkgs.readmeHtml}";
         AGENT_MCP_INSTALLER_TEMPLATE = "${packagedPkgs.installerTemplate}";

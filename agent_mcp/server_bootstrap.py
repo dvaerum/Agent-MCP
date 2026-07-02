@@ -545,7 +545,16 @@ async def _run_sse(config: ServerConfig, app: Any, tui_active: bool) -> None:
     if config.uds:
         uvicorn_kwargs["uds"] = config.uds
     else:
-        uvicorn_kwargs["host"] = "0.0.0.0"
+        # Bind loopback by default. The router↔backend proxy always
+        # talks to the backend over its Unix socket (the ``config.uds``
+        # branch above; see ``router/app.py::_ensure`` +
+        # ``_proxy_to_backend``), so the TCP listener is only for
+        # direct/standalone use and has no reason to be
+        # internet-reachable. Operators who genuinely need an external
+        # TCP bind opt in via ``AGENT_MCP_MCP_HOST`` (mirrors the
+        # router's ``AGENT_MCP_ROUTER_HOST`` env-override pattern).
+        host = os.environ.get("AGENT_MCP_MCP_HOST", "127.0.0.1")
+        uvicorn_kwargs["host"] = host
         uvicorn_kwargs["port"] = config.port
     uvicorn_config = uvicorn.Config(app, **uvicorn_kwargs)
     server = uvicorn.Server(uvicorn_config)
@@ -563,7 +572,9 @@ async def _run_sse(config: ServerConfig, app: Any, tui_active: bool) -> None:
 
             logger.info(
                 "Starting Uvicorn server for SSE transport on %s.",
-                f"uds {config.uds}" if config.uds else f"http://0.0.0.0:{config.port}",
+                f"uds {config.uds}"
+                if config.uds
+                else f"http://{uvicorn_kwargs['host']}:{config.port}",
             )
             logger.info("Press Ctrl+C to shut down the server gracefully.")
 

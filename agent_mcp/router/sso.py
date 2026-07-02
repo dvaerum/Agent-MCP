@@ -834,7 +834,18 @@ async def init_oidc_login_handler(request: web.Request) -> web.StreamResponse:
 
 def _cookie_secure_flag(request: web.Request) -> bool:
     """Same heuristic as ``login.cookie_secure_flag`` — kept local so
-    this module doesn't take a hard import on the login submodule."""
+    this module doesn't take a hard import on the login submodule.
+
+    Includes the same fail-closed override: when
+    ``AGENT_MCP_REQUIRE_SECURE_COOKIES`` is set the flag is always
+    True so no SSO session / flow cookie is ever issued without
+    ``Secure``.
+    """
+    require = os.environ.get("AGENT_MCP_REQUIRE_SECURE_COOKIES")
+    if require is not None and require.strip().lower() in (
+        "1", "true", "yes", "on",
+    ):
+        return True
     forwarded = request.headers.get("X-Forwarded-Proto", "").lower()
     if forwarded == "https":
         return True
