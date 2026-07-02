@@ -39,6 +39,11 @@ const STRICT_HEADERS = {
   "Content-Type": "application/json",
 }
 
+// Mirrors the router's `_PASSWORD_MIN_LENGTH` (admin_users_api.py). Kept
+// in sync so the client rejects too-short passwords with a clear inline
+// hint instead of letting the server return an opaque 400.
+const PASSWORD_MIN_LENGTH = 8
+
 interface UserRow {
   user_id: string
   username: string
@@ -225,6 +230,9 @@ function AddUserModal({
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  const passwordTooShort =
+    password.length > 0 && password.length < PASSWORD_MIN_LENGTH
+
   const reset = () => {
     setUsername("")
     setPassword("")
@@ -303,8 +311,15 @@ function AddUserModal({
                 type="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
+                minLength={PASSWORD_MIN_LENGTH}
+                aria-invalid={passwordTooShort}
                 required
               />
+              {passwordTooShort && (
+                <p className="text-xs text-destructive">
+                  Password must be at least {PASSWORD_MIN_LENGTH} characters.
+                </p>
+              )}
             </div>
             <div className="space-y-2">
               <Label htmlFor="add-user-email">Email (optional)</Label>
@@ -337,7 +352,10 @@ function AddUserModal({
             >
               Cancel
             </Button>
-            <Button type="submit" disabled={submitting}>
+            <Button
+              type="submit"
+              disabled={submitting || password.length < PASSWORD_MIN_LENGTH}
+            >
               {submitting && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}
               Create
             </Button>
@@ -458,8 +476,15 @@ function DeleteUserModal({
 }): React.ReactElement {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // Type-to-confirm guard: the operator must type the exact username
+  // before the destructive delete unlocks. The parent unmounts this
+  // modal when `deleteTarget` clears between selections, so this state
+  // resets naturally on the next open.
+  const [confirmText, setConfirmText] = useState("")
+  const confirmed = confirmText === user.username
 
   const handleDelete = async () => {
+    if (!confirmed) return
     setSubmitting(true)
     setError(null)
     try {
@@ -496,6 +521,20 @@ function DeleteUserModal({
             all its project memberships. This action cannot be undone.
           </DialogDescription>
         </DialogHeader>
+        <div className="space-y-2 py-2">
+          <Label htmlFor="delete-user-confirm">
+            Type <span className="font-mono font-semibold">{user.username}</span>{" "}
+            to confirm
+          </Label>
+          <Input
+            id="delete-user-confirm"
+            value={confirmText}
+            onChange={(e) => setConfirmText(e.target.value)}
+            placeholder={user.username}
+            autoComplete="off"
+            autoFocus
+          />
+        </div>
         {error && (
           <div className="text-sm text-destructive py-2">{error}</div>
         )}
@@ -510,7 +549,7 @@ function DeleteUserModal({
           <Button
             variant="destructive"
             onClick={handleDelete}
-            disabled={submitting}
+            disabled={submitting || !confirmed}
           >
             {submitting && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}
             Delete
