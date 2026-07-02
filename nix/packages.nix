@@ -118,8 +118,9 @@ let
     src = "${src}/agent_mcp/dashboard";
     # Re-set whenever the dashboard's package-lock.json changes
     # upstream (rare). On hash mismatch, nix prints the correct
-    # value; paste it here.
-    npmDepsHash = "sha256-ilzjM1HnVUuWV3m6pbAjZYyMcV7x7mLdRJvHG/k0D8Y=";
+    # value; paste it here. Updated 2026-07-02 for the next
+    # 15.3.4 -> 15.5.20 security bump + npm audit fix lockfile changes.
+    npmDepsHash = "sha256-HGTu2BUl71FCHwJbCKWTpxnMZJP95MePG6tVPFgGtwc=";
     NEXT_PUBLIC_AUTO_CONNECT = "false";
     NEXT_PUBLIC_DEFAULT_SERVER_HOST = "";
     NEXT_PUBLIC_DEFAULT_SERVER_PORT = "";
