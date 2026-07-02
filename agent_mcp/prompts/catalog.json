@@ -43,13 +43,15 @@
           "name": "AGENT_ID",
           "description": "Unique identifier for the worker agent (e.g., frontend-worker, backend-worker)",
           "placeholder": "frontend-worker",
-          "required": true
+          "required": true,
+          "source": "agent"
         },
         {
           "name": "WORKER_TOKEN",
           "description": "The specific worker token provided by the admin agent",
           "placeholder": "worker_token_here",
-          "required": true
+          "required": true,
+          "source": "agent-token"
         }
       ],
       "usage": "Use this prompt in a new AI assistant window to initialize a worker agent that will autonomously work on assigned tasks.",
@@ -106,7 +108,8 @@
           "name": "AGENT_ID",
           "description": "ID of the agent to assign the task to",
           "placeholder": "frontend-worker",
-          "required": true
+          "required": true,
+          "source": "agent"
         },
         {
           "name": "TASK_TITLE",
@@ -124,7 +127,9 @@
           "name": "PRIORITY",
           "description": "Task priority level",
           "placeholder": "high",
-          "required": false
+          "required": false,
+          "type": "enum",
+          "options": ["low", "medium", "high"]
         },
         {
           "name": "ADDITIONAL_CONTEXT",
@@ -277,13 +282,15 @@
           "name": "FROM_AGENT",
           "description": "Agent currently working on the task",
           "placeholder": "frontend-worker-1",
-          "required": true
+          "required": true,
+          "source": "agent"
         },
         {
           "name": "TO_AGENT",
           "description": "Agent who will take over the task",
           "placeholder": "frontend-worker-2",
-          "required": true
+          "required": true,
+          "source": "agent"
         },
         {
           "name": "CURRENT_STATUS",

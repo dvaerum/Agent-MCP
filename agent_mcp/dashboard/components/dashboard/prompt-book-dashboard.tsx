@@ -42,6 +42,7 @@ import {
   type PromptCategory
 } from '@/lib/prompt-book'
 import { useDataStore } from '@/lib/stores/data-store'
+import { AgentSelect } from '@/components/dashboard/shared/agent-select'
 import { CreatePromptModal } from './modals/create-prompt-modal'
 import { PromptBookTutorial, usePromptBookTutorial } from './onboarding/prompt-book-tutorial'
 // CC-3 audit 2026-06-02: imported Skeleton primitive for the
@@ -192,8 +193,33 @@ const PromptBuilder = ({ prompt, onClose }: {
   const [copied, setCopied] = useState(false)
   const [errors, setErrors] = useState<string[]>([])
 
+  // Variable names tagged `source: 'agent-token'` — auto-filled from
+  // the chosen sibling agent's token so the operator never pastes a
+  // token by hand (UX-01).
+  const agentTokenVarNames = useMemo(
+    () => prompt.variables.filter(v => v.source === 'agent-token').map(v => v.name),
+    [prompt.variables],
+  )
+
   const updateVariable = (name: string, value: string) => {
     setVariables(prev => ({ ...prev, [name]: value }))
+  }
+
+  // Selecting an agent-source variable also derives any sibling
+  // agent-token variable(s) from the live data store. If the agent
+  // has no token yet we leave the token field untouched so the
+  // operator can still fill it manually.
+  const handleAgentChange = (name: string, agentId: string) => {
+    setVariables(prev => {
+      const next = { ...prev, [name]: agentId }
+      if (agentId && agentTokenVarNames.length > 0) {
+        const token = useDataStore.getState().getAgentToken(agentId)
+        if (token) {
+          for (const tokenVar of agentTokenVarNames) next[tokenVar] = token
+        }
+      }
+      return next
+    })
   }
 
   const generatePrompt = () => {
@@ -242,13 +268,38 @@ const PromptBuilder = ({ prompt, onClose }: {
                 {variable.name}
                 {variable.required && <span className="text-destructive ml-1">*</span>}
               </Label>
-              <Input
-                id={variable.name}
-                value={variables[variable.name] || ''}
-                onChange={(e) => updateVariable(variable.name, e.target.value)}
-                placeholder={variable.placeholder}
-                className="font-mono text-sm"
-              />
+              {variable.source === 'agent' ? (
+                <AgentSelect
+                  id={variable.name}
+                  value={variables[variable.name] || null}
+                  onChange={(v) => handleAgentChange(variable.name, v ?? '')}
+                  placeholder={variable.placeholder}
+                />
+              ) : variable.type === 'enum' && variable.options ? (
+                <Select
+                  value={variables[variable.name] || ''}
+                  onValueChange={(v) => updateVariable(variable.name, v)}
+                >
+                  <SelectTrigger id={variable.name} className="font-mono text-sm">
+                    <SelectValue placeholder={variable.placeholder} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {variable.options.map(option => (
+                      <SelectItem key={option} value={option}>
+                        {option}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <Input
+                  id={variable.name}
+                  value={variables[variable.name] || ''}
+                  onChange={(e) => updateVariable(variable.name, e.target.value)}
+                  placeholder={variable.placeholder}
+                  className="font-mono text-sm"
+                />
+              )}
               <p className="text-xs text-muted-foreground">{variable.description}</p>
             </div>
           ))}
