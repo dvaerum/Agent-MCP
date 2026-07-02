@@ -1,0 +1,124 @@
+"""Security response headers for every router response.
+
+Threat model: open-internet exposure. The router served no security
+response headers at all, so a public deploy inherited none of the
+browser-side defences (clickjacking, MIME sniffing, referrer leak,
+missing HSTS). This middleware adds them uniformly — including on
+error responses and redirects — by wrapping the whole handler chain.
+
+CSP notes (the one header that can break the app):
+
+  The dashboard is a static Next.js export. Its HTML carries inline
+  ``<script>`` blocks (Next's hydration runtime, ``self.__next_f``
+  pushes) and the Jinja login/setup templates carry an inline
+  ``<style>`` block, so a strict ``script-src 'self'`` / ``style-src
+  'self'`` would break both surfaces. Static export can't use per-
+  response nonces (the files are served verbatim), so we allow
+  ``'unsafe-inline'`` for script + style. We deliberately do NOT add
+  ``'unsafe-eval'`` — production Next.js export doesn't need it, and
+  it's the more dangerous of the two.
+
+  The parts that add real value regardless — ``frame-ancestors
+  'none'`` (clickjacking), ``object-src 'none'``, ``base-uri 'self'``,
+  ``default-src 'self'`` (no off-origin loads) — are all kept strict.
+
+The whole CSP is overridable via ``AGENT_MCP_CSP`` for operators who
+front the router differently or want to tighten it further.
+
+HSTS is emitted ONLY on HTTPS requests (same ``X-Forwarded-Proto`` /
+scheme heuristic as ``login.cookie_secure_flag``) so the plain-HTTP
+dev / VM smoke doesn't get pinned to HTTPS.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Awaitable, Callable
+
+from aiohttp import web
+
+
+# Pragmatic-but-protective default. See module docstring for why
+# script/style get ``'unsafe-inline'`` (static Next.js export) while
+# everything else stays strict.
+_DEFAULT_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: blob:; "
+    "font-src 'self' data:; "
+    "connect-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self'; "
+    "frame-ancestors 'none'"
+)
+
+# Minimal Permissions-Policy: the dashboard needs none of these
+# powerful features, so deny them outright.
+_DEFAULT_PERMISSIONS_POLICY = (
+    "geolocation=(), microphone=(), camera=(), payment=(), usb=()"
+)
+
+_HSTS_VALUE = "max-age=63072000; includeSubDomains"
+
+
+def _request_is_https(request: web.Request) -> bool:
+    """Same heuristic as ``login.cookie_secure_flag``.
+
+    Honours ``X-Forwarded-Proto`` first (TLS terminates upstream and
+    forwards plain HTTP), then the direct request scheme. Kept inline
+    rather than importing ``login`` so this leaf middleware carries no
+    dependency on the login view module.
+    """
+    forwarded = request.headers.get("X-Forwarded-Proto", "").lower()
+    if forwarded == "https":
+        return True
+    if forwarded == "http":
+        return False
+    return request.url.scheme == "https"
+
+
+def _csp() -> str:
+    override = os.environ.get("AGENT_MCP_CSP")
+    return override if override else _DEFAULT_CSP
+
+
+def _apply_headers(response: web.StreamResponse, request: web.Request) -> None:
+    """Set the security headers on ``response`` (idempotent per response).
+
+    Uses ``setdefault`` so a handler that intentionally set its own
+    value (rare) isn't clobbered.
+    """
+    hdrs = response.headers
+    hdrs.setdefault("X-Content-Type-Options", "nosniff")
+    hdrs.setdefault("X-Frame-Options", "DENY")
+    hdrs.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    hdrs.setdefault("Content-Security-Policy", _csp())
+    hdrs.setdefault("Permissions-Policy", _DEFAULT_PERMISSIONS_POLICY)
+    # HSTS only over HTTPS — never pin a plain-HTTP dev/VM to TLS.
+    if _request_is_https(request):
+        hdrs.setdefault("Strict-Transport-Security", _HSTS_VALUE)
+
+
+@web.middleware
+async def security_headers_middleware(
+    request: web.Request,
+    handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
+) -> web.StreamResponse:
+    """Attach security headers to every response, including errors.
+
+    aiohttp raises ``HTTPException`` for redirects (login 303s) and
+    error responses; those ARE the response object, so we catch, stamp
+    the headers, and re-raise to cover the full surface.
+    """
+    try:
+        response = await handler(request)
+    except web.HTTPException as exc:
+        _apply_headers(exc, request)
+        raise
+    _apply_headers(response, request)
+    return response
+
+
+__all__ = ["security_headers_middleware"]
