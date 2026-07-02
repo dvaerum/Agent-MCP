@@ -895,8 +895,23 @@ function DeleteGroupModal({
 }): React.ReactElement {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // Type-to-confirm guard (UX-08): the operator must type the group
+  // name before the destructive Delete becomes enabled. Prevents a
+  // single stray click from wiping a group and its memberships.
+  const [confirmText, setConfirmText] = useState("")
+  const confirmed = confirmText.trim() === group.name
+
+  // Reset the typed confirmation whenever the modal reopens so a prior
+  // (matching) value can't carry over and pre-enable Delete.
+  useEffect(() => {
+    if (open) {
+      setConfirmText("")
+      setError(null)
+    }
+  }, [open])
 
   const handleDelete = async () => {
+    if (!confirmed) return
     setSubmitting(true)
     setError(null)
     try {
@@ -924,9 +939,26 @@ function DeleteGroupModal({
           <DialogTitle>Delete {group.name}?</DialogTitle>
           <DialogDescription>
             Removes the group and all its memberships. Members
-            themselves are not deleted.
+            themselves are not deleted. This cannot be undone.
           </DialogDescription>
         </DialogHeader>
+        <div className="space-y-2 py-2">
+          <Label htmlFor="delete-group-confirm" className="text-sm">
+            Type{" "}
+            <span className="font-mono font-bold text-destructive">
+              {group.name}
+            </span>{" "}
+            to confirm
+          </Label>
+          <Input
+            id="delete-group-confirm"
+            value={confirmText}
+            onChange={(e) => setConfirmText(e.target.value)}
+            placeholder={group.name}
+            autoComplete="off"
+            disabled={submitting}
+          />
+        </div>
         {error && (
           <div className="text-sm text-destructive py-2">{error}</div>
         )}
@@ -941,7 +973,7 @@ function DeleteGroupModal({
           <Button
             variant="destructive"
             onClick={handleDelete}
-            disabled={submitting}
+            disabled={submitting || !confirmed}
           >
             {submitting && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}
             Delete
