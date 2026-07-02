@@ -10,7 +10,6 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { Textarea } from "@/components/ui/textarea"
 import { Switch } from "@/components/ui/switch"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
@@ -28,7 +27,21 @@ import { TaskDetailsDialog } from "./task-details-dialog"
 import { Skeleton } from "@/components/ui/skeleton"
 import { EmptyState } from "@/components/dashboard/shared/empty-state"
 import { AgentsMobileList } from "@/components/dashboard/agents-mobile-list"
+import { CapabilityTagInput } from "@/components/dashboard/shared/capability-tag-input"
 
+
+// agent_id slug rule — mirrors the backend's `_AGENT_ID_RE`
+// (agent_mcp/repositories/agent_repository.py): lowercase letter start,
+// lowercase letters / digits / hyphens, ends on a letter or digit
+// (single-char names allowed). Same shape as the project-name slug in
+// add-project-modal.tsx. Used for the RegisterAgentModal live hint so
+// the operator sees the format problem before submitting instead of
+// eating a 400 from the repo-seam validator.
+const AGENT_ID_RE = /^[a-z](?:[a-z0-9-]*[a-z0-9])?$/
+
+// AoE session id: 16 lowercase hex chars. Backend re-validates and
+// 400s bad input; this drives the live hint + submit-disable.
+const AOE_SESSION_ID_RE = /^[0-9a-f]{16}$/
 
 // Wave 7 PR 2: presence-driven dot. The legacy `Agent['status']`
 // values (running / pending / terminated / failed) were spawn-
@@ -72,7 +85,8 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, op
   onTaskClick: (task: Task) => void
 }) => {
   const { getAgentTasks } = useDataStore()
-  
+  const [copiedToken, setCopiedToken] = useState(false)
+
   // Wave 7 PR 2 — presence drives the row badge.
   const presence = agentPresence(agent)
 
@@ -243,12 +257,17 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, op
               onClick={(e) => {
                 e.stopPropagation()
                 navigator.clipboard.writeText(agent.auth_token || '')
-                // You could add a toast notification here
+                setCopiedToken(true)
+                setTimeout(() => setCopiedToken(false), 1500)
               }}
               className="h-6 w-6 p-0"
+              title="Copy token"
             >
               <Copy className="h-3 w-3" />
             </Button>
+            {copiedToken && (
+              <span className="text-xs text-primary">copied</span>
+            )}
           </div>
         ) : (
           <span className="text-xs text-muted-foreground">No token</span>
@@ -390,9 +409,12 @@ const RegisterAgentModal = () => {
     setSubmitting(false)
   }
 
+  const trimmedName = formData.name.trim()
+  const nameValid = AGENT_ID_RE.test(trimmedName)
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!formData.name.trim() || submitting) return
+    if (!nameValid || submitting) return
     setSubmitting(true)
     setError(null)
     try {
@@ -485,8 +507,15 @@ const RegisterAgentModal = () => {
                 }
                 placeholder="worker-analytics-01"
                 className="bg-background border-border text-foreground"
+                aria-invalid={trimmedName.length > 0 && !nameValid}
                 required
               />
+              {trimmedName.length > 0 && !nameValid && (
+                <p className="text-xs text-destructive mt-1">
+                  Lowercase slug only: start with a letter, then lowercase
+                  letters, digits, or hyphens (^[a-z][a-z0-9-]*[a-z0-9]?$).
+                </p>
+              )}
             </div>
             <div>
               <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
@@ -527,7 +556,7 @@ const RegisterAgentModal = () => {
                 type="submit"
                 size="sm"
                 className="bg-primary hover:bg-primary/90"
-                disabled={submitting || !formData.name.trim()}
+                disabled={submitting || !nameValid}
               >
                 {submitting ? 'Registering...' : 'Register'}
               </Button>
@@ -866,7 +895,7 @@ const EditAgentDialog = ({
   onOpenChange: (open: boolean) => void
   onSaved: () => void
 }) => {
-  const [capabilities, setCapabilities] = useState('')
+  const [capabilities, setCapabilities] = useState<string[]>([])
   const [color, setColor] = useState('')
   const [workingDirectory, setWorkingDirectory] = useState('')
   const [aoeSessionId, setAoeSessionId] = useState('')
@@ -910,7 +939,7 @@ const EditAgentDialog = ({
   const agentId = agent?.agent_id
   useEffect(() => {
     if (!open || !agent) return
-    setCapabilities(normalizeCapabilities(agent.capabilities).join(', '))
+    setCapabilities(normalizeCapabilities(agent.capabilities))
     setColor(agent.color || '')
     setWorkingDirectory(agent.working_directory || '')
     setAoeSessionId(agent.aoe_session_id || '')
@@ -929,6 +958,13 @@ const EditAgentDialog = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, agentId])
 
+  // Live AoE-session-id validity. Empty is valid (clears the binding);
+  // otherwise it must be 16 lowercase hex chars. Drives the inline hint
+  // and the Save-button disable so the operator learns before submit —
+  // the on-submit check below is kept as the last-resort guard.
+  const aoeTrimmedLive = aoeSessionId.trim().toLowerCase()
+  const aoeValid = aoeTrimmedLive === '' || AOE_SESSION_ID_RE.test(aoeTrimmedLive)
+
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!agent) return
@@ -942,10 +978,11 @@ const EditAgentDialog = ({
       auto_event_loop?: boolean
       agent_role?: 'worker' | 'manager'
     } = {}
+    // capabilities is already a normalized string[] (the tag input
+    // lowercases + trims + dedupes on add, mirroring the server's
+    // normalize_capabilities). Send the list straight through — the
+    // edit-agent endpoint accepts `capabilities: string[]`.
     const parsedCaps = capabilities
-      .split(',')
-      .map((c) => c.trim())
-      .filter((c) => c.length > 0)
     const currentCaps = normalizeCapabilities(agent.capabilities)
     if (JSON.stringify(parsedCaps) !== JSON.stringify(currentCaps)) {
       updates.capabilities = parsedCaps
@@ -959,7 +996,7 @@ const EditAgentDialog = ({
     const aoeTrimmed = aoeSessionId.trim().toLowerCase()
     if (aoeTrimmed !== (agent.aoe_session_id || '')) {
       // Client-side hint — the backend re-validates and 400s on bad input.
-      if (aoeTrimmed && !/^[0-9a-f]{16}$/.test(aoeTrimmed)) {
+      if (aoeTrimmed && !AOE_SESSION_ID_RE.test(aoeTrimmed)) {
         setError('AoE session id must be 16 lowercase hex chars (or empty to clear).')
         setBusy(false)
         return
@@ -1008,15 +1045,30 @@ const EditAgentDialog = ({
         </DialogHeader>
         <form onSubmit={handleSave} className="space-y-4">
           <div>
-            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
+            <label
+              htmlFor="edit-agent-capabilities"
+              className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2"
+            >
               Capabilities
             </label>
-            <Textarea
+            {/*
+              Free-text routing skill tags (NOT the Wave 9 permission
+              enum). The chips input suggests tags already in use across
+              live agents/tasks but always allows a brand-new tag — see
+              <CapabilityTagInput>. Normalized client-side to match the
+              server's normalize_capabilities.
+            */}
+            <CapabilityTagInput
+              id="edit-agent-capabilities"
               value={capabilities}
-              onChange={(e) => setCapabilities(e.target.value)}
-              placeholder="code_edit, file_read, web_search"
-              className="bg-background border-border text-foreground h-20 resize-none"
+              onChange={setCapabilities}
+              disabled={busy}
+              placeholder="Add a capability, press Enter"
             />
+            <p className="text-[10px] text-muted-foreground mt-1">
+              Routing skill tags. A task routes to this agent only when
+              its required capabilities are a subset of these.
+            </p>
           </div>
           <div>
             <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
@@ -1059,7 +1111,13 @@ const EditAgentDialog = ({
               className="bg-background border-border text-foreground font-mono text-sm"
               maxLength={16}
               pattern="[0-9a-f]{16}"
+              aria-invalid={!aoeValid}
             />
+            {!aoeValid && (
+              <p className="text-[10px] text-destructive mt-1">
+                Must be 16 lowercase hex chars (0-9, a-f), or empty to clear.
+              </p>
+            )}
             <p className="text-[10px] text-muted-foreground mt-1">
               Binds this agent to a specific Agents-of-Empires tmux session for the
               notification side-channel. Leave empty to fall back to title-match.
@@ -1152,7 +1210,7 @@ const EditAgentDialog = ({
             <Button
               type="submit"
               size="sm"
-              disabled={busy}
+              disabled={busy || !aoeValid}
               className="bg-primary hover:bg-primary/90"
             >
               {busy ? 'Saving...' : 'Save changes'}
@@ -1405,6 +1463,7 @@ const AgentDetailDialog = ({
 }) => {
   const [revealToken, setRevealToken] = useState(false)
   const [copied, setCopied] = useState(false)
+  const [copiedToken, setCopiedToken] = useState(false)
   const [copiedSnippet, setCopiedSnippet] = useState<ClientTab | null>(null)
   const [activeTab, setActiveTab] = useState<ClientTab>('claude-code')
   const { getAgentTasks } = useDataStore()
@@ -1428,6 +1487,7 @@ const AgentDetailDialog = ({
     if (!open) {
       setRevealToken(false)
       setCopied(false)
+      setCopiedToken(false)
       setCopiedSnippet(null)
     }
   }, [open])
@@ -1699,12 +1759,17 @@ const AgentDetailDialog = ({
                     size="sm"
                     onClick={() => {
                       navigator.clipboard.writeText(agent.auth_token || '')
+                      setCopiedToken(true)
+                      setTimeout(() => setCopiedToken(false), 1500)
                     }}
                     className="h-6 w-6 p-0 flex-shrink-0"
                     title="Copy token"
                   >
                     <Copy className="h-3 w-3" />
                   </Button>
+                  {copiedToken && (
+                    <span className="text-xs text-primary flex-shrink-0">copied</span>
+                  )}
                 </>
               ) : (
                 <span className="text-muted-foreground italic">none</span>

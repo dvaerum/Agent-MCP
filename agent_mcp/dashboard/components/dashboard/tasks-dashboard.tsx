@@ -23,6 +23,7 @@ import { cn } from "@/lib/utils"
 import { Skeleton } from "@/components/ui/skeleton"
 import { EmptyState } from "@/components/dashboard/shared/empty-state"
 import { AgentSelect } from "@/components/dashboard/shared/agent-select"
+import { CapabilityTagInput } from "@/components/dashboard/shared/capability-tag-input"
 import { TasksMobileList } from "@/components/dashboard/tasks-mobile-list"
 
 // Status / priority colour helpers shared by the row + the View / Edit
@@ -405,33 +406,28 @@ const CreateTaskModal = React.memo(({ onCreateTask }: { onCreateTask: (data: any
     // <AgentSelect> dropdown, which surfaces the live agent roster
     // instead of asking the admin to type an agent_id.
     assigned_to: string | null
-    required_capabilities: string
+    required_capabilities: string[]
   }>({
     title: '',
     description: '',
     priority: 'medium',
     assigned_to: null,
-    // Event-coord PR-1: free-text comma-separated capability labels.
-    // Server normalizes at write time (lowercase + strip + dedupe).
-    required_capabilities: '',
+    // Event-coord PR-1: free-text capability labels (routing skill
+    // tags). The <CapabilityTagInput> normalizes each tag on add
+    // (lowercase + strip + dedupe), mirroring the server's
+    // normalize_capabilities; the server re-normalizes at write time.
+    required_capabilities: [],
   })
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     if (!formData.title.trim()) return
 
-    // Event-coord PR-1: split / strip / dedupe locally too so the
-    // create-task POST shape matches the assign_task tool's
-    // expectations (array of strings). Server re-normalizes — this is
-    // belt-and-suspenders so a stray blank doesn't propagate.
-    const capsParsed = formData.required_capabilities
-      .split(',')
-      .map((c) => c.trim().toLowerCase())
-      .filter((c) => c.length > 0)
-    const capsDeduped: string[] = []
-    for (const c of capsParsed) {
-      if (!capsDeduped.includes(c)) capsDeduped.push(c)
-    }
+    // required_capabilities is already a normalized string[] (the tag
+    // input lowercases + strips + dedupes on add). Send the array
+    // straight through — the create-task POST shape is an array of
+    // strings, matching the assign_task tool. Server re-normalizes.
+    const capsDeduped = formData.required_capabilities
 
     onCreateTask({
       title: formData.title.trim(),
@@ -449,7 +445,7 @@ const CreateTaskModal = React.memo(({ onCreateTask }: { onCreateTask: (data: any
       description: '',
       priority: 'medium',
       assigned_to: null,
-      required_capabilities: '',
+      required_capabilities: [],
     })
     setOpen(false)
   }
@@ -542,18 +538,29 @@ const CreateTaskModal = React.memo(({ onCreateTask }: { onCreateTask: (data: any
             agents).
           */}
           <div>
-            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
+            <label
+              htmlFor="create-task-required-capabilities"
+              className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2"
+            >
               Required capabilities
             </label>
-            <Input
+            {/*
+              Free-text routing skill tags (NOT the Wave 9 permission
+              enum). The chips input suggests tags already in use across
+              live agents/tasks but always allows a new tag — see
+              <CapabilityTagInput>. An agent must satisfy
+              `agent.capabilities ⊇ task.required_capabilities` to
+              receive this task's wake event.
+            */}
+            <CapabilityTagInput
+              id="create-task-required-capabilities"
               value={formData.required_capabilities}
-              onChange={(e) => setFormData(prev => ({ ...prev, required_capabilities: e.target.value }))}
-              placeholder="backend, db"
-              className="bg-background border-border text-foreground font-mono text-sm"
+              onChange={(tags) => setFormData(prev => ({ ...prev, required_capabilities: tags }))}
+              placeholder="Add a capability, press Enter"
             />
             <p className="text-[10px] text-muted-foreground mt-1">
-              Comma-separated, lowercase on submit. Leave blank to
-              broadcast to every idle agent (PR-2 wake-loop routing).
+              Leave blank to broadcast to every idle agent (PR-2
+              wake-loop routing).
             </p>
           </div>
           <DialogFooter className="gap-2">
