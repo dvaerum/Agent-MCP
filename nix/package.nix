@@ -72,9 +72,10 @@ let
     # sentinel, the router substitutes at serve time. See nix/README.md
     # § "Asset prefix".
     # Re-set on package-lock.json drift. Nix prints the correct value
-    # on hash mismatch; paste it back here. Lockfile shipped with the
-    # repo as of 2026-05-31 hashes to:
-    npmDepsHash = "sha256-ilzjM1HnVUuWV3m6pbAjZYyMcV7x7mLdRJvHG/k0D8Y=";
+    # on hash mismatch; paste it back here. Updated 2026-07-02 for the
+    # next 15.3.4 -> 15.5.20 security bump + npm audit fix lockfile
+    # changes.
+    npmDepsHash = "sha256-HGTu2BUl71FCHwJbCKWTpxnMZJP95MePG6tVPFgGtwc=";
     NEXT_PUBLIC_AUTO_CONNECT = "false";
     NEXT_PUBLIC_DEFAULT_SERVER_HOST = "";
     NEXT_PUBLIC_DEFAULT_SERVER_PORT = "";

@@ -324,11 +324,13 @@ Thumbs.db
 *.agent.log
 agent_audit.log
 mcp_server.log
-uv.lock
 .mcp.json
 *.jsonl
 *.lock
 !flake.lock
+# uv.lock is committed: pyproject.toml leaves most runtime deps
+# unpinned, so the lockfile is the only committed pin for fresh installs.
+!uv.lock
 *.db
 
 # Backup files
