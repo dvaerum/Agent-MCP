@@ -16,6 +16,7 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog'
 import { SmartValueEditor } from './smart-value-editor'
+import { useDataStore } from '@/lib/stores/data-store'
 
 interface CreateMemoryData {
   context_key: string
@@ -36,6 +37,20 @@ export function CreateMemoryModal({ onCreateMemory, trigger }: CreateMemoryModal
     context_value: '',
     description: ''
   })
+
+  // UX-10: suggestion chips must reflect the project's REAL existing
+  // memory keys (pulled from the shared data store) so clicking one
+  // reuses / edits an actual key, rather than inserting a hardcoded
+  // fake example that doesn't exist. Typing a brand-new key free-text
+  // stays fully supported.
+  const context = useDataStore((s) => s.data?.context)
+  const existingKeys = React.useMemo(() => {
+    const keys = (context ?? [])
+      .map((c: any) => c?.context_key)
+      .filter((k: unknown): k is string => typeof k === 'string' && k.length > 0)
+    // De-dupe, sort, and cap so a large bank doesn't flood the modal.
+    return Array.from(new Set(keys)).sort().slice(0, 12)
+  }, [context])
 
   const handleValueChange = (value: any) => {
     setFormData(prev => ({ ...prev, context_value: value }))
@@ -71,15 +86,6 @@ export function CreateMemoryModal({ onCreateMemory, trigger }: CreateMemoryModal
     setFormData({ context_key: '', context_value: '', description: '' })
     setOpen(false)
   }
-
-  // Generate context key suggestions based on common patterns
-  const contextKeySuggestions = [
-    'api.endpoints.base_url',
-    'config.database.connection',
-    'settings.ui.theme',
-    'memory.system.status',
-    'cache.ttl.default'
-  ]
 
   const defaultTrigger = (
     <Button size="sm" className="bg-primary hover:bg-primary/90 text-primary-foreground shadow-lg hover:shadow-primary/25 transition-all duration-200">
@@ -147,22 +153,25 @@ export function CreateMemoryModal({ onCreateMemory, trigger }: CreateMemoryModal
             />
           </div>
 
-          {/* Common Patterns Helper */}
-          <div className="bg-muted/30 border border-border rounded-lg p-3">
-            <div className="text-xs font-medium text-foreground mb-2">Common Key Patterns:</div>
-            <div className="flex flex-wrap gap-1">
-              {contextKeySuggestions.map((suggestion) => (
-                <button
-                  key={suggestion}
-                  type="button"
-                  onClick={() => setFormData(prev => ({ ...prev, context_key: suggestion }))}
-                  className="text-xs bg-background hover:bg-muted border border-border rounded px-2 py-1 text-muted-foreground hover:text-foreground transition-colors"
-                >
-                  {suggestion}
-                </button>
-              ))}
+          {/* Existing keys helper (UX-10). Only rendered when the
+              project actually has memory keys — no fake examples. */}
+          {existingKeys.length > 0 && (
+            <div className="bg-muted/30 border border-border rounded-lg p-3">
+              <div className="text-xs font-medium text-foreground mb-2">Existing keys (click to reuse or edit):</div>
+              <div className="flex flex-wrap gap-1">
+                {existingKeys.map((key) => (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() => setFormData(prev => ({ ...prev, context_key: key }))}
+                    className="text-xs bg-background hover:bg-muted border border-border rounded px-2 py-1 text-muted-foreground hover:text-foreground transition-colors font-mono"
+                  >
+                    {key}
+                  </button>
+                ))}
+              </div>
             </div>
-          </div>
+          )}
 
           <DialogFooter className="gap-2 pt-4">
             <Button 

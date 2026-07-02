@@ -140,6 +140,26 @@ function coerceNonNegInt(raw: unknown): number {
   return Math.floor(n)
 }
 
+// Retention bounds (UX-09). The backend (features/message_retention.py)
+// stores a plain non-negative integer day count: 0 = disabled (keep
+// forever), any positive integer is a valid window; there is no upper
+// bound enforced server-side. So the only real constraints are
+// "whole number" and ">= 0". Validate against those on blur and show
+// an inline hint rather than silently coercing garbage on Save.
+const RETENTION_MIN = 0
+
+// Returns a human-readable error when the draft is NOT a valid
+// retention value (blank, negative, fractional, or non-numeric), or
+// null when it is acceptable to save as-is.
+function validateRetention(draft: string): string | null {
+  const s = draft.trim()
+  if (s === "") return "Enter a number of days (0 = keep forever)."
+  if (!/^\d+$/.test(s)) {
+    return `Must be a whole number of days ≥ ${RETENTION_MIN} (0 = keep forever).`
+  }
+  return null
+}
+
 interface RetentionState {
   // Current saved value (last seen from server). 0 means disabled.
   saved: number
@@ -163,6 +183,9 @@ export function SettingsDashboard() {
     exists: false,
     pending: false,
   })
+  // Show the inline validation hint only after the field has been
+  // blurred (UX-09), so we don't nag mid-typing.
+  const [retentionTouched, setRetentionTouched] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   // Event-coord PR-3: count of agents currently inside a
@@ -208,6 +231,7 @@ export function SettingsDashboard() {
       } else {
         setRetention({ saved: 0, draft: "0", exists: false, pending: false })
       }
+      setRetentionTouched(false)
     } catch (e: any) {
       setError(e.message ?? String(e))
     } finally {
@@ -216,6 +240,12 @@ export function SettingsDashboard() {
   }
 
   const saveRetention = async () => {
+    // UX-09: refuse to save invalid input instead of silently
+    // coercing it. Surface the hint and bail.
+    if (validateRetention(retention.draft) !== null) {
+      setRetentionTouched(true)
+      return
+    }
     const next = coerceNonNegInt(retention.draft)
     if (next === retention.saved && retention.exists) {
       // No change — nothing to do.
@@ -237,6 +267,7 @@ export function SettingsDashboard() {
         })
       }
       setRetention({ saved: next, draft: String(next), exists: true, pending: false })
+      setRetentionTouched(false)
     } catch (e: any) {
       setRetention((s) => ({ ...s, pending: false }))
       setError(e.message ?? String(e))
@@ -388,33 +419,43 @@ export function SettingsDashboard() {
                 )}
               </div>
             </div>
-            <div className="flex-shrink-0 sm:pt-1 flex items-center gap-2 self-end sm:self-auto">
-              <Input
-                type="number"
-                min={0}
-                step={1}
-                inputMode="numeric"
-                value={retention.draft}
-                disabled={retention.pending}
-                onChange={(e) =>
-                  setRetention((s) => ({ ...s, draft: e.target.value }))
-                }
-                className="w-24"
-                aria-label="Message retention days"
-              />
-              <span className="text-xs text-muted-foreground">days</span>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={saveRetention}
-                disabled={
-                  retention.pending ||
-                  (retention.exists &&
-                    coerceNonNegInt(retention.draft) === retention.saved)
-                }
-              >
-                Save
-              </Button>
+            <div className="flex-shrink-0 sm:pt-1 flex flex-col gap-1 self-end sm:self-auto sm:items-end">
+              <div className="flex items-center gap-2">
+                <Input
+                  type="number"
+                  min={0}
+                  step={1}
+                  inputMode="numeric"
+                  value={retention.draft}
+                  disabled={retention.pending}
+                  onChange={(e) =>
+                    setRetention((s) => ({ ...s, draft: e.target.value }))
+                  }
+                  onBlur={() => setRetentionTouched(true)}
+                  aria-invalid={validateRetention(retention.draft) !== null}
+                  className="w-24"
+                  aria-label="Message retention days"
+                />
+                <span className="text-xs text-muted-foreground">days</span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={saveRetention}
+                  disabled={
+                    retention.pending ||
+                    validateRetention(retention.draft) !== null ||
+                    (retention.exists &&
+                      coerceNonNegInt(retention.draft) === retention.saved)
+                  }
+                >
+                  Save
+                </Button>
+              </div>
+              {retentionTouched && validateRetention(retention.draft) && (
+                <div className="text-xs text-destructive" role="alert">
+                  {validateRetention(retention.draft)}
+                </div>
+              )}
             </div>
           </div>
         </CardContent>
