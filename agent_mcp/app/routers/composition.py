@@ -62,6 +62,31 @@ router = APIRouter(
 )
 
 
+def is_confirmed_operator_tier(auth: Dict[str, Any]) -> bool:
+    """Return True iff ``auth`` came via a CONFIRMED operator-tier path.
+
+    ``require_operator_session`` admits three kinds:
+
+      * ``"operator_bearer"`` — a per-agent bearer that resolved to a
+        manager/admin agent row (worker tokens are rejected). Operator
+        tier is CONFIRMED.
+      * ``"session"`` / ``"forwarding"`` — cookie or signed-header
+        operator identity. The router admits viewer-tier operators on
+        GET requests, and the per-project backend has no router.db
+        project-role handle (by design — role gating is the router
+        middleware's job; see ``app/deps.py`` + ``main_app`` Principal
+        construction). So for these paths the tier is UNVERIFIABLE from
+        the backend — it could be a read-only viewer.
+
+    Endpoints that return agent bearer tokens use this to withhold them
+    from the unverifiable-tier paths, closing the viewer→agent token
+    disclosure / privilege-escalation surface. Operators who need agent
+    tokens use the operator-tier bearer path (agent CLI / admin scripts)
+    or a dedicated operator-gated endpoint.
+    """
+    return auth.get("kind") == "operator_bearer"
+
+
 # --- Composition reads (cross-resource) ---
 
 
@@ -124,8 +149,39 @@ async def task_tree_data_api_route(request: Request) -> JSONResponse:
         return JSONResponse({'nodes': [], 'edges': [], 'error': str(e)}, status_code=500)
 
 
+#: Safe, non-secret columns to project from ``agents`` for the
+#: node-details panel. Excludes ``token`` (the bearer secret — leaking
+#: it lets a viewer replay as the agent) and ``aoe_session_id`` (the
+#: AoE side-channel session credential). The previous ``SELECT *`` +
+#: ``dict(row)`` returned both verbatim. Keep this in sync with the
+#: agents model (``agent_mcp/db/models/agent.py``) when columns change.
+_AGENT_NODE_SAFE_COLUMNS = (
+    "agent_id",
+    "status",
+    "agent_role",
+    "capabilities",
+    "created_at",
+    "updated_at",
+    "terminated_at",
+    "current_task",
+    "working_directory",
+    "color",
+    "auto_event_loop",
+    "last_event_seen_at",
+)
+
+
 @router.api_route("/node-details", methods=["GET", "OPTIONS"])
-async def node_details_api_route(request: Request) -> JSONResponse:
+async def node_details_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    # SECURITY: this endpoint previously had NO auth dependency and, for
+    # an ``agent_<id>`` node, returned ``SELECT * FROM agents`` verbatim
+    # — including the secret bearer ``token`` column. The router admits
+    # viewer-tier operators on GET, so any viewer could harvest an
+    # agent's bearer and replay it to escalate to write. The gate below
+    # + the safe-column projection in the ``agent`` branch close it.
     if request.method == 'OPTIONS':
         return await handle_options(request)
     node_id = request.query_params.get('node_id')
@@ -141,7 +197,15 @@ async def node_details_api_route(request: Request) -> JSONResponse:
         actual_id_from_node = parts[1] if len(parts) > 1 else (node_id if node_type_from_id != 'admin' else 'admin')
         details['type'] = node_type_from_id
         if node_type_from_id == 'agent':
-            cursor.execute("SELECT * FROM agents WHERE agent_id = ?", (actual_id_from_node,))
+            # Explicit safe-column projection — NEVER ``SELECT *`` here:
+            # the agents table holds the secret bearer ``token`` (and the
+            # ``aoe_session_id`` side-channel credential) which must not
+            # reach any dashboard client. See ``_AGENT_NODE_SAFE_COLUMNS``.
+            _cols = ", ".join(_AGENT_NODE_SAFE_COLUMNS)
+            cursor.execute(
+                f"SELECT {_cols} FROM agents WHERE agent_id = ?",
+                (actual_id_from_node,),
+            )
             row = cursor.fetchone()
             if row:
                 details['data'] = dict(row)
@@ -232,16 +296,25 @@ async def all_data_api_route(
             requested_limit = _ALL_DATA_DEFAULT_LIMIT
         section_limit = max(1, min(requested_limit, _ALL_DATA_MAX_LIMIT))
 
+        # SECURITY: agent bearer tokens are only attached for CONFIRMED
+        # operator-tier callers. The router admits viewer-tier operators
+        # on GET, and the backend cannot verify the tier of a
+        # cookie/forwarding caller, so a viewer must never receive an
+        # agent's bearer (which they could replay to escalate to write).
+        # See ``is_confirmed_operator_tier``.
+        expose_tokens = is_confirmed_operator_tier(auth)
+
         # Build a single agent_id -> active-token map up front so the
         # per-agent token lookup below is O(1) instead of O(n²)
-        # (db review item 9).
+        # (db review item 9). Only populated when tokens may be exposed.
         active_token_by_agent: dict[str, str] = {}
-        for token, data in g.active_agents.items():
-            if data.get("status") == "terminated":
-                continue
-            ag_id = data.get("agent_id")
-            if ag_id and ag_id not in active_token_by_agent:
-                active_token_by_agent[ag_id] = token
+        if expose_tokens:
+            for token, data in g.active_agents.items():
+                if data.get("status") == "terminated":
+                    continue
+                ag_id = data.get("agent_id")
+                if ag_id and ag_id not in active_token_by_agent:
+                    active_token_by_agent[ag_id] = token
 
         cursor.execute(
             "SELECT * FROM agents ORDER BY created_at DESC LIMIT ?",
@@ -250,6 +323,14 @@ async def all_data_api_route(
         agents_data = []
         for row in cursor.fetchall():
             agent_dict = dict(row)
+            # SECURITY: the ``SELECT *`` above pulls the secret bearer
+            # ``token`` column. Drop it unconditionally — the canonical
+            # (operator-gated) token field is ``auth_token`` below.
+            # Leaving the raw column in ``dict(row)`` re-opened the
+            # viewer→agent bearer disclosure that ``auth_token`` gating
+            # otherwise closes. (``aoe_session_id`` is intentionally
+            # retained: the dashboard AoE editor pre-fills from it.)
+            agent_dict.pop('token', None)
             # Defensive skip for the legacy 'admin' pseudo-agent row.
             # Wave 4 (migration 0014) deletes it; this filter remains
             # so a partially-upgraded DB (or one with the
