@@ -137,18 +137,31 @@ def _synthesize_principal_from_arguments(
 def _is_operator_tier(principal: Principal) -> bool:
     """True iff ``principal`` is an operator-tier caller.
 
-    Operator-tier = the cookie-session / signed-forwarding-header
-    identity path, OR any sysadmin. Distinct from "an agent_bearer
-    with agent_role='manager'" — supervisory agents are not operators.
+    Operator-tier = a caller carrying the per-project operator write
+    marker (``system.config.write``, present in
+    :data:`PROJECT_ROLE_BUNDLES["operator"]` and short-circuited by the
+    sysadmin wildcard). Distinct from "an agent_bearer with
+    agent_role='manager'" — supervisory agents are not operators.
+
+    SEC (Finding 1, 2026-07-08): this used to gate on
+    ``principal.kind`` alone, so ANY cookie-session /
+    forwarding-header identity — *including a viewer-tier one* —
+    collapsed to operator-tier and walked past
+    :func:`requires_policy`. That is the same viewer→operator collapse
+    SEC1 (#273) fixed on the wire. The gate is now
+    role/capability-aware: sysadmins (wildcard) and operators pass;
+    viewers, who lack the write marker, are excluded. Mirrors the
+    already-correct ``_is_operator_tier`` in
+    ``agent_mcp.tools.agent_communication_tools`` (the two duplicate
+    helpers should eventually be collapsed into one — out of scope
+    for this fix).
 
     Used inside :func:`requires_policy` to bypass the worker-toggle
-    check for human operators (and the harness's
-    ``agent_id == "admin"`` label that historically stood in for
-    "operator at the dashboard").
+    check for human operators. The harness's ``agent_id == "admin"``
+    label that historically stood in for "operator at the dashboard"
+    is handled separately by ``requires_policy`` itself.
     """
-    if principal.sysadmin:
-        return True
-    return principal.kind in ("operator_session", "forwarding_header")
+    return principal.has_capability("system.config.write")
 
 
 def requires_capability(cap: str) -> Callable[[ToolImpl], ToolImpl]:

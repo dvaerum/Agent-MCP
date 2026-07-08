@@ -253,7 +253,16 @@ def resolve_capabilities(
             )
             group_ids = resolve_user_groups(user_id)
             for gid in group_ids:
-                caps |= _gcap_fetch(gid)
+                # SEC (Finding 2, 2026-07-08): defense-in-depth. Group
+                # rows are data — a migration, repair script, second
+                # writer, or direct SQL could land ``"*"`` (the sysadmin
+                # wildcard) or a typo'd string here, and unioning it
+                # verbatim would silently grant it. The wildcard must
+                # ONLY ever be mintable by the ``sysadmin=True`` branch
+                # above, never sourced from a group row; intersect with
+                # KNOWN_CAPABILITIES (which excludes ``"*"``) so any
+                # non-known string is dropped.
+                caps |= _gcap_fetch(gid) & KNOWN_CAPABILITIES
         except Exception:  # pragma: no cover - router.db not available
             # Tests / per-project backend / cold-start paths reach
             # here. The bundle (resolved below) is still applied; only

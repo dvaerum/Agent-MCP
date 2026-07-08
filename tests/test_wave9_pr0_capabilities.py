@@ -300,6 +300,84 @@ def test_resolve_capabilities_agent_bearer_no_role_is_empty():
     assert caps == frozenset()
 
 
+# ── resolve_capabilities: group caps are sanitised (Finding 2) ─────
+
+
+def _patch_group_caps(monkeypatch, group_caps):
+    """Point resolve_capabilities' group lookup at ``group_caps``.
+
+    Patches the source symbols (imported lazily inside the function)
+    so a single group ``"g1"`` resolves to the given cap frozenset.
+    """
+    import agent_mcp.router.group_resolver as gr
+    import agent_mcp.repositories.group_capability_repository as gcr
+
+    monkeypatch.setattr(gr, "resolve_user_groups", lambda user_id: {"g1"})
+    monkeypatch.setattr(gcr, "fetch", lambda gid: frozenset(group_caps))
+
+
+def test_resolve_capabilities_drops_wildcard_from_group_data(monkeypatch):
+    """SEC (Finding 2): the sysadmin wildcard ``"*"`` must NEVER be
+    sourced from group data.
+
+    Only the ``sysadmin=True`` branch may mint the wildcard. If a
+    group_capability row somehow contains ``"*"`` (migration bug,
+    repair script, direct SQL), unioning it verbatim would silently
+    make every group member a sysadmin. resolve_capabilities must drop
+    it — the caller stays a plain operator, not a sysadmin.
+    """
+    _patch_group_caps(monkeypatch, {SYSADMIN_WILDCARD, "tasks.assign"})
+
+    caps = resolve_capabilities(
+        user_id="alice",
+        agent_id=None,
+        sysadmin=False,
+        agent_role=None,
+        project_role="viewer",
+        kind="operator_session",
+    )
+
+    assert SYSADMIN_WILDCARD not in caps
+    # The legitimate, KNOWN cap from the group still comes through.
+    assert "tasks.assign" in caps
+    # And the wildcard did not smuggle in blanket admit.
+    p = Principal(
+        kind="operator_session",
+        user_id="alice",
+        agent_id=None,
+        sysadmin=False,
+        project_name="proj",
+        project_role="viewer",
+        agent_role=None,
+        can_wake_loop=False,
+        source_token=None,
+        capabilities=caps,
+    )
+    assert not p.has_capability("system.users.manage")
+
+
+def test_resolve_capabilities_drops_unknown_group_capability(monkeypatch):
+    """A bogus / typo'd capability string from group data is dropped —
+    only members of KNOWN_CAPABILITIES survive the union."""
+    _patch_group_caps(
+        monkeypatch, {"tasks.asssign_typo", "not.a.real.cap", "memories.view"}
+    )
+
+    caps = resolve_capabilities(
+        user_id="alice",
+        agent_id=None,
+        sysadmin=False,
+        agent_role=None,
+        project_role="viewer",
+        kind="operator_session",
+    )
+
+    assert "tasks.asssign_typo" not in caps
+    assert "not.a.real.cap" not in caps
+    # The one real cap survives.
+    assert "memories.view" in caps
+
+
 # ── with_capabilities harness helper ───────────────────────────────
 
 
