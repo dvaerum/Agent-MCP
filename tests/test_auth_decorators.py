@@ -134,6 +134,83 @@ async def test_requires_policy_worker_allowed_when_any_toggle_on(
         assert result[0].text == "worker in"
 
 
+# --- _is_operator_tier: role/capability-aware, not bare-kind ----------------
+
+
+def _forwarding_principal(project_role, *, sysadmin=False):
+    """Build a forwarding-header Principal with the given project role.
+
+    Caps back-fill from ``resolve_capabilities`` via ``__post_init__``,
+    so a ``"viewer"`` role yields the read-only bundle and ``"operator"``
+    yields the write bundle (which carries ``system.config.write``).
+    """
+    from agent_mcp.core.principal import Principal
+
+    return Principal(
+        kind="forwarding_header",
+        user_id="op-user",
+        agent_id=None,
+        sysadmin=sysadmin,
+        project_name="proj",
+        project_role=project_role,
+        agent_role=None,
+        can_wake_loop=False,
+        source_token=None,
+    )
+
+
+def test_is_operator_tier_excludes_viewer_forwarding_header() -> None:
+    """SEC (Finding 1): a viewer-tier forwarding-header principal must
+    NOT be treated as operator-tier.
+
+    The old helper gated on ``principal.kind`` alone, so ANY
+    forwarding-header identity (including a viewer) collapsed to
+    operator-tier and walked past ``requires_policy``. The fix makes
+    the check role/capability-aware — a viewer lacks the operator
+    write marker and must be excluded.
+    """
+    from agent_mcp.core.authorize import _is_operator_tier
+
+    viewer = _forwarding_principal("viewer")
+    assert _is_operator_tier(viewer) is False
+
+
+def test_is_operator_tier_admits_operator_forwarding_header() -> None:
+    """An operator-role forwarding-header principal stays operator-tier."""
+    from agent_mcp.core.authorize import _is_operator_tier
+
+    operator = _forwarding_principal("operator")
+    assert _is_operator_tier(operator) is True
+
+
+def test_is_operator_tier_admits_sysadmin() -> None:
+    """A sysadmin (wildcard caps) is always operator-tier, regardless
+    of project role."""
+    from agent_mcp.core.authorize import _is_operator_tier
+
+    sysadmin = _forwarding_principal(None, sysadmin=True)
+    assert _is_operator_tier(sysadmin) is True
+
+
+@pytest.mark.asyncio
+async def test_requires_policy_rejects_viewer_forwarding_header(
+    reset_globals,
+) -> None:
+    """A viewer forwarding-header caller must be rejected at the policy
+    gate (it is neither operator-tier nor an agent bearer)."""
+    from agent_mcp.core.authorize import requires_policy, AuthRejected
+
+    @requires_policy("config_some_toggle", default=False)
+    async def my_tool(
+        arguments: Dict[str, Any],
+    ) -> List[mcp_types.TextContent]:  # pragma: no cover - must not run
+        return [mcp_types.TextContent(type="text", text="viewer in")]
+
+    viewer = _forwarding_principal("viewer")
+    with pytest.raises(AuthRejected):
+        await my_tool({"token": "anything"}, principal=viewer)
+
+
 # --- Dispatcher integration -------------------------------------------------
 
 
