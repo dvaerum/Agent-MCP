@@ -11,7 +11,15 @@ We still re-validate the cookie at the FastAPI layer for two reasons:
   1. Defence in depth — a misconfiguration that bypassed the router
      middleware (e.g. someone exposing the backend Unix socket
      directly) shouldn't accidentally open the dashboard mutation
-     surface.
+     surface. The cookie path therefore AUTHORIZES, not just
+     authenticates: it reverse-maps this backend's ``MCP_PROJECT_DIR``
+     to its project name via the router registry and re-resolves the
+     caller's membership + operator/viewer split with the same
+     resolver the router uses (see ``_authorize_session_for_project``).
+     A cookie for a project the operator isn't a member of, or a
+     viewer attempting a mutation, is rejected — even if the backend
+     is reached directly. When the project name can't be determined
+     (ad-hoc / test harness) the dep falls back to authenticate-only.
   2. Per-agent bearers (workers / managers) still POST to the backend
      directly and need to authenticate.
 
@@ -33,6 +41,8 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
+from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException, Request
@@ -42,6 +52,13 @@ logger = logging.getLogger(__name__)
 
 
 SESSION_COOKIE_NAME = "agent_mcp_session"
+
+
+#: HTTP methods that mutate. Kept in lock-step with the router's
+#: ``auth_middleware._MUTATION_METHODS`` so the backend's cookie-path
+#: operator/viewer split matches the wire gate exactly: reads (GET /
+#: HEAD / OPTIONS) admit on either tier; these require operator.
+_MUTATION_METHODS = frozenset({"POST", "PATCH", "DELETE", "PUT"})
 
 
 #: Agent rows whose ``agent_role`` is treated as operator-tier for
@@ -94,6 +111,120 @@ def _resolve_session_user(session_id: str) -> dict[str, Any] | None:
             "treating as anonymous", session_id[:8],
         )
         return None
+
+
+def _backend_project_name() -> str | None:
+    """Best-effort: the project name THIS backend serves, or None.
+
+    The systemd launcher hands the backend only ``--project-dir`` (→
+    ``MCP_PROJECT_DIR``); the project *name* lives in the router-owned
+    registry keyed name→workspace. Reverse-map our resolved project dir
+    against the registry so the cookie-path authorization gate can ask
+    the router's resolver "is this caller a member of THIS project?".
+
+    Returns None when the registry is unavailable or has no entry whose
+    workspace matches our dir (ad-hoc / test harness, or a
+    not-yet-registered project). A None here means the dep cannot
+    authorize by project and falls back to the pre-existing
+    authenticate-only behaviour — no worse than before the fix, and it
+    keeps the fix from denying deploys where the reverse-map is
+    genuinely unavailable. In the internet-exposure posture this fix
+    targets (co-located systemd backend reachable directly) the
+    registry IS present, so the hole is closed where it matters.
+    """
+    try:
+        from ..core import config
+        from ..router.project_registry import ProjectRegistry
+
+        my_dir = config.get_project_dir()
+        for proj in ProjectRegistry().list():
+            workspace = proj.get("workspace")
+            if not workspace:
+                continue
+            try:
+                if Path(workspace).resolve() == my_dir:
+                    return proj.get("name")
+            except OSError:  # pragma: no cover - defensive (unresolvable path)
+                continue
+    except Exception:  # pragma: no cover - defensive
+        return None
+    return None
+
+
+def _authorize_session_for_project(user: dict[str, Any], request: Request) -> None:
+    """Enforce project membership + the read/mutation split on the
+    cookie/session path — the AUTHORIZE step the dep previously skipped.
+
+    Mirrors ``router/auth_middleware.require_operator_session_middleware``:
+
+      * sysadmin (directly or via a group) bypasses the membership check;
+      * a caller with no role for this backend's project → 401;
+      * a viewer performing a mutation (POST/PATCH/PUT/DELETE) → 403;
+      * everyone else admits.
+
+    The normal router-proxied path is unaffected: the router already
+    gated membership with the same resolver before forwarding the
+    cookie, so this re-resolves the identical role and admits. When the
+    backend cannot determine its own project name, we return without
+    enforcing (see :func:`_backend_project_name`).
+
+    Raises ``HTTPException`` (401 / 403) on denial.
+    """
+    project = _backend_project_name()
+    if project is None:
+        return
+
+    user_id = user.get("user_id")
+    if user_id is None:  # pragma: no cover - session rows always carry one
+        return
+    user_id = str(user_id)
+
+    from ..router import group_resolver
+
+    try:
+        if group_resolver.resolve_user_is_sysadmin(user_id):
+            return
+    except Exception:  # pragma: no cover - defensive; mirror router (non-sysadmin)
+        pass
+
+    try:
+        role = group_resolver.resolve_user_project_role(user_id, project)
+    except sqlite3.OperationalError:
+        # router.db missing/unmigrated — but reaching here means the
+        # session already resolved against the same DB, so this is
+        # unexpected. Fail closed (role=None → deny), consistent with
+        # the router middleware.
+        role = None
+    except Exception:  # pragma: no cover - defensive
+        logger.exception(
+            "backend project-role resolution failed for user=%r project=%r",
+            user.get("username"), project,
+        )
+        role = None
+
+    if role is None:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error": "login_required",
+                "message": (
+                    f"operator {user.get('username')!r} has no membership "
+                    f"in project {project!r}"
+                ),
+            },
+        )
+
+    if request.method.upper() in _MUTATION_METHODS and role != "operator":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "forbidden",
+                "message": (
+                    f"viewer-tier operator {user.get('username')!r} "
+                    f"cannot mutate project {project!r}"
+                ),
+            },
+        )
 
 
 # ── The dep ───────────────────────────────────────────────────────
@@ -157,6 +288,12 @@ async def require_operator_session(request: Request) -> dict[str, Any]:
     if session_id:
         user = _resolve_session_user(session_id)
         if user is not None:
+            # AUTHORIZE, not just authenticate: re-check project
+            # membership + the read/mutation split for THIS backend's
+            # project so a cookie for another project (or a viewer
+            # mutating) can't walk in when the backend is reached
+            # directly. Raises 401/403 on denial.
+            _authorize_session_for_project(user, request)
             return {"kind": "session", "user": user}
 
     # 2. Forwarding-header path — retire-system-token Wave 1. The
