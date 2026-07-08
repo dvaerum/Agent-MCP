@@ -395,7 +395,10 @@ def test_update_file_metadata_entry_gate_uses_system_config_write() -> None:
         ("view_status_tool_impl", "system.view"),
         ("terminate_agent_tool_impl", "agents.terminate"),
         ("view_audit_log_tool_impl", "system.view"),
-        ("get_agent_tokens_tool_impl", "agents.view"),
+        # FINDING 2 security fix: agent bearer tokens are operator-tier
+        # secrets, so the gate moved off the viewer-held ``agents.view``
+        # onto the operator-only ``agents.register`` cap.
+        ("get_agent_tokens_tool_impl", "agents.register"),
     ],
 )
 def test_admin_tool_require_capability_per_tool(tool_name, cap) -> None:

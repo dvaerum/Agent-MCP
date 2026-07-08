@@ -63,6 +63,29 @@ def _require_capability(
     return None
 
 
+def _is_confirmed_operator_tier(principal: Optional[Principal]) -> bool:
+    """Return True iff ``principal`` is CONFIRMED operator-tier.
+
+    MCP-side mirror of
+    ``app/routers/composition.py::is_confirmed_operator_tier`` so the
+    REST and MCP surfaces agree on who may see agent bearer tokens in
+    plaintext. Confirmed operator tier is a sysadmin OR an operator-role
+    project member (``project_role == "operator"``).
+
+    A viewer (``project_role == "viewer"``) is NOT confirmed operator
+    tier — even one whose group memberships happen to grant an
+    operator-only capability. Such a caller can pass a coarse capability
+    gate but must still have agent tokens withheld: a bearer they harvest
+    can be replayed to re-authenticate as that agent and escalate to
+    write. This is the defense-in-depth layer behind the capability gate.
+    """
+    if principal is None:
+        return False
+    if principal.sysadmin:
+        return True
+    return principal.project_role == "operator"
+
+
 
 # --- register_agent tool (Wave 7 PR 0 — coordinator transition) ---
 #
@@ -431,7 +454,11 @@ async def view_status_tool_impl(
     if denied is not None:
         return denied
 
-    log_audit("admin", "view_status", {})  # main.py:1249
+    log_audit(
+        principal.actor_label() if principal else "operator",
+        "view_status",
+        {},
+    )  # main.py:1249
 
     # Build agent status from g.active_agents and g.agent_working_dirs (main.py:1251-1259)
     agent_status_dict = {}
@@ -599,7 +626,9 @@ async def terminate_agent_tool_impl(
         # both retired here.
 
         log_audit(
-            "admin", "terminate_agent", {"agent_id": agent_id_to_terminate}
+            principal.actor_label() if principal else "operator",
+            "terminate_agent",
+            {"agent_id": agent_id_to_terminate},
         )  # main.py:1313
         logger.info(f"Agent '{agent_id_to_terminate}' terminated successfully.")
         return Ok(
@@ -690,7 +719,7 @@ async def view_audit_log_tool_impl(
 
     # Log this action itself (main.py:1405)
     log_audit(
-        "admin",
+        principal.actor_label() if principal else "operator",
         "view_audit_log",
         {
             "filter_agent_id": filter_agent_id,
@@ -732,7 +761,17 @@ async def get_agent_tokens_tool_impl(
     Supports filtering by status, agent_id pattern, creation date range,
     and more. Operator-only.
     """
-    denied = _require_capability(principal, "agents.view")
+    # SECURITY (FINDING 2): agent bearer tokens are operator-tier
+    # secrets. The viewer bundle holds ``agents.view`` (see
+    # core/capabilities.py::PROJECT_ROLE_BUNDLES), so gating on it leaked
+    # every agent's plaintext bearer to read-only viewers, who could
+    # replay a harvested token to escalate to write. Gate on an
+    # operator-only cap instead: ``agents.register`` is the operation
+    # that MINTS + returns an agent bearer, so the privilege to view
+    # existing agent tokens belongs to the same tier. Viewers (and agent
+    # bearers, which lack this cap) are denied here; the masking check
+    # below is the second, defense-in-depth layer.
+    denied = _require_capability(principal, "agents.register")
     if denied is not None:
         return denied
 
@@ -746,7 +785,11 @@ async def get_agent_tokens_tool_impl(
     filter_created_after = arguments.get("filter_created_after")  # ISO format date
     filter_created_before = arguments.get("filter_created_before")  # ISO format date
     include_terminated = arguments.get("include_terminated", False)  # Boolean
-    include_sensitive_data = arguments.get("include_sensitive_data", True)  # Boolean
+    # SECURITY (FINDING 2): default to MASKED. The prior default of True
+    # meant a caller who simply omitted the flag received plaintext
+    # bearers. Callers must now explicitly opt in AND be confirmed
+    # operator tier (checked via ``expose_tokens`` below) to see them.
+    include_sensitive_data = arguments.get("include_sensitive_data", False)  # Boolean
     limit = arguments.get("limit", 50)  # Default limit
     offset = arguments.get("offset", 0)  # Pagination offset
     sort_by = arguments.get("sort_by", "created_at")  # Sort field
@@ -792,11 +835,19 @@ async def get_agent_tokens_tool_impl(
             "offset": offset,
         })
 
-        # Mask sensitive data the same way the legacy inline path did.
+        # SECURITY (FINDING 2): plaintext tokens are surfaced ONLY when
+        # the caller both explicitly opted in AND is confirmed operator
+        # tier. Any non-confirmed-operator-tier caller (e.g. a viewer
+        # whose group grant let them pass the coarse cap gate) is masked
+        # regardless of the flag — mirrors ``is_confirmed_operator_tier``
+        # in app/routers/composition.py so REST and MCP agree.
+        expose_tokens = include_sensitive_data and _is_confirmed_operator_tier(
+            principal
+        )
         agents_data = []
         for row in rows:
             agent_data = dict(row)
-            if not include_sensitive_data:
+            if not expose_tokens:
                 if "token" in agent_data:
                     token_value = agent_data["token"]
                     if token_value and len(token_value) > 8:
@@ -807,9 +858,12 @@ async def get_agent_tokens_tool_impl(
                         agent_data["token"] = "***"
             agents_data.append(agent_data)
 
-        # Log this access
+        # Log this access against the REAL caller (FINDING 2 audit bug:
+        # the actor was hard-coded "admin", so a viewer's dump was
+        # recorded as an admin action). ``expose_tokens`` records whether
+        # plaintext was actually surfaced, not merely requested.
         log_audit(
-            "admin",
+            principal.actor_label() if principal else "operator",
             "get_agent_tokens",
             {
                 "filter_status": filter_status,
@@ -817,6 +871,7 @@ async def get_agent_tokens_tool_impl(
                 "agents_returned": len(agents_data),
                 "total_matching": total_count,
                 "include_sensitive_data": include_sensitive_data,
+                "tokens_exposed": expose_tokens,
             },
         )
 
@@ -836,7 +891,9 @@ async def get_agent_tokens_tool_impl(
                 "filter_created_after": filter_created_after,
                 "filter_created_before": filter_created_before,
                 "include_terminated": include_terminated,
-                "include_sensitive_data": include_sensitive_data,
+                # Report the EFFECTIVE exposure, not merely the requested
+                # flag, so a client can tell whether tokens were masked.
+                "include_sensitive_data": expose_tokens,
             },
             "sort": {"sort_by": sort_by, "sort_order": sort_order},
         }
