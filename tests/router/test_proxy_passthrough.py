@@ -234,6 +234,111 @@ async def test_query_string_passes_through(
 
 
 @pytest.mark.no_auth_seed_session
+async def test_chunked_post_does_not_error(
+    aiohttp_client, router_app, fake_backend, router_module,
+) -> None:
+    """A genuinely chunked inbound ``POST /mcp`` (streamed body, no
+    Content-Length) must proxy cleanly.
+
+    Regression: the router forwarded the inbound ``Transfer-Encoding:
+    chunked`` header to the backend while aiohttp's client set a
+    Content-Length from the materialised body. Content-Length + a
+    hop-by-hop Transfer-Encoding is an illegal combination, so the
+    backend rejected the otherwise-valid request with a hard
+    ``BadHttpMessage`` (4xx/5xx). Stripping the RFC-7230 hop-by-hop set
+    before forwarding fixes it.
+    """
+    router_module._agent_token_cache["proj"] = (9.9e18, {"tok-1234": "Admin"})
+
+    async def _chunked_body():
+        yield b'{"jsonrpc":"2.0",'
+        yield b'"id":1,"method":"tools/list","params":{}}'
+
+    client = await aiohttp_client(router_app)
+    resp = await client.post(
+        "/agent-mcp/mcp/proj",
+        data=_chunked_body(),  # async-iterable → aiohttp uses chunked TE
+        headers={"Authorization": "Bearer tok-1234"},
+    )
+
+    assert resp.status == 200, (
+        f"chunked POST regressed to {resp.status}: {await resp.text()}"
+    )
+    assert len(fake_backend.records) == 1
+    rec = fake_backend.records[0]
+    assert rec["body"] == (
+        b'{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+    )
+    # The hop-by-hop Transfer-Encoding must NOT have been forwarded.
+    fwd = {k.lower() for k in rec["headers"]}
+    assert "transfer-encoding" not in fwd, (
+        "Transfer-Encoding leaked to the backend"
+    )
+
+
+@pytest.mark.no_auth_seed_session
+async def test_hop_by_hop_headers_stripped(
+    aiohttp_client, router_app, fake_backend, router_module,
+) -> None:
+    """RFC-7230 §6.1 hop-by-hop headers (+ ``Proxy-*``) supplied by the
+    client must be stripped before the request reaches the backend."""
+    router_module._agent_token_cache["proj"] = (9.9e18, {"tok-1234": "Admin"})
+    client = await aiohttp_client(router_app)
+
+    await client.post(
+        "/agent-mcp/mcp/proj",
+        data=b"{}",
+        headers={
+            "Authorization": "Bearer tok-1234",
+            "Connection": "keep-alive",
+            "Keep-Alive": "timeout=5",
+            "TE": "trailers",
+            "Upgrade": "h2c",
+            "Proxy-Authorization": "Basic Zm9vOmJhcg==",
+        },
+    )
+
+    rec = fake_backend.records[-1]
+    fwd = {k.lower() for k in rec["headers"]}
+    for banned in (
+        "connection", "keep-alive", "te", "upgrade",
+        "proxy-authorization", "transfer-encoding",
+    ):
+        assert banned not in fwd, f"hop-by-hop header {banned!r} leaked upstream"
+    # The load-bearing header still gets through.
+    assert rec["headers"].get("Authorization") == "Bearer tok-1234"
+
+
+@pytest.mark.no_auth_seed_session
+async def test_junk_bearer_known_vs_unknown_uniform_401(
+    aiohttp_client, router_app, fake_backend, router_module,
+) -> None:
+    """SEC5: with a junk bearer, a KNOWN and an UNKNOWN project must
+    both return 401 — no status-code oracle. The known project forwards
+    to the backend, which rejects the junk bearer (simulated here as the
+    real ``AuthHeaderMiddleware`` would); the unknown project resolves
+    to the same uniform 401 at the router edge.
+    """
+    async def _reject(req):
+        return web.Response(status=401, body=b"bad bearer")
+
+    fake_backend.response_factory = _reject
+    client = await aiohttp_client(router_app)
+
+    hdrs = {"Authorization": "Bearer junk", "Content-Type": "application/json"}
+    resp_known = await client.post(
+        "/agent-mcp/mcp/proj", data=b"{}", headers=hdrs, allow_redirects=False,
+    )
+    resp_unknown = await client.post(
+        "/agent-mcp/mcp/does-not-exist", data=b"{}", headers=hdrs,
+        allow_redirects=False,
+    )
+
+    assert resp_known.status == 401, await resp_known.text()
+    assert resp_unknown.status == 401, await resp_unknown.text()
+
+
+@pytest.mark.no_auth_seed_session
 async def test_missing_bearer_returns_401(
     aiohttp_client, router_app, fake_backend,
 ) -> None:

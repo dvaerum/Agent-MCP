@@ -18,10 +18,25 @@ ITEM 2 (LOW) — pre-auth project-existence oracle
   * The MCP handler resolved the project (404 for unknown) BEFORE the
     auth check (401 for known-but-unauthenticated). An anonymous caller
     could therefore enumerate valid project names by status-code
-    differencing (unknown→404 vs known→401). The handler now gates on
-    credential PRESENCE before resolving, so an anonymous probe gets a
-    uniform 401 either way. Authenticated callers still get a genuine
-    404 for a truly-unknown project.
+    differencing (unknown→404 vs known→401). The credential-PRESENCE
+    gate closed the fully-anonymous probe, but a junk
+    ``Authorization: Bearer <garbage>`` cleared that gate and still hit
+    the resolve → unknown→404 vs known→401 remained observable. The
+    handler now ALSO collapses the resolve's 404 into the same uniform
+    401 for any not-yet-authenticated caller (the router can't validate
+    a bearer itself), so unknown and known are indistinguishable on the
+    MCP transport regardless of what junk credential is presented.
+    Genuine 404 semantics for unknown projects survive on the
+    operator-session-gated REST/lifecycle handlers, which an
+    unauthenticated caller can't reach.
+
+ITEM 3 (LOW) — reason-phrase reflection
+  * Several router/admin handlers reflected an attacker-controlled
+    project name / alias / agent_id into the HTTP ``reason`` (status
+    line): ``reason=f"unknown project: {name!r}"`` etc. Echoing caller
+    input into the status line is response-splitting-adjacent and
+    leaks nothing an operator needs; every such site now emits a fixed
+    constant phrase.
 """
 
 from __future__ import annotations
@@ -189,19 +204,18 @@ async def test_anonymous_mcp_401_carries_www_authenticate(
         assert "Bearer" in resp.headers.get("WWW-Authenticate", "")
 
 
-async def test_authenticated_mcp_unknown_project_still_404(
+@pytest.mark.no_auth_seed_session
+async def test_junk_bearer_mcp_unknown_project_is_401_not_404(
     aiohttp_client, router_app, register_project,
 ) -> None:
-    """Regression guard: a caller that DOES present a credential (here a
-    bearer) still gets a genuine 404 for a truly-unknown project — the
-    auth-before-resolve reorder must not blanket-401 authenticated
-    callers, since the overview/lifecycle handlers rely on real 404
-    semantics for unknown projects.
+    """SEC5 core: a junk ``Authorization: Bearer <garbage>`` to an
+    UNKNOWN project must return 401 — NOT the 404 the resolve would
+    otherwise raise. The router can't validate a bearer itself, so a
+    junk-bearer caller is not-yet-authenticated and must not be able to
+    tell unknown from known by status-code differencing.
 
-    A bearer to an UNKNOWN project resolves to 404 at the router (the
-    project can't be found, so there's no backend to forward to); a
-    bearer to a KNOWN project would forward to the backend (not tested
-    here — no backend stood up).
+    (Pre-fix this returned 404, which — paired with a known project's
+    401 — was exactly the enumeration oracle.)
     """
     register_project("known-proj")
     client = await aiohttp_client(router_app)
@@ -210,10 +224,106 @@ async def test_authenticated_mcp_unknown_project_still_404(
         "/agent-mcp/mcp/does-not-exist",
         data=b'{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
         headers={
-            "Authorization": "Bearer some-agent-token",
+            "Authorization": "Bearer some-junk-token",
             "Content-Type": "application/json",
         },
         allow_redirects=False,
     )
 
+    assert resp.status == 401, await resp.text()
+    assert "Bearer" in resp.headers.get("WWW-Authenticate", "")
+
+
+async def test_authenticated_rest_unknown_project_still_404(
+    aiohttp_client, router_app, register_project,
+) -> None:
+    """Regression guard: the auth-before-resolve hardening on the MCP
+    transport must NOT blanket-401 the operator-session-gated REST path.
+    An authenticated operator (the auto-attached sentinel cookie) that
+    asks for an UNKNOWN project on a lifecycle/admin endpoint still gets
+    a genuine 404 — that's the legit path the fix must leave intact, and
+    an unauthenticated caller can't reach it (the middleware 401s first).
+    """
+    register_project("known-proj")
+    client = await aiohttp_client(router_app)
+
+    resp = await client.get(
+        "/agent-mcp/api/router/projects/does-not-exist/client-config",
+        headers={"Accept": "application/vnd.agent-mcp.v1+json"},
+        allow_redirects=False,
+    )
+
     assert resp.status == 404, await resp.text()
+
+
+# ── ITEM 3: reason-phrase reflection ────────────────────────────────
+
+
+async def test_unknown_project_reason_phrase_is_constant(
+    aiohttp_client, router_app, register_project,
+) -> None:
+    """The REST 404 for an unknown project must not reflect the
+    caller-supplied name into the HTTP status line (reason phrase)."""
+    register_project("known-proj")
+    client = await aiohttp_client(router_app)
+
+    marker = "sentinel-secret-name"
+    resp = await client.get(
+        f"/agent-mcp/api/router/projects/{marker}/client-config",
+        headers={"Accept": "application/vnd.agent-mcp.v1+json"},
+        allow_redirects=False,
+    )
+
+    assert resp.status == 404
+    assert marker not in (resp.reason or ""), (
+        f"reason phrase reflects the caller-supplied name: {resp.reason!r}"
+    )
+
+
+async def test_unknown_agent_reason_phrase_is_constant(
+    aiohttp_client, router_app, register_project, router_module,
+) -> None:
+    """The 404 for an unknown ``?agent=`` on the wiring endpoint must not
+    reflect the caller-supplied agent_id into the status line."""
+    register_project("known-proj")
+    # Seed the token cache so ``_resolve_agent_token`` resolves against a
+    # known (empty-of-this-agent) map instead of hitting a real backend.
+    router_module._agent_token_cache["known-proj"] = (
+        9.9e18, {"tok-real": "RealAgent"},
+    )
+    client = await aiohttp_client(router_app)
+
+    marker = "sentinel-secret-agent"
+    resp = await client.get(
+        f"/agent-mcp/api/router/projects/known-proj/client-config?agent={marker}",
+        headers={"Accept": "application/vnd.agent-mcp.v1+json"},
+        allow_redirects=False,
+    )
+
+    assert resp.status == 404
+    assert marker not in (resp.reason or ""), (
+        f"reason phrase reflects the caller-supplied agent_id: {resp.reason!r}"
+    )
+
+
+@pytest.mark.no_auth_seed_session
+async def test_mcp_wrong_method_reason_phrase_is_constant(
+    aiohttp_client, router_app, register_project,
+) -> None:
+    """The 405 for a disallowed HTTP verb on /mcp must not reflect the
+    caller-supplied project name into the status line."""
+    register_project("known-proj")
+    client = await aiohttp_client(router_app)
+
+    resp = await client.request(
+        "PUT",
+        "/agent-mcp/mcp/known-proj",
+        data=b"{}",
+        headers={"Authorization": "Bearer some-junk-token"},
+        allow_redirects=False,
+    )
+
+    assert resp.status == 405
+    assert "known-proj" not in (resp.reason or ""), (
+        f"reason phrase reflects the project name: {resp.reason!r}"
+    )

@@ -855,46 +855,48 @@ async def mcp_call_tool_handler(name: str, arguments: dict) -> List[mcp_types.Te
 session_manager: Optional[StreamableHTTPSessionManager] = None
 
 
-#: JSON-RPC error codes the terse sanitizer emits. -32700 parse error
-#: is already terse from the SDK (no internal dump), so we leave it be;
-#: the leaky case is the schema-validation failure the SDK labels
-#: -32602 with a full pydantic dump. We remap that to -32600 (Invalid
-#: Request) — the payload wasn't a valid JSON-RPC Request object — with
-#: a fixed, detail-free message.
+#: Terse, detail-free ``message`` strings the sanitizer emits, keyed by
+#: JSON-RPC error code. The sanitizer rebuilds every ``error`` envelope
+#: from this map, so any code NOT listed here falls back to the generic
+#: -32603 "Internal error" text — no exception channel can leak an
+#: internal string through an unrecognised code.
 _JSONRPC_TERSE_MESSAGES: dict[int, str] = {
     -32700: "Parse error",
     -32600: "Invalid Request",
     -32602: "Invalid params",
+    -32603: "Internal error",
 }
-
-#: Substrings that mark a JSON-RPC error ``message`` as leaking
-#: internal validation machinery (pydantic dump). Case-insensitive.
-_JSONRPC_LEAK_MARKERS: tuple[str, ...] = (
-    "pydantic",
-    "input_value",
-    "validation error",
-    "for further information visit",
-)
 
 
 def _sanitize_jsonrpc_error_body(raw: bytes) -> Optional[bytes]:
-    """Return a terse replacement for a JSON-RPC error body that leaks
-    internal validation detail; ``None`` to leave the body untouched.
+    """Rebuild a JSON-RPC error envelope with a fixed, detail-free
+    ``message``; ``None`` to leave the body untouched (not JSON-RPC).
 
-    SEC-1 fold-in: a malformed-but-parseable JSON-RPC POST (e.g.
-    ``method`` as an int) makes the MCP SDK's ``JSONRPCMessage``
-    pydantic model raise, and the SDK serialises the full
-    ``ValidationError`` — ``input_value=…``, ``errors.pydantic.dev``
-    URLs, the internal model field names — into the JSON-RPC error
-    ``message`` sent to the client. That discloses server internals
-    (library, version, schema shape). We rewrite the envelope to the
-    standard JSON-RPC error text, preserving ``jsonrpc``/``id`` so the
-    response is still a well-formed JSON-RPC error the client can
-    parse.
+    SEC-1: the MCP SDK serialises uncaught server-side detail straight
+    into the JSON-RPC error ``message`` it sends the client — a
+    malformed-but-parseable POST (e.g. ``method`` as an int) yields the
+    full pydantic ``ValidationError`` (``input_value=…``,
+    ``errors.pydantic.dev`` URLs, internal field names), and the SDK's
+    catch-all emits any uncaught exception as
+    ``{"code":-32603,"message":"Error handling POST request: <str(err)>"}``
+    (a deep-nested-JSON body even makes that ``str(err)`` a live
+    ``RecursionError`` message). All of it discloses server internals
+    — library, version, schema shape, stack detail.
 
-    Only rewrites when the message actually carries a leak marker, so a
-    clean transport-level 4xx (no internal dump) passes through
-    verbatim.
+    The earlier SEC-1 pass sniffed for four leak-marker substrings and
+    only rewrote on a hit; any exception string lacking all four passed
+    through verbatim. This is now an UNCONDITIONAL fixed-envelope
+    rebuild: for any parseable JSON-RPC ``error`` shape we replace
+    ``error.message`` with the terse text keyed off ``error.code`` (a
+    schema-validation ``-32602`` is remapped to ``-32600`` Invalid
+    Request; an unrecognised code falls back to ``-32603`` Internal
+    error). ``jsonrpc``/``id`` are preserved so the response stays a
+    well-formed JSON-RPC error the client can parse. No marker sniff
+    remains, so no exception channel can leak.
+
+    The wrapper only feeds status-``>= 400`` ``application/json``
+    responses here (SSE 2xx tool streams are never touched), so a
+    healthy tool result is never rebuilt.
     """
     try:
         payload = json.loads(raw)
@@ -905,22 +907,18 @@ def _sanitize_jsonrpc_error_body(raw: bytes) -> Optional[bytes]:
     err = payload.get("error")
     if not isinstance(err, dict):
         return None
-    message = err.get("message")
-    if not isinstance(message, str):
-        return None
-    lowered = message.lower()
-    if not any(marker in lowered for marker in _JSONRPC_LEAK_MARKERS):
-        return None
 
     code = err.get("code")
     # A schema-validation failure means the request object was invalid
-    # → -32600 Invalid Request. Keep a genuine parse error's -32700.
+    # → -32600 Invalid Request. A recognised code keeps its own terse
+    # message; anything else (incl. the SDK's -32603 catch-all and any
+    # unmapped/absent code) collapses to -32603 Internal error.
     if code == -32602:
         new_code = -32600
     elif isinstance(code, int) and code in _JSONRPC_TERSE_MESSAGES:
         new_code = code
     else:
-        new_code = -32600
+        new_code = -32603
     payload["error"] = {
         "code": new_code,
         "message": _JSONRPC_TERSE_MESSAGES[new_code],
