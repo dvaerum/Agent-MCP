@@ -105,7 +105,17 @@ def get_agent_by_id(agent_id: str) -> Optional[Dict[str, Any]]:
             return cached
 
     row = _db_get_agent_by_id(agent_id)
-    if row is not None and not _cache_disabled:
+    # SECURITY (terminate-revocation): never warm the auth cache with a
+    # terminated row. The /mcp gate is cache-only and trusts the
+    # invariant "active_agents holds only non-terminated rows"; a
+    # cache-write here for a status='terminated' row would silently
+    # reactivate a revoked bearer. The row is still RETURNED for
+    # audit/attribution — only the cache write is gated.
+    if (
+        row is not None
+        and not _cache_disabled
+        and row.get("status") != "terminated"
+    ):
         token = row.get("token")
         if token:
             state.active_agents[token] = row
@@ -127,7 +137,15 @@ def get_agent_by_token(token: str) -> Optional[Dict[str, Any]]:
             return cached
 
     row = _db_get_agent_by_token(token)
-    if row is not None and not _cache_disabled:
+    # SECURITY (terminate-revocation): see get_agent_by_id above. A
+    # terminated bearer resolved here (e.g. an active worker naming the
+    # terminated token in assign_task) must NOT be re-inserted into the
+    # cache-only /mcp auth gate. Return the row for audit; skip the write.
+    if (
+        row is not None
+        and not _cache_disabled
+        and row.get("status") != "terminated"
+    ):
         state.active_agents[token] = row
         agent_id = row.get("agent_id")
         wd = row.get("working_directory")

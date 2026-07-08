@@ -430,7 +430,16 @@ class AgentRepository:
                 return cached
 
         row = _db_get_agent_by_id(agent_id)
-        if row is not None and not self._cache_disabled:
+        # SECURITY (terminate-revocation): never warm the auth cache with
+        # a terminated row. The /mcp gate is cache-only and trusts that
+        # active_agents holds only non-terminated rows; caching a
+        # status='terminated' row would silently reactivate a revoked
+        # bearer. Row still RETURNED for audit — only the write is gated.
+        if (
+            row is not None
+            and not self._cache_disabled
+            and row.get("status") != "terminated"
+        ):
             token = row.get("token")
             if token:
                 state.active_agents[token] = row
@@ -452,7 +461,15 @@ class AgentRepository:
                 return cached
 
         row = _db_get_agent_by_token(token)
-        if row is not None and not self._cache_disabled:
+        # SECURITY (terminate-revocation): see get_by_id above. A
+        # terminated bearer resolved on the auth hot path must NOT be
+        # re-inserted into the cache-only /mcp gate. Row still RETURNED
+        # for audit; the cache write is gated on non-terminated status.
+        if (
+            row is not None
+            and not self._cache_disabled
+            and row.get("status") != "terminated"
+        ):
             state.active_agents[token] = row
             agent_id = row.get("agent_id")
             wd = row.get("working_directory")
