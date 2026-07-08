@@ -450,7 +450,17 @@ async def view_status_tool_impl(
     principal: Optional[Principal] = None,
 ) -> ToolResult:
     """Report active agents + server status — operator-only."""
-    denied = _require_capability(principal, "system.view")
+    # SECURITY (viewer-read-gating, 2026-07-08): gated on
+    # ``system.config.write`` — the operator-only system capability —
+    # NOT ``system.view``. ``system.view`` is in the VIEWER project-role
+    # bundle (core/capabilities.py::PROJECT_ROLE_BUNDLES), so gating on
+    # it let a read-only viewer who called this tool directly over the
+    # MCP wire (it's hidden from their tools/list, but visibility is not
+    # enforcement) read every agent's status + absolute working
+    # directory. ``system.config.write`` is held by operators + sysadmin
+    # but not viewers, so it names the operator tier that may see
+    # system-level oversight data. Sysadmin admits via the wildcard.
+    denied = _require_capability(principal, "system.config.write")
     if denied is not None:
         return denied
 
@@ -672,7 +682,12 @@ async def view_audit_log_tool_impl(
     principal: Optional[Principal] = None,
 ) -> ToolResult:
     """Read recent audit-log entries — operator-only."""
-    denied = _require_capability(principal, "system.view")
+    # SECURITY (viewer-read-gating, 2026-07-08): gated on
+    # ``system.config.write`` (operator-only system cap), NOT
+    # ``system.view`` — the audit log discloses operator user_ids and
+    # every agent action, and ``system.view`` is in the VIEWER bundle.
+    # See view_status_tool_impl for the full rationale.
+    denied = _require_capability(principal, "system.config.write")
     if denied is not None:
         return denied
 
@@ -848,14 +863,16 @@ async def get_agent_tokens_tool_impl(
         for row in rows:
             agent_data = dict(row)
             if not expose_tokens:
+                # SECURITY (viewer-read-gating finding 3, 2026-07-08):
+                # FULL-mask the bearer for the non-confirmed-operator
+                # path. The prior ``token[:4] + "..." + token[-4:]`` form
+                # disclosed 8 characters of a secret bearer to any
+                # non-operator caller — enough to narrow a brute-force or
+                # confirm a guessed token. Confirmed operators still get
+                # the real token via the ``expose_tokens`` branch (the
+                # SEC2 contract, unchanged).
                 if "token" in agent_data:
-                    token_value = agent_data["token"]
-                    if token_value and len(token_value) > 8:
-                        agent_data["token"] = (
-                            token_value[:4] + "..." + token_value[-4:]
-                        )
-                    else:
-                        agent_data["token"] = "***"
+                    agent_data["token"] = "***"
             agents_data.append(agent_data)
 
         # Log this access against the REAL caller (FINDING 2 audit bug:
