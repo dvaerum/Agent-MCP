@@ -208,6 +208,7 @@ def _build_principal_from_request(
     request,
     bearer_token: str,
     forwarding_operator: Optional[str],
+    forwarding_role: Optional[str] = None,
 ):
     """Construct the per-request :class:`Principal` for the per-project backend.
 
@@ -223,13 +224,21 @@ def _build_principal_from_request(
       operator who arrived via the router. Build a
       ``forwarding_header`` Principal naming that operator. The
       per-project backend has no router.db handle, so group-cap
-      overlays don't apply here — but the operator still carries
-      ``project_role="operator"`` so :func:`resolve_capabilities`
-      back-fills the operator bundle and ``has_capability`` admits
-      the operator-tier caps (parity with the REST path in
-      ``routers/agents.py``). Wave 9 PR 6 deleted the legacy
-      ``has_role`` bridge, so the capability set — not ``kind`` — is
-      now what gates admin tools and tool visibility.
+      overlays don't apply here — but the operator carries
+      ``project_role=forwarding_role`` (the REAL role the router
+      resolved from ``project_membership`` and signed into the
+      header) so :func:`resolve_capabilities` back-fills the matching
+      bundle: viewer caps for a viewer, operator caps for an operator.
+      SEC-1 (2026-07): this used to hard-code
+      ``project_role="operator"`` for every verified header, which
+      handed a viewer-tier operator the full operator bundle
+      (agents.register / terminate, system.config.write, …) over the
+      MCP wire even though the REST ``/api/`` surface correctly 403'd
+      them. The role now rides the HMAC-signed header, so it can't be
+      tampered in flight and the wire path matches the REST path's
+      per-role gating. Wave 9 PR 6 deleted the legacy ``has_role``
+      bridge, so the capability set — not ``kind`` — is now what
+      gates admin tools and tool visibility.
     * If a per-agent bearer authenticated, build an ``agent_bearer``
       Principal sourcing ``agent_id`` + ``agent_role`` from the
       agents table (via the in-memory cache). ``can_wake_loop``
@@ -255,22 +264,23 @@ def _build_principal_from_request(
             # cookie path, so the forwarding-header Principal here is
             # purely the in-process restatement of that admit.
             #
-            # project_role="operator" back-fills the operator bundle
-            # (agents.register / terminate, system.config.write, …). It
-            # is required, not optional: has_capability's project-
-            # membership gate rejects every non-system cap when
-            # project_role is None, and resolve_capabilities only unions
-            # PROJECT_ROLE_BUNDLES[project_role] when it's set — so
-            # without it a cookie operator has zero caps over the MCP
-            # wire. Mirrors the REST path (routers/agents.py), which
-            # hard-codes project_role="operator" for the identical
-            # cookie-operator admin action.
+            # SEC-1: project_role is the operator's REAL signed role
+            # (``forwarding_role``), NOT a fixed "operator". A viewer
+            # signs role="viewer" and gets PROJECT_ROLE_BUNDLES["viewer"]
+            # (read-only); an operator signs role="operator" and gets
+            # the full write bundle. has_capability's project-membership
+            # gate still admits resource caps because project_role is
+            # non-None for both tiers. If the header verified but
+            # carried no role (shouldn't happen — verify enforces a
+            # known role — but defensive), project_role stays None and
+            # the operator gets only system-ungated caps, i.e. nearly
+            # nothing: fail closed, never fail open to "operator".
             caps = resolve_capabilities(
                 user_id=forwarding_operator,
                 agent_id=None,
                 sysadmin=False,
                 agent_role=None,
-                project_role="operator",
+                project_role=forwarding_role,
                 kind="forwarding_header",
             )
             return Principal(
@@ -279,7 +289,7 @@ def _build_principal_from_request(
                 agent_id=None,
                 sysadmin=False,
                 project_name=None,
-                project_role="operator",
+                project_role=forwarding_role,
                 agent_role=None,
                 can_wake_loop=False,
                 source_token=None,
@@ -437,18 +447,26 @@ class AuthHeaderMiddleware(BaseHTTPMiddleware):
         # side); active when it is.
         forwarding_raw = request.headers.get(_fh.HEADER_NAME)
         forwarding_operator: Optional[str] = None
+        forwarding_role: Optional[str] = None
         if forwarding_raw is not None:
             if _g.forwarding_hmac_key:
-                forwarding_operator = _fh.verify(
+                verified = _fh.verify(
                     forwarding_raw, _g.forwarding_hmac_key
                 )
-                if forwarding_operator is None:
-                    # Present-but-invalid header: reject hard. Falling
+                if verified is None:
+                    # Present-but-invalid header (bad HMAC, expired,
+                    # malformed, OR unknown role): reject hard. Falling
                     # through to the bearer path would let a tampered
                     # header silently downgrade auth to "whatever bearer
                     # was attached", which is the wrong defaults-secure
                     # behaviour.
                     return _build_unauthorized_response(token)
+                # SEC-1: carry the operator's REAL signed role through
+                # to the Principal so a viewer gets viewer caps, not the
+                # operator bundle. The role is HMAC-covered, so a value
+                # that reaches here is one the router legitimately
+                # signed for this operator's project membership.
+                forwarding_operator, forwarding_role = verified
                 _g.current_operator = forwarding_operator
             else:
                 # Key not loaded yet — dormant fallback. The header
@@ -483,6 +501,7 @@ class AuthHeaderMiddleware(BaseHTTPMiddleware):
             request=request,
             bearer_token=token,
             forwarding_operator=forwarding_operator,
+            forwarding_role=forwarding_role,
         )
         if principal is not None:
             request.state.principal = principal
@@ -607,8 +626,16 @@ def _principal_role() -> str:
 
     Wave 9 PR 6: the operator-tier check is the typed Principal's own
     discriminators (``sysadmin`` flag or operator-kind seam) rather
-    than the deleted ``has_role("admin")`` bridge. Same admit shape;
-    no behaviour change.
+    than the deleted ``has_role("admin")`` bridge.
+
+    SEC-1 (2026-07): an operator-tier Principal only maps to ``admin``
+    when it actually holds the operator role (or is a sysadmin). A
+    viewer-tier operator (``project_role == "viewer"``) is NOT admin —
+    mapping every ``forwarding_header`` / ``operator_session`` caller
+    to ``admin`` regardless of role let a viewer see admin-only
+    Prompt Book entries, the same escalation class as the capability
+    collapse this fix closes. A viewer maps to ``worker`` (an
+    authenticated non-admin) so admin-only prompts stay hidden.
     """
     principal = request_principal.get()
     if principal is None:
@@ -624,10 +651,12 @@ def _principal_role() -> str:
             if agent_id:
                 return "worker"
         return "anonymous"
-    if principal.sysadmin or principal.kind in (
-        "operator_session", "forwarding_header",
-    ):
+    if principal.sysadmin:
         return "admin"
+    if principal.kind in ("operator_session", "forwarding_header"):
+        # Operator-tier: admin only for the operator role; a viewer is
+        # a non-admin authenticated caller.
+        return "admin" if principal.project_role == "operator" else "worker"
     if principal.kind == "agent_bearer":
         return "worker"
     return "anonymous"
@@ -826,6 +855,140 @@ async def mcp_call_tool_handler(name: str, arguments: dict) -> List[mcp_types.Te
 session_manager: Optional[StreamableHTTPSessionManager] = None
 
 
+#: JSON-RPC error codes the terse sanitizer emits. -32700 parse error
+#: is already terse from the SDK (no internal dump), so we leave it be;
+#: the leaky case is the schema-validation failure the SDK labels
+#: -32602 with a full pydantic dump. We remap that to -32600 (Invalid
+#: Request) — the payload wasn't a valid JSON-RPC Request object — with
+#: a fixed, detail-free message.
+_JSONRPC_TERSE_MESSAGES: dict[int, str] = {
+    -32700: "Parse error",
+    -32600: "Invalid Request",
+    -32602: "Invalid params",
+}
+
+#: Substrings that mark a JSON-RPC error ``message`` as leaking
+#: internal validation machinery (pydantic dump). Case-insensitive.
+_JSONRPC_LEAK_MARKERS: tuple[str, ...] = (
+    "pydantic",
+    "input_value",
+    "validation error",
+    "for further information visit",
+)
+
+
+def _sanitize_jsonrpc_error_body(raw: bytes) -> Optional[bytes]:
+    """Return a terse replacement for a JSON-RPC error body that leaks
+    internal validation detail; ``None`` to leave the body untouched.
+
+    SEC-1 fold-in: a malformed-but-parseable JSON-RPC POST (e.g.
+    ``method`` as an int) makes the MCP SDK's ``JSONRPCMessage``
+    pydantic model raise, and the SDK serialises the full
+    ``ValidationError`` — ``input_value=…``, ``errors.pydantic.dev``
+    URLs, the internal model field names — into the JSON-RPC error
+    ``message`` sent to the client. That discloses server internals
+    (library, version, schema shape). We rewrite the envelope to the
+    standard JSON-RPC error text, preserving ``jsonrpc``/``id`` so the
+    response is still a well-formed JSON-RPC error the client can
+    parse.
+
+    Only rewrites when the message actually carries a leak marker, so a
+    clean transport-level 4xx (no internal dump) passes through
+    verbatim.
+    """
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    err = payload.get("error")
+    if not isinstance(err, dict):
+        return None
+    message = err.get("message")
+    if not isinstance(message, str):
+        return None
+    lowered = message.lower()
+    if not any(marker in lowered for marker in _JSONRPC_LEAK_MARKERS):
+        return None
+
+    code = err.get("code")
+    # A schema-validation failure means the request object was invalid
+    # → -32600 Invalid Request. Keep a genuine parse error's -32700.
+    if code == -32602:
+        new_code = -32600
+    elif isinstance(code, int) and code in _JSONRPC_TERSE_MESSAGES:
+        new_code = code
+    else:
+        new_code = -32600
+    payload["error"] = {
+        "code": new_code,
+        "message": _JSONRPC_TERSE_MESSAGES[new_code],
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+class _JsonRpcErrorSanitizer:
+    """Wrap an ASGI ``send`` to terse-ify leaky JSON-RPC error bodies.
+
+    SEC-1 fold-in. Only touches responses that are BOTH ``status >=
+    400`` AND ``application/json`` — the transport-level JSON-RPC error
+    envelopes the SDK emits for malformed requests. Successful tool
+    calls stream as ``text/event-stream`` and pass straight through, so
+    the SSE fan-out is never buffered.
+
+    The ``http.response.start`` message is held until the (small) error
+    body is fully buffered so a rewrite can recompute ``Content-Length``
+    before either message goes to the wire.
+    """
+
+    def __init__(self, send) -> None:
+        self._send = send
+        self._intercept = False
+        self._start: Optional[dict] = None
+        self._body = bytearray()
+
+    async def __call__(self, message) -> None:
+        mtype = message.get("type")
+        if mtype == "http.response.start":
+            status = message.get("status", 200)
+            ctype = b""
+            for k, v in message.get("headers") or []:
+                if k.lower() == b"content-type":
+                    ctype = v.lower()
+                    break
+            if status >= 400 and ctype.startswith(b"application/json"):
+                # Buffer: hold the start until the body is rewritten so
+                # Content-Length stays correct.
+                self._intercept = True
+                self._start = message
+                return
+            await self._send(message)
+            return
+        if mtype == "http.response.body" and self._intercept:
+            self._body.extend(message.get("body", b"") or b"")
+            if message.get("more_body", False):
+                return
+            raw = bytes(self._body)
+            replacement = _sanitize_jsonrpc_error_body(raw)
+            out = replacement if replacement is not None else raw
+            start = self._start or {"type": "http.response.start", "status": 400}
+            headers = [
+                (k, v)
+                for k, v in (start.get("headers") or [])
+                if k.lower() != b"content-length"
+            ]
+            headers.append((b"content-length", str(len(out)).encode("ascii")))
+            new_start = dict(start)
+            new_start["headers"] = headers
+            await self._send(new_start)
+            await self._send(
+                {"type": "http.response.body", "body": out, "more_body": False}
+            )
+            return
+        await self._send(message)
+
+
 class _McpAsgiApp:
     """ASGI app that delegates to a StreamableHTTP session manager.
 
@@ -873,7 +1036,13 @@ class _McpAsgiApp:
         if scope.get("type") == "http" and scope.get("method") == "GET":
             await self._handle_get(scope, receive, send)
             return
-        await self._manager.handle_request(scope, receive, send)
+        # POST/DELETE → SDK. Wrap ``send`` so a malformed-request
+        # JSON-RPC error envelope (which the SDK fills with a raw
+        # pydantic ValidationError dump) is rewritten to a terse
+        # standard envelope before it reaches the client — SEC-1.
+        await self._manager.handle_request(
+            scope, receive, _JsonRpcErrorSanitizer(send)
+        )
 
     async def _handle_get(self, scope, receive, send) -> None:
         """Open an SSE stream + drain `session_registry` queue at it.

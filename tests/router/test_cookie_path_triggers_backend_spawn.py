@@ -192,13 +192,16 @@ class _VerifyingBackend:
 
         raw = req.headers.get(_fh.HEADER_NAME)
         operator_id = None
+        role = None
         if raw is not None:
             try:
                 key = self.key_path.read_bytes()
             except FileNotFoundError:
                 key = None
             if key:
-                operator_id = _fh.verify(raw, key)
+                verified = _fh.verify(raw, key)
+                if verified is not None:
+                    operator_id, role = verified
         body = await req.read()
         self.records.append(
             {
@@ -207,6 +210,7 @@ class _VerifyingBackend:
                 "headers": dict(req.headers),
                 "body": body,
                 "operator_id": operator_id,
+                "role": role,
             },
         )
         if operator_id is None:

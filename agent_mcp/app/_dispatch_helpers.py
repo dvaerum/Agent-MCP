@@ -281,7 +281,29 @@ def _build_route_principal(
 # ``Access-Control-Allow-Credentials: true`` makes any browser at any
 # origin able to issue credentialed requests, which lets a logged-in
 # operator be CSRF'd from an attacker-controlled page.
-_DEFAULT_ALLOWED_ORIGINS: frozenset[str] = frozenset({
+#
+# SEC-1 fold-in (2026-07): the production default is now EMPTY. Shipping
+# ``localhost:3000/3001/3847`` in the default allowlist paired with
+# ``allow_credentials=True`` is a latent CSRF surface on any deployment
+# that binds a reachable interface — a malicious app running on the
+# victim's own machine at one of those origins could issue credentialed
+# requests against the dashboard using the operator's session cookie.
+# Local dashboard development opts the dev origins back in via the
+# existing ``MCP_DASHBOARD_EXTRA_ORIGINS`` env-var (see
+# :data:`_DEV_ORIGINS` for the exact value to set).
+_DEFAULT_ALLOWED_ORIGINS: frozenset[str] = frozenset()
+
+#: The localhost origins the local dashboard dev servers run on (Next.js
+#: dev on :3000/:3001, the packaged dashboard on :3847). NOT included by
+#: default — a developer opts them in explicitly:
+#:
+#:     export MCP_DASHBOARD_EXTRA_ORIGINS=\
+#:       "http://localhost:3000,http://localhost:3001,\
+#:        http://localhost:3847,http://127.0.0.1:3847"
+#:
+#: Kept as a named constant so the value has one canonical home the
+#: docs / dev tooling can reference instead of hard-coding the list.
+_DEV_ORIGINS: frozenset[str] = frozenset({
     'http://localhost:3847',
     'http://127.0.0.1:3847',
     'http://localhost:3000',

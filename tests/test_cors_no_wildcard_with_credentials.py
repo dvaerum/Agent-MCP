@@ -103,12 +103,17 @@ def test_preflight_from_evil_origin_does_not_grant_credentials(client) -> None:
     )
 
 
-def test_preflight_from_allowed_origin_still_works(client) -> None:
-    """Preflight from a configured localhost origin must keep working.
+def test_preflight_from_localhost_not_allowed_by_default(client) -> None:
+    """SEC-1 (2026-07): the localhost dev origins are NOT in the
+    production default allowlist.
 
-    Regression guard: the fix removes ``'*'`` from the allowlist, but
-    must NOT regress the dashboard's own credentialed flow served
-    from http://localhost:3847.
+    Pre-SEC-1 the default allowlist shipped
+    ``http://localhost:3000/3001/3847`` with ``allow_credentials=True``
+    — a latent CSRF surface on any reachable deployment. The default is
+    now empty; a preflight from ``http://localhost:3847`` must NOT be
+    echoed with credentials unless an operator opted it in via
+    ``MCP_DASHBOARD_EXTRA_ORIGINS`` (covered in
+    ``test_handle_options_origin_allowlist.py``).
     """
     response = client.options(
         "/api/status",
@@ -124,17 +129,10 @@ def test_preflight_from_allowed_origin_still_works(client) -> None:
         "access-control-allow-credentials", ""
     ).lower()
 
-    # The dashboard expects an echoed, specific Allow-Origin (NOT '*'
-    # — wildcard would itself disable credentials per the spec) and
-    # Allow-Credentials: true so the session cookie rides along.
-    assert allow_origin == "http://localhost:3847", (
-        f"Expected Allow-Origin: http://localhost:3847, got {allow_origin!r}. "
-        "The dashboard's credentialed flow depends on the origin being "
-        "echoed back; a wildcard would also break the flow because "
-        "browsers refuse to send credentials when ACAO is '*'."
-    )
-    assert allow_credentials == "true", (
-        "Expected Allow-Credentials: true for the allowlisted origin. "
-        "Without it, the dashboard's session cookie is dropped on the "
-        "preflight floor and subsequent requests are unauthenticated."
-    )
+    # Never the exploit shape: an echoed localhost origin + credentials.
+    if allow_credentials == "true":
+        assert allow_origin != "http://localhost:3847", (
+            "SEC-1: localhost:3847 was granted credentials by default. "
+            "The production default allowlist must be empty; dev origins "
+            "opt in via MCP_DASHBOARD_EXTRA_ORIGINS."
+        )

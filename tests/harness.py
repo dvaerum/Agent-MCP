@@ -710,7 +710,9 @@ class AdminClient(WorkerSession):
     # --- Forwarding-header helpers ---------------------------------
 
     def forwarding_header(
-        self, operator_id: str = _HARNESS_OPERATOR_ID
+        self,
+        operator_id: str = _HARNESS_OPERATOR_ID,
+        role: str = "operator",
     ) -> dict[str, str]:
         """Return a one-shot signed forwarding header for ``operator_id``.
 
@@ -720,12 +722,17 @@ class AdminClient(WorkerSession):
         authenticate against backend REST routes via the router
         path (cookie → signed header) use this helper to build the
         header on each call.
+
+        SEC-1: ``role`` is the signed per-project role (defaults to
+        ``operator`` so existing callers keep operator-tier access;
+        pass ``role="viewer"`` to exercise the viewer path over the
+        wire).
         """
         from agent_mcp.app import forwarding_header as _fh
 
         return {
             _fh.HEADER_NAME: _fh.sign(
-                operator_id, self._forwarding_hmac_key, ttl_sec=30
+                operator_id, role, self._forwarding_hmac_key, ttl_sec=30
             )
         }
 

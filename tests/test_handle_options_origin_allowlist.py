@@ -55,21 +55,45 @@ class _StubRequest:
         self.headers = headers or {}
 
 
-def test_handle_options_echoes_allowed_origin() -> None:
-    """A request from an allowlisted origin gets the credentialed CORS
+def test_handle_options_echoes_allowed_origin(
+    monkeypatch: pytest.MonkeyPatch,
+    reload_dispatch_helpers,
+) -> None:
+    """A request from an opted-in origin gets the credentialed CORS
     reply: ``Access-Control-Allow-Origin: <origin>``,
     ``Access-Control-Allow-Credentials: true``, plus ``Vary: Origin``
-    so any CDN caches the reply per-origin instead of poisoning it."""
+    so any CDN caches the reply per-origin instead of poisoning it.
+
+    SEC-1: the production default allowlist is empty, so the origin has
+    to be opted in via ``MCP_DASHBOARD_EXTRA_ORIGINS`` before it's
+    echoed."""
+    monkeypatch.setenv(
+        "MCP_DASHBOARD_EXTRA_ORIGINS", "https://ops.example.com"
+    )
+    dh = reload_dispatch_helpers()
+
+    request = _StubRequest(headers={"origin": "https://ops.example.com"})
+    response = asyncio.run(dh.handle_options(request))
+
+    assert response.headers.get("access-control-allow-origin") == (
+        "https://ops.example.com"
+    )
+    assert response.headers.get("access-control-allow-credentials") == "true"
+    assert response.headers.get("vary") == "Origin"
+
+
+def test_handle_options_localhost_not_allowed_by_default() -> None:
+    """SEC-1: the localhost dev origins are NOT in the production
+    default allowlist. A preflight from ``http://localhost:3847`` gets
+    NO CORS headers unless the operator opted it in via
+    ``MCP_DASHBOARD_EXTRA_ORIGINS``."""
     from agent_mcp.app._dispatch_helpers import handle_options
 
     request = _StubRequest(headers={"origin": "http://localhost:3847"})
     response = asyncio.run(handle_options(request))
 
-    assert response.headers.get("access-control-allow-origin") == (
-        "http://localhost:3847"
-    )
-    assert response.headers.get("access-control-allow-credentials") == "true"
-    assert response.headers.get("vary") == "Origin"
+    assert "access-control-allow-origin" not in response.headers
+    assert "access-control-allow-credentials" not in response.headers
 
 
 def test_handle_options_rejects_non_allowlisted_origin() -> None:
@@ -157,22 +181,52 @@ def test_extra_origins_env_var_adds_to_allowlist(
     monkeypatch: pytest.MonkeyPatch,
     reload_dispatch_helpers,
 ) -> None:
-    """Setting ``MCP_DASHBOARD_EXTRA_ORIGINS`` adds the parsed
-    origins to :data:`ALLOWED_ORIGINS` alongside the localhost
-    defaults — no default eviction, additive only."""
+    """Setting ``MCP_DASHBOARD_EXTRA_ORIGINS`` adds the parsed origins
+    to :data:`ALLOWED_ORIGINS`.
+
+    SEC-1: the production default is empty, so the allowlist is exactly
+    the opted-in extras — no localhost dev origins sneak in by
+    default."""
     monkeypatch.setenv(
         "MCP_DASHBOARD_EXTRA_ORIGINS",
         "https://dashboard.example.com,https://ops.internal",
     )
     dh = reload_dispatch_helpers()
 
-    assert "https://dashboard.example.com" in dh.ALLOWED_ORIGINS
-    assert "https://ops.internal" in dh.ALLOWED_ORIGINS
-    # Defaults still present — env-var extends, never replaces.
-    assert "http://localhost:3847" in dh.ALLOWED_ORIGINS
-    assert "http://127.0.0.1:3847" in dh.ALLOWED_ORIGINS
-    assert "http://localhost:3000" in dh.ALLOWED_ORIGINS
-    assert "http://localhost:3001" in dh.ALLOWED_ORIGINS
+    assert dh.ALLOWED_ORIGINS == frozenset({
+        "https://dashboard.example.com",
+        "https://ops.internal",
+    })
+    # SEC-1: localhost dev origins are NOT present by default.
+    assert "http://localhost:3847" not in dh.ALLOWED_ORIGINS
+    assert "http://localhost:3000" not in dh.ALLOWED_ORIGINS
+
+
+def test_dev_origins_opt_in_via_extra_origins(
+    monkeypatch: pytest.MonkeyPatch,
+    reload_dispatch_helpers,
+) -> None:
+    """SEC-1 'don't break local dev': the localhost dashboard dev
+    origins are re-enabled by listing :data:`_DEV_ORIGINS` in
+    ``MCP_DASHBOARD_EXTRA_ORIGINS``. Proves the opt-in path works while
+    the production default stays empty."""
+    from agent_mcp.app import _dispatch_helpers as _dh0
+
+    dev_csv = ",".join(sorted(_dh0._DEV_ORIGINS))
+    monkeypatch.setenv("MCP_DASHBOARD_EXTRA_ORIGINS", dev_csv)
+    dh = reload_dispatch_helpers()
+
+    for origin in _dh0._DEV_ORIGINS:
+        assert origin in dh.ALLOWED_ORIGINS
+
+
+def test_production_default_allowlist_is_empty() -> None:
+    """SEC-1: with no ``MCP_DASHBOARD_EXTRA_ORIGINS`` set, the default
+    allowlist is empty — no credentialed cross-origin surface ships by
+    default."""
+    from agent_mcp.app._dispatch_helpers import _DEFAULT_ALLOWED_ORIGINS
+
+    assert _DEFAULT_ALLOWED_ORIGINS == frozenset()
 
 
 def test_extra_origins_env_var_trims_whitespace(
