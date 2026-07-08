@@ -62,6 +62,32 @@ let
   daemonAgentWrapper =
     resolvedPkgs.agentMcpDaemonAgentWrapper cfg.router.port;
 
+  # ── Shared systemd hardening (defense-in-depth) ───────────────────
+  # The SAFE subset for user-scope units that need $HOME (~/.config +
+  # ~/.local/share) RW plus loopback + UDS networking. Deliberately
+  # OMITS ProtectHome / ProtectSystem=strict — the router writes its
+  # SQLite DB under XDG_DATA_HOME and reads projects.local.json under
+  # XDG_CONFIG_HOME, so a home-blocking sandbox would crash-loop the
+  # units. Merged into every Service block via `// hardening`.
+  #   - NoNewPrivileges: no setuid/setgid escalation from the unit.
+  #   - RestrictAddressFamilies: only UNIX sockets (backend UDS) + IPv4
+  #     /IPv6 (router loopback + ollama/OIDC egress); blocks AF_PACKET,
+  #     AF_NETLINK, etc.
+  #   - RestrictNamespaces / LockPersonality / ProtectKernelTunables /
+  #     ProtectKernelModules: block namespace creation, personality(2)
+  #     ADDR_NO_RANDOMIZE, /proc/sys + /sys writes, and module (un)load.
+  #   - SystemCallArchitectures=native: drop non-native syscall ABIs
+  #     (a common sandbox-bypass surface).
+  hardening = {
+    NoNewPrivileges = true;
+    RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" ];
+    RestrictNamespaces = true;
+    LockPersonality = true;
+    ProtectKernelTunables = true;
+    ProtectKernelModules = true;
+    SystemCallArchitectures = "native";
+  };
+
   # ── Single-tenant ExecStartPre seed ───────────────────────────────
   # When the module is configured for N=1 (`multiTenant = false` +
   # `singleProject = {…}`), we seed ~/.config/agent-mcp/projects.local.json
@@ -571,7 +597,7 @@ in {
           Restart = "on-failure";
           RestartSec = 5;
           TimeoutStopSec = 10;
-        };
+        } // hardening;
         # Not WantedBy any target — instances are started on demand by
         # the router (`systemctl --user start agent-mcp@<name>`).
       };
@@ -675,7 +701,7 @@ in {
           # (90 s, inherited from systemd) was the source of the
           # 2026-06-04 08:57 production stall — see PR <#TBD>.
           TimeoutStopSec = 15;
-        };
+        } // hardening;
         Install.WantedBy = [ "default.target" ];
       };
     } // lib.listToAttrs (map (a: {
@@ -698,7 +724,7 @@ in {
           ExecStart = "${daemonAgentWrapper}/bin/agent-mcp-daemon-agent ${daemonAgentInstanceName a}";
           Restart = "on-failure";
           RestartSec = 10;
-        };
+        } // hardening;
         Install.WantedBy = [ "default.target" ];
       };
     }) cfg.daemonAgents);
