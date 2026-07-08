@@ -89,11 +89,54 @@ def _mocked(remote: str, xff: str | None = None):
     )
 
 
-def test_client_ip_honours_xff_from_trusted_peer() -> None:
+def test_client_ip_uses_rightmost_untrusted_hop_from_trusted_peer() -> None:
     cfg = RateLimitConfig.from_env()
+    # Chain shape: the client may PREPEND a spoofed leftmost value, but
+    # the trusted proxy (nginx on loopback) appends the address it saw
+    # the connection come from as the RIGHTMOST hop. The real client is
+    # that rightmost untrusted entry, not the spoofable leftmost one.
     req = _mocked("127.0.0.1", xff="9.9.9.9, 10.0.0.1")
-    # Loopback peer is trusted by default → leftmost XFF is the client.
-    assert resolve_client_ip(req, cfg) == "9.9.9.9"
+    assert resolve_client_ip(req, cfg) == "10.0.0.1"
+
+
+def test_client_ip_single_proxy_chain_resolves_real_client() -> None:
+    cfg = RateLimitConfig.from_env()
+    # A legit single-proxy hop: nginx on loopback forwards, XFF carries
+    # exactly the real client IP → that is the client.
+    req = _mocked("127.0.0.1", xff="203.0.113.7")
+    assert resolve_client_ip(req, cfg) == "203.0.113.7"
+
+
+def test_client_ip_walks_past_multiple_trusted_proxy_hops() -> None:
+    cfg = RateLimitConfig.from_env()
+    # Real client behind two trusted proxies (both loopback). Walking the
+    # chain right-to-left skips the trusted-proxy hops and stops at the
+    # first untrusted entry.
+    req = _mocked("127.0.0.1", xff="203.0.113.9, 127.0.0.1, ::1")
+    assert resolve_client_ip(req, cfg) == "203.0.113.9"
+
+
+def test_client_ip_all_hops_trusted_falls_back_to_leftmost() -> None:
+    cfg = RateLimitConfig.from_env()
+    # Degenerate chain of only trusted proxies — no untrusted hop to
+    # find. Fall back to the leftmost so keying is at least stable.
+    req = _mocked("127.0.0.1", xff="127.0.0.1, ::1")
+    assert resolve_client_ip(req, cfg) == "127.0.0.1"
+
+
+def test_client_ip_spoofed_leftmost_collapses_to_one_bucket() -> None:
+    cfg = RateLimitConfig.from_env()
+    # An attacker rotating the leftmost (client-supplied) XFF value must
+    # NOT get a fresh limiter bucket per request: every variant resolves
+    # to the same real rightmost hop.
+    real = "198.51.100.5"
+    keys = {
+        resolve_client_ip(
+            _mocked("127.0.0.1", xff=f"{spoof}, {real}"), cfg
+        )
+        for spoof in ("1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4")
+    }
+    assert keys == {real}
 
 
 def test_client_ip_ignores_xff_from_untrusted_peer() -> None:
@@ -149,6 +192,43 @@ async def test_login_post_rate_limited_returns_429(
     )
     assert resp.status == 429, await resp.text()
     assert resp.headers.get("Retry-After")
+    assert int(resp.headers["Retry-After"]) >= 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.no_auth_seed_session
+async def test_rate_limit_not_bypassed_by_spoofed_leftmost_xff(
+    aiohttp_client, rl_app,
+) -> None:
+    """Rotating the client-supplied leftmost XFF must not reset budget.
+
+    The direct peer is the loopback TestServer connection (a trusted
+    proxy), so it appends the real client IP as the rightmost hop. An
+    attacker spoofing a different leftmost value each request is still
+    charged to the SAME real-client bucket → 429 after the cap.
+    """
+    _seed_user()
+    client = await aiohttp_client(rl_app)
+    real = "203.0.113.55"
+
+    for i in range(3):
+        spoof = f"{i + 1}.{i + 1}.{i + 1}.{i + 1}"
+        resp = await client.post(
+            "/agent-mcp/login",
+            data={"username": "rluser", "password": "wrong"},
+            headers={"X-Forwarded-For": f"{spoof}, {real}"},
+            allow_redirects=False,
+        )
+        assert resp.status == 401, await resp.text()
+
+    # A fresh spoofed leftmost value — still the same real client bucket.
+    resp = await client.post(
+        "/agent-mcp/login",
+        data={"username": "rluser", "password": "wrong"},
+        headers={"X-Forwarded-For": f"9.9.9.9, {real}"},
+        allow_redirects=False,
+    )
+    assert resp.status == 429, await resp.text()
     assert int(resp.headers["Retry-After"]) >= 1
 
 

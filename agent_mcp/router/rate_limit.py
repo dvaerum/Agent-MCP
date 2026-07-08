@@ -27,7 +27,10 @@ Two limiters wire in via ``attach``:
 Client-IP resolution honours ``X-Forwarded-For`` ONLY when the
 direct peer is a trusted proxy — reusing the same trust posture as
 ``sso.is_trusted_proxy_source`` (the forwarded chain is
-attacker-controllable, so the peer-IP check is the gatekeeper).
+attacker-controllable, so the peer-IP check is the gatekeeper). The
+chain is walked right-to-left past trusted-proxy hops to the first
+untrusted client, never the spoofable leftmost entry (see
+``resolve_client_ip``).
 """
 
 from __future__ import annotations
@@ -208,27 +211,21 @@ class SlidingWindowLimiter:
 # ── Client-IP resolution ───────────────────────────────────────────
 
 
-def _is_trusted_proxy(request: web.Request, cfg: RateLimitConfig) -> bool:
-    """Return True iff the direct peer may set ``X-Forwarded-For``.
+def _is_trusted_ip(ip: str, cfg: RateLimitConfig) -> bool:
+    """Return True iff ``ip`` (a raw string) is a configured trusted proxy.
 
-    Reuses the SSO proxy-header trust set when that mode is active
-    (so the two features share one trust anchor), unioned with the
-    limiter's own ``trusted_proxies`` config. A UDS peer reports an
-    empty ``request.remote`` and is treated as trusted loopback.
+    Canonicalises the address first, then checks the limiter's own
+    ``trusted_proxies`` config unioned with the SSO proxy-header
+    trusted-IP set (so an operator who configured proxy-header SSO
+    doesn't have to re-declare the same proxy IPs for the limiter).
+    A non-parseable value is never trusted.
     """
-    peer = request.remote or ""
-    if not peer:
-        # UDS / in-process transport — the reverse proxy forwards here.
-        return True
     try:
-        canonical = str(ipaddress.ip_address(peer))
+        canonical = str(ipaddress.ip_address(ip))
     except ValueError:
         return False
     if canonical in cfg.trusted_proxies:
         return True
-    # Also honour the SSO proxy-header trusted-IP set, so an operator
-    # who configured proxy-header SSO doesn't have to re-declare the
-    # same proxy IPs for the limiter.
     try:
         from . import sso
 
@@ -240,20 +237,51 @@ def _is_trusted_proxy(request: web.Request, cfg: RateLimitConfig) -> bool:
     return False
 
 
+def _is_trusted_proxy(request: web.Request, cfg: RateLimitConfig) -> bool:
+    """Return True iff the direct peer may set ``X-Forwarded-For``.
+
+    A UDS peer reports an empty ``request.remote`` and is treated as
+    trusted loopback (the reverse proxy forwards over that socket).
+    Otherwise the peer IP is matched against the trusted-proxy set via
+    ``_is_trusted_ip``.
+    """
+    peer = request.remote or ""
+    if not peer:
+        # UDS / in-process transport — the reverse proxy forwards here.
+        return True
+    return _is_trusted_ip(peer, cfg)
+
+
 def resolve_client_ip(request: web.Request, cfg: RateLimitConfig) -> str:
     """Best-effort client IP for rate-limit keying.
 
-    Honours the leftmost ``X-Forwarded-For`` entry ONLY when the
-    direct peer is trusted; otherwise the peer IP. Falls back to a
-    constant sentinel when neither is available so limiting still
-    engages (fail-closed) rather than silently disabling.
+    Honours ``X-Forwarded-For`` ONLY when the direct peer is a trusted
+    proxy; otherwise the peer IP. Falls back to a constant sentinel
+    when neither is available so limiting still engages (fail-closed)
+    rather than silently disabling.
+
+    Security (finding: XFF spoof bypass): the header is appended
+    left-to-right as a request traverses proxies, so the LEFTMOST entry
+    is fully client-controlled and MUST NOT be used for keying — an
+    attacker who rotates it would mint a fresh brute-force / argon2-DoS
+    budget per request. Instead, walk the chain RIGHT-TO-LEFT (from the
+    hop our trusted proxy appended) skipping trusted-proxy IPs; the
+    first untrusted entry is the real client. If every entry is a
+    trusted proxy, fall back to the leftmost. This is correct
+    regardless of how the edge proxy is configured (it does not rely on
+    the edge overwriting the header).
     """
     if _is_trusted_proxy(request, cfg):
         xff = request.headers.get("X-Forwarded-For", "")
         if xff:
-            first = xff.split(",", 1)[0].strip()
-            if first:
-                return first
+            hops = [part.strip() for part in xff.split(",") if part.strip()]
+            for hop in reversed(hops):
+                if not _is_trusted_ip(hop, cfg):
+                    return hop
+            if hops:
+                # All hops are trusted proxies — no untrusted client in
+                # the chain; the leftmost is as close as we can get.
+                return hops[0]
     return request.remote or "unknown"
 
 
