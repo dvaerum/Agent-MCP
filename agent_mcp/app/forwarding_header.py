@@ -11,13 +11,25 @@ key.
 Format
 ------
 
-The header value is three dot-separated fields::
+The header value is four dot-separated fields::
 
-    <operator_id>.<expiry-unix-seconds>.<HMAC-hex>
+    <operator_id>.<role>.<expiry-unix-seconds>.<HMAC-hex>
 
 * ``operator_id`` — opaque string identifying the operator (the
   dashboard's logged-in user). The backend stamps this onto
   ``g.current_operator`` so audit logs can attribute the action.
+* ``role`` — the operator's *real* per-project role, drawn from the
+  known project-role set (``operator`` / ``viewer``). The router
+  resolves this from ``project_membership`` (via
+  ``group_resolver.resolve_user_project_role``) and signs it; the
+  backend parses it back onto ``Principal.project_role`` so
+  :func:`resolve_capabilities` yields the caller's *actual*
+  capability bundle. This field is the fix for the viewer→operator
+  escalation (SEC-1): the pre-fix backend hard-coded
+  ``project_role="operator"`` for every verified header, so a
+  viewer-tier operator got the full operator bundle over the MCP
+  wire. The role is HMAC-covered, so it can't be tampered in flight,
+  and an unknown role value fails ``verify`` (hard reject).
 * ``expiry-unix-seconds`` — integer-seconds-since-epoch after which
   the backend rejects the header. The router-side ``sign`` helper
   defaults to ``now + 30 s``; the backend's ``verify`` helper also
@@ -25,8 +37,8 @@ The header value is three dot-separated fields::
   more than ``replay_window_sec`` in the future, so a stolen header
   with a year-long expiry is rejected).
 * ``HMAC-hex`` — lowercase hex HMAC-SHA256 over the literal string
-  ``f"{operator_id}.{expiry}"`` keyed by the per-project HMAC key.
-  Note that the HMAC input does NOT include the trailing
+  ``f"{operator_id}.{role}.{expiry}"`` keyed by the per-project HMAC
+  key. Note that the HMAC input does NOT include the trailing
   ``.<hmac>`` — that would be circular.
 
 Key material
@@ -72,13 +84,24 @@ import time
 from typing import Optional
 
 
-__all__ = ["HEADER_NAME", "sign", "verify"]
+__all__ = ["HEADER_NAME", "VALID_ROLES", "sign", "verify"]
 
 
 #: HTTP header name the router uses to carry the signed token. Kept
 #: as a module constant so the middleware + the test suite reference
 #: the same string and a future rename is one edit.
 HEADER_NAME = "X-Agent-MCP-Forwarded-Operator"
+
+
+#: The known per-project role vocabulary the forwarding header may
+#: carry. Kept in lock-step with ``project_membership.role`` (the
+#: router's ``group_resolver.resolve_user_project_role`` only ever
+#: returns one of these) and with
+#: :data:`agent_mcp.core.capabilities.PROJECT_ROLE_BUNDLES`. ``sign``
+#: refuses to mint a header for a role outside this set and ``verify``
+#: hard-rejects (returns ``None``) an unknown role — an unrecognised
+#: role must never silently collapse to a broad capability bundle.
+VALID_ROLES: frozenset[str] = frozenset({"operator", "viewer"})
 
 
 #: Default lifetime for a freshly-signed header. The router's request
@@ -95,19 +118,22 @@ _DEFAULT_TTL_SEC: int = 30
 _DEFAULT_REPLAY_WINDOW_SEC: int = 30
 
 
-def _hmac_hex(operator_id: str, expiry: int, key: bytes) -> str:
-    """Compute the HMAC-SHA256 over ``f"{operator_id}.{expiry}"``.
+def _hmac_hex(operator_id: str, role: str, expiry: int, key: bytes) -> str:
+    """Compute the HMAC-SHA256 over ``f"{operator_id}.{role}.{expiry}"``.
 
     Extracted so sign + verify use exactly the same input shape;
-    a single source of truth for "what does the HMAC cover".
+    a single source of truth for "what does the HMAC cover". The
+    ``role`` is inside the MAC so a man-in-the-middle can't rewrite a
+    ``viewer`` header into an ``operator`` one without the key.
     """
-    message = f"{operator_id}.{expiry}".encode("utf-8")
+    message = f"{operator_id}.{role}.{expiry}".encode("utf-8")
     digest = hmac.new(key, message, hashlib.sha256).hexdigest()
     return digest
 
 
 def sign(
     operator_id: str,
+    role: str,
     key: bytes,
     ttl_sec: int = _DEFAULT_TTL_SEC,
     *,
@@ -123,6 +149,13 @@ def sign(
         contain no dot characters (the dot is the field separator;
         an operator-id with a dot would be unparseable on the verify
         side and indicate a deeper input-validation bug).
+    role:
+        The operator's *real* per-project role — one of
+        :data:`VALID_ROLES` (``operator`` / ``viewer``). The router
+        MUST pass the value it resolved from ``project_membership``,
+        NOT a fixed ``"operator"``: signing a fixed role is exactly
+        the SEC-1 escalation this parameter closes. A role outside
+        :data:`VALID_ROLES` is a programmer error and raises.
     key:
         Raw HMAC key bytes. The caller is responsible for sourcing
         these (per-project file written by the launcher).
@@ -135,14 +168,18 @@ def sign(
 
     Returns
     -------
-    A ``"<operator_id>.<expiry>.<hex-hmac>"`` string ready to drop
-    into the :data:`HEADER_NAME` HTTP header.
+    A ``"<operator_id>.<role>.<expiry>.<hex-hmac>"`` string ready to
+    drop into the :data:`HEADER_NAME` HTTP header.
     """
     if not operator_id:
         raise ValueError("operator_id must be non-empty")
     if "." in operator_id:
         raise ValueError(
             "operator_id must not contain '.' (header field separator)"
+        )
+    if role not in VALID_ROLES:
+        raise ValueError(
+            f"role must be one of {sorted(VALID_ROLES)}; got {role!r}"
         )
     if not key:
         raise ValueError("key must be non-empty bytes")
@@ -151,8 +188,8 @@ def sign(
 
     now = int(_now) if _now is not None else int(time.time())
     expiry = now + int(ttl_sec)
-    mac = _hmac_hex(operator_id, expiry, key)
-    return f"{operator_id}.{expiry}.{mac}"
+    mac = _hmac_hex(operator_id, role, expiry, key)
+    return f"{operator_id}.{role}.{expiry}.{mac}"
 
 
 def verify(
@@ -161,14 +198,14 @@ def verify(
     replay_window_sec: int = _DEFAULT_REPLAY_WINDOW_SEC,
     *,
     _now: Optional[int] = None,
-) -> Optional[str]:
-    """Validate a forwarding-header value; return operator_id on success.
+) -> Optional[tuple[str, str]]:
+    """Validate a forwarding-header value; return (operator_id, role).
 
     Returns ``None`` on ANY verification failure — malformed, wrong
-    HMAC, expired, or replay-window-violating. Callers MUST treat a
-    ``None`` return as "reject this request" without falling through
-    to a different auth mode (otherwise a tampered header could
-    shadow the bearer-token path).
+    HMAC, expired, replay-window-violating, or an unknown ``role``.
+    Callers MUST treat a ``None`` return as "reject this request"
+    without falling through to a different auth mode (otherwise a
+    tampered header could shadow the bearer-token path).
 
     Parameters
     ----------
@@ -187,8 +224,9 @@ def verify(
 
     Returns
     -------
-    The ``operator_id`` parsed out of the header on success, else
-    ``None``.
+    The ``(operator_id, role)`` pair parsed out of the header on
+    success, else ``None``. ``role`` is guaranteed to be a member of
+    :data:`VALID_ROLES`.
     """
     if not header_value or not key:
         return None
@@ -196,13 +234,21 @@ def verify(
         return None
 
     parts = header_value.split(".")
-    # Exactly three fields. A dot in the operator_id at sign time was
-    # already rejected; on the verify side an unexpected dot count is
-    # a malformed header.
-    if len(parts) != 3:
+    # Exactly four fields (operator_id, role, expiry, mac). A dot in
+    # the operator_id at sign time was already rejected; on the verify
+    # side an unexpected dot count is a malformed header.
+    if len(parts) != 4:
         return None
-    operator_id, expiry_str, presented_mac = parts
-    if not operator_id or not expiry_str or not presented_mac:
+    operator_id, role, expiry_str, presented_mac = parts
+    if not operator_id or not role or not expiry_str or not presented_mac:
+        return None
+
+    # Unknown role → hard reject. This is the SEC-1 defence: a role we
+    # don't recognise must never reach ``resolve_capabilities`` (where
+    # an unexpected value could, in the worst case, be mishandled into
+    # a broad grant). Validate BEFORE the constant-time MAC compare so
+    # a forged role is rejected regardless of MAC.
+    if role not in VALID_ROLES:
         return None
 
     try:
@@ -222,7 +268,7 @@ def verify(
     if expiry - now > int(replay_window_sec):
         return None
 
-    expected_mac = _hmac_hex(operator_id, expiry, key)
+    expected_mac = _hmac_hex(operator_id, role, expiry, key)
 
     # Constant-time compare — guard against timing-side-channel
     # discovery of valid HMAC prefixes. ``hmac.compare_digest`` is the
@@ -230,4 +276,4 @@ def verify(
     if not hmac.compare_digest(expected_mac, presented_mac):
         return None
 
-    return operator_id
+    return operator_id, role

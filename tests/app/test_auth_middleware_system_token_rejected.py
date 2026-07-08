@@ -38,11 +38,22 @@ pytestmark = pytest.mark.asyncio
 # ---------- helpers --------------------------------------------------
 
 
-def _sign_header(operator_id: str, key: bytes, ttl_sec: int = 30) -> dict:
-    """Sign a forwarding-header value and return the dict form."""
+def _sign_header(
+    operator_id: str,
+    key: bytes,
+    ttl_sec: int = 30,
+    role: str = "operator",
+) -> dict:
+    """Sign a forwarding-header value and return the dict form.
+
+    SEC-1: ``role`` is now part of the signed payload; defaults to
+    ``operator`` so these auth-gate tests (which only care about
+    "did auth pass?", not the tier) keep their prior semantics."""
     from agent_mcp.app import forwarding_header as _fh
 
-    return {_fh.HEADER_NAME: _fh.sign(operator_id, key, ttl_sec=ttl_sec)}
+    return {
+        _fh.HEADER_NAME: _fh.sign(operator_id, role, key, ttl_sec=ttl_sec)
+    }
 
 
 # ---------- /api/tokens (require_operator_session dep) ---------------
@@ -139,7 +150,7 @@ async def test_forwarding_header_expired_is_rejected(tmp_path) -> None:
 
         # Sign with _now in the deep past so expiry < now-at-verify.
         header_value = _fh.sign(
-            "alice", g.forwarding_hmac_key, ttl_sec=10, _now=1
+            "alice", "operator", g.forwarding_hmac_key, ttl_sec=10, _now=1
         )
         headers = {_fh.HEADER_NAME: header_value}
 

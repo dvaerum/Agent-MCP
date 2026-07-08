@@ -996,6 +996,8 @@ async def _forwarding_header_from_cookie(
     # lookup and the HMAC key probe.
     if not req.cookies.get("agent_mcp_session", ""):
         return None
+    from . import group_resolver
+
     user = resolve_current_user(req)
     if user is None:
         return None
@@ -1003,6 +1005,23 @@ async def _forwarding_header_from_cookie(
         if not identity.is_project_member(user["user_id"], real_project_name):
             return None
     except Exception:  # pragma: no cover - defensive
+        return None
+    # Resolve the operator's REAL per-project role and sign THAT — not
+    # a fixed "operator". This is the SEC-1 fix: signing a fixed role
+    # let a viewer-tier operator collect the full operator capability
+    # bundle over the MCP wire. ``resolve_user_project_role`` is the
+    # same resolver the REST middleware (``router/auth_middleware.py``)
+    # already gates on, so the wire path and the /api path agree on the
+    # caller's tier. A member with no resolvable role (shouldn't happen
+    # given the ``is_project_member`` gate above, but defensive) is
+    # denied rather than defaulted.
+    try:
+        role = group_resolver.resolve_user_project_role(
+            user["user_id"], real_project_name
+        )
+    except Exception:  # pragma: no cover - defensive
+        return None
+    if role is None:
         return None
     # Ensure the backend systemd unit is started so its ExecStartPre
     # has run and written ``/run/agent-mcp/<name>/forwarding_hmac``.
@@ -1030,7 +1049,7 @@ async def _forwarding_header_from_cookie(
         # is the correct user-visible signal.
         return None
     operator_id = str(user["user_id"])
-    signed = _fh.sign(operator_id, key)
+    signed = _fh.sign(operator_id, role, key)
     return (_fh.HEADER_NAME, signed)
 
 

@@ -123,8 +123,11 @@ class _Wave2Backend:
 
         raw = req.headers.get(_fh.HEADER_NAME)
         operator_id = None
+        role = None
         if raw is not None:
-            operator_id = _fh.verify(raw, self.hmac_key)
+            verified = _fh.verify(raw, self.hmac_key)
+            if verified is not None:
+                operator_id, role = verified
         body = await req.read()
         self.records.append(
             {
@@ -133,6 +136,7 @@ class _Wave2Backend:
                 "headers": dict(req.headers),
                 "body": body,
                 "operator_id": operator_id,
+                "role": role,
             },
         )
         if operator_id is None:
@@ -258,16 +262,23 @@ async def test_cookie_only_request_forwards_signed_header(
         f"backend verified operator_id={rec['operator_id']!r}; expected "
         f"the dashboard-logged-in user's id {alice_id!r}"
     )
+    # SEC-1: the router signs alice's REAL per-project role.
+    # ``add_project_membership`` grants the default ``operator`` role.
+    assert rec["role"] == "operator", (
+        f"backend verified role={rec['role']!r}; expected 'operator' "
+        f"(the default project_membership.role granted to alice)"
+    )
     # No legacy bearer should be injected — the cookie path is now
     # bearer-free.
     assert "Authorization" not in rec["headers"], (
         f"cookie path must not inject Authorization; got "
         f"{rec['headers'].get('Authorization')!r}"
     )
-    # And the header value is well-formed under the documented contract.
+    # And the header value is well-formed under the documented contract:
+    # SEC-1 four fields (operator_id.role.expiry.hmac).
     raw = rec["headers"][_fh.HEADER_NAME]
-    assert raw.count(".") == 2, (
-        f"forwarding header should be three dot-separated fields, got "
+    assert raw.count(".") == 3, (
+        f"forwarding header should be four dot-separated fields, got "
         f"{raw!r}"
     )
 
