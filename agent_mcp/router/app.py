@@ -472,6 +472,33 @@ def _unauthorized() -> web.HTTPException:
     )
 
 
+# RFC 7230 §6.1 hop-by-hop headers — meaningful only for a single
+# transport connection and MUST NOT be forwarded by a proxy. We strip
+# them from the request we build for the backend. The load-bearing one
+# is ``Transfer-Encoding``: aiohttp's client sets Content-Length from
+# the materialised ``data=`` body, so a forwarded ``Transfer-Encoding:
+# chunked`` (which arrives on a genuinely chunked inbound POST /mcp)
+# collides with it and the backend rejects the request with a hard 4xx
+# BadHttpMessage instead of serving it. ``proxy-*`` is matched by prefix
+# (covers Proxy-Authenticate / Proxy-Authorization and any vendor
+# Proxy- header). Names are compared lowercased.
+_HOP_BY_HOP_HEADERS = frozenset({
+    "connection",
+    "keep-alive",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+})
+
+
+def _is_hop_by_hop_header(name: str) -> bool:
+    """True iff ``name`` is an RFC 7230 hop-by-hop header a proxy must
+    not forward (the fixed set above, or any ``Proxy-*`` header)."""
+    lowered = name.lower()
+    return lowered in _HOP_BY_HOP_HEADERS or lowered.startswith("proxy-")
+
+
 # ── Project file helpers ─────────────────────────────────────────────
 
 
@@ -630,6 +657,7 @@ async def _proxy_to_backend(
     headers = {
         k: v for k, v in req.headers.items()
         if k.lower() not in ("host", "content-length", _forwarding_header_lower)
+        and not _is_hop_by_hop_header(k)
     }
     if inject_bearer is not None:
         # Strip any caller-supplied Authorization (case-insensitive)
@@ -842,13 +870,17 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
     # (the backend's ``AuthHeaderMiddleware`` is the source of truth)
     # and validating the cookie needs the resolved project, so
     # presence is the strongest check we can make pre-resolve — and it
-    # closes the realistic anonymous-enumeration attack. A caller that
-    # DOES present a credential still resolves normally and still gets
-    # a genuine 404 for a truly-unknown project (the semantics the
-    # overview/lifecycle handlers and authenticated callers rely on).
+    # closes the realistic anonymous-enumeration attack.
     #
-    # ``resolve()`` itself is intentionally NOT changed — it is shared
-    # by handlers that legitimately need 404 for unknown projects.
+    # A junk ``Authorization: Bearer <garbage>`` clears this presence
+    # gate, so the gate alone did NOT close the oracle: the resolve
+    # below (which 404s an unknown project) still fired for a junk
+    # bearer, leaking unknown-vs-known by status code. The resolve is
+    # therefore wrapped just below to collapse its 404 into the same
+    # uniform 401 — see that comment. ``resolve()`` itself is
+    # intentionally NOT changed; it is shared by the operator-session-
+    # gated REST/lifecycle handlers that legitimately need 404 for
+    # unknown projects (and that unauthenticated callers can't reach).
     if bearer is None and not req.cookies.get("agent_mcp_session", ""):
         raise _unauthorized()
 
@@ -887,13 +919,27 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
         raise web.HTTPMethodNotAllowed(
             method=req.method,
             allowed_methods=["POST", "GET", "DELETE"],
-            reason=f"/mcp/{name} accepts only POST/GET/DELETE",
+            # Fixed reason phrase — never reflect the caller-supplied
+            # project name into the HTTP status line (SEC4 pattern).
+            reason="/mcp accepts only POST, GET, or DELETE",
         )
-    # Resolve alias → real project (AFTER the credential-presence gate
-    # above, so an anonymous caller can't reach this 404). The token
-    # map is fetched against the *real* project because alias
-    # resolution is transparent; tokens are not per-alias.
-    real_name, alias_entry = _resolve_project_or_alias(name)
+    # Resolve alias → real project. On this transport the router can
+    # never itself confirm a caller is authenticated before forwarding
+    # (a bearer is validated only by the backend's AuthHeaderMiddleware;
+    # the cookie path needs the resolved project to check membership),
+    # so a not-yet-authenticated caller reaching an UNKNOWN project must
+    # be indistinguishable from one reaching a known-but-unauthenticated
+    # project — both get a uniform 401. Collapse resolve()'s 404 into
+    # that same 401 here: this closes the SEC5 project-existence oracle
+    # for EVERY not-yet-authenticated caller, including a junk
+    # ``Authorization: Bearer <garbage>`` that cleared the presence gate
+    # above. Genuine 404 semantics for unknown projects live on the
+    # operator-session-gated REST/lifecycle handlers (admin_api), which
+    # unauthenticated callers can't reach, so they leak nothing.
+    try:
+        real_name, alias_entry = _resolve_project_or_alias(name)
+    except web.HTTPNotFound:
+        raise _unauthorized() from None
 
     forwarding_header: tuple[str, str] | None = None
     if bearer is None:
@@ -1701,7 +1747,9 @@ async def _resolve_agent_token(
     for tok, aid in tokens.items():
         if aid == agent_id:
             return tok, aid
-    raise web.HTTPNotFound(reason=f"unknown agent {agent_id!r} on {name!r}")
+    # Fixed reason phrase — never reflect the caller-supplied agent_id
+    # or project name into the HTTP status line (SEC4 pattern).
+    raise web.HTTPNotFound(reason="unknown agent")
 
 
 # Wiring helpers (client-config / installer / create-agent) live

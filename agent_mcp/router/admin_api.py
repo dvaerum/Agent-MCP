@@ -410,7 +410,9 @@ async def client_config_handler(req: web.Request) -> web.Response:
 
     name = req.match_info["name"]
     if name not in _app._projects_dict():
-        raise web.HTTPNotFound(reason=f"unknown project: {name!r}")
+        # Fixed reason phrase — never reflect the caller-supplied name
+        # into the HTTP status line (SEC4 pattern).
+        raise web.HTTPNotFound(reason="unknown project")
     agent_id = req.rel_url.query.get("agent")
     token, _aid = await _app._resolve_agent_token(name, agent_id)
     body = json.dumps(_app._mcp_json_for(name, token=token), indent=2) + "\n"
@@ -436,7 +438,8 @@ async def installer_handler(req: web.Request) -> web.Response:
 
     name = req.match_info["name"]
     if name not in _app._projects_dict():
-        raise web.HTTPNotFound(reason=f"unknown project: {name!r}")
+        # Fixed reason phrase — see client_config_handler (SEC4 pattern).
+        raise web.HTTPNotFound(reason="unknown project")
     agent_id = req.rel_url.query.get("agent")
     token, _aid = await _app._resolve_agent_token(name, agent_id)
     return web.Response(
@@ -465,19 +468,17 @@ async def alias_usage_handler(req: web.Request) -> web.Response:
     if not alias:
         raise web.HTTPBadRequest(reason="missing 'alias' query parameter")
     real_name = _app._REGISTRY.resolve_alias(alias)
+    # Fixed reason phrases — never reflect the caller-supplied alias or
+    # project name into the HTTP status line (SEC4 pattern).
     if real_name is None:
-        raise web.HTTPNotFound(
-            reason=f"alias {alias!r} is not active on any project"
-        )
+        raise web.HTTPNotFound(reason="unknown alias")
     if real_name != project_name:
         # The path-keyed project doesn't own this alias. Treat as
         # 404 — same UX as "alias not found here".
-        raise web.HTTPNotFound(
-            reason=f"alias {alias!r} is not active on project {project_name!r}"
-        )
+        raise web.HTTPNotFound(reason="unknown alias")
     row = _app._REGISTRY.get(real_name)
     if row is None:
-        raise web.HTTPNotFound(reason=f"alias {alias!r} no longer resolves")
+        raise web.HTTPNotFound(reason="unknown alias")
     expires_at = ""
     for entry in row.get("aliases", []) or []:
         if entry.get("name") == alias:
@@ -529,7 +530,8 @@ async def remove_alias_handler(req: web.Request) -> web.Response:
         raise web.HTTPBadRequest(reason="missing 'name' or 'alias'")
     row = _app._REGISTRY.get(name)
     if row is None:
-        raise web.HTTPNotFound(reason=f"unknown project: {name!r}")
+        # Fixed reason phrase — see client_config_handler (SEC4 pattern).
+        raise web.HTTPNotFound(reason="unknown project")
     _app._REGISTRY.expire_alias(name, alias)
     updated = _app._REGISTRY.get(name)
     remaining = list((updated or {}).get("aliases", []) or [])
