@@ -402,7 +402,9 @@ async def restore_agent_api_route(
         # are not surfaced through this re-add path (admin can fetch
         # via /api/all-data if needed).
         cursor.execute(
-            "SELECT agent_id, capabilities, created_at, status, color "
+            "SELECT agent_id, capabilities, created_at, status, color, "
+            "working_directory, terminated_at, updated_at, current_task, "
+            "agent_role "
             "FROM agents WHERE agent_id = ?",
             (agent_id,),
         )
@@ -412,12 +414,22 @@ async def restore_agent_api_route(
                 caps = json.loads(full["capabilities"] or "[]")
             except (TypeError, json.JSONDecodeError):
                 caps = []
+            # SECURITY (terminate-revocation, related): rebuild the FULL
+            # cache row including agent_role. Omitting it made a restored
+            # manager transiently resolve to worker capabilities (a
+            # privilege downgrade) until the next lifespan reload.
             g.active_agents[agent_token] = {
+                "token": agent_token,
                 "agent_id": full["agent_id"],
                 "capabilities": caps,
                 "created_at": full["created_at"],
                 "status": full["status"],
                 "color": full["color"],
+                "working_directory": full["working_directory"],
+                "terminated_at": full["terminated_at"],
+                "updated_at": full["updated_at"],
+                "current_task": full["current_task"],
+                "agent_role": full["agent_role"],
             }
 
         return JSONResponse({
