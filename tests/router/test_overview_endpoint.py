@@ -8,7 +8,8 @@ The overview endpoint is consumed by the React overview route
 registered project containing the fields the cards render (R2 + S2):
 
   ``name``            : str — project name (canonical).
-  ``workspace``       : str — workspace path on disk.
+  ``workspace``       : str — project-RELATIVE workspace label (SEC:
+                        never the absolute server path).
   ``status``          : str — one of
                         ``active``/``idle``/``sleeping``/``stopped``/
                         ``starting``/``failed`` (S2).
@@ -75,7 +76,7 @@ async def test_overview_one_project_stopped_no_db(
 ) -> None:
     """One registered project with no backend running and no SQLite
     file on disk: status ``stopped``, counts all 0, alias ``[]``."""
-    workspace = register_project("alpha")
+    register_project("alpha")
     client = await aiohttp_client(router_app)
 
     resp = await client.get(
@@ -88,7 +89,12 @@ async def test_overview_one_project_stopped_no_db(
     assert len(projects) == 1
     row = projects[0]
     assert row["name"] == "alpha"
-    assert row["workspace"] == str(workspace)
+    # SEC: the envelope carries a project-RELATIVE workspace label, not
+    # the server's absolute filesystem path. The fixture registers the
+    # workspace outside the managed default-parent, so the label is the
+    # leaf directory name (the project name here).
+    assert row["workspace"] == "alpha"
+    assert not row["workspace"].startswith("/")
     assert row["status"] == "stopped"
     assert row["last_activity_ts"] is None
     assert row["agents"] == 0

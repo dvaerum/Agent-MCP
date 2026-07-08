@@ -283,36 +283,15 @@ def _accept_prefers_html(accept_header: str) -> bool:
 # layout without scraping HTML or hard-coding paths. PR-A surfaces the
 # CURRENT shape (still under __api / __dashboard); PR-B's rename
 # updates the embedded URLs to the new top-level prefixes.
-def _read_package_version() -> str:
-    """Best-effort fork version, read once at module import.
-
-    Prefers ``importlib.metadata.version`` (correct when the package
-    is installed), falls back to reading ``pyproject.toml`` from the
-    repo root (correct in editable / dev installs), final fallback to
-    ``agent_mcp.__version__`` (stale, but never raises).
-    """
-    try:  # installed-package path
-        from importlib.metadata import version as _pkg_version
-        return _pkg_version("agent-mcp")
-    except Exception:  # noqa: BLE001 — fall through to next path
-        pass
-    try:  # editable / dev path
-        import tomllib  # py311+, available on the supported Python
-        pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
-        data = tomllib.loads(pyproject.read_text())
-        v = data.get("project", {}).get("version")
-        if v:
-            return str(v)
-    except Exception:  # noqa: BLE001 — fall through to last-resort
-        pass
-    try:
-        from agent_mcp import __version__ as _legacy_version
-        return str(_legacy_version)
-    except Exception:  # noqa: BLE001
-        return "0.0.0"
-
-
-_PACKAGE_VERSION = _read_package_version()
+#
+# SEC (owner-authorised, defensive): the internal package version is no
+# longer read or published anywhere in the router. It was previously
+# echoed by ``_service_descriptor`` and the public ``/health`` probe;
+# both were pure attacker-useful build fingerprinting that no operator
+# surface consumed (the dashboard hard-codes its own product string).
+# The ``_read_package_version`` helper was removed with its only two
+# callers — reintroduce it (behind a sysadmin gate) if a build-version
+# surface is ever genuinely needed.
 
 
 def _single_tenant_disabled_response() -> web.Response:
@@ -846,12 +825,33 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
     redirect = _maybe_single_tenant_redirect(req, name)
     if redirect is not None:
         return redirect
-    # Resolve alias → real project. The token map is fetched against
-    # the *real* project because alias resolution is transparent;
-    # tokens are not per-alias.
-    real_name, alias_entry = _resolve_project_or_alias(name)
 
     bearer = _extract_bearer(req)
+
+    # ── SEC (auth-before-resolve, owner-authorised) ──────────────────
+    # ``_resolve_project_or_alias`` raises 404 for an unknown project;
+    # the no-credential path below returns 401. Resolving BEFORE the
+    # auth gate therefore turned the pair into a project-existence
+    # oracle — an anonymous ``POST /agent-mcp/mcp/<unknown>`` got 404
+    # while ``<known>`` got 401, so valid project names could be
+    # enumerated by status-code differencing.
+    #
+    # Gate on credential PRESENCE first: a caller with NEITHER a bearer
+    # NOR an operator-session cookie gets a uniform 401 whether or not
+    # the project exists. The router can't validate a bearer itself
+    # (the backend's ``AuthHeaderMiddleware`` is the source of truth)
+    # and validating the cookie needs the resolved project, so
+    # presence is the strongest check we can make pre-resolve — and it
+    # closes the realistic anonymous-enumeration attack. A caller that
+    # DOES present a credential still resolves normally and still gets
+    # a genuine 404 for a truly-unknown project (the semantics the
+    # overview/lifecycle handlers and authenticated callers rely on).
+    #
+    # ``resolve()`` itself is intentionally NOT changed — it is shared
+    # by handlers that legitimately need 404 for unknown projects.
+    if bearer is None and not req.cookies.get("agent_mcp_session", ""):
+        raise _unauthorized()
+
     # Method whitelist — verify-all-v4 MUTATING #2 follow-up. The MCP
     # Streamable HTTP transport (spec rev 2025-03-26) defines only
     # three verbs:
@@ -889,6 +889,12 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
             allowed_methods=["POST", "GET", "DELETE"],
             reason=f"/mcp/{name} accepts only POST/GET/DELETE",
         )
+    # Resolve alias → real project (AFTER the credential-presence gate
+    # above, so an anonymous caller can't reach this 404). The token
+    # map is fetched against the *real* project because alias
+    # resolution is transparent; tokens are not per-alias.
+    real_name, alias_entry = _resolve_project_or_alias(name)
+
     forwarding_header: tuple[str, str] | None = None
     if bearer is None:
         # No bearer header — try the operator-session cookie. The
@@ -1432,6 +1438,32 @@ def _derive_status(
     return "sleeping"
 
 
+def _workspace_label(workspace: str) -> str:
+    """Operator-facing, non-disclosing label for a project's workspace.
+
+    SEC (owner-authorised, defensive): the overview envelope must not
+    echo the server's ABSOLUTE workspace path — that discloses the
+    deployment's filesystem layout (and, under the default
+    ``~/.local/share/...`` parent, the service account's home dir).
+
+    When the workspace lives under ``DEFAULT_WORKSPACE_PARENT`` (the
+    managed default) we return the path relative to that parent — for
+    the common ``<parent>/<name>`` layout that's just the project name.
+    For a workspace pointed somewhere custom (outside the managed root)
+    we fall back to the final path component, so the directory is still
+    identifiable without leaking the parent chain.
+    """
+    try:
+        p = Path(workspace)
+        try:
+            return str(p.resolve().relative_to(DEFAULT_WORKSPACE_PARENT.resolve()))
+        except ValueError:
+            # Outside the managed parent — surface only the leaf name.
+            return p.name
+    except Exception:  # pragma: no cover - defensive
+        return Path(workspace).name if workspace else ""
+
+
 def _build_overview_envelope() -> dict:
     """Assemble the overview JSON envelope from registry + systemd +
     per-project SQLite. Cheap-ish; cached in `_overview_cache`."""
@@ -1447,7 +1479,8 @@ def _build_overview_envelope() -> dict:
         projects_out.append(
             {
                 "name": name,
-                "workspace": workspace,
+                # Relative label, never the absolute server path (SEC).
+                "workspace": _workspace_label(workspace),
                 "status": _derive_status(
                     name,
                     running=running,
@@ -1704,9 +1737,12 @@ def _service_descriptor() -> dict:
     in PR-B; PR-D moves it to ``/agent-mcp/mcp/<name>``. The descriptor
     publishes the parent prefix only.
     """
+    # SEC (owner-authorised, defensive): the internal package version is
+    # deliberately NOT echoed here. Operators don't consume it (the
+    # dashboard hard-codes its own product string), so it's pure
+    # attacker-useful fingerprinting of the deployed build.
     return {
         "service": "agent-mcp",
-        "version": _PACKAGE_VERSION,
         "mode": "single-tenant" if SINGLE_TENANT_NAME is not None else "multi-tenant",
         "endpoints": {
             "api": "/agent-mcp/api",

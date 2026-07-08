@@ -49,11 +49,14 @@ async def health_handler(req: web.Request) -> web.Response:
     """
     from . import app as _app
 
+    # SEC (owner-authorised, defensive): this endpoint is PUBLIC
+    # (allow-listed, no session required). It must not echo the internal
+    # package version — an unauthenticated liveness probe should learn
+    # only "the router is up", not the deployed build number.
     return web.json_response(
         {
             "ok": True,
             "service": "agent-mcp-router",
-            "version": _app._PACKAGE_VERSION,
             "mode": (
                 "single-tenant"
                 if _app.SINGLE_TENANT_NAME is not None
