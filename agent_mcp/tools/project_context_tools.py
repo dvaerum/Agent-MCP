@@ -193,6 +193,54 @@ def _is_admin_principal(principal: Optional[Principal]) -> bool:
     return principal.has_capability("system.config.write")
 
 
+def _deny_viewer_tier_write(
+    principal: Optional[Principal], capability: str
+) -> Optional[PermissionDenied]:
+    """Reject operator-path callers who lack the memories-write cap.
+
+    SEC1-class fix (companion to #273 / #274). The REST surface 403s
+    every viewer mutation at ``router/auth_middleware.py``
+    (``method in _MUTATION_METHODS and role != "operator"``). The MCP
+    wire, however, signs a ``role="viewer"`` forwarding header and
+    delegates authorization to each tool — and the project_context
+    write tools gated ONLY on identity
+    (:func:`_requires_authenticated_caller`) plus a per-key
+    creator-ownership matrix (:func:`_check_write_authorization`) that
+    treated a viewer exactly like a worker. A read-only viewer could
+    therefore create arbitrary new context keys and edit / delete their
+    own. project_context rows feed the RAG corpus that operators +
+    worker agents consume, so this was a stored-injection /
+    RAG-poisoning primitive from a read-only principal.
+
+    This gate mirrors the REST intent (viewer = read-only) by requiring
+    the operator-held memories-write ``capability`` that viewers do NOT
+    carry — see ``PROJECT_ROLE_BUNDLES`` in ``core/capabilities.py``:
+    the viewer bundle holds ``memories.view`` only, the operator bundle
+    adds ``memories.create`` / ``memories.update`` / ``memories.delete``.
+
+    Scope is deliberately the operator-path kinds ONLY
+    (``operator_session`` / ``forwarding_header``). Agent bearers
+    (worker / manager) are untouched — they legitimately author context
+    — so the per-key ownership matrix keeps governing them exactly as
+    before. ``None`` is left to the earlier
+    :func:`_requires_authenticated_caller` gate (this helper is only
+    ever called after it).
+    """
+    if principal is None:
+        return None
+    if (
+        principal.kind in ("operator_session", "forwarding_header")
+        and not principal.has_capability(capability)
+    ):
+        return PermissionDenied(
+            reason=(
+                "viewer-tier operator cannot mutate project context "
+                "(read-only project membership)"
+            )
+        )
+    return None
+
+
 def _requires_authenticated_caller(
     principal: Optional[Principal],
 ) -> Optional[PermissionDenied]:
@@ -1008,6 +1056,12 @@ async def update_project_context_tool_impl(
     if denied is not None:
         return denied
 
+    # SEC1: operator-path viewers are read-only; deny them here before
+    # the per-key ownership matrix (which treats them like a worker).
+    viewer_denied = _deny_viewer_tier_write(principal, "memories.update")
+    if viewer_denied is not None:
+        return viewer_denied
+
     # Support both single and bulk operations
     context_key_to_update = arguments.get("context_key")
     context_value_to_set = arguments.get("context_value")
@@ -1184,6 +1238,12 @@ async def bulk_update_project_context_tool_impl(
     denied = _requires_authenticated_caller(principal)
     if denied is not None:
         return denied
+
+    # SEC1: operator-path viewers are read-only (see
+    # _deny_viewer_tier_write); block before the per-key ownership matrix.
+    viewer_denied = _deny_viewer_tier_write(principal, "memories.update")
+    if viewer_denied is not None:
+        return viewer_denied
 
     updates = arguments.get("updates", [])  # List of update operations
     requesting_agent_id = _actor_label(principal)
@@ -1786,6 +1846,13 @@ async def delete_project_context_tool_impl(
     denied = _requires_authenticated_caller(principal)
     if denied is not None:
         return denied
+
+    # SEC1: operator-path viewers are read-only (see
+    # _deny_viewer_tier_write); block deletes before the per-key
+    # ownership matrix would otherwise let a viewer remove its own keys.
+    viewer_denied = _deny_viewer_tier_write(principal, "memories.delete")
+    if viewer_denied is not None:
+        return viewer_denied
 
     context_keys = arguments.get("context_keys", [])
     context_key = arguments.get("context_key")
