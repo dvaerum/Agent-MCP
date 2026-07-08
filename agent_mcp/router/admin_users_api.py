@@ -1223,10 +1223,17 @@ def register_admin_users_routes(app: web.Application) -> None:
     membership management for sysadmins; non-sysadmin operators
     fall through to a 403 with the standard envelope shape.
 
-    Reads (``GET``) stay open to any logged-in operator so the
-    dashboard's user / group / membership browse panes still
-    render — operators need to *see* the matrix to ask their
-    sysadmin for changes, even if they can't mutate it.
+    SECURITY (viewer-read-gating finding 2, 2026-07-08): the
+    collection ``GET`` reads (``list_users`` / ``list_groups`` /
+    ``list_group_members`` / ``list_project_memberships``) are gated
+    on the SAME capability as their sibling mutations. The Wave 1b
+    "reads stay open to any logged-in operator" stance leaked the
+    full identity matrix — every user + email + is_sysadmin flag,
+    every group, every membership — to a plain project *viewer* who
+    hit the router API directly. These reads expose exactly the data
+    the mutations manage, so a caller who may not mutate the matrix
+    must not enumerate it either. Sysadmins still admit via the
+    wildcard; an operator delegated the cap via a group admits too.
 
     Wave 9 PR 4 (prancy-napping-pie): each mutating route moved
     from ``require_sysadmin`` to a capability-shaped gate. The
@@ -1252,7 +1259,8 @@ def register_admin_users_routes(app: web.Application) -> None:
 
     # Users
     app.router.add_get(
-        "/agent-mcp/api/router/users", gated(list_users_handler),
+        "/agent-mcp/api/router/users",
+        gated(users_gate(list_users_handler)),
     )
     app.router.add_post(
         "/agent-mcp/api/router/users",
@@ -1269,7 +1277,8 @@ def register_admin_users_routes(app: web.Application) -> None:
 
     # Groups
     app.router.add_get(
-        "/agent-mcp/api/router/groups", gated(list_groups_handler),
+        "/agent-mcp/api/router/groups",
+        gated(groups_gate(list_groups_handler)),
     )
     app.router.add_post(
         "/agent-mcp/api/router/groups",
@@ -1287,7 +1296,7 @@ def register_admin_users_routes(app: web.Application) -> None:
     # Group members
     app.router.add_get(
         "/agent-mcp/api/router/groups/{group_id}/members",
-        gated(list_group_members_handler),
+        gated(groups_gate(list_group_members_handler)),
     )
     app.router.add_post(
         "/agent-mcp/api/router/groups/{group_id}/members",
@@ -1318,7 +1327,7 @@ def register_admin_users_routes(app: web.Application) -> None:
     # Project memberships
     app.router.add_get(
         "/agent-mcp/api/router/projects/{name}/memberships",
-        gated(list_project_memberships_handler),
+        gated(projects_gate(list_project_memberships_handler)),
     )
     app.router.add_post(
         "/agent-mcp/api/router/projects/{name}/memberships",

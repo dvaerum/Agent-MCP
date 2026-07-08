@@ -70,16 +70,23 @@ async def test_trusted_header_from_localhost_admits(
     client = await aiohttp_client(router_app)
     # The TestServer binds 127.0.0.1, so the header IS coming from a
     # trusted source by construction.
+    #
+    # Probe endpoint: ``/api/router/projects`` (auth-only ``gated``, no
+    # capability gate) rather than ``/api/router/users``. The latter is
+    # now capability-gated (``system.users.manage``) by the
+    # viewer-read-gating fix (2026-07-08, finding 2), so a JIT-created
+    # non-sysadmin proxy user would 403 there — which would test the
+    # authz gate, not the proxy-header AUTH gate this test is about. A
+    # bare-authenticated user reads ``/projects`` with 200, so a 200
+    # here isolates "the proxy-header gate admitted the request".
     resp = await client.get(
-        "/agent-mcp/api/router/users",
+        "/agent-mcp/api/router/projects",
         headers={
             "Remote-User": "alice-from-proxy",
             "Accept": "application/vnd.agent-mcp.v1+json",
         },
     )
-    # 200 means the proxy-header gate let us through. (We don't care
-    # about the listing contents here — that's covered by the users
-    # API tests.)
+    # 200 means the proxy-header gate let us through.
     assert resp.status == 200, await resp.text()
 
     # The JIT user MUST exist after a successful proxy-trusted request.

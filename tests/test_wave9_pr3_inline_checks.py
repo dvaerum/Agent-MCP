@@ -392,9 +392,13 @@ def test_update_file_metadata_entry_gate_uses_system_config_write() -> None:
     "tool_name,cap",
     [
         ("register_agent_tool_impl", "agents.register"),
-        ("view_status_tool_impl", "system.view"),
+        # viewer-read-gating finding 1: view_status / view_audit_log
+        # moved off the viewer-held ``system.view`` onto the operator-
+        # only ``system.config.write`` — the audit log + agent working
+        # dirs are operator-tier oversight data, not viewer reads.
+        ("view_status_tool_impl", "system.config.write"),
         ("terminate_agent_tool_impl", "agents.terminate"),
-        ("view_audit_log_tool_impl", "system.view"),
+        ("view_audit_log_tool_impl", "system.config.write"),
         # FINDING 2 security fix: agent bearer tokens are operator-tier
         # secrets, so the gate moved off the viewer-held ``agents.view``
         # onto the operator-only ``agents.register`` cap.

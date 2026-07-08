@@ -111,13 +111,21 @@ async def test_viewer_forwarding_header_denied_register_agent(tmp_path) -> None:
 
 async def test_viewer_forwarding_header_allowed_read(tmp_path) -> None:
     """The SAME viewer header is still admitted for a viewer-tier READ
-    (``view_status`` needs only ``system.view``, which is in the viewer
+    (``view_tasks`` needs only ``tasks.view``, which is in the viewer
     bundle). Proves the fix denies WRITE without breaking viewer READ —
-    it's a role-fidelity fix, not a blanket lockout."""
+    it's a role-fidelity fix, not a blanket lockout.
+
+    Uses ``view_tasks`` rather than ``view_status``: the viewer-read-
+    gating fix (2026-07-08, finding 1) moved ``view_status`` /
+    ``view_audit_log`` off the viewer-held ``system.view`` onto the
+    operator-only ``system.config.write`` (they leak agent working
+    dirs + operator user_ids), so ``view_status`` is no longer a
+    viewer read. ``view_tasks`` is the genuine viewer read that keeps
+    this test asserting what it means to."""
     async with mcp_session(tmp_path) as admin:
         r = _tools_call(
             admin.client,
-            "view_status",
+            "view_tasks",
             {},
             _sign("viewer-op", "viewer"),
         )
@@ -130,10 +138,10 @@ async def test_viewer_forwarding_header_allowed_read(tmp_path) -> None:
             if isinstance(block, dict)
         ).lower()
         assert result.get("isError") is not True, (
-            f"viewer view_status (a read) must succeed; got {payload!r}"
+            f"viewer view_tasks (a read) must succeed; got {payload!r}"
         )
         assert "unauthorized" not in text, (
-            f"viewer view_status (system.view is a viewer cap) must NOT be "
+            f"viewer view_tasks (tasks.view is a viewer cap) must NOT be "
             f"denied; got {payload!r}"
         )
 
