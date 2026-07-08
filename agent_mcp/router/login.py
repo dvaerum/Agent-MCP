@@ -70,6 +70,20 @@ COOKIE_PATH = "/agent-mcp/"
 COOKIE_MAX_AGE = 60 * 60 * 24 * 30
 
 
+# Fixed decoy hash for the missing-user login path. The login POST must
+# run an argon2 verify whether or not the username exists: otherwise the
+# missing-user branch returns near-instantly (no hash work) while the
+# found-user branch pays the ~argon2 cost — a ~40x timing gap that leaks
+# which usernames exist, defeating the same-status/same-copy enumeration
+# mitigation below. Hashing a throwaway password ONCE at import gives a
+# constant, well-formed argon2id string to verify against; the verify
+# always mismatches (returns False) but spends the same CPU/memory as a
+# real verify. See the ``user is None`` branch in login_post_handler.
+_DECOY_PASSWORD_HASH = identity.hash_password(
+    "decoy-password-never-a-real-credential"
+)
+
+
 # ── Jinja environment ──────────────────────────────────────────────
 
 
@@ -333,10 +347,12 @@ async def login_post_handler(request: web.Request) -> web.StreamResponse:
 
     user = identity.get_user_by_username(username)
     if user is None:
-        # Constant-ish behaviour: same status + same copy as a bad
-        # password, so a malicious caller can't tell whether the
-        # username exists. (We don't go full constant-time here —
-        # argon2's verify cost dominates anyway.)
+        # Enumeration defense: same status + same copy as a bad
+        # password AND equal argon2 work. A missing user must still pay
+        # a verify against the fixed decoy hash — otherwise this branch
+        # returns near-instantly while the found-user branch runs
+        # argon2, and the ~40x timing gap leaks which usernames exist.
+        identity.verify_password(_DECOY_PASSWORD_HASH, password)
         return web.Response(
             text=error_html, status=401,
             content_type="text/html", charset="utf-8",

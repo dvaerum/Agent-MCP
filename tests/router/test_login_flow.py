@@ -140,6 +140,70 @@ async def test_login_failure_unknown_user_returns_401(
     assert resp.status == 401, await resp.text()
 
 
+@pytest.mark.no_auth_seed_session
+async def test_login_unknown_user_runs_equal_argon2_work(
+    aiohttp_client, router_app, monkeypatch,
+) -> None:
+    """Missing-user login must run a dummy argon2 verify (timing enum).
+
+    The enumeration mitigation is same-status + same-copy, but that is
+    defeated if the missing-user branch skips argon2 entirely: an
+    existing user costs ~argon2-verify, a nonexistent one is near-free,
+    a >10x timing gap. Both branches must invoke ``verify_password``
+    exactly once so the response timing carries no signal about whether
+    the username exists.
+    """
+    import agent_mcp.router.identity as identity
+    from agent_mcp.router import login as login_views
+
+    _seed_user(username="realuser", password="realpw")
+
+    calls: list[tuple[str, str]] = []
+    real_verify = identity.verify_password
+
+    def _spy(hashed: str, password: str) -> bool:
+        calls.append((hashed, password))
+        return real_verify(hashed, password)
+
+    monkeypatch.setattr(identity, "verify_password", _spy)
+
+    client = await aiohttp_client(router_app)
+
+    # Existing user, wrong password → argon2 verify runs once.
+    r_existing = await client.post(
+        "/agent-mcp/login",
+        data={"username": "realuser", "password": "wrong"},
+        allow_redirects=False,
+    )
+    assert r_existing.status == 401, await r_existing.text()
+    assert len(calls) == 1, "existing-user path must run argon2 verify once"
+    body_existing = await r_existing.text()
+
+    calls.clear()
+
+    # Nonexistent user → argon2 verify STILL runs once, against the
+    # fixed decoy hash (equal work, no timing signal).
+    r_missing = await client.post(
+        "/agent-mcp/login",
+        data={"username": "ghost-does-not-exist", "password": "wrong"},
+        allow_redirects=False,
+    )
+    assert r_missing.status == 401, await r_missing.text()
+    assert len(calls) == 1, (
+        "missing-user path must run a dummy argon2 verify to equalise timing"
+    )
+    # The dummy verify runs against the constant decoy hash, not a real
+    # user's stored hash.
+    assert calls[0][0] == login_views._DECOY_PASSWORD_HASH
+    body_missing = await r_missing.text()
+
+    # Identical 401 + identical error copy → no content-based signal
+    # either. (The echoed username differs, as it is attacker-supplied
+    # and reveals nothing; the error message must match.)
+    assert "Invalid username or password." in body_existing
+    assert "Invalid username or password." in body_missing
+
+
 # ── Logout ─────────────────────────────────────────────────────────
 
 
