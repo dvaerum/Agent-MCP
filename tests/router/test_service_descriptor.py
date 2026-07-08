@@ -109,7 +109,9 @@ async def test_index_returns_service_descriptor_for_json_client(
     assert resp.content_type == "application/json"
     body = await resp.json()
     assert body["service"] == "agent-mcp"
-    assert "version" in body and body["version"]
+    # SEC: the internal package version is deliberately NOT published —
+    # it's attacker-useful build fingerprinting no operator consumes.
+    assert "version" not in body
     assert body["mode"] == "multi-tenant"
     # The endpoint URLs are the Shape-3 surface (PR-B). They MUST
     # point at actual mounted routes — see ``make_app`` wire-up.

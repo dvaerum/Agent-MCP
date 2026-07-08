@@ -63,7 +63,8 @@ async def test_health_descriptor_is_public(
     assert resp.status == 200, f"got {resp.status}: {await resp.text()}"
     body = await resp.json()
     assert body.get("ok") is True
-    assert "version" in body
+    # SEC: the public liveness probe must NOT leak the build version.
+    assert "version" not in body
 
 
 # ── GET /api/router/projects — list projects ────────────────────────
