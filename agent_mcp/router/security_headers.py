@@ -96,6 +96,15 @@ def _apply_headers(response: web.StreamResponse, request: web.Request) -> None:
     hdrs.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
     hdrs.setdefault("Content-Security-Policy", _csp())
     hdrs.setdefault("Permissions-Policy", _DEFAULT_PERMISSIONS_POLICY)
+    # Cross-origin isolation (defense-in-depth alongside frame-ancestors
+    # / X-Frame-Options). COOP: same-origin severs cross-origin window
+    # handles so a popup/opener can't reach into this context (blocks
+    # a class of Spectre-style + tab-nabbing side channels). CORP:
+    # same-origin refuses embedding of the router's responses as a
+    # cross-origin resource. The dashboard is fully same-origin, so
+    # neither breaks any legitimate load.
+    hdrs.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+    hdrs.setdefault("Cross-Origin-Resource-Policy", "same-origin")
     # HSTS only over HTTPS — never pin a plain-HTTP dev/VM to TLS.
     if _request_is_https(request):
         hdrs.setdefault("Strict-Transport-Security", _HSTS_VALUE)

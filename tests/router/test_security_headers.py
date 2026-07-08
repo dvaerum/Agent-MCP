@@ -45,6 +45,44 @@ async def test_security_headers_present_on_normal_response(
 
 
 @pytest.mark.no_auth_seed_session
+async def test_cross_origin_isolation_headers_present(
+    aiohttp_client, router_app,
+) -> None:
+    """COOP + CORP defense-in-depth headers land on normal responses.
+
+    Cross-Origin-Opener-Policy: same-origin isolates the browsing
+    context group (blocks cross-origin window handles / Spectre-style
+    side channels); Cross-Origin-Resource-Policy: same-origin blocks
+    other origins from embedding the router's responses as a resource.
+    Both sit alongside the existing frame-ancestors / X-Frame-Options
+    clickjacking defences.
+    """
+    _seed_user()
+    client = await aiohttp_client(router_app)
+    resp = await client.get("/agent-mcp/login")
+    assert resp.status == 200
+    assert resp.headers.get("Cross-Origin-Opener-Policy") == "same-origin"
+    assert resp.headers.get("Cross-Origin-Resource-Policy") == "same-origin"
+
+
+@pytest.mark.no_auth_seed_session
+async def test_cross_origin_isolation_headers_on_401_response(
+    aiohttp_client, router_app,
+) -> None:
+    """COOP + CORP must land on the unauthenticated 401 path too — the
+    middleware stamps error responses, same as the other headers."""
+    _seed_user()
+    client = await aiohttp_client(router_app)
+    resp = await client.get(
+        "/agent-mcp/api/router/projects",
+        headers={"Accept": "application/vnd.agent-mcp.v1+json"},
+    )
+    assert resp.status == 401
+    assert resp.headers.get("Cross-Origin-Opener-Policy") == "same-origin"
+    assert resp.headers.get("Cross-Origin-Resource-Policy") == "same-origin"
+
+
+@pytest.mark.no_auth_seed_session
 async def test_hsts_present_on_https_request(
     aiohttp_client, router_app,
 ) -> None:

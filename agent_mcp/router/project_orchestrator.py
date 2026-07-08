@@ -322,7 +322,12 @@ async def _ensure(name: str, role: str) -> Path:
     # test path.
     registry = project_registry.ProjectRegistry()
     if registry.get(name) is None:
-        raise web.HTTPNotFound(reason=f"unknown project: {name!r}")
+        # Fixed reason phrase — never reflect the caller-supplied
+        # ``name`` into the HTTP status line. aiohttp rejects CR/LF in
+        # ``reason`` today, but echoing attacker input into the status
+        # line is fragile (response-splitting-adjacent); a constant
+        # string removes the surface entirely.
+        raise web.HTTPNotFound(reason="unknown project")
     unit = _unit_name(name, role)
     sock = _sock_path(name, role)
 
@@ -684,7 +689,9 @@ class ProjectOrchestrator:
             return name, None
         real_name = self.registry.resolve_alias(name)
         if real_name is None:
-            raise web.HTTPNotFound(reason=f"unknown project: {name!r}")
+            # Fixed reason phrase — see ``_ensure`` above: never reflect
+            # the caller-supplied ``name`` into the HTTP status line.
+            raise web.HTTPNotFound(reason="unknown project")
         real_row = self.registry.get(real_name)
         alias_entry: dict | None = None
         if real_row is not None:

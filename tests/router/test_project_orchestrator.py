@@ -232,6 +232,24 @@ async def test_resolve_unknown_raises_404(orchestrator):
         orchestrator.resolve("nonesuch")
 
 
+async def test_resolve_unknown_reason_does_not_reflect_name(orchestrator):
+    """SEC hardening: the 404 reason phrase must be a fixed string and
+    must NOT echo the caller-supplied project name back into the HTTP
+    status line / body. Reflecting attacker input into the reason
+    phrase is fragile (response-splitting-adjacent) even though aiohttp
+    currently rejects CR/LF; a fixed reason removes the surface.
+    """
+    from aiohttp import web
+
+    attacker_name = "nonesuch-<script>"
+    with pytest.raises(web.HTTPNotFound) as exc_info:
+        orchestrator.resolve(attacker_name)
+    reason = exc_info.value.reason
+    assert reason == "unknown project"
+    assert attacker_name not in reason
+    assert "nonesuch" not in reason
+
+
 # ── add_alias() / remove_alias() ───────────────────────────────────
 
 
