@@ -406,6 +406,138 @@ async def test_sso_group_mapping_wildcard_jit(
     assert "ops-team" in group_names
 
 
+async def test_sso_login_generates_and_stores_nonce(
+    aiohttp_client, router_app, sso_oidc_env,
+):
+    """Login mints a nonce, sends it to the IdP, and stashes it in the flow cookie.
+
+    Nonce is the OIDC anti-replay / token-injection defence binding the
+    id_token to this specific auth attempt. It MUST reach the authorize
+    request AND be recoverable from the flow cookie so the callback can
+    enforce it against the returned id_token.
+    """
+    import sys
+    sso = sys.modules["agent_mcp.router.sso"]
+
+    client = await aiohttp_client(router_app)
+    resp = await client.get("/agent-mcp/sso/login", allow_redirects=False)
+    assert resp.status in (302, 303)
+    qs = urllib.parse.parse_qs(
+        urllib.parse.urlparse(resp.headers["Location"]).query
+    )
+    assert "nonce" in qs, "authorize request MUST carry a nonce"
+    url_nonce = qs["nonce"][0]
+    assert url_nonce, "nonce MUST be non-empty"
+
+    flow_cookie = resp.cookies.get("agent_mcp_sso_flow")
+    assert flow_cookie is not None
+    flow = sso._decode_flow_cookie(flow_cookie.value)
+    assert flow is not None
+    assert flow.nonce == url_nonce, (
+        "the nonce stored in the flow cookie MUST match the one sent to the IdP"
+    )
+
+
+async def test_sso_callback_passes_stored_nonce_to_decode(
+    aiohttp_client, router_app, sso_oidc_env, monkeypatch,
+):
+    """The callback threads the flow-cookie nonce into id_token validation.
+
+    Without this the id_token is decoded with ``nonce=None`` and
+    CodeIDToken.validate() cannot enforce the anti-replay binding.
+    """
+    import sys
+    sso = sys.modules["agent_mcp.router.sso"]
+
+    _patch_idp(monkeypatch, id_token_claims={
+        "sub": "u", "email": "nonce@example.test",
+        "preferred_username": "nonce", "groups": [],
+    })
+
+    captured: dict[str, Any] = {}
+
+    def _capturing_decode(token, metadata, client_id, nonce=None):
+        captured["nonce"] = nonce
+        return {
+            "sub": "u", "email": "nonce@example.test",
+            "preferred_username": "nonce", "groups": [],
+        }
+
+    monkeypatch.setattr(sso, "_decode_id_token", _capturing_decode)
+
+    client = await aiohttp_client(router_app)
+    init = await client.get("/agent-mcp/sso/login", allow_redirects=False)
+    flow_cookie = init.cookies.get("agent_mcp_sso_flow")
+    assert flow_cookie is not None
+    flow = sso._decode_flow_cookie(flow_cookie.value)
+    assert flow is not None and flow.nonce
+    state = urllib.parse.parse_qs(
+        urllib.parse.urlparse(init.headers["Location"]).query
+    )["state"][0]
+
+    cb = await client.get(
+        "/agent-mcp/sso/callback",
+        params={"code": "ok", "state": state},
+        allow_redirects=False,
+    )
+    assert cb.status in (302, 303), await cb.text()
+    assert captured.get("nonce") == flow.nonce, (
+        "callback MUST pass the stored flow nonce into _decode_id_token"
+    )
+
+
+async def test_decode_id_token_rejects_nonce_mismatch(monkeypatch):
+    """_decode_id_token enforces the nonce via CodeIDToken.validate().
+
+    A signed id_token whose ``nonce`` claim doesn't match the expected
+    value MUST be rejected; a matching one MUST pass. This exercises the
+    real Authlib validation path (JWKS fetch patched, signature real).
+    """
+    import sys
+    import time
+    from authlib.jose import jwt, JsonWebKey
+    sso = sys.modules.get("agent_mcp.router.sso")
+    if sso is None:
+        import importlib
+        sso = importlib.import_module("agent_mcp.router.sso")
+
+    key = JsonWebKey.generate_key("RSA", 2048, is_private=True)
+    pub = key.as_dict(is_private=False)
+    pub["kid"] = "k1"
+    metadata = {
+        "issuer": _FAKE_ISSUER,
+        "jwks_uri": f"{_FAKE_ISSUER}/certs",
+    }
+    now = int(time.time())
+    claims = {
+        "iss": _FAKE_ISSUER, "aud": _FAKE_CLIENT_ID, "sub": "u",
+        "exp": now + 300, "iat": now, "nonce": "the-real-nonce",
+    }
+    token = jwt.encode({"alg": "RS256", "kid": "k1"}, claims, key).decode()
+
+    class _FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"keys": [pub]}
+
+    import requests
+    monkeypatch.setattr(requests, "get", lambda *a, **k: _FakeResp())
+
+    # Matching nonce validates.
+    out = sso._decode_id_token(
+        token, metadata, _FAKE_CLIENT_ID, nonce="the-real-nonce",
+    )
+    assert out["sub"] == "u"
+
+    # Mismatched nonce is rejected.
+    with pytest.raises(Exception):
+        sso._decode_id_token(
+            token, metadata, _FAKE_CLIENT_ID, nonce="attacker-nonce",
+        )
+
+
 async def test_sso_callback_rejects_bad_state(
     aiohttp_client, router_app, sso_oidc_env, monkeypatch,
 ):

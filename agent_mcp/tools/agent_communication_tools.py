@@ -155,8 +155,11 @@ def _can_agents_communicate(sender_id: str, recipient_id: str, is_admin: bool) -
     if sender_id == recipient_id:
         return False, "Self-communication not allowed"
 
-    # Admin agent can always be contacted
-    if recipient_id == "admin" or recipient_id.lower().startswith("admin"):
+    # Admin agent can always be contacted. Match the canonical "admin"
+    # identity EXACTLY — a startswith wildcard would let a worker message
+    # any agent whose id merely begins with "admin" (e.g.
+    # "admin-impersonator"), bypassing the worker→worker default-deny.
+    if recipient_id.lower() == "admin":
         return True, "Admin agent always contactable"
 
     # Worker→worker: gated by per-project toggle (issue K).

@@ -636,19 +636,23 @@ _FLOW_COOKIE_MAX_AGE = 10 * 60  # 10 minutes — plenty for the round-trip
 class _FlowState:
     state: str
     code_verifier: str
+    nonce: str
 
 
 def _encode_flow_cookie(state: _FlowState) -> str:
     """Encode the per-flow state as a single cookie value.
 
-    The state + PKCE verifier are bound to the operator's browser via
-    an opaque cookie (so a phishing IdP can't replay another user's
-    in-flight state). We pack as base64url(JSON) since both fields
-    are short ASCII strings.
+    The state + PKCE verifier + nonce are bound to the operator's
+    browser via an opaque cookie (so a phishing IdP can't replay
+    another user's in-flight state). The nonce additionally binds the
+    returned id_token to this auth attempt (OIDC anti-replay). We pack
+    as base64url(JSON) since all fields are short ASCII strings.
     """
     import base64
     payload = json.dumps({
-        "state": state.state, "verifier": state.code_verifier,
+        "state": state.state,
+        "verifier": state.code_verifier,
+        "nonce": state.nonce,
     }).encode()
     return base64.urlsafe_b64encode(payload).rstrip(b"=").decode()
 
@@ -660,7 +664,12 @@ def _decode_flow_cookie(raw: str) -> _FlowState | None:
         data = base64.urlsafe_b64decode(padded.encode())
         parsed = json.loads(data)
         return _FlowState(
-            state=parsed["state"], code_verifier=parsed["verifier"],
+            state=parsed["state"],
+            code_verifier=parsed["verifier"],
+            # Pre-nonce cookies (in-flight during a rolling deploy) lack
+            # the field; treat as empty so the callback still validates
+            # state + PKCE rather than 500-ing on a KeyError.
+            nonce=parsed.get("nonce", ""),
         )
     except Exception:
         return None
@@ -804,6 +813,7 @@ async def init_oidc_login_handler(request: web.Request) -> web.StreamResponse:
     from authlib.integrations.requests_client import OAuth2Session
 
     code_verifier = secrets.token_urlsafe(64)
+    nonce = secrets.token_urlsafe(32)
     redirect_uri = _resolve_redirect_url(request, cfg)
     sess = OAuth2Session(
         client_id=cfg.client_id,
@@ -815,10 +825,13 @@ async def init_oidc_login_handler(request: web.Request) -> web.StreamResponse:
     url, state = sess.create_authorization_url(
         metadata["authorization_endpoint"],
         code_verifier=code_verifier,
+        nonce=nonce,
     )
 
     cookie_value = _encode_flow_cookie(
-        _FlowState(state=state, code_verifier=code_verifier),
+        _FlowState(
+            state=state, code_verifier=code_verifier, nonce=nonce,
+        ),
     )
     response = web.HTTPSeeOther(location=url)
     response.set_cookie(
@@ -904,6 +917,7 @@ async def handle_oidc_callback(request: web.Request) -> web.StreamResponse:
     try:
         claims = await asyncio.to_thread(
             _decode_id_token, id_token, metadata, cfg.client_id,
+            flow.nonce,
         )
     except Exception as e:
         logger.exception("OIDC id_token decode failed")
