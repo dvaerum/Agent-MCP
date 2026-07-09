@@ -181,6 +181,52 @@ def _generate_notification_id() -> str:
     return f"notification_{secrets.token_hex(8)}"
 
 
+# --- Task status lifecycle -------------------------------------------------
+#
+# Terminal states are sinks: once a task reaches completed / cancelled /
+# failed, no further status write is permitted — not even to the same
+# terminal state. Without this guard a caller could double-complete a
+# task (re-firing ``auto_update_dependencies``), un-complete it, or
+# resurrect a cancelled/failed task. Enforced in both
+# ``_update_single_task`` (the update_task_status path) and
+# ``bulk_task_operations``.
+_TERMINAL_TASK_STATUSES: set = {"completed", "cancelled", "failed"}
+
+
+def _is_status_transition_allowed(old_status: Optional[str], new_status: str) -> bool:
+    """Return True iff a task may move from ``old_status`` to ``new_status``.
+
+    Rules:
+      * A terminal source state (completed/cancelled/failed) is a sink —
+        every outgoing transition is rejected, including a no-op write
+        of the same terminal state (a re-complete would re-fire the
+        dependency-advance side effects).
+      * A same-state write on a non-terminal state is an idempotent
+        no-op and is allowed (e.g. re-affirming ``in_progress`` while
+        appending a note).
+      * Any transition out of a non-terminal state is allowed.
+    """
+    if old_status == new_status:
+        return old_status not in _TERMINAL_TASK_STATUSES
+    if old_status in _TERMINAL_TASK_STATUSES:
+        return False
+    return True
+
+
+def _agent_assignable(cursor, agent_id: str) -> bool:
+    """True iff ``agent_id`` exists and is not terminated.
+
+    Assignment targets must be live agents — a task pinned on a
+    terminated agent is unreachable work (and, for the audit trail,
+    attributes to a revoked identity).
+    """
+    cursor.execute(
+        "SELECT 1 FROM agents WHERE agent_id = ? AND status != ?",
+        (agent_id, "terminated"),
+    )
+    return cursor.fetchone() is not None
+
+
 async def _update_single_task(
     cursor,
     task_id: str,
@@ -213,6 +259,39 @@ async def _update_single_task(
             "success": False,
             "error": f"Unauthorized: Cannot update task '{task_id}' assigned to {task_current_data.get('assigned_to')}",
         }
+
+    # Terminal-state / transition guard. Terminal states are sinks; a
+    # double-complete would re-fire auto_update_dependencies and an
+    # un-complete / resurrect would violate the lifecycle invariant.
+    old_status = task_current_data.get("status")
+    if not _is_status_transition_allowed(old_status, new_status):
+        return {
+            "success": False,
+            "error": (
+                f"Invalid status transition for task '{task_id}': "
+                f"'{old_status}' -> '{new_status}' is not allowed "
+                f"({old_status} is a terminal state)."
+                if old_status in _TERMINAL_TASK_STATUSES
+                else (
+                    f"Invalid status transition for task '{task_id}': "
+                    f"'{old_status}' -> '{new_status}' is not allowed."
+                )
+            ),
+        }
+
+    # Reassignment target validation (admin path only). A free-string
+    # ``assigned_to`` would otherwise pin the task on a non-existent or
+    # terminated agent.
+    if is_admin_request and new_assigned_to is not None:
+        if not _agent_assignable(cursor, new_assigned_to):
+            return {
+                "success": False,
+                "error": (
+                    f"Cannot reassign task '{task_id}' to "
+                    f"'{new_assigned_to}': agent does not exist or is "
+                    f"terminated."
+                ),
+            }
 
     updated_at_iso = datetime.datetime.now().isoformat()
 
@@ -357,6 +436,39 @@ async def _create_unassigned_tasks(
 
     top_level_required_caps_raw = arguments.get("required_capabilities")
 
+    # Provenance (non-repudiation). ``_worker_created_by`` is tagged by
+    # ``_authorize_assign_task`` when a *worker* files an unassigned task
+    # (Mode 0, no agent_token). Operator / manager callers never carry
+    # the tag, so they fall back to the historical "admin" attribution.
+    # Resolving it here means BOTH the ``tasks.created_by`` column and
+    # the ``agent_actions`` audit actor name the real creator, never the
+    # forged literal "admin". Mirrors request_assistance_tool_impl.
+    worker_created_by = arguments.get("_worker_created_by")
+    creator = worker_created_by or "admin"
+
+    # Single-root / parent-required guard. A worker on the Mode-0 path
+    # must NOT be able to create parent-less ROOT tasks — that would
+    # bypass the hierarchy invariant that create_self_task ("Agents can
+    # NEVER create root tasks") and the Mode-1 root-count check enforce.
+    # Operator/manager callers (no ``_worker_created_by`` tag) are
+    # unaffected.
+    if worker_created_by is not None:
+        if tasks:
+            if any(not t.get("parent_task_id") for t in tasks):
+                return Conflict(
+                    reason=(
+                        "Workers cannot create root tasks. Every task filed "
+                        "via assign_task must specify a parent_task_id."
+                    )
+                )
+        elif not parent_task_id_arg:
+            return Conflict(
+                reason=(
+                    "Workers cannot create root tasks. Specify a "
+                    "parent_task_id when filing an unassigned task."
+                )
+            )
+
     # Define the write operation as an async function
     async def write_operation():
         conn = None
@@ -395,7 +507,7 @@ async def _create_unassigned_tasks(
                             "title": title,
                             "description": description,
                             "assigned_to": None,
-                            "created_by": "admin",
+                            "created_by": creator,
                             "status": "unassigned",
                             "priority": task_priority,
                             "parent_task": parent_task,
@@ -412,7 +524,7 @@ async def _create_unassigned_tasks(
 
                     log_agent_action_to_db(
                         cursor,
-                        "admin",
+                        creator,
                         "created_unassigned_task",
                         task_id=task_id,
                         details={"title": title, "mode": "unassigned_multiple"},
@@ -433,7 +545,7 @@ async def _create_unassigned_tasks(
                         "title": task_title,
                         "description": task_description,
                         "assigned_to": None,
-                        "created_by": "admin",
+                        "created_by": creator,
                         "status": "unassigned",
                         "priority": priority,
                         "parent_task": parent_task_id_arg,
@@ -450,7 +562,7 @@ async def _create_unassigned_tasks(
 
                 log_agent_action_to_db(
                     cursor,
-                    "admin",
+                    creator,
                     "created_unassigned_task",
                     task_id=task_id,
                     details={"title": task_title, "mode": "unassigned_single"},
@@ -562,7 +674,8 @@ async def _assign_to_existing_tasks(
         # Validate that all tasks exist and are unassigned
         placeholders = ",".join(["?" for _ in task_ids])
         cursor.execute(
-            f"SELECT task_id, title, assigned_to FROM tasks WHERE task_id IN ({placeholders})",
+            f"SELECT task_id, title, assigned_to, required_capabilities "
+            f"FROM tasks WHERE task_id IN ({placeholders})",
             task_ids,
         )
         found_tasks = cursor.fetchall()
@@ -585,12 +698,35 @@ async def _assign_to_existing_tasks(
                 reason=f"some tasks are already assigned: {', '.join(assigned_list)}"
             )
 
-        # Validate agent exists
+        # Validate agent exists and is not terminated. A terminated
+        # target makes the task unreachable work and misattributes the
+        # audit trail to a revoked identity.
         cursor.execute(
-            "SELECT agent_id FROM agents WHERE agent_id = ?", (target_agent_id,)
+            "SELECT capabilities FROM agents WHERE agent_id = ? AND status != ?",
+            (target_agent_id, "terminated"),
         )
-        if not cursor.fetchone():
+        agent_caps_row = cursor.fetchone()
+        if not agent_caps_row:
             return NotFound(resource="agent", identifier=target_agent_id)
+
+        # Capability-routing enforcement (Mode-3 self-claim). A caller
+        # that learns a task_id must not claim work it lacks the
+        # capabilities for: enforce required_capabilities ⊆ agent
+        # capabilities. Empty required_capabilities always passes. Both
+        # sides are already normalized (lowercased) at write time.
+        agent_caps = set(json.loads(agent_caps_row["capabilities"] or "[]"))
+        for task in found_tasks:
+            raw_req = task["required_capabilities"]
+            required = set(json.loads(raw_req) if raw_req else [])
+            missing = required - agent_caps
+            if missing:
+                return PermissionDenied(
+                    reason=(
+                        f"agent '{target_agent_id}' lacks required "
+                        f"capabilities for task {task['task_id']}: "
+                        f"{sorted(missing)}"
+                    )
+                )
 
         # PR 6: task assignment UPDATEs go through task_repo with the
         # caller's cursor so they're atomic with the audit-log
@@ -683,11 +819,8 @@ async def _create_and_assign_multiple_tasks(
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # Validate agent exists
-        cursor.execute(
-            "SELECT agent_id FROM agents WHERE agent_id = ?", (target_agent_id,)
-        )
-        if not cursor.fetchone():
+        # Validate agent exists and is not terminated.
+        if not _agent_assignable(cursor, target_agent_id):
             return NotFound(resource="agent", identifier=target_agent_id)
 
         created_tasks = []
@@ -858,7 +991,9 @@ async def assign_task_tool_impl(
         from ..repositories import agent_repo
         with agent_repo.disable_cache():
             row = agent_repo.get_by_id(target_agent_id_alias)
-        if not row:
+        # get_by_id RETURNS terminated rows (for audit) but never caches
+        # them; treat a terminated agent as unassignable here.
+        if not row or row.get("status") == "terminated":
             # Use Invalid with the legacy "Unknown agent_id" wording so
             # the rendered wire text continues to contain that prefix
             # (callers + tests grep for it).
@@ -3064,6 +3199,21 @@ async def bulk_task_operations_tool_impl(
                             )
                             continue
 
+                        # Terminal-state / transition guard (mirrors
+                        # _update_single_task): terminal states are sinks
+                        # so the bulk surface can't double-complete /
+                        # resurrect a task.
+                        old_status = task_data.get("status")
+                        if not _is_status_transition_allowed(
+                            old_status, new_status
+                        ):
+                            results.append(
+                                f"Operation {i+1}: Invalid status "
+                                f"transition '{old_status}' -> "
+                                f"'{new_status}' for task '{task_id}'"
+                            )
+                            continue
+
                         # PR 7 (Task flip): bulk status+notes update flows
                         # through task_repo.update_fields with the caller's
                         # cursor. The repo's _MUTABLE_FIELDS allowlist
@@ -3182,6 +3332,17 @@ async def bulk_task_operations_tool_impl(
                         if not new_assigned_to:
                             results.append(
                                 f"Operation {i+1}: Missing 'assigned_to' for reassign operation"
+                            )
+                            continue
+
+                        # Reassignment target validation — reject a
+                        # free-string ``assigned_to`` that names a
+                        # non-existent or terminated agent.
+                        if not _agent_assignable(cursor, new_assigned_to):
+                            results.append(
+                                f"Operation {i+1}: Cannot reassign task "
+                                f"'{task_id}' to '{new_assigned_to}': "
+                                f"agent does not exist or is terminated"
                             )
                             continue
 

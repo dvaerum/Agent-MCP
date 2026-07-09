@@ -68,20 +68,47 @@ def _set_toggle(value: bool) -> None:
     conn.close()
 
 
+def _seed_root_task(title: str = "root") -> str:
+    """Insert a parent-less ROOT task so worker Mode-0 filings have a
+    parent to hang under (agents can never create root tasks)."""
+    import secrets
+
+    from agent_mcp.db.connection import get_db_connection
+
+    task_id = f"task_{secrets.token_hex(6)}"
+    now = _dt.datetime.now().isoformat()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO tasks (task_id, title, description, status, priority, "
+        "assigned_to, created_by, created_at, updated_at, parent_task) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (task_id, title, "root desc", "pending", "medium", None,
+         "admin", now, now, None),
+    )
+    conn.commit()
+    conn.close()
+    return task_id
+
+
 async def test_worker_can_create_unassigned_task_with_default_toggle(
     tmp_path,
 ) -> None:
     """Default (toggle absent → allow): a worker token may call
     `assign_task` in mode 0 (no `agent_token`) and successfully file
-    a task into the unassigned pool."""
+    a task into the unassigned pool. The worker must file under an
+    existing parent — the hierarchy invariant forbids agents from
+    creating root tasks on the Mode-0 path."""
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
+        parent_id = _seed_root_task()
 
         result = await alice.call(
             "assign_task",
             {
                 "task_title": "found a bug",
                 "task_description": "needs triage",
+                "parent_task_id": parent_id,
             },
         )
         text = result[0].text

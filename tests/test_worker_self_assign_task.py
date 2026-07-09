@@ -248,15 +248,20 @@ async def test_admin_self_claim_via_agent_token_unchanged(tmp_path) -> None:
 
 async def test_worker_create_unassigned_still_works(tmp_path) -> None:
     """Regression guard for PR #32: worker Mode 0 (no agent_token)
-    creates an unassigned task — must remain unaffected by this PR."""
+    creates an unassigned task — must remain unaffected by this PR.
+
+    The worker files under an existing parent: the hierarchy invariant
+    forbids agents from creating parent-less root tasks on Mode 0."""
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
+        parent_id = _seed_unassigned_task("root parent")
 
         result = await alice.call(
             "assign_task",
             {
                 "task_title": "found a bug",
                 "task_description": "needs triage",
+                "parent_task_id": parent_id,
             },
         )
         text = result[0].text
