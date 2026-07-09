@@ -221,3 +221,121 @@ async def test_repeated_proxy_header_reconciles_to_single_user(
     )
     assert second[0]["user_id"] == user_id
     assert gid in group_resolver.resolve_user_groups(user_id)
+
+
+def _users_by_subject_prefix(prefix: str) -> list[dict]:
+    """All users whose ``sso_subject`` begins with ``prefix``."""
+    from agent_mcp.router import identity
+    import sqlite3
+
+    with sqlite3.connect(str(identity.get_router_db_path())) as conn:
+        conn.row_factory = sqlite3.Row
+        return [
+            dict(r) for r in conn.execute(
+                "SELECT * FROM users WHERE sso_subject LIKE ?",
+                (prefix + "%",),
+            )
+        ]
+
+
+@pytest.mark.no_auth_seed_session
+async def test_sanitise_colliding_usernames_map_to_distinct_users(
+    aiohttp_client, router_app, sso_proxy_env, register_project,
+):
+    """Two DISTINCT trusted principals whose usernames sanitise-COLLIDE
+    (``a.b@corp`` and ``a-b@corp`` both slugify to ``a-b-corp``) MUST
+    resolve to TWO distinct user rows — not reconcile the second INTO
+    the first's account (a login-as regression: the second principal
+    would inherit the first's groups/grants/sysadmin bit).
+
+    The proxy subject key MUST derive from the RAW trusted username so
+    distinct upstream identities stay distinct; sanitisation is only for
+    the display username.
+    """
+    register_project("proj-collide")
+    client = await aiohttp_client(router_app)
+
+    async def _probe(remote_user: str):
+        return await client.get(
+            "/agent-mcp/api/router/projects",
+            headers={
+                "Remote-User": remote_user,
+                "Accept": "application/vnd.agent-mcp.v1+json",
+            },
+        )
+
+    r1 = await _probe("a.b@corp")
+    assert r1.status == 200, await r1.text()
+    r2 = await _probe("a-b@corp")
+    assert r2.status == 200, await r2.text()
+
+    rows = _users_by_subject_prefix("proxy:")
+    subjects = {r["sso_subject"] for r in rows}
+    user_ids = {r["user_id"] for r in rows}
+    assert len(user_ids) == 2, (
+        f"sanitise-colliding principals collapsed into one account: {rows!r}"
+    )
+    # Distinct subjects keyed on the raw (un-sanitised) username.
+    assert subjects == {"proxy:a.b@corp", "proxy:a-b@corp"}, subjects
+
+
+@pytest.mark.no_seed_operator
+async def test_proxy_empty_table_default_sysadmin_false_forces_setup(
+    aiohttp_client, router_app, router_env, monkeypatch, register_project,
+):
+    """On an EMPTY users table with ``DEFAULT_SYSADMIN=false`` the proxy
+    path MUST NOT auto-mint a bootstrap sysadmin. The operator explicitly
+    declined proxy auto-sysadmin, so the first admin must be minted via
+    the setup wizard. The JIT MUST NOT fire (which would both violate the
+    flag AND make the users table non-empty, locking the wizard away).
+    """
+    from agent_mcp.router import identity
+    identity.run_router_migrations_upgrade()
+
+    monkeypatch.setenv("AGENT_MCP_SSO_PROXY_HEADER", "Remote-User")
+    monkeypatch.setenv("AGENT_MCP_SSO_PROXY_TRUSTED_IPS", "127.0.0.1,::1")
+    monkeypatch.setenv("AGENT_MCP_SSO_PROXY_DEFAULT_SYSADMIN", "false")
+
+    client = await aiohttp_client(router_app)
+    resp = await client.get(
+        "/agent-mcp/api/router/projects",
+        headers={
+            "Remote-User": "should-not-be-admin",
+            "Accept": "application/vnd.agent-mcp.v1+json",
+        },
+    )
+    # No identity minted → the request is unauthenticated.
+    assert resp.status == 401, await resp.text()
+    # The users table is still empty — the operator can still reach the
+    # setup wizard to bootstrap a real admin.
+    assert identity.get_user_by_username("should-not-be-admin") is None
+    from agent_mcp.router.setup_wizard import users_table_is_empty
+    assert users_table_is_empty() is True
+
+
+@pytest.mark.no_seed_operator
+async def test_proxy_empty_table_default_sysadmin_true_still_bootstraps(
+    aiohttp_client, router_app, router_env, monkeypatch, register_project,
+):
+    """``DEFAULT_SYSADMIN=true`` bootstrap is preserved: the first proxy
+    login on an empty table DOES mint a sysadmin (avoids lock-out for
+    deployments that boot straight into proxy-header SSO)."""
+    from agent_mcp.router import identity
+    identity.run_router_migrations_upgrade()
+
+    monkeypatch.setenv("AGENT_MCP_SSO_PROXY_HEADER", "Remote-User")
+    monkeypatch.setenv("AGENT_MCP_SSO_PROXY_TRUSTED_IPS", "127.0.0.1,::1")
+    monkeypatch.setenv("AGENT_MCP_SSO_PROXY_DEFAULT_SYSADMIN", "true")
+
+    client = await aiohttp_client(router_app)
+    resp = await client.get(
+        "/agent-mcp/api/router/projects",
+        headers={
+            "Remote-User": "boot-admin",
+            "Accept": "application/vnd.agent-mcp.v1+json",
+        },
+    )
+    assert resp.status == 200, await resp.text()
+    row = identity.get_user_by_username("boot-admin")
+    assert row is not None
+    assert row["is_sysadmin"] == 1

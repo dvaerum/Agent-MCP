@@ -693,6 +693,18 @@ def _add_user_to_group_idempotent(group_id: str, user_id: str) -> bool:
 # ── Proxy-header trust helpers ─────────────────────────────────────
 
 
+def _users_table_is_empty() -> bool:
+    """True iff no operator account exists yet (fresh-deploy state).
+
+    Delegates to the setup wizard's canonical check so the "is the
+    users table empty" predicate has a single home. Imported lazily to
+    avoid an import cycle (setup_wizard → login → sso).
+    """
+    from .setup_wizard import users_table_is_empty
+
+    return users_table_is_empty()
+
+
 def is_trusted_proxy_source(
     request: web.Request, settings: ProxyHeaderSettings,
 ) -> bool:
@@ -735,13 +747,30 @@ def extract_proxy_header_user(
     raw = request.headers.get(settings.trust_header, "").strip()
     if not raw:
         return None
-    # Stable subject for the proxy path is the sanitised trusted
-    # username, namespaced so it can't collide with an OIDC ``sub``.
-    # Without it every request (no session cookie in proxy mode) would
-    # re-mint a fresh ``name``/``name-2``/… row — and, under
-    # ``default_is_sysadmin``, a fresh sysadmin — with grants that
-    # never stick.
-    subject = _PROXY_SUBJECT_PREFIX + _sanitise_username(raw)
+    # Bootstrap gate: on an EMPTY users table, only auto-mint the first
+    # user when the operator opted into proxy auto-sysadmin. With
+    # ``DEFAULT_SYSADMIN=false`` the operator explicitly declined it, so
+    # the first admin must be minted through the setup wizard instead —
+    # JIT-creating a non-sysadmin passwordless row here would both
+    # violate the flag AND make the users table non-empty, locking the
+    # wizard away (it only renders while the table is empty). Returning
+    # None leaves the caller unauthenticated; HTML paths then 303 to
+    # /setup via the empty-users middleware.
+    if not settings.default_is_sysadmin and _users_table_is_empty():
+        return None
+    # Stable subject for the proxy path is the RAW trusted username,
+    # namespaced so it can't collide with an OIDC ``sub``. It MUST be
+    # the raw (un-sanitised) value: ``_sanitise_username`` collapses
+    # every run of non-[a-z0-9-] to a single dash, so ``a.b@corp``,
+    # ``a-b@corp`` and ``a_b@corp`` would all slugify to one subject and
+    # the second principal would reconcile INTO the first's account
+    # (inheriting its groups/grants — a login-as regression). Keying on
+    # the raw header value keeps distinct upstream principals distinct;
+    # sanitisation is applied ONLY to the display username below.
+    # Without a stable subject every request (no session cookie in proxy
+    # mode) would re-mint a fresh ``name``/``name-2``/… row with grants
+    # that never stick.
+    subject = _PROXY_SUBJECT_PREFIX + raw
     return find_or_create_sso_user(
         email=None,
         preferred_username=raw,
