@@ -334,6 +334,33 @@ def _reset_cache_for_tests() -> None:
 
 _USERNAME_SANITISE = re.compile(r"[^a-z0-9-]+")
 
+# Reserved namespace for wildcard-JIT'd OIDC groups. The ``:`` can't
+# appear in a sanitised slug (the sanitiser collapses it to ``-``), so
+# an ``oidc:``-prefixed group can never be produced by, or collide
+# with, a locally-managed group slug — that's the anti-privilege-
+# escalation invariant for the group-mapping wildcard path.
+_WILDCARD_GROUP_PREFIX = "oidc:"
+
+# Namespaces for the stable ``users.sso_subject`` reconciliation key,
+# keeping OIDC subjects and proxy-header identities in disjoint spaces
+# even if both modes leave rows in the same DB across a reconfigure.
+_OIDC_SUBJECT_PREFIX = "oidc:"
+_PROXY_SUBJECT_PREFIX = "proxy:"
+
+
+def _oidc_subject(iss: str | None, sub: str | None) -> str | None:
+    """Build the stable OIDC subject key from ``(iss, sub)``.
+
+    Per the OIDC spec ``sub`` is unique+stable only WITHIN an issuer,
+    so both parts are needed. Returns None when either is missing (a
+    spec-noncompliant id_token) — the caller then falls back to the
+    verified-email / JIT-create path rather than keying on a partial
+    identifier.
+    """
+    if not iss or not sub:
+        return None
+    return f"{_OIDC_SUBJECT_PREFIX}{iss}:{sub}"
+
 
 def _sanitise_username(raw: str) -> str:
     """Convert an arbitrary IdP-provided name to our slug shape.
@@ -357,21 +384,39 @@ def find_or_create_sso_user(
     *,
     email: str | None,
     preferred_username: str | None,
+    subject: str | None = None,
+    email_verified: bool = False,
     default_is_sysadmin: bool = False,
 ) -> dict[str, Any]:
-    """Match-by-email or JIT-create the local user; return the row.
+    """Reconcile-by-subject, verified-email-link, or JIT-create; return the row.
 
-    Matching algorithm:
+    Matching algorithm (in order):
 
-      1. If ``email`` matches an existing ``users.email``, return that
-         row. The SSO username is ignored — operators rename users in
-         the local store; matching by email keeps the link stable.
-      2. Else, sanitise ``preferred_username`` and create a new row
-         with ``password_hash = NULL`` (the row exists only to anchor
-         the session; the operator cannot log in via the password
-         form). When the requested username already exists for a
-         DIFFERENT email, suffix ``-2``, ``-3``, … until we land on a
-         free slot.
+      1. **Stable subject.** If ``subject`` (OIDC ``(iss, sub)`` or the
+         sanitised proxy-trusted username) matches an existing row's
+         ``sso_subject``, return it. This is the ONLY reconciliation
+         key for passwordless SSO rows — email is mutable / absent, so
+         keying on it re-minted a new user (and, under
+         ``AGENT_MCP_SSO_PROXY_DEFAULT_SYSADMIN``, a fresh sysadmin) on
+         every request.
+
+      2. **Verified-email link.** If ``email`` is present AND the IdP
+         asserted ``email_verified is True``, link to a PRE-EXISTING
+         local account of that email — a password-backed operator, or
+         a legacy (pre-subject) SSO row. The verification gate closes
+         the account-takeover vector: an IdP that lets a user set an
+         arbitrary UNVERIFIED email must not be able to seize a local
+         operator of that email. Post-fix passwordless rows (which
+         always carry a subject) are deliberately NOT email-matchable,
+         so an attacker's unverified-email row can never be linked into
+         by a later victim login. The subject is stamped onto the
+         linked row so subsequent logins reconcile via step 1.
+
+      3. **JIT-create.** A genuinely new subject → create a
+         ``password_hash = NULL`` row (anchors the session only; no
+         password login). The username collision-suffix (``-2``,
+         ``-3``, …) now fires ONLY for genuinely different subjects —
+         same-subject reconciliation already returned in step 1.
 
     ``default_is_sysadmin`` flips the sysadmin bit on the JIT row;
     only the proxy-header path passes True today, gated by
@@ -379,12 +424,23 @@ def find_or_create_sso_user(
     """
     from . import identity
 
-    if email:
-        existing = _find_user_by_email(email)
+    # 1. Stable-subject reconciliation.
+    if subject:
+        existing = _find_user_by_subject(subject)
         if existing is not None:
             identity.touch_last_login(existing["user_id"])
             return existing
 
+    # 2. Verified-email link to a pre-existing local account.
+    if email and email_verified:
+        linked = _find_linkable_user_by_email(email)
+        if linked is not None:
+            if subject:
+                _stamp_subject_if_absent(linked["user_id"], subject)
+            identity.touch_last_login(linked["user_id"])
+            return identity.get_user_by_id(linked["user_id"]) or linked
+
+    # 3. Genuinely new subject → JIT-create a passwordless row.
     base = _sanitise_username(preferred_username or (email or "user"))
     candidate = base
     suffix = 2
@@ -395,6 +451,7 @@ def find_or_create_sso_user(
     user_id = _create_passwordless_user(
         username=candidate,
         email=email,
+        subject=subject,
         is_sysadmin=default_is_sysadmin,
     )
     identity.touch_last_login(user_id)
@@ -403,22 +460,76 @@ def find_or_create_sso_user(
     return row
 
 
-def _find_user_by_email(email: str) -> dict[str, Any] | None:
-    """Return the users row for ``email`` (case-insensitive), or None."""
+def _find_user_by_subject(subject: str) -> dict[str, Any] | None:
+    """Return the users row whose ``sso_subject`` == ``subject``, or None."""
     from . import identity
 
     with sqlite3.connect(str(identity.get_router_db_path())) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.execute(
-            "SELECT * FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1",
+            "SELECT * FROM users WHERE sso_subject = ? LIMIT 1",
+            (subject,),
+        )
+        row = cur.fetchone()
+    return dict(row) if row is not None else None
+
+
+def _find_linkable_user_by_email(email: str) -> dict[str, Any] | None:
+    """Return a LINK-eligible local row for ``email`` (case-insensitive).
+
+    Only two row shapes are eligible link targets for a verified email:
+
+      * a password-backed local operator (``password_hash IS NOT NULL``)
+        — the account-linking feature's intended target, and
+      * a legacy SSO row (``sso_subject IS NULL``) minted before the
+        stable-subject column existed, so upgrading deployments keep
+        reconciling their existing SSO users instead of duplicating.
+
+    Post-fix passwordless SSO rows carry a non-NULL ``sso_subject`` and
+    are excluded — that's what stops an attacker's unverified-email row
+    from being linked into by a later victim login. Password users are
+    preferred when both shapes share an email.
+    """
+    from . import identity
+
+    with sqlite3.connect(str(identity.get_router_db_path())) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            """
+            SELECT * FROM users
+            WHERE LOWER(email) = LOWER(?)
+              AND (password_hash IS NOT NULL OR sso_subject IS NULL)
+            ORDER BY (password_hash IS NULL) ASC
+            LIMIT 1
+            """,
             (email,),
         )
         row = cur.fetchone()
     return dict(row) if row is not None else None
 
 
+def _stamp_subject_if_absent(user_id: str, subject: str) -> None:
+    """Bind ``subject`` to ``user_id`` iff the row has no subject yet.
+
+    Idempotent + race-safe against the partial UNIQUE index: the
+    ``sso_subject IS NULL`` guard means a second, different subject can
+    never overwrite an already-bound row, and the index rejects binding
+    the same subject to two rows.
+    """
+    from . import identity
+
+    with sqlite3.connect(str(identity.get_router_db_path())) as conn:
+        conn.execute(
+            "UPDATE users SET sso_subject = ? "
+            "WHERE user_id = ? AND sso_subject IS NULL",
+            (subject, user_id),
+        )
+        conn.commit()
+
+
 def _create_passwordless_user(
     *, username: str, email: str | None, is_sysadmin: bool,
+    subject: str | None = None,
 ) -> str:
     """Insert a NULL-password user row directly.
 
@@ -445,12 +556,13 @@ def _create_passwordless_user(
             """
             INSERT INTO users
                 (user_id, username, email, password_hash, created_at,
-                 last_login_at, is_sysadmin)
-            VALUES (?, ?, ?, NULL, ?, NULL, ?)
+                 last_login_at, is_sysadmin, sso_subject)
+            VALUES (?, ?, ?, NULL, ?, NULL, ?, ?)
             """,
             (
                 user_id, username, email, created_at,
                 1 if (is_sysadmin or was_empty) else 0,
+                subject,
             ),
         )
         if was_empty:
@@ -486,7 +598,13 @@ def apply_group_mapping(
         sysadmin pre-creates groups before binding claims).
       * ``"*"`` in the mapping is the wildcard JIT escape — every
         unmatched claim auto-creates a sanitized agent-mcp group and
-        the user is added.
+        the user is added. Wildcard-provisioned groups are NAMESPACED
+        under the reserved ``oidc:`` prefix (e.g. claim ``admins`` →
+        group ``oidc:admins``) so a claim value can never collide with
+        — and silently inherit the capabilities / sysadmin bit of — a
+        locally-managed group of the same slug. Explicit mappings are
+        exempt: an operator who writes ``{"admins": "admins"}`` has
+        deliberately opted into binding that claim to the local group.
       * Unmapped claims (no entry, no wildcard) are silently ignored.
 
     Idempotent: re-running with the same claims is a no-op for the
@@ -504,7 +622,7 @@ def apply_group_mapping(
         if target:
             group_name = target
         elif wildcard is not None:
-            group_name = _sanitise_group_name(claim)
+            group_name = _WILDCARD_GROUP_PREFIX + _sanitise_group_name(claim)
         else:
             continue
         if not group_name:
@@ -617,9 +735,17 @@ def extract_proxy_header_user(
     raw = request.headers.get(settings.trust_header, "").strip()
     if not raw:
         return None
+    # Stable subject for the proxy path is the sanitised trusted
+    # username, namespaced so it can't collide with an OIDC ``sub``.
+    # Without it every request (no session cookie in proxy mode) would
+    # re-mint a fresh ``name``/``name-2``/… row — and, under
+    # ``default_is_sysadmin``, a fresh sysadmin — with grants that
+    # never stick.
+    subject = _PROXY_SUBJECT_PREFIX + _sanitise_username(raw)
     return find_or_create_sso_user(
         email=None,
         preferred_username=raw,
+        subject=subject,
         default_is_sysadmin=settings.default_is_sysadmin,
     )
 
@@ -926,7 +1052,14 @@ async def handle_oidc_callback(request: web.Request) -> web.StreamResponse:
         )
 
     email = claims.get("email")
+    # Strict boolean check: an IdP that omits the claim, or sends a
+    # string / falsy value, is treated as UNVERIFIED so its email can't
+    # be used to link to (take over) a pre-existing local account.
+    email_verified = claims.get("email_verified") is True
     preferred_username = claims.get("preferred_username") or claims.get("sub")
+    # Stable reconciliation key: (iss, sub). ``iss`` is the validated
+    # issuer from the id_token; fall back to the configured issuer.
+    subject = _oidc_subject(claims.get("iss") or cfg.issuer, claims.get("sub"))
     groups_claim = claims.get("groups") or []
     if not isinstance(groups_claim, list):
         groups_claim = []
@@ -934,6 +1067,8 @@ async def handle_oidc_callback(request: web.Request) -> web.StreamResponse:
     user = find_or_create_sso_user(
         email=email,
         preferred_username=preferred_username,
+        subject=subject,
+        email_verified=email_verified,
     )
     if cfg.group_mapping:
         apply_group_mapping(

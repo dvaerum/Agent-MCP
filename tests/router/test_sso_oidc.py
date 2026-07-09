@@ -284,7 +284,12 @@ async def test_sso_callback_creates_user_and_session(
 async def test_sso_callback_matches_existing_user_by_email(
     aiohttp_client, router_app, sso_oidc_env, monkeypatch,
 ):
-    """Existing local user is matched by email rather than re-created."""
+    """A VERIFIED email matches an existing local user rather than re-creating.
+
+    The email-link path is gated on ``email_verified is True`` (the
+    account-takeover fix): a matching, IdP-asserted-verified email
+    binds the SSO login to the pre-existing local (password) operator.
+    """
     from agent_mcp.router import identity
 
     identity.run_router_migrations_upgrade()
@@ -296,6 +301,7 @@ async def test_sso_callback_matches_existing_user_by_email(
     _patch_idp(monkeypatch, id_token_claims={
         "sub": "user-bob",
         "email": "bob@example.test",
+        "email_verified": True,
         "preferred_username": "BobFromSSO",
         "groups": [],
     })
@@ -373,7 +379,13 @@ async def test_sso_group_mapping_explicit(
 async def test_sso_group_mapping_wildcard_jit(
     aiohttp_client, router_app, sso_oidc_env, monkeypatch,
 ):
-    """The ``*`` wildcard mapping JIT-creates each unknown group."""
+    """The ``*`` wildcard mapping JIT-creates each unknown group.
+
+    Wildcard-provisioned groups are namespaced under an ``oidc:``
+    prefix so a claim value can never collide with (and inherit the
+    caps of) a locally-managed group of the same slug — see
+    ``test_sso_wildcard_group_does_not_bind_existing_privileged_group``.
+    """
     monkeypatch.setenv(
         "AGENT_MCP_SSO_OIDC_GROUP_MAPPING",
         json.dumps({"*": ""}),
@@ -401,9 +413,11 @@ async def test_sso_group_mapping_wildcard_jit(
     assert user is not None
     group_ids = group_resolver.resolve_user_groups(user["user_id"])
     group_names = _group_names_for(group_ids)
-    # Names get sanitized (lowercase, spaces → dashes) but should appear.
-    assert "eng-backend" in group_names
-    assert "ops-team" in group_names
+    # Names get sanitized (lowercase, spaces → dashes) AND namespaced
+    # under ``oidc:`` so wildcard claims live in their own reserved
+    # space, unable to collide with locally-managed groups.
+    assert "oidc:eng-backend" in group_names
+    assert "oidc:ops-team" in group_names
 
 
 async def test_sso_login_generates_and_stores_nonce(
@@ -556,3 +570,210 @@ async def test_sso_callback_rejects_bad_state(
     assert cb.status == 400
     # No session cookie on a rejected callback.
     assert "agent_mcp_session" not in cb.headers.get("Set-Cookie", "")
+
+
+# ── Account-linking security tests (SSO takeover / reconciliation) ──
+
+
+async def _drive_callback(client):
+    """Run one login→callback round-trip; return the callback response."""
+    init = await client.get("/agent-mcp/sso/login", allow_redirects=False)
+    assert init.status in (302, 303), await init.text()
+    state = urllib.parse.parse_qs(
+        urllib.parse.urlparse(init.headers["Location"]).query
+    )["state"][0]
+    return await client.get(
+        "/agent-mcp/sso/callback",
+        params={"code": "ok", "state": state},
+        allow_redirects=False,
+    )
+
+
+def _passwordless_users():
+    """All SSO-minted (password_hash IS NULL) users.
+
+    Filters out the sentinel operator the router fixtures seed (which
+    is password-backed) so the assertions below count only the rows
+    the SSO flow itself created.
+    """
+    from agent_mcp.router import identity
+    import sqlite3
+
+    with sqlite3.connect(str(identity.get_router_db_path())) as conn:
+        conn.row_factory = sqlite3.Row
+        return [
+            dict(r) for r in conn.execute(
+                "SELECT * FROM users WHERE password_hash IS NULL"
+            )
+        ]
+
+
+async def test_sso_unverified_email_does_not_take_over_local_user(
+    aiohttp_client, router_app, sso_oidc_env, monkeypatch,
+):
+    """An IdP email with ``email_verified`` != True MUST NOT link to a
+    pre-existing local account of the same email — that would be an
+    account-takeover primitive (attacker sets a victim operator's email
+    at an IdP that never verifies it and logs in AS the victim).
+
+    The colliding local account is left untouched; the SSO login lands
+    on a FRESH passwordless identity instead.
+    """
+    from agent_mcp.router import identity
+
+    identity.run_router_migrations_upgrade()
+    victim_id = identity.create_user(
+        username="victim-admin",
+        password="correct horse battery",
+        email="admin@corp.test",
+    )
+    # Make the victim a sysadmin so a successful takeover would be
+    # maximally damaging — the assertion below proves it did NOT happen.
+    import sqlite3
+    with sqlite3.connect(str(identity.get_router_db_path())) as conn:
+        conn.execute(
+            "UPDATE users SET is_sysadmin = 1 WHERE user_id = ?",
+            (victim_id,),
+        )
+        conn.commit()
+
+    # Attacker-controlled IdP asserts the victim's email but does NOT
+    # (cannot) assert email_verified.
+    _patch_idp(monkeypatch, id_token_claims={
+        "sub": "attacker-subject",
+        "email": "admin@corp.test",
+        "email_verified": False,
+        "preferred_username": "attacker",
+        "groups": [],
+    })
+    client = await aiohttp_client(router_app)
+    cb = await _drive_callback(client)
+    assert cb.status in (302, 303), await cb.text()
+
+    # The victim row is untouched — still password-backed, still
+    # sysadmin, no SSO login stamped onto it.
+    victim = identity.get_user_by_id(victim_id)
+    assert victim is not None
+    assert victim["password_hash"] is not None
+    assert victim["last_login_at"] is None, (
+        "victim account was logged into — takeover occurred"
+    )
+
+    # A distinct, fresh passwordless identity was created for the SSO
+    # login — it is NOT the victim and is NOT a sysadmin.
+    fresh_users = _passwordless_users()
+    assert len(fresh_users) == 1, (
+        f"expected one fresh SSO user, got {fresh_users!r}"
+    )
+    fresh = fresh_users[0]
+    assert fresh["is_sysadmin"] == 0
+    assert fresh["user_id"] != victim_id
+
+
+async def test_sso_emailless_login_reconciles_to_single_user(
+    aiohttp_client, router_app, sso_oidc_env, monkeypatch,
+):
+    """Two OIDC logins for the same subject with NO email claim resolve
+    to ONE user row (not a fresh ``name``/``name-2``/… every time).
+
+    Reconciliation keys on the stable ``(iss, sub)`` subject, not the
+    (absent) email — otherwise every login mints a new user and any
+    grants attached to the previous row are orphaned.
+    """
+    from agent_mcp.router import identity, group_resolver
+
+    _patch_idp(monkeypatch, id_token_claims={
+        "sub": "stable-subject-42",
+        "preferred_username": "eve",
+        "groups": [],
+        # no "email" claim at all
+    })
+    client = await aiohttp_client(router_app)
+
+    cb1 = await _drive_callback(client)
+    assert cb1.status in (302, 303), await cb1.text()
+    after_first = _passwordless_users()
+    assert len(after_first) == 1, after_first
+    user_id = after_first[0]["user_id"]
+
+    # Attach a grant to the freshly-minted user; it MUST survive the
+    # next login (i.e. the next login returns the SAME row).
+    import sqlite3
+    import secrets
+    with sqlite3.connect(str(identity.get_router_db_path())) as conn:
+        gid = secrets.token_hex(8)
+        conn.execute(
+            "INSERT INTO groups (group_id, name, is_sysadmin, created_at) "
+            "VALUES (?, 'persisted-grant', 0, datetime('now'))",
+            (gid,),
+        )
+        conn.execute(
+            "INSERT INTO group_membership "
+            "(group_id, member_user_id, member_group_id, added_at) "
+            "VALUES (?, ?, NULL, datetime('now'))",
+            (gid, user_id),
+        )
+        conn.commit()
+
+    cb2 = await _drive_callback(client)
+    assert cb2.status in (302, 303), await cb2.text()
+
+    after_second = _passwordless_users()
+    assert len(after_second) == 1, (
+        f"emailless re-login minted a duplicate user: {after_second!r}"
+    )
+    assert after_second[0]["user_id"] == user_id
+    # The grant attached after the first login is still resolved.
+    assert gid in group_resolver.resolve_user_groups(user_id)
+
+
+async def test_sso_wildcard_group_does_not_bind_existing_privileged_group(
+    aiohttp_client, router_app, sso_oidc_env, monkeypatch,
+):
+    """A wildcard group claim whose slug collides with a pre-existing
+    LOCALLY-MANAGED privileged group MUST NOT bind the user into that
+    group (which would hand out its caps / sysadmin bit).
+
+    Wildcard-provisioned groups are namespaced (``oidc:<slug>``) so the
+    collision is impossible: the user joins a fresh ``oidc:admins``
+    group, never the locally-managed ``admins`` sysadmin group.
+    """
+    from agent_mcp.router import identity, group_resolver
+    import sqlite3
+    import secrets
+
+    identity.run_router_migrations_upgrade()
+    # Locally-managed, sysadmin-flagged group named "admins".
+    admins_gid = secrets.token_hex(8)
+    with sqlite3.connect(str(identity.get_router_db_path())) as conn:
+        conn.execute(
+            "INSERT INTO groups (group_id, name, is_sysadmin, created_at) "
+            "VALUES (?, 'admins', 1, datetime('now'))",
+            (admins_gid,),
+        )
+        conn.commit()
+
+    monkeypatch.setenv(
+        "AGENT_MCP_SSO_OIDC_GROUP_MAPPING",
+        json.dumps({"*": ""}),
+    )
+    _patch_idp(monkeypatch, id_token_claims={
+        "sub": "wild",
+        "email": "mallory@corp.test",
+        "email_verified": True,
+        "preferred_username": "mallory",
+        "groups": ["admins"],
+    })
+    client = await aiohttp_client(router_app)
+    cb = await _drive_callback(client)
+    assert cb.status in (302, 303), await cb.text()
+
+    user = identity.get_user_by_username("mallory")
+    assert user is not None
+    resolved = group_resolver.resolve_user_groups(user["user_id"])
+    # The user MUST NOT be a member of the pre-existing privileged group
+    assert admins_gid not in resolved
+    # …and therefore MUST NOT have inherited its sysadmin bit.
+    assert group_resolver.resolve_user_is_sysadmin(user["user_id"]) is False
+    # The user landed in the namespaced JIT group instead.
+    assert "oidc:admins" in _group_names_for(resolved)
