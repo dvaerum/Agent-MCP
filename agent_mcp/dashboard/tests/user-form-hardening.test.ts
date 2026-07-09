@@ -8,9 +8,10 @@
  * enforce:
  *
  *   UX-05  The Add-user password field carries a client-side
- *          ``minLength`` matching the router's ``_PASSWORD_MIN_LENGTH``
- *          (8), so a too-short password is rejected inline instead of
- *          bouncing off the server with an opaque 400.
+ *          ``minLength`` matching the server's canonical
+ *          ``identity.PASSWORD_MIN_LENGTH`` (12), so a too-short
+ *          password is rejected inline instead of bouncing off the
+ *          server with an opaque 400.
  *
  *   UX-08  The Delete-user modal is behind a type-to-confirm guard: a
  *          controlled ``confirmText`` input gated against the exact
@@ -29,8 +30,8 @@ const read = (rel: string) =>
 const SRC = read("components/dashboard/users-dashboard.tsx")
 
 describe("UX-05: add-user password min length", () => {
-  it("declares PASSWORD_MIN_LENGTH = 8 to mirror the server rule", () => {
-    expect(/PASSWORD_MIN_LENGTH\s*=\s*8\b/.test(SRC)).toBe(true)
+  it("declares PASSWORD_MIN_LENGTH = 12 to mirror the server rule", () => {
+    expect(/PASSWORD_MIN_LENGTH\s*=\s*12\b/.test(SRC)).toBe(true)
   })
 
   it("binds minLength on the password Input", () => {
