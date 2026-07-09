@@ -37,6 +37,25 @@ from aiohttp import web
 logger = logging.getLogger(__name__)
 
 
+def _token_dir() -> Path:
+    """Resolve the on-disk agent-token directory.
+
+    SEC (owner-authorised, defensive) FINDING 5 [LOW] — ``Path("")`` is
+    TRUTHY (it evaluates to ``PosixPath('.')``), so the previous
+    ``Path(os.environ.get("AGENT_MCP_TOKENS_DIR", "")) or <default>``
+    idiom resolved an UNSET env var to the process CWD rather than the
+    intended default. ``token_dir.is_dir()`` then usually pointed at the
+    working directory, so the ``<name>--*.token`` purge on delete /
+    rename was a silent no-op and stale token files survived. Branch on
+    the env var's PRESENCE explicitly so an unset var falls through to
+    the real default.
+    """
+    env = os.environ.get("AGENT_MCP_TOKENS_DIR")
+    if env:
+        return Path(env)
+    return Path.home() / ".config" / "agent-mcp" / "tokens"
+
+
 # ── Health (public) ─────────────────────────────────────────────────
 
 
@@ -79,8 +98,12 @@ async def list_projects_handler(req: web.Request) -> web.Response:
     """
     from . import app as _app
 
+    # SEC FINDING 4: filter to projects the caller may see (sysadmin →
+    # all). Was an unfiltered cross-tenant listing.
+    names = sorted(_app._projects_dict().keys())
+    visible = _app._visible_project_names(req, names)
     return web.json_response(
-        {"projects": sorted(_app._projects_dict().keys())},
+        {"projects": [n for n in names if n in visible]},
         headers={"Cache-Control": "no-store"},
     )
 
@@ -170,6 +193,23 @@ async def rename_project_handler(req: web.Request) -> web.Response:
             message=f"grace_days must be an integer, got {grace_days_raw!r}",
             status=400,
         )
+    # SEC (owner-authorised, defensive) FINDING 3 [MED-HIGH] — bound
+    # grace_days BEFORE any destructive step. ``_REGISTRY.rename``
+    # computes ``datetime.now(UTC) + timedelta(days=grace_days)``; an
+    # unbounded huge int raises ``OverflowError``, which the rollback
+    # ``except (ValueError, KeyError)`` below does NOT catch. By then the
+    # backend has been stopped and the workspace + token files renamed,
+    # so the project is left half-renamed (bricked): registry still on
+    # the old name, disk on the new. Reject out-of-range up front —
+    # before the ``systemctl stop`` / workspace rename / token rename /
+    # registry rename — so nothing destructive runs on a bad value.
+    # 0..3650 days (10 years) is a generous alias grace window.
+    if not (0 <= grace_days <= 3650):
+        return _app._error_envelope(
+            error=_app._ERROR_INVALID_NAME,
+            message="grace_days must be between 0 and 3650",
+            status=400,
+        )
     if not _app._SLUG_RE.match(old_name):
         return _app._error_envelope(
             error=_app._ERROR_INVALID_NAME,
@@ -228,10 +268,7 @@ async def rename_project_handler(req: web.Request) -> web.Response:
                 message=f"could not rename workspace dir: {e.strerror}",
                 status=500,
             )
-    token_dir = (
-        Path(os.environ.get("AGENT_MCP_TOKENS_DIR", ""))
-        or (Path.home() / ".config" / "agent-mcp" / "tokens")
-    )
+    token_dir = _token_dir()
     if token_dir.is_dir():
         for tok in token_dir.glob(f"{old_name}--*.token"):
             suffix = tok.name[len(old_name) + len("--"):]
@@ -352,10 +389,7 @@ async def delete_project_handler(req: web.Request) -> web.Response:
             "delete_project: failed to purge project_membership for %s",
             name,
         )
-    token_dir = (
-        Path(os.environ.get("AGENT_MCP_TOKENS_DIR", ""))
-        or (Path.home() / ".config" / "agent-mcp" / "tokens")
-    )
+    token_dir = _token_dir()
     if token_dir.is_dir():
         for tok in token_dir.glob(f"{name}--*.token"):
             try:
@@ -423,7 +457,18 @@ async def overview_handler(req: web.Request) -> web.Response:
     else:
         envelope = _app._build_overview_envelope()
         _app._overview_cache = (now + _app._OVERVIEW_CACHE_TTL_SEC, envelope)
-    return web.json_response(envelope, headers={"Cache-Control": "no-store"})
+    # SEC FINDING 4: the envelope is cached process-wide (full, cross-
+    # tenant); filter the ``projects`` list per-request to the caller's
+    # memberships (sysadmin → all) so an operator only sees THEIR
+    # projects' names / stats / aliases. Shallow-copy so the cached
+    # full envelope is never mutated.
+    all_projects = envelope.get("projects", [])
+    visible = _app._visible_project_names(
+        req, [p["name"] for p in all_projects],
+    )
+    filtered = dict(envelope)
+    filtered["projects"] = [p for p in all_projects if p["name"] in visible]
+    return web.json_response(filtered, headers={"Cache-Control": "no-store"})
 
 
 # ── Wiring helpers (client-config / installer) ──────────────────────
