@@ -146,6 +146,59 @@ async def test_recreate_after_delete_grants_no_residual_membership(
     )
 
 
+async def test_delete_purges_runtime_dir_with_hmac_key(
+    aiohttp_client, router_app, router_module, router_env, register_project,
+    monkeypatch, tmp_path,
+) -> None:
+    """SC-3 [LOW]: the systemd unit preserves ``/run/agent-mcp/<name>/``
+    across stop/start (``RuntimeDirectoryPreserve=yes``), so the
+    ``forwarding_hmac`` key lingers there after a project delete. The
+    delete handler must purge the runtime dir itself.
+    """
+    monkeypatch.setenv("AGENT_MCP_TOKENS_DIR", str(tmp_path / "tokens"))
+    register_project("hmac-proj")
+
+    # Lay down the per-project runtime dir the systemd unit would create,
+    # with the preserved HMAC key + backend socket placeholder.
+    runtime_dir = router_env.sock_dir / "hmac-proj"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    (runtime_dir / "forwarding_hmac").write_bytes(b"x" * 32)
+    (runtime_dir / "backend.sock").write_bytes(b"")
+    # A sibling project's runtime dir must be left untouched.
+    sibling = router_env.sock_dir / "keep-proj"
+    sibling.mkdir(parents=True, exist_ok=True)
+    (sibling / "forwarding_hmac").write_bytes(b"y" * 32)
+
+    client = await aiohttp_client(router_app)
+    resp = await client.delete(
+        "/agent-mcp/api/router/projects/hmac-proj", headers=_ACCEPT,
+    )
+    assert resp.status == 200, await resp.text()
+
+    # The deleted project's runtime dir (and its HMAC key) are gone.
+    assert not runtime_dir.exists()
+    # The sibling's runtime dir + key survive.
+    assert (sibling / "forwarding_hmac").exists()
+
+
+async def test_delete_runtime_dir_cleanup_is_idempotent(
+    aiohttp_client, router_app, router_module, router_env, register_project,
+    monkeypatch, tmp_path,
+) -> None:
+    """SC-3: delete must succeed even when the runtime dir was never
+    created (ignore-if-absent)."""
+    monkeypatch.setenv("AGENT_MCP_TOKENS_DIR", str(tmp_path / "tokens"))
+    register_project("no-runtime")
+    # Deliberately do NOT create sock_dir/no-runtime.
+    assert not (router_env.sock_dir / "no-runtime").exists()
+
+    client = await aiohttp_client(router_app)
+    resp = await client.delete(
+        "/agent-mcp/api/router/projects/no-runtime", headers=_ACCEPT,
+    )
+    assert resp.status == 200, await resp.text()
+
+
 async def test_delete_membership_cleanup_is_idempotent(
     aiohttp_client, router_app, router_module, register_project,
     monkeypatch, tmp_path,

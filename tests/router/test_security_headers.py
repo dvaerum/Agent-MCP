@@ -132,6 +132,99 @@ async def test_security_headers_on_401_response(
 
 
 @pytest.mark.no_auth_seed_session
+async def test_cache_control_no_store_on_login(
+    aiohttp_client, router_app,
+) -> None:
+    """SC-1: the login page must carry ``Cache-Control: no-store`` so an
+    auth surface can't land in bfcache / a shared cache."""
+    _seed_user()
+    client = await aiohttp_client(router_app)
+    resp = await client.get("/agent-mcp/login")
+    assert resp.status == 200
+    assert resp.headers.get("Cache-Control") == "no-store"
+
+
+@pytest.mark.no_auth_seed_session
+async def test_cache_control_no_store_on_api_401(
+    aiohttp_client, router_app,
+) -> None:
+    """SC-1: authed-API 401 JSON must not be cacheable either."""
+    _seed_user()
+    client = await aiohttp_client(router_app)
+    resp = await client.get(
+        "/agent-mcp/api/router/projects",
+        headers={"Accept": "application/vnd.agent-mcp.v1+json"},
+    )
+    assert resp.status == 401
+    assert resp.headers.get("Cache-Control") == "no-store"
+
+
+async def test_apply_headers_preserves_explicit_cache_control() -> None:
+    """SC-1: the static dashboard handlers set their own
+    ``Cache-Control`` (``immutable`` for hash-named assets) BEFORE the
+    middleware runs; ``_apply_headers`` must not clobber it."""
+    from aiohttp import web
+
+    from agent_mcp.router.security_headers import _apply_headers
+
+    resp = web.Response(
+        headers={"Cache-Control": "public, max-age=31536000, immutable"}
+    )
+    _apply_headers(resp, _FakeHttpRequest())
+    assert (
+        resp.headers.get("Cache-Control")
+        == "public, max-age=31536000, immutable"
+    )
+
+
+class _FakeHttpRequest:
+    """Minimal stand-in exposing what ``_apply_headers`` reads: a
+    ``headers`` mapping and a ``.url.scheme``. Kept plain-HTTP so no
+    HSTS is added."""
+
+    class _URL:
+        scheme = "http"
+
+    headers: dict = {}
+    url = _URL()
+
+
+@pytest.mark.no_auth_seed_session
+async def test_server_banner_stripped_of_versions(
+    aiohttp_client, router_app,
+) -> None:
+    """SC-2 / SD-3: the ``Server`` header must NOT disclose framework
+    versions (aiohttp defaults to ``Python/… aiohttp/…``). The
+    middleware overwrites it with a neutral, version-free banner."""
+    _seed_user()
+    client = await aiohttp_client(router_app)
+    resp = await client.get("/agent-mcp/login")
+    assert resp.status == 200
+    server = resp.headers.get("Server", "")
+    assert "aiohttp" not in server.lower()
+    assert "python" not in server.lower()
+    assert server == "agent-mcp"
+
+
+@pytest.mark.no_auth_seed_session
+async def test_server_banner_stripped_on_401(
+    aiohttp_client, router_app,
+) -> None:
+    """SC-2 / SD-3: the neutral ``Server`` banner must land on the error
+    path too (aiohttp stamps its default on HTTPException responses)."""
+    _seed_user()
+    client = await aiohttp_client(router_app)
+    resp = await client.get(
+        "/agent-mcp/api/router/projects",
+        headers={"Accept": "application/vnd.agent-mcp.v1+json"},
+    )
+    assert resp.status == 401
+    server = resp.headers.get("Server", "")
+    assert "aiohttp" not in server.lower()
+    assert server == "agent-mcp"
+
+
+@pytest.mark.no_auth_seed_session
 async def test_csp_override_via_env(
     aiohttp_client, router_module, monkeypatch,
 ) -> None:

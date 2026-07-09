@@ -396,6 +396,27 @@ async def delete_project_handler(req: web.Request) -> web.Response:
                 tok.unlink()
             except OSError:
                 pass
+    # SC-3 [LOW]: the systemd unit sets ``RuntimeDirectoryPreserve=yes``
+    # (nix/module.nix) so the per-project ``forwarding_hmac`` key survives
+    # stop/start cycles — but that same preservation leaves the key (and
+    # backend.sock) at ``$AGENT_MCP_SOCK_DIR/<name>/`` after a delete, on
+    # disk for a now-gone project. Purge the runtime dir here (systemd
+    # won't, precisely because we asked it to preserve). Best-effort +
+    # ignore-if-absent; a cleanup failure must not fail the delete. The
+    # slug guard mirrors the token/workspace cleanup's defensive posture:
+    # ``name`` is already a validated, registered project slug, but we
+    # re-check before an ``rmtree`` under a shared runtime root.
+    if _app._SLUG_RE.match(name):
+        runtime_dir = _app.SOCK_DIR / name
+        if runtime_dir.is_dir():
+            import shutil
+            try:
+                shutil.rmtree(runtime_dir)
+            except OSError:
+                logger.exception(
+                    "delete_project: failed to purge runtime dir %s",
+                    runtime_dir,
+                )
     payload: dict = {
         "unregistered": name,
         "workspace_deleted": workspace_deleted,

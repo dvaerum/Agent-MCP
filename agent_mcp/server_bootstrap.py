@@ -541,6 +541,10 @@ async def _run_sse(config: ServerConfig, app: Any, tui_active: bool) -> None:
         log_config=None,  # keep our logging setup
         access_log=False,
         lifespan="on",
+        # SC-2 / SD-3: suppress uvicorn's ``Server: uvicorn`` banner. On a
+        # direct bind (no nginx masking) the version-free framework name is
+        # still a needless fingerprint; defence-in-depth against CVE-matching.
+        server_header=False,
     )
     if config.uds:
         uvicorn_kwargs["uds"] = config.uds

@@ -28,6 +28,22 @@ front the router differently or want to tighten it further.
 HSTS is emitted ONLY on HTTPS requests (same ``X-Forwarded-Proto`` /
 scheme heuristic as ``login.cookie_secure_flag``) so the plain-HTTP
 dev / VM smoke doesn't get pinned to HTTPS.
+
+Cache-Control (SC-1): sensitive router surfaces — the login page, authed
+API JSON, and 401/error bodies — carried no cache directive, so they
+could land in bfcache or a shared cache. We stamp ``no-store`` via
+``setdefault`` so those responses opt out of caching, while the static
+dashboard handlers (which set their OWN ``Cache-Control`` BEFORE this
+middleware runs — ``no-store`` for HTML, ``immutable`` for hash-named
+assets) keep their explicit value untouched.
+
+Server banner (SC-2 / SD-3): aiohttp fills a ``Server:
+Python/… aiohttp/…`` header at prepare time (``setdefault`` on
+``SERVER_SOFTWARE``). That discloses exact framework versions for
+CVE-matching on a direct bind (nginx masks it in prod, but this is the
+defence-in-depth gap). We assign a neutral, version-free banner
+UNCONDITIONALLY (not ``setdefault``) so it's present before aiohttp's
+own default fires and wins over it.
 """
 
 from __future__ import annotations
@@ -61,6 +77,11 @@ _DEFAULT_PERMISSIONS_POLICY = (
 )
 
 _HSTS_VALUE = "max-age=63072000; includeSubDomains"
+
+# Neutral, version-free replacement for aiohttp's ``Server:
+# Python/… aiohttp/…`` banner (SC-2 / SD-3). Names the product but
+# discloses nothing a CVE scanner can pivot on.
+_SERVER_BANNER = "agent-mcp"
 
 
 def _request_is_https(request: web.Request) -> bool:
@@ -108,6 +129,16 @@ def _apply_headers(response: web.StreamResponse, request: web.Request) -> None:
     # HSTS only over HTTPS — never pin a plain-HTTP dev/VM to TLS.
     if _request_is_https(request):
         hdrs.setdefault("Strict-Transport-Security", _HSTS_VALUE)
+    # SC-1: opt sensitive surfaces out of caching. ``setdefault`` so the
+    # static dashboard handlers keep their own explicit value (they set
+    # ``Cache-Control`` on the response BEFORE this middleware runs —
+    # ``no-store`` for HTML, ``immutable`` for hash-named assets).
+    hdrs.setdefault("Cache-Control", "no-store")
+    # SC-2 / SD-3: overwrite aiohttp's version-disclosing ``Server``
+    # banner. Direct assignment (NOT ``setdefault``) because aiohttp
+    # fills ``SERVER_SOFTWARE`` via its own ``setdefault`` at prepare
+    # time — our value must already be present so it wins.
+    hdrs["Server"] = _SERVER_BANNER
 
 
 @web.middleware
