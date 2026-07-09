@@ -320,6 +320,27 @@ async def create_task_api_route(
                     "notify_agent_inbox(%s) raised after REST create_task: %s",
                     assigned_to, notify_exc,
                 )
+        else:
+            # BL-R15-1: REST-vs-MCP notify parity. The canonical MCP
+            # unassigned-create path fires
+            # ``g.notify_unassigned_task_appeared(task_id, caps)`` per task
+            # (task_tools.py) so an idle worker blocked in wait_for_events
+            # is edge-woken and a GET /mcp streaming subscriber receives the
+            # push. Publishing ``task.created`` under the literal id ``"*"``
+            # above is NOT a wildcard wake (no agent waits under ``"*"``), so
+            # without this the task only re-surfaced on the next ~2s DB
+            # recheck and never reached a streaming subscriber. Mirror the
+            # MCP path in the UNASSIGNED branch, best-effort (a notify
+            # failure must not poison the already-committed task write).
+            try:
+                from ...core import globals as _g
+                _g.notify_unassigned_task_appeared(task_id, _norm_caps or [])
+            except Exception as notify_exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "notify_unassigned_task_appeared(%s) raised after REST "
+                    "create_task: %s",
+                    task_id, notify_exc,
+                )
 
         return JSONResponse({
             "success": True,
