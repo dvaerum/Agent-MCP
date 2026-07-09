@@ -857,6 +857,82 @@ class AgentRepository:
         )
         return fresh
 
+    def advance_event_cursor(self, agent_id: str, cursor_value: str) -> bool:
+        """Monotonically advance ``last_event_seen_at`` — never regress.
+
+        Unlike :meth:`update_field` (last-writer-wins), this issues
+        ``SET last_event_seen_at = MAX(COALESCE(last_event_seen_at, ''), ?)``
+        so a stale / lower cursor from a slow concurrent ``wait_for_events``
+        waiter can't rewind the high-water mark and replay events that
+        were already delivered. Timestamps are ISO-8601 strings, so the
+        lexicographic ``MAX`` matches the chronological ordering the
+        event stream compares on elsewhere.
+
+        ``COALESCE(..., '')`` guards the first write while the column is
+        still NULL: SQLite's scalar ``max()`` returns NULL if *any*
+        argument is NULL, which would otherwise swallow the first cursor
+        and leave the column NULL forever. ``''`` sorts before any real
+        ISO timestamp, so the incoming value always wins on the first
+        write.
+
+        Returns True when the agent row exists (rowcount > 0), False on
+        unknown agent, empty ``cursor_value``, or DB error. Refreshes the
+        caches + publishes ``agent.updated`` to match the side effects
+        :meth:`update_field` produced for this field before the flip.
+        """
+        if not cursor_value:
+            return False
+
+        from sqlalchemy import func, update as sa_update
+
+        now = datetime.datetime.now().isoformat()
+        try:
+            with get_session() as session:
+                result = session.execute(
+                    sa_update(Agent)
+                    .where(Agent.agent_id == agent_id)
+                    .values(
+                        last_event_seen_at=func.max(
+                            func.coalesce(Agent.last_event_seen_at, ""),
+                            cursor_value,
+                        ),
+                        updated_at=now,
+                    )
+                )
+                session.commit()
+                if (result.rowcount or 0) == 0:
+                    return False
+        except SQLAlchemyError as e:
+            logger.error(
+                f"Database error advancing event cursor for agent "
+                f"'{agent_id}': {e}",
+                exc_info=True,
+            )
+            return False
+
+        fresh = _db_get_agent_by_id(agent_id)
+        if fresh is None:
+            return False
+
+        if not self._cache_disabled:
+            token = fresh.get("token")
+            if token:
+                state.active_agents[token] = fresh
+            wd = fresh.get("working_directory")
+            if wd:
+                state.agent_working_dirs[agent_id] = wd
+
+        _publish(
+            agent_id,
+            "agent.updated",
+            {
+                "agent_id": agent_id,
+                "field": "last_event_seen_at",
+                "value": fresh.get("last_event_seen_at"),
+            },
+        )
+        return True
+
     def _update_field_with_cursor(
         self,
         cursor: Any,

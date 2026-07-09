@@ -31,6 +31,14 @@ from ..repositories import message_repo
 # Default loop interval (24 hours). Settable via env for tests / ops.
 DEFAULT_INTERVAL_SECONDS = 24 * 60 * 60
 
+# Upper bound on the retention window (~10 years). A misconfigured
+# ``config_message_retention_days`` (e.g. 10**18) would overflow
+# ``datetime.timedelta`` — whose max is 999,999,999 days — and raise
+# ``OverflowError`` from inside the sweep, silently stopping retention.
+# Clamp before constructing the timedelta so a huge value degrades to
+# "keep ~10 years" rather than "retention throws and stops".
+MAX_RETENTION_DAYS = 3650
+
 
 def _read_retention_days() -> int:
     """Read config_message_retention_days from project_context.
@@ -68,7 +76,11 @@ def _read_retention_days() -> int:
         days = int(parsed)
     except (TypeError, ValueError):
         return 0
-    return days if days > 0 else 0
+    if days <= 0:
+        return 0
+    # Upper-clamp before the caller feeds this into timedelta(days=...)
+    # so a huge value can't overflow and stop the sweep.
+    return min(days, MAX_RETENTION_DAYS)
 
 
 def prune_old_messages() -> int:

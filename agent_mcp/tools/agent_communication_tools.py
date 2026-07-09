@@ -539,29 +539,28 @@ async def get_agent_messages_tool_impl(
         
         # Mark received messages as read if requested.
         #
-        # Pre-2026-06-02 behavior: filter the LIMIT-bounded result set
-        # in Python (`msg["recipient_id"] == agent_id and not
-        # msg["read"]`), then issue an UPDATE with an IN-list of
-        # message_ids. Two problems:
-        #   1. Unread messages beyond `limit` stayed unread — surprising
-        #      since the user asked to mark "as read" without qualifier.
-        #   2. The Python filter + IN-list is unnecessary when SQL can
-        #      express the same predicate in a single UPDATE.
-        #
-        # New behavior per the 2026-06-02 database review (item 10):
-        # one UPDATE keyed on `(recipient_id, read = 0)` covers every
-        # unread message addressed to this agent — including those
-        # truncated by the SELECT's LIMIT. The fetched message rows
-        # we return still show their pre-update read flag (we don't
-        # re-fetch), so the response shape is unchanged from the
-        # caller's perspective.
+        # SECURITY (round-2): the mark-read UPDATE must be scoped to
+        # EXACTLY the rows this fetch returned. An unscoped
+        # `UPDATE ... WHERE recipient_id = ? AND read = 0` (the
+        # 2026-06-02 "item 10" behavior) marks the WHOLE inbox read,
+        # including messages excluded by the `message_type` filter,
+        # `unread_only`, or truncated by `LIMIT` — so a filtered/paged
+        # view silently loses unread control messages the caller never
+        # saw. Collect the ids of the RECEIVED rows on this page and
+        # flip only those. `mark_read_by_ids` additionally scopes to
+        # `recipient_id` (defense-in-depth) and fires the EventBus
+        # `message.read` publish so subscribers don't have to poll.
         if mark_as_read and include_received:
-            # PR 6: route through MessageRepository so the EventBus
-            # `message.read` publish fires (subscribers don't need to
-            # poll the DB to notice the flag flip). The repo opens
-            # its own session/commit; our cursor here only reads.
             from ..repositories import message_repo
-            message_repo.mark_read_for_recipient(agent_id)
+            received_ids = [
+                msg["message_id"]
+                for msg in messages
+                if msg["recipient_id"] == agent_id and not msg["read"]
+            ]
+            if received_ids:
+                message_repo.mark_read_by_ids(
+                    received_ids, recipient_id=agent_id
+                )
         
         # Format response
         if not messages:
@@ -1014,18 +1013,18 @@ def _write_last_event_seen_at(agent_id: str, cursor_value: str) -> None:
     """
     if not cursor_value:
         return
-    # PR 8 (Agent flip): single-field write — goes through
-    # agent_repo.update_field so the cache + EventBus stay in sync
-    # with the DB. ``last_event_seen_at`` is on the allowlist
-    # (event-coord PR-2). Best-effort wrap stays — a falsy/None return
-    # from update_field is logged the same way as the previous raw-SQL
-    # exception path.
+    # SECURITY (round-2): the cursor MUST advance monotonically. The
+    # previous `agent_repo.update_field(..., "last_event_seen_at", ...)`
+    # was last-writer-wins, so a slow concurrent `wait_for_events`
+    # waiter writing an older cursor could rewind the high-water mark
+    # and replay already-delivered events. `advance_event_cursor` does
+    # `SET last_event_seen_at = MAX(last_event_seen_at, ?)` so a lower
+    # value is a no-op. It keeps the same cache + EventBus side effects
+    # `update_field` had for this field.
     try:
         from ..repositories import agent_repo
-        result = agent_repo.update_field(
-            agent_id, "last_event_seen_at", cursor_value,
-        )
-        if result is None:
+        ok = agent_repo.advance_event_cursor(agent_id, cursor_value)
+        if not ok:
             logger.warning(
                 "wait_for_events: failed to persist last_event_seen_at "
                 "for %s (unknown agent or DB error)",

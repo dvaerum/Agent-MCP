@@ -340,6 +340,56 @@ def mark_read_for_recipient(recipient_id: str) -> int:
         return 0
 
 
+def mark_read_by_ids(
+    message_ids: Iterable[str],
+    recipient_id: Optional[str] = None,
+) -> int:
+    """Flip ``read=1`` on exactly the given ``message_ids`` (that are
+    still unread).
+
+    Scoped counterpart to :func:`mark_read_for_recipient`. Where that
+    function flips *every* unread row for a recipient, this flips only
+    the enumerated ids — so a filtered / paged inbox fetch marks just
+    the rows the caller actually saw, never control messages truncated
+    by a ``LIMIT`` or excluded by a ``message_type`` filter.
+
+    ``recipient_id`` (when supplied) additionally constrains the UPDATE
+    to that recipient as defense-in-depth: a caller can never flip the
+    read flag on another agent's message by passing its id.
+
+    Returns the number of rows touched (0 for an empty id list).
+    """
+    ids = [m for m in message_ids if m]
+    if not ids:
+        return 0
+    try:
+        with get_session() as session:
+            stmt = (
+                sa_update(AgentMessage)
+                .where(AgentMessage.message_id.in_(ids))
+                .where(AgentMessage.read.is_(False))
+            )
+            if recipient_id is not None:
+                stmt = stmt.where(
+                    AgentMessage.recipient_id == recipient_id
+                )
+            result = session.execute(stmt.values(read=True))
+            session.commit()
+            return result.rowcount if result.rowcount != -1 else 0
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error marking messages read by id: {e}",
+            exc_info=True,
+        )
+        return 0
+    except Exception as e:
+        logger.error(
+            f"Unexpected error marking messages read by id: {e}",
+            exc_info=True,
+        )
+        return 0
+
+
 def count_unread_for_recipient(recipient_id: str) -> int:
     """Count unread messages for a given recipient."""
     try:
@@ -398,6 +448,7 @@ _db_get_message_by_id = get_message_by_id
 _db_delete_message = delete_message
 _db_mark_delivered = mark_delivered
 _db_mark_read_for_recipient = mark_read_for_recipient
+_db_mark_read_by_ids = mark_read_by_ids
 
 
 class MessageRepository:
@@ -1066,6 +1117,34 @@ class MessageRepository:
         """
         n = _db_mark_read_for_recipient(recipient_id)
         if n > 0:
+            _publish(
+                recipient_id,
+                "message.read",
+                {"recipient_id": recipient_id, "count": n},
+            )
+        return n
+
+    def mark_read_by_ids(
+        self,
+        message_ids: Iterable[str],
+        *,
+        recipient_id: Optional[str] = None,
+    ) -> int:
+        """Mark exactly ``message_ids`` as read; publish ``message.read``.
+
+        Scoped counterpart to :meth:`mark_read_for_recipient` for the
+        ``get_agent_messages`` fetch path: only the rows the caller
+        actually saw (post filter / limit) are flipped, so unread
+        control messages truncated by the page are never silently lost.
+
+        ``recipient_id`` scopes the UPDATE to that recipient (defense-
+        in-depth) AND keys the ``message.read`` publish — subscribers'
+        long-poll waiters consume the event by recipient_id. The publish
+        fires only when at least one row was touched, matching
+        :meth:`mark_read_for_recipient`'s no-spurious-wake contract.
+        """
+        n = _db_mark_read_by_ids(message_ids, recipient_id)
+        if n > 0 and recipient_id is not None:
             _publish(
                 recipient_id,
                 "message.read",
