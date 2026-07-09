@@ -330,6 +330,38 @@ async def delete_project_handler(req: web.Request) -> web.Response:
         _app._REGISTRY.unregister(name)
     except KeyError:
         pass
+    # SEC (owner-authorised, defensive) FINDING 2: purge router.db
+    # membership + on-disk agent-token files. ``project_membership``
+    # keys per-user AND per-group grants on a bare TEXT
+    # ``project_name`` (no FK), so without this delete the rows
+    # survive; re-creating the same-named project (deterministic
+    # workspace path) would silently resurrect every prior member's
+    # caps. The ``<name>--*.token`` files were likewise cleaned only
+    # on rename. Both are best-effort + idempotent — a cleanup failure
+    # must not fail the delete.
+    try:
+        from .identity import _connect
+
+        with _connect() as conn:
+            conn.execute(
+                "DELETE FROM project_membership WHERE project_name = ?",
+                (name,),
+            )
+    except Exception:
+        logger.exception(
+            "delete_project: failed to purge project_membership for %s",
+            name,
+        )
+    token_dir = (
+        Path(os.environ.get("AGENT_MCP_TOKENS_DIR", ""))
+        or (Path.home() / ".config" / "agent-mcp" / "tokens")
+    )
+    if token_dir.is_dir():
+        for tok in token_dir.glob(f"{name}--*.token"):
+            try:
+                tok.unlink()
+            except OSError:
+                pass
     payload: dict = {
         "unregistered": name,
         "workspace_deleted": workspace_deleted,
@@ -575,9 +607,18 @@ def register_admin_routes(app: web.Application) -> None:
     additionally wrapped with the project-lifecycle gate — the system
     perm matrix reserves project lifecycle (and the rename, which
     is a re-key with grace-alias semantics) for sysadmins.
-    ``stop`` stays operator-tier because it doesn't change the
-    project's identity or membership; an operator with mutation
-    access to a project may bounce its backend.
+
+    SEC FINDING 1 (owner-authorised, defensive, 2026-07-09): the
+    per-project wiring / lifecycle routes ``stop``, ``client-config``,
+    ``installer``, ``aliases`` (GET), and ``aliases/{alias}`` (DELETE)
+    are ALSO wrapped with the project-lifecycle gate. They were
+    previously session-only; because ``router`` is exempt from the
+    project-membership middleware, ``{name}`` was never checked, so a
+    viewer of an unrelated project could read another project's live
+    agent token (client-config / installer embed a live bearer) or
+    DoS / mutate its backend and aliases. Gating on
+    ``system.projects.manage`` matches the sibling create / delete /
+    rename routes and closes the cross-tenant hole.
 
     Wave 9 PR 4 (prancy-napping-pie): the lifecycle gate moved from
     ``require_sysadmin`` to
@@ -614,25 +655,34 @@ def register_admin_routes(app: web.Application) -> None:
         "/agent-mcp/api/router/projects/{name}",
         gated(project_lifecycle_gate(delete_project_handler)),
     )
+    # SEC (owner-authorised, defensive) FINDING 1: these five routes
+    # were previously ``gated(...)``-only (session presence). Because
+    # ``router`` is in ``_NON_PROJECT_API_SEGMENTS``, the project-
+    # membership middleware never checks ``{name}`` either — so any
+    # authenticated caller (even a viewer of an unrelated project)
+    # could read another project's live agent bearer via client-config
+    # / installer, or DoS / mutate its backend + aliases. Gate them on
+    # the SAME capability as the sibling create / rename / delete
+    # lifecycle routes.
     app.router.add_post(
         "/agent-mcp/api/router/projects/{name}/stop",
-        gated(stop_project_handler),
+        gated(project_lifecycle_gate(stop_project_handler)),
     )
     app.router.add_get(
         "/agent-mcp/api/router/projects/{name}/client-config",
-        gated(client_config_handler),
+        gated(project_lifecycle_gate(client_config_handler)),
     )
     app.router.add_get(
         "/agent-mcp/api/router/projects/{name}/installer",
-        gated(installer_handler),
+        gated(project_lifecycle_gate(installer_handler)),
     )
     app.router.add_get(
         "/agent-mcp/api/router/projects/{name}/aliases",
-        gated(alias_usage_handler),
+        gated(project_lifecycle_gate(alias_usage_handler)),
     )
     app.router.add_delete(
         "/agent-mcp/api/router/projects/{name}/aliases/{alias}",
-        gated(remove_alias_handler),
+        gated(project_lifecycle_gate(remove_alias_handler)),
     )
     # retire-system-token Wave 5: the router-level admin create-agent
     # endpoint (``POST .../{name}/agents``) was deleted along with its
