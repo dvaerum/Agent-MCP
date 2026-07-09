@@ -100,6 +100,13 @@ def _authorize_assign_task(
     )
 
     if is_admin_or_manager:
+        # Strip any client-supplied provenance tag. ``_worker_created_by``
+        # is an internal marker THIS function sets for the worker Mode-0
+        # path; an operator/manager caller must never be able to smuggle
+        # it in via raw arguments to forge the ``created_by`` attribution
+        # on a Mode-0 unassigned task (it would otherwise flow straight
+        # into ``_create_unassigned_tasks``'s ``creator``).
+        arguments.pop("_worker_created_by", None)
         return None
 
     if not worker_id:
@@ -1264,6 +1271,13 @@ async def assign_task_tool_impl(
             )
             # assigned_agent_active_token remains None if not in active_agents
 
+        # Explicit assignability gate. The in-memory presence check above
+        # does NOT verify DB status, so a terminated-but-warm agent
+        # (still in g.agent_working_dirs) would otherwise skip the
+        # ``status != 'terminated'`` check entirely. Run it unconditionally.
+        if not _agent_assignable(cursor, target_agent_id):
+            return NotFound(resource="agent", identifier=target_agent_id)
+
         # Generate task ID and timestamps first
         new_task_id = _generate_task_id()
         created_at_iso = datetime.datetime.now().isoformat()
@@ -1442,6 +1456,21 @@ async def assign_task_tool_impl(
             arguments.get("required_capabilities")
         )
         _required_caps_json = json.dumps(_norm_caps) if _norm_caps else None
+
+        # TOCTOU recheck (terminate-reconcile). ``validate_task_placement``
+        # above yields on a RAG await; a concurrent ``terminate_agent``
+        # can commit in that window, after the assignability gate passed
+        # but before this INSERT — pinning the task on a terminated agent.
+        # Re-run the gate in-transaction, immediately before the write,
+        # so the just-terminated agent can't receive the task.
+        if not _agent_assignable(cursor, target_agent_id):
+            return Conflict(
+                reason=(
+                    f"Cannot assign task to '{target_agent_id}': agent was "
+                    f"terminated during task placement. Re-issue against a "
+                    f"live agent."
+                )
+            )
 
         # PR 6: task INSERT goes through task_repo with the caller's
         # cursor so it's atomic with the agent UPDATE and audit log.
@@ -1795,6 +1824,23 @@ async def create_self_task_tool_impl(
                     validation_message += "⚠️ Task flagged for admin review\n"
             else:
                 validation_message = "\n✓ RAG validation approved placement\n"
+
+        # TOCTOU recheck (terminate-reconcile). ``validate_task_placement``
+        # above yields on a RAG await; a concurrent ``terminate_agent``
+        # can commit in that window and revoke this agent before the row
+        # is written — leaving a task self-assigned to a terminated
+        # identity. Re-run the assignability gate in-transaction,
+        # immediately before the INSERT. ``admin`` is exempt: it has no
+        # standard assignable agent row and creates coordination tasks.
+        if requesting_agent_id != "admin" and not _agent_assignable(
+            cursor, requesting_agent_id
+        ):
+            return Conflict(
+                reason=(
+                    f"Cannot create task for '{requesting_agent_id}': agent "
+                    f"was terminated during task placement."
+                )
+            )
 
         # PR 6: task INSERT via task_repo with the caller's cursor.
         from ..repositories import agent_repo, task_repo
