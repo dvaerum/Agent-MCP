@@ -349,8 +349,13 @@ Always err on the side of providing more detailed explanations and comprehensive
             try:
                 cc = completion_client()
             except CompletionConfigError as e_cfg:
+                # SECURITY (round 9, SD-R9-1): do NOT reflect the config
+                # exception text — it can carry env-var names / internal
+                # paths and this string is returned verbatim to any
+                # worker via ask_project_rag's Ok(message=...). Detail is
+                # logged server-side; the caller gets a static category.
                 logger.error(f"RAG Query: completion config error: {e_cfg}")
-                return f"RAG Error: {e_cfg}"
+                return "RAG Error: completion provider is not configured"
             answer = await cc.chat(
                 messages=[
                     {"role": "system", "content": system_prompt_for_llm},
@@ -359,17 +364,20 @@ Always err on the side of providing more detailed explanations and comprehensive
                 temperature=0.4,
             )
 
+    # SECURITY (round 9, SD-R9-1): these arms return VERBATIM to any
+    # worker via ask_project_rag's Ok(message=...)/data. Never embed the
+    # exception (provider URLs / error bodies, SQL + table/column names,
+    # filesystem paths). Log the detail server-side with exc_info; hand
+    # the caller a static, category-preserving message.
     except openai.APIError as e_openai:  # main.py:1563
         logger.error(f"RAG Query: OpenAI API error: {e_openai}", exc_info=True)
-        answer = f"Error communicating with OpenAI: {e_openai}"
+        answer = "Error: RAG provider unavailable"
     except sqlite3.Error as e_sql:  # main.py:1566
         logger.error(f"RAG Query: Database error: {e_sql}", exc_info=True)
-        answer = f"Error querying RAG database: {e_sql}"
+        answer = "Error: RAG query failed"
     except Exception as e_unexpected:  # main.py:1569
         logger.error(f"RAG Query: Unexpected error: {e_unexpected}", exc_info=True)
-        answer = (
-            f"An unexpected error occurred during the RAG query: {str(e_unexpected)}"
-        )
+        answer = "An unexpected error occurred during the RAG query."
     finally:
         if conn:
             conn.close()
@@ -584,10 +592,12 @@ Answer in the exact JSON format requested, but include thorough explanations in 
             try:
                 cc = completion_client()
             except CompletionConfigError as e_cfg:
+                # SECURITY (round 9, SD-R9-1): static string, no e_cfg
+                # (consistency with query_rag_system's arm above).
                 logger.error(
                     f"RAG Query (task analysis): completion config error: {e_cfg}"
                 )
-                return f"RAG Error: {e_cfg}"
+                return "RAG Error: completion provider is not configured"
             logger.info(
                 f"Task Analysis Query: using {cc.provider}/{cc.model} "
                 f"(context_limit={context_limit})"
@@ -601,8 +611,9 @@ Answer in the exact JSON format requested, but include thorough explanations in 
             )
 
     except Exception as e:
+        # SECURITY (round 9, SD-R9-1): static string, no str(e).
         logger.error(f"RAG Query (task analysis): Error: {e}", exc_info=True)
-        answer = f"Error during RAG task-analysis query: {str(e)}"
+        answer = "An unexpected error occurred during the RAG task-analysis query."
     finally:
         if conn:
             conn.close()
