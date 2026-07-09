@@ -464,6 +464,36 @@ def _group_resolved_capabilities(
     return frozenset(row[0] for row in rows)
 
 
+def _group_resolved_project_roles(
+    conn: sqlite3.Connection, group_id: str,
+) -> dict[str, str]:
+    """Every project role a new member of ``group_id`` would inherit.
+
+    ``group_resolver.resolve_user_project_role`` grants a user a project
+    role when any group in their transitive (upward) membership carries a
+    ``project_membership`` row for that project — taking the highest tier
+    (``operator`` > ``viewer``) when several match. So a new member of
+    ``group_id`` inherits, per project, the highest role attached to
+    ``group_id`` itself OR any of its ancestor groups. Read on the
+    caller's ``BEGIN IMMEDIATE`` connection for a consistent snapshot
+    (mirrors ``_group_resolved_capabilities``). Returns
+    ``{project_name: role}``.
+    """
+    ancestors = _group_and_ancestors(conn, group_id)
+    placeholders = ",".join("?" for _ in ancestors)
+    rows = conn.execute(
+        f"SELECT project_name, role FROM project_membership "
+        f"WHERE group_id IN ({placeholders})",
+        tuple(ancestors),
+    ).fetchall()
+    best: dict[str, str] = {}
+    for row in rows:
+        project, role = row["project_name"], row["role"]
+        if project not in best or _role_rank(role) > _role_rank(best[project]):
+            best[project] = role
+    return best
+
+
 def _caps_caller_lacks(
     req: web.Request, caps: Iterable[str],
 ) -> list[str]:
@@ -1150,6 +1180,25 @@ async def add_group_member_handler(req: web.Request) -> web.Response:
                 if lacked:
                     conn.execute("ROLLBACK")
                     return _forbid_cap_amplification(req, lacked)
+            # SEC round-6 (AZ-R6-1) — third amplification sibling of the two
+            # above. The sysadmin-FLAG and system-CAPABILITY joins are blocked,
+            # but a group that is a PROJECT MEMBER confers that project's role
+            # on every member via ``group_resolver.resolve_user_project_role``
+            # (the resolver the ``/api/<project>/`` data middleware gates on).
+            # So joining such a group turns table-management authority into
+            # cross-tenant DATA authority. A non-sysadmin delegate must not add
+            # a member (themselves OR a nested group they control — both
+            # transitively inherit) into a group whose inherited project roles
+            # exceed what the delegate already holds on those projects. Reuse
+            # the round-5 role-rank logic per conferred (project, role).
+            if not _caller_is_sysadmin(req):
+                for project, role in _group_resolved_project_roles(
+                    conn, parent_group_id,
+                ).items():
+                    denied = _membership_grant_denied(req, project, role)
+                    if denied is not None:
+                        conn.execute("ROLLBACK")
+                        return denied
             if member_group_id is not None and _gr._would_create_cycle(
                 conn, parent_group_id, member_group_id,
             ):
@@ -1188,9 +1237,12 @@ async def add_group_member_handler(req: web.Request) -> web.Response:
                     ),
                     status=409,
                 )
+            # SD-R6-2: a raw IntegrityError text (FK/CHECK) discloses the SQL
+            # constraint + schema. Log server-side, return a generic message.
+            logger.warning("add_group_member insert failed: %s", e)
             return _error(
                 error=_ERROR_VALIDATION,
-                message=f"could not add member: {e}",
+                message="could not add member",
                 status=400,
             )
     finally:
@@ -1361,9 +1413,12 @@ async def add_project_membership_handler(req: web.Request) -> web.Response:
                 )
             conn.commit()
         except sqlite3.IntegrityError as e:
+            # SD-R6-2: don't reflect the raw IntegrityError (SQL/schema
+            # disclosure). Log server-side, return a generic message.
+            logger.warning("add_project_membership insert failed: %s", e)
             return _error(
                 error=_ERROR_CONFLICT,
-                message=f"could not add membership: {e}",
+                message="could not add membership",
                 status=409,
             )
     finally:
