@@ -195,11 +195,20 @@ async def _dispatch_through_tool(
             status_code=409,
         )
     if isinstance(result, _Failed):
+        # SEC-R8-1: ~40 tool impls return ``Failed(message=f"…{e}")`` built
+        # from a caught sqlite3/SQLAlchemy error, so ``result.message`` can
+        # embed table/column names, filesystem paths, and internals. The
+        # raised-exception path above was genericized in round 7 (SD-R7-1);
+        # this is the RETURNED half. Log the real detail server-side, return
+        # a STATIC generic message to the client.
+        logger.error(
+            f"Tool {tool_name!r} returned Failed result: {result.message}"
+        )
         return JSONResponse(
             {
                 "success": False,
                 "error": "failed",
-                "message": result.message,
+                "message": "Operation failed",
             },
             status_code=500,
         )
