@@ -353,7 +353,27 @@ def _requires_authenticated_caller(
 def _analyze_context_health(context_entries: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Analyze project context health and identify issues"""
     if not context_entries:
-        return {"status": "no_data", "total": 0}
+        # Empty context still returns the FULL shape — every consumer
+        # (backup report, view_project_context health block) reads
+        # health_score / stale_entries / json_errors / recommendations
+        # unconditionally, so a truncated dict here KeyError'd them.
+        # ``status`` stays "no_data" (a distinct value the dashboard's
+        # lib/api.ts models); the numeric fields default to a clean
+        # zero-issue / full-score baseline.
+        return {
+            "status": "no_data",
+            "health_score": 100.0,
+            "total": 0,
+            "stale_entries": 0,
+            "json_errors": 0,
+            "large_entries": 0,
+            "issues": [],
+            "warnings": [],
+            "recommendations": [
+                "No context entries yet - add project context to enable "
+                "health analysis"
+            ],
+        }
 
     total = len(context_entries)
     issues = []
