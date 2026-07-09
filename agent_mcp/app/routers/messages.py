@@ -291,6 +291,25 @@ async def create_message_api_route(
             return JSONResponse(
                 {"error": "message_content must be a string"}, status_code=400
             )
+        # SD-R10-1: same silent-drop class as recipient_id/content. A
+        # non-string ``subject``/``parent_message_id`` (dict/list) is
+        # truthy, so it slips past every check below and reaches the
+        # SQLite bind inside message_repo.send() — which swallows the
+        # ProgrammingError into a None return. The route then reports a
+        # false 200 for a message that was never stored. Reject up front.
+        if explicit_subject is not None and not isinstance(
+            explicit_subject, str
+        ):
+            return JSONResponse(
+                {"error": "subject must be a string"}, status_code=400
+            )
+        if parent_message_id is not None and not isinstance(
+            parent_message_id, str
+        ):
+            return JSONResponse(
+                {"error": "parent_message_id must be a string"},
+                status_code=400,
+            )
         if not recipient_id:
             return JSONResponse(
                 {"error": "recipient_id is required"}, status_code=400
@@ -398,7 +417,7 @@ async def create_message_api_route(
 
         # PR 6: single-recipient message INSERT goes through message_repo
         # with the caller's cursor so it's atomic with the audit log.
-        message_repo.send(
+        stored = message_repo.send(
             message_id=message_id,
             sender_id=sender_id,
             recipient_id=recipient_id,
@@ -410,6 +429,21 @@ async def create_message_api_route(
             parent_message_id=parent_message_id,
             connection=cursor,
         )
+        # SD-R10-1: send() returns None when the INSERT failed (bad
+        # bind, FK violation, DB error) — it swallows the exception
+        # internally. Must NOT commit a "sent" audit entry nor report
+        # success for a message that was never stored. Roll back and
+        # 500 BEFORE the audit-log INSERT so no false trace survives.
+        if stored is None:
+            conn.rollback()
+            logger.error(
+                "message_repo.send returned None for message %s to %s "
+                "(store failed); reporting 500, no audit entry committed",
+                message_id, recipient_id,
+            )
+            return JSONResponse(
+                {"error": "Failed to send message"}, status_code=500
+            )
         log_agent_action_to_db(
             cursor, sender_id, "sent_message_via_dashboard",
             details={"message_id": message_id, "recipient": recipient_id},
