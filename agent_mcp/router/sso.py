@@ -74,6 +74,7 @@ __all__ = [
     "get_sso_config",
     "find_or_create_sso_user",
     "apply_group_mapping",
+    "reconcile_oidc_group_membership",
     "is_trusted_proxy_source",
     "extract_proxy_header_user",
     "init_oidc_login_handler",
@@ -126,6 +127,13 @@ class OIDCSettings:
     group_mapping: dict[str, str]
     redirect_url: str | None
     scopes: list[str]
+    # Bootstrap gate for the OIDC sibling of the proxy-header
+    # ``default_is_sysadmin`` fix (round-9 AC-R9-2). Gates ONLY the
+    # empty-table FIRST-user sysadmin promotion — NOT every OIDC user
+    # (unlike the proxy flag, which trusts the upstream gateway for
+    # every request). Off by default: a fresh OIDC deploy's first IdP
+    # user is NOT silently minted as sysadmin.
+    default_is_sysadmin: bool = False
 
 
 @dataclass(frozen=True)
@@ -270,6 +278,9 @@ def load_sso_config() -> SSOSettings:
         scopes = (
             scopes_raw.split() if scopes_raw else list(_DEFAULT_SCOPES)
         )
+        oidc_default_sysadmin = _env_truthy(
+            os.environ.get("AGENT_MCP_SSO_OIDC_DEFAULT_SYSADMIN"),
+        )
         return SSOSettings(
             mode=SSOMode.OIDC,
             oidc=OIDCSettings(
@@ -280,6 +291,7 @@ def load_sso_config() -> SSOSettings:
                 group_mapping=group_mapping,
                 redirect_url=redirect_url,
                 scopes=scopes,
+                default_is_sysadmin=oidc_default_sysadmin,
             ),
             proxy=None,
         )
@@ -387,6 +399,7 @@ def find_or_create_sso_user(
     subject: str | None = None,
     email_verified: bool = False,
     default_is_sysadmin: bool = False,
+    bootstrap_sysadmin: bool = False,
 ) -> dict[str, Any]:
     """Reconcile-by-subject, verified-email-link, or JIT-create; return the row.
 
@@ -421,6 +434,14 @@ def find_or_create_sso_user(
     ``default_is_sysadmin`` flips the sysadmin bit on the JIT row;
     only the proxy-header path passes True today, gated by
     ``AGENT_MCP_SSO_PROXY_DEFAULT_SYSADMIN``.
+
+    ``bootstrap_sysadmin`` (round-9 AC-R9-2) gates the separate
+    empty-table FIRST-user sysadmin promotion inside
+    ``_create_passwordless_user`` and DEFAULTS OFF. The OIDC callback
+    threads its ``AGENT_MCP_SSO_OIDC_DEFAULT_SYSADMIN`` flag here so a
+    fresh OIDC deploy's first IdP user is only auto-promoted when the
+    operator opted in; the proxy path leaves the default (its sysadmin
+    bit rides on ``default_is_sysadmin`` instead).
     """
     from . import identity
 
@@ -453,6 +474,7 @@ def find_or_create_sso_user(
         email=email,
         subject=subject,
         is_sysadmin=default_is_sysadmin,
+        bootstrap_sysadmin=bootstrap_sysadmin,
     )
     identity.touch_last_login(user_id)
     row = identity.get_user_by_id(user_id)
@@ -530,15 +552,25 @@ def _stamp_subject_if_absent(user_id: str, subject: str) -> None:
 def _create_passwordless_user(
     *, username: str, email: str | None, is_sysadmin: bool,
     subject: str | None = None,
+    bootstrap_sysadmin: bool = False,
 ) -> str:
     """Insert a NULL-password user row directly.
 
     ``identity.create_user`` hashes a password into ``password_hash``;
     SSO-only users have no password at all. We bypass the helper for
-    the INSERT — but we DO copy the "first user in an empty table is
-    a sysadmin + gets membership in every project" promotion path so
-    a fresh deploy that boots straight into SSO mode doesn't lock the
-    operator out.
+    the INSERT.
+
+    The "first user in an empty table gets membership in every project"
+    promotion is ALWAYS applied (so the bootstrap operator can reach the
+    existing projects). The "…AND is a sysadmin" half is gated behind
+    ``bootstrap_sysadmin`` (round-9 AC-R9-2) and DEFAULTS OFF: a fresh
+    SSO deploy's first IdP user is NOT silently minted as sysadmin. The
+    OIDC callback threads its ``AGENT_MCP_SSO_OIDC_DEFAULT_SYSADMIN``
+    flag through here so an operator can deliberately opt the first user
+    in. The proxy-header path leaves this default (its sysadmin bit
+    rides on ``is_sysadmin`` / ``default_is_sysadmin`` instead, gated at
+    its own call site ``extract_proxy_header_user``), so its behaviour
+    is unchanged.
     """
     from . import identity
     from datetime import datetime, timezone
@@ -561,7 +593,8 @@ def _create_passwordless_user(
             """,
             (
                 user_id, username, email, created_at,
-                1 if (is_sysadmin or was_empty) else 0,
+                1 if (is_sysadmin or (was_empty and bootstrap_sysadmin))
+                else 0,
                 subject,
             ),
         )
@@ -633,6 +666,118 @@ def apply_group_mapping(
         if _add_user_to_group_idempotent(group_id, user_id):
             added.add(group_name)
     return added
+
+
+def _mapped_group_names(
+    group_claims: list[str], mapping: dict[str, str],
+) -> set[str]:
+    """The set of agent-mcp group NAMES the current claims map to.
+
+    Same mapping logic as ``apply_group_mapping`` (explicit entry wins,
+    else the ``"*"`` wildcard produces an ``oidc:``-namespaced slug,
+    else the claim is ignored) — but returns the FULL target set
+    regardless of whether the user is already a member. Used by the
+    de-provisioning reconciler to compute which IdP-managed memberships
+    the current claim still justifies.
+    """
+    wildcard = mapping.get("*")
+    out: set[str] = set()
+    for claim in group_claims:
+        if not isinstance(claim, str):
+            continue
+        target = mapping.get(claim)
+        if target:
+            name = target
+        elif wildcard is not None:
+            name = _WILDCARD_GROUP_PREFIX + _sanitise_group_name(claim)
+        else:
+            continue
+        if name:
+            out.add(name)
+    return out
+
+
+def reconcile_oidc_group_membership(
+    user_id: str,
+    group_claims: list[str],
+    mapping: dict[str, str],
+) -> set[str]:
+    """Revoke IdP-managed group memberships the current claim no longer
+    justifies; return the group names removed.
+
+    De-provisioning counterpart to ``apply_group_mapping`` (round-9
+    AC-R9-1). ``apply_group_mapping`` is additive-only, so a user
+    dropped from an IdP group kept the local ``group_membership`` row —
+    and, because ``group_resolver`` derives sysadmin / project-role
+    transitively from those rows, kept the privilege indefinitely.
+
+    SCOPING — CRITICAL: only the reserved ``oidc:`` namespace is
+    reconciled. ``group_membership`` carries NO per-row provenance
+    column (see migration 0002), so at the row level an IdP-derived
+    grant is indistinguishable from a manual admin grant. The ONLY
+    unambiguous IdP-sourced marker is the ``oidc:`` group-name prefix:
+    those groups are provisioned EXCLUSIVELY by the wildcard-JIT path in
+    ``apply_group_mapping``, so every membership in them is IdP-sourced
+    and safe to revoke when the claim disappears. Everything else — an
+    operator's manual grant to a locally-managed group, AND explicit-
+    mapping target groups (arbitrary local slugs an operator bound a
+    claim to, which a manual grant can also populate) — is left
+    additive-only so an SSO login can never remove a manual grant.
+
+    Idempotent: unchanged claims remove nothing (the still-claimed
+    ``oidc:`` groups stay in the retained set).
+    """
+    claimed = _mapped_group_names(group_claims, mapping)
+    claimed_oidc = {
+        n for n in claimed if n.startswith(_WILDCARD_GROUP_PREFIX)
+    }
+    current_oidc = _user_oidc_group_memberships(user_id)
+    removed: set[str] = set()
+    for name, group_id in current_oidc.items():
+        if name in claimed_oidc:
+            continue
+        if _remove_user_from_group(group_id, user_id):
+            removed.add(name)
+    return removed
+
+
+def _user_oidc_group_memberships(user_id: str) -> dict[str, str]:
+    """Return ``{group_name: group_id}`` for the user's DIRECT memberships
+    in ``oidc:``-namespaced groups (the IdP-managed reconcile scope).
+
+    Returns ``{}`` when the groups tables are absent (backlevel deploy),
+    matching the silent-skip posture of the other group helpers.
+    """
+    from . import identity
+
+    try:
+        with sqlite3.connect(str(identity.get_router_db_path())) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(
+                "SELECT g.group_id, g.name FROM group_membership gm "
+                "JOIN groups g ON g.group_id = gm.group_id "
+                "WHERE gm.member_user_id = ? AND g.name LIKE ? ESCAPE '\\'",
+                (user_id, _WILDCARD_GROUP_PREFIX + "%"),
+            )
+            return {row["name"]: row["group_id"] for row in cur.fetchall()}
+    except sqlite3.OperationalError:
+        return {}
+
+
+def _remove_user_from_group(group_id: str, user_id: str) -> bool:
+    """Delete a user→group edge; return True iff a row was removed."""
+    from . import identity
+
+    try:
+        with sqlite3.connect(str(identity.get_router_db_path())) as conn:
+            cur = conn.execute(
+                "DELETE FROM group_membership WHERE group_id = ? "
+                "AND member_user_id = ?", (group_id, user_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+    except sqlite3.OperationalError:
+        return False
 
 
 def _ensure_group(name: str) -> str | None:
@@ -1111,9 +1256,23 @@ async def handle_oidc_callback(request: web.Request) -> web.StreamResponse:
         preferred_username=preferred_username,
         subject=subject,
         email_verified=email_verified,
+        # Bootstrap gate (round-9 AC-R9-2): the empty-table first-user
+        # sysadmin promotion only fires when the operator opted in. The
+        # empty-users redirect middleware already bounces empty-table
+        # HTTP logins to /setup, so this is the code-level backstop that
+        # keeps a fresh OIDC deploy from silently minting a sysadmin if
+        # the callback is ever reached against an empty table.
+        bootstrap_sysadmin=cfg.default_is_sysadmin,
     )
     if cfg.group_mapping:
         apply_group_mapping(
+            user["user_id"], groups_claim, cfg.group_mapping,
+        )
+        # De-provision (round-9 AC-R9-1): revoke IdP-managed (oidc:)
+        # memberships the current claim no longer justifies, so shrinking
+        # IdP group membership revokes the corresponding local privilege.
+        # Manual local grants are out of scope and untouched.
+        reconcile_oidc_group_membership(
             user["user_id"], groups_claim, cfg.group_mapping,
         )
 
