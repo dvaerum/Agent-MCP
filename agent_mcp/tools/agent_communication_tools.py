@@ -1098,14 +1098,24 @@ def _collect_unassigned_task_events_for(
         except Exception:
             agent_caps = set()
 
+        # BL-R10-2: key on ``updated_at`` (the transition-to-unassigned
+        # time), NOT ``created_at``. A task orphaned by terminate/purge
+        # (or a manual unassign/reassignment) keeps its ORIGINAL creation
+        # time, so a ``created_at``-keyed catch-up past that time would
+        # never surface a task that only BECAME available afterwards. The
+        # event timestamp below rides ``updated_at`` too, so the caller's
+        # cursor advances past the transition and the task is not
+        # re-surfaced on the next catch-up. Freshly-created unassigned
+        # tasks have ``created_at == updated_at``, so the create case is
+        # unchanged.
         cursor.execute(
             """
             SELECT task_id, title, priority, required_capabilities,
-                   created_at
+                   updated_at
             FROM tasks
             WHERE assigned_to IS NULL
-              AND created_at > ?
-            ORDER BY created_at ASC
+              AND updated_at > ?
+            ORDER BY updated_at ASC
             """,
             (since_iso,),
         )
@@ -1127,7 +1137,7 @@ def _collect_unassigned_task_events_for(
             events.append({
                 "type": "unassigned_task_appeared",
                 "ref_id": trow["task_id"],
-                "timestamp": trow["created_at"],
+                "timestamp": trow["updated_at"],
                 "payload": {
                     "task_id": trow["task_id"],
                     "title": trow["title"],

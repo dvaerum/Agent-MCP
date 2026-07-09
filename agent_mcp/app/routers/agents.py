@@ -22,6 +22,7 @@ mechanical URL-stable move.
 
 from __future__ import annotations
 
+import datetime
 import json
 from typing import Any, Dict, List, Optional
 
@@ -906,10 +907,27 @@ async def purge_agent_api_route(
             )
             # Reassignment: anything assigned to this agent becomes
             # unassigned (admin can pick it up + reassign).
+            #
+            # BL-R10-1/2: capture the affected rows (with their
+            # required_capabilities) BEFORE the UPDATE so we can
+            # reconcile the g.tasks cache + wake workers post-commit. We
+            # also bump updated_at so the catch-up feed
+            # (``_collect_unassigned_task_events_for``, keyed on
+            # updated_at) surfaces a task that TRANSITIONED to unassigned
+            # after a disconnected worker's cursor.
             cursor.execute(
-                "UPDATE tasks SET assigned_to = NULL, status = 'unassigned' "
+                "SELECT task_id, required_capabilities FROM tasks "
                 "WHERE assigned_to = ?",
                 (agent_id,),
+            )
+            reassigned_tasks = [
+                (r["task_id"], r["required_capabilities"])
+                for r in cursor.fetchall()
+            ]
+            cursor.execute(
+                "UPDATE tasks SET assigned_to = NULL, status = 'unassigned', "
+                "updated_at = ? WHERE assigned_to = ?",
+                (datetime.datetime.now().isoformat(), agent_id),
             )
             cursor.execute(
                 "UPDATE agent_actions SET agent_id = ? WHERE agent_id = ?",
@@ -968,6 +986,12 @@ async def purge_agent_api_route(
         for filepath, info in list(g.file_map.items()):
             if info.get("agent_id") == agent_id:
                 del g.file_map[filepath]
+
+        # BL-R10-1/2: reconcile the reassigned tasks' g.tasks cache
+        # entries + wake capability-matched workers. Shares the
+        # terminate cascade's helper so both paths reconcile identically.
+        from ...tools.admin_tools import _reconcile_reassigned_tasks
+        _reconcile_reassigned_tasks(reassigned_tasks)
 
         return JSONResponse({
             "success": True,
