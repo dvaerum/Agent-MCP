@@ -21,6 +21,32 @@ let
     inherit pkgs lib;
     src = cfg.src;
   };
+
+  # ── Systemd hardening (defense-in-depth) ──────────────────────────
+  # The SAFE sandboxing subset is shared verbatim with the home-manager
+  # (user-scope) module via nix/hardening.nix — one source of truth for
+  # both deployment shapes. See that file for the per-directive
+  # rationale and the deliberately-omitted set.
+  #
+  # system-mode runs as a dedicated system user (not under $HOME), so it
+  # goes stricter than the shared subset: ProtectSystem="strict" +
+  # ProtectHome + explicit ReadWritePaths lock the filesystem down to
+  # exactly the state + runtime dirs the service writes (all three units
+  # keep their persistent state under cfg.stateDir and their sockets /
+  # HMAC keys under cfg.runtimeDir). Merged into every serviceConfig via
+  # `// systemHardening`.
+  #
+  # Still NOT adding MemoryDenyWriteExecute / SystemCallFilter here —
+  # CPython + the sqlite-vec native extension need W+X mappings and make
+  # syscalls outside any conservative allow-list, so those two crash the
+  # units in system-mode exactly as they would under $HOME. Do not add
+  # them without a passing VM boot (see nix/hardening.nix).
+  hardening = import ./hardening.nix;
+  systemHardening = hardening // {
+    ProtectSystem = "strict";
+    ProtectHome = true;
+    ReadWritePaths = [ cfg.stateDir cfg.runtimeDir ];
+  };
 in {
   options.services.agent-mcp = {
     enable = lib.mkEnableOption "agent-mcp (multi-tenant router or single-tenant backend)";
@@ -155,7 +181,7 @@ in {
           ExecStart = "${pkgs'.agentMcpRouterWrapper}/bin/agent-mcp-router";
           Restart = "on-failure";
           RestartSec = 10;
-        };
+        } // systemHardening;
       };
 
       # Polkit rule so the router's unprivileged user can drive
@@ -230,7 +256,7 @@ in {
           Restart = "on-failure";
           RestartSec = 5;
           TimeoutStopSec = 10;
-        };
+        } // systemHardening;
       };
 
       # First-boot project bootstrap retired — see the autoProject
@@ -274,7 +300,7 @@ in {
           '';
           Restart = "on-failure";
           RestartSec = 5;
-        };
+        } // systemHardening;
       };
     })
   ]);
