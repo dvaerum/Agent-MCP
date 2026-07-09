@@ -51,6 +51,108 @@ from .agent_communication_tools import send_agent_message_tool_impl
 from ..utils.prompt_templates import build_agent_prompt  # still used by other paths
 
 
+def _publish_task_event(
+    assigned_to: Optional[str], event: str, payload: Dict[str, Any]
+) -> None:
+    """Publish a task lifecycle event through the EventBus shim.
+
+    Mirrors ``task_repository._publish``: the addressee is the assignee
+    (or ``"*"`` for unassigned/broadcast). Used on the ``connection=``
+    write paths, where ``task_repo.create``/``delete`` defer the publish
+    to the caller (post-commit) so a subscriber never observes an
+    uncommitted / rolled-back row. Delivery failures are swallowed by the
+    shim — the source-of-truth commit already happened.
+    """
+    from ..core.repositories import _event_bus_shim
+
+    _event_bus_shim.publish(assigned_to or "*", event, payload)
+
+
+def _link_child_to_parent(cursor, parent_task_id, child_task_id) -> bool:
+    """Append ``child_task_id`` to the parent's ``child_tasks`` mirror.
+
+    BL-2: every creation path that sets ``parent_task`` must maintain the
+    parent's back-reference (like ``request_assistance`` does) so
+    hierarchy reads (``view_tasks`` / metrics) and the ``delete_task``
+    cascade see the child. Runs inside the caller's creation transaction
+    (writes via ``task_repo.update_fields`` with the caller's cursor, so
+    it stays atomic with the child INSERT). The parent's cache entry is
+    reconciled separately post-commit via :func:`_refresh_parent_cache`.
+
+    No-ops when ``parent_task_id`` is falsy or the parent row is absent.
+    Returns True when a mirror write happened (so the caller knows to
+    refresh the parent's cache after commit).
+    """
+    if not parent_task_id:
+        return False
+    from ..repositories import task_repo as _task_repo
+
+    cursor.execute(
+        "SELECT child_tasks FROM tasks WHERE task_id = ?", (parent_task_id,)
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return False
+    children = json.loads(row["child_tasks"] or "[]")
+    if child_task_id in children:
+        return True
+    children.append(child_task_id)
+    _task_repo.update_fields(
+        parent_task_id, {"child_tasks": children}, connection=cursor
+    )
+    return True
+
+
+def _refresh_parent_cache(parent_task_id) -> None:
+    """Reconcile a parent task's cache entry after its ``child_tasks``
+    mirror was updated inside a now-committed transaction.
+
+    ``update_fields(connection=)`` defers the cache write to the caller
+    (see ``task_repository.update_fields``); this mirrors the
+    ``upsert_cache`` the working create paths do for the child row.
+    No-ops when ``parent_task_id`` is falsy or the row vanished.
+    """
+    if not parent_task_id:
+        return
+    from ..repositories import task_repo as _task_repo
+
+    fresh_parent = _task_repo.get_by_id(parent_task_id)
+    if fresh_parent is not None:
+        _task_repo.upsert_cache(fresh_parent)
+
+
+def _collect_task_descendants(cursor, root_task_id) -> list[tuple[str, Any]]:
+    """Return ``[(task_id, assigned_to), ...]`` for every descendant of
+    ``root_task_id``, ordered so front-to-back deletion never violates the
+    ``tasks.parent_task`` self-FK (deepest descendants first).
+
+    Source of truth is the ``parent_task`` FK column — NOT the
+    ``child_tasks`` JSON mirror — so ``force_delete`` cascades correctly
+    even when the mirror has drifted (BL-2). A ``seen`` set guards against
+    a malformed parent cycle.
+    """
+    ordered: list[tuple[str, Any]] = []  # BFS order: parent before child
+    seen: set[str] = {root_task_id}
+    frontier = [root_task_id]
+    while frontier:
+        next_frontier: list[str] = []
+        for tid in frontier:
+            cursor.execute(
+                "SELECT task_id, assigned_to FROM tasks WHERE parent_task = ?",
+                (tid,),
+            )
+            for r in cursor.fetchall():
+                child_id = r["task_id"]
+                if child_id in seen:
+                    continue
+                seen.add(child_id)
+                ordered.append((child_id, r["assigned_to"]))
+                next_frontier.append(child_id)
+        frontier = next_frontier
+    ordered.reverse()  # deepest first → safe delete order under the FK
+    return ordered
+
+
 def _authorize_assign_task(
     *,
     admin_auth_token: Optional[str],
@@ -491,6 +593,7 @@ async def _create_unassigned_tasks(
             # happens after conn.commit() via task_repo.upsert_cache.
             from ..repositories import task_repo
             cached_dicts: list[dict] = []
+            parents_to_refresh: set[str] = set()
 
             if tasks:
                 # Multiple unassigned task creation
@@ -528,6 +631,10 @@ async def _create_unassigned_tasks(
                         connection=cursor,
                     )
                     cached_dicts.append(fresh)
+
+                    # BL-2: maintain the parent's child_tasks mirror.
+                    if _link_child_to_parent(cursor, parent_task, task_id):
+                        parents_to_refresh.add(parent_task)
 
                     log_agent_action_to_db(
                         cursor,
@@ -567,6 +674,10 @@ async def _create_unassigned_tasks(
                 )
                 cached_dicts.append(fresh)
 
+                # BL-2: maintain the parent's child_tasks mirror.
+                if _link_child_to_parent(cursor, parent_task_id_arg, task_id):
+                    parents_to_refresh.add(parent_task_id_arg)
+
                 log_agent_action_to_db(
                     cursor,
                     creator,
@@ -592,6 +703,9 @@ async def _create_unassigned_tasks(
             # is owned in one place.
             for d in cached_dicts:
                 task_repo.upsert_cache(d)
+            # BL-2: reconcile parents whose child_tasks mirror changed.
+            for parent_id in parents_to_refresh:
+                _refresh_parent_cache(parent_id)
 
             return created_tasks
 
@@ -838,6 +952,7 @@ async def _create_and_assign_multiple_tasks(
         # Cache reconciliation deferred to post-commit.
         from ..repositories import agent_repo, task_repo
         cached_dicts: list[dict] = []
+        parents_to_refresh: set[str] = set()
 
         # Create each task
         for i, task in enumerate(tasks):
@@ -864,6 +979,10 @@ async def _create_and_assign_multiple_tasks(
                 connection=cursor,
             )
             cached_dicts.append(fresh)
+
+            # BL-2: maintain the parent's child_tasks mirror.
+            if _link_child_to_parent(cursor, parent_task, task_id):
+                parents_to_refresh.add(parent_task)
 
             # Log the creation
             log_agent_action_to_db(
@@ -898,6 +1017,9 @@ async def _create_and_assign_multiple_tasks(
         # Post-commit cache reconciliation through the repo.
         for d in cached_dicts:
             task_repo.upsert_cache(d)
+        # BL-2: reconcile parents whose child_tasks mirror changed.
+        for parent_id in parents_to_refresh:
+            _refresh_parent_cache(parent_id)
 
         # Wake wait_for_events waiter + fan out resources/updated to
         # every registered GET /mcp stream for the newly-assigned agent.
@@ -1496,6 +1618,11 @@ async def assign_task_tool_impl(
             connection=cursor,
         )
 
+        # BL-2: maintain the parent's child_tasks mirror.
+        parent_mirror_updated = _link_child_to_parent(
+            cursor, final_parent_task_id, new_task_id
+        )
+
         # Update agent's current task in DB if they don't have one (main.py:1376-1387)
         should_update_agent_current_task = False
         if (
@@ -1530,6 +1657,9 @@ async def assign_task_tool_impl(
 
         # Post-commit cache reconciliation.
         task_repo.upsert_cache(fresh_task)
+        # BL-2: reconcile the parent whose child_tasks mirror changed.
+        if parent_mirror_updated:
+            _refresh_parent_cache(final_parent_task_id)
 
         # Wake wait_for_events waiter + fan out resources/updated to
         # every registered GET /mcp stream for the new assignee. Done
@@ -1861,6 +1991,11 @@ async def create_self_task_tool_impl(
             connection=cursor,
         )
 
+        # BL-2: maintain the parent's child_tasks mirror.
+        parent_mirror_updated = _link_child_to_parent(
+            cursor, final_parent_task_id, new_task_id
+        )
+
         # Update agent's current task in DB if they don't have one (main.py:1455-1469)
         should_update_agent_current_task = False
         if agent_auth_token in g.active_agents:  # Check memory first
@@ -1895,6 +2030,9 @@ async def create_self_task_tool_impl(
 
         # Post-commit: reconcile caches through repos.
         task_repo.upsert_cache(fresh_task)
+        # BL-2: reconcile the parent whose child_tasks mirror changed.
+        if parent_mirror_updated:
+            _refresh_parent_cache(final_parent_task_id)
 
         if should_update_agent_current_task and agent_auth_token in g.active_agents:
             g.active_agents[agent_auth_token]["current_task"] = new_task_id
@@ -4322,23 +4460,26 @@ async def delete_task_tool_impl(
 
         task_data = dict(task_row)
 
-        # Parse relationships. The columns are nullable in the schema;
-        # ``dict.get(.., "[]")`` returns the stored value (None) when
-        # the key exists, so we need ``or "[]"`` to handle BOTH absent
-        # keys AND NULL column values. Pre-Wave-6 this TypeError was
-        # masked by a lax text-matching adapter; the typed-Failed
-        # variant correctly surfaces it as 500, exposing the bug.
-        child_tasks = json.loads(task_data.get("child_tasks") or "[]")
-        depends_on_tasks = json.loads(
-            task_data.get("depends_on_tasks") or "[]"
+        from ..repositories import task_repo as _task_repo
+
+        # BL-2: enumerate children authoritatively from the
+        # ``parent_task`` FK column — the source of truth — NOT the
+        # ``child_tasks`` JSON mirror (which historically drifted when a
+        # creation path failed to append the back-reference). A cascade
+        # driven by the stale mirror missed real children, so the main
+        # DELETE tripped the ``tasks.parent_task`` self-FK and
+        # ``force_delete`` did not actually force.
+        cursor.execute(
+            "SELECT task_id FROM tasks WHERE parent_task = ?", (task_id,)
         )
+        direct_child_ids = [r["task_id"] for r in cursor.fetchall()]
 
         # Check for child tasks
-        if child_tasks and not force_delete:
+        if direct_child_ids and not force_delete:
             return Conflict(
                 reason=(
-                    f"Task '{task_id}' has {len(child_tasks)} child tasks: "
-                    f"{child_tasks}. Use force_delete=true to cascade delete."
+                    f"Task '{task_id}' has {len(direct_child_ids)} child tasks: "
+                    f"{direct_child_ids}. Use force_delete=true to cascade delete."
                 )
             )
 
@@ -4362,8 +4503,17 @@ async def delete_task_tool_impl(
 
         # Begin cascade deletion operations
         cascade_operations = []
+        # BL-1: (task_id, assigned_to) rows to evict from g.tasks +
+        # publish ``task.deleted`` for, AFTER commit. ``task_repo.delete``
+        # on the connection= path defers cache + publish to the caller so
+        # a subscriber never observes an uncommitted / rolled-back delete.
+        deleted_events: List[tuple] = [
+            (task_id, task_data.get("assigned_to"))
+        ]
+        parent_to_refresh: Optional[str] = None
+        deps_to_refresh: set = set()
 
-        # Update parent task to remove this child
+        # Update parent task to remove this child (JSON mirror upkeep).
         if task_data.get("parent_task"):
             parent_id = task_data["parent_task"]
             cursor.execute(
@@ -4375,25 +4525,31 @@ async def delete_task_tool_impl(
                 parent_children = json.loads(parent_row["child_tasks"] or "[]")
                 if task_id in parent_children:
                     parent_children.remove(task_id)
-                    # PR 7 (Task flip): cascade child-removal goes
-                    # through task_repo with the caller's cursor so
-                    # the wider delete transaction stays atomic.
-                    from ..repositories import task_repo as _task_repo
                     _task_repo.update_fields(
                         parent_id,
                         {"child_tasks": parent_children},
                         connection=cursor,
                     )
+                    parent_to_refresh = parent_id
                     cascade_operations.append(
                         f"Updated parent task '{parent_id}' to remove child reference"
                     )
 
-        # Handle child tasks
-        if child_tasks and force_delete:
-            for child_id in child_tasks:
-                cursor.execute("DELETE FROM tasks WHERE task_id = ?", (child_id,))
-                if cursor.rowcount > 0:
-                    cascade_operations.append(f"Deleted child task '{child_id}'")
+        # Handle child tasks — force-cascade the whole subtree, deepest
+        # descendant first (authoritative FK order) so no DELETE trips the
+        # self-FK. Route each through task_repo.delete so the cache +
+        # publish contract is honoured post-commit.
+        if force_delete:
+            for descendant_id, descendant_assignee in (
+                _collect_task_descendants(cursor, task_id)
+            ):
+                if _task_repo.delete(descendant_id, connection=cursor):
+                    deleted_events.append(
+                        (descendant_id, descendant_assignee)
+                    )
+                    cascade_operations.append(
+                        f"Deleted child task '{descendant_id}'"
+                    )
 
         # Handle dependent tasks
         if dependent_tasks and force_delete:
@@ -4410,24 +4566,19 @@ async def delete_task_tool_impl(
                     )
                     if task_id in dep_dependencies:
                         dep_dependencies.remove(task_id)
-                        # PR 7 (Task flip): cascade dependency-removal
-                        # goes through task_repo with the caller's
-                        # cursor so the wider delete transaction stays
-                        # atomic.
-                        from ..repositories import task_repo as _task_repo
                         _task_repo.update_fields(
                             dep_id,
                             {"depends_on_tasks": dep_dependencies},
                             connection=cursor,
                         )
+                        deps_to_refresh.add(dep_id)
                         cascade_operations.append(
                             f"Updated task '{dep_id}' to remove dependency on '{task_id}'"
                         )
 
-        # Delete the main task
-        cursor.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
-
-        if cursor.rowcount == 0:
+        # Delete the main task through the repo (cache + publish deferred
+        # to post-commit per the connection= contract).
+        if not _task_repo.delete(task_id, connection=cursor):
             return Failed(message=f"Failed to delete task '{task_id}'")
 
         # Log the deletion action
@@ -4444,6 +4595,23 @@ async def delete_task_tool_impl(
         )
 
         conn.commit()
+
+        # BL-1: post-commit cache reconciliation + EventBus publish. Evict
+        # every deleted row from g.tasks and publish ``task.deleted``;
+        # refresh the parent + dependents whose JSON mirrors we mutated
+        # (update_fields(connection=) also deferred their cache write).
+        for deleted_id, deleted_assignee in deleted_events:
+            _task_repo.evict_from_cache(deleted_id)
+            _publish_task_event(
+                deleted_assignee,
+                "task.deleted",
+                {"task_id": deleted_id, "assigned_to": deleted_assignee},
+            )
+        _refresh_parent_cache(parent_to_refresh)
+        for dep_id in deps_to_refresh:
+            fresh_dep = _task_repo.get_by_id(dep_id)
+            if fresh_dep is not None:
+                _task_repo.upsert_cache(fresh_dep)
 
         # Prepare response
         response_parts = [
