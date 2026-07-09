@@ -2076,6 +2076,20 @@ async def delete_project_context_tool_impl(
             },
         )
 
+        # BL-R4-1: prune each deleted key's RAG chunk + hash watermark
+        # in the SAME transaction as the row delete. The incremental
+        # indexer keys on ``updated_at`` and never sweeps orphans, so a
+        # deleted context row's ``source_type='context'`` chunk would
+        # otherwise stay queryable via ``ask_project_rag`` forever.
+        # Clearing the hash also lets a future re-add of the same key
+        # re-index instead of being skipped as unchanged.
+        from ..repositories import rag_repo
+
+        for detail in deletion_details:
+            rag_repo.purge_source(
+                "context", detail["key"], connection=cursor,
+            )
+
         session.commit()
 
         # Prepare response

@@ -512,7 +512,15 @@ async def test_edit_task_note_admits_manager_token(tmp_path) -> None:
 async def test_edit_task_note_rejects_worker_non_author(tmp_path) -> None:
     """A worker-role agent token who is NOT the author must be
     rejected — the per-note ownership check is the only gate that
-    stops cross-worker note mutation."""
+    stops cross-worker note mutation.
+
+    PF-1 (round 4): the rejection must be INDISTINGUISHABLE from a
+    nonexistent note — a typed :class:`NotFound` — so a worker holding
+    a foreign ``note_id`` can't use the 403-vs-404 shape as a
+    note-existence oracle, and the DB layer's ``"owned by {author}"``
+    string never leaks the authoring agent's id. (Previously this
+    surfaced as ``PermissionDenied`` naming the author.)
+    """
     async with mcp_session(tmp_path) as admin:
         await _seed_task(admin, "tn-task-3", assigned_to="note-author-3")
         author = await admin.create_worker("note-author-3")
@@ -520,16 +528,25 @@ async def test_edit_task_note_rejects_worker_non_author(tmp_path) -> None:
 
         intruder = await admin.create_worker("note-intruder-3")
         result = await _edit_note(intruder.token, note_id, "v2-by-intruder")
-        # Failure case: Wave 6 PR 1 surfaces the ownership failure as a
-        # typed :class:`PermissionDenied`, which the MCP renderer
-        # formats as ``"Unauthorized: Note N is owned by 'alice'; …"``.
-        # The pre-PR-1 prose ("Error: Note …") came from the legacy
-        # bridge-wrap; both wordings name the author so we accept either
-        # the "unauthorized" prefix or the ownership clue.
         lower = result.lower()
-        assert "unauthorized" in lower or "only the author" in lower, (
-            f"worker non-author must NOT be able to edit; got {result!r}"
+        # Rejected as not-found …
+        assert "not found" in lower, (
+            f"worker non-author must be rejected as not-found; got {result!r}"
         )
+        # … and the response must NOT leak the author id or the
+        # ownership/authorization distinction.
+        assert "note-author-3" not in result, (
+            f"response must not leak the author id; got {result!r}"
+        )
+        assert "owned by" not in lower and "unauthorized" not in lower, (
+            f"response must not reveal an ownership/authz distinction; "
+            f"got {result!r}"
+        )
+
+        # Oracle parity: a genuinely nonexistent note yields the SAME
+        # response shape (no existence differential).
+        missing = await _edit_note(intruder.token, note_id + 9999, "nope")
+        assert "not found" in missing.lower(), missing
 
 
 async def test_edit_task_note_admits_worker_author(tmp_path) -> None:

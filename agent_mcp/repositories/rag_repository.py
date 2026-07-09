@@ -308,6 +308,104 @@ class RagRepository:
             if owns_conn is not None:
                 owns_conn.close()
 
+    def purge_source(
+        self,
+        source_type: str,
+        source_ref: str,
+        *,
+        connection: Any = None,
+    ) -> int:
+        """Hard-evict a source from the RAG index on row delete.
+
+        Deletes the source's chunks + embeddings (via
+        :meth:`delete_chunks_for`) AND clears its
+        ``hash_<source_type>_<source_ref>`` ``rag_meta`` watermark.
+        Returns the count of ``rag_chunks`` rows deleted.
+
+        Why both, together: the incremental indexer keys on
+        ``updated_at`` and only re-touches a source when its content
+        hash differs from the stored ``hash_*`` row. Deleting the
+        underlying task/context row leaves no future ``updated_at`` to
+        trip that comparison, so a stale chunk (and the secret-free but
+        deleted content it holds) would live forever and keep surfacing
+        through ``ask_project_rag``. Clearing the hash also means a
+        future re-add of the SAME key re-indexes instead of being
+        skipped as "unchanged" against a ghost hash.
+
+        Distinct from :meth:`delete_chunks_for`, which the indexer uses
+        mid-cycle and MUST NOT clear the hash (it re-inserts the chunk
+        and re-sets the hash in the same cycle).
+
+        ``connection`` is the transaction-aware seam — pass the caller's
+        cursor so the purge joins the same transaction as the row
+        delete. When ``None``, opens its own connection and commits.
+
+        Robustness note: the chunk-row delete is what actually stops
+        ``ask_project_rag`` surfacing the content (its kNN inner-joins
+        ``rag_embeddings`` to ``rag_chunks`` on ``chunk_id`` — a chunk-
+        less embedding row can't project any text). So the embeddings
+        delete is best-effort: if the ``vec0`` virtual table is
+        registered in the schema but its module isn't loaded on this
+        connection, the embeddings ``DELETE`` raises but MUST NOT abort
+        the chunk delete. sqlite3 keeps the transaction usable after a
+        per-statement error, so we swallow it and press on.
+        """
+        external_conn = connection is not None
+        if external_conn:
+            cursor = connection
+            owns_conn = None
+        else:
+            owns_conn = get_db_connection()
+            cursor = owns_conn.cursor()
+
+        try:
+            if _embeddings_table_exists(cursor):
+                try:
+                    cursor.execute(
+                        "DELETE FROM rag_embeddings WHERE rowid IN ("
+                        "  SELECT chunk_id FROM rag_chunks "
+                        "  WHERE source_type = ? AND source_ref = ?"
+                        ")",
+                        (source_type, source_ref),
+                    )
+                except sqlite3.OperationalError as e_vec:
+                    # vec0 registered but not loaded on this connection —
+                    # orphan embedding is harmless (no chunk to join to);
+                    # the chunk delete below is the security-relevant one.
+                    logger.warning(
+                        "purge_source: embeddings delete skipped for "
+                        "%s:%s (%s); continuing with chunk delete.",
+                        source_type, source_ref, e_vec,
+                    )
+            result = cursor.execute(
+                "DELETE FROM rag_chunks "
+                "WHERE source_type = ? AND source_ref = ?",
+                (source_type, source_ref),
+            )
+            count = result.rowcount or 0
+            cursor.execute(
+                "DELETE FROM rag_meta WHERE meta_key = ?",
+                (f"hash_{source_type}_{source_ref}",),
+            )
+            if owns_conn is not None:
+                owns_conn.commit()
+            return count
+        except sqlite3.Error as e:
+            logger.error(
+                f"Database error purging RAG source "
+                f"{source_type}:{source_ref}: {e}",
+                exc_info=True,
+            )
+            if owns_conn is not None:
+                try:
+                    owns_conn.rollback()
+                except sqlite3.Error:
+                    pass
+            return 0
+        finally:
+            if owns_conn is not None:
+                owns_conn.close()
+
     def set_meta(
         self,
         *,

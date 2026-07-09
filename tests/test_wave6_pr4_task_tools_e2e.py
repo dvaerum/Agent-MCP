@@ -283,9 +283,13 @@ async def test_update_task_status_worker_own_task_returns_ok(tmp_path) -> None:
 #     (rendered text starts with "Unauthorized:") ──────────────────
 
 
-async def test_update_task_status_worker_other_task_returns_permission_denied(
+async def test_update_task_status_worker_other_task_returns_not_found(
     tmp_path,
 ) -> None:
+    """PF-1 (round 4): a worker updating a foreign task gets a
+    :class:`NotFound` identical to a nonexistent task — no 403-vs-404
+    existence oracle, no owner-id leak. (Previously PermissionDenied
+    rendered as "Unauthorized: … assigned to <owner>".)"""
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
         bob = await admin.create_worker("bob")
@@ -296,10 +300,23 @@ async def test_update_task_status_worker_other_task_returns_permission_denied(
             {"task_id": task_id, "status": "completed"},
         )
         text = result[0].text
-        # Renderer for PermissionDenied: "Unauthorized: <reason>".
-        assert text.startswith("Unauthorized:"), (
-            f"expected PermissionDenied rendered as 'Unauthorized: ...', "
-            f"got: {text!r}"
+        # Renderer for NotFound: "Error: task '<id>' not found."
+        assert "not found" in text.lower(), (
+            f"expected NotFound rendered as '... not found.', got: {text!r}"
+        )
+        assert "unauthorized" not in text.lower(), text
+        assert alice.agent_id not in text, (
+            f"owner id must not leak; got: {text!r}"
+        )
+
+        # Same response as a genuinely nonexistent task (no differential).
+        missing = await bob.call(
+            "update_task_status",
+            {"task_id": "no-such-task-xyz", "status": "completed"},
+        )
+        assert missing[0].text.replace("no-such-task-xyz", "X") == \
+            text.replace(task_id, "X"), (
+            f"foreign vs missing differ: {text!r} vs {missing[0].text!r}"
         )
 
         # And the underlying task is unchanged.

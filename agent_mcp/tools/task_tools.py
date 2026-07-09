@@ -359,15 +359,22 @@ async def _update_single_task(
 
     task_current_data = dict(task_db_row)
 
-    # Verify permissions
+    # Verify permissions.
+    #
+    # SECURITY (PF-1): a non-owner without ``tasks.assign`` must NOT be
+    # able to tell "task exists but isn't yours" from "task doesn't
+    # exist", and must never see the owning agent's id. Both are
+    # differential-response oracles a worker can exploit — workers
+    # routinely hold foreign task_ids (via ``depends_on_tasks`` /
+    # ``parent_task``, coordination messages, ``view_tasks``) and cannot
+    # otherwise enumerate the owning agent's identity. So return the
+    # EXACT not-found result the missing-row branch above returns, with
+    # no ``assigned_to`` interpolation.
     if (
         task_current_data.get("assigned_to") != requesting_agent_id
         and not is_admin_request
     ):
-        return {
-            "success": False,
-            "error": f"Unauthorized: Cannot update task '{task_id}' assigned to {task_current_data.get('assigned_to')}",
-        }
+        return {"success": False, "error": f"Task '{task_id}' not found"}
 
     # Terminal-state / transition guard. Terminal states are sinks; a
     # double-complete would re-fire auto_update_dependencies and an
@@ -3349,14 +3356,18 @@ async def bulk_task_operations_tool_impl(
 
                 task_data = dict(task_row)
 
-                # Permission check
+                # Permission check.
+                #
+                # SECURITY (PF-1): mirror the not-found branch above so a
+                # non-owner without ``tasks.assign`` cannot distinguish a
+                # foreign existing task from a nonexistent one (the 403-
+                # vs-404 existence oracle). Same wording as the
+                # missing-row case; never name the owner.
                 if (
                     task_data.get("assigned_to") != requesting_agent_id
                     and not is_admin_request
                 ):
-                    results.append(
-                        f"Operation {i+1}: Unauthorized - can only modify own tasks"
-                    )
+                    results.append(f"Operation {i+1}: Task '{task_id}' not found")
                     continue
 
                 try:
@@ -4613,6 +4624,18 @@ async def delete_task_tool_impl(
         # to post-commit per the connection= contract).
         if not _task_repo.delete(task_id, connection=cursor):
             return Failed(message=f"Failed to delete task '{task_id}'")
+
+        # BL-R4-1: prune each deleted task's RAG chunk + hash watermark
+        # in the SAME transaction as the row delete. The incremental
+        # indexer keys on ``updated_at`` and never sweeps orphans, so a
+        # deleted task's ``source_type='task'`` chunk would otherwise
+        # stay queryable via ``ask_project_rag`` forever. ``deleted_events``
+        # holds the whole delete set (target + every force-cascaded
+        # descendant), so this covers the cascade too. Clearing the hash
+        # lets a future task with the same id re-index cleanly.
+        from ..repositories import rag_repo as _rag_repo
+        for deleted_id, _ in deleted_events:
+            _rag_repo.purge_source("task", deleted_id, connection=cursor)
 
         # Log the deletion action
         log_agent_action_to_db(

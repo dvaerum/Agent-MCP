@@ -171,9 +171,13 @@ async def test_edit_task_note_returns_ok_for_author(tmp_path) -> None:
 async def test_edit_task_note_permission_denied_for_non_author(
     tmp_path,
 ) -> None:
-    """A worker editing someone else's note returns
-    :class:`PermissionDenied` (typed; rendered as
-    "Unauthorized: …" on the MCP wire and 403 on REST)."""
+    """A worker editing someone else's note is rejected.
+
+    PF-1 (round 4): the rejection is a typed :class:`NotFound`
+    indistinguishable from a nonexistent note — closing the
+    note-existence oracle — and must never leak the authoring agent's
+    id (the DB layer's ``"owned by 'alice'"`` string). (Previously this
+    surfaced as PermissionDenied naming the author.)"""
     from agent_mcp.tools.registry import dispatch_tool_call
     from agent_mcp.db.actions import task_notes_db
 
@@ -195,10 +199,12 @@ async def test_edit_task_note_permission_denied_for_non_author(
             principal=p,
         )
 
-        assert isinstance(result, PermissionDenied), (
-            f"expected PermissionDenied, got {result!r}"
+        assert isinstance(result, NotFound), (
+            f"expected NotFound, got {result!r}"
         )
-        assert "alice" in result.reason
+        assert "alice" not in repr(result), (
+            f"author id must not leak; got {result!r}"
+        )
         # Note unchanged.
         assert task_notes_db.get_note(note_id)["text"] == "v1"
 
