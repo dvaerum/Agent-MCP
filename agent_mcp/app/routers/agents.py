@@ -466,6 +466,16 @@ async def restore_agent_api_route(
                 "agent_role": full["agent_role"],
             }
 
+            # BL-R13-2: working_directory has a SECOND in-memory view —
+            # g.agent_working_dirs (keyed by agent_id), which
+            # get_working_directory() reads FIRST and returns on a
+            # non-None hit. The active_agents restore above (keyed by
+            # token) never reaches it, so after a restore the file tools +
+            # get_agent_details keep resolving against stale/missing dir
+            # data. Mirror the BL-R11-1 edit-path reconcile (and the
+            # server_lifecycle warm-from-DB) for the restored agent.
+            g.agent_working_dirs[agent_id] = full["working_directory"]
+
         return JSONResponse({
             "success": True,
             "agent_id": agent_id,

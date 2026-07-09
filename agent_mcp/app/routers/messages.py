@@ -480,6 +480,20 @@ async def create_message_api_route(
         })
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
+    except LookupError as e:
+        # BL-R13-3: message_repo.send raises LookupError for a recipient
+        # that is neither a live agent, a tombstone row, nor the 'admin'
+        # label. The canonical MCP send path
+        # (send_agent_message_tool_impl) maps this to a clean NotFound /
+        # 404; without this branch the same LookupError fell through to
+        # the generic handler below and surfaced as an uncaught 500.
+        # Roll back so no partial state / audit entry survives.
+        if conn:
+            conn.rollback()
+        logger.warning("Dashboard message rejected (unknown recipient): %s", e)
+        return JSONResponse(
+            {"error": "Recipient not found"}, status_code=404
+        )
     except Exception as e:
         if conn:
             conn.rollback()

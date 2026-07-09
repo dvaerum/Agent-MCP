@@ -211,6 +211,27 @@ async def create_task_api_route(
 
         conn = get_db_connection()
         cursor = conn.cursor()
+
+        # BL-R13-1: enforce the assignability invariant the canonical MCP
+        # task paths gate on (``_agent_assignable`` in task_tools.py —
+        # True only if the agent exists AND is not terminated). Writing
+        # ``assigned_to`` directly here bypassed it, so a task could be
+        # persisted pinned on a nonexistent / terminated agent behind a
+        # 200 — unreachable work attributed to a dead identity. An empty
+        # / absent assignment stays allowed (falls through as unassigned).
+        if assigned_to:
+            from ...tools.task_tools import _agent_assignable
+            if not _agent_assignable(cursor, assigned_to):
+                # ``finally`` below closes ``conn``.
+                return JSONResponse(
+                    {
+                        "error": (
+                            f"Cannot assign task to '{assigned_to}': agent "
+                            f"does not exist or is terminated."
+                        )
+                    },
+                    status_code=400,
+                )
         # PR 7 (Task flip): create flows through task_repo.create with
         # the caller's cursor so the wider audit-log INSERT stays in
         # the same transaction. The repo handles JSON serialisation

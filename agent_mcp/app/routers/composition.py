@@ -851,6 +851,26 @@ async def update_task_details_api_route(
                 new_assigned = None
             else:
                 new_assigned = str(raw_assigned).strip()
+            # BL-R13-1: a non-empty reassignment target must satisfy the
+            # assignability invariant the canonical MCP path enforces
+            # (``_update_single_task`` → ``_agent_assignable`` — the agent
+            # exists AND is not terminated). Writing ``assigned_to``
+            # directly here bypassed it, so a task could be re-pinned on a
+            # nonexistent / terminated agent behind a 200. Clearing the
+            # assignment (new_assigned is None) stays allowed.
+            if new_assigned is not None:
+                from ...tools.task_tools import _agent_assignable
+                if not _agent_assignable(cursor, new_assigned):
+                    return JSONResponse(
+                        {
+                            "error": (
+                                f"Cannot reassign task '{task_id_to_update}' "
+                                f"to '{new_assigned}': agent does not exist "
+                                f"or is terminated."
+                            )
+                        },
+                        status_code=400,
+                    )
             fields_to_update["assigned_to"] = new_assigned
             log_details["assigned_to_changed"] = new_assigned
         if 'notes' in data and data['notes'] and isinstance(data['notes'], str) and data['notes'].strip():
