@@ -685,6 +685,38 @@ def _reject_non_str(value: Any, field: str, *, allow_none: bool) -> str | None:
     return None
 
 
+def _parse_bool_field(
+    body: dict, field: str, *, default: bool = False,
+) -> tuple[bool, str | None]:
+    """Strictly parse a JSON-boolean body field. Returns ``(value, err)``.
+
+    PF-R13-1: ``is_sysadmin`` (the only caller-supplied SECURITY boolean
+    on this surface) was coerced with a bare ``bool()`` on the raw JSON
+    value, so a truthy NON-boolean — a non-empty string like ``"false"``,
+    a dict/list, a non-zero number — read as ``True`` and SILENTLY minted
+    (or flipped) a sysadmin. Accept ONLY a real JSON boolean
+    (``true``/``false``); an absent key yields ``default``. Any other
+    type returns an error message the caller surfaces as a 400
+    ``validation_error`` — the same tight, predictable contract as
+    ``_reject_non_str`` (PF-R7-1), preferring reject-on-ambiguity over a
+    surprising coercion.
+
+    ``isinstance(True, int)`` is ``True`` in Python but
+    ``isinstance(1, bool)`` is ``False``, so the ``isinstance(value,
+    bool)`` guard accepts only JSON ``true``/``false`` and rejects a JSON
+    number ``0``/``1`` as well as strings / objects / arrays.
+    """
+    if field not in body:
+        return default, None
+    value = body[field]
+    if isinstance(value, bool):
+        return value, None
+    return default, (
+        f"{field} must be a boolean (true/false); got "
+        f"{type(value).__name__}"
+    )
+
+
 # ── Row shape helpers ──────────────────────────────────────────────
 
 
@@ -752,7 +784,15 @@ async def create_user_handler(req: web.Request) -> web.Response:
     username = (body.get("username") or "").strip()
     password = body.get("password") or ""
     email = body.get("email")
-    is_sysadmin = bool(body.get("is_sysadmin", False))
+    # PF-R13-1: strict boolean parse — a truthy non-bool (e.g. "false")
+    # must not silently mint a sysadmin.
+    is_sysadmin, is_sysadmin_err = _parse_bool_field(
+        body, "is_sysadmin", default=False,
+    )
+    if is_sysadmin_err is not None:
+        return _error(
+            error=_ERROR_VALIDATION, message=is_sysadmin_err, status=400,
+        )
 
     # Granting sysadmin is sysadmin-only (self-escalation defence).
     if is_sysadmin and not _caller_is_sysadmin(req):
@@ -827,9 +867,22 @@ async def edit_user_handler(req: web.Request) -> web.Response:
         return _forbid_sysadmin_write(req)
     sets: list[str] = []
     params: list[Any] = []
-    if "is_sysadmin" in body:
+    # PF-R13-1: strict boolean parse — a truthy non-bool (e.g. "false")
+    # must not silently flip the sysadmin bit. Parsed once here so the
+    # ``demoting`` check below reflects the same value.
+    has_is_sysadmin = "is_sysadmin" in body
+    is_sysadmin_val = False
+    if has_is_sysadmin:
+        is_sysadmin_val, is_sysadmin_err = _parse_bool_field(
+            body, "is_sysadmin", default=False,
+        )
+        if is_sysadmin_err is not None:
+            return _error(
+                error=_ERROR_VALIDATION, message=is_sysadmin_err,
+                status=400,
+            )
         sets.append("is_sysadmin = ?")
-        params.append(1 if bool(body["is_sysadmin"]) else 0)
+        params.append(1 if is_sysadmin_val else 0)
     if "email" in body:
         # email is nullable (setting None clears it); reject structured
         # JSON types before the write lock (PF-R7-1).
@@ -848,7 +901,7 @@ async def edit_user_handler(req: web.Request) -> web.Response:
         )
     # Demotion = clearing an existing sysadmin bit. Guarded below against
     # dropping the sysadmin count to zero (last-sysadmin lockout).
-    demoting = "is_sysadmin" in body and not bool(body["is_sysadmin"])
+    demoting = has_is_sysadmin and not is_sysadmin_val
     conn = _connect()
     # Manual transaction so the last-sysadmin count check and the UPDATE
     # are atomic under one write-lock — two peers racing to demote the
@@ -978,7 +1031,15 @@ async def create_group_handler(req: web.Request) -> web.Response:
     if name_err is not None:
         return _error(error=_ERROR_VALIDATION, message=name_err, status=400)
     name = (body.get("name") or "").strip()
-    is_sysadmin = bool(body.get("is_sysadmin", False))
+    # PF-R13-1: strict boolean parse — a truthy non-bool (e.g. "false")
+    # must not silently mint a sysadmin-flagged group.
+    is_sysadmin, is_sysadmin_err = _parse_bool_field(
+        body, "is_sysadmin", default=False,
+    )
+    if is_sysadmin_err is not None:
+        return _error(
+            error=_ERROR_VALIDATION, message=is_sysadmin_err, status=400,
+        )
     # A sysadmin-flagged group confers sysadmin to its members, so
     # minting one is sysadmin-only (self-escalation defence).
     if is_sysadmin and not _caller_is_sysadmin(req):
@@ -1043,8 +1104,18 @@ async def edit_group_handler(req: web.Request) -> web.Response:
         sets.append("name = ?")
         params.append(new_name)
     if "is_sysadmin" in body:
+        # PF-R13-1: strict boolean parse — a truthy non-bool (e.g.
+        # "false") must not silently flip the group's sysadmin bit.
+        is_sysadmin_val, is_sysadmin_err = _parse_bool_field(
+            body, "is_sysadmin", default=False,
+        )
+        if is_sysadmin_err is not None:
+            return _error(
+                error=_ERROR_VALIDATION, message=is_sysadmin_err,
+                status=400,
+            )
         sets.append("is_sysadmin = ?")
-        params.append(1 if bool(body["is_sysadmin"]) else 0)
+        params.append(1 if is_sysadmin_val else 0)
     if not sets:
         return _error(
             error=_ERROR_VALIDATION,
