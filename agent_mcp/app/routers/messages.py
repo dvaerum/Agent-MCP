@@ -178,6 +178,11 @@ async def list_participants_api_route(
         from ...repositories import message_repo
         result = message_repo.list_participants()
         return JSONResponse(result)
+    except ValueError as e:
+        # PF-R12-1: a non-object body (list / string / scalar) now raises
+        # ValueError in get_sanitized_json_body. Return a clean 400 rather
+        # than letting the generic Exception handler below map it to 500.
+        return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:
         logger.error(f"Error listing participants: {e}", exc_info=True)
         # BL-R5-2 / SD-R6-1: generic message — see list-messages note.
