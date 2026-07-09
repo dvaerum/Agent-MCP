@@ -139,7 +139,9 @@ async def create_memory_api_route(
         if session is not None:
             session.rollback()
         logger.error(f"Error creating memory: {e}", exc_info=True)
-        return JSONResponse({"error": f"Failed to create memory: {str(e)}"}, status_code=500)
+        # BL-R5-2: generic message — ``str(e)`` on a SQLAlchemyError
+        # embeds SQL text + bound params (schema disclosure).
+        return JSONResponse({"error": "Failed to create memory"}, status_code=500)
     finally:
         if session is not None:
             session.close()
@@ -236,7 +238,9 @@ async def update_memory_api_route(
         if session is not None:
             session.rollback()
         logger.error(f"Error updating memory: {e}", exc_info=True)
-        return JSONResponse({"error": f"Failed to update memory: {str(e)}"}, status_code=500)
+        # BL-R5-2: generic message — ``str(e)`` on a SQLAlchemyError
+        # embeds SQL text + bound params (schema disclosure).
+        return JSONResponse({"error": "Failed to update memory"}, status_code=500)
     finally:
         if session is not None:
             session.close()
@@ -338,6 +342,20 @@ async def delete_memory_api_route(
             "deleted_memory",
             details={"context_key": context_key},
         )
+
+        # BL-R5-1: prune the deleted memory's RAG chunk + hash watermark
+        # in the SAME transaction as the row delete, mirroring the MCP
+        # ``delete_project_context`` tool (project_context_tools.py). The
+        # REST surface (the dashboard's primary delete path) previously
+        # skipped this, so a ``source_type='context'`` chunk for the
+        # deleted key survived and stayed retrievable via
+        # ``ask_project_rag`` forever — the incremental indexer keys on
+        # ``updated_at`` and never sweeps orphans. Purging on the shared
+        # cursor means a purge failure rolls back the row delete too.
+        from ...repositories import rag_repo
+
+        rag_repo.purge_source("context", context_key, connection=cursor)
+
         session.commit()
 
         return JSONResponse({
@@ -349,8 +367,11 @@ async def delete_memory_api_route(
         if session is not None:
             session.rollback()
         logger.error(f"Error deleting memory: {e}", exc_info=True)
+        # BL-R5-2: return a generic message — ``str(e)`` on a
+        # SQLAlchemyError embeds the SQL text + bound parameters
+        # (schema disclosure). The details are in the server log above.
         return JSONResponse(
-            {"error": f"Failed to delete memory: {str(e)}"},
+            {"error": "Failed to delete memory"},
             status_code=500,
         )
     finally:
