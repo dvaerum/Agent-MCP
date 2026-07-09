@@ -69,6 +69,31 @@ router = APIRouter(
 )
 
 
+def _context_value_should_redact(
+    context_key: Any, value: Any, description: Any
+) -> bool:
+    """True iff a ``project_context`` row must be withheld from a
+    non-confirmed-operator caller.
+
+    TWO-part filter, identical to the tool boundary
+    (``project_context_tools``) and the RAG surfaces
+    (``rag/indexing.py`` / ``rag/query.py``): redact when the KEY name is
+    secret OR the VALUE / DESCRIPTION carries an embedded credential
+    (round-4 backstop — a secret pasted into a benign-named key). Without
+    the value backstop, the dashboard REST reads leaked such a secret to
+    every viewer-tier / cookie / forwarding operator (which
+    ``is_confirmed_operator_tier`` cannot verify).
+
+    The predicate is imported lazily — exactly as the tool does — to
+    avoid the tools <-> rag import cycle. Do NOT reimplement it here.
+    """
+    if is_secret_key(context_key):
+        return True
+    from ...features.rag.indexing import _value_has_embedded_secret
+
+    return _value_has_embedded_secret(value, description)
+
+
 def is_confirmed_operator_tier(auth: Dict[str, Any]) -> bool:
     """Return True iff ``auth`` came via a CONFIRMED operator-tier path.
 
@@ -129,7 +154,7 @@ async def simple_status_api_route(request: Request) -> JSONResponse:
         })
     except Exception as e:
         logger.error(f"Error in simple_status_api_route: {e}", exc_info=True)
-        return JSONResponse({"error": f"Failed to get simple status: {str(e)}"}, status_code=500)
+        return JSONResponse({"error": "Failed to get simple status."}, status_code=500)
 
 
 @router.api_route("/graph-data", methods=["GET", "OPTIONS"])
@@ -141,7 +166,7 @@ async def graph_data_api_route(request: Request) -> JSONResponse:
         return JSONResponse(data)
     except Exception as e:
         logger.error(f"Error serving graph data: {e}", exc_info=True)
-        return JSONResponse({'nodes': [], 'edges': [], 'error': str(e)}, status_code=500)
+        return JSONResponse({'nodes': [], 'edges': [], 'error': 'Failed to serve graph data.'}, status_code=500)
 
 
 @router.api_route("/task-tree-data", methods=["GET", "OPTIONS"])
@@ -153,7 +178,7 @@ async def task_tree_data_api_route(request: Request) -> JSONResponse:
         return JSONResponse(data)
     except Exception as e:
         logger.error(f"Error serving task tree data: {e}", exc_info=True)
-        return JSONResponse({'nodes': [], 'edges': [], 'error': str(e)}, status_code=500)
+        return JSONResponse({'nodes': [], 'edges': [], 'error': 'Failed to serve task tree data.'}, status_code=500)
 
 
 #: Safe, non-secret columns to project from ``agents`` for the
@@ -232,15 +257,20 @@ async def node_details_api_route(
             row = cursor.fetchone()
             if row:
                 data = dict(row)
-                # SECURITY (round-2): the router admits viewer-tier
+                # SECURITY (round-2/4): the router admits viewer-tier
                 # operators on GET and the backend can't verify a
-                # cookie/forwarding caller's tier, so redact secret-keyed
-                # VALUES unless the caller is CONFIRMED operator tier.
-                # Previously ``dict(row)`` shipped ``config_*_token`` /
-                # ``*_secret`` values verbatim to any viewer.
-                if (
-                    not is_confirmed_operator_tier(auth)
-                    and is_secret_key(data.get('context_key'))
+                # cookie/forwarding caller's tier, so redact secret VALUES
+                # unless the caller is CONFIRMED operator tier. Round-4:
+                # redact on the TWO-part filter (secret KEY name OR an
+                # embedded credential in the VALUE/DESCRIPTION), matching
+                # the tool boundary — not is_secret_key alone, which let a
+                # secret pasted into a benign key leak verbatim here.
+                if not is_confirmed_operator_tier(auth) and (
+                    _context_value_should_redact(
+                        data.get('context_key'),
+                        data.get('value'),
+                        data.get('description'),
+                    )
                 ):
                     data['value'] = _REDACTED_VALUE
                 details['data'] = data
@@ -258,7 +288,7 @@ async def node_details_api_route(
             return JSONResponse({'error': 'Node data not found or type unrecognized'}, status_code=404)
     except Exception as e:
         logger.error(f"Error fetching details for node {node_id}: {e}", exc_info=True)
-        return JSONResponse({'error': f'Failed to fetch node details: {str(e)}'}, status_code=500)
+        return JSONResponse({'error': 'Failed to fetch node details.'}, status_code=500)
     finally:
         if conn:
             conn.close()
@@ -431,20 +461,24 @@ async def all_data_api_route(
                 .limit(section_limit)
                 .all()
             )
-            # SECURITY (round-2): redact secret-keyed VALUES for callers
-            # that are not CONFIRMED operator tier. ``expose_tokens`` is
-            # the same confirmed-operator gate used for agent bearers
-            # above; the router admits viewer-tier operators on GET and
-            # the backend can't verify a cookie/forwarding caller's tier,
-            # so those paths get the redacted view. Mirrors
-            # ``/api/context-data``. Without this, a viewer harvested raw
-            # ``config_*`` / ``*_token`` values straight from all-data.
+            # SECURITY (round-2/4): redact secret VALUES for callers that
+            # are not CONFIRMED operator tier. ``expose_tokens`` is the
+            # same confirmed-operator gate used for agent bearers above;
+            # the router admits viewer-tier operators on GET and the
+            # backend can't verify a cookie/forwarding caller's tier, so
+            # those paths get the redacted view. Mirrors
+            # ``/api/context-data``. Round-4: redact on the TWO-part
+            # filter (secret KEY OR embedded-secret VALUE/DESCRIPTION) so a
+            # credential pasted into a benign key can't leak here either.
             context_data = [
                 {
                     "context_key": r.context_key,
                     "value": (
                         r.value
-                        if expose_tokens or not is_secret_key(r.context_key)
+                        if expose_tokens
+                        or not _context_value_should_redact(
+                            r.context_key, r.value, r.description
+                        )
                         else _REDACTED_VALUE
                     ),
                     "updated_at": r.updated_at,
@@ -498,7 +532,7 @@ async def all_data_api_route(
 
     except Exception as e:
         logger.error(f"Error fetching all data: {e}", exc_info=True)
-        return JSONResponse({"error": f"Failed to fetch all data: {str(e)}"}, status_code=500)
+        return JSONResponse({"error": "Failed to fetch all data."}, status_code=500)
     finally:
         if conn:
             conn.close()
@@ -539,12 +573,19 @@ async def context_data_api_route(
                 .order_by(ProjectContext.updated_at.desc())
                 .all()
             )
+            # Round-4: redact on the TWO-part filter (secret KEY OR an
+            # embedded credential in the VALUE/DESCRIPTION), matching the
+            # tool boundary and ``/api/all-data`` — is_secret_key alone let
+            # a secret pasted into a benign key leak to viewer-tier here.
             context_data = [
                 {
                     "context_key": r.context_key,
                     "value": (
                         r.value
-                        if expose_secrets or not is_secret_key(r.context_key)
+                        if expose_secrets
+                        or not _context_value_should_redact(
+                            r.context_key, r.value, r.description
+                        )
                         else _REDACTED_VALUE
                     ),
                     "updated_at": r.updated_at,
@@ -563,7 +604,7 @@ async def context_data_api_route(
 
     except Exception as e:
         logger.error(f"Error fetching context data: {e}", exc_info=True)
-        return JSONResponse({"error": f"Failed to fetch context data: {str(e)}"}, status_code=500)
+        return JSONResponse({"error": "Failed to fetch context data."}, status_code=500)
 
 
 # --- Legacy verb-y URLs placed here because the URL prefix doesn't
@@ -753,12 +794,12 @@ async def update_task_details_api_route(
         if conn:
             conn.rollback()
         logger.error(f"DB error updating task via dashboard: {e_sql}", exc_info=True)
-        return JSONResponse({"error": f"Failed to update task (DB): {str(e_sql)}"}, status_code=500)
+        return JSONResponse({"error": "Failed to update task (DB)."}, status_code=500)
     except Exception as e:
         if conn:
             conn.rollback()
         logger.error(f"Error updating task via dashboard: {e}", exc_info=True)
-        return JSONResponse({"error": f"Failed to update task: {str(e)}"}, status_code=500)
+        return JSONResponse({"error": "Failed to update task."}, status_code=500)
     finally:
         if conn:
             conn.close()
@@ -861,7 +902,7 @@ async def create_sample_memories_route(
         logger.error(f"Error creating sample memories: {e}", exc_info=True)
         return JSONResponse({
             "success": False,
-            "error": str(e)
+            "error": "Failed to create sample memories."
         }, status_code=500)
     finally:
         session.close()
