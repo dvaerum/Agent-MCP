@@ -981,11 +981,36 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
         req["resolved_via_alias"] = name
         req["resolved_project"] = real_name
         alias_info = (name, alias_entry.get("expires_at", ""))
-    return await _proxy_to_backend(
+    resp = await _proxy_to_backend(
         req, real_name, "/mcp",
         alias_info=alias_info,
         inject_header=forwarding_header,
     )
+    # ── SEC5 (401-envelope parity, owner-authorised) ─────────────────
+    # A bearer that the backend rejects (not live in ``g.active_agents``)
+    # comes back as the backend's OWN 401: a ``Server: uvicorn`` header,
+    # a JSON ``invalid_bearer``/``agent_terminated`` body, NO
+    # ``WWW-Authenticate``, ~230 bytes. The router's own pre-auth 401
+    # (unknown project / no creds) is ``_unauthorized()``: ``Server``
+    # from aiohttp, a ``WWW-Authenticate`` challenge, a plaintext reason,
+    # ~42 bytes. Those five distinguishers let an anonymous caller diff
+    # the two 401s and enumerate valid project names — PR #279 unified
+    # the status CODE but left the ENVELOPE divergent (SEC5 still open).
+    #
+    # A 401 on THIS transport always means "not-yet-authenticated" (the
+    # backend is the sole judge of bearer validity and we forwarded the
+    # bearer to reach here). Collapse it into the router's canonical
+    # ``_unauthorized()`` so a KNOWN-but-unauthenticated project and an
+    # UNKNOWN project are byte-indistinguishable to that caller — same
+    # status line/reason, same body, same WWW-Authenticate, and the
+    # upstream ``Server: uvicorn`` fingerprint is dropped. Authenticated
+    # 2xx responses (and any non-401 the backend returns) pass through
+    # untouched. The backend's richer ``agent_terminated`` hint is still
+    # available to a caller hitting the backend UDS directly; over the
+    # public router boundary, uniform-401 hygiene wins.
+    if resp.status == 401:
+        raise _unauthorized()
+    return resp
 
 
 async def _forwarding_header_from_cookie(

@@ -44,6 +44,8 @@ from __future__ import annotations
 import re
 
 import pytest
+import pytest_asyncio
+from aiohttp import web
 
 
 pytestmark = pytest.mark.asyncio
@@ -326,4 +328,155 @@ async def test_mcp_wrong_method_reason_phrase_is_constant(
     assert resp.status == 405
     assert "known-proj" not in (resp.reason or ""), (
         f"reason phrase reflects the project name: {resp.reason!r}"
+    )
+
+
+# ── ITEM 4: pre-auth 401-ENVELOPE parity (SEC5, still open) ─────────
+#
+# PR #279 unified the pre-auth 401 STATUS CODE (unknown project → 401,
+# not 404) but NOT the 401 ENVELOPE. A junk bearer to a KNOWN project
+# is forwarded to the backend, whose ``AuthHeaderMiddleware`` returns
+# its own 401: JSON ``invalid_bearer`` body, a ``Server: uvicorn``
+# header, and NO ``WWW-Authenticate``. The SAME junk bearer to an
+# UNKNOWN project is short-circuited by the router's own
+# ``_unauthorized()``: a ``Server: aiohttp``-flavoured header, a
+# ``WWW-Authenticate`` challenge, a different body, a different length.
+#
+# Those 5 distinguishers (Server header, body, WWW-Authenticate
+# presence, length, reason) let an ANONYMOUS attacker enumerate valid
+# project names by diffing the two 401s. The fix normalises the
+# backend's pre-auth 401 into the router's canonical envelope so the
+# two are BYTE-INDISTINGUISHABLE to a not-yet-authenticated caller.
+
+
+class _ProductionShaped401Backend:
+    """UDS backend that mirrors production's divergent ``invalid_bearer``
+    401 — the exact envelope ``agent_mcp.app.main_app`` emits.
+
+    Distinctive on purpose: a ``Server: uvicorn`` header (the ASGI
+    server's fingerprint), a JSON ``invalid_bearer`` body, and NO
+    ``WWW-Authenticate``. These are the leaks the router must scrub so
+    the KNOWN-project 401 can't be told apart from the UNKNOWN-project
+    401.
+    """
+
+    def app(self) -> web.Application:
+        app = web.Application()
+        app.router.add_route("*", "/{tail:.*}", self._reject)
+        return app
+
+    async def _reject(self, req: web.Request) -> web.Response:
+        await req.read()
+        return web.Response(
+            status=401,
+            body=(
+                b'{"error":"invalid_bearer","message":"Bearer token does '
+                b'not match any active agent. Send Authorization: Bearer '
+                b'<per-agent-token> on POST /mcp, or route the request '
+                b'through the router so it can attach the signed '
+                b'forwarding header."}'
+            ),
+            content_type="application/json",
+            # Mimic uvicorn's server fingerprint. aiohttp's writer uses
+            # ``setdefault`` for the Server header, so an explicit value
+            # survives — exactly like the real backend behind uvicorn.
+            headers={"Server": "uvicorn"},
+        )
+
+
+@pytest_asyncio.fixture
+async def production_shaped_401_backend(
+    router_module, router_env, systemctl_stub,
+):
+    """Register KNOWN project ``known-proj`` and stand up a backend on
+    its UDS that returns production's divergent ``invalid_bearer`` 401.
+
+    Marks the systemd unit active so ``_ensure`` is a no-op and the
+    junk-bearer request is forwarded to (and rejected by) this backend.
+    """
+    name = "known-proj"
+    router_module._REGISTRY.register(name, str(router_env.root / "ws" / name))
+    sock = router_env.sock_dir / name / "backend.sock"
+    sock.parent.mkdir(parents=True, exist_ok=True)
+    sock.unlink(missing_ok=True)
+    backend = _ProductionShaped401Backend()
+    runner = web.AppRunner(backend.app())
+    await runner.setup()
+    site = web.UnixSite(runner, str(sock))
+    await site.start()
+    systemctl_stub.active_units.add(f"agent-mcp@{name}.service")
+    try:
+        yield backend
+    finally:
+        await runner.cleanup()
+
+
+def _envelope_fingerprint(resp, body: bytes) -> dict:
+    """The security-relevant, deterministic 401 distinguishers.
+
+    Excludes ``Date`` (clock-dependent) and ``Content-Type`` charset
+    noise is kept as-is because it IS an observable distinguisher. The
+    two 401s must agree on every field here.
+    """
+    return {
+        "status": resp.status,
+        "server": resp.headers.get("Server"),
+        "www_authenticate": resp.headers.get("WWW-Authenticate"),
+        "content_type": resp.headers.get("Content-Type"),
+        "content_length": resp.headers.get("Content-Length"),
+        "body": body,
+        "reason": resp.reason,
+    }
+
+
+@pytest.mark.no_auth_seed_session
+async def test_junk_bearer_401_envelope_indistinguishable_known_vs_unknown(
+    aiohttp_client, router_app, production_shaped_401_backend,
+) -> None:
+    """SEC5 (still open): a junk ``Authorization: Bearer <garbage>`` to a
+    KNOWN project (forwarded → backend 401) and to an UNKNOWN project
+    (router ``_unauthorized()``) must be BYTE-INDISTINGUISHABLE.
+
+    Pre-fix the KNOWN 401 leaks ``Server: uvicorn``, the JSON
+    ``invalid_bearer`` body, no ``WWW-Authenticate``, and a ~230-byte
+    length — none of which the UNKNOWN 401 has. That divergence is the
+    project-existence oracle an anonymous attacker exploits.
+    """
+    client = await aiohttp_client(router_app)
+
+    body = b'{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+    hdrs = {
+        "Authorization": "Bearer some-junk-token",
+        "Content-Type": "application/json",
+    }
+
+    resp_known = await client.post(
+        "/agent-mcp/mcp/known-proj", data=body, headers=hdrs,
+        allow_redirects=False,
+    )
+    known_body = await resp_known.read()
+    resp_unknown = await client.post(
+        "/agent-mcp/mcp/does-not-exist", data=body, headers=hdrs,
+        allow_redirects=False,
+    )
+    unknown_body = await resp_unknown.read()
+
+    fp_known = _envelope_fingerprint(resp_known, known_body)
+    fp_unknown = _envelope_fingerprint(resp_unknown, unknown_body)
+
+    assert fp_known == fp_unknown, (
+        "401-envelope oracle: a junk bearer to a KNOWN project produced a "
+        f"different 401 envelope than to an UNKNOWN project.\n"
+        f"  known:   {fp_known}\n"
+        f"  unknown: {fp_unknown}"
+    )
+    # The uvicorn fingerprint in particular must be scrubbed.
+    assert fp_known["server"] != "uvicorn", (
+        "backend 'Server: uvicorn' header leaked through the proxy on the "
+        "pre-auth 401 path — fingerprints the ASGI server AND diverges "
+        "from the router's own 401"
+    )
+    # The scrubbed 401 keeps the legitimate auth-challenge UX.
+    assert "Bearer" in (fp_known["www_authenticate"] or ""), (
+        "the normalised 401 must still carry a WWW-Authenticate challenge"
     )
