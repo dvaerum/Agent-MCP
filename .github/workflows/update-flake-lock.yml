@@ -1,0 +1,47 @@
+name: Update flake.lock
+
+# The Nix flake (single input: nixpkgs) is the one dependency ecosystem
+# Dependabot can't cover — nix isn't a Dependabot ecosystem. Yet flake.lock
+# pins the whole system-library closure (openssl, glibc, the Python
+# interpreter) for the shipped systemd module + VM artifact, so a stale lock
+# means unpatched system deps. This is the nix analogue of the Dependabot
+# uv/npm/github-actions entries: a weekly PR that bumps flake.lock, gated by
+# the same CI (incl. the nix-flake-check VM job) as any human bump.
+
+on:
+  schedule:
+    # Weekly, matching the Dependabot cadence. Monday 05:00 UTC keeps it
+    # clear of the Dependabot runs.
+    - cron: "0 5 * * 1"
+  # Allow a manual bump on demand.
+  workflow_dispatch:
+
+# Least-privilege: the action only needs to push the lock update to a branch
+# (contents: write) and open the PR (pull-requests: write). It runs on the
+# trusted `schedule`/`workflow_dispatch` events with no untrusted PR head, so
+# `pull_request_target` (and its checkout-of-fork-code risk) is not involved.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-flake-lock:
+    name: Bump flake.lock
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Update flake.lock
+        uses: DeterminateSystems/update-flake-lock@834c491b2ece4de0bbd00d85214bb5e83b4da5c6 # v28
+        with:
+          pr-title: "chore(deps): bump flake.lock (nixpkgs)"
+          pr-labels: |
+            dependencies
+            nix
+          # Uses the default GITHUB_TOKEN. Note: PRs opened by GITHUB_TOKEN
+          # don't themselves trigger further workflow runs, so CI is
+          # re-triggered by closing/reopening or an empty commit. Kept on the
+          # default token to avoid a stored PAT secret; revisit if the PR
+          # needs CI to auto-run on open.
