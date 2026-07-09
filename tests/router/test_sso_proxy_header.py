@@ -149,3 +149,75 @@ async def test_default_sysadmin_flag_applied_on_jit_create(
     row = identity.get_user_by_username("first-proxy-admin")
     assert row is not None
     assert row["is_sysadmin"] == 1
+
+
+@pytest.mark.no_auth_seed_session
+async def test_repeated_proxy_header_reconciles_to_single_user(
+    aiohttp_client, router_app, sso_proxy_env, register_project,
+):
+    """Two requests carrying the SAME trusted ``Remote-User`` MUST
+    resolve to ONE user row — not a fresh ``alice``/``alice-2``/… per
+    request (which would leak unbounded rows and orphan any grants).
+
+    The proxy path re-runs on every request (no session cookie in
+    proxy mode), so stable reconciliation by the trusted username is
+    the property under test.
+    """
+    register_project("proj-recon")
+    client = await aiohttp_client(router_app)
+
+    async def _probe():
+        return await client.get(
+            "/agent-mcp/api/router/projects",
+            headers={
+                "Remote-User": "carol-from-proxy",
+                "Accept": "application/vnd.agent-mcp.v1+json",
+            },
+        )
+
+    r1 = await _probe()
+    assert r1.status == 200, await r1.text()
+
+    from agent_mcp.router import identity
+    import sqlite3
+    import secrets
+
+    def _proxy_users():
+        with sqlite3.connect(str(identity.get_router_db_path())) as conn:
+            conn.row_factory = sqlite3.Row
+            return [
+                dict(r) for r in conn.execute(
+                    "SELECT * FROM users WHERE username LIKE 'carol-from-proxy%'"
+                )
+            ]
+
+    first = _proxy_users()
+    assert len(first) == 1, first
+    user_id = first[0]["user_id"]
+
+    # Attach a grant; it MUST survive the second request.
+    from agent_mcp.router import group_resolver
+    with sqlite3.connect(str(identity.get_router_db_path())) as conn:
+        gid = secrets.token_hex(8)
+        conn.execute(
+            "INSERT INTO groups (group_id, name, is_sysadmin, created_at) "
+            "VALUES (?, 'proxy-grant', 0, datetime('now'))",
+            (gid,),
+        )
+        conn.execute(
+            "INSERT INTO group_membership "
+            "(group_id, member_user_id, member_group_id, added_at) "
+            "VALUES (?, ?, NULL, datetime('now'))",
+            (gid, user_id),
+        )
+        conn.commit()
+
+    r2 = await _probe()
+    assert r2.status == 200, await r2.text()
+
+    second = _proxy_users()
+    assert len(second) == 1, (
+        f"repeated proxy-header request minted a duplicate user: {second!r}"
+    )
+    assert second[0]["user_id"] == user_id
+    assert gid in group_resolver.resolve_user_groups(user_id)
