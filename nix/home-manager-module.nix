@@ -63,30 +63,19 @@ let
     resolvedPkgs.agentMcpDaemonAgentWrapper cfg.router.port;
 
   # ── Shared systemd hardening (defense-in-depth) ───────────────────
-  # The SAFE subset for user-scope units that need $HOME (~/.config +
-  # ~/.local/share) RW plus loopback + UDS networking. Deliberately
-  # OMITS ProtectHome / ProtectSystem=strict — the router writes its
-  # SQLite DB under XDG_DATA_HOME and reads projects.local.json under
-  # XDG_CONFIG_HOME, so a home-blocking sandbox would crash-loop the
-  # units. Merged into every Service block via `// hardening`.
-  #   - NoNewPrivileges: no setuid/setgid escalation from the unit.
-  #   - RestrictAddressFamilies: only UNIX sockets (backend UDS) + IPv4
-  #     /IPv6 (router loopback + ollama/OIDC egress); blocks AF_PACKET,
-  #     AF_NETLINK, etc.
-  #   - RestrictNamespaces / LockPersonality / ProtectKernelTunables /
-  #     ProtectKernelModules: block namespace creation, personality(2)
-  #     ADDR_NO_RANDOMIZE, /proc/sys + /sys writes, and module (un)load.
-  #   - SystemCallArchitectures=native: drop non-native syscall ABIs
-  #     (a common sandbox-bypass surface).
-  hardening = {
-    NoNewPrivileges = true;
-    RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" ];
-    RestrictNamespaces = true;
-    LockPersonality = true;
-    ProtectKernelTunables = true;
-    ProtectKernelModules = true;
-    SystemCallArchitectures = "native";
-  };
+  # The SAFE sandboxing subset, factored into nix/hardening.nix so the
+  # system-mode module (nix/module.nix) shares the exact same set — see
+  # that file for the per-directive rationale and the list of
+  # deliberately-omitted directives (MemoryDenyWriteExecute /
+  # SystemCallFilter / ProtectSystem=strict) that break CPython + the
+  # sqlite-vec native extension or the $HOME-RW these user-scope units
+  # need. Merged into every Service block via `// hardening`.
+  #
+  # User-scope note: these units write the router SQLite DB under
+  # XDG_DATA_HOME and read projects.local.json under XDG_CONFIG_HOME, so
+  # the shared set stays clear of ProtectHome / ProtectSystem=strict; a
+  # home-blocking sandbox would crash-loop the units.
+  hardening = import ./hardening.nix;
 
   # ── Single-tenant ExecStartPre seed ───────────────────────────────
   # When the module is configured for N=1 (`multiTenant = false` +
