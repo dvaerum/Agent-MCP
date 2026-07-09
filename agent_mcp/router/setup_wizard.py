@@ -32,6 +32,7 @@ from aiohttp import web
 
 from . import identity
 from .login import (
+    _form_str,
     _render,
     _set_session_cookie,
 )
@@ -133,10 +134,10 @@ async def setup_post_handler(request: web.Request) -> web.StreamResponse:
         raise web.HTTPSeeOther(location="/agent-mcp/login")
 
     form = await request.post()
-    username = (form.get("username") or "").strip()
-    password = form.get("password") or ""
-    password_confirm = form.get("password_confirm") or ""
-    email = (form.get("email") or "").strip() or None
+    username = _form_str(form, "username").strip()
+    password = _form_str(form, "password")
+    password_confirm = _form_str(form, "password_confirm")
+    email = _form_str(form, "email").strip() or None
 
     if not username:
         return web.Response(
