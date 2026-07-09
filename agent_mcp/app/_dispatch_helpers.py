@@ -235,15 +235,37 @@ def _build_route_principal(
     * Bearer present, no operator session → ``agent_bearer`` Principal
       sourced from the row in ``agents``.
     * Neither → None (the dispatcher will reject downstream).
+
+    AC-R5-1 (round 5): for the ``operator_session`` shape, use the
+    forwarding caller's REAL HMAC-signed ``project_role`` + ``sysadmin``
+    when :func:`agent_mcp.app.deps.forwarding_route_role` reports them
+    (set by ``require_operator_session``'s forwarding branch for THIS
+    request task). A forwarding VIEWER thus gets a viewer-role Principal
+    whose capability set the tool's own gate denies — closing the latent
+    viewer→operator escalation the hard-coded ``"operator"`` left open.
+    The cookie / operator-tier bearer paths report ``None`` here and keep
+    the historical operator-tier default: those paths are genuinely
+    operator (the cookie mutation admit is authorized as operator
+    upstream; the bearer resolves an operator-tier agent row).
     """
     if operator_session:
+        # Local import: deps.py imports nothing from this module, so a
+        # module-level import is cycle-free — but keeping it local also
+        # sidesteps any app-construction import-ordering surprise.
+        from .deps import forwarding_route_role
+
+        threaded = forwarding_route_role()
+        if threaded is not None:
+            project_role, sysadmin = threaded
+        else:
+            project_role, sysadmin = "operator", False
         return Principal(
             kind="operator_session",
             user_id=operator_user_id,
             agent_id=None,
-            sysadmin=False,
+            sysadmin=sysadmin,
             project_name=None,
-            project_role="operator",
+            project_role=project_role,
             agent_role=None,
             can_wake_loop=False,
             source_token=bearer_token,

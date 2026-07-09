@@ -39,11 +39,12 @@ The dep admits:
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import HTTPException, Request
 
@@ -52,6 +53,51 @@ logger = logging.getLogger(__name__)
 
 
 SESSION_COOKIE_NAME = "agent_mcp_session"
+
+
+#: Threads the forwarding caller's REAL HMAC-signed ``(project_role,
+#: sysadmin)`` from :func:`require_operator_session`'s forwarding branch
+#: to ``_dispatch_helpers._build_route_principal`` — which builds the
+#: Principal for an ``operator_session`` REST dispatch but has no handle
+#: on the Request or the auth dict (the routers only thread the operator
+#: *id* string, ``operator_user_id=caller_identity(auth)``).
+#:
+#: AC-R5-1 (round 5, defence-in-depth): the MCP-wire path
+#: (``main_app._build_principal_from_request``) already stamps the
+#: forwarding operator's REAL signed role onto its Principal, so a
+#: viewer gets viewer caps. The REST path dropped it and hard-coded
+#: ``project_role="operator"``, handing every forwarding caller — viewer
+#: or operator — the full operator bundle for any ``operator_session``
+#: dispatch. Carrying the real role here closes that latent hole: a
+#: forwarding VIEWER is now denied by the tool's own capability gate,
+#: not merely by the router's method-gate.
+#:
+#: Set ONLY on the forwarding-header path. The cookie and operator-tier
+#: bearer paths leave it at ``None`` so ``_build_route_principal`` keeps
+#: its historical ``operator`` / ``sysadmin=False`` default — those
+#: paths are genuinely operator-tier (the cookie path is authorized as
+#: operator by ``_authorize_session_for_project`` before it admits a
+#: mutation; the bearer path resolves an operator-tier agent row).
+#:
+#: Task-local: FastAPI resolves ``require_operator_session`` and calls
+#: the route handler (hence ``_build_route_principal``) in the same
+#: request task, so the value the dep sets is visible to the dispatch
+#: helper and cannot leak across concurrent requests.
+_forwarding_route_role: contextvars.ContextVar[
+    Optional[tuple[Optional[str], bool]]
+] = contextvars.ContextVar("agent_mcp_forwarding_route_role", default=None)
+
+
+def forwarding_route_role() -> Optional[tuple[Optional[str], bool]]:
+    """Return the current forwarding caller's signed ``(project_role,
+    sysadmin)``, or ``None`` when the admitted path was not a forwarding
+    header (cookie / operator-tier bearer / no auth).
+
+    Consumed by ``_dispatch_helpers._build_route_principal`` to stamp the
+    REAL role onto the ``operator_session`` Principal instead of a
+    hard-coded ``"operator"`` — see :data:`_forwarding_route_role`.
+    """
+    return _forwarding_route_role.get()
 
 
 #: HTTP methods that mutate. Kept in lock-step with the router's
@@ -289,6 +335,13 @@ async def require_operator_session(request: Request) -> dict[str, Any]:
     manager-role row in the ``agents`` table. Worker tokens are
     rejected here — see ``tests/test_tokens_endpoint_worker_guard.py``.
     """
+    # Reset the forwarding-role carrier for THIS request up-front: only
+    # the forwarding branch below re-arms it. The cookie / bearer admits
+    # leave it None so ``_build_route_principal`` keeps its operator-tier
+    # default (see :data:`_forwarding_route_role`). Task-local, so this
+    # neither reads nor clobbers a concurrent request's value.
+    _forwarding_route_role.set(None)
+
     # 1. Cookie path — dashboard auth (Wave 1 of prancy-napping-pie).
     session_id = request.cookies.get(SESSION_COOKIE_NAME, "")
     if session_id:
@@ -325,6 +378,23 @@ async def require_operator_session(request: Request) -> dict[str, Any]:
         and getattr(principal, "kind", None) == "forwarding_header"
         and getattr(principal, "user_id", None)
     ):
+        # AC-R5-1 (round 5): carry the operator's REAL signed role (and
+        # sysadmin flag) forward instead of dropping them. The MCP-wire
+        # path already threads these onto its Principal; the REST path
+        # used to discard them, so ``_build_route_principal`` rebuilt an
+        # operator_session Principal with a hard-coded
+        # ``project_role="operator"`` — handing a forwarding VIEWER the
+        # full operator bundle for any ``operator_session`` dispatch.
+        #
+        # We thread the real role via the task-local carrier rather than
+        # the returned dict: the dispatch helper has no Request/auth-dict
+        # handle, and the dict's shape is contract-pinned elsewhere
+        # (``tests/test_sec_r4_operator_identity_race.py`` asserts it
+        # verbatim). The carrier is the single value the dispatch seam
+        # actually consumes.
+        project_role = getattr(principal, "project_role", None)
+        sysadmin = bool(getattr(principal, "sysadmin", False))
+        _forwarding_route_role.set((project_role, sysadmin))
         return {"kind": "forwarding", "operator_id": principal.user_id}
 
     # 3. Authorization-bearer path — admits per-agent manager-role
@@ -378,6 +448,7 @@ def caller_identity(auth: dict[str, Any]) -> str:
 
 __all__ = [
     "caller_identity",
+    "forwarding_route_role",
     "require_operator_session",
     "SESSION_COOKIE_NAME",
 ]
