@@ -260,6 +260,34 @@ def _api_version_required_response() -> web.Response:
     )
 
 
+def unknown_project_response(req: web.Request) -> web.StreamResponse:
+    """The response an ``/api/<project>/`` request gets for a project
+    the router does not serve.
+
+    Single source of truth for the "unknown project" wire shape so the
+    auth middleware can hand back the SAME thing for a project the
+    caller has no membership in — closing the cross-tenant project-
+    existence oracle (round 3, PF-1). Without it, an existing-but-not-a-
+    member project answered a name-reflecting 401 while a nonexistent
+    one answered 404 "unknown project"; that differential let any
+    authenticated user enumerate other tenants' slugs (the class SEC5
+    already closed on ``/mcp``).
+
+    Reproduces ``backend_api_handler``'s own decision ORDER so the two
+    cases stay byte-identical: the Accept-version gate fires first
+    (returns a 406 ``Response``), then the unknown-project 404 (RAISED
+    as ``HTTPNotFound`` exactly the way ``project_orchestrator._ensure``
+    does, so it flows through the same middleware chain and renders
+    identically). Neither body reflects the project name — the 404
+    reason is a fixed phrase.
+    """
+    if req.method != "OPTIONS" and not _accept_includes_strict_api_media(
+        req.headers.get("Accept", "")
+    ):
+        return _api_version_required_response()
+    raise web.HTTPNotFound(reason="unknown project")
+
+
 def _accept_prefers_html(accept_header: str) -> bool:
     """Return True iff Accept lists text/html (or an */* aliased to it).
 

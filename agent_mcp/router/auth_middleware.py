@@ -427,10 +427,36 @@ async def require_operator_session_middleware(
                 )
                 role = None
             if role is None:
-                return _unauth_response(
-                    f"operator {user['username']!r} has no membership in "
-                    f"project {project!r}"
-                )
+                # SEC round 3 (PF-1): a project the operator has no
+                # membership in MUST be indistinguishable from one the
+                # router doesn't serve, or the status+body differential
+                # is a cross-tenant project-existence oracle — the same
+                # class SEC5 closed on ``/mcp``. The old name-reflecting
+                # 401 here (against a 404 "unknown project" for a
+                # nonexistent slug, and a 200 SPA shell on ``/app/``)
+                # let ANY authenticated user brute-force other tenants'
+                # slugs. Hand back EXACTLY what the downstream handler
+                # emits for an unknown project on each surface; no
+                # project-name reflection.
+                if path.startswith("/agent-mcp/app/"):
+                    # ``/app/``: ``dashboard_handler`` serves the static
+                    # SPA shell for ANY segment (existent or not), so a
+                    # nonexistent slug already answers 200. Fall through
+                    # to it — the shell carries no project data (all of
+                    # that is gated behind ``/api/``), so a non-member
+                    # sees the same response as for a bogus slug across
+                    # every method (a POST 405s the GET-only route
+                    # either way). We deliberately skip the user /
+                    # Principal stash below: a non-member gets nothing
+                    # but the public shell.
+                    return await handler(request)
+                # ``/api/``: mirror ``backend_api_handler``'s
+                # unknown-project response (406 Accept-version gate
+                # first — returned; else 404 "unknown project" —
+                # RAISED, so it renders identically to the handler's
+                # own path).
+                from .app import unknown_project_response
+                return unknown_project_response(request)
             method = request.method.upper()
             if method in _MUTATION_METHODS and role != "operator":
                 return web.json_response(

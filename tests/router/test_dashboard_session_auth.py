@@ -165,11 +165,18 @@ async def test_project_scoped_route_requires_membership(
     aiohttp_client, router_app, register_project,
 ) -> None:
     """A user without ``project_membership`` for ``<project>`` cannot
-    hit ``/agent-mcp/api/<project>/...`` — even though the same user
+    reach ``/agent-mcp/api/<project>/...`` — even though the same user
     can hit router-global routes.
 
     The first-operator retroactive-membership rule (PR B) applies
     to the FIRST user only; subsequent users need explicit grants.
+
+    SEC round 3 (PF-1): the denial is now returned as the SAME
+    "unknown project" 404 a nonexistent slug yields — NOT a
+    name-reflecting 401 — so a non-member can't use the status/body
+    differential to enumerate other tenants' project slugs. See
+    ``test_sec_r3_xtenant_oracle`` for the indistinguishability
+    contract.
     """
     register_project("alpha")
     # Seed two operators: alice (who joined first, retroactively a
@@ -185,7 +192,7 @@ async def test_project_scoped_route_requires_membership(
         cookies={"agent_mcp_session": bob_cookie},
         allow_redirects=False,
     )
-    assert resp.status == 401, await resp.text()
+    assert resp.status == 404, await resp.text()
 
 
 @pytest.mark.no_seed_operator
