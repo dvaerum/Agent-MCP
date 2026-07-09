@@ -31,10 +31,10 @@ from starlette.requests import Request
 from .._dispatch_helpers import handle_options
 from ..deps import caller_identity, require_operator_session
 from ...core.config import logger
-from ...core import globals as g
 from ...db.actions.agent_actions_db import log_agent_action_to_db
 from ...db.engine import SessionLocal
 from ...db.models import ProjectContext
+from ...tools.project_context_tools import emit_context_write_wakes
 from ...utils.json_utils import get_sanitized_json_body
 from ...utils.string_utils import (
     UNSAFE_KEY_ERROR,
@@ -143,17 +143,14 @@ async def create_memory_api_route(
         log_agent_action_to_db(cursor, requesting_admin_id, "created_memory", details={"context_key": context_key})
         session.commit()
 
-        # PR-2 event-coord: creating the global toggle key with a
-        # falsy initial value should wake in-flight wait_for_events
-        # so they re-evaluate (same shape as the update path).
-        if context_key == "config_auto_event_loop_global":
-            try:
-                g.wake_all_for_flag_recheck()
-            except Exception as e:  # pragma: no cover - defensive
-                logger.warning(
-                    "wake_all_for_flag_recheck failed after global "
-                    "toggle create: %s", e,
-                )
+        # BL-R14-1: fire the full post-write wake set this key requires.
+        # Global loop toggle → wake_all_for_flag_recheck (PR-2 event
+        # -coord); worker-capability toggle (config_allow_worker_*) →
+        # tools/list_changed so connected workers see the newly granted
+        # tool. The REST surface previously fired only the loop wake, so
+        # a capability grant from the dashboard never pushed
+        # tools/list_changed. Shared with the MCP write surface.
+        await emit_context_write_wakes(context_key)
 
         return JSONResponse({
             "success": True,
@@ -249,17 +246,11 @@ async def update_memory_api_route(
         log_agent_action_to_db(cursor, requesting_admin_id, "updated_memory", details={"context_key": context_key})
         session.commit()
 
-        # PR-2 event-coord: a flip of the global wake-loop toggle must
-        # wake every in-flight wait_for_events so they can re-evaluate
-        # and return `stop_listening` if the new state is OFF.
-        if context_key == "config_auto_event_loop_global":
-            try:
-                g.wake_all_for_flag_recheck()
-            except Exception as e:  # pragma: no cover - defensive
-                logger.warning(
-                    "wake_all_for_flag_recheck failed after global "
-                    "toggle update: %s", e,
-                )
+        # BL-R14-1: fire the full post-write wake set this key requires
+        # (loop toggle → wake_all_for_flag_recheck; worker-capability
+        # toggle → tools/list_changed). Shared with the MCP write
+        # surface so both fire the SAME wakes. See the create handler.
+        await emit_context_write_wakes(context_key)
 
         return JSONResponse({
             "success": True,
