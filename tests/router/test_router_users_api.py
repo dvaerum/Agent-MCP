@@ -148,9 +148,10 @@ async def test_create_user_rejects_duplicate_username(
 async def test_create_user_rejects_short_password(
     aiohttp_client, router_app,
 ) -> None:
-    """Pydantic validates a minimum password length so the
-    argon2 hash isn't computed on trivial inputs. The validation
-    happens at the body model, returning 400 before any DB work."""
+    """A trivially-short password is rejected with the 400
+    validation-error envelope before any DB work. The error shape
+    (``success: false`` + ``error: "validation_error"``) is the
+    contract the dashboard renders."""
     client = await aiohttp_client(router_app)
 
     resp = await client.post(
@@ -160,6 +161,60 @@ async def test_create_user_rejects_short_password(
     )
 
     assert resp.status == 400, f"got {resp.status}: {await resp.text()}"
+    body = await resp.json()
+    assert body.get("success") is False
+    assert body.get("error") == "validation_error"
+
+
+async def test_create_user_rejects_password_below_min_12(
+    aiohttp_client, router_app,
+) -> None:
+    """Round-3 hardening: admin user-create now enforces the CANONICAL
+    min-12 password policy (``identity.validate_password_strength``),
+    not the old inline min-8 validator. An 11-char password — accepted
+    under the old min-8 policy — is now rejected with the same 400
+    weak-password envelope, closing the policy-drift gap where an
+    admin-created user could carry a weaker password than a
+    self-provisioned one."""
+    client = await aiohttp_client(router_app)
+
+    eleven_chars = "abcdefghij1"  # 11 chars: passed min-8, fails min-12
+    assert len(eleven_chars) == 11
+    resp = await client.post(
+        "/agent-mcp/api/router/users",
+        data=json.dumps({
+            "username": "shortpw", "password": eleven_chars,
+        }),
+        headers=_STRICT_ACCEPT,
+    )
+
+    assert resp.status == 400, f"got {resp.status}: {await resp.text()}"
+    body = await resp.json()
+    assert body.get("success") is False
+    assert body.get("error") == "validation_error"
+    assert "12" in body.get("message", "")
+
+
+async def test_create_user_accepts_min_12_password(
+    aiohttp_client, router_app,
+) -> None:
+    """A password at exactly the min-12 boundary is accepted (201)."""
+    client = await aiohttp_client(router_app)
+
+    twelve_chars = "abcdefghij12"  # exactly 12 chars
+    assert len(twelve_chars) == 12
+    resp = await client.post(
+        "/agent-mcp/api/router/users",
+        data=json.dumps({
+            "username": "boundarypw", "password": twelve_chars,
+        }),
+        headers=_STRICT_ACCEPT,
+    )
+
+    assert resp.status == 201, f"got {resp.status}: {await resp.text()}"
+    body = await resp.json()
+    assert body["success"] is True
+    assert body["user"]["username"] == "boundarypw"
 
 
 async def test_create_user_rejects_missing_fields(
