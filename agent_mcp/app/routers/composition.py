@@ -734,11 +734,16 @@ async def update_task_details_api_route(
         requesting_admin_id = caller_identity(auth)
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT notes FROM tasks WHERE task_id = ?", (task_id_to_update,))
+        cursor.execute("SELECT notes, assigned_to FROM tasks WHERE task_id = ?", (task_id_to_update,))
         task_row = cursor.fetchone()
         if not task_row:
             return JSONResponse({"error": "Task not found"}, status_code=404)
         existing_notes_str = task_row["notes"]
+        # BL-R7-1: capture the PRIOR assignee before the UPDATE so a
+        # reassignment can wake the old assignee (task left their queue)
+        # in addition to the new one — see the post-commit publish/notify
+        # block below.
+        prior_assignee = task_row["assigned_to"]
         # PR 7 (Task flip): build the field dict the same way the
         # legacy code built its SET clause, then hand it to
         # task_repo.update_fields(connection=cursor). The repo's
@@ -803,6 +808,64 @@ async def update_task_details_api_route(
                             g.tasks[task_id_to_update][field_key] = []
             else:
                 del g.tasks[task_id_to_update]
+        # BL-R7-1: task_repo.update_fields(connection=cursor) DELIBERATELY
+        # defers the cache-write AND the EventBus publish to the caller
+        # (the connection= path returns a thin dict, no _publish — a
+        # subscriber must never observe an uncommitted / rolled-back row).
+        # Every OTHER mutation path reconciles both after commit: REST
+        # create publishes task.created + wakes the assignee (tasks.py,
+        # round-5 BL-1); MCP update_task_status wakes each touched task's
+        # assignee (task_tools.py). Without this, a dashboard edit that
+        # reassigns / re-statuses a task never wakes an agent blocked in
+        # wait_for_events and never fans resources/updated to /mcp
+        # subscribers. Mirror the create path — publish task.updated and
+        # wake the assignee — on the successful-commit path only.
+        if fields_to_update:
+            # Post-update assignee, cache-first (reconciled above) with a
+            # DB fallback for tasks not held in g.tasks.
+            current_assignee = None
+            if task_id_to_update in g.tasks:
+                current_assignee = g.tasks[task_id_to_update].get("assigned_to")
+            else:
+                cursor.execute(
+                    "SELECT assigned_to FROM tasks WHERE task_id = ?",
+                    (task_id_to_update,),
+                )
+                fresh_row = cursor.fetchone()
+                if fresh_row:
+                    current_assignee = fresh_row["assigned_to"]
+            from ...core.repositories import _event_bus_shim
+            _event_bus_shim.publish(
+                current_assignee or "*",
+                "task.updated",
+                {
+                    "task_id": task_id_to_update,
+                    "fields": list(fields_to_update.keys()),
+                },
+            )
+            # Wake wait_for_events waiters. The current assignee learns
+            # their task changed; on reassignment the prior assignee also
+            # learns the task left their queue. Dedupe to avoid a double
+            # wake when nothing moved.
+            reassigned = "assigned_to" in fields_to_update
+            to_wake: list[str] = []
+            if current_assignee:
+                to_wake.append(current_assignee)
+            if reassigned and prior_assignee and prior_assignee != current_assignee:
+                to_wake.append(prior_assignee)
+            woken: set = set()
+            for aid in to_wake:
+                if not aid or aid in woken:
+                    continue
+                try:
+                    g.notify_agent_inbox(aid)
+                    woken.add(aid)
+                except Exception as notify_exc:  # pragma: no cover - defensive
+                    logger.warning(
+                        "notify_agent_inbox(%s) raised after dashboard "
+                        "task edit: %s",
+                        aid, notify_exc,
+                    )
         return JSONResponse({"success": True, "message": "Task updated successfully via dashboard."})
     except ValueError as e_val:
         return JSONResponse({"error": str(e_val)}, status_code=400)
