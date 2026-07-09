@@ -385,10 +385,12 @@ class AuthHeaderMiddleware(BaseHTTPMiddleware):
        (``X-Agent-MCP-Forwarded-Operator``) if present and the
        per-project HMAC key has been loaded into
        ``g.forwarding_hmac_key``. On success the resolved operator_id
-       is stamped onto ``g.current_operator`` for downstream handlers
-       + audit logs. On a present-but-invalid header (wrong HMAC,
-       expired, malformed) the request is rejected with 401 — we
-       never silently fall through to the bearer-token path.
+       is carried forward on the per-request ``Principal`` (built at
+       step 4) for downstream handlers + audit logs — NOT on a
+       process-wide global (SEC round-4 AC-race). On a
+       present-but-invalid header (wrong HMAC, expired, malformed) the
+       request is rejected with 401 — we never silently fall through to
+       the bearer-token path.
 
     3. Gate ``/mcp`` at the HTTP layer. POST/GET/DELETE on ``/mcp``
        must carry either (a) a per-agent bearer that resolves to an
@@ -416,13 +418,6 @@ class AuthHeaderMiddleware(BaseHTTPMiddleware):
         # introspection (route shape, etc.).
         from . import forwarding_header as _fh
         from ..core import globals as _g
-
-        # Reset request-scoped state. ``current_operator`` is a
-        # process-wide global by storage shape; we treat it as
-        # request-scoped by clearing on entry so a previous request's
-        # operator_id never leaks into a request that authenticates
-        # via a per-agent bearer.
-        _g.current_operator = None
 
         auth = request.headers.get("Authorization", "")
         token = ""
@@ -466,8 +461,14 @@ class AuthHeaderMiddleware(BaseHTTPMiddleware):
                 # operator bundle. The role is HMAC-covered, so a value
                 # that reaches here is one the router legitimately
                 # signed for this operator's project membership.
+                # SEC round-4 (AC-race): the operator identity is carried
+                # forward ONLY via the per-request ``Principal`` built
+                # below (stashed on ``request.state`` + the
+                # ``request_principal`` ContextVar, both copy-per-task and
+                # race-safe). We deliberately do NOT stamp a process-wide
+                # global here — doing so let a second concurrent
+                # forwarding request clobber this one's audit identity.
                 forwarding_operator, forwarding_role = verified
-                _g.current_operator = forwarding_operator
             else:
                 # Key not loaded yet — dormant fallback. The header
                 # is ignored (no operator identity established) but
@@ -644,7 +645,6 @@ def _principal_role() -> str:
         except LookupError:
             bearer = None
         if bearer:
-            from ..core import globals as _g
             agent_id = get_agent_id(bearer)
             if agent_id == "admin":
                 return "admin"
