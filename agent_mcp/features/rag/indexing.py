@@ -367,8 +367,19 @@ async def run_rag_indexing_periodically(
                 "SELECT context_key, value, description, updated_at FROM project_context WHERE updated_at > ?",
                 (last_ctx_time_str,),
             )
+            # Lazy import to avoid the tools/__init__ -> rag import cycle.
+            from ...tools.project_context_tools import is_secret_key
+
             for row in cursor.fetchall():
                 key = row["context_key"]
+                # SECURITY: never embed secret-keyed rows (config_*_token
+                # etc.) into the RAG index — otherwise ask_project_rag
+                # can retrieve and echo the secret to any worker. The
+                # query path also filters at retrieval time (defense
+                # against a stale index), but not embedding them in the
+                # first place is the primary control.
+                if is_secret_key(key):
+                    continue
                 value_str = row["value"]  # Already a JSON string in DB
                 desc = row["description"] or ""
                 last_mod_iso = row["updated_at"]
