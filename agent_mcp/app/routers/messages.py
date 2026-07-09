@@ -216,7 +216,15 @@ async def suggest_subject_api_route(
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-    content = (data.get('content') or "").strip()
+    # PF-R8-1: guard non-string ``content`` BEFORE ``.strip()`` — this
+    # line sits outside the ValueError try above, so a dict/list body
+    # would raise AttributeError and surface as an uncaught 500.
+    raw_content = data.get('content')
+    if raw_content is not None and not isinstance(raw_content, str):
+        return JSONResponse(
+            {"error": "content must be a string"}, status_code=400
+        )
+    content = (raw_content or "").strip()
     if not content:
         return JSONResponse({"subject": None})
 
@@ -271,6 +279,18 @@ async def create_message_api_route(
         explicit_subject = data.get('subject')
         parent_message_id = data.get('parent_message_id')
 
+        # PF-R8-1: reject non-string ``recipient_id`` / ``message_content``
+        # BEFORE the truthiness gate + SQLite bind. A dict/list passes
+        # ``if not x`` (truthy), then a bind raises sqlite ProgrammingError
+        # → an uncaught 500; validate to a 400 up front instead.
+        if recipient_id is not None and not isinstance(recipient_id, str):
+            return JSONResponse(
+                {"error": "recipient_id must be a string"}, status_code=400
+            )
+        if content is not None and not isinstance(content, str):
+            return JSONResponse(
+                {"error": "message_content must be a string"}, status_code=400
+            )
         if not recipient_id:
             return JSONResponse(
                 {"error": "recipient_id is required"}, status_code=400
@@ -395,6 +415,24 @@ async def create_message_api_route(
             details={"message_id": message_id, "recipient": recipient_id},
         )
         conn.commit()
+
+        # BL-R8-1: message_repo.send(connection=cursor) DELIBERATELY
+        # suppresses its own ``message.created`` publish while the caller
+        # cursor is open (a subscriber must never observe an uncommitted
+        # row). Every other send path re-fires the wake post-commit — the
+        # MCP send_agent_message tool calls g.notify_agent_inbox(), the
+        # broadcast branch above publishes via bulk_send. Mirror that here
+        # so a recipient blocked in wait_for_events is woken for a
+        # dashboard-composed direct message. Defensive: the row is already
+        # committed, so a failed wake must not fail the request.
+        try:
+            from ...core import globals as _g
+            _g.notify_agent_inbox(recipient_id)
+        except Exception as notify_exc:  # pragma: no cover - defensive
+            logger.warning(
+                "notify_agent_inbox(%s) raised after dashboard message "
+                "send: %s", recipient_id, notify_exc,
+            )
 
         return JSONResponse({
             "success": True,
