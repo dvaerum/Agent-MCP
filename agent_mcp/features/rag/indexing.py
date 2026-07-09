@@ -6,6 +6,7 @@ import json
 import hashlib
 import glob
 import os
+import re
 import sqlite3
 from pathlib import Path
 from typing import List, Dict, Tuple, Any, Optional, NoReturn
@@ -70,6 +71,54 @@ IGNORE_DIRS_FOR_INDEXING = [
     ".ipynb_checkpoints",
     ".agent",  # Also ignore the .agent directory itself
 ]
+
+# ── Embedded-secret value scanner (round-2 secret-redaction fix) ─────
+# is_secret_key() gates by KEY, but a credential can also be pasted into
+# the VALUE / DESCRIPTION of a non-secret-named context row (e.g. a
+# token in a ``deploy_notes`` value). Embedding such a chunk would let
+# ask_project_rag echo it to any worker. These patterns catch the
+# well-known token shapes plus long high-entropy runs; scanning is
+# scoped to the ``context`` source only (markdown/code legitimately
+# contain long tokens like commit hashes).
+_EMBEDDED_SECRET_PATTERNS = (
+    re.compile(r"sk-[A-Za-z0-9_-]{16,}"),                 # OpenAI-style key
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),           # GitHub PAT / OAuth
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),         # GitHub fine-grained PAT
+    re.compile(r"AKIA[0-9A-Z]{16}"),                     # AWS access key id
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),         # Slack token
+    re.compile(                                          # JWT (header.payload.sig)
+        r"eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}"
+    ),
+)
+# A long run of credential-ish characters. Applied with an entropy
+# guard (must mix letters + digits) so prose / long words don't trip it.
+_HIGH_ENTROPY_RE = re.compile(r"[A-Za-z0-9+/=_-]{40,}")
+
+
+def _value_has_embedded_secret(*texts: Optional[str]) -> bool:
+    """Best-effort scan of a project_context value/description for an
+    embedded credential (belt-and-suspenders alongside is_secret_key,
+    which only inspects the KEY). Returns True if any text matches a
+    well-known token prefix or a long high-entropy token."""
+    for text in texts:
+        if not text:
+            continue
+        for pat in _EMBEDDED_SECRET_PATTERNS:
+            if pat.search(text):
+                return True
+        for token in _HIGH_ENTROPY_RE.findall(text):
+            if any(c.isdigit() for c in token) and any(
+                c.isalpha() for c in token
+            ):
+                return True
+    return False
+
+
+# rag_meta flag marking that the one-time context-secret purge has run.
+# Bump the suffix if the secret policy ever broadens again and a fresh
+# eviction of pre-existing context vectors is required.
+_CTX_SECRET_PURGE_META_KEY = "security_context_secret_purge_v1"
+
 
 # Increased concurrency for Tier 3 pricing (5000 RPM)
 # Original main.py: 654
@@ -234,6 +283,75 @@ async def run_rag_indexing_periodically(
                 k: v for k, v in rag_meta_data.items() if k.startswith("hash_")
             }
 
+            # ── One-time security purge (round-2 secret-redaction fix) ──
+            # Vectors embedded before the broadened is_secret_key /
+            # value-scanner landed may hold a secret that the OLD
+            # (narrower) policy didn't skip. Evict ALL `context` chunks +
+            # embeddings once, clear their hashes, and reset the context
+            # watermark so the scan below re-embeds every row through the
+            # new filters. Gated on a rag_meta flag so it runs exactly
+            # once per project. Only `context` is purged — markdown/code/
+            # task vectors never carried project_context secrets.
+            if _CTX_SECRET_PURGE_META_KEY not in rag_meta_data:
+                try:
+                    if _embeddings_table_exists(cursor):
+                        cursor.execute(
+                            "DELETE FROM rag_embeddings WHERE rowid IN ("
+                            "  SELECT chunk_id FROM rag_chunks "
+                            "  WHERE source_type = 'context')"
+                        )
+                    cursor.execute(
+                        "DELETE FROM rag_chunks WHERE source_type = 'context'"
+                    )
+                    purged = cursor.rowcount or 0
+                    cursor.execute(
+                        "DELETE FROM rag_meta WHERE meta_key LIKE 'hash_context_%'"
+                    )
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO rag_meta (meta_key, meta_value) "
+                        "VALUES (?, ?)",
+                        ("last_indexed_context", "1970-01-01T00:00:00Z"),
+                    )
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO rag_meta (meta_key, meta_value) "
+                        "VALUES (?, ?)",
+                        (
+                            _CTX_SECRET_PURGE_META_KEY,
+                            datetime.datetime.now().isoformat(),
+                        ),
+                    )
+                    conn.commit()
+                    logger.warning(
+                        "Security: one-time RAG context purge evicted %d "
+                        "pre-fix context chunk(s); re-indexing through the "
+                        "broadened secret filter.",
+                        purged,
+                    )
+                    # Refresh in-memory copies so the rest of this cycle
+                    # sees the reset watermark + cleared hashes.
+                    rag_meta_data = rag_repo.get_all_meta()
+                    last_indexed_timestamps = {
+                        k: v
+                        for k, v in rag_meta_data.items()
+                        if k.startswith("last_indexed_")
+                    }
+                    stored_hashes = {
+                        k: v
+                        for k, v in rag_meta_data.items()
+                        if k.startswith("hash_")
+                    }
+                except sqlite3.Error as e_purge:
+                    logger.error(
+                        "Security context purge failed (will retry next "
+                        "cycle): %s",
+                        e_purge,
+                        exc_info=True,
+                    )
+                    try:
+                        conn.rollback()
+                    except sqlite3.Error:
+                        pass
+
             current_project_dir = get_project_dir()  # From config (main.py:537)
             sources_to_check: List[Tuple[str, str, str, Any, str]] = (
                 []
@@ -382,6 +500,18 @@ async def run_rag_indexing_periodically(
                     continue
                 value_str = row["value"]  # Already a JSON string in DB
                 desc = row["description"] or ""
+                # Belt-and-suspenders: a credential can live in the VALUE
+                # / DESCRIPTION of a non-secret-named key. Skip embedding
+                # it so ask_project_rag can't echo it (see
+                # _value_has_embedded_secret).
+                if _value_has_embedded_secret(value_str, desc):
+                    logger.warning(
+                        "Skipping RAG embedding for context key '%s': "
+                        "value/description matched an embedded-secret "
+                        "pattern.",
+                        key,
+                    )
+                    continue
                 last_mod_iso = row["updated_at"]
                 # Content for hashing and embedding (main.py:593-595)
                 content_for_embedding = (

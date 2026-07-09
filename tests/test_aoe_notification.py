@@ -388,11 +388,11 @@ async def test_bearer_token_is_redacted_for_workers(tmp_path) -> None:
     """config_aoe_bearer_token must match the secret-key redaction regex so
     workers cannot read it via view_project_context.
     """
-    from agent_mcp.tools.project_context_tools import _SECRET_KEY_RE
+    from agent_mcp.tools.project_context_tools import is_secret_key
 
-    assert _SECRET_KEY_RE.search("config_aoe_bearer_token"), (
+    assert is_secret_key("config_aoe_bearer_token"), (
         "config_aoe_bearer_token must match the secret-key filter "
-        "(see project_context_tools._SECRET_KEY_RE)"
+        "(see project_context_tools.is_secret_key)"
     )
 
     async with mcp_session(tmp_path) as admin:

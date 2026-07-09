@@ -231,7 +231,19 @@ async def node_details_api_route(
             cursor.execute("SELECT * FROM project_context WHERE context_key = ?", (actual_id_from_node,))
             row = cursor.fetchone()
             if row:
-                details['data'] = dict(row)
+                data = dict(row)
+                # SECURITY (round-2): the router admits viewer-tier
+                # operators on GET and the backend can't verify a
+                # cookie/forwarding caller's tier, so redact secret-keyed
+                # VALUES unless the caller is CONFIRMED operator tier.
+                # Previously ``dict(row)`` shipped ``config_*_token`` /
+                # ``*_secret`` values verbatim to any viewer.
+                if (
+                    not is_confirmed_operator_tier(auth)
+                    and is_secret_key(data.get('context_key'))
+                ):
+                    data['value'] = _REDACTED_VALUE
+                details['data'] = data
             cursor.execute("SELECT timestamp, agent_id, action_type FROM agent_actions WHERE (action_type = 'updated_context' OR action_type = 'update_project_context') AND details LIKE ? ORDER BY timestamp DESC LIMIT 5", (f'%"{actual_id_from_node}"%',))
             details['actions'] = [dict(r) for r in cursor.fetchall()]
         elif node_type_from_id == 'file':
@@ -419,10 +431,22 @@ async def all_data_api_route(
                 .limit(section_limit)
                 .all()
             )
+            # SECURITY (round-2): redact secret-keyed VALUES for callers
+            # that are not CONFIRMED operator tier. ``expose_tokens`` is
+            # the same confirmed-operator gate used for agent bearers
+            # above; the router admits viewer-tier operators on GET and
+            # the backend can't verify a cookie/forwarding caller's tier,
+            # so those paths get the redacted view. Mirrors
+            # ``/api/context-data``. Without this, a viewer harvested raw
+            # ``config_*`` / ``*_token`` values straight from all-data.
             context_data = [
                 {
                     "context_key": r.context_key,
-                    "value": r.value,
+                    "value": (
+                        r.value
+                        if expose_tokens or not is_secret_key(r.context_key)
+                        else _REDACTED_VALUE
+                    ),
                     "updated_at": r.updated_at,
                     "updated_by": r.updated_by,
                     "created_at": r.created_at,
