@@ -275,7 +275,11 @@ def expire_stale(threshold_seconds: int = 300) -> List[str]:
             )
             session.commit()
     for sid in expired:
+        # Drop the runtime queue + cached Principal, mirroring
+        # unregister_session / detach_runtime_queue — otherwise a
+        # stale-reaped session's Principal lingers forever (AC-R5-2).
         _runtime_queues.pop(sid, None)
+        _runtime_principals.pop(sid, None)
     return expired
 
 
