@@ -792,8 +792,16 @@ async def _assign_to_existing_tasks(
     task_ids: List[str],
     validate_agent_workload: bool,
     coordination_notes: str,
+    requesting_actor: str = "admin",
 ) -> ToolResult:
-    """Mode 3: Assign agent to existing unassigned tasks"""
+    """Mode 3: Assign agent to existing unassigned tasks.
+
+    ``requesting_actor`` is the real principal actor label (the worker
+    for a self-claim, the operator/admin when they assign on a
+    worker's behalf) — used for audit attribution instead of a
+    hardcoded ``"admin"`` so the trail reflects who actually claimed
+    the work (OBS-R17-AZ, same provenance family as the Mode-0 fix).
+    """
     conn = None
     try:
         conn = get_db_connection()
@@ -868,7 +876,7 @@ async def _assign_to_existing_tasks(
             )
             log_agent_action_to_db(
                 cursor,
-                "admin",
+                requesting_actor,
                 "assigned_task",
                 task_id=task_id,
                 details={
@@ -1264,12 +1272,22 @@ async def assign_task_tool_impl(
 
     # Route to appropriate handler based on operation mode
     if operation_mode == "existing":
+        # OBS-R17-AZ: thread the real principal actor into the Mode-3
+        # audit trail. Mirrors the actor idiom used elsewhere in this
+        # file (``agent_id or user_id or "admin"``): the worker's id on
+        # a self-claim, ``"admin"`` for the operator/admin caller.
+        requesting_actor = (
+            (principal.agent_id or principal.user_id or "admin")
+            if principal is not None
+            else "admin"
+        )
         return await _assign_to_existing_tasks(
             arguments,
             target_agent_id,
             task_ids,
             validate_agent_workload,
             coordination_notes,
+            requesting_actor,
         )
     elif operation_mode == "multiple":
         return await _create_and_assign_multiple_tasks(
@@ -3048,16 +3066,20 @@ async def request_assistance_tool_impl(
     # Verify ownership or admin (main.py:1688-1691) — the per-task
     # ownership gate now sources is_admin_request from the principal
     # block above; assignee can always request, admins/managers always.
+    #
+    # AZ-R17-1: on the ownership-deny branch return the SAME phantom
+    # NotFound a nonexistent task returns (identical variant + text),
+    # not a PermissionDenied. A distinct 403-vs-404 split leaked a
+    # task-existence oracle — a worker could probe arbitrary task_ids
+    # and read "exists but not yours" (403) vs "doesn't exist" (404),
+    # enumerating foreign tasks project-wide. This is the last sibling
+    # of the uniform-not-found class already closed in
+    # _update_single_task / bulk_task_operations / add_task_note.
     if (
         parent_task_current_data.get("assigned_to") != requesting_agent_id
         and not is_admin_request
     ):
-        return PermissionDenied(
-            reason=(
-                "You can only request assistance for tasks assigned to "
-                "you, or use an admin token."
-            )
-        )
+        return NotFound(resource="task", identifier=parent_task_id)
 
     try:
         # Create child assistance task (main.py:1694-1696)
