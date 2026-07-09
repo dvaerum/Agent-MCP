@@ -48,10 +48,14 @@ own default fires and wins over it.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Awaitable, Callable
 
 from aiohttp import web
+
+
+logger = logging.getLogger(__name__)
 
 
 # Pragmatic-but-protective default. See module docstring for why
@@ -151,12 +155,35 @@ async def security_headers_middleware(
     aiohttp raises ``HTTPException`` for redirects (login 303s) and
     error responses; those ARE the response object, so we catch, stamp
     the headers, and re-raise to cover the full surface.
+
+    An UNhandled exception (a bare ``ValueError`` from malformed
+    multipart, a ``TypeError`` in a handler, …) is NOT an
+    ``HTTPException``, so it would otherwise propagate past this
+    outermost middleware to aiohttp's core 500 renderer — which never
+    runs ``_apply_headers`` (SD-R5-1). That path leaked aiohttp's
+    version-disclosing ``Server`` banner and dropped every hardened
+    header. We catch it here, log the real exception server-side, and
+    return a generic 500 stamped with the full header set — keeping the
+    exception detail off the wire.
     """
     try:
         response = await handler(request)
     except web.HTTPException as exc:
         _apply_headers(exc, request)
         raise
+    except Exception:
+        # Log the real cause server-side (with traceback) but NEVER put
+        # it in the response body — a generic message keeps internals
+        # (and any secret in the exception text) off the wire.
+        logger.error(
+            "Unhandled exception in %s %s; returning generic 500",
+            request.method,
+            request.rel_url,
+            exc_info=True,
+        )
+        response = web.Response(status=500, text="Internal Server Error")
+        _apply_headers(response, request)
+        return response
     _apply_headers(response, request)
     return response
 
