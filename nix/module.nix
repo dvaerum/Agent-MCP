@@ -225,6 +225,13 @@ in {
           # ``--forwarding-hmac-in`` flag points at. Preserving the
           # runtime dir across restarts keeps the file alive between
           # stop/start cycles.
+          #
+          # SC-3: the flip side of preservation is that systemd will NOT
+          # wipe ``/run/agent-mcp/%i/`` when a project is deleted (only on
+          # reboot, since it's tmpfs). The router's ``delete_project_handler``
+          # (agent_mcp/router/admin_api.py) owns that cleanup — it rmtree's
+          # ``$AGENT_MCP_SOCK_DIR/<name>/`` after stopping the unit so the
+          # ``forwarding_hmac`` key doesn't linger for a now-gone project.
           RuntimeDirectoryPreserve = "yes";
           Environment = [
             "AGENT_MCP_PROJECTS_FILE=${cfg.stateDir}/projects.local.json"
