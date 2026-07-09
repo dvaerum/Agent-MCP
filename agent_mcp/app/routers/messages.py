@@ -95,6 +95,10 @@ async def list_messages_api_route(
             return JSONResponse(
                 {"error": "limit must be 1..500"}, status_code=400
             )
+        # PF-R14-1: a negative offset is a harmless sqlite no-op today,
+        # but clamp to a 0 floor for defense-in-depth (unbounded-below
+        # pagination has no legitimate use).
+        offset = max(0, offset)
 
         # PR 6: route through MessageRepository.query / count_query.
         # The repo owns the WHERE-building loop today — one entry
@@ -120,7 +124,13 @@ async def list_messages_api_route(
 
         return JSONResponse({"messages": rows, "total": total,
                              "limit": limit, "offset": offset})
-    except ValueError as e:
+    except (TypeError, ValueError) as e:
+        # PF-R14-1: ``int(data.get('limit'/'offset'))`` raises TypeError
+        # (not ValueError) when the caller sends a list/dict value, e.g.
+        # ``{"limit": [1, 2]}``. A bare ``except ValueError`` let that
+        # fall through to the generic 500; catch both so a non-numeric
+        # limit/offset returns a clean 400 like the non-numeric-string
+        # case (``int("abc")`` → ValueError) already did.
         return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:
         logger.error(f"Error listing messages: {e}", exc_info=True)
