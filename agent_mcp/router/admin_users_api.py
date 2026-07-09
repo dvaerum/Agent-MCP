@@ -58,7 +58,7 @@ import re
 import secrets
 import sqlite3
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterable
 
 from aiohttp import web
 
@@ -384,20 +384,20 @@ def _forbid_sysadmin_membership(req: web.Request) -> web.Response:
     )
 
 
-def _group_is_transitively_sysadmin(
+def _group_and_ancestors(
     conn: sqlite3.Connection, group_id: str,
-) -> bool:
-    """True iff a member of ``group_id`` would inherit sysadmin.
+) -> set[str]:
+    """Return ``group_id`` plus every ancestor group (walking UPWARD).
 
-    A user gains sysadmin (per ``group_resolver.resolve_user_is_sysadmin``)
-    when any group in their transitive membership carries ``is_sysadmin=1``.
-    ``resolve_user_groups`` walks UPWARD — a user's groups plus every
-    ancestor group. So a new member of ``group_id`` inherits sysadmin iff
-    ``group_id`` itself OR any of its ancestor groups is sysadmin-flagged.
-
-    Walks the ancestor set here (rather than in ``group_resolver`` — a
-    read-only reference for this fix) so the whole check runs on the
-    caller's ``BEGIN IMMEDIATE`` connection and sees a consistent snapshot.
+    ``group_resolver.resolve_user_groups`` resolves a user's groups by
+    walking UP over ``group_membership.member_group_id`` — a user's
+    direct groups plus every ancestor. So a new member of ``group_id``
+    inherits everything attached to ``group_id`` itself OR any of its
+    ancestor groups (both the ``is_sysadmin`` flag and capability
+    grants). This BFS mirrors that upward walk on the caller's
+    ``BEGIN IMMEDIATE`` connection so the check sees a consistent
+    snapshot (rather than reaching into ``group_resolver``, which opens
+    its own connection).
     """
     visited: set[str] = {group_id}
     frontier: list[str] = [group_id]
@@ -415,13 +415,101 @@ def _group_is_transitively_sysadmin(
                 visited.add(gid)
                 next_frontier.append(gid)
         frontier = next_frontier
-    placeholders = ",".join("?" for _ in visited)
+    return visited
+
+
+def _group_is_transitively_sysadmin(
+    conn: sqlite3.Connection, group_id: str,
+) -> bool:
+    """True iff a member of ``group_id`` would inherit sysadmin.
+
+    A user gains sysadmin (per ``group_resolver.resolve_user_is_sysadmin``)
+    when any group in their transitive membership carries ``is_sysadmin=1``.
+    So a new member of ``group_id`` inherits sysadmin iff ``group_id``
+    itself OR any of its ancestor groups is sysadmin-flagged.
+    """
+    ancestors = _group_and_ancestors(conn, group_id)
+    placeholders = ",".join("?" for _ in ancestors)
     hit = conn.execute(
         f"SELECT 1 FROM groups WHERE is_sysadmin = 1 "
         f"AND group_id IN ({placeholders}) LIMIT 1",
-        tuple(visited),
+        tuple(ancestors),
     ).fetchone()
     return hit is not None
+
+
+def _group_resolved_capabilities(
+    conn: sqlite3.Connection, group_id: str,
+) -> frozenset[str]:
+    """Every capability a new member of ``group_id`` would inherit.
+
+    The union of ``group_capability`` grants across ``group_id`` and its
+    ancestor groups — mirrors the group-cap overlay in
+    ``core.capabilities.resolve_capabilities`` (which unions caps over
+    ``resolve_user_groups``' upward closure). Read on the caller's
+    ``BEGIN IMMEDIATE`` connection for a consistent snapshot. Defensive
+    against a pre-migration DB without the ``group_capability`` table
+    (mirrors ``resolve_capabilities``' swallow-and-degrade posture).
+    """
+    ancestors = _group_and_ancestors(conn, group_id)
+    placeholders = ",".join("?" for _ in ancestors)
+    try:
+        rows = conn.execute(
+            f"SELECT DISTINCT capability FROM group_capability "
+            f"WHERE group_id IN ({placeholders})",
+            tuple(ancestors),
+        ).fetchall()
+    except sqlite3.OperationalError:  # table absent on a pre-0004 DB
+        return frozenset()
+    return frozenset(row[0] for row in rows)
+
+
+def _caps_caller_lacks(
+    req: web.Request, caps: Iterable[str],
+) -> list[str]:
+    """The subset of ``caps`` a NON-sysadmin caller does not hold.
+
+    The single privilege-amplification guard shared by the cap-grant
+    path (AZ-1: ``replace_group_capabilities_handler``) and the
+    group-join path (AZ-2: ``add_group_member_handler``). Both routes
+    admit callers by a ``system.*.manage`` cap alone, but that cap must
+    only let a delegate ADMINISTER authority they already hold — never
+    MINT authority beyond it and confer it on themselves (a group they
+    control, or their own group's cap set).
+
+    A sysadmin may grant / confer anything, so returns ``[]`` for them.
+    For a non-sysadmin, a cap is a violation unless the caller already
+    carries it (:meth:`Principal.has_capability`). Fail closed when no
+    Principal is on the request — treat every cap as un-held.
+    """
+    if _caller_is_sysadmin(req):
+        return []
+    principal = req.get("principal")
+    if principal is None:
+        return sorted(caps)
+    return sorted(c for c in caps if not principal.has_capability(c))
+
+
+def _forbid_cap_amplification(
+    req: web.Request, offending: list[str],
+) -> web.Response:
+    """403 envelope for a non-sysadmin attempting to grant / confer caps
+    they do not themselves hold (privilege amplification).
+
+    Mirrors ``_forbid_sysadmin_write`` / ``_forbid_sysadmin_membership``:
+    ``error="forbidden"``, 403, operator named for the audit trail.
+    """
+    user = req.get("user") or {}
+    username = user.get("username", "<unknown>")
+    return _error(
+        error="forbidden",
+        message=(
+            f"operator {username!r} may not grant capabilities they do "
+            f"not themselves hold: "
+            f"{', '.join(repr(c) for c in offending)}"
+        ),
+        status=403,
+    )
 
 
 def _connect() -> sqlite3.Connection:
@@ -977,6 +1065,21 @@ async def add_group_member_handler(req: web.Request) -> web.Response:
             ):
                 conn.execute("ROLLBACK")
                 return _forbid_sysadmin_membership(req)
+            # SEC round-4 (AZ-2) — same amplification class as AZ-1. The
+            # sysadmin-FLAG join is blocked above, but a group carrying
+            # elevated ``system.*`` capabilities confers them to a new
+            # member just the same (an independent amplification path). A
+            # non-sysadmin delegate must not add a member (themselves or a
+            # group they control) into a group whose RESOLVED caps exceed
+            # what the delegate already holds.
+            if not _caller_is_sysadmin(req):
+                inherited = _group_resolved_capabilities(
+                    conn, parent_group_id,
+                )
+                lacked = _caps_caller_lacks(req, inherited)
+                if lacked:
+                    conn.execute("ROLLBACK")
+                    return _forbid_cap_amplification(req, lacked)
             if member_group_id is not None and _gr._would_create_cycle(
                 conn, parent_group_id, member_group_id,
             ):
@@ -1389,6 +1492,17 @@ async def replace_group_capabilities_handler(
             status=400,
             extra={"unknown": unknown},
         )
+
+    # SEC round-4 (AZ-1) — capability-grant privilege amplification
+    # (confused deputy). The route admits any caller holding
+    # ``system.groups.capabilities.manage``, but that management cap
+    # alone must NOT let a non-sysadmin grant their own group the
+    # sysadmin-equivalent ``system.*`` management caps and self-amplify.
+    # A non-sysadmin may only grant caps they already hold; a sysadmin
+    # may grant anything in KNOWN_CAPABILITIES (validated above).
+    lacked = _caps_caller_lacks(req, ordered)
+    if lacked:
+        return _forbid_cap_amplification(req, lacked)
 
     from ..repositories import group_capability_repository as _gcap
 
