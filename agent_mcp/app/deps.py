@@ -303,17 +303,29 @@ async def require_operator_session(request: Request) -> dict[str, Any]:
             return {"kind": "session", "user": user}
 
     # 2. Forwarding-header path — retire-system-token Wave 1. The
-    #    ``AuthHeaderMiddleware`` already verified the header and
-    #    stamped ``g.current_operator``; we read that here rather
-    #    than re-verifying so a single source of truth on
-    #    verification semantics + key handling holds. If middleware
-    #    rejected the header (tamper / expired / wrong key) the
-    #    request never reached this dep — the 401 was returned
-    #    upstream.
-    from ..core import globals as _g
-
-    if _g.current_operator:
-        return {"kind": "forwarding", "operator_id": _g.current_operator}
+    #    ``AuthHeaderMiddleware`` already verified the header and built
+    #    the per-request ``Principal`` (``kind == "forwarding_header"``,
+    #    ``user_id`` = the operator id the router signed). We read the
+    #    operator identity off THAT principal rather than re-verifying,
+    #    so a single source of truth on verification semantics + key
+    #    handling holds. If middleware rejected the header (tamper /
+    #    expired / wrong key) the request never reached this dep — the
+    #    401 was returned upstream.
+    #
+    #    SEC round-4 (AC-race): the operator id is sourced from
+    #    ``request.state.principal`` — which is built once per request
+    #    and is copy-per-task race-safe — NOT from a process-wide
+    #    global. The former ``g.current_operator`` global was written
+    #    before ``await call_next`` and read here after it, so a second
+    #    concurrent forwarding request could overwrite it and get this
+    #    request's action audit-logged under the wrong operator.
+    principal = getattr(request.state, "principal", None)
+    if (
+        principal is not None
+        and getattr(principal, "kind", None) == "forwarding_header"
+        and getattr(principal, "user_id", None)
+    ):
+        return {"kind": "forwarding", "operator_id": principal.user_id}
 
     # 3. Authorization-bearer path — admits per-agent manager-role
     #    (or legacy admin-role) tokens. Worker tokens fall through.

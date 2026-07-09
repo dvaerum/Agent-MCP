@@ -59,15 +59,23 @@ active_agents: Dict[str, Dict[str, Any]] = {}
 # This keeps spawned agents working while the router catches up.
 forwarding_hmac_key: Optional[bytes] = None
 
-# Request-scoped operator identity, stamped by ``AuthHeaderMiddleware``
-# when a request authenticated via the forwarding-header path. Read by
-# downstream handlers (audit logs, operator-attributed mutations) that
-# want to know "which operator did this".
+# DEPRECATED / diagnostic-only — do NOT use as request identity.
 #
-# Reset to ``None`` on every request entry — the middleware writes the
-# operator_id parsed from the verified header, or leaves it ``None``
-# when the request authenticated via a per-agent bearer (in which
-# case ``get_agent_id(token)`` is the authoritative caller identity).
+# This was the forwarding-header operator id, stamped by
+# ``AuthHeaderMiddleware`` before ``await call_next`` and read by
+# ``require_operator_session`` after it to build the audit ``user_id``.
+# SEC round-4 (AC-race) retired that use: a process-wide global written
+# before an await and read after it lets two concurrent forwarding
+# requests (two dashboard operators on the same per-project backend)
+# interleave, so one operator's action gets audit-logged under the
+# other's id. Request identity now flows exclusively through the
+# per-request ``Principal`` (``request.state.principal`` +
+# ``tools.registry.request_principal`` ContextVar), which is
+# copy-per-task and race-safe.
+#
+# The name is retained (unwritten, unread by the request path) only so
+# the ``agent_mcp.core.globals`` compatibility shim's explicit re-export
+# list keeps resolving. Slated for removal alongside that shim.
 current_operator: Optional[str] = None
 
 # Task ID -> Task data (in-memory cache of tasks).
