@@ -22,9 +22,16 @@ from tests.harness import mcp_session
 pytestmark = pytest.mark.asyncio
 
 
-def _insert_task(task_id: str, *, title: str = "T") -> None:
+def _insert_task(
+    task_id: str, *, title: str = "T", assigned_to: str | None = None,
+) -> None:
     """Insert a task row via raw SQL (mirrors the helper in
-    test_sqlalchemy_task.py)."""
+    test_sqlalchemy_task.py).
+
+    SEC Wave-B: ``add_task_note`` gates note authorship on task
+    ownership; tests that have a worker author a note pass
+    ``assigned_to=<worker_agent_id>`` so the worker owns the task.
+    """
     import json as _json
 
     from agent_mcp.db.connection import get_db_connection
@@ -38,8 +45,8 @@ def _insert_task(task_id: str, *, title: str = "T") -> None:
             "parent_task, child_tasks, depends_on_tasks, notes) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
             (
-                task_id, title, "", None, "admin", "pending", "medium",
-                now, now,
+                task_id, title, "", assigned_to, "admin", "pending",
+                "medium", now, now,
                 _json.dumps([]),
                 _json.dumps([]),
                 _json.dumps([]),
@@ -280,7 +287,7 @@ async def test_edit_task_note_tool_admin_edits_worker_note(
     from agent_mcp.db.actions import task_notes_db
 
     async with mcp_session(tmp_path) as admin:
-        _insert_task("tool-task-2")
+        _insert_task("tool-task-2", assigned_to="alice")
         alice = await admin.create_worker("alice")
         # Alice authors a note.
         await alice.assert_tool_succeeds(
@@ -304,7 +311,7 @@ async def test_delete_task_note_tool_non_author_blocked(tmp_path) -> None:
     from agent_mcp.db.actions import task_notes_db
 
     async with mcp_session(tmp_path) as admin:
-        _insert_task("tool-task-3")
+        _insert_task("tool-task-3", assigned_to="alice")
         alice = await admin.create_worker("alice")
         bob = await admin.create_worker("bob")
         await alice.assert_tool_succeeds(

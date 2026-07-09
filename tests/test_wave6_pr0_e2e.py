@@ -40,7 +40,7 @@ from tests.harness import mcp_session, with_principal
 pytestmark = pytest.mark.asyncio
 
 
-def _insert_task(task_id: str) -> None:
+def _insert_task(task_id: str, *, assigned_to: str | None = None) -> None:
     """Seed a task row so add_note's FK is satisfied.
 
     Mirrors the helper in ``tests/test_sqlalchemy_task_note.py`` —
@@ -48,6 +48,9 @@ def _insert_task(task_id: str) -> None:
     a note has to seed the parent first. Kept inline rather than
     imported so this file is self-contained when other tests
     reference it.
+
+    SEC Wave-B: ``add_task_note`` gates authorship on task ownership;
+    a worker authoring a note passes ``assigned_to=<worker_agent_id>``.
     """
     from agent_mcp.db.connection import get_db_connection
 
@@ -59,8 +62,8 @@ def _insert_task(task_id: str) -> None:
             "INSERT OR IGNORE INTO tasks "
             "(task_id, title, description, status, created_at, updated_at, "
             "priority, parent_task, child_tasks, depends_on_tasks, notes, "
-            "created_by) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "created_by, assigned_to) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 "demo task",
@@ -74,6 +77,7 @@ def _insert_task(task_id: str) -> None:
                 "[]",
                 "[]",
                 "admin",
+                assigned_to,
             ),
         )
         conn.commit()
@@ -204,7 +208,7 @@ async def test_add_task_note_worker_bearer_admits_as_agent(tmp_path) -> None:
     ``request_auth_token``.
     """
     async with mcp_session(tmp_path) as admin:
-        _insert_task("wave6-demo-worker-1")
+        _insert_task("wave6-demo-worker-1", assigned_to="alice")
         alice = await admin.create_worker("alice")
         result = await alice.assert_tool_succeeds(
             "add_task_note",
