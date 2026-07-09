@@ -158,31 +158,32 @@ async def test_all_data_attaches_auth_token_to_every_known_agent(
 # ---------------------------------------------------------------------------
 
 
-async def test_get_agent_messages_marks_all_received_unread(tmp_path) -> None:
-    """mark_as_read=True must mark **every** received-unread message,
-    not just the ones returned by the LIMIT-bounded SELECT.
+async def test_get_agent_messages_marks_only_returned_page_read(tmp_path) -> None:
+    """mark_as_read=True must mark ONLY the rows the fetch returned,
+    not the whole inbox.
 
-    The refactor changes mark_as_read from "filter the fetched rows,
-    UPDATE by IDs" (which leaves unread rows beyond the limit
-    flagged) to a single UPDATE `WHERE recipient_id=? AND read=0`
-    that covers them all. We seed more unread than the request's
-    limit so the pre-refactor behavior would visibly differ from the
-    refactored behavior.
+    Round-2 security fix (control-message loss): the earlier behavior
+    was a single unscoped ``UPDATE ... WHERE recipient_id=? AND read=0``
+    that flipped EVERY unread row — including messages truncated by the
+    request's ``LIMIT`` or excluded by a ``message_type`` filter. That
+    silently marks unread control messages the caller never saw as
+    read. The corrected behavior scopes the mark-read to exactly the
+    ids on the returned page. We seed more unread than the request's
+    limit so the two behaviors visibly differ.
     """
     from agent_mcp.db.connection import get_db_connection
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
 
-        # Seed three unread messages directly via SQL — the
+        # Seed unread messages directly via SQL — the
         # send_agent_message MCP tool is worker-to-worker-policy-gated
         # and turning that policy on would muddy this test's focus
         # (which is purely the mark-as-read SQL path).
         import datetime as _dt
 
-        # Seed 30 unread so that with a request limit of 5 the
-        # pre-refactor mark_as_read would only flag the 5 fetched
-        # messages; the refactored behavior must flag all 30.
+        # Seed 30 unread so that with a request limit of 5 only the 5
+        # fetched messages get flagged; the other 25 must stay unread.
         conn = get_db_connection()
         try:
             for i in range(30):
@@ -215,14 +216,13 @@ async def test_get_agent_messages_marks_all_received_unread(tmp_path) -> None:
         assert unread == 30, f"expected 30 unread for alice, got {unread}"
 
         # Have alice fetch with a tight limit so the SELECT only sees
-        # 5 of the 30 unread. After the refactor, mark_as_read must
-        # still clear all 30.
+        # 5 of the 30 unread. Only those 5 must be flipped to read.
         await alice.call(
             "get_agent_messages",
             {"token": alice.token, "limit": 5},
         )
 
-        # All received unread should now be 0.
+        # Exactly the 5 returned rows are now read; 25 stay unread.
         conn = get_db_connection()
         try:
             still_unread = conn.execute(
@@ -231,9 +231,9 @@ async def test_get_agent_messages_marks_all_received_unread(tmp_path) -> None:
             ).fetchone()[0]
         finally:
             conn.close()
-        assert still_unread == 0, (
-            f"mark_as_read should have cleared all received unread "
-            f"for alice; {still_unread} still flagged unread"
+        assert still_unread == 25, (
+            f"mark_as_read should have cleared ONLY the 5-row page; "
+            f"expected 25 still unread, got {still_unread}"
         )
 
 
