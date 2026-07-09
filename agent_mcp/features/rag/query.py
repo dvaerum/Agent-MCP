@@ -37,6 +37,13 @@ def _is_secret_key(key: Optional[str]) -> bool:
     return is_secret_key(key)
 
 
+# Canonical embedded-secret VALUE scanner, reused (not duplicated) from
+# the index path so the live-context query filter applies the SAME skip
+# the indexer does: a secret in the VALUE of a non-secret-named key
+# (e.g. ``deploy_notes`` holding an AWS key) must not reach the LLM.
+from .indexing import _value_has_embedded_secret  # noqa: E402
+
+
 def _drop_secret_context_chunks(
     results: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
@@ -114,6 +121,9 @@ async def query_rag_system(query_text: str) -> str:
             live_context_results = [
                 r for r in live_context_results
                 if not _is_secret_key(r.get("context_key"))
+                and not _value_has_embedded_secret(
+                    r.get("value"), r.get("description")
+                )
             ]
         except sqlite3.Error as e_live_ctx:
             logger.warning(
@@ -322,11 +332,16 @@ Always err on the side of providing more detailed explanations and comprehensive
 
             user_message_for_llm = f"CONTEXT:\n{combined_context_str}\n\nQUERY:\n{query_text}\n\nBased *only* on the CONTEXT provided above, please answer the QUERY."
 
+            # SECURITY (round-3): do NOT log the assembled context /
+            # prompt excerpt — even after the secret filters above, a
+            # low-signal credential could survive the heuristics and land
+            # in DEBUG logs. Log only non-sensitive size metrics.
             logger.debug(
-                f"RAG Query: Combined context for LLM (approx tokens: {current_token_count}):\n{combined_context_str[:500]}..."
-            )  # Log excerpt
-            logger.debug(
-                f"RAG Query: User message for LLM:\n{user_message_for_llm[:500]}..."
+                "RAG Query: assembled context for LLM "
+                "(approx tokens: %d, context chars: %d, prompt chars: %d)",
+                current_token_count,
+                len(combined_context_str),
+                len(user_message_for_llm),
             )
 
             # Provider-agnostic chat call. completion_client() picks
@@ -415,6 +430,9 @@ async def query_rag_system_with_model(
         live_context_results = [
             r for r in live_context_results
             if not _is_secret_key(r.get("context_key"))
+            and not _value_has_embedded_secret(
+                r.get("value"), r.get("description")
+            )
         ]
 
         # Get live tasks (same as regular RAG)
