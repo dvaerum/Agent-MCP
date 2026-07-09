@@ -4501,6 +4501,26 @@ async def delete_task_tool_impl(
                 )
             )
 
+        # BL-3: the ``agents.current_task → tasks.task_id`` FK. A task
+        # referenced by some agent's ``current_task`` cannot be DELETEd
+        # while the pointer stands. Non-force: refuse with a clear message
+        # (mirrors the child / dependent refusals above) instead of letting
+        # the DELETE trip a raw ``FOREIGN KEY constraint failed``. Force:
+        # the pointers across the whole delete set are NULLed below, in the
+        # same transaction, before any DELETE.
+        cursor.execute(
+            "SELECT agent_id FROM agents WHERE current_task = ?", (task_id,)
+        )
+        agents_on_task = [r["agent_id"] for r in cursor.fetchall()]
+        if agents_on_task and not force_delete:
+            return Conflict(
+                reason=(
+                    f"Task '{task_id}' is the current task of "
+                    f"{len(agents_on_task)} agent(s): {agents_on_task}. "
+                    f"Use force_delete=true to clear it and cascade delete."
+                )
+            )
+
         # Begin cascade deletion operations
         cascade_operations = []
         # BL-1: (task_id, assigned_to) rows to evict from g.tasks +
@@ -4540,9 +4560,22 @@ async def delete_task_tool_impl(
         # self-FK. Route each through task_repo.delete so the cache +
         # publish contract is honoured post-commit.
         if force_delete:
-            for descendant_id, descendant_assignee in (
-                _collect_task_descendants(cursor, task_id)
-            ):
+            descendants = _collect_task_descendants(cursor, task_id)
+
+            # BL-3: NULL ``agents.current_task`` for every agent whose
+            # pointer is anywhere in the delete set (target + descendants)
+            # BEFORE the DELETEs. Otherwise the
+            # ``agents.current_task → tasks.task_id`` FK aborts the
+            # ``DELETE FROM tasks`` and ``force_delete`` fails to force.
+            # Routed through the repo (one UPDATE ... IN (...)) so the
+            # in-memory agent cache mirror stays consistent with the DB.
+            from ..repositories import agent_repo as _agent_repo
+            delete_set_ids = [task_id] + [d_id for d_id, _ in descendants]
+            _agent_repo.clear_current_task_for_many(
+                delete_set_ids, connection=cursor
+            )
+
+            for descendant_id, descendant_assignee in descendants:
                 if _task_repo.delete(descendant_id, connection=cursor):
                     deleted_events.append(
                         (descendant_id, descendant_assignee)
