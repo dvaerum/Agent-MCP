@@ -1349,6 +1349,43 @@ async def overview_dashboard_handler(req: web.Request) -> web.StreamResponse:
     return _serve_dashboard_file(candidate, cache_control="no-store")
 
 
+async def _warm_backend(name: str) -> None:
+    """Best-effort, fire-and-forget lazy-spawn of a project's backend.
+
+    Fired from the dashboard ``/app/<name>/`` handler so opening the
+    dashboard warms the backend while the static shell paints —
+    consistent with how the ``/api/`` handler triggers ``_ensure`` on
+    first contact. A non-browser client (curl, a smoke test, a health
+    probe) fetches only the HTML and never runs the SPA JS that would
+    otherwise fire the first ``/api/<name>/...`` XHR, so without this
+    the backend unit would never start for such callers.
+
+    Swallows every failure — unknown project (404), unit error (500),
+    spawn timeout (504): serving the static shell must NEVER depend on
+    the backend coming up (the SPA-fallback contract). Real spawn
+    errors still surface on the subsequent ``/api/<name>/...`` XHR,
+    which awaits ``_ensure`` and maps failures to the right status.
+    """
+    try:
+        await _ensure(name, "backend")
+    except web.HTTPException as exc:
+        log.debug("dashboard warm-start for %r skipped: %s", name, exc.reason)
+    except Exception:  # pragma: no cover - defensive; never break serve
+        log.debug("dashboard warm-start for %r failed", name, exc_info=True)
+
+
+def _schedule_backend_warm(req: web.Request, name: str) -> None:
+    """Kick a tracked, non-blocking backend warm-start for ``name``.
+
+    Registered in the app's proxy-task set so ``_drain_proxy_tasks``
+    cancels it cleanly on shutdown rather than leaking a pending task.
+    """
+    task = asyncio.create_task(_warm_backend(name))
+    tasks = _proxy_task_set(req.app)
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
+
 async def dashboard_handler(req: web.Request) -> web.StreamResponse:
     """Serve the Next.js page HTML at /agent-mcp/__dashboard/<name>/.
 
@@ -1358,12 +1395,19 @@ async def dashboard_handler(req: web.Request) -> web.StreamResponse:
     (default ``/agent-mcp/__dashboard``) before the bytes go on the
     wire. Assets themselves are served by
     `dashboard_assets_handler` below.
+
+    Opening a per-project dashboard also warm-starts that project's
+    backend (best-effort, non-blocking — see ``_warm_backend``) so it's
+    ready by the time the SPA fires its first ``/api/<name>/...`` XHR,
+    and so non-browser callers that never run the JS still trigger the
+    documented "lazily on first request" spawn.
     """
     name = req.match_info.get("name", "")
     if name:
         redirect = _maybe_single_tenant_redirect(req, name)
         if redirect is not None:
             return redirect
+        _schedule_backend_warm(req, name)
     rest = req.match_info.get("rest", "")
     if rest == "" or rest.endswith("/"):
         candidate = _safe_dashboard_path(rest + "index.html")
