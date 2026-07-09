@@ -512,6 +512,76 @@ def _forbid_cap_amplification(
     )
 
 
+# ── Project-membership self-escalation guard (SEC round 5) ─────────
+
+# viewer < operator. Mirrors ``group_resolver._ROLE_TIER`` but kept
+# local so the two modules don't couple on a private symbol; unknown
+# roles rank 0 (below every known role) so they can never out-rank a
+# real membership.
+_MEMBERSHIP_ROLE_RANK: dict[str, int] = {"viewer": 1, "operator": 2}
+
+
+def _role_rank(role: str) -> int:
+    """Numeric rank for a project role; unknown roles sort below all."""
+    return _MEMBERSHIP_ROLE_RANK.get(role, 0)
+
+
+def _membership_grant_denied(
+    req: web.Request, project_name: str, conferred_role: str,
+) -> web.Response | None:
+    """403 when a non-sysadmin caller would confer project access above
+    their own on ``project_name`` (SEC round 5, finding AZ-R5-1).
+
+    ``add_project_membership_handler`` and
+    ``change_project_membership_role_handler`` are gated only by
+    ``system.projects.manage`` — a DELEGABLE table-management cap. But the
+    per-project data middleware (``auth_middleware``) gates
+    ``/api/<project>/…`` on ``project_membership``, NOT on that cap. So a
+    non-sysadmin delegate self-writing a membership row (as a user, or via
+    a group they belong to, or by PATCHing their own viewer row up) turns
+    table-management authority into cross-tenant DATA authority — the
+    unguarded sibling of the round-4 AZ-1/AZ-2 amplification fix.
+
+    Guard (regardless of member kind — user OR group):
+      * a sysadmin may confer anything (returns ``None``);
+      * a non-sysadmin with NO membership on the project may confer
+        nothing — they can't hand out access they don't have;
+      * a non-sysadmin may not confer a role ABOVE their own effective
+        role on the project (a viewer-caller may not grant/set operator).
+
+    Fail closed: no Principal / no caller identity ⇒ treat as no
+    membership and deny.
+    """
+    if _caller_is_sysadmin(req):
+        return None
+    from . import group_resolver as _gr
+
+    principal = req.get("principal")
+    caller_id = getattr(principal, "user_id", None) if principal else None
+    caller_role = (
+        _gr.resolve_user_project_role(caller_id, project_name)
+        if caller_id
+        else None
+    )
+    if caller_role is None or _role_rank(conferred_role) > _role_rank(
+        caller_role
+    ):
+        user = req.get("user") or {}
+        username = user.get("username", "<unknown>")
+        held = caller_role or "none"
+        return _error(
+            error="forbidden",
+            message=(
+                f"operator {username!r} may not confer role "
+                f"{conferred_role!r} on project {project_name!r}: a "
+                "non-sysadmin may only grant membership at or below their "
+                f"own role on that project (currently {held})"
+            ),
+            status=403,
+        )
+    return None
+
+
 def _connect() -> sqlite3.Connection:
     """Open a router.db connection with FK + row factory enabled.
 
@@ -1270,6 +1340,9 @@ async def add_project_membership_handler(req: web.Request) -> web.Response:
     err = _validate_role(role)
     if err is not None:
         return _error(error=_ERROR_VALIDATION, message=err, status=400)
+    denied = _membership_grant_denied(req, project_name, role)
+    if denied is not None:
+        return denied
     conn = _connect()
     try:
         try:
@@ -1344,6 +1417,9 @@ async def change_project_membership_role_handler(
     err = _validate_role(role)
     if err is not None:
         return _error(error=_ERROR_VALIDATION, message=err, status=400)
+    denied = _membership_grant_denied(req, project_name, role)
+    if denied is not None:
+        return denied
     conn = _connect()
     try:
         if kind == "user":
