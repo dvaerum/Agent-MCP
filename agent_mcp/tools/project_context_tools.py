@@ -177,6 +177,60 @@ async def _emit_tools_list_changed(context_key: str) -> None:
         )
 
 
+# Global event-loop toggle (Phase: event-coordination). Flipping it
+# OFF must wake every in-flight `wait_for_events` so they re-evaluate
+# and return `stop_listening`; the wake fn is `wake_all_for_flag_recheck`
+# (state.py). Kept separate from the worker-policy toggle above because
+# the two changes require *different* wakes.
+_LOOP_TOGGLE_KEY = "config_auto_event_loop_global"
+
+
+def _is_loop_toggle(context_key: str) -> bool:
+    """True if `context_key` is the global event-loop toggle whose flip
+    must wake in-flight `wait_for_events` (see
+    `agent_communication_tools.py`)."""
+    return context_key == _LOOP_TOGGLE_KEY
+
+
+async def emit_context_write_wakes(context_key: str) -> None:
+    """Fire the post-write notify wakes a `project_context` write on
+    `context_key` requires — the single source of truth for
+    REST-vs-MCP notify parity (BL-R14-1).
+
+    Two independent wakes, each keyed on what the write changed:
+
+    * `config_allow_worker_*` (worker-capability toggle) →
+      `_emit_tools_list_changed`: push `notifications/tools/list_changed`
+      so subscribed workers re-fetch `tools/list` and can see/invoke a
+      newly granted tool without waiting for a periodic refresh.
+    * `config_auto_event_loop_global` (global event-loop toggle) →
+      `wake_all_for_flag_recheck`: wake in-flight `wait_for_events` so
+      they re-evaluate and return `stop_listening` when flipped OFF.
+
+    BOTH operator-reachable write surfaces — REST `/api/memories`
+    (create/update) and MCP `update_project_context` — call this so
+    each fires the SAME wake set. Before this helper each surface fired
+    only one: a capability grant over REST never pushed
+    `tools/list_changed`, and a loop flip over MCP never woke waiters.
+
+    Best-effort + defensive: a wake failure is logged, never raised —
+    the toggle write itself is the source of truth, so clients converge
+    on their next refresh even if the push/wake is lost.
+    """
+    if _is_worker_policy_toggle(context_key):
+        await _emit_tools_list_changed(context_key)
+    if _is_loop_toggle(context_key):
+        try:
+            g.wake_all_for_flag_recheck()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "wake_all_for_flag_recheck failed after global "
+                "toggle write (key=%s): %s",
+                context_key,
+                e,
+            )
+
+
 def _config_key_error() -> str:
     return (
         "Unauthorized: config_* keys are admin-only; "
@@ -1071,10 +1125,12 @@ async def _handle_single_context_update(
             reason = reason[len("Unauthorized:"):].lstrip()
         return PermissionDenied(reason=reason)
 
-    # Phase 4: notify subscribers when a worker-policy toggle flips.
-    # The helper is best-effort and safe outside a request context.
-    if _is_worker_policy_toggle(context_key_to_update):
-        await _emit_tools_list_changed(context_key_to_update)
+    # BL-R14-1: fire the full wake set this key requires — worker-policy
+    # toggle → tools/list_changed, loop toggle → wake_all_for_flag_recheck.
+    # The MCP surface previously fired only the tools/list_changed half,
+    # so a loop-toggle flip over MCP never woke in-flight waiters. The
+    # helper is best-effort and safe outside a request context.
+    await emit_context_write_wakes(context_key_to_update)
 
     return Ok(
         data={"context_key": context_key_to_update},
@@ -1136,6 +1192,21 @@ async def _handle_bulk_context_update(
         for u in updates_list
     ):
         await _emit_tools_list_changed("__bulk__")
+
+    # BL-R14-1: bulk parity — if any entry flipped the global loop
+    # toggle, wake in-flight waiters (mirrors the single-update path).
+    if any(
+        _is_loop_toggle(u.get("context_key", ""))
+        for u in updates_list
+    ):
+        try:
+            g.wake_all_for_flag_recheck()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "wake_all_for_flag_recheck failed after bulk "
+                "loop-toggle write: %s",
+                e,
+            )
 
     return Ok(
         data={
