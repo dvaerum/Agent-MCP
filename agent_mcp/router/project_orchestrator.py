@@ -787,10 +787,19 @@ class ProjectOrchestrator:
         if _is_active(unit):
             r = _systemctl("stop", unit)
             if r.returncode != 0:
+                # SD-R15-1 (class-sweep sibling of the stop_project REST
+                # handler): don't surface raw systemd stderr (unit paths,
+                # exec-step detail) in the structured result a caller may
+                # render. Log the detail server-side; return a generic
+                # message.
+                log.error(
+                    "systemctl stop %s failed (rc=%s): %s",
+                    unit, r.returncode, r.stderr.strip(),
+                )
                 return {
                     "stopped": False,
                     "reason": "systemctl_failed",
-                    "message": r.stderr.strip(),
+                    "message": "failed to stop project backend",
                 }
         last_active.pop((name, "backend"), None)
         # SC-R7-1: drop the boot-window record on an explicit stop for
