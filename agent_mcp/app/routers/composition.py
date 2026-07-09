@@ -831,6 +831,10 @@ async def update_task_details_api_route(
         # applied above via the canonical ``update_task_status`` tool.
         fields_to_update: Dict[str, Any] = {}
         log_details: Dict[str, Any] = {}
+        # BL-R16-1: set when this edit CLEARS the assignment (raw value is
+        # null / '' / 'unassigned') so the post-commit block can mirror the
+        # canonical unassign producers — status flip + unassigned fanout.
+        clearing_assignment = False
         if new_status:
             log_details["status_updated_to"] = new_status
         if 'title' in data and data['title'] is not None:
@@ -873,6 +877,27 @@ async def update_task_details_api_route(
                     )
             fields_to_update["assigned_to"] = new_assigned
             log_details["assigned_to_changed"] = new_assigned
+            # BL-R16-1: notify-parity for the CLEAR-ASSIGNMENT path. When
+            # the assignment is cleared (new_assigned is None), the task must
+            # land in the SAME terminal state the three canonical unassign
+            # producers produce — ``status='unassigned'`` AND a
+            # ``notify_unassigned_task_appeared`` fanout — so an idle worker
+            # blocked in ``wait_for_events`` (or a GET /mcp streaming
+            # subscriber) is edge-woken that the task became claimable:
+            #   * agent-terminate (tools/admin_tools.py),
+            #   * agent-purge     (app/routers/agents.py),
+            #   * REST create-unassigned, BL-R15-1 (app/routers/tasks.py).
+            # Reassignment to a real agent (new_assigned is not None) keeps
+            # its existing behavior untouched. The status write is a direct
+            # write mirroring the canonical unassign SQL (they also skip the
+            # transition guard); it is suppressed when the caller ALSO sent an
+            # explicit ``status`` (already routed through update_task_status
+            # above per BL-R12-1) so we don't clobber their choice.
+            if new_assigned is None:
+                clearing_assignment = True
+                if not new_status:
+                    fields_to_update["status"] = "unassigned"
+                    log_details["status_unassigned"] = True
         if 'notes' in data and data['notes'] and isinstance(data['notes'], str) and data['notes'].strip():
             try:
                 current_notes_list = json.loads(existing_notes_str or "[]")
@@ -963,6 +988,48 @@ async def update_task_details_api_route(
                         "notify_agent_inbox(%s) raised after dashboard "
                         "task edit: %s",
                         aid, notify_exc,
+                    )
+            # BL-R16-1: clear-assignment notify parity. When this edit
+            # cleared the assignment the task just became a first-class
+            # ``unassigned`` task; mirror the canonical producers and fan out
+            # ``unassigned_task_appeared`` so idle / streaming workers learn
+            # it is claimable now (not on the next ~2s DB recheck). Carry the
+            # task's required_capabilities (cache-first, DB fallback) so the
+            # matcher wakes only qualifying agents. Best-effort — a notify
+            # failure must never poison the already-committed write.
+            if clearing_assignment:
+                raw_caps: Any = None
+                if task_id_to_update in g.tasks:
+                    raw_caps = g.tasks[task_id_to_update].get(
+                        "required_capabilities"
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT required_capabilities FROM tasks "
+                        "WHERE task_id = ?",
+                        (task_id_to_update,),
+                    )
+                    caps_row = cursor.fetchone()
+                    if caps_row:
+                        raw_caps = caps_row["required_capabilities"]
+                if isinstance(raw_caps, str):
+                    try:
+                        caps_list = json.loads(raw_caps or "[]")
+                    except json.JSONDecodeError:
+                        caps_list = []
+                elif isinstance(raw_caps, list):
+                    caps_list = raw_caps
+                else:
+                    caps_list = []
+                try:
+                    g.notify_unassigned_task_appeared(
+                        task_id_to_update, caps_list or []
+                    )
+                except Exception as notify_exc:  # pragma: no cover - defensive
+                    logger.warning(
+                        "notify_unassigned_task_appeared(%s) raised after "
+                        "dashboard clear-assignment: %s",
+                        task_id_to_update, notify_exc,
                     )
         return JSONResponse({"success": True, "message": "Task updated successfully via dashboard."})
     except ValueError as e_val:
