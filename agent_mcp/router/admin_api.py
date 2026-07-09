@@ -166,9 +166,17 @@ async def create_project_handler(req: web.Request) -> web.Response:
     try:
         workspace.mkdir(parents=True, exist_ok=True)
     except OSError as e:
+        # SD-R15-2: don't reflect the resolved ABSOLUTE workspace path
+        # (server home dir / username) into the client body — mirror the
+        # already-hardened rename handler and keep only the generic OS
+        # category (``e.strerror``, e.g. "Permission denied"). Log the
+        # real path server-side.
+        logger.error(
+            "could not create workspace %s: %s", workspace, e.strerror,
+        )
         return _app._error_envelope(
             error=_app._ERROR_INTERNAL,
-            message=f"could not create workspace {workspace}: {e.strerror}",
+            message=f"could not create project workspace: {e.strerror}",
             status=500,
         )
     try:
@@ -414,10 +422,19 @@ async def delete_project_handler(req: web.Request) -> web.Response:
     workspace_deleted = False
     workspace_delete_skipped_reason: str | None = None
     if want_delete:
+        # SD-R15 class-sweep: the ``workspace_delete_skipped_reason`` is
+        # surfaced to the client, so it must not carry the resolved
+        # ABSOLUTE workspace path (server home dir / username). Log the
+        # path server-side; keep the reason generic (and, for the rmtree
+        # failure, only the generic OS category via ``e.strerror``).
         if not _app._is_within_default_workspace(workspace_path):
+            logger.warning(
+                "refusing recursive delete: workspace %s resolves outside "
+                "the default workspace parent", workspace_path,
+            )
             workspace_delete_skipped_reason = (
-                f"workspace {workspace_path} resolves outside the default "
-                f"workspace parent; refusing recursive delete"
+                "workspace resolves outside the default workspace parent; "
+                "refusing recursive delete"
             )
         elif workspace_path.exists():
             import shutil
@@ -425,12 +442,19 @@ async def delete_project_handler(req: web.Request) -> web.Response:
                 shutil.rmtree(workspace_path)
                 workspace_deleted = True
             except OSError as e:
+                logger.error(
+                    "rmtree(%s) failed: %s", workspace_path, e.strerror,
+                )
                 workspace_delete_skipped_reason = (
-                    f"rmtree({workspace_path}) failed: {e.strerror}"
+                    f"could not delete project workspace: {e.strerror}"
                 )
         else:
+            logger.info(
+                "workspace %s did not exist on disk at delete time",
+                workspace_path,
+            )
             workspace_delete_skipped_reason = (
-                f"workspace {workspace_path} did not exist on disk"
+                "workspace did not exist on disk"
             )
             workspace_deleted = True
     # BL-R6-1 (belt-and-suspenders): hold ``_ensure_lock(name,
@@ -569,9 +593,19 @@ async def stop_project_handler(req: web.Request) -> web.Response:
     if _app._is_active(unit):
         r = _app._systemctl("stop", unit)
         if r.returncode != 0:
+            # SD-R15-1: sibling of SC-R8-2 (project_orchestrator._ensure).
+            # Reachable via the delegatable ``system.projects.manage`` cap,
+            # so a non-sysadmin delegate could otherwise read raw systemd
+            # stderr (unit-file paths, "Failed at step EXEC …"). Log the
+            # detail server-side; hand the client a static message with no
+            # unit path and no stderr.
+            logger.error(
+                "systemctl stop %s failed (rc=%s): %s",
+                unit, r.returncode, r.stderr.strip(),
+            )
             return _app._error_envelope(
                 error=_app._ERROR_INTERNAL,
-                message=f"systemctl stop {unit} failed: {r.stderr.strip()}",
+                message="failed to stop project backend",
                 status=500,
             )
     return _app._success_envelope({"stopped": name})
