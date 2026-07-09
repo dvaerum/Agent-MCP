@@ -59,8 +59,10 @@ from .migrations_runner import (
 # migrations module.
 __all__ = [
     "DEFAULT_SESSION_LIFETIME_DAYS",
+    "PASSWORD_MIN_LENGTH",
     "IdentityError",
     "UsernameAlreadyExistsError",
+    "WeakPasswordError",
     "add_project_membership",
     "create_session",
     "create_user",
@@ -77,6 +79,7 @@ __all__ = [
     "remove_project_membership",
     "run_router_migrations_upgrade",
     "touch_last_login",
+    "validate_password_strength",
     "verify_password",
 ]
 
@@ -95,10 +98,28 @@ class UsernameAlreadyExistsError(IdentityError):
     """Raised by create_user when the username UNIQUE constraint fails."""
 
 
+class WeakPasswordError(IdentityError):
+    """Raised when a password fails the strength policy.
+
+    The message is operator-facing (rendered into the setup form), so
+    it MUST NOT echo the rejected value.
+    """
+
+
 # ── Constants ───────────────────────────────────────────────────────
 
 
 DEFAULT_SESSION_LIFETIME_DAYS = 30
+
+# Minimum password length for any NEW operator password. 12 is a
+# defensible modern floor: argon2 + login rate-limiting (round-1)
+# already blunt online brute-force, so this guards mainly against
+# trivially-guessable secrets on self-provisioned multi-tenant
+# deployments (round-3 finding AC-2). This is the canonical policy
+# home — the setup wizard imports it rather than defining its own.
+# NOTE: this gates NEW password-setting only; it never re-validates
+# existing stored hashes, so pre-policy operators keep working.
+PASSWORD_MIN_LENGTH = 12
 
 
 # Module-level PasswordHasher: stateless, thread-safe, cheap to share.
@@ -144,6 +165,21 @@ def _now_iso() -> str:
 
 
 # ── Password hashing ───────────────────────────────────────────────
+
+
+def validate_password_strength(password: str) -> None:
+    """Enforce the password-strength policy; raise on violation.
+
+    Canonical single-source policy check. Call it BEFORE ``create_user``
+    at every path that sets a NEW operator password (the setup wizard;
+    admin/self-serve user-create flows). Existing hashes are never
+    re-validated. Raises ``WeakPasswordError`` (with an operator-facing
+    message) when the policy is not met; returns ``None`` when it is.
+    """
+    if len(password) < PASSWORD_MIN_LENGTH:
+        raise WeakPasswordError(
+            f"Password must be at least {PASSWORD_MIN_LENGTH} characters."
+        )
 
 
 def hash_password(password: str) -> str:

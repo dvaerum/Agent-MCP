@@ -777,3 +777,86 @@ async def test_sso_wildcard_group_does_not_bind_existing_privileged_group(
     assert group_resolver.resolve_user_is_sysadmin(user["user_id"]) is False
     # The user landed in the namespaced JIT group instead.
     assert "oidc:admins" in _group_names_for(resolved)
+
+
+# ── Fail-closed nonce (round-3 security finding AC-1) ───────────────
+#
+# The flow cookie is unauthenticated base64(JSON) — no HMAC/signature —
+# so an attacker can craft one that OMITS the ``nonce`` field. Authlib's
+# ``validate_nonce`` is gated on ``if nonce_value:``: an EMPTY expected
+# nonce performs NO comparison, so an id_token minted for a DIFFERENT
+# authorization request would be accepted. The fix treats an absent /
+# empty nonce as an INVALID flow (fail closed).
+
+
+async def test_decode_flow_cookie_rejects_missing_nonce():
+    """A flow cookie without a ``nonce`` field decodes to None (invalid).
+
+    Pre-fix this defaulted the nonce to "" and returned a usable
+    _FlowState, silently disabling nonce validation downstream.
+
+    (async only to match this module's asyncio-marked convention; the
+    assertions themselves are synchronous.)
+    """
+    import sys
+
+    sso = sys.modules.get("agent_mcp.router.sso")
+    if sso is None:
+        import importlib
+        sso = importlib.import_module("agent_mcp.router.sso")
+
+    # Attacker-craftable cookie: valid state + verifier, NO nonce.
+    forged = _b64url_nopad(
+        json.dumps({"state": "s", "verifier": "v" * 43}).encode()
+    )
+    assert sso._decode_flow_cookie(forged) is None
+
+    # Empty-string nonce is likewise rejected.
+    empty = _b64url_nopad(
+        json.dumps(
+            {"state": "s", "verifier": "v" * 43, "nonce": ""}
+        ).encode()
+    )
+    assert sso._decode_flow_cookie(empty) is None
+
+    # A cookie WITH a real nonce still decodes normally.
+    good = _b64url_nopad(
+        json.dumps(
+            {"state": "s", "verifier": "v" * 43, "nonce": "real-nonce"}
+        ).encode()
+    )
+    flow = sso._decode_flow_cookie(good)
+    assert flow is not None and flow.nonce == "real-nonce"
+
+
+async def test_sso_callback_rejects_nonceless_flow_cookie(
+    aiohttp_client, router_app, sso_oidc_env, monkeypatch,
+):
+    """A callback presenting a nonce-less flow cookie is rejected (400).
+
+    Even though state matches and the (patched) IdP returns a valid
+    id_token, the missing nonce means anti-replay can't be enforced,
+    so the flow MUST be rejected and no session minted.
+    """
+    _patch_idp(monkeypatch, id_token_claims={
+        "sub": "attacker", "email": "evil@example.test",
+        "preferred_username": "evil", "groups": [],
+    })
+    client = await aiohttp_client(router_app)
+    # Forge a flow cookie with a matching state but no nonce field.
+    forged = _b64url_nopad(
+        json.dumps(
+            {"state": "forged-state", "verifier": "v" * 43}
+        ).encode()
+    )
+    cb = await client.get(
+        "/agent-mcp/sso/callback",
+        params={"code": "c", "state": "forged-state"},
+        cookies={"agent_mcp_sso_flow": forged},
+        allow_redirects=False,
+    )
+    assert cb.status == 400, await cb.text()
+    assert "agent_mcp_session" not in cb.headers.get("Set-Cookie", "")
+    # No user was JIT-created off the rejected flow.
+    from agent_mcp.router import identity
+    assert identity.get_user_by_username("evil") is None
