@@ -19,6 +19,42 @@ from ...external.completion_service import (
 # For OpenAI exceptions
 import openai
 
+
+def _is_secret_key(key: Optional[str]) -> bool:
+    """Thin lazy wrapper over the canonical
+    :func:`agent_mcp.tools.project_context_tools.is_secret_key`.
+
+    Imported lazily (not at module top) to sidestep the import cycle:
+    ``tools/__init__`` imports ``rag_tools`` which imports this module,
+    so a top-level ``from ...tools...`` here can hit a half-initialised
+    tools package. The RAG side-channel must apply the SAME secret-key
+    policy as ``view_project_context`` so a worker can't read a
+    ``config_*_token`` value by asking ``ask_project_rag`` — see
+    ``tests/test_sec_rag_secret_redaction.py``.
+    """
+    from ...tools.project_context_tools import is_secret_key
+
+    return is_secret_key(key)
+
+
+def _drop_secret_context_chunks(
+    results: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Drop retrieved vector chunks that carry a secret project_context
+    row. Defense against a STALE index that embedded a secret before the
+    index-time skip (indexing.py) was in place: the chunk's
+    ``source_ref`` is the context_key for ``source_type == "context"``.
+    """
+    return [
+        r
+        for r in results
+        if not (
+            r.get("source_type") == "context"
+            and _is_secret_key(r.get("source_ref"))
+        )
+    ]
+
+
 # Original location: main.py lines 1432 - 1566 (ask_project_rag_tool function body)
 
 
@@ -71,6 +107,14 @@ async def query_rag_system(query_text: str) -> str:
             live_context_results = rag_repo.fetch_recent_context(
                 since=last_indexed_context_time, limit=5,
             )
+            # SECURITY: never surface secret-keyed rows (config_*_token
+            # etc.) to the LLM — the RAG answer is readable by any worker
+            # via ask_project_rag, bypassing view_project_context's
+            # redaction. Same policy as the tool boundary.
+            live_context_results = [
+                r for r in live_context_results
+                if not _is_secret_key(r.get("context_key"))
+            ]
         except sqlite3.Error as e_live_ctx:
             logger.warning(
                 f"RAG Query: Failed to fetch live project context: {e_live_ctx}"
@@ -155,6 +199,11 @@ async def query_rag_system(query_text: str) -> str:
                 vector_search_results = rag_repo.search_similar(
                     query_embedding=query_embedding,
                     limit=13,
+                )
+                # Retrieval-time defense against a stale index that
+                # already embedded a secret context row.
+                vector_search_results = _drop_secret_context_chunks(
+                    vector_search_results
                 )
             except (
                 openai.APIError
@@ -352,11 +401,21 @@ async def query_rag_system_with_model(
         live_task_results: List[Dict[str, Any]] = []
         vector_search_results: List[Dict[str, Any]] = []
 
-        # Get live context (same as regular RAG)
+        # Get live context (same as regular RAG). Phase 7b renamed
+        # project_context.last_updated -> updated_at; this path still
+        # referenced the old name and threw "no such column" on every
+        # call, silently returning an empty live-context section. Fixed
+        # to updated_at so the section works — and is secret-filtered.
         cursor.execute(
-            "SELECT context_key, value, description, last_updated FROM project_context ORDER BY last_updated DESC"
+            "SELECT context_key, value, description, updated_at FROM project_context ORDER BY updated_at DESC"
         )
         live_context_results = [dict(row) for row in cursor.fetchall()]
+        # SECURITY: drop secret-keyed rows before they reach the LLM
+        # (same policy as query_rag_system / view_project_context).
+        live_context_results = [
+            r for r in live_context_results
+            if not _is_secret_key(r.get("context_key"))
+        ]
 
         # Get live tasks (same as regular RAG)
         cursor.execute(
@@ -387,6 +446,11 @@ async def query_rag_system_with_model(
                     query_embedding=query_embedding,
                     limit=13,
                 )
+                # Retrieval-time defense against a stale index that
+                # already embedded a secret context row.
+                vector_search_results = _drop_secret_context_chunks(
+                    vector_search_results
+                )
             except openai.APIError as e_openai_emb:
                 logger.error(
                     f"RAG Query: OpenAI API error during query embedding: {e_openai_emb}"
@@ -405,7 +469,7 @@ async def query_rag_system_with_model(
         if live_context_results:
             context_parts.append("=== Live Project Context ===")
             for item in live_context_results:
-                entry_text = f"Key: {item['context_key']}\nDescription: {item['description']}\nValue: {item['value']}\nLast Updated: {item['last_updated']}\n"
+                entry_text = f"Key: {item['context_key']}\nDescription: {item['description']}\nValue: {item['value']}\nLast Updated: {item['updated_at']}\n"
                 chunk_tokens = len(entry_text.split())
                 if current_token_count + chunk_tokens < context_limit:
                     context_parts.append(entry_text)

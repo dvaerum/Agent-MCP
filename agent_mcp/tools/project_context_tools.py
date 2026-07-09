@@ -15,6 +15,22 @@ _SECRET_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 
+
+def is_secret_key(key: Optional[str]) -> bool:
+    """Return True if ``key`` names a project_context secret.
+
+    Single source of truth for the secret-key policy, shared across
+    every surface that exposes project_context: the tool boundary
+    (``view_project_context`` redaction, below), the RAG index + query
+    paths (``features/rag/{indexing,query}.py`` — the RAG side-channel
+    otherwise echoes secrets to any worker), and the dashboard
+    composition endpoints (``app/routers/composition.py``). Keeping the
+    check here — reusing the one ``_SECRET_KEY_RE`` — means the surfaces
+    can't drift out of sync. Matches keys like ``config_*_token``,
+    ``config_*_secret``, ``config_*_api_key``, ``config_*_private_key``.
+    """
+    return bool(key) and _SECRET_KEY_RE.search(key) is not None
+
 # Keys reserved for admin-only writes/deletes (Phase 7b). Broader than
 # `_SECRET_KEY_RE`: any `config_*` is treated as policy or secret data,
 # regardless of suffix. Workers attempting to create or modify a
@@ -587,7 +603,7 @@ async def view_project_context_tool_impl(
         # the legacy ``operator_session_active`` ContextVar during
         # the bridge window.
         if not _is_admin_principal(principal):
-            rows = [r for r in rows if not _SECRET_KEY_RE.search(r.context_key)]
+            rows = [r for r in rows if not is_secret_key(r.context_key)]
 
         # Process results with enhanced information
         for row_data in rows:

@@ -231,7 +231,9 @@ async def test_context_data_endpoint_returns_project_context(tmp_path) -> None:
             },
         )
 
-        ctx = admin.client.get("/api/context-data")
+        # /api/context-data is now gated behind require_operator_session
+        # (secret-exposure fix); authenticate via the forwarding header.
+        ctx = admin.get("/api/context-data")
         assert ctx.status_code == 200
         body = ctx.json()
         keys = {entry.get("context_key") for entry in body}

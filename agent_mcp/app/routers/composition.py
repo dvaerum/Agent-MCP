@@ -52,8 +52,15 @@ from ...features.dashboard.api import (
     fetch_graph_data_logic,
     fetch_task_tree_data_logic,
 )
+from ...tools.project_context_tools import is_secret_key
 from ...utils.json_utils import get_sanitized_json_body
 from .agents import _mcp_presence_for
+
+
+#: Placeholder shown in place of a secret project_context value when the
+#: caller is not confirmed operator tier. Keeps the key visible (so the
+#: dashboard can show that a secret exists) while withholding the value.
+_REDACTED_VALUE = "[redacted]"
 
 
 router = APIRouter(
@@ -328,9 +335,16 @@ async def all_data_api_route(
             # (operator-gated) token field is ``auth_token`` below.
             # Leaving the raw column in ``dict(row)`` re-opened the
             # viewer→agent bearer disclosure that ``auth_token`` gating
-            # otherwise closes. (``aoe_session_id`` is intentionally
-            # retained: the dashboard AoE editor pre-fills from it.)
+            # otherwise closes.
             agent_dict.pop('token', None)
+            # SECURITY: aoe_session_id is the AoE side-channel session
+            # credential. /api/all-data is served to the viewer tier
+            # (the router admits viewers on GET), and node-details
+            # already strips it via _AGENT_NODE_SAFE_COLUMNS — strip it
+            # here too so the two agent-exposing surfaces agree and a
+            # viewer can't harvest it. (Operators edit AoE via the
+            # operator-gated POST /api/agents/<id>/edit path.)
+            agent_dict.pop('aoe_session_id', None)
             # Defensive skip for the legacy 'admin' pseudo-agent row.
             # Wave 4 (migration 0014) deletes it; this filter remains
             # so a partially-upgraded DB (or one with the
@@ -467,7 +481,10 @@ async def all_data_api_route(
 
 
 @router.api_route("/context-data", methods=["GET", "OPTIONS"])
-async def context_data_api_route(request: Request) -> JSONResponse:
+async def context_data_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
     """Get only context data.
 
     URL placement note: this lives on the composition router
@@ -475,9 +492,21 @@ async def context_data_api_route(request: Request) -> JSONResponse:
     ``/api/memories``) because the URL is ``/api/context-data``,
     not ``/api/memories``. URL stability wins; a future PR can
     migrate to ``/api/memories`` GET alongside dashboard updates.
+
+    SECURITY: this route previously had NO auth dep and returned the
+    raw project_context — any project member (including a read-only
+    viewer) could read ``config_*_token`` / ``config_*_secret`` values.
+    Now gated behind ``require_operator_session`` and secret-keyed
+    VALUES are redacted for callers that are not CONFIRMED operator
+    tier (mirrors ``/api/all-data``'s agent-bearer gate; the router
+    admits viewer-tier operators on GET, and the backend can't verify
+    the tier of a cookie/forwarding caller — so those paths get the
+    redacted view).
     """
     if request.method == 'OPTIONS':
         return await handle_options(request)
+
+    expose_secrets = is_confirmed_operator_tier(auth)
 
     try:
         with SessionLocal() as session:
@@ -489,7 +518,11 @@ async def context_data_api_route(request: Request) -> JSONResponse:
             context_data = [
                 {
                     "context_key": r.context_key,
-                    "value": r.value,
+                    "value": (
+                        r.value
+                        if expose_secrets or not is_secret_key(r.context_key)
+                        else _REDACTED_VALUE
+                    ),
                     "updated_at": r.updated_at,
                     "updated_by": r.updated_by,
                     "created_at": r.created_at,
@@ -709,7 +742,10 @@ async def update_task_details_api_route(
 
 # --- Test/Demo Data Endpoint ---
 @router.api_route("/create-sample-memories", methods=["POST", "OPTIONS"])
-async def create_sample_memories_route(request: Request) -> JSONResponse:
+async def create_sample_memories_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
     """Create sample memory entries for testing.
 
     Wave 8 PR 1 placement: lives on the composition router (not the
@@ -717,6 +753,12 @@ async def create_sample_memories_route(request: Request) -> JSONResponse:
     and doesn't match the memories router's ``/api/memories`` prefix.
     URL stability is the constraint; a future PR could migrate to
     ``POST /api/memories/sample`` alongside dashboard updates.
+
+    SECURITY: this route previously had NO auth dep — an unauthenticated
+    caller (or a read-only viewer) could WRITE project_context rows.
+    ``require_operator_session`` authenticates AND enforces the
+    mutation gate (POST is a mutation method, so viewer-tier callers are
+    rejected — only operator tier may write).
     """
     if request.method == 'OPTIONS':
         return await handle_options(request)
