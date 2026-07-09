@@ -915,6 +915,14 @@ async def delete_user_handler(req: web.Request) -> web.Response:
                 message=f"unknown user_id: {user_id!r}",
                 status=404,
             )
+        # Deleting a sysadmin account is sysadmin-only, mirroring the
+        # demote guard in edit_user_handler (clearing the is_sysadmin bit
+        # is _forbid_sysadmin_write, 403). Without this, a delegate with
+        # system.users.manage could DELETE a sysadmin it cannot DEMOTE —
+        # delete would supersede the demote guard (AZ-R9-1).
+        if row["is_sysadmin"] and not _caller_is_sysadmin(req):
+            conn.execute("ROLLBACK")
+            return _forbid_sysadmin_write(req)
         if row["is_sysadmin"] and _is_last_sysadmin(conn, user_id):
             conn.execute("ROLLBACK")
             return _last_sysadmin_error("delete")
