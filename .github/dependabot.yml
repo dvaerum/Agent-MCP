@@ -1,0 +1,46 @@
+# Automated dependency-update PRs. Complements the dependency-audit CI
+# job in workflows/ci.yml: Dependabot raises the bump PRs, the audit job
+# gates HIGH/CRITICAL advisories that slip through.
+version: 2
+updates:
+  # Python deps live in pyproject.toml + uv.lock at the repo root.
+  # uv is a first-class Dependabot ecosystem (distinct from "pip") and
+  # is what keeps uv.lock in sync.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      # Fold minor+patch bumps into one PR to cut review noise; majors
+      # stay as individual PRs so breaking changes get scrutiny.
+      python-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Dashboard (Next.js) npm deps.
+  - package-ecosystem: "npm"
+    directory: "/agent_mcp/dashboard"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # GitHub Actions pinned by SHA in workflows/ci.yml. Dependabot scans
+  # /.github/workflows when directory is "/".
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      # Actions rarely break across minors; one grouped PR is easier to
+      # review than a stream of single-action bumps.
+      github-actions-all:
+        patterns:
+          - "*"
