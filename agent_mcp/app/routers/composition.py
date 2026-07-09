@@ -764,7 +764,7 @@ async def update_task_details_api_route(
         requesting_admin_id = caller_identity(auth)
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT notes, assigned_to FROM tasks WHERE task_id = ?", (task_id_to_update,))
+        cursor.execute("SELECT notes, assigned_to, status FROM tasks WHERE task_id = ?", (task_id_to_update,))
         task_row = cursor.fetchone()
         if not task_row:
             return JSONResponse({"error": "Task not found"}, status_code=404)
@@ -774,16 +774,64 @@ async def update_task_details_api_route(
         # in addition to the new one — see the post-commit publish/notify
         # block below.
         prior_assignee = task_row["assigned_to"]
+
+        # BL-R12-1: the ``status`` transition must NOT be direct-written
+        # here — that bypassed all four invariants the canonical MCP path
+        # (``update_task_status`` tool → ``_update_single_task``) enforces:
+        # (1) the terminal-state transition guard (a ``completed`` task
+        # could be resurrected to ``in_progress`` behind a misleading
+        # 200), (2) ``clear_current_task_for`` (a completed task left
+        # ``agents.current_task`` pinned, leaking a stale pointer into
+        # ``/api/all-data``), (3) the parent subtask-completion note, and
+        # (4) status-enum validation. Route the status change through the
+        # SAME tool the MCP wire uses so all four apply uniformly, rather
+        # than duplicating the invariant logic inline. Non-status fields
+        # (title/description/priority/assigned_to/notes) keep the direct
+        # path below. We pre-check the transition with the canonical
+        # ``_is_status_transition_allowed`` so an illegal transition gets a
+        # clean 409 (the tool reports a rejected transition as an ``Ok``
+        # envelope carrying a "Failed …" message → HTTP 200, so the tool
+        # alone can't surface the right status code; the DB write is still
+        # correctly refused either way).
+        if new_status:
+            from ...tools.task_tools import _is_status_transition_allowed
+
+            old_status = task_row["status"]
+            if not _is_status_transition_allowed(old_status, new_status):
+                return JSONResponse(
+                    {
+                        "error": (
+                            f"Invalid status transition: "
+                            f"'{old_status}' -> '{new_status}' is not allowed."
+                        )
+                    },
+                    status_code=409,
+                )
+            status_resp = await _dispatch_through_tool(
+                "update_task_status",
+                {"task_id": task_id_to_update, "status": new_status},
+                bearer_token=None,
+                operator_session=True,
+                operator_user_id=requesting_admin_id,
+            )
+            # Enum-invalid status → Invalid → 400; any other non-2xx →
+            # propagate verbatim. On success the tool has already applied
+            # the status write + current_task clear + parent note.
+            if status_resp.status_code not in (200, 201):
+                return status_resp
+
         # PR 7 (Task flip): build the field dict the same way the
         # legacy code built its SET clause, then hand it to
         # task_repo.update_fields(connection=cursor). The repo's
         # _MUTABLE_FIELDS allowlist + JSON-serialisation rule (for
         # `notes`) live in one place now; the route stops carrying
         # them as inline SQL fragments.
+        #
+        # BL-R12-1: ``status`` is intentionally absent here — it is
+        # applied above via the canonical ``update_task_status`` tool.
         fields_to_update: Dict[str, Any] = {}
         log_details: Dict[str, Any] = {}
         if new_status:
-            fields_to_update["status"] = new_status
             log_details["status_updated_to"] = new_status
         if 'title' in data and data['title'] is not None:
             fields_to_update["title"] = data['title']

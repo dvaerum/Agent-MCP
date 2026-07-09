@@ -96,7 +96,7 @@ def sanitize_json_input(input_data: Union[str, bytes, Dict, List, Any]) -> Union
 
 # Helper function for API request handling
 # Original location: main.py lines 126-143
-async def get_sanitized_json_body(request: Any) -> Union[Dict, List, Any]: # 'request: Request' if Starlette is imported
+async def get_sanitized_json_body(request: Any) -> Dict: # 'request: Request' if Starlette is imported
     """
     Helper function to safely get and sanitize a JSON request body.
     Assumes 'request' is a Starlette Request object or similar with an awaitable .body() method.
@@ -105,17 +105,35 @@ async def get_sanitized_json_body(request: Any) -> Union[Dict, List, Any]: # 're
         request: The Starlette request object (or any object with awaitable .body())
 
     Returns:
-        The sanitized JSON data as a Python object
+        The sanitized JSON body as a ``dict``.
 
     Raises:
-        ValueError: If the request body is not valid JSON or cannot be processed.
+        ValueError: If the request body is not valid JSON, cannot be
+            processed, or does not decode to a top-level JSON object.
+
+    Container-shape guard (PF-R12-1): every FastAPI ``app/routers/*``
+    caller of this helper immediately does ``data.get(...)`` /
+    ``data[key]`` — they all expect a JSON *object*. A top-level
+    non-dict body (a bare list ``[1,2,3]``, a JSON string, or a scalar)
+    parses cleanly, then raises ``AttributeError`` / ``TypeError`` at the
+    ``.get()`` site and surfaces as an uncaught 500. Enforcing
+    ``isinstance(parsed, dict)`` HERE turns that class of type-confusion
+    into a clean ``ValueError`` the callers already map to 400 — matching
+    the aiohttp ``router/`` tier's ``_parse_json_body`` object guard. No
+    caller of this helper legitimately expects a top-level array; the
+    lower-level :func:`sanitize_json_input` (used by the tool-argument
+    path in ``tools/registry.py``) is deliberately left unguarded so it
+    can still return list/scalar values.
     """
     try:
         # Get the raw body data
         raw_body = await request.body() # This is usually bytes
 
         # Sanitize and parse it (sanitize_json_input now handles bytes decoding)
-        return sanitize_json_input(raw_body)
+        parsed = sanitize_json_input(raw_body)
+        if not isinstance(parsed, dict):
+            raise ValueError("request body must be a JSON object")
+        return parsed
     except ValueError as ve: # Catch ValueError from sanitize_json_input or body decoding
         logger.error(f"Failed to get/sanitize request body: {ve}")
         raise ValueError(f"Invalid request body: {ve}") # Re-raise with context
