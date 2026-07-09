@@ -1109,11 +1109,15 @@ async def init_oidc_login_handler(request: web.Request) -> web.StreamResponse:
 
     try:
         metadata = await asyncio.to_thread(_fetch_oidc_metadata, cfg.issuer)
-    except Exception as e:
+    except Exception:
+        # Full detail (issuer URL, network/TLS specifics) is retained in
+        # the server log; the client gets a static, non-reflective body
+        # so an unauthenticated browser can't probe the IdP topology
+        # (SD-R10-1 error-hygiene sweep).
         logger.exception("OIDC discovery fetch failed for %s", cfg.issuer)
         return web.Response(
             status=502,
-            text=f"OIDC discovery fetch failed: {e}",
+            text="OIDC discovery failed",
             content_type="text/plain",
         )
 
@@ -1200,10 +1204,12 @@ async def handle_oidc_callback(request: web.Request) -> web.StreamResponse:
 
     try:
         metadata = await asyncio.to_thread(_fetch_oidc_metadata, cfg.issuer)
-    except Exception as e:
+    except Exception:
+        # Static client body; issuer URL + failure detail stay in the log
+        # (SD-R10-1).
         logger.exception("OIDC discovery fetch failed during callback")
         return web.Response(
-            status=502, text=f"OIDC discovery fetch failed: {e}",
+            status=502, text="OIDC discovery failed",
         )
 
     redirect_uri = _resolve_redirect_url(request, cfg)
@@ -1216,10 +1222,11 @@ async def handle_oidc_callback(request: web.Request) -> web.StreamResponse:
             redirect_uri=redirect_uri,
             code_verifier=flow.code_verifier,
         )
-    except Exception as e:
+    except Exception:
+        # Token-endpoint URL + IdP error prose stay server-side (SD-R10-1).
         logger.exception("OIDC token exchange failed")
         return web.Response(
-            status=502, text=f"OIDC token exchange failed: {e}",
+            status=502, text="OIDC token exchange failed",
         )
 
     id_token = token.get("id_token", "")
@@ -1232,10 +1239,11 @@ async def handle_oidc_callback(request: web.Request) -> web.StreamResponse:
             _decode_id_token, id_token, metadata, cfg.client_id,
             flow.nonce,
         )
-    except Exception as e:
+    except Exception:
+        # JWKS URL + validation internals stay server-side (SD-R10-1).
         logger.exception("OIDC id_token decode failed")
         return web.Response(
-            status=502, text=f"OIDC id_token decode failed: {e}",
+            status=502, text="OIDC id_token validation failed",
         )
 
     email = claims.get("email")
