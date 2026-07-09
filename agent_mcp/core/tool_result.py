@@ -61,6 +61,8 @@ from typing import Any, List, Optional, Union
 
 import mcp.types as mcp_types
 
+from .config import logger
+
 
 @dataclass(frozen=True)
 class Ok:
@@ -220,7 +222,16 @@ def render_as_text_content(result: ToolResult) -> List[mcp_types.TextContent]:
     elif isinstance(result, Conflict):
         text = f"Error: conflict: {result.reason}"
     elif isinstance(result, Failed):
-        text = f"Error: {result.message}"
+        # SEC-R8-1: ~40 tool impls return ``Failed(message=f"…{e}")`` built
+        # from a caught sqlite3/SQLAlchemy error, so ``result.message`` can
+        # embed table/column names, filesystem paths, and internals. The
+        # RAISED-exception paths were genericized in round 7 (SD-R7-1); this
+        # is the RETURNED half. Treat ``Failed.message`` as INTERNAL: log it
+        # server-side, render a STATIC generic string to the client.
+        # ``isError`` fidelity is preserved — ``is_error_result`` still flags
+        # ``Failed`` so the MCP handler sets ``isError=True`` (finding AS-1).
+        logger.error("Tool returned Failed result: %s", result.message)
+        text = "Error: Operation failed"
     else:  # pragma: no cover - defensive
         text = f"Error: unknown ToolResult variant: {result!r}"
 
