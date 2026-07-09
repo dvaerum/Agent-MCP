@@ -502,26 +502,29 @@ async def _ensure(name: str, role: str) -> Path:
                 # socket below.
                 r = subprocess.CompletedProcess(args=[], returncode=0)
             if r.returncode != 0:
-                # F015 v6: aiohttp's HTTPException rejects ``reason``
-                # values containing CR/LF (per RFC 7230 status-line
-                # framing). systemctl's stderr for a failed start often
-                # spans multiple lines (e.g. "Failed at step EXEC..."
-                # + "Job for X failed..."). Collapse newlines BEFORE
-                # building the reason so the router returns a clean
-                # 500 instead of crashing with ``ValueError: Reason
-                # cannot contain \r or \n``. Full stderr is kept for
-                # the cooldown cache and the body via ``text=``.
+                # SC-R8-2 / error-hygiene: the systemctl-failure path is
+                # reachable by any project MEMBER (a member request warm-
+                # starts the backend), not just a sysadmin — so the client
+                # response must not reflect raw systemd stderr (unit-file
+                # paths, "Failed at step EXEC …", exec-step details).
+                # Genericise the client message and log the full stderr
+                # server-side. Preserve the 500 status. The generic reason
+                # also has no CR/LF, so it sidesteps the F015 v6 crash
+                # (aiohttp rejects a ``reason`` containing CR/LF per RFC
+                # 7230) without needing to collapse newlines.
                 full_stderr = r.stderr.strip()
-                single_line = " ".join(full_stderr.split())[:300]
-                reason = f"systemctl {action} {unit} failed: {single_line}"
-                # Same cooldown applies to a hard systemctl failure
-                # — without it, the next queued request immediately
-                # invokes systemctl again, which loops on the same
-                # unit-file / permission / OOM condition.
-                ensure_failures[(name, role)] = (time.monotonic(), reason)
-                raise web.HTTPInternalServerError(
-                    reason=reason, text=f"{reason}\n\n{full_stderr}"
+                log.error(
+                    "systemctl %s %s failed (rc=%s): %s",
+                    action, unit, r.returncode, full_stderr,
                 )
+                reason = "backend failed to start"
+                # Same cooldown applies to a hard systemctl failure — without
+                # it, the next queued request immediately invokes systemctl
+                # again, which loops on the same unit-file / permission / OOM
+                # condition. Store the GENERIC reason so the replayed 504
+                # within the cooldown window stays generic too.
+                ensure_failures[(name, role)] = (time.monotonic(), reason)
+                raise web.HTTPInternalServerError(reason=reason, text=reason)
             # Poll for the socket file. Production waits up to ~20 s
             # (200 × 0.1 s) for the unit to come up. The budget is
             # env-overridable so unit tests — which stub systemctl and
