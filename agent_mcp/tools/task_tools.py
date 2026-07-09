@@ -793,6 +793,7 @@ async def _assign_to_existing_tasks(
     validate_agent_workload: bool,
     coordination_notes: str,
     requesting_actor: str = "admin",
+    is_admin_request: bool = False,
 ) -> ToolResult:
     """Mode 3: Assign agent to existing unassigned tasks.
 
@@ -801,22 +802,62 @@ async def _assign_to_existing_tasks(
     worker's behalf) — used for audit attribution instead of a
     hardcoded ``"admin"`` so the trail reflects who actually claimed
     the work (OBS-R17-AZ, same provenance family as the Mode-0 fix).
+
+    ``is_admin_request`` is the caller's ``tasks.assign`` capability
+    (operator / manager / sysadmin). It gates the informative-vs-phantom
+    error split below:
+
+      * SEC-R18 (AZ-R18-1) — for a NON-admin self-claim caller EVERY
+        non-claimable outcome (nonexistent task, task assigned to
+        another, terminal-status task, or capability-mismatch)
+        collapses to the IDENTICAL phantom ``NotFound`` the nonexistent
+        branch returns — no owner id, no existence signal. This closes
+        the last worker-reachable sibling of the uniform-phantom
+        existence-oracle class (AZ-R17-1 et al): a worker can no longer
+        enumerate which task_ids exist, nor read a foreign task's
+        assignee.
+      * SEC-R18 (BL-R18-1) — a TERMINAL task (completed/cancelled/
+        failed) is non-claimable on the ASSIGN axis too, mirroring the
+        status-axis terminal sink in ``_update_single_task`` /
+        ``_is_status_transition_allowed``. A terminal-but-unassigned
+        task (reachable by admin-cancelling an unclaimed task, or the
+        BL-R17-2 purge clearing a terminal task's assignee) must not be
+        re-claimable and re-executed.
+
+    Admin/manager callers keep the real, informative errors
+    (Conflict-with-owner, PermissionDenied, and an informative terminal
+    block) — the phantom collapse is ONLY for the non-admin self-claim
+    oracle.
     """
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # Validate that all tasks exist and are unassigned
+        # Validate that all tasks exist and are unassigned. ``status`` is
+        # SELECTed so the terminal-sink check below can see terminal
+        # state (BL-R18-1).
         placeholders = ",".join(["?" for _ in task_ids])
         cursor.execute(
-            f"SELECT task_id, title, assigned_to, required_capabilities "
+            f"SELECT task_id, title, assigned_to, required_capabilities, status "
             f"FROM tasks WHERE task_id IN ({placeholders})",
             task_ids,
         )
         found_tasks = cursor.fetchall()
 
+        # SEC-R18 phantom NotFound. For a non-admin self-claim caller,
+        # every non-claimable outcome collapses to this — byte-identical
+        # to the nonexistent-task branch, with the identifier being the
+        # id(s) the caller asked for (never the missing subset, which
+        # would itself signal which of a batch exists). See the function
+        # docstring for the AZ-R18-1 / BL-R18-1 rationale.
+        phantom_not_found = NotFound(
+            resource="task", identifier=", ".join(task_ids)
+        )
+
         if len(found_tasks) != len(task_ids):
+            if not is_admin_request:
+                return phantom_not_found
             found_ids = [task["task_id"] for task in found_tasks]
             missing_ids = [tid for tid in task_ids if tid not in found_ids]
             return NotFound(resource="task", identifier=", ".join(missing_ids))
@@ -826,12 +867,40 @@ async def _assign_to_existing_tasks(
             task for task in found_tasks if task["assigned_to"] is not None
         ]
         if assigned_tasks:
+            if not is_admin_request:
+                return phantom_not_found
             assigned_list = [
                 f"{task['task_id']} (assigned to {task['assigned_to']})"
                 for task in assigned_tasks
             ]
             return Conflict(
                 reason=f"some tasks are already assigned: {', '.join(assigned_list)}"
+            )
+
+        # Terminal-sink on the assign axis (BL-R18-1). A terminal task
+        # (completed/cancelled/failed) is finished work; re-assigning it
+        # would let the claimant re-execute it. Terminal is a sink here
+        # exactly as it is on the status axis
+        # (``_is_status_transition_allowed`` / ``_update_single_task``).
+        # Non-admin callers get the phantom NotFound; admins get an
+        # informative block (never a silent claim).
+        terminal_tasks = [
+            task
+            for task in found_tasks
+            if task["status"] in _TERMINAL_TASK_STATUSES
+        ]
+        if terminal_tasks:
+            if not is_admin_request:
+                return phantom_not_found
+            terminal_list = [
+                f"{task['task_id']} ({task['status']})"
+                for task in terminal_tasks
+            ]
+            return Conflict(
+                reason=(
+                    "cannot assign task(s) in a terminal state "
+                    f"(terminal states are a sink): {', '.join(terminal_list)}"
+                )
             )
 
         # Validate agent exists and is not terminated. A terminated
@@ -856,6 +925,12 @@ async def _assign_to_existing_tasks(
             required = set(json.loads(raw_req) if raw_req else [])
             missing = required - agent_caps
             if missing:
+                # SEC-R18: a non-admin self-claim caller must not learn
+                # the task exists via a capability-mismatch signal —
+                # collapse to the phantom NotFound. Admins keep the
+                # informative PermissionDenied.
+                if not is_admin_request:
+                    return phantom_not_found
                 return PermissionDenied(
                     reason=(
                         f"agent '{target_agent_id}' lacks required "
@@ -1288,6 +1363,7 @@ async def assign_task_tool_impl(
             validate_agent_workload,
             coordination_notes,
             requesting_actor,
+            is_admin_request,
         )
     elif operation_mode == "multiple":
         return await _create_and_assign_multiple_tasks(
