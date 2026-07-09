@@ -549,6 +549,69 @@ async def view_status_tool_impl(
     )
 
 
+def _reconcile_reassigned_tasks(
+    reassigned_tasks: list,
+) -> None:
+    """Post-commit reconciliation for tasks bulk-unassigned by the
+    terminate (here) and purge (``app/routers/agents.py``) cascades.
+
+    ``reassigned_tasks`` is a list of ``(task_id,
+    required_capabilities_raw)`` tuples captured BEFORE the bulk
+    ``UPDATE tasks SET assigned_to=NULL`` ran.
+
+    Two round-10 findings are addressed per task:
+
+    * **BL-R10-1** — refresh ``g.tasks[task_id]`` from the
+      DB-authoritative row so ``view_tasks`` (which iterates the cache)
+      shows the task as unassigned instead of pinned to the now-dead
+      agent. We UPSERT the fresh row rather than evict it: the task
+      still exists (just unassigned), and eviction would make it vanish
+      from ``view_tasks`` instead of showing it available.
+      ``get_task_by_id`` (the DB free function) is used deliberately —
+      ``task_repo.get_by_id`` is cache-first and would hand back the
+      stale entry we are trying to replace.
+    * **BL-R10-2** — wake every capability-matched worker via
+      ``notify_unassigned_task_appeared`` so a live ``wait_for_events``
+      waiter picks the task up immediately. (Disconnected workers catch
+      up via ``_collect_unassigned_task_events_for``, which keys on
+      ``updated_at``.)
+
+    Best-effort per task: a cache/notify failure must never poison the
+    reassignment, which is already committed.
+    """
+    if not reassigned_tasks:
+        return
+    from ..db.actions.task_db import get_task_by_id
+    from ..repositories import task_repo
+
+    for task_id, req_caps_raw in reassigned_tasks:
+        try:
+            fresh = get_task_by_id(task_id)
+            if fresh is not None:
+                task_repo.upsert_cache(fresh)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "cache reconcile of reassigned task %s failed: %s",
+                task_id, e,
+            )
+        try:
+            if isinstance(req_caps_raw, str):
+                caps_list = json.loads(req_caps_raw or "[]")
+            elif req_caps_raw is None:
+                caps_list = []
+            else:
+                caps_list = list(req_caps_raw)
+        except Exception:
+            caps_list = []
+        try:
+            g.notify_unassigned_task_appeared(task_id, caps_list)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "notify_unassigned_task_appeared(%s) failed after "
+                "reassignment: %s", task_id, e,
+            )
+
+
 # --- terminate_agent tool ---
 # Original logic from main.py: lines 1270-1316 (terminate_agent_tool function)
 async def terminate_agent_tool_impl(
@@ -629,6 +692,23 @@ async def terminate_agent_tool_impl(
         from ..tools.task_tools import _TERMINAL_TASK_STATUSES
 
         terminal_placeholders = ",".join("?" * len(_TERMINAL_TASK_STATUSES))
+        # BL-R10-1/2: capture the rows we're about to reassign BEFORE the
+        # bulk UPDATE so we can reconcile them post-commit. We grab
+        # required_capabilities here too — the unassign UPDATE doesn't
+        # touch that column and the cache projection drops it, so this is
+        # the cheapest place to read it for the capability-matched wake.
+        cursor.execute(
+            "SELECT task_id, required_capabilities FROM tasks "
+            f"WHERE assigned_to = ? AND status NOT IN ({terminal_placeholders})",
+            (
+                agent_id_to_terminate,
+                *sorted(_TERMINAL_TASK_STATUSES),
+            ),
+        )
+        reassigned_tasks = [
+            (r["task_id"], r["required_capabilities"])
+            for r in cursor.fetchall()
+        ]
         cursor.execute(
             "UPDATE tasks SET assigned_to = NULL, status = 'unassigned', "
             "updated_at = ? "
@@ -661,6 +741,11 @@ async def terminate_agent_tool_impl(
         agent_repo.evict_from_cache(
             agent_id_to_terminate, token=found_agent_token,
         )
+
+        # BL-R10-1/2: reconcile the tasks we just unassigned — refresh
+        # their g.tasks cache entries (so view_tasks stops pinning them
+        # to the dead agent) and wake capability-matched workers.
+        _reconcile_reassigned_tasks(reassigned_tasks)
 
         # Release any files held by this agent from g.file_map
         files_released_count = 0
