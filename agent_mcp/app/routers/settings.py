@@ -35,6 +35,45 @@ router = APIRouter(
 )
 
 
+# SD-R16-1: ``GET /api/aoe/health`` is reachable by a viewer-tier operator
+# (``require_operator_session`` admits viewers on GET — the per-project
+# backend cannot resolve the caller's project role). ``check_health``'s
+# ``message`` strings embed the internal AoE ``base_url`` (topology
+# disclosure) and raw httpx/exception text, and the "ok" path returns
+# ``base_url`` outright. Sanitise at the response boundary so internal
+# callers of ``check_health`` (and the server log) keep the detail while
+# the client sees only a coarse, useful status. Whitelisting the output
+# fields (rather than blacklisting the leaky ones) keeps this robust
+# against any future leaky field on the ``check_health`` result.
+_AOE_HEALTH_CLIENT_MESSAGES = {
+    "ok": "AoE reachable",
+    "disabled": "AoE notifications are disabled",
+    "unauthorized": "AoE rejected the bearer token (missing, stale, or rejected)",
+    "unreachable": "AoE is unreachable",
+    "timeout": "AoE timed out",
+    "misconfigured": "AoE bearer-token source is misconfigured (see server log)",
+}
+
+
+def _sanitize_aoe_health(result: dict) -> dict:
+    """Strip internal detail from a ``check_health`` result before it
+    crosses the client boundary. See SD-R16-1.
+
+    Keeps the coarse ``status`` (+ ``session_count`` when present) an
+    operator needs; replaces the detailed ``message`` with a static
+    per-status string and drops ``base_url`` and any raw exception text.
+    """
+    status = result.get("status", "unreachable")
+    out: dict = {
+        "status": status,
+        "message": _AOE_HEALTH_CLIENT_MESSAGES.get(status, "AoE status unknown"),
+    }
+    session_count = result.get("session_count")
+    if isinstance(session_count, int):
+        out["session_count"] = session_count
+    return out
+
+
 @router.api_route("/tokens", methods=["GET", "OPTIONS"])
 async def tokens_api_route(
     request: Request,
@@ -112,13 +151,20 @@ async def aoe_health_api_route(
     The dashboard no longer passes the admin token in the query string.
 
     Pings the configured AoE instance with the current bearer token
-    (resolved live, including file-sourced rotations) and reports back:
+    (resolved live, including file-sourced rotations). The raw
+    ``check_health`` result is sanitised through ``_sanitize_aoe_health``
+    (SD-R16-1) before it crosses the client boundary, so the response
+    carries only a coarse status + static message:
 
-      {"status": "ok",            "session_count": N, "base_url": "..."}
-      {"status": "disabled",      "message": "config_aoe_notify_enabled is off"}
-      {"status": "unauthorized",  "message": "AoE returned 401 ..."}
+      {"status": "ok",            "session_count": N, "message": "..."}
+      {"status": "disabled",      "message": "..."}
+      {"status": "unauthorized",  "message": "..."}
       {"status": "unreachable",   "message": "..."}
-      {"status": "misconfigured", "message": "no bearer token resolved"}
+      {"status": "misconfigured", "message": "..."}
+
+    The internal AoE ``base_url`` and any httpx/exception text stay in
+    the server log, never in the client body (the endpoint is
+    viewer-reachable — see ``_sanitize_aoe_health``).
 
     Used by the Settings tab to surface a "your AoE token has gone
     stale" warning without requiring the admin to attempt a real send.
@@ -134,11 +180,17 @@ async def aoe_health_api_route(
         result = await check_health()
     except Exception as e:
         logger.error("AoE health probe crashed: %s", e, exc_info=True)
+        # SD-R16-1: static client message — ``str(e)`` on the outbound
+        # httpx/probe failure embeds the internal AoE ``base_url`` +
+        # exception text. Detail stays in the log above.
         return JSONResponse(
-            {"status": "unreachable", "message": f"probe crashed: {e}"},
+            {
+                "status": "unreachable",
+                "message": _AOE_HEALTH_CLIENT_MESSAGES["unreachable"],
+            },
             status_code=200,
         )
-    return JSONResponse(result)
+    return JSONResponse(_sanitize_aoe_health(result))
 
 
 # --- Prompt Book catalog (plan Phase 6) ---

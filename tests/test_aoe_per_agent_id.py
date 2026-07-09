@@ -434,7 +434,12 @@ async def test_aoe_health_bad_token(tmp_path, aoe_mock) -> None:
         assert r.status_code == 200, r.text  # endpoint itself succeeds
         body = r.json()
         assert body["status"] == "unauthorized", body
-        assert "401" in body.get("message", "")
+        # SD-R16-1: the message is sanitised to a static per-status string
+        # at the response boundary (no base_url / str(e) / raw upstream
+        # text). The coarse "unauthorized" status is the meaningful signal;
+        # the message conveys the token was rejected without echoing the
+        # upstream response detail.
+        assert "reject" in body.get("message", "").lower(), body
 
 
 async def test_aoe_health_requires_admin(tmp_path) -> None:
