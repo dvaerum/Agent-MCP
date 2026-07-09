@@ -641,6 +641,15 @@ async def edit_agent_api_route(
             for field, value in applied.items():
                 g.active_agents[agent_token][field] = value
 
+        # BL-R11-1: working_directory has a SECOND in-memory view —
+        # g.agent_working_dirs (keyed by agent_id), which
+        # get_working_directory() reads FIRST and returns on a non-None
+        # hit. The active_agents reconcile above (keyed by token) never
+        # reaches it, so file tools + get_agent_details keep resolving
+        # against the stale dir. Mirror the sibling reconcile.
+        if "working_directory" in applied:
+            g.agent_working_dirs[agent_id] = applied["working_directory"]
+
         # PR-2 event-coord: if `auto_event_loop` was flipped, wake any
         # in-flight wait_for_events for this agent so it re-evaluates
         # the flag state. The wait_for_events impl returns
