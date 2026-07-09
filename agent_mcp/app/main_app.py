@@ -839,7 +839,35 @@ async def mcp_call_tool_handler(name: str, arguments: dict) -> mcp_types.CallToo
                 bearer_token=bearer,
                 forwarding_operator=None,
             )
-    result = await dispatch_tool_call(name, arguments, principal=principal)
+    # SD-R7-1: ``dispatch_tool_call`` RE-RAISES two controlled exception
+    # types whose message is deliberate, safe client feedback —
+    # ``AuthRejected`` ("Unauthorized: …") and ``ToolInputValidationError``
+    # ("Input validation error: …"). We let those propagate so the MCP
+    # SDK's ``_make_error_result(str(e))`` renders their intended message
+    # with ``isError=True`` (round-3/4 fidelity). ANY OTHER exception is
+    # an UNCAUGHT tool-body failure (sqlite3/SQLAlchemy error, KeyError,
+    # OSError with a path) whose ``str(e)`` leaks table/column names,
+    # paths, and internals — the SDK would reflect it verbatim to any
+    # worker/manager bearer. Catch it here, log the detail server-side
+    # only, and return a generic ``isError=True`` result instead.
+    from ..core.authorize import AuthRejected
+    from ..tools.registry import ToolInputValidationError
+
+    try:
+        result = await dispatch_tool_call(name, arguments, principal=principal)
+    except (AuthRejected, ToolInputValidationError):
+        # Controlled, non-sensitive messages — let the framework render
+        # them (isError=True). Do NOT genericize.
+        raise
+    except Exception as e:
+        logger.error(
+            f"Unexpected error executing tool {name!r}: {e}",
+            exc_info=True,
+        )
+        return mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(type="text", text="Tool execution failed")],
+            isError=True,
+        )
     return mcp_types.CallToolResult(
         content=render_as_text_content(result),
         isError=is_error_result(result),

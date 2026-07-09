@@ -132,6 +132,10 @@ async def _dispatch_through_tool(
             status_code=400,
         )
     except Exception as e:
+        # SD-R7-1: the raw ``str(e)`` of an uncaught tool-body exception
+        # (sqlite3/SQLAlchemy error, KeyError, OSError with a path) leaks
+        # table/column names, filesystem paths, and internals. Log the
+        # detail server-side only; return a STATIC generic 500 message.
         logger.error(
             f"Unexpected error dispatching tool {tool_name!r}: {e}",
             exc_info=True,
@@ -139,8 +143,8 @@ async def _dispatch_through_tool(
         return JSONResponse(
             {
                 "success": False,
-                "error": f"Tool dispatch failed: {e}",
-                "message": f"Tool dispatch failed: {e}",
+                "error": "Tool dispatch failed",
+                "message": "Tool dispatch failed",
             },
             status_code=500,
         )

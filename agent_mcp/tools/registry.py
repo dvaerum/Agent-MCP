@@ -506,8 +506,13 @@ async def dispatch_tool_call(
         logger.error(f"Invalid input arguments for tool '{tool_name}': {e}")
         return _Invalid(field=None, message=f"Invalid input arguments: {str(e)}")
     except Exception as e: # Catch any other sanitization errors
+        # SD-R7-1: an unexpected sanitization error is a server-side bug,
+        # not caller feedback — its ``str(e)`` can carry internals. Log
+        # the detail server-side; return a STATIC generic message. (The
+        # ``ValueError`` arm above keeps its message: those are controlled
+        # argument-format validation strings, safe caller feedback.)
         logger.error(f"Error sanitizing arguments for tool '{tool_name}': {e}", exc_info=True)
-        return _Failed(message=f"Error processing tool arguments: {str(e)}")
+        return _Failed(message="Error processing tool arguments")
 
 
     # Dispatch to the correct tool implementation (main.py:1879 onwards)
