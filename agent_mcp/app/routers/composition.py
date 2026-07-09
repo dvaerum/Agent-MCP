@@ -774,6 +774,11 @@ async def update_task_details_api_route(
         # in addition to the new one — see the post-commit publish/notify
         # block below.
         prior_assignee = task_row["assigned_to"]
+        # BL-R17-1: the task's CURRENT status, captured before the UPDATE,
+        # so the clear-assignment branch below can carve out TERMINAL tasks
+        # (completed/cancelled/failed) exactly as the canonical unassign
+        # producers do — see the guard where ``assigned_to`` is cleared.
+        prior_status = task_row["status"]
 
         # BL-R12-1: the ``status`` transition must NOT be direct-written
         # here — that bypassed all four invariants the canonical MCP path
@@ -894,10 +899,28 @@ async def update_task_details_api_route(
             # explicit ``status`` (already routed through update_task_status
             # above per BL-R12-1) so we don't clobber their choice.
             if new_assigned is None:
-                clearing_assignment = True
-                if not new_status:
-                    fields_to_update["status"] = "unassigned"
-                    log_details["status_unassigned"] = True
+                # BL-R17-1: terminal tasks (completed/cancelled/failed) are
+                # SINKS — carve them out here to mirror the canonical unassign
+                # producers. agent-terminate (tools/admin_tools.py) filters
+                # ``status NOT IN (terminal)`` before its unassign UPDATE;
+                # REST create-unassigned (app/routers/tasks.py) only ever
+                # produces fresh non-terminal tasks. Without this guard,
+                # clearing (or editing) a terminal task's assignee flipped its
+                # status back to 'unassigned' and fired
+                # notify_unassigned_task_appeared — RESURRECTING finished work
+                # (a worker re-executes an already-completed task) and
+                # bypassing the BL-R12-1 terminal-sink transition guard (which
+                # correctly 409s a direct completed->unassigned status write on
+                # the canonical path). For a terminal task we still allow
+                # clearing ``assigned_to`` but keep the terminal status intact
+                # and fire NO unassigned fanout. The non-terminal
+                # (pending/in_progress) clear keeps its BL-R16-1 behavior.
+                from ...tools.task_tools import _TERMINAL_TASK_STATUSES
+                if prior_status not in _TERMINAL_TASK_STATUSES:
+                    clearing_assignment = True
+                    if not new_status:
+                        fields_to_update["status"] = "unassigned"
+                        log_details["status_unassigned"] = True
         if 'notes' in data and data['notes'] and isinstance(data['notes'], str) and data['notes'].strip():
             try:
                 current_notes_list = json.loads(existing_notes_str or "[]")
