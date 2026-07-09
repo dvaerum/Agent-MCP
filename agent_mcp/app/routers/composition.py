@@ -92,6 +92,22 @@ router = APIRouter(
 )
 
 
+# SEC round-9 (type-confusion 400-not-500): the update-task-dashboard
+# handler writes the DB directly, bypassing the schema-validating MCP
+# tool dispatch. A dict/list in a string field used to reach
+# ``task_repo.update_fields`` → a SQLite bind that raises inside the repo,
+# is swallowed (returns False), and the handler STILL commits + returns a
+# misleading ``200 {"success": true}`` — a silent no-op. Guard each field
+# up front so a bad value is a clean 400. Local to this router per scope.
+def _require_str(value, field):
+    """Return a 400 JSONResponse if ``value`` is present but not a str."""
+    if value is not None and not isinstance(value, str):
+        return JSONResponse(
+            {"error": f"{field} must be a string"}, status_code=400
+        )
+    return None
+
+
 def _context_value_should_redact(
     context_key: Any, value: Any, description: Any
 ) -> bool:
@@ -731,6 +747,20 @@ async def update_task_details_api_route(
                 {"error": "at least one editable field is required (status, title, description, priority, notes, assigned_to)."},
                 status_code=400,
             )
+
+        # SEC round-9: reject structured JSON in the string fields BEFORE
+        # they reach task_repo.update_fields. Without this a dict/list
+        # value raises inside the repo's SQLite bind, is swallowed
+        # (returns False), and the handler still commits + returns a
+        # misleading 200 success — a silent no-op. ``task_id`` binds into
+        # the WHERE clause; ``notes`` is already isinstance-guarded below
+        # (non-str notes are ignored, not an error, preserving behaviour).
+        for _field in ("task_id", "status", "title", "description",
+                       "priority", "assigned_to"):
+            _err = _require_str(data.get(_field), _field)
+            if _err is not None:
+                return _err
+
         requesting_admin_id = caller_identity(auth)
         conn = get_db_connection()
         cursor = conn.cursor()

@@ -48,6 +48,22 @@ router = APIRouter(
 )
 
 
+# SEC round-9 (type-confusion 400-not-500): these direct-SQL handlers
+# bypass the schema-validating MCP tool dispatch. ``context_key`` binds
+# straight into a WHERE clause / the ORM column, and ``description`` is
+# a TEXT column — a structured JSON type in either used to 500 (or, for
+# a non-str ``context_key``, slip past ``has_unsafe_unicode_for_identifier``
+# which returns False for non-str). ``context_value`` is intentionally
+# arbitrary JSON (``json.dumps``-serialised), so it is NOT guarded here.
+def _require_str(value, field):
+    """Return a 400 JSONResponse if ``value`` is present but not a str."""
+    if value is not None and not isinstance(value, str):
+        return JSONResponse(
+            {"error": f"{field} must be a string"}, status_code=400
+        )
+    return None
+
+
 @router.api_route("", methods=["POST", "OPTIONS"])
 async def create_memory_api_route(
     request: Request,
@@ -69,6 +85,17 @@ async def create_memory_api_route(
 
         if not context_key:
             return JSONResponse({"error": "context_key is required"}, status_code=400)
+
+        # SEC round-9: a dict/list ``context_key`` binds into the WHERE /
+        # ORM column and 500s (and slips past the unsafe-unicode check
+        # below, which returns False for non-str). ``description`` is a
+        # TEXT column — reject structured JSON up front.
+        _err = _require_str(context_key, "context_key")
+        if _err is not None:
+            return _err
+        _err = _require_str(description, "description")
+        if _err is not None:
+            return _err
 
         # F005 verify-all-v6 MUTATING #3: reject keys containing
         # Unicode control / bidi-override / invisible characters.
@@ -181,6 +208,13 @@ async def update_memory_api_route(
         data = await get_sanitized_json_body(request)
         context_value = data.get('context_value')
         description = data.get('description')
+
+        # SEC round-9: ``description`` binds into the TEXT column — reject
+        # structured JSON. ``context_value`` is arbitrary JSON (json.dumps
+        # -serialised) so it stays unguarded, matching the CREATE handler.
+        _err = _require_str(description, "description")
+        if _err is not None:
+            return _err
 
         requesting_admin_id = caller_identity(auth)
 
