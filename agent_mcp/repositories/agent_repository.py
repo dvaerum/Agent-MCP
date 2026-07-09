@@ -126,6 +126,21 @@ def _publish(addressee: str, event: str, payload: Dict[str, Any]) -> None:
 # letter and a trailing lowercase letter/digit).
 _AGENT_ID_RE = re.compile(r"^[a-z][a-z0-9-]*[a-z0-9]$|^[a-z]$")
 
+# Reserved agent_id prefixes. Several authorization gates privilege an
+# agent purely by the agent_id STRING rather than by role — e.g.
+# ``agent_id == "admin"`` (messaging / read-any-inbox / authorize) and
+# ``agent_id.lower().startswith("admin")`` (task_tools / state). A
+# worker-role row literally named "admin" (or "admin-x") would inherit
+# those name-keyed privileges, so the repository — the single owner of
+# the agent_id invariant — refuses to mint one. Case-insensitive
+# prefix match to mirror the ``.lower().startswith("admin")`` gates.
+_RESERVED_AGENT_ID_PREFIXES: tuple[str, ...] = ("admin",)
+
+
+def _is_reserved_agent_id(agent_id: str) -> bool:
+    lowered = agent_id.lower()
+    return any(lowered.startswith(p) for p in _RESERVED_AGENT_ID_PREFIXES)
+
 
 _MUTABLE_FIELDS: set[str] = {
     "status",
@@ -642,6 +657,18 @@ class AgentRepository:
                 f"{_AGENT_ID_RE.pattern} "
                 f"(lowercase letters, digits, hyphens; must start with "
                 f"a letter; must not end with a hyphen)."
+            )
+
+        # Reserved-name guard (Wave-B): reject names that name-keyed
+        # authorization gates would privilege. See
+        # ``_RESERVED_AGENT_ID_PREFIXES``. Raised BEFORE any DB write so
+        # no partial state leaks, matching the slug-regex guard above.
+        if _is_reserved_agent_id(agent_id):
+            raise ValueError(
+                f"reserved agent_id {agent_id!r}: names beginning with "
+                f"{_RESERVED_AGENT_ID_PREFIXES!r} are reserved for "
+                f"privileged / built-in identities and cannot be "
+                f"assigned to an agent."
             )
 
         now = datetime.datetime.now().isoformat()

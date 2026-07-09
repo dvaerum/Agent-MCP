@@ -82,6 +82,12 @@ def _is_operator_tier_bearer(token: str) -> bool:
     row = agent_repo.get_agent_by_token(token)
     if not isinstance(row, dict):
         return False
+    # Termination-revocation (Wave-B; same class as #275/#280 on this
+    # REST dep path): ``get_agent_by_token`` still returns terminated
+    # rows (for audit/attribution), so a terminated manager's bearer
+    # must be denied operator-tier here explicitly.
+    if row.get("status") == "terminated":
+        return False
     return row.get("agent_role") in _OPERATOR_TIER_AGENT_ROLES
 
 

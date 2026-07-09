@@ -291,6 +291,23 @@ async def register_agent_tool_impl(
             ),
         )
 
+    # Reserved-name guard (Wave-B). The repo's create() would also
+    # reject this (single owner of the invariant) — returning a clean
+    # Invalid here gives the operator a precise reason instead of a
+    # generic DB-error. Kept in lockstep with
+    # ``agent_repo._is_reserved_agent_id``.
+    from ..repositories.agent_repository import _is_reserved_agent_id
+
+    if _is_reserved_agent_id(agent_id):
+        return Invalid(
+            field="name",
+            message=(
+                f"reserved name {agent_id!r}: names beginning with "
+                "'admin' are reserved for privileged / built-in "
+                "identities and cannot be assigned to an agent."
+            ),
+        )
+
     # Refuse to clobber an existing agent. Mirrors create_agent's
     # in-memory + DB checks so both surfaces give the operator the
     # same wording when they try to re-register a name in use.
@@ -598,6 +615,35 @@ async def terminate_agent_tool_impl(
             return NotFound(
                 resource="agent",
                 identifier=agent_id_to_terminate,
+            )
+
+        # Wave-B: reconcile tasks so no ACTIVE task is stranded on a
+        # terminated agent that will never run it. Terminal tasks
+        # (completed/cancelled/failed) keep their attribution —
+        # terminate is a soft-delete (the row still exists), and
+        # reverting a completed task to unassigned would destroy
+        # completion history. Runs on the caller's cursor so it stays
+        # atomic with the status flip + audit INSERT. Mirrors the
+        # purge-cascade convention in app/routers/agents.py, minus the
+        # terminal-status carve-out (purge is a hard delete).
+        from ..tools.task_tools import _TERMINAL_TASK_STATUSES
+
+        terminal_placeholders = ",".join("?" * len(_TERMINAL_TASK_STATUSES))
+        cursor.execute(
+            "UPDATE tasks SET assigned_to = NULL, status = 'unassigned', "
+            "updated_at = ? "
+            f"WHERE assigned_to = ? AND status NOT IN ({terminal_placeholders})",
+            (
+                datetime.datetime.now().isoformat(),
+                agent_id_to_terminate,
+                *sorted(_TERMINAL_TASK_STATUSES),
+            ),
+        )
+        tasks_unassigned = cursor.rowcount
+        if tasks_unassigned:
+            logger.info(
+                "Unassigned %d active task(s) from terminated agent %s.",
+                tasks_unassigned, agent_id_to_terminate,
             )
 
         log_agent_action_to_db(
