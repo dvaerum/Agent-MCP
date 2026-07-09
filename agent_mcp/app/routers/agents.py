@@ -854,6 +854,27 @@ async def purge_agent_api_route(
                 "UPDATE agent_actions SET agent_id = ? WHERE agent_id = ?",
                 (tombstone, agent_id),
             )
+            # BL-R4-2: mcp_sessions.agent_id and
+            # claude_code_sessions.agent_id are FKs to agents.agent_id
+            # (migrations 0007/0008). On a migration-built DB the FK is
+            # enforced, so a session row still referencing this agent at
+            # DELETE time makes the final `DELETE FROM agents` raise
+            # `FOREIGN KEY constraint failed` and roll back the whole
+            # purge. A purged agent's sessions are dead anyway, so DELETE
+            # them here — in the same transaction, BEFORE the agents-row
+            # delete below. Guarded on table presence so the purge still
+            # works on an older schema that predates these tables.
+            for _session_table in ("mcp_sessions", "claude_code_sessions"):
+                cursor.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name = ?",
+                    (_session_table,),
+                )
+                if cursor.fetchone() is not None:
+                    cursor.execute(
+                        f"DELETE FROM {_session_table} WHERE agent_id = ?",
+                        (agent_id,),
+                    )
             # Audit the purge itself — written *before* the agent row
             # disappears so the action log has a non-tombstoned
             # 'purged_agent' entry attributable to admin.
