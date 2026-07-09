@@ -539,10 +539,23 @@ async def _ensure(name: str, role: str) -> Path:
                     break
                 await asyncio.sleep(0.1)
             else:
-                reason = (
+                # SC-R9-1 / error-hygiene: mirror the systemctl-failure
+                # branch above (SC-R8-2). This socket-poll-timeout path is
+                # reachable by any project MEMBER warm-starting a slow/
+                # broken backend, so the client response must not reflect
+                # the raw unit name or the ABSOLUTE server-side socket path
+                # (``$AGENT_MCP_SOCK_DIR/<name>/backend.sock`` — under
+                # ``/run/...`` in prod). Log the detailed unit+sock phrase
+                # server-side; return AND store a GENERIC client reason so
+                # the 504 status line and the cooldown-replay 504 (the
+                # short-circuit branch above re-raises the stored reason)
+                # both stay generic.
+                detail = (
                     f"{unit} did not create {sock} within "
                     f"~{attempts * 0.1:.0f} s"
                 )
+                log.error("ensure socket timeout: %s", detail)
+                reason = "backend not ready"
                 ensure_failures[(name, role)] = (time.monotonic(), reason)
                 raise web.HTTPGatewayTimeout(reason=reason)
         # Success — evict any stale failure entry so the next caller
