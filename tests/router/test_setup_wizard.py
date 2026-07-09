@@ -120,8 +120,9 @@ async def test_setup_creates_user_and_logs_in(
         "/agent-mcp/setup",
         data={
             "username": "first_op",
-            "password": "secretpw",
-            "password_confirm": "secretpw",
+            # ≥12 chars to satisfy the password-strength policy (AC-2).
+            "password": "secret-pw-1234",
+            "password_confirm": "secret-pw-1234",
         },
         allow_redirects=False,
     )
@@ -133,7 +134,7 @@ async def test_setup_creates_user_and_logs_in(
     identity = _identity_module()
     user = identity.get_user_by_username("first_op")
     assert user is not None
-    assert identity.verify_password(user["password_hash"], "secretpw")
+    assert identity.verify_password(user["password_hash"], "secret-pw-1234")
 
 
 async def test_setup_accepts_optional_email(
@@ -145,8 +146,9 @@ async def test_setup_accepts_optional_email(
         "/agent-mcp/setup",
         data={
             "username": "with_email",
-            "password": "pw",
-            "password_confirm": "pw",
+            # ≥12 chars to satisfy the password-strength policy (AC-2).
+            "password": "ops-password-1",
+            "password_confirm": "ops-password-1",
             "email": "ops@example.com",
         },
         allow_redirects=False,

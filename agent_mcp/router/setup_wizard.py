@@ -174,6 +174,24 @@ async def setup_post_handler(request: web.Request) -> web.StreamResponse:
             charset="utf-8",
         )
 
+    # Enforce the shared password-strength policy BEFORE create_user, so
+    # a self-provisioned first operator can't set a trivially-guessable
+    # secret (round-3 finding AC-2). Policy lives in identity so the
+    # admin/self-serve paths can share the exact same rule.
+    try:
+        identity.validate_password_strength(password)
+    except identity.WeakPasswordError as exc:
+        return web.Response(
+            text=_render_setup_form(
+                error=str(exc),
+                username=username,
+                email=email or "",
+            ),
+            status=400,
+            content_type="text/html",
+            charset="utf-8",
+        )
+
     try:
         user_id = identity.create_user(
             username=username, password=password, email=email,

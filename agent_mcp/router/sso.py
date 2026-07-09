@@ -818,13 +818,20 @@ def _decode_flow_cookie(raw: str) -> _FlowState | None:
         padded = raw + "=" * (-len(raw) % 4)
         data = base64.urlsafe_b64decode(padded.encode())
         parsed = json.loads(data)
+        # Fail closed on a missing/empty nonce. Authlib's validate_nonce
+        # is gated on `if nonce_value:` — an EMPTY expected nonce skips
+        # the comparison entirely, so an id_token minted for a DIFFERENT
+        # auth request would be accepted. The flow cookie is unsigned
+        # base64(JSON), hence attacker-craftable, so a nonce-less cookie
+        # MUST be treated as an invalid flow rather than one that
+        # silently disables anti-replay (round-3 finding AC-1).
+        nonce = parsed.get("nonce", "")
+        if not nonce:
+            return None
         return _FlowState(
             state=parsed["state"],
             code_verifier=parsed["verifier"],
-            # Pre-nonce cookies (in-flight during a rolling deploy) lack
-            # the field; treat as empty so the callback still validates
-            # state + PKCE rather than 500-ing on a KeyError.
-            nonce=parsed.get("nonce", ""),
+            nonce=nonce,
         )
     except Exception:
         return None
@@ -1039,6 +1046,12 @@ async def handle_oidc_callback(request: web.Request) -> web.StreamResponse:
     flow = _decode_flow_cookie(flow_cookie)
     if flow is None or flow.state != state_param:
         return web.Response(status=400, text="invalid oidc state")
+    # Defence in depth: never hand Authlib an empty expected nonce (its
+    # validate_nonce no-ops on a falsy value). _decode_flow_cookie
+    # already rejects a nonce-less cookie, so this is a redundant guard
+    # kept explicit at the trust boundary (round-3 finding AC-1).
+    if not flow.nonce:
+        return web.Response(status=400, text="invalid oidc flow")
 
     try:
         metadata = await asyncio.to_thread(_fetch_oidc_metadata, cfg.issuer)
