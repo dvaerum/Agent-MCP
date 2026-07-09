@@ -738,6 +738,17 @@ async def create_user_handler(req: web.Request) -> web.Response:
     """
     _ensure_wave1a_schema()
     body = await _json_body(req)
+    # PF-R8-1: reject a non-string ``username`` BEFORE ``.strip()`` — a
+    # JSON dict/list makes ``(x or "").strip()`` raise AttributeError →
+    # uncaught 500. ``_validate_username``'s isinstance check runs only
+    # after the strip, too late. ``allow_none=True`` lets a missing field
+    # fall through to the "" default so ``_validate_username`` still emits
+    # its "username is required" message.
+    username_err = _reject_non_str(
+        body.get("username"), "username", allow_none=True,
+    )
+    if username_err is not None:
+        return _error(error=_ERROR_VALIDATION, message=username_err, status=400)
     username = (body.get("username") or "").strip()
     password = body.get("password") or ""
     email = body.get("email")
@@ -952,6 +963,12 @@ async def create_group_handler(req: web.Request) -> web.Response:
     """
     _ensure_wave1a_schema()
     body = await _json_body(req)
+    # PF-R8-1: reject a non-string ``name`` BEFORE ``.strip()`` (see
+    # create_user_handler). ``allow_none=True`` defers the required-field
+    # message to ``_validate_group_name``.
+    name_err = _reject_non_str(body.get("name"), "name", allow_none=True)
+    if name_err is not None:
+        return _error(error=_ERROR_VALIDATION, message=name_err, status=400)
     name = (body.get("name") or "").strip()
     is_sysadmin = bool(body.get("is_sysadmin", False))
     # A sysadmin-flagged group confers sysadmin to its members, so
@@ -1001,6 +1018,14 @@ async def edit_group_handler(req: web.Request) -> web.Response:
     sets: list[str] = []
     params: list[Any] = []
     if "name" in body:
+        # PF-R8-1: reject a non-string ``name`` BEFORE ``.strip()`` (see
+        # create_user_handler). ``allow_none=True`` defers the
+        # required-field message to ``_validate_group_name``.
+        name_err = _reject_non_str(body["name"], "name", allow_none=True)
+        if name_err is not None:
+            return _error(
+                error=_ERROR_VALIDATION, message=name_err, status=400,
+            )
         new_name = (body["name"] or "").strip()
         err = _validate_group_name(new_name)
         if err is not None:

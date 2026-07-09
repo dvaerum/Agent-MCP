@@ -58,6 +58,30 @@ def _token_dir() -> Path:
     return Path.home() / ".config" / "agent-mcp" / "tokens"
 
 
+def _reject_non_str_name(value) -> web.Response | None:
+    """PF-R8-1: guard the ``name`` body field against a non-string JSON value.
+
+    The create / rename handlers read ``name`` via ``(body.get("name") or
+    "").strip()``. For a JSON ``dict`` / ``list`` / ``int``, ``value or ""``
+    returns ``value`` and ``value.strip()`` raises ``AttributeError`` →
+    uncaught 500. ``_validate_name``'s slug check only runs AFTER the strip,
+    so it can't catch this. Reject a non-``str`` here, up front, with the
+    handler's existing 400 ``invalid_name`` envelope. ``None`` (missing
+    field) is allowed through so the ``"" `` default + ``_validate_name``
+    still emit the canonical "name is required" message. Returns the error
+    response to hand back, or ``None`` when the value is fine.
+    """
+    from . import app as _app
+
+    if value is not None and not isinstance(value, str):
+        return _app._error_envelope(
+            error=_app._ERROR_INVALID_NAME,
+            message="name must be a string",
+            status=400,
+        )
+    return None
+
+
 # ── Health (public) ─────────────────────────────────────────────────
 
 
@@ -124,7 +148,11 @@ async def create_project_handler(req: web.Request) -> web.Response:
     if _app.SINGLE_TENANT_NAME is not None:
         return _app._single_tenant_disabled_response()
     body = await _app._parse_json_body(req)
-    name = (body.get("name") or "").strip()
+    raw_name = body.get("name")
+    bad = _reject_non_str_name(raw_name)
+    if bad is not None:
+        return bad
+    name = (raw_name or "").strip()
     err = _app._validate_name(name, _app._projects_dict())
     if err is not None:
         if "already" in err:
@@ -185,7 +213,11 @@ async def rename_project_handler(req: web.Request) -> web.Response:
         return _app._single_tenant_disabled_response()
     old_name = req.match_info["name"]
     body = await _app._parse_json_body(req)
-    new_name = (body.get("name") or "").strip()
+    raw_new_name = body.get("name")
+    bad = _reject_non_str_name(raw_new_name)
+    if bad is not None:
+        return bad
+    new_name = (raw_new_name or "").strip()
     grace_days_raw = body.get("grace_days", 30)
     try:
         grace_days = int(grace_days_raw)
@@ -410,6 +442,18 @@ async def delete_project_handler(req: web.Request) -> web.Response:
         _app.active_conns.pop(name, None)
         _app._po.unit_start_times.pop((name, "backend"), None)
         _app._po.forwarding_hmac_keys.pop(name, None)
+    # SC-R8-1: drop the per-name ``_ensure`` lock too — but only AFTER
+    # the ``async with _ensure_lock(...)`` block above has RELEASED it.
+    # Popping while holding would break the lock's release semantics, so
+    # the sibling-map purge above (which must be atomic with
+    # stop+unregister) can't include it. Without this pop, create+delete
+    # of N distinct project names leaks N ``asyncio.Lock`` objects
+    # forever. A concurrent ``_ensure`` that was already awaiting this
+    # lock still holds its own reference and will abort on the round-6
+    # inside-lock registry re-check (the project is now unregistered); a
+    # later ``_ensure`` mints a fresh lock via ``_ensure_lock``.
+    # Idempotent.
+    _app.ensure_locks.pop((name, "backend"), None)
     # SEC (owner-authorised, defensive) FINDING 2: purge router.db
     # membership + on-disk agent-token files. ``project_membership``
     # keys per-user AND per-group grants on a bare TEXT
