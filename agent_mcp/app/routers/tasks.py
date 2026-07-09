@@ -180,7 +180,68 @@ async def create_task_api_route(
             cursor, requesting_admin_id, "created_task",
             task_id=task_id, details={"title": title, "assigned_to": assigned_to},
         )
+
+        # BL-2: maintain the parent's child_tasks back-reference mirror in
+        # the same transaction so hierarchy reads + the delete cascade see
+        # this child. update_fields(connection=) defers the parent's cache
+        # write to post-commit (reconciled below).
+        parent_mirror_updated = False
+        if parent_task:
+            cursor.execute(
+                "SELECT child_tasks FROM tasks WHERE task_id = ?",
+                (parent_task,),
+            )
+            parent_row = cursor.fetchone()
+            if parent_row is not None:
+                import json as _json
+                children = _json.loads(parent_row["child_tasks"] or "[]")
+                if task_id not in children:
+                    children.append(task_id)
+                    _task_repo.update_fields(
+                        parent_task,
+                        {"child_tasks": children},
+                        connection=cursor,
+                    )
+                    parent_mirror_updated = True
+
         conn.commit()
+
+        # BL-1: task_repo.create(connection=) defers the g.tasks cache
+        # write + EventBus publish to the caller (see the create()
+        # docstring — a subscriber must never observe an uncommitted /
+        # rolled-back row). Reconcile now that the transaction committed:
+        # without this, the row is absent from view_tasks (which reads
+        # g.tasks) and no wait_for_events waiter wakes for an assigned
+        # REST-created task.
+        fresh = _task_repo.get_by_id(task_id)
+        if fresh is not None:
+            _task_repo.upsert_cache(fresh)
+        if parent_mirror_updated:
+            fresh_parent = _task_repo.get_by_id(parent_task)
+            if fresh_parent is not None:
+                _task_repo.upsert_cache(fresh_parent)
+
+        from ...core.repositories import _event_bus_shim
+        _event_bus_shim.publish(
+            assigned_to or "*",
+            "task.created",
+            {
+                "task_id": task_id,
+                "status": status,
+                "assigned_to": assigned_to,
+            },
+        )
+        if assigned_to:
+            # Wake the assignee's wait_for_events waiter so a REST-assigned
+            # task is delivered without polling.
+            try:
+                from ...core import globals as _g
+                _g.notify_agent_inbox(assigned_to)
+            except Exception as notify_exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "notify_agent_inbox(%s) raised after REST create_task: %s",
+                    assigned_to, notify_exc,
+                )
 
         return JSONResponse({
             "success": True,
