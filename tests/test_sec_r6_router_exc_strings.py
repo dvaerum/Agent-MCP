@@ -53,18 +53,34 @@ def _assert_no_leak(body: dict) -> None:
 # ── tasks.py — create handler (live dict-as-description repro) ────────────
 
 
-async def test_tasks_create_500_is_generic_on_unexpected_error(tmp_path) -> None:
-    """POST /api/tasks with a dict ``task_description`` drives an
-    ``Error binding parameter`` deep in the insert — CONFIRMED-live on
-    origin/main. The 500 body must be a static generic message, not the
-    reflected binding-parameter detail."""
+async def test_tasks_create_500_is_generic_on_unexpected_error(
+    tmp_path, monkeypatch
+) -> None:
+    """When an unexpected error is raised deep in the create-task insert,
+    the 500 body must be a static generic message, not the reflected
+    exception detail.
+
+    SEC round-9 note: this test formerly triggered the 500 by POSTing a
+    dict ``task_description`` (which reached a SQLite bind and 500'd).
+    That type-confusion path is now guarded to a clean 400 up front
+    (see ``tests/test_sec_r9_rest_type_confusion.py``), so the generic-
+    500 body is exercised the same way the sibling handlers below are —
+    by monkeypatching the DB seam to raise an SQL-sentinel error after
+    the validation guards have passed.
+    """
+    import agent_mcp.app.routers.tasks as tasks_router
+
+    def _boom(*_a, **_k):
+        raise sqlite3.OperationalError(_SENTINEL_SQL)
+
     async with mcp_session(tmp_path) as admin:
+        monkeypatch.setattr(tasks_router, "get_db_connection", _boom)
         r = admin.client.post(
             "/api/tasks",
             json={
                 "token": admin.admin_token,
                 "task_title": "leak probe",
-                "task_description": {"a": 1},  # dict -> insert binding error
+                "task_description": "a valid string description",
             },
         )
         assert r.status_code == 500, r.text

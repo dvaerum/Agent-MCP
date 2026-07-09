@@ -41,6 +41,39 @@ router = APIRouter(
 )
 
 
+# SEC round-9 (type-confusion 400-not-500): these direct-SQL handlers
+# bypass the schema-validating MCP tool dispatch, so a structured JSON
+# type (dict / list) in a string-typed field reaches a SQLite bind and
+# surfaces as an uncaught 500 — or is silently stored as bad data.
+# Guard every user-supplied field up front. Kept local to the file per
+# the round-9 scope (do NOT add a shared util outside these routers).
+def _require_str(value, field):
+    """Return a 400 JSONResponse if ``value`` is present but not a str.
+
+    ``None`` (an absent / cleared optional field) is allowed; callers
+    that require presence check truthiness separately.
+    """
+    if value is not None and not isinstance(value, str):
+        return JSONResponse(
+            {"error": f"{field} must be a string"}, status_code=400
+        )
+    return None
+
+
+def _require_str_list(value, field):
+    """Return a 400 JSONResponse unless ``value`` is None or a list[str]."""
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(
+        isinstance(x, str) for x in value
+    ):
+        return JSONResponse(
+            {"error": f"{field} must be a list of strings"},
+            status_code=400,
+        )
+    return None
+
+
 @router.api_route("", methods=["GET", "OPTIONS"])
 async def all_tasks_api_route(request: Request) -> JSONResponse:
     # GET /api/tasks[?assigned_to=<agent_id>][?unassigned=true]
@@ -115,6 +148,27 @@ async def create_task_api_route(
         priority = data.get('priority', 'medium')
         assigned_to = data.get('assigned_to')  # nullable
         parent_task = data.get('parent_task')  # nullable
+
+        # SEC round-9: reject structured JSON in string/list fields BEFORE
+        # any .strip() / SQL bind / repo write. (``task_title`` is handled
+        # by the isinstance-guarded strip below.) A dict/list here used to
+        # reach a bind and 500, or — for ``task_description`` — be stored
+        # verbatim into the TEXT column.
+        for _val, _name in (
+            (description, "task_description"),
+            (priority, "priority"),
+            (assigned_to, "assigned_to"),
+            (parent_task, "parent_task"),
+        ):
+            _err = _require_str(_val, _name)
+            if _err is not None:
+                return _err
+        _caps_err = _require_str_list(
+            data.get('required_capabilities'), "required_capabilities"
+        )
+        if _caps_err is not None:
+            return _caps_err
+
         # Event-coord PR-1: optional capability gate (list of free-text
         # labels, normalized to lowercase+stripped+deduped at write
         # time via the shared helper). Empty/missing => stored as NULL

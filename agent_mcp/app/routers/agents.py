@@ -55,6 +55,35 @@ router = APIRouter(
 )
 
 
+# SEC round-9 (type-confusion 400-not-500): the edit-agent handler writes
+# the DB directly, bypassing the schema-validating MCP tool dispatch.
+# ``color`` / ``working_directory`` bind straight into TEXT columns and
+# 500 on a dict/list; ``capabilities`` feeds ``normalize_capabilities``
+# which iterates a dict's KEYS (or a str's CHARS) and silently stores bad
+# data — and that data lands in ``g.active_agents`` which the task-claim
+# authz gate consumes. Guard every editable field up front. Kept local to
+# this router per the round-9 scope.
+def _require_str(value, field):
+    """Return a 400 JSONResponse if ``value`` is present but not a str."""
+    if value is not None and not isinstance(value, str):
+        return JSONResponse(
+            {"error": f"{field} must be a string"}, status_code=400
+        )
+    return None
+
+
+def _require_str_list(value, field):
+    """Return a 400 JSONResponse unless ``value`` is a list[str]."""
+    if not isinstance(value, list) or not all(
+        isinstance(x, str) for x in value
+    ):
+        return JSONResponse(
+            {"error": f"{field} must be a list of strings"},
+            status_code=400,
+        )
+    return None
+
+
 def _mcp_presence_for(agent_id: str) -> Dict[str, Any]:
     """Return ``{"online": bool, "last_mcp_connection": str | None}``
     for ``agent_id`` derived from :mod:`agent_mcp.core.session_registry`.
@@ -526,6 +555,31 @@ async def edit_agent_api_route(
             return JSONResponse(
                 {"error": "No editable fields supplied. Accepts any of: "
                           + ", ".join(editable)},
+                status_code=400,
+            )
+
+        # SEC round-9: type-guard each editable field BEFORE it reaches a
+        # SQL bind / normalize_capabilities / the g.active_agents cache.
+        # ``capabilities`` must be a genuine list[str] — a dict here would
+        # have normalize_capabilities iterate its keys and store them as
+        # capabilities (the task-claim authz gate reads this cache), all
+        # behind a misleading 200. ``color`` / ``working_directory`` 500
+        # on a dict/list bind. ``auto_event_loop`` is a bool toggle — a
+        # dict/list/str is truthy-coerced to a silent 1/0, so reject those.
+        if 'capabilities' in updates:
+            _err = _require_str_list(updates['capabilities'], "capabilities")
+            if _err is not None:
+                return _err
+        for _field in ('color', 'working_directory'):
+            if _field in updates:
+                _err = _require_str(updates[_field], _field)
+                if _err is not None:
+                    return _err
+        if 'auto_event_loop' in updates and not isinstance(
+            updates['auto_event_loop'], (bool, int)
+        ):
+            return JSONResponse(
+                {"error": "auto_event_loop must be a boolean"},
                 status_code=400,
             )
 
