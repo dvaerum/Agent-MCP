@@ -63,6 +63,29 @@ from .agents import _mcp_presence_for
 _REDACTED_VALUE = "[redacted]"
 
 
+def _redact_context_row(row: Any, *, redact: bool) -> Dict[str, Any]:
+    """Serialise a ``ProjectContext`` ORM row for the dashboard reads,
+    blanking BOTH ``value`` AND ``description`` when ``redact`` is True.
+
+    Round-5: the redaction filter (``_context_value_should_redact``)
+    inspects the value *and* the description, so a credential pasted into
+    either field trips it — and both must therefore be withheld. Masking
+    the value alone leaked a secret sitting in the description. The KEY
+    stays visible so the dashboard can still show that a secret exists.
+    Shared by ``/api/all-data`` and ``/api/context-data`` so the two
+    reads never drift on redaction shape.
+    """
+    return {
+        "context_key": row.context_key,
+        "value": _REDACTED_VALUE if redact else row.value,
+        "updated_at": row.updated_at,
+        "updated_by": row.updated_by,
+        "created_at": row.created_at,
+        "created_by": row.created_by,
+        "description": _REDACTED_VALUE if redact else row.description,
+    }
+
+
 router = APIRouter(
     prefix="/api",
     tags=["composition"],
@@ -257,14 +280,17 @@ async def node_details_api_route(
             row = cursor.fetchone()
             if row:
                 data = dict(row)
-                # SECURITY (round-2/4): the router admits viewer-tier
+                # SECURITY (round-2/4/5): the router admits viewer-tier
                 # operators on GET and the backend can't verify a
-                # cookie/forwarding caller's tier, so redact secret VALUES
-                # unless the caller is CONFIRMED operator tier. Round-4:
-                # redact on the TWO-part filter (secret KEY name OR an
-                # embedded credential in the VALUE/DESCRIPTION), matching
-                # the tool boundary — not is_secret_key alone, which let a
-                # secret pasted into a benign key leak verbatim here.
+                # cookie/forwarding caller's tier, so redact secrets unless
+                # the caller is CONFIRMED operator tier. Round-4: redact on
+                # the TWO-part filter (secret KEY name OR an embedded
+                # credential in the VALUE/DESCRIPTION), matching the tool
+                # boundary — not is_secret_key alone, which let a secret
+                # pasted into a benign key leak verbatim here. Round-5:
+                # blank the DESCRIPTION too, not just the value — the filter
+                # scans both fields, so a credential pasted into the
+                # description tripped the predicate yet leaked verbatim.
                 if not is_confirmed_operator_tier(auth) and (
                     _context_value_should_redact(
                         data.get('context_key'),
@@ -273,6 +299,7 @@ async def node_details_api_route(
                     )
                 ):
                     data['value'] = _REDACTED_VALUE
+                    data['description'] = _REDACTED_VALUE
                 details['data'] = data
             cursor.execute("SELECT timestamp, agent_id, action_type FROM agent_actions WHERE (action_type = 'updated_context' OR action_type = 'update_project_context') AND details LIKE ? ORDER BY timestamp DESC LIMIT 5", (f'%"{actual_id_from_node}"%',))
             details['actions'] = [dict(r) for r in cursor.fetchall()]
@@ -461,32 +488,27 @@ async def all_data_api_route(
                 .limit(section_limit)
                 .all()
             )
-            # SECURITY (round-2/4): redact secret VALUES for callers that
-            # are not CONFIRMED operator tier. ``expose_tokens`` is the
-            # same confirmed-operator gate used for agent bearers above;
-            # the router admits viewer-tier operators on GET and the
-            # backend can't verify a cookie/forwarding caller's tier, so
-            # those paths get the redacted view. Mirrors
-            # ``/api/context-data``. Round-4: redact on the TWO-part
-            # filter (secret KEY OR embedded-secret VALUE/DESCRIPTION) so a
-            # credential pasted into a benign key can't leak here either.
+            # SECURITY (round-2/4/5): redact secrets for callers that are
+            # not CONFIRMED operator tier. ``expose_tokens`` is the same
+            # confirmed-operator gate used for agent bearers above; the
+            # router admits viewer-tier operators on GET and the backend
+            # can't verify a cookie/forwarding caller's tier, so those
+            # paths get the redacted view. Mirrors ``/api/context-data``.
+            # Round-4: redact on the TWO-part filter (secret KEY OR
+            # embedded-secret VALUE/DESCRIPTION) so a credential pasted
+            # into a benign key can't leak either. Round-5: the verdict is
+            # computed once and blanks BOTH value AND description — the
+            # filter scans both, so a secret in the description tripped the
+            # predicate yet shipped verbatim when only the value was masked
+            # (matches the tool boundary, which drops the whole row).
             context_data = [
-                {
-                    "context_key": r.context_key,
-                    "value": (
-                        r.value
-                        if expose_tokens
-                        or not _context_value_should_redact(
-                            r.context_key, r.value, r.description
-                        )
-                        else _REDACTED_VALUE
+                _redact_context_row(
+                    r,
+                    redact=not expose_tokens
+                    and _context_value_should_redact(
+                        r.context_key, r.value, r.description
                     ),
-                    "updated_at": r.updated_at,
-                    "updated_by": r.updated_by,
-                    "created_at": r.created_at,
-                    "created_by": r.created_by,
-                    "description": r.description,
-                }
+                )
                 for r in ctx_rows
             ]
 
@@ -577,23 +599,17 @@ async def context_data_api_route(
             # embedded credential in the VALUE/DESCRIPTION), matching the
             # tool boundary and ``/api/all-data`` — is_secret_key alone let
             # a secret pasted into a benign key leak to viewer-tier here.
+            # Round-5: ``_redact_context_row`` blanks BOTH value AND
+            # description on a redaction verdict — masking the value alone
+            # leaked a secret pasted into the description.
             context_data = [
-                {
-                    "context_key": r.context_key,
-                    "value": (
-                        r.value
-                        if expose_secrets
-                        or not _context_value_should_redact(
-                            r.context_key, r.value, r.description
-                        )
-                        else _REDACTED_VALUE
+                _redact_context_row(
+                    r,
+                    redact=not expose_secrets
+                    and _context_value_should_redact(
+                        r.context_key, r.value, r.description
                     ),
-                    "updated_at": r.updated_at,
-                    "updated_by": r.updated_by,
-                    "created_at": r.created_at,
-                    "created_by": r.created_by,
-                    "description": r.description,
-                }
+                )
                 for r in rows
             ]
 
