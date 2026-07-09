@@ -362,12 +362,22 @@ async def login_post_handler(request: web.Request) -> web.StreamResponse:
         )
 
     user = identity.get_user_by_username(username)
-    if user is None:
+    if user is None or not user.get("password_hash"):
         # Enumeration defense: same status + same copy as a bad
         # password AND equal argon2 work. A missing user must still pay
         # a verify against the fixed decoy hash — otherwise this branch
         # returns near-instantly while the found-user branch runs
         # argon2, and the ~40x timing gap leaks which usernames exist.
+        #
+        # A user that EXISTS but has a NULL/empty password_hash (an
+        # SSO-provisioned account — sso._create_passwordless_user INSERTs
+        # NULL) is folded into the same branch (AC-R17-1). Otherwise it
+        # reaches verify_password(None, …), which crashes argon2 with an
+        # uncaught AttributeError → HTTP 500 — a status- AND timing-oracle
+        # that fingerprints SSO accounts. Paying the decoy verify here
+        # keeps the SSO case byte-identical (401) and timing-identical to
+        # a bad password / missing user. Password login is not a valid
+        # path for SSO-only users; they authenticate via the IdP.
         identity.verify_password(_DECOY_PASSWORD_HASH, password)
         return web.Response(
             text=error_html, status=401,
