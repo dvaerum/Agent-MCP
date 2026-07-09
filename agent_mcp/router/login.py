@@ -99,6 +99,22 @@ def _render(template: str, **ctx: Any) -> str:
     return _jinja_env.get_template(template).render(**ctx)
 
 
+def _form_str(form: Any, key: str) -> str:
+    """Read a ``request.post()`` field as ``str``, or "" if not a string.
+
+    ``request.post()`` returns an ``aiohttp.web.FileField`` (not a
+    ``str``) for any field submitted as a multipart FILE part — a
+    truthy object with no ``.strip()`` and no meaning as a credential.
+    Passing one on to ``.strip()`` or argon2 raised an uncaught 500,
+    reachable unauthenticated. Coercing non-strings (FileField, missing
+    field) to "" routes them through each handler's normal
+    validation/auth-failure path instead. This is the ``request.post()``
+    FORM analogue of the JSON-body ``_reject_non_str`` sweep.
+    """
+    value = form.get(key)
+    return value if isinstance(value, str) else ""
+
+
 # ── Cookie helpers ─────────────────────────────────────────────────
 
 
@@ -328,8 +344,8 @@ def _resolve_sso_provider_name() -> str | None:
 async def login_post_handler(request: web.Request) -> web.StreamResponse:
     """POST /agent-mcp/login — validate, set cookie, redirect."""
     form = await request.post()
-    username = (form.get("username") or "").strip()
-    password = form.get("password") or ""
+    username = _form_str(form, "username").strip()
+    password = _form_str(form, "password")
     next_url = request.rel_url.query.get("next", "")
 
     error_html = _render(
