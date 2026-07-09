@@ -200,12 +200,46 @@ async def test_sysadmin_admits(
     assert resp.status != 403, await resp.text()
 
 
-# ── Cap delegation admits (Wave-9 shape) ───────────────────────────
+# ── Cap delegation admits the cap-gated routes (Wave-9 shape) ───────
 
 
-async def test_delegated_cap_admits_client_config(
+async def test_delegated_cap_admits_stop(
     aiohttp_client, router_app, router_module, register_project,
 ) -> None:
+    """A delegated-cap non-member still admits the cap-gated lifecycle
+    routes (here: ``stop``). Only the two wiring routes (client-config /
+    installer) carry the DiD-R7 extra operator-membership requirement.
+    """
+    from agent_mcp.router import group_resolver
+
+    register_project("victim")
+    alice_id = _seed_user("alice", is_sysadmin=False)
+    group_id = _create_group("g-proj-admins", "Project Admins")
+    _grant_capability(group_id, _CAP)
+    group_resolver.add_group_member(group_id, member_user_id=alice_id)
+
+    client = await aiohttp_client(router_app)
+    cookie = await _login(client, "alice")
+    resp = await _call(
+        client,
+        "post",
+        "/agent-mcp/api/router/projects/victim/stop",
+        cookie,
+    )
+
+    # The cap gate must NOT be what stops a delegated cap-holder.
+    assert resp.status != 403, await resp.text()
+
+
+async def test_delegated_cap_non_member_denied_client_config(
+    aiohttp_client, router_app, router_module, register_project,
+) -> None:
+    """DiD-R7: the cap alone is NO LONGER enough for the wiring routes —
+    a delegated-cap NON-MEMBER is denied client-config (which embeds a
+    live agent bearer). Superseded the pre-DiD-R7
+    ``test_delegated_cap_admits_client_config``. Full coverage lives in
+    ``test_sec_r7_wiring_gate.py``.
+    """
     from agent_mcp.router import group_resolver
 
     register_project("victim")
@@ -226,4 +260,5 @@ async def test_delegated_cap_admits_client_config(
         cookie,
     )
 
-    assert resp.status == 200, await resp.text()
+    assert resp.status == 403, await resp.text()
+    assert "tok-secret" not in (await resp.text())

@@ -25,6 +25,8 @@ where the legacy ``rename`` handler used ``new_name``), and delegate.
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 import logging
 import os
@@ -378,11 +380,36 @@ async def delete_project_handler(req: web.Request) -> web.Response:
     # started the backend between our ``stop`` and our ``unregister``
     # would leave an orphan the reaper only clears after ``IDLE_SEC``.
     async with _app._ensure_lock(name, "backend"):
-        _app._systemctl("stop", _app._unit_name(name, "backend"))
+        # BL-R7-3: run the blocking ``systemctl stop`` OFF the event
+        # loop (mirrors the round-6 BL-R6-2b fix in ``_ensure``).
+        # ``_systemctl`` is a synchronous ``subprocess.run`` (~15-150 ms,
+        # or up to the SC-R7-2 timeout on a D-Bus stall); calling it
+        # directly while holding ``_ensure_lock`` stalls every other
+        # tenant's request on this single event loop for the duration.
+        await asyncio.to_thread(
+            _app._systemctl, "stop", _app._unit_name(name, "backend"),
+        )
         try:
             _app._REGISTRY.unregister(name)
         except KeyError:
             pass
+        # BL-R7-2: purge the per-name orchestrator lifecycle state.
+        # This handler stops the unit directly instead of routing
+        # through ``orchestrator.stop()`` (which pops ``last_active``),
+        # so without this the deleted project lingered in
+        # ``last_active`` / ``list_active()`` until the idle reaper —
+        # and ``_schedule_backend_warm``'s ``(name,"backend") in
+        # last_active`` dedup would then skip warm-starts for a
+        # same-name RE-created project. Pop every sibling map keyed by
+        # this name, inside the lock (atomic with stop+unregister) so a
+        # concurrent ``_ensure`` that just released can't repopulate
+        # them. ``_ensure``'s inside-lock registry re-check (BL-R6-1)
+        # aborts before it writes any of these once we've unregistered.
+        _app.last_active.pop((name, "backend"), None)
+        _app.ensure_failures.pop((name, "backend"), None)
+        _app.active_conns.pop(name, None)
+        _app._po.unit_start_times.pop((name, "backend"), None)
+        _app._po.forwarding_hmac_keys.pop(name, None)
     # SEC (owner-authorised, defensive) FINDING 2: purge router.db
     # membership + on-disk agent-token files. ``project_membership``
     # keys per-user AND per-group grants on a bare TEXT
@@ -673,6 +700,82 @@ async def remove_alias_handler(req: web.Request) -> web.Response:
 # task can be created with a separate ``assign_task`` call.
 
 
+# ── DiD-R7: operator-membership gate for the wiring routes ──────────
+
+
+def _require_project_operator_membership(handler):
+    """Require SYSADMIN or ``operator``-membership of the ``{name}`` project.
+
+    DiD-R7 (defense-in-depth, 2026-07-09). The two wiring routes —
+    ``client-config`` and ``installer`` — embed a LIVE agent bearer for
+    the target project. Round-6 (#322) gated them on the delegable
+    ``system.projects.manage`` capability, same as the sibling create /
+    delete / rename routes. But that cap is DEPLOYMENT-WIDE: a sysadmin
+    can grant it to a group whose members are NOT members of the target
+    project (the Wave-9 delegation model), so a delegated-cap-only
+    non-member could pull another tenant's live agent bearer.
+
+    This is currently INERT — ``_resolve_agent_token`` yields an empty
+    map because ``GET /api/tokens`` requires confirmed-operator tier, so
+    the embedded token is empty for everyone — but it's a latent
+    landmine if that token-map wiring is ever repaired. Cheap DiD: layer
+    an operator-membership check on top of the cap gate for these two
+    routes only.
+
+    Composed INSIDE ``require_capability("system.projects.manage")`` (see
+    ``register_admin_routes``): a caller lacking the cap is already
+    denied at the cap layer with the cap-named message the round-6
+    cross-tenant tests pin; this wrapper only runs for cap-holders and
+    then additionally demands sysadmin OR project-``operator`` role. A
+    viewer-tier member, a non-member, and a delegated-cap-only
+    non-member are all denied here.
+    """
+
+    @functools.wraps(handler)
+    async def wrapper(req: web.Request) -> web.StreamResponse:
+        from . import app as _app
+
+        # Single-tenant (ADR-0008): one operator-owned box; the session
+        # middleware bypasses gating entirely, so mirror
+        # ``require_capability`` and pass through.
+        if _app.SINGLE_TENANT_NAME is not None:
+            return await handler(req)
+        # Sysadmin admits unconditionally (their cap set is the wildcard).
+        if req.get("is_sysadmin"):
+            return await handler(req)
+        name = req.match_info.get("name", "")
+        user = req.get("user") or {}
+        user_id = user.get("user_id")
+        role = None
+        if user_id:
+            from . import group_resolver
+
+            try:
+                role = group_resolver.resolve_user_project_role(user_id, name)
+            except Exception:  # pragma: no cover - defensive
+                # router.db not migrated / transient DB error → fail
+                # closed (deny) rather than over-disclose the bearer.
+                role = None
+        if role == "operator":
+            return await handler(req)
+        username = user.get("username", "<unknown>")
+        return web.json_response(
+            {
+                "success": False,
+                "error": "forbidden",
+                "message": (
+                    f"operator {username!r} must be an operator member of "
+                    f"the target project to fetch its wiring "
+                    f"(client-config / installer embed a live agent bearer)"
+                ),
+            },
+            status=403,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    return wrapper
+
+
 # ── Route registration ──────────────────────────────────────────────
 
 
@@ -750,13 +853,23 @@ def register_admin_routes(app: web.Application) -> None:
         "/agent-mcp/api/router/projects/{name}/stop",
         gated(project_lifecycle_gate(stop_project_handler)),
     )
+    # DiD-R7: client-config / installer embed a LIVE agent bearer, so
+    # they carry an EXTRA operator-membership gate on top of the shared
+    # cap gate — a delegated-cap-only non-member must not pull another
+    # tenant's bearer. The membership wrapper is composed INSIDE the cap
+    # gate so a caller lacking the cap is still denied with the cap
+    # message the round-6 cross-tenant tests assert.
     app.router.add_get(
         "/agent-mcp/api/router/projects/{name}/client-config",
-        gated(project_lifecycle_gate(client_config_handler)),
+        gated(project_lifecycle_gate(
+            _require_project_operator_membership(client_config_handler),
+        )),
     )
     app.router.add_get(
         "/agent-mcp/api/router/projects/{name}/installer",
-        gated(project_lifecycle_gate(installer_handler)),
+        gated(project_lifecycle_gate(
+            _require_project_operator_membership(installer_handler),
+        )),
     )
     app.router.add_get(
         "/agent-mcp/api/router/projects/{name}/aliases",

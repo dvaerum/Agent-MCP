@@ -106,6 +106,13 @@ async def test_cooldown_expires_and_allows_retry(
     monkeypatch.setattr(
         router_module._po, "ENSURE_FAILURE_COOLDOWN_SEC", 0.0,
     )
+    # SC-R7-1: 0 s boot-grace so the second call treats the active-but-
+    # socketless unit as PAST its boot window and restarts it (the
+    # behaviour this test asserts). With the default grace (90 s) a
+    # retry within the window would re-poll the socket WITHOUT
+    # restarting — that boot-aware suppression is covered by
+    # test_sec_r7_boot_aware_restart.py.
+    monkeypatch.setattr(router_module._po, "BOOT_GRACE_SEC", 0.0)
     with pytest.raises(web.HTTPGatewayTimeout):
         await router_module._ensure(name, "backend")
     with pytest.raises(web.HTTPGatewayTimeout):
