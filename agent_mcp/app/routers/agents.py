@@ -944,8 +944,23 @@ async def purge_agent_api_route(
                 "UPDATE tasks SET created_by = ? WHERE created_by = ?",
                 (tombstone, agent_id),
             )
-            # Reassignment: anything assigned to this agent becomes
+            # Reassignment: anything ACTIVE assigned to this agent becomes
             # unassigned (admin can pick it up + reassign).
+            #
+            # BL-R17-2: carve out TERMINAL tasks (completed/cancelled/
+            # failed). Reverting a finished task to 'unassigned' resurrects
+            # already-done work and (via the notify fanout below) wakes a
+            # worker to re-execute it. This mirrors the terminate producer's
+            # carve-out in tools/admin_tools.py — the sibling that already
+            # filters `status NOT IN (terminal)`. Purge is a HARD delete
+            # (the agents row is DELETEd below), so unlike terminate we
+            # cannot leave a terminal task's `assigned_to` pointing at the
+            # doomed agent: `tasks.assigned_to` is an FK to
+            # `agents.agent_id` (migration 0007) and the final
+            # `DELETE FROM agents` would raise `FOREIGN KEY constraint
+            # failed`. So terminal tasks get a SEPARATE UPDATE that NULLs
+            # the dangling ref while KEEPING the terminal status (no
+            # resurrection, no notify).
             #
             # BL-R10-1/2: capture the affected rows (with their
             # required_capabilities) BEFORE the UPDATE so we can
@@ -954,19 +969,36 @@ async def purge_agent_api_route(
             # (``_collect_unassigned_task_events_for``, keyed on
             # updated_at) surfaces a task that TRANSITIONED to unassigned
             # after a disconnected worker's cursor.
+            from ...tools.task_tools import _TERMINAL_TASK_STATUSES
+            terminal_placeholders = ",".join(
+                "?" * len(_TERMINAL_TASK_STATUSES)
+            )
+            terminal_params = sorted(_TERMINAL_TASK_STATUSES)
             cursor.execute(
                 "SELECT task_id, required_capabilities FROM tasks "
-                "WHERE assigned_to = ?",
-                (agent_id,),
+                "WHERE assigned_to = ? "
+                f"AND status NOT IN ({terminal_placeholders})",
+                (agent_id, *terminal_params),
             )
             reassigned_tasks = [
                 (r["task_id"], r["required_capabilities"])
                 for r in cursor.fetchall()
             ]
+            now_iso = datetime.datetime.now().isoformat()
             cursor.execute(
                 "UPDATE tasks SET assigned_to = NULL, status = 'unassigned', "
-                "updated_at = ? WHERE assigned_to = ?",
-                (datetime.datetime.now().isoformat(), agent_id),
+                "updated_at = ? WHERE assigned_to = ? "
+                f"AND status NOT IN ({terminal_placeholders})",
+                (now_iso, agent_id, *terminal_params),
+            )
+            # Terminal tasks: clear only the dangling assigned_to ref (FK
+            # would block the agents-row DELETE) — status stays terminal,
+            # no notify fanout (they are not in `reassigned_tasks`).
+            cursor.execute(
+                "UPDATE tasks SET assigned_to = NULL, updated_at = ? "
+                "WHERE assigned_to = ? "
+                f"AND status IN ({terminal_placeholders})",
+                (now_iso, agent_id, *terminal_params),
             )
             cursor.execute(
                 "UPDATE agent_actions SET agent_id = ? WHERE agent_id = ?",
