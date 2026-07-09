@@ -663,6 +663,28 @@ def _validate_role(role: str) -> str | None:
     return None
 
 
+def _reject_non_str(value: Any, field: str, *, allow_none: bool) -> str | None:
+    """Guard scalar-string body fields against structured JSON types.
+
+    PF-R7-1: a JSON ``dict``/``list`` in ``user_id``/``group_id``/``email``
+    reaches a SQLite bind and raises ``sqlite3.ProgrammingError`` ("type
+    'dict' is not supported"), which the handlers' ``IntegrityError`` catch
+    doesn't cover — so it escapes as a 500. Reject a non-``str`` here, before
+    the write lock, with the same 400 ``validation_error`` envelope the
+    handlers use elsewhere. ``float``/``bool``/``int`` already coerce and hit
+    the IntegrityError→400 path, so only structured types need guarding; we
+    reject any non-``str`` for a tight, predictable contract.
+
+    ``allow_none`` covers optional fields (``email``); a ``None`` there means
+    "unset", which binds fine.
+    """
+    if value is None:
+        return None if allow_none else f"{field} is required"
+    if not isinstance(value, str):
+        return f"{field} must be a string; got {type(value).__name__}"
+    return None
+
+
 # ── Row shape helpers ──────────────────────────────────────────────
 
 
@@ -741,6 +763,9 @@ async def create_user_handler(req: web.Request) -> web.Response:
         return _error(
             error=_ERROR_VALIDATION, message=str(exc), status=400,
         )
+    email_err = _reject_non_str(email, "email", allow_none=True)
+    if email_err is not None:
+        return _error(error=_ERROR_VALIDATION, message=email_err, status=400)
 
     user_id = secrets.token_hex(8)
     password_hash = identity.hash_password(password)
@@ -795,6 +820,13 @@ async def edit_user_handler(req: web.Request) -> web.Response:
         sets.append("is_sysadmin = ?")
         params.append(1 if bool(body["is_sysadmin"]) else 0)
     if "email" in body:
+        # email is nullable (setting None clears it); reject structured
+        # JSON types before the write lock (PF-R7-1).
+        email_err = _reject_non_str(body["email"], "email", allow_none=True)
+        if email_err is not None:
+            return _error(
+                error=_ERROR_VALIDATION, message=email_err, status=400,
+            )
         sets.append("email = ?")
         params.append(body["email"])
     if not sets:
@@ -1127,6 +1159,14 @@ async def add_group_member_handler(req: web.Request) -> web.Response:
     body = await _json_body(req)
     member_user_id = body.get("user_id")
     member_group_id = body.get("group_id")
+    # PF-R7-1: reject structured JSON types before the write lock — a dict/list
+    # here would otherwise reach the INSERT bind and raise ProgrammingError
+    # (uncaught → 500). Each id is individually optional (exactly-one enforced
+    # just below), so a None passes and is handled by that check.
+    for _val, _field in ((member_user_id, "user_id"), (member_group_id, "group_id")):
+        _err = _reject_non_str(_val, _field, allow_none=True)
+        if _err is not None:
+            return _error(error=_ERROR_VALIDATION, message=_err, status=400)
     if bool(member_user_id) == bool(member_group_id):
         return _error(
             error=_ERROR_VALIDATION,
@@ -1383,6 +1423,13 @@ async def add_project_membership_handler(req: web.Request) -> web.Response:
     user_id = body.get("user_id")
     group_id = body.get("group_id")
     role = body.get("role", "operator")
+    # PF-R7-1: reject structured JSON types before the INSERT bind (a dict/list
+    # would raise ProgrammingError, uncaught → 500). Each id is individually
+    # optional (exactly-one enforced just below).
+    for _val, _field in ((user_id, "user_id"), (group_id, "group_id")):
+        _err = _reject_non_str(_val, _field, allow_none=True)
+        if _err is not None:
+            return _error(error=_ERROR_VALIDATION, message=_err, status=400)
     if bool(user_id) == bool(group_id):
         return _error(
             error=_ERROR_VALIDATION,
