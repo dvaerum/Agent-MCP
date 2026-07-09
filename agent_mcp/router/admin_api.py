@@ -229,7 +229,13 @@ async def rename_project_handler(req: web.Request) -> web.Response:
     grace_days_raw = body.get("grace_days", 30)
     try:
         grace_days = int(grace_days_raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # PF-R18-1: ``int(float('inf'))`` raises OverflowError (not
+        # ValueError/TypeError). A JSON number token like ``1e400`` parses
+        # to ``float('inf')`` via ``json.loads``, so an overflowing
+        # ``{"grace_days": 1e400}`` slipped past the ``(TypeError,
+        # ValueError)`` guard to a 500. Catch it too so it 400s like the
+        # non-numeric cases before any destructive rename step runs.
         return _app._error_envelope(
             error=_app._ERROR_INVALID_NAME,
             message=f"grace_days must be an integer, got {grace_days_raw!r}",

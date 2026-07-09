@@ -124,13 +124,18 @@ async def list_messages_api_route(
 
         return JSONResponse({"messages": rows, "total": total,
                              "limit": limit, "offset": offset})
-    except (TypeError, ValueError) as e:
+    except (TypeError, ValueError, OverflowError) as e:
         # PF-R14-1: ``int(data.get('limit'/'offset'))`` raises TypeError
         # (not ValueError) when the caller sends a list/dict value, e.g.
         # ``{"limit": [1, 2]}``. A bare ``except ValueError`` let that
         # fall through to the generic 500; catch both so a non-numeric
         # limit/offset returns a clean 400 like the non-numeric-string
         # case (``int("abc")`` → ValueError) already did.
+        # PF-R18-1: ``int(float('inf'))`` raises OverflowError — a THIRD
+        # sibling PF-R14-1 missed. A JSON number token like ``1e400``
+        # parses to ``float('inf')`` via ``json.loads``, so an
+        # overflowing ``{"limit": 1e400}`` slipped past the guard to a
+        # 500. Catch it too so it 400s like the other malformed numerics.
         return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:
         logger.error(f"Error listing messages: {e}", exc_info=True)
