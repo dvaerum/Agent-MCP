@@ -3569,8 +3569,28 @@ async def bulk_task_operations_tool_impl(
                             )
 
                 except Exception as e:
-                    results.append(f"Operation {i+1}: Error processing - {str(e)}")
-                    logger.error(f"Error in bulk operation {i+1}: {e}", exc_info=True)
+                    # SECURITY (round 12, SD-R12-1): this per-op line is
+                    # appended to ``results`` and returned as
+                    # ``Ok(message=...)``, which the renderer emits
+                    # VERBATIM — only the ``Failed`` variant is
+                    # genericised at the choke-point (SD-R8-1). So
+                    # interpolating ``str(e)`` here leaked raw SQLite
+                    # table/column names + OSError paths to any worker
+                    # holding ``tasks.update``. Keep the detail
+                    # server-side (logger, exc_info); the client-facing
+                    # line is STATIC (op index + caller-supplied op type
+                    # only — no ``str(e)``). Retains the "Error" token so
+                    # the ``success_count`` filter below still excludes
+                    # it. Same class as SD-R9-1 (RAG ``Ok``-body bypass).
+                    results.append(
+                        f"Operation {i+1}: Error processing "
+                        f"{operation_type}: internal error"
+                    )
+                    logger.error(
+                        f"Error in bulk operation {i+1} "
+                        f"({operation_type}): {e}",
+                        exc_info=True,
+                    )
 
             # Final success_count is patched onto the audit-row details
             # dict; `atomic_with_audit` reads the same dict at block
