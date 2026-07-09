@@ -124,8 +124,11 @@ async def list_messages_api_route(
         return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:
         logger.error(f"Error listing messages: {e}", exc_info=True)
+        # BL-R5-2 / SD-R6-1: generic message — ``str(e)`` on a
+        # SQLAlchemyError / sqlite3.*Error embeds SQL text + bound
+        # params (schema disclosure). Detail stays in the log above.
         return JSONResponse(
-            {"error": f"Failed to list messages: {str(e)}"}, status_code=500
+            {"error": "Failed to list messages"}, status_code=500
         )
 
 
@@ -177,8 +180,9 @@ async def list_participants_api_route(
         return JSONResponse(result)
     except Exception as e:
         logger.error(f"Error listing participants: {e}", exc_info=True)
+        # BL-R5-2 / SD-R6-1: generic message — see list-messages note.
         return JSONResponse(
-            {"error": f"Failed to list participants: {str(e)}"},
+            {"error": "Failed to list participants"},
             status_code=500,
         )
 
@@ -403,8 +407,9 @@ async def create_message_api_route(
         if conn:
             conn.rollback()
         logger.error(f"Error sending message: {e}", exc_info=True)
+        # BL-R5-2 / SD-R6-1: generic message — see list-messages note.
         return JSONResponse(
-            {"error": f"Failed to send message: {str(e)}"}, status_code=500
+            {"error": "Failed to send message"}, status_code=500
         )
     finally:
         if conn:
@@ -500,8 +505,9 @@ async def patch_message_api_route(
         if conn:
             conn.rollback()
         logger.error(f"Error patching message: {e}", exc_info=True)
+        # BL-R5-2 / SD-R6-1: generic message — see list-messages note.
         return JSONResponse(
-            {"error": f"Failed to patch message: {str(e)}"}, status_code=500
+            {"error": "Failed to patch message"}, status_code=500
         )
     finally:
         if conn:

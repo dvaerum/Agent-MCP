@@ -166,7 +166,10 @@ async def agents_list_api_route(request: Request) -> JSONResponse:
             agents_list_data.append(agent_dict)
     except Exception as e:
         logger.error(f"Error fetching agents list: {e}", exc_info=True)
-        return JSONResponse({'error': f'Failed to fetch agents list: {str(e)}'}, status_code=500)
+        # BL-R5-2 / SD-R6-1: generic message — ``str(e)`` on a
+        # SQLAlchemyError / sqlite3.*Error embeds SQL text + bound
+        # params (schema disclosure). Detail stays in the log above.
+        return JSONResponse({'error': 'Failed to fetch agents list'}, status_code=500)
     finally:
         if conn:
             conn.close()
@@ -271,8 +274,9 @@ async def register_agent_dashboard_api_route(
             "Error in register_agent_dashboard_api_route: %s", e,
             exc_info=True,
         )
+        # BL-R5-2 / SD-R6-1: generic message — see fetch-agents-list note.
         return JSONResponse(
-            {"message": f"Error registering agent: {e}"}, status_code=500,
+            {"message": "Error registering agent"}, status_code=500,
         )
 
     if isinstance(result, _Ok):
@@ -444,8 +448,9 @@ async def restore_agent_api_route(
         if conn:
             conn.rollback()
         logger.error(f"Error restoring agent {agent_id}: {e}", exc_info=True)
+        # BL-R5-2 / SD-R6-1: generic message — see fetch-agents-list note.
         return JSONResponse(
-            {"error": f"Failed to restore agent: {str(e)}"}, status_code=500,
+            {"error": "Failed to restore agent"}, status_code=500,
         )
     finally:
         if conn:
@@ -613,8 +618,9 @@ async def edit_agent_api_route(
         if conn:
             conn.rollback()
         logger.error(f"Error editing agent {agent_id}: {e}", exc_info=True)
+        # BL-R5-2 / SD-R6-1: generic message — see fetch-agents-list note.
         return JSONResponse(
-            {"error": f"Failed to edit agent: {str(e)}"}, status_code=500,
+            {"error": "Failed to edit agent"}, status_code=500,
         )
     finally:
         if conn:
@@ -734,8 +740,9 @@ async def purge_preview_api_route(
         logger.error(
             f"Error computing purge preview for {agent_id}: {e}", exc_info=True,
         )
+        # BL-R5-2 / SD-R6-1: generic message — see fetch-agents-list note.
         return JSONResponse(
-            {"error": f"Failed to compute purge preview: {str(e)}"},
+            {"error": "Failed to compute purge preview"},
             status_code=500,
         )
     finally:
@@ -924,8 +931,9 @@ async def purge_agent_api_route(
             except Exception:
                 pass
         logger.error(f"Error purging agent {agent_id}: {e}", exc_info=True)
+        # BL-R5-2 / SD-R6-1: generic message — see fetch-agents-list note.
         return JSONResponse(
-            {"error": f"Failed to purge agent: {str(e)}"}, status_code=500,
+            {"error": "Failed to purge agent"}, status_code=500,
         )
     finally:
         if conn:
