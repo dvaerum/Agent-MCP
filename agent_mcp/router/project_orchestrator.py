@@ -85,6 +85,21 @@ last_active: dict[tuple[str, str], float] = {}
 # non-zero so an SSE session isn't yanked mid-stream.
 active_conns: dict[str, int] = defaultdict(int)
 
+# SC-R7-1: monotonic timestamp of the most recent start/restart the
+# router issued (or adopted) for each (name, role). Feeds ``_ensure``'s
+# boot-aware restart decision: an ``active`` unit whose socket is absent
+# but which entered its start window within ``BOOT_GRACE_SEC`` is "still
+# booting" — keep polling the socket, DON'T restart. A backend cold boot
+# (~44 s of embedding/DB init) far exceeds ``ENSURE_FAILURE_COOLDOWN_SEC``
+# (5 s), so without this a member polling every ≥5 s during a cold boot
+# would ``systemctl restart`` the still-booting backend on every call,
+# resetting its clock and denying it to co-members (an authenticated,
+# same-project availability DoS — FLAG-2). Overwritten on every start/
+# restart; popped on stop/delete/reap so a later autonomous systemd
+# restart of a since-stopped unit doesn't inherit a stale (past-grace)
+# timestamp.
+unit_start_times: dict[tuple[str, str], float] = {}
+
 # Per-(name, role) lock serialising ``_ensure``. The dashboard fires
 # several parallel API calls on first load; without this each one
 # raced systemctl independently — fastest wins, the rest see the unit
@@ -115,6 +130,28 @@ ensure_failures: dict[tuple[str, str], tuple[float, str]] = {}
 # re-importing.
 ENSURE_FAILURE_COOLDOWN_SEC: float = float(
     os.environ.get("AGENT_MCP_ENSURE_FAILURE_COOLDOWN_SEC", "5")
+)
+
+# SC-R7-1: boot-grace budget for the boot-aware restart decision in
+# ``_ensure``. An ``active``-but-socketless unit that entered its start
+# window less than this many seconds ago is treated as "still booting"
+# (keep waiting for the socket) rather than "stale" (restart). Must be
+# ≥ the expected cold-boot time (~44 s of embedding/DB init) AND ≥ the
+# socket-wait budget (``AGENT_MCP_ENSURE_SOCKET_ATTEMPTS`` × 0.1 s,
+# ~20 s in prod) so a single caller's own socket-wait never trips the
+# grace into a restart. Read at every call so tests can monkeypatch the
+# module-level value without re-importing.
+BOOT_GRACE_SEC: float = float(
+    os.environ.get("AGENT_MCP_BOOT_GRACE_SEC", "90")
+)
+
+# SC-R7-2: wall-clock ceiling for a single ``systemctl`` shell-out. A
+# D-Bus / systemd stall would otherwise pin the worker thread until
+# systemd's own (much longer) job timeout. On expiry ``_systemctl``
+# returns a synthetic non-zero ``CompletedProcess`` so the existing
+# error paths format it into a clean 500/504 instead of crashing.
+_SYSTEMCTL_TIMEOUT_SEC: float = float(
+    os.environ.get("AGENT_MCP_SYSTEMCTL_TIMEOUT_SEC", "30")
 )
 
 
@@ -263,9 +300,35 @@ def _systemctl(*args: str) -> subprocess.CompletedProcess:
     base = ["systemctl"]
     if _SYSTEMCTL_MODE == "user":
         base.append("--user")
-    return subprocess.run(
-        [*base, *args], capture_output=True, text=True
-    )
+    cmd = [*base, *args]
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=_SYSTEMCTL_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        # SC-R7-2: a stalled D-Bus/systemd call must not pin the worker
+        # thread until systemd's own timeout. Surface it as a FAILED
+        # systemctl action — a non-zero returncode plus a single-line
+        # stderr — so every caller's existing "returncode != 0" branch
+        # (``_ensure``, ``stop``, the reaper) formats it into a clean
+        # 500/504 instead of raising ``TimeoutExpired`` up the stack.
+        # 124 mirrors coreutils ``timeout``'s exit code.
+        verb = " ".join(args)
+        log.warning(
+            "systemctl %s timed out after %.0fs", verb, _SYSTEMCTL_TIMEOUT_SEC,
+        )
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=124,
+            stdout="",
+            stderr=(
+                f"systemctl {verb} timed out after "
+                f"{_SYSTEMCTL_TIMEOUT_SEC:.0f}s"
+            ),
+        )
 
 
 def _is_active(unit: str) -> bool:
@@ -339,10 +402,8 @@ async def _ensure(name: str, role: str) -> Path:
         # responsive. ``asyncio.to_thread`` resolves the module-level
         # ``_is_active`` / ``_systemctl`` names at call time, so tests
         # that monkeypatch them still take effect.
-        needs_start = (
-            not await asyncio.to_thread(_is_active, unit)
-            or not sock.exists()
-        )
+        unit_active = await asyncio.to_thread(_is_active, unit)
+        needs_start = not unit_active or not sock.exists()
         # Recent-failure short-circuit (P005 cascade-fix). If the
         # previous ``_ensure`` for this (name, role) raised within
         # ``ENSURE_FAILURE_COOLDOWN_SEC`` AND the backend STILL isn't
@@ -379,10 +440,42 @@ async def _ensure(name: str, role: str) -> Path:
             # (``get_forwarding_hmac_key`` from the cookie path)
             # will pick up the bytes ExecStartPre wrote.
             ensure_forwarding_hmac_key(name)
-            action = (
-                "restart" if await asyncio.to_thread(_is_active, unit)
-                else "start"
-            )
+            # SC-R7-1: boot-aware restart decision. Three cases:
+            #
+            #   * unit INACTIVE (dead/failed/never-started) → ``start``
+            #     promptly, regardless of any grace window.
+            #   * unit ACTIVE but socketless AND within the boot-grace
+            #     window → it's still coming up (Type=simple goes
+            #     ``active`` the instant the process forks, ~44 s before
+            #     the backend finishes embedding/DB init and binds its
+            #     UDS). ``action = None`` → skip systemctl entirely and
+            #     fall through to the socket poll below. This is what
+            #     breaks FLAG-2's livelock: a member polling every ≥5 s
+            #     during a cold boot no longer restarts (and resets the
+            #     clock of) the still-booting backend.
+            #   * unit ACTIVE but socketless AND PAST the grace window →
+            #     genuinely stale (e.g. crashed mid-write leaving the
+            #     unit ``active`` but the socket gone) → ``restart``.
+            #
+            # An active-but-socketless unit with NO recorded start time
+            # (a router restart lost the map, or systemd autonomously
+            # restarted the unit via ``Restart=on-failure`` without going
+            # through us) is ADOPTED as starting "now" and given the full
+            # grace window rather than restarted immediately — the safe
+            # default that favours not disrupting a possibly-booting
+            # backend. A genuinely stale unit adopted this way still gets
+            # restarted once the grace elapses on a later call.
+            if not unit_active:
+                action = "start"
+            else:
+                started_at = unit_start_times.get((name, role))
+                if started_at is None:
+                    started_at = time.monotonic()
+                    unit_start_times[(name, role)] = started_at
+                if time.monotonic() - started_at < BOOT_GRACE_SEC:
+                    action = None  # still booting — keep waiting
+                else:
+                    action = "restart"
             # BL-R6-1: TOCTOU re-check. The registry-existence probe at
             # the top of ``_ensure`` runs OUTSIDE this lock, so a
             # concurrent ``delete_project_handler`` (which holds no
@@ -397,7 +490,17 @@ async def _ensure(name: str, role: str) -> Path:
             # on-disk file each call, so this observes the delete.
             if registry.get(name) is None:
                 raise web.HTTPNotFound(reason="unknown project")
-            r = await asyncio.to_thread(_systemctl, action, unit)
+            if action is not None:
+                # Record the start window BEFORE the shell-out so a
+                # concurrent caller that acquires the lock next observes
+                # the grace window from this start (SC-R7-1).
+                unit_start_times[(name, role)] = time.monotonic()
+                r = await asyncio.to_thread(_systemctl, action, unit)
+            else:
+                # Boot-grace skip: the unit is active and within its
+                # boot window; don't touch systemctl, just poll for the
+                # socket below.
+                r = subprocess.CompletedProcess(args=[], returncode=0)
             if r.returncode != 0:
                 # F015 v6: aiohttp's HTTPException rejects ``reason``
                 # values containing CR/LF (per RFC 7230 status-line
@@ -476,6 +579,10 @@ async def _reaper_tick() -> None:
         if now - last_active[key] > IDLE_SEC:
             _systemctl("stop", _unit_name(*key))
             last_active.pop(key, None)
+            # SC-R7-1: drop the boot-window record so a later start (or
+            # an autonomous systemd restart) of this unit is measured
+            # from its own fresh start, not this now-stopped instance.
+            unit_start_times.pop(key, None)
             # F015 v4: no HMAC-cache pop here. The on-disk key file
             # is owned by the systemd unit (RuntimeDirectoryPreserve
             # keeps it across stop; ExecStartPre regenerates if
@@ -670,6 +777,10 @@ class ProjectOrchestrator:
                     "message": r.stderr.strip(),
                 }
         last_active.pop((name, "backend"), None)
+        # SC-R7-1: drop the boot-window record on an explicit stop for
+        # the same reason as the reaper — the next start is measured
+        # fresh.
+        unit_start_times.pop((name, "backend"), None)
         # F015 v4: drop the in-memory HMAC cache entry so the next
         # spawn re-reads from disk. The on-disk file is owned by the
         # systemd unit (ExecStartPre regenerates if missing,
