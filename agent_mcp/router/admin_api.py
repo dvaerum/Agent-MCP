@@ -330,6 +330,36 @@ async def rename_project_handler(req: web.Request) -> web.Response:
             message="registry rename failed",
             status=500,
         )
+    # SEC (owner-authorised, defensive) FINDING AZ-R13-1 [MED] — migrate
+    # the router.db authority table now that the registry rename has
+    # landed. ``project_membership`` keys per-user AND per-group grants on
+    # a bare TEXT ``project_name`` (no FK cascade), so a rename that
+    # touched only the registry / workspace / token files ORPHANED every
+    # membership row under the OLD name: (1) members lose access under the
+    # new name (lockout), and (2) re-creating a NEW project reusing the
+    # old name silently RESURRECTS the prior members' roles on that fresh
+    # project (cross-tenant privilege resurrection). This is the RENAME
+    # sibling of the round-3 delete-purge fix (#283), which class-swept
+    # delete but missed rename. ``project_membership`` is the ONLY
+    # project_name-keyed table in router.db; per-project data lives in the
+    # per-project DB under the workspace dir, which the rename already
+    # moved via ``os.rename``. Best-effort + idempotent (single atomic
+    # UPDATE) — a cleanup failure is logged, never fails the rename.
+    try:
+        from .identity import _connect
+
+        with _connect() as conn:
+            conn.execute(
+                "UPDATE project_membership SET project_name = ? "
+                "WHERE project_name = ?",
+                (new_name, old_name),
+            )
+    except Exception:
+        logger.exception(
+            "rename_project: failed to migrate project_membership %r -> %r",
+            old_name,
+            new_name,
+        )
     new_row = _app._REGISTRY.get(new_name)
     alias_expires_at = ""
     for entry in (new_row or {}).get("aliases", []) or []:
