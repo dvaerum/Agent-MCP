@@ -160,11 +160,19 @@ def render_as_text_content(result: ToolResult) -> List[mcp_types.TextContent]:
     renderer lost the data field.
 
     Error rendering:
-        ``"Error: <variant_label>: <detail>"`` — the framework's
-        ``isError=true`` handling sees the ``"Error:"`` prefix and
-        the dispatcher catches it via the registered tool's exception
-        handler. The format mirrors the legacy hand-rolled error
-        strings tool impls produced before this PR.
+        Error variants render to a single human-readable
+        ``TextContent`` block (``"Unauthorized: ..."`` for
+        :class:`PermissionDenied`, ``"Error: ..."`` for the rest).
+        This renderer decides the *text* only — it does NOT set the
+        MCP ``isError`` flag. The framework keys ``isError`` off
+        whether the ``call_tool`` handler RAISES (raised → the
+        framework's ``_make_error_result`` sets ``isError=True``); the
+        ``"Error:"`` text prefix has no bearing on it. The MCP wire
+        handler (``app.main_app.mcp_call_tool_handler``) therefore
+        consults :func:`is_error_result` on the variant and builds a
+        ``CallToolResult`` with ``isError`` set explicitly, so a
+        RETURNED denial reaches the client with ``isError=True`` just
+        like a RAISED one. See finding AS-1 (round 3).
     """
     if isinstance(result, Ok):
         # Render ``data`` as a string for the second-block path
@@ -219,6 +227,19 @@ def render_as_text_content(result: ToolResult) -> List[mcp_types.TextContent]:
     return [mcp_types.TextContent(type="text", text=text)]
 
 
+def is_error_result(result: ToolResult) -> bool:
+    """Whether a :data:`ToolResult` represents a failure.
+
+    :class:`Ok` is the sole success variant; every other variant
+    (NotFound / PermissionDenied / Invalid / Conflict / Failed) is an
+    error. The MCP wire handler uses this to set ``CallToolResult.isError``
+    so a RETURNED denial reaches the client with the same ``isError=True``
+    the framework sets for a RAISED exception — one authority, both
+    paths agree (finding AS-1, round 3).
+    """
+    return not isinstance(result, Ok)
+
+
 __all__ = [
     "Ok",
     "NotFound",
@@ -228,4 +249,5 @@ __all__ = [
     "Failed",
     "ToolResult",
     "render_as_text_content",
+    "is_error_result",
 ]

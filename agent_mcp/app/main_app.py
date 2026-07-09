@@ -792,7 +792,7 @@ async def mcp_read_resource_handler(uri):
 
 
 @mcp_app_instance.call_tool(validate_input=False)
-async def mcp_call_tool_handler(name: str, arguments: dict) -> List[mcp_types.TextContent]:
+async def mcp_call_tool_handler(name: str, arguments: dict) -> mcp_types.CallToolResult:
     """MCP endpoint to call a specific tool.
 
     ``validate_input=False`` disables the framework's automatic
@@ -810,8 +810,18 @@ async def mcp_call_tool_handler(name: str, arguments: dict) -> List[mcp_types.Te
     threaded explicitly into the dispatcher. The legacy ContextVar
     bridge in ``dispatch_tool_call`` is gone — ``principal`` is now
     a required kwarg.
+
+    Finding AS-1 (round 3): this handler is the single authority that
+    sets ``isError`` on the wire for RETURNED results. ``dispatch_tool_call``
+    RETURNS a typed :data:`ToolResult` (the REST adapter matches on the
+    variant, so it must return, not raise); we consult
+    :func:`is_error_result` and build a ``CallToolResult`` with
+    ``isError`` set explicitly. A RETURNED denial therefore reaches the
+    client with ``isError=True`` — the same fidelity the framework's
+    ``_make_error_result`` gives a RAISED ``AuthRejected`` (which still
+    propagates as an exception through the framework's own error path).
     """
-    from ..core.tool_result import render_as_text_content
+    from ..core.tool_result import render_as_text_content, is_error_result
 
     principal = request_principal.get()
     if principal is None:
@@ -830,7 +840,10 @@ async def mcp_call_tool_handler(name: str, arguments: dict) -> List[mcp_types.Te
                 forwarding_operator=None,
             )
     result = await dispatch_tool_call(name, arguments, principal=principal)
-    return render_as_text_content(result)
+    return mcp_types.CallToolResult(
+        content=render_as_text_content(result),
+        isError=is_error_result(result),
+    )
 
 
 # --- Streamable HTTP transport (spec rev 2025-03-26) --------------
