@@ -472,6 +472,45 @@ def _unauthorized() -> web.HTTPException:
     )
 
 
+# SEC (owner-authorised, defensive) FINDING 1 [MED] — constant-time
+# floor for pre-auth 401s on the /mcp transport. The status CODE and
+# ENVELOPE are already unified (PR #279 / SEC5), but the LATENCY was
+# not: an UNKNOWN project collapses to 401 in-process (~fast) while a
+# KNOWN project with an unvalidated bearer incurs a full backend UDS
+# round-trip before ITS 401 collapses (~slow). That delta let a
+# not-yet-authenticated caller enumerate valid project names by timing.
+# Floor every pre-auth 401 to a fixed wall-clock target measured from
+# request receipt so known and unknown return at ~the same time.
+# Authenticated (2xx / any non-401) responses are NEVER floored. The
+# floor is comfortably above the observed backend round-trip (~14 ms)
+# so the round-trip is absorbed rather than observable. Module-level so
+# tests can monkeypatch it.
+_PREAUTH_401_FLOOR_SEC = 0.05
+
+# SEC (owner-authorised, defensive) FINDING 2 [LOW-MED] — explicit
+# request-body cap. aiohttp's default is a silent 1 MiB; make it
+# explicit so the limit is intentional and so ``backend_mcp_handler``
+# can collapse an oversized-body 413 into the uniform pre-auth 401
+# (a 413 that fires only for a KNOWN project is itself an existence
+# oracle — see the handler).
+_MCP_MAX_BODY_BYTES = 1024 * 1024
+
+
+async def _floored_unauthorized(t0: float) -> web.HTTPException:
+    """Return the canonical pre-auth 401, but not before the timing
+    floor (measured from ``t0``, a ``time.monotonic()`` reading taken
+    at handler entry) has elapsed.
+
+    Closes the SEC5 timing oracle: the known path (which paid for a
+    backend round-trip) and the unknown path (in-process) both return
+    at ~``_PREAUTH_401_FLOOR_SEC``. See that constant.
+    """
+    remaining = _PREAUTH_401_FLOOR_SEC - (time.monotonic() - t0)
+    if remaining > 0:
+        await asyncio.sleep(remaining)
+    return _unauthorized()
+
+
 # RFC 7230 §6.1 hop-by-hop headers — meaningful only for a single
 # transport connection and MUST NOT be forwarded by a proxy. We strip
 # them from the request we build for the backend. The load-bearing one
@@ -850,6 +889,11 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
     doesn't apply.
     """
     name = req.match_info["name"]
+    # SEC FINDING 1: anchor the pre-auth timing floor at handler entry
+    # so every pre-auth 401 (unknown-project collapse, no-cred, bad
+    # cookie, backend-rejected bearer) returns at the same wall-clock
+    # target regardless of whether a backend round-trip happened.
+    t0 = time.monotonic()
     redirect = _maybe_single_tenant_redirect(req, name)
     if redirect is not None:
         return redirect
@@ -882,7 +926,7 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
     # gated REST/lifecycle handlers that legitimately need 404 for
     # unknown projects (and that unauthenticated callers can't reach).
     if bearer is None and not req.cookies.get("agent_mcp_session", ""):
-        raise _unauthorized()
+        raise await _floored_unauthorized(t0)
 
     # Method whitelist — verify-all-v4 MUTATING #2 follow-up. The MCP
     # Streamable HTTP transport (spec rev 2025-03-26) defines only
@@ -939,7 +983,8 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
     try:
         real_name, alias_entry = _resolve_project_or_alias(name)
     except web.HTTPNotFound:
-        raise _unauthorized() from None
+        exc = await _floored_unauthorized(t0)
+        raise exc from None
 
     forwarding_header: tuple[str, str] | None = None
     if bearer is None:
@@ -948,7 +993,7 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
         # the cookie (Wave 2, cleanup/wave-2-strip-frontend-admin-token).
         forwarding_header = await _forwarding_header_from_cookie(req, real_name)
         if forwarding_header is None:
-            raise _unauthorized()
+            raise await _floored_unauthorized(t0)
     # When ``bearer`` is set, the request is forwarded to the backend
     # WITHOUT a router-side validity check. The backend's
     # ``AuthHeaderMiddleware`` (see ``agent_mcp.app.main_app``) gates
@@ -981,11 +1026,26 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
         req["resolved_via_alias"] = name
         req["resolved_project"] = real_name
         alias_info = (name, alias_entry.get("expires_at", ""))
-    resp = await _proxy_to_backend(
-        req, real_name, "/mcp",
-        alias_info=alias_info,
-        inject_header=forwarding_header,
-    )
+    try:
+        resp = await _proxy_to_backend(
+            req, real_name, "/mcp",
+            alias_info=alias_info,
+            inject_header=forwarding_header,
+        )
+    except web.HTTPRequestEntityTooLarge:
+        # SEC FINDING 2: the request body is read inside
+        # ``_proxy_to_backend`` (only reached for a KNOWN project); an
+        # UNKNOWN project 401s above before any body read. So an
+        # oversized body 413s only for a known project — a 413-vs-401
+        # project-existence oracle for a not-yet-authenticated caller.
+        # Collapse the 413 into the same uniform (floored) pre-auth 401
+        # so body size can't distinguish known from unknown. A genuine
+        # 413 for an authenticated caller is an acceptable loss here:
+        # on this transport the router can't confirm the bearer is live
+        # until AFTER the body is read + forwarded, so it can't tell an
+        # authenticated oversized request from an attacker's probe.
+        exc = await _floored_unauthorized(t0)
+        raise exc from None
     # ── SEC5 (401-envelope parity, owner-authorised) ─────────────────
     # A bearer that the backend rejects (not live in ``g.active_agents``)
     # comes back as the backend's OWN 401: a ``Server: uvicorn`` header,
@@ -1009,7 +1069,7 @@ async def backend_mcp_handler(req: web.Request) -> web.StreamResponse:
     # available to a caller hitting the backend UDS directly; over the
     # public router boundary, uniform-401 hygiene wins.
     if resp.status == 401:
-        raise _unauthorized()
+        raise await _floored_unauthorized(t0)
     return resp
 
 
@@ -1580,6 +1640,50 @@ def _build_overview_envelope() -> dict:
 # ``_OVERVIEW_CACHE_TTL_SEC`` cache state defined above.
 
 
+def _visible_project_names(req: web.Request, names) -> set[str]:
+    """Subset of ``names`` the operator behind ``req`` may see.
+
+    SEC (owner-authorised, defensive) FINDING 4 [MED] — the router
+    ``overview`` + ``projects`` listings were session-only with NO
+    membership filter, so any authenticated operator (even a non-member,
+    non-sysadmin) enumerated EVERY tenant's project names / stats /
+    aliases. Filter to the caller's ``project_membership`` (direct OR
+    via a group — same access model ``resolve_user_project_role`` uses
+    for the per-project middleware, so a group-granted member keeps
+    their overview). A sysadmin sees all. Same class as the {name}-route
+    gate (#283 / FINDING 1); the listing routes are the collection
+    analogue.
+
+    ``req["user"]`` / ``req["is_sysadmin"]`` are populated by
+    ``require_operator_session_middleware`` before these handlers run.
+    """
+    names = list(names)
+    # Single-tenant mode is a single operator-owned box (ADR-0008): the
+    # session middleware bypasses gating entirely there, so ``req`` has
+    # no ``user`` / ``is_sysadmin`` stashed and there is no cross-tenant
+    # audience to filter against. See everything.
+    if SINGLE_TENANT_NAME is not None:
+        return set(names)
+    if req.get("is_sysadmin"):
+        return set(names)
+    user = req.get("user") or {}
+    user_id = user.get("user_id")
+    if not user_id:
+        return set()
+    from . import group_resolver
+
+    visible: set[str] = set()
+    for name in names:
+        try:
+            if group_resolver.resolve_user_project_role(user_id, name) is not None:
+                visible.add(name)
+        except Exception:  # pragma: no cover - defensive
+            # router.db not migrated / transient DB error → fail closed
+            # for this project (omit it) rather than over-disclose.
+            continue
+    return visible
+
+
 # ── Shared envelope / gate helpers ─────────────────────────────────
 #
 # The handlers themselves moved to ``agent_mcp.router.admin_api``
@@ -2068,6 +2172,10 @@ def make_app(
             empty_users_redirect_middleware,
             require_operator_session_middleware,
         ],
+        # SEC FINDING 2: make the request-body cap explicit (aiohttp's
+        # default is a silent 1 MiB). ``backend_mcp_handler`` collapses
+        # the resulting 413 into the uniform pre-auth 401.
+        client_max_size=_MCP_MAX_BODY_BYTES,
     )
     # Load rate-limit config + limiter instances onto the app. The
     # middleware (in the list above) reads them at request time.
