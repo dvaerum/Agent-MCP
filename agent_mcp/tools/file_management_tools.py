@@ -2,13 +2,14 @@
 """File-claim / file-status MCP tools.
 
 Wave 6 PR 1 migration — both tools take a :class:`Principal` and
-return :data:`ToolResult`. Admission stays agent-only
-(``principal.kind == "agent_bearer"``), matching the legacy
-``@requires("any")`` decorator that required a resolvable agent
-token. Operator-session callers are not admitted because the file
-map is keyed on agent identity (claim / release / lookup are all
-per-agent verbs) and an operator session doesn't have an
-``agent_id``.
+return :data:`ToolResult`. Admission is agent-only AND
+capability-gated: the caller must be an ``agent_bearer`` AND carry
+the ``files.use`` capability (SEC round-2 defense-in-depth; see the
+per-tool comments). Operator-session callers are not admitted
+because the file map is keyed on agent identity (claim / release /
+lookup are all per-agent verbs) and an operator session doesn't
+have an ``agent_id``; empty-capability bearers (``agent_role`` None)
+are likewise denied by the ``files.use`` check.
 """
 import os
 import datetime
@@ -35,9 +36,21 @@ async def check_file_status_tool_impl(
     *,
     principal: Optional[Principal] = None,
 ) -> ToolResult:
-    if principal is None or principal.kind != "agent_bearer":
+    # SEC round-2 (defense-in-depth): gate on the ``files.use``
+    # capability, not the bare ``kind`` (mirrors ``rag_tools.py`` under
+    # SEC Wave-B / Finding 2). The prior ``kind == "agent_bearer"``
+    # check admitted a bearer whose ``agent_role`` is None (empty
+    # capability bundle). The ``kind`` check is retained so operator
+    # sessions stay rejected — the in-memory file map keys on
+    # ``agent_id``, which operators don't carry; this tool is
+    # agent-only by design.
+    if (
+        principal is None
+        or principal.kind != "agent_bearer"
+        or not principal.has_capability("files.use")
+    ):
         return PermissionDenied(
-            reason="agent token required to check file status"
+            reason="agent token with files.use capability required to check file status"
         )
 
     filepath_arg = arguments.get("filepath")
@@ -121,9 +134,15 @@ async def update_file_status_tool_impl(
     *,
     principal: Optional[Principal] = None,
 ) -> ToolResult:
-    if principal is None or principal.kind != "agent_bearer":
+    # SEC round-2 (defense-in-depth): gate on the ``files.use``
+    # capability, not the bare ``kind`` (see check_file_status above).
+    if (
+        principal is None
+        or principal.kind != "agent_bearer"
+        or not principal.has_capability("files.use")
+    ):
         return PermissionDenied(
-            reason="agent token required to update file status"
+            reason="agent token with files.use capability required to update file status"
         )
 
     filepath_arg = arguments.get("filepath")

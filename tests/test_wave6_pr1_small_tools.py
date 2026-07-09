@@ -361,7 +361,10 @@ async def test_check_file_status_returns_not_in_use(tmp_path) -> None:
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
-        p = _agent_principal("alice", bearer=alice.token)
+        # SEC round-2: check_file_status now requires the ``files.use``
+        # capability, so the principal must carry the worker role so it
+        # has files.use — a role=None bearer is denied.
+        p = _agent_principal("alice", bearer=alice.token, role="worker")
         result = await dispatch_tool_call(
             "check_file_status",
             {"filepath": "/tmp/never-claimed-by-anyone.txt"},
@@ -379,7 +382,10 @@ async def test_update_file_status_claim_then_release(tmp_path) -> None:
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
-        p = _agent_principal("alice", bearer=alice.token)
+        # SEC round-2: update_file_status now requires the ``files.use``
+        # capability, so the principal must carry the worker role so it
+        # has files.use — a role=None bearer is denied.
+        p = _agent_principal("alice", bearer=alice.token, role="worker")
         filepath = "/tmp/wave6-pr1-file.txt"
 
         # Claim for editing.
@@ -428,8 +434,11 @@ async def test_update_file_status_conflict_when_claimed_by_other(
         bob = await admin.create_worker("bob")
         filepath = "/tmp/wave6-pr1-conflict.txt"
 
+        # SEC round-2: update_file_status now requires the ``files.use``
+        # capability, so both principals must carry the worker role so
+        # they have files.use — a role=None bearer is denied.
         # Alice claims.
-        p_alice = _agent_principal("alice", bearer=alice.token)
+        p_alice = _agent_principal("alice", bearer=alice.token, role="worker")
         await dispatch_tool_call(
             "update_file_status",
             {"filepath": filepath, "status": "editing"},
@@ -437,7 +446,7 @@ async def test_update_file_status_conflict_when_claimed_by_other(
         )
 
         # Bob attempts to claim same file.
-        p_bob = _agent_principal("bob", bearer=bob.token)
+        p_bob = _agent_principal("bob", bearer=bob.token, role="worker")
         result = await dispatch_tool_call(
             "update_file_status",
             {"filepath": filepath, "status": "editing"},
@@ -477,7 +486,10 @@ async def test_view_file_metadata_not_found(tmp_path) -> None:
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
-        p = _agent_principal("alice", bearer=alice.token)
+        # SEC round-2: view_file_metadata now requires the ``files.use``
+        # capability, so the principal must carry the worker role so it
+        # has files.use — a role=None bearer is denied.
+        p = _agent_principal("alice", bearer=alice.token, role="worker")
         result = await dispatch_tool_call(
             "view_file_metadata",
             {"filepath": "/tmp/never-recorded.txt"},
@@ -500,7 +512,10 @@ async def test_view_file_metadata_ok_returns_parsed_data(tmp_path) -> None:
         filepath = "/tmp/wave6-pr1-seeded.txt"
         _set_file_metadata(filepath, {"purpose": "demo", "owner": "alice"})
 
-        p = _agent_principal("alice", bearer=alice.token)
+        # SEC round-2: view_file_metadata now requires the ``files.use``
+        # capability, so the principal must carry the worker role so it
+        # has files.use — a role=None bearer is denied.
+        p = _agent_principal("alice", bearer=alice.token, role="worker")
         result = await dispatch_tool_call(
             "view_file_metadata",
             {"filepath": filepath},

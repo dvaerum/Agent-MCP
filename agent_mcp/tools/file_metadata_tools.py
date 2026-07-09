@@ -5,8 +5,9 @@ Wave 6 PR 1 migration — both tools take a :class:`Principal` and
 return :data:`ToolResult`. The legacy decorators are gone; the
 admission moves into the impl:
 
-* ``view_file_metadata`` — agent_bearer only (matches the legacy
-  ``@requires("any")``).
+* ``view_file_metadata`` — agent_bearer AND ``files.use``
+  capability (SEC round-2 defense-in-depth; the legacy gate was
+  ``@requires("any")`` / bare ``kind``).
 * ``update_file_metadata`` — operator-tier only (matches the legacy
   ``@requires_role("operator")`` and the ``visibility="operator"``
   declaration on registration).
@@ -72,9 +73,21 @@ async def view_file_metadata_tool_impl(
     *,
     principal: Optional[Principal] = None,
 ) -> ToolResult:
-    if principal is None or principal.kind != "agent_bearer":
+    # SEC round-2 (defense-in-depth): gate on the ``files.use``
+    # capability, not the bare ``kind`` (mirrors ``rag_tools.py`` under
+    # SEC Wave-B / Finding 2). The prior ``kind == "agent_bearer"``
+    # check admitted a bearer whose ``agent_role`` is None (empty
+    # capability bundle). The ``kind`` check is retained so operator
+    # sessions stay rejected — metadata working-dir resolution keys on
+    # ``agent_id``, which operators don't carry; this read is
+    # agent-only by design (the dashboard has no use case for it today).
+    if (
+        principal is None
+        or principal.kind != "agent_bearer"
+        or not principal.has_capability("files.use")
+    ):
         return PermissionDenied(
-            reason="agent token required to view file metadata"
+            reason="agent token with files.use capability required to view file metadata"
         )
 
     filepath_arg = arguments.get("filepath")
