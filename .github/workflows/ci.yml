@@ -163,7 +163,11 @@ jobs:
         # needed) so the gate reflects what actually ships, transitive
         # deps included. --no-emit-project drops the local agent-mcp
         # package (not on PyPI, unauditable anyway).
-        run: uv export --no-emit-project --format requirements-txt --output-file requirements-audit.txt
+        # --locked hard-fails on pyproject.toml <-> uv.lock drift instead
+        # of silently re-resolving and auditing a tree that isn't the
+        # committed lock. This mirrors the strict `npm ci` leg below and
+        # keeps the gate honest to "audit what ships".
+        run: uv export --locked --no-emit-project --format requirements-txt --output-file requirements-audit.txt
 
       - name: pip-audit (Python deps)
         # Fails the build on any advisory in the locked tree EXCEPT the
