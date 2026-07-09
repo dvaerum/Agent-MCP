@@ -85,7 +85,10 @@ async def all_tasks_api_route(request: Request) -> JSONResponse:
         return JSONResponse(tasks_data)
     except Exception as e:
         logger.error(f"Error fetching all tasks: {e}", exc_info=True)
-        return JSONResponse({"error": f"Failed to fetch all tasks: {str(e)}"}, status_code=500)
+        # BL-R5-2 / SD-R6-1: generic message — ``str(e)`` on a
+        # SQLAlchemyError / sqlite3.*Error embeds SQL text + bound
+        # params (schema disclosure). Detail stays in the log above.
+        return JSONResponse({"error": "Failed to fetch all tasks"}, status_code=500)
 
 
 @router.api_route("", methods=["POST", "OPTIONS"])
@@ -255,8 +258,9 @@ async def create_task_api_route(
         if conn:
             conn.rollback()
         logger.error(f"Error creating task: {e}", exc_info=True)
+        # BL-R5-2 / SD-R6-1: generic message — see fetch-all-tasks note.
         return JSONResponse(
-            {"error": f"Failed to create task: {str(e)}"}, status_code=500
+            {"error": "Failed to create task"}, status_code=500
         )
     finally:
         if conn:

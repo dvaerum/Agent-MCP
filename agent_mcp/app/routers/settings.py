@@ -95,7 +95,10 @@ async def tokens_api_route(
         return JSONResponse({"agent_tokens": agent_tokens_list})
     except Exception as e:
         logger.error(f"Error retrieving tokens for dashboard: {e}", exc_info=True)
-        return JSONResponse({"error": f"Error retrieving tokens: {str(e)}"}, status_code=500)
+        # BL-R5-2 / SD-R6-1: generic message — ``str(e)`` on a
+        # SQLAlchemyError / sqlite3.*Error embeds SQL text + bound
+        # params (schema disclosure). Detail stays in the log above.
+        return JSONResponse({"error": "Error retrieving tokens"}, status_code=500)
 
 
 @router.api_route("/aoe/health", methods=["GET", "OPTIONS"])
