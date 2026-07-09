@@ -28,12 +28,28 @@ _CONFIG_KEY_RE = re.compile(r"^config_", re.IGNORECASE)
 # RAG side-channel + dashboard reads.
 _SECRET_SUFFIX_RE = re.compile(
     r"(?:^|[_\-.])"
-    r"(?:credential|cred|passphrase|password|passwd|pass|pw|"
-    r"api[_-]?key|apikey|secret|token|bearer|cookie|jwt|auth|pat|key)"
+    r"(?:"
+    # credential / password family
+    r"credential|cred|passphrase|password|passwd|pass|pwd|pw|"
+    # api key / secret / token / auth family
+    r"api[_-]?key|apikey|secret|bearertoken|bearer|token|jwt|auth|pat|"
+    # cookie / key family
+    r"sessioncookie|cookie|privkey|key|"
+    # wallet / crypto material
+    r"seed|mnemonic|"
+    # connection-string / DSN key names (credential-bearing URLs)
+    r"dsn|conn[_-]?str|connection[_-]?string|database[_-]?url|db[_-]?url"
+    r")"
     r"s?"
     r"(?:$|[_\-.])",
     re.IGNORECASE,
 )
+
+# lowerUpper camelCase transition — normalized to a delimiter before the
+# vocab match so ``clientSecret`` -> ``client_Secret`` matches ``secret``
+# (round-3 fix: the delimited regex above never saw camelCase keys like
+# ``accessToken`` / ``refreshToken`` as carrying a secret segment).
+_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z])(?=[A-Z])")
 
 
 def is_secret_key(key: Optional[str]) -> bool:
@@ -47,22 +63,31 @@ def is_secret_key(key: Optional[str]) -> bool:
     composition endpoints (``app/routers/composition.py``). Keeping the
     check here means the surfaces can't drift out of sync.
 
-    Two rules (round-2 broadening):
+    Two rules (round-2 broadening; round-3 extended the vocab +
+    camelCase handling):
 
     * ANY ``config_*`` key is secret — the ``config_`` namespace holds
       the project's policy + credential rows and non-operators must not
       read their values regardless of suffix.
     * Any other key carrying a delimited secret-word segment
-      (``token``, ``secret``, ``password``, ``api_key``, ``pat``,
-      ``bearer``, ``jwt``, ``auth``, ``cookie``, ``credential``, …) is
-      secret too — catches credentials stored outside the ``config_``
-      namespace (``openai_api_key``, ``db_password``, ``github_pat``).
+      (``token``, ``secret``, ``password``, ``pwd``, ``api_key``,
+      ``pat``, ``bearer``, ``jwt``, ``auth``, ``cookie``, ``seed``,
+      ``mnemonic``, ``privkey``, ``dsn``, ``conn_str``,
+      ``database_url``, ``credential``, …) is secret too — catches
+      credentials stored outside the ``config_`` namespace
+      (``openai_api_key``, ``db_password``, ``github_pat``). camelCase
+      keys (``clientSecret``, ``accessToken``) are segmented at the
+      lowerUpper boundary first so they match too.
     """
     if not key:
         return False
     if _CONFIG_KEY_RE.match(key):
         return True
-    return _SECRET_SUFFIX_RE.search(key) is not None
+    # Segment camelCase (``clientSecret`` -> ``client_Secret``) so a
+    # lowerUpper transition counts as a word boundary for the delimited
+    # vocab match — otherwise ``accessToken`` / ``apiSecret`` slip past.
+    segmented = _CAMEL_BOUNDARY_RE.sub("_", key)
+    return _SECRET_SUFFIX_RE.search(segmented) is not None
 
 # Worker-policy toggle keys (Phase 4). Writing one of these flips the
 # tools/list visibility for worker bearers (PR #55 reads the toggle
@@ -638,7 +663,20 @@ async def view_project_context_tool_impl(
         # the legacy ``operator_session_active`` ContextVar during
         # the bridge window.
         if not _is_admin_principal(principal):
-            rows = [r for r in rows if not is_secret_key(r.context_key)]
+            # Defense-in-depth (round-3): also drop a row whose VALUE /
+            # DESCRIPTION carries an embedded credential under a benign
+            # KEY name, mirroring the RAG index-time value scan so a
+            # secret pasted into a non-secret key never leaks at the tool
+            # boundary either. Import the single canonical predicate
+            # lazily to avoid the tools <-> rag import cycle.
+            from ..features.rag.indexing import _value_has_embedded_secret
+
+            rows = [
+                r
+                for r in rows
+                if not is_secret_key(r.context_key)
+                and not _value_has_embedded_secret(r.value, r.description)
+            ]
 
         # Process results with enhanced information
         for row_data in rows:
