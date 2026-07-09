@@ -1350,6 +1350,30 @@ async def remove_group_member_handler(req: web.Request) -> web.Response:
     member_id = req.match_info["member_id"]
     conn = _connect()
     try:
+        # AZ-R12-1 (revoke mirror of add_group_member_handler's three
+        # amplification guards): removing a member STRIPS the authority the
+        # parent group confers on that member — the symmetric operation of
+        # adding them. A non-sysadmin delegate holding only
+        # ``system.groups.manage`` must not strip authority they could never
+        # GRANT, or the revoke path supersedes the guarded add path. Deny
+        # (regardless of member kind) when the parent group confers, via the
+        # resolver's transitive closure, any of:
+        #   * sysadmin (the group's transitive is_sysadmin flag),
+        #   * a ``system.*`` capability the delegate lacks, or
+        #   * a project role above the delegate's own.
+        if not _caller_is_sysadmin(req):
+            if _group_is_transitively_sysadmin(conn, parent_group_id):
+                return _forbid_sysadmin_membership(req)
+            inherited = _group_resolved_capabilities(conn, parent_group_id)
+            lacked = _caps_caller_lacks(req, inherited)
+            if lacked:
+                return _forbid_cap_amplification(req, lacked)
+            for project, role in _group_resolved_project_roles(
+                conn, parent_group_id,
+            ).items():
+                denied = _membership_grant_denied(req, project, role)
+                if denied is not None:
+                    return denied
         cur = conn.execute(
             "DELETE FROM group_membership "
             "WHERE group_id = ? AND "
@@ -1567,19 +1591,30 @@ async def change_project_membership_role_handler(
         return denied
     conn = _connect()
     try:
+        # AZ-R12-1 (revoke mirror) — a PATCH changes a role, so like the
+        # cap REPLACE it must guard the SYMMETRIC delta, not just the NEW
+        # role. Guarding only the new role lets a viewer-delegate DOWNGRADE
+        # an operator to viewer: the new role (viewer) is within their
+        # authority, but the operator role they STRIP is not. That is the
+        # same cross-tenant revoke as the DELETE path (a downgrade-to-viewer
+        # is a near-equivalent lockout of operator-tier data access), so it
+        # would otherwise be a trivial bypass of the DELETE guard. Look up
+        # the EXISTING role and apply the same grant guard to it — the
+        # caller must be authorised for BOTH the role they set and the role
+        # they remove. 404 (unchanged) when no such row.
         if kind == "user":
-            cur = conn.execute(
-                "UPDATE project_membership SET role = ? "
+            existing = conn.execute(
+                "SELECT role FROM project_membership "
                 "WHERE project_name = ? AND user_id = ?",
-                (role, project_name, target_id),
-            )
+                (project_name, target_id),
+            ).fetchone()
         else:
-            cur = conn.execute(
-                "UPDATE project_membership SET role = ? "
+            existing = conn.execute(
+                "SELECT role FROM project_membership "
                 "WHERE project_name = ? AND group_id = ?",
-                (role, project_name, target_id),
-            )
-        if cur.rowcount == 0:
+                (project_name, target_id),
+            ).fetchone()
+        if existing is None:
             return _error(
                 error=_ERROR_NOT_FOUND,
                 message=(
@@ -1587,6 +1622,21 @@ async def change_project_membership_role_handler(
                     f"project {project_name!r}"
                 ),
                 status=404,
+            )
+        denied = _membership_grant_denied(req, project_name, existing["role"])
+        if denied is not None:
+            return denied
+        if kind == "user":
+            conn.execute(
+                "UPDATE project_membership SET role = ? "
+                "WHERE project_name = ? AND user_id = ?",
+                (role, project_name, target_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE project_membership SET role = ? "
+                "WHERE project_name = ? AND group_id = ?",
+                (role, project_name, target_id),
             )
         conn.commit()
     finally:
@@ -1714,6 +1764,8 @@ async def replace_group_capabilities_handler(
             extra={"unknown": unknown},
         )
 
+    from ..repositories import group_capability_repository as _gcap
+
     # SEC round-4 (AZ-1) — capability-grant privilege amplification
     # (confused deputy). The route admits any caller holding
     # ``system.groups.capabilities.manage``, but that management cap
@@ -1721,13 +1773,21 @@ async def replace_group_capabilities_handler(
     # sysadmin-equivalent ``system.*`` management caps and self-amplify.
     # A non-sysadmin may only grant caps they already hold; a sysadmin
     # may grant anything in KNOWN_CAPABILITIES (validated above).
-    lacked = _caps_caller_lacks(req, ordered)
+    #
+    # AZ-R12-1 (revoke mirror) — the guard must cover the SYMMETRIC
+    # DIFFERENCE, not just the NEW list. This is an atomic REPLACE, so a
+    # shrinking PUT (or ``[]``) REMOVES caps; a non-sysadmin must not STRIP
+    # a cap they don't hold any more than they may GRANT one — otherwise
+    # they could revoke authority they could never confer. Delta = caps
+    # added (new − current) ∪ caps removed (current − new).
+    current = _gcap.fetch(group_id)
+    new_caps = frozenset(ordered)
+    delta = (new_caps - current) | (current - new_caps)
+    lacked = _caps_caller_lacks(req, delta)
     if lacked:
         return _forbid_cap_amplification(req, lacked)
 
-    from ..repositories import group_capability_repository as _gcap
-
-    _gcap.replace(group_id, frozenset(ordered))
+    _gcap.replace(group_id, new_caps)
     # Re-read so the response body matches what a subsequent GET would
     # return (sorted, de-duped) — the dashboard uses this to confirm
     # the round-trip.
@@ -1763,19 +1823,29 @@ async def delete_project_membership_handler(
     kind, target_id = parsed
     conn = _connect()
     try:
+        # AZ-R12-1 (revoke mirror of add_project_membership_handler's
+        # ``_membership_grant_denied`` guard): DELETE is gated only by the
+        # delegable ``system.projects.manage`` cap, but revoking a
+        # membership row is cross-tenant DATA authority just like granting
+        # one — a non-sysadmin delegate with NO role on the project could
+        # lock a victim out (or a viewer-delegate could strip an operator).
+        # Look up the role being revoked and apply the SAME grant guard so
+        # the DELETE path can't supersede the ADD-side check: a caller may
+        # revoke only a role at or below their own, and only on a project
+        # they hold a membership on. 404 (unchanged) when no such row.
         if kind == "user":
-            cur = conn.execute(
-                "DELETE FROM project_membership "
+            existing = conn.execute(
+                "SELECT role FROM project_membership "
                 "WHERE project_name = ? AND user_id = ?",
                 (project_name, target_id),
-            )
+            ).fetchone()
         else:
-            cur = conn.execute(
-                "DELETE FROM project_membership "
+            existing = conn.execute(
+                "SELECT role FROM project_membership "
                 "WHERE project_name = ? AND group_id = ?",
                 (project_name, target_id),
-            )
-        if cur.rowcount == 0:
+            ).fetchone()
+        if existing is None:
             return _error(
                 error=_ERROR_NOT_FOUND,
                 message=(
@@ -1783,6 +1853,21 @@ async def delete_project_membership_handler(
                     f"project {project_name!r}"
                 ),
                 status=404,
+            )
+        denied = _membership_grant_denied(req, project_name, existing["role"])
+        if denied is not None:
+            return denied
+        if kind == "user":
+            conn.execute(
+                "DELETE FROM project_membership "
+                "WHERE project_name = ? AND user_id = ?",
+                (project_name, target_id),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM project_membership "
+                "WHERE project_name = ? AND group_id = ?",
+                (project_name, target_id),
             )
         conn.commit()
     finally:
