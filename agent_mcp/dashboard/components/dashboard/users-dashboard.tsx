@@ -39,10 +39,13 @@ const STRICT_HEADERS = {
   "Content-Type": "application/json",
 }
 
-// Mirrors the router's `_PASSWORD_MIN_LENGTH` (admin_users_api.py). Kept
-// in sync so the client rejects too-short passwords with a clear inline
-// hint instead of letting the server return an opaque 400.
-const PASSWORD_MIN_LENGTH = 8
+// Client-side hint that MUST be kept in sync with the server's canonical
+// policy: `identity.PASSWORD_MIN_LENGTH` / `validate_password_strength`
+// (agent_mcp/router/identity.py). The TS build can't import the Python
+// constant, so this value is duplicated here purely so the client rejects
+// too-short passwords with a clear inline hint instead of letting the
+// server return an opaque 400. Update both together if the policy changes.
+const PASSWORD_MIN_LENGTH = 12
 
 interface UserRow {
   user_id: string
@@ -290,8 +293,8 @@ function AddUserModal({
           <DialogHeader>
             <DialogTitle>Add user</DialogTitle>
             <DialogDescription>
-              Create a new operator account. Password must be at least 8
-              characters.
+              Create a new operator account. Password must be at least{" "}
+              {PASSWORD_MIN_LENGTH} characters.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-4">
