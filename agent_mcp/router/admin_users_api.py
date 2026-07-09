@@ -265,6 +265,54 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+# ── Sysadmin-grant guard (self-escalation defence) ─────────────────
+
+
+def _caller_is_sysadmin(req: web.Request) -> bool:
+    """True iff the CALLER of this request is a sysadmin.
+
+    Writing the ``is_sysadmin`` bit — on a user OR a group, granting on
+    create/edit or clearing on edit — is reserved for sysadmins. The
+    ``system.users.manage`` / ``system.groups.manage`` capabilities that
+    gate these routes are NOT sufficient: a sysadmin-flagged group
+    confers sysadmin to its members (``group_resolver`` walks the
+    transitive closure), so letting a delegated operator flip the bit
+    would let them self-escalate to full sysadmin. Granting sysadmin is
+    strictly a sysadmin-only operation.
+
+    Single-tenant mode (ADR-0008) pins the deploy to one operator-owned
+    host with no multi-operator audience; the auth middleware bypasses
+    the per-request Principal there, so treat that operator as sysadmin
+    (mirrors ``perm_gates.require_capability``'s single-tenant bypass).
+    """
+    try:
+        from . import app as _app
+        if _app.SINGLE_TENANT_NAME is not None:
+            return True
+    except Exception:  # pragma: no cover - defensive
+        pass
+    principal = req.get("principal")
+    if principal is not None and getattr(principal, "sysadmin", False):
+        return True
+    # Fall back to the flag the middleware stashes alongside the
+    # Principal (canonical source is the Principal; this mirrors it).
+    return bool(req.get("is_sysadmin"))
+
+
+def _forbid_sysadmin_write(req: web.Request) -> web.Response:
+    """403 envelope for a non-sysadmin attempting to write ``is_sysadmin``."""
+    user = req.get("user") or {}
+    username = user.get("username", "<unknown>")
+    return _error(
+        error="forbidden",
+        message=(
+            f"operator {username!r} may not set 'is_sysadmin'; granting "
+            "or clearing sysadmin is reserved for sysadmins"
+        ),
+        status=403,
+    )
+
+
 def _connect() -> sqlite3.Connection:
     """Open a router.db connection with FK + row factory enabled.
 
@@ -384,6 +432,10 @@ async def create_user_handler(req: web.Request) -> web.Response:
     email = body.get("email")
     is_sysadmin = bool(body.get("is_sysadmin", False))
 
+    # Granting sysadmin is sysadmin-only (self-escalation defence).
+    if is_sysadmin and not _caller_is_sysadmin(req):
+        return _forbid_sysadmin_write(req)
+
     for err in (_validate_username(username), _validate_password(password)):
         if err is not None:
             return _error(
@@ -434,6 +486,9 @@ async def edit_user_handler(req: web.Request) -> web.Response:
     _ensure_wave1a_schema()
     user_id = req.match_info["user_id"]
     body = await _json_body(req)
+    # Setting OR clearing the sysadmin bit is sysadmin-only.
+    if "is_sysadmin" in body and not _caller_is_sysadmin(req):
+        return _forbid_sysadmin_write(req)
     sets: list[str] = []
     params: list[Any] = []
     if "is_sysadmin" in body:
@@ -542,6 +597,10 @@ async def create_group_handler(req: web.Request) -> web.Response:
     body = await _json_body(req)
     name = (body.get("name") or "").strip()
     is_sysadmin = bool(body.get("is_sysadmin", False))
+    # A sysadmin-flagged group confers sysadmin to its members, so
+    # minting one is sysadmin-only (self-escalation defence).
+    if is_sysadmin and not _caller_is_sysadmin(req):
+        return _forbid_sysadmin_write(req)
     err = _validate_group_name(name)
     if err is not None:
         return _error(error=_ERROR_VALIDATION, message=err, status=400)
@@ -579,6 +638,9 @@ async def edit_group_handler(req: web.Request) -> web.Response:
     _ensure_wave1a_schema()
     group_id = req.match_info["group_id"]
     body = await _json_body(req)
+    # Setting OR clearing the sysadmin bit is sysadmin-only.
+    if "is_sysadmin" in body and not _caller_is_sysadmin(req):
+        return _forbid_sysadmin_write(req)
     sets: list[str] = []
     params: list[Any] = []
     if "name" in body:
@@ -726,10 +788,14 @@ async def add_group_member_handler(req: web.Request) -> web.Response:
 
     Body: exactly one of ``{user_id}`` / ``{group_id}``. Returns
     400 if both or neither are supplied (defence in depth before
-    the DB CHECK fires). Cycle detection is left to Wave 1a's
-    helper — calling code can validate via that helper once it
-    lands; for now we accept whatever the operator supplies and
-    rely on the FK to reject unknown ids.
+    the DB CHECK fires).
+
+    For a group-into-group edge, cycle detection runs BEFORE the
+    insert, reusing ``group_resolver``'s reachability logic. The
+    check-and-insert happen inside one ``BEGIN IMMEDIATE`` transaction
+    so two concurrent adders can't each pass the check and then close a
+    cycle between them — the immediate write-lock serialises them, so
+    the second adder's check sees the first's edge and rejects (409).
     """
     _ensure_wave1a_schema()
     parent_group_id = req.match_info["group_id"]
@@ -742,18 +808,40 @@ async def add_group_member_handler(req: web.Request) -> web.Response:
             message="exactly one of user_id or group_id is required",
             status=400,
         )
+    from . import group_resolver as _gr
+
     conn = _connect()
+    # Manual transaction control so BEGIN IMMEDIATE / COMMIT / ROLLBACK
+    # are fully under our hand (default isolation_level auto-manages
+    # DML and would fight the explicit BEGIN).
+    conn.isolation_level = None
     try:
-        existing = conn.execute(
-            "SELECT 1 FROM groups WHERE group_id = ?", (parent_group_id,),
-        ).fetchone()
-        if existing is None:
-            return _error(
-                error=_ERROR_NOT_FOUND,
-                message=f"unknown group_id: {parent_group_id!r}",
-                status=404,
-            )
+        conn.execute("BEGIN IMMEDIATE")
         try:
+            existing = conn.execute(
+                "SELECT 1 FROM groups WHERE group_id = ?",
+                (parent_group_id,),
+            ).fetchone()
+            if existing is None:
+                conn.execute("ROLLBACK")
+                return _error(
+                    error=_ERROR_NOT_FOUND,
+                    message=f"unknown group_id: {parent_group_id!r}",
+                    status=404,
+                )
+            if member_group_id is not None and _gr._would_create_cycle(
+                conn, parent_group_id, member_group_id,
+            ):
+                conn.execute("ROLLBACK")
+                return _error(
+                    error=_ERROR_CONFLICT,
+                    message=(
+                        f"adding group {member_group_id!r} as a member of "
+                        f"{parent_group_id!r} would close a cycle in the "
+                        "membership DAG"
+                    ),
+                    status=409,
+                )
             conn.execute(
                 "INSERT INTO group_membership "
                 "(group_id, member_user_id, member_group_id, added_at) "
@@ -763,9 +851,10 @@ async def add_group_member_handler(req: web.Request) -> web.Response:
                     _now_iso(),
                 ),
             )
-            conn.commit()
+            conn.execute("COMMIT")
         except sqlite3.IntegrityError as e:
             # FK violation (unknown member id) or CHECK violation.
+            conn.execute("ROLLBACK")
             return _error(
                 error=_ERROR_VALIDATION,
                 message=f"could not add member: {e}",
