@@ -31,7 +31,11 @@ from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
 from .._dispatch_helpers import handle_options
-from ..deps import caller_identity, require_operator_session
+from ..deps import (
+    caller_identity,
+    forwarding_route_role,
+    require_operator_session,
+)
 from ...core.config import logger
 from ...core import globals as g
 from ...core import session_registry
@@ -269,18 +273,34 @@ async def register_agent_dashboard_api_route(
         )
 
     operator_id = caller_identity(auth)
+    # AZ-R14-1 (round 14): thread the forwarding caller's REAL signed
+    # ``(project_role, sysadmin)`` instead of a hard-coded ``"operator"``,
+    # mirroring ``_dispatch_helpers._build_route_principal``. This was the
+    # last per-project REST route that built its own ``operator_session``
+    # Principal inline, so it never got the round-5 AC-R5-1 forwarding-role
+    # threading — a forwarding VIEWER reaching here (should the router
+    # method-gate / cookie-authorize ever be bypassed) would otherwise get
+    # the full operator bundle, incl ``agents.register``. The carrier is
+    # armed per-request by ``require_operator_session``'s forwarding branch;
+    # the cookie / operator-tier bearer paths report ``None`` and keep the
+    # historical operator-tier default (those admits are genuinely
+    # operator). We thread inline rather than call ``_build_route_principal``
+    # because this route needs the bespoke ``project_name`` field the helper
+    # doesn't carry (Principal is frozen — it can't be set after the fact).
+    threaded = forwarding_route_role()
+    project_role, sysadmin = threaded if threaded is not None else ("operator", False)
     principal = Principal(
         kind="operator_session",
         user_id=operator_id,
         agent_id=None,
-        sysadmin=False,
+        sysadmin=sysadmin,
         # The frontend supplies ``project_name`` explicitly — the
         # per-project backend doesn't yet derive its own project
         # name from the request. The Principal field is best-effort
         # plumbing; the tool's snippet builder reads
         # ``arguments["project_name"]`` first either way.
         project_name=project_name if isinstance(project_name, str) else None,
-        project_role="operator",
+        project_role=project_role,
         agent_role=None,
         can_wake_loop=False,
         source_token=None,
