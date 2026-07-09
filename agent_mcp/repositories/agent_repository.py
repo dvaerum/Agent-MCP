@@ -1261,6 +1261,104 @@ class AgentRepository:
                     entry["current_task"] = None
         return int(rowcount)
 
+    def clear_current_task_for_many(
+        self,
+        task_ids: List[str],
+        *,
+        connection: Any = None,
+    ) -> int:
+        """Clear ``current_task`` on every agent pointing at any of ``task_ids``.
+
+        The set-valued sibling of :meth:`clear_current_task_for`. Used by
+        ``task_tools.delete_task_tool_impl``'s ``force_delete`` path: a task
+        (the delete target OR a cascaded descendant) referenced by some
+        agent's ``current_task`` would otherwise abort the
+        ``DELETE FROM tasks`` on the ``agents.current_task → tasks.task_id``
+        FK, so ``force_delete`` must NULL those pointers in the SAME
+        transaction, before the DELETE, for the force to actually force.
+
+        Single ``UPDATE ... WHERE current_task IN (...)`` so N descendants
+        cost one statement, not N. Empty ``task_ids`` is a no-op (returns
+        0). Cache mirror matches :meth:`clear_current_task_for`: entries
+        whose ``current_task`` is in the set get cleared in place.
+
+        ``connection`` is the transaction-aware seam (sqlite3 ``Cursor``
+        or SQLAlchemy ``Session``) so the call stays atomic with the wider
+        delete transaction. Returns the number of rows updated. On DB
+        error returns 0.
+        """
+        if not task_ids:
+            return 0
+        # Dedupe while preserving determinism; the IN-list only needs the
+        # distinct set.
+        id_set = list(dict.fromkeys(task_ids))
+        updated_at = datetime.datetime.now().isoformat()
+        rowcount = 0
+
+        if connection is not None and not hasattr(connection, "query"):
+            cur = connection
+            placeholders = ",".join("?" for _ in id_set)
+            try:
+                cur.execute(
+                    f"UPDATE agents SET current_task = NULL, updated_at = ? "
+                    f"WHERE current_task IN ({placeholders})",
+                    (updated_at, *id_set),
+                )
+                rowcount = cur.rowcount or 0
+            except Exception as e:
+                logger.error(
+                    f"Database error clearing current_task for tasks "
+                    f"{id_set!r} via shared cursor: {e}",
+                    exc_info=True,
+                )
+                return 0
+        elif connection is not None:
+            session = connection
+            try:
+                q = session.query(Agent).filter(
+                    Agent.current_task.in_(id_set),
+                )
+                rowcount = q.update(
+                    {Agent.current_task: None, Agent.updated_at: updated_at},
+                    synchronize_session=False,
+                )
+                session.flush()
+            except SQLAlchemyError as e:
+                logger.error(
+                    f"Database error clearing current_task for tasks "
+                    f"{id_set!r} via shared session: {e}",
+                    exc_info=True,
+                )
+                return 0
+        else:
+            try:
+                with get_session() as session:
+                    q = session.query(Agent).filter(
+                        Agent.current_task.in_(id_set),
+                    )
+                    rowcount = q.update(
+                        {
+                            Agent.current_task: None,
+                            Agent.updated_at: updated_at,
+                        },
+                        synchronize_session=False,
+                    )
+                    session.commit()
+            except SQLAlchemyError as e:
+                logger.error(
+                    f"Database error clearing current_task for tasks "
+                    f"{id_set!r}: {e}",
+                    exc_info=True,
+                )
+                return 0
+
+        if not self._cache_disabled:
+            id_lookup = set(id_set)
+            for entry in state.active_agents.values():
+                if entry.get("current_task") in id_lookup:
+                    entry["current_task"] = None
+        return int(rowcount)
+
     # --- Write interface: rotate_token ----------------------------------
 
     def rotate_token(
