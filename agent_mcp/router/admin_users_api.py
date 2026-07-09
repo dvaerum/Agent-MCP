@@ -79,7 +79,11 @@ _ERROR_INTERNAL = "internal_error"
 
 _USERNAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 _GROUP_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
-_PASSWORD_MIN_LENGTH = 8
+# Password STRENGTH policy is NOT defined here — it lives canonically in
+# ``identity.validate_password_strength`` (min length ``identity.
+# PASSWORD_MIN_LENGTH``). This handler calls that single source so an
+# admin-created user gets the same floor as a self-provisioned one (no
+# policy drift). Only the required-field check stays local below.
 
 
 # ── Schema guard (Wave 1a interop) ─────────────────────────────────
@@ -455,16 +459,6 @@ def _validate_username(name: str) -> str | None:
     return None
 
 
-def _validate_password(pw: str) -> str | None:
-    if not pw or not isinstance(pw, str):
-        return "password is required"
-    if len(pw) < _PASSWORD_MIN_LENGTH:
-        return (
-            f"password must be at least {_PASSWORD_MIN_LENGTH} characters"
-        )
-    return None
-
-
 def _validate_group_name(name: str) -> str | None:
     if not name or not isinstance(name, str):
         return "name is required"
@@ -543,11 +537,22 @@ async def create_user_handler(req: web.Request) -> web.Response:
     if is_sysadmin and not _caller_is_sysadmin(req):
         return _forbid_sysadmin_write(req)
 
-    for err in (_validate_username(username), _validate_password(password)):
-        if err is not None:
-            return _error(
-                error=_ERROR_VALIDATION, message=err, status=400,
-            )
+    err = _validate_username(username)
+    if err is not None:
+        return _error(error=_ERROR_VALIDATION, message=err, status=400)
+    # Required-field guard stays local; the STRENGTH policy is delegated
+    # to the canonical single source (identity.validate_password_strength).
+    if not isinstance(password, str) or not password:
+        return _error(
+            error=_ERROR_VALIDATION, message="password is required",
+            status=400,
+        )
+    try:
+        identity.validate_password_strength(password)
+    except identity.WeakPasswordError as exc:
+        return _error(
+            error=_ERROR_VALIDATION, message=str(exc), status=400,
+        )
 
     user_id = secrets.token_hex(8)
     password_hash = identity.hash_password(password)
