@@ -198,6 +198,18 @@ pkgs.testers.nixosTest {
     # 2. Force backend startup by hitting the dashboard endpoint —
     # this routes to /agent-mcp/app/idle-test/ which spawns the
     # per-project backend on first contact.
+    #
+    # SC-R6-1 (round 6): the /app/ warm-start side-effect is now
+    # authorization-gated. The auth middleware serves the SPA shell to
+    # authenticated NON-MEMBERS too (round-4 project-existence-oracle
+    # fix), but only sets the internal ``_warm_authorized`` flag — and
+    # thus fires the lazy-spawn — for an AUTHORIZED caller (sysadmin,
+    # sufficient membership, or single-tenant). The ``-b`` cookie below
+    # is therefore load-bearing: ci-sentinel is the first operator
+    # (bootstrap sysadmin) AND the creator/member of idle-test, so the
+    # spawn fires. Dropping the cookie here would still 200 (uniform
+    # shell, no oracle) but would NO LONGER start the backend, breaking
+    # this test's premise — do not remove it.
     machine.succeed(
         "curl -fsS -b /tmp/agent-mcp-cookies.txt -o /dev/null "
         "http://127.0.0.1:${toString ports.routerPort}/agent-mcp/app/idle-test/"

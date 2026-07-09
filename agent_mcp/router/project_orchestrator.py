@@ -332,7 +332,17 @@ async def _ensure(name: str, role: str) -> Path:
     sock = _sock_path(name, role)
 
     async with _ensure_lock(name, role):
-        needs_start = not _is_active(unit) or not sock.exists()
+        # BL-R6-2b: ``_is_active`` (and ``_systemctl`` below) shell out
+        # via a synchronous ``subprocess.run`` — ~15-150 ms of blocking
+        # that would stall every other tenant's request on this single
+        # event loop. Run them in a worker thread so the loop stays
+        # responsive. ``asyncio.to_thread`` resolves the module-level
+        # ``_is_active`` / ``_systemctl`` names at call time, so tests
+        # that monkeypatch them still take effect.
+        needs_start = (
+            not await asyncio.to_thread(_is_active, unit)
+            or not sock.exists()
+        )
         # Recent-failure short-circuit (P005 cascade-fix). If the
         # previous ``_ensure`` for this (name, role) raised within
         # ``ENSURE_FAILURE_COOLDOWN_SEC`` AND the backend STILL isn't
@@ -369,8 +379,25 @@ async def _ensure(name: str, role: str) -> Path:
             # (``get_forwarding_hmac_key`` from the cookie path)
             # will pick up the bytes ExecStartPre wrote.
             ensure_forwarding_hmac_key(name)
-            action = "restart" if _is_active(unit) else "start"
-            r = _systemctl(action, unit)
+            action = (
+                "restart" if await asyncio.to_thread(_is_active, unit)
+                else "start"
+            )
+            # BL-R6-1: TOCTOU re-check. The registry-existence probe at
+            # the top of ``_ensure`` runs OUTSIDE this lock, so a
+            # concurrent ``delete_project_handler`` (which holds no
+            # mutex with us and whose ``active_conns`` guard never sees
+            # warm-starts) can stop + unregister the project while we
+            # were blocked acquiring ``_ensure_lock``. Re-read the
+            # registry inside the lock, immediately before the spawn,
+            # and abort if the project is gone — otherwise we'd
+            # ``systemctl start`` a unit for a deleted project, leaving
+            # an orphan backend running until the idle reaper stops it
+            # (up to ``IDLE_SEC``, ~4 h). ``registry.get`` re-reads the
+            # on-disk file each call, so this observes the delete.
+            if registry.get(name) is None:
+                raise web.HTTPNotFound(reason="unknown project")
+            r = await asyncio.to_thread(_systemctl, action, unit)
             if r.returncode != 0:
                 # F015 v6: aiohttp's HTTPException rejects ``reason``
                 # values containing CR/LF (per RFC 7230 status-line

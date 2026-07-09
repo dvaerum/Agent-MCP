@@ -358,6 +358,12 @@ async def require_operator_session_middleware(
     # "endpoint disabled in single-tenant mode" responses surface for
     # __create/__unregister/__rename (covered by nix/tests/single-tenant.nix).
     if _single_tenant_mode():
+        # SC-R6-1: single-tenant is an authorized audience (ADR-0008,
+        # one operator-owned host), so the ``/app/`` dashboard warm-
+        # start side-effect is permitted here. The flag is read by
+        # ``dashboard_handler`` — we can't key that off ``req["user"]``
+        # because this bypass never stashes a user.
+        request["_warm_authorized"] = True
         return await handler(request)
 
     user = resolve_current_user(request)
@@ -475,6 +481,18 @@ async def require_operator_session_middleware(
     # per-route policy) can use them without re-resolving.
     request["user"] = user
     request["is_sysadmin"] = is_sysadmin
+
+    # SC-R6-1: reaching here means the caller is AUTHORIZED for this
+    # path — a sysadmin, or a member with a sufficient role for the
+    # project-scoped segment (the non-member ``/app/`` branch returned
+    # the bare SPA shell above WITHOUT falling through to this stash).
+    # ``dashboard_handler`` reads this flag before scheduling the
+    # per-project backend warm-start, so an authenticated non-member
+    # can no longer activate an arbitrary tenant's backend via a plain
+    # ``GET /agent-mcp/app/<victim>/``. The ``/app/`` response itself
+    # stays a uniform 200 shell either way (no project-existence
+    # oracle); only the spawn side-effect is gated.
+    request["_warm_authorized"] = True
 
     # Wave 6 PR 0: build a Principal once, here, at the outermost
     # seam that has identity + project + sysadmin in hand. Downstream
