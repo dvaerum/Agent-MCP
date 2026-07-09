@@ -284,9 +284,16 @@ async def rename_project_handler(req: web.Request) -> web.Response:
                 os.rename(new_workspace, workspace)
             except OSError:
                 pass
+        # SD-R6-2: don't reflect the raw ``ValueError``/``KeyError`` text
+        # (which can echo registry internals / caller input) into the
+        # client envelope. Log the detail server-side; hand back a
+        # generic message.
+        logger.warning(
+            "registry rename %r -> %r failed: %s", old_name, new_name, e,
+        )
         return _app._error_envelope(
             error=_app._ERROR_INTERNAL,
-            message=f"registry rename failed: {e}",
+            message="registry rename failed",
             status=500,
         )
     new_row = _app._REGISTRY.get(new_name)
@@ -362,11 +369,20 @@ async def delete_project_handler(req: web.Request) -> web.Response:
                 f"workspace {workspace_path} did not exist on disk"
             )
             workspace_deleted = True
-    _app._systemctl("stop", _app._unit_name(name, "backend"))
-    try:
-        _app._REGISTRY.unregister(name)
-    except KeyError:
-        pass
+    # BL-R6-1 (belt-and-suspenders): hold ``_ensure_lock(name,
+    # "backend")`` across the stop+unregister so a concurrent
+    # ``_ensure`` warm-start can't interleave — either it spawns before
+    # us and our ``stop`` reaps it, or it blocks on this lock and its
+    # inside-lock registry re-check (project_orchestrator._ensure) sees
+    # the unregister and aborts. Without this pairing, a warm-start that
+    # started the backend between our ``stop`` and our ``unregister``
+    # would leave an orphan the reaper only clears after ``IDLE_SEC``.
+    async with _app._ensure_lock(name, "backend"):
+        _app._systemctl("stop", _app._unit_name(name, "backend"))
+        try:
+            _app._REGISTRY.unregister(name)
+        except KeyError:
+            pass
     # SEC (owner-authorised, defensive) FINDING 2: purge router.db
     # membership + on-disk agent-token files. ``project_membership``
     # keys per-user AND per-group grants on a bare TEXT

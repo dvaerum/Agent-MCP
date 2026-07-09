@@ -1374,16 +1374,39 @@ async def _warm_backend(name: str) -> None:
         log.debug("dashboard warm-start for %r failed", name, exc_info=True)
 
 
+# BL-R6-2a: names with an in-flight warm-start task. A flood of
+# ``/app/<name>/`` GETs (each serving only the static shell, no JS)
+# would otherwise spawn one untracked warm task per request; we dedup
+# so at most one warm-start is pending per project at a time.
+_warm_inflight: set[str] = set()
+
+
 def _schedule_backend_warm(req: web.Request, name: str) -> None:
     """Kick a tracked, non-blocking backend warm-start for ``name``.
 
     Registered in the app's proxy-task set so ``_drain_proxy_tasks``
     cancels it cleanly on shutdown rather than leaking a pending task.
+
+    BL-R6-2a dedup: skip scheduling when a warm-start for ``name`` is
+    already pending, or when the unit is already known-active (a fresh
+    ``last_active`` entry, kept warm by the ``/api/`` path). Both keep
+    a burst of shell-only GETs from accumulating redundant tasks — the
+    underlying ``_ensure`` is idempotent, but the task churn isn't free.
     """
+    if name in _warm_inflight:
+        return
+    if (name, "backend") in last_active:
+        return
+    _warm_inflight.add(name)
     task = asyncio.create_task(_warm_backend(name))
     tasks = _proxy_task_set(req.app)
     tasks.add(task)
-    task.add_done_callback(tasks.discard)
+
+    def _done(t: asyncio.Task) -> None:
+        _warm_inflight.discard(name)
+        tasks.discard(t)
+
+    task.add_done_callback(_done)
 
 
 async def dashboard_handler(req: web.Request) -> web.StreamResponse:
@@ -1407,7 +1430,18 @@ async def dashboard_handler(req: web.Request) -> web.StreamResponse:
         redirect = _maybe_single_tenant_redirect(req, name)
         if redirect is not None:
             return redirect
-        _schedule_backend_warm(req, name)
+        # SC-R6-1: only warm-start the backend for an AUTHORIZED
+        # caller. The auth middleware serves this same SPA shell to
+        # authenticated NON-MEMBERS (to avoid a project-existence
+        # oracle, round-4), so gating the spawn on the middleware's
+        # ``_warm_authorized`` flag — set only on the sysadmin,
+        # sufficient-membership, and single-tenant branches — stops any
+        # authenticated operator from activating an arbitrary tenant's
+        # backend via a plain ``GET /app/<victim>/``. The response
+        # stays a uniform 200 shell for member / non-member / bogus
+        # slug alike; only the side-effect is authorization-gated.
+        if req.get("_warm_authorized"):
+            _schedule_backend_warm(req, name)
     rest = req.match_info.get("rest", "")
     if rest == "" or rest.endswith("/"):
         candidate = _safe_dashboard_path(rest + "index.html")
