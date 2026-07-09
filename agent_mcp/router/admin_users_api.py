@@ -152,6 +152,21 @@ def _ensure_wave1a_schema() -> None:
             )
             """
         )
+        # Partial UNIQUE indices per grant path (mirrors router migration
+        # 0006 / the project_membership uniqueness). Keeps add_group_member
+        # idempotent: a double-submit hits the constraint → 409 instead of
+        # a duplicate row. Same names as the migration so the two paths
+        # (Wave1a-first vs Wave1b-first) converge without drift.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_group_membership_user "
+            "ON group_membership(group_id, member_user_id) "
+            "WHERE member_user_id IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_group_membership_group "
+            "ON group_membership(group_id, member_group_id) "
+            "WHERE member_group_id IS NOT NULL"
+        )
         # project_membership.role / .group_id
         pm_cols = {
             r[1] for r in conn.execute("PRAGMA table_info(project_membership)")
@@ -311,6 +326,98 @@ def _forbid_sysadmin_write(req: web.Request) -> web.Response:
         ),
         status=403,
     )
+
+
+def _is_last_sysadmin(conn: sqlite3.Connection, user_id: str) -> bool:
+    """True iff ``user_id`` is the only remaining ``users.is_sysadmin=1``.
+
+    Guards the last-sysadmin lockout: demoting or deleting the final
+    sysadmin would leave nobody able to grant sysadmin again. Scoped to
+    the direct ``users.is_sysadmin`` flag (the canonical grant path);
+    sysadmin conferred transitively via a group is a separate,
+    self-healing bit (the group can be re-flagged by any remaining
+    direct sysadmin).
+    """
+    others = conn.execute(
+        "SELECT 1 FROM users WHERE is_sysadmin = 1 AND user_id != ? LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    return others is None
+
+
+def _last_sysadmin_error(verb: str) -> web.Response:
+    """409 envelope for an attempt to demote/delete the last sysadmin."""
+    return _error(
+        error=_ERROR_CONFLICT,
+        message=(
+            f"cannot {verb} the last remaining sysadmin; promote another "
+            "user or group to sysadmin first"
+        ),
+        status=409,
+    )
+
+
+def _forbid_sysadmin_membership(req: web.Request) -> web.Response:
+    """403 envelope for a non-sysadmin adding a member to a group that is
+    transitively sysadmin-flagged.
+
+    A member of a (transitively) sysadmin-flagged group inherits sysadmin
+    via ``group_resolver``'s transitive closure. So adding a member into
+    such a group is a sysadmin-grant in disguise: a delegated operator
+    could add themselves — or a group they control — and self-escalate.
+    Reserved for sysadmins, exactly like writing the ``is_sysadmin`` bit.
+    """
+    user = req.get("user") or {}
+    username = user.get("username", "<unknown>")
+    return _error(
+        error="forbidden",
+        message=(
+            f"operator {username!r} may not add members to a "
+            "sysadmin-flagged group; a member inherits sysadmin via the "
+            "group's transitive closure, so this is reserved for sysadmins"
+        ),
+        status=403,
+    )
+
+
+def _group_is_transitively_sysadmin(
+    conn: sqlite3.Connection, group_id: str,
+) -> bool:
+    """True iff a member of ``group_id`` would inherit sysadmin.
+
+    A user gains sysadmin (per ``group_resolver.resolve_user_is_sysadmin``)
+    when any group in their transitive membership carries ``is_sysadmin=1``.
+    ``resolve_user_groups`` walks UPWARD — a user's groups plus every
+    ancestor group. So a new member of ``group_id`` inherits sysadmin iff
+    ``group_id`` itself OR any of its ancestor groups is sysadmin-flagged.
+
+    Walks the ancestor set here (rather than in ``group_resolver`` — a
+    read-only reference for this fix) so the whole check runs on the
+    caller's ``BEGIN IMMEDIATE`` connection and sees a consistent snapshot.
+    """
+    visited: set[str] = {group_id}
+    frontier: list[str] = [group_id]
+    while frontier:
+        placeholders = ",".join("?" for _ in frontier)
+        rows = conn.execute(
+            f"SELECT DISTINCT group_id FROM group_membership "
+            f"WHERE member_group_id IN ({placeholders})",
+            tuple(frontier),
+        ).fetchall()
+        next_frontier: list[str] = []
+        for row in rows:
+            gid = row[0]
+            if gid not in visited:
+                visited.add(gid)
+                next_frontier.append(gid)
+        frontier = next_frontier
+    placeholders = ",".join("?" for _ in visited)
+    hit = conn.execute(
+        f"SELECT 1 FROM groups WHERE is_sysadmin = 1 "
+        f"AND group_id IN ({placeholders}) LIMIT 1",
+        tuple(visited),
+    ).fetchone()
+    return hit is not None
 
 
 def _connect() -> sqlite3.Connection:
@@ -503,28 +610,43 @@ async def edit_user_handler(req: web.Request) -> web.Response:
             message="no editable fields supplied",
             status=400,
         )
+    # Demotion = clearing an existing sysadmin bit. Guarded below against
+    # dropping the sysadmin count to zero (last-sysadmin lockout).
+    demoting = "is_sysadmin" in body and not bool(body["is_sysadmin"])
     conn = _connect()
+    # Manual transaction so the last-sysadmin count check and the UPDATE
+    # are atomic under one write-lock — two peers racing to demote the
+    # last two sysadmins can't both pass the check (BEGIN IMMEDIATE
+    # serialises them; the loser sees the winner's write and is rejected).
+    conn.isolation_level = None
     try:
+        conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
-            "SELECT 1 FROM users WHERE user_id = ?", (user_id,),
+            "SELECT is_sysadmin FROM users WHERE user_id = ?", (user_id,),
         ).fetchone()
         if existing is None:
+            conn.execute("ROLLBACK")
             return _error(
                 error=_ERROR_NOT_FOUND,
                 message=f"unknown user_id: {user_id!r}",
                 status=404,
             )
+        if demoting and existing["is_sysadmin"] and _is_last_sysadmin(
+            conn, user_id,
+        ):
+            conn.execute("ROLLBACK")
+            return _last_sysadmin_error("demote")
         params.append(user_id)
         conn.execute(
             f"UPDATE users SET {', '.join(sets)} WHERE user_id = ?",
             params,
         )
-        conn.commit()
         row = conn.execute(
             "SELECT user_id, username, email, is_sysadmin, "
             "created_at, last_login_at FROM users WHERE user_id = ?",
             (user_id,),
         ).fetchone()
+        conn.execute("COMMIT")
     finally:
         conn.close()
     return _success({"user": _user_public_row(row)})
@@ -541,17 +663,27 @@ async def delete_user_handler(req: web.Request) -> web.Response:
     _ensure_wave1a_schema()
     user_id = req.match_info["user_id"]
     conn = _connect()
+    # Manual transaction: the last-sysadmin count check + DELETE must be
+    # atomic so two racing deletes can't each remove the final two
+    # sysadmins (BEGIN IMMEDIATE serialises; the loser is rejected).
+    conn.isolation_level = None
     try:
-        cur = conn.execute(
-            "DELETE FROM users WHERE user_id = ?", (user_id,),
-        )
-        if cur.rowcount == 0:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT is_sysadmin FROM users WHERE user_id = ?", (user_id,),
+        ).fetchone()
+        if row is None:
+            conn.execute("ROLLBACK")
             return _error(
                 error=_ERROR_NOT_FOUND,
                 message=f"unknown user_id: {user_id!r}",
                 status=404,
             )
-        conn.commit()
+        if row["is_sysadmin"] and _is_last_sysadmin(conn, user_id):
+            conn.execute("ROLLBACK")
+            return _last_sysadmin_error("delete")
+        conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        conn.execute("COMMIT")
     finally:
         conn.close()
     return _success({"deleted": user_id})
@@ -829,6 +961,17 @@ async def add_group_member_handler(req: web.Request) -> web.Response:
                     message=f"unknown group_id: {parent_group_id!r}",
                     status=404,
                 )
+            # #288 round-2: adding a member to a (transitively) sysadmin
+            # group confers sysadmin to that member via the resolver's
+            # transitive closure — a sysadmin-grant in disguise. #288
+            # locked SETTING is_sysadmin + CREATING a sysadmin group but
+            # not JOINING one; close that vector here. Reserved for
+            # sysadmins regardless of member kind (self or a nested group).
+            if not _caller_is_sysadmin(req) and _group_is_transitively_sysadmin(
+                conn, parent_group_id,
+            ):
+                conn.execute("ROLLBACK")
+                return _forbid_sysadmin_membership(req)
             if member_group_id is not None and _gr._would_create_cycle(
                 conn, parent_group_id, member_group_id,
             ):
@@ -853,8 +996,20 @@ async def add_group_member_handler(req: web.Request) -> web.Response:
             )
             conn.execute("COMMIT")
         except sqlite3.IntegrityError as e:
-            # FK violation (unknown member id) or CHECK violation.
+            # UNIQUE → the membership already exists (idempotency guard,
+            # router migration 0006): surface as a 409 conflict, mirroring
+            # add_project_membership. FK (unknown member id) / CHECK
+            # violations stay a 400 validation error.
             conn.execute("ROLLBACK")
+            if "UNIQUE" in str(e).upper():
+                return _error(
+                    error=_ERROR_CONFLICT,
+                    message=(
+                        "membership already exists for this "
+                        "group + member"
+                    ),
+                    status=409,
+                )
             return _error(
                 error=_ERROR_VALIDATION,
                 message=f"could not add member: {e}",
