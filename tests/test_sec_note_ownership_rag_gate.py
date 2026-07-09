@@ -109,7 +109,11 @@ def _notes_for(task_id: str) -> list:
 
 async def test_worker_cannot_note_foreign_task(tmp_path) -> None:
     """A worker that is neither creator nor assignee of a task is
-    denied — the cross-agent stored-injection primitive is closed."""
+    denied — the cross-agent stored-injection primitive is closed.
+
+    PF-1 (round 4): the denial is a :class:`NotFound` identical to a
+    nonexistent task, so a non-owner worker can't use the 403-vs-404
+    shape as a task-existence oracle and the owner's id never leaks."""
     async with mcp_session(tmp_path):
         _insert_task("t-foreign", created_by="alice", assigned_to="alice")
         bob = _agent(agent_id="bob", role="worker")
@@ -117,7 +121,8 @@ async def test_worker_cannot_note_foreign_task(tmp_path) -> None:
             {"task_id": "t-foreign", "text": "injected"},
             principal=bob,
         )
-        assert isinstance(result, PermissionDenied), result
+        assert isinstance(result, NotFound), result
+        assert "alice" not in repr(result)
         assert _notes_for("t-foreign") == []
 
 

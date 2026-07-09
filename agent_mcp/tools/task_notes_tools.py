@@ -60,9 +60,19 @@ def _classify_db_error(err: str, note_id: int) -> ToolResult:
     text-match on stable substrings to produce typed results:
 
     * ``"not found"`` → :class:`NotFound` (REST → 404)
-    * ``"owned by"`` (ownership failure) →
-      :class:`PermissionDenied` (REST → 403)
+    * ``"owned by"`` (ownership failure) → :class:`NotFound` — see
+      SECURITY below
     * anything else (DB error) → :class:`Failed` (REST → 500)
+
+    SECURITY (PF-1): the ownership-failure path must return the SAME
+    :class:`NotFound` as the missing-note path. Otherwise a worker
+    holding a foreign ``note_id`` can distinguish "note exists but
+    isn't yours" (403) from "no such note" (404) — a note-existence
+    oracle — and the DB layer's ``"owned by {author!r}"`` string would
+    leak the authoring agent's id into a caller-visible message. A
+    manager-tier caller never reaches this branch (``is_admin=True``
+    bypasses the ownership check in the DB layer), so collapsing it to
+    NotFound only affects non-owner workers.
 
     Centralised so the two callers (edit, delete) classify
     consistently and the contract with the DB layer is documented
@@ -72,7 +82,7 @@ def _classify_db_error(err: str, note_id: int) -> ToolResult:
     if "not found" in low:
         return NotFound(resource="task note", identifier=str(note_id))
     if "owned by" in low:
-        return PermissionDenied(reason=err)
+        return NotFound(resource="task note", identifier=str(note_id))
     return Failed(message=err)
 
 
@@ -128,13 +138,11 @@ async def add_task_note_tool_impl(
     if not principal.has_capability("tasks.assign"):
         owners = {task.get("assigned_to"), task.get("created_by")}
         if not requester or requester not in owners:
-            return PermissionDenied(
-                reason=(
-                    f"task '{task_id}' is not assigned to or created by "
-                    f"{requester!r}; only the task's owner or a "
-                    f"manager-tier caller may add a note."
-                )
-            )
+            # SECURITY (PF-1): return the SAME not-found result the
+            # phantom-task branch above returns, so a non-owner worker
+            # cannot use the 403-vs-404 shape to confirm a foreign task
+            # exists. Never interpolate the owner's identity.
+            return NotFound(resource="task", identifier=str(task_id))
 
     # Author attribution: agent_bearer → agent_id; operator path →
     # user_id (the operator's username from the session row). The
