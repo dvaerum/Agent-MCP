@@ -6,12 +6,32 @@ import sqlite3
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
-# Keys that hold project-level secrets. view_project_context filters
-# rows whose key matches when the caller isn't admin, so worker-tier
-# tokens can't read the admin credential (or other secrets) through
-# the tool surface. UPSTREAM_ISSUES.md issue I.
-_SECRET_KEY_RE = re.compile(
-    r"config_.*_(token|secret|password|api[_-]?key|priv(?:ate)?[_-]?key)",
+# Keys reserved for admin-only writes/deletes (Phase 7b), and — since
+# the round-2 secret-redaction fix — the primary secret-read gate too:
+# ANY `config_*` key is treated as policy or secret data regardless of
+# suffix. Workers attempting to create or modify a config_* entry are
+# rejected at the tool boundary; non-operator READS of config_* values
+# are redacted (see :func:`is_secret_key`).
+_CONFIG_KEY_RE = re.compile(r"^config_", re.IGNORECASE)
+
+# Secret-ish vocabulary that marks a NON-config key as holding a
+# credential (e.g. ``openai_api_key``, ``db_password``, ``github_pat``,
+# ``session_cookie``, ``jwt_secret``). Matched only as a delimited
+# segment — bounded by start/end of the key or one of ``_ - .`` — so we
+# don't over-redact innocent keys that merely CONTAIN these letters
+# (``monkey`` ⊅ ``key``, ``passenger`` ⊅ ``pass``, ``author`` ⊅
+# ``auth``). A trailing ``s`` is tolerated so plurals (``credentials``,
+# ``cookies``, ``keys``) still match. Round-2 fix: the pre-fix pattern
+# required a ``config_`` prefix AND a second ``_`` before one of only 5
+# suffixes, so ``config_api_key`` / ``config_secret`` / ``openai_api_key``
+# / ``db_password`` all slipped through as NOT-secret and leaked via the
+# RAG side-channel + dashboard reads.
+_SECRET_SUFFIX_RE = re.compile(
+    r"(?:^|[_\-.])"
+    r"(?:credential|cred|passphrase|password|passwd|pass|pw|"
+    r"api[_-]?key|apikey|secret|token|bearer|cookie|jwt|auth|pat|key)"
+    r"s?"
+    r"(?:$|[_\-.])",
     re.IGNORECASE,
 )
 
@@ -25,17 +45,24 @@ def is_secret_key(key: Optional[str]) -> bool:
     paths (``features/rag/{indexing,query}.py`` — the RAG side-channel
     otherwise echoes secrets to any worker), and the dashboard
     composition endpoints (``app/routers/composition.py``). Keeping the
-    check here — reusing the one ``_SECRET_KEY_RE`` — means the surfaces
-    can't drift out of sync. Matches keys like ``config_*_token``,
-    ``config_*_secret``, ``config_*_api_key``, ``config_*_private_key``.
-    """
-    return bool(key) and _SECRET_KEY_RE.search(key) is not None
+    check here means the surfaces can't drift out of sync.
 
-# Keys reserved for admin-only writes/deletes (Phase 7b). Broader than
-# `_SECRET_KEY_RE`: any `config_*` is treated as policy or secret data,
-# regardless of suffix. Workers attempting to create or modify a
-# config_* entry are rejected at the tool boundary.
-_CONFIG_KEY_RE = re.compile(r"^config_", re.IGNORECASE)
+    Two rules (round-2 broadening):
+
+    * ANY ``config_*`` key is secret — the ``config_`` namespace holds
+      the project's policy + credential rows and non-operators must not
+      read their values regardless of suffix.
+    * Any other key carrying a delimited secret-word segment
+      (``token``, ``secret``, ``password``, ``api_key``, ``pat``,
+      ``bearer``, ``jwt``, ``auth``, ``cookie``, ``credential``, …) is
+      secret too — catches credentials stored outside the ``config_``
+      namespace (``openai_api_key``, ``db_password``, ``github_pat``).
+    """
+    if not key:
+        return False
+    if _CONFIG_KEY_RE.match(key):
+        return True
+    return _SECRET_SUFFIX_RE.search(key) is not None
 
 # Worker-policy toggle keys (Phase 4). Writing one of these flips the
 # tools/list visibility for worker bearers (PR #55 reads the toggle
@@ -523,7 +550,15 @@ async def view_project_context_tool_impl(
     include_backup_info = arguments.get(
         "include_backup_info", False
     )  # Include backup status
-    max_results = arguments.get("max_results", 50)  # Limit results
+    # Limit results. Clamp to [1, 200] defensively: the tool schema
+    # already declares minimum/maximum, but jsonschema validation is
+    # skipped when the optional dependency is absent — an unclamped
+    # ``max_results=-1`` becomes ``LIMIT -1`` (SQLite = no limit → full
+    # table dump). Coerce + clamp so the LIMIT is always sane.
+    try:
+        max_results = max(1, min(int(arguments.get("max_results", 50)), 200))
+    except (TypeError, ValueError):
+        max_results = 50
     # Sort by: key, updated_at, size. Accept `last_updated` as a
     # backward-compatible alias for `updated_at` so existing dashboard
     # builds + MCP clients don't break mid-deploy.
@@ -597,7 +632,7 @@ async def view_project_context_tool_impl(
 
         # Redact secret-looking keys for non-admin callers (issue I).
         # Admins continue to see everything; workers see everything
-        # EXCEPT keys matching _SECRET_KEY_RE. Wave 6 PR 3:
+        # EXCEPT keys where is_secret_key() is True. Wave 6 PR 3:
         # ``verify_token(.., "admin")`` → :func:`_is_admin_principal`
         # which prefers the Principal's typed role and falls back to
         # the legacy ``operator_session_active`` ContextVar during
