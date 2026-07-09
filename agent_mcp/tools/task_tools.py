@@ -3394,6 +3394,30 @@ async def bulk_task_operations_tool_impl(
                             )
                             continue
 
+                        # SECURITY (AZ-R16-1): honor the
+                        # config_allow_worker_update_own_status policy the
+                        # single path enforces via
+                        # @requires_policy("config_allow_worker_update_own_status").
+                        # The decorator can't wrap the bulk surface (it
+                        # mixes op types in one call), so replicate the
+                        # toggle check inline per-op: a non-admin worker
+                        # is denied the status transition when the
+                        # operator has turned the toggle OFF. Admin/
+                        # manager callers (is_admin_request, i.e.
+                        # tasks.assign) always pass, mirroring the
+                        # decorator's operator-tier bypass.
+                        if not is_admin_request and not _access._get_config_bool(
+                            "config_allow_worker_update_own_status",
+                            default=True,
+                        ):
+                            results.append(
+                                f"Operation {i+1}: worker status updates "
+                                f"disabled by project policy "
+                                f"(config_allow_worker_update_own_status="
+                                f"false)"
+                            )
+                            continue
+
                         # Terminal-state / transition guard (mirrors
                         # _update_single_task): terminal states are sinks
                         # so the bulk surface can't double-complete /
@@ -3458,6 +3482,23 @@ async def bulk_task_operations_tool_impl(
                         )
 
                     elif operation_type == "update_priority":
+                        # SECURITY (AZ-R16-1): priority is an admin/
+                        # manager-only field on the single path —
+                        # _update_single_task only copies new_priority
+                        # into fields_to_update when is_admin_request is
+                        # True (dropping it for a non-admin). Mirror that
+                        # gate here so a worker can't escalate its own
+                        # task's priority via the bulk surface. Same
+                        # is_admin_request marker (tasks.assign) and same
+                        # "requires admin privileges" refusal shape the
+                        # sibling reassign op already uses.
+                        if not is_admin_request:
+                            results.append(
+                                f"Operation {i+1}: Update priority "
+                                f"operation requires admin privileges"
+                            )
+                            continue
+
                         new_priority = op.get("priority")
 
                         if not new_priority or new_priority not in [
