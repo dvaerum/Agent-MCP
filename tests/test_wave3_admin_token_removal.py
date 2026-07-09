@@ -317,13 +317,20 @@ async def test_delete_memory_via_operator_session_succeeds(tmp_path) -> None:
             sess.close()
 
 
-async def _seed_task(admin, task_id: str) -> None:
+async def _seed_task(
+    admin, task_id: str, *, assigned_to: str | None = None,
+) -> None:
     """Seed a task row via direct SQL insert.
 
     The dashboard ``/api/tasks`` POST handler relies on the same
     auth dep, so going via the public API would be a circular test.
     Direct INSERT is the harness convention for "we need a row,
     not exercising the public-API path".
+
+    SEC Wave-B: ``add_task_note`` now gates note authorship on the
+    task's assignee / creator (or a manager-tier caller). Tests that
+    have a worker author a note pass ``assigned_to=<worker_agent_id>``
+    so the worker owns the task it annotates.
     """
     import datetime
     from agent_mcp.db.connection import get_db_connection
@@ -334,9 +341,12 @@ async def _seed_task(admin, task_id: str) -> None:
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO tasks (task_id, title, description, status, "
-            "priority, created_at, updated_at, created_by) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (task_id, "t", "d", "pending", "medium", now, now, "admin"),
+            "priority, created_at, updated_at, created_by, assigned_to) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id, "t", "d", "pending", "medium", now, now,
+                "admin", assigned_to,
+            ),
         )
         conn.commit()
     finally:
@@ -474,7 +484,7 @@ async def test_edit_task_note_admits_system_bearer(tmp_path) -> None:
     """The system bearer (legacy admin) must continue to admit
     non-author edits — the Wave 3 rewrite must preserve this."""
     async with mcp_session(tmp_path) as admin:
-        await _seed_task(admin, "tn-task-1")
+        await _seed_task(admin, "tn-task-1", assigned_to="note-author-1")
         worker = await admin.create_worker("note-author-1")
         note_id = await _add_note(worker.token, "tn-task-1", "v1")
 
@@ -488,7 +498,7 @@ async def test_edit_task_note_admits_manager_token(tmp_path) -> None:
     ``verify_token(..., 'manager')``, so manager-tier callers can
     moderate worker notes."""
     async with mcp_session(tmp_path) as admin:
-        await _seed_task(admin, "tn-task-2")
+        await _seed_task(admin, "tn-task-2", assigned_to="note-author-2")
         worker = await admin.create_worker("note-author-2")
         note_id = await _add_note(worker.token, "tn-task-2", "v1")
 
@@ -504,7 +514,7 @@ async def test_edit_task_note_rejects_worker_non_author(tmp_path) -> None:
     rejected — the per-note ownership check is the only gate that
     stops cross-worker note mutation."""
     async with mcp_session(tmp_path) as admin:
-        await _seed_task(admin, "tn-task-3")
+        await _seed_task(admin, "tn-task-3", assigned_to="note-author-3")
         author = await admin.create_worker("note-author-3")
         note_id = await _add_note(author.token, "tn-task-3", "v1")
 
@@ -526,7 +536,7 @@ async def test_edit_task_note_admits_worker_author(tmp_path) -> None:
     """The original author (worker-role) must still be able to edit
     their own note — that's the pre-Wave-3 behaviour we must preserve."""
     async with mcp_session(tmp_path) as admin:
-        await _seed_task(admin, "tn-task-4")
+        await _seed_task(admin, "tn-task-4", assigned_to="note-author-4")
         author = await admin.create_worker("note-author-4")
         note_id = await _add_note(author.token, "tn-task-4", "v1")
 

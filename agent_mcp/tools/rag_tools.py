@@ -27,9 +27,20 @@ async def ask_project_rag_tool_impl(
     *,
     principal: Optional[Principal] = None,
 ) -> ToolResult:
-    if principal is None or principal.kind != "agent_bearer":
+    # SEC Wave-B (Finding 2): gate on the ``rag.query`` capability, not
+    # the bare ``kind``. The prior ``kind == "agent_bearer"`` check
+    # admitted a bearer whose ``agent_role`` is None (empty capability
+    # bundle) — a token that carries no caps could still read the RAG
+    # corpus. The ``kind`` check is retained so operators (who DO carry
+    # ``rag.query`` in their project bundle) stay rejected — this tool
+    # is agent-only by design; a later UX PR can widen if needed.
+    if (
+        principal is None
+        or principal.kind != "agent_bearer"
+        or not principal.has_capability("rag.query")
+    ):
         return PermissionDenied(
-            reason="agent token required to query project RAG"
+            reason="agent token with rag.query capability required to query project RAG"
         )
 
     query_text = arguments.get("query")

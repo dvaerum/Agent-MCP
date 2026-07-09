@@ -292,7 +292,10 @@ async def test_ask_project_rag_ok_for_agent(tmp_path) -> None:
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
-        p = _agent_principal("alice", bearer=alice.token)
+        # SEC Wave-B: ask_project_rag now requires the ``rag.query``
+        # capability, so the principal must carry the worker role (the
+        # bundle that grants it) — a role=None bearer is denied.
+        p = _agent_principal("alice", bearer=alice.token, role="worker")
         result = await dispatch_tool_call(
             "ask_project_rag",
             {"query": "what does the project do?"},
@@ -334,7 +337,9 @@ async def test_ask_project_rag_invalid_query(tmp_path) -> None:
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
-        p = _agent_principal("alice", bearer=alice.token)
+        # SEC Wave-B: needs ``rag.query`` (worker bundle) to reach the
+        # query-validation branch; a role=None bearer 403s first.
+        p = _agent_principal("alice", bearer=alice.token, role="worker")
         result = await dispatch_tool_call(
             "ask_project_rag",
             {"query": ""},

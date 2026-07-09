@@ -48,6 +48,7 @@ from ..core.tool_result import (
     ToolResult,
 )
 from ..db.actions import task_notes_db
+from ..db.actions.task_db import get_task_by_id
 from .registry import register_tool
 
 
@@ -82,9 +83,16 @@ async def add_task_note_tool_impl(
 ) -> ToolResult:
     """Wave 6 PR 0 demo + PR 1 family.
 
-    Policy: any authenticated principal can author a note. Operator
-    sessions count (the dashboard adds notes on the operator's
-    behalf); any agent_bearer counts (workers + managers).
+    Policy (SEC Wave-B, per-task ownership): a note author must be the
+    target task's assignee or creator, OR a manager-tier caller
+    (``tasks.assign`` — operator sessions, forwarding headers, and
+    manager-role agents; short-circuited by the sysadmin wildcard). A
+    worker may annotate only its own tasks; a manager / operator may
+    annotate any. Notes to a nonexistent task are rejected — task
+    notes feed other agents' / the operator's LLM context, so an
+    unrelated bearer writing into a foreign (or phantom) task's notes
+    is a cross-agent stored-injection primitive (same class as the
+    viewer project_context write already fixed).
     """
     if principal is None or (
         principal.kind != "agent_bearer"
@@ -106,6 +114,27 @@ async def add_task_note_tool_impl(
             field="text",
             message="`text` is required.",
         )
+
+    # Per-task ownership gate. Reject phantom tasks (no orphan notes)
+    # and, for non-manager callers, require the caller to be the task's
+    # assignee or creator. ``tasks.assign`` is the manager-tier marker
+    # (present in PROJECT_ROLE_BUNDLES["operator"] AND
+    # AGENT_ROLE_BUNDLES["manager"], short-circuited by the sysadmin
+    # wildcard) — the same marker the edit/delete note tools use.
+    task = get_task_by_id(task_id)
+    if task is None:
+        return NotFound(resource="task", identifier=str(task_id))
+    requester = principal.agent_id or principal.user_id or ""
+    if not principal.has_capability("tasks.assign"):
+        owners = {task.get("assigned_to"), task.get("created_by")}
+        if not requester or requester not in owners:
+            return PermissionDenied(
+                reason=(
+                    f"task '{task_id}' is not assigned to or created by "
+                    f"{requester!r}; only the task's owner or a "
+                    f"manager-tier caller may add a note."
+                )
+            )
 
     # Author attribution: agent_bearer → agent_id; operator path →
     # user_id (the operator's username from the session row). The
