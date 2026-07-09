@@ -1097,15 +1097,25 @@ async def delete_group_handler(req: web.Request) -> web.Response:
     group_id = req.match_info["group_id"]
     conn = _connect()
     try:
-        cur = conn.execute(
-            "DELETE FROM groups WHERE group_id = ?", (group_id,),
-        )
-        if cur.rowcount == 0:
+        row = conn.execute(
+            "SELECT is_sysadmin FROM groups WHERE group_id = ?",
+            (group_id,),
+        ).fetchone()
+        if row is None:
             return _error(
                 error=_ERROR_NOT_FOUND,
                 message=f"unknown group_id: {group_id!r}",
                 status=404,
             )
+        # Deleting a sysadmin-flagged group is sysadmin-only, mirroring
+        # the demote guard in edit_group_handler (clearing the group's
+        # is_sysadmin bit is _forbid_sysadmin_write, 403). Without this, a
+        # delegate with only system.groups.manage could DELETE a sysadmin
+        # group it cannot DEMOTE — destroying the group-conferred sysadmin
+        # grant to every member, superseding the demote guard (AZ-R10-1).
+        if row["is_sysadmin"] and not _caller_is_sysadmin(req):
+            return _forbid_sysadmin_write(req)
+        conn.execute("DELETE FROM groups WHERE group_id = ?", (group_id,))
         conn.commit()
     finally:
         conn.close()
