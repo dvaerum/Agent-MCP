@@ -366,6 +366,31 @@ async def rename_project_handler(req: web.Request) -> web.Response:
     # it re-acquires the same key, so holding it across the awaited
     # ``to_thread`` stop cannot deadlock (delete does exactly this).
     async with _app._ensure_lock(old_name, "backend"):
+        # PF-R36-1 [500-hygiene/TOCTOU]: the existence + alias-collision
+        # probes above ran OUTSIDE this lock. Two concurrent renames of the
+        # SAME project serialise here (BL-R35-1), so the LOSING racer would,
+        # without this re-check, reach ``_REGISTRY.rename(old_name, …)``
+        # after the winner already renamed ``old_name`` away → ``KeyError``
+        # → the rollback ``except`` maps it to a 500 "registry rename
+        # failed". Re-validate INSIDE the lock (the standard TOCTOU
+        # pattern): if ``old_name`` is gone, hand back the SAME clean 404 the
+        # outside-lock probe emits; if ``new_name`` is now an active alias,
+        # hand back 409 alias_collision. Only fall through to the
+        # destructive stop/move/registry-rename when both re-checks pass.
+        # ``old_row`` is re-fetched here (authoritative) and used below.
+        old_row = _app._REGISTRY.get(old_name)
+        if old_row is None:
+            return _app._error_envelope(
+                error=_app._ERROR_NOT_REGISTERED,
+                message=f"unknown project: {old_name!r}",
+                status=404,
+            )
+        if _app._REGISTRY.resolve_alias(new_name) is not None:
+            return _app._error_envelope(
+                error=_app._ERROR_ALIAS_COLLISION,
+                message=f"name {new_name!r} is an active alias",
+                status=409,
+            )
         # OBS-R34-RENAME-ONLOOP [availability]: run the blocking ``systemctl
         # stop`` OFF the event loop (mirrors delete's BL-R7-3).
         # ``_systemctl`` is a synchronous ``subprocess.run`` (~15-150 ms, or
@@ -711,30 +736,62 @@ async def stop_project_handler(req: web.Request) -> web.Response:
             extra={"active_connections": conns, "agents": []},
         )
     unit = _app._unit_name(name, "backend")
-    # OBS-R34-RENAME-ONLOOP class-sweep: ``_is_active`` and ``_systemctl``
-    # both shell out (blocking ``subprocess.run``), so calling them
-    # directly stalls the single aiohttp event loop — every other
-    # concurrent router request — for the duration. Run both off-loop via
-    # ``asyncio.to_thread`` (mirrors the orchestrator's BL-R6-2b and
-    # delete's BL-R7-3).
-    if await asyncio.to_thread(_app._is_active, unit):
-        r = await asyncio.to_thread(_app._systemctl, "stop", unit)
-        if r.returncode != 0:
-            # SD-R15-1: sibling of SC-R8-2 (project_orchestrator._ensure).
-            # Reachable via the delegatable ``system.projects.manage`` cap,
-            # so a non-sysadmin delegate could otherwise read raw systemd
-            # stderr (unit-file paths, "Failed at step EXEC …"). Log the
-            # detail server-side; hand the client a static message with no
-            # unit path and no stderr.
-            logger.error(
-                "systemctl stop %s failed (rc=%s): %s",
-                unit, r.returncode, r.stderr.strip(),
-            )
-            return _app._error_envelope(
-                error=_app._ERROR_INTERNAL,
-                message="failed to stop project backend",
-                status=500,
-            )
+    # BL-R36-1 [data-integrity/lifecycle-parity]: hold ``_ensure_lock(name,
+    # "backend")`` across the stop + orchestrator-state clear, mirroring
+    # delete's BL-R6-1 and rename's BL-R35-1. Unlike delete/rename this is
+    # the router-side equivalent of ``ProjectOrchestrator.stop()``: the
+    # project still EXISTS after a stop, so we DON'T touch the registry /
+    # membership / token / runtime dir — only the RUNTIME orchestrator
+    # state. Without the lock + state-clear, a stop left ``last_active`` on
+    # the pre-stop timestamp (overview showed ``status:"stopped"`` with a
+    # stale ``last_activity_ts``), suppressed the ``_schedule_backend_warm``
+    # dedup, and reopened the SC-R7-1 boot-grace window; a concurrent
+    # ``_ensure`` warm-start could also race the stop. ``_ensure_lock`` is a
+    # non-reentrant per-(name,role) ``asyncio.Lock``; nothing we call under
+    # it re-acquires the same key, so holding it across the awaited
+    # ``to_thread`` stop cannot deadlock (delete/rename do exactly this).
+    async with _app._ensure_lock(name, "backend"):
+        # OBS-R34-RENAME-ONLOOP class-sweep: ``_is_active`` and
+        # ``_systemctl`` both shell out (blocking ``subprocess.run``), so
+        # calling them directly stalls the single aiohttp event loop —
+        # every other concurrent router request — for the duration. Run
+        # both off-loop via ``asyncio.to_thread`` (mirrors the
+        # orchestrator's BL-R6-2b and delete's BL-R7-3).
+        if await asyncio.to_thread(_app._is_active, unit):
+            r = await asyncio.to_thread(_app._systemctl, "stop", unit)
+            if r.returncode != 0:
+                # SD-R15-1: sibling of SC-R8-2 (project_orchestrator._ensure).
+                # Reachable via the delegatable ``system.projects.manage``
+                # cap, so a non-sysadmin delegate could otherwise read raw
+                # systemd stderr (unit-file paths, "Failed at step EXEC …").
+                # Log the detail server-side; hand the client a static
+                # message with no unit path and no stderr.
+                logger.error(
+                    "systemctl stop %s failed (rc=%s): %s",
+                    unit, r.returncode, r.stderr.strip(),
+                )
+                return _app._error_envelope(
+                    error=_app._ERROR_INTERNAL,
+                    message="failed to stop project backend",
+                    status=500,
+                )
+        # BL-R36-1 (mirrors ProjectOrchestrator.stop() + delete's BL-R7-2):
+        # clear the per-name RUNTIME orchestrator state inside the lock
+        # (atomic with the stop) so a warm-start that raced in before we
+        # acquired can't leave a stale ``last_active`` and a subsequent
+        # ``_schedule_backend_warm`` for this (still-registered) project
+        # isn't skipped by the ``(name,"backend") in last_active`` dedup.
+        # Cleared unconditionally (even when the unit was already inactive)
+        # — the stale-timestamp bug is exactly the already-stopped case.
+        # ``active_conns``/``ensure_failures`` are popped too (delete's
+        # superset): the ``conns > 0`` guard above already refused a busy
+        # project, so the pop is a no-op there, and dropping any recorded
+        # ensure-failure lets the next explicit start be measured fresh.
+        _app.last_active.pop((name, "backend"), None)
+        _app.ensure_failures.pop((name, "backend"), None)
+        _app.active_conns.pop(name, None)
+        _app._po.unit_start_times.pop((name, "backend"), None)
+        _app._po.forwarding_hmac_keys.pop(name, None)
     return _app._success_envelope({"stopped": name})
 
 
