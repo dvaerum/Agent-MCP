@@ -1009,6 +1009,24 @@ async def update_task_details_api_route(
                 fields_to_update,
                 connection=cursor,
             )
+        # BL-R30-1: reconcile agents.current_task on the rebind. A
+        # dashboard edit that changed ``assigned_to`` (reassign to another
+        # agent, or clear-assignment to none) left the LOSING agent's
+        # current_task pointing at a task it no longer owns and never set
+        # the GAINING agent's. Mirror the MCP reassign paths: clear the
+        # loser, set the gainer if idle. Runs inside the same cursor/txn as
+        # the write above, before commit. ``prior_assignee`` was captured
+        # from the pre-update row; the new assignee is the value just
+        # written (``None`` on a clear-assignment, which clears only the
+        # loser).
+        if "assigned_to" in fields_to_update:
+            from ...repositories import agent_repo as _agent_repo
+            _agent_repo.reconcile_current_task_on_reassign(
+                task_id_to_update,
+                prior_assignee,
+                fields_to_update["assigned_to"],
+                connection=cursor,
+            )
         log_agent_action_to_db(cursor, requesting_admin_id, "updated_task_dashboard", task_id=task_id_to_update, details=log_details)
         conn.commit()
         if task_id_to_update in g.tasks:

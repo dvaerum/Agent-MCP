@@ -546,6 +546,23 @@ async def _update_single_task(
             if new_depends_on_tasks is not None:
                 g.tasks[task_id]["depends_on_tasks"] = new_depends_on_tasks
 
+    # BL-R30-1: reconcile agents.current_task on a REBIND. The
+    # terminal-clear below only fires on a terminal status change; a plain
+    # reassign left the LOSING agent's current_task pointing at a task it
+    # no longer owns and never set the GAINING agent's. Run BEFORE the
+    # terminal-clear sweep so a terminal reassign composes correctly: the
+    # gainer is set then swept back to NULL by clear_current_task_for
+    # (the task it now points at is terminal). Uses the PRIOR assignee
+    # captured before the write above.
+    if is_admin_request and new_assigned_to is not None:
+        from ..repositories import agent_repo as _agent_repo
+        _agent_repo.reconcile_current_task_on_reassign(
+            task_id,
+            task_current_data.get("assigned_to"),
+            new_assigned_to,
+            connection=cursor,
+        )
+
     # Clear agents.current_task when the task it points at reaches a
     # terminal status. Before this guard, ios-app-dev (washing-brothers
     # production DB, 2026-06-04) had `agents.current_task` still
@@ -3981,6 +3998,20 @@ async def bulk_task_operations_tool_impl(
                         if task_id in g.tasks:
                             g.tasks[task_id]["assigned_to"] = new_assigned_to
                             g.tasks[task_id]["updated_at"] = updated_at_iso
+
+                        # BL-R30-1: reconcile agents.current_task on the
+                        # rebind (clear the loser, set the gainer if idle),
+                        # mirroring the single reassign path. Terminal tasks
+                        # are already rejected above, so no terminal-clear
+                        # composition to worry about here. Uses the PRIOR
+                        # assignee from the pre-update task snapshot.
+                        from ..repositories import agent_repo as _agent_repo
+                        _agent_repo.reconcile_current_task_on_reassign(
+                            task_id,
+                            task_data.get("assigned_to"),
+                            new_assigned_to,
+                            connection=cursor,
+                        )
 
                         # BL-R26-1: wake the new assignee post-commit like
                         # the single reassign path does.
