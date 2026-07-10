@@ -91,7 +91,11 @@ def get_note(note_id: int) -> Optional[Dict[str, Any]]:
                 .one_or_none()
             )
             return _note_to_dict(row) if row is not None else None
-    except SQLAlchemyError as e:
+    # OverflowError (PF-R39-1): binding a note_id outside sqlite's
+    # signed-64-bit range makes the sqlite3 driver raise a BARE
+    # OverflowError that escapes SQLAlchemyError. Such an id can never
+    # match a real row, so treat it as "no such note" rather than crash.
+    except (SQLAlchemyError, OverflowError) as e:
         logger.error(
             f"Database error fetching note '{note_id}': {e}", exc_info=True,
         )
@@ -150,7 +154,10 @@ def edit_note(
             row.text = new_text
             session.commit()
             return True, ""
-    except SQLAlchemyError as e:
+    # OverflowError (PF-R39-1): an oversized note_id overflows the
+    # sqlite3 int bind with a bare OverflowError outside SQLAlchemyError.
+    # Return the same clean error tuple instead of crashing.
+    except (SQLAlchemyError, OverflowError) as e:
         logger.error(
             f"Database error editing note '{note_id}': {e}", exc_info=True,
         )
@@ -179,7 +186,10 @@ def delete_note(
             session.delete(row)
             session.commit()
             return True, ""
-    except SQLAlchemyError as e:
+    # OverflowError (PF-R39-1): see edit_note above — an oversized
+    # note_id overflows the sqlite3 int bind; return the clean error
+    # tuple instead of crashing.
+    except (SQLAlchemyError, OverflowError) as e:
         logger.error(
             f"Database error deleting note '{note_id}': {e}", exc_info=True,
         )
