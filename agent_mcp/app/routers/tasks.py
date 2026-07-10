@@ -212,6 +212,26 @@ async def create_task_api_route(
         conn = get_db_connection()
         cursor = conn.cursor()
 
+        # PF-R32-1b (unvalidated caller-FK → 500): pre-validate
+        # ``parent_task`` existence BEFORE the INSERT. ``tasks.parent_task``
+        # is a declared self-FK (migration 0007) enforced with
+        # ``PRAGMA foreign_keys=ON``, so a well-formed but NONEXISTENT
+        # parent violated the FK at the INSERT and surfaced as the generic
+        # 500 below — a SEC-round-9 clean-4xx contract violation. Mirror
+        # PR #383's message-parent fix and this file's other pre-validations
+        # (``assigned_to`` via ``_agent_assignable``): missing parent → 404.
+        # A valid parent and ``parent_task=None`` (top-level) are unchanged.
+        if parent_task:
+            cursor.execute(
+                "SELECT 1 FROM tasks WHERE task_id = ?", (parent_task,)
+            )
+            if cursor.fetchone() is None:
+                # ``finally`` below closes ``conn``.
+                return JSONResponse(
+                    {"error": f"Parent task '{parent_task}' not found"},
+                    status_code=404,
+                )
+
         # BL-R13-1: enforce the assignability invariant the canonical MCP
         # task paths gate on (``_agent_assignable`` in task_tools.py —
         # True only if the agent exists AND is not terminated). Writing
