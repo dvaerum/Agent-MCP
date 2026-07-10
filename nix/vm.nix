@@ -100,6 +100,14 @@ in
     # /var/lib lives on the qcow2 disk, which the wrapper places in
     # the user's persist dir so it survives between runs.
     stateDir = "/var/lib/agent-mcp";
+    # VM-only: qemu user-mode hostfwd needs a wildcard bind. Packets
+    # arrive on the guest's primary IP, not loopback, so a loopback bind
+    # would make the router unreachable on the host-forwarded port.
+    # Production keeps the module's loopback default (see module.nix
+    # routerHost) and fronts the router with an nginx reverse proxy.
+    # vm-dev.nix imports this file, so both `nix run .#vm` and
+    # `nix run .#vm-dev` inherit this override.
+    routerHost = "0.0.0.0";
   };
 
   environment.systemPackages = with pkgs; [ curl jq htop vim ];

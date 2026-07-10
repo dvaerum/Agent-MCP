@@ -97,6 +97,22 @@ in {
       description = "TCP port the router listens on (multi mode only).";
     };
 
+    routerHost = lib.mkOption {
+      type = lib.types.str;
+      default = "127.0.0.1";
+      description = ''
+        Interface the router binds (multi mode only), passed through as
+        AGENT_MCP_ROUTER_HOST. Defaults to loopback — matching the
+        application code's deliberately-safe default (agent_mcp/cli.py,
+        agent_mcp/router/app.py) — so a bare import of this module keeps
+        the router behind a reverse proxy (nginx on loopback handles
+        rate-limiting, XFF sanitization, TLS) instead of exposing it on
+        every interface. The VM configs (nix/vm.nix) override this to
+        "0.0.0.0" because qemu user-mode hostfwd delivers packets to the
+        guest's primary IP, not loopback — see the comment there.
+      '';
+    };
+
     backendPort = lib.mkOption {
       type = lib.types.port;
       default = 8080;
@@ -159,10 +175,15 @@ in {
           AGENT_MCP_EXTERNAL_URL = cfg.externalUrl;
           AGENT_MCP_DEFAULT_WORKSPACE = "${cfg.stateDir}/projects";
           AGENT_MCP_ROUTER_PORT = toString cfg.routerPort;
-          # Bind on the wildcard so qemu user-mode hostfwd packets
-          # (which arrive on the guest's primary IP, not loopback)
-          # can be served.
-          AGENT_MCP_ROUTER_HOST = "0.0.0.0";
+          # Bind interface for the router. Defaults to loopback
+          # (cfg.routerHost = "127.0.0.1"), which is the safe production
+          # posture: the router sits behind an nginx-on-loopback reverse
+          # proxy that owns rate-limiting, XFF sanitization, and TLS. The
+          # VM configs override cfg.routerHost to "0.0.0.0" because qemu
+          # user-mode hostfwd delivers packets to the guest's primary IP
+          # (not loopback), so the VM must bind the wildcard to be
+          # reachable on the host-forwarded port. See nix/vm.nix.
+          AGENT_MCP_ROUTER_HOST = cfg.routerHost;
           AGENT_MCP_IDLE_SEC = "14400";
           AGENT_MCP_README_HTML = "${pkgs'.readmeHtml}";
           AGENT_MCP_INSTALLER_TEMPLATE = "${pkgs'.installerTemplate}";
