@@ -1062,7 +1062,7 @@ def _check_auto_event_loop_flags(agent_id: str) -> tuple[bool, Optional[str]]:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT auto_event_loop FROM agents WHERE agent_id = ?",
+            "SELECT auto_event_loop, status FROM agents WHERE agent_id = ?",
             (agent_id,),
         )
         row = cursor.fetchone()
@@ -1079,6 +1079,16 @@ def _check_auto_event_loop_flags(agent_id: str) -> tuple[bool, Optional[str]]:
 
     if row is None:
         return False, f"agent '{agent_id}' not found"
+    # AC-R29-1 class-sweep: wait_for_events is the sibling long-lived
+    # authenticated channel. It re-auths at the gate on each call and is
+    # bounded (≤300s), but mid-flight it only re-checked the
+    # auto_event_loop toggle — a token terminated during an in-flight
+    # long-poll would keep receiving event content for the rest of the
+    # window. Reuse this per-tick DB recheck (run every ~2s) to stop the
+    # wake loop the moment the agent is terminated, mirroring the SSE
+    # pump's self-validation.
+    if str(row["status"]) == "terminated":
+        return False, f"agent '{agent_id}' terminated"
     # SQLite stores BOOLEAN as INTEGER; both 0/1 and True/False arrive.
     per_agent_on = bool(row["auto_event_loop"])
     if not per_agent_on:

@@ -742,6 +742,34 @@ async def terminate_agent_tool_impl(
             agent_id_to_terminate, token=found_agent_token,
         )
 
+        # AC-R29-1: an already-open GET /mcp SSE push stream
+        # authenticates its bearer once at open then pumps indefinitely;
+        # without an active nudge it would survive revocation until its
+        # next heartbeat self-validation tick. Signal every open stream
+        # for this agent to re-validate NOW (cache eviction above already
+        # made the bearer read as revoked), so teardown is immediate.
+        # The pump's own per-heartbeat self-validation is the backstop if
+        # a stream can't be signalled here (queue full / not yet
+        # reconnected).
+        try:
+            from ..core import session_registry
+
+            closed_streams = session_registry.close_streams_for_agent(
+                agent_id_to_terminate
+            )
+            if closed_streams:
+                logger.info(
+                    "Signalled %d open MCP stream(s) to close for "
+                    "terminated agent %s.",
+                    len(closed_streams), agent_id_to_terminate,
+                )
+        except Exception:  # pragma: no cover - defensive
+            logger.warning(
+                "Failed to signal open MCP streams for terminated agent "
+                "%s (pump self-validation will still tear them down).",
+                agent_id_to_terminate, exc_info=True,
+            )
+
         # BL-R10-1/2: reconcile the tasks we just unassigned — refresh
         # their g.tasks cache entries (so view_tasks stops pinning them
         # to the dead agent) and wake capability-matched workers.
