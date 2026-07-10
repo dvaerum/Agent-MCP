@@ -323,15 +323,19 @@ def _is_status_transition_allowed(old_status: Optional[str], new_status: str) ->
 
 
 def _agent_assignable(cursor, agent_id: str) -> bool:
-    """True iff ``agent_id`` exists and is not terminated.
+    """True iff ``agent_id`` exists and is a live (active) agent.
 
     Assignment targets must be live agents — a task pinned on a
     terminated agent is unreachable work (and, for the audit trail,
-    attributes to a revoked identity).
+    attributes to a revoked identity). "Live" also excludes
+    ``'tombstone'`` rows (`[deleted-<id>]` purge-cascade FK artefacts,
+    BL-R31-3b): a tombstone is not an agent at all, so pinning work
+    onto it is unreachable work attributed to a deleted identity.
     """
     cursor.execute(
-        "SELECT 1 FROM agents WHERE agent_id = ? AND status != ?",
-        (agent_id, "terminated"),
+        "SELECT 1 FROM agents WHERE agent_id = ? "
+        "AND status NOT IN ('terminated', 'tombstone')",
+        (agent_id,),
     )
     return cursor.fetchone() is not None
 
@@ -366,9 +370,13 @@ def _missing_capabilities(
         required = set(task_required_capabilities or [])
     if not required:
         return []
+    # A terminated/tombstone/absent agent has no live capabilities row,
+    # so the whole required set is reported missing (BL-R31-3b: a
+    # tombstone `[deleted-<id>]` is not a live agent).
     cursor.execute(
-        "SELECT capabilities FROM agents WHERE agent_id = ? AND status != ?",
-        (target_agent_id, "terminated"),
+        "SELECT capabilities FROM agents WHERE agent_id = ? "
+        "AND status NOT IN ('terminated', 'tombstone')",
+        (target_agent_id,),
     )
     row = cursor.fetchone()
     agent_caps = set(json.loads(row["capabilities"] or "[]")) if row else set()
@@ -1163,12 +1171,16 @@ async def _assign_to_existing_tasks(
                 )
             )
 
-        # Validate agent exists and is not terminated. A terminated
+        # Validate agent exists and is a live target. A terminated
         # target makes the task unreachable work and misattributes the
-        # audit trail to a revoked identity.
+        # audit trail to a revoked identity; a 'tombstone' row
+        # (`[deleted-<id>]` purge FK artefact) is not an agent at all
+        # (BL-R31-3b). This is the existence gate for this assign path
+        # (it does not route through ``_agent_assignable``).
         cursor.execute(
-            "SELECT capabilities FROM agents WHERE agent_id = ? AND status != ?",
-            (target_agent_id, "terminated"),
+            "SELECT capabilities FROM agents WHERE agent_id = ? "
+            "AND status NOT IN ('terminated', 'tombstone')",
+            (target_agent_id,),
         )
         agent_caps_row = cursor.fetchone()
         if not agent_caps_row:
@@ -1741,9 +1753,14 @@ async def assign_task_tool_impl(
                     break
 
         if not agent_exists_in_memory:
+            # Live-agent lookup: excludes terminated AND tombstone
+            # (`[deleted-<id>]`) rows — a tombstone is never an
+            # assignment target (BL-R31-3b). The unconditional
+            # ``_agent_assignable`` gate below enforces the same.
             cursor.execute(
-                "SELECT token FROM agents WHERE agent_id = ? AND status != ?",
-                (target_agent_id, "terminated"),
+                "SELECT token FROM agents WHERE agent_id = ? "
+                "AND status NOT IN ('terminated', 'tombstone')",
+                (target_agent_id,),
             )
             row = cursor.fetchone()
             if not row:

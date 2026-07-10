@@ -139,25 +139,23 @@ async def application_startup(
         conn_load_state = get_db_connection()
         cursor = conn_load_state.cursor()
 
-        # Load Active Agents (status != 'terminated'). Wave 4: the
-        # synthetic 'admin' row is gone (migration 0014), so the
-        # earlier `agent_id != 'admin'` filter is redundant — a normal
-        # `status != 'terminated'` WHERE returns the right set on its
-        # own. Defence in depth: also exclude any leftover
-        # `agent_id='admin'` row from a DB that pre-dates 0014 but
-        # somehow survived (e.g. an INSERT OR IGNORE racing the
-        # migration on a partially-upgraded DB).
+        # Load Active Agents into the g.active_agents auth cache.
+        # "Active" excludes BOTH 'terminated' (soft-deleted) AND
+        # 'tombstone' (BL-R31-3b): a purge inserts a durable
+        # status='tombstone' agents row (`[deleted-<id>]`, reserved
+        # `__tombstone_<id>` token) as an FK target, and that row
+        # SURVIVES restarts — so a plain `status != 'terminated'` load
+        # would pull it into the auth allow-list on the next boot after
+        # a purge, from where the operator token listing (which filters
+        # only `!= 'terminated'`) would leak it. Wave 4: the synthetic
+        # 'admin' row is gone (migration 0014), so the earlier
+        # `agent_id != 'admin'` filter is redundant.
         active_agents_count = 0
-        # retire-system-token Wave 3: the synthetic ``admin`` pseudo-agent
-        # row was deleted in Wave 4 (migration 0014), so the historic
-        # ``AND agent_id != 'admin'`` filter is no longer required. A
-        # plain ``status != 'terminated'`` returns the right set.
         cursor.execute(
             """
             SELECT token, agent_id, capabilities, created_at, status, current_task, working_directory, color
-            FROM agents WHERE status != ?
+            FROM agents WHERE status NOT IN ('terminated', 'tombstone')
         """,
-            ("terminated",),
         )
         for row in cursor.fetchall():
             agent_token_val = row["token"]
