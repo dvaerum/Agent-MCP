@@ -363,3 +363,43 @@ def fanout_to_all(payload: Any) -> List[str]:
     that affects every worker simultaneously.
     """
     return _enqueue_to(all_sessions(), payload)
+
+
+# ---- revocation teardown (AC-R29-1) -----------------------------------------
+
+# Sentinel enqueued onto a session's runtime queue to wake its GET /mcp
+# SSE pump immediately so it re-validates the streaming bearer's
+# liveness. Used by terminate/revoke for prompt teardown instead of
+# waiting for the pump's next heartbeat self-validation tick. The pump
+# identity-compares against this object and never serialises it onto the
+# wire.
+CLOSE_STREAM = object()
+
+
+def close_streams_for_agent(agent_id: str) -> List[str]:
+    """Wake every open GET /mcp stream for ``agent_id`` so its pump
+    re-validates the bearer now. Returns the session_ids signalled.
+
+    Enqueues :data:`CLOSE_STREAM` onto each attached runtime queue. The
+    pump recognises the sentinel, re-checks liveness (cache-only), and —
+    for a terminated / revoked agent — tears the stream down immediately
+    rather than after the next ≤heartbeat-interval self-validation tick.
+
+    Best-effort: a session whose queue is full isn't signalled here, but
+    it is still torn down on its next heartbeat's self-validation check
+    (the pump never trusts its open-time auth indefinitely). Rows without
+    an attached runtime queue (registered by a prior backend process,
+    client not yet reconnected) are skipped — there's no live pump to
+    signal, and a reconnect re-derives auth at the gate.
+    """
+    signalled: List[str] = []
+    for handle in sessions_for_agent(agent_id):
+        q = _runtime_queues.get(handle.session_id)
+        if q is None:
+            continue
+        try:
+            q.put_nowait(CLOSE_STREAM)
+        except asyncio.QueueFull:
+            continue
+        signalled.append(handle.session_id)
+    return signalled

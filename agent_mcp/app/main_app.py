@@ -487,9 +487,11 @@ class AuthHeaderMiddleware(BaseHTTPMiddleware):
             # agent's token (which the repo would happily resolve
             # against the DB row + re-populate the cache as a
             # side effect) cleanly fails auth — the cache holds only
-            # non-terminated rows.
-            authenticated = bool(forwarding_operator) or (
-                bool(token) and token in _g.active_agents
+            # non-terminated rows. ``_bearer_is_active`` is the single
+            # definition of that predicate, shared with the GET /mcp SSE
+            # pump's per-heartbeat self-validation (AC-R29-1).
+            authenticated = bool(forwarding_operator) or _bearer_is_active(
+                token
             )
             if not authenticated:
                 return _build_unauthorized_response(token)
@@ -1175,7 +1177,7 @@ class _McpAsgiApp:
                 name=f"mcp-get-disconnect-{session_id}",
             )
             pump_task = asyncio.create_task(
-                self._pump(session_id, queue, send),
+                self._pump(session_id, queue, send, bearer),
                 name=f"mcp-get-pump-{session_id}",
             )
             try:
@@ -1208,7 +1210,9 @@ class _McpAsgiApp:
                 session_id, agent_id,
             )
 
-    async def _pump(self, session_id: str, queue: asyncio.Queue, send) -> None:
+    async def _pump(
+        self, session_id: str, queue: asyncio.Queue, send, bearer: str
+    ) -> None:
         """Drain `queue` onto the SSE wire forever (until cancelled).
 
         One SSE `data:` frame per queue payload. Heartbeat comments
@@ -1220,8 +1224,27 @@ class _McpAsgiApp:
         We also call `session_registry.touch_session` on every
         successful payload + heartbeat so the periodic pruner doesn't
         evict still-live sessions.
+
+        Self-validation (AC-R29-1): a GET /mcp stream authenticates its
+        bearer ONCE at open, then this loop pumps indefinitely. On every
+        iteration we re-check that the bearer is still live (the same
+        cache-only predicate the ``/mcp`` auth gate uses). If the agent
+        was terminated / the token revoked, we break so the surrounding
+        `_handle_get` tears the stream down — the push channel never
+        trusts its open-time auth beyond one heartbeat interval, so
+        revocation is complete across this channel too, not just the
+        request path. `terminate_agent` also enqueues a
+        ``CLOSE_STREAM`` sentinel to wake this loop immediately rather
+        than waiting for the next heartbeat tick.
         """
         while True:
+            # Re-validate before every emit — teardown on revocation.
+            if not _bearer_is_active(bearer):
+                logger.info(
+                    "session_registry: bearer revoked — closing GET /mcp "
+                    "stream session=%s", session_id,
+                )
+                return
             try:
                 payload = await asyncio.wait_for(
                     queue.get(), timeout=self._HEARTBEAT_INTERVAL_SECONDS
@@ -1238,6 +1261,13 @@ class _McpAsgiApp:
                     pass
                 continue
 
+            # Active teardown wake (AC-R29-1): loop back so the
+            # top-of-loop self-validation runs now and returns if the
+            # bearer is revoked, instead of serialising the sentinel
+            # onto the wire.
+            if payload is session_registry.CLOSE_STREAM:
+                continue
+
             data = json.dumps(payload).encode("utf-8")
             await send({
                 "type": "http.response.body",
@@ -1248,6 +1278,24 @@ class _McpAsgiApp:
                 session_registry.touch_session(session_id)
             except Exception:  # pragma: no cover - defensive
                 pass
+
+
+def _bearer_is_active(bearer: str) -> bool:
+    """True iff ``bearer`` maps to a live (non-terminated) agent.
+
+    Cache-only predicate: ``state.active_agents`` holds only
+    non-terminated rows — terminate evicts post-commit and the repo
+    never warms a terminated row back in (see
+    ``test_terminate_token_revocation_cache``) — so a terminated /
+    revoked bearer is absent and this reads ``False`` without a DB
+    roundtrip. This is the SAME liveness check the ``/mcp`` auth gate
+    and the per-request tool-dispatch path rely on; the GET /mcp SSE
+    pump re-checks it every heartbeat so a stream opened BEFORE
+    revocation is torn down rather than surviving it (AC-R29-1).
+    """
+    from ..core import globals as _g
+
+    return bool(bearer) and bearer in _g.active_agents
 
 
 def _bearer_from_scope(scope) -> str:
