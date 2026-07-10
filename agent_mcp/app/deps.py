@@ -299,7 +299,14 @@ async def _legacy_body_token(request: Request) -> str | None:
         return None
     try:
         parsed = json.loads(raw)
-    except (ValueError, json.JSONDecodeError):
+    # RecursionError (a RuntimeError, NOT a ValueError subclass) escapes
+    # a narrow (ValueError, JSONDecodeError) guard: a ~10k-deep nested
+    # body would propagate out of this auth-dep fallback as an HTTP 500
+    # before any handler runs. A deep-nested body simply isn't a valid
+    # token body — swallow it and fall through to the other auth methods.
+    # (json.JSONDecodeError is a ValueError subclass; kept explicit for
+    # clarity. Backend-tier sibling of PF-R20-1's router-tier fix.)
+    except (ValueError, json.JSONDecodeError, RecursionError):
         return None
     if not isinstance(parsed, dict):
         return None
