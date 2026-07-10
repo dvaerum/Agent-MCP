@@ -162,7 +162,15 @@ def is_confirmed_operator_tier(auth: Dict[str, Any]) -> bool:
 
 
 @router.api_route("/status", methods=["GET", "OPTIONS"])
-async def simple_status_api_route(request: Request) -> JSONResponse:
+async def simple_status_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    # SECURITY (AZ-R28-1): gated to match the composition router's other
+    # reads (node-details / all-data / context-data). AuthHeaderMiddleware
+    # gates only /mcp, not /api/*, so without this dep the backend's own
+    # (UDS) surface served system status unauthenticated — the direct-UDS
+    # defense-in-depth tier PRs #280 / #281 closed on the sibling reads.
     # Handle OPTIONS for CORS preflight
     if request.method == 'OPTIONS':
         return await handle_options(request)
@@ -197,7 +205,12 @@ async def simple_status_api_route(request: Request) -> JSONResponse:
 
 
 @router.api_route("/graph-data", methods=["GET", "OPTIONS"])
-async def graph_data_api_route(request: Request) -> JSONResponse:
+async def graph_data_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    # SECURITY (AZ-R28-1): gated to match the sibling composition reads —
+    # see simple_status_api_route.
     if request.method == 'OPTIONS':
         return await handle_options(request)
     try:
@@ -209,7 +222,12 @@ async def graph_data_api_route(request: Request) -> JSONResponse:
 
 
 @router.api_route("/task-tree-data", methods=["GET", "OPTIONS"])
-async def task_tree_data_api_route(request: Request) -> JSONResponse:
+async def task_tree_data_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    # SECURITY (AZ-R28-1): gated to match the sibling composition reads —
+    # see simple_status_api_route.
     if request.method == 'OPTIONS':
         return await handle_options(request)
     try:

@@ -2749,6 +2749,15 @@ async def view_tasks_tool_impl(
     # whether there is a next page.
     limit = arguments.get("limit")  # None = unbounded, preserves shape
     offset = arguments.get("offset", 0) or 0
+    # OBS-R28-PF: coerce to int BEFORE the [offset:] / [:limit] slices.
+    # jsonschema's ``integer`` type admits an integral float (limit=2.0),
+    # which then raises ``TypeError: slice indices must be integers`` at
+    # the slice. Mirror the sibling numeric fields (admin_tools.list_agents,
+    # messages router) which int()-coerce; preserve None (unbounded) for
+    # ``limit`` so the response shape + the "Total:" gate are unchanged.
+    if limit is not None:
+        limit = int(limit)
+    offset = int(offset)
 
     # Smart filtering and analysis options
     show_dependencies = arguments.get(
@@ -4060,6 +4069,11 @@ async def search_tasks_tool_impl(
     search_query = arguments.get("search_query")
     status_filter = arguments.get("status_filter")
     max_results = arguments.get("max_results", 20)
+    # OBS-R28-PF: coerce to int BEFORE the [:max_results] slices below.
+    # Same numeric-coercion sibling as view_tasks — an integral float
+    # (max_results=2.0) validates against the ``integer`` schema then
+    # raises ``TypeError: slice indices must be integers`` at the slice.
+    max_results = int(max_results)
     include_notes = arguments.get("include_notes", True)
 
     # Wave 9 PR 3: per-row filter sources ``is_admin_request`` from
