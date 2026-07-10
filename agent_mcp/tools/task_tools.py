@@ -387,8 +387,17 @@ async def _update_single_task(
     new_priority: Optional[str] = None,
     new_assigned_to: Optional[str] = None,
     new_depends_on_tasks: Optional[List[str]] = None,
+    system_transition: bool = False,
 ) -> Dict[str, Any]:
-    """Helper function to update a single task with smart features"""
+    """Helper function to update a single task with smart features.
+
+    ``system_transition`` marks an INTERNAL, system-driven reconcile
+    (dependency auto-advance, child-cascade) rather than a caller-named
+    edit. It bypasses ONLY the per-row ownership gate below so the
+    transition can touch a dependent/child owned by a DIFFERENT agent —
+    it grants NO admin field powers (title/priority/assignee stay gated
+    on ``is_admin_request``). See BL-R29-1.
+    """
 
     # Fetch task current data
     cursor.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
@@ -409,9 +418,18 @@ async def _update_single_task(
     # otherwise enumerate the owning agent's identity. So return the
     # EXACT not-found result the missing-row branch above returns, with
     # no ``assigned_to`` interpolation.
+    #
+    # BL-R29-1: a ``system_transition`` (dependency auto-advance /
+    # child-cascade fired by the completion path) is an internal
+    # reconcile, not a caller-named edit, so it MUST advance a
+    # dependent/child owned by a different agent. It bypasses ONLY this
+    # ownership gate — never the admin-field powers below — so it cannot
+    # be used to smuggle a reassignment or priority change through the
+    # worker path.
     if (
         task_current_data.get("assigned_to") != requesting_agent_id
         and not is_admin_request
+        and not system_transition
     ):
         return {"success": False, "error": f"Task '{task_id}' not found"}
 
@@ -651,6 +669,10 @@ async def _advance_dependents_after_completion(
                 None,
                 None,
                 None,
+                # BL-R29-1: system-driven advance must cross agent
+                # ownership — the dependent may be owned by an agent
+                # other than the one that completed the blocker.
+                system_transition=True,
             )
             advanced.append(dep_result)
     return advanced
@@ -2573,6 +2595,10 @@ async def update_task_status_tool_impl(
                         None,
                         None,
                         None,
+                        # BL-R29-1: system-driven child-cascade must cross
+                        # agent ownership — a child of the caller's task
+                        # may be owned by a different agent.
+                        system_transition=True,
                     )
                     cascade_results.append(child_result)
 
