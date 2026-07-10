@@ -121,14 +121,19 @@ async def test_start_is_idempotent_when_already_running(
     sock_path = router_env.sock_dir / name / "backend.sock"
     sock_path.parent.mkdir(parents=True, exist_ok=True)
     sock_path.touch()
+    # Save + restore the ORIGINAL method — NOT ``del``. ``del Path.is_socket``
+    # removes the real ``pathlib.Path.is_socket`` from ``Path.__dict__`` (on
+    # 3.11 it is defined directly there), so every later test on the same
+    # xdist worker that calls ``.is_socket()`` on a real Path raised
+    # ``AttributeError``. Mirror the save/restore idiom used above.
+    real_is_socket = Path.is_socket
     Path.is_socket = lambda self: True  # type: ignore[assignment]
     try:
         # Two back-to-back calls; second one must not start/restart.
         await orchestrator.start(name)
         await orchestrator.start(name)
     finally:
-        # Restore the original.
-        del Path.is_socket
+        Path.is_socket = real_is_socket  # type: ignore[assignment]
     assert systemctl_stub.counts[("start", unit)] == 0
     assert systemctl_stub.counts[("restart", unit)] == 0
 
