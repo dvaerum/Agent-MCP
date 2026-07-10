@@ -145,6 +145,88 @@ async def test_overview_envelope_carries_no_absolute_paths_anywhere(
     )
 
 
+# ── ITEM 1: create-project SUCCESS envelope (SD-R34-1) ──────────────
+
+
+async def test_create_project_success_workspace_is_relative_label(
+    aiohttp_client, router_app,
+) -> None:
+    """SD-R34-1: the create-project SUCCESS envelope must expose the SAME
+    project-RELATIVE workspace label the overview handler uses — never the
+    fully-resolved ABSOLUTE server path (which discloses the deployment's
+    filesystem layout / the service account's home dir to any
+    ``system.projects.manage`` holder, including a delegated-cap
+    non-sysadmin).
+
+    Missed sibling: overview already scrubs via ``_workspace_label`` and
+    the SD-R15 series scrubbed the create/rename/delete ERROR paths; the
+    create SUCCESS path was the last leaker.
+    """
+    client = await aiohttp_client(router_app)
+
+    resp = await client.post(
+        "/agent-mcp/api/router/projects",
+        data='{"name": "alpha"}',
+        headers={
+            "Accept": "application/vnd.agent-mcp.v1+json",
+            "Content-Type": "application/json",
+        },
+    )
+
+    assert resp.status == 201, await resp.text()
+    body = await resp.json()
+    ws = body["project"]["workspace"]
+    assert not ws.startswith("/"), (
+        f"create workspace is an absolute path: {ws!r}"
+    )
+    assert not _ABS_PATH_RE.search(ws), (
+        f"create workspace discloses a server filesystem location: {ws!r}"
+    )
+    # Same relative label the overview handler emits — just the name for
+    # the common ``<default-parent>/<name>`` layout.
+    assert ws == "alpha"
+
+
+async def test_create_project_register_error_scrubs_absolute_path(
+    aiohttp_client, router_app, router_module, monkeypatch,
+) -> None:
+    """SD-R34-1 class-sweep: the create ERROR path (``_REGISTRY.register``
+    raising a ValueError) must not reflect the registry's absolute-path
+    text (``… already registered at '<abs>'; refusing to re-point at
+    '<abs>'``) into the client envelope. Force the ValueError and assert
+    the response body carries the generic ``already_registered`` message
+    with NO server filesystem path.
+    """
+
+    def _boom(name, workspace, **extra):
+        raise ValueError(
+            f"project {name!r} is already registered at "
+            f"'/var/lib/agent-mcp/projects/{name}'; refusing to re-point "
+            f"at {workspace!r}"
+        )
+
+    monkeypatch.setattr(router_module._REGISTRY, "register", _boom)
+    client = await aiohttp_client(router_app)
+
+    resp = await client.post(
+        "/agent-mcp/api/router/projects",
+        data='{"name": "collide"}',
+        headers={
+            "Accept": "application/vnd.agent-mcp.v1+json",
+            "Content-Type": "application/json",
+        },
+    )
+
+    assert resp.status == 409, await resp.text()
+    body = await resp.json()
+    assert body["success"] is False
+    assert body["error"] == "already_registered"
+    text = await resp.text()
+    assert not _ABS_PATH_RE.search(text), (
+        f"create register-error envelope leaks an absolute path: {text!r}"
+    )
+
+
 # ── ITEM 2: pre-auth project-existence oracle ───────────────────────
 
 
