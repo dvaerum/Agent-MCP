@@ -785,11 +785,40 @@ _MESSAGE_EVENT_QUERY_CAP = 500
 def _collect_events_for(
     agent_id: str, since: Optional[str]
 ) -> List[Dict[str, Any]]:
-    """Collect new events for `agent_id` strictly after the ISO-UTC
-    timestamp `since`.
+    """Back-compat shim: return just the event list.
 
-    Returns a chronologically-ordered (ASC) list of dicts:
-    ``{"type": "<event_type>", "timestamp": "<iso>", "data": {...}}``.
+    Retained for callers that don't merge the additional (unbounded)
+    event streams — the inbox resource and the BL-R20 tests — and so
+    only need the DB-backed events, not the truncation boundary. The
+    long-poll / catch-up tool impls call :func:`_collect_events_with_cap`
+    directly so they can propagate the clamp (BL-R21-1).
+    """
+    events, _msg_cap_ts = _collect_events_with_cap(agent_id, since)
+    return events
+
+
+def _collect_events_with_cap(
+    agent_id: str, since: Optional[str]
+) -> tuple[List[Dict[str, Any]], Optional[str]]:
+    """Collect new events for `agent_id` strictly after the ISO-UTC
+    timestamp `since`, plus the message-truncation boundary.
+
+    Returns ``(events, msg_cap_ts)`` where ``events`` is a
+    chronologically-ordered (ASC) list of dicts
+    ``{"type": "<event_type>", "timestamp": "<iso>", "data": {...}}`` and
+    ``msg_cap_ts`` is:
+
+      * the timestamp of the newest message in the batch **when the
+        message backlog filled the query cap** (the batch is a truncated
+        contiguous prefix), or
+      * ``None`` when the batch was NOT truncated.
+
+    BL-R21-1: the caller MUST cap its final (merged) cursor to
+    ``msg_cap_ts`` when it is not ``None``. The internal clamp below only
+    trims THIS function's own events (messages + assigned tasks); the
+    unbounded streams the callers merge in afterwards
+    (``unassigned_task_appeared`` + the synthetic queue) would otherwise
+    drag the global ``max()`` cursor past the un-returned messages 501+.
 
     Event types:
 
@@ -927,17 +956,50 @@ def _collect_events_for(
     # via a newer, unbounded task event. Task events beyond the boundary
     # are re-collected on the next poll (their query is `updated_at >
     # cursor`), so nothing is lost — the backlog just drains in order.
+    truncation_boundary: Optional[str] = None
     if messages_truncated and msg_cap_ts:
         events = [
             e for e in events
             if (e.get("timestamp") or "") <= msg_cap_ts
         ]
+        # Propagate the boundary so the callers can cap their MERGED
+        # cursor (BL-R21-1) — the unbounded streams they add afterwards
+        # are not visible to this internal clamp.
+        truncation_boundary = msg_cap_ts
 
     # Merge-sort by timestamp ASC. Stable sort preserves the per-source
     # arrival order on ties (which only happen at sub-millisecond
     # resolution if at all, but be defensive).
     events.sort(key=lambda e: e["timestamp"])
-    return events
+    return events, truncation_boundary
+
+
+def _cap_events_to_boundary(
+    events: List[Dict[str, Any]], msg_cap_ts: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Clamp a merged event batch to the message-truncation boundary.
+
+    BL-R21-1: when the message backlog was truncated (``msg_cap_ts`` is
+    not ``None``), drop every merged event newer than the boundary so
+    the returned batch AND the cursor derived from it
+    (``max(timestamp)``) never advance past the last delivered message.
+
+    The dropped events are all re-derivable on the next poll:
+    ``unassigned_task_appeared`` rows are re-queried by
+    :func:`_collect_unassigned_task_events_for` (``updated_at > cursor``),
+    and the synthetic-queue copies are wake-edge notifications for those
+    same DB rows (see ``state.dispatch_synthetic_event``), so nothing is
+    lost — the backlog just drains in timestamp order.
+
+    When ``msg_cap_ts`` is ``None`` (no truncation) the batch is
+    returned unchanged.
+    """
+    if msg_cap_ts is None:
+        return events
+    return [
+        e for e in events
+        if (e.get("timestamp") or "") <= msg_cap_ts
+    ]
 
 
 def _envelope(
@@ -1259,9 +1321,14 @@ async def wait_for_events_tool_impl(
 
         # Fast path — combine DB backlog with synthetic events that
         # arrived between register_waiter() and this point.
-        events: List[Dict[str, Any]] = _collect_events_for(agent_id, since)
+        events: List[Dict[str, Any]]
+        events, msg_cap_ts = _collect_events_with_cap(agent_id, since)
         events.extend(_collect_unassigned_task_events_for(agent_id, since))
         events.extend(g.drain_waiter_queue(waiter_queue))
+        # BL-R21-1: cap the MERGED batch to the message-truncation
+        # boundary so a newer unbounded task/synthetic event can't drag
+        # the persisted cursor past the un-returned messages 501+.
+        events = _cap_events_to_boundary(events, msg_cap_ts)
         if events:
             events.sort(key=lambda e: e.get("timestamp") or "")
             env = _envelope(events, since)
@@ -1315,12 +1382,15 @@ async def wait_for_events_tool_impl(
                 # synthetic queue (plus the first_item we already
                 # popped to release ``queue.get()``) + a fresh re-query
                 # of DB-backed events.
-                events = _collect_events_for(agent_id, since)
+                events, msg_cap_ts = _collect_events_with_cap(agent_id, since)
                 events.extend(_collect_unassigned_task_events_for(agent_id, since))
                 rest = g.drain_waiter_queue(waiter_queue)
                 if first_item is not g.WAITER_WAKE_SENTINEL and first_item is not None:
                     events.append(first_item)
                 events.extend(rest)
+                # BL-R21-1: cap the MERGED batch to the message
+                # truncation boundary (same rationale as the fast path).
+                events = _cap_events_to_boundary(events, msg_cap_ts)
                 if events:
                     events.sort(key=lambda e: e.get("timestamp") or "")
                     env = _envelope(events, since)
@@ -1395,8 +1465,12 @@ async def fetch_events_since_tool_impl(
     # the queue contents are only meaningful in the context of a
     # wait_for_events session that established expectations about
     # ordering.
-    events = _collect_events_for(agent_id, cursor)
+    events, msg_cap_ts = _collect_events_with_cap(agent_id, cursor)
     events.extend(_collect_unassigned_task_events_for(agent_id, cursor))
+    # BL-R21-1: cap the MERGED batch to the message truncation boundary
+    # so the persisted catch-up cursor can't leap past messages 501+ via
+    # a newer unbounded unassigned-task event.
+    events = _cap_events_to_boundary(events, msg_cap_ts)
     events.sort(key=lambda e: e.get("timestamp") or "")
     if events:
         new_cursor = max((e.get("timestamp") or "") for e in events) or (cursor or "")
