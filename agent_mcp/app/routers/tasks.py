@@ -276,6 +276,19 @@ async def create_task_api_route(
             },
             connection=cursor,
         )
+        # BL-R30-1: set the gaining agent's ``current_task`` on a
+        # create-with-assignee, mirroring the MCP create+assign paths
+        # (``task_tools`` assign_task / multi-create both set current_task
+        # when the agent is idle). Without this, a REST-created assigned
+        # task left the agent rendering idle in /api/all-data and the
+        # dashboard despite owning the task. prior=None (fresh create), so
+        # the helper only SETS the gainer when its current_task IS NULL —
+        # it never clears anything here. Same cursor/txn as the create.
+        if assigned_to:
+            from ...repositories import agent_repo as _agent_repo
+            _agent_repo.reconcile_current_task_on_reassign(
+                task_id, None, assigned_to, connection=cursor,
+            )
         log_agent_action_to_db(
             cursor, requesting_admin_id, "created_task",
             task_id=task_id, details={"title": title, "assigned_to": assigned_to},

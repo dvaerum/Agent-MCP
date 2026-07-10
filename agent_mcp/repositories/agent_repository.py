@@ -1359,6 +1359,168 @@ class AgentRepository:
                     entry["current_task"] = None
         return int(rowcount)
 
+    def reconcile_current_task_on_reassign(
+        self,
+        task_id: str,
+        prior_assignee: Optional[str],
+        new_assignee: Optional[str],
+        *,
+        connection: Any = None,
+    ) -> None:
+        """Reconcile ``agents.current_task`` when a task is reassigned.
+
+        The terminal-status path clears ``current_task`` via
+        :meth:`clear_current_task_for`, but a REBIND (task moved from
+        agent X to agent Y with no status change) reconciled neither
+        pointer, so:
+
+          * the LOSING agent kept a stale ``current_task`` pointing at a
+            task it no longer owns (BL-R30-1 — the exact leak the
+            terminal-clear guard was added for), and
+          * the GAINING agent's ``current_task`` was never set, so it
+            rendered idle in ``/api/all-data`` and the dashboard despite
+            owning the task.
+
+        This mirrors the two halves of the existing behaviour:
+
+          * clear side — mirrors :meth:`clear_current_task_for`, but
+            scoped to the LOSING agent only (``agent_id = prior AND
+            current_task = task_id``) so a rebind never disturbs an
+            unrelated agent whose ``current_task`` happens to differ.
+          * set side — mirrors the canonical assign path
+            (``task_tools._assign_to_existing_tasks``): set the gaining
+            agent's ``current_task`` to ``task_id`` ONLY when it is
+            currently ``NULL`` (never clobber a different in-flight
+            pointer the agent already holds).
+
+        Safe in the degenerate cases: ``prior == new`` is a no-op (the
+        clear would immediately be re-set to the same value; both sides
+        are guarded to avoid a spurious write); a clear-assignment
+        (``new_assignee is None``) clears only the loser; a fresh assign
+        (``prior_assignee is None``) sets only the gainer.
+
+        ``connection`` is the transaction-aware seam (sqlite3 ``Cursor``
+        or SQLAlchemy ``Session``) so the reconcile stays atomic with the
+        ``tasks.assigned_to`` write that triggers it. Cache mirror on
+        ``state.active_agents`` matches the sibling helpers. Best-effort
+        on the write: a DB error is logged, not raised, so it can never
+        poison the surrounding reassign transaction.
+        """
+        # prior == new (including None == None) → nothing moved.
+        if prior_assignee == new_assignee:
+            return
+
+        updated_at = datetime.datetime.now().isoformat()
+
+        clear_target = prior_assignee
+        set_target = new_assignee
+
+        if connection is not None and not hasattr(connection, "query"):
+            cur = connection
+            try:
+                if clear_target is not None:
+                    cur.execute(
+                        "UPDATE agents SET current_task = NULL, "
+                        "updated_at = ? "
+                        "WHERE agent_id = ? AND current_task = ?",
+                        (updated_at, clear_target, task_id),
+                    )
+                if set_target is not None:
+                    cur.execute(
+                        "UPDATE agents SET current_task = ?, "
+                        "updated_at = ? "
+                        "WHERE agent_id = ? AND current_task IS NULL",
+                        (task_id, updated_at, set_target),
+                    )
+            except Exception as e:
+                logger.error(
+                    f"Database error reconciling current_task on reassign "
+                    f"of task '{task_id}' ({prior_assignee!r} -> "
+                    f"{new_assignee!r}) via shared cursor: {e}",
+                    exc_info=True,
+                )
+                return
+        elif connection is not None:
+            session = connection
+            try:
+                if clear_target is not None:
+                    session.query(Agent).filter(
+                        Agent.agent_id == clear_target,
+                        Agent.current_task == task_id,
+                    ).update(
+                        {Agent.current_task: None, Agent.updated_at: updated_at},
+                        synchronize_session=False,
+                    )
+                if set_target is not None:
+                    session.query(Agent).filter(
+                        Agent.agent_id == set_target,
+                        Agent.current_task.is_(None),
+                    ).update(
+                        {Agent.current_task: task_id, Agent.updated_at: updated_at},
+                        synchronize_session=False,
+                    )
+                session.flush()
+            except SQLAlchemyError as e:
+                logger.error(
+                    f"Database error reconciling current_task on reassign "
+                    f"of task '{task_id}' ({prior_assignee!r} -> "
+                    f"{new_assignee!r}) via shared session: {e}",
+                    exc_info=True,
+                )
+                return
+        else:
+            try:
+                with get_session() as session:
+                    if clear_target is not None:
+                        session.query(Agent).filter(
+                            Agent.agent_id == clear_target,
+                            Agent.current_task == task_id,
+                        ).update(
+                            {
+                                Agent.current_task: None,
+                                Agent.updated_at: updated_at,
+                            },
+                            synchronize_session=False,
+                        )
+                    if set_target is not None:
+                        session.query(Agent).filter(
+                            Agent.agent_id == set_target,
+                            Agent.current_task.is_(None),
+                        ).update(
+                            {
+                                Agent.current_task: task_id,
+                                Agent.updated_at: updated_at,
+                            },
+                            synchronize_session=False,
+                        )
+                    session.commit()
+            except SQLAlchemyError as e:
+                logger.error(
+                    f"Database error reconciling current_task on reassign "
+                    f"of task '{task_id}' ({prior_assignee!r} -> "
+                    f"{new_assignee!r}): {e}",
+                    exc_info=True,
+                )
+                return
+
+        # Cache mirror: match the sibling helpers so the next tool call
+        # sees the update without waiting for a lifespan reload.
+        if not self._cache_disabled:
+            for entry in state.active_agents.values():
+                aid = entry.get("agent_id")
+                if (
+                    clear_target is not None
+                    and aid == clear_target
+                    and entry.get("current_task") == task_id
+                ):
+                    entry["current_task"] = None
+                if (
+                    set_target is not None
+                    and aid == set_target
+                    and entry.get("current_task") is None
+                ):
+                    entry["current_task"] = task_id
+
     # --- Write interface: rotate_token ----------------------------------
 
     def rotate_token(
