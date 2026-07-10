@@ -343,10 +343,28 @@ def _resolve_sso_provider_name() -> str | None:
 
 async def login_post_handler(request: web.Request) -> web.StreamResponse:
     """POST /agent-mcp/login — validate, set cookie, redirect."""
-    form = await request.post()
+    next_url = request.rel_url.query.get("next", "")
+    try:
+        form = await request.post()
+    except (ValueError, UnicodeDecodeError):
+        # A malformed form body (e.g. invalid UTF-8 in a urlencoded
+        # payload) makes ``request.post()`` raise ``UnicodeDecodeError``
+        # (a ``ValueError`` subclass). This endpoint is UNAUTHENTICATED,
+        # so an uncaught raise here is an unauth attacker's 500 oracle /
+        # DoS (PF-R21-1). Treat it exactly like an invalid login: the
+        # same 401 + re-rendered form, no cookie, no info leak.
+        return web.Response(
+            text=_render(
+                "login.html",
+                error="Invalid username or password.",
+                username="",
+                next=next_url,
+            ),
+            status=401,
+            content_type="text/html", charset="utf-8",
+        )
     username = _form_str(form, "username").strip()
     password = _form_str(form, "password")
-    next_url = request.rel_url.query.get("next", "")
 
     error_html = _render(
         "login.html",
