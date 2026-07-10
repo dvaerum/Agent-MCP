@@ -261,11 +261,17 @@ async def _json_body(req: web.Request) -> dict:
         return {}
     try:
         parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, RecursionError) as exc:
+        # Broaden past JSONDecodeError: a deeply-nested body makes
+        # ``json.loads`` raise ``RecursionError`` (a ``RuntimeError``,
+        # NOT a ``ValueError`` subclass), which would otherwise
+        # propagate to an uncaught 500. Both are a malformed body →
+        # the same clean 400 (PF-R20-1).
+        msg = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
         raise web.HTTPBadRequest(
             text=json.dumps({
                 "success": False, "error": _ERROR_VALIDATION,
-                "message": f"request body is not valid JSON: {exc.msg}",
+                "message": f"request body is not valid JSON: {msg}",
             }),
             content_type="application/json",
         )
