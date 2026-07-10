@@ -22,8 +22,24 @@ from ..core.tool_result import (
     ToolResult,
 )
 from ..features.aoe_notify import notify_aoe as _aoe_notify
+from ..repositories.message_repository import ParentMessageNotFound
 from ..utils.audit_utils import log_audit
 from ..db.connection import get_db_connection
+
+
+class _MessageStoreFailed(RuntimeError):
+    """Internal signal: ``message_repo.send`` returned ``None`` inside the
+    ``atomic_with_audit`` block (PF-R32-1).
+
+    Raised so the exception propagates out of the atomic block and rolls
+    back the whole unit (no orphan audit/delivery row for a message that
+    was never stored). Caught in ``send_agent_message_tool_impl`` and
+    mapped to a ``Failed`` result — never a false success.
+    """
+
+    def __init__(self, message_id: str) -> None:
+        self.message_id = message_id
+        super().__init__(f"message store returned None for {message_id!r}")
 
 
 # ── Wave 6 PR 6 helpers ────────────────────────────────────────────────
@@ -340,7 +356,7 @@ async def send_agent_message_tool_impl(
             # caller's cursor so it's atomic with the subsequent delivery
             # UPDATE + audit-log INSERT below.
             from ..repositories import message_repo as _msg_repo
-            _msg_repo.send(
+            stored = _msg_repo.send(
                 message_id=message_id,
                 sender_id=sender_id,
                 recipient_id=recipient_id,
@@ -354,6 +370,15 @@ async def send_agent_message_tool_impl(
                 parent_message_id=parent_message_id,
                 connection=cursor,
             )
+            # PF-R32-1: honor send()'s result. A None return means the
+            # INSERT failed for a reason send() swallowed internally (DB
+            # error / bad bind). Raise to abort the WHOLE atomic unit so
+            # no audit/delivery row is committed for a message that was
+            # never stored — never report a false success. (A nonexistent
+            # parent no longer reaches here: send() now raises
+            # ParentMessageNotFound up front, caught below.)
+            if stored is None:
+                raise _MessageStoreFailed(message_id)
 
             # Wave 7 PR 3 (coordinator transition): every message is
             # stored in the DB. Recipients pick it up via
@@ -433,6 +458,17 @@ async def send_agent_message_tool_impl(
             message=response_text,
         )
 
+    except ParentMessageNotFound as e:
+        # PF-R32-1: the reply named a parent_message_id that doesn't
+        # exist. `atomic_with_audit` already rolled back the message
+        # INSERT + audit row (nothing was committed). Distinct from the
+        # unknown-recipient LookupError below so the error names the
+        # missing PARENT, not the recipient.
+        logger.warning(f"send_agent_message rejected (unknown parent): {e}")
+        return NotFound(
+            resource="parent message",
+            identifier=str(parent_message_id),
+        )
     except LookupError as e:
         # Repository rejected an unknown recipient (VM e2e fix
         # 2026-06-16). `atomic_with_audit` already rolled back the
@@ -440,6 +476,15 @@ async def send_agent_message_tool_impl(
         # verbatim — it explains live / admin / tombstone semantics.
         logger.warning(f"send_agent_message rejected: {e}")
         return NotFound(resource="agent", identifier=str(recipient_id))
+    except _MessageStoreFailed as e:
+        # PF-R32-1: send() returned None (store failed for a reason it
+        # swallowed). `atomic_with_audit` rolled back the audit row, so
+        # nothing was committed. Report an error — never a false success.
+        logger.error(
+            "send_agent_message store failed (send returned None) for "
+            "message %s to %s", e.message_id, recipient_id,
+        )
+        return Failed(message="Failed to send message")
     except sqlite3.Error as e:
         # `atomic_with_audit` already rolled back + closed the conn
         # before re-raising; nothing left for us to do but report.

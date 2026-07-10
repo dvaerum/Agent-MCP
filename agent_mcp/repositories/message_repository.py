@@ -99,6 +99,35 @@ from ..db.engine import get_session
 from ..db.models import Agent, AgentMessage
 
 
+class ParentMessageNotFound(LookupError):
+    """A supplied ``parent_message_id`` matches no existing message.
+
+    Raised by :meth:`MessageRepository.send` BEFORE the INSERT when a
+    caller threads a reply onto a parent that doesn't exist (PF-R32-1).
+    Without this up-front check the INSERT violated the migration-0012
+    self-FK, ``send`` swallowed the ``IntegrityError`` into an ambiguous
+    ``None`` return, and the two send surfaces mishandled it in opposite
+    both-wrong ways: the MCP tool discarded the ``None`` and reported a
+    false success (silent data-loss + an orphan audit row), and the REST
+    route surfaced a 500.
+
+    Distinct type — not the bare ``LookupError`` :meth:`send` raises for
+    an unknown *recipient* — so each send surface can map it to a
+    parent-specific error (MCP ``NotFound(resource="parent message")``;
+    REST 404 "Parent message not found") without reusing the recipient
+    messaging. Subclasses ``LookupError`` so a generic not-found handler
+    still treats it as a 404-class failure.
+    """
+
+    def __init__(self, parent_message_id: Any) -> None:
+        self.parent_message_id = parent_message_id
+        super().__init__(
+            f"parent message not found: {parent_message_id!r} does not "
+            f"match any existing message. A reply's parent_message_id "
+            f"must reference a message that already exists."
+        )
+
+
 def _publish(addressee: str, event: str, payload: Dict[str, Any]) -> None:
     """Lazy-import shim around ``_event_bus_shim.publish``.
 
@@ -586,6 +615,85 @@ class MessageRepository:
             )
             return False
 
+    @staticmethod
+    def _parent_message_exists(
+        parent_message_id: Any,
+        *,
+        connection: Any = None,
+    ) -> bool:
+        """Return True iff ``parent_message_id`` names an existing message.
+
+        The threading self-FK (migration 0012) means a reply must point
+        at a real parent row. Validating up front — instead of letting
+        the INSERT trip the FK and swallowing the error — is what lets
+        :meth:`send` raise a distinct :class:`ParentMessageNotFound`
+        (PF-R32-1).
+
+        Same three connection shapes as :meth:`_recipient_exists` so the
+        check participates in the caller's open transaction on every path
+        :meth:`send` is reachable from:
+
+        * ``None`` — open our own session.
+        * SQLAlchemy ``Session`` — query against the caller's session.
+        * sqlite3 ``Cursor`` — query against the caller's cursor so the
+          existence check sees rows written earlier in the same
+          transaction and holds no separate connection lock.
+        """
+        if not isinstance(parent_message_id, str) or not parent_message_id:
+            return False
+
+        # sqlite3 cursor path.
+        if connection is not None and not hasattr(connection, "query"):
+            cur = connection
+            try:
+                cur.execute(
+                    "SELECT 1 FROM agent_messages "
+                    "WHERE message_id = ? LIMIT 1",
+                    (parent_message_id,),
+                )
+                return cur.fetchone() is not None
+            except Exception as e:  # pragma: no cover - defensive
+                logger.error(
+                    f"Database error checking parent-message existence "
+                    f"for {parent_message_id!r} via shared cursor: {e}",
+                    exc_info=True,
+                )
+                return False
+
+        # SQLAlchemy session path (caller-provided OR standalone).
+        if connection is not None:
+            session = connection
+            try:
+                row = (
+                    session.query(AgentMessage.message_id)
+                    .filter(AgentMessage.message_id == parent_message_id)
+                    .one_or_none()
+                )
+                return row is not None
+            except SQLAlchemyError as e:  # pragma: no cover - defensive
+                logger.error(
+                    f"Database error checking parent-message existence "
+                    f"for {parent_message_id!r} via shared session: {e}",
+                    exc_info=True,
+                )
+                return False
+
+        try:
+            with get_session() as session:
+                row = (
+                    session.query(AgentMessage.message_id)
+                    .filter(AgentMessage.message_id == parent_message_id)
+                    .one_or_none()
+                )
+                return row is not None
+        except SQLAlchemyError as e:  # pragma: no cover - defensive
+            logger.error(
+                f"Database error checking parent-message existence for "
+                f"{parent_message_id!r}: {e}",
+                exc_info=True,
+            )
+            return False
+
     # --- Read interface --------------------------------------------------
 
     def get_by_id(self, message_id: str) -> Optional[Dict[str, Any]]:
@@ -866,6 +974,19 @@ class MessageRepository:
                 f"`admin` pseudo-agent, or a tombstone row "
                 f"(`[deleted-<id>]`)."
             )
+
+        # PF-R32-1: a supplied parent_message_id must reference an
+        # existing message. The migration-0012 self-FK would otherwise
+        # trip on INSERT and get swallowed into an ambiguous None return
+        # — which the MCP send path discards (false success, silent
+        # data-loss) and the REST path maps to a 500. Validate up front
+        # and raise a DISTINCT error so both surfaces return a clean
+        # parent-not-found. Raise BEFORE any DB write so no partial state
+        # is left behind in the caller's wider transaction.
+        if parent_message_id is not None and not self._parent_message_exists(
+            parent_message_id, connection=connection
+        ):
+            raise ParentMessageNotFound(parent_message_id)
 
         if connection is not None and not hasattr(connection, "query"):
             cur = connection
@@ -1509,4 +1630,4 @@ class MessageRepository:
         return _db_delete_message(message_id)
 
 
-__all__ = ["MessageRepository"]
+__all__ = ["MessageRepository", "ParentMessageNotFound"]

@@ -34,6 +34,7 @@ from ..deps import caller_identity, require_operator_session
 from ...core.config import logger
 from ...db.actions.agent_actions_db import log_agent_action_to_db
 from ...db.connection import get_db_connection
+from ...repositories.message_repository import ParentMessageNotFound
 from ...utils.json_utils import get_sanitized_json_body
 
 
@@ -495,6 +496,18 @@ async def create_message_api_route(
         })
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
+    except ParentMessageNotFound as e:
+        # PF-R32-1: message_repo.send raises ParentMessageNotFound when
+        # the reply names a parent_message_id that doesn't exist. Without
+        # this branch the swallowed self-FK violation surfaced as a 500;
+        # mirror the recipient-not-found shape below and return a clean
+        # 404. Roll back so no partial state / audit entry survives.
+        if conn:
+            conn.rollback()
+        logger.warning("Dashboard message rejected (unknown parent): %s", e)
+        return JSONResponse(
+            {"error": "Parent message not found"}, status_code=404
+        )
     except LookupError as e:
         # BL-R13-3: message_repo.send raises LookupError for a recipient
         # that is neither a live agent, a tombstone row, nor the 'admin'
