@@ -86,18 +86,37 @@ async def test_valueerror_500_carries_security_headers(
 
 
 @pytest.mark.no_auth_seed_session
-async def test_malformed_multipart_login_500_is_hardened(
+async def test_malformed_multipart_login_is_clean_401_not_500(
     aiohttp_client, router_app,
 ) -> None:
-    """Confirmed-live UNAUTH trigger: POST /agent-mcp/login with a
-    malformed multipart body makes ``await request.post()`` raise a bare
-    ``ValueError``. The resulting 500 must still be stamped by the
-    outermost security-headers middleware (regression of the round-1–4
-    banner/header hardening on the error path)."""
+    """UNAUTH trigger: POST /agent-mcp/login with a malformed multipart
+    body makes ``await request.post()`` raise a bare ``ValueError``.
+
+    Round-5 hardened the resulting 500 so the outermost security-headers
+    middleware still stamped it. PF-R21-1 then closed the vector at the
+    source: ``login_post_handler`` now wraps ``request.post()`` in
+    ``except (ValueError, UnicodeDecodeError)`` and folds a malformed
+    body into the ordinary invalid-login path, so this no longer 500s at
+    all — it returns a clean, hardened 401 (no version-banner leak, full
+    header set). The middleware's non-HTTPException 500-stamping contract
+    stays covered by ``test_valueerror_500_carries_security_headers``.
+    """
     client = await aiohttp_client(router_app)
     resp = await client.post(
         "/agent-mcp/login",
         data=b"x",
         headers={"Content-Type": "multipart/form-data; boundary="},
     )
-    _assert_hardened_500(resp)
+    # No longer a 500 — the parse failure is caught and returned as a
+    # clean invalid-login 401.
+    assert resp.status == 401, await resp.text()
+    # The 401 still carries the full hardened header set + stripped banner.
+    server = resp.headers.get("Server", "")
+    assert server == "agent-mcp", server
+    assert "aiohttp" not in server.lower()
+    assert "python" not in server.lower()
+    assert resp.headers.get("X-Content-Type-Options") == "nosniff"
+    assert resp.headers.get("X-Frame-Options") == "DENY"
+    csp = resp.headers.get("Content-Security-Policy", "")
+    assert "frame-ancestors 'none'" in csp
+    assert resp.headers.get("Cache-Control") == "no-store"

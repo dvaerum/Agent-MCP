@@ -133,7 +133,25 @@ async def setup_post_handler(request: web.Request) -> web.StreamResponse:
         # surfacing a 409, which is the friendlier UX.
         raise web.HTTPSeeOther(location="/agent-mcp/login")
 
-    form = await request.post()
+    try:
+        form = await request.post()
+    except (ValueError, UnicodeDecodeError):
+        # A malformed form body (e.g. invalid UTF-8 in a urlencoded
+        # payload) makes ``request.post()`` raise ``UnicodeDecodeError``
+        # (a ``ValueError`` subclass), which would otherwise propagate to
+        # an uncaught 500 in the bootstrap window (PF-R21-1). Fold it into
+        # the wizard's existing invalid-input path: the same 400 +
+        # re-rendered form the missing-field branches below return.
+        return web.Response(
+            text=_render_setup_form(
+                error="Invalid form submission.",
+                username="",
+                email="",
+            ),
+            status=400,
+            content_type="text/html",
+            charset="utf-8",
+        )
     username = _form_str(form, "username").strip()
     password = _form_str(form, "password")
     password_confirm = _form_str(form, "password_confirm")

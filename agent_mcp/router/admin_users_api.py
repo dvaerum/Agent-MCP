@@ -261,12 +261,15 @@ async def _json_body(req: web.Request) -> dict:
         return {}
     try:
         parsed = json.loads(raw)
-    except (json.JSONDecodeError, RecursionError) as exc:
-        # Broaden past JSONDecodeError: a deeply-nested body makes
-        # ``json.loads`` raise ``RecursionError`` (a ``RuntimeError``,
-        # NOT a ``ValueError`` subclass), which would otherwise
-        # propagate to an uncaught 500. Both are a malformed body →
-        # the same clean 400 (PF-R20-1).
+    except (ValueError, RecursionError) as exc:
+        # Broaden to ValueError (was JSONDecodeError): an invalid-UTF8
+        # body makes ``json.loads(bytes)`` raise ``UnicodeDecodeError``
+        # — a ``ValueError`` subclass but NOT a ``JSONDecodeError`` — so
+        # the narrower guard let it propagate to an uncaught 500
+        # (PF-R21-1). ``ValueError`` covers BOTH JSONDecodeError and
+        # UnicodeDecodeError; ``RecursionError`` (a ``RuntimeError``, not
+        # a ValueError subclass) stays explicit for the deeply-nested
+        # body case (PF-R20-1). All are a malformed body → clean 400.
         msg = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
         raise web.HTTPBadRequest(
             text=json.dumps({
