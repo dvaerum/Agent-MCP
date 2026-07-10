@@ -178,6 +178,97 @@ def test_list_active_excludes_terminated(project_dir, reset_globals):
         assert "dead-1" not in ids
 
 
+def test_list_active_excludes_tombstone(project_dir, reset_globals):
+    """Purge-cascade tombstone rows (``status='tombstone'``) are FK
+    artefacts, not agents — ``list_active`` must not surface them.
+
+    Mirrors the REST ``WHERE status != 'tombstone'`` filter so MCP
+    consumers of ``list_active`` (``/api/all-data`` startup hydration
+    et al.) share the REST agent-list contract (BL-R31-3).
+    """
+    with _make_client(project_dir):
+        from agent_mcp.repositories import agent_repo
+
+        _seed_agent("alive-tomb", token="tok-alive-tomb", status="active")
+        _seed_agent(
+            "[deleted-ghost]",
+            token="__tombstone_ghost",
+            status="tombstone",
+        )
+
+        rows = agent_repo.list_active()
+        ids = {row["agent_id"] for row in rows}
+        assert "alive-tomb" in ids
+        assert "[deleted-ghost]" not in ids, (
+            f"tombstone row leaked into list_active(): {ids}"
+        )
+
+
+# --- Query interface (view_agents / MCP) --------------------------------
+
+
+def test_query_excludes_tombstone_rows_and_count(project_dir, reset_globals):
+    """``AgentRepository.query`` backs the MCP ``view_agents`` tool.
+
+    BL-R31-3: it must exclude ``status='tombstone'`` rows AND those
+    rows must not inflate ``total_count`` — matching every REST
+    agent-list surface (``routers/agents.py`` applies
+    ``WHERE status != 'tombstone'`` unconditionally). Before the fix
+    the tombstone row leaks into both the page and the count.
+    """
+    with _make_client(project_dir):
+        from agent_mcp.repositories import agent_repo
+
+        _seed_agent("q-alive", token="tok-q-alive", status="active")
+        _seed_agent("q-created", token="tok-q-created", status="created")
+        _seed_agent(
+            "[deleted-q-ghost]",
+            token="__tombstone_q-ghost",
+            status="tombstone",
+        )
+
+        rows, total = agent_repo.query({})
+        ids = {r["agent_id"] for r in rows}
+        statuses = {r["status"] for r in rows}
+
+        assert "q-alive" in ids
+        assert "q-created" in ids
+        assert "[deleted-q-ghost]" not in ids, (
+            f"tombstone row leaked into view_agents query: {ids}"
+        )
+        assert "tombstone" not in statuses, (
+            f"any status='tombstone' row in view_agents is a leak: {statuses}"
+        )
+        # total_count must reflect the tombstone-excluded set (2 rows),
+        # not inflate to 3.
+        assert total == 2, (
+            f"total_count must exclude tombstone rows; expected 2, got {total}"
+        )
+
+
+def test_query_status_tombstone_filter_returns_empty(project_dir, reset_globals):
+    """An explicit ``status='tombstone'`` filter must return nothing —
+    tombstone is a DB-internal FK artefact, never an operator-queryable
+    status (mirrors ``GET /api/agents?status=tombstone`` → ``[]``)."""
+    with _make_client(project_dir):
+        from agent_mcp.repositories import agent_repo
+
+        _seed_agent(
+            "[deleted-alpha]",
+            token="__tombstone_alpha",
+            status="tombstone",
+        )
+        _seed_agent(
+            "[deleted-beta]",
+            token="__tombstone_beta",
+            status="tombstone",
+        )
+
+        rows, total = agent_repo.query({"status": "tombstone"})
+        assert rows == []
+        assert total == 0
+
+
 # --- Write interface: create --------------------------------------------
 
 

@@ -266,7 +266,15 @@ def get_agent_by_token(token: str) -> Optional[Dict[str, Any]]:
 
 
 def get_all_active_agents_from_db() -> List[Dict[str, Any]]:
-    """Fetch every agent whose status is not 'terminated'.
+    """Fetch every active agent.
+
+    "Active" excludes both ``'terminated'`` (soft-deleted) and
+    ``'tombstone'`` (purge-cascade FK artefacts). Tombstone rows exist
+    only to keep ``agent_messages`` FKs valid after a purge (see
+    ``insert_tombstone``); they are neither agents nor terminated
+    agents and must never surface in a listing — mirrors the REST
+    ``WHERE status != 'tombstone'`` filter so MCP and REST share one
+    active-agents contract (BL-R31-3).
 
     Used by ``application_startup`` to populate ``g.active_agents``.
     """
@@ -274,7 +282,7 @@ def get_all_active_agents_from_db() -> List[Dict[str, Any]]:
         with get_session() as session:
             rows = (
                 session.query(Agent)
-                .filter(Agent.status != "terminated")
+                .filter(Agent.status.notin_(("terminated", "tombstone")))
                 .all()
             )
             return [_agent_to_dict(r) for r in rows]
@@ -557,6 +565,16 @@ class AgentRepository:
         try:
             with get_session() as session:
                 q = session.query(Agent)
+                # BL-R31-3: tombstone rows (purge-cascade FK artefacts,
+                # created by insert_tombstone) are NEVER listable agents.
+                # Exclude them unconditionally — before the count — so
+                # MCP view_agents matches the REST agent-list surfaces
+                # (routers/agents.py applies `WHERE status != 'tombstone'`
+                # regardless of any status filter, and refuses
+                # `status=tombstone`). Combined with an explicit
+                # `status='tombstone'` filter this yields the empty set,
+                # mirroring `GET /api/agents?status=tombstone` → [].
+                q = q.filter(Agent.status != "tombstone")
                 if filter_status:
                     q = q.filter(Agent.status == filter_status)
                 if filter_pattern:
@@ -1782,10 +1800,11 @@ class AgentRepository:
 
         Tombstone rows live alongside real agents but are off the
         active-agents cache by construction: they have ``status =
-        'tombstone'`` so ``list_active()`` (which excludes
-        ``status != 'terminated'`` — but tombstones are neither
-        active nor terminated; they're tombstones) won't surface them.
-        Existing read paths that look up by token will resolve the
+        'tombstone'``, which the active-agents listing filter
+        (``get_all_active_agents_from_db`` / ``query``) excludes
+        alongside ``'terminated'`` (BL-R31-3), so neither
+        ``list_active()`` nor the MCP ``view_agents`` query surfaces
+        them. Existing read paths that look up by token will resolve the
         ``__tombstone_<id>`` namespaced token to this row, but no real
         bearer can present that token because it's reserved.
 
