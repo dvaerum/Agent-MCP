@@ -147,7 +147,6 @@ async def test_reaper_stop_runs_off_event_loop(
     from agent_mcp.router import project_orchestrator as _po
 
     name = "slow-reap"
-    unit = f"agent-mcp@{name}.service"
 
     last = 1_000_000.0
     _po.last_active[(name, "backend")] = last
