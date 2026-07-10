@@ -185,11 +185,24 @@ async def update_file_status_tool_impl(
             ),
         )
 
-    # Check if file is already in use by another agent.
+    # Ownership gate: only the holder may mutate a foreign-held lock —
+    # claim (editing/reading/reviewing) OR release. SEC-R20 (AZ-R20-1):
+    # the prior guard carved out ``and new_status != "released"`` so
+    # "Can always release, even if map is out of sync." That let a
+    # NON-holder call ``update_file_status(release)`` on another
+    # agent's file and the release branch below unconditionally
+    # ``del``'d the entry — a cross-agent advisory-lock STEAL (same
+    # foreign-object-mutation class the R19 task-tools sweep gated).
+    # Dropping the carve-out routes a non-holder release to the SAME
+    # Conflict a non-holder claim gets. The holder still releases their
+    # own lock: ``agent_id != requesting_agent_id`` is false when the
+    # requester IS the holder, so this guard doesn't fire for
+    # self-release. Operators never reach this tool (it is gated to
+    # ``kind == "agent_bearer"``), so there is no operator/admin
+    # force-release affordance to preserve here.
     if (
         resolved_abs_filepath in g.file_map
         and g.file_map[resolved_abs_filepath].get("agent_id") != requesting_agent_id
-        and new_status != "released"  # Can always release, even if map is out of sync.
     ):
         current_holder_agent_id = g.file_map[resolved_abs_filepath].get(
             "agent_id", "another agent"
@@ -197,11 +210,12 @@ async def update_file_status_tool_impl(
         # Another agent holds the claim. Conflict (HTTP 409) rather
         # than PermissionDenied — the caller's principal is fine,
         # the state of the file map blocks the operation.
+        verb = "release" if new_status == "released" else "claim"
         return Conflict(
             reason=(
                 f"File '{filepath_arg}' (resolved: {resolved_abs_filepath}) "
                 f"is already being used by agent "
-                f"'{current_holder_agent_id}'. Cannot claim it with status "
+                f"'{current_holder_agent_id}'. Cannot {verb} it with status "
                 f"'{new_status}'."
             )
         )
@@ -209,9 +223,9 @@ async def update_file_status_tool_impl(
     # Update the file map (g.file_map)
     if new_status == "released":
         if resolved_abs_filepath in g.file_map:
-            # The original code allowed any agent to release if they knew
-            # the path and it was in file_map. For 1-to-1, we keep this
-            # behavior.
+            # Reached only when the requester IS the holder (the
+            # ownership gate above returns Conflict for a foreign
+            # holder) — self-release of one's own advisory lock.
             del g.file_map[resolved_abs_filepath]
             log_audit(
                 requesting_agent_id,
