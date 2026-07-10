@@ -691,7 +691,16 @@ async def overview_handler(req: web.Request) -> web.Response:
     if _app._overview_cache is not None and _app._overview_cache[0] > now:
         envelope = _app._overview_cache[1]
     else:
-        envelope = _app._build_overview_envelope()
+        # OBS-R34-RENAME-ONLOOP class-sweep: ``_build_overview_envelope``
+        # loops over every project calling ``_is_active`` (blocking
+        # ``systemctl is-active`` subprocess) plus a blocking SQLite COUNT
+        # fan-out, so building it directly stalls the single aiohttp event
+        # loop — every other concurrent router request — for N sequential
+        # subprocess calls. The builder is read-only (``_REGISTRY.list()``
+        # returns a fresh snapshot; no shared-state mutation), so run the
+        # whole thing off-loop via ``asyncio.to_thread`` (mirrors the
+        # rename/stop fixes and delete's BL-R7-3).
+        envelope = await asyncio.to_thread(_app._build_overview_envelope)
         _app._overview_cache = (now + _app._OVERVIEW_CACHE_TTL_SEC, envelope)
     # SEC FINDING 4: the envelope is cached process-wide (full, cross-
     # tenant); filter the ``projects`` list per-request to the caller's
