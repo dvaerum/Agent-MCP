@@ -162,6 +162,23 @@ async def create_project_handler(req: web.Request) -> web.Response:
         return _app._error_envelope(
             error=_app._ERROR_INVALID_NAME, message=err, status=400,
         )
+    # BL-R33-1 [data-integrity/routing]: refuse to create a REAL project
+    # whose name is a currently-active grace-period alias of ANOTHER
+    # project. ``orchestrator.resolve()`` returns the real project BEFORE
+    # falling back to the alias, so a create on an active-alias name would
+    # silently SHADOW the alias and redirect legacy clients (still hitting
+    # the old name during its ADR-0010 deprecation window) into a DIFFERENT
+    # project/DB — with no 409, no deprecation header, no warning. Mirror
+    # the sibling ``rename_project_handler`` guard exactly (same
+    # ``resolve_alias`` check, ``_ERROR_ALIAS_COLLISION``, 409, message
+    # shape) so create enforces the same invariant as rename / add_alias.
+    # An EXPIRED alias returns None here, so it stays reclaimable.
+    if _app._REGISTRY.resolve_alias(name) is not None:
+        return _app._error_envelope(
+            error=_app._ERROR_ALIAS_COLLISION,
+            message=f"name {name!r} is an active alias",
+            status=409,
+        )
     workspace = (_app.DEFAULT_WORKSPACE_PARENT / name).expanduser().resolve()
     try:
         workspace.mkdir(parents=True, exist_ok=True)

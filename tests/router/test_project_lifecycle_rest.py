@@ -138,6 +138,62 @@ async def test_create_project_requires_strict_accept_header(
     assert resp.status == 406
 
 
+async def test_create_project_rejects_active_alias_name(
+    aiohttp_client, router_app, router_module, register_project,
+) -> None:
+    """BL-R33-1: a create whose name is an ACTIVE grace-period alias of
+    another project must 409 ALIAS_COLLISION — not silently create a
+    real project that shadows the alias and redirects legacy clients.
+
+    Mirrors ``rename``'s active-alias guard (which already rejects at
+    409): create was the last project-name-write path missing it.
+    """
+    register_project("real-project")
+    router_module._REGISTRY.add_alias("real-project", "old-a")
+    # Sanity: the alias is currently active, so resolve() would re-point
+    # ``old-a`` at ``real-project``.
+    assert router_module._REGISTRY.resolve_alias("old-a") == "real-project"
+
+    client = await aiohttp_client(router_app)
+    resp = await client.post(
+        "/agent-mcp/api/router/projects",
+        data=json.dumps({"name": "old-a"}),
+        headers=_STRICT_ACCEPT,
+    )
+
+    assert resp.status == 409, f"got {resp.status}: {await resp.text()}"
+    body = await resp.json()
+    assert body["success"] is False
+    assert body["error"] == "alias_collision"
+    # The alias must NOT have been shadowed by a new real project.
+    assert router_module._REGISTRY.get("old-a") is None
+    assert router_module._REGISTRY.resolve_alias("old-a") == "real-project"
+
+
+async def test_create_project_reclaims_expired_alias_name(
+    aiohttp_client, router_app, router_module, register_project,
+) -> None:
+    """BL-R33-1 boundary: an EXPIRED alias is reclaimable — the guard only
+    blocks ACTIVE aliases. ``resolve_alias`` returns None for a past-due
+    alias, so creating that name succeeds."""
+    register_project("real-project")
+    # grace_days=0 → dead on arrival; resolve_alias never returns it.
+    router_module._REGISTRY.add_alias("real-project", "old-a", grace_days=0)
+    assert router_module._REGISTRY.resolve_alias("old-a") is None
+
+    client = await aiohttp_client(router_app)
+    resp = await client.post(
+        "/agent-mcp/api/router/projects",
+        data=json.dumps({"name": "old-a"}),
+        headers=_STRICT_ACCEPT,
+    )
+
+    assert resp.status == 201, f"got {resp.status}: {await resp.text()}"
+    body = await resp.json()
+    assert body["success"] is True
+    assert body["project"]["name"] == "old-a"
+
+
 # ── DELETE /api/router/projects/<name> — unregister ────────────────────────
 
 
