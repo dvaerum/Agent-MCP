@@ -68,9 +68,14 @@ def _set_toggle(value: bool) -> None:
     conn.close()
 
 
-def _seed_root_task(title: str = "root") -> str:
+def _seed_root_task(title: str = "root", assigned_to: str | None = None) -> str:
     """Insert a parent-less ROOT task so worker Mode-0 filings have a
-    parent to hang under (agents can never create root tasks)."""
+    parent to hang under (agents can never create root tasks).
+
+    AZ-R19-1: a worker may only file under a parent it OWNS, so callers
+    that expect a worker filing to succeed must seed ``assigned_to`` as
+    the worker's id.
+    """
     import secrets
 
     from agent_mcp.db.connection import get_db_connection
@@ -83,7 +88,7 @@ def _seed_root_task(title: str = "root") -> str:
         "INSERT INTO tasks (task_id, title, description, status, priority, "
         "assigned_to, created_by, created_at, updated_at, parent_task) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (task_id, title, "root desc", "pending", "medium", None,
+        (task_id, title, "root desc", "pending", "medium", assigned_to,
          "admin", now, now, None),
     )
     conn.commit()
@@ -101,7 +106,8 @@ async def test_worker_can_create_unassigned_task_with_default_toggle(
     creating root tasks on the Mode-0 path."""
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
-        parent_id = _seed_root_task()
+        # AZ-R19-1: worker may only file under a parent it owns.
+        parent_id = _seed_root_task(assigned_to="alice")
 
         result = await alice.call(
             "assign_task",

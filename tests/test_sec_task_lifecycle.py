@@ -167,7 +167,10 @@ def _audit_actor(action_type: str) -> str | None:
 async def test_worker_mode0_created_by_records_worker(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
-        root = _seed_task(title="root", parent_task=None)
+        # AZ-R19-1: a worker may only file under a parent it OWNS. Seed
+        # the parent assigned to alice so this test exercises the
+        # created_by provenance it targets, not the ownership gate.
+        root = _seed_task(title="root", parent_task=None, assigned_to="alice")
 
         result = await alice.call(
             "assign_task",

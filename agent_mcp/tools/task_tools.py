@@ -577,6 +577,7 @@ async def _create_unassigned_tasks(
                         "via assign_task must specify a parent_task_id."
                     )
                 )
+            worker_parent_ids = [t.get("parent_task_id") for t in tasks]
         elif not parent_task_id_arg:
             return Conflict(
                 reason=(
@@ -584,6 +585,38 @@ async def _create_unassigned_tasks(
                     "parent_task_id when filing an unassigned task."
                 )
             )
+        else:
+            worker_parent_ids = [parent_task_id_arg]
+
+        # AZ-R19-1: a WORKER may only attach a child under a parent it
+        # OWNS (parent.assigned_to == worker). Without this gate a worker
+        # could inject an attacker-titled child under ANY foreign /
+        # operator-owned parent, mutating the victim parent's child_tasks
+        # JSON mirror (a cross-agent stored-injection primitive — the
+        # victim sees an unexpected child appear under their task). Mirrors
+        # the ownership gate ``add_task_note`` / ``request_assistance``
+        # enforce (assigned_to == requesting agent). A FOREIGN *or*
+        # NONEXISTENT parent collapses to the SAME phantom NotFound the
+        # existence-oracle-safe siblings return (AZ-R17-1 / AZ-R18-1) so a
+        # worker can't distinguish "not yours" from "doesn't exist".
+        # Operator/manager callers never carry ``_worker_created_by`` (it's
+        # stripped in ``_authorize_assign_task``), so ``worker_created_by``
+        # is None for them and they keep the ability to parent under any
+        # task — this gate is worker-only.
+        from ..db.connection import get_db_connection_read
+
+        _read_conn = get_db_connection_read()
+        try:
+            _read_cur = _read_conn.cursor()
+            for _pid in worker_parent_ids:
+                _read_cur.execute(
+                    "SELECT assigned_to FROM tasks WHERE task_id = ?", (_pid,)
+                )
+                _prow = _read_cur.fetchone()
+                if _prow is None or _prow["assigned_to"] != worker_created_by:
+                    return NotFound(resource="task", identifier=_pid)
+        finally:
+            _read_conn.close()
 
     # Define the write operation as an async function
     async def write_operation():
@@ -2072,6 +2105,33 @@ async def create_self_task_tool_impl(
                     f"was terminated during task placement."
                 )
             )
+
+        # AZ-R19-1 (class-sweep sibling of the Mode-0 fix): a worker may
+        # only parent its self-task under a task it OWNS (assigned_to ==
+        # itself). An unguarded parent link lets a worker inject an
+        # attacker-titled child under ANY foreign parent, mutating that
+        # parent's child_tasks JSON mirror (a cross-agent stored-injection
+        # primitive — the victim sees an unexpected child appear under
+        # their task). A FOREIGN *or* NONEXISTENT parent collapses to the
+        # SAME phantom NotFound the Mode-0 / add_task_note /
+        # request_assistance gates return (no existence oracle).
+        # Supervision-tier callers (``tasks.assign``: operator / manager /
+        # sysadmin) are exempt, mirroring the Mode-0 gate's
+        # ``is_admin_request`` exemption. Checks ``final_parent_task_id``
+        # so an accepted RAG re-parent suggestion is covered too.
+        _is_privileged = principal is not None and principal.has_capability(
+            "tasks.assign"
+        )
+        if not _is_privileged and final_parent_task_id is not None:
+            cursor.execute(
+                "SELECT assigned_to FROM tasks WHERE task_id = ?",
+                (final_parent_task_id,),
+            )
+            _prow = cursor.fetchone()
+            if _prow is None or _prow["assigned_to"] != requesting_agent_id:
+                return NotFound(
+                    resource="task", identifier=final_parent_task_id
+                )
 
         # PR 6: task INSERT via task_repo with the caller's cursor.
         from ..repositories import agent_repo, task_repo
@@ -4754,29 +4814,98 @@ async def delete_task_tool_impl(
                         f"Deleted child task '{descendant_id}'"
                     )
 
-        # Handle dependent tasks
-        if dependent_tasks and force_delete:
-            for dep_row in dependent_tasks:
-                dep_id = dep_row["task_id"]
-                cursor.execute(
-                    "SELECT depends_on_tasks FROM tasks WHERE task_id = ?", (dep_id,)
-                )
-                dep_task_row = cursor.fetchone()
+        # Handle dependent tasks.
+        #
+        # BL-R19-1: reconcile dangling ``depends_on_tasks`` references
+        # across the WHOLE deleted set (root + every cascade-deleted
+        # descendant), not just the root. Previously only tasks depending
+        # on the ROOT were cleaned; an OUTSIDE task depending on a
+        # cascade-deleted DESCENDANT kept a reference to a now-absent id.
+        # ``auto_update_dependencies`` only advances a dependent when a
+        # dependency *completes* — it never fires for a *deleted*
+        # dependency — so that outside task stalled at ``pending`` forever
+        # (silent workflow stall). Same "delete must reconcile references"
+        # class as BL-2 / BL-R4-1, extended from the root to the subtree.
+        reeval_candidates: set = set()
+        if force_delete:
+            deleted_id_set = set(delete_set_ids)  # root + all descendants
 
-                if dep_task_row:
-                    dep_dependencies = json.loads(
-                        dep_task_row["depends_on_tasks"] or "[]"
+            # Gather every OUTSIDE task referencing any deleted id in its
+            # deps. Read all rows first (before any write) so a task that
+            # references two deleted ids is captured with its ORIGINAL
+            # dep list exactly once.
+            affected_deps: Dict[str, List[str]] = {}
+            for deleted_id in delete_set_ids:
+                cursor.execute(
+                    "SELECT task_id, depends_on_tasks FROM tasks "
+                    "WHERE json_extract(depends_on_tasks, '$') LIKE ?",
+                    (f'%"{deleted_id}"%',),
+                )
+                for dep_row in cursor.fetchall():
+                    dep_id = dep_row["task_id"]
+                    if dep_id in deleted_id_set:
+                        continue  # itself being deleted — no reconcile
+                    affected_deps.setdefault(
+                        dep_id,
+                        json.loads(dep_row["depends_on_tasks"] or "[]"),
                     )
-                    if task_id in dep_dependencies:
-                        dep_dependencies.remove(task_id)
-                        _task_repo.update_fields(
-                            dep_id,
-                            {"depends_on_tasks": dep_dependencies},
-                            connection=cursor,
-                        )
-                        deps_to_refresh.add(dep_id)
+
+            for dep_id, dep_dependencies in affected_deps.items():
+                pruned = [
+                    d for d in dep_dependencies if d not in deleted_id_set
+                ]
+                if pruned != dep_dependencies:
+                    _task_repo.update_fields(
+                        dep_id,
+                        {"depends_on_tasks": pruned},
+                        connection=cursor,
+                    )
+                    deps_to_refresh.add(dep_id)
+                    reeval_candidates.add(dep_id)
+                    cascade_operations.append(
+                        f"Updated task '{dep_id}' to remove dependency on "
+                        f"deleted task(s) in the '{task_id}' cascade"
+                    )
+
+            # BL-R19-1: re-evaluate each unblocked task. A ``pending`` task
+            # whose remaining deps are all completed advances to
+            # ``in_progress`` — mirrors the auto-advance in the
+            # update_task_status path (auto_update_dependencies). Without
+            # this a task whose last blocking dependency was deleted would
+            # never progress on its own (deletion, unlike completion, never
+            # triggers the advance).
+            for dep_id in reeval_candidates:
+                cursor.execute(
+                    "SELECT status, depends_on_tasks FROM tasks "
+                    "WHERE task_id = ?",
+                    (dep_id,),
+                )
+                row = cursor.fetchone()
+                if row is None or row["status"] != "pending":
+                    continue
+                remaining = json.loads(row["depends_on_tasks"] or "[]")
+                all_completed = True
+                for rid in remaining:
+                    cursor.execute(
+                        "SELECT status FROM tasks WHERE task_id = ?", (rid,)
+                    )
+                    r2 = cursor.fetchone()
+                    if r2 is None or r2["status"] != "completed":
+                        all_completed = False
+                        break
+                if all_completed:
+                    advance = await _update_single_task(
+                        cursor,
+                        dep_id,
+                        "in_progress",
+                        "admin",
+                        True,
+                        "Auto-advanced: blocking dependency deleted",
+                    )
+                    if advance.get("success"):
                         cascade_operations.append(
-                            f"Updated task '{dep_id}' to remove dependency on '{task_id}'"
+                            f"Auto-advanced task '{dep_id}' to in_progress "
+                            f"(blocking dependency deleted)"
                         )
 
         # Delete the main task through the repo (cache + publish deferred
