@@ -188,6 +188,56 @@ async def _get_embeddings_batch_openai(
         return False
 
 
+def _watermark_after_failures(
+    old_watermark: Any,
+    uncapped_max: Any,
+    source_type: str,
+    source_mod_time: Dict[Tuple[str, str], Any],
+    fully_embedded_sources: set,
+    sources_with_failed_chunks: set,
+) -> Any:
+    """Cap an incremental RAG watermark so it never advances past a row
+    that failed to embed this cycle (BL-R31-1).
+
+    The periodic indexer selects rows with ``updated_at > watermark``.
+    If the watermark advanced to the max ``updated_at`` of *scanned*
+    rows while some of them failed to embed, those rows are never
+    re-selected and ``ask_project_rag`` serves them stale forever. This
+    holds the watermark strictly below the earliest failed row's
+    mod-time so it is re-scanned next cycle, while still advancing over
+    the rows that embedded cleanly below it.
+
+    ``source_type`` filters the source keys (both sets key on the row's
+    scan type — e.g. ``"context"`` / ``"task"``). ``old_watermark`` is
+    the value already stored in ``rag_meta`` (used as the floor so the
+    watermark never regresses); ``uncapped_max`` is the value the caller
+    would have written with no failures. All compared values share a
+    type per source_type (ISO strings for context/task, float mtimes for
+    markdown/code), so the ``min``/``max`` are well-defined.
+
+    Trade-off: a permanently-failing row pins the watermark at its
+    predecessor, so newer clean rows above it are re-scanned every cycle
+    — cheap, since their hash matches and they are not re-embedded.
+    Content still reaches the index; only the watermark is held. This is
+    the intended bounded-retry behaviour.
+    """
+    failed_times = [
+        source_mod_time[k]
+        for k in sources_with_failed_chunks
+        if k[0] == source_type and k in source_mod_time
+    ]
+    if not failed_times:
+        return uncapped_max
+    earliest_failed = min(failed_times)
+    candidates = [old_watermark]
+    for k in fully_embedded_sources:
+        if k[0] == source_type and k in source_mod_time:
+            mod_time = source_mod_time[k]
+            if mod_time < earliest_failed:
+                candidates.append(mod_time)
+    return max(candidates)
+
+
 async def run_rag_indexing_periodically(
     interval_seconds: int = 300, *, task_status=anyio.TASK_STATUS_IGNORED
 ) -> NoReturn:
@@ -570,6 +620,23 @@ async def run_rag_indexing_periodically(
                     if last_mod_iso > max_task_mod_time_iso:
                         max_task_mod_time_iso = last_mod_iso
 
+            # Map (source_type, source_ref) -> the row's mod-time (float
+            # st_mtime for markdown/code, ISO ``updated_at`` for
+            # context/task). Consulted at the watermark-advance step so
+            # the incremental high-water mark is never pushed past a row
+            # that failed to embed this cycle (BL-R31-1).
+            source_mod_time: Dict[Tuple[str, str], Any] = {
+                (s_type, s_ref): mod_time
+                for s_type, s_ref, _content, mod_time, _hash in sources_to_check
+            }
+            # Populated after embedding: sources whose EVERY chunk
+            # embedded (safe to advance past) vs. sources with >=1 failed
+            # chunk (must be re-selected next cycle). Default empty so the
+            # watermark logic below is a straight no-op when nothing was
+            # embedded this cycle.
+            fully_embedded_sources: set = set()
+            sources_with_failed_chunks: set = set()
+
             # Filter sources based on hash comparison (Original main.py:608-615)
             sources_to_process_for_embedding: List[Tuple[str, str, str, str]] = (
                 []
@@ -814,6 +881,35 @@ async def run_rag_indexing_periodically(
                                 "More than half of the embeddings failed. Marking RAG indexing cycle for these sources as unsuccessful."
                             )
 
+                    # Per-source embedding outcome (BL-R31-1). A source
+                    # row counts as fully embedded only when EVERY one of
+                    # its chunks produced a vector. A row with any failed
+                    # chunk must NOT advance its hash and must hold the
+                    # incremental watermark back, or the next cycle's
+                    # ``updated_at > watermark`` scan would never re-select
+                    # it and ask_project_rag would serve it stale forever.
+                    source_total_chunks: Dict[Tuple[str, str], int] = {}
+                    source_failed_chunks: Dict[Tuple[str, str], int] = {}
+                    for chunk_idx, (
+                        s_type,
+                        s_ref,
+                        _s_hash,
+                        _s_meta,
+                    ) in enumerate(chunk_source_metadata_map):
+                        src_key = (s_type, s_ref)
+                        source_total_chunks[src_key] = (
+                            source_total_chunks.get(src_key, 0) + 1
+                        )
+                        if all_embeddings_vectors[chunk_idx] is None:
+                            source_failed_chunks[src_key] = (
+                                source_failed_chunks.get(src_key, 0) + 1
+                            )
+                    for src_key in source_total_chunks:
+                        if source_failed_chunks.get(src_key, 0) == 0:
+                            fully_embedded_sources.add(src_key)
+                        else:
+                            sources_with_failed_chunks.add(src_key)
+
                     # Insert new chunks and embeddings into DB.
                     # PR F: rag_repo.bulk_index_chunks owns the
                     # chunk + embedding INSERT pair and the
@@ -854,13 +950,21 @@ async def run_rag_indexing_periodically(
                             )
                             if n_written > 0:
                                 inserted_count += n_written
-                                # Mark this source's hash to be updated in rag_meta
-                                meta_key_for_hash_update = (
-                                    f"hash_{source_type}_{source_ref}"
-                                )
-                                processed_hashes_to_update_in_meta[
-                                    meta_key_for_hash_update
-                                ] = current_hash_of_source
+                                # Only advance the stored hash when the
+                                # ENTIRE source embedded (BL-R31-1). A
+                                # partially-embedded row keeps its old
+                                # hash so the next cycle re-embeds it in
+                                # full instead of leaving chunks missing.
+                                if (
+                                    source_type,
+                                    source_ref,
+                                ) in fully_embedded_sources:
+                                    meta_key_for_hash_update = (
+                                        f"hash_{source_type}_{source_ref}"
+                                    )
+                                    processed_hashes_to_update_in_meta[
+                                        meta_key_for_hash_update
+                                    ] = current_hash_of_source
 
                         logger.info(
                             f"Successfully inserted {inserted_count} new chunks/embeddings."
@@ -916,10 +1020,22 @@ async def run_rag_indexing_periodically(
             if (
                 "embeddings_api_successful" not in locals() or embeddings_api_successful
             ):  # Check if flag exists and is True
+                # Cap every watermark below the earliest row that failed
+                # to embed this cycle so failed rows are re-scanned next
+                # cycle (BL-R31-1). With no failures these collapse to the
+                # original ``max_*`` values.
                 if not DISABLE_AUTO_INDEXING:
+                    capped_md_ts = _watermark_after_failures(
+                        last_md_timestamp,
+                        max_md_mod_timestamp,
+                        "markdown",
+                        source_mod_time,
+                        fully_embedded_sources,
+                        sources_with_failed_chunks,
+                    )
                     new_md_time_iso = (
                         datetime.datetime.fromtimestamp(
-                            max_md_mod_timestamp
+                            capped_md_ts
                         ).isoformat()
                         + "Z"
                     )
@@ -928,17 +1044,33 @@ async def run_rag_indexing_periodically(
                         last_indexed_at=new_md_time_iso,
                         connection=cursor,
                     )
+                capped_ctx_iso = _watermark_after_failures(
+                    last_ctx_time_str,
+                    max_ctx_mod_time_iso,
+                    "context",
+                    source_mod_time,
+                    fully_embedded_sources,
+                    sources_with_failed_chunks,
+                )
                 rag_repo.set_meta(
                     source_type="context",
-                    last_indexed_at=max_ctx_mod_time_iso,
+                    last_indexed_at=capped_ctx_iso,
                     connection=cursor,
                 )
 
                 # Only update code and tasks timestamps in advanced mode
                 if ADVANCED_EMBEDDINGS:
+                    capped_code_ts = _watermark_after_failures(
+                        last_code_timestamp,
+                        max_code_mod_timestamp,
+                        "code",
+                        source_mod_time,
+                        fully_embedded_sources,
+                        sources_with_failed_chunks,
+                    )
                     new_code_time_iso = (
                         datetime.datetime.fromtimestamp(
-                            max_code_mod_timestamp
+                            capped_code_ts
                         ).isoformat()
                         + "Z"
                     )
@@ -947,9 +1079,19 @@ async def run_rag_indexing_periodically(
                         last_indexed_at=new_code_time_iso,
                         connection=cursor,
                     )
+                    # Task rows scan as source_type "task" (singular);
+                    # the watermark meta key is "tasks".
+                    capped_task_iso = _watermark_after_failures(
+                        last_task_time_str,
+                        max_task_mod_time_iso,
+                        "task",
+                        source_mod_time,
+                        fully_embedded_sources,
+                        sources_with_failed_chunks,
+                    )
                     rag_repo.set_meta(
                         source_type="tasks",
-                        last_indexed_at=max_task_mod_time_iso,
+                        last_indexed_at=capped_task_iso,
                         connection=cursor,
                     )
                 # Add other source types here
