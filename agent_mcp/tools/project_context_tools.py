@@ -1028,7 +1028,14 @@ def _single_update_inline(
             existing.value = value_json_str
             existing.updated_at = now_iso
             existing.updated_by = requesting_agent_id
-            existing.description = description_for_context
+            # BL-R22-1: partial-update parity with the REST handler
+            # (memories.py: `if description is not None: row.description
+            # = description`). `description_for_context` is
+            # `arguments.get("description")`, so `None` means the caller
+            # omitted it — a value-only update must PRESERVE the
+            # existing description, not NULL it.
+            if description_for_context is not None:
+                existing.description = description_for_context
             # created_at / created_by stay frozen on UPDATE
 
         raw_conn = session.connection().connection
@@ -1325,6 +1332,13 @@ def _bulk_update_inline(
             try:
                 context_key = update["context_key"]
                 context_value = update["context_value"]
+                # BL-R22-1: distinguish "caller explicitly supplied a
+                # description for this item" from "omitted". The junk
+                # `"Bulk update operation N"` default must ONLY seed a
+                # fresh CREATE — on an UPDATE a value-only item must
+                # PRESERVE the existing description (REST partial-update
+                # parity), so `.get(..., default)` alone can't be used.
+                description_provided = "description" in update
                 description = update.get(
                     "description", f"Bulk update operation {i+1}"
                 )
@@ -1352,7 +1366,8 @@ def _bulk_update_inline(
                     existing.value = value_json_str
                     existing.updated_at = now_iso
                     existing.updated_by = requesting_agent_id
-                    existing.description = description
+                    if description_provided:
+                        existing.description = description
 
                 session.flush()
                 results.append(f"✓ Updated '{context_key}'")
