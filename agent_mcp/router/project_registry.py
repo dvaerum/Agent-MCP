@@ -83,10 +83,67 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, TypedDict
 
-__all__ = ["Alias", "Project", "ProjectRegistry", "REGISTRY_PATH"]
+__all__ = [
+    "Alias",
+    "AliasCollision",
+    "InvalidName",
+    "Project",
+    "ProjectNameTaken",
+    "ProjectRegistry",
+    "RegistryError",
+    "REGISTRY_PATH",
+    "UnknownProject",
+]
 
 
 log = logging.getLogger(__name__)
+
+
+# ── Typed mutation failures ─────────────────────────────────────────
+#
+# PF-R37-1 (500-hygiene / error-mapping class): the registry's write
+# methods (``register`` / ``add_alias`` / ``rename``) previously signalled
+# every semantically-distinct failure with a bare ``ValueError`` /
+# ``KeyError`` whose meaning was carried ONLY in the message string. The
+# REST handlers then had to string-match (fragile) or, worse, collapse the
+# whole group to a single HTTP status — ``rename_project_handler`` mapped
+# EVERY ``(ValueError, KeyError)`` to a 500, so a concurrent rename to an
+# already-taken name (the atomic "already registered" guard) surfaced a
+# 500 instead of a 409.
+#
+# These typed exceptions give each failure mode a stable identity a handler
+# can map to the correct 404 / 409 / 400. They SUBCLASS the built-ins they
+# replace (``UnknownProject`` is a ``KeyError``; the rest are ``ValueError``)
+# so every existing ``except ValueError`` / ``except KeyError`` / bare
+# ``pytest.raises(ValueError)`` keeps catching them unchanged — the typing
+# is purely additive. A handler catches the specific subclass for a precise
+# status and reserves a bare-``ValueError``/``KeyError`` backstop for a
+# genuine internal error → 500.
+class RegistryError(Exception):
+    """Base for a registry mutation refused for a *semantic* reason
+    (name taken, unknown project, alias collision, invalid name) — as
+    opposed to a genuine internal fault. Handlers map these to 4xx and
+    reserve 500 for everything else."""
+
+
+class UnknownProject(RegistryError, KeyError):
+    """The named project isn't registered → HTTP 404. Subclasses
+    ``KeyError`` so callers doing ``except KeyError`` still catch it."""
+
+
+class InvalidName(RegistryError, ValueError):
+    """A project / alias name failed slug validation → HTTP 400."""
+
+
+class ProjectNameTaken(RegistryError, ValueError):
+    """The target name is already a REGISTERED project → HTTP 409.
+    Distinct from ``AliasCollision``: this is a real project, not a
+    grace-period alias."""
+
+
+class AliasCollision(RegistryError, ValueError):
+    """The target name is a currently-ACTIVE alias of another project →
+    HTTP 409. An expired alias is reclaimable and never raises this."""
 
 
 # Default location. Overridable per-instance (constructor takes
@@ -229,7 +286,7 @@ class ProjectRegistry:
             if existing is not None:
                 existing_row = self._materialise(name, existing)
                 if existing_row["workspace"] != workspace:
-                    raise ValueError(
+                    raise ProjectNameTaken(
                         f"project {name!r} is already registered at "
                         f"{existing_row['workspace']!r}; refusing to "
                         f"re-point at {workspace!r}"
@@ -264,7 +321,7 @@ class ProjectRegistry:
                     except (KeyError, ValueError):
                         continue
                     if exp > now:
-                        raise ValueError(
+                        raise AliasCollision(
                             f"name {name!r} is already an active alias "
                             f"for project {other_name!r}"
                         )
@@ -315,12 +372,17 @@ class ProjectRegistry:
             return them anyway, so reclamation is safe and useful
             after a long-overdue cleanup.)
 
-        Raises:
-            ValueError: on any validation failure.
-            KeyError: if `name` is not a registered project.
+        Raises (typed subclasses of the built-ins, so existing
+        ``except (KeyError, ValueError)`` still catch them):
+            UnknownProject (KeyError): `name` is not a registered project.
+            InvalidName (ValueError): `alias` fails slug validation.
+            ProjectNameTaken (ValueError): `alias` collides with a real
+                project name (and is not dead-on-arrival expired).
+            AliasCollision (ValueError): `alias` is a currently-active
+                alias of some other project.
         """
         if not _SLUG_RE.match(alias):
-            raise ValueError(
+            raise InvalidName(
                 f"alias {alias!r} is not a valid slug — must match "
                 f"{_SLUG_RE.pattern}"
             )
@@ -348,10 +410,10 @@ class ProjectRegistry:
 
         with self._lock_for_write() as (fd, data):
             if name not in data:
-                raise KeyError(name)
+                raise UnknownProject(name)
 
             if alias in data and not already_expired:
-                raise ValueError(
+                raise ProjectNameTaken(
                     f"alias {alias!r} collides with a real project name"
                 )
 
@@ -368,7 +430,7 @@ class ProjectRegistry:
                         # Malformed entry — treat as expired.
                         continue
                     if entry_exp > now:
-                        raise ValueError(
+                        raise AliasCollision(
                             f"alias {alias!r} is already an active alias "
                             f"for project {other_name!r}"
                         )
@@ -429,13 +491,17 @@ class ProjectRegistry:
         (`agent_mcp.router.app.rename_handler`). This method only
         rewrites the registry file.
 
-        Raises:
-            KeyError: if `old_name` isn't registered.
-            ValueError: if `new_name` is invalid or already taken
-                (project or active alias).
+        Raises (all subclass the built-in they replace, so existing
+        ``except KeyError`` / ``except ValueError`` catch them unchanged):
+            UnknownProject (KeyError): `old_name` isn't registered → 404.
+            ProjectNameTaken (ValueError): `new_name` is a registered
+                project → 409.
+            AliasCollision (ValueError): `new_name` is a currently-active
+                alias of another project → 409.
+            InvalidName (ValueError): `new_name` fails slug validation → 400.
         """
         if not _SLUG_RE.match(new_name):
-            raise ValueError(
+            raise InvalidName(
                 f"new name {new_name!r} is not a valid slug — must match "
                 f"{_SLUG_RE.pattern}"
             )
@@ -446,9 +512,9 @@ class ProjectRegistry:
 
         with self._lock_for_write() as (fd, data):
             if old_name not in data:
-                raise KeyError(old_name)
+                raise UnknownProject(old_name)
             if new_name in data:
-                raise ValueError(
+                raise ProjectNameTaken(
                     f"project {new_name!r} is already registered"
                 )
 
@@ -464,7 +530,7 @@ class ProjectRegistry:
                     except (KeyError, ValueError):
                         continue
                     if exp > now:
-                        raise ValueError(
+                        raise AliasCollision(
                             f"name {new_name!r} is already an active "
                             f"alias for project {other_name!r}"
                         )

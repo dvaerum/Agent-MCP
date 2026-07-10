@@ -433,3 +433,78 @@ def test_rename_rejects_when_new_name_exists(reg) -> None:
 def test_rename_rejects_unknown_old_name(reg) -> None:
     with pytest.raises(KeyError):
         reg.rename("nope", "yep")
+
+
+# ── PF-R37-1: registry mutation failures carry a typed identity ──────
+#
+# Each signal subclasses the built-in it replaces, so every existing
+# ``except (ValueError, KeyError)`` / ``pytest.raises(ValueError)`` keeps
+# catching it — the typing is purely additive and lets a handler map each
+# failure mode to its correct 404 / 409 / 400 instead of collapsing the
+# whole group to a 500.
+
+
+def test_rename_new_name_taken_raises_project_name_taken(reg) -> None:
+    from agent_mcp.router import project_registry as pr
+
+    reg.register("alpha", "/tmp/alpha")
+    reg.register("beta", "/tmp/beta")
+    with pytest.raises(pr.ProjectNameTaken):
+        reg.rename("alpha", "beta")
+    assert issubclass(pr.ProjectNameTaken, ValueError)
+
+
+def test_rename_unknown_old_name_raises_unknown_project(reg) -> None:
+    from agent_mcp.router import project_registry as pr
+
+    with pytest.raises(pr.UnknownProject):
+        reg.rename("nope", "yep")
+    assert issubclass(pr.UnknownProject, KeyError)
+
+
+def test_rename_new_name_active_alias_raises_alias_collision(reg) -> None:
+    from agent_mcp.router import project_registry as pr
+
+    reg.register("alpha", "/tmp/alpha")
+    reg.register("beta", "/tmp/beta")
+    reg.add_alias("beta", "shared")
+    with pytest.raises(pr.AliasCollision):
+        reg.rename("alpha", "shared")
+
+
+def test_rename_invalid_new_name_raises_invalid_name(reg) -> None:
+    from agent_mcp.router import project_registry as pr
+
+    reg.register("alpha", "/tmp/alpha")
+    with pytest.raises(pr.InvalidName):
+        reg.rename("alpha", "Bad_Slug")
+
+
+def test_register_conflict_and_alias_raise_typed(reg) -> None:
+    from agent_mcp.router import project_registry as pr
+
+    reg.register("alpha", "/tmp/alpha")
+    # Re-register at a different workspace → ProjectNameTaken.
+    with pytest.raises(pr.ProjectNameTaken):
+        reg.register("alpha", "/tmp/other")
+    # Claiming a name that is an active alias of another project.
+    reg.register("beta", "/tmp/beta")
+    reg.add_alias("beta", "aliased")
+    with pytest.raises(pr.AliasCollision):
+        reg.register("aliased", "/tmp/aliased")
+
+
+def test_add_alias_typed_failures(reg) -> None:
+    from agent_mcp.router import project_registry as pr
+
+    reg.register("alpha", "/tmp/alpha")
+    reg.register("beta", "/tmp/beta")
+    with pytest.raises(pr.UnknownProject):
+        reg.add_alias("ghost", "x")
+    with pytest.raises(pr.InvalidName):
+        reg.add_alias("alpha", "Bad_Slug")
+    with pytest.raises(pr.ProjectNameTaken):
+        reg.add_alias("alpha", "beta")  # collides with a real project name
+    reg.add_alias("beta", "shared")
+    with pytest.raises(pr.AliasCollision):
+        reg.add_alias("alpha", "shared")  # active alias of beta

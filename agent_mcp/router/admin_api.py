@@ -260,6 +260,7 @@ async def rename_project_handler(req: web.Request) -> web.Response:
     are unchanged.
     """
     from . import app as _app
+    from . import project_registry as _registry
 
     if _app.SINGLE_TENANT_NAME is not None:
         return _app._single_tenant_disabled_response()
@@ -436,18 +437,60 @@ async def rename_project_handler(req: web.Request) -> web.Response:
         try:
             _app._REGISTRY.rename(old_name, new_name, grace_days=grace_days)
         except (ValueError, KeyError) as e:
+            # PF-R37-1 [500-hygiene / error-mapping class]: ``_REGISTRY.rename``
+            # signals SEMANTICALLY-DISTINCT failures — each now carries a typed
+            # identity (``project_registry`` exceptions that subclass
+            # ValueError/KeyError). The inside-lock re-checks above give a fast
+            # clean 404/409 for the SERIALISED cases (same old_name), but two
+            # renames with DIFFERENT old-names and the SAME new-name never
+            # serialise (``_ensure_lock`` keys on OLD_name), so the atomic
+            # ``ProjectNameTaken`` guard here is the ONLY backstop for that
+            # race — and it previously collapsed to a 500. Map each failure
+            # mode to its correct status; reserve 500 for a bare / unexpected
+            # ValueError/KeyError (a genuine internal fault, not a
+            # not-found/collision/invalid signal). Roll the workspace dir
+            # rename back first, then map.
             if new_workspace is not None and new_workspace.exists():
                 try:
                     os.rename(new_workspace, workspace)
                 except OSError:
                     pass
-            # SD-R6-2: don't reflect the raw ``ValueError``/``KeyError`` text
-            # (which can echo registry internals / caller input) into the
-            # client envelope. Log the detail server-side; hand back a
-            # generic message.
+            # SD-R6-2: never reflect the raw exception text (registry
+            # internals / caller input) into the client envelope — log the
+            # detail server-side, hand back a fixed reason phrase.
             logger.warning(
                 "registry rename %r -> %r failed: %s", old_name, new_name, e,
             )
+            if isinstance(e, _registry.UnknownProject):
+                # old_name vanished (lost a concurrent rename/delete race).
+                return _app._error_envelope(
+                    error=_app._ERROR_NOT_REGISTERED,
+                    message=f"unknown project: {old_name!r}",
+                    status=404,
+                )
+            if isinstance(e, _registry.ProjectNameTaken):
+                # new_name is a registered PROJECT (concurrent rename/create
+                # to the same new name won the atomic write). This is the
+                # PF-R37-1 edge: 409, not 500.
+                return _app._error_envelope(
+                    error=_app._ERROR_NAME_TAKEN,
+                    message="project name is already registered",
+                    status=409,
+                )
+            if isinstance(e, _registry.AliasCollision):
+                # new_name became a currently-active alias of another project.
+                return _app._error_envelope(
+                    error=_app._ERROR_ALIAS_COLLISION,
+                    message=f"name {new_name!r} is an active alias",
+                    status=409,
+                )
+            if isinstance(e, _registry.InvalidName):
+                return _app._error_envelope(
+                    error=_app._ERROR_INVALID_NAME,
+                    message="new name is not a valid slug",
+                    status=400,
+                )
+            # Genuine internal fault — not a semantic refusal.
             return _app._error_envelope(
                 error=_app._ERROR_INTERNAL,
                 message="registry rename failed",
