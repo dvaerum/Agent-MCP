@@ -28,6 +28,8 @@ import time
 
 import pytest
 
+from tests.harness import assert_ran_off_event_loop
+
 
 pytestmark = [pytest.mark.asyncio]
 
@@ -51,11 +53,13 @@ async def test_rename_systemctl_runs_off_event_loop(
     register_project("slow-rename")
 
     started = threading.Event()
+    started_at: list[float] = []
     BLOCK_SEC = 0.4
 
     def _blocking_systemctl(*args: str) -> subprocess.CompletedProcess:
         verb = args[0] if args else ""
         if verb == "stop":
+            started_at.append(time.monotonic())
             started.set()
             time.sleep(BLOCK_SEC)  # bounded: no permanent hang on regress
         return subprocess.CompletedProcess(list(args), 0, "", "")
@@ -64,17 +68,15 @@ async def test_rename_systemctl_runs_off_event_loop(
     from agent_mcp.router import project_orchestrator as _po
     monkeypatch.setattr(_po, "_systemctl", _blocking_systemctl)
 
-    loop_free_at: float | None = None
+    loop_free_at: list[float] = []
 
     async def _probe() -> None:
-        nonlocal loop_free_at
         while not started.is_set():
             await asyncio.sleep(0.005)
-        loop_free_at = time.monotonic()
+        loop_free_at.append(time.monotonic())
 
     client = await aiohttp_client(router_app)
 
-    t0 = time.monotonic()
     rename = asyncio.create_task(
         client.patch(
             "/agent-mcp/api/router/projects/slow-rename",
@@ -84,13 +86,9 @@ async def test_rename_systemctl_runs_off_event_loop(
     )
     probe = asyncio.create_task(_probe())
 
-    await asyncio.sleep(0.15)
-
-    assert loop_free_at is not None, "rename systemctl stop never began"
-    elapsed = loop_free_at - t0
-    assert elapsed < 0.25, (
-        f"event loop was blocked ~{elapsed:.3f}s during the rename "
-        "systemctl stop — it must run off-loop via asyncio.to_thread"
+    await assert_ran_off_event_loop(
+        started_at, loop_free_at, block_sec=BLOCK_SEC,
+        what="rename systemctl stop",
     )
 
     resp = await rename
@@ -116,6 +114,7 @@ async def test_stop_project_systemctl_runs_off_event_loop(
     register_project("slow-stop")
 
     started = threading.Event()
+    started_at: list[float] = []
     BLOCK_SEC = 0.4
 
     def _blocking_systemctl(*args: str) -> subprocess.CompletedProcess:
@@ -125,6 +124,7 @@ async def test_stop_project_systemctl_runs_off_event_loop(
         if verb == "is-active":
             return subprocess.CompletedProcess(list(args), 0, "", "")
         if verb == "stop":
+            started_at.append(time.monotonic())
             started.set()
             time.sleep(BLOCK_SEC)  # bounded: no permanent hang on regress
         return subprocess.CompletedProcess(list(args), 0, "", "")
@@ -134,17 +134,15 @@ async def test_stop_project_systemctl_runs_off_event_loop(
     from agent_mcp.router import project_orchestrator as _po
     monkeypatch.setattr(_po, "_systemctl", _blocking_systemctl)
 
-    loop_free_at: float | None = None
+    loop_free_at: list[float] = []
 
     async def _probe() -> None:
-        nonlocal loop_free_at
         while not started.is_set():
             await asyncio.sleep(0.005)
-        loop_free_at = time.monotonic()
+        loop_free_at.append(time.monotonic())
 
     client = await aiohttp_client(router_app)
 
-    t0 = time.monotonic()
     stop = asyncio.create_task(
         client.post(
             "/agent-mcp/api/router/projects/slow-stop/stop",
@@ -154,13 +152,9 @@ async def test_stop_project_systemctl_runs_off_event_loop(
     )
     probe = asyncio.create_task(_probe())
 
-    await asyncio.sleep(0.15)
-
-    assert loop_free_at is not None, "stop systemctl stop never began"
-    elapsed = loop_free_at - t0
-    assert elapsed < 0.25, (
-        f"event loop was blocked ~{elapsed:.3f}s during the stop-project "
-        "systemctl stop — it must run off-loop via asyncio.to_thread"
+    await assert_ran_off_event_loop(
+        started_at, loop_free_at, block_sec=BLOCK_SEC,
+        what="stop-project systemctl stop",
     )
 
     resp = await stop

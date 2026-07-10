@@ -40,6 +40,8 @@ import time
 import pytest
 from aiohttp import web
 
+from tests.harness import assert_ran_off_event_loop
+
 
 pytestmark = pytest.mark.asyncio
 
@@ -219,11 +221,13 @@ async def test_systemctl_start_runs_off_event_loop(
 
     register_project("slow")
     started = threading.Event()
+    started_at: list[float] = []
     BLOCK_SEC = 0.4
 
     def _blocking_systemctl(*args: str) -> subprocess.CompletedProcess:
         verb = args[0] if args else ""
         if verb in ("start", "restart"):
+            started_at.append(time.monotonic())
             started.set()
             time.sleep(BLOCK_SEC)  # bounded: no permanent hang on regress
             return subprocess.CompletedProcess(list(args), 0, "", "")
@@ -235,27 +239,21 @@ async def test_systemctl_start_runs_off_event_loop(
     monkeypatch.setattr(_po, "_systemctl", _blocking_systemctl)
     monkeypatch.setattr(router_module, "_systemctl", _blocking_systemctl)
 
-    loop_free_at: float | None = None
+    loop_free_at: list[float] = []
 
     async def _probe() -> None:
-        nonlocal loop_free_at
         while not started.is_set():
             await asyncio.sleep(0.005)
-        loop_free_at = time.monotonic()
+        loop_free_at.append(time.monotonic())
 
-    t0 = time.monotonic()
     warm = asyncio.create_task(_po._ensure("slow", "backend"))
     probe = asyncio.create_task(_probe())
 
-    # While systemctl blocks in its worker thread, the loop must stay
-    # free — the probe should record loop_free_at well before BLOCK_SEC.
-    await asyncio.sleep(0.15)
-
-    assert loop_free_at is not None, "systemctl start never began"
-    elapsed = loop_free_at - t0
-    assert elapsed < 0.25, (
-        f"event loop was blocked ~{elapsed:.3f}s during systemctl start "
-        "— it must run off-loop via asyncio.to_thread"
+    # While systemctl blocks in its worker thread, the loop must stay free —
+    # the probe records loop_free_at ~immediately after the start began.
+    await assert_ran_off_event_loop(
+        started_at, loop_free_at, block_sec=BLOCK_SEC,
+        what="systemctl start",
     )
 
     for task in (warm, probe):
