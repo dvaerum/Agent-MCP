@@ -244,10 +244,11 @@ async def test_assign_task_handoff_reassignment(tmp_path) -> None:
 
 async def test_create_self_task_worker_succeeds(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
-        # Seed a root task so the worker has something to parent under.
-        root = _seed_assigned_task("root task", "admin")
-
         alice = await admin.create_worker("alice")
+        # AZ-R19-1: a worker may only self-task under a parent it OWNS.
+        # Seed the parent assigned to alice so this test exercises the
+        # self-task creation path, not the ownership gate.
+        root = _seed_assigned_task("root task", alice.agent_id)
 
         result = await alice.call(
             "create_self_task",
