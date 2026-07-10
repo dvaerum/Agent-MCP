@@ -125,6 +125,78 @@ async def test_post_tasks_rejects_control_chars_only_title(tmp_path) -> None:
         assert payload.get("error") == "task_title_empty_after_strip", payload
 
 
+async def test_post_tasks_nonexistent_parent_is_404_not_500(tmp_path) -> None:
+    """PF-R32-1b (unvalidated caller-FK → 500): a well-formed but
+    NONEXISTENT ``parent_task`` must return 404 (parent not found), NOT
+    500. ``tasks.parent_task`` is a declared self-FK (migration 0007)
+    enforced with ``PRAGMA foreign_keys=ON``, so on origin/main the
+    unvalidated parent violates the FK at INSERT and surfaces as the
+    generic ``Failed to create task`` 500 — violating this router's
+    SEC-round-9 clean-4xx contract. No task row must be created."""
+    async with mcp_session(tmp_path) as admin:
+        r = admin.client.post(
+            "/api/tasks",
+            json={
+                "token": admin.admin_token,
+                "task_title": "orphan-parent task",
+                "task_description": "must never be created",
+                "parent_task": "task_does_not_exist_0123",
+            },
+        )
+        assert r.status_code == 404, r.text
+        assert r.json().get("success") is not True, r.json()
+        # Nothing was persisted.
+        listing = admin.client.get("/api/tasks").json()
+        assert "orphan-parent task" not in _json.dumps(listing), (
+            "a task with a nonexistent parent was persisted"
+        )
+
+
+async def test_post_tasks_valid_parent_still_creates(tmp_path) -> None:
+    """Regression: a child task naming an EXISTING ``parent_task`` still
+    creates (200) and is linked into the parent."""
+    async with mcp_session(tmp_path) as admin:
+        parent = admin.client.post(
+            "/api/tasks",
+            json={
+                "token": admin.admin_token,
+                "task_title": "parent task",
+                "task_description": "the root",
+            },
+        ).json()
+        parent_id = parent["task_id"]
+
+        child = admin.client.post(
+            "/api/tasks",
+            json={
+                "token": admin.admin_token,
+                "task_title": "child task",
+                "task_description": "under parent",
+                "parent_task": parent_id,
+            },
+        )
+        assert child.status_code == 200, child.text
+        assert child.json().get("success") is True, child.json()
+        assert "task_id" in child.json(), child.json()
+
+
+async def test_post_tasks_top_level_no_parent_still_creates(tmp_path) -> None:
+    """Regression: a top-level task (``parent_task`` absent/None) still
+    creates (200)."""
+    async with mcp_session(tmp_path) as admin:
+        r = admin.client.post(
+            "/api/tasks",
+            json={
+                "token": admin.admin_token,
+                "task_title": "top-level task",
+                "task_description": "no parent",
+                "parent_task": None,
+            },
+        )
+        assert r.status_code == 200, r.text
+        assert r.json().get("success") is True, r.json()
+
+
 async def test_delete_tasks_removes_task_with_admin_token(tmp_path) -> None:
     """DELETE /api/tasks/<id> with admin token removes the task."""
     async with mcp_session(tmp_path) as admin:
