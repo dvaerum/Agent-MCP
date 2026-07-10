@@ -868,6 +868,31 @@ async def update_task_details_api_route(
             # nonexistent / terminated agent behind a 200. Clearing the
             # assignment (new_assigned is None) stays allowed.
             if new_assigned is not None:
+                # BL-R18-1: TERMINAL is a sink on the ASSIGN axis too. A
+                # completed/cancelled/failed task must NOT be reassigned to
+                # a real agent — that re-pins finished work onto an active
+                # worker's queue, RESURRECTING it exactly as a direct
+                # completed->in_progress status write would (which the
+                # BL-R12-1 terminal-sink transition guard above 409s). The
+                # canonical unassign producers keep terminal as a sink on
+                # the clear branch (BL-R17-1, below); this closes the same
+                # invariant on the reassign branch. Mirror the status-path
+                # illegal-transition response shape: 409 Conflict. Checked
+                # BEFORE _agent_assignable so the task's own terminal state
+                # is reported regardless of the target agent's liveness.
+                from ...tools.task_tools import _TERMINAL_TASK_STATUSES
+                if prior_status in _TERMINAL_TASK_STATUSES:
+                    return JSONResponse(
+                        {
+                            "error": (
+                                f"Cannot reassign task '{task_id_to_update}': "
+                                f"its status '{prior_status}' is terminal "
+                                f"(completed/cancelled/failed). A terminal "
+                                f"task is a sink and may not be reassigned."
+                            )
+                        },
+                        status_code=409,
+                    )
                 from ...tools.task_tools import _agent_assignable
                 if not _agent_assignable(cursor, new_assigned):
                     return JSONResponse(
