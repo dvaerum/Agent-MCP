@@ -75,6 +75,7 @@ import contextlib
 import datetime as _dt
 import os
 import secrets
+import time
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -83,6 +84,48 @@ from typing import Any, AsyncIterator, List, Optional
 import httpx
 import mcp.types as mcp_types
 import pytest
+
+
+async def assert_ran_off_event_loop(
+    started_at: "List[float]",
+    loop_free_at: "List[float]",
+    *,
+    block_sec: float,
+    what: str,
+    liveness_timeout: float = 5.0,
+) -> None:
+    """Assert a blocking probe ran OFF the event loop — robust to slow CI.
+
+    Shared by the OBS-R34 / BL-R7 "must run via ``asyncio.to_thread``"
+    regression tests. Each caller:
+
+    * stubs a blocking ``systemctl`` verb that, in the worker thread,
+      appends ``time.monotonic()`` to ``started_at`` then sleeps
+      ``block_sec`` (bounded, so a regression can't hang forever), and
+    * runs a probe coroutine that appends ``time.monotonic()`` to
+      ``loop_free_at`` the instant it observes the blocking call began.
+
+    Why this instead of the old ``await asyncio.sleep(0.15); assert
+    loop_free_at is not None; assert (loop_free_at - t0) < 0.25`` pattern:
+    the FIRST request under test triggers lazy init (Alembic migrations)
+    whose duration varies wildly on a loaded runner, so a fixed 0.15s budget
+    for routing to *reach* the blocking call flakes, and measuring the
+    loop-free gap from ``t0`` (before routing) folds that variable init time
+    into the result. Here we wait a generous bound for the probe to begin,
+    then measure the gap from when the blocking call *actually started*.
+    Off-loop: the loop is free, so the probe records within a few ms.
+    On-loop: the loop is frozen for ~``block_sec``, so the gap approaches
+    ``block_sec`` and the assertion fails — preserving the regression's teeth.
+    """
+    deadline = time.monotonic() + liveness_timeout
+    while not loop_free_at and time.monotonic() < deadline:
+        await asyncio.sleep(0.005)
+    assert loop_free_at, f"{what} never began within {liveness_timeout:.0f}s"
+    gap = loop_free_at[0] - started_at[0]
+    assert gap < block_sec / 2, (
+        f"event loop was blocked ~{gap:.3f}s after {what} began — it must "
+        f"run off-loop via asyncio.to_thread (block_sec={block_sec})"
+    )
 
 
 # --- Internal helpers (mirroring the patterns scattered across tests/) ---

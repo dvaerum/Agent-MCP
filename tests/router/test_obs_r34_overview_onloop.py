@@ -27,6 +27,8 @@ import time
 
 import pytest
 
+from tests.harness import assert_ran_off_event_loop
+
 
 pytestmark = [pytest.mark.asyncio]
 
@@ -50,11 +52,13 @@ async def test_overview_systemctl_probes_run_off_event_loop(
     router_module._overview_cache = None
 
     started = threading.Event()
+    started_at: list[float] = []
     BLOCK_SEC = 0.4
 
     def _blocking_systemctl(*args: str) -> subprocess.CompletedProcess:
         verb = args[0] if args else ""
         if verb == "is-active":
+            started_at.append(time.monotonic())
             started.set()
             time.sleep(BLOCK_SEC)  # bounded: no permanent hang on regress
             # rc=3 → not active → status "stopped" (unchanged semantics).
@@ -65,30 +69,23 @@ async def test_overview_systemctl_probes_run_off_event_loop(
     from agent_mcp.router import project_orchestrator as _po
     monkeypatch.setattr(_po, "_systemctl", _blocking_systemctl)
 
-    loop_free_at: float | None = None
+    loop_free_at: list[float] = []
 
     async def _probe() -> None:
-        nonlocal loop_free_at
         while not started.is_set():
             await asyncio.sleep(0.005)
-        loop_free_at = time.monotonic()
+        loop_free_at.append(time.monotonic())
 
     client = await aiohttp_client(router_app)
 
-    t0 = time.monotonic()
     overview = asyncio.create_task(
         client.get("/agent-mcp/api/router/overview", headers=_STRICT_ACCEPT)
     )
     probe = asyncio.create_task(_probe())
 
-    await asyncio.sleep(0.15)
-
-    assert loop_free_at is not None, "overview is-active probe never began"
-    elapsed = loop_free_at - t0
-    assert elapsed < 0.25, (
-        f"event loop was blocked ~{elapsed:.3f}s during the overview "
-        "systemctl is-active probe — it must run off-loop via "
-        "asyncio.to_thread"
+    await assert_ran_off_event_loop(
+        started_at, loop_free_at, block_sec=BLOCK_SEC,
+        what="overview systemctl is-active probe",
     )
 
     resp = await overview
