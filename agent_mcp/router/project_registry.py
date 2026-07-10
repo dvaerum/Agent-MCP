@@ -238,6 +238,37 @@ class ProjectRegistry:
                 # rather than rewriting the file.
                 return existing_row
 
+            # BL-R33-1 (chokepoint defense-in-depth): refuse to claim a
+            # name that is a currently-active grace-period alias of
+            # ANOTHER project. ``resolve()`` returns a real project before
+            # falling back to an alias, so registering a real project on an
+            # active-alias name would silently SHADOW the alias and redirect
+            # legacy clients into a different project/DB. The create HANDLER
+            # returns a proper 409 ALIAS_COLLISION envelope before reaching
+            # here; this is the single chokepoint every create funnels
+            # through, so guarding it makes any future create path inherit
+            # the invariant. Scanned INLINE (mirroring ``rename()``'s
+            # active-alias scan below) rather than via ``resolve_alias`` —
+            # that method re-opens the sidecar for LOCK_SH and would
+            # self-deadlock against the LOCK_EX we already hold here. Only
+            # fires for a NEW registration (the idempotent re-register above
+            # already returned), and an EXPIRED alias is skipped, so a
+            # past-due name stays reclaimable.
+            now = datetime.now(timezone.utc)
+            for other_name, payload in data.items():
+                for entry in self._aliases_of(payload):
+                    if entry.get("name") != name:
+                        continue
+                    try:
+                        exp = _parse_iso(entry["expires_at"])
+                    except (KeyError, ValueError):
+                        continue
+                    if exp > now:
+                        raise ValueError(
+                            f"name {name!r} is already an active alias "
+                            f"for project {other_name!r}"
+                        )
+
             data[name] = self._make_record(workspace, aliases=[])
             self._write_locked(fd, self._normalise_for_write(data))
             return self._materialise(name, data[name])

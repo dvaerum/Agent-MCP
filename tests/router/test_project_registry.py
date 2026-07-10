@@ -191,6 +191,37 @@ def test_reregister_different_workspace_raises(reg) -> None:
         reg.register("alpha", "/tmp/different")
 
 
+def test_register_on_active_alias_raises(reg) -> None:
+    """BL-R33-1 (chokepoint defense-in-depth): registering a name that is
+    a currently-active alias of ANOTHER project must raise — otherwise the
+    new real project silently shadows the alias (``resolve()`` returns the
+    real project before the alias fallback). Mirrors ``rename``'s inline
+    active-alias scan."""
+    reg.register("alpha", "/tmp/alpha")
+    reg.add_alias("alpha", "old-a")  # active (default 30-day grace)
+    assert reg.resolve_alias("old-a") == "alpha"
+
+    with pytest.raises(ValueError):
+        reg.register("old-a", "/tmp/old-a")
+
+    # The alias was not clobbered and no shadowing project was created.
+    assert reg.get("old-a") is None
+    assert reg.resolve_alias("old-a") == "alpha"
+
+
+def test_register_on_expired_alias_succeeds(reg) -> None:
+    """BL-R33-1 boundary: an EXPIRED alias is reclaimable — the chokepoint
+    guard only blocks ACTIVE aliases (``resolve_alias`` returns None for a
+    past-due alias)."""
+    reg.register("alpha", "/tmp/alpha")
+    reg.add_alias("alpha", "old-a", grace_days=0)  # dead on arrival
+    assert reg.resolve_alias("old-a") is None
+
+    row = reg.register("old-a", "/tmp/old-a")
+    assert row["name"] == "old-a"
+    assert reg.get("old-a") is not None
+
+
 # ── 5. Atomic publish via os.replace ────────────────────────────────
 
 
