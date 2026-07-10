@@ -39,9 +39,17 @@ async def fetch_graph_data_logic(
         conn = get_db_connection() # Use the imported function
         cursor = conn.cursor()
 
-        # 1. Agents - Get colors first, only include non-terminated
+        # 1. Agents - Get colors first, only include active agents.
+        # "Active" excludes BOTH 'terminated' (soft-deleted) AND
+        # 'tombstone' (purge-cascade FK artefacts). A tombstone row
+        # (status='tombstone', agent_id='[deleted-<id>]') would otherwise
+        # render as a visible graph node — mirrors the REST/ORM listing
+        # filter (BL-R31-3b; see agent_repository.get_all_active_agents_from_db).
         # Original dashboard_api.py: lines 53-68
-        cursor.execute("SELECT agent_id, status, color, working_directory, current_task FROM agents WHERE status != 'terminated'")
+        cursor.execute(
+            "SELECT agent_id, status, color, working_directory, current_task "
+            "FROM agents WHERE status NOT IN ('terminated', 'tombstone')"
+        )
         agent_rows = cursor.fetchall()
         for row in agent_rows:
             agent_id_val = row['agent_id']

@@ -645,10 +645,14 @@ async def terminate_agent_tool_impl(
         cursor = conn.cursor()
 
         if not found_agent_token:
-            # Check DB if not found in memory (main.py:1285-1290)
+            # Check DB if not found in memory (main.py:1285-1290).
+            # Exclude tombstone rows (`[deleted-<id>]` purge FK
+            # artefacts, BL-R31-3b): a tombstone is not a live agent, so
+            # it is not a terminate target — treat it as not-found.
             cursor.execute(
-                "SELECT token FROM agents WHERE agent_id = ? AND status != ?",
-                (agent_id_to_terminate, "terminated"),
+                "SELECT token FROM agents WHERE agent_id = ? "
+                "AND status NOT IN ('terminated', 'tombstone')",
+                (agent_id_to_terminate,),
             )
             row = cursor.fetchone()
             if row:

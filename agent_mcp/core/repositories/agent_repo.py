@@ -106,15 +106,17 @@ def get_agent_by_id(agent_id: str) -> Optional[Dict[str, Any]]:
 
     row = _db_get_agent_by_id(agent_id)
     # SECURITY (terminate-revocation): never warm the auth cache with a
-    # terminated row. The /mcp gate is cache-only and trusts the
-    # invariant "active_agents holds only non-terminated rows"; a
-    # cache-write here for a status='terminated' row would silently
-    # reactivate a revoked bearer. The row is still RETURNED for
-    # audit/attribution — only the cache write is gated.
+    # non-active row. The /mcp gate is cache-only and trusts the
+    # invariant "active_agents holds only active rows"; a cache-write
+    # here for a status='terminated' row would silently reactivate a
+    # revoked bearer, and a status='tombstone' row (BL-R31-3b) would
+    # leak the purge FK artefact into the operator token listing. The
+    # row is still RETURNED for audit/attribution — only the cache
+    # write is gated.
     if (
         row is not None
         and not _cache_disabled
-        and row.get("status") != "terminated"
+        and row.get("status") not in ("terminated", "tombstone")
     ):
         token = row.get("token")
         if token:
@@ -138,13 +140,15 @@ def get_agent_by_token(token: str) -> Optional[Dict[str, Any]]:
 
     row = _db_get_agent_by_token(token)
     # SECURITY (terminate-revocation): see get_agent_by_id above. A
-    # terminated bearer resolved here (e.g. an active worker naming the
-    # terminated token in assign_task) must NOT be re-inserted into the
-    # cache-only /mcp auth gate. Return the row for audit; skip the write.
+    # non-active bearer resolved here (e.g. an active worker naming the
+    # terminated token in assign_task, or the reserved tombstone token)
+    # must NOT be re-inserted into the cache-only /mcp auth gate. Return
+    # the row for audit; skip the write for both 'terminated' and
+    # 'tombstone' status (BL-R31-3b).
     if (
         row is not None
         and not _cache_disabled
-        and row.get("status") != "terminated"
+        and row.get("status") not in ("terminated", "tombstone")
     ):
         state.active_agents[token] = row
         agent_id = row.get("agent_id")

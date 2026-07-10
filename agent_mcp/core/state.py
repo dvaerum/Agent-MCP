@@ -516,8 +516,11 @@ def notify_unassigned_task_appeared(
                 return
 
             cursor.execute(
+                # "Active" excludes BOTH 'terminated' AND 'tombstone'
+                # (purge-cascade FK artefacts) — a tombstone row must
+                # never receive an unassigned-task fan-out (BL-R31-3b).
                 "SELECT agent_id, capabilities FROM agents "
-                "WHERE status != 'terminated'",
+                "WHERE status NOT IN ('terminated', 'tombstone')",
             )
             agent_rows = cursor.fetchall()
         finally:

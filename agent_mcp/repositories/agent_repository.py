@@ -454,14 +454,16 @@ class AgentRepository:
 
         row = _db_get_agent_by_id(agent_id)
         # SECURITY (terminate-revocation): never warm the auth cache with
-        # a terminated row. The /mcp gate is cache-only and trusts that
-        # active_agents holds only non-terminated rows; caching a
+        # a non-active row. The /mcp gate is cache-only and trusts that
+        # active_agents holds only active rows; caching a
         # status='terminated' row would silently reactivate a revoked
-        # bearer. Row still RETURNED for audit — only the write is gated.
+        # bearer, and a status='tombstone' row (BL-R31-3b) would leak the
+        # purge FK artefact into the operator token listing. Row still
+        # RETURNED for audit — only the write is gated.
         if (
             row is not None
             and not self._cache_disabled
-            and row.get("status") != "terminated"
+            and row.get("status") not in ("terminated", "tombstone")
         ):
             token = row.get("token")
             if token:
@@ -485,13 +487,14 @@ class AgentRepository:
 
         row = _db_get_agent_by_token(token)
         # SECURITY (terminate-revocation): see get_by_id above. A
-        # terminated bearer resolved on the auth hot path must NOT be
+        # non-active bearer resolved on the auth hot path must NOT be
         # re-inserted into the cache-only /mcp gate. Row still RETURNED
-        # for audit; the cache write is gated on non-terminated status.
+        # for audit; the cache write is gated on active status
+        # (excludes 'terminated' AND 'tombstone' — BL-R31-3b).
         if (
             row is not None
             and not self._cache_disabled
-            and row.get("status") != "terminated"
+            and row.get("status") not in ("terminated", "tombstone")
         ):
             state.active_agents[token] = row
             agent_id = row.get("agent_id")
@@ -1089,7 +1092,12 @@ class AgentRepository:
                 row_status = row["status"]
             except (KeyError, IndexError):
                 row_token, row_status = row[0], row[1]
-            if row_status == "terminated":
+            # BL-R31-3b: a 'tombstone' row (`[deleted-<id>]` purge FK
+            # artefact) is not a live agent and must not be
+            # terminatable — flipping it to 'terminated' would leak the
+            # artefact into the terminated-agents listing. Treat it (and
+            # an already-terminated row) as not-found.
+            if row_status in ("terminated", "tombstone"):
                 return False
             token = row_token
             cur.execute(
@@ -1097,10 +1105,9 @@ class AgentRepository:
                 UPDATE agents
                 SET status = ?, terminated_at = ?, updated_at = ?,
                     current_task = NULL
-                WHERE agent_id = ? AND status != ?
+                WHERE agent_id = ? AND status NOT IN ('terminated', 'tombstone')
                 """,
-                ("terminated", terminated_at, terminated_at,
-                 agent_id, "terminated"),
+                ("terminated", terminated_at, terminated_at, agent_id),
             )
             if cur.rowcount == 0:
                 return False
@@ -1110,7 +1117,9 @@ class AgentRepository:
                 row = (
                     session.query(Agent)
                     .filter(Agent.agent_id == agent_id)
-                    .filter(Agent.status != "terminated")
+                    # BL-R31-3b: exclude 'tombstone' (purge FK artefact)
+                    # too — it is not a live, terminatable agent.
+                    .filter(Agent.status.notin_(("terminated", "tombstone")))
                     .one_or_none()
                 )
                 if row is None:
@@ -1134,7 +1143,9 @@ class AgentRepository:
                     row = (
                         session.query(Agent)
                         .filter(Agent.agent_id == agent_id)
-                        .filter(Agent.status != "terminated")
+                        # BL-R31-3b: exclude 'tombstone' too — not a
+                        # live, terminatable agent.
+                        .filter(Agent.status.notin_(("terminated", "tombstone")))
                         .one_or_none()
                     )
                     if row is None:
