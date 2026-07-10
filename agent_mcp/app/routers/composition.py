@@ -764,11 +764,16 @@ async def update_task_details_api_route(
         requesting_admin_id = caller_identity(auth)
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT notes, assigned_to, status FROM tasks WHERE task_id = ?", (task_id_to_update,))
+        cursor.execute("SELECT notes, assigned_to, status, required_capabilities FROM tasks WHERE task_id = ?", (task_id_to_update,))
         task_row = cursor.fetchone()
         if not task_row:
             return JSONResponse({"error": "Task not found"}, status_code=404)
         existing_notes_str = task_row["notes"]
+        # AZ-R26-1: the task's capability tag, captured before the UPDATE,
+        # so the reassign branch below can enforce the same
+        # ``required_capabilities ⊆ agent.capabilities`` routing control the
+        # canonical MCP assign path enforces (``_missing_capabilities``).
+        prior_required_capabilities = task_row["required_capabilities"]
         # BL-R7-1: capture the PRIOR assignee before the UPDATE so a
         # reassignment can wake the old assignee (task left their queue)
         # in addition to the new one — see the post-commit publish/notify
@@ -901,6 +906,28 @@ async def update_task_details_api_route(
                                 f"Cannot reassign task '{task_id_to_update}' "
                                 f"to '{new_assigned}': agent does not exist "
                                 f"or is terminated."
+                            )
+                        },
+                        status_code=400,
+                    )
+                # AZ-R26-1: capability-routing parity. The canonical MCP
+                # assign path refuses to pin a capability-tagged task onto
+                # an under-capable agent; the dashboard reassign must
+                # enforce the SAME control or it becomes a bypass. Checked
+                # after assignability so a live-but-under-capable target is
+                # reported on the capability axis.
+                from ...tools.task_tools import _missing_capabilities
+                missing_caps = _missing_capabilities(
+                    cursor, prior_required_capabilities, new_assigned
+                )
+                if missing_caps:
+                    return JSONResponse(
+                        {
+                            "error": (
+                                f"Cannot reassign task "
+                                f"'{task_id_to_update}' to '{new_assigned}': "
+                                f"agent lacks required capabilities "
+                                f"{missing_caps}."
                             )
                         },
                         status_code=400,

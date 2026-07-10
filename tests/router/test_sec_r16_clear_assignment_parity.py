@@ -50,6 +50,31 @@ def _row(table: str, where_sql: str, params: tuple) -> dict | None:
         conn.close()
 
 
+def _grant_caps(agent_id: str, caps: list[str]) -> None:
+    """Give an existing agent the capability set ``caps``.
+
+    AZ-R26-1 gates create-with-``assigned_to`` on
+    ``required_capabilities ⊆ agent.capabilities`` (parity with every
+    reassign path). This test assigns a caps-tagged task to ``alice`` at
+    create time, so ``alice`` must actually carry those caps — the caps
+    tag is what the test asserts is *forwarded*, not that under-capable
+    assignment is permitted.
+    """
+    import json as _json
+
+    from agent_mcp.db.connection import get_db_connection
+
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            "UPDATE agents SET capabilities = ? WHERE agent_id = ?",
+            (_json.dumps(caps), agent_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 async def _create_task(admin, **body_extra) -> str:
     body = {"token": admin.admin_token, "task_title": "r16-clear-probe"}
     body.update(body_extra)
@@ -140,6 +165,9 @@ async def test_clear_assignment_forwards_required_capabilities(
     the qualifying agents are woken."""
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
+        # AZ-R26-1: alice must carry the caps the task is tagged with to
+        # be a valid assignee at create time.
+        _grant_caps("alice", ["python", "docker"])
         task_id = await _create_task(
             admin, assigned_to="alice",
             required_capabilities=["python", "docker"],

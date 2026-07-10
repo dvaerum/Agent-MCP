@@ -232,6 +232,28 @@ async def create_task_api_route(
                     },
                     status_code=400,
                 )
+            # AZ-R26-1: capability-routing parity at create time. If this
+            # new task carries a required-capabilities tag, the directly-
+            # assigned agent must satisfy it — the same
+            # ``required_capabilities ⊆ agent.capabilities`` control the
+            # canonical MCP assign path enforces. Create-time is
+            # self-consistent (both values are set in this request), but
+            # gating it here keeps every assign/reassign surface uniform
+            # and closes the class.
+            from ...tools.task_tools import _missing_capabilities
+            missing_caps = _missing_capabilities(
+                cursor, _norm_caps, assigned_to
+            )
+            if missing_caps:
+                return JSONResponse(
+                    {
+                        "error": (
+                            f"Cannot assign task to '{assigned_to}': agent "
+                            f"lacks required capabilities {missing_caps}."
+                        )
+                    },
+                    status_code=400,
+                )
         # PR 7 (Task flip): create flows through task_repo.create with
         # the caller's cursor so the wider audit-log INSERT stays in
         # the same transaction. The repo handles JSON serialisation

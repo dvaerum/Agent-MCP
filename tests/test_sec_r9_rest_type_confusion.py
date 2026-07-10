@@ -102,6 +102,24 @@ async def test_create_task_description_dict_not_stored(tmp_path) -> None:
 async def test_create_task_valid_still_works(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
+        # AZ-R26-1: create-with-assigned_to now enforces
+        # required_capabilities ⊆ agent.capabilities (parity with the
+        # reassign paths). Provision alice with the caps this task is
+        # tagged with so the valid-create path is exercised (the caps
+        # here are incidental to what this test asserts).
+        import json as _json
+
+        from agent_mcp.db.connection import get_db_connection
+
+        _conn = get_db_connection()
+        try:
+            _conn.execute(
+                "UPDATE agents SET capabilities = ? WHERE agent_id = ?",
+                (_json.dumps(["code_edit", "file_read"]), "alice"),
+            )
+            _conn.commit()
+        finally:
+            _conn.close()
         r = admin.client.post(
             "/api/tasks",
             json={

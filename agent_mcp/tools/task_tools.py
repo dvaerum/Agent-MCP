@@ -336,6 +336,45 @@ def _agent_assignable(cursor, agent_id: str) -> bool:
     return cursor.fetchone() is not None
 
 
+def _missing_capabilities(
+    cursor,
+    task_required_capabilities: Any,
+    target_agent_id: str,
+) -> List[str]:
+    """Capabilities the target agent lacks for a task's required set.
+
+    Single source of truth for the Mode-3 routing control
+    ``required_capabilities ⊆ agent.capabilities`` (added round-1 in
+    ``_assign_to_existing_tasks``). EVERY assign/reassign write site must
+    call this before pinning a capability-tagged task onto an agent, so
+    the control cannot be bypassed on a reassign path (AZ-R26-1). Returns
+    the sorted list of missing capabilities (empty ⇒ satisfied).
+
+    ``task_required_capabilities`` may be the raw DB TEXT column (a JSON
+    string) or an already-decoded list. An empty/absent required set
+    always satisfies (empty ⇒ no missing). A terminated/absent agent has
+    no capabilities row, so the whole required set is reported missing.
+    Both sides are normalized (lowercased) at write time.
+    """
+    if isinstance(task_required_capabilities, str):
+        required = set(
+            json.loads(task_required_capabilities)
+            if task_required_capabilities
+            else []
+        )
+    else:
+        required = set(task_required_capabilities or [])
+    if not required:
+        return []
+    cursor.execute(
+        "SELECT capabilities FROM agents WHERE agent_id = ? AND status != ?",
+        (target_agent_id, "terminated"),
+    )
+    row = cursor.fetchone()
+    agent_caps = set(json.loads(row["capabilities"] or "[]")) if row else set()
+    return sorted(required - agent_caps)
+
+
 async def _update_single_task(
     cursor,
     task_id: str,
@@ -406,6 +445,26 @@ async def _update_single_task(
                     f"Cannot reassign task '{task_id}' to "
                     f"'{new_assigned_to}': agent does not exist or is "
                     f"terminated."
+                ),
+            }
+        # Capability-routing parity (AZ-R26-1): the canonical assign path
+        # (``_assign_to_existing_tasks``) refuses to pin a
+        # capability-tagged task onto an under-capable agent; the single
+        # reassign path must enforce the SAME control or it becomes a
+        # bypass. ``required_capabilities`` is unchanged by this update,
+        # so check the task's stored tag against the new assignee.
+        missing_caps = _missing_capabilities(
+            cursor,
+            task_current_data.get("required_capabilities"),
+            new_assigned_to,
+        )
+        if missing_caps:
+            return {
+                "success": False,
+                "error": (
+                    f"Cannot reassign task '{task_id}' to "
+                    f"'{new_assigned_to}': agent lacks required "
+                    f"capabilities {missing_caps}."
                 ),
             }
 
@@ -524,6 +583,135 @@ async def _update_single_task(
             task_current_data.get("depends_on_tasks") or "[]"
         ),
     }
+
+
+# --- Shared post-status reconcile / notify tail (BL-R26-1) -----------------
+#
+# The canonical single ``update_task_status`` path runs a three-phase tail
+# after a successful status mutation: dependency-advance (Phase 3, inside
+# the transaction), assignee-wake (Phase 2, post-commit), and RAG reindex
+# (Phase 4, post-commit). ``bulk_task_operations`` historically skipped all
+# three, so a bulk status→completed stalled dependents forever, never woke
+# the reassign target, and left RAG stale. These helpers are the single
+# source of truth for that tail so the single and bulk paths cannot drift
+# apart again.
+
+
+async def _advance_dependents_after_completion(
+    cursor,
+    completed_task_id: str,
+    requesting_agent_id: str,
+    is_admin_request: bool,
+) -> List[Dict[str, Any]]:
+    """Phase-3 dependency advance for one just-completed task.
+
+    Finds every task that depends on ``completed_task_id``; when ALL of
+    that dependent's dependencies are now completed and the dependent is
+    still ``pending``, advances it to ``in_progress`` via
+    ``_update_single_task`` (inside the caller's open transaction).
+    Returns the advance-result dicts so the caller can wake/reindex them
+    post-commit. Shared by the single + bulk status paths.
+    """
+    advanced: List[Dict[str, Any]] = []
+    cursor.execute("SELECT task_id, depends_on_tasks FROM tasks")
+    all_tasks = cursor.fetchall()
+    for task_row in all_tasks:
+        task_deps = json.loads(task_row["depends_on_tasks"] or "[]")
+        if completed_task_id not in task_deps:
+            continue
+        # Every OTHER dependency of this dependent must also be complete.
+        all_deps_completed = True
+        for dep_id in task_deps:
+            if dep_id == completed_task_id:
+                continue
+            cursor.execute(
+                "SELECT status FROM tasks WHERE task_id = ?", (dep_id,)
+            )
+            dep_row = cursor.fetchone()
+            if not dep_row or dep_row["status"] != "completed":
+                all_deps_completed = False
+                break
+        if not all_deps_completed:
+            continue
+        cursor.execute(
+            "SELECT status FROM tasks WHERE task_id = ?",
+            (task_row["task_id"],),
+        )
+        dependent_task = cursor.fetchone()
+        if dependent_task and dependent_task["status"] == "pending":
+            dep_result = await _update_single_task(
+                cursor,
+                task_row["task_id"],
+                "in_progress",
+                requesting_agent_id,
+                is_admin_request,
+                "Auto-advanced: all dependencies completed",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            advanced.append(dep_result)
+    return advanced
+
+
+def _wake_task_assignees(task_ids: List[str]) -> None:
+    """Post-commit Phase-2 wake of each mutated task's current assignee.
+
+    Prefers the in-memory cache (updated in-transaction by the write
+    paths) with a lazy DB fallback for a task not held in cache. Deduped
+    so bulk-updating one agent's tasks wakes them once. Best-effort — a
+    notify failure must never poison an already-committed write. MUST run
+    AFTER commit so re-reads observe the new state. Shared by the single
+    + bulk status paths.
+    """
+    fallback_conn = None
+    try:
+        woken: set = set()
+        for tid in task_ids:
+            if not tid:
+                continue
+            assignee = None
+            if tid in g.tasks:
+                assignee = g.tasks[tid].get("assigned_to")
+            if not assignee:
+                if fallback_conn is None:
+                    fallback_conn = get_db_connection()
+                fc = fallback_conn.cursor()
+                fc.execute(
+                    "SELECT assigned_to FROM tasks WHERE task_id = ?",
+                    (tid,),
+                )
+                row = fc.fetchone()
+                if row:
+                    assignee = row["assigned_to"]
+            if assignee and assignee not in woken:
+                g.notify_agent_inbox(assignee)
+                woken.add(assignee)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("notify_agent_inbox fan-out raised: %s", e)
+    finally:
+        if fallback_conn is not None:
+            fallback_conn.close()
+
+
+def _reindex_tasks(task_ids: List[str]) -> None:
+    """Post-commit Phase-4 RAG reindex of each mutated task.
+
+    Reads the committed cache snapshot; a task absent from cache is
+    skipped (nothing to index). Fire-and-forget via ``asyncio.create_task``,
+    deduped. Shared by the single + bulk status paths.
+    """
+    import asyncio
+
+    seen: set = set()
+    for tid in task_ids:
+        if not tid or tid in seen:
+            continue
+        seen.add(tid)
+        if tid in g.tasks:
+            asyncio.create_task(index_task_data(tid, g.tasks[tid].copy()))
 
 
 # Filter / sort / dependency-analysis / health-metrics rules moved to
@@ -950,13 +1138,13 @@ async def _assign_to_existing_tasks(
         # Capability-routing enforcement (Mode-3 self-claim). A caller
         # that learns a task_id must not claim work it lacks the
         # capabilities for: enforce required_capabilities ⊆ agent
-        # capabilities. Empty required_capabilities always passes. Both
-        # sides are already normalized (lowercased) at write time.
-        agent_caps = set(json.loads(agent_caps_row["capabilities"] or "[]"))
+        # capabilities. Empty required_capabilities always passes. The
+        # subset check is factored into ``_missing_capabilities`` so
+        # every reassign path enforces the SAME control (AZ-R26-1).
         for task in found_tasks:
-            raw_req = task["required_capabilities"]
-            required = set(json.loads(raw_req) if raw_req else [])
-            missing = required - agent_caps
+            missing = _missing_capabilities(
+                cursor, task["required_capabilities"], target_agent_id
+            )
             if missing:
                 # SEC-R18: a non-admin self-claim caller must not learn
                 # the task exists via a capability-mismatch signal —
@@ -968,7 +1156,7 @@ async def _assign_to_existing_tasks(
                     reason=(
                         f"agent '{target_agent_id}' lacks required "
                         f"capabilities for task {task['task_id']}: "
-                        f"{sorted(missing)}"
+                        f"{missing}"
                     )
                 )
 
@@ -1728,6 +1916,24 @@ async def assign_task_tool_impl(
                 )
             )
 
+        # SECURITY (AZ-R26-1): capability-routing parity at create time.
+        # This Mode-1 create+assign path tags the new task with
+        # ``required_capabilities`` AND pins it on ``target_agent_id`` in
+        # one call — so a caps-tagged task could land on an under-capable
+        # agent, the same routing-control bypass the reassign paths close.
+        # Enforce the SAME subset check the canonical assign path uses; an
+        # admin/operator caller gets the informative refusal.
+        missing_caps = _missing_capabilities(
+            cursor, _norm_caps, target_agent_id
+        )
+        if missing_caps:
+            return PermissionDenied(
+                reason=(
+                    f"Cannot assign task to '{target_agent_id}': agent "
+                    f"lacks required capabilities {missing_caps}."
+                )
+            )
+
         # PR 6: task INSERT goes through task_repo with the caller's
         # cursor so it's atomic with the agent UPDATE and audit log.
         from ..repositories import agent_repo, task_repo
@@ -2370,58 +2576,22 @@ async def update_task_status_tool_impl(
                     )
                     cascade_results.append(child_result)
 
-        # Phase 3: Smart dependency updates if requested
+        # Phase 3: Smart dependency updates if requested. The advance
+        # logic is shared with the bulk path via
+        # ``_advance_dependents_after_completion`` (BL-R26-1) so both
+        # surfaces unblock dependents identically.
         dependency_updates = []
         if auto_update_dependencies:
             for result in results:
                 if result["success"] and new_status == "completed":
-                    # Find tasks that depend on this completed task
-                    cursor.execute("SELECT task_id, depends_on_tasks FROM tasks")
-                    all_tasks = cursor.fetchall()
-
-                    for task_row in all_tasks:
-                        task_deps = json.loads(task_row["depends_on_tasks"] or "[]")
-                        if result["task_id"] in task_deps:
-                            # Check if all dependencies are now completed
-                            all_deps_completed = True
-                            for dep_id in task_deps:
-                                if (
-                                    dep_id != result["task_id"]
-                                ):  # Skip the one we just completed
-                                    cursor.execute(
-                                        "SELECT status FROM tasks WHERE task_id = ?",
-                                        (dep_id,),
-                                    )
-                                    dep_row = cursor.fetchone()
-                                    if not dep_row or dep_row["status"] != "completed":
-                                        all_deps_completed = False
-                                        break
-
-                            if all_deps_completed:
-                                # Auto-update dependent task to in_progress if it's pending
-                                cursor.execute(
-                                    "SELECT status FROM tasks WHERE task_id = ?",
-                                    (task_row["task_id"],),
-                                )
-                                dependent_task = cursor.fetchone()
-                                if (
-                                    dependent_task
-                                    and dependent_task["status"] == "pending"
-                                ):
-                                    dep_result = await _update_single_task(
-                                        cursor,
-                                        task_row["task_id"],
-                                        "in_progress",
-                                        requesting_agent_id,
-                                        is_admin_request,
-                                        f"Auto-advanced: all dependencies completed",
-                                        None,
-                                        None,
-                                        None,
-                                        None,
-                                        None,
-                                    )
-                                    dependency_updates.append(dep_result)
+                    dependency_updates.extend(
+                        await _advance_dependents_after_completion(
+                            cursor,
+                            result["task_id"],
+                            requesting_agent_id,
+                            is_admin_request,
+                        )
+                    )
 
         # Wave 7 PR 3 (coordinator transition): the "Phase 3.5
         # auto-launch testing agents on task completion" hook is gone.
@@ -2432,52 +2602,17 @@ async def update_task_status_tool_impl(
         # Commit all changes
         conn.commit()
 
-        # Phase 2: wake `wait_for_events` waiters for every touched
-        # task's current assignee. Done AFTER commit so re-queries
-        # see the new state. We dedupe via a set to avoid waking the
-        # same agent multiple times when bulk-updating their tasks.
-        try:
-            woken: set = set()
-            for r in results + cascade_results + dependency_updates:
-                if not r.get("success"):
-                    continue
-                tid = r.get("task_id")
-                if not tid:
-                    continue
-                # Prefer the in-memory cache (updated by
-                # `_update_single_task`); fall back to the DB row
-                # if the task isn't cached for some reason.
-                assignee = None
-                if tid in g.tasks:
-                    assignee = g.tasks[tid].get("assigned_to")
-                if not assignee:
-                    cursor.execute(
-                        "SELECT assigned_to FROM tasks WHERE task_id = ?",
-                        (tid,),
-                    )
-                    row = cursor.fetchone()
-                    if row:
-                        assignee = row["assigned_to"]
-                if assignee and assignee not in woken:
-                    g.notify_agent_inbox(assignee)
-                    woken.add(assignee)
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning(
-                "notify_agent_inbox fan-out raised after "
-                "update_task_status: %s",
-                e,
-            )
-
-        # Phase 4: Re-index updated tasks
-        import asyncio
-
-        for result in results + cascade_results + dependency_updates:
-            if result.get("success"):
-                task_id = result["task_id"]
-                if task_id in g.tasks:
-                    asyncio.create_task(
-                        index_task_data(task_id, g.tasks[task_id].copy())
-                    )
+        # Phase 2 + 4: wake each touched task's assignee and re-index
+        # the mutated tasks. Both run AFTER commit (re-reads observe the
+        # new state) and are shared verbatim with the bulk path via
+        # ``_wake_task_assignees`` / ``_reindex_tasks`` (BL-R26-1).
+        _mutated_ids = [
+            r["task_id"]
+            for r in results + cascade_results + dependency_updates
+            if r.get("success") and r.get("task_id")
+        ]
+        _wake_task_assignees(_mutated_ids)
+        _reindex_tasks(_mutated_ids)
 
         # Build comprehensive response
         successful_updates = [r for r in results if r.get("success")]
@@ -3483,6 +3618,14 @@ async def bulk_task_operations_tool_impl(
         "operations_count": len(operations),
         "success_count": 0,
     }
+    # BL-R26-1: the reconcile/notify tail the single ``update_task_status``
+    # path runs must also run on the bulk path or bulk-mutated tasks stall
+    # dependents / never wake their assignee / leave RAG stale. Track the
+    # ids to reconcile: ``completed_task_ids`` (status→completed, dependency
+    # advance INSIDE the txn) and ``mutated_task_ids`` (status/reassign +
+    # advanced dependents, wake + reindex AFTER commit).
+    completed_task_ids: List[str] = []
+    mutated_task_ids: List[str] = []
     try:
         with atomic_with_audit(
             operation="bulk_task_operations",
@@ -3635,6 +3778,14 @@ async def bulk_task_operations_tool_impl(
                                 task_id, connection=cursor,
                             )
 
+                        # BL-R26-1: this task's status changed — reconcile
+                        # its assignee wake + RAG reindex post-commit, and
+                        # (on completion) advance its dependents like the
+                        # single path does.
+                        mutated_task_ids.append(task_id)
+                        if new_status == "completed":
+                            completed_task_ids.append(task_id)
+
                         results.append(
                             f"Operation {i+1}: Task '{task_id}' status updated to '{new_status}'"
                         )
@@ -3761,6 +3912,28 @@ async def bulk_task_operations_tool_impl(
                             )
                             continue
 
+                        # SECURITY (AZ-R26-1): capability-routing parity.
+                        # The canonical assign path
+                        # (``_assign_to_existing_tasks``) refuses to pin a
+                        # capability-tagged task onto an under-capable
+                        # agent; the bulk reassign op must enforce the SAME
+                        # control or it is a bypass. Deny this one op
+                        # (per-op error + continue), matching the
+                        # terminal-sink / assignability handling above.
+                        missing_caps = _missing_capabilities(
+                            cursor,
+                            task_data.get("required_capabilities"),
+                            new_assigned_to,
+                        )
+                        if missing_caps:
+                            results.append(
+                                f"Operation {i+1}: Cannot reassign task "
+                                f"'{task_id}' to '{new_assigned_to}': "
+                                f"agent lacks required capabilities "
+                                f"{missing_caps}"
+                            )
+                            continue
+
                         # PR 7 (Task flip): bulk reassign flows through
                         # task_repo.update_fields with the caller's cursor.
                         from ..repositories import task_repo as _task_repo
@@ -3773,6 +3946,10 @@ async def bulk_task_operations_tool_impl(
                         if task_id in g.tasks:
                             g.tasks[task_id]["assigned_to"] = new_assigned_to
                             g.tasks[task_id]["updated_at"] = updated_at_iso
+
+                        # BL-R26-1: wake the new assignee post-commit like
+                        # the single reassign path does.
+                        mutated_task_ids.append(task_id)
 
                         results.append(
                             f"Operation {i+1}: Task '{task_id}' reassigned to '{new_assigned_to}'"
@@ -3812,12 +3989,38 @@ async def bulk_task_operations_tool_impl(
                         exc_info=True,
                     )
 
+            # BL-R26-1 Phase-3: advance dependents of every task this
+            # batch drove to ``completed`` — inside the SAME transaction,
+            # via the helper shared with the single path, so a bulk
+            # completion unblocks its dependents identically. Runs after
+            # the op loop so all completions in the batch are visible
+            # before the advance (a dependent gated on two batch-completed
+            # tasks advances correctly).
+            for _done_id in completed_task_ids:
+                _advanced = await _advance_dependents_after_completion(
+                    cursor,
+                    _done_id,
+                    requesting_agent_id,
+                    is_admin_request,
+                )
+                mutated_task_ids.extend(
+                    r["task_id"] for r in _advanced if r.get("success")
+                )
+
             # Final success_count is patched onto the audit-row details
             # dict; `atomic_with_audit` reads the same dict at block
             # exit and emits one agent_actions row before committing.
             audit_details["success_count"] = len(
                 [r for r in results if "Error" not in r]
             )
+
+        # BL-R26-1 Phase-2 + 4: POST-commit (the ``with`` block committed
+        # and closed its connection) wake each mutated task's assignee and
+        # re-index the mutated tasks, via the helpers shared with the
+        # single path. Reached only on the success path — an aborted
+        # transaction raises out of the ``with`` and skips this.
+        _wake_task_assignees(mutated_task_ids)
+        _reindex_tasks(mutated_task_ids)
 
         response_text = (
             f"Bulk Task Operations Results ({len(operations)} operations):\n\n"
