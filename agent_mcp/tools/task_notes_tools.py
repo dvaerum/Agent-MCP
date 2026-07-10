@@ -324,6 +324,14 @@ def register_task_notes_tools() -> None:
                 "note_id": {
                     "type": "integer",
                     "description": "Side-table note_id to edit.",
+                    # PF-R39-1: clamp to sqlite's signed-64-bit range.
+                    # note_id is a positive autoincrement PK, so a value
+                    # outside [1, 2^63-1] can never match a real row —
+                    # and binding an out-of-range int makes the sqlite3
+                    # driver raise a bare OverflowError. Reject it at
+                    # dispatch (clean -32602) before it reaches the DB.
+                    "minimum": 1,
+                    "maximum": 9223372036854775807,
                 },
                 "text": {
                     "type": "string",
@@ -354,6 +362,12 @@ def register_task_notes_tools() -> None:
                 "note_id": {
                     "type": "integer",
                     "description": "Side-table note_id to delete.",
+                    # PF-R39-1: see edit_task_note above — clamp to
+                    # sqlite's signed-64-bit range so an out-of-range id
+                    # is rejected at dispatch instead of overflowing the
+                    # sqlite3 driver's int bind.
+                    "minimum": 1,
+                    "maximum": 9223372036854775807,
                 },
             },
             "required": ["note_id"],

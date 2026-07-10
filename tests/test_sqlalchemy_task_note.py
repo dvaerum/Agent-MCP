@@ -16,7 +16,7 @@ import sqlite3
 
 import pytest
 
-from tests.harness import mcp_session
+from tests.harness import _first_text, mcp_session
 
 
 pytestmark = pytest.mark.asyncio
@@ -255,6 +255,75 @@ async def test_delete_note_non_author_rejected(tmp_path) -> None:
         assert task_notes_db.get_note(nid) is not None
 
 
+# ---- PF-R39-1: oversized note_id (>= 2^63) must not crash --------------------
+#
+# sqlite3 binds a Python int into the ``TaskNote.note_id == note_id``
+# filter; an int outside signed-64-bit range makes the driver raise a
+# BARE ``OverflowError`` that escaped the ``except SQLAlchemyError``
+# guard. These pin the belt-and-suspenders DB-layer catch: an oversized
+# id returns the SAME clean not-found/error result the missing-note path
+# returns, never an unhandled crash.
+
+_OVERSIZED_NOTE_ID = 2**63  # 9223372036854775808 — first value past int64
+_MAX_NOTE_ID = 2**63 - 1    # 9223372036854775807 — the valid boundary
+
+
+async def test_get_note_oversized_id_returns_none_not_crash(tmp_path) -> None:
+    from agent_mcp.db.actions import task_notes_db
+
+    async with mcp_session(tmp_path):
+        # Must not raise OverflowError; treated as "no such note".
+        assert task_notes_db.get_note(_OVERSIZED_NOTE_ID) is None
+
+
+async def test_edit_note_oversized_id_returns_error_not_crash(
+    tmp_path,
+) -> None:
+    from agent_mcp.db.actions import task_notes_db
+
+    async with mcp_session(tmp_path):
+        ok, err = task_notes_db.edit_note(
+            note_id=_OVERSIZED_NOTE_ID, requester="alice",
+            new_text="x", is_admin=False,
+        )
+        assert ok is False
+        assert isinstance(err, str) and err  # clean, non-empty message
+
+
+async def test_delete_note_oversized_id_returns_error_not_crash(
+    tmp_path,
+) -> None:
+    from agent_mcp.db.actions import task_notes_db
+
+    async with mcp_session(tmp_path):
+        ok, err = task_notes_db.delete_note(
+            note_id=_OVERSIZED_NOTE_ID, requester="alice", is_admin=False,
+        )
+        assert ok is False
+        assert isinstance(err, str) and err
+
+
+async def test_edit_note_max_int64_id_still_not_found(tmp_path) -> None:
+    """Regression: the valid signed-64-bit boundary must keep returning
+    a clean not-found (it must NOT be swept up by the overflow guard)."""
+    from agent_mcp.db.actions import task_notes_db
+
+    async with mcp_session(tmp_path):
+        ok, err = task_notes_db.edit_note(
+            note_id=_MAX_NOTE_ID, requester="alice",
+            new_text="x", is_admin=False,
+        )
+        assert ok is False
+        assert str(_MAX_NOTE_ID) in err  # "Note <id> not found"
+
+
+async def test_get_note_max_int64_id_returns_none(tmp_path) -> None:
+    from agent_mcp.db.actions import task_notes_db
+
+    async with mcp_session(tmp_path):
+        assert task_notes_db.get_note(_MAX_NOTE_ID) is None
+
+
 # ---- tool surface ------------------------------------------------------------
 
 
@@ -327,3 +396,46 @@ async def test_delete_task_note_tool_non_author_blocked(tmp_path) -> None:
         assert "error" in text.lower() or "alice" in text.lower()
         # Note still exists.
         assert task_notes_db.get_note(nid) is not None
+
+
+async def test_edit_task_note_tool_rejects_oversized_id(tmp_path) -> None:
+    """PF-R39-1: an oversized note_id (>= 2^63) must be rejected cleanly
+    by the schema ``maximum`` clamp at dispatch — a well-formed
+    validation error, NOT an unhandled OverflowError surfacing as a
+    generic "Tool execution failed"."""
+    async with mcp_session(tmp_path) as admin:
+        result = await admin.call(
+            "edit_task_note", {"note_id": _OVERSIZED_NOTE_ID, "text": "x"},
+        )
+        assert admin._last_is_error is True
+        text = _first_text(result).lower()
+        assert "validation" in text or "maximum" in text or "note_id" in text
+        # The crash signature must NOT be present.
+        assert "tool execution failed" not in text
+        assert "overflow" not in text
+
+
+async def test_delete_task_note_tool_rejects_oversized_id(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        result = await admin.call(
+            "delete_task_note", {"note_id": _OVERSIZED_NOTE_ID},
+        )
+        assert admin._last_is_error is True
+        text = _first_text(result).lower()
+        assert "validation" in text or "maximum" in text or "note_id" in text
+        assert "tool execution failed" not in text
+        assert "overflow" not in text
+
+
+async def test_edit_task_note_tool_max_int64_id_not_found(tmp_path) -> None:
+    """Regression: the valid boundary (2^63 - 1) still passes schema
+    validation and reaches the DB, returning a clean not-found."""
+    async with mcp_session(tmp_path) as admin:
+        result = await admin.call(
+            "edit_task_note", {"note_id": _MAX_NOTE_ID, "text": "x"},
+        )
+        text = _first_text(result).lower()
+        # Not-found is a clean typed result — not the crash signature.
+        assert "not found" in text or str(_MAX_NOTE_ID) in text
+        assert "tool execution failed" not in text
+        assert "overflow" not in text
