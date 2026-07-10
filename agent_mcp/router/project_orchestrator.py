@@ -592,8 +592,36 @@ async def _reaper_tick() -> None:
     """
     now = time.time()
     for key in list(last_active.keys()):
-        if now - last_active[key] > IDLE_SEC:
-            _systemctl("stop", _unit_name(*key))
+        # Re-read under the current turn: a concurrent stop/delete may
+        # have popped this key since we snapshotted the key list, so
+        # ``last_active[key]`` could KeyError. ``.get`` + skip is the
+        # guard (mirrors ``_ensure``'s inside-lock re-reads).
+        ts = last_active.get(key)
+        if ts is None:
+            continue
+        if now - ts > IDLE_SEC:
+            # SEC-R34: the ``systemctl stop`` is a blocking
+            # ``subprocess.run`` (~15-150 ms, up to the SC-R7-2 timeout
+            # on a D-Bus stall). This tick runs as a background task on
+            # the shared aiohttp event loop, so a synchronous stop would
+            # stall EVERY concurrent router request for its duration.
+            # Run it off-loop in a worker thread — the final sibling of
+            # the class fixed in the request handlers (delete BL-R7-3,
+            # ensure/start BL-R6-2b, rename+stop OBS-R34). Mirrors the
+            # off-loop pattern in ``_ensure`` (``await asyncio.to_thread(
+            # _systemctl, action, unit)``). The module-level name is
+            # resolved at call time so tests that monkeypatch
+            # ``_systemctl`` still take effect.
+            await asyncio.to_thread(_systemctl, "stop", _unit_name(*key))
+            # TOCTOU: the awaited stop yielded the loop, so a concurrent
+            # ``_ensure`` warm-start could have re-activated this backend
+            # and refreshed its timestamp WHILE the stop ran. Only drop
+            # the tracking entry if the timestamp we decided to reap on
+            # is still the current one — otherwise a now-live backend
+            # would silently fall out of the reaper's view and never be
+            # reaped again. Don't stop-and-forget a re-activated unit.
+            if last_active.get(key) != ts:
+                continue
             last_active.pop(key, None)
             # SC-R7-1: drop the boot-window record so a later start (or
             # an autonomous systemd restart) of this unit is measured
