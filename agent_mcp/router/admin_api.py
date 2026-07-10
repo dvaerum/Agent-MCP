@@ -347,55 +347,95 @@ async def rename_project_handler(req: web.Request) -> web.Response:
             status=409,
             extra={"active_connections": conns, "agents": []},
         )
-    # OBS-R34-RENAME-ONLOOP [availability]: run the blocking ``systemctl
-    # stop`` OFF the event loop (mirrors delete's BL-R7-3). ``_systemctl``
-    # is a synchronous ``subprocess.run`` (~15-150 ms, or up to the
-    # SC-R7-2 timeout on a D-Bus stall); calling it directly stalls the
-    # single aiohttp event loop — every other concurrent router request —
-    # for the duration of the stop.
-    await asyncio.to_thread(
-        _app._systemctl, "stop", _app._unit_name(old_name, "backend"),
-    )
-    workspace = Path(old_row.get("workspace", ""))
-    new_workspace: Path | None = None
-    if workspace.name == old_name and workspace.exists():
-        new_workspace = workspace.with_name(new_name)
+    # BL-R35-1 [data-integrity/availability]: hold ``_ensure_lock(old_name,
+    # "backend")`` across the WHOLE destructive sequence (stop → workspace
+    # move → token move → registry rename), mirroring delete's BL-R6-1. The
+    # registry-existence probe above runs OUTSIDE this lock, so without it a
+    # concurrent ``_ensure(old_name)`` warm-start (a member/dashboard
+    # ``GET /app/<old>/`` → ``_schedule_backend_warm``) could, in the
+    # stop→os.rename window, ``systemctl start agent-mcp@old_name`` against
+    # the ALREADY-MOVED workspace — a half-renamed / orphan backend the idle
+    # reaper only clears after ``IDLE_SEC`` (~4 h). Holding the lock forces
+    # such a warm-start to either (a) run to completion BEFORE we acquire —
+    # then our ``stop`` reaps its unit and the state-pop below clears its
+    # orchestrator state — or (b) block on this lock and, on acquiring it
+    # after we release, hit ``_ensure``'s inside-lock registry re-check
+    # (BL-R6-1), which sees ``old_name`` gone (renamed, not alias-resolved by
+    # ``registry.get``) and aborts with 404. ``_ensure_lock`` is a plain
+    # per-(name,role) ``asyncio.Lock`` (non-reentrant); nothing we call under
+    # it re-acquires the same key, so holding it across the awaited
+    # ``to_thread`` stop cannot deadlock (delete does exactly this).
+    async with _app._ensure_lock(old_name, "backend"):
+        # OBS-R34-RENAME-ONLOOP [availability]: run the blocking ``systemctl
+        # stop`` OFF the event loop (mirrors delete's BL-R7-3).
+        # ``_systemctl`` is a synchronous ``subprocess.run`` (~15-150 ms, or
+        # up to the SC-R7-2 timeout on a D-Bus stall); calling it directly
+        # while holding ``_ensure_lock`` stalls the single aiohttp event
+        # loop — every other concurrent router request — for the duration.
+        await asyncio.to_thread(
+            _app._systemctl, "stop", _app._unit_name(old_name, "backend"),
+        )
+        # BL-R35-1 (mirrors delete's BL-R7-2): purge the per-OLD-name
+        # orchestrator lifecycle state, inside the lock (atomic with
+        # stop+registry rename) so a warm-start that raced in before we
+        # acquired the lock can't leave stale old-name state, and a
+        # ``_schedule_backend_warm`` for a same-name RE-created project isn't
+        # skipped by the ``(name,"backend") in last_active`` dedup. After the
+        # registry rename lands, ``old_name`` is an inactive alias and
+        # ``_ensure(old_name)`` 404s, so none of these get repopulated.
+        _app.last_active.pop((old_name, "backend"), None)
+        _app.ensure_failures.pop((old_name, "backend"), None)
+        _app.active_conns.pop(old_name, None)
+        _app._po.unit_start_times.pop((old_name, "backend"), None)
+        _app._po.forwarding_hmac_keys.pop(old_name, None)
+        workspace = Path(old_row.get("workspace", ""))
+        new_workspace: Path | None = None
+        if workspace.name == old_name and workspace.exists():
+            new_workspace = workspace.with_name(new_name)
+            try:
+                os.rename(workspace, new_workspace)
+            except OSError as e:
+                return _app._error_envelope(
+                    error=_app._ERROR_INTERNAL,
+                    message=f"could not rename workspace dir: {e.strerror}",
+                    status=500,
+                )
+        token_dir = _token_dir()
+        if token_dir.is_dir():
+            for tok in token_dir.glob(f"{old_name}--*.token"):
+                suffix = tok.name[len(old_name) + len("--"):]
+                try:
+                    tok.rename(token_dir / f"{new_name}--{suffix}")
+                except OSError:
+                    pass
         try:
-            os.rename(workspace, new_workspace)
-        except OSError as e:
+            _app._REGISTRY.rename(old_name, new_name, grace_days=grace_days)
+        except (ValueError, KeyError) as e:
+            if new_workspace is not None and new_workspace.exists():
+                try:
+                    os.rename(new_workspace, workspace)
+                except OSError:
+                    pass
+            # SD-R6-2: don't reflect the raw ``ValueError``/``KeyError`` text
+            # (which can echo registry internals / caller input) into the
+            # client envelope. Log the detail server-side; hand back a
+            # generic message.
+            logger.warning(
+                "registry rename %r -> %r failed: %s", old_name, new_name, e,
+            )
             return _app._error_envelope(
                 error=_app._ERROR_INTERNAL,
-                message=f"could not rename workspace dir: {e.strerror}",
+                message="registry rename failed",
                 status=500,
             )
-    token_dir = _token_dir()
-    if token_dir.is_dir():
-        for tok in token_dir.glob(f"{old_name}--*.token"):
-            suffix = tok.name[len(old_name) + len("--"):]
-            try:
-                tok.rename(token_dir / f"{new_name}--{suffix}")
-            except OSError:
-                pass
-    try:
-        _app._REGISTRY.rename(old_name, new_name, grace_days=grace_days)
-    except (ValueError, KeyError) as e:
-        if new_workspace is not None and new_workspace.exists():
-            try:
-                os.rename(new_workspace, workspace)
-            except OSError:
-                pass
-        # SD-R6-2: don't reflect the raw ``ValueError``/``KeyError`` text
-        # (which can echo registry internals / caller input) into the
-        # client envelope. Log the detail server-side; hand back a
-        # generic message.
-        logger.warning(
-            "registry rename %r -> %r failed: %s", old_name, new_name, e,
-        )
-        return _app._error_envelope(
-            error=_app._ERROR_INTERNAL,
-            message="registry rename failed",
-            status=500,
-        )
+    # SC-R8-1 (mirrors delete): drop the per-OLD-name ``_ensure`` lock now
+    # that the block above has RELEASED it — otherwise create/rename of N
+    # distinct names leaks N ``asyncio.Lock`` objects. Only reached on the
+    # success path (both early returns above leave ``old_name`` a live
+    # project whose lock must stay). A concurrent ``_ensure`` already
+    # awaiting this lock keeps its own reference and aborts on the
+    # inside-lock registry re-check; a later ``_ensure`` mints a fresh lock.
+    _app.ensure_locks.pop((old_name, "backend"), None)
     # SEC (owner-authorised, defensive) FINDING AZ-R13-1 [MED] — migrate
     # the router.db authority table now that the registry rename has
     # landed. ``project_membership`` keys per-user AND per-group grants on
@@ -426,6 +466,29 @@ async def rename_project_handler(req: web.Request) -> web.Response:
             old_name,
             new_name,
         )
+    # BL-R35-1 parity (SC-3 sibling): the systemd unit sets
+    # ``RuntimeDirectoryPreserve=yes`` (nix/module.nix), so the OLD-name
+    # runtime dir ``$AGENT_MCP_SOCK_DIR/<old_name>/`` (its ``backend.sock``
+    # and per-project ``forwarding_hmac`` key) survives the ``systemctl
+    # stop`` above and is left on disk for a project that no longer exists
+    # under that name (``os.rename`` only moved the WORKSPACE, which lives
+    # under the projects root — not the runtime dir under SOCK_DIR). Delete
+    # purges this; rename didn't. Purge it here so a stale socket + HMAC key
+    # for the gone name don't linger. Best-effort + ignore-if-absent; a
+    # cleanup failure must not fail the rename. Slug-guarded before an
+    # ``rmtree`` under the shared runtime root (``old_name`` is already a
+    # validated slug — belt-and-suspenders, mirroring delete).
+    if _app._SLUG_RE.match(old_name):
+        runtime_dir = _app.SOCK_DIR / old_name
+        if runtime_dir.is_dir():
+            import shutil
+            try:
+                shutil.rmtree(runtime_dir)
+            except OSError:
+                logger.exception(
+                    "rename_project: failed to purge runtime dir %s",
+                    runtime_dir,
+                )
     new_row = _app._REGISTRY.get(new_name)
     alias_expires_at = ""
     for entry in (new_row or {}).get("aliases", []) or []:
