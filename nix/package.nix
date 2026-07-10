@@ -18,6 +18,18 @@
 let
   python = pkgs.python312;
 
+  # Product version for the dashboard sidebar, read from pyproject.toml
+  # (single source of truth). Distinct from agentMcpPy's deliberate
+  # "2.5.0-flake" derivation tag below — that tag signals "flake/dev build",
+  # whereas the sidebar must show the real product version. Same extraction
+  # idiom as nix/packages.nix.
+  productVersion =
+    let
+      py = builtins.readFile "${src}/pyproject.toml";
+      m = builtins.match ".*\nversion = \"([^\"]+)\".*" py;
+    in
+      if m == null then "0.0.0-unknown" else builtins.head m;
+
   agentMcpPy = python.pkgs.buildPythonApplication {
     pname = "agent-mcp";
     # pyproject.toml says 2.5.0; tag dev rather than chase upstream.
@@ -79,6 +91,10 @@ let
     NEXT_PUBLIC_AUTO_CONNECT = "false";
     NEXT_PUBLIC_DEFAULT_SERVER_HOST = "";
     NEXT_PUBLIC_DEFAULT_SERVER_PORT = "";
+    # Sidebar-footer version, from pyproject (see nix/packages.nix +
+    # dashboard/next.config.ts). Sandboxed build can't reach pyproject on
+    # its own, so pass it explicitly.
+    NEXT_PUBLIC_AGENT_MCP_VERSION = productVersion;
     installPhase = ''
       runHook preInstall
       mkdir -p $out/share
