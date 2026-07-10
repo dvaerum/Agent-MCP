@@ -1839,14 +1839,20 @@ async def _parse_json_body(req: web.Request) -> dict:
         return {}
     try:
         parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, RecursionError) as exc:
+        # Broaden past JSONDecodeError: a deeply-nested body makes
+        # ``json.loads`` raise ``RecursionError`` (a ``RuntimeError``,
+        # NOT a ``ValueError`` subclass like JSONDecodeError), which
+        # would otherwise propagate to an uncaught 500. Both are a
+        # malformed body → the same clean 400 (PF-R20-1).
         # Raise via aiohttp so the per-endpoint handler can catch and
         # surface through the envelope (sticking the message into the
         # exception keeps the call sites simple).
+        msg = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
         raise web.HTTPBadRequest(
             text=json.dumps({
                 "success": False, "error": "invalid_json",
-                "message": f"request body is not valid JSON: {exc.msg}",
+                "message": f"request body is not valid JSON: {msg}",
             }),
             content_type="application/json",
         )
