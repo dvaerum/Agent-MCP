@@ -199,8 +199,21 @@ async def create_project_handler(req: web.Request) -> web.Response:
     try:
         _app._REGISTRY.register(name, str(workspace))
     except ValueError as e:
+        # SD-R34-1 class-sweep: ``ProjectRegistry.register`` raises a
+        # ValueError whose text embeds the ABSOLUTE workspace path(s)
+        # (``… already registered at '<abs>'; refusing to re-point at
+        # '<abs>'``). Reflecting ``str(e)`` here would disclose the same
+        # server filesystem layout the success-envelope fix + the SD-R6-2
+        # rename registry-error scrub already close. This branch is a
+        # narrow TOCTOU (``_validate_name`` above already 409s a known
+        # name in-memory), but scrub defensively: log the detail
+        # server-side, hand back a generic message under the existing
+        # discriminator so the caller still sees ``already_registered``.
+        logger.warning("register %r failed: %s", name, e)
         return _app._error_envelope(
-            error=_app._ERROR_ALREADY_REGISTERED, message=str(e), status=409,
+            error=_app._ERROR_ALREADY_REGISTERED,
+            message="project name is already registered",
+            status=409,
         )
     creator = req.get("user")
     if creator and creator.get("user_id"):
@@ -214,8 +227,22 @@ async def create_project_handler(req: web.Request) -> web.Response:
                 creator.get("username"),
                 name,
             )
+    # SD-R34-1 [info-disclosure]: don't reflect the fully-resolved
+    # ABSOLUTE workspace path (server home dir / deployment filesystem
+    # layout) into the SUCCESS envelope — it's readable by any
+    # ``system.projects.manage`` holder, including a delegated-cap
+    # non-sysadmin operator. Emit the SAME project-relative label the
+    # overview handler uses (``_workspace_label``), so create / overview
+    # are consistent. Missed sibling of the overview scrub + the SD-R15
+    # create/rename/delete ERROR-path scrubs; the create SUCCESS path was
+    # the last leaker.
     return _app._success_envelope(
-        {"project": {"name": name, "workspace": str(workspace)}},
+        {
+            "project": {
+                "name": name,
+                "workspace": _app._workspace_label(str(workspace)),
+            },
+        },
         status=201,
     )
 
@@ -320,7 +347,15 @@ async def rename_project_handler(req: web.Request) -> web.Response:
             status=409,
             extra={"active_connections": conns, "agents": []},
         )
-    _app._systemctl("stop", _app._unit_name(old_name, "backend"))
+    # OBS-R34-RENAME-ONLOOP [availability]: run the blocking ``systemctl
+    # stop`` OFF the event loop (mirrors delete's BL-R7-3). ``_systemctl``
+    # is a synchronous ``subprocess.run`` (~15-150 ms, or up to the
+    # SC-R7-2 timeout on a D-Bus stall); calling it directly stalls the
+    # single aiohttp event loop — every other concurrent router request —
+    # for the duration of the stop.
+    await asyncio.to_thread(
+        _app._systemctl, "stop", _app._unit_name(old_name, "backend"),
+    )
     workspace = Path(old_row.get("workspace", ""))
     new_workspace: Path | None = None
     if workspace.name == old_name and workspace.exists():
@@ -613,8 +648,14 @@ async def stop_project_handler(req: web.Request) -> web.Response:
             extra={"active_connections": conns, "agents": []},
         )
     unit = _app._unit_name(name, "backend")
-    if _app._is_active(unit):
-        r = _app._systemctl("stop", unit)
+    # OBS-R34-RENAME-ONLOOP class-sweep: ``_is_active`` and ``_systemctl``
+    # both shell out (blocking ``subprocess.run``), so calling them
+    # directly stalls the single aiohttp event loop — every other
+    # concurrent router request — for the duration. Run both off-loop via
+    # ``asyncio.to_thread`` (mirrors the orchestrator's BL-R6-2b and
+    # delete's BL-R7-3).
+    if await asyncio.to_thread(_app._is_active, unit):
+        r = await asyncio.to_thread(_app._systemctl, "stop", unit)
         if r.returncode != 0:
             # SD-R15-1: sibling of SC-R8-2 (project_orchestrator._ensure).
             # Reachable via the delegatable ``system.projects.manage`` cap,
