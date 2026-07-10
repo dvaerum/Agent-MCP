@@ -3729,6 +3729,27 @@ async def bulk_task_operations_tool_impl(
                             )
                             continue
 
+                        # SECURITY (BL-R25-1): terminal-sink guard on the
+                        # ASSIGN axis. Terminal states are sinks — a
+                        # completed/cancelled/failed task must not be
+                        # re-pinned onto a live agent, which would silently
+                        # resurrect finished work onto an active worker.
+                        # The single path (_update_single_task) and the
+                        # dashboard composition reassign both refuse a
+                        # terminal-task reassignment; mirror that here.
+                        # Deny this one op (append error + continue) rather
+                        # than aborting the whole bulk transaction, matching
+                        # the _agent_assignable failure handling below.
+                        current_status = task_data.get("status")
+                        if current_status in _TERMINAL_TASK_STATUSES:
+                            results.append(
+                                f"Operation {i+1}: cannot reassign task "
+                                f"'{task_id}' — its status "
+                                f"'{current_status}' is terminal "
+                                f"(completed/cancelled/failed)"
+                            )
+                            continue
+
                         # Reassignment target validation — reject a
                         # free-string ``assigned_to`` that names a
                         # non-existent or terminated agent.
