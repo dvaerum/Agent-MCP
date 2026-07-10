@@ -126,7 +126,12 @@ export function AppSidebar() {
                   Dashboard" tagline — read as leftover beta-marketing
                   copy. Show product + version only. */}
               <div className="font-medium text-foreground">Agent-MCP</div>
-              <div className="text-muted-foreground tabular-nums">v3.4.0</div>
+              {/* Version derived from pyproject.toml via
+                  NEXT_PUBLIC_AGENT_MCP_VERSION (see next.config.ts). Never
+                  hardcode a version literal here — it drifts silently. */}
+              <div className="text-muted-foreground tabular-nums">
+                v{process.env.NEXT_PUBLIC_AGENT_MCP_VERSION ?? "dev"}
+              </div>
             </div>
           )}
           <ServerManagementModal />

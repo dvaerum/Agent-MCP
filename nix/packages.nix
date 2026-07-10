@@ -124,6 +124,11 @@ let
     NEXT_PUBLIC_AUTO_CONNECT = "false";
     NEXT_PUBLIC_DEFAULT_SERVER_HOST = "";
     NEXT_PUBLIC_DEFAULT_SERVER_PORT = "";
+    # Product version shown in the sidebar footer. Sourced from pyproject
+    # (via agentMcpPy.version) so the sandboxed build — which can't see the
+    # repo-root pyproject.toml — still bakes the right number. See
+    # dashboard/next.config.ts resolveVersion().
+    NEXT_PUBLIC_AGENT_MCP_VERSION = agentMcpPy.version;
     installPhase = ''
       runHook preInstall
       mkdir -p $out/share

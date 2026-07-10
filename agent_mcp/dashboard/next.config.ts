@@ -1,9 +1,39 @@
 import type { NextConfig } from "next";
+import { readFileSync } from "fs";
+import { join } from "path";
 
 // Bundle analyzer
 const withBundleAnalyzer = require('@next/bundle-analyzer')({
   enabled: process.env.ANALYZE === 'true',
 })
+
+// Product version shown in the UI (sidebar footer). pyproject.toml is the
+// single source of truth; this NEVER hardcodes a literal (the sidebar used
+// to carry a frozen "v3.4.0" that drifted far behind the real version).
+//
+// Resolution order:
+//   1. NEXT_PUBLIC_AGENT_MCP_VERSION from the environment — the Nix build
+//      passes it (sourced from pyproject) so the sandboxed build, which has
+//      no repo-root pyproject in scope, still gets the right number.
+//   2. Read ../../pyproject.toml at build time — covers plain `npm run
+//      dev` / `npm run build` from the dashboard dir (pyproject is two
+//      levels up: agent_mcp/dashboard -> repo root).
+//   3. "dev" — last-resort fallback if neither is available.
+function resolveVersion(): string {
+  const fromEnv = process.env.NEXT_PUBLIC_AGENT_MCP_VERSION
+  if (fromEnv) return fromEnv
+  try {
+    const pyproject = readFileSync(join(__dirname, "..", "..", "pyproject.toml"), "utf8")
+    const m = pyproject.match(/^\s*version\s*=\s*"([^"]+)"/m)
+    if (m) return m[1]
+  } catch {
+    // pyproject not reachable (e.g. sandboxed build without the env var) —
+    // fall through to the dev sentinel.
+  }
+  return "dev"
+}
+
+const AGENT_MCP_VERSION = resolveVersion()
 
 const nextConfig: NextConfig = {
   // Enable static export for serving through Python backend (only in production)
@@ -48,6 +78,12 @@ const nextConfig: NextConfig = {
   // set the env var — let the sentinel default fire so the router
   // can do its job.
   assetPrefix: process.env.ASSET_PREFIX || '__AGENT_MCP_ASSET_PREFIX__',
+
+  // Inline the resolved product version so client components (the sidebar
+  // footer) read it via process.env at build time. See resolveVersion().
+  env: {
+    NEXT_PUBLIC_AGENT_MCP_VERSION: AGENT_MCP_VERSION,
+  },
 
   eslint: {
     ignoreDuringBuilds: true,

@@ -17,4 +17,12 @@ You should have received a copy of the GNU Affero General Public License
 along with this program. If not, see <https://www.gnu.org/licenses/>.
 """
 
-__version__ = "2.2.0"
+from importlib.metadata import PackageNotFoundError, version as _version
+
+# pyproject.toml is the single source of truth for the version; read it back
+# from the installed package metadata rather than duplicating a literal here
+# (the old hand-maintained "2.2.0" silently drifted years behind pyproject).
+try:
+    __version__ = _version("agent-mcp")
+except PackageNotFoundError:  # running from a source tree without an install
+    __version__ = "0.0.0+source"
