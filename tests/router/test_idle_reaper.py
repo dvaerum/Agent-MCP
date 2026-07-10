@@ -16,6 +16,9 @@ Two cases pinned:
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import threading
+import time
 
 import pytest
 
@@ -115,3 +118,123 @@ async def test_recently_active_project_is_not_stopped(
         "the IDLE_SEC keep-alive window"
     )
     assert (name, "backend") in router_module.last_active
+
+
+# ── SEC-R34: the idle-reaper stop must run off the event loop ────────
+#
+# ``_reaper_tick`` ran ``_systemctl("stop", …)`` SYNCHRONOUSLY on the
+# shared aiohttp event loop. ``_systemctl`` is a blocking
+# ``subprocess.run`` (~15-150 ms, or up to the SC-R7-2 timeout on a
+# D-Bus stall), so reaping a batch of idle units stalled EVERY other
+# concurrent router request for the duration of each stop. This is the
+# final sibling of the "blocking-systemctl-on-event-loop" class already
+# fixed in request handlers (delete BL-R7-3, ensure/start BL-R6-2b,
+# rename+stop OBS-R34, overview #387). It must run off-loop via
+# ``asyncio.to_thread`` — mirroring ``_ensure``'s own off-loop pattern.
+
+
+async def test_reaper_stop_runs_off_event_loop(
+    router_module, router_env, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow ``systemctl stop`` inside a reaper tick MUST NOT block the
+    event loop — it must run via ``asyncio.to_thread``. We block the
+    stubbed ``stop`` in a worker thread and assert a sibling coroutine
+    observes the loop as free almost immediately.
+
+    RED against the pre-fix code: the reaper's stop is a direct on-loop
+    call, so the probe can't run until the ~0.4 s blocking stop returns.
+    """
+    from agent_mcp.router import project_orchestrator as _po
+
+    name = "slow-reap"
+    unit = f"agent-mcp@{name}.service"
+
+    last = 1_000_000.0
+    _po.last_active[(name, "backend")] = last
+    # Wind the clock past IDLE_SEC so this entry is decided idle.
+    monkeypatch.setattr(
+        _po.time, "time", lambda: last + _po.IDLE_SEC + 60.0,
+    )
+
+    started = threading.Event()
+    BLOCK_SEC = 0.4
+
+    def _blocking_systemctl(*args: str) -> subprocess.CompletedProcess:
+        if args and args[0] == "stop":
+            started.set()
+            time.sleep(BLOCK_SEC)  # bounded: no permanent hang on regress
+        return subprocess.CompletedProcess(list(args), 0, "", "")
+
+    monkeypatch.setattr(_po, "_systemctl", _blocking_systemctl)
+
+    loop_free_at: float | None = None
+
+    async def _probe() -> None:
+        nonlocal loop_free_at
+        while not started.is_set():
+            await asyncio.sleep(0.005)
+        loop_free_at = time.monotonic()
+
+    t0 = time.monotonic()
+    tick = asyncio.create_task(_po._reaper_tick())
+    probe = asyncio.create_task(_probe())
+
+    await asyncio.sleep(0.15)
+
+    assert loop_free_at is not None, "reaper systemctl stop never began"
+    elapsed = loop_free_at - t0
+    assert elapsed < 0.25, (
+        f"event loop was blocked ~{elapsed:.3f}s during the reaper "
+        "systemctl stop — it must run off-loop via asyncio.to_thread"
+    )
+
+    await tick
+    await probe
+    # The idle unit was still stopped + dropped from tracking.
+    assert (name, "backend") not in _po.last_active
+
+
+async def test_reaper_does_not_drop_unit_reactivated_during_stop(
+    router_module, router_env, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TOCTOU guard: awaiting the off-loop stop yields the event loop, so
+    a concurrent ``_ensure`` warm-start can re-activate the backend and
+    refresh its ``last_active`` timestamp WHILE the stop runs. The reaper
+    must NOT drop that now-live backend from tracking — otherwise it
+    silently falls out of the reaper's view and is never reaped again.
+
+    RED against the pre-fix code: it pops ``last_active[key]``
+    unconditionally after the stop, discarding the refreshed timestamp.
+    """
+    from agent_mcp.router import project_orchestrator as _po
+
+    name = "reactivated"
+    idle_ts = 1_000_000.0
+    fresh_ts = 9_000_000.0
+    key = (name, "backend")
+    _po.last_active[key] = idle_ts
+    _po.unit_start_times[key] = idle_ts
+
+    # Decided idle at tick start.
+    monkeypatch.setattr(
+        _po.time, "time", lambda: idle_ts + _po.IDLE_SEC + 60.0,
+    )
+
+    def _reactivating_stop(*args: str) -> subprocess.CompletedProcess:
+        if args and args[0] == "stop":
+            # Simulate a concurrent _ensure re-activating the backend
+            # and refreshing its timestamp DURING the stop.
+            _po.last_active[key] = fresh_ts
+            _po.unit_start_times[key] = fresh_ts
+        return subprocess.CompletedProcess(list(args), 0, "", "")
+
+    monkeypatch.setattr(_po, "_systemctl", _reactivating_stop)
+
+    await _po._reaper_tick()
+
+    # The refreshed (live) timestamp must survive — the reaper must not
+    # drop a backend that came back to life during its stop.
+    assert _po.last_active.get(key) == fresh_ts, (
+        "reaper dropped a backend that was re-activated during its stop"
+    )
+    assert _po.unit_start_times.get(key) == fresh_ts
