@@ -599,6 +599,8 @@ class MessageRepository:
     def query(
         self,
         filters: Optional[Dict[str, Any]] = None,
+        *,
+        oldest_first: bool = False,
     ) -> List[Dict[str, Any]]:
         """Run a rich-filter SELECT and return the matching rows.
 
@@ -624,7 +626,14 @@ class MessageRepository:
         * ``limit`` (int, default 50)  — page size (clamped 1..500)
         * ``offset`` (int, default 0) — page offset
 
-        Returns a timestamp-DESC list of message dicts. The dashboard's
+        Returns a timestamp-DESC list of message dicts by default (the
+        shape the dashboard message-list and agent-detail sample
+        callers expect). Pass ``oldest_first=True`` for timestamp-ASC
+        order — the agent event feed (:func:`agent_mcp.tools.
+        agent_communication_tools._collect_events_for`) needs a
+        contiguous OLDEST-first prefix from its cursor so a backlog
+        larger than ``limit`` drains in order across successive polls
+        without dropping the oldest tail (BL-R20-1). The dashboard's
         ``« Newest / Newer / Older / Oldest »`` pagination controls
         (PR #145) need the unfiltered count too — for that, see
         :meth:`count_query`.
@@ -649,9 +658,14 @@ class MessageRepository:
                     stmt, _unused, filters,
                 )
 
+                order_col = (
+                    AgentMessage.timestamp.asc()
+                    if oldest_first
+                    else AgentMessage.timestamp.desc()
+                )
                 rows = (
                     session.execute(
-                        stmt.order_by(AgentMessage.timestamp.desc())
+                        stmt.order_by(order_col)
                         .limit(limit)
                         .offset(offset)
                     )

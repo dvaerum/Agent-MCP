@@ -774,6 +774,13 @@ _FLAG_RECHECK_INTERVAL_SECONDS = 2.0
 
 _BROADCAST_MESSAGE_TYPES = ("broadcast", "announcement", "system_alert")
 
+# Per-poll cap on the message backlog the event feed drains at once.
+# Matches the `query()` upper bound. When more than this many messages
+# have accrued since the cursor, one poll returns a contiguous
+# OLDEST-first prefix and the cursor advances only to the prefix
+# boundary, so the next poll drains the remainder in order (BL-R20-1).
+_MESSAGE_EVENT_QUERY_CAP = 500
+
 
 def _collect_events_for(
     agent_id: str, since: Optional[str]
@@ -818,16 +825,27 @@ def _collect_events_for(
     # so we bump the cursor by an "epsilon" (1 char) so `>= cursor+ε`
     # is equivalent to `> cursor` for ASCII-only ISO timestamps.
     from ..repositories import message_repo
-    # The repo query orders DESC + limits; for the event stream we want
-    # ASC + unbounded. The natural way: query with a large limit and
-    # reverse. The wait_for_events tool today doesn't bound the
-    # per-poll event count, so 500 (the query() upper bound) is a soft
-    # cap we apply transparently — see docstring on query().
+    # BL-R20-1: request the OLDEST messages since the cursor first
+    # (timestamp ASC, capped at `_MESSAGE_EVENT_QUERY_CAP`). The batch
+    # is then a contiguous prefix starting at the cursor, so advancing
+    # the cursor to max(returned) can only skip past messages we
+    # actually delivered. The previous DESC-then-reverse fetch returned
+    # the NEWEST 500 and let the cursor jump past a >500 backlog's
+    # oldest tail — permanent event loss on catch-up plus a
+    # control-message-burying / censorship vector (flood 500+ messages
+    # right after a critical one so the critical sits in the dropped
+    # tail).
     msg_rows = message_repo.query(
-        {"to": agent_id, "since": since_iso, "limit": 500}
+        {"to": agent_id, "since": since_iso,
+         "limit": _MESSAGE_EVENT_QUERY_CAP},
+        oldest_first=True,
     )
-    # Repo returns timestamp DESC; reverse for the ASC event stream.
-    msg_rows.reverse()
+    # When the message backlog fills the cap, the batch is truncated:
+    # the cursor must NOT advance past the newest message we returned,
+    # or messages between the prefix boundary and any newer (unbounded)
+    # task event would be skipped. `msg_cap_ts` is that boundary.
+    messages_truncated = len(msg_rows) >= _MESSAGE_EVENT_QUERY_CAP
+    msg_cap_ts = msg_rows[-1].get("timestamp") if msg_rows else None
     for row in msg_rows:
         # repo `since` is inclusive (`>=`); the legacy SQL was strict
         # `>`. Re-apply the strict filter here to preserve the old
@@ -902,6 +920,18 @@ def _collect_events_for(
     finally:
         if conn:
             conn.close()
+
+    # BL-R20-1: when the message batch was truncated at the cap, clamp
+    # the whole batch to the prefix boundary so the cursor (which
+    # advances to max(returned)) can't leap past undelivered messages
+    # via a newer, unbounded task event. Task events beyond the boundary
+    # are re-collected on the next poll (their query is `updated_at >
+    # cursor`), so nothing is lost — the backlog just drains in order.
+    if messages_truncated and msg_cap_ts:
+        events = [
+            e for e in events
+            if (e.get("timestamp") or "") <= msg_cap_ts
+        ]
 
     # Merge-sort by timestamp ASC. Stable sort preserves the per-source
     # arrival order on ties (which only happen at sub-millisecond
