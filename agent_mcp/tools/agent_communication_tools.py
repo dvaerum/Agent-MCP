@@ -1002,6 +1002,84 @@ def _cap_events_to_boundary(
     ]
 
 
+# BL-R31-2: event types that can arrive in BOTH the DB re-query stream
+# AND the synthetic in-memory queue for the SAME logical event. These
+# are exactly the synthetic event types (``event_bus._SYNTHETIC_EVENT_
+# TYPES``): ``notify_unassigned_task_appeared`` fans out a wall-clock-
+# timestamped queue copy while ``_collect_unassigned_task_events_for``
+# re-queries an ``updated_at``-timestamped DB copy of the same row.
+# Kept as a small local frozenset (rather than importing the private bus
+# constant into the tool layer); the dedup tests pin the invariant that
+# the two sets track each other.
+_DEDUP_EVENT_TYPES = frozenset({"unassigned_task_appeared"})
+
+
+def _event_identity(event: Dict[str, Any]) -> Optional[tuple]:
+    """Stable logical identity for an event, or ``None`` when the event
+    has no cross-stream identity (never deduped).
+
+    Only the dual-source event types (:data:`_DEDUP_EVENT_TYPES`) get an
+    identity: the DB re-query copy and the synthetic queue copy of the
+    SAME task must collapse to one delivery. Every other event type
+    comes from a single source (one DB query returns each row once), so
+    it is left un-keyed and can never be collapsed — genuinely-distinct
+    events stay distinct.
+    """
+    etype = event.get("type")
+    if etype not in _DEDUP_EVENT_TYPES:
+        return None
+    ref = event.get("ref_id")
+    if ref is None:
+        ref = (event.get("payload") or {}).get("task_id")
+    if ref is None:
+        return None
+    return (etype, ref)
+
+
+def _dedup_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Collapse duplicate copies of the same logical event (BL-R31-2).
+
+    ``unassigned_task_appeared`` is delivered from two sources that
+    describe the SAME task: a DB re-query copy timestamped by the task's
+    ``updated_at`` and a synthetic in-memory-queue copy timestamped by
+    wall-clock ``now()``. Merging them without dedup delivers the task
+    twice per envelope, so an auto-claiming worker double-claims it.
+
+    For each stable identity we keep the copy with the EARLIEST
+    timestamp. The DB ``updated_at`` is always <= the synthetic wake's
+    ``now()`` (the notify fires after the row is committed), so this
+    keeps the DB copy — preserving the BL-R20-1 oldest-first ordering
+    and the BL-R21-1 clamp/cursor anchor: the surviving event's
+    timestamp is the real DB transition time, not a later wall-clock
+    instant that could drag the persisted cursor forward or dodge the
+    message-truncation clamp. Dedup therefore runs BEFORE
+    :func:`_cap_events_to_boundary` at every call site.
+
+    Events with no identity (:func:`_event_identity` returns ``None``)
+    are passed through unchanged. Relative order of the kept events is
+    otherwise preserved (the caller re-sorts by timestamp afterwards).
+    """
+    seen: Dict[tuple, int] = {}
+    out: List[Dict[str, Any]] = []
+    for e in events:
+        ident = _event_identity(e)
+        if ident is None:
+            out.append(e)
+            continue
+        prev_idx = seen.get(ident)
+        if prev_idx is None:
+            seen[ident] = len(out)
+            out.append(e)
+            continue
+        # Duplicate identity: keep the earlier-timestamped copy (the DB
+        # ``updated_at`` copy over the wall-clock synthetic copy).
+        if (e.get("timestamp") or "") < (
+            out[prev_idx].get("timestamp") or ""
+        ):
+            out[prev_idx] = e
+    return out
+
+
 def _envelope(
     events: List[Dict[str, Any]], since: Optional[str]
 ) -> Ok:
@@ -1335,6 +1413,11 @@ async def wait_for_events_tool_impl(
         events, msg_cap_ts = _collect_events_with_cap(agent_id, since)
         events.extend(_collect_unassigned_task_events_for(agent_id, since))
         events.extend(g.drain_waiter_queue(waiter_queue))
+        # BL-R31-2: dedup the DB re-query copy and the synthetic-queue
+        # copy of the same unassigned task down to one delivery (keeping
+        # the DB updated_at copy) BEFORE the clamp so the clamp/cursor
+        # anchor stays on the DB transition time.
+        events = _dedup_events(events)
         # BL-R21-1: cap the MERGED batch to the message-truncation
         # boundary so a newer unbounded task/synthetic event can't drag
         # the persisted cursor past the un-returned messages 501+.
@@ -1398,6 +1481,10 @@ async def wait_for_events_tool_impl(
                 if first_item is not g.WAITER_WAKE_SENTINEL and first_item is not None:
                     events.append(first_item)
                 events.extend(rest)
+                # BL-R31-2: dedup the DB re-query + synthetic-queue copies
+                # of the same unassigned task (same rationale as the fast
+                # path) BEFORE the clamp.
+                events = _dedup_events(events)
                 # BL-R21-1: cap the MERGED batch to the message
                 # truncation boundary (same rationale as the fast path).
                 events = _cap_events_to_boundary(events, msg_cap_ts)
@@ -1477,6 +1564,12 @@ async def fetch_events_since_tool_impl(
     # ordering.
     events, msg_cap_ts = _collect_events_with_cap(agent_id, cursor)
     events.extend(_collect_unassigned_task_events_for(agent_id, cursor))
+    # BL-R31-2: dedup any duplicate unassigned-task copies before the
+    # clamp. fetch_events_since doesn't drain the synthetic queue, so the
+    # DB re-query is normally the only source here — this is defensive
+    # parity with the wait_for_events merge path (same helper, same
+    # invariant) so no caller can emit a double.
+    events = _dedup_events(events)
     # BL-R21-1: cap the MERGED batch to the message truncation boundary
     # so the persisted catch-up cursor can't leap past messages 501+ via
     # a newer unbounded unassigned-task event.
