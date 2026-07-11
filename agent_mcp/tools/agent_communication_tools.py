@@ -117,16 +117,20 @@ def _generate_message_id() -> str:
 def _agents_active_by_id() -> set[str]:
     """Set of agent_ids currently registered as active.
 
-    PR-W2c: routed through AgentRepository so non-live agents are
-    excluded by the canonical DB-level filter (LIVE_AGENT_SQL —
-    excludes 'terminated' AND 'tombstone') and tokens
-    aren't part of the projection. The cache shape (token-keyed) is
-    irrelevant to callers — they want the set of *agent_ids* for
-    membership tests.
+    arch-r5 #7: one-line delegate to
+    :meth:`AgentRepository.active_agent_ids` — the single owner of
+    "which agents are active". That owner projects the SAME
+    ``state.active_agents`` cache the ``/mcp`` auth gate
+    (``main_app._bearer_is_active``) and ``view_status`` read, so this
+    predicate can never drift from what a bearer's liveness check
+    reports. (Formerly routed through ``agent_repo.list_active()`` — a
+    fresh DB query — which is a *different*, DB-authoritative
+    projection now reserved for reconciliation/warm/boot; see that
+    method's docstring for why the two must stay separate.)
     """
     from ..repositories import agent_repo
 
-    return {row.get("agent_id") for row in agent_repo.list_active()}
+    return agent_repo.active_agent_ids()
 
 
 def _can_agents_communicate(sender_id: str, recipient_id: str, is_admin: bool) -> tuple[bool, str]:
