@@ -262,9 +262,11 @@ from ..core.tool_result import (
 )
 from ..utils.audit_utils import log_audit
 from ..db.connection import get_db_connection
-from ..db.engine import SessionLocal, get_session
+from ..db.engine import get_session
 from ..db.models import ProjectContext
 from ..db.actions.agent_actions_db import log_agent_action_to_db
+from ..db.unit_of_work import unit_of_work
+from ..repositories import project_context_repository as project_context_repo
 
 
 # ── Wave 6 PR 3 helpers ──────────────────────────────────────────────
@@ -556,7 +558,7 @@ def _row_to_dict(row: ProjectContext) -> Dict[str, Any]:
 
 
 def _check_write_authorization(
-    session,
+    connection,
     requesting_agent_id: str,
     context_key: str,
     *,
@@ -572,21 +574,20 @@ def _check_write_authorization(
     - Non-admin + new key (no row yet) + non-config: allowed.
     - Non-admin + existing key + creator == self + non-config: allowed.
 
-    Reads `created_by` via the same SQLAlchemy session, so the check
-    sees pending changes inside an open transaction.
+    arch-r4 #6: reads `created_by` via ``project_context_repo.get()``
+    against the caller's open ``unit_of_work().cursor``, so the check
+    sees pending changes inside the same open transaction (was a
+    SQLAlchemy session query pre-migration; same in-transaction
+    visibility guarantee, now on the raw-sqlite seam).
     """
     if is_admin:
         return None
     if _CONFIG_KEY_RE.match(context_key):
         return _config_key_error()
-    existing = (
-        session.query(ProjectContext.created_by)
-        .filter(ProjectContext.context_key == context_key)
-        .one_or_none()
-    )
+    existing = project_context_repo.get(context_key, connection=connection)
     if existing is None:
         return None
-    creator = existing[0]
+    creator = existing["created_by"]
     # Legacy rows where created_by is NULL (pre-migration backfill edge
     # case) cannot be safely attributed — treat as admin-only so workers
     # can't claim them.
@@ -597,23 +598,26 @@ def _check_write_authorization(
     return None
 
 
-def _create_context_backup(session, backup_name: str = None) -> Dict[str, Any]:
-    """Create a backup of all project context data via the ORM."""
+def _create_context_backup(
+    connection, backup_name: str = None
+) -> Dict[str, Any]:
+    """Create a backup of all project context data.
+
+    arch-r4 #6: reads via ``project_context_repo.list_all()`` against
+    the caller's open ``unit_of_work().cursor`` (was a SQLAlchemy
+    session query pre-migration).
+    """
     if not backup_name:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_name = f"context_backup_{timestamp}"
 
-    rows = (
-        session.query(ProjectContext)
-        .order_by(ProjectContext.context_key)
-        .all()
-    )
+    rows = project_context_repo.list_all(connection=connection)
 
     backup_data = {
         "backup_name": backup_name,
         "created_at": datetime.datetime.now().isoformat(),
         "total_entries": len(rows),
-        "entries": [_row_to_dict(r) for r in rows],
+        "entries": rows,
     }
 
     return backup_data
@@ -694,286 +698,284 @@ async def view_project_context_tool_impl(
     results_list: List[Dict[str, Any]] = []
     response_message: str = ""
 
-    session = SessionLocal()
-    try:
-        # Build smart query based on filters
-        stmt = select(
-            ProjectContext.context_key,
-            ProjectContext.value,
-            ProjectContext.description,
-            ProjectContext.updated_by,
-            ProjectContext.updated_at,
-            ProjectContext.created_by,
-            ProjectContext.created_at,
-            func.length(ProjectContext.value).label("value_size"),
-        )
-
-        conditions = []
-        if context_key_filter:
-            conditions.append(ProjectContext.context_key == context_key_filter)
-        elif search_query_filter:
-            like_pattern = f"%{search_query_filter}%"
-            conditions.append(
-                or_(
-                    ProjectContext.context_key.like(like_pattern),
-                    ProjectContext.description.like(like_pattern),
-                    ProjectContext.value.like(like_pattern),
-                )
+    # arch-r4 #6: read-only body — ``get_session()`` (commit-on-exit,
+    # rollback-on-exception, always-close) replaces the hand-rolled
+    # ``SessionLocal()`` + manual close-in-every-branch pattern. Since
+    # this body never writes, the commit-on-exit is a no-op; the win is
+    # a single owner for the session lifecycle instead of one
+    # ``session.close()`` call per except branch plus a defensive
+    # double-close in ``finally``.
+    with get_session() as session:
+        try:
+            # Build smart query based on filters
+            stmt = select(
+                ProjectContext.context_key,
+                ProjectContext.value,
+                ProjectContext.description,
+                ProjectContext.updated_by,
+                ProjectContext.updated_at,
+                ProjectContext.created_by,
+                ProjectContext.created_at,
+                func.length(ProjectContext.value).label("value_size"),
             )
 
-        if show_stale_entries:
-            # Show entries older than 30 days
-            thirty_days_ago = (
-                datetime.datetime.now() - datetime.timedelta(days=30)
-            ).isoformat()
-            conditions.append(ProjectContext.updated_at < thirty_days_ago)
-
-        if conditions:
-            stmt = stmt.where(*conditions)
-
-        # Smart sorting
-        if sort_by == "size":
-            stmt = stmt.order_by(func.length(ProjectContext.value).desc())
-        elif sort_by == "key":
-            stmt = stmt.order_by(ProjectContext.context_key.asc())
-        else:  # updated_at (default)
-            stmt = stmt.order_by(ProjectContext.updated_at.desc())
-
-        stmt = stmt.limit(max_results)
-
-        rows = session.execute(stmt).all()
-
-        # Redact secret-looking keys for non-admin callers (issue I).
-        # Admins continue to see everything; workers see everything
-        # EXCEPT keys where is_secret_key() is True. Wave 6 PR 3:
-        # ``verify_token(.., "admin")`` → :func:`_is_admin_principal`
-        # which prefers the Principal's typed role and falls back to
-        # the legacy ``operator_session_active`` ContextVar during
-        # the bridge window.
-        if not _is_admin_principal(principal):
-            # Defense-in-depth (round-3): also drop a row whose VALUE /
-            # DESCRIPTION carries an embedded credential under a benign
-            # KEY name, mirroring the RAG index-time value scan so a
-            # secret pasted into a non-secret key never leaks at the tool
-            # boundary either. Import the single canonical predicate
-            # lazily to avoid the tools <-> rag import cycle.
-            from ..features.rag.indexing import _value_has_embedded_secret
-
-            rows = [
-                r
-                for r in rows
-                if not is_secret_key(r.context_key)
-                and not _value_has_embedded_secret(r.value, r.description)
-            ]
-
-        # Process results with enhanced information
-        for row_data in rows:
-            try:
-                value_parsed = json.loads(row_data.value)
-                json_valid = True
-            except json.JSONDecodeError:
-                value_parsed = row_data.value
-                json_valid = False
-
-            # Calculate additional metadata
-            entry_size = len(str(row_data.value))
-            updated_at = row_data.updated_at
-            days_old = None
-
-            if updated_at:
-                try:
-                    updated_time = datetime.datetime.fromisoformat(
-                        updated_at.replace("Z", "+00:00").replace("+00:00", "")
-                    )
-                    days_old = (datetime.datetime.now() - updated_time).days
-                except:
-                    pass
-
-            entry_data = {
-                "key": row_data.context_key,
-                "value": value_parsed,
-                "description": row_data.description,
-                "updated_by": row_data.updated_by,
-                "updated_at": updated_at,
-                "created_by": row_data.created_by,
-                "created_at": row_data.created_at,
-                "_metadata": {
-                    "size_bytes": entry_size,
-                    "size_kb": round(entry_size / 1024, 2),
-                    "json_valid": json_valid,
-                    "days_old": days_old,
-                    "is_stale": days_old and days_old > 30,
-                    "is_large": entry_size > 10240,  # >10KB
-                },
-            }
-            results_list.append(entry_data)
-
-        # Generate smart response
-        if not results_list:
-            response_message = "No project context entries found matching the criteria."
-        else:
-            # Build header with filter information
-            filter_info = []
+            conditions = []
             if context_key_filter:
-                filter_info.append(f"key='{context_key_filter}'")
-            if search_query_filter:
-                filter_info.append(f"search='{search_query_filter}'")
+                conditions.append(ProjectContext.context_key == context_key_filter)
+            elif search_query_filter:
+                like_pattern = f"%{search_query_filter}%"
+                conditions.append(
+                    or_(
+                        ProjectContext.context_key.like(like_pattern),
+                        ProjectContext.description.like(like_pattern),
+                        ProjectContext.value.like(like_pattern),
+                    )
+                )
+
             if show_stale_entries:
-                filter_info.append("stale_only=true")
+                # Show entries older than 30 days
+                thirty_days_ago = (
+                    datetime.datetime.now() - datetime.timedelta(days=30)
+                ).isoformat()
+                conditions.append(ProjectContext.updated_at < thirty_days_ago)
 
-            header = f"Project Context ({len(results_list)} entries"
-            if filter_info:
-                header += f", filtered by: {', '.join(filter_info)}"
-            header += f", sorted by: {sort_by})"
+            if conditions:
+                stmt = stmt.where(*conditions)
 
-            response_parts = [header + "\n"]
+            # Smart sorting
+            if sort_by == "size":
+                stmt = stmt.order_by(func.length(ProjectContext.value).desc())
+            elif sort_by == "key":
+                stmt = stmt.order_by(ProjectContext.context_key.asc())
+            else:  # updated_at (default)
+                stmt = stmt.order_by(ProjectContext.updated_at.desc())
 
-            # Add health analysis if requested
-            if show_health_analysis:
-                # Fetch all entries for comprehensive health analysis
-                all_rows = session.execute(
-                    select(
-                        ProjectContext.context_key,
-                        ProjectContext.value,
-                        ProjectContext.updated_at,
-                    )
-                ).all()
-                all_entries = [
-                    {
-                        "context_key": r.context_key,
-                        "value": r.value,
-                        "updated_at": r.updated_at,
-                    }
-                    for r in all_rows
+            stmt = stmt.limit(max_results)
+
+            rows = session.execute(stmt).all()
+
+            # Redact secret-looking keys for non-admin callers (issue I).
+            # Admins continue to see everything; workers see everything
+            # EXCEPT keys where is_secret_key() is True. Wave 6 PR 3:
+            # ``verify_token(.., "admin")`` → :func:`_is_admin_principal`
+            # which prefers the Principal's typed role and falls back to
+            # the legacy ``operator_session_active`` ContextVar during
+            # the bridge window.
+            if not _is_admin_principal(principal):
+                # Defense-in-depth (round-3): also drop a row whose VALUE /
+                # DESCRIPTION carries an embedded credential under a benign
+                # KEY name, mirroring the RAG index-time value scan so a
+                # secret pasted into a non-secret key never leaks at the tool
+                # boundary either. Import the single canonical predicate
+                # lazily to avoid the tools <-> rag import cycle.
+                from ..features.rag.indexing import _value_has_embedded_secret
+
+                rows = [
+                    r
+                    for r in rows
+                    if not is_secret_key(r.context_key)
+                    and not _value_has_embedded_secret(r.value, r.description)
                 ]
-                health_analysis = _analyze_context_health(all_entries)
 
-                health_status = health_analysis["status"]
-                health_score = health_analysis["health_score"]
+            # Process results with enhanced information
+            for row_data in rows:
+                try:
+                    value_parsed = json.loads(row_data.value)
+                    json_valid = True
+                except json.JSONDecodeError:
+                    value_parsed = row_data.value
+                    json_valid = False
 
-                health_icon = (
-                    "🟢"
-                    if health_status == "excellent"
-                    else (
-                        "🟡"
-                        if health_status == "good"
-                        else "🟠" if health_status == "needs_attention" else "🔴"
+                # Calculate additional metadata
+                entry_size = len(str(row_data.value))
+                updated_at = row_data.updated_at
+                days_old = None
+
+                if updated_at:
+                    try:
+                        updated_time = datetime.datetime.fromisoformat(
+                            updated_at.replace("Z", "+00:00").replace("+00:00", "")
+                        )
+                        days_old = (datetime.datetime.now() - updated_time).days
+                    except:
+                        pass
+
+                entry_data = {
+                    "key": row_data.context_key,
+                    "value": value_parsed,
+                    "description": row_data.description,
+                    "updated_by": row_data.updated_by,
+                    "updated_at": updated_at,
+                    "created_by": row_data.created_by,
+                    "created_at": row_data.created_at,
+                    "_metadata": {
+                        "size_bytes": entry_size,
+                        "size_kb": round(entry_size / 1024, 2),
+                        "json_valid": json_valid,
+                        "days_old": days_old,
+                        "is_stale": days_old and days_old > 30,
+                        "is_large": entry_size > 10240,  # >10KB
+                    },
+                }
+                results_list.append(entry_data)
+
+            # Generate smart response
+            if not results_list:
+                response_message = "No project context entries found matching the criteria."
+            else:
+                # Build header with filter information
+                filter_info = []
+                if context_key_filter:
+                    filter_info.append(f"key='{context_key_filter}'")
+                if search_query_filter:
+                    filter_info.append(f"search='{search_query_filter}'")
+                if show_stale_entries:
+                    filter_info.append("stale_only=true")
+
+                header = f"Project Context ({len(results_list)} entries"
+                if filter_info:
+                    header += f", filtered by: {', '.join(filter_info)}"
+                header += f", sorted by: {sort_by})"
+
+                response_parts = [header + "\n"]
+
+                # Add health analysis if requested
+                if show_health_analysis:
+                    # Fetch all entries for comprehensive health analysis
+                    all_rows = session.execute(
+                        select(
+                            ProjectContext.context_key,
+                            ProjectContext.value,
+                            ProjectContext.updated_at,
+                        )
+                    ).all()
+                    all_entries = [
+                        {
+                            "context_key": r.context_key,
+                            "value": r.value,
+                            "updated_at": r.updated_at,
+                        }
+                        for r in all_rows
+                    ]
+                    health_analysis = _analyze_context_health(all_entries)
+
+                    health_status = health_analysis["status"]
+                    health_score = health_analysis["health_score"]
+
+                    health_icon = (
+                        "🟢"
+                        if health_status == "excellent"
+                        else (
+                            "🟡"
+                            if health_status == "good"
+                            else "🟠" if health_status == "needs_attention" else "🔴"
+                        )
                     )
-                )
 
-                response_parts.append(
-                    f"📊 **Context Health:** {health_icon} {health_status.title()} ({health_score}/100)"
-                )
-                response_parts.append(f"   Total: {health_analysis['total']} entries")
-                response_parts.append(
-                    f"   Issues: {health_analysis['json_errors']} JSON errors, {health_analysis['stale_entries']} stale, {health_analysis['large_entries']} large"
-                )
-
-                if health_analysis["recommendations"]:
                     response_parts.append(
-                        f"   💡 {health_analysis['recommendations'][0]}"
+                        f"📊 **Context Health:** {health_icon} {health_status.title()} ({health_score}/100)"
                     )
-                response_parts.append("")
-
-            # Add backup info if requested
-            if include_backup_info:
-                response_parts.append(
-                    "💾 **Backup Info:** Use bulk_update_project_context for backups"
-                )
-                response_parts.append("")
-
-            # Format entries
-            for i, entry in enumerate(results_list[:20]):  # Limit display to 20 entries
-                metadata = entry.get("_metadata", {})
-
-                # Entry header with smart indicators
-                indicators = []
-                if not metadata.get("json_valid", True):
-                    indicators.append("❌ JSON_ERROR")
-                if metadata.get("is_stale", False):
-                    indicators.append(f"⏰ STALE({metadata.get('days_old')}d)")
-                if metadata.get("is_large", False):
-                    indicators.append(f"📦 LARGE({metadata.get('size_kb')}KB)")
-
-                indicator_text = " " + " ".join(indicators) if indicators else ""
-
-                response_parts.append(f"**{entry['key']}**{indicator_text}")
-                response_parts.append(
-                    f"  Description: {entry.get('description', 'No description')}"
-                )
-                response_parts.append(
-                    f"  Updated: {entry.get('updated_at', 'Unknown')} by {entry.get('updated_by', 'Unknown')}"
-                )
-                if entry.get("created_by"):
+                    response_parts.append(f"   Total: {health_analysis['total']} entries")
                     response_parts.append(
-                        f"  Created: {entry.get('created_at', 'Unknown')} by {entry.get('created_by')}"
+                        f"   Issues: {health_analysis['json_errors']} JSON errors, {health_analysis['stale_entries']} stale, {health_analysis['large_entries']} large"
                     )
 
-                # Show value preview (truncated for large values)
-                value_str = (
-                    json.dumps(entry["value"], indent=2)
-                    if isinstance(entry["value"], (dict, list))
-                    else str(entry["value"])
-                )
-                if len(value_str) > 500:
-                    value_str = value_str[:500] + "... [TRUNCATED]"
-                response_parts.append(f"  Value: {value_str}")
-                response_parts.append("")
+                    if health_analysis["recommendations"]:
+                        response_parts.append(
+                            f"   💡 {health_analysis['recommendations'][0]}"
+                        )
+                    response_parts.append("")
 
-            if len(results_list) > 20:
-                response_parts.append(f"... and {len(results_list) - 20} more entries")
+                # Add backup info if requested
+                if include_backup_info:
+                    response_parts.append(
+                        "💾 **Backup Info:** Use bulk_update_project_context for backups"
+                    )
+                    response_parts.append("")
+
+                # Format entries
+                for i, entry in enumerate(results_list[:20]):  # Limit display to 20 entries
+                    metadata = entry.get("_metadata", {})
+
+                    # Entry header with smart indicators
+                    indicators = []
+                    if not metadata.get("json_valid", True):
+                        indicators.append("❌ JSON_ERROR")
+                    if metadata.get("is_stale", False):
+                        indicators.append(f"⏰ STALE({metadata.get('days_old')}d)")
+                    if metadata.get("is_large", False):
+                        indicators.append(f"📦 LARGE({metadata.get('size_kb')}KB)")
+
+                    indicator_text = " " + " ".join(indicators) if indicators else ""
+
+                    response_parts.append(f"**{entry['key']}**{indicator_text}")
+                    response_parts.append(
+                        f"  Description: {entry.get('description', 'No description')}"
+                    )
+                    response_parts.append(
+                        f"  Updated: {entry.get('updated_at', 'Unknown')} by {entry.get('updated_by', 'Unknown')}"
+                    )
+                    if entry.get("created_by"):
+                        response_parts.append(
+                            f"  Created: {entry.get('created_at', 'Unknown')} by {entry.get('created_by')}"
+                        )
+
+                    # Show value preview (truncated for large values)
+                    value_str = (
+                        json.dumps(entry["value"], indent=2)
+                        if isinstance(entry["value"], (dict, list))
+                        else str(entry["value"])
+                    )
+                    if len(value_str) > 500:
+                        value_str = value_str[:500] + "... [TRUNCATED]"
+                    response_parts.append(f"  Value: {value_str}")
+                    response_parts.append("")
+
+                if len(results_list) > 20:
+                    response_parts.append(f"... and {len(results_list) - 20} more entries")
+                    response_parts.append(
+                        "Use max_results parameter to see more, or add filters to narrow results"
+                    )
+
+                # Add smart usage tips
+                response_parts.append("\n💡 Smart Tips:")
+                if not show_health_analysis:
+                    response_parts.append(
+                        "• Add show_health_analysis=true for context health metrics"
+                    )
+                if not show_stale_entries:
+                    response_parts.append(
+                        "• Add show_stale_entries=true to see entries needing updates"
+                    )
                 response_parts.append(
-                    "Use max_results parameter to see more, or add filters to narrow results"
+                    "• Use sort_by=[key|size|updated_at] for different sorting"
+                )
+                response_parts.append(
+                    "• Use validate_context_consistency to fix JSON errors"
                 )
 
-            # Add smart usage tips
-            response_parts.append("\n💡 Smart Tips:")
-            if not show_health_analysis:
-                response_parts.append(
-                    "• Add show_health_analysis=true for context health metrics"
-                )
-            if not show_stale_entries:
-                response_parts.append(
-                    "• Add show_stale_entries=true to see entries needing updates"
-                )
-            response_parts.append(
-                "• Use sort_by=[key|size|updated_at] for different sorting"
+                response_message = "\n".join(response_parts)
+
+        except SQLAlchemyError as e_sql:
+            logger.error(
+                f"Database error viewing project context: {e_sql}", exc_info=True
+            )  # main.py:1462
+            return Failed(
+                message=f"Database error viewing project context: {e_sql}"
             )
-            response_parts.append(
-                "• Use validate_context_consistency to fix JSON errors"
+        except (
+            json.JSONDecodeError
+        ) as e_json:  # Should be caught per-item, but as a fallback
+            logger.error(
+                f"Error decoding JSON from project_context table during bulk view: {e_json}",
+                exc_info=True,
+            )  # main.py:1465
+            return Failed(
+                message="Error decoding stored project context value(s)."
             )
-
-            response_message = "\n".join(response_parts)
-
-    except SQLAlchemyError as e_sql:
-        logger.error(
-            f"Database error viewing project context: {e_sql}", exc_info=True
-        )  # main.py:1462
-        session.close()
-        return Failed(
-            message=f"Database error viewing project context: {e_sql}"
-        )
-    except (
-        json.JSONDecodeError
-    ) as e_json:  # Should be caught per-item, but as a fallback
-        logger.error(
-            f"Error decoding JSON from project_context table during bulk view: {e_json}",
-            exc_info=True,
-        )  # main.py:1465
-        session.close()
-        return Failed(
-            message="Error decoding stored project context value(s)."
-        )
-    except Exception as e:
-        logger.error(f"Unexpected error viewing project context: {e}", exc_info=True)
-        session.close()
-        return Failed(message=f"An unexpected error occurred: {e}")
-    finally:
-        # The early-return branches above already close the session;
-        # this finally handles the success path. Calling .close()
-        # twice on a SQLAlchemy session is harmless (no-op if already
-        # closed).
-        session.close()
+        except Exception as e:
+            logger.error(f"Unexpected error viewing project context: {e}", exc_info=True)
+            return Failed(message=f"An unexpected error occurred: {e}")
 
     return Ok(
         data={
@@ -1002,58 +1004,48 @@ def _single_update_inline(
 ) -> Optional[str]:
     """Sync single-update body — returns an error message or None.
 
-    Inline (not queued) for the same reason as the bulk path: tests +
-    test-style entry points run tools on ad-hoc asyncio loops and
-    deadlock when the body posts into the lifespan write queue.
-    SQLAlchemy + SQLite WAL handles the actual write serialization.
+    arch-r4 #6: the unit-of-work owns the transaction. The upsert (via
+    ``project_context_repo``) and its ``updated_context`` DB-audit row
+    commit atomically on ``u.cursor`` — replaces the
+    ``session.connection().connection`` ORM-drill-through and the
+    hand-rolled ``session.commit()``/``rollback()``/``close()`` trio.
+    An authorization failure (or any exception) returns/raises before
+    anything is written, so the scope's clean-exit commit is a no-op
+    and nothing needs to be undone; any exception after a write is
+    rolled back by the scope itself (emit-iff-commit).
+
+    Still inline (not queued) for the same reason as the bulk path:
+    tests + test-style entry points run tools on ad-hoc asyncio loops
+    and deadlock when the body posts into the lifespan write queue.
     """
-    session = SessionLocal()
-    try:
+    with unit_of_work() as u:
+        cursor = u.cursor
+
         err = _check_write_authorization(
-            session,
+            cursor,
             requesting_agent_id,
             context_key_to_update,
             is_admin=is_admin,
         )
         if err is not None:
-            session.rollback()
             return err
 
-        now_iso = datetime.datetime.now().isoformat()
-
-        existing = (
-            session.query(ProjectContext)
-            .filter(ProjectContext.context_key == context_key_to_update)
-            .one_or_none()
+        # BL-R22-1: partial-update parity with the REST handler
+        # (memories.py: `if description is not None: row.description =
+        # description`). `description_for_context` is
+        # `arguments.get("description")`, so `None` means the caller
+        # omitted it — a value-only update must PRESERVE the existing
+        # description, not NULL it. On INSERT the repo stores whatever
+        # `description_for_context` is (including None) unconditionally.
+        project_context_repo.upsert(
+            context_key_to_update,
+            value_json_str,
+            description_for_context,
+            description_provided=description_for_context is not None,
+            actor=requesting_agent_id,
+            connection=cursor,
         )
-        if existing is None:
-            session.add(
-                ProjectContext(
-                    context_key=context_key_to_update,
-                    value=value_json_str,
-                    description=description_for_context,
-                    created_at=now_iso,
-                    created_by=requesting_agent_id,
-                    updated_at=now_iso,
-                    updated_by=requesting_agent_id,
-                )
-            )
-        else:
-            existing.value = value_json_str
-            existing.updated_at = now_iso
-            existing.updated_by = requesting_agent_id
-            # BL-R22-1: partial-update parity with the REST handler
-            # (memories.py: `if description is not None: row.description
-            # = description`). `description_for_context` is
-            # `arguments.get("description")`, so `None` means the caller
-            # omitted it — a value-only update must PRESERVE the
-            # existing description, not NULL it.
-            if description_for_context is not None:
-                existing.description = description_for_context
-            # created_at / created_by stay frozen on UPDATE
 
-        raw_conn = session.connection().connection
-        cursor = raw_conn.cursor()
         log_agent_action_to_db(
             cursor,
             requesting_agent_id,
@@ -1061,13 +1053,10 @@ def _single_update_inline(
             details={"context_key": context_key_to_update, "action": "set/update"},
         )
 
-        session.commit()
         logger.info(
             f"Project context for key '{context_key_to_update}' updated by '{requesting_agent_id}'."
         )
         return None
-    finally:
-        session.close()
 
 
 async def _handle_single_context_update(
@@ -1320,26 +1309,34 @@ def _bulk_update_inline(
     Both `_handle_bulk_context_update` (queued) and the standalone
     `bulk_update_project_context_tool_impl` (inline) call this so the
     ownership rules + atomicity can't drift between the two surfaces.
+
+    arch-r4 #6: one ``unit_of_work()`` scope owns the whole batch — the
+    Phase 1 all-keys-authorized-first / Phase 2 per-item apply-and-log
+    shape is unchanged, but every write + its ``bulk_updated_context``
+    DB-audit row goes through ``u.cursor`` (was
+    ``session.connection().connection``). A Phase 1 authorization
+    failure returns before any write, so the scope's commit is a no-op;
+    a per-item exception in Phase 2 is still swallowed into
+    ``failed_updates`` (intentional partial-success semantics — the
+    batch is atomic on AUTHORIZATION, not on per-item success) and the
+    scope commits whatever succeeded, exactly matching the legacy
+    single ``session.commit()`` at the end of the batch.
     """
-    session = SessionLocal()
     results: List[str] = []
     failed_updates: List[str] = []
-    try:
+    with unit_of_work() as u:
+        cursor = u.cursor
+
         # Phase 1 — authorize every key up front.
         for upd in updates_list:
             key = upd.get("context_key")
             if not key:
                 continue
             err = _check_write_authorization(
-                session, requesting_agent_id, key, is_admin=is_admin
+                cursor, requesting_agent_id, key, is_admin=is_admin
             )
             if err is not None:
-                session.rollback()
                 return err, []
-
-        now_iso = datetime.datetime.now().isoformat()
-        raw_conn = session.connection().connection
-        cursor = raw_conn.cursor()
 
         # Phase 2 — apply each update.
         for i, update in enumerate(updates_list):
@@ -1359,31 +1356,15 @@ def _bulk_update_inline(
 
                 value_json_str = json.dumps(context_value)
 
-                existing = (
-                    session.query(ProjectContext)
-                    .filter(ProjectContext.context_key == context_key)
-                    .one_or_none()
+                project_context_repo.upsert(
+                    context_key,
+                    value_json_str,
+                    description,
+                    description_provided=description_provided,
+                    actor=requesting_agent_id,
+                    connection=cursor,
                 )
-                if existing is None:
-                    session.add(
-                        ProjectContext(
-                            context_key=context_key,
-                            value=value_json_str,
-                            description=description,
-                            created_at=now_iso,
-                            created_by=requesting_agent_id,
-                            updated_at=now_iso,
-                            updated_by=requesting_agent_id,
-                        )
-                    )
-                else:
-                    existing.value = value_json_str
-                    existing.updated_at = now_iso
-                    existing.updated_by = requesting_agent_id
-                    if description_provided:
-                        existing.description = description
 
-                session.flush()
                 results.append(f"✓ Updated '{context_key}'")
 
                 log_agent_action_to_db(
@@ -1405,8 +1386,6 @@ def _bulk_update_inline(
                     f"✗ Failed '{update.get('context_key', 'unknown')}': {str(e_update)}"
                 )
 
-        session.commit()
-
         response_parts = [
             f"Bulk update completed: {len(results)} successful, {len(failed_updates)} failed"
         ]
@@ -1420,8 +1399,6 @@ def _bulk_update_inline(
             f"Bulk context update by '{requesting_agent_id}': {len(results)} successful, {len(failed_updates)} failed."
         )
         return None, response_parts
-    finally:
-        session.close()
 
 
 async def bulk_update_project_context_tool_impl(
@@ -1538,62 +1515,48 @@ def _create_context_inline(
 
     Inline (not queued) for the same loop-affinity reason as the update
     path — see :func:`_single_update_inline`: tools run on ad-hoc asyncio
-    loops that deadlock on the lifespan write queue; SQLAlchemy + SQLite
-    WAL serialises the write.
+    loops that deadlock on the lifespan write queue.
+
+    arch-r4 #6: the unit-of-work owns the transaction — the INSERT (via
+    ``project_context_repo.create_new``) and its ``created_memory``
+    DB-audit row commit atomically on ``u.cursor``, replacing the
+    ``session.connection().connection`` ORM-drill-through.
     """
-    session = SessionLocal()
-    try:
+    with unit_of_work() as u:
+        cursor = u.cursor
+
         err = _check_write_authorization(
-            session, requesting_agent_id, context_key, is_admin=is_admin
+            cursor, requesting_agent_id, context_key, is_admin=is_admin
         )
         if err is not None:
-            session.rollback()
             reason = err
             if reason.lower().startswith("unauthorized:"):
                 reason = reason[len("Unauthorized:"):].lstrip()
             return PermissionDenied(reason=reason)
 
-        existing = (
-            session.query(ProjectContext)
-            .filter(ProjectContext.context_key == context_key)
-            .one_or_none()
+        row = project_context_repo.create_new(
+            context_key,
+            value_json_str,
+            description,
+            actor=requesting_agent_id,
+            connection=cursor,
         )
-        if existing is not None:
-            session.rollback()
+        if row is None:
             return Conflict(reason="Memory with this key already exists")
 
-        now_iso = datetime.datetime.now().isoformat()
-        session.add(
-            ProjectContext(
-                context_key=context_key,
-                value=value_json_str,
-                description=description,
-                created_at=now_iso,
-                created_by=requesting_agent_id,
-                updated_at=now_iso,
-                updated_by=requesting_agent_id,
-            )
-        )
-        session.flush()
-
-        # Audit through the session's raw connection so the action lands
-        # in the SAME transaction as the project_context insert.
-        raw_conn = session.connection().connection
-        cursor = raw_conn.cursor()
+        # Audit through the same cursor so the action lands in the SAME
+        # transaction as the project_context insert.
         log_agent_action_to_db(
             cursor,
             requesting_agent_id,
             "created_memory",
             details={"context_key": context_key},
         )
-        session.commit()
         logger.info(
             f"Project context created for key '{context_key}' by "
             f"'{requesting_agent_id}'."
         )
         return None
-    finally:
-        session.close()
 
 
 async def create_project_context_tool_impl(
@@ -1609,10 +1572,10 @@ async def create_project_context_tool_impl(
     wake set) now lives here ONCE, so the REST route and this MCP tool are
     ONE implementation.
 
-    ORM, not the raw-sqlite unit_of_work: project_context is a SQLAlchemy
-    table (``SessionLocal``), matching its ``update_``/``delete_`` siblings.
-    An ORM-session-aware unit_of_work variant is a separate follow-up (see
-    the arch-deepening plan's "design notes surfaced during D").
+    arch-r4 #6: routes through ``unit_of_work()`` + ``project_context_repo``
+    (parameterized SQL on ``u.cursor``), matching its ``update_``/``delete_``
+    siblings — this is the "ORM-session-aware unit_of_work follow-up" the
+    arch-deepening plan's design notes flagged as a separate PR.
 
     Auth mirrors the siblings: authenticated caller
     (:func:`_requires_authenticated_caller`) + viewer-tier operators denied
@@ -1736,123 +1699,126 @@ async def backup_project_context_tool_impl(
         requesting_agent_id, "backup_project_context", {"backup_name": backup_name}
     )
 
-    session = SessionLocal()
+    # arch-r4 #6: the unit-of-work owns the transaction — the full-table
+    # read (via project_context_repo.list_all) and the
+    # ``backup_project_context`` DB-audit row run on the SAME
+    # ``u.cursor``, and a failure anywhere in the scope (including the
+    # file-write below) rolls back before any audit row lands. Replaces
+    # the ``session.connection().connection`` ORM-drill-through.
     try:
-        # Create backup
-        backup_data = _create_context_backup(session, backup_name)
+        with unit_of_work() as u:
+            cursor = u.cursor
 
-        # Add health analysis if requested
-        if include_health_report:
-            all_entries = backup_data["entries"]
-            health_analysis = _analyze_context_health(all_entries)
-            backup_data["health_report"] = health_analysis
+            # Create backup
+            backup_data = _create_context_backup(cursor, backup_name)
 
-        # Save backup to a file in the project directory (optional - could be database too)
-        import os
+            # Add health analysis if requested
+            if include_health_report:
+                all_entries = backup_data["entries"]
+                health_analysis = _analyze_context_health(all_entries)
+                backup_data["health_report"] = health_analysis
 
-        project_dir = os.environ.get("MCP_PROJECT_DIR", ".")
-        backup_dir = os.path.join(project_dir, ".agent", "backups", "context")
-        os.makedirs(backup_dir, exist_ok=True)
+            # Save backup to a file in the project directory (optional - could be database too)
+            import os
 
-        backup_filename = f"{backup_data['backup_name']}.json"
-        # VULN-003 defense-in-depth: resolve the candidate backup path
-        # and verify it stays inside the backup directory before we
-        # open() it for write. The tool-schema `pattern` on backup_name
-        # is the primary gate (rejects anything outside
-        # ``[A-Za-z0-9._-]{1,128}``, so `../`, absolute paths, NUL bytes
-        # etc. never reach the impl); this check is a belt-and-suspenders
-        # second layer for in-process callers that bypass schema
-        # validation (direct impl invocation in tests, future internal
-        # callers). Path traversal here matters under
-        # stolen-operator-cookie + the VULN-001 CORS exploit vector,
-        # where an attacker who has reached this tool could otherwise
-        # write arbitrary JSON anywhere the server process can write.
-        backup_path_resolved = Path(backup_dir, backup_filename).resolve()
-        backup_dir_resolved = Path(backup_dir).resolve()
-        try:
-            backup_path_resolved.relative_to(backup_dir_resolved)
-        except ValueError:
-            return Invalid(
-                field="backup_name",
-                message=(
-                    "backup_name resolves outside the backup directory"
-                ),
-            )
-        backup_path = str(backup_path_resolved)
+            project_dir = os.environ.get("MCP_PROJECT_DIR", ".")
+            backup_dir = os.path.join(project_dir, ".agent", "backups", "context")
+            os.makedirs(backup_dir, exist_ok=True)
 
-        with open(backup_path, "w", encoding="utf-8") as f:
-            json.dump(backup_data, f, indent=2, ensure_ascii=False)
-
-        # Generate response
-        response_parts = [
-            f"✅ **Context Backup Created**",
-            f"   Name: {backup_data['backup_name']}",
-            f"   Entries: {backup_data['total_entries']}",
-            f"   File: {backup_path}",
-            f"   Created: {backup_data['created_at']}",
-        ]
-
-        if include_health_report and "health_report" in backup_data:
-            health = backup_data["health_report"]
-            health_icon = (
-                "🟢"
-                if health["status"] == "excellent"
-                else (
-                    "🟡"
-                    if health["status"] == "good"
-                    else "🟠" if health["status"] == "needs_attention" else "🔴"
+            backup_filename = f"{backup_data['backup_name']}.json"
+            # VULN-003 defense-in-depth: resolve the candidate backup path
+            # and verify it stays inside the backup directory before we
+            # open() it for write. The tool-schema `pattern` on backup_name
+            # is the primary gate (rejects anything outside
+            # ``[A-Za-z0-9._-]{1,128}``, so `../`, absolute paths, NUL bytes
+            # etc. never reach the impl); this check is a belt-and-suspenders
+            # second layer for in-process callers that bypass schema
+            # validation (direct impl invocation in tests, future internal
+            # callers). Path traversal here matters under
+            # stolen-operator-cookie + the VULN-001 CORS exploit vector,
+            # where an attacker who has reached this tool could otherwise
+            # write arbitrary JSON anywhere the server process can write.
+            backup_path_resolved = Path(backup_dir, backup_filename).resolve()
+            backup_dir_resolved = Path(backup_dir).resolve()
+            try:
+                backup_path_resolved.relative_to(backup_dir_resolved)
+            except ValueError:
+                return Invalid(
+                    field="backup_name",
+                    message=(
+                        "backup_name resolves outside the backup directory"
+                    ),
                 )
-            )
+            backup_path = str(backup_path_resolved)
+
+            with open(backup_path, "w", encoding="utf-8") as f:
+                json.dump(backup_data, f, indent=2, ensure_ascii=False)
+
+            # Generate response
+            response_parts = [
+                f"✅ **Context Backup Created**",
+                f"   Name: {backup_data['backup_name']}",
+                f"   Entries: {backup_data['total_entries']}",
+                f"   File: {backup_path}",
+                f"   Created: {backup_data['created_at']}",
+            ]
+
+            if include_health_report and "health_report" in backup_data:
+                health = backup_data["health_report"]
+                health_icon = (
+                    "🟢"
+                    if health["status"] == "excellent"
+                    else (
+                        "🟡"
+                        if health["status"] == "good"
+                        else "🟠" if health["status"] == "needs_attention" else "🔴"
+                    )
+                )
+
+                response_parts.extend(
+                    [
+                        "",
+                        f"📊 **Health Report:** {health_icon} {health['status'].title()} ({health['health_score']}/100)",
+                        f"   Issues: {health['json_errors']} JSON errors, {health['stale_entries']} stale entries",
+                        f"   Recommendations: {len(health['recommendations'])} items",
+                    ]
+                )
 
             response_parts.extend(
                 [
                     "",
-                    f"📊 **Health Report:** {health_icon} {health['status'].title()} ({health['health_score']}/100)",
-                    f"   Issues: {health['json_errors']} JSON errors, {health['stale_entries']} stale entries",
-                    f"   Recommendations: {len(health['recommendations'])} items",
+                    "💡 **Backup Usage:**",
+                    "• Use this backup to restore context in case of corruption",
+                    "• Store backup files securely - they contain sensitive project data",
+                    "• Regular backups recommended before major context changes",
                 ]
             )
 
-        response_parts.extend(
-            [
-                "",
-                "💡 **Backup Usage:**",
-                "• Use this backup to restore context in case of corruption",
-                "• Store backup files securely - they contain sensitive project data",
-                "• Regular backups recommended before major context changes",
-            ]
-        )
+            # log_agent_action_to_db expects a cursor; reuse the scope's
+            # cursor so the action lives in the same transaction.
+            log_agent_action_to_db(
+                cursor,
+                requesting_agent_id,
+                "backup_project_context",
+                backup_name,
+                {"total_entries": backup_data["total_entries"], "backup_path": backup_path},
+            )
 
-        # log_agent_action_to_db expects a cursor; reuse the session's
-        # raw connection so the action lives in the same transaction.
-        raw_conn = session.connection().connection
-        cursor = raw_conn.cursor()
-        log_agent_action_to_db(
-            cursor,
-            requesting_agent_id,
-            "backup_project_context",
-            backup_name,
-            {"total_entries": backup_data["total_entries"], "backup_path": backup_path},
-        )
-        session.commit()
-
-        return Ok(
-            data={
-                "backup_name": backup_data["backup_name"],
-                "backup_path": backup_path,
-                "total_entries": backup_data["total_entries"],
-                "created_at": backup_data["created_at"],
-                "health_report": backup_data.get("health_report"),
-            },
-            message="\n".join(response_parts),
-        )
+            return Ok(
+                data={
+                    "backup_name": backup_data["backup_name"],
+                    "backup_path": backup_path,
+                    "total_entries": backup_data["total_entries"],
+                    "created_at": backup_data["created_at"],
+                    "health_report": backup_data.get("health_report"),
+                },
+                message="\n".join(response_parts),
+            )
 
     except Exception as e:
-        session.rollback()
+        # The unit-of-work already rolled back + closed the connection.
         logger.error(f"Error creating context backup: {e}", exc_info=True)
         return Failed(message=f"Error creating backup: {e}")
-    finally:
-        session.close()
 
 
 # --- validate_context_consistency tool ---
@@ -1875,134 +1841,134 @@ async def validate_context_consistency_tool_impl(
     # Log audit
     log_audit(requesting_agent_id, "validate_context_consistency", {})
 
-    session = SessionLocal()
-    try:
-        issues = []
-        warnings = []
+    # arch-r4 #6: read-only body — ``get_session()`` replaces the
+    # hand-rolled ``SessionLocal()`` + ``finally: session.close()`` pair.
+    with get_session() as session:
+        try:
+            issues = []
+            warnings = []
 
-        # Get all context entries
-        all_rows = (
-            session.query(ProjectContext)
-            .order_by(ProjectContext.context_key)
-            .all()
-        )
-        all_entries = [_row_to_dict(r) for r in all_rows]
-
-        if not all_entries:
-            return Ok(
-                data={"total_entries": 0, "issues": [], "warnings": []},
-                message="No project context entries found.",
+            # Get all context entries
+            all_rows = (
+                session.query(ProjectContext)
+                .order_by(ProjectContext.context_key)
+                .all()
             )
+            all_entries = [_row_to_dict(r) for r in all_rows]
 
-        # Check 1: Invalid JSON values
-        for entry in all_entries:
-            try:
-                json.loads(entry["value"])
-            except json.JSONDecodeError as e:
-                issues.append(f"Invalid JSON in '{entry['context_key']}': {e}")
-
-        # Check 2: Duplicate or conflicting keys (case-insensitive)
-        key_map = {}
-        for entry in all_entries:
-            key_lower = entry["context_key"].lower()
-            if key_lower in key_map:
-                issues.append(
-                    f"Potential duplicate keys: '{key_map[key_lower]}' and '{entry['context_key']}'"
+            if not all_entries:
+                return Ok(
+                    data={"total_entries": 0, "issues": [], "warnings": []},
+                    message="No project context entries found.",
                 )
+
+            # Check 1: Invalid JSON values
+            for entry in all_entries:
+                try:
+                    json.loads(entry["value"])
+                except json.JSONDecodeError as e:
+                    issues.append(f"Invalid JSON in '{entry['context_key']}': {e}")
+
+            # Check 2: Duplicate or conflicting keys (case-insensitive)
+            key_map = {}
+            for entry in all_entries:
+                key_lower = entry["context_key"].lower()
+                if key_lower in key_map:
+                    issues.append(
+                        f"Potential duplicate keys: '{key_map[key_lower]}' and '{entry['context_key']}'"
+                    )
+                else:
+                    key_map[key_lower] = entry["context_key"]
+
+            # Check 3: Missing descriptions
+            missing_desc = [
+                entry["context_key"]
+                for entry in all_entries
+                if not entry.get("description")
+            ]
+            if missing_desc:
+                warnings.extend(
+                    [f"Missing description: '{key}'" for key in missing_desc[:10]]
+                )
+                if len(missing_desc) > 10:
+                    warnings.append(
+                        f"... and {len(missing_desc) - 10} more missing descriptions"
+                    )
+
+            # Check 4: Very old entries (potential staleness)
+            import datetime as dt
+
+            cutoff_date = (dt.datetime.now() - dt.timedelta(days=30)).isoformat()
+            old_entries = [
+                entry["context_key"]
+                for entry in all_entries
+                if (entry.get("updated_at") or "") < cutoff_date
+            ]
+            if old_entries:
+                warnings.extend(
+                    [f"Old entry (>30 days): '{key}'" for key in old_entries[:5]]
+                )
+                if len(old_entries) > 5:
+                    warnings.append(f"... and {len(old_entries) - 5} more old entries")
+
+            # Check 5: Unusually large values (potential bloat)
+            large_entries = []
+            for entry in all_entries:
+                if len(entry["value"]) > 10000:  # 10KB threshold
+                    large_entries.append(
+                        f"{entry['context_key']} ({len(entry['value'])} chars)"
+                    )
+            if large_entries:
+                warnings.extend([f"Large entry: {entry}" for entry in large_entries[:5]])
+                if len(large_entries) > 5:
+                    warnings.append(f"... and {len(large_entries) - 5} more large entries")
+
+            # Build response
+            response_parts = [f"Context Consistency Validation Results"]
+            response_parts.append(f"Total entries: {len(all_entries)}")
+
+            if not issues and not warnings:
+                response_parts.append("\n✅ No issues found! Context appears consistent.")
             else:
-                key_map[key_lower] = entry["context_key"]
+                if issues:
+                    response_parts.append(f"\n🚨 Critical Issues ({len(issues)}):")
+                    response_parts.extend([f"  {issue}" for issue in issues])
 
-        # Check 3: Missing descriptions
-        missing_desc = [
-            entry["context_key"]
-            for entry in all_entries
-            if not entry.get("description")
-        ]
-        if missing_desc:
-            warnings.extend(
-                [f"Missing description: '{key}'" for key in missing_desc[:10]]
+                if warnings:
+                    response_parts.append(f"\n⚠️  Warnings ({len(warnings)}):")
+                    response_parts.extend([f"  {warning}" for warning in warnings])
+
+                response_parts.append("\nRecommendations:")
+                if issues:
+                    response_parts.append("- Fix critical issues immediately")
+                    response_parts.append(
+                        "- Use bulk_update_project_context for corrections"
+                    )
+                if warnings:
+                    response_parts.append("- Review warnings for potential cleanup")
+                    response_parts.append(
+                        "- Consider using delete_project_context for unused entries"
+                    )
+
+            return Ok(
+                data={
+                    "total_entries": len(all_entries),
+                    "issues": issues,
+                    "warnings": warnings,
+                },
+                message="\n".join(response_parts),
             )
-            if len(missing_desc) > 10:
-                warnings.append(
-                    f"... and {len(missing_desc) - 10} more missing descriptions"
-                )
 
-        # Check 4: Very old entries (potential staleness)
-        import datetime as dt
-
-        cutoff_date = (dt.datetime.now() - dt.timedelta(days=30)).isoformat()
-        old_entries = [
-            entry["context_key"]
-            for entry in all_entries
-            if (entry.get("updated_at") or "") < cutoff_date
-        ]
-        if old_entries:
-            warnings.extend(
-                [f"Old entry (>30 days): '{key}'" for key in old_entries[:5]]
+        except SQLAlchemyError as e_sql:
+            logger.error(
+                f"Database error validating context consistency: {e_sql}", exc_info=True
             )
-            if len(old_entries) > 5:
-                warnings.append(f"... and {len(old_entries) - 5} more old entries")
-
-        # Check 5: Unusually large values (potential bloat)
-        large_entries = []
-        for entry in all_entries:
-            if len(entry["value"]) > 10000:  # 10KB threshold
-                large_entries.append(
-                    f"{entry['context_key']} ({len(entry['value'])} chars)"
-                )
-        if large_entries:
-            warnings.extend([f"Large entry: {entry}" for entry in large_entries[:5]])
-            if len(large_entries) > 5:
-                warnings.append(f"... and {len(large_entries) - 5} more large entries")
-
-        # Build response
-        response_parts = [f"Context Consistency Validation Results"]
-        response_parts.append(f"Total entries: {len(all_entries)}")
-
-        if not issues and not warnings:
-            response_parts.append("\n✅ No issues found! Context appears consistent.")
-        else:
-            if issues:
-                response_parts.append(f"\n🚨 Critical Issues ({len(issues)}):")
-                response_parts.extend([f"  {issue}" for issue in issues])
-
-            if warnings:
-                response_parts.append(f"\n⚠️  Warnings ({len(warnings)}):")
-                response_parts.extend([f"  {warning}" for warning in warnings])
-
-            response_parts.append("\nRecommendations:")
-            if issues:
-                response_parts.append("- Fix critical issues immediately")
-                response_parts.append(
-                    "- Use bulk_update_project_context for corrections"
-                )
-            if warnings:
-                response_parts.append("- Review warnings for potential cleanup")
-                response_parts.append(
-                    "- Consider using delete_project_context for unused entries"
-                )
-
-        return Ok(
-            data={
-                "total_entries": len(all_entries),
-                "issues": issues,
-                "warnings": warnings,
-            },
-            message="\n".join(response_parts),
-        )
-
-    except SQLAlchemyError as e_sql:
-        logger.error(
-            f"Database error validating context consistency: {e_sql}", exc_info=True
-        )
-        return Failed(message=f"Database error validating context: {e_sql}")
-    except Exception as e:
-        logger.error(
-            f"Unexpected error validating context consistency: {e}", exc_info=True
-        )
-        return Failed(message=f"Unexpected error validating context: {e}")
-    finally:
-        session.close()
+            return Failed(message=f"Database error validating context: {e_sql}")
+        except Exception as e:
+            logger.error(
+                f"Unexpected error validating context consistency: {e}", exc_info=True
+            )
+            return Failed(message=f"Unexpected error validating context: {e}")
 
 
 # --- Register project context tools ---
@@ -2339,123 +2305,120 @@ async def delete_project_context_tool_impl(
             ),
         )
 
-    session = SessionLocal()
+    # arch-r4 #6: the unit-of-work owns the transaction — the per-key
+    # authorization check runs BEFORE any deletion (so an early return
+    # here is a commit-of-nothing, not a dangling transaction the old
+    # code relied on ``session.close()`` to implicitly roll back), and
+    # the DELETE + its ``deleted_context`` DB-audit row + the RAG
+    # chunk-purge all commit atomically on the SAME ``u.cursor``.
+    # Replaces the ``session.connection().connection`` ORM-drill-through.
     try:
-        # Per-key ownership check before any deletion runs.
-        for key in keys_to_delete:
-            err = _check_write_authorization(
-                session, requesting_agent_id, key, is_admin=is_admin
-            )
-            if err is not None:
-                reason = err
-                if reason.lower().startswith("unauthorized:"):
-                    reason = reason[len("Unauthorized:"):].lstrip()
-                return PermissionDenied(reason=reason)
+        with unit_of_work() as u:
+            cursor = u.cursor
 
-        # Fetch existing rows up front so we know what's actually there.
-        existing_rows = (
-            session.query(ProjectContext)
-            .filter(ProjectContext.context_key.in_(keys_to_delete))
-            .all()
-        )
-        existing_map = {r.context_key: r for r in existing_rows}
+            # Per-key ownership check before any deletion runs.
+            for key in keys_to_delete:
+                err = _check_write_authorization(
+                    cursor, requesting_agent_id, key, is_admin=is_admin
+                )
+                if err is not None:
+                    reason = err
+                    if reason.lower().startswith("unauthorized:"):
+                        reason = reason[len("Unauthorized:"):].lstrip()
+                    return PermissionDenied(reason=reason)
 
-        if not existing_map:
-            return NotFound(
-                resource="project_context",
-                identifier=", ".join(keys_to_delete),
+            deleted_rows = project_context_repo.delete_many(
+                keys_to_delete, connection=cursor,
             )
 
-        # Delete the keys
-        deleted_count = 0
-        deletion_details = []
+            if not deleted_rows:
+                return NotFound(
+                    resource="project_context",
+                    identifier=", ".join(keys_to_delete),
+                )
 
-        for key, row in existing_map.items():
-            description = row.description if row.description else ""
-            session.delete(row)
-            deleted_count += 1
-            deletion_details.append(
-                {
-                    "key": key,
-                    "description": description,
-                    "was_critical": key in critical_keys_found,
-                }
+            # Delete the keys
+            deleted_count = 0
+            deletion_details = []
+
+            for row in deleted_rows:
+                key = row["context_key"]
+                description = row["description"] if row["description"] else ""
+                deleted_count += 1
+                deletion_details.append(
+                    {
+                        "key": key,
+                        "description": description,
+                        "was_critical": key in critical_keys_found,
+                    }
+                )
+
+            # Log the deletion action via the shared cursor.
+            log_agent_action_to_db(
+                cursor=cursor,
+                agent_id=requesting_agent_id,
+                action_type="deleted_context",
+                details={
+                    "deleted_keys": [d["key"] for d in deletion_details],
+                    "critical_keys_deleted": critical_keys_found,
+                    "force_delete": force_delete,
+                    "total_deleted": deleted_count,
+                },
             )
 
-        session.flush()
+            # BL-R4-1: prune each deleted key's RAG chunk + hash watermark
+            # in the SAME transaction as the row delete. The incremental
+            # indexer keys on ``updated_at`` and never sweeps orphans, so a
+            # deleted context row's ``source_type='context'`` chunk would
+            # otherwise stay queryable via ``ask_project_rag`` forever.
+            # Clearing the hash also lets a future re-add of the same key
+            # re-index instead of being skipped as unchanged.
+            from ..repositories import rag_repo
 
-        # Log the deletion action via the shared connection.
-        raw_conn = session.connection().connection
-        cursor = raw_conn.cursor()
-        log_agent_action_to_db(
-            cursor=cursor,
-            agent_id=requesting_agent_id,
-            action_type="deleted_context",
-            details={
-                "deleted_keys": [d["key"] for d in deletion_details],
-                "critical_keys_deleted": critical_keys_found,
-                "force_delete": force_delete,
-                "total_deleted": deleted_count,
-            },
-        )
+            for detail in deletion_details:
+                rag_repo.purge_source(
+                    "context", detail["key"], connection=cursor,
+                )
 
-        # BL-R4-1: prune each deleted key's RAG chunk + hash watermark
-        # in the SAME transaction as the row delete. The incremental
-        # indexer keys on ``updated_at`` and never sweeps orphans, so a
-        # deleted context row's ``source_type='context'`` chunk would
-        # otherwise stay queryable via ``ask_project_rag`` forever.
-        # Clearing the hash also lets a future re-add of the same key
-        # re-index instead of being skipped as unchanged.
-        from ..repositories import rag_repo
+            # Prepare response
+            response_parts = [
+                f"Deleted {deleted_count} project context entries successfully:"
+            ]
 
-        for detail in deletion_details:
-            rag_repo.purge_source(
-                "context", detail["key"], connection=cursor,
-            )
+            for detail in deletion_details:
+                key_info = f"  • {detail['key']}"
+                if detail["description"]:
+                    key_info += f" ({detail['description']})"
+                if detail["was_critical"]:
+                    key_info += " [CRITICAL]"
+                response_parts.append(key_info)
 
-        session.commit()
+            if critical_keys_found:
+                response_parts.append(
+                    f"\n⚠️  WARNING: {len(critical_keys_found)} critical system keys were deleted!"
+                )
+                response_parts.append(
+                    "System functionality may be affected. Consider backing up before restart."
+                )
 
-        # Prepare response
-        response_parts = [
-            f"Deleted {deleted_count} project context entries successfully:"
-        ]
-
-        for detail in deletion_details:
-            key_info = f"  • {detail['key']}"
-            if detail["description"]:
-                key_info += f" ({detail['description']})"
-            if detail["was_critical"]:
-                key_info += " [CRITICAL]"
-            response_parts.append(key_info)
-
-        if critical_keys_found:
             response_parts.append(
-                f"\n⚠️  WARNING: {len(critical_keys_found)} critical system keys were deleted!"
-            )
-            response_parts.append(
-                "System functionality may be affected. Consider backing up before restart."
+                f"\nDeletion completed at: {datetime.datetime.now().isoformat()}"
             )
 
-        response_parts.append(
-            f"\nDeletion completed at: {datetime.datetime.now().isoformat()}"
-        )
-
-        return Ok(
-            data={
-                "deleted_count": deleted_count,
-                "deleted_keys": [d["key"] for d in deletion_details],
-                "critical_keys_deleted": critical_keys_found,
-                "force_delete": force_delete,
-            },
-            message="\n".join(response_parts),
-        )
+            return Ok(
+                data={
+                    "deleted_count": deleted_count,
+                    "deleted_keys": [d["key"] for d in deletion_details],
+                    "critical_keys_deleted": critical_keys_found,
+                    "force_delete": force_delete,
+                },
+                message="\n".join(response_parts),
+            )
 
     except Exception as e:
-        session.rollback()
+        # The unit-of-work already rolled back + closed the connection.
         logger.error(f"Error in delete_project_context_tool_impl: {e}", exc_info=True)
         return Failed(message=f"Error deleting project context: {str(e)}")
-    finally:
-        session.close()
 
 
 # Call registration when this module is imported

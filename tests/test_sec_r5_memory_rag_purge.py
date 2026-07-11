@@ -231,14 +231,21 @@ async def test_create_memory_db_error_returns_generic_message(
 ):
     async with mcp_session(tmp_path) as admin:
         # E3: create_memory is now a thin adapter over the
-        # ``create_project_context`` tool, so the DB session lives in
-        # ``project_context_tools`` (ORM) — patch it there. The tool
-        # returns ``Failed`` on a SQLAlchemyError; the adapter maps that
-        # to a STATIC generic 500 body (no SQL/params/table-name leak).
+        # ``create_project_context`` tool. arch-r4 #6 moved that tool's
+        # write off a raw ``SessionLocal()`` ORM session onto
+        # ``unit_of_work()`` + ``project_context_repo`` (parameterized
+        # SQL on the uow's cursor) — patch the repo's INSERT entry point
+        # so it raises the same leaky-looking error a real DB fault
+        # would. The tool returns ``Failed`` on the exception; the
+        # adapter maps that to a STATIC generic 500 body (no
+        # SQL/params/table-name leak).
         import agent_mcp.tools.project_context_tools as pctx_mod
 
+        def _boom_create_new(*args, **kwargs):
+            raise SQLAlchemyError(_LEAKY_MESSAGE)
+
         monkeypatch.setattr(
-            pctx_mod, "SessionLocal", lambda: _BoomSession()
+            pctx_mod.project_context_repo, "create_new", _boom_create_new
         )
 
         r = admin.client.post(
