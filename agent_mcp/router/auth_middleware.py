@@ -394,11 +394,36 @@ async def require_operator_session_middleware(
     # or membership in a group that's flagged sysadmin (the resolver
     # walks the transitive closure). Resolve once per request and
     # stash for downstream handlers.
+    #
+    # arch-r4 #3 (ResolvedOperator): ``resolve_user_groups`` below is
+    # the ONE group-membership-graph walk this request pays for.
+    # Every downstream consumer that used to independently re-walk
+    # the same graph for the same ``user_id`` — the sysadmin check,
+    # the project-role gate, and the Principal's capability
+    # resolution — now takes the resulting ``groups`` set as an
+    # explicit parameter instead of re-deriving it (see
+    # ``group_resolver.resolve_user_is_sysadmin``/
+    # ``resolve_user_project_role`` and
+    # ``core.capabilities.resolve_capabilities``, all of which treat
+    # ``groups=None`` as "not supplied, self-resolve" so every OTHER
+    # caller keeps its original single-call behaviour). If the walk
+    # itself fails, ``groups`` stays ``None`` and every downstream
+    # call falls back to its own independent resolution — the exact
+    # per-call retry-on-failure behaviour this middleware had before.
+    from . import group_resolver
+
+    groups: set[str] | None = None
+    try:
+        groups = set(group_resolver.resolve_user_groups(user["user_id"]))
+    except sqlite3.OperationalError:
+        groups = None
+    except Exception:  # pragma: no cover - defensive
+        groups = None
+
     is_sysadmin = False
     try:
-        from . import group_resolver
         is_sysadmin = group_resolver.resolve_user_is_sysadmin(
-            user["user_id"]
+            user["user_id"], groups=groups
         )
     except sqlite3.OperationalError:
         # router.db not migrated — same fail-closed UX as the
@@ -412,6 +437,7 @@ async def require_operator_session_middleware(
         is_sysadmin = False
 
     project = _project_from_path(path)
+    role: str | None = None
     if project is not None and _project_exists(project):
         if not is_sysadmin:
             # Phase 3 Wave 2: per-project role gating. Reads (GET /
@@ -422,7 +448,7 @@ async def require_operator_session_middleware(
             # viewer here.
             try:
                 role = group_resolver.resolve_user_project_role(
-                    user["user_id"], project
+                    user["user_id"], project, groups=groups
                 )
             except sqlite3.OperationalError:
                 role = None
@@ -514,14 +540,25 @@ async def require_operator_session_middleware(
             if project is not None and _project_exists(project)
             else None
         )
+        # arch-r4 #3: ``role`` is the SAME value the mutation gate
+        # above already resolved (or ``None`` if that block never
+        # ran, in which case the conditions below are ``None`` too) —
+        # no second ``resolve_user_project_role`` call. This used to
+        # be ``_safe_resolve_role(user.get("user_id"), project)``, a
+        # wrapper that re-ran the identical resolution because the
+        # gate's result was never stashed; deleted along with this
+        # call site.
         principal_project_role = (
             None
             if is_sysadmin or project is None or not _project_exists(project)
-            else _safe_resolve_role(user.get("user_id"), project)
+            else role
         )
         # arch-B: capabilities resolved once via the shared builder (Wave
         # 9 PR 0 resolved them at this seam; the builder is now the single
-        # home for that + the Principal construction).
+        # home for that + the Principal construction). arch-r4 #3: pass
+        # the already-resolved ``groups`` through so the builder's
+        # capability resolution doesn't re-walk group_membership a
+        # fourth time for this request.
         request["principal"] = build_operator_principal(
             user_id=principal_user_id,
             kind="operator_session",
@@ -529,6 +566,7 @@ async def require_operator_session_middleware(
             sysadmin=is_sysadmin,
             project_name=principal_project_name,
             source_token=None,
+            groups=groups,
         )
     except Exception:  # pragma: no cover - defensive
         # Principal stash is additive; if construction fails for any
@@ -541,26 +579,6 @@ async def require_operator_session_middleware(
             user.get("username"),
         )
     return await handler(request)
-
-
-def _safe_resolve_role(user_id: object, project: str) -> str | None:
-    """Best-effort ``resolve_user_project_role`` that never raises.
-
-    Wave 6 PR 0 — used when building the operator-session Principal
-    for non-sysadmin callers. Mirrors the resolver chain the
-    primary gate already walked above (so we don't pay for a second
-    DB round-trip on the happy path the resolver above already
-    cached results from); failures collapse to ``None`` so the
-    Principal still gets stashed and the bridge has something to
-    consume.
-    """
-    if user_id is None:
-        return None
-    try:
-        from . import group_resolver
-        return group_resolver.resolve_user_project_role(str(user_id), project)
-    except Exception:  # pragma: no cover - defensive
-        return None
 
 
 __all__ = [

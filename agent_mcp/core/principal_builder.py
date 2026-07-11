@@ -115,6 +115,7 @@ def build_operator_principal(
     sysadmin: bool,
     project_name: Optional[str] = None,
     source_token: Optional[str] = None,
+    groups: Optional[set[str]] = None,
 ) -> Principal:
     """Build an operator-tier Principal (cookie or forwarding-header).
 
@@ -126,6 +127,12 @@ def build_operator_principal(
     ``router.db`` is unavailable — e.g. the per-project backend — but the
     resolution path is identical, so no site can silently resolve a
     different set).
+
+    ``groups`` (arch-deepening R4 #3): forwarded verbatim to
+    :func:`resolve_capabilities` — pass the caller's already-resolved
+    transitive group set (e.g. the router auth middleware, which needs
+    it for the sysadmin + project-role checks too) to skip a redundant
+    ``resolve_user_groups`` walk. ``None`` self-resolves.
     """
     from .capabilities import resolve_capabilities
 
@@ -136,6 +143,7 @@ def build_operator_principal(
         agent_role=None,
         project_role=project_role,
         kind=kind,
+        groups=groups,
     )
     return Principal(
         kind=kind,
