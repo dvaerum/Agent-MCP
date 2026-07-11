@@ -345,6 +345,50 @@ def tool_result_to_http(result: ToolResult) -> tuple[int, dict[str, Any]]:
     }
 
 
+def tool_result_error_message(
+    result: ToolResult,
+    fallback: str = "Operation failed",
+    *,
+    not_found_label: Optional[str] = None,
+) -> str:
+    """Human-readable error string for the legacy ``{"error": ...}``
+    envelope several REST routes return, given a non-``Ok`` ``ToolResult``.
+
+    arch-r4 #10: this is the ONE match every route-level error-detail
+    mapper used to re-implement (``_agent_tool_error`` in
+    ``app/routers/agents.py``, ``_tool_error_detail`` in
+    ``app/routers/tasks.py``, ``_memory_create_error_detail`` in
+    ``app/routers/memories.py``) — same variant ladder, three copies.
+    Pairs with :func:`tool_result_to_http`, which supplies the STATUS;
+    this supplies the legacy ``{"error": ...}`` body wording (the
+    dashboard + the REST tests pin the exact strings below, which is why
+    this stays a distinct body shape from ``tool_result_to_http``'s own
+    ``{"success": False, "message": ...}`` envelope rather than reusing
+    it outright).
+
+    * ``NotFound`` → ``"<label> '<identifier>' not found"``. ``label``
+      defaults to ``result.resource`` (matching the pre-existing
+      ``memories.py`` wording) but a caller may override it via
+      ``not_found_label`` for a route that has always used bespoke
+      wording — e.g. ``"Agent"`` (capitalized, ignoring
+      ``result.resource == "agent"``) for the agents-router routes, or
+      ``"Parent task"`` for ``create_task``'s missing-parent case.
+    * ``Conflict`` / ``PermissionDenied`` → ``result.reason``.
+    * ``Invalid`` → ``result.message``.
+    * ``Failed`` (or any residual/unknown variant) → ``fallback``, the
+      route's static generic message (SEC-R8-1 — no exception-detail
+      leak; the dispatcher already logged the real one).
+    """
+    if isinstance(result, NotFound):
+        label = not_found_label if not_found_label is not None else result.resource
+        return f"{label} '{result.identifier}' not found"
+    if isinstance(result, (Conflict, PermissionDenied)):
+        return result.reason
+    if isinstance(result, Invalid):
+        return result.message
+    return fallback
+
+
 def is_error_result(result: ToolResult) -> bool:
     """Whether a :data:`ToolResult` represents a failure.
 
@@ -368,5 +412,6 @@ __all__ = [
     "ToolResult",
     "render_as_text_content",
     "tool_result_to_http",
+    "tool_result_error_message",
     "is_error_result",
 ]

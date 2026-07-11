@@ -32,6 +32,8 @@ from .._dispatch_helpers import (
     _build_route_principal,
     handle_options,
 )
+from ._wire_validation import require_str as _require_str
+from ._wire_validation import require_str_list as _require_str_list
 from ..deps import (
     caller_identity,
     forwarding_route_role,
@@ -41,13 +43,10 @@ from ...core.config import logger
 from ...core import session_registry
 from ...core.principal_builder import build_operator_principal
 from ...core.tool_result import (
-    Conflict,
     Failed as _Failed,
-    Invalid,
-    NotFound,
     Ok as _Ok,
-    PermissionDenied,
     ToolResult,
+    tool_result_error_message,
     tool_result_to_http,
 )
 from ...db.connection import get_db_connection
@@ -72,27 +71,14 @@ router = APIRouter(
 # 500 on a dict/list; ``capabilities`` feeds ``normalize_capabilities``
 # which iterates a dict's KEYS (or a str's CHARS) and silently stores bad
 # data — and that data lands in ``g.active_agents`` which the task-claim
-# authz gate consumes. Guard every editable field up front. Kept local to
-# this router per the round-9 scope.
-def _require_str(value, field):
-    """Return a 400 JSONResponse if ``value`` is present but not a str."""
-    if value is not None and not isinstance(value, str):
-        return JSONResponse(
-            {"error": f"{field} must be a string"}, status_code=400
-        )
-    return None
-
-
-def _require_str_list(value, field):
-    """Return a 400 JSONResponse unless ``value`` is a list[str]."""
-    if not isinstance(value, list) or not all(
-        isinstance(x, str) for x in value
-    ):
-        return JSONResponse(
-            {"error": f"{field} must be a list of strings"},
-            status_code=400,
-        )
-    return None
+# authz gate consumes. Guard every editable field up front.
+#
+# arch-r4 #10: ``_require_str`` / ``_require_str_list`` now live once in
+# ``._wire_validation`` (imported above) — the round-9 "kept local, do
+# NOT consolidate" scope boundary is settled. ``capabilities`` here has
+# always rejected an explicit ``None`` (unlike ``create_task``'s
+# ``required_capabilities``, which treats ``None`` as "not supplied"),
+# so the call site below passes ``allow_none=False``.
 
 
 def _mcp_presence_for(agent_id: str) -> Dict[str, Any]:
@@ -418,25 +404,25 @@ def _agent_tool_error(result: ToolResult, failed_message: str) -> JSONResponse:
     ``{"error": ...}`` envelope these routes have always returned.
 
     STATUS comes from the shared C-wave adapter
-    (:func:`tool_result_to_http`); only the body wording lives here
-    (the dashboard + the restore/edit/purge REST tests pin this shape).
-    ``Failed`` renders the route's static generic message (SEC — no
-    exception-detail leak; the dispatcher already logged the real one).
+    (:func:`tool_result_to_http`); the body wording comes from the ONE
+    shared :func:`tool_result_error_message` mapper (arch-r4 #10 —
+    this used to be a private re-implementation of the same variant
+    ladder). ``not_found_label="Agent"`` (capitalized, not the tool's
+    ``resource="agent"``) preserves this route's historical NotFound
+    wording (the dashboard + the restore/edit/purge REST tests pin this
+    shape). ``Failed`` (or any residual variant) renders the route's
+    static generic ``failed_message`` (SEC — no exception-detail leak;
+    the dispatcher already logged the real one).
     """
     status, _ = tool_result_to_http(result)
-    if isinstance(result, NotFound):
-        return JSONResponse(
-            {"error": f"Agent '{result.identifier}' not found"},
-            status_code=status,
-        )
-    if isinstance(result, Conflict):
-        return JSONResponse({"error": result.reason}, status_code=status)
-    if isinstance(result, PermissionDenied):
-        return JSONResponse({"error": result.reason}, status_code=status)
-    if isinstance(result, Invalid):
-        return JSONResponse({"error": result.message}, status_code=status)
-    # Failed (or any residual variant) → static generic message.
-    return JSONResponse({"error": failed_message}, status_code=status)
+    return JSONResponse(
+        {
+            "error": tool_result_error_message(
+                result, failed_message, not_found_label="Agent",
+            )
+        },
+        status_code=status,
+    )
 
 
 @router.api_route("/{agent_id}/restore", methods=["POST", "OPTIONS"])
@@ -563,7 +549,9 @@ async def edit_agent_api_route(
     # bind. ``auto_event_loop`` is a bool toggle — a dict/list/str is
     # truthy-coerced to a silent 1/0, so reject those.
     if 'capabilities' in updates:
-        _err = _require_str_list(updates['capabilities'], "capabilities")
+        _err = _require_str_list(
+            updates['capabilities'], "capabilities", allow_none=False,
+        )
         if _err is not None:
             return _err
     for _field in ('color', 'working_directory'):

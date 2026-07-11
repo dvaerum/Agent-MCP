@@ -45,6 +45,7 @@ from .._dispatch_helpers import (
     _dispatch_through_tool,
     handle_options,
 )
+from ._wire_validation import require_str as _require_str
 from ..deps import caller_identity, require_operator_session
 from ...core.authorize import AuthRejected
 from ...core.config import logger
@@ -116,14 +117,13 @@ router = APIRouter(
 # ``task_repo.update_fields`` → a SQLite bind that raises inside the repo,
 # is swallowed (returns False), and the handler STILL commits + returns a
 # misleading ``200 {"success": true}`` — a silent no-op. Guard each field
-# up front so a bad value is a clean 400. Local to this router per scope.
-def _require_str(value, field):
-    """Return a 400 JSONResponse if ``value`` is present but not a str."""
-    if value is not None and not isinstance(value, str):
-        return JSONResponse(
-            {"error": f"{field} must be a string"}, status_code=400
-        )
-    return None
+# up front so a bad value is a clean 400.
+#
+# arch-r4 #10: ``_require_str`` now lives once in ``._wire_validation``
+# (imported above) — the round-9 "kept local, do NOT consolidate" scope
+# boundary is settled. This is an import-only change; the
+# ``update_task_details_api_route`` handler body (arch-r4 #1's
+# just-completed dispatch-through-tool refactor) is untouched.
 
 
 def _context_value_should_redact(

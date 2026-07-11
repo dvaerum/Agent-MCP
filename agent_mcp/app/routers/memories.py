@@ -29,15 +29,12 @@ from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
 from .._dispatch_helpers import _build_route_principal, handle_options
+from ._wire_validation import require_str as _require_str
 from ..deps import caller_identity, require_operator_session
 from ...core.config import logger
 from ...core.tool_result import (
-    Conflict,
-    Failed,
-    Invalid,
-    NotFound,
     Ok,
-    PermissionDenied,
+    tool_result_error_message,
     tool_result_to_http,
 )
 from ...db.actions.agent_actions_db import log_agent_action_to_db
@@ -65,34 +62,10 @@ router = APIRouter(
 # a non-str ``context_key``, slip past ``has_unsafe_unicode_for_identifier``
 # which returns False for non-str). ``context_value`` is intentionally
 # arbitrary JSON (``json.dumps``-serialised), so it is NOT guarded here.
-def _require_str(value, field):
-    """Return a 400 JSONResponse if ``value`` is present but not a str."""
-    if value is not None and not isinstance(value, str):
-        return JSONResponse(
-            {"error": f"{field} must be a string"}, status_code=400
-        )
-    return None
-
-
-def _memory_create_error_detail(result) -> str:
-    """Human-readable error string for the legacy ``{"error": ...}``
-    envelope this route returns, given a non-``Ok`` ``create_project_context``
-    result. STATUS comes from the shared :func:`tool_result_to_http`
-    adapter; only the body wording lives here.
-
-    ``Conflict`` / ``Failed`` are handled by the caller with the exact
-    legacy strings ("Memory with this key already exists" / "Failed to
-    create memory"); this covers the remaining variants (``Invalid`` from
-    a non-serializable value, ``PermissionDenied`` from a forwarding
-    viewer, the unlikely ``NotFound``).
-    """
-    if isinstance(result, Invalid):
-        return result.message
-    if isinstance(result, PermissionDenied):
-        return result.reason
-    if isinstance(result, NotFound):
-        return f"{result.resource} '{result.identifier}' not found"
-    return "Failed to create memory"
+#
+# arch-r4 #10: ``_require_str`` now lives once in ``._wire_validation``
+# (imported above) — the round-9 "kept local, do NOT consolidate" scope
+# boundary is settled.
 
 
 @router.api_route("", methods=["POST", "OPTIONS"])
@@ -195,19 +168,18 @@ async def create_memory_api_route(
 
     # Error variants: STATUS from the shared C-wave adapter; body kept in
     # the legacy ``{"error": ...}`` envelope the dashboard + tests pin.
+    # arch-r4 #10: body wording now comes from the ONE shared
+    # :func:`tool_result_error_message` mapper. ``Conflict``'s ``reason``
+    # is already the exact legacy 409 wording ("Memory with this key
+    # already exists" — set at the source in
+    # ``create_project_context_tool_impl``). ``Failed`` (or any residual
+    # variant, BL-R5-2 / SEC-R8-1) falls back to the same static "Failed
+    # to create memory" this route has always used — no exception-detail
+    # leak; the tool impl already logged the real detail server-side.
     status, _ = tool_result_to_http(result)
-    if isinstance(result, Conflict):
-        # Preserve the exact legacy 409 wording.
-        return JSONResponse(
-            {"error": "Memory with this key already exists"}, status_code=status
-        )
-    if isinstance(result, Failed):
-        # BL-R5-2 / SEC-R8-1: static generic message (no exception-detail
-        # leak). The tool impl already logged the real detail server-side
-        # before returning ``Failed``.
-        return JSONResponse({"error": "Failed to create memory"}, status_code=status)
     return JSONResponse(
-        {"error": _memory_create_error_detail(result)}, status_code=status
+        {"error": tool_result_error_message(result, "Failed to create memory")},
+        status_code=status,
     )
 
 
