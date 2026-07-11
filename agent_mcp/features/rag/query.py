@@ -5,12 +5,10 @@ from typing import List, Dict, Any, Optional
 # Imports from our project
 from ...core.config import (
     logger,
-    EMBEDDING_MODEL,
-    EMBEDDING_DIMENSION,
     MAX_CONTEXT_TOKENS,  # From main.py:182
 )
 from ...db.connection import get_db_connection, is_vss_loadable
-from ...external.openai_service import get_openai_client
+from ...external.embedding_service import embedding_client
 from ...external.completion_service import (
     CompletionConfigError,
     completion_client,
@@ -93,12 +91,6 @@ async def query_rag_system(query_text: str) -> str:
     Returns:
         A string containing the answer or an error message.
     """
-    # Get OpenAI client (main.py:1438)
-    openai_client = get_openai_client()
-    if not openai_client:
-        logger.error("RAG Query: OpenAI client is not available. Cannot process query.")
-        return "RAG Error: OpenAI client not available. Please check server configuration and OpenAI API key."
-
     conn = None
     answer = (
         "An unexpected error occurred during the RAG query."  # Default error message
@@ -206,12 +198,7 @@ async def query_rag_system(query_text: str) -> str:
         # the vector in.
         if is_vss_loadable():
             try:
-                response = openai_client.embeddings.create(
-                    input=[query_text],
-                    model=EMBEDDING_MODEL,
-                    dimensions=EMBEDDING_DIMENSION,
-                )
-                query_embedding = response.data[0].embedding
+                query_embedding = embedding_client().embed([query_text])[0]
                 # k=13 is the legacy knn-results constant the previous
                 # raw SQL used; preserved exactly so retrieval quality
                 # is unchanged across the migration.
@@ -413,12 +400,6 @@ async def query_rag_system_with_model(
     Returns:
         A string containing the answer or an error message.
     """
-    # Get OpenAI client
-    openai_client = get_openai_client()
-    if not openai_client:
-        logger.error("RAG Query: OpenAI client is not available. Cannot process query.")
-        return "RAG Error: OpenAI client not available. Please check server configuration and OpenAI API key."
-
     # Use provided max_tokens or default to the configured value
     context_limit = max_tokens if max_tokens else MAX_CONTEXT_TOKENS
 
@@ -471,12 +452,7 @@ async def query_rag_system_with_model(
             try:
                 from ...repositories import rag_repo
 
-                query_embedding_response = openai_client.embeddings.create(
-                    input=[query_text],
-                    model=EMBEDDING_MODEL,
-                    dimensions=EMBEDDING_DIMENSION,
-                )
-                query_embedding = query_embedding_response.data[0].embedding
+                query_embedding = embedding_client().embed([query_text])[0]
                 # search_similar (the seam) already drops secret context
                 # chunks; the wrap here is defense-in-depth for an
                 # injected/mocked repo that bypasses the real seam.

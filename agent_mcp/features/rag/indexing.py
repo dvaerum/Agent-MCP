@@ -20,9 +20,7 @@ except ImportError:
 # Imports from our own project modules
 from ...core.config import (
     logger,
-    EMBEDDING_MODEL,
     EMBEDDING_DIMENSION,
-    MAX_EMBEDDING_BATCH_SIZE,
     get_project_dir,
     OPENAI_API_KEY_ENV,  # Also import the API key env variable
     ADVANCED_EMBEDDINGS,  # Import advanced mode flag at module level
@@ -30,11 +28,11 @@ from ...core.config import (
 from ...core import globals as g  # For server_running flag
 from ...db.connection import get_db_connection, is_vss_loadable
 
-# We need the actual OpenAI client, not just the service module, for batching logic.
-# The client instance is stored in g.openai_client_instance by openai_service.initialize_openai_client()
-from ...external.openai_service import (
-    get_openai_client,
-)  # To get the initialized client
+# Provider-agnostic embedding seam: owns (model, dimension, base_url,
+# api_key) and picks OpenAI-vs-Ollama from the same env vars the
+# completion seam uses, so every "turn text into a vector" resolves one
+# endpoint. Mirrors external.completion_service.completion_client().
+from ...external.embedding_service import embedding_client
 
 # Import chunking functions from this RAG feature package
 from .chunking import simple_chunker, markdown_aware_chunker
@@ -132,10 +130,14 @@ async def _get_embeddings_batch_openai(
     batch_chunks: List[str],
     batch_index_start: int,
     results_list: List[Optional[List[float]]],
-    openai_api_key: str,  # Pass API key directly for true async client
+    openai_api_key: str,  # Retained for signature compat; the seam now
+    # resolves the api_key/base_url from env itself.
 ) -> bool:
     """
-    Processes a single batch of embeddings asynchronously using a new AsyncOpenAI client.
+    Processes a single batch of embeddings asynchronously through the
+    embedding seam (:func:`embedding_client`). A fresh client per batch
+    preserves the original "separate async client per batch for true
+    concurrency" behaviour.
     This is a helper for run_rag_indexing_periodically.
     Based on original main.py: lines 656-675.
     """
@@ -162,19 +164,16 @@ async def _get_embeddings_batch_openai(
                     " "
                 )  # Use single space as fallback to maintain batch size
 
-        # Create a separate async client for each batch for true concurrency
-        # Using async client directly with HTTPX to ensure truly parallel requests
-        async_client = openai.AsyncOpenAI(api_key=openai_api_key)
-        response = await async_client.embeddings.create(
-            input=validated_chunks,
-            model=EMBEDDING_MODEL,
-            dimensions=EMBEDDING_DIMENSION,  # Ensure API returns vector size matching DB schema
-        )
+        # A fresh embedding client per batch preserves the original
+        # "separate async client for true concurrency" behaviour; the
+        # seam owns model/dimension/base_url/api_key so the endpoint is
+        # resolved the same way as every other embedding call site.
+        vectors = await embedding_client().aembed(validated_chunks)
         # Store results directly in the provided results list
-        for j, item_embedding in enumerate(response.data):
+        for j, vector in enumerate(vectors):
             pos = batch_index_start + j
             if pos < len(results_list):
-                results_list[pos] = item_embedding.embedding
+                results_list[pos] = vector
         # logger.info(f"Completed embedding batch starting at index {batch_index_start}") # Original: main.py:672
         return True
     except Exception as e:
@@ -1194,21 +1193,14 @@ async def index_task_data(task_id: str, task_data: Dict[str, Any]) -> None:
         # inserts all stage atomically.
         rag_repo.delete_chunks_for("task", task_id, connection=cursor)
 
-        # Get OpenAI client for embeddings
-        client = get_openai_client()
-        if not client:
-            logger.error("OpenAI client not available for task indexing")
-            return
+        # Embedding seam: one endpoint-resolution rule shared with the
+        # periodic indexer + the query path.
+        emb_client = embedding_client()
 
         # Generate embeddings for each chunk + insert via repo.
         for chunk_text in chunks:
             try:
-                embedding_response = client.embeddings.create(
-                    model=EMBEDDING_MODEL,
-                    input=chunk_text,
-                    dimensions=EMBEDDING_DIMENSION,
-                )
-                embedding_vector = embedding_response.data[0].embedding
+                embedding_vector = emb_client.embed([chunk_text])[0]
                 rag_repo.bulk_index_chunks(
                     source_type="task",
                     source_ref=task_id,

@@ -85,13 +85,20 @@ def _seed(admin, *, key: str, value: str) -> None:
     assert r.status_code == 200, r.text
 
 
+class _StubEmbedder:
+    """Deterministic stand-in for the embedding seam so the vector-search
+    path resolves a query vector without touching the network."""
+
+    def embed(self, texts):
+        return [[0.0] * 8 for _ in texts]
+
+
 def _wire_capture(monkeypatch, *, vss: bool = False) -> _CapturingClient:
     cap = _CapturingClient()
     monkeypatch.setattr(query_mod, "completion_client", lambda: cap)
-    # get_openai_client() returns None in the test env (empty key), which
-    # short-circuits query_rag_system before any context assembly. Patch
-    # it to a truthy stub so the assembly + filter code actually runs.
-    monkeypatch.setattr(query_mod, "get_openai_client", lambda: object())
+    # Route the query embedding through a deterministic stub seam so the
+    # assembly + filter code runs without a live embedding endpoint.
+    monkeypatch.setattr(query_mod, "embedding_client", lambda: _StubEmbedder())
     monkeypatch.setattr(query_mod, "is_vss_loadable", lambda: vss)
     return cap
 
@@ -194,16 +201,8 @@ async def test_retrieved_context_chunk_secret_dropped(
         monkeypatch.setattr(
             get_rag_repo(), "search_similar", lambda **kw: fake_results
         )
-        # Embedding call: give a deterministic stub so the openai path
-        # doesn't reach the network.
-        class _Emb:
-            def create(self, **kw):
-                class _R:
-                    data = [type("D", (), {"embedding": [0.0] * 8})()]
-                return _R()
-
-        stub = type("C", (), {"embeddings": _Emb()})()
-        monkeypatch.setattr(query_mod, "get_openai_client", lambda: stub)
+        # Embedding call: the seam is already stubbed by _wire_capture
+        # (_StubEmbedder) so the vector-search path runs without network.
 
         await query_rag_system("what tokens does the project use?")
 

@@ -226,7 +226,13 @@ EMBEDDING_DIMENSION: int = (
 # `agent_mcp.external.completion_service.completion_client()`, which
 # picks Ollama vs OpenAI from env vars (OPENAI_API_KEY / OPENAI_MODEL
 # / OLLAMA_MODEL). See that module's docstring for the decision table.
-MAX_EMBEDDING_BATCH_SIZE: int = 100  # From main.py:181
+#
+# Embedding likewise flows through
+# `agent_mcp.external.embedding_service.embedding_client()`, which owns
+# (model, dimension, base_url, api_key). The former MAX_EMBEDDING_BATCH_SIZE
+# constant was dead (the real batch controls are
+# PARALLEL_EMBEDDING_BATCH_SIZE / MAX_CONCURRENT_EMBEDDING_REQUESTS in
+# features/rag/indexing.py) and was removed.
 MAX_CONTEXT_TOKENS: int = 1000000  # GPT-4.1 has 1M token context window
 TASK_ANALYSIS_MAX_TOKENS: int = (
     1000000  # Same 1M token context window for task analysis
