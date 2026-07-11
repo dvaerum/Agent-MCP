@@ -67,12 +67,17 @@ async def test_assign_existing_tasks_commits_once(tmp_path) -> None:
             task_ids.append(r.json()["task_id"])
 
         # Spy on Connection.commit so we can count the calls during
-        # the assign tool invocation. `task_tools.py` does
-        # `from ..db.connection import get_db_connection`, which
-        # binds the name at the tool-module level — patching
-        # `db.connection.get_db_connection` wouldn't affect the
-        # already-bound reference, so we patch the tool module too.
+        # the assign tool invocation. Post-D1 the Mode-3 assign path
+        # acquires its connection through the unit-of-work seam
+        # (``unit_of_work()`` -> ``agent_mcp.db.unit_of_work``'s locally
+        # bound ``get_db_connection``); pre-D1 it did
+        # ``from ..db.connection import get_db_connection`` at the tool
+        # module. Both modules bind the name locally, so we patch BOTH
+        # module refs to catch the connection regardless of which path
+        # opens it (the commit-once invariant is what we pin, not the
+        # acquisition site).
         from agent_mcp.tools import task_tools as task_tools_mod
+        from agent_mcp.db import unit_of_work as uow_mod
 
         commit_count = {"n": 0}
         real_get_conn = conn_mod.get_db_connection
@@ -105,6 +110,8 @@ async def test_assign_existing_tasks_commits_once(tmp_path) -> None:
 
         with mock.patch.object(
             task_tools_mod, "get_db_connection", side_effect=spy_get_conn
+        ), mock.patch.object(
+            uow_mod, "get_db_connection", side_effect=spy_get_conn
         ):
             from agent_mcp.tools.task_tools import assign_task_tool_impl
             from agent_mcp.core.tool_result import Ok
