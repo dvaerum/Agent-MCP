@@ -173,8 +173,9 @@ class ToolImpl:
     shared :class:`agent_mcp.core.registry.Registry` filter keeps
     working; the raw declaration is preserved here so
     :data:`agent_mcp.tools.access.TOOL_ACCESS` can derive the access
-    table from registry introspection (kwarg + decorator
-    ``_required_role``) without re-parsing source.
+    table from registry introspection (the impl's
+    ``_required_capability`` cap gate, with the kwarg as an explicit
+    tighten-only override) without re-parsing source.
     """
 
     description: str
@@ -250,19 +251,25 @@ def register_tool(
     Registers a tool's schema and its implementation.
     This function will be called by each tool module to register itself.
 
-    ``visibility`` (PR-W1c, 2026-06-05): one of ``"admin"``, ``"any"``,
-    or ``"worker-if-toggled:<key>[,<key>...]"``. Surfaces the access
-    policy at the registration site so the registry / ``tools/list``
-    filter / UI can introspect it without re-reading source. Defaults
-    to ``"any"`` (matches the pre-PR-W1c implicit default in
-    ``is_visible_to_role`` — unclassified tools are visible to
-    everyone).
+    ``visibility``: one of ``"operator"``, ``"manager"``, ``"worker"``,
+    ``"any"``, or ``"worker-if-toggled:<key>[,<key>...]"``. Surfaces the
+    access policy at the registration site so the registry /
+    ``tools/list`` filter / UI can introspect it without re-reading
+    source. Defaults to ``"any"``.
+
+    For a tool gated by ``@requires_capability`` the visibility is
+    DERIVED from the cap (arch-r3 #1+5); this kwarg then acts as a
+    tighten-only override (it may hide the tool from a role the cap
+    admits, never advertise it to a role the cap rejects). For a tool
+    whose cap check is in-body (no ``_required_capability`` on the
+    wrapper) the kwarg is the sole visibility signal.
 
     Enforcement of the policy lives at the call site in the impl's
-    ``@requires_role(...)`` / ``@requires_policy(...)`` decorator —
-    the kwarg here is metadata for the visibility filter, not the
-    auth gate. See :mod:`agent_mcp.tools._access` for the decorator
-    and the double-source-of-truth rationale.
+    ``@requires_capability(...)`` / ``@requires_policy(...)`` decorator
+    (or an in-body ``_require_capability`` check) — the kwarg here is
+    metadata for the visibility filter, not the auth gate, and serves
+    only as a tighten-only override of the cap-derived tier. See
+    :mod:`agent_mcp.tools.access` for the derivation rationale.
     """
     global tool_schemas, tool_implementations
 
