@@ -252,6 +252,7 @@ from ..core.config import logger
 from ..core import globals as g  # Not directly used here, but auth uses it
 from ..core.principal import Principal
 from ..core.tool_result import (
+    Conflict,
     Failed,
     Invalid,
     NotFound,
@@ -1504,6 +1505,193 @@ async def bulk_update_project_context_tool_impl(
     )
 
 
+# --- create_project_context tool ---
+def _create_context_inline(
+    requesting_agent_id: str,
+    context_key: str,
+    value_json_str: str,
+    description: Optional[str],
+    *,
+    is_admin: bool,
+) -> Optional[ToolResult]:
+    """Sync INSERT-only body — returns an error :data:`ToolResult` or None.
+
+    INSERT-only (unlike ``_single_update_inline``'s upsert): an existing
+    key yields :class:`Conflict` (REST 409) rather than an overwrite. The
+    per-key creator-ownership matrix (:func:`_check_write_authorization`)
+    still governs which caller may create the key — operators always pass
+    (``is_admin``); agent bearers pass for a non-``config_*`` key exactly
+    as the update path admits them.
+
+    Inline (not queued) for the same loop-affinity reason as the update
+    path — see :func:`_single_update_inline`: tools run on ad-hoc asyncio
+    loops that deadlock on the lifespan write queue; SQLAlchemy + SQLite
+    WAL serialises the write.
+    """
+    session = SessionLocal()
+    try:
+        err = _check_write_authorization(
+            session, requesting_agent_id, context_key, is_admin=is_admin
+        )
+        if err is not None:
+            session.rollback()
+            reason = err
+            if reason.lower().startswith("unauthorized:"):
+                reason = reason[len("Unauthorized:"):].lstrip()
+            return PermissionDenied(reason=reason)
+
+        existing = (
+            session.query(ProjectContext)
+            .filter(ProjectContext.context_key == context_key)
+            .one_or_none()
+        )
+        if existing is not None:
+            session.rollback()
+            return Conflict(reason="Memory with this key already exists")
+
+        now_iso = datetime.datetime.now().isoformat()
+        session.add(
+            ProjectContext(
+                context_key=context_key,
+                value=value_json_str,
+                description=description,
+                created_at=now_iso,
+                created_by=requesting_agent_id,
+                updated_at=now_iso,
+                updated_by=requesting_agent_id,
+            )
+        )
+        session.flush()
+
+        # Audit through the session's raw connection so the action lands
+        # in the SAME transaction as the project_context insert.
+        raw_conn = session.connection().connection
+        cursor = raw_conn.cursor()
+        log_agent_action_to_db(
+            cursor,
+            requesting_agent_id,
+            "created_memory",
+            details={"context_key": context_key},
+        )
+        session.commit()
+        logger.info(
+            f"Project context created for key '{context_key}' by "
+            f"'{requesting_agent_id}'."
+        )
+        return None
+    finally:
+        session.close()
+
+
+async def create_project_context_tool_impl(
+    arguments: Dict[str, Any],
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    """Create a NEW project_context entry (INSERT-only; 409 on existing).
+
+    E3 (arch-deepening): the create choreography that
+    ``app/routers/memories.py::create_memory_api_route`` hand-rolled inline
+    (SQLAlchemy INSERT + ``created_memory`` audit + the BL-R14-1 post-write
+    wake set) now lives here ONCE, so the REST route and this MCP tool are
+    ONE implementation.
+
+    ORM, not the raw-sqlite unit_of_work: project_context is a SQLAlchemy
+    table (``SessionLocal``), matching its ``update_``/``delete_`` siblings.
+    An ORM-session-aware unit_of_work variant is a separate follow-up (see
+    the arch-deepening plan's "design notes surfaced during D").
+
+    Auth mirrors the siblings: authenticated caller
+    (:func:`_requires_authenticated_caller`) + viewer-tier operators denied
+    (:func:`_deny_viewer_tier_write`, ``memories.create``) + the per-key
+    creator-ownership matrix (:func:`_check_write_authorization`). Operator
+    sessions (the REST seam) always pass; agent bearers pass subject to the
+    ownership matrix — the same surface ``update_project_context`` already
+    exposes for its insert branch, so no new privilege opens.
+    """
+    denied = _requires_authenticated_caller(principal)
+    if denied is not None:
+        return denied
+
+    # SEC1: operator-path viewers are read-only; deny before the per-key
+    # ownership matrix (which would otherwise treat them like a worker).
+    viewer_denied = _deny_viewer_tier_write(principal, "memories.create")
+    if viewer_denied is not None:
+        return viewer_denied
+
+    context_key = arguments.get("context_key")
+    context_value = arguments.get("context_value")
+    description = arguments.get("description")
+
+    if not context_key:
+        return Invalid(
+            field="context_key", message="context_key is required"
+        )
+
+    requesting_agent_id = _actor_label(principal)
+    is_admin = _is_admin_principal(principal)
+
+    log_audit(
+        requesting_agent_id,
+        "create_project_context",
+        {"context_key": context_key},
+    )
+
+    try:
+        value_json_str = json.dumps(context_value)
+    except TypeError as e_type:
+        logger.error(
+            f"Value provided for project context key '{context_key}' is "
+            f"not JSON serializable: {e_type}"
+        )
+        return Invalid(
+            field="context_value",
+            message=(
+                f"Provided context_value is not JSON serializable: {e_type}"
+            ),
+        )
+
+    try:
+        err_result = _create_context_inline(
+            requesting_agent_id,
+            context_key,
+            value_json_str,
+            description,
+            is_admin=is_admin,
+        )
+    except (sqlite3.Error, SQLAlchemyError) as e_sql:
+        logger.error(
+            f"Database error creating project context for key "
+            f"'{context_key}': {e_sql}",
+            exc_info=True,
+        )
+        return Failed(
+            message=f"Database error creating project context: {e_sql}"
+        )
+    except Exception as e:
+        logger.error(
+            f"Unexpected error creating project context for key "
+            f"'{context_key}': {e}",
+            exc_info=True,
+        )
+        return Failed(
+            message=f"Unexpected error creating project context: {e}"
+        )
+
+    if err_result is not None:
+        return err_result
+
+    # BL-R14-1: fire the full post-write wake set this key requires —
+    # worker-policy toggle → tools/list_changed, loop toggle →
+    # wake_all_for_flag_recheck. Shared with the update surfaces.
+    await emit_context_write_wakes(context_key)
+
+    return Ok(
+        data={"context_key": context_key},
+        message=f"Memory '{context_key}' created successfully",
+    )
+
+
 # --- backup_project_context tool ---
 async def backup_project_context_tool_impl(
     arguments: Dict[str, Any],
@@ -1888,6 +2076,42 @@ def register_project_context_tools():
             "additionalProperties": False,
         },
         implementation=update_project_context_tool_impl,
+    )
+
+    register_tool(
+        name="create_project_context",
+        description="Create a NEW project context entry with a specific key. Fails with a conflict if the key already exists (use update_project_context to overwrite). The value can be any JSON-serializable type.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "token": {
+                    "type": "string",
+                    "description": "Authentication token (agent or admin). Optional if Authorization: Bearer header is supplied (recommended).",
+                },
+                "context_key": {
+                    "type": "string",
+                    "description": "The exact key for the new context entry (e.g., 'api.service_x.url').",
+                },
+                "context_value": {
+                    "description": "The JSON-serializable value to set (e.g., string, number, list, dict).",
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "number"},
+                        {"type": "boolean"},
+                        {"type": "null"},
+                        {"type": "object", "additionalProperties": True},
+                        {"type": "array"}
+                    ]
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Optional description of this context entry.",
+                },
+            },
+            "required": ["context_key"],
+            "additionalProperties": False,
+        },
+        implementation=create_project_context_tool_impl,
     )
 
     register_tool(
