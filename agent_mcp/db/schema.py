@@ -36,7 +36,7 @@ import sqlite3
 
 from sqlalchemy import text as sa_text
 
-from ..core.config import logger, EMBEDDING_DIMENSION
+from ..core.config import logger, embedding_settings
 from .connection import get_db_connection, check_vss_loadability, is_vss_loadable
 from .engine import Base, get_engine
 from . import models  # noqa: F401  — registers every ORM model on Base.metadata
@@ -58,11 +58,12 @@ _DEFAULT_RAG_META_ENTRIES = [
 
 def check_embedding_dimension_compatibility(conn: sqlite3.Connection) -> bool:
     """Check whether the current rag_embeddings table matches the
-    configured EMBEDDING_DIMENSION.
+    configured embedding dimension (``embedding_settings().dimension``).
 
     Returns True if compatible (or the table is absent), False if
     the on-disk dimension differs from the configured one.
     """
+    required_dimension = embedding_settings().dimension
     cursor = conn.cursor()
 
     cursor.execute(
@@ -74,7 +75,7 @@ def check_embedding_dimension_compatibility(conn: sqlite3.Connection) -> bool:
     if result is None:
         logger.debug(
             f"rag_embeddings table does not exist - will create with "
-            f"dimension {EMBEDDING_DIMENSION}"
+            f"dimension {required_dimension}"
         )
         return True
 
@@ -89,16 +90,16 @@ def check_embedding_dimension_compatibility(conn: sqlite3.Connection) -> bool:
         current_dim = int(dimension_match.group(1))
         logger.info(
             f"Current embedding table dimension: {current_dim}, "
-            f"Required dimension: {EMBEDDING_DIMENSION}"
+            f"Required dimension: {required_dimension}"
         )
 
-        if current_dim != EMBEDDING_DIMENSION:
+        if current_dim != required_dimension:
             logger.warning("Embedding dimension mismatch detected!")
             logger.warning(f"  Current table: {current_dim} dimensions")
-            logger.warning(f"  Config expects: {EMBEDDING_DIMENSION} dimensions")
+            logger.warning(f"  Config expects: {required_dimension} dimensions")
             logger.info(
                 f"Will trigger migration from {current_dim}D to "
-                f"{EMBEDDING_DIMENSION}D"
+                f"{required_dimension}D"
             )
             return False
         else:
@@ -114,9 +115,10 @@ def check_embedding_dimension_compatibility(conn: sqlite3.Connection) -> bool:
 
 
 def handle_embedding_dimension_change(conn: sqlite3.Connection) -> None:
-    """Drop and recreate the embeddings table when EMBEDDING_DIMENSION
-    changes between runs. Existing embeddings are deleted so the
-    indexer will re-embed everything next pass."""
+    """Drop and recreate the embeddings table when the configured
+    embedding dimension changes between runs. Existing embeddings are
+    deleted so the indexer will re-embed everything next pass."""
+    required_dimension = embedding_settings().dimension
     cursor = conn.cursor()
 
     logger.info("=" * 60)
@@ -162,7 +164,7 @@ def handle_embedding_dimension_change(conn: sqlite3.Connection) -> None:
         logger.info("Next steps:")
         logger.info(
             f"   - New vector table will be created with "
-            f"{EMBEDDING_DIMENSION} dimensions"
+            f"{required_dimension} dimensions"
         )
         logger.info(
             f"   - RAG indexer will automatically re-process all "
@@ -185,19 +187,20 @@ def _emit_rag_embeddings_virtual_table(conn: sqlite3.Connection) -> None:
     here, gated on the same runtime VSS-loadability check the
     pre-PR-W3 init_database() used.
     """
-    if not isinstance(EMBEDDING_DIMENSION, int) or EMBEDDING_DIMENSION <= 0:
-        raise ValueError(f"Invalid EMBEDDING_DIMENSION: {EMBEDDING_DIMENSION}")
+    dimension = embedding_settings().dimension
+    if not isinstance(dimension, int) or dimension <= 0:
+        raise ValueError(f"Invalid embedding dimension: {dimension}")
 
     cursor = conn.cursor()
-    # EMBEDDING_DIMENSION is validated above; safe to f-string.
+    # dimension is validated above; safe to f-string.
     create_table_sql = (
         f"CREATE VIRTUAL TABLE IF NOT EXISTS rag_embeddings USING vec0("
-        f"embedding FLOAT[{EMBEDDING_DIMENSION}])"
+        f"embedding FLOAT[{dimension}])"
     )
     cursor.execute(create_table_sql)
     logger.info(
         f"Vector table 'rag_embeddings' (using vec0 with dimension "
-        f"{EMBEDDING_DIMENSION}) ensured."
+        f"{dimension}) ensured."
     )
 
 

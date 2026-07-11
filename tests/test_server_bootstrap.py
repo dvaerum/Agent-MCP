@@ -165,7 +165,7 @@ def test_server_config_normalizes_project_dir_to_absolute(tmp_path: Path) -> Non
 def test_apply_runtime_flags_sets_advanced_embeddings(tmp_path: Path) -> None:
     """``apply_runtime_flags`` flips ``core.config.ADVANCED_EMBEDDINGS``
     when ``advanced=True`` so downstream callers (RAG indexer) see the
-    larger-dim model."""
+    larger-dim model via ``embedding_settings()``."""
     from agent_mcp import server_bootstrap
     from agent_mcp.core import config as core_config
 
@@ -177,15 +177,13 @@ def test_apply_runtime_flags_sets_advanced_embeddings(tmp_path: Path) -> None:
     try:
         server_bootstrap.apply_runtime_flags(cfg)
         assert core_config.ADVANCED_EMBEDDINGS is True
-        # EMBEDDING_MODEL also flips to advanced.
-        assert core_config.EMBEDDING_MODEL == core_config.ADVANCED_EMBEDDING_MODEL
+        # embedding_settings() also resolves to advanced.
+        assert (
+            core_config.embedding_settings().model
+            == core_config.ADVANCED_EMBEDDING_MODEL
+        )
     finally:
         core_config.ADVANCED_EMBEDDINGS = original
-        core_config.EMBEDDING_MODEL = (
-            core_config.ADVANCED_EMBEDDING_MODEL
-            if original
-            else core_config.SIMPLE_EMBEDDING_MODEL
-        )
 
 
 def test_apply_runtime_flags_disables_auto_indexing(tmp_path: Path) -> None:

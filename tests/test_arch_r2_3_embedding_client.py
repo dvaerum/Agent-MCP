@@ -126,8 +126,9 @@ def test_model_and_dimension_come_from_config(
     from agent_mcp.external.embedding_service import embedding_client
 
     client = embedding_client()
-    assert client.model == cfg.EMBEDDING_MODEL
-    assert client.dimension == cfg.EMBEDDING_DIMENSION
+    settings = cfg.embedding_settings()
+    assert client.model == settings.model
+    assert client.dimension == settings.dimension
 
 
 # ── uniform interface contract ───────────────────────────────────────
