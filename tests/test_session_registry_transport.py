@@ -181,7 +181,6 @@ async def live_server(tmp_path: Path) -> AsyncIterator[tuple[str, str]]:
         "file_map": dict(g.file_map),
         "agent_working_dirs": dict(g.agent_working_dirs),
         "audit_log": list(g.audit_log),
-        "openai_client_instance": g.openai_client_instance,
         "global_vss_load_tested": g.global_vss_load_tested,
         "global_vss_load_successful": g.global_vss_load_successful,
     }
@@ -189,12 +188,12 @@ async def live_server(tmp_path: Path) -> AsyncIterator[tuple[str, str]]:
     # We DON'T install the global httpx-init mock-ollama patch here:
     # the test fixture itself uses live httpx clients against uvicorn
     # at 127.0.0.1:<port>, and a global mock-transport patch would
-    # short-circuit those to a 404-returning mock. The
-    # `conftest._isolate_env` already sets OPENAI_API_KEY="", which
-    # makes `initialize_openai_client()` short-circuit to None — that's
-    # enough to keep embeddings calls from going out during lifespan.
-    # Tests that need embeddings calls answered should add their own
-    # narrower mock around just those code paths.
+    # short-circuit those to a 404-returning mock. Lifespan startup no
+    # longer makes any eager OpenAI/Ollama network call (arch-r4 #2
+    # removed the boot-time client-init round-trip), so there's nothing
+    # to keep from going out here. Tests that need embeddings calls
+    # answered should add their own narrower mock around just those
+    # code paths.
     original_client_init = httpx.Client.__init__
     original_async_init = httpx.AsyncClient.__init__
 
@@ -314,7 +313,6 @@ async def live_server(tmp_path: Path) -> AsyncIterator[tuple[str, str]]:
         g.agent_working_dirs.update(snapshot["agent_working_dirs"])
         g.audit_log.clear()
         g.audit_log.extend(snapshot["audit_log"])
-        g.openai_client_instance = snapshot["openai_client_instance"]
         g.global_vss_load_tested = snapshot["global_vss_load_tested"]
         g.global_vss_load_successful = snapshot["global_vss_load_successful"]
         _engine.reset_engine_cache()
