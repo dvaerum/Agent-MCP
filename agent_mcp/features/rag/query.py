@@ -40,17 +40,33 @@ def _is_secret_key(key: Optional[str]) -> bool:
 # Canonical embedded-secret VALUE scanner, reused (not duplicated) from
 # the index path so the live-context query filter applies the SAME skip
 # the indexer does: a secret in the VALUE of a non-secret-named key
-# (e.g. ``deploy_notes`` holding an AWS key) must not reach the LLM.
+# (e.g. ``deploy_notes`` holding an AWS key) must not reach the LLM. Still
+# used by the query_rag_system_with_model raw ``SELECT ... FROM
+# project_context`` path below, which reads the table directly rather than
+# through the redaction-owning ``rag_repo.fetch_recent_context`` seam.
 from .indexing import _value_has_embedded_secret  # noqa: E402
 
 
+# SECRET REDACTION OWNERSHIP: the retrieval SEAM
+# (``rag_repo.search_similar`` + ``rag_repo.fetch_recent_context``) now
+# owns secret redaction — the seam that returns the data drops the
+# secrets. The former by-hand live-context filter here is gone (the seam's
+# fetch_recent_context enforces it). Two thin filters remain as explicit
+# defense-in-depth, NOT as the primary guard:
+#   * ``_drop_secret_context_chunks`` around ``search_similar`` — protects
+#     callers that inject/mock the repo and bypass the real seam.
+#   * the ``_is_secret_key`` / ``_value_has_embedded_secret`` filter on the
+#     raw ``SELECT ... FROM project_context`` in
+#     ``query_rag_system_with_model``, which does NOT read through the
+#     seam at all.
 def _drop_secret_context_chunks(
     results: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """Drop retrieved vector chunks that carry a secret project_context
-    row. Defense against a STALE index that embedded a secret before the
-    index-time skip (indexing.py) was in place: the chunk's
-    ``source_ref`` is the context_key for ``source_type == "context"``.
+    row. Defense-in-depth mirroring ``rag_repo.search_similar``'s own
+    seam-level drop, for the case where a caller injects/mocks the repo
+    and bypasses the real seam. The chunk's ``source_ref`` is the
+    context_key for ``source_type == "context"``.
     """
     return [
         r
@@ -111,20 +127,13 @@ async def query_rag_system(query_text: str) -> str:
                 rag_repo.get_last_indexed("context")
                 or "1970-01-01T00:00:00Z"
             )
+            # SECURITY: fetch_recent_context is the retrieval seam and
+            # owns secret redaction — secret-keyed rows (config_*_token
+            # etc.) and embedded-credential values are already dropped
+            # before they return here.
             live_context_results = rag_repo.fetch_recent_context(
                 since=last_indexed_context_time, limit=5,
             )
-            # SECURITY: never surface secret-keyed rows (config_*_token
-            # etc.) to the LLM — the RAG answer is readable by any worker
-            # via ask_project_rag, bypassing view_project_context's
-            # redaction. Same policy as the tool boundary.
-            live_context_results = [
-                r for r in live_context_results
-                if not _is_secret_key(r.get("context_key"))
-                and not _value_has_embedded_secret(
-                    r.get("value"), r.get("description")
-                )
-            ]
         except sqlite3.Error as e_live_ctx:
             logger.warning(
                 f"RAG Query: Failed to fetch live project context: {e_live_ctx}"
@@ -206,14 +215,14 @@ async def query_rag_system(query_text: str) -> str:
                 # k=13 is the legacy knn-results constant the previous
                 # raw SQL used; preserved exactly so retrieval quality
                 # is unchanged across the migration.
-                vector_search_results = rag_repo.search_similar(
-                    query_embedding=query_embedding,
-                    limit=13,
-                )
-                # Retrieval-time defense against a stale index that
-                # already embedded a secret context row.
+                # search_similar (the seam) already drops secret context
+                # chunks; the wrap here is defense-in-depth for an
+                # injected/mocked repo that bypasses the real seam.
                 vector_search_results = _drop_secret_context_chunks(
-                    vector_search_results
+                    rag_repo.search_similar(
+                        query_embedding=query_embedding,
+                        limit=13,
+                    )
                 )
             except (
                 openai.APIError
@@ -468,14 +477,14 @@ async def query_rag_system_with_model(
                     dimensions=EMBEDDING_DIMENSION,
                 )
                 query_embedding = query_embedding_response.data[0].embedding
-                vector_search_results = rag_repo.search_similar(
-                    query_embedding=query_embedding,
-                    limit=13,
-                )
-                # Retrieval-time defense against a stale index that
-                # already embedded a secret context row.
+                # search_similar (the seam) already drops secret context
+                # chunks; the wrap here is defense-in-depth for an
+                # injected/mocked repo that bypasses the real seam.
                 vector_search_results = _drop_secret_context_chunks(
-                    vector_search_results
+                    rag_repo.search_similar(
+                        query_embedding=query_embedding,
+                        limit=13,
+                    )
                 )
             except openai.APIError as e_openai_emb:
                 logger.error(

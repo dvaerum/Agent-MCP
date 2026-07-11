@@ -541,6 +541,9 @@ def test_fetch_recent_context_time_windowed(project_dir, reset_globals):
         # in the future so the admin-token row (inserted at lifespan
         # startup with a "now" timestamp) doesn't pollute the
         # comparison. The cutoff sits between the two seeded rows.
+        # Non-secret context_key names: fetch_recent_context now applies
+        # the secret-redaction seam, so ``*_key`` names (secret vocab)
+        # would be dropped and defeat the time-window assertion.
         conn = get_db_connection()
         try:
             c = conn.cursor()
@@ -549,7 +552,7 @@ def test_fetch_recent_context_time_windowed(project_dir, reset_globals):
                 "(context_key, value, description, created_at, "
                 "created_by, updated_at, updated_by) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                ("old_key", '"old"', "old desc",
+                ("old_note", '"old"', "old desc",
                  "2099-06-01T00:00:00Z", "test",
                  "2099-06-01T00:00:00Z", "test"),
             )
@@ -558,7 +561,7 @@ def test_fetch_recent_context_time_windowed(project_dir, reset_globals):
                 "(context_key, value, description, created_at, "
                 "created_by, updated_at, updated_by) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                ("new_key", '"new"', "new desc",
+                ("new_note", '"new"', "new desc",
                  "2099-06-10T00:00:00Z", "test",
                  "2099-06-10T00:00:00Z", "test"),
             )
@@ -568,7 +571,7 @@ def test_fetch_recent_context_time_windowed(project_dir, reset_globals):
 
         results = rag_repo.fetch_recent_context(since="2099-06-05T00:00:00Z")
         assert len(results) == 1
-        assert results[0]["context_key"] == "new_key"
+        assert results[0]["context_key"] == "new_note"
 
 
 def test_bulk_index_chunks_joins_parent_transaction(
