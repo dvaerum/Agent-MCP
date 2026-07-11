@@ -31,16 +31,13 @@ from .._dispatch_helpers import (
     _dispatch_through_tool,
     handle_options,
 )
+from ._wire_validation import require_str as _require_str
+from ._wire_validation import require_str_list as _require_str_list
 from ..deps import caller_identity, require_operator_session
 from ...core.config import logger
 from ...core.tool_result import (
-    Conflict,
-    Failed,
-    Invalid,
-    NotFound,
     Ok,
-    PermissionDenied,
-    ToolResult,
+    tool_result_error_message,
     tool_result_to_http,
 )
 from ...tools.registry import ToolInputValidationError, dispatch_tool_call
@@ -57,33 +54,11 @@ router = APIRouter(
 # bypass the schema-validating MCP tool dispatch, so a structured JSON
 # type (dict / list) in a string-typed field reaches a SQLite bind and
 # surfaces as an uncaught 500 — or is silently stored as bad data.
-# Guard every user-supplied field up front. Kept local to the file per
-# the round-9 scope (do NOT add a shared util outside these routers).
-def _require_str(value, field):
-    """Return a 400 JSONResponse if ``value`` is present but not a str.
-
-    ``None`` (an absent / cleared optional field) is allowed; callers
-    that require presence check truthiness separately.
-    """
-    if value is not None and not isinstance(value, str):
-        return JSONResponse(
-            {"error": f"{field} must be a string"}, status_code=400
-        )
-    return None
-
-
-def _require_str_list(value, field):
-    """Return a 400 JSONResponse unless ``value`` is None or a list[str]."""
-    if value is None:
-        return None
-    if not isinstance(value, list) or not all(
-        isinstance(x, str) for x in value
-    ):
-        return JSONResponse(
-            {"error": f"{field} must be a list of strings"},
-            status_code=400,
-        )
-    return None
+# Guard every user-supplied field up front.
+#
+# arch-r4 #10: ``_require_str`` / ``_require_str_list`` now live once in
+# ``._wire_validation`` (imported above) — the round-9 "kept local, do
+# NOT consolidate" scope boundary is settled.
 
 
 @router.api_route("", methods=["GET", "OPTIONS"])
@@ -134,26 +109,6 @@ async def all_tasks_api_route(request: Request) -> JSONResponse:
         # SQLAlchemyError / sqlite3.*Error embeds SQL text + bound
         # params (schema disclosure). Detail stays in the log above.
         return JSONResponse({"error": "Failed to fetch all tasks"}, status_code=500)
-
-
-def _tool_error_detail(result: ToolResult) -> str:
-    """Human-readable error string for the legacy ``{"error": ...}``
-    envelope this route returns, given a non-``Ok`` create_task result.
-
-    Kept in the legacy envelope (not the shared
-    :func:`tool_result_to_http` body) because the dashboard + the
-    create-task REST tests pin this shape. The STATUS comes from the
-    shared adapter; only the body wording lives here. The only
-    ``NotFound`` ``create_task`` can return is the missing parent, so we
-    render the historical "Parent task '<id>' not found" text.
-    """
-    if isinstance(result, NotFound):
-        return f"Parent task '{result.identifier}' not found"
-    if isinstance(result, (Conflict, PermissionDenied)):
-        return result.reason
-    if isinstance(result, Invalid):
-        return result.message
-    return "Failed to create task"
 
 
 @router.api_route("", methods=["POST", "OPTIONS"])
@@ -286,15 +241,23 @@ async def create_task_api_route(
 
     # Error variants: STATUS from the shared C-wave adapter; body kept in
     # the legacy ``{"error": ...}`` envelope the dashboard + tests pin.
+    # arch-r4 #10: body wording now comes from the ONE shared
+    # :func:`tool_result_error_message` mapper. ``not_found_label="Parent
+    # task"`` preserves this route's historical wording (the only
+    # ``NotFound`` ``create_task`` can return is the missing parent).
+    # ``Failed`` (or any residual variant, SEC-R6 / SD-R6-1) falls back to
+    # the same static "Failed to create task" this route has always used
+    # — no exception-detail leak; the dispatcher already logged the real
+    # one.
     status, _ = tool_result_to_http(result)
-    if isinstance(result, Failed):
-        # SEC-R6 / SD-R6-1: static generic 500 message (no exception-detail
-        # leak). ``_dispatch_helpers`` already logged the real detail.
-        return JSONResponse(
-            {"error": "Failed to create task"}, status_code=status
-        )
     return JSONResponse(
-        {"error": _tool_error_detail(result)}, status_code=status
+        {
+            "error": tool_result_error_message(
+                result, "Failed to create task",
+                not_found_label="Parent task",
+            )
+        },
+        status_code=status,
     )
 
 
