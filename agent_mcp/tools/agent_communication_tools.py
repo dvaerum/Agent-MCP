@@ -28,6 +28,7 @@ from ..features.aoe_notify import notify_aoe as _aoe_notify
 from ..repositories.message_repository import ParentMessageNotFound
 from ..utils.audit_utils import log_audit
 from ..db.connection import get_db_connection
+from ..db.unit_of_work import unit_of_work
 
 
 class _MessageStoreFailed(RuntimeError):
@@ -311,27 +312,21 @@ async def send_agent_message_tool_impl(
                 else message_content
             )
 
-    # PR A (round 2): the send → mark_delivered → audit-log → commit
-    # boilerplate becomes a single `atomic_with_audit` block. Details
-    # of the audit row are built incrementally as the delivery branch
-    # decides what happened; the seam reads the dict at block exit so
-    # the final `delivery_status` is what the audit row reflects.
-    from ..db.atomic import atomic_with_audit
-    audit_details: Dict[str, Any] = {
-        "recipient": recipient_id,
-        "message_type": message_type,
-        "priority": priority,
-        "delivery_status": "stored",
-    }
+    # D2: the send mutation runs on the write-path unit-of-work. The
+    # message INSERT drives ``u.cursor``; the recipient inbox wake and
+    # the (now unified) audit are only *registered* on ``u`` and flush
+    # after a successful commit — so emit-iff-commit is structural. On
+    # ANY exception inside the scope (ParentMessageNotFound, unknown
+    # recipient LookupError, or send() → None → _MessageStoreFailed) the
+    # uow rolls back and fires ZERO effects: no message row, no delivery,
+    # no recipient wake, no audit row. That re-guards PF-R32-1's
+    # silent-drop contract (a failed send never reports success nor
+    # strands orphan audit/delivery state).
+    delivery_status = "stored"
     try:
-        with atomic_with_audit(
-            operation="send_message",
-            actor=sender_id,
-            details=audit_details,
-        ) as cursor:
-            # PR 6: message INSERT goes through message_repo with the
-            # caller's cursor so it's atomic with the subsequent delivery
-            # UPDATE + audit-log INSERT below.
+        with unit_of_work() as u:
+            # PR 6: message INSERT goes through message_repo on the uow's
+            # cursor so it's atomic with the audit row under one commit.
             from ..repositories import message_repo as _msg_repo
             stored = _msg_repo.send(
                 message_id=message_id,
@@ -345,14 +340,14 @@ async def send_agent_message_tool_impl(
                 read=False,
                 subject=effective_subject,
                 parent_message_id=parent_message_id,
-                connection=cursor,
+                connection=u.cursor,
             )
             # PF-R32-1: honor send()'s result. A None return means the
             # INSERT failed for a reason send() swallowed internally (DB
-            # error / bad bind). Raise to abort the WHOLE atomic unit so
-            # no audit/delivery row is committed for a message that was
-            # never stored — never report a false success. (A nonexistent
-            # parent no longer reaches here: send() now raises
+            # error / bad bind). Raise to abort the WHOLE unit so no
+            # audit/delivery row is committed for a message that was never
+            # stored — never report a false success. (A nonexistent parent
+            # no longer reaches here: send() now raises
             # ParentMessageNotFound up front, caught below.)
             if stored is None:
                 raise _MessageStoreFailed(message_id)
@@ -364,31 +359,46 @@ async def send_agent_message_tool_impl(
             # cannot push directly to a tmux pane.
             delivery_status = "stored"
 
-            # Mutate the audit-details dict in place; `atomic_with_audit`
-            # reads it at block exit, so the final delivery_status lands
-            # on the audit row alongside the message INSERT + delivery
-            # UPDATE, all under one commit.
-            audit_details["delivery_status"] = delivery_status
+            # Register the recipient inbox wake to fire AFTER commit, so
+            # the waiter's re-query sees the new row. notify_agent_inbox
+            # wakes any `wait_for_events` waiter AND fans out
+            # `notifications/resources/updated` on every registered GET
+            # /mcp stream (per-recipient wake covers broadcasts too — the
+            # broadcast tool loops this impl, one notify per recipient).
+            # The bus swallows per-adapter errors and the uow's flush
+            # additionally isolates it, so a broken wake can't crash a
+            # send whose commit already happened.
+            u.on_commit(lambda: g.notify_agent_inbox(recipient_id))
 
-        # Wake any `wait_for_events` waiter for the recipient AND fan
-        # out `notifications/resources/updated` on every registered
-        # GET /mcp stream for them. Single helper so both sinks fire
-        # in lockstep (per-recipient wake covers broadcasts too — they
-        # call this impl in a loop, one notify per recipient row).
-        # Called AFTER commit so the waiter's re-query sees the new row.
-        try:
-            g.notify_agent_inbox(recipient_id)
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning(
-                "notify_agent_inbox(%s) raised after send_agent_message: %s",
-                recipient_id, e,
+            # Unified audit: ONE register writes BOTH sinks (the DB
+            # ``agent_actions`` row + the in-memory ``g.audit_log`` entry),
+            # and only after commit. Replaces the split
+            # ``atomic_with_audit(operation="send_message")`` DB row plus
+            # the separate post-commit ``log_audit("send_agent_message")``
+            # — the two audit sinks now agree on action + details.
+            u.audit(
+                sender_id,
+                "send_message",
+                details={
+                    "recipient": recipient_id,
+                    "message_type": message_type,
+                    "priority": priority,
+                    "delivery_status": delivery_status,
+                    "message_id": message_id,
+                },
             )
+
+        # Clean exit above committed the message and flushed the wake +
+        # audit. Everything below is post-commit and only runs on a
+        # successful send (an exception inside the scope re-raises out of
+        # the ``with`` and skips straight to the handlers below).
 
         # AoE notification side-channel (best-effort, fire-and-forget).
         # Disabled by default; admins opt in via
-        # project_context[config_aoe_notify_enabled]. Never blocks or
-        # raises — the message is already persisted, and AoE is just
-        # a tmux-pane wake-up call.
+        # project_context[config_aoe_notify_enabled]. Async, so it stays
+        # OUTSIDE the (synchronous) uow flush — it fires only after a
+        # clean commit and never blocks or raises: the message is already
+        # persisted, and AoE is just a tmux-pane wake-up call.
         try:
             asyncio.create_task(
                 _aoe_notify(recipient_id, sender_id, message_id)
@@ -398,15 +408,6 @@ async def send_agent_message_tool_impl(
             # synchronously). Run inline; still swallows errors.
             await _aoe_notify(recipient_id, sender_id, message_id)
 
-        # Audit log
-        log_audit(sender_id, "send_agent_message", {
-            "recipient": recipient_id,
-            "message_type": message_type,
-            "priority": priority,
-            "delivery_status": delivery_status,
-            "message_id": message_id
-        })
-        
         # Build response. Wave 7 PR 3: stop_command and regular text
         # both land on the "stored" outcome — the recipient's
         # ``wait_for_events`` long-poll surfaces them on the next wake.
@@ -437,8 +438,8 @@ async def send_agent_message_tool_impl(
 
     except ParentMessageNotFound as e:
         # PF-R32-1: the reply named a parent_message_id that doesn't
-        # exist. `atomic_with_audit` already rolled back the message
-        # INSERT + audit row (nothing was committed). Distinct from the
+        # exist. The unit-of-work already rolled back the message INSERT
+        # and fired no effects (no audit row, no wake). Distinct from the
         # unknown-recipient LookupError below so the error names the
         # missing PARENT, not the recipient.
         logger.warning(f"send_agent_message rejected (unknown parent): {e}")
@@ -448,23 +449,24 @@ async def send_agent_message_tool_impl(
         )
     except LookupError as e:
         # Repository rejected an unknown recipient (VM e2e fix
-        # 2026-06-16). `atomic_with_audit` already rolled back the
-        # message INSERT + audit row. Surface the repo's message
+        # 2026-06-16). The unit-of-work already rolled back the message
+        # INSERT and fired no effects. Surface the repo's message
         # verbatim — it explains live / admin / tombstone semantics.
         logger.warning(f"send_agent_message rejected: {e}")
         return NotFound(resource="agent", identifier=str(recipient_id))
     except _MessageStoreFailed as e:
         # PF-R32-1: send() returned None (store failed for a reason it
-        # swallowed). `atomic_with_audit` rolled back the audit row, so
-        # nothing was committed. Report an error — never a false success.
+        # swallowed). The unit-of-work rolled back and fired no effects,
+        # so nothing was committed. Report an error — never a false
+        # success.
         logger.error(
             "send_agent_message store failed (send returned None) for "
             "message %s to %s", e.message_id, recipient_id,
         )
         return Failed(message="Failed to send message")
     except sqlite3.Error as e:
-        # `atomic_with_audit` already rolled back + closed the conn
-        # before re-raising; nothing left for us to do but report.
+        # The unit-of-work already rolled back + closed the conn before
+        # re-raising; nothing left for us to do but report.
         logger.error(f"Database error sending message: {e}", exc_info=True)
         return Failed(message=f"Database error sending message: {e}")
     except Exception as e:
