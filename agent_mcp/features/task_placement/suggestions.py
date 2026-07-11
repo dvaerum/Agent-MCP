@@ -36,16 +36,7 @@ def format_suggestions_for_agent(
     # Add main status message
     status = validation_result.get("status", "approved")
     main_message = validation_result.get("message", "")
-    
-    # Check for hierarchy violations
-    hierarchy_analysis = validation_result.get("hierarchy_analysis", {})
-    hierarchy_violation = hierarchy_analysis.get("hierarchy_violation", False)
-    
-    if hierarchy_violation:
-        messages.append("🚫 HIERARCHY VIOLATION: Only ONE root task is allowed!")
-        messages.append(f"   Existing root task: {hierarchy_analysis.get('current_root_task_id', 'unknown')}")
-        messages.append("   This task MUST have a parent.")
-    
+
     if status == "approved":
         messages.append(f"✓ Task placement approved: {main_message}")
     elif status == "suggest_changes":

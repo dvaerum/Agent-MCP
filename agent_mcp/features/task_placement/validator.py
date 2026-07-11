@@ -14,8 +14,21 @@ async def validate_task_placement(
     auth_token: str
 ) -> Dict[str, Any]:
     """
-    Validate task placement using RAG system.
-    
+    Advisory-only task placement analysis via the RAG system.
+
+    Suggests a parent task, suggests dependency changes, and flags
+    likely duplicate tasks by semantic similarity over the RAG corpus.
+
+    This function does NOT touch the database and does NOT enforce the
+    single-root-task invariant. That invariant is a hard structural
+    constraint (``COUNT(*) ... WHERE parent_task IS NULL``) enforced in
+    ``task_tools.py`` *before* this validator is ever called — a
+    features-layer module has no business opening its own DB
+    connection, and an LLM has no way to verify a hierarchy claim
+    against ground truth, so it must never be trusted to enforce one
+    (arch-r4 #9). This function only suggests; it never denies a task
+    based on hierarchy.
+
     Args:
         title: Proposed task title
         description: Proposed task description
@@ -23,7 +36,7 @@ async def validate_task_placement(
         depends_on_tasks: List of proposed dependency task IDs
         created_by: Agent ID creating the task
         auth_token: Authentication token for RAG query
-        
+
     Returns:
         Dictionary with validation results:
         {
@@ -42,69 +55,39 @@ async def validate_task_placement(
         }
     """
     try:
-        # Check if trying to create a root task (no parent)
-        from ...db.connection import get_db_connection
-        root_task_check = ""
-        if parent_task_id is None:
-            # Check if a root task already exists
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) as count FROM tasks WHERE parent_task IS NULL")
-            root_count = cursor.fetchone()['count']
-            conn.close()
-            
-            if root_count > 0:
-                root_task_check = f"""
-                CRITICAL: There are already {root_count} root task(s) in the system. 
-                ONLY ONE root task is allowed. This task MUST have a parent.
-                """
-        
         # Format the query for RAG with emphasis on critical thinking
         query = f"""
-        {root_task_check}
-        
-        CRITICAL THINKING REQUIRED: Analyze the proposed task placement with deep consideration of the ENTIRE task hierarchy:
-        
+        CRITICAL THINKING REQUIRED: Analyze the proposed task placement with deep consideration of the existing task structure:
+
         Title: {title}
         Description: {description}
-        Proposed Parent Task: {parent_task_id or 'None (ATTEMPTING TO CREATE ROOT TASK)'}
+        Proposed Parent Task: {parent_task_id or 'None (root-level task)'}
         Proposed Dependencies: {json.dumps(depends_on_tasks or [])}
         Created By: {created_by}
-        
+
         YOU MUST CRITICALLY EVALUATE:
-        
-        1. HIERARCHY RULES:
-           - There can be ONLY ONE root task (no parent) in the entire system
-           - Every other task MUST have a parent
-           - If proposing a root task, explain why this should be THE root task
-        
-        2. LOGICAL PLACEMENT:
+
+        1. LOGICAL PLACEMENT:
            - Analyze ALL existing tasks to find the most logical parent
            - Consider the task's purpose, scope, and relationship to other tasks
            - Don't just accept the proposed parent - think if there's a better one
-        
-        3. DEPENDENCIES:
+
+        2. DEPENDENCIES:
            - Identify ALL tasks this should depend on based on logical workflow
            - Consider both direct and indirect dependencies
            - Remove any redundant or incorrect dependencies
-        
-        4. DUPLICATION:
+
+        3. DUPLICATION:
            - Check if similar tasks already exist
            - Consider if this should be a subtask of an existing task instead
-        
-        5. PROJECT STRUCTURE:
+
+        4. PROJECT STRUCTURE:
            - Ensure the task fits logically within the project's architecture
            - Consider the impact on the overall task hierarchy
-        
+
         Please respond in the following JSON format:
         {{
             "placement_assessment": "appropriate" | "needs_adjustment" | "problematic",
-            "hierarchy_analysis": {{
-                "root_task_exists": true | false,
-                "current_root_task_id": "task_id or null",
-                "proposed_is_root": true | false,
-                "hierarchy_violation": true | false
-            }},
             "parent_suggestion": {{
                 "recommended_parent": "task_id or null",
                 "reasoning": "detailed explanation of why this parent is the most logical choice after analyzing all tasks"
@@ -184,10 +167,6 @@ async def validate_task_placement(
         
         # Process the RAG response into our format
         if rag_data:
-            # Check for hierarchy violations first
-            hierarchy_analysis = rag_data.get("hierarchy_analysis", {})
-            hierarchy_violation = hierarchy_analysis.get("hierarchy_violation", False)
-            
             # Map RAG recommendations to our status codes
             status_map = {
                 "proceed": "approved",
@@ -195,19 +174,12 @@ async def validate_task_placement(
                 "reconsider": "warning",
                 "deny": "denied"
             }
-            
-            base_status = status_map.get(
+
+            status = status_map.get(
                 rag_data.get("overall_recommendation", "proceed"),
                 "approved"
             )
-            
-            # Override status if hierarchy violation detected
-            if hierarchy_violation and parent_task_id is None:
-                status = "denied"
-                logger.warning(f"Task creation denied due to hierarchy violation (attempting to create second root task)")
-            else:
-                status = base_status
-            
+
             # Extract suggestions
             parent_suggestion = rag_data.get("parent_suggestion", {})
             dependency_suggestions = rag_data.get("dependency_suggestions", {})
@@ -260,7 +232,6 @@ async def validate_task_placement(
                 "suggestions": suggestions,
                 "duplicates": duplicates,
                 "message": full_message,
-                "hierarchy_analysis": hierarchy_analysis  # Include for additional context
             }
         else:
             # Fallback response if RAG parsing failed
