@@ -881,6 +881,568 @@ async def terminate_agent_tool_impl(
         return Failed(message=f"Unexpected error terminating agent: {e}")
 
 
+# --- agent lifecycle: restore / edit / purge tools (E2 arch-deepening) ---
+#
+# `terminate_agent` (above) is a soft-delete: it flips status='terminated'
+# but leaves the row + tokens + messages + tasks intact. An operator then
+# either Restore (reverse soft-delete) or Purge (hard delete + cascade
+# tombstone rewrite). Before E2 these three mutations existed ONLY as
+# shadow business-logic tiers inside ``app/routers/agents.py`` — the REST
+# route WAS the implementation. E2 extracts them as real tools on the
+# unit-of-work; the routes become thin adapters (mirroring E1's
+# ``create_task``). Cascade table (purge):
+#
+#   agents          → DELETE row (last in tx)
+#   agent_messages  → tombstone sender_id/recipient_id → [deleted-<id>]
+#   tasks           → tombstone created_by; SET NULL assigned_to + status=unassigned
+#   agent_actions   → tombstone agent_id
+#   mcp_sessions / claude_code_sessions → DELETE (FK to agents.agent_id)
+#   tasks.notes JSON → UNTOUCHED — preserved as audit trail
+#
+# Tombstone format ``[deleted-<id>]`` depends on ``[``/``]`` being absent
+# from real agent_ids; see register_agent_tool_impl validation.
+#
+# Audit sink (D3 finding): all three REST handlers wrote ONLY the DB sink
+# (``log_agent_action_to_db`` — ``restored_agent`` / ``edited_agent`` /
+# ``purged_agent``) and NEVER the in-memory ``log_audit``. We keep that
+# exactly — the DB row is written inside the scope on ``u.cursor`` (NOT
+# via ``u.audit``, which would add the in-memory sink they never wrote).
+
+
+#: Whitelisted editable agent fields for :func:`edit_agent_tool_impl` and
+#: the ``POST /api/agents/<id>/edit`` route adapter. ONE source of truth so
+#: the route's wire-level type guards and the tool's apply loop can't drift.
+#: Anything outside this tuple is silently ignored (defence in depth —
+#: status / agent_id / token must never flow through the edit surface).
+EDITABLE_AGENT_FIELDS = (
+    "capabilities", "color", "working_directory", "aoe_session_id",
+    "auto_event_loop", "agent_role",
+)
+
+
+def _purge_tombstone(agent_id: str) -> str:
+    """Tombstone literal used to rewrite references to a purged agent."""
+    return f"[deleted-{agent_id}]"
+
+
+def _gather_purge_preview(cursor, agent_id: str) -> Dict[str, Any]:
+    """Compute the blast-radius counts + samples for a future purge.
+
+    Message counts + sample go through ``message_repo`` so the repo owns
+    the agent_messages query surface. The task / agent_actions counts stay
+    on the cursor — they live in tables the message repo doesn't own, and
+    the surrounding purge cascade is a multi-table transaction the cursor
+    still drives. Shared by :func:`purge_agent_tool_impl` (counts only) and
+    the ``GET /api/agents/<id>/purge-preview`` route (counts + samples).
+    """
+    from ..repositories import message_repo
+
+    messages_sent = message_repo.count_query({"from": agent_id})
+    messages_received = message_repo.count_query({"to": agent_id})
+    cursor.execute(
+        "SELECT COUNT(*) AS n FROM tasks WHERE created_by = ?",
+        (agent_id,),
+    )
+    tasks_created = cursor.fetchone()["n"]
+    cursor.execute(
+        "SELECT COUNT(*) AS n FROM tasks WHERE assigned_to = ?",
+        (agent_id,),
+    )
+    tasks_assigned = cursor.fetchone()["n"]
+    cursor.execute(
+        "SELECT COUNT(*) AS n FROM agent_actions WHERE agent_id = ?",
+        (agent_id,),
+    )
+    agent_actions = cursor.fetchone()["n"]
+
+    # Samples (most-recent first; small enough to inline in a modal).
+    def _trim(s: "str | None", n: int = 80) -> str:
+        if not s:
+            return ""
+        return s if len(s) <= n else s[:n] + "..."
+
+    sample_messages_sent = [
+        {"content": _trim(m["message_content"]),
+         "timestamp": m["timestamp"]}
+        for m in message_repo.query(
+            {"from": agent_id, "limit": 3, "offset": 0}
+        )
+    ]
+    cursor.execute(
+        "SELECT title FROM tasks WHERE created_by = ? "
+        "ORDER BY created_at DESC LIMIT 3",
+        (agent_id,),
+    )
+    sample_tasks_created = [r["title"] for r in cursor.fetchall()]
+    cursor.execute(
+        "SELECT title FROM tasks WHERE assigned_to = ? "
+        "ORDER BY created_at DESC LIMIT 3",
+        (agent_id,),
+    )
+    sample_tasks_assigned = [r["title"] for r in cursor.fetchall()]
+
+    return {
+        "counts": {
+            "messages_sent": messages_sent,
+            "messages_received": messages_received,
+            "tasks_created": tasks_created,
+            "tasks_assigned": tasks_assigned,
+            "agent_actions": agent_actions,
+        },
+        "samples": {
+            "messages_sent": sample_messages_sent,
+            "tasks_created": sample_tasks_created,
+            "tasks_assigned": sample_tasks_assigned,
+        },
+    }
+
+
+# E2: @requires_capability("agents.terminate"). Restore/edit/purge are all
+# operator-tier agent-lifecycle mutations; the locked capability vocabulary
+# (core/capabilities.py, 27 entries) carries no ``agents.restore/edit/purge``
+# verb, so they gate on ``agents.terminate`` — the agents.* write cap the
+# operator bundle carries and the REST routes' ``require_operator_session``
+# resolves to. Auth-equivalent, no privilege change (sysadmin wildcards;
+# viewer/worker lacks it → PermissionDenied → 403).
+async def restore_agent_tool_impl(
+    arguments: Dict[str, Any],
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    """Reverse a soft-delete: flip status='terminated' → 'created'.
+
+    E2: the CANONICAL restore implementation, shared by the
+    ``restore_agent`` MCP tool and ``POST /api/agents/<id>/restore``.
+    Side effects of the original terminate (cleared current_task,
+    released files) are NOT undone — the operator reassigns work
+    explicitly. On the unit-of-work: the two field clears (status,
+    terminated_at) + the ``restored_agent`` DB audit row commit in ONE
+    transaction on ``u.cursor``; the ``g.active_agents`` /
+    ``g.agent_working_dirs`` cache rebuild registers post-commit
+    (emit-iff-commit — a rollback re-adds nothing).
+    """
+    denied = _require_capability(principal, "agents.terminate")
+    if denied is not None:
+        return denied
+
+    agent_id = arguments.get("agent_id")
+    if not agent_id or not isinstance(agent_id, str):
+        return Invalid(field="agent_id", message="`agent_id` is required.")
+
+    actor_label = principal.actor_label() if principal else "operator"
+
+    try:
+        with unit_of_work() as u:
+            cursor = u.cursor
+            cursor.execute(
+                "SELECT token, status FROM agents WHERE agent_id = ?",
+                (agent_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return NotFound(resource="agent", identifier=agent_id)
+            if row["status"] != "terminated":
+                return Conflict(
+                    reason=(
+                        f"Agent '{agent_id}' is not terminated "
+                        f"(status={row['status']!r}); nothing to restore"
+                    ),
+                )
+
+            agent_token = row["token"]
+            # PR 6 + PR 8: restore goes through agent_repo.update_field with
+            # the caller's cursor — atomic with the audit INSERT below.
+            # update_field takes one field at a time, so two calls.
+            from ..repositories import agent_repo
+
+            agent_repo.update_field(
+                agent_id, "status", "created", connection=cursor,
+            )
+            agent_repo.update_field(
+                agent_id, "terminated_at", None, connection=cursor,
+            )
+            log_agent_action_to_db(
+                cursor, actor_label, "restored_agent",
+                details={"agent_id": agent_id},
+            )
+
+            # Read the (uncommitted, same-connection) restored row so the
+            # post-commit cache rebuild uses the fresh values.
+            cursor.execute(
+                "SELECT agent_id, capabilities, created_at, status, color, "
+                "working_directory, terminated_at, updated_at, current_task, "
+                "agent_role "
+                "FROM agents WHERE agent_id = ?",
+                (agent_id,),
+            )
+            full = cursor.fetchone()
+
+            def _restore_cache() -> None:
+                # Re-add to the in-memory active map so the dashboard sees
+                # the restored agent again.
+                if full is not None:
+                    try:
+                        caps = json.loads(full["capabilities"] or "[]")
+                    except (TypeError, json.JSONDecodeError):
+                        caps = []
+                    # SECURITY (terminate-revocation, related): rebuild the
+                    # FULL cache row including agent_role. Omitting it made a
+                    # restored manager transiently resolve to worker
+                    # capabilities (a privilege downgrade) until reload.
+                    g.active_agents[agent_token] = {
+                        "token": agent_token,
+                        "agent_id": full["agent_id"],
+                        "capabilities": caps,
+                        "created_at": full["created_at"],
+                        "status": full["status"],
+                        "color": full["color"],
+                        "working_directory": full["working_directory"],
+                        "terminated_at": full["terminated_at"],
+                        "updated_at": full["updated_at"],
+                        "current_task": full["current_task"],
+                        "agent_role": full["agent_role"],
+                    }
+                    # BL-R13-2: working_directory has a SECOND in-memory view
+                    # (g.agent_working_dirs, keyed by agent_id) that
+                    # get_working_directory() reads first. Mirror the
+                    # edit-path reconcile for the restored agent.
+                    g.agent_working_dirs[agent_id] = full["working_directory"]
+
+            u.on_commit(_restore_cache)
+
+            return Ok(
+                data={"agent_id": agent_id, "status": "created"},
+                message=f"Agent '{agent_id}' restored",
+            )
+    except sqlite3.Error as e_sql:
+        logger.error(
+            "Database error restoring agent %s: %s", agent_id, e_sql,
+            exc_info=True,
+        )
+        return Failed(message=f"Database error restoring agent: {e_sql}")
+    except Exception as e:
+        logger.error(
+            "Unexpected error restoring agent %s: %s", agent_id, e,
+            exc_info=True,
+        )
+        return Failed(message=f"Unexpected error restoring agent: {e}")
+
+
+async def edit_agent_tool_impl(
+    arguments: Dict[str, Any],
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    """Update mutable agent fields — operator-tier.
+
+    E2: the CANONICAL edit implementation, shared by the ``edit_agent``
+    MCP tool and ``POST /api/agents/<id>/edit``. Accepts any combination
+    of :data:`EDITABLE_AGENT_FIELDS`; non-whitelisted keys are ignored
+    (status / agent_id / token have their own flows). On the
+    unit-of-work: each field update (repo write on ``u.cursor``) + the
+    ``edited_agent`` DB audit row commit atomically; the ``g.active_agents``
+    / ``g.agent_working_dirs`` cache refresh and the ``auto_event_loop``
+    wake register post-commit (emit-iff-commit).
+
+    Wire-level type guards + the ``agent_role`` 422 + ``aoe_session_id``
+    format normalisation live in the REST adapter (they carry non-standard
+    HTTP statuses / body wording the dashboard pins); by dispatch time the
+    values are already validated. The tool's inputSchema validates the same
+    fields on the MCP path.
+    """
+    denied = _require_capability(principal, "agents.terminate")
+    if denied is not None:
+        return denied
+
+    agent_id = arguments.get("agent_id")
+    if not agent_id or not isinstance(agent_id, str):
+        return Invalid(field="agent_id", message="`agent_id` is required.")
+
+    updates = {
+        k: arguments[k] for k in EDITABLE_AGENT_FIELDS if k in arguments
+    }
+    if not updates:
+        return Invalid(
+            message=(
+                "No editable fields supplied. Accepts any of: "
+                + ", ".join(EDITABLE_AGENT_FIELDS)
+            ),
+        )
+    if "agent_role" in updates and updates["agent_role"] not in (
+        "worker", "manager",
+    ):
+        return Invalid(
+            field="agent_role",
+            message=(
+                f"Invalid agent_role {updates['agent_role']!r}: "
+                "must be 'worker' or 'manager'."
+            ),
+        )
+
+    actor_label = principal.actor_label() if principal else "operator"
+
+    try:
+        with unit_of_work() as u:
+            cursor = u.cursor
+            cursor.execute(
+                "SELECT token, status FROM agents WHERE agent_id = ?",
+                (agent_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return NotFound(resource="agent", identifier=agent_id)
+
+            # PR 6: field updates route through agent_repo with the caller's
+            # cursor so each update + the audit INSERT land in one txn. A
+            # None return means the field write failed — abort (roll back
+            # the partial) and surface Failed.
+            from ..repositories import agent_repo
+
+            applied: Dict[str, Any] = {}
+            for field, value in updates.items():
+                # aoe_session_id clear sentinel: the REST adapter normalises
+                # the clear case to ``""`` (``None`` would be stripped by the
+                # dispatch layer); a direct MCP caller may also pass ``""``.
+                # Store NULL in the column either way.
+                if field == "aoe_session_id" and value == "":
+                    value = None
+                result = agent_repo.update_field(
+                    agent_id, field, value, connection=cursor,
+                )
+                if result is None:
+                    raise _UnitOfWorkAbort(
+                        Failed(message=f"Failed to update field {field!r}")
+                    )
+                applied[field] = value
+
+            agent_token = row["token"]
+
+            log_agent_action_to_db(
+                cursor, actor_label, "edited_agent",
+                details={"agent_id": agent_id, "fields": list(applied.keys())},
+            )
+
+            def _edit_cache() -> None:
+                # Refresh the in-memory active entry so the dashboard sees
+                # the new color/capabilities without a restart.
+                if agent_token in g.active_agents:
+                    for field, value in applied.items():
+                        g.active_agents[agent_token][field] = value
+                # BL-R11-1: working_directory's second view (g.agent_working_dirs).
+                if "working_directory" in applied:
+                    g.agent_working_dirs[agent_id] = applied["working_directory"]
+                # PR-2 event-coord: wake in-flight wait_for_events so the
+                # agent re-evaluates the flag state.
+                if "auto_event_loop" in applied:
+                    try:
+                        g.wake_for_flag_recheck(agent_id)
+                    except Exception as e:  # pragma: no cover - defensive
+                        logger.warning(
+                            "wake_for_flag_recheck(%s) failed after toggle: %s",
+                            agent_id, e,
+                        )
+
+            u.on_commit(_edit_cache)
+
+            return Ok(
+                data={"agent_id": agent_id, "updated": applied},
+                message=(
+                    f"Agent '{agent_id}' updated: " + ", ".join(applied.keys())
+                ),
+            )
+    except _UnitOfWorkAbort as ab:
+        return ab.result
+    except sqlite3.Error as e_sql:
+        logger.error(
+            "Database error editing agent %s: %s", agent_id, e_sql,
+            exc_info=True,
+        )
+        return Failed(message=f"Database error editing agent: {e_sql}")
+    except Exception as e:
+        logger.error(
+            "Unexpected error editing agent %s: %s", agent_id, e,
+            exc_info=True,
+        )
+        return Failed(message=f"Unexpected error editing agent: {e}")
+
+
+async def purge_agent_tool_impl(
+    arguments: Dict[str, Any],
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    """Hard-delete an agent + cascade-tombstone every reference.
+
+    E2: the CANONICAL purge implementation, shared by the ``purge_agent``
+    MCP tool and ``DELETE /api/agents/<id>?cascade=true``. The whole
+    6-table cascade (tombstone insert → agent_messages / tasks /
+    agent_actions rewrites → session-table deletes → ``purged_agent`` DB
+    audit → agents-row DELETE, LAST) runs as ONE atomic transaction on
+    ``u.cursor``. Before E2 this was an explicit ``BEGIN``/``COMMIT`` block
+    in the router; the unit-of-work now owns the transaction. In-memory
+    reference drops + the reassigned-task reconcile register post-commit
+    (emit-iff-commit — a rollback tombstones nothing).
+
+    The ``?cascade=true`` confirmation gate is a wire-level safety kept in
+    the REST adapter (refuse a bare DELETE); a direct MCP call to this
+    operator-tier tool is already a deliberate purge.
+    """
+    denied = _require_capability(principal, "agents.terminate")
+    if denied is not None:
+        return denied
+
+    agent_id = arguments.get("agent_id")
+    if not agent_id or not isinstance(agent_id, str):
+        return Invalid(field="agent_id", message="`agent_id` is required.")
+
+    actor_label = principal.actor_label() if principal else "operator"
+
+    try:
+        with unit_of_work() as u:
+            cursor = u.cursor
+            cursor.execute(
+                "SELECT token FROM agents WHERE agent_id = ?", (agent_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return NotFound(resource="agent", identifier=agent_id)
+            agent_token = row["token"]
+
+            # Snapshot counts before tombstoning so the response reflects
+            # what we actually rewrote.
+            counts = _gather_purge_preview(cursor, agent_id)["counts"]
+            tombstone = _purge_tombstone(agent_id)
+
+            from ..repositories import agent_repo
+            from ..repositories import message_repo
+
+            # PR-G1: agent_messages.{sender_id,recipient_id} FK to
+            # agents.agent_id, so the tombstone `[deleted-<id>]` must exist
+            # as an agents row before any rewrite. INSERT OR IGNORE so a
+            # re-purge is a no-op; token namespaced under `__tombstone_`.
+            agent_repo.insert_tombstone(
+                token=f"__tombstone_{agent_id}",
+                tombstone_agent_id=tombstone,
+                connection=cursor,
+            )
+            message_repo.rename_participant(
+                agent_id, tombstone, connection=cursor,
+            )
+            cursor.execute(
+                "UPDATE tasks SET created_by = ? WHERE created_by = ?",
+                (tombstone, agent_id),
+            )
+            # Reassignment: ACTIVE tasks assigned to this agent become
+            # unassigned (operator reassigns). BL-R17-2: carve out TERMINAL
+            # tasks — reverting a finished task resurrects done work. Purge
+            # is a HARD delete (agents row DELETEd below) and
+            # tasks.assigned_to is an FK, so terminal tasks get a SEPARATE
+            # UPDATE that NULLs the dangling ref while KEEPING terminal
+            # status (no resurrection, no notify).
+            # BL-R10-1/2: capture affected rows (+ required_capabilities)
+            # BEFORE the UPDATE for the post-commit cache reconcile + wake;
+            # bump updated_at so the catch-up feed surfaces the transition.
+            from ..tools.task_tools import _TERMINAL_TASK_STATUSES
+
+            terminal_placeholders = ",".join(
+                "?" * len(_TERMINAL_TASK_STATUSES)
+            )
+            terminal_params = sorted(_TERMINAL_TASK_STATUSES)
+            cursor.execute(
+                "SELECT task_id, required_capabilities FROM tasks "
+                "WHERE assigned_to = ? "
+                f"AND status NOT IN ({terminal_placeholders})",
+                (agent_id, *terminal_params),
+            )
+            reassigned_tasks = [
+                (r["task_id"], r["required_capabilities"])
+                for r in cursor.fetchall()
+            ]
+            now_iso = datetime.datetime.now().isoformat()
+            cursor.execute(
+                "UPDATE tasks SET assigned_to = NULL, status = 'unassigned', "
+                "updated_at = ? WHERE assigned_to = ? "
+                f"AND status NOT IN ({terminal_placeholders})",
+                (now_iso, agent_id, *terminal_params),
+            )
+            cursor.execute(
+                "UPDATE tasks SET assigned_to = NULL, updated_at = ? "
+                "WHERE assigned_to = ? "
+                f"AND status IN ({terminal_placeholders})",
+                (now_iso, agent_id, *terminal_params),
+            )
+            cursor.execute(
+                "UPDATE agent_actions SET agent_id = ? WHERE agent_id = ?",
+                (tombstone, agent_id),
+            )
+            # BL-R4-2: mcp_sessions / claude_code_sessions FK agents.agent_id;
+            # a session row still referencing this agent at DELETE time makes
+            # the final DELETE FROM agents raise FOREIGN KEY constraint
+            # failed. A purged agent's sessions are dead — DELETE them here,
+            # same txn, BEFORE the agents-row delete. Guarded on table
+            # presence for older schemas that predate them.
+            for _session_table in ("mcp_sessions", "claude_code_sessions"):
+                cursor.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name = ?",
+                    (_session_table,),
+                )
+                if cursor.fetchone() is not None:
+                    cursor.execute(
+                        f"DELETE FROM {_session_table} WHERE agent_id = ?",
+                        (agent_id,),
+                    )
+            # Audit the purge BEFORE the agent row disappears so the action
+            # log has a non-tombstoned 'purged_agent' entry.
+            log_agent_action_to_db(
+                cursor, actor_label, "purged_agent",
+                details={
+                    "agent_id": agent_id,
+                    "tombstone": tombstone,
+                    "counts": counts,
+                },
+            )
+            # DELETE the agents row LAST (PR 8: through agent_repo.delete
+            # with the caller's cursor).
+            agent_repo.delete(agent_id, connection=cursor)
+
+            def _purge_post_commit() -> None:
+                # Drop in-memory references.
+                if agent_token in g.active_agents:
+                    del g.active_agents[agent_token]
+                if agent_id in g.agent_working_dirs:
+                    del g.agent_working_dirs[agent_id]
+                for filepath, info in list(g.file_map.items()):
+                    if info.get("agent_id") == agent_id:
+                        del g.file_map[filepath]
+                # BL-R10-1/2: reconcile reassigned tasks' cache + wake
+                # capability-matched workers (shared with the terminate path).
+                _reconcile_reassigned_tasks(reassigned_tasks)
+
+            u.on_commit(_purge_post_commit)
+
+            return Ok(
+                data={
+                    "agent_id": agent_id,
+                    "tombstone": tombstone,
+                    "counts": counts,
+                },
+                message=f"Agent '{agent_id}' purged",
+            )
+    except sqlite3.Error as e_sql:
+        logger.error(
+            "Database error purging agent %s: %s", agent_id, e_sql,
+            exc_info=True,
+        )
+        return Failed(message=f"Database error purging agent: {e_sql}")
+    except Exception as e:
+        logger.error(
+            "Unexpected error purging agent %s: %s", agent_id, e,
+            exc_info=True,
+        )
+        return Failed(message=f"Unexpected error purging agent: {e}")
+
+
 # --- view_audit_log tool ---
 # Original logic from main.py: lines 1387-1408 (view_audit_log_tool function)
 async def view_audit_log_tool_impl(
@@ -1248,6 +1810,115 @@ def register_admin_tools():
             "additionalProperties": False,
         },
         implementation=terminate_agent_tool_impl,
+        visibility="operator",
+    )
+
+    # E2 (arch-deepening): the real tools behind the agent-lifecycle REST
+    # routes (``/api/agents/<id>/restore``, ``/edit``, ``DELETE /<id>``).
+    # Each gates on ``agents.terminate`` — the same operator-tier cap the
+    # routes' ``require_operator_session`` resolves to (auth-equivalent).
+    # ``visibility="operator"`` keeps them out of a worker's tools/list.
+    register_tool(
+        name="restore_agent",
+        description=(
+            "Restore a terminated agent (reverse a soft-delete): flip "
+            "status='terminated' back to 'created' and clear terminated_at. "
+            "Operator-only."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "token": {
+                    "type": "string",
+                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Unique identifier for the terminated agent to restore.",
+                },
+            },
+            "required": ["agent_id"],
+            "additionalProperties": False,
+        },
+        implementation=restore_agent_tool_impl,
+        visibility="operator",
+    )
+
+    register_tool(
+        name="edit_agent",
+        description=(
+            "Update mutable fields of an existing agent (capabilities, "
+            "color, working_directory, aoe_session_id, auto_event_loop, "
+            "agent_role). Operator-only."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "token": {
+                    "type": "string",
+                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Unique identifier for the agent to edit.",
+                },
+                "capabilities": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Replacement capability labels for the agent.",
+                },
+                "color": {
+                    "type": "string",
+                    "description": "Display color for the agent in the dashboard.",
+                },
+                "working_directory": {
+                    "type": "string",
+                    "description": "Agent working directory (informational metadata).",
+                },
+                "aoe_session_id": {
+                    "type": "string",
+                    "description": "AoE session binding (16 lowercase hex chars, or empty to clear).",
+                },
+                "auto_event_loop": {
+                    "type": "boolean",
+                    "description": "Per-agent wake-loop toggle.",
+                },
+                "agent_role": {
+                    "type": "string",
+                    "description": "Agent role: 'worker' or 'manager'.",
+                    "enum": ["worker", "manager"],
+                },
+            },
+            "required": ["agent_id"],
+            "additionalProperties": False,
+        },
+        implementation=edit_agent_tool_impl,
+        visibility="operator",
+    )
+
+    register_tool(
+        name="purge_agent",
+        description=(
+            "Hard-delete an agent and cascade-tombstone every reference "
+            "(messages, tasks, actions, sessions). Destructive + "
+            "irreversible. Operator-only."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "token": {
+                    "type": "string",
+                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Unique identifier for the agent to purge.",
+                },
+            },
+            "required": ["agent_id"],
+            "additionalProperties": False,
+        },
+        implementation=purge_agent_tool_impl,
         visibility="operator",
     )
 

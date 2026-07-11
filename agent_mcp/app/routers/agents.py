@@ -22,32 +22,41 @@ mechanical URL-stable move.
 
 from __future__ import annotations
 
-import datetime
-import json
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
-from .._dispatch_helpers import handle_options
+from .._dispatch_helpers import (
+    _build_route_principal,
+    handle_options,
+)
 from ..deps import (
     caller_identity,
     forwarding_route_role,
     require_operator_session,
 )
 from ...core.config import logger
-from ...core import globals as g
 from ...core import session_registry
 from ...core.principal_builder import build_operator_principal
 from ...core.tool_result import (
+    Conflict,
     Failed as _Failed,
+    Invalid,
+    NotFound,
     Ok as _Ok,
+    PermissionDenied,
+    ToolResult,
     tool_result_to_http,
 )
-from ...db.actions.agent_actions_db import log_agent_action_to_db
 from ...db.connection import get_db_connection
-from ...tools.admin_tools import register_agent_tool_impl
+from ...tools.admin_tools import (
+    _gather_purge_preview,
+    _purge_tombstone,
+    register_agent_tool_impl,
+)
+from ...tools.registry import ToolInputValidationError, dispatch_tool_call
 from ...utils.json_utils import get_sanitized_json_body
 
 
@@ -357,25 +366,77 @@ async def register_agent_dashboard_api_route(
     return JSONResponse({"message": message}, status_code=status)
 
 
-# --- Agent restore + purge endpoints ---
-# `terminate_agent` is a soft-delete: it flips status='terminated' but
-# leaves the row + tokens + messages + tasks intact. Admins then either
-# Restore (reverse soft-delete) or Purge (hard delete + cascade
-# tombstone rewrite). Cascade table:
-#
-#   agents          → DELETE row (last in tx)
-#   agent_messages  → tombstone sender_id/recipient_id → [deleted-<id>]
-#   tasks           → tombstone created_by; SET NULL assigned_to + status=unassigned
-#   agent_actions   → tombstone agent_id
-#   tasks.notes JSON → UNTOUCHED — preserved as audit trail
-#
-# Tombstone format `[deleted-<id>]` depends on `[`/`]` being absent
-# from real agent_ids; see create_agent_tool_impl validation.
+# --- Agent restore + edit + purge endpoints (E2: thin adapters) ---
+# `terminate_agent` is a soft-delete; an operator then Restores (reverse
+# soft-delete), Edits, or Purges (hard delete + cascade tombstone). E2
+# (arch-deepening) extracted the logic into ``tools.admin_tools``
+# (``restore_agent`` / ``edit_agent`` / ``purge_agent`` on the
+# unit-of-work); the routes below are thin adapters that keep only the
+# wire concerns (body sanitize, method/param guards, wire-level input
+# hygiene) then dispatch + map the ToolResult to the legacy body shape.
+# The cascade contract + tombstone helper live with the tool now.
 
 
-def _purge_tombstone(agent_id: str) -> str:
-    """Tombstone literal used to rewrite references to a purged agent."""
-    return f"[deleted-{agent_id}]"
+async def _dispatch_agent_lifecycle_tool(
+    tool_name: str,
+    arguments: Dict[str, Any],
+    auth: dict,
+) -> ToolResult | JSONResponse:
+    """Dispatch an agent-lifecycle tool from a REST handler.
+
+    Builds the operator-session Principal (AC-R5-1: a forwarding VIEWER
+    gets a viewer-role Principal the tool's ``agents.terminate`` gate
+    denies), dispatches, and returns the raw :data:`ToolResult` for the
+    caller to shape into its legacy body. On a dispatch-level failure
+    (input-validation / unexpected exception) returns a ready
+    :class:`JSONResponse` instead — the caller returns it verbatim.
+    """
+    principal = _build_route_principal(
+        bearer_token=None,
+        operator_session=True,
+        operator_user_id=caller_identity(auth),
+    )
+    try:
+        return await dispatch_tool_call(
+            tool_name, arguments, principal=principal,
+        )
+    except ToolInputValidationError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:  # pragma: no cover - defensive
+        # SD-R7-1: a raw ``str(e)`` can leak internals; log server-side,
+        # return a static generic 500 (the caller supplies the wording).
+        logger.error(
+            "Error dispatching %s: %s", tool_name, e, exc_info=True,
+        )
+        return JSONResponse(
+            {"error": f"Failed to dispatch {tool_name}"}, status_code=500,
+        )
+
+
+def _agent_tool_error(result: ToolResult, failed_message: str) -> JSONResponse:
+    """Map a non-``Ok`` agent-lifecycle :data:`ToolResult` to the legacy
+    ``{"error": ...}`` envelope these routes have always returned.
+
+    STATUS comes from the shared C-wave adapter
+    (:func:`tool_result_to_http`); only the body wording lives here
+    (the dashboard + the restore/edit/purge REST tests pin this shape).
+    ``Failed`` renders the route's static generic message (SEC — no
+    exception-detail leak; the dispatcher already logged the real one).
+    """
+    status, _ = tool_result_to_http(result)
+    if isinstance(result, NotFound):
+        return JSONResponse(
+            {"error": f"Agent '{result.identifier}' not found"},
+            status_code=status,
+        )
+    if isinstance(result, Conflict):
+        return JSONResponse({"error": result.reason}, status_code=status)
+    if isinstance(result, PermissionDenied):
+        return JSONResponse({"error": result.reason}, status_code=status)
+    if isinstance(result, Invalid):
+        return JSONResponse({"error": result.message}, status_code=status)
+    # Failed (or any residual variant) → static generic message.
+    return JSONResponse({"error": failed_message}, status_code=status)
 
 
 @router.api_route("/{agent_id}/restore", methods=["POST", "OPTIONS"])
@@ -383,15 +444,16 @@ async def restore_agent_api_route(
     request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
-    """POST /api/agents/<id>/restore — admin reverses a soft-delete.
+    """POST /api/agents/<id>/restore — thin adapter over ``restore_agent``.
 
-    Side effects of the original terminate (cleared current_task,
-    released held files, killed tmux session) are NOT undone. Admin
-    reassigns work explicitly. We only flip status back and re-add to
-    g.active_agents so the dashboard's active-list/token-list pick it
-    up again.
-
-    PR D (prancy-napping-pie): auth via ``require_operator_session``.
+    E2 (arch-deepening): the reverse-soft-delete choreography (status flip
+    + terminated_at clear + ``restored_agent`` audit + ``g.active_agents``
+    / ``g.agent_working_dirs`` rebuild) lives ONCE in
+    :func:`agent_mcp.tools.admin_tools.restore_agent_tool_impl` on the
+    unit-of-work. This handler keeps only the wire concerns (method / path
+    guards, legacy body read) then dispatches + maps the ToolResult to the
+    legacy body shape. Auth stays operator-only via
+    ``require_operator_session``.
     """
     if request.method == 'OPTIONS':
         return await handle_options(request)
@@ -402,120 +464,26 @@ async def restore_agent_api_route(
     if not agent_id:
         return JSONResponse({"error": "agent_id required"}, status_code=400)
 
-    conn = None
+    # Body is read for shape-compat with legacy callers but no field is
+    # required; the dep enforces auth.
     try:
-        # Body is read for shape-compat with legacy callers but no
-        # field is required; the dep enforces auth.
-        try:
-            _ = await get_sanitized_json_body(request)
-        except ValueError:
-            pass
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT token, status FROM agents WHERE agent_id = ?",
-            (agent_id,),
-        )
-        row = cursor.fetchone()
-        if row is None:
-            return JSONResponse(
-                {"error": f"Agent '{agent_id}' not found"},
-                status_code=404,
-            )
-        if row["status"] != "terminated":
-            return JSONResponse(
-                {"error": f"Agent '{agent_id}' is not terminated "
-                          f"(status={row['status']!r}); nothing to restore"},
-                status_code=409,
-            )
-
-        agent_token = row["token"]
-        # PR 6 + PR 8 (Agent flip): restore goes through
-        # agent_repo.update_field with caller's cursor — atomic with
-        # the audit log INSERT below. ``terminated_at`` was added to
-        # the allowlist in PR 8 so the second field clear also goes
-        # through the repo instead of owning a raw UPDATE on the
-        # cursor. update_field accepts one field at a time, so two
-        # calls; both share the caller's cursor so they stay inside
-        # the wider BEGIN/COMMIT.
-        from ...repositories import agent_repo as _agent_repo
-        _agent_repo.update_field(
-            agent_id, "status", "created", connection=cursor,
-        )
-        _agent_repo.update_field(
-            agent_id, "terminated_at", None, connection=cursor,
-        )
-        log_agent_action_to_db(
-            cursor, caller_identity(auth), "restored_agent",
-            details={"agent_id": agent_id},
-        )
-        conn.commit()
-
-        # Re-add to in-memory active map so the dashboard sees them.
-        # We rebuild the entry from DB-known fields; capabilities/color
-        # are not surfaced through this re-add path (admin can fetch
-        # via /api/all-data if needed).
-        cursor.execute(
-            "SELECT agent_id, capabilities, created_at, status, color, "
-            "working_directory, terminated_at, updated_at, current_task, "
-            "agent_role "
-            "FROM agents WHERE agent_id = ?",
-            (agent_id,),
-        )
-        full = cursor.fetchone()
-        if full is not None:
-            try:
-                caps = json.loads(full["capabilities"] or "[]")
-            except (TypeError, json.JSONDecodeError):
-                caps = []
-            # SECURITY (terminate-revocation, related): rebuild the FULL
-            # cache row including agent_role. Omitting it made a restored
-            # manager transiently resolve to worker capabilities (a
-            # privilege downgrade) until the next lifespan reload.
-            g.active_agents[agent_token] = {
-                "token": agent_token,
-                "agent_id": full["agent_id"],
-                "capabilities": caps,
-                "created_at": full["created_at"],
-                "status": full["status"],
-                "color": full["color"],
-                "working_directory": full["working_directory"],
-                "terminated_at": full["terminated_at"],
-                "updated_at": full["updated_at"],
-                "current_task": full["current_task"],
-                "agent_role": full["agent_role"],
-            }
-
-            # BL-R13-2: working_directory has a SECOND in-memory view —
-            # g.agent_working_dirs (keyed by agent_id), which
-            # get_working_directory() reads FIRST and returns on a
-            # non-None hit. The active_agents restore above (keyed by
-            # token) never reaches it, so after a restore the file tools +
-            # get_agent_details keep resolving against stale/missing dir
-            # data. Mirror the BL-R11-1 edit-path reconcile (and the
-            # server_lifecycle warm-from-DB) for the restored agent.
-            g.agent_working_dirs[agent_id] = full["working_directory"]
-
-        return JSONResponse({
-            "success": True,
-            "agent_id": agent_id,
-            "status": "created",
-            "message": f"Agent '{agent_id}' restored",
-        })
+        _ = await get_sanitized_json_body(request)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        logger.error(f"Error restoring agent {agent_id}: {e}", exc_info=True)
-        # BL-R5-2 / SD-R6-1: generic message — see fetch-agents-list note.
-        return JSONResponse(
-            {"error": "Failed to restore agent"}, status_code=500,
-        )
-    finally:
-        if conn:
-            conn.close()
+
+    result = await _dispatch_agent_lifecycle_tool(
+        "restore_agent", {"agent_id": agent_id}, auth,
+    )
+    if isinstance(result, JSONResponse):
+        return result
+    if isinstance(result, _Ok):
+        return JSONResponse({
+            "success": True,
+            "agent_id": result.data["agent_id"],
+            "status": result.data["status"],
+            "message": result.message or f"Agent '{agent_id}' restored",
+        })
+    return _agent_tool_error(result, "Failed to restore agent")
 
 
 @router.api_route("/{agent_id}/edit", methods=["POST", "OPTIONS"])
@@ -523,20 +491,25 @@ async def edit_agent_api_route(
     request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
-    """POST /api/agents/<id>/edit — admin updates mutable agent fields.
+    """POST /api/agents/<id>/edit — thin adapter over ``edit_agent``.
 
-    Accepts any combination of the editable fields: ``capabilities``
-    (list[str]), ``color`` (str), ``working_directory`` (str),
-    ``aoe_session_id`` (str), ``auto_event_loop`` (bool). Returns
-    400 if none of the editable fields are supplied (avoids no-op
-    writes), 404 if the agent does not exist.
+    Accepts any combination of the editable fields
+    (:data:`agent_mcp.tools.admin_tools.EDITABLE_AGENT_FIELDS`):
+    ``capabilities`` (list[str]), ``color`` (str), ``working_directory``
+    (str), ``aoe_session_id`` (str), ``auto_event_loop`` (bool),
+    ``agent_role`` ('worker'|'manager'). Returns 400 if none are supplied,
+    404 if the agent does not exist. Non-whitelisted fields are ignored —
+    status / agent_id / token have their own flows.
 
-    Non-whitelisted fields in the body are silently ignored — the
-    endpoint never touches status/agent_id/token; those have their own
-    dedicated flows (terminate/restore/purge for status; create for
-    agent_id+token; nothing for editing tokens).
-
-    PR D (prancy-napping-pie): auth via ``require_operator_session``.
+    E2 (arch-deepening): the apply choreography (field writes +
+    ``edited_agent`` audit + cache refresh + auto_event_loop wake) lives
+    ONCE in :func:`agent_mcp.tools.admin_tools.edit_agent_tool_impl` on the
+    unit-of-work. This handler keeps only the wire concerns — body
+    sanitize, the SEC-round-9 type-confusion guards, the ``agent_role``
+    422, and the ``aoe_session_id`` format normalisation (all carry
+    non-standard HTTP statuses / body wording the dashboard pins) — then
+    dispatches the pre-validated fields and maps the ToolResult back to the
+    legacy body. Auth stays operator-only via ``require_operator_session``.
     """
     if request.method == 'OPTIONS':
         return await handle_options(request)
@@ -547,250 +520,108 @@ async def edit_agent_api_route(
     if not agent_id:
         return JSONResponse({"error": "agent_id required"}, status_code=400)
 
-    conn = None
     try:
         data = await get_sanitized_json_body(request)
-
-        # Whitelisted editable fields. Anything else in `data` is ignored
-        # (defense in depth — status / agent_id / token must not flow
-        # through this endpoint).
-        #
-        # Event-coord PR-1: `auto_event_loop` (per-agent wake-loop
-        # toggle) joins the editable list — dashboard's agent-edit
-        # modal flips it to opt this agent out of the wake-loop
-        # bootstrap shipped in PR-2.
-        #
-        # Phase 2 Wave 2b (plan §2e): `agent_role` joins the editable
-        # list so the dashboard's Edit Agent modal can promote a
-        # worker to manager (or demote). The Pydantic-equivalent
-        # validation lives just below — rejecting anything outside
-        # {worker, manager} with 422 so the CHECK constraint never
-        # surfaces as a 500.
-        editable = (
-            'capabilities', 'color', 'working_directory', 'aoe_session_id',
-            'auto_event_loop', 'agent_role',
-        )
-        updates = {k: data[k] for k in editable if k in data}
-
-        if 'agent_role' in updates and updates['agent_role'] not in (
-            'worker', 'manager',
-        ):
-            return JSONResponse(
-                {"error": (
-                    f"Invalid agent_role {updates['agent_role']!r}: "
-                    "must be 'worker' or 'manager'."
-                )},
-                status_code=422,
-            )
-
-        if not updates:
-            return JSONResponse(
-                {"error": "No editable fields supplied. Accepts any of: "
-                          + ", ".join(editable)},
-                status_code=400,
-            )
-
-        # SEC round-9: type-guard each editable field BEFORE it reaches a
-        # SQL bind / normalize_capabilities / the g.active_agents cache.
-        # ``capabilities`` must be a genuine list[str] — a dict here would
-        # have normalize_capabilities iterate its keys and store them as
-        # capabilities (the task-claim authz gate reads this cache), all
-        # behind a misleading 200. ``color`` / ``working_directory`` 500
-        # on a dict/list bind. ``auto_event_loop`` is a bool toggle — a
-        # dict/list/str is truthy-coerced to a silent 1/0, so reject those.
-        if 'capabilities' in updates:
-            _err = _require_str_list(updates['capabilities'], "capabilities")
-            if _err is not None:
-                return _err
-        for _field in ('color', 'working_directory'):
-            if _field in updates:
-                _err = _require_str(updates[_field], _field)
-                if _err is not None:
-                    return _err
-        if 'auto_event_loop' in updates and not isinstance(
-            updates['auto_event_loop'], (bool, int)
-        ):
-            return JSONResponse(
-                {"error": "auto_event_loop must be a boolean"},
-                status_code=400,
-            )
-
-        # aoe_session_id: AoE generates 16-char lowercase hex ids.
-        # Accept that exact shape or empty string (clears the binding,
-        # stored as NULL in the column). Anything else → 400.
-        if 'aoe_session_id' in updates:
-            raw = updates['aoe_session_id']
-            if raw is None or raw == '':
-                updates['aoe_session_id'] = None
-            elif (
-                not isinstance(raw, str)
-                or len(raw) != 16
-                or any(c not in '0123456789abcdef' for c in raw)
-            ):
-                return JSONResponse(
-                    {"error": "aoe_session_id must be 16 lowercase hex chars "
-                              "or empty (got " + repr(raw) + ")"},
-                    status_code=400,
-                )
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT token, status FROM agents WHERE agent_id = ?",
-            (agent_id,),
-        )
-        row = cursor.fetchone()
-        if row is None:
-            return JSONResponse(
-                {"error": f"Agent '{agent_id}' not found"},
-                status_code=404,
-            )
-
-        # PR 6: route field updates through agent_repo with the
-        # caller's cursor so each update + the audit log INSERT below
-        # land in the same transaction. The repo's allowlist + JSON
-        # serialisation rules mirror the legacy update_agent_db_field
-        # behaviour 1:1.
-        from ...repositories import agent_repo as _agent_repo
-
-        applied: Dict[str, Any] = {}
-        for field, value in updates.items():
-            result = _agent_repo.update_field(
-                agent_id, field, value, connection=cursor,
-            )
-            if result is None:
-                return JSONResponse(
-                    {"error": f"Failed to update field {field!r}"},
-                    status_code=500,
-                )
-            applied[field] = value
-
-        # Refresh the in-memory active agent entry so the dashboard sees
-        # the new color/capabilities without a server restart.
-        agent_token = row["token"]
-        if agent_token in g.active_agents:
-            for field, value in applied.items():
-                g.active_agents[agent_token][field] = value
-
-        # BL-R11-1: working_directory has a SECOND in-memory view —
-        # g.agent_working_dirs (keyed by agent_id), which
-        # get_working_directory() reads FIRST and returns on a non-None
-        # hit. The active_agents reconcile above (keyed by token) never
-        # reaches it, so file tools + get_agent_details keep resolving
-        # against the stale dir. Mirror the sibling reconcile.
-        if "working_directory" in applied:
-            g.agent_working_dirs[agent_id] = applied["working_directory"]
-
-        # PR-2 event-coord: if `auto_event_loop` was flipped, wake any
-        # in-flight wait_for_events for this agent so it re-evaluates
-        # the flag state. The wait_for_events impl returns
-        # `stop_listening` when the new state is OFF.
-        if "auto_event_loop" in applied:
-            try:
-                g.wake_for_flag_recheck(agent_id)
-            except Exception as e:  # pragma: no cover - defensive
-                logger.warning(
-                    "wake_for_flag_recheck(%s) failed after toggle: %s",
-                    agent_id, e,
-                )
-
-        log_agent_action_to_db(
-            cursor, caller_identity(auth), "edited_agent",
-            details={"agent_id": agent_id, "fields": list(applied.keys())},
-        )
-        conn.commit()
-
-        return JSONResponse({
-            "success": True,
-            "agent_id": agent_id,
-            "updated": applied,
-            "message": f"Agent '{agent_id}' updated: "
-                       + ", ".join(applied.keys()),
-        })
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        logger.error(f"Error editing agent {agent_id}: {e}", exc_info=True)
-        # BL-R5-2 / SD-R6-1: generic message — see fetch-agents-list note.
+
+    # Whitelisted editable fields (shared source of truth with the tool).
+    # Anything else in `data` is ignored (defense in depth — status /
+    # agent_id / token must not flow through this endpoint).
+    from ...tools.admin_tools import EDITABLE_AGENT_FIELDS
+
+    updates = {k: data[k] for k in EDITABLE_AGENT_FIELDS if k in data}
+
+    # agent_role validation is a wire-level 422 (Pydantic-equivalent) — the
+    # CHECK constraint would otherwise surface as a 500. Kept here because
+    # 422 is not a standard ToolResult status.
+    if 'agent_role' in updates and updates['agent_role'] not in (
+        'worker', 'manager',
+    ):
         return JSONResponse(
-            {"error": "Failed to edit agent"}, status_code=500,
+            {"error": (
+                f"Invalid agent_role {updates['agent_role']!r}: "
+                "must be 'worker' or 'manager'."
+            )},
+            status_code=422,
         )
-    finally:
-        if conn:
-            conn.close()
 
-
-def _gather_purge_preview(cursor, agent_id: str) -> Dict[str, Any]:
-    """Compute the blast-radius counts + samples for a future purge.
-
-    PR 6: message counts + sample go through ``message_repo`` so the
-    repo owns the agent_messages query surface. The task / agent_actions
-    counts stay on the cursor — they live in tables the message repo
-    doesn't own, and the surrounding purge cascade is a multi-table
-    transaction the cursor still drives.
-    """
-    from ...repositories import message_repo
-
-    messages_sent = message_repo.count_query({"from": agent_id})
-    messages_received = message_repo.count_query({"to": agent_id})
-    cursor.execute(
-        "SELECT COUNT(*) AS n FROM tasks WHERE created_by = ?",
-        (agent_id,),
-    )
-    tasks_created = cursor.fetchone()["n"]
-    cursor.execute(
-        "SELECT COUNT(*) AS n FROM tasks WHERE assigned_to = ?",
-        (agent_id,),
-    )
-    tasks_assigned = cursor.fetchone()["n"]
-    cursor.execute(
-        "SELECT COUNT(*) AS n FROM agent_actions WHERE agent_id = ?",
-        (agent_id,),
-    )
-    agent_actions = cursor.fetchone()["n"]
-
-    # Samples (most-recent first; small enough to inline in a modal).
-    def _trim(s: str | None, n: int = 80) -> str:
-        if not s:
-            return ""
-        return s if len(s) <= n else s[:n] + "..."
-
-    sample_messages_sent = [
-        {"content": _trim(m["message_content"]),
-         "timestamp": m["timestamp"]}
-        for m in message_repo.query(
-            {"from": agent_id, "limit": 3, "offset": 0}
+    if not updates:
+        return JSONResponse(
+            {"error": "No editable fields supplied. Accepts any of: "
+                      + ", ".join(EDITABLE_AGENT_FIELDS)},
+            status_code=400,
         )
-    ]
-    cursor.execute(
-        "SELECT title FROM tasks WHERE created_by = ? "
-        "ORDER BY created_at DESC LIMIT 3",
-        (agent_id,),
-    )
-    sample_tasks_created = [r["title"] for r in cursor.fetchall()]
-    cursor.execute(
-        "SELECT title FROM tasks WHERE assigned_to = ? "
-        "ORDER BY created_at DESC LIMIT 3",
-        (agent_id,),
-    )
-    sample_tasks_assigned = [r["title"] for r in cursor.fetchall()]
 
-    return {
-        "counts": {
-            "messages_sent": messages_sent,
-            "messages_received": messages_received,
-            "tasks_created": tasks_created,
-            "tasks_assigned": tasks_assigned,
-            "agent_actions": agent_actions,
-        },
-        "samples": {
-            "messages_sent": sample_messages_sent,
-            "tasks_created": sample_tasks_created,
-            "tasks_assigned": sample_tasks_assigned,
-        },
-    }
+    # SEC round-9: type-guard each editable field BEFORE it reaches a SQL
+    # bind / normalize_capabilities / the g.active_agents cache. Wire-level
+    # hygiene kept local per the round-9 scope — the MCP path validates the
+    # same via the tool's inputSchema. ``capabilities`` must be a genuine
+    # list[str] — a dict would have normalize_capabilities iterate its keys
+    # and store them (the task-claim authz gate reads this cache), behind a
+    # misleading 200. ``color`` / ``working_directory`` 500 on a dict/list
+    # bind. ``auto_event_loop`` is a bool toggle — a dict/list/str is
+    # truthy-coerced to a silent 1/0, so reject those.
+    if 'capabilities' in updates:
+        _err = _require_str_list(updates['capabilities'], "capabilities")
+        if _err is not None:
+            return _err
+    for _field in ('color', 'working_directory'):
+        if _field in updates:
+            _err = _require_str(updates[_field], _field)
+            if _err is not None:
+                return _err
+    if 'auto_event_loop' in updates and not isinstance(
+        updates['auto_event_loop'], (bool, int)
+    ):
+        return JSONResponse(
+            {"error": "auto_event_loop must be a boolean"},
+            status_code=400,
+        )
+
+    # aoe_session_id: AoE generates 16-char lowercase hex ids. Accept that
+    # exact shape or empty string (clears the binding, stored as NULL).
+    # Anything else → 400. The clear case is normalised to the ``""``
+    # sentinel (NOT ``None``): ``dispatch_tool_call`` strips top-level
+    # ``None`` args (its ``{"token": null}`` handler), so a ``None`` here
+    # would silently drop the field and never clear the column. The tool
+    # maps ``""`` → NULL at write time.
+    if 'aoe_session_id' in updates:
+        raw = updates['aoe_session_id']
+        if raw is None or raw == '':
+            updates['aoe_session_id'] = ""
+        elif (
+            not isinstance(raw, str)
+            or len(raw) != 16
+            or any(c not in '0123456789abcdef' for c in raw)
+        ):
+            return JSONResponse(
+                {"error": "aoe_session_id must be 16 lowercase hex chars "
+                          "or empty (got " + repr(raw) + ")"},
+                status_code=400,
+            )
+
+    result = await _dispatch_agent_lifecycle_tool(
+        "edit_agent", {"agent_id": agent_id, **updates}, auth,
+    )
+    if isinstance(result, JSONResponse):
+        return result
+    if isinstance(result, _Ok):
+        return JSONResponse({
+            "success": True,
+            "agent_id": result.data["agent_id"],
+            "updated": result.data["updated"],
+            "message": result.message or (
+                f"Agent '{agent_id}' updated: "
+                + ", ".join(result.data["updated"].keys())
+            ),
+        })
+    return _agent_tool_error(result, "Failed to edit agent")
+
+
+# ``_gather_purge_preview`` + ``_purge_tombstone`` moved to
+# ``tools.admin_tools`` (E2) — the purge cascade logic now lives with the
+# ``purge_agent`` tool; this route + the preview route import them.
 
 
 @router.api_route("/{agent_id}/purge-preview", methods=["GET", "OPTIONS"])
@@ -850,18 +681,21 @@ async def purge_agent_api_route(
     request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
-    """DELETE /api/agents/<id>?cascade=true — hard delete + cascade tombstone.
-
-    Wraps the cascade in a transaction (BEGIN/COMMIT) so a
-    half-purged state is impossible if any step fails. The DELETE on
-    agents runs LAST so logical references can be tombstoned while the
-    row is still present (no DB foreign keys, but this preserves
-    intent-readability).
+    """DELETE /api/agents/<id>?cascade=true — thin adapter over ``purge_agent``.
 
     Refuses without ?cascade=true so a bare DELETE doesn't silently
-    hard-delete data.
+    hard-delete data (wire-level safety kept here).
 
-    PR D (prancy-napping-pie): auth via ``require_operator_session``.
+    E2 (arch-deepening): the 6-table tombstone cascade (agents /
+    agent_messages / tasks / agent_actions / mcp_sessions /
+    claude_code_sessions, DELETE of the agents row LAST) lives ONCE in
+    :func:`agent_mcp.tools.admin_tools.purge_agent_tool_impl` on the
+    unit-of-work — one atomic transaction, in-memory reference drops +
+    reassigned-task reconcile registered post-commit. This handler keeps
+    only the wire concerns (method / param guards, the cascade=true
+    confirmation, legacy body read) then dispatches + maps the ToolResult
+    to the legacy body. Auth stays operator-only via
+    ``require_operator_session``.
     """
     if request.method == 'OPTIONS':
         return await handle_options(request)
@@ -879,212 +713,24 @@ async def purge_agent_api_route(
             status_code=400,
         )
 
-    conn = None
+    # Body is read for shape-compat with legacy callers but no field is
+    # required; the dep enforces auth.
     try:
-        # Body is read for shape-compat with legacy callers but no
-        # field is required; the dep enforces auth.
-        try:
-            _ = await get_sanitized_json_body(request)
-        except ValueError:
-            pass
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT token FROM agents WHERE agent_id = ?", (agent_id,),
-        )
-        row = cursor.fetchone()
-        if row is None:
-            return JSONResponse(
-                {"error": f"Agent '{agent_id}' not found"},
-                status_code=404,
-            )
-        agent_token = row["token"]
-
-        # Snapshot counts before tombstoning so the response reflects
-        # what we actually rewrote.
-        preview = _gather_purge_preview(cursor, agent_id)
-        counts = preview["counts"]
-
-        tombstone = _purge_tombstone(agent_id)
-
-        # Cascade — wrapped in an explicit transaction. sqlite3's
-        # default isolation level already implicitly opens one on
-        # mutation, but we use BEGIN/COMMIT for self-documenting intent
-        # and to make rollback unambiguous.
-        cursor.execute("BEGIN")
-        try:
-            # PR-G1: agent_messages.{sender_id, recipient_id} now FK to
-            # agents.agent_id. The tombstone string `[deleted-<id>]`
-            # must therefore exist as an `agents` row before any UPDATE
-            # can rewrite a sender_id/recipient_id to it. INSERT OR
-            # IGNORE so a re-purge (same agent_id, already tombstoned)
-            # is a no-op. The token PK is namespaced under
-            # `__tombstone_` so it can't collide with a real bearer.
-            #
-            # PR 8 (Agent flip): goes through
-            # agent_repo.insert_tombstone with the caller's cursor so
-            # the wider purge transaction (FK rewrites across
-            # agent_messages / tasks / agent_actions, then the DELETE
-            # of the original agents row) stays atomic.
-            from ...repositories import agent_repo as _agent_repo
-            _agent_repo.insert_tombstone(
-                token=f"__tombstone_{agent_id}",
-                tombstone_agent_id=tombstone,
-                connection=cursor,
-            )
-            # PR 6: tombstone rewrite goes through message_repo with
-            # the caller's cursor so the wider BEGIN/COMMIT cascade
-            # stays atomic. The repo's transaction-aware seam tolerates
-            # a sqlite3 cursor on the `connection=` kwarg.
-            from ...repositories import message_repo as _msg_repo
-            _msg_repo.rename_participant(
-                agent_id, tombstone, connection=cursor,
-            )
-            cursor.execute(
-                "UPDATE tasks SET created_by = ? WHERE created_by = ?",
-                (tombstone, agent_id),
-            )
-            # Reassignment: anything ACTIVE assigned to this agent becomes
-            # unassigned (admin can pick it up + reassign).
-            #
-            # BL-R17-2: carve out TERMINAL tasks (completed/cancelled/
-            # failed). Reverting a finished task to 'unassigned' resurrects
-            # already-done work and (via the notify fanout below) wakes a
-            # worker to re-execute it. This mirrors the terminate producer's
-            # carve-out in tools/admin_tools.py — the sibling that already
-            # filters `status NOT IN (terminal)`. Purge is a HARD delete
-            # (the agents row is DELETEd below), so unlike terminate we
-            # cannot leave a terminal task's `assigned_to` pointing at the
-            # doomed agent: `tasks.assigned_to` is an FK to
-            # `agents.agent_id` (migration 0007) and the final
-            # `DELETE FROM agents` would raise `FOREIGN KEY constraint
-            # failed`. So terminal tasks get a SEPARATE UPDATE that NULLs
-            # the dangling ref while KEEPING the terminal status (no
-            # resurrection, no notify).
-            #
-            # BL-R10-1/2: capture the affected rows (with their
-            # required_capabilities) BEFORE the UPDATE so we can
-            # reconcile the g.tasks cache + wake workers post-commit. We
-            # also bump updated_at so the catch-up feed
-            # (``_collect_unassigned_task_events_for``, keyed on
-            # updated_at) surfaces a task that TRANSITIONED to unassigned
-            # after a disconnected worker's cursor.
-            from ...tools.task_tools import _TERMINAL_TASK_STATUSES
-            terminal_placeholders = ",".join(
-                "?" * len(_TERMINAL_TASK_STATUSES)
-            )
-            terminal_params = sorted(_TERMINAL_TASK_STATUSES)
-            cursor.execute(
-                "SELECT task_id, required_capabilities FROM tasks "
-                "WHERE assigned_to = ? "
-                f"AND status NOT IN ({terminal_placeholders})",
-                (agent_id, *terminal_params),
-            )
-            reassigned_tasks = [
-                (r["task_id"], r["required_capabilities"])
-                for r in cursor.fetchall()
-            ]
-            now_iso = datetime.datetime.now().isoformat()
-            cursor.execute(
-                "UPDATE tasks SET assigned_to = NULL, status = 'unassigned', "
-                "updated_at = ? WHERE assigned_to = ? "
-                f"AND status NOT IN ({terminal_placeholders})",
-                (now_iso, agent_id, *terminal_params),
-            )
-            # Terminal tasks: clear only the dangling assigned_to ref (FK
-            # would block the agents-row DELETE) — status stays terminal,
-            # no notify fanout (they are not in `reassigned_tasks`).
-            cursor.execute(
-                "UPDATE tasks SET assigned_to = NULL, updated_at = ? "
-                "WHERE assigned_to = ? "
-                f"AND status IN ({terminal_placeholders})",
-                (now_iso, agent_id, *terminal_params),
-            )
-            cursor.execute(
-                "UPDATE agent_actions SET agent_id = ? WHERE agent_id = ?",
-                (tombstone, agent_id),
-            )
-            # BL-R4-2: mcp_sessions.agent_id and
-            # claude_code_sessions.agent_id are FKs to agents.agent_id
-            # (migrations 0007/0008). On a migration-built DB the FK is
-            # enforced, so a session row still referencing this agent at
-            # DELETE time makes the final `DELETE FROM agents` raise
-            # `FOREIGN KEY constraint failed` and roll back the whole
-            # purge. A purged agent's sessions are dead anyway, so DELETE
-            # them here — in the same transaction, BEFORE the agents-row
-            # delete below. Guarded on table presence so the purge still
-            # works on an older schema that predates these tables.
-            for _session_table in ("mcp_sessions", "claude_code_sessions"):
-                cursor.execute(
-                    "SELECT 1 FROM sqlite_master "
-                    "WHERE type = 'table' AND name = ?",
-                    (_session_table,),
-                )
-                if cursor.fetchone() is not None:
-                    cursor.execute(
-                        f"DELETE FROM {_session_table} WHERE agent_id = ?",
-                        (agent_id,),
-                    )
-            # Audit the purge itself — written *before* the agent row
-            # disappears so the action log has a non-tombstoned
-            # 'purged_agent' entry attributable to admin.
-            log_agent_action_to_db(
-                cursor, caller_identity(auth), "purged_agent",
-                details={
-                    "agent_id": agent_id,
-                    "tombstone": tombstone,
-                    "counts": counts,
-                },
-            )
-            # DELETE the agents row LAST. PR 8 (Agent flip): goes
-            # through agent_repo.delete with the caller's cursor so
-            # cache eviction is owned by the repo (the explicit cache
-            # pops below still run because the caller knows the
-            # ``agent_token`` and doesn't want to depend on the repo's
-            # post-commit scan).
-            _agent_repo.delete(agent_id, connection=cursor)
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-
-        # Drop in-memory references.
-        if agent_token in g.active_agents:
-            del g.active_agents[agent_token]
-        if agent_id in g.agent_working_dirs:
-            del g.agent_working_dirs[agent_id]
-        # Drop g.file_map entries held by this agent (cheap, idempotent).
-        for filepath, info in list(g.file_map.items()):
-            if info.get("agent_id") == agent_id:
-                del g.file_map[filepath]
-
-        # BL-R10-1/2: reconcile the reassigned tasks' g.tasks cache
-        # entries + wake capability-matched workers. Shares the
-        # terminate cascade's helper so both paths reconcile identically.
-        from ...tools.admin_tools import _reconcile_reassigned_tasks
-        _reconcile_reassigned_tasks(reassigned_tasks)
-
-        return JSONResponse({
-            "success": True,
-            "agent_id": agent_id,
-            "tombstone": tombstone,
-            "counts": counts,
-            "message": f"Agent '{agent_id}' purged",
-        })
+        _ = await get_sanitized_json_body(request)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
-    except Exception as e:
-        if conn:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-        logger.error(f"Error purging agent {agent_id}: {e}", exc_info=True)
-        # BL-R5-2 / SD-R6-1: generic message — see fetch-agents-list note.
-        return JSONResponse(
-            {"error": "Failed to purge agent"}, status_code=500,
-        )
-    finally:
-        if conn:
-            conn.close()
+
+    result = await _dispatch_agent_lifecycle_tool(
+        "purge_agent", {"agent_id": agent_id}, auth,
+    )
+    if isinstance(result, JSONResponse):
+        return result
+    if isinstance(result, _Ok):
+        return JSONResponse({
+            "success": True,
+            "agent_id": result.data["agent_id"],
+            "tombstone": result.data["tombstone"],
+            "counts": result.data["counts"],
+            "message": result.message or f"Agent '{agent_id}' purged",
+        })
+    return _agent_tool_error(result, "Failed to purge agent")
