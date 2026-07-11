@@ -421,6 +421,7 @@ def add_group_member(
     member_user_id: Optional[str] = None,
     member_group_id: Optional[str] = None,
     added_at: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> None:
     """Insert a ``group_membership`` row after validation.
 
@@ -433,6 +434,14 @@ def add_group_member(
     Raises ``CycleDetected`` (a ``ValueError`` subclass) on the
     parent/child pair that would close the cycle; the table is left
     untouched.
+
+    Connection ownership (arch-deepening R2 #1b): pass ``conn`` to
+    enlist in a caller's open ``BEGIN IMMEDIATE`` transaction — the
+    cycle check AND the insert then run on that one connection so a
+    handler gets a single consistent snapshot without a second
+    connection being opened. ``conn=None`` self-opens (commit-on-exit).
+    ``sqlite3.IntegrityError`` from the idempotency UNIQUE indices is
+    deliberately NOT swallowed — the admin handler maps it to a 409.
     """
     if (member_user_id is None) == (member_group_id is None):
         raise ValueError(
@@ -440,17 +449,16 @@ def add_group_member(
             "member_user_id or member_group_id"
         )
 
-    if member_group_id is not None:
-        with _identity._connect() as conn:
-            if _would_create_cycle_on(conn, group_id, member_group_id):
-                raise CycleDetected(
-                    f"adding group {member_group_id!r} as a member of "
-                    f"{group_id!r} would close a cycle in the membership DAG"
-                )
-
     ts = added_at or _now_iso()
-    with _identity._connect() as conn:
-        conn.execute(
+    with _conn_ctx(conn) as c:
+        if member_group_id is not None and _would_create_cycle_on(
+            c, group_id, member_group_id
+        ):
+            raise CycleDetected(
+                f"adding group {member_group_id!r} as a member of "
+                f"{group_id!r} would close a cycle in the membership DAG"
+            )
+        c.execute(
             """
             INSERT INTO group_membership
                 (group_id, member_user_id, member_group_id, added_at)

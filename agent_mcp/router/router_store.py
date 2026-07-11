@@ -36,6 +36,7 @@ import sqlite3
 from typing import Literal, Optional
 
 from . import group_resolver as _gr
+from . import identity as _identity
 
 
 class RouterStore:
@@ -97,6 +98,66 @@ class RouterStore:
     ) -> bool:
         return _gr.would_create_cycle(
             parent_group_id, new_child_group_id, conn=conn
+        )
+
+    # ── membership writes (was forked ×4 each) ──────────────────────
+
+    def add_group_member(
+        self,
+        group_id: str,
+        *,
+        member_user_id: Optional[str] = None,
+        member_group_id: Optional[str] = None,
+        added_at: Optional[str] = None,
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> None:
+        """Insert a ``group_membership`` edge — the single writer the
+        four inline INSERTs (``group_resolver``, ``admin_users_api``,
+        ``sso._add_user_to_group_idempotent``) route through.
+
+        Exactly one of ``member_user_id`` / ``member_group_id``; group
+        edges run cycle detection first (``CycleDetected`` on a closing
+        edge). ``conn`` enlists in the caller's ``BEGIN IMMEDIATE`` so
+        the cycle check and the insert share one snapshot;
+        ``sqlite3.IntegrityError`` from the idempotency UNIQUE indices
+        propagates so the admin handler can map it to a 409.
+        """
+        _gr.add_group_member(
+            group_id,
+            member_user_id=member_user_id,
+            member_group_id=member_group_id,
+            added_at=added_at,
+            conn=conn,
+        )
+
+    def add_project_membership(
+        self,
+        project_name: str,
+        *,
+        user_id: Optional[str] = None,
+        group_id: Optional[str] = None,
+        role: Optional[str] = None,
+        or_ignore: bool = False,
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> None:
+        """Insert a ``project_membership`` row — the single writer the
+        four inline INSERTs (``identity`` grant + first-user loop, the
+        admin user- and group-grant handlers, the SSO first-user loop)
+        route through.
+
+        Exactly one of ``user_id`` / ``group_id``; ``role=None`` lets the
+        DB default (``operator``) apply; ``or_ignore`` selects the
+        idempotent ``INSERT OR IGNORE`` vs a plain ``INSERT`` whose
+        ``IntegrityError`` the admin handler maps to a 409. ``conn``
+        enlists in the caller's open transaction.
+        """
+        _identity.insert_project_membership(
+            project_name,
+            user_id=user_id,
+            group_id=group_id,
+            role=role,
+            or_ignore=or_ignore,
+            conn=conn,
         )
 
     # ── ranking ─────────────────────────────────────────────────────
