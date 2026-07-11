@@ -109,6 +109,14 @@ export function ProjectMembershipsModal({
   const error = mutationError ?? fetchError?.message ?? null
   const [addOpen, setAddOpen] = useState(false)
 
+  // Mirrors the old shared-``error``-state's synchronous reset at the
+  // start of every ``refresh()`` — a stale mutation error (e.g. a
+  // failed remove) must not linger once a fresh GET (reopen, or a
+  // ``projectName`` change) starts.
+  useEffect(() => {
+    if (loading) setMutationError(null)
+  }, [loading])
+
   const handleRemove = async (id: string) => {
     try {
       await routerApi.request(projectMembershipUrl(projectName, id), {
