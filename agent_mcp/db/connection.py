@@ -15,9 +15,6 @@ except ImportError:
 from ..core.config import logger, get_db_path
 from ..core import globals as g  # For setting global VSS flags
 
-# Import write queue for serializing database write operations
-from .write_queue import get_write_queue, execute_write_operation
-
 # Module-level flags for VSS loadability, now directly using the global ones.
 # These are initialized in mcp_server_src.core.globals
 # _vss_load_tested: bool = False # Replaced by g.global_vss_load_tested
@@ -242,16 +239,3 @@ def get_db_connection_read() -> sqlite3.Connection:
     This is an alias for get_db_connection() for clarity.
     """
     return get_db_connection()
-
-
-async def execute_db_write(operation_func):
-    """
-    Execute a database write operation through the write queue.
-
-    Args:
-        operation_func: A function that performs the database write operation
-
-    Returns:
-        The result of the write operation
-    """
-    return await execute_write_operation(operation_func)

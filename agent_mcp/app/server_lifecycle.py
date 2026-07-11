@@ -29,7 +29,6 @@ from ..features.session_registry_pruner import (
     run_session_registry_pruner,
 )
 from ..utils.signal_utils import register_signal_handlers  # For graceful shutdown
-from ..db.write_queue import get_write_queue
 
 
 # Wave 4 (cleanup/wave-4-delete-admin-pseudo-agent): the synthetic
@@ -240,12 +239,6 @@ async def application_startup(
         )
         # Server can continue, but RAG won't work.
 
-    # 6.5. Initialize Database Write Queue
-    # This prevents SQLite lock contention during concurrent write operations
-    write_queue = get_write_queue()
-    await write_queue.start()
-    logger.info("Database write queue initialized and started.")
-
     # 6.6. Install Repository singletons (PR #146).
     # The class-based ``TaskRepository`` is the single owner of the
     # ``state.tasks`` cache + DB invariant; installing here (after the
@@ -300,9 +293,9 @@ async def application_startup(
     # So bg tasks (session-registry pruner, message-retention pruner,
     # RAG indexer, claude-session monitor) are already scheduled by the
     # time we get here — but they MUST NOT fire their first cycle until
-    # `MCP_PROJECT_DIR` is set (step 1 above), the DB schema + Alembic
-    # migrations are applied (steps 3 + 3a), and the write-queue is
-    # running (step 6.5). Without this gate, the pruner's SQLAlchemy
+    # `MCP_PROJECT_DIR` is set (step 1 above) and the DB schema + Alembic
+    # migrations are applied (steps 3 + 3a). Without this gate, the
+    # pruner's SQLAlchemy
     # `get_engine()` call resolves the DB path via the fallback
     # `Path(".")` and the engine cache binds to a wrong / empty
     # bystander file — every subsequent ORM query then sees "no such
@@ -406,11 +399,6 @@ async def application_shutdown():
     ):
         logger.info("Attempting to cancel session registry pruner task...")
         g.session_registry_pruner_task_scope.cancel()
-
-    # Stop database write queue
-    write_queue = get_write_queue()
-    await write_queue.stop()
-    logger.info("Database write queue stopped.")
 
     # Clear Repository singletons (PR #146) so a subsequent app build
     # in the same process (test harness, hot reload) gets a fresh

@@ -195,9 +195,7 @@ def _snapshot_and_reset_globals(stack: ExitStack) -> None:
     times per test process (across consecutive `async with`)."""
     from agent_mcp.core import globals as g
     from agent_mcp.db import engine as _engine
-    from agent_mcp.db import write_queue as _wq
 
-    _wq._global_write_queue = None
     _engine.reset_engine_cache()
     # `agent_event_signals` holds asyncio.Event objects bound to
     # whatever loop created them. Pytest-asyncio gives each test its
@@ -246,7 +244,6 @@ def _snapshot_and_reset_globals(stack: ExitStack) -> None:
         g.openai_client_instance = snapshot["openai_client_instance"]
         g.global_vss_load_tested = snapshot["global_vss_load_tested"]
         g.global_vss_load_successful = snapshot["global_vss_load_successful"]
-        _wq._global_write_queue = None
         _engine.reset_engine_cache()
         # Drop any signals created during this test so the next test
         # (different event loop) starts with a fresh registry.
