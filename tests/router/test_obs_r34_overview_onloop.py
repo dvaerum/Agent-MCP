@@ -65,7 +65,6 @@ async def test_overview_systemctl_probes_run_off_event_loop(
             return subprocess.CompletedProcess(list(args), 3, "", "")
         return subprocess.CompletedProcess(list(args), 0, "", "")
 
-    monkeypatch.setattr(router_module, "_systemctl", _blocking_systemctl)
     from agent_mcp.router import project_orchestrator as _po
     monkeypatch.setattr(_po, "_systemctl", _blocking_systemctl)
 

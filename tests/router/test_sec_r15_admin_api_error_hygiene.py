@@ -67,7 +67,6 @@ async def test_stop_project_does_not_reflect_systemctl_stderr(
             args=list(args), returncode=0, stdout="", stderr="",
         )
 
-    monkeypatch.setattr(router_module, "_systemctl", _fake_systemctl)
     monkeypatch.setattr(_po, "_systemctl", _fake_systemctl)
 
     client = await aiohttp_client(router_app)
