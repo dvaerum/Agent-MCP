@@ -240,8 +240,6 @@ def requires_policy(
             # Agent path: a worker / manager bearer is required.
             if principal.kind != "agent_bearer" or not principal.agent_id:
                 raise AuthRejected("Unauthorized: Valid token required")
-            if principal.agent_id == "admin":
-                return await _call(arguments, principal, kwargs)
 
             # Lazy import: the access module pulls in DB helpers we
             # don't want to load at module-import time (keeps
