@@ -5,7 +5,8 @@ import { X, Copy, CheckCircle2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { ScrollArea } from '@/components/ui/scroll-area'
-import { cn } from '@/lib/utils'
+import { cn, formatRelative } from '@/lib/utils'
+import { statusColorClasses } from '@/lib/status'
 import { Agent, Task } from '@/lib/api'
 import { useDataStore } from '@/lib/stores/data-store'
 import { useDialog } from '@/hooks/use-dialog'
@@ -54,28 +55,6 @@ export function AgentDetailsPanel({ agent, onClose }: AgentDetailsPanelProps) {
     }
   }
 
-  const formatTimestamp = (timestamp: string) => {
-    const date = new Date(timestamp)
-    const now = new Date()
-    const diff = now.getTime() - date.getTime()
-    
-    if (diff < 60000) return 'Just now'
-    if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`
-    if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`
-    return date.toLocaleDateString()
-  }
-
-  const getStatusColor = (status: Agent['status']) => {
-    const colors = {
-      running: 'bg-primary/15 text-primary border-primary/30',
-      pending: 'bg-warning/15 text-warning border-warning/30',
-      terminated: 'bg-muted/50 text-muted-foreground border-border',
-      failed: 'bg-destructive/15 text-destructive border-destructive/30'
-    }
-    return colors[status] || colors.pending
-  }
-
-
   return (
     <div className={cn(
       "fixed right-0 top-16 h-[calc(100vh-4rem)] bg-background border-l transform transition-all duration-500 z-30",
@@ -91,7 +70,7 @@ export function AgentDetailsPanel({ agent, onClose }: AgentDetailsPanelProps) {
                 <h2 className="text-base font-semibold">{agent.agent_id}</h2>
                 <Badge 
                   variant="outline" 
-                  className={cn("text-xs", getStatusColor(agent.status))}
+                  className={cn("text-xs", statusColorClasses(agent.status))}
                 >
                   {agent.status}
                 </Badge>
@@ -169,7 +148,7 @@ export function AgentDetailsPanel({ agent, onClose }: AgentDetailsPanelProps) {
                         <div className="flex-1">
                           <div className="flex items-center justify-between">
                             <p className="font-medium">{action.action_type.replace(/_/g, ' ')}</p>
-                            <span className="text-xs text-muted-foreground">{formatTimestamp(action.timestamp)}</span>
+                            <span className="text-xs text-muted-foreground">{formatRelative(action.timestamp)}</span>
                           </div>
                           {action.task_id && (
                             <p className="text-xs text-muted-foreground mt-0.5">Task: {action.task_id.slice(-8)}</p>

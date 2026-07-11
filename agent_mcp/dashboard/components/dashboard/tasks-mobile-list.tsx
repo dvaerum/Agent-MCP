@@ -4,7 +4,7 @@ import * as React from "react"
 import { Eye, Pencil, Trash2, Users, GitBranch } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
-import { cn } from "@/lib/utils"
+import { cn, formatRelative } from "@/lib/utils"
 import type { Task } from "@/lib/api"
 
 /**
@@ -38,17 +38,6 @@ const PRIORITY_TONE: Record<string, string> = {
   high: "bg-orange-500/10 text-orange-600 dark:text-orange-400 border-orange-500/20",
   medium: "bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/20",
   low: "bg-muted text-muted-foreground border-border",
-}
-
-function formatRelative(iso: string | undefined): string {
-  if (!iso) return "—"
-  const t = new Date(iso).getTime()
-  if (Number.isNaN(t)) return iso
-  const diff = Date.now() - t
-  if (diff < 60_000) return "just now"
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`
-  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`
-  return `${Math.floor(diff / 86_400_000)}d ago`
 }
 
 interface TasksMobileListProps {

@@ -9,6 +9,7 @@ import { Separator } from '@/components/ui/separator'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { apiClient, Agent, Task } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import { statusColorClasses, priorityColorClasses } from '@/lib/status'
 import { useDataStore } from '@/lib/stores/data-store'
 
 interface ContextData {
@@ -53,22 +54,6 @@ const statusIcons = {
   terminated: XCircle,
   failed: AlertCircle,
   cancelled: XCircle
-}
-
-const statusColors = {
-  pending: 'bg-yellow-500/10 text-yellow-600 border-yellow-500/30',
-  running: 'bg-blue-500/10 text-blue-600 border-blue-500/30',
-  in_progress: 'bg-blue-500/10 text-blue-600 border-blue-500/30',
-  completed: 'bg-green-500/10 text-green-600 border-green-500/30',
-  terminated: 'bg-red-500/10 text-red-600 border-red-500/30',
-  failed: 'bg-red-500/10 text-red-600 border-red-500/30',
-  cancelled: 'bg-gray-500/10 text-gray-600 border-gray-500/30'
-}
-
-const priorityColors = {
-  low: 'bg-slate-500/10 text-slate-600 border-slate-500/30',
-  medium: 'bg-amber-500/10 text-amber-600 border-amber-500/30',
-  high: 'bg-red-500/10 text-red-600 border-red-500/30'
 }
 
 export function NodeDetailPanel({ nodeId, nodeType, isOpen, onClose, nodeData }: NodeDetailPanelProps) {
@@ -159,7 +144,7 @@ export function NodeDetailPanel({ nodeId, nodeType, isOpen, onClose, nodeData }:
               <p className="text-sm text-muted-foreground">Agent ID</p>
             </div>
           </div>
-          <Badge variant="outline" className={cn(statusColors[agent.status])}>
+          <Badge variant="outline" className={cn(statusColorClasses(agent.status))}>
             <StatusIcon className={cn("h-3 w-3 mr-1", isActive && "animate-spin")} />
             {agent.status}
           </Badge>
@@ -299,11 +284,11 @@ export function NodeDetailPanel({ nodeId, nodeType, isOpen, onClose, nodeData }:
 
         {/* Status and Priority */}
         <div className="flex gap-2 mb-4">
-          <Badge variant="outline" className={cn(statusColors[task.status])}>
+          <Badge variant="outline" className={cn(statusColorClasses(task.status))}>
             <StatusIcon className={cn("h-3 w-3 mr-1", isActive && "animate-spin")} />
             {task.status}
           </Badge>
-          <Badge variant="outline" className={cn(priorityColors[task.priority])}>
+          <Badge variant="outline" className={cn(priorityColorClasses(task.priority))}>
             {task.priority} priority
           </Badge>
         </div>

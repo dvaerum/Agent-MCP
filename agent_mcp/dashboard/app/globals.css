@@ -25,6 +25,16 @@
   --color-input: var(--input);
   --color-border: var(--border);
   --color-destructive: var(--destructive);
+  /* success/warning: --success/--warning custom properties existed
+     (below, :root + .dark) but were never registered as Tailwind
+     color tokens here, so `bg-success`/`text-warning`/etc classes
+     already in use (agents-dashboard, agent-details-panel,
+     task-details-dialog) generated zero CSS. Registering them makes
+     the semantic-token status palette (arch-r5 #8) actually render. */
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
   --color-accent-foreground: var(--accent-foreground);
   --color-accent: var(--accent);
   --color-muted-foreground: var(--muted-foreground);

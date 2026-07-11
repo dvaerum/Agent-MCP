@@ -46,6 +46,7 @@ import {
   type ProjectStatus,
 } from "@/lib/stores/projects-store"
 import { appUrl } from "@/lib/urls"
+import { formatRelative } from "@/lib/utils"
 import { AddProjectModal } from "./add-project-modal"
 import { RemoveProjectModal } from "./remove-project-modal"
 import { RenameProjectModal } from "./rename-project-modal"
@@ -75,15 +76,6 @@ const STATUS_DOT_COLOUR: Record<ProjectStatus, string> = {
   stopped: "bg-slate-300",
   starting: "bg-blue-500",
   failed: "bg-red-500",
-}
-
-function formatRelative(ts: number | null): string {
-  if (ts === null) return "never"
-  const ageSec = Math.max(0, Math.floor(Date.now() / 1000 - ts))
-  if (ageSec < 60) return `${ageSec}s ago`
-  if (ageSec < 3600) return `${Math.floor(ageSec / 60)}m ago`
-  if (ageSec < 86400) return `${Math.floor(ageSec / 3600)}h ago`
-  return `${Math.floor(ageSec / 86400)}d ago`
 }
 
 function ProjectCard({
@@ -158,7 +150,7 @@ function ProjectCard({
           <span>
             Last activity:{" "}
             <span className="text-foreground">
-              {formatRelative(row.last_activity_ts)}
+              {formatRelative(row.last_activity_ts, { emptyLabel: "never" })}
             </span>
           </span>
           <span>
