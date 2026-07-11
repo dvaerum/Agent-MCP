@@ -63,6 +63,7 @@ from typing import Any, Iterable
 from aiohttp import web
 
 from . import identity
+from .router_store import store
 
 
 logger = logging.getLogger(__name__)
@@ -393,60 +394,6 @@ def _forbid_sysadmin_membership(req: web.Request) -> web.Response:
     )
 
 
-def _group_and_ancestors(
-    conn: sqlite3.Connection, group_id: str,
-) -> set[str]:
-    """Return ``group_id`` plus every ancestor group (walking UPWARD).
-
-    ``group_resolver.resolve_user_groups`` resolves a user's groups by
-    walking UP over ``group_membership.member_group_id`` — a user's
-    direct groups plus every ancestor. So a new member of ``group_id``
-    inherits everything attached to ``group_id`` itself OR any of its
-    ancestor groups (both the ``is_sysadmin`` flag and capability
-    grants). This BFS mirrors that upward walk on the caller's
-    ``BEGIN IMMEDIATE`` connection so the check sees a consistent
-    snapshot (rather than reaching into ``group_resolver``, which opens
-    its own connection).
-    """
-    visited: set[str] = {group_id}
-    frontier: list[str] = [group_id]
-    while frontier:
-        placeholders = ",".join("?" for _ in frontier)
-        rows = conn.execute(
-            f"SELECT DISTINCT group_id FROM group_membership "
-            f"WHERE member_group_id IN ({placeholders})",
-            tuple(frontier),
-        ).fetchall()
-        next_frontier: list[str] = []
-        for row in rows:
-            gid = row[0]
-            if gid not in visited:
-                visited.add(gid)
-                next_frontier.append(gid)
-        frontier = next_frontier
-    return visited
-
-
-def _group_is_transitively_sysadmin(
-    conn: sqlite3.Connection, group_id: str,
-) -> bool:
-    """True iff a member of ``group_id`` would inherit sysadmin.
-
-    A user gains sysadmin (per ``group_resolver.resolve_user_is_sysadmin``)
-    when any group in their transitive membership carries ``is_sysadmin=1``.
-    So a new member of ``group_id`` inherits sysadmin iff ``group_id``
-    itself OR any of its ancestor groups is sysadmin-flagged.
-    """
-    ancestors = _group_and_ancestors(conn, group_id)
-    placeholders = ",".join("?" for _ in ancestors)
-    hit = conn.execute(
-        f"SELECT 1 FROM groups WHERE is_sysadmin = 1 "
-        f"AND group_id IN ({placeholders}) LIMIT 1",
-        tuple(ancestors),
-    ).fetchone()
-    return hit is not None
-
-
 def _group_resolved_capabilities(
     conn: sqlite3.Connection, group_id: str,
 ) -> frozenset[str]:
@@ -455,12 +402,15 @@ def _group_resolved_capabilities(
     The union of ``group_capability`` grants across ``group_id`` and its
     ancestor groups — mirrors the group-cap overlay in
     ``core.capabilities.resolve_capabilities`` (which unions caps over
-    ``resolve_user_groups``' upward closure). Read on the caller's
-    ``BEGIN IMMEDIATE`` connection for a consistent snapshot. Defensive
-    against a pre-migration DB without the ``group_capability`` table
-    (mirrors ``resolve_capabilities``' swallow-and-degrade posture).
+    ``resolve_user_groups``' upward closure). The ancestor closure comes
+    from ``RouterStore.resolve_group_ancestors`` on the caller's
+    ``BEGIN IMMEDIATE`` connection (one snapshot, no second connection);
+    the cap lookup stays here because capabilities are this module's
+    (``group_capability``), not the resolver's, domain. Defensive against
+    a pre-migration DB without the ``group_capability`` table (mirrors
+    ``resolve_capabilities``' swallow-and-degrade posture).
     """
-    ancestors = _group_and_ancestors(conn, group_id)
+    ancestors = store.resolve_group_ancestors(group_id, conn=conn)
     placeholders = ",".join("?" for _ in ancestors)
     try:
         rows = conn.execute(
@@ -471,36 +421,6 @@ def _group_resolved_capabilities(
     except sqlite3.OperationalError:  # table absent on a pre-0004 DB
         return frozenset()
     return frozenset(row[0] for row in rows)
-
-
-def _group_resolved_project_roles(
-    conn: sqlite3.Connection, group_id: str,
-) -> dict[str, str]:
-    """Every project role a new member of ``group_id`` would inherit.
-
-    ``group_resolver.resolve_user_project_role`` grants a user a project
-    role when any group in their transitive (upward) membership carries a
-    ``project_membership`` row for that project — taking the highest tier
-    (``operator`` > ``viewer``) when several match. So a new member of
-    ``group_id`` inherits, per project, the highest role attached to
-    ``group_id`` itself OR any of its ancestor groups. Read on the
-    caller's ``BEGIN IMMEDIATE`` connection for a consistent snapshot
-    (mirrors ``_group_resolved_capabilities``). Returns
-    ``{project_name: role}``.
-    """
-    ancestors = _group_and_ancestors(conn, group_id)
-    placeholders = ",".join("?" for _ in ancestors)
-    rows = conn.execute(
-        f"SELECT project_name, role FROM project_membership "
-        f"WHERE group_id IN ({placeholders})",
-        tuple(ancestors),
-    ).fetchall()
-    best: dict[str, str] = {}
-    for row in rows:
-        project, role = row["project_name"], row["role"]
-        if project not in best or _role_rank(role) > _role_rank(best[project]):
-            best[project] = role
-    return best
 
 
 def _caps_caller_lacks(
@@ -553,17 +473,6 @@ def _forbid_cap_amplification(
 
 # ── Project-membership self-escalation guard (SEC round 5) ─────────
 
-# viewer < operator. Mirrors ``group_resolver._ROLE_TIER`` but kept
-# local so the two modules don't couple on a private symbol; unknown
-# roles rank 0 (below every known role) so they can never out-rank a
-# real membership.
-_MEMBERSHIP_ROLE_RANK: dict[str, int] = {"viewer": 1, "operator": 2}
-
-
-def _role_rank(role: str) -> int:
-    """Numeric rank for a project role; unknown roles sort below all."""
-    return _MEMBERSHIP_ROLE_RANK.get(role, 0)
-
 
 def _membership_grant_denied(
     req: web.Request, project_name: str, conferred_role: str,
@@ -593,18 +502,16 @@ def _membership_grant_denied(
     """
     if _caller_is_sysadmin(req):
         return None
-    from . import group_resolver as _gr
-
     principal = req.get("principal")
     caller_id = getattr(principal, "user_id", None) if principal else None
     caller_role = (
-        _gr.resolve_user_project_role(caller_id, project_name)
+        store.resolve_user_project_role(caller_id, project_name)
         if caller_id
         else None
     )
-    if caller_role is None or _role_rank(conferred_role) > _role_rank(
-        caller_role
-    ):
+    if caller_role is None or store.role_rank(
+        conferred_role
+    ) > store.role_rank(caller_role):
         user = req.get("user") or {}
         username = user.get("username", "<unknown>")
         held = caller_role or "none"
@@ -1296,8 +1203,6 @@ async def add_group_member_handler(req: web.Request) -> web.Response:
             message="exactly one of user_id or group_id is required",
             status=400,
         )
-    from . import group_resolver as _gr
-
     conn = _connect()
     # Manual transaction control so BEGIN IMMEDIATE / COMMIT / ROLLBACK
     # are fully under our hand (default isolation_level auto-manages
@@ -1323,8 +1228,10 @@ async def add_group_member_handler(req: web.Request) -> web.Response:
             # locked SETTING is_sysadmin + CREATING a sysadmin group but
             # not JOINING one; close that vector here. Reserved for
             # sysadmins regardless of member kind (self or a nested group).
-            if not _caller_is_sysadmin(req) and _group_is_transitively_sysadmin(
-                conn, parent_group_id,
+            if not _caller_is_sysadmin(
+                req
+            ) and store.group_is_transitively_sysadmin(
+                parent_group_id, conn=conn,
             ):
                 conn.execute("ROLLBACK")
                 return _forbid_sysadmin_membership(req)
@@ -1355,15 +1262,15 @@ async def add_group_member_handler(req: web.Request) -> web.Response:
             # exceed what the delegate already holds on those projects. Reuse
             # the round-5 role-rank logic per conferred (project, role).
             if not _caller_is_sysadmin(req):
-                for project, role in _group_resolved_project_roles(
-                    conn, parent_group_id,
+                for project, role in store.group_resolved_project_roles(
+                    parent_group_id, conn=conn,
                 ).items():
                     denied = _membership_grant_denied(req, project, role)
                     if denied is not None:
                         conn.execute("ROLLBACK")
                         return denied
-            if member_group_id is not None and _gr._would_create_cycle(
-                conn, parent_group_id, member_group_id,
+            if member_group_id is not None and store.would_create_cycle(
+                parent_group_id, member_group_id, conn=conn,
             ):
                 conn.execute("ROLLBACK")
                 return _error(
@@ -1442,14 +1349,14 @@ async def remove_group_member_handler(req: web.Request) -> web.Response:
         #   * a ``system.*`` capability the delegate lacks, or
         #   * a project role above the delegate's own.
         if not _caller_is_sysadmin(req):
-            if _group_is_transitively_sysadmin(conn, parent_group_id):
+            if store.group_is_transitively_sysadmin(parent_group_id, conn=conn):
                 return _forbid_sysadmin_membership(req)
             inherited = _group_resolved_capabilities(conn, parent_group_id)
             lacked = _caps_caller_lacks(req, inherited)
             if lacked:
                 return _forbid_cap_amplification(req, lacked)
-            for project, role in _group_resolved_project_roles(
-                conn, parent_group_id,
+            for project, role in store.group_resolved_project_roles(
+                parent_group_id, conn=conn,
             ).items():
                 denied = _membership_grant_denied(req, project, role)
                 if denied is not None:

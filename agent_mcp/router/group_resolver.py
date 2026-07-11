@@ -14,56 +14,76 @@ Phase 2 code paths (which import identity but don't care about
 groups) stay light, and the cycle-detection logic has one canonical
 home that the dashboard / CLI / tests can all reach for.
 
+Connection ownership (arch-deepening R2 #1a): every resolution
+function takes ``conn: sqlite3.Connection | None = None``. Pass
+``None`` (the default) to self-open an autocommit connection via
+``identity._connect``; pass a caller's OPEN connection to enlist in
+that transaction so a handler running inside ``BEGIN IMMEDIATE`` sees
+one consistent snapshot without a second connection being opened.
+The ``RouterStore`` seam (:mod:`agent_mcp.router.router_store`) is the
+OO facade over these functions; the group-rooted variants
+(``resolve_group_ancestors``, ``group_is_transitively_sysadmin``,
+``group_resolved_project_roles``) replaced the hand-forked traversals
+that ``admin_users_api`` used to carry because the resolver owned its
+own connection.
+
 Public surface (re-exported via ``__all__``):
 
   * ``CycleDetected`` — raised by ``add_group_member`` when the new
     edge would close a cycle in the membership DAG.
 
-  * ``add_group_member(group_id, member_user_id=None,
-    member_group_id=None, added_at=None)`` — the canonical writer
-    for ``group_membership``. Validates exactly-one-of, runs cycle
-    detection from the proposed edge outward (DFS until we either
-    revisit ``group_id`` or exhaust the reachable set), then inserts.
+  * ``add_group_member(...)`` — the canonical writer for
+    ``group_membership``.
 
-  * ``resolve_user_groups(user_id) -> set[str]`` — every group_id the
-    user is in, directly or transitively via nested groups.
+  * ``resolve_user_groups(user_id, conn=None) -> set[str]`` — every
+    group_id the user is in, directly or transitively.
 
-  * ``resolve_user_is_sysadmin(user_id) -> bool`` — true if
-    ``users.is_sysadmin`` OR any group in the resolved set has
-    ``is_sysadmin = 1``.
+  * ``resolve_user_is_sysadmin(user_id, conn=None) -> bool``.
 
-  * ``resolve_user_project_role(user_id, project_name) ->
-    Optional[Literal['operator', 'viewer']]`` — walks
-    ``project_membership`` rows for the user OR any of their groups,
-    returning the highest-tier match (operator > viewer) or ``None``
-    when no row covers the user.
+  * ``resolve_user_project_role(user_id, project_name, conn=None)``.
+
+  * ``resolve_group_ancestors(group_id, conn=None) -> set[str]`` —
+    ``group_id`` plus every ancestor group (upward closure).
+
+  * ``group_is_transitively_sysadmin(group_id, conn=None) -> bool`` —
+    whether a fresh member of ``group_id`` would inherit sysadmin.
+
+  * ``group_resolved_project_roles(group_id, conn=None) -> dict`` —
+    the project roles a fresh member of ``group_id`` would inherit.
+
+  * ``would_create_cycle(parent, child, conn=None) -> bool``.
 
   * ``bootstrap_first_operator_as_sysadmin()`` — idempotent helper
-    that flips the earliest-by-created_at user to
-    ``is_sysadmin = 1`` when no sysadmin exists yet. Re-runnable
-    from anywhere (init hook, repair CLI, tests); the migration
-    calls it once during upgrade.
+    that flips the earliest-by-created_at user to ``is_sysadmin = 1``.
 
-All public callers go through ``identity._connect()`` for the DB
-handle, sharing FK enforcement + commit/rollback contract.
+  * ``ROLE_TIER`` / ``role_rank`` — the single canonical project-role
+    ranking (``operator`` > ``viewer`` > unknown).
 """
 
 from __future__ import annotations
 
 import logging
+import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Iterable, Literal, Optional
+from typing import Iterator, Literal, Optional
 
 from . import identity as _identity
 
 
 __all__ = [
     "CycleDetected",
+    "ROLE_TIER",
     "add_group_member",
     "bootstrap_first_operator_as_sysadmin",
+    "group_is_transitively_sysadmin",
+    "group_resolved_project_roles",
+    "resolve_group_ancestors",
     "resolve_user_groups",
     "resolve_user_is_sysadmin",
     "resolve_user_project_role",
+    "role_rank",
+    "would_create_cycle",
 ]
 
 
@@ -84,6 +104,20 @@ class CycleDetected(ValueError):
     """
 
 
+# ── Project-role ranking (single canonical source) ─────────────────
+
+# viewer < operator; unknown roles rank 0 (below every known role) so a
+# malformed row can never out-rank a real membership. This is the ONE
+# home for the tier — ``admin_users_api`` and ``router_store`` both read
+# it via ``role_rank`` rather than re-declaring the table.
+ROLE_TIER: dict[str, int] = {"viewer": 1, "operator": 2}
+
+
+def role_rank(role: str) -> int:
+    """Numeric rank for a project role; unknown roles sort below all."""
+    return ROLE_TIER.get(role, 0)
+
+
 # ── Helpers ────────────────────────────────────────────────────────
 
 
@@ -93,7 +127,29 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
-def _children_of_group(conn, group_id: str) -> list[tuple[Optional[str], Optional[str]]]:
+@contextmanager
+def _conn_ctx(
+    conn: Optional[sqlite3.Connection],
+) -> Iterator[sqlite3.Connection]:
+    """Yield a usable connection: the caller's if given, else a freshly
+    self-opened autocommit one.
+
+    When ``conn`` is provided the caller owns the transaction — we do
+    NOT commit or close it, we merely run our SELECTs on it so a handler
+    inside ``BEGIN IMMEDIATE`` gets a single consistent snapshot without
+    a second connection. When ``conn`` is ``None`` we borrow
+    ``identity._connect`` (commit-on-exit, rollback-on-error).
+    """
+    if conn is not None:
+        yield conn
+    else:
+        with _identity._connect() as owned:
+            yield owned
+
+
+def _children_of_group(
+    conn: sqlite3.Connection, group_id: str
+) -> list[tuple[Optional[str], Optional[str]]]:
     """Yield (member_user_id, member_group_id) edges out of ``group_id``."""
     cur = conn.execute(
         """
@@ -106,27 +162,161 @@ def _children_of_group(conn, group_id: str) -> list[tuple[Optional[str], Optiona
     return [(row["member_user_id"], row["member_group_id"]) for row in cur.fetchall()]
 
 
-def _would_create_cycle(
-    conn, parent_group_id: str, new_child_group_id: str
+# ── Graph kernels (each takes an already-open connection) ───────────
+
+
+def _ancestors_on(conn: sqlite3.Connection, seed: set[str]) -> set[str]:
+    """Upward closure over ``group_membership.member_group_id``.
+
+    Returns ``seed`` PLUS every group reachable by walking upward from
+    it (a group that has any seed member as a ``member_group_id``, then
+    that group's parents, transitively). Batches each level via ``IN``
+    so it costs O(depth) round-trips.
+    """
+    result: set[str] = set(seed)
+    frontier: list[str] = list(seed)
+    while frontier:
+        placeholders = ",".join("?" for _ in frontier)
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT group_id FROM group_membership
+            WHERE member_group_id IN ({placeholders})
+            """,
+            tuple(frontier),
+        ).fetchall()
+        next_frontier: list[str] = []
+        for row in rows:
+            gid = row["group_id"]
+            if gid not in result:
+                result.add(gid)
+                next_frontier.append(gid)
+        frontier = next_frontier
+    return result
+
+
+def _resolve_user_groups_on(conn: sqlite3.Connection, user_id: str) -> set[str]:
+    cur = conn.execute(
+        "SELECT group_id FROM group_membership WHERE member_user_id = ?",
+        (user_id,),
+    )
+    direct = {row["group_id"] for row in cur.fetchall()}
+    if not direct:
+        return set()
+    return _ancestors_on(conn, direct)
+
+
+def _resolve_group_ancestors_on(
+    conn: sqlite3.Connection, group_id: str
+) -> set[str]:
+    return _ancestors_on(conn, {group_id})
+
+
+def _any_group_is_sysadmin_on(
+    conn: sqlite3.Connection, groups: set[str]
+) -> bool:
+    if not groups:
+        return False
+    placeholders = ",".join("?" for _ in groups)
+    cur = conn.execute(
+        f"""
+        SELECT 1 FROM groups
+        WHERE is_sysadmin = 1 AND group_id IN ({placeholders})
+        LIMIT 1
+        """,
+        tuple(groups),
+    )
+    return cur.fetchone() is not None
+
+
+def _resolve_user_is_sysadmin_on(
+    conn: sqlite3.Connection, user_id: str
+) -> bool:
+    row = conn.execute(
+        "SELECT is_sysadmin FROM users WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    if row is not None and row["is_sysadmin"]:
+        return True
+    return _any_group_is_sysadmin_on(conn, _resolve_user_groups_on(conn, user_id))
+
+
+def _group_is_transitively_sysadmin_on(
+    conn: sqlite3.Connection, group_id: str
+) -> bool:
+    return _any_group_is_sysadmin_on(
+        conn, _resolve_group_ancestors_on(conn, group_id)
+    )
+
+
+def _project_roles_for_groups_on(
+    conn: sqlite3.Connection, groups: set[str]
+) -> dict[str, str]:
+    """Highest role per project across a set of groups (group rows only)."""
+    if not groups:
+        return {}
+    placeholders = ",".join("?" for _ in groups)
+    rows = conn.execute(
+        f"""
+        SELECT project_name, role FROM project_membership
+        WHERE group_id IN ({placeholders})
+        """,
+        tuple(groups),
+    ).fetchall()
+    best: dict[str, str] = {}
+    for row in rows:
+        project, role = row["project_name"], row["role"]
+        if project not in best or role_rank(role) > role_rank(best[project]):
+            best[project] = role
+    return best
+
+
+def _group_resolved_project_roles_on(
+    conn: sqlite3.Connection, group_id: str
+) -> dict[str, str]:
+    return _project_roles_for_groups_on(
+        conn, _resolve_group_ancestors_on(conn, group_id)
+    )
+
+
+def _resolve_user_project_role_on(
+    conn: sqlite3.Connection, user_id: str, project_name: str
+) -> Optional[Literal["operator", "viewer"]]:
+    candidates: list[str] = []
+    cur = conn.execute(
+        "SELECT role FROM project_membership "
+        "WHERE project_name = ? AND user_id = ?",
+        (project_name, user_id),
+    )
+    candidates.extend(row["role"] for row in cur.fetchall())
+    groups = _resolve_user_groups_on(conn, user_id)
+    if groups:
+        placeholders = ",".join("?" for _ in groups)
+        cur = conn.execute(
+            f"""
+            SELECT role FROM project_membership
+            WHERE project_name = ? AND group_id IN ({placeholders})
+            """,
+            (project_name, *groups),
+        )
+        candidates.extend(row["role"] for row in cur.fetchall())
+    if not candidates:
+        return None
+    best = max(candidates, key=role_rank)
+    return best  # type: ignore[return-value]
+
+
+def _would_create_cycle_on(
+    conn: sqlite3.Connection, parent_group_id: str, new_child_group_id: str
 ) -> bool:
     """Detect whether adding ``new_child_group_id`` as a member of
     ``parent_group_id`` would close a cycle.
 
     A cycle exists iff ``parent_group_id`` is reachable from
-    ``new_child_group_id`` via the existing membership edges (because
-    once we add ``new_child_group_id ∈ parent_group_id``, traversing
-    from ``new_child_group_id`` would now loop back to itself through
-    its newly-acquired parent).
-
-    Self-loop (``new_child_group_id == parent_group_id``) is the
-    trivial 1-cycle and is handled by the same reachability check.
+    ``new_child_group_id`` via the existing membership edges. Self-loop
+    (``new_child_group_id == parent_group_id``) is the trivial 1-cycle.
+    Iterative DFS + visited-set to stay off the recursion limit.
     """
     if parent_group_id == new_child_group_id:
         return True
-
-    # DFS from the proposed child, looking for an existing path back
-    # to the proposed parent. Iterative + visited-set so we don't blow
-    # the Python recursion limit on adversarial inputs.
     visited: set[str] = set()
     stack: list[str] = [new_child_group_id]
     while stack:
@@ -142,6 +332,85 @@ def _would_create_cycle(
             if child_group not in visited:
                 stack.append(child_group)
     return False
+
+
+# ── Public: connection-injectable resolution surface ────────────────
+
+
+def resolve_user_groups(
+    user_id: str, conn: Optional[sqlite3.Connection] = None
+) -> set[str]:
+    """Return the transitive set of group_ids ``user_id`` belongs to.
+
+    A user belongs to a group directly (``member_user_id``) or
+    transitively when a direct group is itself nested in a parent group.
+    Empty set when the user has no memberships (or doesn't exist).
+    """
+    with _conn_ctx(conn) as c:
+        return _resolve_user_groups_on(c, user_id)
+
+
+def resolve_group_ancestors(
+    group_id: str, conn: Optional[sqlite3.Connection] = None
+) -> set[str]:
+    """Return ``group_id`` plus every ancestor group (upward closure).
+
+    This is what a fresh member of ``group_id`` would resolve INTO — the
+    group-rooted mirror of ``resolve_user_groups`` for a user whose only
+    membership is ``group_id``.
+    """
+    with _conn_ctx(conn) as c:
+        return _resolve_group_ancestors_on(c, group_id)
+
+
+def resolve_user_is_sysadmin(
+    user_id: str, conn: Optional[sqlite3.Connection] = None
+) -> bool:
+    """True iff the user is a sysadmin directly OR via any group in their
+    transitive membership."""
+    with _conn_ctx(conn) as c:
+        return _resolve_user_is_sysadmin_on(c, user_id)
+
+
+def group_is_transitively_sysadmin(
+    group_id: str, conn: Optional[sqlite3.Connection] = None
+) -> bool:
+    """True iff a fresh member of ``group_id`` would inherit sysadmin —
+    i.e. ``group_id`` itself OR any ancestor group is sysadmin-flagged."""
+    with _conn_ctx(conn) as c:
+        return _group_is_transitively_sysadmin_on(c, group_id)
+
+
+def resolve_user_project_role(
+    user_id: str,
+    project_name: str,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Optional[Literal["operator", "viewer"]]:
+    """Return the user's effective role for ``project_name`` — the highest
+    tier (``operator`` > ``viewer``) across the user's direct rows and any
+    of their groups' rows, or ``None`` when no row covers them."""
+    with _conn_ctx(conn) as c:
+        return _resolve_user_project_role_on(c, user_id, project_name)
+
+
+def group_resolved_project_roles(
+    group_id: str, conn: Optional[sqlite3.Connection] = None
+) -> dict[str, str]:
+    """Every project role a fresh member of ``group_id`` would inherit —
+    the highest tier per project across ``group_id`` and its ancestors."""
+    with _conn_ctx(conn) as c:
+        return _group_resolved_project_roles_on(c, group_id)
+
+
+def would_create_cycle(
+    parent_group_id: str,
+    new_child_group_id: str,
+    conn: Optional[sqlite3.Connection] = None,
+) -> bool:
+    """True iff adding ``new_child_group_id`` as a member of
+    ``parent_group_id`` would close a cycle in the membership DAG."""
+    with _conn_ctx(conn) as c:
+        return _would_create_cycle_on(c, parent_group_id, new_child_group_id)
 
 
 # ── Public: add_group_member ───────────────────────────────────────
@@ -173,7 +442,7 @@ def add_group_member(
 
     if member_group_id is not None:
         with _identity._connect() as conn:
-            if _would_create_cycle(conn, group_id, member_group_id):
+            if _would_create_cycle_on(conn, group_id, member_group_id):
                 raise CycleDetected(
                     f"adding group {member_group_id!r} as a member of "
                     f"{group_id!r} would close a cycle in the membership DAG"
@@ -189,123 +458,6 @@ def add_group_member(
             """,
             (group_id, member_user_id, member_group_id, ts),
         )
-
-
-# ── Public: resolve_user_groups ─────────────────────────────────────
-
-
-def resolve_user_groups(user_id: str) -> set[str]:
-    """Return the transitive set of group_ids ``user_id`` belongs to.
-
-    A user belongs to a group directly if there's a
-    ``group_membership`` row with ``member_user_id = user_id``. A user
-    belongs to a parent group transitively if any direct group is
-    itself a member of the parent (recursive).
-
-    Implementation: collect direct groups, then BFS upward over
-    ``group_membership.member_group_id`` to find every ancestor group.
-    Empty set when the user has no memberships (or doesn't exist).
-    """
-    result: set[str] = set()
-    with _identity._connect() as conn:
-        cur = conn.execute(
-            """
-            SELECT group_id FROM group_membership
-            WHERE member_user_id = ?
-            """,
-            (user_id,),
-        )
-        frontier: list[str] = [row["group_id"] for row in cur.fetchall()]
-        result.update(frontier)
-        while frontier:
-            next_frontier: list[str] = []
-            # Find every group that has any of the current frontier
-            # as a member (member_group_id in (...)). Batch via IN to
-            # keep this O(depth) round-trips instead of O(n).
-            placeholders = ",".join("?" for _ in frontier)
-            cur = conn.execute(
-                f"""
-                SELECT DISTINCT group_id FROM group_membership
-                WHERE member_group_id IN ({placeholders})
-                """,
-                tuple(frontier),
-            )
-            for row in cur.fetchall():
-                gid = row["group_id"]
-                if gid not in result:
-                    result.add(gid)
-                    next_frontier.append(gid)
-            frontier = next_frontier
-    return result
-
-
-# ── Public: resolve_user_is_sysadmin ───────────────────────────────
-
-
-def resolve_user_is_sysadmin(user_id: str) -> bool:
-    """Return True iff the user is a sysadmin directly OR via any
-    group in their transitive membership."""
-    user = _identity.get_user_by_id(user_id)
-    if user is not None and user.get("is_sysadmin"):
-        return True
-    groups = resolve_user_groups(user_id)
-    if not groups:
-        return False
-    placeholders = ",".join("?" for _ in groups)
-    with _identity._connect() as conn:
-        cur = conn.execute(
-            f"""
-            SELECT 1 FROM groups
-            WHERE is_sysadmin = 1 AND group_id IN ({placeholders})
-            LIMIT 1
-            """,
-            tuple(groups),
-        )
-        return cur.fetchone() is not None
-
-
-# ── Public: resolve_user_project_role ──────────────────────────────
-
-
-_ROLE_TIER: dict[str, int] = {"viewer": 1, "operator": 2}
-
-
-def resolve_user_project_role(
-    user_id: str, project_name: str
-) -> Optional[Literal["operator", "viewer"]]:
-    """Return the user's effective role for ``project_name``.
-
-    Walks every ``project_membership`` row matching ``user_id``
-    directly OR any group in ``resolve_user_groups(user_id)``. When
-    multiple rows match, returns the highest tier (``operator``
-    outranks ``viewer``). Returns ``None`` when no row covers the
-    user — caller treats that as "no access".
-    """
-    candidates: list[str] = []
-    groups = resolve_user_groups(user_id)
-    with _identity._connect() as conn:
-        cur = conn.execute(
-            "SELECT role FROM project_membership "
-            "WHERE project_name = ? AND user_id = ?",
-            (project_name, user_id),
-        )
-        candidates.extend(row["role"] for row in cur.fetchall())
-        if groups:
-            placeholders = ",".join("?" for _ in groups)
-            cur = conn.execute(
-                f"""
-                SELECT role FROM project_membership
-                WHERE project_name = ? AND group_id IN ({placeholders})
-                """,
-                (project_name, *groups),
-            )
-            candidates.extend(row["role"] for row in cur.fetchall())
-    if not candidates:
-        return None
-    # max by tier; unknown tiers (shouldn't happen given the CHECK)
-    # sort below known ones so they don't accidentally win.
-    best = max(candidates, key=lambda r: _ROLE_TIER.get(r, 0))
-    return best  # type: ignore[return-value]
 
 
 # ── Public: bootstrap_first_operator_as_sysadmin ───────────────────
@@ -354,9 +506,3 @@ def bootstrap_first_operator_as_sysadmin() -> None:
             "Bootstrapped earliest operator (user_id=%s) as sysadmin.",
             row["user_id"],
         )
-
-
-# Silence unused-import warnings from static analyzers — we re-export
-# nothing from ``identity`` but importing it primes the migrations
-# runner so ``_identity._connect`` always sees an up-to-date schema.
-_ = Iterable
