@@ -185,7 +185,7 @@ def test_all_four_sites_use_the_seam_not_inline_assembly() -> None:
     from agent_mcp.features.rag import indexing as indexing_mod
     from agent_mcp.features.rag import query as query_mod
 
-    batch_src = inspect.getsource(indexing_mod._get_embeddings_batch_openai)
+    batch_src = inspect.getsource(indexing_mod._get_embeddings_batch)
     assert "embedding_client(" in batch_src
     assert "AsyncOpenAI(" not in batch_src
 

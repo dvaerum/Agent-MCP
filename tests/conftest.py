@@ -21,8 +21,8 @@ import pytest
 # or reading the user's home OPENAI_API_KEY.
 @pytest.fixture(autouse=True)
 def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    # Empty key → openai_service.initialize_openai_client() short-circuits
-    # to None (graceful degrade); no models.list() call goes out.
+    # Empty key → embedding_client()/completion_client() resolve to the
+    # Ollama provider (no OpenAI network call goes out).
     monkeypatch.setenv("OPENAI_API_KEY", "")
     # Don't load whatever .env happens to be in the cwd.
     monkeypatch.setenv("DOTENV_PATH", "/dev/null")
@@ -54,10 +54,9 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 def reset_globals() -> Iterator[None]:
     """Reset agent_mcp.core.globals state between tests.
 
-    agent-mcp uses a module-level singleton (g.openai_client_instance,
-    in-memory task/agent caches, etc.). Tests that build their own app
-    instances must reset these or state leaks across tests in
-    surprising ways.
+    agent-mcp uses module-level singletons (in-memory task/agent
+    caches, etc.). Tests that build their own app instances must reset
+    these or state leaks across tests in surprising ways.
 
     """
     from agent_mcp.core import globals as g
@@ -94,7 +93,6 @@ def reset_globals() -> Iterator[None]:
         "file_map": dict(g.file_map),
         "agent_working_dirs": dict(g.agent_working_dirs),
         "audit_log": list(g.audit_log),
-        "openai_client_instance": g.openai_client_instance,
         "global_vss_load_tested": g.global_vss_load_tested,
         "global_vss_load_successful": g.global_vss_load_successful,
     }
@@ -120,7 +118,6 @@ def reset_globals() -> Iterator[None]:
     g.agent_working_dirs.update(snapshot["agent_working_dirs"])
     g.audit_log.clear()
     g.audit_log.extend(snapshot["audit_log"])
-    g.openai_client_instance = snapshot["openai_client_instance"]
     g.global_vss_load_tested = snapshot["global_vss_load_tested"]
     g.global_vss_load_successful = snapshot["global_vss_load_successful"]
     _engine.reset_engine_cache()

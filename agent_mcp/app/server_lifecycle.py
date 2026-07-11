@@ -15,7 +15,6 @@ from ..utils.project_utils import init_agent_directory
 from ..db.schema import init_database as initialize_database_schema
 from ..db.connection import get_db_connection, check_vss_loadability
 from ..db.migrations_runner import run_migrations_upgrade
-from ..external.openai_service import initialize_openai_client
 from ..features.rag.indexing import run_rag_indexing_periodically
 
 from ..features.claude_session_monitor import run_claude_session_monitoring
@@ -229,15 +228,15 @@ async def application_startup(
             conn_load_state.close()
     logger.info("State loading from database complete.")
 
-    # 6. Initialize OpenAI Client (Original main.py: part of get_openai_client, called by RAG indexer)
-    # We explicitly initialize it at startup now.
-    if (
-        not initialize_openai_client()
-    ):  # external.openai_service.initialize_openai_client
-        logger.warning(
-            "OpenAI client failed to initialize. OpenAI-dependent features (like RAG) will be unavailable."
-        )
-        # Server can continue, but RAG won't work.
+    # Step 6 used to eagerly construct a global `openai.OpenAI` client
+    # here (`external.openai_service.initialize_openai_client`) with a
+    # blocking `client.models.list()` network round-trip, and warn if it
+    # failed with "RAG will be unavailable" — false even at the time,
+    # since RAG's actual embed/chat calls never read that global (arch-r4
+    # #2). Removed: `agent_mcp.external.embedding_service.embedding_client()`
+    # / `completion_service.completion_client()` are the seams RAG
+    # actually uses, and they resolve OpenAI-vs-Ollama fresh on every
+    # call — there's nothing left to warm up at boot.
 
     # 6.6. Install Repository singletons (PR #146).
     # The class-based ``TaskRepository`` is the single owner of the

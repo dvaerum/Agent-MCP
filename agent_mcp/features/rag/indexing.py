@@ -21,7 +21,6 @@ except ImportError:
 from ...core.config import (
     logger,
     get_project_dir,
-    OPENAI_API_KEY_ENV,  # Also import the API key env variable
     embedding_settings,  # Resolve (model, dimension, advanced) at call time,
     # not at THIS module's import time — see EmbeddingSettings docstring.
 )
@@ -126,12 +125,10 @@ MAX_CONCURRENT_EMBEDDING_REQUESTS = 25
 PARALLEL_EMBEDDING_BATCH_SIZE = 50
 
 
-async def _get_embeddings_batch_openai(
+async def _get_embeddings_batch(
     batch_chunks: List[str],
     batch_index_start: int,
     results_list: List[Optional[List[float]]],
-    openai_api_key: str,  # Retained for signature compat; the seam now
-    # resolves the api_key/base_url from env itself.
 ) -> bool:
     """
     Processes a single batch of embeddings asynchronously through the
@@ -257,16 +254,21 @@ async def run_rag_indexing_periodically(
     # ordering; the explicit `await` removes the timing assumption.
     await g.startup_complete_event.wait()
 
-    # Get OpenAI client. The service initializes it and stores in g.openai_client_instance
-    # The API key itself is also needed for the truly async batch embedding function.
-    # This should come from config.OPENAI_API_KEY_ENV
-    from ...core.config import OPENAI_API_KEY_ENV as openai_api_key_for_batches
+    # No OPENAI_API_KEY liveness gate here (arch-r4 #2): the indexer
+    # used to hard-abort the whole background loop when
+    # OPENAI_API_KEY was empty, on the theory that RAG needs an
+    # OpenAI key. That's wrong for the documented Ollama-default
+    # deployment (see completion_service.py's module docstring) —
+    # `embedding_client()` (below) resolves OpenAI-vs-Ollama from env
+    # vars and works fine with no OpenAI key at all. The old guard
+    # meant an Ollama-only deploy could QUERY the vec index (query.py
+    # has no such guard) but the WRITER bailed on cycle one, leaving
+    # the index permanently empty. "Can I embed?" now has exactly one
+    # answer — resolved by embedding_client() — for both read and
+    # write, matching how features/rag/query.py already resolves it.
 
-    if not openai_api_key_for_batches:
-        logger.error("OpenAI API Key not configured. RAG indexer cannot run.")
-        return
-
-    # Check if the OpenAI library itself was loaded
+    # Check if the openai package itself was importable (a hard dep of
+    # embedding_client() regardless of provider).
     if openai is None:
         logger.error("OpenAI Python library not loaded. RAG indexer cannot run.")
         return
@@ -837,11 +839,10 @@ async def run_rag_indexing_periodically(
                                         continue
 
                                     tg_embed.start_soon(
-                                        _get_embeddings_batch_openai,
+                                        _get_embeddings_batch,
                                         current_batch_chunks,
                                         batch_actual_start_index,
                                         all_embeddings_vectors,
-                                        openai_api_key_for_batches,  # Pass the API key
                                     )
                         except (
                             Exception

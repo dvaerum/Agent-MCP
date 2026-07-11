@@ -86,7 +86,7 @@ def _install_indexer_harness(
 
     state = {"cycle": 0, "embedded": [], "max_cycles": max_cycles}
 
-    async def fake_embed(batch_chunks, batch_index_start, results_list, key):
+    async def fake_embed(batch_chunks, batch_index_start, results_list):
         cyc = state["cycle"]
         while len(state["embedded"]) <= cyc:
             state["embedded"].append([])
@@ -117,13 +117,12 @@ def _install_indexer_harness(
     def fake_bulk(*, source_type, source_ref, chunks, connection=None):
         return len(chunks)
 
-    # OPENAI key must be truthy or the loop returns before its first cycle.
-    monkeypatch.setattr(
-        "agent_mcp.core.config.OPENAI_API_KEY_ENV", "test-key"
-    )
+    # arch-r4 #2: the indexer no longer gates on OPENAI_API_KEY being
+    # truthy — it always resolves a provider via embedding_client(),
+    # so no OPENAI_API_KEY_ENV monkeypatch is needed here anymore.
     monkeypatch.setattr(indexing_mod, "is_vss_loadable", lambda: True)
     monkeypatch.setattr(
-        indexing_mod, "_get_embeddings_batch_openai", fake_embed
+        indexing_mod, "_get_embeddings_batch", fake_embed
     )
     # Keep set_meta / get_all_meta REAL (they carry the watermark we
     # assert on); stub only the vec0-touching ingest calls so the test

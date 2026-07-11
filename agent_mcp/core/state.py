@@ -114,13 +114,6 @@ server_running: bool = True
 server_start_time: Optional[str] = None
 
 
-# --- External Service Clients (placeholders) ----------------------------
-# The actual OpenAI client instance is initialized and managed by
-# external/openai_service.py. This global serves as a reference if truly
-# global access is needed.
-openai_client_instance: Optional[Any] = None
-
-
 # --- Database/VSS State -------------------------------------------------
 # Flag to check if sqlite-vec extension loadability has been tested.
 global_vss_load_tested: bool = False

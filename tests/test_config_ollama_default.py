@@ -52,8 +52,8 @@ def test_openai_api_key_env_module_attr_is_ollama_when_unset(
     _clean_ollama_env,
 ) -> None:
     cfg = _reload_config()
-    # The module-level OPENAI_API_KEY_ENV that openai_service.py reads
-    # must reflect the seeded default, not stay None.
+    # The module-level OPENAI_API_KEY_ENV must reflect the seeded
+    # default, not stay None.
     assert getattr(cfg, "OPENAI_API_KEY_ENV") == "ollama"
 
 

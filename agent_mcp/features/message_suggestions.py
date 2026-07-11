@@ -20,16 +20,16 @@ Two environment variables:
 Both are read on every call so operators can toggle them via systemd
 unit reloads without restarting agent-mcp.
 
-Why not the global `g.openai_client_instance`?
-----------------------------------------------
-The global sync client is bound to OpenAI cloud (api.openai.com)
-with the operator's OPENAI_API_KEY. Pointing it at a local Ollama
-would break RAG embeddings (which legitimately want the cloud
-client). A per-call `openai.AsyncOpenAI(base_url=..., api_key="ollama")`
+Why a dedicated per-call client (not a shared global)?
+-------------------------------------------------------
+This module always wants a local Ollama endpoint regardless of
+whatever provider RAG embeddings/completions are using for this
+deploy. A per-call `openai.AsyncOpenAI(base_url=..., api_key="ollama")`
 keeps the two pools fully separate, costs ~free (HTTP/2 keepalive
 amortises the connect cost), and matches the convention the rag
 indexer already uses (one `AsyncOpenAI` per batch — see
-`features/rag/indexing.py`).
+`features/rag/indexing.py`). (arch-r4 #2 removed the old shared
+`g.openai_client_instance` global entirely — nothing read it.)
 
 Failure mode
 ------------

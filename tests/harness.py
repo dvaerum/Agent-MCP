@@ -223,7 +223,6 @@ def _snapshot_and_reset_globals(stack: ExitStack) -> None:
         "file_map": dict(g.file_map),
         "agent_working_dirs": dict(g.agent_working_dirs),
         "audit_log": list(g.audit_log),
-        "openai_client_instance": g.openai_client_instance,
         "global_vss_load_tested": g.global_vss_load_tested,
         "global_vss_load_successful": g.global_vss_load_successful,
     }
@@ -241,7 +240,6 @@ def _snapshot_and_reset_globals(stack: ExitStack) -> None:
         g.agent_working_dirs.update(snapshot["agent_working_dirs"])
         g.audit_log.clear()
         g.audit_log.extend(snapshot["audit_log"])
-        g.openai_client_instance = snapshot["openai_client_instance"]
         g.global_vss_load_tested = snapshot["global_vss_load_tested"]
         g.global_vss_load_successful = snapshot["global_vss_load_successful"]
         _engine.reset_engine_cache()
