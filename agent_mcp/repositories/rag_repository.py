@@ -22,8 +22,9 @@ Why one repository covers both ingest and search (Option 1):
   rowid IN (SELECT chunk_id FROM rag_chunks ...) ; DELETE FROM
   rag_chunks ...`` would have to cross two repositories.
 * The codebase already has three repos (Task/Agent/Message);
-  consistency wins. The empty ``db/actions/rag_db.py`` stops being a
-  placeholder.
+  consistency wins. The empty ``db/actions/rag_db.py`` stopped being a
+  placeholder here (became a re-export shim) and was later deleted
+  outright by arch-deepening R3 #2b once nothing needed the extra hop.
 * The vector-search dialect (``vec0`` MATCH syntax, ``k = ?`` knn
   bind, ``ORDER BY distance``) lives in **one place**. Callers
   describe what they want (``search_similar(query_embedding, *,
@@ -75,23 +76,25 @@ def _publish(event: str, payload: Dict[str, Any]) -> None:  # pragma: no cover
     publish would just spam subscribers with chunks they don't
     consume. It exists for parity with :func:`MessageRepository._publish`
     and to mark the seam where a future "index updated" event would
-    plug in. The lazy import shape mirrors PR #153/#154/#155 because
-    eagerly importing ``core.repositories`` here would trigger the
-    legacy module-of-functions package import chain (Task/Agent/
-    Message), which itself imports from ``db.actions.*`` — and after
-    this PR, ``db.actions.rag_db`` re-exports from THIS module.
-    Circular at first load if not deferred.
+    plug in. The lazy import shape mirrors PR #153/#154/#155; the
+    original cycle it dodged (eagerly importing the legacy
+    module-of-functions ``core.repositories`` package, which imported
+    ``db.actions.*``, which re-exported from this module) was closed
+    when arch-deepening R3 #2a deleted those shadow modules. Kept lazy
+    here anyway for parity with the other repos' ``_publish`` and to
+    avoid re-litigating import order on every relocation.
     """
-    from ..core.repositories import _event_bus_shim
+    from ..core import event_bus_shim
 
-    _event_bus_shim.publish("rag", event, payload)
+    event_bus_shim.publish("rag", event, payload)
 
 
 # ---------------------------------------------------------------------------
 # Module-level helpers — formerly lived as raw INSERT/UPDATE blocks
 # inside ``features/rag/indexing.py`` and SELECT blocks inside
-# ``features/rag/query.py``. The shim at ``db/actions/rag_db.py``
-# re-exports these so any legacy caller keeps working unchanged.
+# ``features/rag/query.py``. ``db/actions/rag_db.py`` used to
+# re-export these for legacy callers; arch-deepening R3 #2b deleted
+# that shim (``features/rag/indexing.py`` now imports directly).
 #
 # Behaviour is byte-for-byte identical to the pre-PR cursor work:
 # same column order, same MATCH+k+ORDER BY clause, same handling of

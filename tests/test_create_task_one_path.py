@@ -73,7 +73,7 @@ async def test_rest_and_mcp_create_task_are_one_path(
     async with mcp_session(tmp_path) as admin:
         # Spy on the EventBus publish funnel both paths' uow.emit flows
         # through, so we can prove each fired ``task.created``.
-        import agent_mcp.core.repositories._event_bus_shim as _shim
+        import agent_mcp.core.event_bus_shim as _shim
 
         published: list[tuple] = []
         _orig_publish = _shim.publish

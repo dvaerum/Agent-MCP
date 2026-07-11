@@ -81,7 +81,7 @@ def _insert_task(
 def _warm_cache(task_id: str) -> None:
     """Mirror the boot-time load: put the DB-authoritative row into
     ``state.tasks`` so ``view_tasks`` (which reads the cache) sees it."""
-    from agent_mcp.db.actions.task_db import get_task_by_id
+    from agent_mcp.repositories.task_repository import get_task_by_id
     from agent_mcp.repositories import task_repo
 
     row = get_task_by_id(task_id)

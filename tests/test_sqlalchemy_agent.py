@@ -3,7 +3,7 @@
 Second model in the incremental SQLAlchemy adoption that started
 with `ProjectContext`. The model must mirror what
 `init_database()` creates for fresh DBs; this test catches drift
-and pins the read-side cutover of `agent_mcp.db.actions.agent_db`.
+and pins the read-side cutover of `agent_mcp.repositories.agent_repository`.
 
 Mirrors the shape of `tests/test_sqlalchemy_project_context.py`.
 """
@@ -148,7 +148,7 @@ async def test_agent_db_get_agent_by_id_uses_orm(tmp_path) -> None:
     `agent['status']`, `agent['agent_id']`). The ORM cutover must
     preserve that.
     """
-    from agent_mcp.db.actions.agent_db import get_agent_by_id
+    from agent_mcp.repositories.agent_repository import get_agent_by_id
 
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
@@ -163,7 +163,7 @@ async def test_agent_db_get_agent_by_id_uses_orm(tmp_path) -> None:
 
 
 async def test_agent_db_get_agent_by_token_uses_orm(tmp_path) -> None:
-    from agent_mcp.db.actions.agent_db import get_agent_by_token
+    from agent_mcp.repositories.agent_repository import get_agent_by_token
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -175,7 +175,7 @@ async def test_agent_db_get_agent_by_token_uses_orm(tmp_path) -> None:
 
 
 async def test_agent_db_get_agent_by_id_missing_returns_none(tmp_path) -> None:
-    from agent_mcp.db.actions.agent_db import get_agent_by_id
+    from agent_mcp.repositories.agent_repository import get_agent_by_id
 
     async with mcp_session(tmp_path):
         assert get_agent_by_id("no-such-agent") is None
@@ -184,7 +184,7 @@ async def test_agent_db_get_agent_by_id_missing_returns_none(tmp_path) -> None:
 async def test_agent_db_get_all_active_agents_uses_orm(tmp_path) -> None:
     """`get_all_active_agents_from_db` excludes terminated rows and
     returns dicts compatible with `g.active_agents` consumers."""
-    from agent_mcp.db.actions.agent_db import get_all_active_agents_from_db
+    from agent_mcp.repositories.agent_repository import get_all_active_agents_from_db
 
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
@@ -202,7 +202,7 @@ async def test_agent_db_get_all_active_agents_uses_orm(tmp_path) -> None:
 async def test_agent_db_update_agent_field_uses_orm(tmp_path) -> None:
     """`update_agent_db_field` mutates the row via the ORM and bumps
     updated_at."""
-    from agent_mcp.db.actions.agent_db import (
+    from agent_mcp.repositories.agent_repository import (
         get_agent_by_id,
         update_agent_db_field,
     )
@@ -227,7 +227,7 @@ async def test_agent_db_update_agent_field_capabilities_serialises(
     tmp_path,
 ) -> None:
     """Updating `capabilities` must JSON-serialise the list."""
-    from agent_mcp.db.actions.agent_db import (
+    from agent_mcp.repositories.agent_repository import (
         get_agent_by_id,
         update_agent_db_field,
     )
@@ -247,7 +247,7 @@ async def test_agent_db_update_agent_field_rejects_unknown_field(
     tmp_path,
 ) -> None:
     """Unsupported field names must be rejected (anti-injection guard)."""
-    from agent_mcp.db.actions.agent_db import update_agent_db_field
+    from agent_mcp.repositories.agent_repository import update_agent_db_field
 
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")

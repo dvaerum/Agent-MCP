@@ -33,7 +33,7 @@ from __future__ import annotations
 import pytest
 
 import agent_mcp.core.globals as _g_mod
-from agent_mcp.core.repositories import _event_bus_shim as _shim
+from agent_mcp.core import event_bus_shim as _shim
 from tests.harness import mcp_session
 
 

@@ -39,7 +39,7 @@ def _capture_publishes(monkeypatch) -> list:
         published.append((agent_id, event_type, payload))
 
     monkeypatch.setattr(
-        "agent_mcp.core.repositories._event_bus_shim.publish", _capture
+        "agent_mcp.core.event_bus_shim.publish", _capture
     )
     return published
 

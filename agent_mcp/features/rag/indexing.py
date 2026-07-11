@@ -303,10 +303,11 @@ async def run_rag_indexing_periodically(
 
             # Check for rag_embeddings table specifically. PR F
             # exposes the existence-check via
-            # ``agent_mcp.db.actions.rag_db._embeddings_table_exists``
-            # — re-exported from the repository so the gate check
-            # uses the same source-of-truth predicate.
-            from ...db.actions.rag_db import _embeddings_table_exists
+            # ``agent_mcp.repositories.rag_repository._embeddings_table_exists``
+            # (arch-deepening R3 #2b deleted the ``db.actions.rag_db``
+            # re-export shim; import the repository directly) so the
+            # gate check uses the same source-of-truth predicate.
+            from ...repositories.rag_repository import _embeddings_table_exists
             if not _embeddings_table_exists(cursor):
                 logger.warning(
                     "Vector table 'rag_embeddings' not found. Skipping RAG indexing cycle. Ensure DB schema is initialized."

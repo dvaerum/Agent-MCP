@@ -189,7 +189,7 @@ async def simple_status_api_route(
 
     try:
         # Get system status
-        from ...db.actions.agent_db import get_all_active_agents_from_db
+        from ...repositories.agent_repository import get_all_active_agents_from_db
         from ...repositories import task_repo
 
         agents = get_all_active_agents_from_db()
@@ -1080,8 +1080,8 @@ async def update_task_details_api_route(
                 fresh_row = cursor.fetchone()
                 if fresh_row:
                     current_assignee = fresh_row["assigned_to"]
-            from ...core.repositories import _event_bus_shim
-            _event_bus_shim.publish(
+            from ...core import event_bus_shim
+            event_bus_shim.publish(
                 current_assignee or "*",
                 "task.updated",
                 {

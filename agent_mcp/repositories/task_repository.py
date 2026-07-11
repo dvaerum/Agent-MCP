@@ -17,9 +17,11 @@ After the flip:
 * All read/write SQL bodies live here (module-level functions for the
   legacy free-function API, instance methods for the cache-aware
   surface).
-* ``agent_mcp.db.actions.task_db`` is a ~30-line re-export shim that
-  keeps legacy importers (``cli.py``, the older module-of-functions
-  repo, tests pinning the read-side cutover) working unchanged.
+* ``agent_mcp.db.actions.task_db`` was a ~30-line re-export shim that
+  kept legacy importers (the older module-of-functions repo, tests
+  pinning the read-side cutover) working unchanged. arch-deepening R3
+  #2b deleted the shim and repointed every importer at this module
+  directly.
 * ``TaskRepository`` is the single owner — handler → repo → SQL.
 
 Public surface (class methods):
@@ -35,8 +37,8 @@ Public surface (class methods):
   separate ``update_fields`` calls in a loop produce 20 events; the
   bulk variant produces one batched event.
 
-Module-level free functions (preserved for legacy importers via the
-``db.actions.task_db`` shim):
+Module-level free functions (preserved for legacy importers that used
+to go through the now-deleted ``db.actions.task_db`` shim):
 
 * ``get_task_by_id`` / ``get_all_tasks_from_db`` / ``get_tasks_by_agent_id``
 * ``update_task_fields_in_db``
@@ -65,32 +67,30 @@ from sqlalchemy.exc import SQLAlchemyError
 from ..core import state
 from ..core.config import logger
 # NOTE: we import the bus shim lazily inside the publish call sites
-# below. A top-level ``from ..core.repositories import _event_bus_shim``
-# would execute ``core.repositories.__init__``, which eagerly imports
-# the legacy module-of-functions ``core.repositories.task_repo``, which
-# in turn imports ``db.actions.task_db`` — now a shim that re-exports
-# from THIS module. That produces a circular import at first load.
-# The lazy import inside ``_publish`` breaks the cycle without
-# changing publish semantics (the shim is itself lazy-imports event_bus
-# on every call, so call-site latency is unaffected).
+# below. Historically a top-level
+# ``from ..core.repositories import _event_bus_shim`` would execute
+# ``core.repositories.__init__``, which eagerly imported the legacy
+# module-of-functions ``core.repositories.task_repo``, which in turn
+# imported ``db.actions.task_db`` — a shim that re-exported from THIS
+# module — producing a circular import at first load. arch-deepening
+# R3 #2a deleted ``task_repo`` and #2b deleted ``db.actions.task_db``
+# outright (closing that cycle for good) and relocated the bus shim to
+# ``core.event_bus_shim``. Kept lazy anyway: a function-local import
+# costs nothing at this call frequency.
 from ..db.engine import get_session
 from ..db.models import Task
 
 
 def _publish(addressee: str, event: str, payload: Dict[str, Any]) -> None:
-    """Lazy-import shim around ``_event_bus_shim.publish``.
+    """Lazy-import shim around ``event_bus_shim.publish``.
 
-    Importing the submodule path directly under ``core.repositories``
-    via ``from ... import _event_bus_shim`` would still trigger
-    ``core.repositories.__init__`` (which eagerly imports the legacy
-    ``task_repo`` module-of-functions, which imports the shim at
-    ``db.actions.task_db``, which now re-exports from THIS module —
-    circular). Doing the import at call time keeps the publish
-    side-effect identical while avoiding the cycle.
+    See the module-level NOTE above the imports for why this stays a
+    function-local import (a stale cycle this used to dodge, closed by
+    arch-deepening R3 #2a/#2b).
     """
-    from ..core.repositories import _event_bus_shim
+    from ..core import event_bus_shim
 
-    _event_bus_shim.publish(addressee, event, payload)
+    event_bus_shim.publish(addressee, event, payload)
 
 
 # ---------------------------------------------------------------------------
@@ -125,9 +125,10 @@ _JSON_LIST_FIELDS: set[str] = {
 
 # ---------------------------------------------------------------------------
 # Module-level free functions — formerly lived in db/actions/task_db.py.
-# These remain ORM-backed and behaviourally unchanged. They are exported
-# unchanged via the ``db.actions.task_db`` shim so legacy callers
-# (``cli.py``, ``core.repositories.task_repo``, tests) keep working.
+# These remain ORM-backed and behaviourally unchanged. Legacy callers
+# (``cli.py``, tests) used to reach them via the ``db.actions.task_db``
+# re-export shim; arch-deepening R3 #2b deleted that shim and
+# repointed every importer at this module directly.
 # ---------------------------------------------------------------------------
 
 
@@ -1000,7 +1001,8 @@ class TaskRepository:
 __all__ = [
     "TaskRepository",
     # Module-level free functions kept for legacy compatibility.
-    # The shim at ``agent_mcp.db.actions.task_db`` re-exports these.
+    # ``agent_mcp.db.actions.task_db`` used to re-export these; #2b
+    # deleted that shim (importers now use this module directly).
     "get_task_by_id",
     "get_all_tasks_from_db",
     "get_tasks_by_agent_id",

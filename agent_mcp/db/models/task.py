@@ -7,11 +7,13 @@ Third model in the incremental SQLAlchemy adoption (after
 keeping the column set + types identical means the ORM can read/write
 rows on a DB that was bootstrapped by raw SQL.
 
-This PR ships the model + parity test + a cutover of
-`agent_mcp.db.actions.task_db` (the reader surface used by
-lifespan startup, dashboard API, and the all-tasks route). The
-tool-side writes (task_tools.py, routes.py purge cascade) keep raw
-SQL for now; follow-up PRs migrate them.
+This PR ships the model + parity test + a cutover of the reader
+surface used by lifespan startup, dashboard API, and the all-tasks
+route — originally `agent_mcp.db.actions.task_db`, a re-export shim
+arch-deepening R3 #2b deleted in favour of importing
+`agent_mcp.repositories.task_repository` directly. The tool-side
+writes (task_tools.py, routes.py purge cascade) keep raw SQL for now;
+follow-up PRs migrate them.
 
 Column rationale:
 
