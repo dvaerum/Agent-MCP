@@ -63,6 +63,7 @@ Public surface (re-exported via ``__all__``):
 from __future__ import annotations
 
 import logging
+import secrets
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -76,13 +77,16 @@ __all__ = [
     "ROLE_TIER",
     "add_group_member",
     "bootstrap_first_operator_as_sysadmin",
+    "ensure_group",
     "group_is_transitively_sysadmin",
     "group_resolved_project_roles",
+    "remove_group_member",
     "resolve_group_ancestors",
     "resolve_user_groups",
     "resolve_user_is_sysadmin",
     "resolve_user_project_role",
     "role_rank",
+    "user_group_memberships_by_name_prefix",
     "would_create_cycle",
 ]
 
@@ -471,7 +475,9 @@ def add_group_member(
 # ── Public: bootstrap_first_operator_as_sysadmin ───────────────────
 
 
-def bootstrap_first_operator_as_sysadmin() -> None:
+def bootstrap_first_operator_as_sysadmin(
+    conn: Optional[sqlite3.Connection] = None,
+) -> None:
     """Promote the earliest-by-created_at operator to sysadmin.
 
     No-op when:
@@ -491,13 +497,13 @@ def bootstrap_first_operator_as_sysadmin() -> None:
     workflows (CLI subcommand in a future PR, or hand-invocation
     from an operator who somehow ended up sysadmin-less).
     """
-    with _identity._connect() as conn:
-        existing = conn.execute(
+    with _conn_ctx(conn) as c:
+        existing = c.execute(
             "SELECT 1 FROM users WHERE is_sysadmin = 1 LIMIT 1"
         ).fetchone()
         if existing is not None:
             return
-        row = conn.execute(
+        row = c.execute(
             """
             SELECT user_id FROM users
             ORDER BY created_at ASC, user_id ASC
@@ -506,7 +512,7 @@ def bootstrap_first_operator_as_sysadmin() -> None:
         ).fetchone()
         if row is None:
             return
-        conn.execute(
+        c.execute(
             "UPDATE users SET is_sysadmin = 1 WHERE user_id = ?",
             (row["user_id"],),
         )
@@ -514,3 +520,72 @@ def bootstrap_first_operator_as_sysadmin() -> None:
             "Bootstrapped earliest operator (user_id=%s) as sysadmin.",
             row["user_id"],
         )
+
+
+# ── Public: SSO group reads/writes (via RouterStore) ───────────────
+
+
+def ensure_group(
+    name: str, conn: Optional[sqlite3.Connection] = None,
+) -> Optional[str]:
+    """Return the ``group_id`` for ``name``, JIT-creating if missing.
+
+    Connection-injectable home (arch-deepening R2 #1c) for sso.py's
+    former inline ``sqlite3.connect`` in ``_ensure_group``. A missing
+    ``groups`` table raises ``sqlite3.OperationalError`` (the sso caller
+    swallows it to silently skip provisioning on a backlevel deploy).
+    """
+    with _conn_ctx(conn) as c:
+        row = c.execute(
+            "SELECT group_id FROM groups WHERE name = ?", (name,),
+        ).fetchone()
+        if row is not None:
+            return row["group_id"]
+        group_id = secrets.token_hex(8)
+        c.execute(
+            "INSERT INTO groups (group_id, name, is_sysadmin, "
+            "created_at) VALUES (?, ?, 0, datetime('now'))",
+            (group_id, name),
+        )
+        return group_id
+
+
+def remove_group_member(
+    group_id: str, user_id: str, conn: Optional[sqlite3.Connection] = None,
+) -> bool:
+    """Delete a user→group edge; return True iff a row was removed.
+
+    Connection-injectable home (arch-deepening R2 #1c) for sso.py's
+    former inline ``sqlite3.connect`` in ``_remove_user_from_group``.
+    """
+    with _conn_ctx(conn) as c:
+        cur = c.execute(
+            "DELETE FROM group_membership WHERE group_id = ? "
+            "AND member_user_id = ?",
+            (group_id, user_id),
+        )
+        return cur.rowcount > 0
+
+
+def user_group_memberships_by_name_prefix(
+    user_id: str,
+    name_prefix: str,
+    conn: Optional[sqlite3.Connection] = None,
+) -> dict[str, str]:
+    """Return ``{group_name: group_id}`` for the user's DIRECT memberships
+    in groups whose ``name`` starts with ``name_prefix``.
+
+    Connection-injectable home (arch-deepening R2 #1c) for sso.py's
+    former inline ``sqlite3.connect`` in ``_user_oidc_group_memberships``
+    (the ``oidc:``-namespaced IdP-managed reconcile scope). ``name_prefix``
+    is treated literally: the ``LIKE`` pattern is ``name_prefix + '%'``
+    with backslash as the escape char, matching the inline query.
+    """
+    with _conn_ctx(conn) as c:
+        cur = c.execute(
+            "SELECT g.group_id, g.name FROM group_membership gm "
+            "JOIN groups g ON g.group_id = gm.group_id "
+            "WHERE gm.member_user_id = ? AND g.name LIKE ? ESCAPE '\\'",
+            (user_id, name_prefix + "%"),
+        )
+        return {row["name"]: row["group_id"] for row in cur.fetchall()}

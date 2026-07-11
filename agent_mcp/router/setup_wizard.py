@@ -25,7 +25,6 @@ cache is not warranted for Phase 1.
 from __future__ import annotations
 
 import logging
-import sqlite3
 from typing import Callable, Awaitable
 
 from aiohttp import web
@@ -50,14 +49,15 @@ def users_table_is_empty() -> bool:
     Returns True (treat as empty) if the table is missing — that's
     the pre-migration state, which presents the same operator-facing
     "you need to set up" UX as a freshly-migrated empty table.
+
+    Delegates to ``store.users_table_is_empty`` — the single empty-table
+    probe (arch-deepening R2 #1c). Kept as a module function so the
+    middleware, setup handlers, and tests that import it by name keep
+    working.
     """
-    try:
-        with identity._connect() as conn:
-            cur = conn.execute("SELECT 1 FROM users LIMIT 1")
-            return cur.fetchone() is None
-    except sqlite3.OperationalError:
-        # Table missing — schema not yet applied. Same UX path.
-        return True
+    from .router_store import store
+
+    return store.users_table_is_empty()
 
 
 # ── Middleware ─────────────────────────────────────────────────────

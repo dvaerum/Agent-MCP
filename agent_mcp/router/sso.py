@@ -489,17 +489,14 @@ def find_or_create_sso_user(
 
 
 def _find_user_by_subject(subject: str) -> dict[str, Any] | None:
-    """Return the users row whose ``sso_subject`` == ``subject``, or None."""
-    from . import identity
+    """Return the users row whose ``sso_subject`` == ``subject``, or None.
 
-    with sqlite3.connect(str(identity.get_router_db_path())) as conn:
-        conn.row_factory = sqlite3.Row
-        cur = conn.execute(
-            "SELECT * FROM users WHERE sso_subject = ? LIMIT 1",
-            (subject,),
-        )
-        row = cur.fetchone()
-    return dict(row) if row is not None else None
+    Routes through the RouterStore (arch-deepening R2 #1c) so the router's
+    user reads have one home instead of an inline ``sqlite3.connect``.
+    """
+    from .router_store import store
+
+    return store.find_user_by_sso_subject(subject)
 
 
 def _find_linkable_user_by_email(email: str) -> dict[str, Any] | None:
@@ -517,23 +514,13 @@ def _find_linkable_user_by_email(email: str) -> dict[str, Any] | None:
     are excluded — that's what stops an attacker's unverified-email row
     from being linked into by a later victim login. Password users are
     preferred when both shapes share an email.
-    """
-    from . import identity
 
-    with sqlite3.connect(str(identity.get_router_db_path())) as conn:
-        conn.row_factory = sqlite3.Row
-        cur = conn.execute(
-            """
-            SELECT * FROM users
-            WHERE LOWER(email) = LOWER(?)
-              AND (password_hash IS NOT NULL OR sso_subject IS NULL)
-            ORDER BY (password_hash IS NULL) ASC
-            LIMIT 1
-            """,
-            (email,),
-        )
-        row = cur.fetchone()
-    return dict(row) if row is not None else None
+    Routes through the RouterStore (arch-deepening R2 #1c); the link
+    predicate is unchanged from the inline query it replaces.
+    """
+    from .router_store import store
+
+    return store.find_linkable_user_by_email(email)
 
 
 def _stamp_subject_if_absent(user_id: str, subject: str) -> None:
@@ -542,17 +529,12 @@ def _stamp_subject_if_absent(user_id: str, subject: str) -> None:
     Idempotent + race-safe against the partial UNIQUE index: the
     ``sso_subject IS NULL`` guard means a second, different subject can
     never overwrite an already-bound row, and the index rejects binding
-    the same subject to two rows.
+    the same subject to two rows. Routes through the RouterStore
+    (arch-deepening R2 #1c).
     """
-    from . import identity
+    from .router_store import store
 
-    with sqlite3.connect(str(identity.get_router_db_path())) as conn:
-        conn.execute(
-            "UPDATE users SET sso_subject = ? "
-            "WHERE user_id = ? AND sso_subject IS NULL",
-            (subject, user_id),
-        )
-        conn.commit()
+    store.stamp_sso_subject_if_absent(user_id, subject)
 
 
 # ── Group mapping ──────────────────────────────────────────────────
@@ -688,36 +670,31 @@ def _user_oidc_group_memberships(user_id: str) -> dict[str, str]:
     in ``oidc:``-namespaced groups (the IdP-managed reconcile scope).
 
     Returns ``{}`` when the groups tables are absent (backlevel deploy),
-    matching the silent-skip posture of the other group helpers.
+    matching the silent-skip posture of the other group helpers. Routes
+    through the RouterStore (arch-deepening R2 #1c); the
+    ``OperationalError``-swallow stays here so the backlevel-deploy
+    tolerance is unchanged.
     """
-    from . import identity
+    from .router_store import store
 
     try:
-        with sqlite3.connect(str(identity.get_router_db_path())) as conn:
-            conn.row_factory = sqlite3.Row
-            cur = conn.execute(
-                "SELECT g.group_id, g.name FROM group_membership gm "
-                "JOIN groups g ON g.group_id = gm.group_id "
-                "WHERE gm.member_user_id = ? AND g.name LIKE ? ESCAPE '\\'",
-                (user_id, _WILDCARD_GROUP_PREFIX + "%"),
-            )
-            return {row["name"]: row["group_id"] for row in cur.fetchall()}
+        return store.user_group_memberships_by_name_prefix(
+            user_id, _WILDCARD_GROUP_PREFIX,
+        )
     except sqlite3.OperationalError:
         return {}
 
 
 def _remove_user_from_group(group_id: str, user_id: str) -> bool:
-    """Delete a user→group edge; return True iff a row was removed."""
-    from . import identity
+    """Delete a user→group edge; return True iff a row was removed.
+
+    Routes through the RouterStore (arch-deepening R2 #1c); the
+    ``OperationalError``-swallow (backlevel deploy) stays here.
+    """
+    from .router_store import store
 
     try:
-        with sqlite3.connect(str(identity.get_router_db_path())) as conn:
-            cur = conn.execute(
-                "DELETE FROM group_membership WHERE group_id = ? "
-                "AND member_user_id = ?", (group_id, user_id),
-            )
-            conn.commit()
-            return cur.rowcount > 0
+        return store.remove_group_member(group_id, user_id)
     except sqlite3.OperationalError:
         return False
 
@@ -728,27 +705,13 @@ def _ensure_group(name: str) -> str | None:
     Returns None if the schema doesn't have the groups table — the
     Phase-3 migrations haven't run, which means the operator is on a
     backlevel deploy and we should silently skip group provisioning
-    rather than 500 the callback.
+    rather than 500 the callback. Routes through the RouterStore
+    (arch-deepening R2 #1c); the ``OperationalError``-swallow stays here.
     """
-    from . import identity
+    from .router_store import store
 
     try:
-        with sqlite3.connect(str(identity.get_router_db_path())) as conn:
-            conn.row_factory = sqlite3.Row
-            cur = conn.execute(
-                "SELECT group_id FROM groups WHERE name = ?", (name,),
-            )
-            row = cur.fetchone()
-            if row is not None:
-                return row["group_id"]
-            group_id = secrets.token_hex(8)
-            conn.execute(
-                "INSERT INTO groups (group_id, name, is_sysadmin, "
-                "created_at) VALUES (?, ?, 0, datetime('now'))",
-                (group_id, name),
-            )
-            conn.commit()
-            return group_id
+        return store.ensure_group(name)
     except sqlite3.OperationalError:
         return None
 
@@ -788,13 +751,13 @@ def _add_user_to_group_idempotent(group_id: str, user_id: str) -> bool:
 def _users_table_is_empty() -> bool:
     """True iff no operator account exists yet (fresh-deploy state).
 
-    Delegates to the setup wizard's canonical check so the "is the
-    users table empty" predicate has a single home. Imported lazily to
-    avoid an import cycle (setup_wizard → login → sso).
+    Delegates to ``store.users_table_is_empty`` — the single empty-table
+    probe (arch-deepening R2 #1c). Imported lazily to keep sso's import
+    graph light.
     """
-    from .setup_wizard import users_table_is_empty
+    from .router_store import store
 
-    return users_table_is_empty()
+    return store.users_table_is_empty()
 
 
 def is_trusted_proxy_source(
