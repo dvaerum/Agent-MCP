@@ -230,10 +230,15 @@ async def test_create_memory_db_error_returns_generic_message(
     tmp_path, monkeypatch
 ):
     async with mcp_session(tmp_path) as admin:
-        import agent_mcp.app.routers.memories as memories_mod
+        # E3: create_memory is now a thin adapter over the
+        # ``create_project_context`` tool, so the DB session lives in
+        # ``project_context_tools`` (ORM) — patch it there. The tool
+        # returns ``Failed`` on a SQLAlchemyError; the adapter maps that
+        # to a STATIC generic 500 body (no SQL/params/table-name leak).
+        import agent_mcp.tools.project_context_tools as pctx_mod
 
         monkeypatch.setattr(
-            memories_mod, "SessionLocal", lambda: _BoomSession()
+            pctx_mod, "SessionLocal", lambda: _BoomSession()
         )
 
         r = admin.client.post(

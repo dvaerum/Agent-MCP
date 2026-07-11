@@ -28,13 +28,23 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
-from .._dispatch_helpers import handle_options
+from .._dispatch_helpers import _build_route_principal, handle_options
 from ..deps import caller_identity, require_operator_session
 from ...core.config import logger
+from ...core.tool_result import (
+    Conflict,
+    Failed,
+    Invalid,
+    NotFound,
+    Ok,
+    PermissionDenied,
+    tool_result_to_http,
+)
 from ...db.actions.agent_actions_db import log_agent_action_to_db
 from ...db.engine import SessionLocal
 from ...db.models import ProjectContext
 from ...tools.project_context_tools import emit_context_write_wakes
+from ...tools.registry import ToolInputValidationError, dispatch_tool_call
 from ...utils.json_utils import get_sanitized_json_body
 from ...utils.string_utils import (
     UNSAFE_KEY_ERROR,
@@ -64,111 +74,141 @@ def _require_str(value, field):
     return None
 
 
+def _memory_create_error_detail(result) -> str:
+    """Human-readable error string for the legacy ``{"error": ...}``
+    envelope this route returns, given a non-``Ok`` ``create_project_context``
+    result. STATUS comes from the shared :func:`tool_result_to_http`
+    adapter; only the body wording lives here.
+
+    ``Conflict`` / ``Failed`` are handled by the caller with the exact
+    legacy strings ("Memory with this key already exists" / "Failed to
+    create memory"); this covers the remaining variants (``Invalid`` from
+    a non-serializable value, ``PermissionDenied`` from a forwarding
+    viewer, the unlikely ``NotFound``).
+    """
+    if isinstance(result, Invalid):
+        return result.message
+    if isinstance(result, PermissionDenied):
+        return result.reason
+    if isinstance(result, NotFound):
+        return f"{result.resource} '{result.identifier}' not found"
+    return "Failed to create memory"
+
+
 @router.api_route("", methods=["POST", "OPTIONS"])
 async def create_memory_api_route(
     request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
-    """Create a new memory entry. PR D: auth via require_operator_session."""
+    """Create a new memory entry — thin adapter over ``create_project_context``.
+
+    E3 (arch-deepening): the create choreography (INSERT + uniqueness
+    guard, ``created_memory`` audit, the BL-R14-1 post-write wake set)
+    lives ONCE in
+    :func:`agent_mcp.tools.project_context_tools.create_project_context_tool_impl`.
+    project_context is a SQLAlchemy table, so that tool is ORM-based
+    (``SessionLocal``) like its ``update_``/``delete_`` siblings — NOT the
+    raw-sqlite unit-of-work. Before E3 this handler was the sole
+    implementation (hand-rolled INSERT + audit + wakes). It now keeps only
+    the HTTP-wire concerns — body sanitization, the SEC-round-9
+    type-confusion guards, and the unsafe-unicode key check — then
+    dispatches and maps the ``ToolResult`` to the legacy response shape.
+    Auth stays operator-only via ``require_operator_session``.
+    """
     if request.method == 'OPTIONS':
         return await handle_options(request)
 
     if request.method != 'POST':
         return JSONResponse({"error": "Method not allowed"}, status_code=405)
 
-    session = None
     try:
         data = await get_sanitized_json_body(request)
-        context_key = data.get('context_key')
-        context_value = data.get('context_value')
-        description = data.get('description')
-
-        if not context_key:
-            return JSONResponse({"error": "context_key is required"}, status_code=400)
-
-        # SEC round-9: a dict/list ``context_key`` binds into the WHERE /
-        # ORM column and 500s (and slips past the unsafe-unicode check
-        # below, which returns False for non-str). ``description`` is a
-        # TEXT column — reject structured JSON up front.
-        _err = _require_str(context_key, "context_key")
-        if _err is not None:
-            return _err
-        _err = _require_str(description, "description")
-        if _err is not None:
-            return _err
-
-        # F005 verify-all-v6 MUTATING #3: reject keys containing
-        # Unicode control / bidi-override / invisible characters.
-        # See ``agent_mcp/utils/string_utils.py`` for the rationale —
-        # short version: a key like ``config<U+202E>drowssap``
-        # renders in the dashboard as ``configpassword`` (the RTL
-        # override flips display order) but stores/searches as the
-        # original, which is a real spoofing vector for any operator
-        # reviewing memory keys.
-        if has_unsafe_unicode_for_identifier(context_key):
-            return JSONResponse(UNSAFE_KEY_ERROR, status_code=400)
-
-        requesting_admin_id = caller_identity(auth)
-
-        session = SessionLocal()
-
-        # Check if key already exists
-        existing = (
-            session.query(ProjectContext)
-            .filter(ProjectContext.context_key == context_key)
-            .one_or_none()
-        )
-        if existing is not None:
-            return JSONResponse({"error": "Memory with this key already exists"}, status_code=409)
-
-        current_time = datetime.datetime.now().isoformat()
-
-        session.add(
-            ProjectContext(
-                context_key=context_key,
-                value=json.dumps(context_value),
-                created_at=current_time,
-                created_by=requesting_admin_id,
-                updated_at=current_time,
-                updated_by=requesting_admin_id,
-                description=description,
-            )
-        )
-        session.flush()
-
-        # Log the action via the session's raw connection so it lands
-        # in the same transaction as the project_context insert.
-        raw_conn = session.connection().connection
-        cursor = raw_conn.cursor()
-        log_agent_action_to_db(cursor, requesting_admin_id, "created_memory", details={"context_key": context_key})
-        session.commit()
-
-        # BL-R14-1: fire the full post-write wake set this key requires.
-        # Global loop toggle → wake_all_for_flag_recheck (PR-2 event
-        # -coord); worker-capability toggle (config_allow_worker_*) →
-        # tools/list_changed so connected workers see the newly granted
-        # tool. The REST surface previously fired only the loop wake, so
-        # a capability grant from the dashboard never pushed
-        # tools/list_changed. Shared with the MCP write surface.
-        await emit_context_write_wakes(context_key)
-
-        return JSONResponse({
-            "success": True,
-            "message": f"Memory '{context_key}' created successfully"
-        })
-
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
-    except Exception as e:
-        if session is not None:
-            session.rollback()
-        logger.error(f"Error creating memory: {e}", exc_info=True)
-        # BL-R5-2: generic message — ``str(e)`` on a SQLAlchemyError
-        # embeds SQL text + bound params (schema disclosure).
+
+    context_key = data.get('context_key')
+    context_value = data.get('context_value')
+    description = data.get('description')
+
+    if not context_key:
+        return JSONResponse({"error": "context_key is required"}, status_code=400)
+
+    # SEC round-9: a dict/list ``context_key`` binds into the WHERE / ORM
+    # column and 500s (and slips past the unsafe-unicode check below,
+    # which returns False for non-str). ``description`` is a TEXT column —
+    # reject structured JSON up front. Wire-level input hygiene kept local
+    # (the MCP path validates the same via the tool's inputSchema).
+    _err = _require_str(context_key, "context_key")
+    if _err is not None:
+        return _err
+    _err = _require_str(description, "description")
+    if _err is not None:
+        return _err
+
+    # F005 verify-all-v6 MUTATING #3: reject keys containing Unicode
+    # control / bidi-override / invisible characters. See
+    # ``agent_mcp/utils/string_utils.py`` for the rationale — short
+    # version: a key like ``config<U+202E>drowssap`` renders in the
+    # dashboard as ``configpassword`` (the RTL override flips display
+    # order) but stores/searches as the original, a real spoofing vector.
+    if has_unsafe_unicode_for_identifier(context_key):
+        return JSONResponse(UNSAFE_KEY_ERROR, status_code=400)
+
+    # Operator-session Principal (a forwarding VIEWER gets a viewer-role
+    # Principal the tool's capability gate denies — AC-R5-1). Mirrors the
+    # task / agent thin adapters.
+    principal = _build_route_principal(
+        bearer_token=None,
+        operator_session=True,
+        operator_user_id=caller_identity(auth),
+    )
+
+    try:
+        result = await dispatch_tool_call(
+            "create_project_context",
+            {
+                "context_key": context_key,
+                "context_value": context_value,
+                "description": description,
+            },
+            principal=principal,
+        )
+    except ToolInputValidationError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:  # pragma: no cover - defensive
+        # SD-R7-1: a raw ``str(e)`` can leak internals; log server-side,
+        # return the STATIC generic 500 body this route has always used.
+        logger.error(f"Error dispatching create_project_context: {e}", exc_info=True)
         return JSONResponse({"error": "Failed to create memory"}, status_code=500)
-    finally:
-        if session is not None:
-            session.close()
+
+    if isinstance(result, Ok):
+        return JSONResponse(
+            {
+                "success": True,
+                "message": (
+                    result.message
+                    or f"Memory '{context_key}' created successfully"
+                ),
+            },
+            status_code=200,
+        )
+
+    # Error variants: STATUS from the shared C-wave adapter; body kept in
+    # the legacy ``{"error": ...}`` envelope the dashboard + tests pin.
+    status, _ = tool_result_to_http(result)
+    if isinstance(result, Conflict):
+        # Preserve the exact legacy 409 wording.
+        return JSONResponse(
+            {"error": "Memory with this key already exists"}, status_code=status
+        )
+    if isinstance(result, Failed):
+        # BL-R5-2 / SEC-R8-1: static generic message (no exception-detail
+        # leak). The tool impl already logged the real detail server-side
+        # before returning ``Failed``.
+        return JSONResponse({"error": "Failed to create memory"}, status_code=status)
+    return JSONResponse(
+        {"error": _memory_create_error_detail(result)}, status_code=status
+    )
 
 
 @router.api_route("/{context_key}", methods=["PUT", "OPTIONS"])
