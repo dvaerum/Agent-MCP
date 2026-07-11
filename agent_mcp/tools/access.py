@@ -26,39 +26,57 @@ PR-W1c (2026-06-05) refactor — derivation, not hand-maintenance
 ---------------------------------------------------------------
 
 Before this PR the classification was a hand-maintained dict here.
-Adding a new admin-only tool required: (1) the ``@requires("admin")``
-decorator on the impl, (2) a matching entry in ``TOOL_ACCESS``. The
-two had to stay in sync; the invariant test
-``test_every_registered_tool_has_access_classification`` caught
-*omissions* but not *contradictions* (a tool decorated admin but
-classified "any" in the table would leak into worker tools/list).
+The two-source-of-truth (decorator + kwarg) had to stay in sync;
+the invariant test caught *omissions* but not *contradictions* (a
+tool gated one way but classified another would leak into worker
+tools/list).
 
-PR-W1c flipped this to a double source of truth, both at the tool
-declaration site:
+arch-r3 #1+5 PR-A (2026-07-11) — couple visibility to the LIVE cap
+------------------------------------------------------------------
 
-1. ``@requires_role("admin")`` (or the equivalent ``@requires("admin")``
-   from :mod:`agent_mcp.core.authorize`) on the impl — enforces the
-   auth check at the call site and exposes
-   ``func._required_role = "admin"`` for introspection.
-2. ``visibility="admin"`` kwarg on ``register_tool()`` — surfaces
-   the same fact as registry metadata.
+PR-W1c derived visibility from the impl's ``_required_role``
+attribute. Wave 9 deleted the ``@requires_role`` decorator that set
+it; ``_required_role`` is now set NOWHERE, so the derivation silently
+fell through to the ``visibility=`` kwarg — a hand-synced label that
+could disagree with the real authorization gate. A capability-gated
+tool shipped without the kwarg leaked into every worker's / anonymous
+caller's ``tools/list`` even though its cap gate would reject them.
 
-This module now *derives* :data:`TOOL_ACCESS` from the live
-:data:`agent_mcp.tools.registry.tool_registry`. The derived value
-reads, per registered entry:
+The live authority is now :func:`agent_mcp.core.authorize.requires_capability`,
+which stamps ``impl._required_capability`` (a member of
+:data:`agent_mcp.core.capabilities.KNOWN_CAPABILITIES`). This module
+now derives visibility from that cap, mapping cap → tier via the
+capability bundles (:func:`_visibility_for_capability`):
 
-* the impl's ``_required_role`` attribute (set by ``@requires``
-  / ``@requires_role``);
-* the impl's ``_required_policy_keys`` + ``_required_policy_default``
-  attributes (set by ``@requires_policy``);
-* the registry entry's ``meta.declared_visibility`` (the kwarg).
+* a cap in the **worker** bundle → ``"worker"`` tier (visible to
+  worker + manager + admin; hidden from anonymous);
+* a cap only in the **manager** bundle → ``"manager"`` tier;
+* a cap in **neither** agent bundle (operator/sysadmin-only) →
+  ``"operator"`` tier.
 
-When the decorator and kwarg disagree, the decorator wins — the
-call-site enforcement is the real authority; the kwarg merely
-surfaces it for ``tools/list``. The invariant test passes because
-every registered tool has *some* derived classification (the
-fallback is ``"any"``, matching ``is_visible_to_role``'s historical
-default).
+The ``visibility=`` kwarg survives ONLY as an explicit override, and
+ONLY in the tighten direction — it may hide a tool from a role the cap
+would admit (a UX choice), never advertise a tool the cap gate rejects
+(that was the leak). Two legitimate override classes remain:
+
+1. **in-body cap checks** — tools gated by an in-body
+   ``_require_capability(principal, ...)`` (register_agent,
+   terminate_agent, view_status, …) set no ``_required_capability``
+   on the wrapper, so the derivation can't see their cap;
+   ``visibility="operator"`` is the only signal.
+2. **deliberate tighten** — a worker-callable cap the maintainer
+   still keeps out of a worker's tools/list (create_task,
+   bulk_task_operations carry ``tasks.create`` / ``tasks.update`` but
+   are admin-orchestration surfaces). The kwarg tightens ``"worker"``
+   → ``"operator"``; it is honored because it only restricts.
+
+Per-entry the derivation reads:
+
+* the impl's ``_required_capability`` (from ``@requires_capability``)
+  → cap tier, with a tightening kwarg override;
+* the impl's ``_required_policy_keys`` (from ``@requires_policy``)
+  → ``"worker-if-toggled:<keys>"``;
+* otherwise the registry entry's ``meta.declared_visibility`` (kwarg).
 """
 from __future__ import annotations
 
@@ -66,6 +84,45 @@ import json
 from typing import Dict, Iterator, Optional
 
 from ..core.config import logger
+
+
+# Restrictiveness rank of a visibility level, lowest = fewest roles
+# admitted. Used to enforce that a ``visibility=`` kwarg override on a
+# cap-gated tool may only TIGHTEN (hide from more roles), never loosen
+# (advertise a tool the cap gate rejects). ``worker-if-toggled:...`` is
+# ranked with ``worker`` for this comparison.
+_LEVEL_RANK: Dict[str, int] = {
+    "operator": 0,
+    "admin": 0,  # legacy synonym for operator
+    "manager": 1,
+    "worker": 2,
+    "any": 3,
+}
+
+
+def _visibility_for_capability(cap: str) -> str:
+    """Map a required capability to its ``tools/list`` visibility tier.
+
+    The bundles in :mod:`agent_mcp.core.capabilities` are the single
+    source of truth for which agent role carries which cap:
+
+    * cap in the ``worker`` bundle → visible to worker (and manager /
+      admin) → ``"worker"``;
+    * cap only in the ``manager`` bundle → ``"manager"``;
+    * cap in neither agent bundle (operator / sysadmin-only) →
+      ``"operator"``.
+
+    A cap-gated tool is never visible to anonymous callers — they hold
+    no capabilities, so the cap gate rejects every one of them.
+    """
+    # Lazy import: keep module import cheap and avoid any import cycle.
+    from ..core.capabilities import AGENT_ROLE_BUNDLES
+
+    if cap in AGENT_ROLE_BUNDLES.get("worker", frozenset()):
+        return "worker"
+    if cap in AGENT_ROLE_BUNDLES.get("manager", frozenset()):
+        return "manager"
+    return "operator"
 
 
 # Default truthiness for each toggle when the project_context row is
@@ -88,69 +145,74 @@ def _derive_access_level(entry) -> str:
 
     Reads — in priority order:
 
-    1. The impl's ``_required_role`` attribute (from ``@requires`` /
-       ``@requires_role``). ``"admin"`` wins; ``"any"`` is a
-       valid-token gate that still maps to ``"any"`` for tools/list
-       (every active agent — worker or admin — can call it).
+    1. The impl's ``_required_capability`` (from
+       ``@requires_capability``) — the LIVE authorization gate. Maps
+       to a visibility tier via :func:`_visibility_for_capability`. A
+       ``visibility=`` kwarg may only TIGHTEN the derived tier (hide
+       from a role the cap admits); it may never loosen it (advertise
+       a tool the cap gate rejects — the original tools/list leak).
     2. The impl's ``_required_policy_keys`` (from ``@requires_policy``)
        → renders to ``"worker-if-toggled:<comma-joined-keys>"``.
     3. The registry entry's ``meta.declared_visibility`` (the
-       ``visibility=`` kwarg). Used when no decorator was found, or
-       when the decorator says ``"any"`` but the kwarg restricts
-       further (rare; the kwarg can specify ``"admin"`` even without
-       a matching decorator, in which case tools/list hides it but
-       call-time enforcement would slip through — Test C in
-       ``test_tool_access_kwarg_and_decorator.py``).
+       ``visibility=`` kwarg). The only signal for tools gated by an
+       in-body ``_require_capability`` call (which sets no
+       ``_required_capability`` on the wrapper) — e.g. register_agent,
+       terminate_agent, view_status. Recognised values: ``"operator"``,
+       ``"manager"``, ``"worker"``, ``"any"``, or
+       ``"worker-if-toggled:<keys>"``.
     4. Fallback: ``"any"`` (matches the pre-PR-W1c implicit default).
-
-    Decorator wins on disagreement (admin in decorator + ``"any"``
-    in kwarg → ``"admin"``). This pins the most-secure
-    interpretation: if the call site rejects workers, the
-    visibility filter must hide the tool from workers too.
     """
     impl = entry.meta.implementation
     declared = getattr(entry.meta, "declared_visibility", "any") or "any"
 
-    role = getattr(impl, "_required_role", None)
+    cap = getattr(impl, "_required_capability", None)
     policy_keys = getattr(impl, "_required_policy_keys", None)
 
-    # Decorator says operator/admin → the call site rejects all
-    # agent tokens (worker AND manager) → hide from both. The
-    # legacy "admin" tag is preserved as a synonym in the derived
-    # map for one release so dashboard code that string-matches on
-    # "admin" keeps working until Wave 3.
-    if role in ("operator", "admin"):
-        return "operator" if role == "operator" else "admin"
+    # 1. Live capability gate (@requires_capability) — the authority.
+    #    Derive the tier from the cap; let a kwarg override only when it
+    #    is strictly MORE restrictive (a deliberate tighten, e.g.
+    #    create_task / bulk_task_operations carry a worker-tier cap but
+    #    are kept out of a worker's tools/list). A kwarg that would
+    #    LOOSEN the tier is ignored with a loud log — it would advertise
+    #    a tool the cap gate rejects.
+    if cap is not None:
+        cap_tier = _visibility_for_capability(cap)
+        override_rank = _LEVEL_RANK.get(declared)
+        if override_rank is not None and override_rank < _LEVEL_RANK[cap_tier]:
+            return "operator" if declared == "admin" else declared
+        if (
+            declared not in ("any", "worker", cap_tier)
+            and not declared.startswith("worker-if-toggled:")
+            and override_rank is None
+        ):
+            logger.warning(
+                "access.py: tool %r declares visibility=%r but its cap %r "
+                "implies tier %r; using the cap tier.",
+                entry.name,
+                declared,
+                cap,
+                cap_tier,
+            )
+        return cap_tier
 
-    # Decorator says manager → call site rejects workers but admits
-    # manager agents + operator session. Surface as the new
-    # "manager" tag so tools/list shows the tool to manager and
-    # operator callers (and hides it from workers).
-    if role == "manager":
-        return "manager"
-
-    # Decorator says worker-if-toggled → render the canonical string
-    # from the decorator's keys. A kwarg-declared
-    # "worker-if-toggled:..." string SHOULD match the decorator's
-    # keys; we prefer the decorator (canonical) without comparing —
-    # a mismatch would be developer error caught by review.
+    # 2. Toggle-gated worker tool (@requires_policy) → render the
+    #    canonical "worker-if-toggled:<keys>" string from the decorator.
     if policy_keys:
         joined = ",".join(policy_keys)
         return f"worker-if-toggled:{joined}"
 
-    # No decorator (or `@requires("any")`) → fall back to the kwarg.
-    # Recognised values: "operator", "manager", "admin" (legacy),
-    # "any", or "worker-if-toggled:<keys>". Unknown values default
-    # to "any" with a loud log.
+    # 3. No decorator gate → the kwarg is the only visibility signal.
+    #    Legitimate for tools whose cap check lives IN-BODY (the
+    #    derivation can't see an in-body cap) — the `visibility=`
+    #    override is authoritative for these.
     if declared in ("operator", "admin"):
-        # `visibility="operator"` (or legacy "admin") kwarg without
-        # the matching decorator → hide from worker / manager
-        # tools/list, but call-time enforcement would slip through.
-        # The `@requires_role` decorator is the right fix; this is
-        # the "kwarg-only" path from PR-W1c Test C.
-        return declared
+        # "admin" is a legacy synonym for "operator" (admin/operator
+        # session only). Both hide the tool from worker + manager.
+        return "operator" if declared == "admin" else declared
     if declared == "manager":
         return "manager"
+    if declared == "worker":
+        return "worker"
     if declared == "any":
         return "any"
     if declared.startswith("worker-if-toggled:"):
@@ -340,9 +402,15 @@ def is_visible_to_role(tool_name: str, role: str) -> bool:
     | operator   |  yes  |  no     |  no    |  no                    |
     | admin (legacy) | yes | no    |  no    |  no                    |
     | manager    |  yes  |  yes    |  no    |  no                    |
+    | worker     |  yes  |  yes    |  yes   |  no                    |
     | any        |  yes  |  yes    |  yes   |  yes                   |
     | worker-if-toggled:... | yes | yes  | toggle-dependent | no    |
     +------------+-------+---------+--------+-------------------------+
+
+    The ``"worker"`` level is the derived tier for a tool gated on a
+    capability the worker bundle carries (arch-r3 #1+5): every active
+    agent can call it, but anonymous callers (no caps) cannot, so it is
+    hidden from them — unlike ``"any"``.
 
     Unknown tool names default to visible — registry callers should
     not silently hide tools the policy file forgot to classify; the
@@ -375,6 +443,12 @@ def is_visible_to_role(tool_name: str, role: str) -> bool:
         # admin role handled above). Hidden from workers and
         # anonymous callers.
         return role == "manager"
+    if level == "worker":
+        # Worker-tier tools: gated on a cap the worker bundle carries,
+        # so every active agent can call them. Visible to worker and
+        # manager (admin handled above); hidden from anonymous callers
+        # (no caps → the gate rejects them).
+        return role in ("worker", "manager")
     if level == "any":
         return True
     if level.startswith("worker-if-toggled:"):
