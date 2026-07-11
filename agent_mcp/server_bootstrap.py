@@ -37,10 +37,9 @@ What stays elsewhere (deliberate):
 Reading order:
 
   1. ``ServerConfig`` — frozen dataclass; describes "what to boot".
-  2. ``apply_runtime_flags`` — translates the ``advanced`` / ``git`` /
+  2. ``apply_runtime_flags`` — translates the ``advanced`` /
      ``no_index`` / ``debug`` flags into the side effects the rest of
-     the codebase reads (``core.config`` knobs, ``MCP_DEBUG`` env var,
-     worktree feature toggle).
+     the codebase reads (``core.config`` knobs, ``MCP_DEBUG`` env var).
   3. ``bootstrap_server`` — builds the Starlette app (sse) or returns
      ``(None, teardown)`` (stdio).
   4. ``run_server`` — async runners (sse uvicorn + bg tasks, stdio
@@ -164,9 +163,6 @@ def apply_runtime_flags(config: ServerConfig) -> None:
     * ``--no-index`` flips ``core.config.DISABLE_AUTO_INDEXING``.
     * ``--debug`` exports ``MCP_DEBUG=true|false`` — Starlette reads
       this at app construction time inside ``create_app``.
-    * ``--git`` activates the worktree integration feature if the
-      module is importable. Same try/except shape as the legacy CLI
-      so deploys without the optional dep still boot.
 
     Idempotent: calling it twice with the same config is a no-op
     (the writes are deterministic).
@@ -213,36 +209,6 @@ def apply_runtime_flags(config: ServerConfig) -> None:
 
         enable_console_logging()
         logger.info("Debug mode enabled via CLI flag.")
-
-    # Optional worktree feature toggle. The legacy CLI wrapped this in
-    # an aggressive try/except so a missing optional dep doesn't break
-    # boot — preserve that shape.
-    if config.git:
-        try:
-            from .features.worktree_integration import enable_worktree_support
-
-            if enable_worktree_support():
-                logger.info(
-                    "Git worktree support enabled for parallel agent development."
-                )
-            else:
-                logger.warning(
-                    "Git worktree support could not be enabled — check "
-                    "requirements. Continuing without."
-                )
-        except ImportError:
-            logger.error(
-                "Git worktree features not available (missing dependencies). "
-                "Continuing without worktree support."
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.error(
-                "Failed to initialize Git worktree support: %s. Continuing "
-                "without.",
-                exc,
-            )
-    else:
-        logger.info("Git worktree support disabled (use --git to enable).")
 
 
 # --- forwarding-header HMAC key loader -------------------------------

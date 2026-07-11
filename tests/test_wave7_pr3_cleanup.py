@@ -75,30 +75,53 @@ def test_utils_worktree_utils_module_is_gone() -> None:
         importlib.import_module("agent_mcp.utils.worktree_utils")
 
 
-# ── Preserved: worktree primitives at the new home ────────────────────
+# ── Deleted: the worktree-isolation stack (arch-r4 #5) ────────────────
+#
+# The worktree primitives that survived the Wave 7 PR 3 spawn-machinery
+# deletion (``agent_mcp.runtime.worktree``) and their sole caller
+# (``agent_mcp.features.worktree_integration``) were themselves orphaned
+# by that same transition: the spawner→coordinator move means agent-mcp
+# no longer creates per-agent git worktrees, so nothing called into
+# either module any more. Both were deleted outright (pure subtraction,
+# not a relocation) — these guards pin their absence the same way the
+# rest of this file pins the Wave 7 PR 3 deletions.
 
 
-def test_worktree_primitives_survive_at_new_home() -> None:
-    """The worktree side of the old ``agent_runtime`` module survives
-    at :mod:`agent_mcp.runtime.worktree`. ``cleanup_git_worktree`` is
-    the cardinal symbol (the brief calls it out explicitly)."""
-    from agent_mcp.runtime.worktree import (
-        cleanup_git_worktree,
-        create_git_worktree,
-        is_git_repository,
-    )
-
-    assert callable(cleanup_git_worktree)
-    assert callable(create_git_worktree)
-    assert callable(is_git_repository)
+def test_runtime_worktree_module_is_gone() -> None:
+    """The worktree primitives module is deleted; nothing under
+    ``agent_mcp.runtime`` calls into git worktrees any more."""
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("agent_mcp.runtime.worktree")
 
 
-def test_features_worktree_integration_still_works() -> None:
-    """The downstream caller of the worktree primitives still imports
-    cleanly. The migration target was :mod:`agent_mcp.runtime.worktree`."""
-    mod = importlib.import_module("agent_mcp.features.worktree_integration")
-    assert hasattr(mod, "WorktreeManager")
-    assert hasattr(mod, "cleanup_agent_worktree")
+def test_cleanup_git_worktree_is_not_importable() -> None:
+    """The cardinal worktree-teardown primitive is gone."""
+    with pytest.raises(ImportError):
+        from agent_mcp.runtime.worktree import cleanup_git_worktree  # noqa: F401
+
+
+def test_create_git_worktree_is_not_importable() -> None:
+    """The worktree-creation primitive is gone."""
+    with pytest.raises(ImportError):
+        from agent_mcp.runtime.worktree import create_git_worktree  # noqa: F401
+
+
+def test_features_worktree_integration_module_is_gone() -> None:
+    """The sole downstream caller of the worktree primitives —
+    ``agent_mcp.features.worktree_integration`` — is deleted along with
+    them; it had no other reason to exist."""
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("agent_mcp.features.worktree_integration")
+
+
+def test_enable_worktree_support_is_not_importable() -> None:
+    """The feature-toggle function ``server_bootstrap.py`` used to call
+    is gone, and so is the call site (``--git`` no longer wires
+    anything up)."""
+    with pytest.raises(ImportError):
+        from agent_mcp.features.worktree_integration import (  # noqa: F401
+            enable_worktree_support,
+        )
 
 
 # ── Deleted spawn-shaped admin tools ──────────────────────────────────
