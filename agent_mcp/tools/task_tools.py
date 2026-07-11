@@ -24,7 +24,7 @@ from ..core.tool_result import (
     ToolResult,
 )
 from ..utils.audit_utils import log_audit
-from ..db.connection import get_db_connection, execute_db_write
+from ..db.connection import get_db_connection
 from ..db.unit_of_work import unit_of_work
 from ..db.actions.agent_actions_db import log_agent_action_to_db
 from ..features.task_placement.validator import validate_task_placement
@@ -871,22 +871,25 @@ async def _create_unassigned_tasks(
         finally:
             _read_conn.close()
 
-    # Define the write operation as an async function
-    async def write_operation():
-        conn = None
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            created_tasks = []
-            created_at = datetime.datetime.now().isoformat()
+    # D-R3-4: the unit-of-work owns the transaction AND the post-commit
+    # cache reconciliation. task INSERTs go through task_repo.create on
+    # ``u.cursor`` so they stay atomic with the per-task
+    # ``created_unassigned_task`` DB audit rows (DB ``agent_actions`` sink
+    # only — this path writes no in-memory ``log_audit``, so per the D3
+    # finding we keep the rows on ``u.cursor`` rather than folding them via
+    # ``u.audit``). The ``upsert_cache`` + parent refresh register as
+    # post-commit hooks so a rollback fires NOTHING (emit-iff-commit).
+    # Supersedes the retired ``write_queue`` — WAL + ``busy_timeout=5000``
+    # already serialize writes.
+    from ..repositories import task_repo
 
-            # PR 6: task INSERTs now go through task_repo.create with
-            # the caller's cursor so they stay atomic with the
-            # agent_actions audit-log INSERT below. Cache reconciliation
-            # happens after conn.commit() via task_repo.upsert_cache.
-            from ..repositories import task_repo
-            cached_dicts: list[dict] = []
-            parents_to_refresh: set[str] = set()
+    created_tasks: list = []
+    cached_dicts: list[dict] = []
+    parents_to_refresh: set[str] = set()
+
+    try:
+        with unit_of_work() as u:
+            cursor = u.cursor
 
             if tasks:
                 # Multiple unassigned task creation
@@ -988,32 +991,18 @@ async def _create_unassigned_tasks(
                     "Error: Provide either 'task_title' and 'task_description' for single task, or 'tasks' array for multiple tasks."
                 )
 
-            conn.commit()
-
-            # Post-commit cache reconciliation through the repo. Mirrors
-            # the legacy inline `g.tasks[task_id] = task_data` writes
-            # but routes them through the repo so the cache invariant
-            # is owned in one place.
+            # Post-commit cache reconciliation through the repo, registered
+            # to fire only AFTER a clean commit. Mirrors the legacy inline
+            # `g.tasks[task_id] = task_data` writes but routes them through
+            # the repo so the cache invariant is owned in one place.
             for d in cached_dicts:
-                task_repo.upsert_cache(d)
+                u.on_commit(lambda d=d: task_repo.upsert_cache(d))
             # BL-2: reconcile parents whose child_tasks mirror changed.
             for parent_id in parents_to_refresh:
-                _refresh_parent_cache(parent_id)
+                u.on_commit(lambda pid=parent_id: _refresh_parent_cache(pid))
 
-            return created_tasks
-
-        except Exception as e:
-            if conn:
-                conn.rollback()
-            logger.error(f"Error creating unassigned tasks: {e}", exc_info=True)
-            raise e
-        finally:
-            if conn:
-                conn.close()
-
-    # Execute the write operation through the queue
-    try:
-        created_tasks = await execute_db_write(write_operation)
+        # The uow committed and flushed the cache hooks above; g.tasks is
+        # now populated, so the notify fanout below reads fresh rows.
 
         # PR-2 event-coord: fan out `unassigned_task_appeared` events
         # to every active agent whose capabilities satisfy the task's
@@ -3509,22 +3498,18 @@ async def request_assistance_tool_impl(
             }
         )
 
-        # PR A (round 2): the child INSERT + parent UPDATE + audit-log
-        # INSERT collapse into a single atomic_with_audit block. The
-        # writes were already atomic on the legacy path (one cursor,
-        # one commit); the seam now names the audit-row identity at
-        # the call site.
-        from ..db.atomic import atomic_with_audit
+        # D-R3-4: the child INSERT + parent UPDATE + the single
+        # ``request_assistance`` DB audit row commit in ONE transaction on
+        # ``u.cursor`` (supersedes the retired ``atomic_with_audit`` seam,
+        # whose "one write ⇒ exactly one DB audit row" is a strict subset
+        # of the uow). The audit row is written on ``u.cursor`` as a
+        # DB-ONLY sink — replicating atomic_with_audit exactly. The
+        # in-memory ``log_audit`` below carries DIFFERENT details, so per
+        # the D3 finding we do NOT fold the two sinks via ``u.audit`` (that
+        # would rewrite the in-memory sink's details to match the DB row).
         from ..repositories import task_repo
-        with atomic_with_audit(
-            operation="request_assistance",
-            actor=requesting_agent_id,
-            task_id=parent_task_id,
-            details={
-                "description": assistance_description,
-                "child_task_id": child_task_id,
-            },
-        ) as cursor:
+        with unit_of_work() as u:
+            cursor = u.cursor
             # Insert the child (assistance) task. PR 7 (Task flip): write
             # flows through task_repo.create with the caller's cursor.
             task_repo.create(
@@ -3554,6 +3539,22 @@ async def request_assistance_tool_impl(
                     "notes": parent_notes_list,
                 },
                 connection=cursor,
+            )
+
+            # DB-sink audit ('request_assistance') INSIDE the txn on
+            # u.cursor — replicates the retired atomic_with_audit row
+            # exactly (action_type + actor + task_id + details). The
+            # in-memory sink is the separate log_audit(...) below, which
+            # deliberately carries a different details shape (D3).
+            log_agent_action_to_db(
+                cursor,
+                requesting_agent_id,
+                "request_assistance",
+                task_id=parent_task_id,
+                details={
+                    "description": assistance_description,
+                    "child_task_id": child_task_id,
+                },
             )
 
         # Build the in-memory cache shape (matches the post-commit dict
@@ -3649,7 +3650,7 @@ async def request_assistance_tool_impl(
         )
 
     except sqlite3.Error as e_sql:
-        # atomic_with_audit already rolled back + closed before re-raising.
+        # The unit-of-work already rolled back + closed before re-raising.
         logger.error(
             f"Database error requesting assistance for task {parent_task_id}: {e_sql}",
             exc_info=True,

@@ -81,8 +81,7 @@ def clear_task_repo() -> None:
     """Drop the singleton.
 
     Called by ``application_shutdown`` so a stale instance bound to a
-    closed engine doesn't leak across the lifespan boundary. Matches
-    the ``write_queue.stop()`` pattern used by the same shutdown hook.
+    closed engine doesn't leak across the lifespan boundary.
     """
     global _task_repo_instance
     _task_repo_instance = None

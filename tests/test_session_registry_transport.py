@@ -157,7 +157,6 @@ async def live_server(tmp_path: Path) -> AsyncIterator[tuple[str, str]]:
     import os
     from agent_mcp.core import globals as g
     from agent_mcp.db import engine as _engine
-    from agent_mcp.db import write_queue as _wq
 
     env_snapshot = {
         "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY"),
@@ -168,7 +167,6 @@ async def live_server(tmp_path: Path) -> AsyncIterator[tuple[str, str]]:
     os.environ["DOTENV_PATH"] = "/dev/null"
     os.environ.pop("MCP_PROJECT_DIR", None)
 
-    _wq._global_write_queue = None
     _engine.reset_engine_cache()
     g.agent_event_signals.clear()
 
@@ -319,7 +317,6 @@ async def live_server(tmp_path: Path) -> AsyncIterator[tuple[str, str]]:
         g.openai_client_instance = snapshot["openai_client_instance"]
         g.global_vss_load_tested = snapshot["global_vss_load_tested"]
         g.global_vss_load_successful = snapshot["global_vss_load_successful"]
-        _wq._global_write_queue = None
         _engine.reset_engine_cache()
         g.agent_event_signals.clear()
 

@@ -260,3 +260,221 @@ async def test_assign_task_rollback_fires_zero_side_effects(
         assert len(g.audit_log) == audit_before, (
             "rolled-back assign must append nothing to g.audit_log"
         )
+
+
+# --- 3. create-unassigned (bulk) path (D-R3-4: retired write_queue) --------
+
+
+def _capture_unassigned_wakes(monkeypatch) -> list:
+    """Record every ``notify_unassigned_task_appeared`` fan-out."""
+    seen: list = []
+
+    def _cap(task_id, caps):  # noqa: ANN001
+        seen.append((task_id, list(caps or [])))
+
+    monkeypatch.setattr(
+        "agent_mcp.core.globals.notify_unassigned_task_appeared", _cap
+    )
+    return seen
+
+
+def _seed_assigned_parent(title: str, owner: str) -> str:
+    """Insert a parent task owned by ``owner`` (AZ-R19-1 lets that owner
+    file children / request assistance under it)."""
+    import datetime as _dt
+    import secrets
+
+    from agent_mcp.db.connection import get_db_connection
+
+    task_id = f"task_{secrets.token_hex(6)}"
+    now = _dt.datetime.now().isoformat()
+    conn = get_db_connection()
+    conn.execute(
+        "INSERT INTO tasks (task_id, title, description, status, priority, "
+        "assigned_to, created_by, created_at, updated_at, parent_task) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (task_id, title, "d", "in_progress", "medium", owner, "admin",
+         now, now, None),
+    )
+    conn.commit()
+    conn.close()
+    return task_id
+
+
+async def test_create_unassigned_commit_fires_audit_cache_notify(
+    tmp_path, monkeypatch
+):
+    """A successful Mode-0 ``assign_task`` (create unassigned) must, on
+    commit, write the ``created_unassigned_task`` DB audit row, cache the
+    task, and fan out the ``unassigned_task_appeared`` wake — replicating
+    the retired ``write_queue`` path exactly. D3: this path writes ONLY
+    the DB ``agent_actions`` sink, NOT the in-memory ``g.audit_log``."""
+    async with mcp_session(tmp_path) as admin:
+        from agent_mcp.core import globals as g
+
+        notified = _capture_unassigned_wakes(monkeypatch)
+        audit_before = len(g.audit_log)
+
+        res = await admin.call(
+            "assign_task",
+            {"task_title": "pool it", "task_description": "for the pool"},
+        )
+        assert not getattr(admin, "_last_is_error", False), _first_text(res)
+        task_id = _task_id_from(res)
+
+        # DB-only audit sink.
+        assert _audit_rows("created_unassigned_task", task_id) == 1, (
+            "unassigned create must write one created_unassigned_task row"
+        )
+        # D3: this path never touches the in-memory sink.
+        assert len(g.audit_log) == audit_before, (
+            "unassigned create writes only the DB sink, not g.audit_log"
+        )
+        # Cache reflects the committed write.
+        assert task_id in g.tasks, "unassigned task must be cached in g.tasks"
+        assert g.tasks[task_id].get("status") == "unassigned"
+        # Post-commit notify fanout fired for the new task.
+        assert any(t == task_id for t, _ in notified), (
+            f"unassigned create must wake the pool for {task_id}; "
+            f"saw {notified}"
+        )
+
+
+async def test_create_unassigned_rollback_fires_zero_side_effects(
+    tmp_path, monkeypatch
+):
+    """When a write inside the migrated create-unassigned unit-of-work
+    raises before commit, the seam must roll back and fire NOTHING: no
+    task cached, no ``created_unassigned_task`` audit row, no pool wake.
+    This is the D-R3-4 emit-iff-commit invariant that replaces the
+    retired ``write_queue`` (which had no such guarantee)."""
+    async with mcp_session(tmp_path) as admin:
+        from agent_mcp.core import globals as g
+        from agent_mcp.tools import task_tools
+
+        notified = _capture_unassigned_wakes(monkeypatch)
+        tasks_before = set(g.tasks.keys())
+        audit_before = _audit_rows_by_action("created_unassigned_task")
+
+        # Blow up AFTER task_repo.create writes the row but BEFORE commit —
+        # _link_child_to_parent runs immediately after the INSERT.
+        class _Boom(Exception):
+            pass
+
+        def _boom(*args, **kwargs):  # noqa: ANN002, ANN003
+            raise _Boom("induced mid-scope failure")
+
+        monkeypatch.setattr(task_tools, "_link_child_to_parent", _boom)
+
+        res = await admin.call(
+            "assign_task",
+            {"task_title": "never lands", "task_description": "rolled back"},
+        )
+        assert getattr(admin, "_last_is_error", False) or (
+            "error" in _first_text(res).lower()
+        ), f"expected a failure result, got {_first_text(res)!r}"
+
+        # No new task cached.
+        assert set(g.tasks.keys()) == tasks_before, (
+            "rolled-back create must not cache a task"
+        )
+        # No DB audit row landed.
+        assert _audit_rows_by_action("created_unassigned_task") == audit_before, (
+            "rolled-back create must write no created_unassigned_task row"
+        )
+        # No pool wake.
+        assert notified == [], (
+            f"rolled-back create must not wake the pool; woke {notified}"
+        )
+
+
+# --- 4. request_assistance path (D-R3-4: retired atomic_with_audit) --------
+
+
+async def test_request_assistance_commit_fires_db_and_memory_audit(
+    tmp_path,
+):
+    """A successful ``request_assistance`` must, on commit, write exactly
+    one ``request_assistance`` DB audit row (replicating the retired
+    ``atomic_with_audit`` seam) AND — separately — append the in-memory
+    ``log_audit`` entry. D3: the two sinks carry DIFFERENT details, so
+    both must land (they are NOT folded)."""
+    async with mcp_session(tmp_path) as admin:
+        from agent_mcp.core import globals as g
+
+        alice = await admin.create_worker("alice")
+        parent_id = _seed_assigned_parent("alice parent", alice.agent_id)
+
+        audit_before = len(g.audit_log)
+
+        res = await alice.call(
+            "request_assistance",
+            {"task_id": parent_id, "description": "need help here"},
+        )
+        assert "Assistance requested" in _first_text(res), _first_text(res)
+
+        # DB sink — exactly one request_assistance row for the parent.
+        assert _audit_rows("request_assistance", parent_id) == 1, (
+            "request_assistance must write one DB audit row on the parent"
+        )
+        # In-memory sink — the separate log_audit landed too.
+        assert len(g.audit_log) > audit_before, (
+            "request_assistance must also append the in-memory audit entry"
+        )
+        # The child assistance task committed + cached.
+        child_ids = [
+            tid for tid, t in g.tasks.items()
+            if t.get("parent_task") == parent_id
+        ]
+        assert child_ids, "a child assistance task must be created + cached"
+
+
+async def test_request_assistance_rollback_fires_zero_side_effects(
+    tmp_path, monkeypatch
+):
+    """When the write inside the migrated ``request_assistance`` unit-of-
+    work raises before commit, the seam must roll back and fire NOTHING:
+    no child task committed, and no ``request_assistance`` DB audit row.
+    Emit-iff-commit replaces the retired ``atomic_with_audit`` seam."""
+    async with mcp_session(tmp_path) as admin:
+        from agent_mcp.core import globals as g
+        from agent_mcp.tools import task_tools
+
+        alice = await admin.create_worker("alice")
+        parent_id = _seed_assigned_parent("alice parent", alice.agent_id)
+
+        audit_before = _audit_rows_by_action("request_assistance")
+
+        # Blow up on the LAST write inside the scope (the DB audit insert),
+        # after the child INSERT + parent UPDATE but before commit.
+        def _boom(*args, **kwargs):  # noqa: ANN002, ANN003
+            raise RuntimeError("induced mid-scope failure")
+
+        monkeypatch.setattr(task_tools, "log_agent_action_to_db", _boom)
+
+        res = await alice.call(
+            "request_assistance",
+            {"task_id": parent_id, "description": "never lands"},
+        )
+        assert "Assistance requested" not in _first_text(res), (
+            f"expected a failure result, got {_first_text(res)!r}"
+        )
+
+        # The child assistance INSERT rolled back — no child row in the DB.
+        from agent_mcp.db.connection import get_db_connection
+
+        conn = get_db_connection()
+        try:
+            child_rows = conn.execute(
+                "SELECT task_id FROM tasks WHERE parent_task = ?",
+                (parent_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+        assert child_rows == [], (
+            "rolled-back request_assistance must not commit a child task"
+        )
+        # No DB audit row landed.
+        assert _audit_rows_by_action("request_assistance") == audit_before, (
+            "rolled-back request_assistance must write no DB audit row"
+        )
