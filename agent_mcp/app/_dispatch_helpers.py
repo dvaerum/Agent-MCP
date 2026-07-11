@@ -31,9 +31,7 @@ from typing import Any, Dict, List, Optional
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from starlette.requests import Request
 
-from ..core.auth import get_agent_id as auth_get_agent_id
 from ..core.authorize import AuthRejected
-from ..core import globals as g
 from ..core.config import logger
 from ..core.principal import Principal
 from ..core.tool_result import (
@@ -218,6 +216,11 @@ def _build_route_principal(
     operator (the cookie mutation admit is authorized as operator
     upstream; the bearer resolves an operator-tier agent row).
     """
+    from ..core.principal_builder import (
+        build_agent_bearer_principal,
+        build_operator_principal,
+    )
+
     if operator_session:
         # Local import: deps.py imports nothing from this module, so a
         # module-level import is cycle-free — but keeping it local also
@@ -229,38 +232,21 @@ def _build_route_principal(
             project_role, sysadmin = threaded
         else:
             project_role, sysadmin = "operator", False
-        return Principal(
-            kind="operator_session",
+        # arch-B: build via the shared builder so caps resolve through the
+        # one code path (this used to lean on Principal.__post_init__'s
+        # back-fill; the builder now resolves explicitly, identically).
+        return build_operator_principal(
             user_id=operator_user_id,
-            agent_id=None,
+            kind="operator_session",
+            project_role=project_role,
             sysadmin=sysadmin,
             project_name=None,
-            project_role=project_role,
-            agent_role=None,
-            can_wake_loop=False,
             source_token=bearer_token,
         )
     if bearer_token:
-        agent_id = auth_get_agent_id(bearer_token)
-        if agent_id:
-            row = g.active_agents.get(bearer_token) or {}
-            agent_role = row.get("agent_role")
-            normalized_role = (
-                agent_role
-                if agent_role in ("worker", "manager")
-                else None
-            )
-            return Principal(
-                kind="agent_bearer",
-                user_id=None,
-                agent_id=agent_id,
-                sysadmin=False,
-                project_name=None,
-                project_role=None,
-                agent_role=normalized_role,
-                can_wake_loop=False,
-                source_token=bearer_token,
-            )
+        # arch-B: the ×4-duplicated agent_bearer block now lives once in
+        # ``core.principal_builder``. No wake-loop lookup on the REST path.
+        return build_agent_bearer_principal(bearer_token)
     return None
 
 

@@ -502,8 +502,7 @@ async def require_operator_session_middleware(
     # avoids a top-level dependency between the router package and
     # the per-project core package.
     try:
-        from ..core.capabilities import resolve_capabilities
-        from ..core.principal import Principal
+        from ..core.principal_builder import build_operator_principal
 
         principal_user_id = (
             str(user.get("user_id"))
@@ -520,27 +519,16 @@ async def require_operator_session_middleware(
             if is_sysadmin or project is None or not _project_exists(project)
             else _safe_resolve_role(user.get("user_id"), project)
         )
-        # Wave 9 PR 0: capabilities resolved at the seam; threaded into
-        # Principal once.
-        principal_capabilities = resolve_capabilities(
+        # arch-B: capabilities resolved once via the shared builder (Wave
+        # 9 PR 0 resolved them at this seam; the builder is now the single
+        # home for that + the Principal construction).
+        request["principal"] = build_operator_principal(
             user_id=principal_user_id,
-            agent_id=None,
-            sysadmin=is_sysadmin,
-            agent_role=None,
+            kind="operator_session",
             project_role=principal_project_role,
-            kind="operator_session",
-        )
-        request["principal"] = Principal(
-            kind="operator_session",
-            user_id=principal_user_id,
-            agent_id=None,
             sysadmin=is_sysadmin,
             project_name=principal_project_name,
-            project_role=principal_project_role,
-            agent_role=None,
-            can_wake_loop=False,
             source_token=None,
-            capabilities=principal_capabilities,
         )
     except Exception:  # pragma: no cover - defensive
         # Principal stash is additive; if construction fails for any
