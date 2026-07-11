@@ -33,9 +33,17 @@ API = Path("agent_mcp/dashboard/lib/api.ts")
 # ``agent_mcp/app/routes.py`` into the composition router file.
 # Its URL is ``/api/update-task-dashboard`` which doesn't match
 # the tasks router's ``/api/tasks`` prefix, so it landed on the
-# composition router rather than the tasks router. The static
-# greps below follow the handler to its new home.
+# composition router rather than the tasks router.
+#
+# arch-r4 #1 collapsed the route to a thin adapter over the new
+# ``update_task`` MCP tool — the EDITABLE_KEYS allowlist + notes-append
+# choreography now lives in
+# ``agent_mcp.tools.task_tools.update_task_tool_impl`` (wrapping
+# ``_update_single_task``, the SAME helper ``update_task_status`` uses)
+# instead of the router. The static greps below follow the handler to
+# its new home once again.
 ROUTES = Path("agent_mcp/app/routers/composition.py")
+TOOLS = Path("agent_mcp/tools/task_tools.py")
 
 
 def _src(p: Path) -> str:
@@ -206,23 +214,31 @@ def test_update_task_dashboard_endpoint_accepts_notes() -> None:
     `notes` as a recognised editable key (it appends a new entry to the
     JSON array). The route is the persistence layer for the Edit dialog's
     Add-note textarea.
+
+    arch-r4 #1: the EDITABLE_KEYS allowlist lives on the ROUTE (a
+    wire-level "at least one field" check, unchanged in spirit); the
+    actual notes-append choreography now lives in the ``update_task``
+    tool (``update_task_tool_impl``) that the route dispatches through.
     """
-    src = _src(ROUTES)
+    route_src = _src(ROUTES)
     # The EDITABLE_KEYS set in update_task_details_api_route.
     assert re.search(
         r"EDITABLE_KEYS\s*=\s*\{[^}]*\"notes\"[^}]*\}",
-        src,
+        route_src,
     ), (
         "expected `\"notes\"` in EDITABLE_KEYS inside "
         "update_task_details_api_route — without it the dashboard's "
         "Add-note submit returns a 400 'at least one editable field' "
         "error."
     )
-    # The notes-append branch.
-    assert "current_notes_list.append(new_note_entry)" in src, (
-        "expected the notes-append branch in update_task_details_api_route "
-        "that turns the `notes: str` body field into a new "
-        "{timestamp, author, content} entry appended to the JSON array."
+    # The notes-append branch, relocated onto the update_task tool.
+    tool_src = _src(TOOLS)
+    assert '"content": notes_content' in tool_src, (
+        "expected the notes-append branch (in "
+        "_update_single_task, driven by update_task_tool_impl's "
+        "notes_content) that turns the `notes: str` body field into a "
+        "new {timestamp, author, content} entry appended to the JSON "
+        "array."
     )
 
 
