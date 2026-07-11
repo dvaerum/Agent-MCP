@@ -20,18 +20,30 @@ silently flip its auth behavior.
 
 from __future__ import annotations
 
-import uuid as _uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
-from .._dispatch_helpers import _dispatch_through_tool, handle_options
+from .._dispatch_helpers import (
+    _build_route_principal,
+    _dispatch_through_tool,
+    handle_options,
+)
 from ..deps import caller_identity, require_operator_session
 from ...core.config import logger
-from ...db.actions.agent_actions_db import log_agent_action_to_db
-from ...db.connection import get_db_connection
+from ...core.tool_result import (
+    Conflict,
+    Failed,
+    Invalid,
+    NotFound,
+    Ok,
+    PermissionDenied,
+    ToolResult,
+    tool_result_to_http,
+)
+from ...tools.registry import ToolInputValidationError, dispatch_tool_call
 from ...utils.json_utils import get_sanitized_json_body
 
 
@@ -124,12 +136,45 @@ async def all_tasks_api_route(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Failed to fetch all tasks"}, status_code=500)
 
 
+def _tool_error_detail(result: ToolResult) -> str:
+    """Human-readable error string for the legacy ``{"error": ...}``
+    envelope this route returns, given a non-``Ok`` create_task result.
+
+    Kept in the legacy envelope (not the shared
+    :func:`tool_result_to_http` body) because the dashboard + the
+    create-task REST tests pin this shape. The STATUS comes from the
+    shared adapter; only the body wording lives here. The only
+    ``NotFound`` ``create_task`` can return is the missing parent, so we
+    render the historical "Parent task '<id>' not found" text.
+    """
+    if isinstance(result, NotFound):
+        return f"Parent task '{result.identifier}' not found"
+    if isinstance(result, (Conflict, PermissionDenied)):
+        return result.reason
+    if isinstance(result, Invalid):
+        return result.message
+    return "Failed to create task"
+
+
 @router.api_route("", methods=["POST", "OPTIONS"])
 async def create_task_api_route(
     request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
-    """Create a new task. PR D: auth via require_operator_session.
+    """Create a new task — thin adapter over the ``create_task`` MCP tool.
+
+    E1 (arch-deepening): the create choreography (assignability +
+    capability gates, ``task_repo.create``, ``current_task`` reconcile,
+    parent ``child_tasks`` mirror, ``created_task`` audit, cache upsert,
+    ``task.created`` publish, assignee / unassigned wake) lives ONCE in
+    :func:`agent_mcp.tools.task_tools.create_task_tool_impl` on the
+    unit-of-work. Before E1 this handler hand-reimplemented all of it and
+    imported ``_``-prefixed tool internals to stay in parity (the
+    BL-R13-1 / AZ-R26-1 / BL-R15-1 ledger). Now it keeps only the
+    HTTP-wire concerns — body sanitization, the SEC-round-9
+    type-confusion guards, and the missing-vs-empty title distinction —
+    then dispatches and maps the ``ToolResult`` to the legacy response
+    shape. Auth stays operator-only via ``require_operator_session``.
 
     Body: {"task_title", "task_description", "priority"?,
            "assigned_to"?, "parent_task"?, "required_capabilities"?}
@@ -140,282 +185,117 @@ async def create_task_api_route(
     if request.method != 'POST':
         return JSONResponse({"error": "Method not allowed"}, status_code=405)
 
-    conn = None
     try:
         data = await get_sanitized_json_body(request)
-        raw_title = data.get('task_title')
-        description = data.get('task_description', '')
-        priority = data.get('priority', 'medium')
-        assigned_to = data.get('assigned_to')  # nullable
-        parent_task = data.get('parent_task')  # nullable
-
-        # SEC round-9: reject structured JSON in string/list fields BEFORE
-        # any .strip() / SQL bind / repo write. (``task_title`` is handled
-        # by the isinstance-guarded strip below.) A dict/list here used to
-        # reach a bind and 500, or — for ``task_description`` — be stored
-        # verbatim into the TEXT column.
-        for _val, _name in (
-            (description, "task_description"),
-            (priority, "priority"),
-            (assigned_to, "assigned_to"),
-            (parent_task, "parent_task"),
-        ):
-            _err = _require_str(_val, _name)
-            if _err is not None:
-                return _err
-        _caps_err = _require_str_list(
-            data.get('required_capabilities'), "required_capabilities"
-        )
-        if _caps_err is not None:
-            return _caps_err
-
-        # Event-coord PR-1: optional capability gate (list of free-text
-        # labels, normalized to lowercase+stripped+deduped at write
-        # time via the shared helper). Empty/missing => stored as NULL
-        # ("anyone can claim", matches broadcast semantics).
-        from ...utils.capability_normalization import normalize_capabilities
-
-        # The repo (task_repo.create) handles json.dumps internally.
-        _norm_caps = normalize_capabilities(data.get('required_capabilities'))
-
-        # F004 (verify-all-v6 MUTATING #3): distinguish an absent field
-        # from one whose content was stripped to empty by the JSON-input
-        # sanitizer (utils/json_utils.py removes NULL/control bytes and
-        # zero-width Unicode BEFORE the JSON parse — a body like
-        # ``{"task_title":"\x00\x01"}`` arrives here as
-        # ``{"task_title":""}``). Conflating the two emits
-        # "task_title is required" for a title that *was* sent, pointing
-        # the operator at the wrong remediation. Whitespace-only titles
-        # are also rejected here (previously they slipped through as a
-        # truthy string and created a task named "   ").
-        if raw_title is None:
-            return JSONResponse(
-                {"error": "task_title is required"}, status_code=400
-            )
-        title = raw_title.strip() if isinstance(raw_title, str) else ""
-        if not title:
-            return JSONResponse(
-                {
-                    "error": "task_title_empty_after_strip",
-                    "message": (
-                        "task_title contains only whitespace or "
-                        "non-printable characters after sanitization"
-                    ),
-                },
-                status_code=400,
-            )
-
-        requesting_admin_id = caller_identity(auth)
-        task_id = f"task_{_uuid.uuid4().hex[:12]}"
-        status = 'pending' if assigned_to else 'unassigned'
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        # PF-R32-1b (unvalidated caller-FK → 500): pre-validate
-        # ``parent_task`` existence BEFORE the INSERT. ``tasks.parent_task``
-        # is a declared self-FK (migration 0007) enforced with
-        # ``PRAGMA foreign_keys=ON``, so a well-formed but NONEXISTENT
-        # parent violated the FK at the INSERT and surfaced as the generic
-        # 500 below — a SEC-round-9 clean-4xx contract violation. Mirror
-        # PR #383's message-parent fix and this file's other pre-validations
-        # (``assigned_to`` via ``_agent_assignable``): missing parent → 404.
-        # A valid parent and ``parent_task=None`` (top-level) are unchanged.
-        if parent_task:
-            cursor.execute(
-                "SELECT 1 FROM tasks WHERE task_id = ?", (parent_task,)
-            )
-            if cursor.fetchone() is None:
-                # ``finally`` below closes ``conn``.
-                return JSONResponse(
-                    {"error": f"Parent task '{parent_task}' not found"},
-                    status_code=404,
-                )
-
-        # BL-R13-1: enforce the assignability invariant the canonical MCP
-        # task paths gate on (``_agent_assignable`` in task_tools.py —
-        # True only if the agent exists AND is not terminated). Writing
-        # ``assigned_to`` directly here bypassed it, so a task could be
-        # persisted pinned on a nonexistent / terminated agent behind a
-        # 200 — unreachable work attributed to a dead identity. An empty
-        # / absent assignment stays allowed (falls through as unassigned).
-        if assigned_to:
-            from ...tools.task_tools import _agent_assignable
-            if not _agent_assignable(cursor, assigned_to):
-                # ``finally`` below closes ``conn``.
-                return JSONResponse(
-                    {
-                        "error": (
-                            f"Cannot assign task to '{assigned_to}': agent "
-                            f"does not exist or is terminated."
-                        )
-                    },
-                    status_code=400,
-                )
-            # AZ-R26-1: capability-routing parity at create time. If this
-            # new task carries a required-capabilities tag, the directly-
-            # assigned agent must satisfy it — the same
-            # ``required_capabilities ⊆ agent.capabilities`` control the
-            # canonical MCP assign path enforces. Create-time is
-            # self-consistent (both values are set in this request), but
-            # gating it here keeps every assign/reassign surface uniform
-            # and closes the class.
-            from ...tools.task_tools import _missing_capabilities
-            missing_caps = _missing_capabilities(
-                cursor, _norm_caps, assigned_to
-            )
-            if missing_caps:
-                return JSONResponse(
-                    {
-                        "error": (
-                            f"Cannot assign task to '{assigned_to}': agent "
-                            f"lacks required capabilities {missing_caps}."
-                        )
-                    },
-                    status_code=400,
-                )
-        # PR 7 (Task flip): create flows through task_repo.create with
-        # the caller's cursor so the wider audit-log INSERT stays in
-        # the same transaction. The repo handles JSON serialisation
-        # of list fields + the `required_capabilities` quirk.
-        from ...repositories import task_repo as _task_repo
-        _task_repo.create(
-            {
-                "task_id": task_id,
-                "title": title,
-                "description": description,
-                "assigned_to": assigned_to,
-                "created_by": requesting_admin_id,
-                "status": status,
-                "priority": priority,
-                "parent_task": parent_task,
-                "child_tasks": [],
-                "depends_on_tasks": [],
-                "notes": [],
-                "required_capabilities": _norm_caps if _norm_caps else None,
-            },
-            connection=cursor,
-        )
-        # BL-R30-1: set the gaining agent's ``current_task`` on a
-        # create-with-assignee, mirroring the MCP create+assign paths
-        # (``task_tools`` assign_task / multi-create both set current_task
-        # when the agent is idle). Without this, a REST-created assigned
-        # task left the agent rendering idle in /api/all-data and the
-        # dashboard despite owning the task. prior=None (fresh create), so
-        # the helper only SETS the gainer when its current_task IS NULL —
-        # it never clears anything here. Same cursor/txn as the create.
-        if assigned_to:
-            from ...repositories import agent_repo as _agent_repo
-            _agent_repo.reconcile_current_task_on_reassign(
-                task_id, None, assigned_to, connection=cursor,
-            )
-        log_agent_action_to_db(
-            cursor, requesting_admin_id, "created_task",
-            task_id=task_id, details={"title": title, "assigned_to": assigned_to},
-        )
-
-        # BL-2: maintain the parent's child_tasks back-reference mirror in
-        # the same transaction so hierarchy reads + the delete cascade see
-        # this child. update_fields(connection=) defers the parent's cache
-        # write to post-commit (reconciled below).
-        parent_mirror_updated = False
-        if parent_task:
-            cursor.execute(
-                "SELECT child_tasks FROM tasks WHERE task_id = ?",
-                (parent_task,),
-            )
-            parent_row = cursor.fetchone()
-            if parent_row is not None:
-                import json as _json
-                children = _json.loads(parent_row["child_tasks"] or "[]")
-                if task_id not in children:
-                    children.append(task_id)
-                    _task_repo.update_fields(
-                        parent_task,
-                        {"child_tasks": children},
-                        connection=cursor,
-                    )
-                    parent_mirror_updated = True
-
-        conn.commit()
-
-        # BL-1: task_repo.create(connection=) defers the g.tasks cache
-        # write + EventBus publish to the caller (see the create()
-        # docstring — a subscriber must never observe an uncommitted /
-        # rolled-back row). Reconcile now that the transaction committed:
-        # without this, the row is absent from view_tasks (which reads
-        # g.tasks) and no wait_for_events waiter wakes for an assigned
-        # REST-created task.
-        fresh = _task_repo.get_by_id(task_id)
-        if fresh is not None:
-            _task_repo.upsert_cache(fresh)
-        if parent_mirror_updated:
-            fresh_parent = _task_repo.get_by_id(parent_task)
-            if fresh_parent is not None:
-                _task_repo.upsert_cache(fresh_parent)
-
-        from ...core.repositories import _event_bus_shim
-        _event_bus_shim.publish(
-            assigned_to or "*",
-            "task.created",
-            {
-                "task_id": task_id,
-                "status": status,
-                "assigned_to": assigned_to,
-            },
-        )
-        if assigned_to:
-            # Wake the assignee's wait_for_events waiter so a REST-assigned
-            # task is delivered without polling.
-            try:
-                from ...core import globals as _g
-                _g.notify_agent_inbox(assigned_to)
-            except Exception as notify_exc:  # pragma: no cover - defensive
-                logger.warning(
-                    "notify_agent_inbox(%s) raised after REST create_task: %s",
-                    assigned_to, notify_exc,
-                )
-        else:
-            # BL-R15-1: REST-vs-MCP notify parity. The canonical MCP
-            # unassigned-create path fires
-            # ``g.notify_unassigned_task_appeared(task_id, caps)`` per task
-            # (task_tools.py) so an idle worker blocked in wait_for_events
-            # is edge-woken and a GET /mcp streaming subscriber receives the
-            # push. Publishing ``task.created`` under the literal id ``"*"``
-            # above is NOT a wildcard wake (no agent waits under ``"*"``), so
-            # without this the task only re-surfaced on the next ~2s DB
-            # recheck and never reached a streaming subscriber. Mirror the
-            # MCP path in the UNASSIGNED branch, best-effort (a notify
-            # failure must not poison the already-committed task write).
-            try:
-                from ...core import globals as _g
-                _g.notify_unassigned_task_appeared(task_id, _norm_caps or [])
-            except Exception as notify_exc:  # pragma: no cover - defensive
-                logger.warning(
-                    "notify_unassigned_task_appeared(%s) raised after REST "
-                    "create_task: %s",
-                    task_id, notify_exc,
-                )
-
-        return JSONResponse({
-            "success": True,
-            "task_id": task_id,
-            "message": f"Task '{title}' created successfully",
-        })
-
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        logger.error(f"Error creating task: {e}", exc_info=True)
-        # BL-R5-2 / SD-R6-1: generic message — see fetch-all-tasks note.
+
+    raw_title = data.get('task_title')
+    description = data.get('task_description', '')
+    priority = data.get('priority', 'medium')
+    assigned_to = data.get('assigned_to')  # nullable
+    parent_task = data.get('parent_task')  # nullable
+
+    # SEC round-9: reject structured JSON in string/list fields BEFORE
+    # dispatch. (``task_title`` is handled by the isinstance-guarded strip
+    # below.) Wire-level input hygiene, kept local per the round-9 scope —
+    # the MCP path validates the same via the tool's inputSchema.
+    for _val, _name in (
+        (description, "task_description"),
+        (priority, "priority"),
+        (assigned_to, "assigned_to"),
+        (parent_task, "parent_task"),
+    ):
+        _err = _require_str(_val, _name)
+        if _err is not None:
+            return _err
+    _caps_err = _require_str_list(
+        data.get('required_capabilities'), "required_capabilities"
+    )
+    if _caps_err is not None:
+        return _caps_err
+
+    # F004 (verify-all-v6 MUTATING #3): distinguish an absent title from
+    # one whose content was stripped to empty by the JSON-input sanitizer
+    # (utils/json_utils.py removes NULL/control bytes and zero-width
+    # Unicode BEFORE the JSON parse — a body like ``{"task_title":"\x00"}``
+    # arrives here as ``{"task_title":""}``). This distinction depends on
+    # the raw HTTP body + sanitizer, so it stays a wire-level concern here
+    # rather than in the tool. Whitespace-only titles are also rejected.
+    if raw_title is None:
+        return JSONResponse(
+            {"error": "task_title is required"}, status_code=400
+        )
+    title = raw_title.strip() if isinstance(raw_title, str) else ""
+    if not title:
+        return JSONResponse(
+            {
+                "error": "task_title_empty_after_strip",
+                "message": (
+                    "task_title contains only whitespace or "
+                    "non-printable characters after sanitization"
+                ),
+            },
+            status_code=400,
+        )
+
+    arguments = {
+        "task_title": title,
+        "task_description": description,
+        "priority": priority,
+        "assigned_to": assigned_to,
+        "parent_task": parent_task,
+        "required_capabilities": data.get('required_capabilities'),
+    }
+
+    # Operator-session Principal (forwarding VIEWER gets a viewer-role
+    # Principal the tool's capability gate denies — AC-R5-1). Mirrors
+    # ``delete_task_api_route`` / the other thin adapters.
+    principal = _build_route_principal(
+        bearer_token=None,
+        operator_session=True,
+        operator_user_id=caller_identity(auth),
+    )
+
+    try:
+        result = await dispatch_tool_call(
+            "create_task", arguments, principal=principal,
+        )
+    except ToolInputValidationError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:  # pragma: no cover - defensive
+        # SD-R7-1: a raw ``str(e)`` can leak internals; log server-side,
+        # return the STATIC generic 500 body this route has always used.
+        logger.error(f"Error dispatching create_task: {e}", exc_info=True)
         return JSONResponse(
             {"error": "Failed to create task"}, status_code=500
         )
-    finally:
-        if conn:
-            conn.close()
+
+    if isinstance(result, Ok):
+        return JSONResponse(
+            {
+                "success": True,
+                "task_id": result.data["task_id"],
+                "message": (
+                    result.message
+                    or f"Task '{title}' created successfully"
+                ),
+            },
+            status_code=200,
+        )
+
+    # Error variants: STATUS from the shared C-wave adapter; body kept in
+    # the legacy ``{"error": ...}`` envelope the dashboard + tests pin.
+    status, _ = tool_result_to_http(result)
+    if isinstance(result, Failed):
+        # SEC-R6 / SD-R6-1: static generic 500 message (no exception-detail
+        # leak). ``_dispatch_helpers`` already logged the real detail.
+        return JSONResponse(
+            {"error": "Failed to create task"}, status_code=status
+        )
+    return JSONResponse(
+        {"error": _tool_error_detail(result)}, status_code=status
+    )
 
 
 @router.api_route("/{task_id}", methods=["DELETE", "OPTIONS"])
