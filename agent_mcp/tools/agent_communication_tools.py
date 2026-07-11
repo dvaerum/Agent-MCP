@@ -11,8 +11,11 @@ from .registry import register_tool
 from . import access as _access  # Canonical home for _get_config_bool
 from ..core.config import logger
 from ..core import globals as g
-from ..core.auth import get_agent_id
 from ..core.principal import Principal
+from ..core.principal_builder import (
+    build_agent_bearer_principal,
+    is_operator_tier,
+)
 from ..core.tool_result import (
     Failed,
     Invalid,
@@ -68,56 +71,29 @@ def _resolve_principal(
 
     Returns ``None`` if no identity can be derived; the calling tool
     surfaces that as :class:`PermissionDenied` per the new contract.
+
+    arch-B: the ``arguments["token"]`` fallback delegates to the shared
+    :func:`agent_mcp.core.principal_builder.build_agent_bearer_principal`
+    so a synthesized identity resolves its capabilities through the exact
+    same path the middleware seam uses.
     """
     if principal is not None:
         return principal
 
     token = arguments.get("token")
     if token:
-        agent_id = get_agent_id(token)
-        if agent_id:
-            row = g.active_agents.get(token) or {}
-            agent_role = row.get("agent_role")
-            normalized_role = (
-                agent_role if agent_role in ("worker", "manager") else None
-            )
-            return Principal(
-                kind="agent_bearer",
-                user_id=None,
-                agent_id=agent_id,
-                sysadmin=False,
-                project_name=None,
-                project_role=None,
-                agent_role=normalized_role,
-                can_wake_loop=False,
-                source_token=token,
-            )
+        return build_agent_bearer_principal(token)
 
     return None
 
 
-def _is_operator_tier(principal: Principal) -> bool:
-    """Treat the legacy ``"admin"`` pseudo-agent as operator-tier.
-
-    Production post-Wave-4 has no ``agents.agent_id='admin'`` row so
-    this collapses to the operator-tier capability check. Wave 9 PR 3:
-    uses ``has_capability("system.config.write")`` — the per-project
-    operator write marker present in
-    ``PROJECT_ROLE_BUNDLES["operator"]`` and short-circuited by the
-    sysadmin wildcard. Replaces the legacy ``has_role("operator")``
-    which was a strictly looser identity check (admitted viewer-tier
-    operator-session callers too).
-
-    The harness (``tests/harness.py``) seeds a manager-role row
-    labelled ``admin`` and the bearer-wins bridge rule yields an
-    ``agent_bearer`` Principal whose ``agent_id == "admin"`` —
-    recognising that label as operator-tier preserves the harness's
-    pre-Wave-6 contract.
-    """
-    return (
-        principal.has_capability("system.config.write")
-        or principal.agent_id == "admin"
-    )
+# arch-B: the operator-tier predicate is defined once in
+# ``core.principal_builder``. Bound to the historical private name so the
+# call sites below (and the tests pinning it) keep working through the
+# single shared definition — this copy had DRIFTED from the one in
+# ``core.authorize`` (only this one honoured the ``agent_id == "admin"``
+# label), which the shared definition now reconciles.
+_is_operator_tier = is_operator_tier
 
 
 def _sender_label(principal: Principal) -> str:

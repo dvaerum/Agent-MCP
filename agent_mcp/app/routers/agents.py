@@ -39,7 +39,7 @@ from ..deps import (
 from ...core.config import logger
 from ...core import globals as g
 from ...core import session_registry
-from ...core.principal import Principal
+from ...core.principal_builder import build_operator_principal
 from ...core.tool_result import (
     Failed as _Failed,
     Ok as _Ok,
@@ -281,25 +281,20 @@ async def register_agent_dashboard_api_route(
     # armed per-request by ``require_operator_session``'s forwarding branch;
     # the cookie / operator-tier bearer paths report ``None`` and keep the
     # historical operator-tier default (those admits are genuinely
-    # operator). We thread inline rather than call ``_build_route_principal``
-    # because this route needs the bespoke ``project_name`` field the helper
-    # doesn't carry (Principal is frozen — it can't be set after the fact).
+    # operator).
     threaded = forwarding_route_role()
     project_role, sysadmin = threaded if threaded is not None else ("operator", False)
-    principal = Principal(
-        kind="operator_session",
+    # arch-B: build via the shared builder so caps resolve through the one
+    # code path. The frontend supplies ``project_name`` explicitly — the
+    # per-project backend doesn't yet derive its own project name from the
+    # request; the Principal field is best-effort plumbing (the tool's
+    # snippet builder reads ``arguments["project_name"]`` first either way).
+    principal = build_operator_principal(
         user_id=operator_id,
-        agent_id=None,
-        sysadmin=sysadmin,
-        # The frontend supplies ``project_name`` explicitly — the
-        # per-project backend doesn't yet derive its own project
-        # name from the request. The Principal field is best-effort
-        # plumbing; the tool's snippet builder reads
-        # ``arguments["project_name"]`` first either way.
-        project_name=project_name if isinstance(project_name, str) else None,
+        kind="operator_session",
         project_role=project_role,
-        agent_role=None,
-        can_wake_loop=False,
+        sysadmin=sysadmin,
+        project_name=project_name if isinstance(project_name, str) else None,
         source_token=None,
     )
 

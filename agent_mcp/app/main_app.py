@@ -252,17 +252,19 @@ def _build_principal_from_request(
     would have admitted.
     """
     try:
-        from ..core.capabilities import resolve_capabilities
-        from ..core.principal import Principal
+        from ..core.principal_builder import (
+            build_agent_bearer_principal,
+            build_operator_principal,
+        )
 
         if forwarding_operator:
-            # Wave 9 PR 0: capabilities resolved at the seam; threaded
-            # into Principal once. The per-project backend has no
-            # router.db handle so the group-cap overlay returns empty
-            # here — the router middleware (which DOES have router.db)
-            # has already resolved + admitted the operator via the
-            # cookie path, so the forwarding-header Principal here is
-            # purely the in-process restatement of that admit.
+            # arch-B: capabilities resolved once via the shared builder.
+            # The per-project backend has no router.db handle so the
+            # group-cap overlay returns empty here — the router middleware
+            # (which DOES have router.db) has already resolved + admitted
+            # the operator via the cookie path, so the forwarding-header
+            # Principal here is purely the in-process restatement of that
+            # admit.
             #
             # SEC-1: project_role is the operator's REAL signed role
             # (``forwarding_role``), NOT a fixed "operator". A viewer
@@ -275,93 +277,24 @@ def _build_principal_from_request(
             # known role — but defensive), project_role stays None and
             # the operator gets only system-ungated caps, i.e. nearly
             # nothing: fail closed, never fail open to "operator".
-            caps = resolve_capabilities(
+            return build_operator_principal(
                 user_id=forwarding_operator,
-                agent_id=None,
-                sysadmin=False,
-                agent_role=None,
+                kind="forwarding_header",
                 project_role=forwarding_role,
-                kind="forwarding_header",
-            )
-            return Principal(
-                kind="forwarding_header",
-                user_id=forwarding_operator,
-                agent_id=None,
                 sysadmin=False,
                 project_name=None,
-                project_role=forwarding_role,
-                agent_role=None,
-                can_wake_loop=False,
                 source_token=None,
-                capabilities=caps,
             )
         if bearer_token:
-            agent_id = get_agent_id(bearer_token)
-            if agent_id:
-                from ..core import globals as _g
-                row = _g.active_agents.get(bearer_token) or {}
-                agent_role = row.get("agent_role")
-                normalized_role = (
-                    agent_role
-                    if agent_role in ("worker", "manager")
-                    else None
-                )
-                # Wake-loop eligibility — admin agents coordinate
-                # and don't run the worker wake loop; non-admin
-                # agents qualify when the global toggle is on AND
-                # their per-agent flag is on (default True). The
-                # per-agent flag is sourced from the DB rather than
-                # the in-memory cache so an operator who flipped the
-                # flag via REST in the current session sees the
-                # change reflected on the next request.
-                can_wake_loop = False
-                if agent_id != "admin":
-                    try:
-                        from ..tools import access as _access
-                        from ..db.connection import get_db_connection
-                        global_on = _access._get_config_bool(
-                            "config_auto_event_loop_global", default=True,
-                        )
-                        if global_on:
-                            conn = get_db_connection()
-                            try:
-                                cursor = conn.cursor()
-                                cursor.execute(
-                                    "SELECT auto_event_loop FROM agents "
-                                    "WHERE agent_id = ?",
-                                    (agent_id,),
-                                )
-                                db_row = cursor.fetchone()
-                            finally:
-                                conn.close()
-                            if db_row is not None and bool(db_row["auto_event_loop"]):
-                                can_wake_loop = True
-                    except Exception:  # pragma: no cover - defensive
-                        can_wake_loop = False
-                # Wave 9 PR 0: capabilities resolved at the seam;
-                # threaded into Principal once. Agent-bearer caps come
-                # from AGENT_ROLE_BUNDLES[agent_role] alone — group
-                # caps don't apply (they're operator-shaped).
-                caps = resolve_capabilities(
-                    user_id=None,
-                    agent_id=agent_id,
-                    sysadmin=False,
-                    agent_role=normalized_role,
-                    project_role=None,
-                    kind="agent_bearer",
-                )
-                return Principal(
-                    kind="agent_bearer",
-                    user_id=None,
-                    agent_id=agent_id,
-                    sysadmin=False,
-                    project_name=None,
-                    project_role=None,
-                    agent_role=normalized_role,
-                    can_wake_loop=can_wake_loop,
-                    source_token=bearer_token,
-                    capabilities=caps,
-                )
+            # arch-B: the agent_bearer block (row lookup → normalized role
+            # → resolve_capabilities → Principal) lives once in
+            # ``core.principal_builder``. This is the ONLY caller that
+            # needs the wake-loop eligibility lookup, so it opts in via
+            # ``resolve_wake_loop=True``; the other three bearer sites
+            # leave it off (their historical ``can_wake_loop=False``).
+            return build_agent_bearer_principal(
+                bearer_token, resolve_wake_loop=True
+            )
         return None
     except Exception:  # pragma: no cover - defensive
         logger.exception(

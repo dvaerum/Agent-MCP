@@ -50,6 +50,12 @@ import inspect
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from .principal import Principal
+from .principal_builder import build_agent_bearer_principal
+# arch-B: the operator-tier predicate is defined once in
+# ``core.principal_builder``. Bound to the historical private name so the
+# call site in :func:`requires_policy` (and the tests pinning it) keep
+# working through the single shared definition.
+from .principal_builder import is_operator_tier as _is_operator_tier
 
 
 def _func_accepts_principal(func: Callable) -> bool:
@@ -107,61 +113,17 @@ def _synthesize_principal_from_arguments(
     discriminators the production seam would have produced.
     Returns None when no usable bearer is in hand; the wrapper then
     falls through to the cap reject path.
+
+    arch-B: delegates to the shared
+    :func:`agent_mcp.core.principal_builder.build_agent_bearer_principal`
+    so a synthesized fallback Principal resolves its capabilities through
+    the exact same path the seam uses — the fallback never diverges from
+    the middleware-built identity.
     """
     raw_token = arguments.get("token")
     if not isinstance(raw_token, str) or not raw_token:
         return None
-    from .auth import get_agent_id
-    from . import globals as _g
-    agent_id = get_agent_id(raw_token)
-    if not agent_id:
-        return None
-    row = _g.active_agents.get(raw_token) or {}
-    agent_role = row.get("agent_role")
-    normalized_role = (
-        agent_role if agent_role in ("worker", "manager") else None
-    )
-    return Principal(
-        kind="agent_bearer",
-        user_id=None,
-        agent_id=agent_id,
-        sysadmin=False,
-        project_name=None,
-        project_role=None,
-        agent_role=normalized_role,
-        can_wake_loop=False,
-        source_token=raw_token,
-    )
-
-
-def _is_operator_tier(principal: Principal) -> bool:
-    """True iff ``principal`` is an operator-tier caller.
-
-    Operator-tier = a caller carrying the per-project operator write
-    marker (``system.config.write``, present in
-    :data:`PROJECT_ROLE_BUNDLES["operator"]` and short-circuited by the
-    sysadmin wildcard). Distinct from "an agent_bearer with
-    agent_role='manager'" — supervisory agents are not operators.
-
-    SEC (Finding 1, 2026-07-08): this used to gate on
-    ``principal.kind`` alone, so ANY cookie-session /
-    forwarding-header identity — *including a viewer-tier one* —
-    collapsed to operator-tier and walked past
-    :func:`requires_policy`. That is the same viewer→operator collapse
-    SEC1 (#273) fixed on the wire. The gate is now
-    role/capability-aware: sysadmins (wildcard) and operators pass;
-    viewers, who lack the write marker, are excluded. Mirrors the
-    already-correct ``_is_operator_tier`` in
-    ``agent_mcp.tools.agent_communication_tools`` (the two duplicate
-    helpers should eventually be collapsed into one — out of scope
-    for this fix).
-
-    Used inside :func:`requires_policy` to bypass the worker-toggle
-    check for human operators. The harness's ``agent_id == "admin"``
-    label that historically stood in for "operator at the dashboard"
-    is handled separately by ``requires_policy`` itself.
-    """
-    return principal.has_capability("system.config.write")
+    return build_agent_bearer_principal(raw_token)
 
 
 def requires_capability(cap: str) -> Callable[[ToolImpl], ToolImpl]:
