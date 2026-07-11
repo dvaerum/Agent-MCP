@@ -11,10 +11,11 @@
 import React, { useCallback, useEffect, useState } from "react"
 import {
   Loader2, Plus, Pencil, Trash2, ChevronDown, ChevronRight,
-  Shield, User as UserIcon, Users as UsersIcon, X,
+  Shield, ShieldAlert, User as UserIcon, Users as UsersIcon, X,
 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import {
   Dialog,
   DialogContent,
@@ -45,6 +46,7 @@ import {
 } from "@/lib/capability-descriptions"
 import { routerApi } from "@/lib/router-api"
 import { ApiError } from "@/lib/api"
+import { useRouterQuery } from "@/hooks/use-router-query"
 
 interface GroupRow {
   group_id: string
@@ -70,9 +72,10 @@ interface UserRow {
   is_sysadmin: boolean
 }
 
-async function fetchGroups(): Promise<GroupRow[]> {
+async function fetchGroups(signal?: AbortSignal): Promise<GroupRow[]> {
   const body = await routerApi.request<{ groups?: GroupRow[] }>(
     routerGroupsUrl(),
+    signal ? { signal } : {},
   )
   return body.groups || []
 }
@@ -93,29 +96,19 @@ async function fetchUsers(): Promise<UserRow[]> {
 
 
 export function GroupsDashboard(): React.ReactElement {
-  const [groups, setGroups] = useState<GroupRow[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const {
+    data,
+    loading,
+    error: fetchError,
+    forbidden,
+    refresh,
+  } = useRouterQuery<GroupRow[]>(fetchGroups)
+  const groups = data ?? []
+  const error = fetchError?.message ?? null
   const [addOpen, setAddOpen] = useState(false)
   const [editTarget, setEditTarget] = useState<GroupRow | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<GroupRow | null>(null)
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
-
-  const refresh = useCallback(async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      setGroups(await fetchGroups())
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setLoading(false)
-    }
-  }, [])
-
-  useEffect(() => {
-    void refresh()
-  }, [refresh])
 
   const toggleExpand = (id: string) => {
     setExpanded((cur) => {
@@ -149,15 +142,29 @@ export function GroupsDashboard(): React.ReactElement {
             <Loader2 className="h-4 w-4 animate-spin" /> Loading groups…
           </div>
         )}
-        {error && (
+        {!loading && forbidden && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <ShieldAlert className="h-4 w-4 text-destructive" />
+                Sysadmin only
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="text-sm text-muted-foreground">
+              You don&apos;t have sysadmin privileges. Ask a sysadmin to view
+              or manage groups on your behalf.
+            </CardContent>
+          </Card>
+        )}
+        {!loading && !forbidden && error && (
           <div className="text-destructive text-sm">Error: {error}</div>
         )}
-        {!loading && !error && groups.length === 0 && (
+        {!loading && !forbidden && !error && groups.length === 0 && (
           <div className="text-muted-foreground text-center py-8">
             No groups yet.
           </div>
         )}
-        {!loading && !error && groups.map((g) => (
+        {!loading && !forbidden && !error && groups.map((g) => (
           <GroupCard
             key={g.group_id}
             group={g}
@@ -388,43 +395,71 @@ function GroupCapabilitiesSection({
   //                   the read-only / disabled message (plan: "show
   //                   but don't allow edit; tooltip 'requires sysadmin'").
   //   * ``loading`` / ``error`` — transient banners.
+  //
+  // ``loaded`` / ``selected`` / ``forbidden`` / ``error`` stay LOCAL
+  // state (not hook-owned) rather than reading straight off
+  // ``useRouterQuery``'s ``data`` — ``save()`` below writes an
+  // OPTIMISTIC result into them straight from the PUT response (no
+  // extra GET round-trip), and the checklist's dirty-tracking
+  // (``selected``) needs to be independently editable. The hook still
+  // owns the GET's own loading/error/forbidden bookkeeping; a sync
+  // effect below folds its outcome into the local state exactly the
+  // way the old inline ``load()`` used to.
   const [loaded, setLoaded] = React.useState<string[] | null>(null)
   const [selected, setSelected] = React.useState<Set<string>>(new Set())
-  const [loading, setLoading] = React.useState(true)
   const [forbidden, setForbidden] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [saving, setSaving] = React.useState(false)
   const [toast, setToast] = React.useState<string | null>(null)
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    setError(null)
-    setForbidden(false)
-    setToast(null)
-    try {
+  const {
+    loading,
+    data: fetchedCaps,
+    error: loadError,
+    forbidden: loadForbidden,
+  } = useRouterQuery<string[]>(
+    useCallback(async (signal) => {
       const body = await routerApi.request<{ capabilities?: string[] }>(
         routerGroupCapabilitiesUrl(groupId),
+        { signal },
       )
-      const caps = body.capabilities ?? []
-      setLoaded(caps)
-      setSelected(new Set(caps))
-    } catch (e) {
-      // 403 = not sysadmin: render the read-only message, not an error.
-      if (e instanceof ApiError && e.status === 403) {
-        setForbidden(true)
-        setLoaded([])
-        setSelected(new Set())
-        return
-      }
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setLoading(false)
+      return body.capabilities ?? []
+    }, [groupId]),
+    { deps: [groupId] },
+  )
+
+  // Mirrors the old ``load()``'s synchronous reset — as soon as a
+  // fetch starts, any stale forbidden/error/toast from a previous
+  // attempt is cleared.
+  useEffect(() => {
+    if (loading) {
+      setForbidden(false)
+      setError(null)
+      setToast(null)
     }
-  }, [groupId])
+  }, [loading])
 
   useEffect(() => {
-    void load()
-  }, [load])
+    if (fetchedCaps !== null) {
+      setLoaded(fetchedCaps)
+      setSelected(new Set(fetchedCaps))
+    }
+  }, [fetchedCaps])
+
+  useEffect(() => {
+    // 403 = not sysadmin: render the read-only message, not an error.
+    if (loadForbidden) {
+      setForbidden(true)
+      setLoaded([])
+      setSelected(new Set())
+    }
+  }, [loadForbidden])
+
+  useEffect(() => {
+    if (loadError) {
+      setError(loadError.message)
+    }
+  }, [loadError])
 
   const dirty = React.useMemo(() => {
     if (loaded === null) return false

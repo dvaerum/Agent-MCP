@@ -10,10 +10,11 @@
 
 import React, { useCallback, useEffect, useState } from "react"
 import {
-  Loader2, Plus, Trash2, User as UserIcon, Users as UsersIcon,
+  Loader2, Plus, Trash2, ShieldAlert, User as UserIcon, Users as UsersIcon,
 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import {
   Dialog,
   DialogContent,
@@ -43,6 +44,7 @@ import {
   routerUsersUrl, routerGroupsUrl,
 } from "@/lib/urls"
 import { routerApi } from "@/lib/router-api"
+import { useRouterQuery } from "@/hooks/use-router-query"
 
 type Role = "operator" | "viewer"
 
@@ -65,9 +67,13 @@ interface GroupOption {
   name: string
 }
 
-async function fetchMemberships(name: string): Promise<MembershipRow[]> {
+async function fetchMemberships(
+  name: string,
+  signal: AbortSignal,
+): Promise<MembershipRow[]> {
   const body = await routerApi.request<{ memberships?: MembershipRow[] }>(
     projectMembershipsUrl(name),
+    { signal },
   )
   return body.memberships || []
 }
@@ -85,35 +91,33 @@ export function ProjectMembershipsModal({
   open,
   onOpenChange,
 }: ProjectMembershipsModalProps): React.ReactElement {
-  const [rows, setRows] = useState<MembershipRow[]>([])
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const {
+    data,
+    loading,
+    error: fetchError,
+    forbidden,
+    refresh,
+  } = useRouterQuery<MembershipRow[]>(
+    useCallback(
+      (signal: AbortSignal) => fetchMemberships(projectName, signal),
+      [projectName],
+    ),
+    { deps: [projectName], enabled: open },
+  )
+  const rows = data ?? []
+  const [mutationError, setMutationError] = useState<string | null>(null)
+  const error = mutationError ?? fetchError?.message ?? null
   const [addOpen, setAddOpen] = useState(false)
-
-  const refresh = useCallback(async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      setRows(await fetchMemberships(projectName))
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setLoading(false)
-    }
-  }, [projectName])
-
-  useEffect(() => {
-    if (open) void refresh()
-  }, [open, refresh])
 
   const handleRemove = async (id: string) => {
     try {
       await routerApi.request(projectMembershipUrl(projectName, id), {
         method: "DELETE",
       })
-      await refresh()
+      setMutationError(null)
+      refresh()
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setMutationError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -123,9 +127,10 @@ export function ProjectMembershipsModal({
         method: "PATCH",
         body: JSON.stringify({ role }),
       })
-      await refresh()
+      setMutationError(null)
+      refresh()
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setMutationError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -150,8 +155,25 @@ export function ProjectMembershipsModal({
               <Loader2 className="h-4 w-4 animate-spin" /> Loading…
             </div>
           )}
-          {error && <div className="text-destructive text-sm">{error}</div>}
-          {!loading && (
+          {!loading && forbidden && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <ShieldAlert className="h-4 w-4 text-destructive" />
+                  Sysadmin only
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="text-sm text-muted-foreground">
+                You don&apos;t have sysadmin privileges. Ask a sysadmin to
+                view or manage this project&apos;s memberships on your
+                behalf.
+              </CardContent>
+            </Card>
+          )}
+          {!loading && !forbidden && error && (
+            <div className="text-destructive text-sm">{error}</div>
+          )}
+          {!loading && !forbidden && (
             <Table>
               <TableHeader>
                 <TableRow>

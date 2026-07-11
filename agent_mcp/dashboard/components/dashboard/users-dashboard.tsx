@@ -10,10 +10,11 @@
 // Backend: /agent-mcp/api/router/users[/<user_id>] (Wave 1b REST).
 // Cookie session carries auth; no body-token field.
 
-import React, { useCallback, useEffect, useState } from "react"
-import { Loader2, Plus, Pencil, Trash2, Shield } from "lucide-react"
+import React, { useCallback, useState } from "react"
+import { Loader2, Plus, Pencil, Trash2, Shield, ShieldAlert } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import {
   Dialog,
   DialogContent,
@@ -34,6 +35,7 @@ import {
 } from "@/components/ui/table"
 import { routerUsersUrl, routerUserUrl } from "@/lib/urls"
 import { routerApi } from "@/lib/router-api"
+import { useRouterQuery } from "@/hooks/use-router-query"
 
 // Client-side hint that MUST be kept in sync with the server's canonical
 // policy: `identity.PASSWORD_MIN_LENGTH` / `validate_password_strength`
@@ -57,34 +59,24 @@ interface ListResponse {
   users: UserRow[]
 }
 
-async function fetchUsers(): Promise<UserRow[]> {
-  const body = await routerApi.request<ListResponse>(routerUsersUrl())
+async function fetchUsers(signal: AbortSignal): Promise<UserRow[]> {
+  const body = await routerApi.request<ListResponse>(routerUsersUrl(), { signal })
   return body.users || []
 }
 
 export function UsersDashboard(): React.ReactElement {
-  const [users, setUsers] = useState<UserRow[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const {
+    data,
+    loading,
+    error: fetchError,
+    forbidden,
+    refresh,
+  } = useRouterQuery<UserRow[]>(fetchUsers)
+  const users = data ?? []
+  const error = fetchError?.message ?? null
   const [addOpen, setAddOpen] = useState(false)
   const [editTarget, setEditTarget] = useState<UserRow | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<UserRow | null>(null)
-
-  const refresh = useCallback(async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      setUsers(await fetchUsers())
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setLoading(false)
-    }
-  }, [])
-
-  useEffect(() => {
-    void refresh()
-  }, [refresh])
 
   return (
     <div className="flex flex-col h-full w-full">
@@ -106,10 +98,24 @@ export function UsersDashboard(): React.ReactElement {
             <Loader2 className="h-4 w-4 animate-spin" /> Loading users…
           </div>
         )}
-        {error && (
+        {!loading && forbidden && (
+          <Card className="m-4">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <ShieldAlert className="h-4 w-4 text-destructive" />
+                Sysadmin only
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="text-sm text-muted-foreground">
+              You don&apos;t have sysadmin privileges. Ask a sysadmin to view
+              or manage users on your behalf.
+            </CardContent>
+          </Card>
+        )}
+        {!loading && !forbidden && error && (
           <div className="text-destructive text-sm">Error: {error}</div>
         )}
-        {!loading && !error && (
+        {!loading && !forbidden && !error && (
           <Table>
             <TableHeader>
               <TableRow>
