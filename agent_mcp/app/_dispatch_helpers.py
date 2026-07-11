@@ -37,11 +37,9 @@ from ..core import globals as g
 from ..core.config import logger
 from ..core.principal import Principal
 from ..core.tool_result import (
-    Conflict as _Conflict,
     Failed as _Failed,
-    Invalid as _Invalid,
-    NotFound as _NotFound,
-    PermissionDenied as _PermissionDenied,
+    Ok as _Ok,
+    tool_result_to_http,
 )
 from ..tools.registry import (
     ToolInputValidationError,
@@ -96,13 +94,13 @@ async def _dispatch_through_tool(
     it directly.
 
     Error mapping (HTTP-shaped):
-      * AuthRejected            → 403
-      * ToolInputValidationError → 400
-      * NotFound                → 404
-      * PermissionDenied        → 403
-      * Invalid                 → 400
-      * Conflict                → 409
-      * Failed / Unexpected     → 500
+      * AuthRejected            → 403 (raised, before dispatch)
+      * ToolInputValidationError → 400 (raised, before dispatch)
+      * Unexpected exception    → 500 (raised)
+      * ToolResult error variants → via the shared adapter
+        :func:`agent_mcp.core.tool_result.tool_result_to_http`
+        (NotFound 404, PermissionDenied 403, Invalid 400, Conflict
+        409, Failed 500).
 
     Success payload mirrors the legacy REST endpoints'
     ``{"success": true, "message": "...", ...extras}`` shape so the
@@ -152,66 +150,25 @@ async def _dispatch_through_tool(
         if cv_token is not None:
             request_auth_token.reset(cv_token)
 
-    if isinstance(result, _NotFound):
-        text = f"{result.resource} {result.identifier!r} not found."
-        return JSONResponse(
-            {
-                "success": False,
-                "error": "not_found",
-                "resource": result.resource,
-                "identifier": result.identifier,
-                "message": text,
-            },
-            status_code=404,
-        )
-    if isinstance(result, _PermissionDenied):
-        return JSONResponse(
-            {
-                "success": False,
-                "error": "permission_denied",
-                "reason": result.reason,
-                "message": result.reason,
-            },
-            status_code=403,
-        )
-    if isinstance(result, _Invalid):
-        return JSONResponse(
-            {
-                "success": False,
-                "error": "invalid",
-                "field": result.field,
-                "message": result.message,
-            },
-            status_code=400,
-        )
-    if isinstance(result, _Conflict):
-        return JSONResponse(
-            {
-                "success": False,
-                "error": "conflict",
-                "reason": result.reason,
-                "message": result.reason,
-            },
-            status_code=409,
-        )
-    if isinstance(result, _Failed):
-        # SEC-R8-1: ~40 tool impls return ``Failed(message=f"…{e}")`` built
-        # from a caught sqlite3/SQLAlchemy error, so ``result.message`` can
-        # embed table/column names, filesystem paths, and internals. The
-        # raised-exception path above was genericized in round 7 (SD-R7-1);
-        # this is the RETURNED half. Log the real detail server-side, return
-        # a STATIC generic message to the client.
-        logger.error(
-            f"Tool {tool_name!r} returned Failed result: {result.message}"
-        )
-        return JSONResponse(
-            {
-                "success": False,
-                "error": "failed",
-                "message": "Operation failed",
-            },
-            status_code=500,
-        )
+    if not isinstance(result, _Ok):
+        # Every error variant → HTTP via the ONE shared adapter
+        # (:func:`agent_mcp.core.tool_result.tool_result_to_http`). The
+        # adapter owns the variant→status table + the canonical dashboard
+        # body; this replaced the inline ladder that used to live here and
+        # had drifted from the register-agent route's copy (PermissionDenied
+        # 403-vs-401). The status source is now single.
+        if isinstance(result, _Failed):
+            # SEC-R8-1: ~40 tool impls return ``Failed(message=f"…{e}")``
+            # built from a caught sqlite3/SQLAlchemy error, so
+            # ``result.message`` can embed table/column names, filesystem
+            # paths, and internals. The adapter emits a STATIC generic
+            # client message; log the real detail (with the tool name for
+            # server-side triage) here where the tool_name is in scope.
+            logger.error(
+                f"Tool {tool_name!r} returned Failed result: {result.message}"
+            )
+        status, body = tool_result_to_http(result)
+        return JSONResponse(body, status_code=status)
 
     # ``Ok`` — success. ``Ok.data`` (when set) is the JSON body the
     # dashboard consumes; ``Ok.message`` provides a human-readable

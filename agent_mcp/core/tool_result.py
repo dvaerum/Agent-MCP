@@ -238,6 +238,113 @@ def render_as_text_content(result: ToolResult) -> List[mcp_types.TextContent]:
     return [mcp_types.TextContent(type="text", text=text)]
 
 
+# ── HTTP renderer ─────────────────────────────────────────────────
+
+
+# Variant → HTTP status. ONE authority, shared by every REST consumer
+# (``app/_dispatch_helpers._dispatch_through_tool`` and the per-resource
+# routers under ``app/routers/``).
+#
+# TIEBREAK (locked, arch-deepening candidate C): ``PermissionDenied →
+# 403`` — the caller authenticated but lacks the *capability* the tool
+# requires (authenticated-but-forbidden). ``401`` is deliberately NOT
+# used here: it stays reserved for missing / invalid credentials, which
+# the auth middleware returns UPSTREAM of dispatch before any
+# ``ToolResult`` exists. The register-agent route historically returned
+# 401 for ``PermissionDenied`` — that was a divergence from the shared
+# dispatcher's 403; collapsing both onto this table fixes it.
+_STATUS_BY_VARIANT = {
+    Ok: 200,
+    NotFound: 404,
+    PermissionDenied: 403,
+    Invalid: 400,
+    Conflict: 409,
+    Failed: 500,
+}
+
+
+def tool_result_to_http(result: ToolResult) -> tuple[int, dict[str, Any]]:
+    """Convert a :data:`ToolResult` into an ``(http_status, json_body)``
+    pair — the single ToolResult→HTTP adapter every REST consumer shares.
+
+    Returns the canonical dashboard JSON body (the
+    ``{"success": bool, ...}`` shape the dashboard's ApiClient already
+    consumes) alongside the status from :data:`_STATUS_BY_VARIANT`.
+    Consumers that need a different body shape (e.g. the register-agent
+    route flattens ``Ok.data`` into named fields, and replies to errors
+    with a thin ``{"message": ...}``) take the STATUS from here and keep
+    their own body — the status mapping is what's unified, so the
+    403-vs-401 divergence can't reappear.
+
+    ``Failed`` renders a STATIC ``"Operation failed"`` message: ~40 tool
+    impls build ``Failed(message=f"…{e}")`` from a caught DB error, so
+    the raw text can embed schema / paths / internals (SEC-R8-1). The
+    caller logs the real ``result.message`` server-side; the client sees
+    the generic string. This mirrors :func:`render_as_text_content`'s
+    Failed handling on the MCP wire.
+    """
+    status = _STATUS_BY_VARIANT.get(type(result), 500)
+
+    if isinstance(result, Ok):
+        body: dict[str, Any] = {
+            "success": True,
+            "message": result.message or "",
+        }
+        if result.data is not None:
+            body["data"] = result.data
+        return status, body
+
+    if isinstance(result, NotFound):
+        text = f"{result.resource} {result.identifier!r} not found."
+        return status, {
+            "success": False,
+            "error": "not_found",
+            "resource": result.resource,
+            "identifier": result.identifier,
+            "message": text,
+        }
+
+    if isinstance(result, PermissionDenied):
+        return status, {
+            "success": False,
+            "error": "permission_denied",
+            "reason": result.reason,
+            "message": result.reason,
+        }
+
+    if isinstance(result, Invalid):
+        return status, {
+            "success": False,
+            "error": "invalid",
+            "field": result.field,
+            "message": result.message,
+        }
+
+    if isinstance(result, Conflict):
+        return status, {
+            "success": False,
+            "error": "conflict",
+            "reason": result.reason,
+            "message": result.reason,
+        }
+
+    if isinstance(result, Failed):
+        # Generic message only — see docstring (SEC-R8-1). The caller
+        # logs ``result.message`` server-side; it never reaches the wire.
+        return status, {
+            "success": False,
+            "error": "failed",
+            "message": "Operation failed",
+        }
+
+    # Defensive — an unknown variant maps to a generic 500.
+    return 500, {  # pragma: no cover - defensive
+        "success": False,
+        "error": "failed",
+        "message": "Operation failed",
+    }
+
+
 def is_error_result(result: ToolResult) -> bool:
     """Whether a :data:`ToolResult` represents a failure.
 
@@ -260,5 +367,6 @@ __all__ = [
     "Failed",
     "ToolResult",
     "render_as_text_content",
+    "tool_result_to_http",
     "is_error_result",
 ]
