@@ -14,24 +14,6 @@ import {
 export { normalizeAgentId, selectTasks, selectActions, TERMINAL_TASK_STATUSES }
 export type { TaskCriteria, ActionCriteria } from './selectors'
 
-// Debounce utility for API calls
-function debounce<T extends (...args: any[]) => any>(
-  func: T,
-  wait: number
-): (...args: Parameters<T>) => void {
-  let timeout: NodeJS.Timeout | null = null
-  
-  return (...args: Parameters<T>) => {
-    if (timeout) {
-      clearTimeout(timeout)
-    }
-    
-    timeout = setTimeout(() => {
-      func(...args)
-    }, wait)
-  }
-}
-
 interface AllData {
   agents: Agent[]
   tasks: Task[]
@@ -439,11 +421,6 @@ export const useDataStore = create<DataStore>((set, get) => ({
     // Force refresh
     await get().fetchAllData(true)
   },
-  
-  // Debounced refresh to prevent rapid successive calls
-  debouncedRefresh: debounce(async () => {
-    await get().fetchAllData()
-  }, 500),
 
   // Agent display predicate.
   //

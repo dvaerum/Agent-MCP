@@ -187,26 +187,15 @@ class ToolImpl:
 class ToolRegistry(Registry[ToolImpl]):
     """Tool subsystem adapter for the shared Registry.
 
-    Adds `dispatch(name, arguments)` as the tools' verb. The schema
-    + impl live in `entry.meta`; visibility is a callable that
-    consults `tools.access.is_visible_to_role` so every existing
+    The schema + impl live in `entry.meta`; visibility is a callable
+    that consults `tools.access.is_visible_to_role` so every existing
     classification (admin / any / worker-if-toggled:<key>) continues
-    to govern `tools/list` filtering.
+    to govern `tools/list` filtering. Dispatch itself goes through
+    module-level `dispatch_tool_call` (below), not a method on this
+    class — `dispatch_tool_call` owns argument sanitization, schema
+    validation, and Principal threading that a bare `entry.get(name)`
+    lookup doesn't have.
     """
-
-    async def dispatch(
-        self, name: str, arguments: Dict[str, Any]
-    ) -> List[mcp_types.TextContent]:
-        """Look up the tool by name and invoke its implementation
-        with the (already-cleaned) arguments dict. Re-raises every
-        framework-relevant exception (AuthRejected, validation
-        errors) so the MCP framework's `_make_error_result` builds
-        the correct `isError=True` response.
-        """
-        entry = self.get(name)
-        if entry is None:
-            raise ValueError(f"Unknown tool: {name}")
-        return await entry.meta.implementation(arguments)
 
 
 #: The single tool registry consumed by `mcp_call_tool_handler` +
@@ -456,45 +445,17 @@ async def dispatch_tool_call(
     sanitized_arguments: Any
     try:
         if isinstance(raw_arguments, list):
-            # The original code had a recursive call to handle_tool for lists.
-            # This is complex. A simpler approach is to define if tools accept lists of args
-            # or if the client should make individual calls.
-            # For 1-to-1 with original `handle_tool`'s list processing:
-            # This implies that a single tool call message could contain a list of argument sets
-            # for the *same* tool, and the server processes them sequentially, concatenating results.
-            # This is an unusual pattern for tool calls.
-            # Let's assume for now that a tool call is for one set of arguments.
-            # If the list processing is essential, it needs careful thought on how it interacts
-            # with individual tool function signatures.
-            # The original code:
-            # if isinstance(arguments, list):
-            #     sanitized_args = []
-            #     for arg in arguments:
-            #         sanitized_args.append(sanitize_json_input(arg))
-            #     results = []
-            #     for arg in sanitized_args:
-            #         res = await handle_tool(name, arg) # Recursive call
-            #         results.extend(res)
-            #     return results
-            # This recursive structure is problematic for a clean dispatch.
-            # For now, we will assume `raw_arguments` is a single dictionary for one tool call.
-            # If list processing for a single tool name is needed, the tool implementation itself
-            # should be designed to handle a list of argument sets.
-            # The MCP protocol itself (mcp.types) might clarify if a "tool_call" message
-            # can have a list of argument sets.
-            # Given the structure of `call_mcp_tool` in the prompt (singular arguments),
-            # it's more likely `raw_arguments` is a single Dict.
-            if isinstance(raw_arguments, dict):
-                sanitized_arguments = sanitize_json_input(raw_arguments)
-            else: # If it's a list, and we are not supporting recursive calls here.
-                logger.error(f"Received a list of arguments for tool '{tool_name}', but registry expects a single argument dictionary per call.")
-                return _Invalid(
-                    field=None,
-                    message=(
-                        "Server tool dispatcher expects a single argument set, "
-                        "not a list."
-                    ),
-                )
+            # A tool call is always one argument set; the MCP protocol
+            # never sends a list of argument-sets for a single call.
+            # Reject cleanly rather than guessing at batch semantics.
+            logger.error(f"Received a list of arguments for tool '{tool_name}', but registry expects a single argument dictionary per call.")
+            return _Invalid(
+                field=None,
+                message=(
+                    "Server tool dispatcher expects a single argument set, "
+                    "not a list."
+                ),
+            )
 
         elif not isinstance(raw_arguments, dict):
             # Try to sanitize and parse if not a dict (e.g., a JSON string from a raw request)
