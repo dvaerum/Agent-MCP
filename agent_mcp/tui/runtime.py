@@ -15,7 +15,7 @@ from typing import Any
 import anyio
 
 from ..core.config import logger
-from .colors import TUITheme
+from .colors import DASHBOARD_DEV_PORT, TUITheme, dashboard_path
 from .display import TUIDisplay
 
 
@@ -117,12 +117,7 @@ async def tui_display_loop(
 
             tui.move_cursor(current_row, 1)
             tui.clear_line()
-            dashboard_path = (
-                f"{cli_project_dir}/agent_mcp/dashboard"
-                if cli_project_dir != "."
-                else "agent_mcp/dashboard"
-            )
-            print(f"2. Navigate to: {TUITheme.info(dashboard_path)}")
+            print(f"2. Navigate to: {TUITheme.info(dashboard_path(cli_project_dir))}")
             current_row += 1
 
             tui.move_cursor(current_row, 1)
@@ -132,7 +127,7 @@ async def tui_display_loop(
 
             tui.move_cursor(current_row, 1)
             tui.clear_line()
-            print(f"4. Open: {TUITheme.info('http://localhost:3847')}")
+            print(f"4. Open: {TUITheme.info(f'http://localhost:{DASHBOARD_DEV_PORT}')}")
             current_row += 3
 
             tui.move_cursor(current_row, 1)

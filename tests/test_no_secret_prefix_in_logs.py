@@ -37,7 +37,9 @@ captures stdout and asserts:
 
 A regression of any of the three sites would surface here.
 
-The discovery walk in ``agent_mcp.__main__`` is anchored at
+The discovery walk (``agent_mcp.core.env_boot.discover_and_load_dotenv``,
+called from ``agent_mcp.cli`` — arch-r4 #11a folded the old duplicate
+``agent_mcp.__main__`` walk into this one) is anchored at
 ``Path(__file__).resolve().parent.parent`` — i.e. the source-tree
 project root — so the test writes the .env there, with try/finally
 restore of any pre-existing file. ``.env`` is git-ignored in this
