@@ -20,10 +20,10 @@ except ImportError:
 # Imports from our own project modules
 from ...core.config import (
     logger,
-    EMBEDDING_DIMENSION,
     get_project_dir,
     OPENAI_API_KEY_ENV,  # Also import the API key env variable
-    ADVANCED_EMBEDDINGS,  # Import advanced mode flag at module level
+    embedding_settings,  # Resolve (model, dimension, advanced) at call time,
+    # not at THIS module's import time — see EmbeddingSettings docstring.
 )
 from ...core import globals as g  # For server_running flag
 from ...db.connection import get_db_connection, is_vss_loadable
@@ -274,8 +274,14 @@ async def run_rag_indexing_periodically(
     while g.server_running:  # Uses global flag (main.py:521)
         cycle_start_time = time.time()
 
+        # Resolved ONCE per cycle (not at module-import time) so a
+        # runtime ``--advanced`` reconfigure is honoured immediately —
+        # see EmbeddingSettings' docstring for the import-order bug this
+        # closes.
+        _emb_settings = embedding_settings()
+
         # Log what content will be indexed based on mode
-        if EMBEDDING_DIMENSION == 3072:
+        if _emb_settings.dimension == 3072:
             logger.info(
                 "Starting RAG index update cycle (advanced mode: markdown, code, context, tasks)..."
             )
@@ -455,7 +461,7 @@ async def run_rag_indexing_periodically(
 
             # Find all code files (only in advanced mode)
             all_code_files_found = []
-            if ADVANCED_EMBEDDINGS:
+            if _emb_settings.advanced:
                 for extension in CODE_EXTENSIONS:
                     for code_file_path_str in glob.glob(
                         str(current_project_dir / f"**/*{extension}"), recursive=True
@@ -583,7 +589,7 @@ async def run_rag_indexing_periodically(
                 "last_indexed_tasks", "1970-01-01T00:00:00Z"
             )
 
-            if ADVANCED_EMBEDDINGS:
+            if _emb_settings.advanced:
                 last_task_time_str = last_indexed_timestamps.get(
                     "last_indexed_tasks", "1970-01-01T00:00:00Z"
                 )
@@ -691,7 +697,7 @@ async def run_rag_indexing_periodically(
                     Tuple[str, str, str, Dict[str, Any]]
                 ] = []  # type, ref, current_hash, metadata for each chunk
 
-                # ADVANCED_EMBEDDINGS is already imported at module level
+                # _emb_settings was resolved once at the top of this cycle.
 
                 for (
                     source_type,
@@ -701,7 +707,7 @@ async def run_rag_indexing_periodically(
                 ) in sources_to_process_for_embedding:
                     chunks_with_metadata: List[Tuple[str, Dict[str, Any]]] = []
 
-                    if ADVANCED_EMBEDDINGS:
+                    if _emb_settings.advanced:
                         # Advanced mode: Use sophisticated chunking
                         if source_type == "markdown":
                             # Markdown-aware chunking
@@ -1059,7 +1065,7 @@ async def run_rag_indexing_periodically(
                 )
 
                 # Only update code and tasks timestamps in advanced mode
-                if ADVANCED_EMBEDDINGS:
+                if _emb_settings.advanced:
                     capped_code_ts = _watermark_after_failures(
                         last_code_timestamp,
                         max_code_mod_timestamp,

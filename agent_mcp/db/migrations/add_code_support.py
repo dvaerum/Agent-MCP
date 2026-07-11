@@ -16,11 +16,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from agent_mcp.db.connection import get_db_connection
-from agent_mcp.core.config import logger, EMBEDDING_DIMENSION
+from agent_mcp.core.config import logger, embedding_settings
 
 
 def migrate_database():
     """Run the migration to add code-aware support."""
+    required_dimension = embedding_settings().dimension
     conn = None
     try:
         conn = get_db_connection()
@@ -71,16 +72,16 @@ def migrate_database():
             elif '3072' in create_sql[0]:
                 current_dim = 3072
             
-            if current_dim and current_dim != EMBEDDING_DIMENSION:
-                logger.warning(f"rag_embeddings table uses {current_dim} dimensions but config uses {EMBEDDING_DIMENSION}.")
-                logger.warning(f"To use {EMBEDDING_DIMENSION} dimensions, you need to:")
+            if current_dim and current_dim != required_dimension:
+                logger.warning(f"rag_embeddings table uses {current_dim} dimensions but config uses {required_dimension}.")
+                logger.warning(f"To use {required_dimension} dimensions, you need to:")
                 logger.warning("1. Delete all existing embeddings: DELETE FROM rag_embeddings;")
                 logger.warning("2. Drop and recreate the table: DROP TABLE rag_embeddings;")
                 logger.warning("3. Re-run the server to recreate with new dimensions")
                 logger.warning("4. Let the indexer re-generate all embeddings")
                 logger.warning("Note: The server will automatically handle this when dimension changes are detected.")
-            elif create_sql and str(EMBEDDING_DIMENSION) in create_sql[0]:
-                logger.info(f"rag_embeddings table already uses {EMBEDDING_DIMENSION} dimensions.")
+            elif create_sql and str(required_dimension) in create_sql[0]:
+                logger.info(f"rag_embeddings table already uses {required_dimension} dimensions.")
             else:
                 logger.info("Could not determine current embedding dimensions.")
         else:
@@ -108,7 +109,7 @@ def migrate_database():
 if __name__ == "__main__":
     print("Agent-MCP Code-Aware RAG Migration")
     print("==================================")
-    print(f"This will migrate your database to support code-aware RAG with {EMBEDDING_DIMENSION} dimensions.")
+    print(f"This will migrate your database to support code-aware RAG with {embedding_settings().dimension} dimensions.")
     print()
     
     response = input("Do you want to proceed? (y/N): ")

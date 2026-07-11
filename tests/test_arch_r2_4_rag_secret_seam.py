@@ -58,8 +58,8 @@ def _emb(values):
     finally:
         conn.close()
     if row is None:
-        from agent_mcp.core.config import EMBEDDING_DIMENSION
-        dim = EMBEDDING_DIMENSION
+        from agent_mcp.core.config import embedding_settings
+        dim = embedding_settings().dimension
     else:
         m = re.search(r"FLOAT\[(\d+)\]", row[0])
         dim = int(m.group(1)) if m else 1536

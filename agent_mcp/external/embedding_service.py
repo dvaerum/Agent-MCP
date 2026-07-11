@@ -37,9 +37,10 @@ the two seams always agree on which provider is live:
   ignores.
 
 Unlike ``completion_client()`` there is no "key set but model unset"
-fail-fast: the embedding model/dimension always resolve to a
-``core.config`` default (``EMBEDDING_MODEL`` / ``EMBEDDING_DIMENSION``),
-so there is no ambiguous-config trap to guard against.
+fail-fast: the embedding model/dimension always resolve to
+``core.config.embedding_settings()`` — called fresh at each invocation
+so a runtime ``--advanced`` reconfigure is honoured — so there is no
+ambiguous-config trap to guard against.
 """
 
 from __future__ import annotations
@@ -197,10 +198,9 @@ def embedding_client(
     default to the ``core.config`` values (read at call time so a runtime
     reconfigure is honoured) but may be overridden by callers.
     """
-    resolved_model = model or _config.EMBEDDING_MODEL
-    resolved_dimension = (
-        dimension if dimension is not None else _config.EMBEDDING_DIMENSION
-    )
+    settings = _config.embedding_settings()
+    resolved_model = model or settings.model
+    resolved_dimension = dimension if dimension is not None else settings.dimension
 
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if api_key:

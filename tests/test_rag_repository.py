@@ -82,12 +82,13 @@ def _vss_available() -> bool:
 
 
 # Use a vector dimension matching the on-disk vec0 table. The schema
-# bootstrap reads EMBEDDING_DIMENSION at virtual-table-create time, and
-# a leaky-fixture interaction with test_embedding_config can leave the
-# config module's EMBEDDING_DIMENSION out of sync with the dim baked
-# into the table for this test's project_dir. Re-reading the table's
-# declared dimension straight from sqlite_master keeps the fixtures
-# correct regardless of import-time state.
+# bootstrap reads embedding_settings().dimension at virtual-table-create
+# time, and a leaky-fixture interaction with test_embedding_config can
+# leave config's SIMPLE_EMBEDDING_DIMENSION (env-var-driven, resolved at
+# module-import time) out of sync with the dim baked into the table for
+# this test's project_dir. Re-reading the table's declared dimension
+# straight from sqlite_master keeps the fixtures correct regardless of
+# import-time state.
 def _emb(values):
     """Pad/truncate a short fixture vector to whatever dimension the
     on-disk vec0 ``rag_embeddings`` table declares."""
@@ -107,8 +108,8 @@ def _emb(values):
     if row is None:
         # No table: fall back to the config value (the test that needs
         # the table will skip via _vss_available).
-        from agent_mcp.core.config import EMBEDDING_DIMENSION
-        dim = EMBEDDING_DIMENSION
+        from agent_mcp.core.config import embedding_settings
+        dim = embedding_settings().dimension
     else:
         m = re.search(r"FLOAT\[(\d+)\]", row[0])
         dim = int(m.group(1)) if m else 1536

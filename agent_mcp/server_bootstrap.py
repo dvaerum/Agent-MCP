@@ -156,9 +156,11 @@ def apply_runtime_flags(config: ServerConfig) -> None:
 
     Specifically:
 
-    * ``--advanced`` flips ``core.config.ADVANCED_EMBEDDINGS`` and
-      retargets ``EMBEDDING_MODEL`` / ``EMBEDDING_DIMENSION``. Done
-      *before* any RAG indexer module touches them.
+    * ``--advanced`` flips ``core.config.ADVANCED_EMBEDDINGS`` — the
+      ONE global this function mutates for embeddings. Readers resolve
+      ``(model, dimension)`` by calling ``core.config.embedding_settings()``
+      at point of use rather than importing a value that would freeze
+      at their own import time; see that function's docstring.
     * ``--no-index`` flips ``core.config.DISABLE_AUTO_INDEXING``.
     * ``--debug`` exports ``MCP_DEBUG=true|false`` — Starlette reads
       this at app construction time inside ``create_app``.
@@ -171,23 +173,25 @@ def apply_runtime_flags(config: ServerConfig) -> None:
     """
     from .core import config as core_config
 
-    # Embeddings
+    # Embeddings. ``ADVANCED_EMBEDDINGS`` is the single global this sets;
+    # every reader resolves (model, dimension) via
+    # ``core_config.embedding_settings()`` at the point of use, so
+    # there's nothing else to keep in sync here.
+    core_config.ADVANCED_EMBEDDINGS = bool(config.advanced)
+    settings = core_config.embedding_settings(config.advanced)
     if config.advanced:
-        core_config.ADVANCED_EMBEDDINGS = True
-        core_config.EMBEDDING_MODEL = core_config.ADVANCED_EMBEDDING_MODEL
-        core_config.EMBEDDING_DIMENSION = core_config.ADVANCED_EMBEDDING_DIMENSION
         logger.info(
             "Advanced embeddings mode enabled (%d dimensions, %s).",
-            core_config.ADVANCED_EMBEDDING_DIMENSION,
-            core_config.ADVANCED_EMBEDDING_MODEL,
+            settings.dimension,
+            settings.model,
         )
     else:
         # Default is the simple model; only log so operators see which
         # mode is active.
         logger.info(
             "Using simple embeddings mode (%d dimensions, %s).",
-            core_config.SIMPLE_EMBEDDING_DIMENSION,
-            core_config.SIMPLE_EMBEDDING_MODEL,
+            settings.dimension,
+            settings.model,
         )
 
     # Auto-indexing

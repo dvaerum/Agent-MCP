@@ -2,6 +2,7 @@
 import logging
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
@@ -211,13 +212,57 @@ ADVANCED_EMBEDDING_DIMENSION: int = (
     3072  # Full dimension for text-embedding-3-large for better code understanding
 )
 
-# Dynamic configuration based on mode
-EMBEDDING_MODEL: str = (
-    ADVANCED_EMBEDDING_MODEL if ADVANCED_EMBEDDINGS else SIMPLE_EMBEDDING_MODEL
-)
-EMBEDDING_DIMENSION: int = (
-    ADVANCED_EMBEDDING_DIMENSION if ADVANCED_EMBEDDINGS else SIMPLE_EMBEDDING_DIMENSION
-)
+
+@dataclass(frozen=True)
+class EmbeddingSettings:
+    """Resolved (model, dimension, advanced) for the embedding seam.
+
+    Single source of truth for "which embedding config is active right
+    now" — replaces the old ``EMBEDDING_MODEL`` / ``EMBEDDING_DIMENSION``
+    module-level constants, which were computed ONCE at import time and
+    then mutated in place by ``server_bootstrap.apply_runtime_flags`` for
+    ``--advanced`` mode. That mutation was only visible to callers who
+    read the attribute live (``_config.EMBEDDING_DIMENSION``); a caller
+    who did ``from ...core.config import EMBEDDING_DIMENSION`` bound the
+    name at ITS OWN import time and silently kept the pre-mutation
+    (simple-mode) value forever — an unenforced import-order dependency
+    that, for ``db/schema.py``, could build the sqlite-vec column at the
+    wrong dimension.
+
+    ``embedding_settings()`` closes this: it is a function, so every
+    call site re-resolves from the current state instead of freezing a
+    name binding at import time.
+    """
+
+    model: str
+    dimension: int
+    advanced: bool
+
+
+def embedding_settings(advanced: Optional[bool] = None) -> "EmbeddingSettings":
+    """Resolve the embedding (model, dimension) for the current mode.
+
+    ``advanced``, when given, resolves settings directly from that flag
+    — the path for a caller holding a ``ServerConfig`` (e.g.
+    ``server_bootstrap.apply_runtime_flags``), which needs no module
+    state at all. When omitted, falls back to the ``ADVANCED_EMBEDDINGS``
+    flag that ``apply_runtime_flags`` sets at boot — the path for the
+    many call sites deep in the RAG / db layers that have no
+    ``ServerConfig`` to hand and must consult "what mode is the running
+    server in".
+    """
+    is_advanced = ADVANCED_EMBEDDINGS if advanced is None else advanced
+    if is_advanced:
+        return EmbeddingSettings(
+            model=ADVANCED_EMBEDDING_MODEL,
+            dimension=ADVANCED_EMBEDDING_DIMENSION,
+            advanced=True,
+        )
+    return EmbeddingSettings(
+        model=SIMPLE_EMBEDDING_MODEL,
+        dimension=SIMPLE_EMBEDDING_DIMENSION,
+        advanced=False,
+    )
 
 # Chat / task-analysis model names are no longer hardcoded here.
 # v5.0.43 hardcoded "gpt-4.1-2025-04-14" — a non-existent OpenAI model
