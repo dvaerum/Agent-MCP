@@ -41,12 +41,9 @@ from ...core import globals as g
 from ...core import session_registry
 from ...core.principal import Principal
 from ...core.tool_result import (
-    Conflict as _Conflict,
     Failed as _Failed,
-    Invalid as _Invalid,
-    NotFound as _NotFound,
     Ok as _Ok,
-    PermissionDenied as _PermissionDenied,
+    tool_result_to_http,
 )
 from ...db.actions.agent_actions_db import log_agent_action_to_db
 from ...db.connection import get_db_connection
@@ -330,6 +327,10 @@ async def register_agent_dashboard_api_route(
         )
 
     if isinstance(result, _Ok):
+        # Bespoke Ok shaping: this route flattens ``Ok.data`` into the
+        # named fields the dashboard's register modal reads (agent_token,
+        # mcp_snippet, …). Preserved verbatim — only the ERROR status
+        # mapping is unified below.
         payload = result.data if isinstance(result.data, dict) else {}
         return JSONResponse({
             "message": result.message
@@ -340,20 +341,25 @@ async def register_agent_dashboard_api_route(
             "mcp_snippet": payload.get("mcp_snippet"),
             "project_name": payload.get("project_name"),
         })
-    if isinstance(result, _Conflict):
-        return JSONResponse({"message": result.reason}, status_code=409)
-    if isinstance(result, _NotFound):
-        text = f"{result.resource} {result.identifier!r} not found."
-        return JSONResponse({"message": text}, status_code=404)
-    if isinstance(result, _Invalid):
-        return JSONResponse({"message": result.message}, status_code=400)
-    if isinstance(result, _PermissionDenied):
-        return JSONResponse({"message": result.reason}, status_code=401)
-    if isinstance(result, _Failed):
-        return JSONResponse({"message": result.message}, status_code=500)
-    return JSONResponse(
-        {"message": f"Unknown tool result: {result!r}"}, status_code=500,
-    )
+
+    # Error variants: STATUS comes from the ONE shared adapter
+    # (:func:`agent_mcp.core.tool_result.tool_result_to_http`), replacing
+    # the hand-rolled isinstance ladder that had drifted — it mapped
+    # ``PermissionDenied → 401`` where the shared dispatcher maps 403.
+    # 403 is correct: the caller authenticated but lacks the capability
+    # (authenticated-but-forbidden); 401 is reserved for missing/invalid
+    # credentials the auth middleware rejects upstream of dispatch. This
+    # route keeps its thin ``{"message": ...}`` body (the dashboard's
+    # register modal reads ``.message``); only the status is unified.
+    status, body = tool_result_to_http(result)
+    # ``Failed`` keeps this route's historical raw ``result.message`` in
+    # the body — the adapter genericizes it (SEC-R8-1) for the dashboard
+    # dispatch path, but preserving this route's exact wire text keeps the
+    # change status-only + behaviour-preserving (register never surfaces a
+    # DB-error Failed today; the outer except already genericizes RAISED
+    # errors).
+    message = result.message if isinstance(result, _Failed) else body["message"]
+    return JSONResponse({"message": message}, status_code=status)
 
 
 # --- Agent restore + purge endpoints ---

@@ -141,10 +141,18 @@ async def test_register_forwarding_viewer_principal_is_viewer_role(monkeypatch):
 async def test_register_forwarding_viewer_denied_end_to_end():
     """End-to-end: a forwarding VIEWER hitting the register route with the
     REAL tool impl is denied by the ``agents.register`` capability gate —
-    the route returns 401 (``PermissionDenied``) before any DB access.
+    the route returns 403 (``PermissionDenied``) before any DB access.
 
     RED on origin/main: the hard-coded operator Principal passes the gate,
-    so the route does NOT return 401.
+    so the route does NOT deny at all.
+
+    Status note (arch-deepening candidate C): this assertion previously
+    pinned 401 — the register route's hand-rolled ladder mapped
+    ``PermissionDenied → 401``, diverging from the shared dispatcher's
+    403. That divergence was the bug; the route now routes the status
+    through the ONE ``tool_result_to_http`` adapter, so an
+    authenticated-but-forbidden caller gets 403 (401 stays reserved for
+    missing/invalid credentials the auth middleware rejects upstream).
     """
     auth = await require_operator_session(
         _FakeAuthRequest(_forwarding_principal("viewer"))
@@ -156,7 +164,7 @@ async def test_register_forwarding_viewer_denied_end_to_end():
         auth=auth,
     )
 
-    assert resp.status_code == 401
+    assert resp.status_code == 403
 
 
 async def test_register_forwarding_operator_principal_unaffected(monkeypatch):
