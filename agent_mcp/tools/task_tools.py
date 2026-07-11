@@ -297,8 +297,22 @@ def estimate_tokens(text: str) -> int:
 
 
 def _generate_task_id() -> str:
-    """Generates a unique task ID."""
-    return f"task_{secrets.token_hex(6)}"
+    """Generates a unique task ID.
+
+    arch-deepening R4 #7: delegates to the repository's canonical
+    generator (``task_repository._generate_task_id``) so there is
+    exactly one id-minting scheme. This wrapper stays because several
+    call sites below need the id BEFORE the row exists — a log line,
+    a notification payload, or a parent's ``child_tasks`` mirror built
+    ahead of the write transaction — so they can't rely on
+    ``task_repo.create()``'s own auto-mint (which only fires when the
+    caller omits ``task_id`` entirely). Sites that don't need the id
+    early just omit ``task_id`` from the ``create()`` call and read it
+    off the returned row instead.
+    """
+    from ..repositories.task_repository import _generate_task_id as _mint
+
+    return _mint()
 
 
 def _generate_notification_id() -> str:
@@ -891,11 +905,15 @@ async def _create_unassigned_tasks(
             cursor = u.cursor
 
             if tasks:
-                # Multiple unassigned task creation
+                # Multiple unassigned task creation. arch-deepening R4
+                # #7: this used to mint
+                # ``task_{int(now().timestamp()*1000)}_{i}`` — same-
+                # millisecond loop iterations produced colliding ids
+                # (duplicate PK -> IntegrityError). ``task_id`` is now
+                # omitted so ``task_repo.create`` mints an opaque,
+                # collision-resistant id; downstream uses read it off
+                # ``fresh["task_id"]``.
                 for i, task in enumerate(tasks):
-                    task_id = (
-                        f"task_{int(datetime.datetime.now().timestamp() * 1000)}_{i}"
-                    )
                     title = task["title"]
                     description = task["description"]
                     task_priority = task.get("priority", "medium")
@@ -908,7 +926,6 @@ async def _create_unassigned_tasks(
 
                     fresh = task_repo.create(
                         {
-                            "task_id": task_id,
                             "title": title,
                             "description": description,
                             "assigned_to": None,
@@ -916,15 +933,13 @@ async def _create_unassigned_tasks(
                             "status": "unassigned",
                             "priority": task_priority,
                             "parent_task": parent_task,
-                            "child_tasks": [],
-                            "depends_on_tasks": [],
-                            "notes": [],
                             "required_capabilities": (
                                 normalized_caps if normalized_caps else None
                             ),
                         },
                         connection=cursor,
                     )
+                    task_id = fresh["task_id"]
                     cached_dicts.append(fresh)
 
                     # BL-2: maintain the parent's child_tasks mirror.
@@ -944,13 +959,15 @@ async def _create_unassigned_tasks(
                     )
 
             elif task_title and task_description:
-                # Single unassigned task creation
-                task_id = f"task_{int(datetime.datetime.now().timestamp() * 1000)}"
+                # Single unassigned task creation. arch-deepening R4
+                # #7: previously minted
+                # ``task_{int(now().timestamp()*1000)}`` — two calls
+                # landing in the same millisecond collided on the PK.
+                # ``task_id`` omitted; ``task_repo.create`` mints one.
                 normalized_caps = normalize_capabilities(top_level_required_caps_raw)
 
                 fresh = task_repo.create(
                     {
-                        "task_id": task_id,
                         "title": task_title,
                         "description": task_description,
                         "assigned_to": None,
@@ -958,15 +975,13 @@ async def _create_unassigned_tasks(
                         "status": "unassigned",
                         "priority": priority,
                         "parent_task": parent_task_id_arg,
-                        "child_tasks": [],
-                        "depends_on_tasks": [],
-                        "notes": [],
                         "required_capabilities": (
                             normalized_caps if normalized_caps else None
                         ),
                     },
                     connection=cursor,
                 )
+                task_id = fresh["task_id"]
                 cached_dicts.append(fresh)
 
                 # BL-2: maintain the parent's child_tasks mirror.
@@ -1328,9 +1343,12 @@ async def _create_and_assign_multiple_tasks(
             cached_dicts: list[dict] = []
             parents_to_refresh: set[str] = set()
 
-            # Create each task
+            # Create each task. arch-deepening R4 #7: the loop used to
+            # mint ``task_{int(now().timestamp()*1000)}_{i}`` — same-
+            # millisecond iterations collided on the PK. ``task_id`` is
+            # now omitted so ``task_repo.create`` mints an opaque id;
+            # downstream uses read it off ``fresh["task_id"]``.
             for i, task in enumerate(tasks):
-                task_id = f"task_{int(datetime.datetime.now().timestamp() * 1000)}_{i}"
                 title = task["title"]
                 description = task["description"]
                 priority = task.get("priority", "medium")
@@ -1338,7 +1356,6 @@ async def _create_and_assign_multiple_tasks(
 
                 fresh = task_repo.create(
                     {
-                        "task_id": task_id,
                         "title": title,
                         "description": description,
                         "assigned_to": target_agent_id,
@@ -1346,12 +1363,10 @@ async def _create_and_assign_multiple_tasks(
                         "status": "pending",
                         "priority": priority,
                         "parent_task": parent_task,
-                        "child_tasks": [],
-                        "depends_on_tasks": [],
-                        "notes": [],
                     },
                     connection=cursor,
                 )
+                task_id = fresh["task_id"]
                 cached_dicts.append(fresh)
 
                 # BL-2: maintain the parent's child_tasks mirror.
@@ -2019,7 +2034,6 @@ async def assign_task_tool_impl(
                     "status": status,
                     "priority": priority,
                     "parent_task": final_parent_task_id,
-                    "child_tasks": [],
                     "depends_on_tasks": final_depends_on_tasks or [],
                     "notes": initial_notes,
                     "required_capabilities": (
@@ -2422,9 +2436,19 @@ async def create_self_task_tool_impl(
                     "status": status,
                     "priority": priority,
                     "parent_task": final_parent_task_id,
-                    "child_tasks": [],
                     "depends_on_tasks": final_depends_on_tasks or [],
-                    "notes": [],
+                    # arch-deepening R4 #7: explicit, locked decision — a
+                    # self-task is always immediately self-assigned (see
+                    # ``assigned_to`` above), so it never goes through the
+                    # capability-routing gate that ``required_capabilities``
+                    # exists to enforce on a separate assignment step. This
+                    # used to be an accidental omission (the dict simply
+                    # never had the key); it's now an explicit ``None`` so
+                    # the next reader doesn't mistake it for a bug. If a
+                    # future reassignment path needs self-tasks to carry a
+                    # capability tag, that's a deliberate follow-up, not a
+                    # silent behavior change here.
+                    "required_capabilities": None,
                 },
                 connection=cursor,
             )
@@ -3847,10 +3871,7 @@ async def request_assistance_tool_impl(
                     "assigned_to": None,
                     "priority": "high",  # Assistance tasks are high priority
                     "parent_task": parent_task_id,
-                    "depends_on_tasks": [],
                     "created_by": requesting_agent_id,
-                    "child_tasks": [],
-                    "notes": [],
                 },
                 connection=cursor,
             )
@@ -5868,7 +5889,10 @@ async def create_task_tool_impl(
     requesting_admin_id = (
         principal.actor_label() if principal is not None else "admin"
     )
-    task_id = _generate_task_id()
+    # arch-deepening R4 #7: no downstream use here needs the id before
+    # the row exists, so ``task_id`` is minted by ``task_repo.create``
+    # below instead of pre-generated — see ``fresh["task_id"]`` after
+    # the call.
     status = "pending" if assigned_to else "unassigned"
 
     try:
@@ -5915,7 +5939,6 @@ async def create_task_tool_impl(
 
             fresh = _task_repo.create(
                 {
-                    "task_id": task_id,
                     "title": title,
                     "description": description,
                     "assigned_to": assigned_to,
@@ -5923,13 +5946,11 @@ async def create_task_tool_impl(
                     "status": status,
                     "priority": priority,
                     "parent_task": parent_task,
-                    "child_tasks": [],
-                    "depends_on_tasks": [],
-                    "notes": [],
                     "required_capabilities": _norm_caps if _norm_caps else None,
                 },
                 connection=cursor,
             )
+            task_id = fresh["task_id"]
 
             # BL-R30-1: set the gaining agent's ``current_task`` on a
             # create-with-assignee (prior=None → SETs only when idle).

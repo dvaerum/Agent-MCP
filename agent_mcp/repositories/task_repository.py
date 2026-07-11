@@ -60,6 +60,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import json
+import secrets
 from typing import Any, Dict, Iterator, List, Optional
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -123,6 +124,24 @@ _JSON_LIST_FIELDS: set[str] = {
 }
 
 
+def _generate_task_id() -> str:
+    """Mint an opaque, collision-resistant task id.
+
+    arch-deepening R4 #7: this is now the ONE id-minting scheme for
+    tasks. Before this PR, ``tools/task_tools.py`` carried THREE
+    generators feeding ``create()`` — this opaque ``secrets``-based
+    scheme (originally ``task_tools._generate_task_id``, which now
+    delegates here) plus two ``f"task_{int(now().timestamp()*1000)}"``
+    variants used by the unassigned/multi-create paths. The timestamp
+    variants collide under concurrent same-millisecond creates
+    (duplicate PK -> IntegrityError); ``secrets.token_hex`` does not.
+    ``create()`` calls this whenever a caller omits ``task_id``, so
+    every write path that doesn't need the id before the row exists
+    gets the safe scheme for free.
+    """
+    return f"task_{secrets.token_hex(6)}"
+
+
 # ---------------------------------------------------------------------------
 # Module-level free functions — formerly lived in db/actions/task_db.py.
 # These remain ORM-backed and behaviourally unchanged. Legacy callers
@@ -140,6 +159,17 @@ def _task_to_dict(row: Task) -> Dict[str, Any]:
     the three JSON-typed columns are deserialised to Python lists.
     Parse failures fall back to an empty list with a warning (matches
     the legacy helper's behaviour exactly).
+
+    arch-deepening R4 #7: ``required_capabilities`` used to be missing
+    from this projection entirely — ``create()``'s ``connection=``
+    paths always included it in the ``fresh`` dict they build by hand,
+    but the standalone (no-``connection``) path re-fetches via
+    :func:`get_task_by_id`, which goes through here and silently
+    dropped the column. Every other reader of this projection
+    (``get_by_id``, ``list_all``, ``list_by_agent``) inherited the
+    same gap. Fixed here rather than left as a further landmine now
+    that ``create()``'s docstring makes the returned-shape contract
+    explicit.
     """
     data: Dict[str, Any] = {
         "task_id": row.task_id,
@@ -155,6 +185,7 @@ def _task_to_dict(row: Task) -> Dict[str, Any]:
         "child_tasks": row.child_tasks,
         "depends_on_tasks": row.depends_on_tasks,
         "notes": row.notes,
+        "required_capabilities": row.required_capabilities,
     }
     for field_key in _JSON_LIST_FIELDS:
         raw = data.get(field_key)
@@ -169,6 +200,20 @@ def _task_to_dict(row: Task) -> Dict[str, Any]:
                 data[field_key] = []
         elif raw is None:
             data[field_key] = []
+
+    # required_capabilities is NOT in _JSON_LIST_FIELDS: NULL means "no
+    # requirement, anyone can claim" and must stay None, unlike the trio
+    # above whose NULL defaults to [].
+    raw_caps = data.get("required_capabilities")
+    if isinstance(raw_caps, str):
+        try:
+            data["required_capabilities"] = json.loads(raw_caps)
+        except json.JSONDecodeError:
+            logger.warning(
+                f"Failed to parse JSON for field 'required_capabilities' "
+                f"in task '{data.get('task_id', 'Unknown')}'. Raw: {raw_caps}"
+            )
+            data["required_capabilities"] = None
     return data
 
 
@@ -436,10 +481,14 @@ class TaskRepository:
         """INSERT a task row, update the cache, publish ``"task.created"``.
 
         ``fields`` is a dict carrying every column the caller wants to
-        set. Required keys: ``task_id``, ``title``, ``created_by``.
-        Optional: ``description``, ``assigned_to``, ``status``,
-        ``priority``, ``parent_task``, ``child_tasks``,
-        ``depends_on_tasks``, ``notes``, ``required_capabilities``.
+        set. Required keys: ``title``, ``created_by``. Optional:
+        ``task_id`` (auto-minted via :func:`_generate_task_id` when
+        omitted — see arch-deepening R4 #7), ``description``,
+        ``assigned_to``, ``status`` (defaults ``"pending"``),
+        ``priority`` (defaults ``"medium"``), ``parent_task``,
+        ``child_tasks``/``depends_on_tasks``/``notes`` (each defaults
+        to ``[]`` — callers only need to pass these when the value is
+        non-empty), ``required_capabilities``.
 
         ``connection`` is the transaction-aware seam introduced in
         PR #151 and expanded here for the multi-table writes in
@@ -451,7 +500,11 @@ class TaskRepository:
         case), the method opens its own session.
 
         Returns the freshly-stored row in the same dict shape
-        consumers expect (JSON list fields deserialised). On DB
+        consumers expect (JSON list fields deserialised) — including
+        the minted ``task_id`` when the caller didn't supply one, so
+        callers that need the id for follow-up work (audit rows,
+        parent ``child_tasks`` mirrors, cache upserts) read it off the
+        return value rather than generating it themselves. On DB
         conflict (e.g. duplicate ``task_id``), raises the underlying
         ``SQLAlchemyError`` — silently returning the existing row
         would mask write conflicts and the legacy raw-SQL path
@@ -463,7 +516,7 @@ class TaskRepository:
         notes = fields.get("notes") or []
         required_caps = fields.get("required_capabilities")
 
-        task_id = fields["task_id"]
+        task_id = fields.get("task_id") or _generate_task_id()
         assigned_to = fields.get("assigned_to")
         status = fields.get("status", "pending")
 

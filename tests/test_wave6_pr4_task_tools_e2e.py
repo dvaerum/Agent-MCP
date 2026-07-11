@@ -263,6 +263,51 @@ async def test_create_self_task_worker_succeeds(tmp_path) -> None:
         assert "Self-assigned task" in text, text
 
 
+async def test_create_self_task_never_carries_required_capabilities(
+    tmp_path,
+) -> None:
+    """arch-deepening R4 #7 — locked decision, made explicit.
+
+    ``create_self_task`` never tagged its row with
+    ``required_capabilities``; before this PR that was an accidental
+    omission (the field was simply missing from the ``task_repo.create``
+    call dict, one of the ~7 near-identical call sites that had drifted
+    from each other). The behavior is now an explicit
+    ``"required_capabilities": None`` with a comment recording why: a
+    self-task is always immediately self-assigned at creation, so the
+    capability-routing gate ``required_capabilities`` exists to enforce
+    on a SEPARATE assignment step never applies here. This test pins
+    that the row lands with no capability tag regardless of what the
+    caller passes (the tool schema doesn't even accept the field) —
+    behavior-preserving, now on purpose.
+    """
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        root = _seed_assigned_task("root task", alice.agent_id)
+
+        result = await alice.call(
+            "create_self_task",
+            {
+                "task_title": "alice's capability-free subtask",
+                "task_description": "must not carry a capability tag",
+                "parent_task_id": root,
+            },
+        )
+        text = result[0].text
+        assert "Unauthorized" not in text and "Error" not in text, text
+
+        m = re.search(r"task_[a-f0-9]+", text)
+        assert m, f"no task_id in result: {text}"
+        task_id = m.group(0)
+
+        row = admin.task_row(task_id)
+        assert row is not None, f"task {task_id} not in /api/tasks listing"
+        assert not row.get("required_capabilities"), (
+            f"create_self_task must not tag the row with "
+            f"required_capabilities; got {row.get('required_capabilities')!r}"
+        )
+
+
 # ── 5. update_task_status worker on own task ─────────────────────
 
 
