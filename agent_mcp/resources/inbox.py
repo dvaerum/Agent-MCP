@@ -1,8 +1,13 @@
 """Inbox resource — JSON event envelope for the calling agent.
 
-Reuses `_collect_events_for` from the agent_communication_tools
-module so the read response is byte-identical to what
-`wait_for_events` returns for the same `since` cursor.
+Routes through `assemble_event_feed` — the single owner of the
+event-feed stream-merge pipeline — so the read response is truly
+byte-identical to what `wait_for_events` returns for the same `since`
+cursor. (The previous `_collect_events_for` shim OMITTED the
+unassigned-task stream + the merged-boundary clamp, so the inbox
+silently diverged from `wait_for_events` despite this docstring's
+claim — routing both through the one owner makes that divergence
+unrepresentable.)
 """
 
 from __future__ import annotations
@@ -20,15 +25,9 @@ def render_inbox(agent_id: str, since: Optional[str] = None) -> str:
     poll the resource and dedupe client-side via `message_id` /
     `task_id`. For cursor-based consumption use `wait_for_events`.
     """
-    from ..tools.agent_communication_tools import (
-        _collect_events_for,
-    )
+    from ..tools.agent_communication_tools import assemble_event_feed
 
-    events = _collect_events_for(agent_id, since)
-    if events:
-        next_cursor = max(e["timestamp"] for e in events)
-    else:
-        next_cursor = since or ""
+    events, next_cursor = assemble_event_feed(agent_id, since)
     return json.dumps(
         {"events": events, "next_cursor": next_cursor},
         ensure_ascii=False,

@@ -1355,6 +1355,71 @@ def _collect_unassigned_task_events_for(
     return events
 
 
+def assemble_event_feed(
+    agent_id: str,
+    cursor: Optional[str],
+    *,
+    drain_queue: Optional[List[Dict[str, Any]]] = None,
+) -> tuple[List[Dict[str, Any]], str]:
+    """Single owner of the event-feed stream-merge pipeline.
+
+    Every event-feed surface — both ``wait_for_events`` paths (fast +
+    slow), ``fetch_events_since``, and the inbox resource — routes
+    through here so the union / dedup / clamp / sort / cursor steps run
+    in the ONE correct order exactly once. Copy-pasting this pipeline was
+    the BL-R20 / BL-R21 fault line (and let the inbox resource silently
+    diverge from ``wait_for_events`` by omitting the unassigned-task
+    stream + the merged-boundary clamp).
+
+    The three streams merged, in order:
+
+      1. DB-backed events (direct/broadcast messages + assigned-task
+         changes) via :func:`_collect_events_with_cap`, which also
+         yields the message-truncation boundary ``msg_cap_ts``.
+      2. Matching ``unassigned_task_appeared`` events via
+         :func:`_collect_unassigned_task_events_for` (an UNBOUNDED
+         query, invisible to the internal clamp inside stream 1).
+      3. ``drain_queue`` — synthetic-queue items a ``wait_for_events``
+         waiter already popped off its private queue. ``None`` for the
+         pure-DB catch-up surfaces (``fetch_events_since``, inbox).
+
+    Ordering invariant (do NOT reorder): dedup runs BEFORE the clamp so
+    the surviving copy of each dual-sourced event carries its DB
+    ``updated_at`` timestamp (not a later wall-clock synthetic instant),
+    keeping the clamp / cursor anchored on the real DB transition time
+    (BL-R31-2). The clamp then caps the MERGED batch — and therefore the
+    ``max()`` cursor derived from it — to ``msg_cap_ts`` so a newer,
+    unbounded stream-2/3 event can't drag the persisted cursor past the
+    un-returned messages 501+ (BL-R21-1).
+
+    Returns ``(events, next_cursor)`` where ``events`` is timestamp-ASC
+    and ``next_cursor`` is ``max(timestamp)`` over the returned batch, or
+    ``cursor or ""`` when the batch is empty (the caller's progress is
+    preserved on an empty poll).
+    """
+    events, msg_cap_ts = _collect_events_with_cap(agent_id, cursor)
+    events.extend(_collect_unassigned_task_events_for(agent_id, cursor))
+    if drain_queue:
+        events.extend(drain_queue)
+    # BL-R31-2: collapse the DB re-query + synthetic-queue copies of the
+    # same unassigned task to one delivery (keeping the DB updated_at
+    # copy) BEFORE the clamp so the clamp/cursor anchor stays on the DB
+    # transition time.
+    events = _dedup_events(events)
+    # BL-R21-1: cap the MERGED batch to the message-truncation boundary
+    # so a newer unbounded task/synthetic event can't drag the persisted
+    # cursor past the un-returned messages 501+.
+    events = _cap_events_to_boundary(events, msg_cap_ts)
+    events.sort(key=lambda e: e.get("timestamp") or "")
+    if events:
+        next_cursor = (
+            max((e.get("timestamp") or "") for e in events) or (cursor or "")
+        )
+    else:
+        next_cursor = cursor or ""
+    return events, next_cursor
+
+
 async def wait_for_events_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -1432,26 +1497,15 @@ async def wait_for_events_tool_impl(
             return _envelope([stop_evt], since)
 
         # Fast path — combine DB backlog with synthetic events that
-        # arrived between register_waiter() and this point.
+        # arrived between register_waiter() and this point. The single
+        # feed owner runs union → dedup → clamp → sort → cursor; drain
+        # the waiter's private synthetic queue as stream 3.
         events: List[Dict[str, Any]]
-        events, msg_cap_ts = _collect_events_with_cap(agent_id, since)
-        events.extend(_collect_unassigned_task_events_for(agent_id, since))
-        events.extend(g.drain_waiter_queue(waiter_queue))
-        # BL-R31-2: dedup the DB re-query copy and the synthetic-queue
-        # copy of the same unassigned task down to one delivery (keeping
-        # the DB updated_at copy) BEFORE the clamp so the clamp/cursor
-        # anchor stays on the DB transition time.
-        events = _dedup_events(events)
-        # BL-R21-1: cap the MERGED batch to the message-truncation
-        # boundary so a newer unbounded task/synthetic event can't drag
-        # the persisted cursor past the un-returned messages 501+.
-        events = _cap_events_to_boundary(events, msg_cap_ts)
+        events, cursor_value = assemble_event_feed(
+            agent_id, since, drain_queue=g.drain_waiter_queue(waiter_queue)
+        )
         if events:
-            events.sort(key=lambda e: e.get("timestamp") or "")
             env = _envelope(events, since)
-            cursor_value = (
-                max((e.get("timestamp") or "") for e in events) or (since or "")
-            )
             if cursor_value:
                 _write_last_event_seen_at(agent_id, cursor_value)
             return env
@@ -1497,28 +1551,18 @@ async def wait_for_events_tool_impl(
                     return _envelope([stop_evt], since)
                 # Drain everything that accumulated — our own private
                 # synthetic queue (plus the first_item we already
-                # popped to release ``queue.get()``) + a fresh re-query
+                # popped to release ``queue.get()``) — and hand it to the
+                # single feed owner as stream 3 alongside a fresh re-query
                 # of DB-backed events.
-                events, msg_cap_ts = _collect_events_with_cap(agent_id, since)
-                events.extend(_collect_unassigned_task_events_for(agent_id, since))
-                rest = g.drain_waiter_queue(waiter_queue)
+                drained: List[Dict[str, Any]] = []
                 if first_item is not g.WAITER_WAKE_SENTINEL and first_item is not None:
-                    events.append(first_item)
-                events.extend(rest)
-                # BL-R31-2: dedup the DB re-query + synthetic-queue copies
-                # of the same unassigned task (same rationale as the fast
-                # path) BEFORE the clamp.
-                events = _dedup_events(events)
-                # BL-R21-1: cap the MERGED batch to the message
-                # truncation boundary (same rationale as the fast path).
-                events = _cap_events_to_boundary(events, msg_cap_ts)
+                    drained.append(first_item)
+                drained.extend(g.drain_waiter_queue(waiter_queue))
+                events, cursor_value = assemble_event_feed(
+                    agent_id, since, drain_queue=drained
+                )
                 if events:
-                    events.sort(key=lambda e: e.get("timestamp") or "")
                     env = _envelope(events, since)
-                    cursor_value = (
-                        max((e.get("timestamp") or "") for e in events)
-                        or (since or "")
-                    )
                     if cursor_value:
                         _write_last_event_seen_at(agent_id, cursor_value)
                     return env
@@ -1580,30 +1624,15 @@ async def fetch_events_since_tool_impl(
     if cursor is None:
         cursor = _read_last_event_seen_at(agent_id)
 
-    # Gather everything since the cursor: DB-backed events + matching
-    # unassigned tasks. We deliberately do NOT drain the in-memory
-    # queue here — fetch_events_since is the "fresh catch-up" path and
-    # the queue contents are only meaningful in the context of a
-    # wait_for_events session that established expectations about
-    # ordering.
-    events, msg_cap_ts = _collect_events_with_cap(agent_id, cursor)
-    events.extend(_collect_unassigned_task_events_for(agent_id, cursor))
-    # BL-R31-2: dedup any duplicate unassigned-task copies before the
-    # clamp. fetch_events_since doesn't drain the synthetic queue, so the
-    # DB re-query is normally the only source here — this is defensive
-    # parity with the wait_for_events merge path (same helper, same
-    # invariant) so no caller can emit a double.
-    events = _dedup_events(events)
-    # BL-R21-1: cap the MERGED batch to the message truncation boundary
-    # so the persisted catch-up cursor can't leap past messages 501+ via
-    # a newer unbounded unassigned-task event.
-    events = _cap_events_to_boundary(events, msg_cap_ts)
-    events.sort(key=lambda e: e.get("timestamp") or "")
+    # Gather everything since the cursor via the single feed owner: DB-
+    # backed events + matching unassigned tasks. We deliberately do NOT
+    # drain the in-memory queue here (``drain_queue`` stays ``None``) —
+    # fetch_events_since is the "fresh catch-up" path and the queue
+    # contents are only meaningful in the context of a wait_for_events
+    # session that established expectations about ordering.
+    events, new_cursor = assemble_event_feed(agent_id, cursor)
     if events:
-        new_cursor = max((e.get("timestamp") or "") for e in events) or (cursor or "")
         _write_last_event_seen_at(agent_id, new_cursor)
-    else:
-        new_cursor = cursor or ""
 
     body = {"events": events, "cursor": new_cursor}
     return Ok(
