@@ -496,6 +496,16 @@ async def get_agent_messages_tool_impl(
             reason="Valid agent token required to retrieve messages"
         )
 
+    # Reads require the ``messages.view`` capability — a no-op for worker +
+    # manager agents (both bundles carry it) and sysadmin. It DENIES the one
+    # over-admit the identity-only gate above let through: an ``agent_bearer``
+    # that identified an ``agent_id`` yet held zero caps (``agent_role`` None
+    # → empty bundle). Same empty-bearer class ``ask_project_rag`` closed.
+    if not principal.has_capability("messages.view"):
+        return PermissionDenied(
+            reason="messages.view capability required to retrieve messages"
+        )
+
     agent_id = principal.agent_id
 
     include_sent = arguments.get("include_sent", False)
