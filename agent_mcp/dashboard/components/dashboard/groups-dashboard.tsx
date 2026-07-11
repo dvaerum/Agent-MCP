@@ -43,11 +43,8 @@ import {
   CAPABILITY_RESOURCE_LABELS,
   groupCapabilitiesByResource,
 } from "@/lib/capability-descriptions"
-
-const STRICT_HEADERS = {
-  Accept: "application/vnd.agent-mcp.v1+json",
-  "Content-Type": "application/json",
-}
+import { routerApi } from "@/lib/router-api"
+import { ApiError } from "@/lib/api"
 
 interface GroupRow {
   group_id: string
@@ -73,46 +70,25 @@ interface UserRow {
   is_sysadmin: boolean
 }
 
-interface ErrorResponse {
-  success: false
-  error: string
-  message: string
-}
-
 async function fetchGroups(): Promise<GroupRow[]> {
-  const r = await fetch(routerGroupsUrl(), {
-    headers: { Accept: STRICT_HEADERS.Accept },
-    credentials: "include",
-  })
-  if (!r.ok) throw new Error(`HTTP ${r.status}`)
-  return (await r.json()).groups || []
+  const body = await routerApi.request<{ groups?: GroupRow[] }>(
+    routerGroupsUrl(),
+  )
+  return body.groups || []
 }
 
 async function fetchMembers(groupId: string): Promise<MemberRow[]> {
-  const r = await fetch(routerGroupMembersUrl(groupId), {
-    headers: { Accept: STRICT_HEADERS.Accept },
-    credentials: "include",
-  })
-  if (!r.ok) throw new Error(`HTTP ${r.status}`)
-  return (await r.json()).members || []
+  const body = await routerApi.request<{ members?: MemberRow[] }>(
+    routerGroupMembersUrl(groupId),
+  )
+  return body.members || []
 }
 
 async function fetchUsers(): Promise<UserRow[]> {
-  const r = await fetch(routerUsersUrl(), {
-    headers: { Accept: STRICT_HEADERS.Accept },
-    credentials: "include",
-  })
-  if (!r.ok) throw new Error(`HTTP ${r.status}`)
-  return (await r.json()).users || []
-}
-
-async function fetchGroupCapabilities(groupId: string): Promise<string[]> {
-  const r = await fetch(routerGroupCapabilitiesUrl(groupId), {
-    headers: { Accept: STRICT_HEADERS.Accept },
-    credentials: "include",
-  })
-  if (!r.ok) throw new Error(`HTTP ${r.status}`)
-  return (await r.json()).capabilities || []
+  const body = await routerApi.request<{ users?: UserRow[] }>(
+    routerUsersUrl(),
+  )
+  return body.users || []
 }
 
 
@@ -260,18 +236,10 @@ function GroupCard({
 
   const handleRemoveMember = async (memberId: string) => {
     try {
-      const r = await fetch(
+      await routerApi.request(
         routerGroupMemberUrl(group.group_id, memberId),
-        {
-          method: "DELETE",
-          headers: { Accept: STRICT_HEADERS.Accept },
-          credentials: "include",
-        },
+        { method: "DELETE" },
       )
-      if (!r.ok) {
-        const body = (await r.json().catch(() => ({}))) as ErrorResponse
-        throw new Error(body.message || `HTTP ${r.status}`)
-      }
       await refreshMembers()
       await onMembersChange()
     } catch (e) {
@@ -434,25 +402,20 @@ function GroupCapabilitiesSection({
     setForbidden(false)
     setToast(null)
     try {
-      const r = await fetch(routerGroupCapabilitiesUrl(groupId), {
-        headers: { Accept: STRICT_HEADERS.Accept },
-        credentials: "include",
-      })
-      if (r.status === 403) {
+      const body = await routerApi.request<{ capabilities?: string[] }>(
+        routerGroupCapabilitiesUrl(groupId),
+      )
+      const caps = body.capabilities ?? []
+      setLoaded(caps)
+      setSelected(new Set(caps))
+    } catch (e) {
+      // 403 = not sysadmin: render the read-only message, not an error.
+      if (e instanceof ApiError && e.status === 403) {
         setForbidden(true)
         setLoaded([])
         setSelected(new Set())
         return
       }
-      if (!r.ok) {
-        const body = (await r.json().catch(() => ({}))) as ErrorResponse
-        throw new Error(body.message || `HTTP ${r.status}`)
-      }
-      const body = (await r.json()) as { capabilities?: string[] }
-      const caps = body.capabilities ?? []
-      setLoaded(caps)
-      setSelected(new Set(caps))
-    } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setLoading(false)
@@ -494,29 +457,14 @@ function GroupCapabilitiesSection({
     setError(null)
     setToast(null)
     try {
-      const r = await fetch(routerGroupCapabilitiesUrl(groupId), {
+      const body = await routerApi.request<{
+        success: true
+        capabilities: string[]
+      }>(routerGroupCapabilitiesUrl(groupId), {
         method: "PUT",
-        headers: STRICT_HEADERS,
-        credentials: "include",
         body: JSON.stringify({ capabilities: [...selected] }),
       })
-      if (r.status === 403) {
-        setForbidden(true)
-        throw new Error(
-          "requires sysadmin — group capabilities are sysadmin-only",
-        )
-      }
-      const body = (await r.json().catch(() => ({}))) as
-        | (ErrorResponse & { unknown?: string[] })
-        | { success: true; capabilities: string[] }
-      if (!r.ok || (body as ErrorResponse).success === false) {
-        throw new Error(
-          (body as ErrorResponse).message ||
-            (body as ErrorResponse).error ||
-            `HTTP ${r.status}`,
-        )
-      }
-      const newCaps = (body as { capabilities: string[] }).capabilities ?? []
+      const newCaps = body.capabilities ?? []
       setLoaded(newCaps)
       setSelected(new Set(newCaps))
       setToast(
@@ -525,7 +473,15 @@ function GroupCapabilitiesSection({
         }`,
       )
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      // 403 = not sysadmin: flag forbidden + a specific hint.
+      if (e instanceof ApiError && e.status === 403) {
+        setForbidden(true)
+        setError(
+          "requires sysadmin — group capabilities are sysadmin-only",
+        )
+      } else {
+        setError(e instanceof Error ? e.message : String(e))
+      }
     } finally {
       setSaving(false)
     }
@@ -704,22 +660,10 @@ function AddGroupModal({
     setSubmitting(true)
     setError(null)
     try {
-      const r = await fetch(routerGroupsUrl(), {
+      await routerApi.request(routerGroupsUrl(), {
         method: "POST",
-        headers: STRICT_HEADERS,
-        credentials: "include",
         body: JSON.stringify({ name, is_sysadmin: isSysadmin }),
       })
-      const body = (await r.json().catch(() => ({}))) as
-        | ErrorResponse
-        | { success: true }
-      if (!r.ok || (body as ErrorResponse).success === false) {
-        throw new Error(
-          (body as ErrorResponse).message ||
-            (body as ErrorResponse).error ||
-            `HTTP ${r.status}`,
-        )
-      }
       await onCreated()
       reset()
       onOpenChange(false)
@@ -810,22 +754,10 @@ function EditGroupModal({
     setSubmitting(true)
     setError(null)
     try {
-      const r = await fetch(routerGroupUrl(group.group_id), {
+      await routerApi.request(routerGroupUrl(group.group_id), {
         method: "PATCH",
-        headers: STRICT_HEADERS,
-        credentials: "include",
         body: JSON.stringify({ name, is_sysadmin: isSysadmin }),
       })
-      const body = (await r.json().catch(() => ({}))) as
-        | ErrorResponse
-        | { success: true }
-      if (!r.ok || (body as ErrorResponse).success === false) {
-        throw new Error(
-          (body as ErrorResponse).message ||
-            (body as ErrorResponse).error ||
-            `HTTP ${r.status}`,
-        )
-      }
       await onSaved()
       onOpenChange(false)
     } catch (e) {
@@ -915,15 +847,9 @@ function DeleteGroupModal({
     setSubmitting(true)
     setError(null)
     try {
-      const r = await fetch(routerGroupUrl(group.group_id), {
+      await routerApi.request(routerGroupUrl(group.group_id), {
         method: "DELETE",
-        headers: { Accept: STRICT_HEADERS.Accept },
-        credentials: "include",
       })
-      if (!r.ok) {
-        const body = (await r.json().catch(() => ({}))) as ErrorResponse
-        throw new Error(body.message || `HTTP ${r.status}`)
-      }
       await onDeleted()
       onOpenChange(false)
     } catch (e) {
@@ -1034,22 +960,10 @@ function AddMemberModal({
         kind === "user"
           ? { user_id: selectedId }
           : { group_id: selectedId }
-      const r = await fetch(routerGroupMembersUrl(groupId), {
+      await routerApi.request(routerGroupMembersUrl(groupId), {
         method: "POST",
-        headers: STRICT_HEADERS,
-        credentials: "include",
         body: JSON.stringify(body),
       })
-      const respBody = (await r.json().catch(() => ({}))) as
-        | ErrorResponse
-        | { success: true }
-      if (!r.ok || (respBody as ErrorResponse).success === false) {
-        throw new Error(
-          (respBody as ErrorResponse).message ||
-            (respBody as ErrorResponse).error ||
-            `HTTP ${r.status}`,
-        )
-      }
       await onAdded()
       setSelectedId("")
       onOpenChange(false)

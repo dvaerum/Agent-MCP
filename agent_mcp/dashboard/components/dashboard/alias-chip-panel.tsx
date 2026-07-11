@@ -22,6 +22,7 @@ import { Loader2, Trash2, Users, AlertCircle } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { useProjectsStore, type ProjectAlias } from "@/lib/stores/projects-store"
 import { projectAliasUrl, projectAliasesUrl } from "@/lib/urls"
+import { routerApi } from "@/lib/router-api"
 
 interface AliasUsage {
   alias: string
@@ -54,16 +55,11 @@ export function AliasChipPanel({
     let cancelled = false
     setLoading(true)
     setError(null)
-    fetch(
-      projectAliasesUrl(projectName, alias.name),
-      {
+    routerApi
+      .request<AliasUsage>(projectAliasesUrl(projectName, alias.name), {
         cache: "no-store",
-        headers: { Accept: "application/vnd.agent-mcp.v1+json" },
-      },
-    )
-      .then(async (r) => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`)
-        const body = (await r.json()) as AliasUsage
+      })
+      .then((body) => {
         if (!cancelled) {
           setUsage(body)
           setLoading(false)
@@ -83,14 +79,9 @@ export function AliasChipPanel({
     setRemoving(true)
     setError(null)
     try {
-      const r = await fetch(projectAliasUrl(projectName, alias.name), {
+      await routerApi.request(projectAliasUrl(projectName, alias.name), {
         method: "DELETE",
-        headers: { Accept: "application/vnd.agent-mcp.v1+json" },
       })
-      if (!r.ok) {
-        const text = await r.text().catch(() => "")
-        throw new Error(text || `HTTP ${r.status}`)
-      }
       await fetchOverview()
       onClose()
     } catch (e) {

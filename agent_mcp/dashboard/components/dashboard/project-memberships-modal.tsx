@@ -42,11 +42,7 @@ import {
   projectMembershipsUrl, projectMembershipUrl,
   routerUsersUrl, routerGroupsUrl,
 } from "@/lib/urls"
-
-const STRICT_HEADERS = {
-  Accept: "application/vnd.agent-mcp.v1+json",
-  "Content-Type": "application/json",
-}
+import { routerApi } from "@/lib/router-api"
 
 type Role = "operator" | "viewer"
 
@@ -69,20 +65,11 @@ interface GroupOption {
   name: string
 }
 
-interface ErrorResponse {
-  success: false
-  error: string
-  message: string
-}
-
-
 async function fetchMemberships(name: string): Promise<MembershipRow[]> {
-  const r = await fetch(projectMembershipsUrl(name), {
-    headers: { Accept: STRICT_HEADERS.Accept },
-    credentials: "include",
-  })
-  if (!r.ok) throw new Error(`HTTP ${r.status}`)
-  return (await r.json()).memberships || []
+  const body = await routerApi.request<{ memberships?: MembershipRow[] }>(
+    projectMembershipsUrl(name),
+  )
+  return body.memberships || []
 }
 
 
@@ -121,15 +108,9 @@ export function ProjectMembershipsModal({
 
   const handleRemove = async (id: string) => {
     try {
-      const r = await fetch(projectMembershipUrl(projectName, id), {
+      await routerApi.request(projectMembershipUrl(projectName, id), {
         method: "DELETE",
-        headers: { Accept: STRICT_HEADERS.Accept },
-        credentials: "include",
       })
-      if (!r.ok) {
-        const body = (await r.json().catch(() => ({}))) as ErrorResponse
-        throw new Error(body.message || `HTTP ${r.status}`)
-      }
       await refresh()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -138,16 +119,10 @@ export function ProjectMembershipsModal({
 
   const handleChangeRole = async (id: string, role: Role) => {
     try {
-      const r = await fetch(projectMembershipUrl(projectName, id), {
+      await routerApi.request(projectMembershipUrl(projectName, id), {
         method: "PATCH",
-        headers: STRICT_HEADERS,
-        credentials: "include",
         body: JSON.stringify({ role }),
       })
-      if (!r.ok) {
-        const body = (await r.json().catch(() => ({}))) as ErrorResponse
-        throw new Error(body.message || `HTTP ${r.status}`)
-      }
       await refresh()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -283,14 +258,8 @@ function AddMembershipModal({
     if (!open) return
     setLoading(true)
     void Promise.all([
-      fetch(routerUsersUrl(), {
-        headers: { Accept: STRICT_HEADERS.Accept },
-        credentials: "include",
-      }).then((r) => r.json()),
-      fetch(routerGroupsUrl(), {
-        headers: { Accept: STRICT_HEADERS.Accept },
-        credentials: "include",
-      }).then((r) => r.json()),
+      routerApi.request<{ users?: UserOption[] }>(routerUsersUrl()),
+      routerApi.request<{ groups?: GroupOption[] }>(routerGroupsUrl()),
     ])
       .then(([u, g]) => {
         setUsers(u.users || [])
@@ -313,22 +282,10 @@ function AddMembershipModal({
         kind === "user"
           ? { user_id: selectedId, role }
           : { group_id: selectedId, role }
-      const r = await fetch(projectMembershipsUrl(projectName), {
+      await routerApi.request(projectMembershipsUrl(projectName), {
         method: "POST",
-        headers: STRICT_HEADERS,
-        credentials: "include",
         body: JSON.stringify(body),
       })
-      const respBody = (await r.json().catch(() => ({}))) as
-        | ErrorResponse
-        | { success: true }
-      if (!r.ok || (respBody as ErrorResponse).success === false) {
-        throw new Error(
-          (respBody as ErrorResponse).message ||
-            (respBody as ErrorResponse).error ||
-            `HTTP ${r.status}`,
-        )
-      }
       await onAdded()
       setSelectedId("")
       onOpenChange(false)

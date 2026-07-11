@@ -29,6 +29,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useProjectsStore } from "@/lib/stores/projects-store"
 import { routerProjectsUrl } from "@/lib/urls"
+import { routerApi } from "@/lib/router-api"
 
 const SLUG_RE = /^[a-z](?:[a-z0-9-]*[a-z0-9])?$/
 
@@ -69,20 +70,10 @@ export function AddProjectModal({
     setSubmitting(true)
     setError(null)
     try {
-      const r = await fetch(routerProjectsUrl(), {
+      await routerApi.request(routerProjectsUrl(), {
         method: "POST",
         body: JSON.stringify({ name }),
-        headers: {
-          "Accept": "application/vnd.agent-mcp.v1+json",
-          "Content-Type": "application/json",
-        },
       })
-      const body = await r.json().catch(() => ({} as any))
-      if (!r.ok || body.success === false) {
-        throw new Error(
-          body.message || body.error || `HTTP ${r.status}`,
-        )
-      }
       await fetchOverview()
       resetAndClose()
     } catch (err) {
