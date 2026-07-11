@@ -25,6 +25,9 @@ from ..core.auth import generate_token  # For register_agent, terminate_agent
 # read by ``tools/access._derive_access_level`` once the decorator
 # is gone.
 from ..core.principal import Principal
+from ..core.operator_tier import (
+    is_confirmed_operator_tier as _shared_is_confirmed_operator_tier,
+)
 from ..core.tool_result import (
     Conflict,
     Failed,
@@ -66,24 +69,30 @@ def _require_capability(
 def _is_confirmed_operator_tier(principal: Optional[Principal]) -> bool:
     """Return True iff ``principal`` is CONFIRMED operator-tier.
 
-    MCP-side mirror of
-    ``app/routers/composition.py::is_confirmed_operator_tier`` so the
-    REST and MCP surfaces agree on who may see agent bearer tokens in
-    plaintext. Confirmed operator tier is a sysadmin OR an operator-role
-    project member (``project_role == "operator"``).
+    Thin MCP-side adapter over the shared predicate
+    ``core/operator_tier.is_confirmed_operator_tier`` — the single source
+    of truth that the REST ``app/routers/composition`` surface also calls,
+    so the two cannot drift (they did: a per-agent manager bearer was
+    confirmed on REST but masked here, because this copy keyed only on
+    ``sysadmin``/``project_role`` and an agent bearer carries neither).
 
-    A viewer (``project_role == "viewer"``) is NOT confirmed operator
-    tier — even one whose group memberships happen to grant an
-    operator-only capability. Such a caller can pass a coarse capability
-    gate but must still have agent tokens withheld: a bearer they harvest
-    can be replayed to re-authenticate as that agent and escalate to
-    write. This is the defense-in-depth layer behind the capability gate.
+    Confirmed operator tier is a verifiable per-agent manager/admin bearer
+    (``kind == "agent_bearer"``), a sysadmin, OR an operator-role project
+    member (``project_role == "operator"``). A viewer — even one whose
+    group memberships happen to grant an operator-only capability — is NOT
+    confirmed: it can pass the coarse capability gate but must still have
+    agent tokens withheld, since a bearer it harvests can be replayed to
+    re-authenticate as that agent and escalate to write. This is the
+    defense-in-depth layer behind the capability gate.
     """
     if principal is None:
         return False
-    if principal.sysadmin:
-        return True
-    return principal.project_role == "operator"
+    return _shared_is_confirmed_operator_tier(
+        kind=principal.kind,
+        sysadmin=principal.sysadmin,
+        project_role=principal.project_role,
+        agent_role=principal.agent_role,
+    )
 
 
 
