@@ -29,6 +29,8 @@ from typing import Awaitable, Callable
 
 from aiohttp import web
 
+from .single_tenant import bypasses_operator_gate
+
 
 __all__ = ["require_capability"]
 
@@ -83,12 +85,8 @@ def require_capability(
             # Single-tenant mode (ADR-0008): the deploy is pinned to
             # one operator box; there's no audience to gate against
             # here.
-            try:
-                from . import app as _app
-                if _app.SINGLE_TENANT_NAME is not None:
-                    return await handler(request)
-            except Exception:  # pragma: no cover - defensive
-                pass
+            if bypasses_operator_gate():
+                return await handler(request)
 
             principal = request.get("principal")
             if principal is None or not principal.has_capability(cap):

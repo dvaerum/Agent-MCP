@@ -35,6 +35,8 @@ from pathlib import Path
 
 from aiohttp import web
 
+from .single_tenant import bypasses_operator_gate, disables_write_endpoint
+
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +147,7 @@ async def create_project_handler(req: web.Request) -> web.Response:
     """
     from . import app as _app
 
-    if _app.SINGLE_TENANT_NAME is not None:
+    if disables_write_endpoint():
         return _app._single_tenant_disabled_response()
     body = await _app._parse_json_body(req)
     raw_name = body.get("name")
@@ -262,7 +264,7 @@ async def rename_project_handler(req: web.Request) -> web.Response:
     from . import app as _app
     from . import project_registry as _registry
 
-    if _app.SINGLE_TENANT_NAME is not None:
+    if disables_write_endpoint():
         return _app._single_tenant_disabled_response()
     old_name = req.match_info["name"]
     body = await _app._parse_json_body(req)
@@ -581,7 +583,7 @@ async def delete_project_handler(req: web.Request) -> web.Response:
     """
     from . import app as _app
 
-    if _app.SINGLE_TENANT_NAME is not None:
+    if disables_write_endpoint():
         return _app._single_tenant_disabled_response()
     name = req.match_info["name"]
     projects = _app._projects_dict()
@@ -1002,7 +1004,7 @@ async def remove_alias_handler(req: web.Request) -> web.Response:
     """
     from . import app as _app
 
-    if _app.SINGLE_TENANT_NAME is not None:
+    if disables_write_endpoint():
         return _app._single_tenant_disabled_response()
     name = req.match_info["name"]
     alias = req.match_info["alias"]
@@ -1072,12 +1074,10 @@ def _require_project_operator_membership(handler):
 
     @functools.wraps(handler)
     async def wrapper(req: web.Request) -> web.StreamResponse:
-        from . import app as _app
-
         # Single-tenant (ADR-0008): one operator-owned box; the session
         # middleware bypasses gating entirely, so mirror
         # ``require_capability`` and pass through.
-        if _app.SINGLE_TENANT_NAME is not None:
+        if bypasses_operator_gate():
             return await handler(req)
         # Sysadmin admits unconditionally (their cap set is the wildcard).
         if req.get("is_sysadmin"):

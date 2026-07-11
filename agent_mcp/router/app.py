@@ -109,6 +109,7 @@ from aiohttp import ClientSession, ClientTimeout, UnixConnector, web
 from . import project_registry  # sibling module — see ./project_registry.py
 from . import asset_prefix as _asset_prefix  # Phase 4: runtime sentinel sub
 from . import project_orchestrator as _po  # PR-C: lifecycle state machine
+from .single_tenant import bypasses_operator_gate  # arch-r4 #8
 
 
 log = logging.getLogger(__name__)
@@ -1757,7 +1758,7 @@ def _visible_project_names(req: web.Request, names) -> set[str]:
     # session middleware bypasses gating entirely there, so ``req`` has
     # no ``user`` / ``is_sysadmin`` stashed and there is no cross-tenant
     # audience to filter against. See everything.
-    if SINGLE_TENANT_NAME is not None:
+    if bypasses_operator_gate():
         return set(names)
     if req.get("is_sysadmin"):
         return set(names)
