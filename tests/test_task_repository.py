@@ -264,6 +264,69 @@ def test_create_returns_dict_and_updates_cache_and_publishes(
         sys.modules.pop("agent_mcp.core.event_bus", None)
 
 
+def test_create_mints_task_id_when_omitted(project_dir, reset_globals):
+    """arch-deepening R4 #7: ``task_id`` is now optional.
+
+    When the caller omits it, ``create`` mints one via the opaque,
+    ``secrets``-based scheme — retiring the two
+    ``task_{int(now().timestamp()*1000)}`` generators that used to
+    live in ``tools/task_tools.py`` (single-unassigned and
+    multi-create paths), which could collide within the same
+    millisecond and raise a duplicate-PK ``IntegrityError``.
+    """
+    with _make_client(project_dir):
+        from agent_mcp.repositories import task_repo
+
+        entity = task_repo.create({"title": "no explicit id", "created_by": "admin"})
+
+        assert entity["task_id"], "create must mint a task_id when omitted"
+        assert entity["task_id"].startswith("task_")
+
+
+def test_create_minted_ids_unique_across_rapid_creates(project_dir, reset_globals):
+    """The minted scheme doesn't collide across a tight back-to-back
+    batch — the same shape of load that used to trip the retired
+    timestamp generators when two calls landed in the same
+    millisecond (see ``tests/test_arch_r4_7_task_row_factory.py`` for
+    the tool-call-boundary reproduction with a frozen clock).
+    """
+    with _make_client(project_dir):
+        from agent_mcp.repositories import task_repo
+
+        ids = [
+            task_repo.create({"title": f"batch {i}", "created_by": "admin"})[
+                "task_id"
+            ]
+            for i in range(50)
+        ]
+
+        assert len(ids) == len(set(ids)), f"minted task_ids collided: {ids}"
+
+
+def test_create_default_row_shape(project_dir, reset_globals):
+    """Single-sourced default row shape.
+
+    A caller that supplies only the required fields (``title``,
+    ``created_by``) gets the SAME defaults every ``create()`` call
+    site used to hand-list explicitly (``child_tasks`` /
+    ``depends_on_tasks`` / ``notes`` = ``[]``, ``status`` =
+    ``"pending"``, ``priority`` = ``"medium"``,
+    ``required_capabilities`` = ``None``) — one assertion here instead
+    of trusting ~7 near-identical call-site dict literals to agree.
+    """
+    with _make_client(project_dir):
+        from agent_mcp.repositories import task_repo
+
+        entity = task_repo.create({"title": "defaults only", "created_by": "admin"})
+
+        assert entity["child_tasks"] == []
+        assert entity["depends_on_tasks"] == []
+        assert entity["notes"] == []
+        assert entity["status"] == "pending"
+        assert entity["priority"] == "medium"
+        assert entity["required_capabilities"] is None
+
+
 def test_create_duplicate_id_raises(project_dir, reset_globals):
     """Inserting a row with a duplicate primary key must surface an error.
 
