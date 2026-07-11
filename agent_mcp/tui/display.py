@@ -12,7 +12,11 @@ try:
 except ImportError:
     requests = None
 from .colors import TUITheme, AGENT_MCP_LOGO, STATUS_SYMBOLS, get_responsive_agent_mcp_banner
-from ..core.config import VERSION, AUTHOR, GITHUB_URL, GITHUB_REPO
+from ..core.config import AUTHOR, GITHUB_URL, GITHUB_REPO
+# Version-single-source (arch-r4 #11b): read the real installed/pyproject
+# version, not the hand-maintained core.config.VERSION literal that had
+# drifted to "2.0" while the real version moved to 5.4.0.
+from .. import __version__ as VERSION
 
 class TUIDisplay:
     """Handles all display-related functionality for the TUI."""

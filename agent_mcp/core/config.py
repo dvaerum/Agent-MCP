@@ -6,8 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
-# Version information
-VERSION = "2.0"
+# Product metadata. The version itself is NOT here — it lives at
+# ``agent_mcp.__version__`` (importlib.metadata / pyproject.toml as the
+# single source of truth; see tests/test_version_single_source.py). A
+# hand-maintained ``VERSION = "2.0"`` literal used to live here and had
+# drifted years behind the real 5.4.0 (arch-r4 #11b).
 GITHUB_REPO = "rinadelph/Agent-MCP"
 AUTHOR = "Luis Alejandro Rincon"
 GITHUB_URL = "https://github.com/rinadelph"

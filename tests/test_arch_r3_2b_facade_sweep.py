@@ -15,10 +15,19 @@ Finishes what #2a started (``tests/test_arch_r3_2a_shadow_repo_collapse.py``):
   classes; #2b deletes them and repoints every importer directly at
   the canonical module. ``file_metadata_db.py`` was an empty, already
   fully-orphaned file (zero importers) and is deleted outright.
-  ``agent_actions_db.py``, ``task_notes_db.py``, and ``context_db.py``
-  own genuine logic (or, for ``context_db.py``, are unrelated dead
-  placeholder code with no canonical repository counterpart) and are
-  kept.
+  ``agent_actions_db.py`` and ``task_notes_db.py`` own genuine logic
+  and are kept.
+
+Correction (arch-r4 #11d): #2b originally also kept ``context_db.py``,
+reasoning it was "unrelated dead placeholder code" rather than a shim
+in scope for this sweep. That was wrong on its own terms — dead code
+with zero importers is dead code regardless of which sweep flagged it.
+Both its functions (``get_context`` returning a hardcoded dict,
+``update_context`` doing a log line and returning ``True``) were
+grep-verified to have zero callers anywhere in ``agent_mcp/`` or
+``tests/`` (the real project-context logic lives in
+``project_context_tools.py`` / the project-context repository). #11d
+deletes it and moves it from the "kept" list below to "deleted".
 
 This guard pins both halves so a future change can't silently
 re-introduce the shadow layer.
@@ -67,13 +76,20 @@ def test_event_bus_shim_relocated_and_importable():
 
 
 def test_deleted_db_actions_facades_are_gone():
-    """The four pure re-export shims + the empty orphan must be gone."""
+    """The four pure re-export shims + the empty orphan must be gone.
+
+    ``context_db`` joins this list as of arch-r4 #11d — it was
+    wrongly kept by R3 #2b as "unrelated dead placeholder code"; dead
+    code with zero importers belongs in this list regardless of which
+    sweep flagged it. See the module docstring's "Correction" note.
+    """
     deleted = (
         "task_db",
         "agent_db",
         "agent_messages_db",
         "rag_db",
         "file_metadata_db",
+        "context_db",
     )
     for name in deleted:
         try:
@@ -82,15 +98,14 @@ def test_deleted_db_actions_facades_are_gone():
             continue
         raise AssertionError(
             f"agent_mcp.db.actions.{name} should have been deleted "
-            "(arch-deepening R3 #2b — pure re-export shim / orphaned "
-            "empty module)"
+            "(arch-deepening R3 #2b / R4 #11d — pure re-export shim / "
+            "orphaned empty module / dead placeholder code)"
         )
 
 
 def test_kept_db_actions_facades_still_import():
-    """Files carrying genuine logic (or unrelated dead code out of this
-    sweep's scope) are untouched and still importable."""
-    kept = ("agent_actions_db", "task_notes_db", "context_db")
+    """Files carrying genuine logic are untouched and still importable."""
+    kept = ("agent_actions_db", "task_notes_db")
     for name in kept:
         mod = importlib.import_module(f"agent_mcp.db.actions.{name}")
         assert mod is not None
