@@ -227,7 +227,6 @@ async def register_agent_dashboard_api_route(
     dashboard's modal gets back a ``mcp_snippet`` it can render in
     the success pane.
     """
-
     try:
         data = await get_sanitized_json_body(request)
     except ValueError as e_val:
