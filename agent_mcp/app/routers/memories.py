@@ -28,7 +28,7 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
-from .._dispatch_helpers import _build_route_principal, handle_options
+from .._dispatch_helpers import _build_route_principal
 from ._wire_validation import require_str as _require_str
 from ..deps import caller_identity, require_operator_session
 from ...core.config import logger
@@ -68,7 +68,7 @@ router = APIRouter(
 # boundary is settled.
 
 
-@router.api_route("", methods=["POST", "OPTIONS"])
+@router.post("")
 async def create_memory_api_route(
     request: Request,
     auth: dict = Depends(require_operator_session),
@@ -88,12 +88,6 @@ async def create_memory_api_route(
     dispatches and maps the ``ToolResult`` to the legacy response shape.
     Auth stays operator-only via ``require_operator_session``.
     """
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
-
-    if request.method != 'POST':
-        return JSONResponse({"error": "Method not allowed"}, status_code=405)
-
     try:
         data = await get_sanitized_json_body(request)
     except ValueError as e:
@@ -183,25 +177,17 @@ async def create_memory_api_route(
     )
 
 
-@router.api_route("/{context_key}", methods=["PUT", "OPTIONS"])
+@router.put("/{context_key}")
 async def update_memory_api_route(
+    context_key: str,
     request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
-    """Update an existing memory entry. PR D: auth via require_operator_session."""
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
+    """Update an existing memory entry. PR D: auth via require_operator_session.
 
-    if request.method != 'PUT':
-        return JSONResponse({"error": "Method not allowed"}, status_code=405)
-
-    # Extract context_key from URL path
-    path_parts = request.url.path.split('/')
-    if len(path_parts) < 4 or not path_parts[-1]:
-        return JSONResponse({"error": "context_key is required in URL"}, status_code=400)
-
-    context_key = path_parts[-1]
-
+    arch-r4 #10: ``context_key`` is now a typed path parameter, replacing
+    the hand-rolled ``request.url.path.split('/')`` extraction.
+    """
     # F005 verify-all-v6 MUTATING #3: reject keys with Unicode
     # control / bidi-override / invisible chars. Matches the
     # CREATE-handler check above so update can't backdoor a
@@ -283,8 +269,9 @@ async def update_memory_api_route(
             session.close()
 
 
-@router.api_route("/{context_key}", methods=["DELETE", "OPTIONS"])
+@router.delete("/{context_key}")
 async def delete_memory_api_route(
+    context_key: str,
     request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
@@ -322,20 +309,10 @@ async def delete_memory_api_route(
     before explained that we passed ``force_delete=true`` to the tool
     to preserve that legacy behavior). Wire-shape parity is pinned by
     ``tests/test_rest_mcp_tool_parity.py``.
+
+    arch-r4 #10: ``context_key`` is now a typed path parameter, replacing
+    the hand-rolled ``request.url.path.split('/')`` extraction.
     """
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
-
-    if request.method != 'DELETE':
-        return JSONResponse({"error": "Method not allowed"}, status_code=405)
-
-    # Extract context_key from URL path
-    path_parts = request.url.path.split('/')
-    if len(path_parts) < 4 or not path_parts[-1]:
-        return JSONResponse({"error": "context_key is required in URL"}, status_code=400)
-
-    context_key = path_parts[-1]
-
     # Consume the JSON body if present (validates that it parses, and
     # — historically — gave the dep the body-token. We no longer act
     # on it here; the dep has already authorised the caller.)

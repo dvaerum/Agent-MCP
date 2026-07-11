@@ -28,10 +28,7 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
-from .._dispatch_helpers import (
-    _build_route_principal,
-    handle_options,
-)
+from .._dispatch_helpers import _build_route_principal
 from ._wire_validation import require_str as _require_str
 from ._wire_validation import require_str_list as _require_str_list
 from ..deps import (
@@ -131,7 +128,7 @@ def _mcp_presence_for(agent_id: str) -> Dict[str, Any]:
     return {"online": online, "last_mcp_connection": last_seen}
 
 
-@router.api_route("", methods=["GET", "OPTIONS"])
+@router.get("")
 async def agents_list_api_route(request: Request) -> JSONResponse:
     # GET /api/agents[?status=<status>]
     #
@@ -155,9 +152,6 @@ async def agents_list_api_route(request: Request) -> JSONResponse:
     # not an operator-queryable agent status). This shape replaces
     # the router's `list_agents` synthetic tool (Phase 7c, Q7.2 in
     # plan).
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
-
     status_filter: Optional[str] = request.query_params.get('status')
     agents_list_data: List[Dict[str, Any]] = []
     conn = None
@@ -220,7 +214,7 @@ async def agents_list_api_route(request: Request) -> JSONResponse:
 # Returns 200 with
 #   {"message": "...", "agent_id": "...", "agent_token": "...",
 #    "mcp_snippet": "<json>"}
-@router.api_route("/register", methods=["POST", "OPTIONS"])
+@router.post("/register")
 async def register_agent_dashboard_api_route(
     request: Request,
     auth: dict = Depends(require_operator_session),
@@ -233,10 +227,6 @@ async def register_agent_dashboard_api_route(
     dashboard's modal gets back a ``mcp_snippet`` it can render in
     the success pane.
     """
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
-    if request.method != 'POST':
-        return JSONResponse({"error": "Method not allowed"}, status_code=405)
 
     try:
         data = await get_sanitized_json_body(request)
@@ -425,8 +415,9 @@ def _agent_tool_error(result: ToolResult, failed_message: str) -> JSONResponse:
     )
 
 
-@router.api_route("/{agent_id}/restore", methods=["POST", "OPTIONS"])
+@router.post("/{agent_id}/restore")
 async def restore_agent_api_route(
+    agent_id: str,
     request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
@@ -436,17 +427,16 @@ async def restore_agent_api_route(
     + terminated_at clear + ``restored_agent`` audit + ``g.active_agents``
     / ``g.agent_working_dirs`` rebuild) lives ONCE in
     :func:`agent_mcp.tools.admin_tools.restore_agent_tool_impl` on the
-    unit-of-work. This handler keeps only the wire concerns (method / path
-    guards, legacy body read) then dispatches + maps the ToolResult to the
-    legacy body shape. Auth stays operator-only via
-    ``require_operator_session``.
-    """
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
-    if request.method != 'POST':
-        return JSONResponse({"error": "Method not allowed"}, status_code=405)
+    unit-of-work. This handler keeps only the wire concerns (legacy body
+    read) then dispatches + maps the ToolResult to the legacy body shape.
+    Auth stays operator-only via ``require_operator_session``.
 
-    agent_id = request.path_params.get('agent_id')
+    arch-r4 #10: ``agent_id`` is now a typed path parameter — FastAPI's
+    own routing already guarantees a non-empty value (the ``str``
+    convertor requires 1+ chars), so the guard below is unreachable in
+    practice; kept as defensive belt-and-suspenders rather than deleted,
+    since removing it risks nothing and changes nothing observable.
+    """
     if not agent_id:
         return JSONResponse({"error": "agent_id required"}, status_code=400)
 
@@ -472,8 +462,9 @@ async def restore_agent_api_route(
     return _agent_tool_error(result, "Failed to restore agent")
 
 
-@router.api_route("/{agent_id}/edit", methods=["POST", "OPTIONS"])
+@router.post("/{agent_id}/edit")
 async def edit_agent_api_route(
+    agent_id: str,
     request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
@@ -496,13 +487,11 @@ async def edit_agent_api_route(
     non-standard HTTP statuses / body wording the dashboard pins) — then
     dispatches the pre-validated fields and maps the ToolResult back to the
     legacy body. Auth stays operator-only via ``require_operator_session``.
-    """
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
-    if request.method != 'POST':
-        return JSONResponse({"error": "Method not allowed"}, status_code=405)
 
-    agent_id = request.path_params.get('agent_id')
+    arch-r4 #10: ``agent_id`` is now a typed path parameter (see
+    ``restore_agent_api_route`` for why the ``not agent_id`` guard below
+    is unreachable-but-kept).
+    """
     if not agent_id:
         return JSONResponse({"error": "agent_id required"}, status_code=400)
 
@@ -612,22 +601,20 @@ async def edit_agent_api_route(
 # ``purge_agent`` tool; this route + the preview route import them.
 
 
-@router.api_route("/{agent_id}/purge-preview", methods=["GET", "OPTIONS"])
+@router.get("/{agent_id}/purge-preview")
 async def purge_preview_api_route(
-    request: Request,
+    agent_id: str,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
     """GET /api/agents/<id>/purge-preview — blast-radius counts + samples.
 
     PR D (prancy-napping-pie): auth via ``require_operator_session``.
     Dashboard no longer passes the admin token in the query string.
-    """
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
-    if request.method != 'GET':
-        return JSONResponse({"error": "Method not allowed"}, status_code=405)
 
-    agent_id = request.path_params.get('agent_id')
+    arch-r4 #10: ``agent_id`` is now a typed path parameter (see
+    ``restore_agent_api_route`` for why the ``not agent_id`` guard below
+    is unreachable-but-kept).
+    """
     if not agent_id:
         return JSONResponse({"error": "agent_id required"}, status_code=400)
 
@@ -664,8 +651,9 @@ async def purge_preview_api_route(
             conn.close()
 
 
-@router.api_route("/{agent_id}", methods=["DELETE", "OPTIONS"])
+@router.delete("/{agent_id}")
 async def purge_agent_api_route(
+    agent_id: str,
     request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
@@ -680,17 +668,14 @@ async def purge_agent_api_route(
     :func:`agent_mcp.tools.admin_tools.purge_agent_tool_impl` on the
     unit-of-work — one atomic transaction, in-memory reference drops +
     reassigned-task reconcile registered post-commit. This handler keeps
-    only the wire concerns (method / param guards, the cascade=true
-    confirmation, legacy body read) then dispatches + maps the ToolResult
-    to the legacy body. Auth stays operator-only via
-    ``require_operator_session``.
-    """
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
-    if request.method != 'DELETE':
-        return JSONResponse({"error": "Method not allowed"}, status_code=405)
+    only the wire concerns (the cascade=true confirmation, legacy body
+    read) then dispatches + maps the ToolResult to the legacy body. Auth
+    stays operator-only via ``require_operator_session``.
 
-    agent_id = request.path_params.get('agent_id')
+    arch-r4 #10: ``agent_id`` is now a typed path parameter (see
+    ``restore_agent_api_route`` for why the ``not agent_id`` guard below
+    is unreachable-but-kept).
+    """
     if not agent_id:
         return JSONResponse({"error": "agent_id required"}, status_code=400)
 

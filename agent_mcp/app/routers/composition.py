@@ -188,9 +188,8 @@ def is_confirmed_operator_tier(auth: Dict[str, Any]) -> bool:
 # --- Composition reads (cross-resource) ---
 
 
-@router.api_route("/status", methods=["GET", "OPTIONS"])
+@router.get("/status")
 async def simple_status_api_route(
-    request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
     # SECURITY (AZ-R28-1): gated to match the composition router's other
@@ -198,10 +197,6 @@ async def simple_status_api_route(
     # gates only /mcp, not /api/*, so without this dep the backend's own
     # (UDS) surface served system status unauthenticated — the direct-UDS
     # defense-in-depth tier PRs #280 / #281 closed on the sibling reads.
-    # Handle OPTIONS for CORS preflight
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
-
     try:
         # Get system status
         from ...repositories.agent_repository import get_all_active_agents_from_db
@@ -231,15 +226,12 @@ async def simple_status_api_route(
         return JSONResponse({"error": "Failed to get simple status."}, status_code=500)
 
 
-@router.api_route("/graph-data", methods=["GET", "OPTIONS"])
+@router.get("/graph-data")
 async def graph_data_api_route(
-    request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
     # SECURITY (AZ-R28-1): gated to match the sibling composition reads —
     # see simple_status_api_route.
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
     try:
         data = await fetch_graph_data_logic(g.file_map.copy())
         return JSONResponse(data)
@@ -248,15 +240,12 @@ async def graph_data_api_route(
         return JSONResponse({'nodes': [], 'edges': [], 'error': 'Failed to serve graph data.'}, status_code=500)
 
 
-@router.api_route("/task-tree-data", methods=["GET", "OPTIONS"])
+@router.get("/task-tree-data")
 async def task_tree_data_api_route(
-    request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
     # SECURITY (AZ-R28-1): gated to match the sibling composition reads —
     # see simple_status_api_route.
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
     try:
         data = await fetch_task_tree_data_logic()
         return JSONResponse(data)
@@ -287,7 +276,7 @@ _AGENT_NODE_SAFE_COLUMNS = (
 )
 
 
-@router.api_route("/node-details", methods=["GET", "OPTIONS"])
+@router.get("/node-details")
 async def node_details_api_route(
     request: Request,
     auth: dict = Depends(require_operator_session),
@@ -298,8 +287,6 @@ async def node_details_api_route(
     # viewer-tier operators on GET, so any viewer could harvest an
     # agent's bearer and replay it to escalate to write. The gate below
     # + the safe-column projection in the ``agent`` branch close it.
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
     node_id = request.query_params.get('node_id')
     if not node_id:
         return JSONResponse({'error': 'Missing node_id parameter'}, status_code=400)
@@ -393,7 +380,7 @@ _ALL_DATA_DEFAULT_LIMIT = 500
 _ALL_DATA_MAX_LIMIT = 5000
 
 
-@router.api_route("/all-data", methods=["GET", "OPTIONS"])
+@router.get("/all-data")
 async def all_data_api_route(
     request: Request,
     auth: dict = Depends(require_operator_session),
@@ -414,9 +401,6 @@ async def all_data_api_route(
     will be replaced by the real ``admin`` row from the agents table
     once Wave 4 drops the admin pseudo-agent entirely.
     """
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
-
     conn = None
     try:
         conn = get_db_connection()
@@ -621,9 +605,8 @@ async def all_data_api_route(
             conn.close()
 
 
-@router.api_route("/context-data", methods=["GET", "OPTIONS"])
+@router.get("/context-data")
 async def context_data_api_route(
-    request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
     """Get only context data.
@@ -644,9 +627,6 @@ async def context_data_api_route(
     the tier of a cookie/forwarding caller — so those paths get the
     redacted view).
     """
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
-
     expose_secrets = is_confirmed_operator_tier(auth)
 
     try:
@@ -693,7 +673,7 @@ async def context_data_api_route(
 # auth-rejection wording cannot drift between the dashboard surface
 # and the MCP surface. Wire-shape parity is pinned by
 # tests/test_rest_mcp_tool_parity.py.
-@router.api_route("/terminate-agent", methods=["POST", "OPTIONS"])
+@router.post("/terminate-agent")
 async def terminate_agent_dashboard_api_route(
     request: Request,
     auth: dict = Depends(require_operator_session),
@@ -719,10 +699,6 @@ async def terminate_agent_dashboard_api_route(
     cleaned up by a future URL-migration PR alongside dashboard
     updates.
     """
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
-    if request.method != 'POST':
-        return JSONResponse({"error": "Method not allowed"}, status_code=405)
     try:
         data = await get_sanitized_json_body(request)
     except ValueError as e_val:
@@ -902,9 +878,8 @@ async def update_task_details_api_route(
 
 
 # --- Test/Demo Data Endpoint ---
-@router.api_route("/create-sample-memories", methods=["POST", "OPTIONS"])
+@router.post("/create-sample-memories")
 async def create_sample_memories_route(
-    request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
     """Create sample memory entries for testing.
@@ -921,9 +896,6 @@ async def create_sample_memories_route(
     mutation gate (POST is a mutation method, so viewer-tier callers are
     rejected — only operator tier may write).
     """
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
-
     session = SessionLocal()
     try:
         # Sample memory entries
