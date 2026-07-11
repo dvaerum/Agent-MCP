@@ -27,9 +27,9 @@ def get_agent_id(token: str) -> Optional[str]:
     # Local import to keep the legacy module-load contract: callers
     # that only want get_agent_id shouldn't pay the cost of loading
     # the SQLAlchemy engine until the first DB-miss path.
-    from .repositories import agent_repo
+    from ..repositories import agent_repo
 
-    agent_data = agent_repo.get_agent_by_token(token)
+    agent_data = agent_repo.get_by_token(token)
     if isinstance(agent_data, dict) and "agent_id" in agent_data:
         return agent_data["agent_id"]
     return None

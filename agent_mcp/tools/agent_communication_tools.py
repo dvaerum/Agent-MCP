@@ -124,9 +124,9 @@ def _agents_active_by_id() -> set[str]:
     irrelevant to callers — they want the set of *agent_ids* for
     membership tests.
     """
-    from ..core.repositories import agent_repo
+    from ..repositories import agent_repo
 
-    return {row.get("agent_id") for row in agent_repo.list_active_agents()}
+    return {row.get("agent_id") for row in agent_repo.list_active()}
 
 
 def _can_agents_communicate(sender_id: str, recipient_id: str, is_admin: bool) -> tuple[bool, str]:

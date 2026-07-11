@@ -26,7 +26,7 @@ from typing import Any, Dict, Optional
 from .registry import register_tool
 from ..core.config import logger
 from ..core.principal import Principal
-from ..core.repositories import agent_repo
+from ..repositories import agent_repo
 from ..core.tool_result import (
     Failed,
     Invalid,

@@ -124,8 +124,8 @@ def _is_operator_tier_bearer(token: str) -> bool:
     """
     if not token:
         return False
-    from ..core.repositories import agent_repo
-    row = agent_repo.get_agent_by_token(token)
+    from ..repositories import agent_repo
+    row = agent_repo.get_by_token(token)
     if not isinstance(row, dict):
         return False
     # Termination-revocation (Wave-B; same class as #275/#280 on this

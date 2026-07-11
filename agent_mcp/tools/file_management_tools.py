@@ -19,7 +19,7 @@ from .registry import register_tool
 from ..core.config import logger
 from ..core import globals as g
 from ..core.principal import Principal
-from ..core.repositories import agent_repo
+from ..repositories import agent_repo
 from ..core.tool_result import (
     Conflict,
     Invalid,
