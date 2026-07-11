@@ -20,7 +20,7 @@ import { projectContext } from "@/lib/project-context"
 import { mcpUrl } from "@/lib/urls"
 import { useServerStore } from "@/lib/stores/server-store"
 import { useDataStore } from "@/lib/stores/data-store"
-import { cn } from "@/lib/utils"
+import { cn, formatRelative } from "@/lib/utils"
 import { useDialog } from "@/hooks/use-dialog"
 import { useFilters } from "@/hooks/use-filters"
 import { TaskDetailsDialog } from "./task-details-dialog"
@@ -1502,16 +1502,6 @@ const AgentDetailDialog = ({
   // header; same derivation as the agents-list row.
   const presence = agentPresence(agent)
 
-  const formatRelative = (iso: string) => {
-    if (!iso || iso === 'N/A') return 'unknown'
-    const d = new Date(iso)
-    const diff = Date.now() - d.getTime()
-    if (diff < 60_000) return 'just now'
-    if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`
-    if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`
-    return `${Math.floor(diff / 86_400_000)}d ago`
-  }
-
   const copyAgentId = () => {
     navigator.clipboard.writeText(agent.agent_id)
     setCopied(true)
@@ -1621,7 +1611,7 @@ const AgentDetailDialog = ({
               </Label>
               <div className="text-sm [overflow-wrap:anywhere]">
                 {agent.created_at && agent.created_at !== 'N/A'
-                  ? `${new Date(agent.created_at).toLocaleString()} (${formatRelative(agent.created_at)})`
+                  ? `${new Date(agent.created_at).toLocaleString()} (${formatRelative(agent.created_at, { emptyLabel: 'unknown' })})`
                   : 'N/A'}
               </div>
             </div>
@@ -1642,7 +1632,7 @@ const AgentDetailDialog = ({
                 <>
                   {new Date(agent.last_mcp_connection).toLocaleString()}{' '}
                   <span className="text-muted-foreground">
-                    ({formatRelative(agent.last_mcp_connection)})
+                    ({formatRelative(agent.last_mcp_connection, { emptyLabel: 'unknown' })})
                   </span>
                 </>
               ) : (
@@ -1661,7 +1651,7 @@ const AgentDetailDialog = ({
               </Label>
               <div className="text-sm [overflow-wrap:anywhere]">
                 {new Date(agent.terminated_at).toLocaleString()} (
-                {formatRelative(agent.terminated_at)})
+                {formatRelative(agent.terminated_at, { emptyLabel: 'unknown' })})
               </div>
             </div>
           )}

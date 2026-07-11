@@ -72,61 +72,6 @@ export const useDashboard = create<DashboardState>()((set) => ({
   setLastUpdated: (date) => set({ lastUpdated: date })
 }))
 
-interface CommandPaletteState {
-  isOpen: boolean
-  setOpen: (open: boolean) => void
-  toggle: () => void
-}
-
-export const useCommandPalette = create<CommandPaletteState>()((set, get) => ({
-  isOpen: false,
-  setOpen: (open) => set({ isOpen: open }),
-  toggle: () => set({ isOpen: !get().isOpen })
-}))
-
-interface NotificationState {
-  notifications: Array<{
-    id: string
-    title: string
-    message: string
-    type: 'info' | 'success' | 'warning' | 'error'
-    timestamp: Date
-    read: boolean
-  }>
-  addNotification: (notification: Omit<NotificationState['notifications'][0], 'id' | 'timestamp' | 'read'>) => void
-  markAsRead: (id: string) => void
-  removeNotification: (id: string) => void
-  clearAll: () => void
-}
-
-export const useNotifications = create<NotificationState>()((set, get) => ({
-  notifications: [],
-  addNotification: (notification) => {
-    const newNotification = {
-      ...notification,
-      id: Math.random().toString(36).substr(2, 9),
-      timestamp: new Date(),
-      read: false
-    }
-    set({ 
-      notifications: [newNotification, ...get().notifications].slice(0, 50) // Keep only latest 50
-    })
-  },
-  markAsRead: (id) => {
-    set({
-      notifications: get().notifications.map(n => 
-        n.id === id ? { ...n, read: true } : n
-      )
-    })
-  },
-  removeNotification: (id) => {
-    set({
-      notifications: get().notifications.filter(n => n.id !== id)
-    })
-  },
-  clearAll: () => set({ notifications: [] })
-}))
-
 interface SearchState {
   query: string
   setQuery: (query: string) => void

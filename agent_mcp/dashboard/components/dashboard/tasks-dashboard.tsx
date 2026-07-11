@@ -19,7 +19,7 @@ import { useServerStore } from "@/lib/stores/server-store"
 import { useDialog } from "@/hooks/use-dialog"
 import { useFilters } from "@/hooks/use-filters"
 import { usePagedQuery } from "@/hooks/use-paged-query"
-import { cn } from "@/lib/utils"
+import { cn, formatRelative } from "@/lib/utils"
 import { Skeleton } from "@/components/ui/skeleton"
 import { EmptyState } from "@/components/dashboard/shared/empty-state"
 import { AgentSelect } from "@/components/dashboard/shared/agent-select"
@@ -65,17 +65,6 @@ const parseJsonField = (field: unknown): unknown[] => {
     }
   }
   return []
-}
-
-const formatRelative = (iso: string | undefined): string => {
-  if (!iso) return '—'
-  const t = new Date(iso).getTime()
-  if (Number.isNaN(t)) return iso
-  const diff = Date.now() - t
-  if (diff < 60_000) return 'just now'
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`
-  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`
-  return `${Math.floor(diff / 86_400_000)}d ago`
 }
 
 // v5.0.31: cache TTL + background-refresh interval for the tasks

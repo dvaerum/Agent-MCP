@@ -7,6 +7,7 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Separator } from '@/components/ui/separator'
 import { Task } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import { statusColorClasses, priorityColorClasses } from '@/lib/status'
 
 interface TaskDetailsDialogProps {
   task: Task | null
@@ -32,33 +33,13 @@ export function TaskDetailsDialog({ task, open, onOpenChange }: TaskDetailsDialo
     return []
   }
 
-  const getStatusColor = (status: Task['status']) => {
-    const colors = {
-      pending: 'bg-warning/15 text-warning border-warning/30',
-      in_progress: 'bg-primary/15 text-primary border-primary/30',
-      completed: 'bg-green-500/15 text-green-600 border-green-500/30',
-      cancelled: 'bg-muted/50 text-muted-foreground border-border',
-      failed: 'bg-destructive/15 text-destructive border-destructive/30'
-    }
-    return colors[status] || colors.pending
-  }
-
-  const getPriorityColor = (priority: Task['priority']) => {
-    const colors = {
-      low: 'bg-muted text-muted-foreground',
-      medium: 'bg-primary/10 text-primary',
-      high: 'bg-destructive/10 text-destructive'
-    }
-    return colors[priority] || colors.medium
-  }
-
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-2xl max-h-[80vh]">
         <DialogHeader>
           <DialogTitle className="flex items-center justify-between pr-8">
             <span className="text-lg font-semibold">{task.title}</span>
-            <Badge variant="outline" className={cn("text-xs", getStatusColor(task.status))}>
+            <Badge variant="outline" className={cn("text-xs", statusColorClasses(task.status))}>
               {task.status.replace(/_/g, ' ')}
             </Badge>
           </DialogTitle>
@@ -74,7 +55,7 @@ export function TaskDetailsDialog({ task, open, onOpenChange }: TaskDetailsDialo
               </div>
               <div>
                 <span className="text-muted-foreground">Priority</span>
-                <Badge variant="outline" className={cn("text-xs mt-1", getPriorityColor(task.priority))}>
+                <Badge variant="outline" className={cn("text-xs mt-1", priorityColorClasses(task.priority))}>
                   {task.priority}
                 </Badge>
               </div>
