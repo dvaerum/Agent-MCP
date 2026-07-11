@@ -1,5 +1,13 @@
-# Agent-MCP/agent_mcp/core/repositories/_event_bus_shim.py
+# Agent-MCP/agent_mcp/core/event_bus_shim.py
 """Soft-dependency adapter for the (parallel) PR-W2b EventBus.
+
+Relocated from ``agent_mcp/core/repositories/_event_bus_shim.py``
+(arch-deepening R3 #2b): it was the only real module left in the
+otherwise-emptied ``core/repositories`` package once #2a deleted the
+four module-of-functions shadow repos, so the package was retired and
+this module moved to a plain ``core/`` home. No longer named with a
+leading underscore — it isn't a package-private helper of a repo tree
+any more, and no other ``core/*.py`` module uses the convention.
 
 PR-W2c can land before *or* after PR-W2b. To avoid a hard import-order
 constraint between two PRs in the same wave, the repos publish to the
@@ -29,7 +37,7 @@ from __future__ import annotations
 import importlib
 from typing import Any, Mapping
 
-from ..config import logger
+from .config import logger
 
 
 def publish(agent_id: str, event_type: str, payload: Mapping[str, Any]) -> None:

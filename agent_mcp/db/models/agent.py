@@ -6,10 +6,13 @@ Second model in the incremental SQLAlchemy adoption that started with
 creates for fresh DBs — keeping the column set + types identical means
 the ORM can read/write rows on a DB that was bootstrapped by raw SQL.
 
-This PR ships the model + parity test + a cutover of
-`agent_mcp.db.actions.agent_db` (the reader surface used by lifespan
-startup + tool authorisation). The tool-side writes (admin_tools,
-task_tools) keep raw SQL for now; follow-up PRs migrate them.
+This PR ships the model + parity test + a cutover of the reader
+surface used by lifespan startup + tool authorisation — originally
+`agent_mcp.db.actions.agent_db`, a re-export shim arch-deepening R3
+#2b deleted in favour of importing
+`agent_mcp.repositories.agent_repository` directly. The tool-side
+writes (admin_tools, task_tools) keep raw SQL for now; follow-up PRs
+migrate them.
 
 Column rationale:
 

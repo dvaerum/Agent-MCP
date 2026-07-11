@@ -3,8 +3,10 @@
 Fourth model in the incremental SQLAlchemy adoption (after
 `ProjectContext`, `Agent`, `Task`). The model must mirror what
 `init_database()` creates for fresh DBs; this test catches drift
-and pins the read/write cutover of the new
-`agent_mcp.db.actions.agent_messages_db` action module.
+and pins the read/write cutover of the
+`agent_mcp.repositories.message_repository` module (arch-deepening
+R3 #2b deleted the `db.actions.agent_messages_db` re-export shim
+these imports used to go through).
 
 Mirrors the shape of `tests/test_sqlalchemy_task.py` (PR-G3).
 Coverage:
@@ -140,7 +142,7 @@ async def test_agent_message_model_nullability_matches_raw_schema(
 
 
 async def test_insert_message_writes_row(tmp_path) -> None:
-    from agent_mcp.db.actions.agent_messages_db import (
+    from agent_mcp.repositories.message_repository import (
         get_message_by_id,
         insert_message,
     )
@@ -176,7 +178,7 @@ async def test_bulk_insert_messages_uses_executemany_pattern(
     executemany. The behavioural contract is just 'all rows show up',
     independent of the SQL surface, so this test exercises the
     public function and counts the rows."""
-    from agent_mcp.db.actions.agent_messages_db import (
+    from agent_mcp.repositories.message_repository import (
         bulk_insert_messages,
         get_message_by_id,
     )
@@ -218,7 +220,7 @@ async def test_bulk_insert_messages_uses_executemany_pattern(
 
 
 async def test_mark_delivered_flips_flag(tmp_path) -> None:
-    from agent_mcp.db.actions.agent_messages_db import (
+    from agent_mcp.repositories.message_repository import (
         get_message_by_id,
         insert_message,
         mark_delivered,
@@ -248,7 +250,7 @@ async def test_mark_delivered_flips_flag(tmp_path) -> None:
 async def test_mark_read_for_recipient_only_flips_unread(tmp_path) -> None:
     """`mark_read_for_recipient` flips read=1 on all unread messages
     addressed to a given recipient and returns the count touched."""
-    from agent_mcp.db.actions.agent_messages_db import (
+    from agent_mcp.repositories.message_repository import (
         bulk_insert_messages,
         get_message_by_id,
         mark_read_for_recipient,
@@ -290,7 +292,7 @@ async def test_mark_read_for_recipient_only_flips_unread(tmp_path) -> None:
 
 
 async def test_count_unread_for_recipient(tmp_path) -> None:
-    from agent_mcp.db.actions.agent_messages_db import (
+    from agent_mcp.repositories.message_repository import (
         bulk_insert_messages,
         count_unread_for_recipient,
         mark_read_for_recipient,
@@ -320,7 +322,7 @@ async def test_count_unread_for_recipient(tmp_path) -> None:
 
 
 async def test_delete_message_removes_row(tmp_path) -> None:
-    from agent_mcp.db.actions.agent_messages_db import (
+    from agent_mcp.repositories.message_repository import (
         delete_message,
         get_message_by_id,
         insert_message,

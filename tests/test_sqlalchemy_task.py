@@ -3,7 +3,7 @@
 Third model in the incremental SQLAlchemy adoption (after
 `ProjectContext` and `Agent`). The model must mirror what
 `init_database()` creates for fresh DBs; this test catches drift
-and pins the read-side cutover of `agent_mcp.db.actions.task_db`.
+and pins the read-side cutover of `agent_mcp.repositories.task_repository`.
 
 Mirrors the shape of `tests/test_sqlalchemy_agent.py`.
 """
@@ -195,7 +195,7 @@ async def test_task_db_get_task_by_id_uses_orm(tmp_path) -> None:
     cutover must preserve that, including JSON deserialisation for
     `notes` / `child_tasks` / `depends_on_tasks`.
     """
-    from agent_mcp.db.actions.task_db import get_task_by_id
+    from agent_mcp.repositories.task_repository import get_task_by_id
 
     async with mcp_session(tmp_path):
         _insert_task("t-by-id", title="Task by id")
@@ -210,14 +210,14 @@ async def test_task_db_get_task_by_id_uses_orm(tmp_path) -> None:
 
 
 async def test_task_db_get_task_by_id_missing_returns_none(tmp_path) -> None:
-    from agent_mcp.db.actions.task_db import get_task_by_id
+    from agent_mcp.repositories.task_repository import get_task_by_id
 
     async with mcp_session(tmp_path):
         assert get_task_by_id("no-such-task") is None
 
 
 async def test_task_db_get_all_tasks_uses_orm(tmp_path) -> None:
-    from agent_mcp.db.actions.task_db import get_all_tasks_from_db
+    from agent_mcp.repositories.task_repository import get_all_tasks_from_db
 
     async with mcp_session(tmp_path):
         _insert_task("t-all-1", title="T1", priority="low")
@@ -233,7 +233,7 @@ async def test_task_db_get_all_tasks_uses_orm(tmp_path) -> None:
 
 
 async def test_task_db_get_tasks_by_agent_id_uses_orm(tmp_path) -> None:
-    from agent_mcp.db.actions.task_db import get_tasks_by_agent_id
+    from agent_mcp.repositories.task_repository import get_tasks_by_agent_id
 
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
@@ -249,7 +249,7 @@ async def test_task_db_get_tasks_by_agent_id_uses_orm(tmp_path) -> None:
 async def test_task_db_get_tasks_by_agent_id_with_status_filter(
     tmp_path,
 ) -> None:
-    from agent_mcp.db.actions.task_db import (
+    from agent_mcp.repositories.task_repository import (
         get_tasks_by_agent_id,
         update_task_fields_in_db,
     )
@@ -268,7 +268,7 @@ async def test_task_db_get_tasks_by_agent_id_with_status_filter(
 
 
 async def test_task_db_update_task_fields_uses_orm(tmp_path) -> None:
-    from agent_mcp.db.actions.task_db import (
+    from agent_mcp.repositories.task_repository import (
         get_task_by_id,
         update_task_fields_in_db,
     )
@@ -296,7 +296,7 @@ async def test_task_db_update_task_fields_uses_orm(tmp_path) -> None:
 async def test_task_db_update_task_fields_json_serialises(tmp_path) -> None:
     """JSON-typed fields (notes/child_tasks/depends_on_tasks) must be
     serialised before being written to the TEXT column."""
-    from agent_mcp.db.actions.task_db import (
+    from agent_mcp.repositories.task_repository import (
         get_task_by_id,
         update_task_fields_in_db,
     )
@@ -327,7 +327,7 @@ async def test_task_db_update_task_fields_rejects_unknown_field(
     The historical behaviour for unknown-only-fields was to return
     False (no valid columns to update). Preserve that.
     """
-    from agent_mcp.db.actions.task_db import update_task_fields_in_db
+    from agent_mcp.repositories.task_repository import update_task_fields_in_db
 
     async with mcp_session(tmp_path):
         _insert_task("t-bad", title="X")
@@ -340,7 +340,7 @@ async def test_task_db_update_task_fields_rejects_unknown_field(
 async def test_task_db_update_task_fields_missing_task_returns_false(
     tmp_path,
 ) -> None:
-    from agent_mcp.db.actions.task_db import update_task_fields_in_db
+    from agent_mcp.repositories.task_repository import update_task_fields_in_db
 
     async with mcp_session(tmp_path):
         ok = update_task_fields_in_db(

@@ -48,7 +48,7 @@ from ..core.tool_result import (
     ToolResult,
 )
 from ..db.actions import task_notes_db
-from ..db.actions.task_db import get_task_by_id
+from ..repositories.task_repository import get_task_by_id
 from .registry import register_tool
 
 

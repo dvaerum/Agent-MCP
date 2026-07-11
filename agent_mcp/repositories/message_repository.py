@@ -59,11 +59,13 @@ After the flip:
 * All read/write SQL bodies live here (module-level functions for the
   legacy free-function API, instance methods for the EventBus-aware
   surface).
-* ``agent_mcp.db.actions.agent_messages_db`` is a re-export shim that
-  keeps legacy importers (``app.routes`` broadcast,
+* ``agent_mcp.db.actions.agent_messages_db`` was a re-export shim that
+  kept legacy importers (``app.routes`` broadcast,
   ``core.repositories.message_repo`` free-function form,
   ``tests/test_sqlalchemy_agent_message.py``,
   ``tests/test_repository_message.py``) working unchanged.
+  arch-deepening R3 #2b deleted the shim and repointed every importer
+  at this module directly.
 * ``MessageRepository`` is the single owner — handler → repo → SQL.
 """
 from __future__ import annotations
@@ -84,17 +86,18 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from ..core.config import logger
 # NOTE: we import the bus shim lazily inside the publish call sites
-# below via ``_publish``. A top-level
+# below via ``_publish``. Historically a top-level
 # ``from ..core.repositories import _event_bus_shim`` would execute
-# ``core.repositories.__init__``, which eagerly imports the legacy
+# ``core.repositories.__init__``, which eagerly imported the legacy
 # module-of-functions ``core.repositories.message_repo``, which in
-# turn imports ``db.actions.agent_messages_db`` — now a shim that
-# re-exports from THIS module. That produces a circular import at
-# first load. The lazy import inside ``_publish`` breaks the cycle
-# without changing publish semantics (the shim is itself lazy-
-# imports event_bus on every call, so call-site latency is
-# unaffected). Mirrors the pattern PR #153 (Task flip) / PR #154
-# (Agent flip) introduced when they hit the same hazard.
+# turn imported ``db.actions.agent_messages_db`` — a shim that
+# re-exported from THIS module — producing a circular import at first
+# load. arch-deepening R3 #2a deleted ``message_repo`` and #2b deleted
+# ``db.actions.agent_messages_db`` outright (closing that cycle for
+# good) and relocated the bus shim to ``core.event_bus_shim``. Kept
+# lazy anyway: mirrors the pattern PR #153 (Task flip) / PR #154
+# (Agent flip) introduced, and a function-local import costs nothing
+# at this call frequency.
 from ..db.engine import get_session
 from ..db.models import Agent, AgentMessage
 
@@ -129,25 +132,22 @@ class ParentMessageNotFound(LookupError):
 
 
 def _publish(addressee: str, event: str, payload: Dict[str, Any]) -> None:
-    """Lazy-import shim around ``_event_bus_shim.publish``.
+    """Lazy-import shim around ``event_bus_shim.publish``.
 
-    Importing the submodule path directly under ``core.repositories``
-    via ``from ... import _event_bus_shim`` would still trigger
-    ``core.repositories.__init__`` (which eagerly imports the legacy
-    ``message_repo`` module-of-functions, which imports the shim at
-    ``db.actions.agent_messages_db``, which now re-exports from THIS
-    module — circular). Doing the import at call time keeps the
-    publish side-effect identical while avoiding the cycle.
+    See the module-level NOTE above the imports for why this stays a
+    function-local import (a stale cycle this used to dodge, closed by
+    arch-deepening R3 #2a/#2b).
     """
-    from ..core.repositories import _event_bus_shim
+    from ..core import event_bus_shim
 
-    _event_bus_shim.publish(addressee, event, payload)
+    event_bus_shim.publish(addressee, event, payload)
 
 
 # ---------------------------------------------------------------------------
 # Module-level helpers — formerly lived in db/actions/agent_messages_db.py.
-# Both the class methods below and the re-export shim at
-# ``agent_mcp.db.actions.agent_messages_db`` consume these.
+# The class methods below consume these; the ``db.actions.agent_messages_db``
+# re-export shim that used to also consume them was deleted in
+# arch-deepening R3 #2b.
 #
 # Behaviour is byte-for-byte identical to the pre-flip helpers (same
 # SQLAlchemy ORM model, same commit semantics, same logging shape).

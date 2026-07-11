@@ -5,7 +5,15 @@ These functions bridge the TUI with the server's functionality.
 
 import asyncio
 from typing import Dict, List, Optional
-from ..db.actions import agent_db, task_db, context_db
+# arch-deepening R3 #2b: ``db.actions.agent_db`` / ``task_db`` were
+# pure re-export shims onto the canonical repository modules and were
+# deleted; aliasing here keeps every ``agent_db.X`` / ``task_db.X``
+# call site below unchanged. ``context_db`` has no canonical
+# repository counterpart (it's placeholder-only, unrelated to the
+# real ``project_context_tools`` surface this module already calls
+# below) so it keeps its original db.actions home.
+from ..repositories import agent_repository as agent_db, task_repository as task_db
+from ..db.actions import context_db
 from ..tools import project_context_tools, utility_tools
 from .colors import TUITheme
 from .display import TUIDisplay

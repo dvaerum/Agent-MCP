@@ -77,10 +77,10 @@ def query_agent_status(token: str) -> Optional[Dict[str, Any]]:
     """
     if not token:
         return None
-    # Local import — `agent_mcp.db.actions.agent_db` pulls in the
-    # SQLAlchemy engine which we don't want to load at module-import
+    # Local import — `agent_mcp.repositories.agent_repository` pulls in
+    # the SQLAlchemy engine which we don't want to load at module-import
     # time for callers that just want ``get_agent_id``.
-    from ..db.actions.agent_db import get_agent_by_token
+    from ..repositories.agent_repository import get_agent_by_token
 
     row = get_agent_by_token(token)
     if row is None:

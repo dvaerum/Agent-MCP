@@ -80,9 +80,9 @@ def _publish_task_event(
     uncommitted / rolled-back row. Delivery failures are swallowed by the
     shim — the source-of-truth commit already happened.
     """
-    from ..core.repositories import _event_bus_shim
+    from ..core import event_bus_shim
 
-    _event_bus_shim.publish(assigned_to or "*", event, payload)
+    event_bus_shim.publish(assigned_to or "*", event, payload)
 
 
 def _link_child_to_parent(cursor, parent_task_id, child_task_id) -> bool:

@@ -54,10 +54,12 @@ After the flip:
 * All read/write SQL bodies live here (module-level functions for the
   legacy free-function API, instance methods for the cache-aware
   surface).
-* ``agent_mcp.db.actions.agent_db`` is a re-export shim that keeps
+* ``agent_mcp.db.actions.agent_db`` was a re-export shim that kept
   legacy importers (``cli.py``, ``core.auth``, ``app.routes`` lifespan,
   the older module-of-functions repo under ``core.repositories``,
-  ``tests/test_sqlalchemy_agent.py``) working unchanged.
+  ``tests/test_sqlalchemy_agent.py``) working unchanged. arch-deepening
+  R3 #2b deleted the shim (it re-exported nothing of its own) and
+  repointed every importer at this module directly.
 * ``AgentRepository`` is the single owner — handler → repo → SQL.
 """
 from __future__ import annotations
@@ -73,14 +75,16 @@ from sqlalchemy.exc import SQLAlchemyError
 from ..core import state
 from ..core.config import logger
 # NOTE: we import the bus shim lazily inside the publish call sites
-# below. A top-level ``from ..core.repositories import _event_bus_shim``
-# would execute ``core.repositories.__init__``, which eagerly imports
-# the legacy module-of-functions ``core.repositories.agent_repo``,
-# which in turn imports ``db.actions.agent_db`` — now a shim that
-# re-exports from THIS module. That produces a circular import at
-# first load. The lazy import inside ``_publish`` breaks the cycle
-# without changing publish semantics (the shim is itself lazy-imports
-# event_bus on every call, so call-site latency is unaffected).
+# below. Historically a top-level
+# ``from ..core.repositories import _event_bus_shim`` would execute
+# ``core.repositories.__init__``, which eagerly imported the legacy
+# module-of-functions ``core.repositories.agent_repo``, which in turn
+# imported ``db.actions.agent_db`` — a shim that re-exported from THIS
+# module — producing a circular import at first load. arch-deepening
+# R3 #2a deleted ``agent_repo`` and #2b deleted ``db.actions.agent_db``
+# outright (closing that cycle for good) and relocated the bus shim to
+# ``core.event_bus_shim``. Kept lazy anyway: a function-local import
+# costs nothing at this call frequency.
 from ..db.engine import get_session
 from ..db.models import Agent
 
@@ -125,19 +129,15 @@ def is_live_agent(agent_id: str, cursor: Any) -> bool:
 
 
 def _publish(addressee: str, event: str, payload: Dict[str, Any]) -> None:
-    """Lazy-import shim around ``_event_bus_shim.publish``.
+    """Lazy-import shim around ``event_bus_shim.publish``.
 
-    Importing the submodule path directly under ``core.repositories``
-    via ``from ... import _event_bus_shim`` would still trigger
-    ``core.repositories.__init__`` (which eagerly imports the legacy
-    ``agent_repo`` module-of-functions, which imports the shim at
-    ``db.actions.agent_db``, which now re-exports from THIS module —
-    circular). Doing the import at call time keeps the publish
-    side-effect identical while avoiding the cycle.
+    See the module-level NOTE above the imports for why this stays a
+    function-local import (a stale cycle this used to dodge, closed by
+    arch-deepening R3 #2a/#2b).
     """
-    from ..core.repositories import _event_bus_shim
+    from ..core import event_bus_shim
 
-    _event_bus_shim.publish(addressee, event, payload)
+    event_bus_shim.publish(addressee, event, payload)
 
 
 # ---------------------------------------------------------------------------
@@ -209,10 +209,11 @@ _MUTABLE_FIELDS: set[str] = {
 
 # ---------------------------------------------------------------------------
 # Module-level free functions — formerly lived in db/actions/agent_db.py.
-# These remain ORM-backed and behaviourally unchanged. They are exported
-# unchanged via the ``db.actions.agent_db`` shim so legacy callers
-# (``cli.py``, ``core.auth``, ``app.routes`` lifespan,
-# ``core.repositories.agent_repo``, tests) keep working.
+# These remain ORM-backed and behaviourally unchanged. Legacy callers
+# (``cli.py``, ``core.auth``, ``app.routes`` lifespan, tests) used to
+# reach them via the ``db.actions.agent_db`` re-export shim;
+# arch-deepening R3 #2b deleted that shim and repointed every importer
+# at this module directly.
 # ---------------------------------------------------------------------------
 
 

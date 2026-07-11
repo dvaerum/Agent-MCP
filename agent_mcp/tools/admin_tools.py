@@ -616,7 +616,7 @@ def _reconcile_reassigned_tasks(
     """
     if not reassigned_tasks:
         return
-    from ..db.actions.task_db import get_task_by_id
+    from ..repositories.task_repository import get_task_by_id
     from ..repositories import task_repo
 
     for task_id, req_caps_raw in reassigned_tasks:

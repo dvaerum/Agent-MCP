@@ -92,9 +92,9 @@ class UnitOfWork:
         """
 
         def _effect() -> None:
-            from ..core.repositories import _event_bus_shim
+            from ..core import event_bus_shim
 
-            _event_bus_shim.publish(addressee or "*", event_type, payload)
+            event_bus_shim.publish(addressee or "*", event_type, payload)
 
         self._post_commit.append(_effect)
 
