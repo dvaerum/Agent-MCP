@@ -68,6 +68,7 @@ import contextlib
 import datetime
 import json
 import re
+import sqlite3
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -205,6 +206,45 @@ _MUTABLE_FIELDS: set[str] = {
     # CHECK constraint (Wave 1a) is the last-resort guard.
     "agent_role",
 }
+
+
+def _sanitise_field(field_name: str, new_value: Any) -> Tuple[bool, Any]:
+    """Allowlist-check ``field_name`` and normalize ``new_value``.
+
+    The single source of truth for the ``_MUTABLE_FIELDS`` allowlist
+    plus the per-field normalization rules (``capabilities`` ->
+    normalized JSON, ``auto_event_loop`` -> 1/0, a ``None``
+    ``updated_at`` -> "now"). Before arch-r5 #3 this block was
+    duplicated 3x (the standalone own-session writer, the shared-cursor
+    writer, and a dead shared-session writer that no caller ever
+    exercised — see the module docstring / PR notes). Both surviving
+    writers call this so the invariant can't drift between them again.
+
+    Returns ``(True, normalized_value)`` when ``field_name`` is
+    allowed, or ``(False, None)`` when it must be rejected.
+    """
+    if field_name not in _MUTABLE_FIELDS:
+        return False, None
+
+    value_to_set = new_value
+    if field_name == "capabilities":
+        # Event-coord PR-1: normalize at write time (strip + lowercase +
+        # dedupe, preserve order of first occurrence). One source of
+        # truth for both agents.capabilities and
+        # tasks.required_capabilities (task_tools applies the same
+        # helper). Read paths must NOT re-normalize.
+        from ..utils.capability_normalization import normalize_capabilities
+
+        value_to_set = json.dumps(normalize_capabilities(new_value))
+    elif field_name == "auto_event_loop":
+        # SQLite has no native bool; coerce any truthy value to 1, any
+        # falsy to 0 so dashboard PATCH bodies (true/false/0/1) all
+        # land as the integer the column expects.
+        value_to_set = 1 if new_value else 0
+    elif field_name == "updated_at" and new_value is None:
+        value_to_set = datetime.datetime.now().isoformat()
+
+    return True, value_to_set
 
 
 # ---------------------------------------------------------------------------
@@ -349,30 +389,13 @@ def update_agent_db_field(
     callers must not be able to mutate ``token`` or ``agent_id`` /
     ``created_at`` via this surface.
     """
-    if field_name not in _MUTABLE_FIELDS:
+    ok, value_to_set = _sanitise_field(field_name, new_value)
+    if not ok:
         logger.error(
             f"Attempted to update an invalid or unsupported agent "
             f"field: {field_name}"
         )
         return False
-
-    value_to_set = new_value
-    if field_name == "capabilities":
-        # Event-coord PR-1: normalize at write time (strip + lowercase +
-        # dedupe, preserve order of first occurrence). One source of
-        # truth for both agents.capabilities and
-        # tasks.required_capabilities (task_tools applies the same
-        # helper). Read paths must NOT re-normalize.
-        from ..utils.capability_normalization import normalize_capabilities
-
-        value_to_set = json.dumps(normalize_capabilities(new_value))
-    elif field_name == "auto_event_loop":
-        # SQLite has no native bool; coerce any truthy value to 1, any
-        # falsy to 0 so dashboard PATCH bodies (true/false/0/1) all
-        # land as the integer the column expects.
-        value_to_set = 1 if new_value else 0
-    elif field_name == "updated_at" and new_value is None:
-        value_to_set = datetime.datetime.now().isoformat()
 
     try:
         with get_session() as session:
@@ -851,17 +874,24 @@ class AgentRepository:
         field_name: str,
         new_value: Any,
         *,
-        connection: Any = None,
+        connection: Optional[sqlite3.Cursor] = None,
     ) -> Optional[Dict[str, Any]]:
         """UPDATE one field via the allowlisted writer; refresh caches; publish.
 
-        ``connection`` is the Risk #1 hook (mirrors
-        ``TaskRepository.update_fields``): a handler that already
-        holds an open SQLAlchemy ``Session`` in a wider transaction
-        can pass it in to keep the write atomic with its surrounding
-        statements. When ``None`` (the normal case), the call opens
-        its own session via the existing ``update_agent_db_field``
-        helper.
+        ``connection`` is the Risk #1 hook: a handler that already
+        holds an open raw ``sqlite3.Cursor`` in a wider transaction
+        (its own BEGIN/COMMIT) can pass it in to keep the write atomic
+        with its surrounding statements. When ``None`` (the normal
+        case), the call opens its own session via the existing
+        ``update_agent_db_field`` helper.
+
+        arch-r5 #3: a SQLAlchemy ``Session`` overload used to be
+        accepted here too (disambiguated via ``hasattr(connection,
+        "query")``), but a grep of every ``update_field(...,
+        connection=...)`` call site across ``agent_mcp/`` and
+        ``tests/`` turned up zero Session-shaped callers — every one
+        passes a raw cursor. Removed the dead branch and typed the
+        parameter honestly.
 
         Returns the post-update dict, or ``None`` if the row was
         unknown / field rejected by the allowlist / DB error. Matches
@@ -873,7 +903,7 @@ class AgentRepository:
           * ``"agent.updated"`` for every other allowlisted field.
         """
         # sqlite3 cursor path: caller owns BEGIN/COMMIT. PR #152.
-        if connection is not None and not hasattr(connection, "query"):
+        if connection is not None:
             ok = self._update_field_with_cursor(
                 connection, agent_id, field_name, new_value,
             )
@@ -885,12 +915,7 @@ class AgentRepository:
             # own response.
             return {"agent_id": agent_id, field_name: new_value}
 
-        if connection is not None:
-            ok = self._update_field_with_session(
-                connection, agent_id, field_name, new_value,
-            )
-        else:
-            ok = update_agent_db_field(agent_id, field_name, new_value)
+        ok = update_agent_db_field(agent_id, field_name, new_value)
         if not ok:
             return None
 
@@ -1017,32 +1042,25 @@ class AgentRepository:
 
     def _update_field_with_cursor(
         self,
-        cursor: Any,
+        cursor: sqlite3.Cursor,
         agent_id: str,
         field_name: str,
         new_value: Any,
     ) -> bool:
         """Internal helper for the sqlite3.Cursor ``connection=`` path.
 
-        Mirrors the allowlist + capabilities-normalisation logic of
-        :func:`update_agent_db_field` but writes via raw SQL against
-        the caller's cursor so the wider BEGIN/COMMIT stays atomic.
+        Uses :func:`_sanitise_field` — the same allowlist +
+        normalisation :func:`update_agent_db_field` uses — but writes
+        via raw SQL against the caller's cursor so the wider
+        BEGIN/COMMIT stays atomic.
         """
-        if field_name not in _MUTABLE_FIELDS:
+        ok, value_to_set = _sanitise_field(field_name, new_value)
+        if not ok:
             logger.error(
                 f"Attempted to update an invalid or unsupported agent "
                 f"field via shared cursor: {field_name}"
             )
             return False
-
-        value_to_set = new_value
-        if field_name == "capabilities":
-            from ..utils.capability_normalization import normalize_capabilities
-            value_to_set = json.dumps(normalize_capabilities(new_value))
-        elif field_name == "auto_event_loop":
-            value_to_set = 1 if new_value else 0
-        elif field_name == "updated_at" and new_value is None:
-            value_to_set = datetime.datetime.now().isoformat()
 
         now = datetime.datetime.now().isoformat()
         try:
@@ -1056,60 +1074,6 @@ class AgentRepository:
             logger.error(
                 f"Database error updating agent '{agent_id}' field "
                 f"'{field_name}' via shared cursor: {e}",
-                exc_info=True,
-            )
-            return False
-
-    def _update_field_with_session(
-        self,
-        session: Any,
-        agent_id: str,
-        field_name: str,
-        new_value: Any,
-    ) -> bool:
-        """Internal helper for the ``connection=`` overload.
-
-        Mirrors the allowlist + capabilities-normalisation logic
-        ``update_agent_db_field`` does, but against the caller-provided
-        session so the wider transaction stays intact. Kept private
-        because the public API is
-        ``update_field(agent_id, field, value, connection=)`` —
-        exposing the session-shaped variant directly would leak a
-        transient implementation detail.
-        """
-        if field_name not in _MUTABLE_FIELDS:
-            logger.error(
-                f"Attempted to update an invalid or unsupported agent "
-                f"field via shared session: {field_name}"
-            )
-            return False
-
-        value_to_set = new_value
-        if field_name == "capabilities":
-            from ..utils.capability_normalization import normalize_capabilities
-
-            value_to_set = json.dumps(normalize_capabilities(new_value))
-        elif field_name == "auto_event_loop":
-            value_to_set = 1 if new_value else 0
-        elif field_name == "updated_at" and new_value is None:
-            value_to_set = datetime.datetime.now().isoformat()
-
-        try:
-            row = (
-                session.query(Agent)
-                .filter(Agent.agent_id == agent_id)
-                .one_or_none()
-            )
-            if row is None:
-                return False
-            setattr(row, field_name, value_to_set)
-            row.updated_at = datetime.datetime.now().isoformat()
-            session.flush()
-            return True
-        except SQLAlchemyError as e:
-            logger.error(
-                f"Database error updating agent '{agent_id}' field "
-                f"'{field_name}' via shared session: {e}",
                 exc_info=True,
             )
             return False

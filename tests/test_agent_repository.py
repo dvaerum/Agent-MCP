@@ -618,3 +618,130 @@ def test_create_rejects_invalid_agent_id(agent_id, project_dir, reset_globals):
         # disabled for the lookup so we hit the DB authoritatively.
         with agent_repo.disable_cache():
             assert agent_repo.get_by_id(agent_id) is None
+
+
+# --- _sanitise_field (arch-r5 #3) -----------------------------------------
+#
+# Before this PR the allowlist + per-field normalisation lived 3x:
+# the standalone own-session writer (``update_agent_db_field``), the
+# shared-cursor writer (``_update_field_with_cursor``), and a shared-
+# session writer (``_update_field_with_session``) that a grep of every
+# ``update_field(..., connection=...)`` call site in ``agent_mcp/`` and
+# ``tests/`` showed was never exercised by any real caller — every
+# site passes a raw ``sqlite3.Cursor``. That dead branch has been
+# deleted; ``_sanitise_field`` is now the single place the two
+# surviving writers (cursor + standalone session) both call. These
+# tests pin its contract directly so the invariant the dead path made
+# hard to isolate is covered without spinning up the app harness.
+
+_SANITISE_FIELD_CASES = [
+    # (field_name, new_value, expected_ok, expected_value)
+    ("status", "active", True, "active"),
+    ("current_task", "task_1", True, "task_1"),
+    ("working_directory", "/tmp/x", True, "/tmp/x"),
+    ("color", "#fff", True, "#fff"),
+    ("aoe_session_id", "sess-1", True, "sess-1"),
+    ("last_event_seen_at", "2026-01-01T00:00:00", True, "2026-01-01T00:00:00"),
+    ("terminated_at", None, True, None),
+    ("agent_role", "manager", True, "manager"),
+    # auto_event_loop: SQLite has no native bool, coerce truthy/falsy -> 1/0.
+    ("auto_event_loop", True, True, 1),
+    ("auto_event_loop", False, True, 0),
+    ("auto_event_loop", 1, True, 1),
+    ("auto_event_loop", 0, True, 0),
+    # capabilities: normalized (stripped, lowercased, deduped, order-preserved)
+    # then JSON-encoded.
+    ("capabilities", ["Foo", "foo", " Bar "], True, '["foo", "bar"]'),
+    ("capabilities", [], True, "[]"),
+    # unknown / off-allowlist fields are rejected outright.
+    ("token", "new-secret", False, None),
+    ("agent_id", "renamed", False, None),
+    ("created_at", "2026-01-01", False, None),
+    ("not_a_real_field", "x", False, None),
+]
+
+
+@pytest.mark.parametrize(
+    "field_name, new_value, expected_ok, expected_value",
+    _SANITISE_FIELD_CASES,
+    ids=[c[0] + ("" if c[2] else "-rejected") for c in _SANITISE_FIELD_CASES],
+)
+def test_sanitise_field(field_name, new_value, expected_ok, expected_value):
+    """Table-driven pin of the allowlist + per-field normalisation.
+
+    Doesn't need the app harness — ``_sanitise_field`` is a pure
+    function of ``(field_name, new_value)``.
+    """
+    from agent_mcp.repositories.agent_repository import _sanitise_field
+
+    ok, value = _sanitise_field(field_name, new_value)
+    assert ok is expected_ok
+    if expected_ok:
+        assert value == expected_value
+    else:
+        assert value is None
+
+
+def test_sanitise_field_updated_at_none_stamps_now():
+    """A ``None`` ``updated_at`` is the one field whose normalized value
+    isn't a pure function of the input — it stamps "now". Pinned
+    separately from the table so the table stays exact-value comparable.
+    """
+    from agent_mcp.repositories.agent_repository import _sanitise_field
+
+    ok, value = _sanitise_field("updated_at", None)
+    assert ok is True
+    # ISO-8601 timestamp, not the literal None that was passed in.
+    assert isinstance(value, str)
+    datetime.datetime.fromisoformat(value)
+
+
+def test_sanitise_field_updated_at_explicit_value_passthrough():
+    """A caller-supplied (non-``None``) ``updated_at`` passes through
+    unchanged — only the ``None`` sentinel triggers the "stamp now" rule.
+    """
+    from agent_mcp.repositories.agent_repository import _sanitise_field
+
+    ok, value = _sanitise_field("updated_at", "2020-01-01T00:00:00")
+    assert ok is True
+    assert value == "2020-01-01T00:00:00"
+
+
+def test_update_field_via_cursor_and_standalone_agree(
+    project_dir, reset_globals,
+):
+    """The cursor writer and the standalone writer both route through
+    ``_sanitise_field`` — this pins that they produce the SAME
+    normalized value for the same input, which is the exact invariant
+    the (now-deleted) dead session writer put at risk of drifting.
+    """
+    with _make_client(project_dir):
+        from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import agent_repo
+
+        _seed_agent("agent-cursor", token="tok-cursor", status="created")
+        _seed_agent("agent-standalone", token="tok-standalone", status="created")
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN")
+            result = agent_repo.update_field(
+                "agent-cursor", "capabilities", ["Foo", "foo"],
+                connection=cursor,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        assert result is not None
+
+        result2 = agent_repo.update_field(
+            "agent-standalone", "capabilities", ["Foo", "foo"],
+        )
+        assert result2 is not None
+
+        with agent_repo.disable_cache():
+            cursor_row = agent_repo.get_by_id("agent-cursor")
+            standalone_row = agent_repo.get_by_id("agent-standalone")
+        assert cursor_row["capabilities"] == standalone_row["capabilities"]
+        assert cursor_row["capabilities"] == ["foo"]
