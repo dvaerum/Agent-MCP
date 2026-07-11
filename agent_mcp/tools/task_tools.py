@@ -1115,197 +1115,198 @@ async def _assign_to_existing_tasks(
     block) — the phantom collapse is ONLY for the non-admin self-claim
     oracle.
     """
-    conn = None
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        # D1: the unit-of-work owns the transaction AND the post-commit
+        # side effects (assignee wake, cache upsert). Effects register on
+        # ``u`` and flush only after a clean commit — a rollback fires
+        # NOTHING (emit-iff-commit). The per-task ``agent_actions`` audit
+        # rows stay INSIDE the scope via ``u.cursor`` (this Mode-3 path
+        # has no in-memory ``log_audit`` sink to unify, so the DB rows
+        # keep their exact per-task cardinality + actor attribution).
+        with unit_of_work() as u:
+            cursor = u.cursor
 
-        # Validate that all tasks exist and are unassigned. ``status`` is
-        # SELECTed so the terminal-sink check below can see terminal
-        # state (BL-R18-1).
-        placeholders = ",".join(["?" for _ in task_ids])
-        cursor.execute(
-            f"SELECT task_id, title, assigned_to, required_capabilities, status "
-            f"FROM tasks WHERE task_id IN ({placeholders})",
-            task_ids,
-        )
-        found_tasks = cursor.fetchall()
+            # Validate that all tasks exist and are unassigned. ``status``
+            # is SELECTed so the terminal-sink check below can see
+            # terminal state (BL-R18-1).
+            placeholders = ",".join(["?" for _ in task_ids])
+            cursor.execute(
+                f"SELECT task_id, title, assigned_to, required_capabilities, status "
+                f"FROM tasks WHERE task_id IN ({placeholders})",
+                task_ids,
+            )
+            found_tasks = cursor.fetchall()
 
-        # SEC-R18 phantom NotFound. For a non-admin self-claim caller,
-        # every non-claimable outcome collapses to this — byte-identical
-        # to the nonexistent-task branch, with the identifier being the
-        # id(s) the caller asked for (never the missing subset, which
-        # would itself signal which of a batch exists). See the function
-        # docstring for the AZ-R18-1 / BL-R18-1 rationale.
-        phantom_not_found = NotFound(
-            resource="task", identifier=", ".join(task_ids)
-        )
-
-        if len(found_tasks) != len(task_ids):
-            if not is_admin_request:
-                return phantom_not_found
-            found_ids = [task["task_id"] for task in found_tasks]
-            missing_ids = [tid for tid in task_ids if tid not in found_ids]
-            return NotFound(resource="task", identifier=", ".join(missing_ids))
-
-        # Check for already assigned tasks
-        assigned_tasks = [
-            task for task in found_tasks if task["assigned_to"] is not None
-        ]
-        if assigned_tasks:
-            if not is_admin_request:
-                return phantom_not_found
-            assigned_list = [
-                f"{task['task_id']} (assigned to {task['assigned_to']})"
-                for task in assigned_tasks
-            ]
-            return Conflict(
-                reason=f"some tasks are already assigned: {', '.join(assigned_list)}"
+            # SEC-R18 phantom NotFound. For a non-admin self-claim caller,
+            # every non-claimable outcome collapses to this — byte-identical
+            # to the nonexistent-task branch, with the identifier being the
+            # id(s) the caller asked for (never the missing subset, which
+            # would itself signal which of a batch exists). See the function
+            # docstring for the AZ-R18-1 / BL-R18-1 rationale.
+            phantom_not_found = NotFound(
+                resource="task", identifier=", ".join(task_ids)
             )
 
-        # Terminal-sink on the assign axis (BL-R18-1). A terminal task
-        # (completed/cancelled/failed) is finished work; re-assigning it
-        # would let the claimant re-execute it. Terminal is a sink here
-        # exactly as it is on the status axis
-        # (``_is_status_transition_allowed`` / ``_update_single_task``).
-        # Non-admin callers get the phantom NotFound; admins get an
-        # informative block (never a silent claim).
-        terminal_tasks = [
-            task
-            for task in found_tasks
-            if task["status"] in _TERMINAL_TASK_STATUSES
-        ]
-        if terminal_tasks:
-            if not is_admin_request:
-                return phantom_not_found
-            terminal_list = [
-                f"{task['task_id']} ({task['status']})"
-                for task in terminal_tasks
-            ]
-            return Conflict(
-                reason=(
-                    "cannot assign task(s) in a terminal state "
-                    f"(terminal states are a sink): {', '.join(terminal_list)}"
-                )
-            )
-
-        # Validate agent exists and is a live target. A terminated
-        # target makes the task unreachable work and misattributes the
-        # audit trail to a revoked identity; a 'tombstone' row
-        # (`[deleted-<id>]` purge FK artefact) is not an agent at all
-        # (BL-R31-3b). This is the existence gate for this assign path
-        # (it does not route through ``_agent_assignable``).
-        from ..repositories.agent_repository import LIVE_AGENT_SQL
-
-        cursor.execute(
-            "SELECT capabilities FROM agents WHERE agent_id = ? "
-            f"AND {LIVE_AGENT_SQL}",
-            (target_agent_id,),
-        )
-        agent_caps_row = cursor.fetchone()
-        if not agent_caps_row:
-            return NotFound(resource="agent", identifier=target_agent_id)
-
-        # Capability-routing enforcement (Mode-3 self-claim). A caller
-        # that learns a task_id must not claim work it lacks the
-        # capabilities for: enforce required_capabilities ⊆ agent
-        # capabilities. Empty required_capabilities always passes. The
-        # subset check is factored into ``_missing_capabilities`` so
-        # every reassign path enforces the SAME control (AZ-R26-1).
-        for task in found_tasks:
-            missing = _missing_capabilities(
-                cursor, task["required_capabilities"], target_agent_id
-            )
-            if missing:
-                # SEC-R18: a non-admin self-claim caller must not learn
-                # the task exists via a capability-mismatch signal —
-                # collapse to the phantom NotFound. Admins keep the
-                # informative PermissionDenied.
+            if len(found_tasks) != len(task_ids):
                 if not is_admin_request:
                     return phantom_not_found
-                return PermissionDenied(
+                found_ids = [task["task_id"] for task in found_tasks]
+                missing_ids = [tid for tid in task_ids if tid not in found_ids]
+                return NotFound(resource="task", identifier=", ".join(missing_ids))
+
+            # Check for already assigned tasks
+            assigned_tasks = [
+                task for task in found_tasks if task["assigned_to"] is not None
+            ]
+            if assigned_tasks:
+                if not is_admin_request:
+                    return phantom_not_found
+                assigned_list = [
+                    f"{task['task_id']} (assigned to {task['assigned_to']})"
+                    for task in assigned_tasks
+                ]
+                return Conflict(
+                    reason=f"some tasks are already assigned: {', '.join(assigned_list)}"
+                )
+
+            # Terminal-sink on the assign axis (BL-R18-1). A terminal task
+            # (completed/cancelled/failed) is finished work; re-assigning it
+            # would let the claimant re-execute it. Terminal is a sink here
+            # exactly as it is on the status axis
+            # (``_is_status_transition_allowed`` / ``_update_single_task``).
+            # Non-admin callers get the phantom NotFound; admins get an
+            # informative block (never a silent claim).
+            terminal_tasks = [
+                task
+                for task in found_tasks
+                if task["status"] in _TERMINAL_TASK_STATUSES
+            ]
+            if terminal_tasks:
+                if not is_admin_request:
+                    return phantom_not_found
+                terminal_list = [
+                    f"{task['task_id']} ({task['status']})"
+                    for task in terminal_tasks
+                ]
+                return Conflict(
                     reason=(
-                        f"agent '{target_agent_id}' lacks required "
-                        f"capabilities for task {task['task_id']}: "
-                        f"{missing}"
+                        "cannot assign task(s) in a terminal state "
+                        f"(terminal states are a sink): {', '.join(terminal_list)}"
                     )
                 )
 
-        # PR 6: task assignment UPDATEs go through task_repo with the
-        # caller's cursor so they're atomic with the audit-log
-        # INSERTs. The repo defers cache + publish on the
-        # connection= path; we reconcile after commit below.
-        from ..repositories import agent_repo, task_repo
-        for task_id in task_ids:
-            task_repo.update_fields(
-                task_id, {"assigned_to": target_agent_id},
-                connection=cursor,
+            # Validate agent exists and is a live target. A terminated
+            # target makes the task unreachable work and misattributes the
+            # audit trail to a revoked identity; a 'tombstone' row
+            # (`[deleted-<id>]` purge FK artefact) is not an agent at all
+            # (BL-R31-3b). This is the existence gate for this assign path
+            # (it does not route through ``_agent_assignable``).
+            from ..repositories.agent_repository import LIVE_AGENT_SQL
+
+            cursor.execute(
+                "SELECT capabilities FROM agents WHERE agent_id = ? "
+                f"AND {LIVE_AGENT_SQL}",
+                (target_agent_id,),
             )
-            log_agent_action_to_db(
-                cursor,
-                requesting_actor,
-                "assigned_task",
-                task_id=task_id,
-                details={
-                    "agent_id": target_agent_id,
-                    "mode": "existing_task_assignment",
-                },
+            agent_caps_row = cursor.fetchone()
+            if not agent_caps_row:
+                return NotFound(resource="agent", identifier=target_agent_id)
+
+            # Capability-routing enforcement (Mode-3 self-claim). A caller
+            # that learns a task_id must not claim work it lacks the
+            # capabilities for: enforce required_capabilities ⊆ agent
+            # capabilities. Empty required_capabilities always passes. The
+            # subset check is factored into ``_missing_capabilities`` so
+            # every reassign path enforces the SAME control (AZ-R26-1).
+            for task in found_tasks:
+                missing = _missing_capabilities(
+                    cursor, task["required_capabilities"], target_agent_id
+                )
+                if missing:
+                    # SEC-R18: a non-admin self-claim caller must not learn
+                    # the task exists via a capability-mismatch signal —
+                    # collapse to the phantom NotFound. Admins keep the
+                    # informative PermissionDenied.
+                    if not is_admin_request:
+                        return phantom_not_found
+                    return PermissionDenied(
+                        reason=(
+                            f"agent '{target_agent_id}' lacks required "
+                            f"capabilities for task {task['task_id']}: "
+                            f"{missing}"
+                        )
+                    )
+
+            # PR 6: task assignment UPDATEs go through task_repo with the
+            # caller's cursor so they're atomic with the audit-log
+            # INSERTs. The repo defers cache + publish on the
+            # connection= path; the uow reconciles cache post-commit.
+            from ..repositories import agent_repo, task_repo
+            for task_id in task_ids:
+                task_repo.update_fields(
+                    task_id, {"assigned_to": target_agent_id},
+                    connection=cursor,
+                )
+                log_agent_action_to_db(
+                    cursor,
+                    requesting_actor,
+                    "assigned_task",
+                    task_id=task_id,
+                    details={
+                        "agent_id": target_agent_id,
+                        "mode": "existing_task_assignment",
+                    },
+                )
+
+            # Update agent's current task if they don't have one (use first task)
+            cursor.execute(
+                "SELECT current_task FROM agents WHERE agent_id = ?", (target_agent_id,)
             )
+            agent_row = cursor.fetchone()
+            if agent_row and agent_row["current_task"] is None:
+                agent_repo.update_field(
+                    target_agent_id, "current_task", task_ids[0],
+                    connection=cursor,
+                )
 
-        # Update agent's current task if they don't have one (use first task)
-        cursor.execute(
-            "SELECT current_task FROM agents WHERE agent_id = ?", (target_agent_id,)
-        )
-        agent_row = cursor.fetchone()
-        if agent_row and agent_row["current_task"] is None:
-            agent_repo.update_field(
-                target_agent_id, "current_task", task_ids[0],
-                connection=cursor,
-            )
+            # Post-commit cache reconciliation through the repos —
+            # registered on the uow so it flushes only after commit.
+            def _reconcile_assigned_cache(tids=list(task_ids)) -> None:
+                for tid in tids:
+                    fresh = task_repo.get_by_id(tid)
+                    if fresh is not None:
+                        task_repo.upsert_cache(fresh)
 
-        conn.commit()
+            u.on_commit(_reconcile_assigned_cache)
 
-        # Post-commit cache reconciliation through the repos.
-        for task_id in task_ids:
-            fresh = task_repo.get_by_id(task_id)
-            if fresh is not None:
-                task_repo.upsert_cache(fresh)
+            # Wake wait_for_events waiter + fan out resources/updated to
+            # every registered GET /mcp stream for the newly-assigned
+            # agent. Registered post-commit (emit-iff-commit); the uow's
+            # flush isolates a notify failure so it can't poison the
+            # already-committed write.
+            u.on_commit(lambda: g.notify_agent_inbox(target_agent_id))
 
-        # Wake wait_for_events waiter + fan out resources/updated to
-        # every registered GET /mcp stream for the newly-assigned agent.
-        try:
-            g.notify_agent_inbox(target_agent_id)
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning(
-                "notify_agent_inbox(%s) raised after _assign_to_existing_tasks: %s",
-                target_agent_id, e,
-            )
+            # Build response
+            task_titles = [task["title"] for task in found_tasks]
+            response_parts = [
+                f"✅ **Tasks Assigned Successfully**",
+                f"   Agent: {target_agent_id}",
+                f"   Tasks Assigned: {len(task_ids)}",
+                "",
+            ]
 
-        # Build response
-        task_titles = [task["title"] for task in found_tasks]
-        response_parts = [
-            f"✅ **Tasks Assigned Successfully**",
-            f"   Agent: {target_agent_id}",
-            f"   Tasks Assigned: {len(task_ids)}",
-            "",
-        ]
+            for i, (task_id, title) in enumerate(zip(task_ids, task_titles), 1):
+                response_parts.append(f"   {i}. {task_id}: {title}")
 
-        for i, (task_id, title) in enumerate(zip(task_ids, task_titles), 1):
-            response_parts.append(f"   {i}. {task_id}: {title}")
+            if coordination_notes:
+                response_parts.append(f"\n📋 **Coordination Notes:** {coordination_notes}")
 
-        if coordination_notes:
-            response_parts.append(f"\n📋 **Coordination Notes:** {coordination_notes}")
-
-        return Ok(message="\n".join(response_parts))
+            return Ok(message="\n".join(response_parts))
 
     except Exception as e:
-        if conn:
-            conn.rollback()
+        # The unit-of-work already rolled back + closed the connection.
         logger.error(f"Error assigning existing tasks: {e}", exc_info=True)
         return Failed(message=f"Error assigning tasks: {e}")
-    finally:
-        if conn:
-            conn.close()
 
 
 async def _create_and_assign_multiple_tasks(
@@ -1317,128 +1318,126 @@ async def _create_and_assign_multiple_tasks(
     coordination_notes: str,
 ) -> ToolResult:
     """Mode 2: Create multiple tasks and assign to agent"""
-    conn = None
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        # D1: unit-of-work owns the txn + post-commit effects (cache
+        # upsert, parent refresh, assignee wake). Per-task ``assigned_task``
+        # DB audit rows stay in-scope via ``u.cursor`` (no in-memory
+        # log_audit sink on this path to unify).
+        with unit_of_work() as u:
+            cursor = u.cursor
 
-        # Validate agent exists and is not terminated.
-        if not _agent_assignable(cursor, target_agent_id):
-            return NotFound(resource="agent", identifier=target_agent_id)
+            # Validate agent exists and is not terminated.
+            if not _agent_assignable(cursor, target_agent_id):
+                return NotFound(resource="agent", identifier=target_agent_id)
 
-        created_tasks = []
-        created_at = datetime.datetime.now().isoformat()
+            created_tasks = []
+            created_at = datetime.datetime.now().isoformat()
 
-        # PR 6: task INSERTs go through task_repo.create with the
-        # caller's cursor — atomic with agent_actions audit log.
-        # Cache reconciliation deferred to post-commit.
-        from ..repositories import agent_repo, task_repo
-        cached_dicts: list[dict] = []
-        parents_to_refresh: set[str] = set()
+            # PR 6: task INSERTs go through task_repo.create with the
+            # caller's cursor — atomic with agent_actions audit log.
+            # Cache reconciliation deferred to post-commit.
+            from ..repositories import agent_repo, task_repo
+            cached_dicts: list[dict] = []
+            parents_to_refresh: set[str] = set()
 
-        # Create each task
-        for i, task in enumerate(tasks):
-            task_id = f"task_{int(datetime.datetime.now().timestamp() * 1000)}_{i}"
-            title = task["title"]
-            description = task["description"]
-            priority = task.get("priority", "medium")
-            parent_task = task.get("parent_task_id")
+            # Create each task
+            for i, task in enumerate(tasks):
+                task_id = f"task_{int(datetime.datetime.now().timestamp() * 1000)}_{i}"
+                title = task["title"]
+                description = task["description"]
+                priority = task.get("priority", "medium")
+                parent_task = task.get("parent_task_id")
 
-            fresh = task_repo.create(
-                {
-                    "task_id": task_id,
-                    "title": title,
-                    "description": description,
-                    "assigned_to": target_agent_id,
-                    "created_by": "admin",
-                    "status": "pending",
-                    "priority": priority,
-                    "parent_task": parent_task,
-                    "child_tasks": [],
-                    "depends_on_tasks": [],
-                    "notes": [],
-                },
-                connection=cursor,
+                fresh = task_repo.create(
+                    {
+                        "task_id": task_id,
+                        "title": title,
+                        "description": description,
+                        "assigned_to": target_agent_id,
+                        "created_by": "admin",
+                        "status": "pending",
+                        "priority": priority,
+                        "parent_task": parent_task,
+                        "child_tasks": [],
+                        "depends_on_tasks": [],
+                        "notes": [],
+                    },
+                    connection=cursor,
+                )
+                cached_dicts.append(fresh)
+
+                # BL-2: maintain the parent's child_tasks mirror.
+                if _link_child_to_parent(cursor, parent_task, task_id):
+                    parents_to_refresh.add(parent_task)
+
+                # Log the creation
+                log_agent_action_to_db(
+                    cursor,
+                    "admin",
+                    "assigned_task",
+                    task_id=task_id,
+                    details={
+                        "agent_id": target_agent_id,
+                        "title": title,
+                        "mode": "multiple_task_creation",
+                    },
+                )
+
+                created_tasks.append(
+                    {"task_id": task_id, "title": title, "priority": priority}
+                )
+
+            # Update agent's current task if they don't have one (use first task)
+            cursor.execute(
+                "SELECT current_task FROM agents WHERE agent_id = ?", (target_agent_id,)
             )
-            cached_dicts.append(fresh)
+            agent_row = cursor.fetchone()
+            if agent_row and agent_row["current_task"] is None and created_tasks:
+                agent_repo.update_field(
+                    target_agent_id, "current_task", created_tasks[0]["task_id"],
+                    connection=cursor,
+                )
 
-            # BL-2: maintain the parent's child_tasks mirror.
-            if _link_child_to_parent(cursor, parent_task, task_id):
-                parents_to_refresh.add(parent_task)
+            # Post-commit cache reconciliation through the repo, registered
+            # on the uow (flush only after commit).
+            def _reconcile_created_cache(
+                dicts=list(cached_dicts),
+                parents=set(parents_to_refresh),
+            ) -> None:
+                for d in dicts:
+                    task_repo.upsert_cache(d)
+                # BL-2: reconcile parents whose child_tasks mirror changed.
+                for parent_id in parents:
+                    _refresh_parent_cache(parent_id)
 
-            # Log the creation
-            log_agent_action_to_db(
-                cursor,
-                "admin",
-                "assigned_task",
-                task_id=task_id,
-                details={
-                    "agent_id": target_agent_id,
-                    "title": title,
-                    "mode": "multiple_task_creation",
-                },
-            )
+            u.on_commit(_reconcile_created_cache)
 
-            created_tasks.append(
-                {"task_id": task_id, "title": title, "priority": priority}
-            )
+            # Wake wait_for_events waiter + fan out resources/updated to
+            # every registered GET /mcp stream for the newly-assigned agent.
+            u.on_commit(lambda: g.notify_agent_inbox(target_agent_id))
 
-        # Update agent's current task if they don't have one (use first task)
-        cursor.execute(
-            "SELECT current_task FROM agents WHERE agent_id = ?", (target_agent_id,)
-        )
-        agent_row = cursor.fetchone()
-        if agent_row and agent_row["current_task"] is None and created_tasks:
-            agent_repo.update_field(
-                target_agent_id, "current_task", created_tasks[0]["task_id"],
-                connection=cursor,
-            )
+            # Build response
+            response_parts = [
+                f"✅ **Multiple Tasks Created and Assigned**",
+                f"   Agent: {target_agent_id}",
+                f"   Tasks Created: {len(created_tasks)}",
+                "",
+            ]
 
-        conn.commit()
+            for i, task in enumerate(created_tasks, 1):
+                response_parts.append(
+                    f"   {i}. {task['task_id']}: {task['title']} (Priority: {task['priority']})"
+                )
 
-        # Post-commit cache reconciliation through the repo.
-        for d in cached_dicts:
-            task_repo.upsert_cache(d)
-        # BL-2: reconcile parents whose child_tasks mirror changed.
-        for parent_id in parents_to_refresh:
-            _refresh_parent_cache(parent_id)
+            if coordination_notes:
+                response_parts.append(f"\n📋 **Coordination Notes:** {coordination_notes}")
 
-        # Wake wait_for_events waiter + fan out resources/updated to
-        # every registered GET /mcp stream for the newly-assigned agent.
-        try:
-            g.notify_agent_inbox(target_agent_id)
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning(
-                "notify_agent_inbox(%s) raised after _create_and_assign_multiple_tasks: %s",
-                target_agent_id, e,
-            )
-
-        # Build response
-        response_parts = [
-            f"✅ **Multiple Tasks Created and Assigned**",
-            f"   Agent: {target_agent_id}",
-            f"   Tasks Created: {len(created_tasks)}",
-            "",
-        ]
-
-        for i, task in enumerate(created_tasks, 1):
-            response_parts.append(
-                f"   {i}. {task['task_id']}: {task['title']} (Priority: {task['priority']})"
-            )
-
-        if coordination_notes:
-            response_parts.append(f"\n📋 **Coordination Notes:** {coordination_notes}")
-
-        return Ok(message="\n".join(response_parts))
+            return Ok(message="\n".join(response_parts))
 
     except Exception as e:
-        if conn:
-            conn.rollback()
+        # The unit-of-work already rolled back + closed the connection.
         logger.error(f"Error creating multiple tasks: {e}", exc_info=True)
         return Failed(message=f"Error creating multiple tasks: {e}")
-    finally:
-        if conn:
-            conn.close()
 
 
 # --- assign_task tool ---
@@ -1758,320 +1757,327 @@ async def assign_task_tool_impl(
 
         conn.close()
 
-    conn = None
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        # D1: the unit-of-work owns the transaction; the DB audit row is
+        # written atomically via ``u.cursor`` inside the scope. The
+        # post-commit tail (cache upsert, assignee wake, RAG reindex,
+        # in-memory reconcile, in-memory audit) runs in the after-``with``
+        # block below — reached ONLY on a clean commit (a rollback
+        # re-raises out of the scope into the ``except`` and skips it),
+        # so emit-iff-commit holds without hand-sequenced commit/rollback.
+        with unit_of_work() as u:
+            cursor = u.cursor
 
-        # Check if agent exists (in memory or DB) - main.py:1331-1346
-        agent_exists_in_memory = target_agent_id in g.agent_working_dirs
-        assigned_agent_active_token: Optional[str] = None
-        if agent_exists_in_memory:
-            for tkn, data in g.active_agents.items():
-                if data.get("agent_id") == target_agent_id:
-                    assigned_agent_active_token = tkn
-                    break
+            # Check if agent exists (in memory or DB) - main.py:1331-1346
+            agent_exists_in_memory = target_agent_id in g.agent_working_dirs
+            assigned_agent_active_token: Optional[str] = None
+            if agent_exists_in_memory:
+                for tkn, data in g.active_agents.items():
+                    if data.get("agent_id") == target_agent_id:
+                        assigned_agent_active_token = tkn
+                        break
 
-        if not agent_exists_in_memory:
-            # Live-agent lookup: excludes terminated AND tombstone
-            # (`[deleted-<id>]`) rows — a tombstone is never an
-            # assignment target (BL-R31-3b). The unconditional
-            # ``_agent_assignable`` gate below enforces the same.
-            from ..repositories.agent_repository import LIVE_AGENT_SQL
+            if not agent_exists_in_memory:
+                # Live-agent lookup: excludes terminated AND tombstone
+                # (`[deleted-<id>]`) rows — a tombstone is never an
+                # assignment target (BL-R31-3b). The unconditional
+                # ``_agent_assignable`` gate below enforces the same.
+                from ..repositories.agent_repository import LIVE_AGENT_SQL
 
-            cursor.execute(
-                "SELECT token FROM agents WHERE agent_id = ? "
-                f"AND {LIVE_AGENT_SQL}",
-                (target_agent_id,),
-            )
-            row = cursor.fetchone()
-            if not row:
-                return NotFound(resource="agent", identifier=target_agent_id)
-            # Agent exists in DB but not memory, can still assign task.
-            logger.warning(
-                f"Assigning task to agent {target_agent_id} found in DB but not active memory."
-            )
-            # assigned_agent_active_token remains None if not in active_agents
-
-        # Explicit assignability gate. The in-memory presence check above
-        # does NOT verify DB status, so a terminated-but-warm agent
-        # (still in g.agent_working_dirs) would otherwise skip the
-        # ``status != 'terminated'`` check entirely. Run it unconditionally.
-        if not _agent_assignable(cursor, target_agent_id):
-            return NotFound(resource="agent", identifier=target_agent_id)
-
-        # Generate task ID and timestamps first
-        new_task_id = _generate_task_id()
-        created_at_iso = datetime.datetime.now().isoformat()
-        status = "pending"
-
-        # Check single root task rule
-        if parent_task_id_arg is None:
-            cursor.execute(
-                "SELECT COUNT(*) as count, MIN(task_id) as root_id FROM tasks WHERE parent_task IS NULL"
-            )
-            result = cursor.fetchone()
-            root_count = result["count"]
-            existing_root_id = result["root_id"]
-
-            if root_count > 0:
-                logger.error(
-                    f"Attempt to create second root task. Existing root: {existing_root_id}"
+                cursor.execute(
+                    "SELECT token FROM agents WHERE agent_id = ? "
+                    f"AND {LIVE_AGENT_SQL}",
+                    (target_agent_id,),
                 )
+                row = cursor.fetchone()
+                if not row:
+                    return NotFound(resource="agent", identifier=target_agent_id)
+                # Agent exists in DB but not memory, can still assign task.
+                logger.warning(
+                    f"Assigning task to agent {target_agent_id} found in DB but not active memory."
+                )
+                # assigned_agent_active_token remains None if not in active_agents
+
+            # Explicit assignability gate. The in-memory presence check above
+            # does NOT verify DB status, so a terminated-but-warm agent
+            # (still in g.agent_working_dirs) would otherwise skip the
+            # ``status != 'terminated'`` check entirely. Run it unconditionally.
+            if not _agent_assignable(cursor, target_agent_id):
+                return NotFound(resource="agent", identifier=target_agent_id)
+
+            # Generate task ID and timestamps first
+            new_task_id = _generate_task_id()
+            created_at_iso = datetime.datetime.now().isoformat()
+            status = "pending"
+
+            # Check single root task rule
+            if parent_task_id_arg is None:
+                cursor.execute(
+                    "SELECT COUNT(*) as count, MIN(task_id) as root_id FROM tasks WHERE parent_task IS NULL"
+                )
+                result = cursor.fetchone()
+                root_count = result["count"]
+                existing_root_id = result["root_id"]
+
+                if root_count > 0:
+                    logger.error(
+                        f"Attempt to create second root task. Existing root: {existing_root_id}"
+                    )
+                    return Conflict(
+                        reason=(
+                            f"Cannot create root task. A root task already "
+                            f"exists ({existing_root_id}). All new tasks must "
+                            f"have a parent."
+                        )
+                    )
+
+            # Smart workload validation
+            workload_analysis = None
+            workload_warnings = []
+
+            if validate_agent_workload:
+                workload_analysis = _analyze_agent_workload(cursor, target_agent_id)
+
+                if not workload_analysis["can_take_new_task"]:
+                    warning_msg = (
+                        f"⚠️ Agent workload warning: {workload_analysis['capacity_status']} "
+                    )
+                    warning_msg += (
+                        f"({workload_analysis['total_active_tasks']} active tasks, "
+                    )
+                    warning_msg += (
+                        f"{workload_analysis['high_priority_tasks']} high priority)"
+                    )
+                    workload_warnings.append(warning_msg)
+
+                    if workload_analysis["recommendations"]:
+                        workload_warnings.extend(
+                            [
+                                f"   💡 {rec}"
+                                for rec in workload_analysis["recommendations"][:2]
+                            ]
+                        )
+
+            # System 8: RAG Pre-Check for Task Placement
+            final_parent_task_id = parent_task_id_arg
+            final_depends_on_tasks = depends_on_tasks_list
+            validation_performed = False
+            validation_message = ""
+
+            if ENABLE_TASK_PLACEMENT_RAG:
+                validation_performed = True
+                validation_result = await validate_task_placement(
+                    title=task_title,
+                    description=task_description,
+                    parent_task_id=parent_task_id_arg,
+                    depends_on_tasks=depends_on_tasks_list,
+                    created_by="admin",
+                    auth_token=admin_auth_token,
+                )
+
+                suggestion_message = format_suggestions_for_agent(
+                    validation_result, parent_task_id_arg, depends_on_tasks_list
+                )
+
+                # For denied status, block creation unless override is allowed.
+                # This is an admin-tier kill switch — runs before the
+                # accept_suggestions opt-in, because an operator with
+                # ALLOW_RAG_OVERRIDE=False is telling the system "never
+                # apply a denied-status suggestion, period".
+                if validation_result["status"] == "denied" and not ALLOW_RAG_OVERRIDE:
+                    return PermissionDenied(
+                        reason=(
+                            f"Task creation BLOCKED by RAG validation:\n"
+                            f"{suggestion_message}"
+                        )
+                    )
+
+                if validation_result["status"] != "approved":
+                    suggestions = validation_result["suggestions"]
+                    if not accept_suggestions:
+                        # VULN-004: surface suggestions as text instead of
+                        # mutating the request. The validator's RAG corpus
+                        # can be poisoned via project_context entries, so
+                        # any LLM-driven suggestion must be the caller's
+                        # explicit decision — not an implicit auto-apply.
+                        return Invalid(
+                            field=None,
+                            message=(
+                                "Task placement validator suggests changes. "
+                                "Re-submit with accept_suggestions=true to "
+                                "apply them, or adjust your request based "
+                                f"on these suggestions:\n\n{suggestion_message}"
+                            ),
+                        )
+
+                    # accept_suggestions=True: caller explicitly consented
+                    # to apply the validator's suggested parent / deps.
+                    validation_message = (
+                        f"\nRAG Validation ({validation_result['status']}):\n"
+                        f"{suggestion_message}\n"
+                    )
+                    if suggestions.get("parent_task") is not None:
+                        final_parent_task_id = suggestions["parent_task"]
+                        validation_message += (
+                            f"✓ Applied suggested parent: {final_parent_task_id}\n"
+                        )
+                    if suggestions.get("dependencies"):
+                        final_depends_on_tasks = suggestions["dependencies"]
+                        validation_message += (
+                            f"✓ Applied suggested dependencies: {final_depends_on_tasks}\n"
+                        )
+
+                    logger.info(
+                        f"RAG suggestions applied (explicitly accepted) "
+                        f"for task {new_task_id}"
+                    )
+                else:
+                    validation_message = "\n✓ RAG validation approved placement\n"
+
+            # Build initial notes with coordination information
+            initial_notes = []
+
+            # Add coordination notes if provided
+            if coordination_notes:
+                initial_notes.append(
+                    {
+                        "timestamp": created_at_iso,
+                        "author": "admin",
+                        "content": f"📋 Coordination: {coordination_notes}",
+                    }
+                )
+
+            # Add workload information
+            if workload_analysis:
+                workload_note = (
+                    f"👤 Agent workload: {workload_analysis['capacity_status']} "
+                )
+                workload_note += f"({workload_analysis['total_active_tasks']} active tasks)"
+                if estimated_hours:
+                    workload_note += f" | Estimated: {estimated_hours}h"
+                initial_notes.append(
+                    {
+                        "timestamp": created_at_iso,
+                        "author": "system",
+                        "content": workload_note,
+                    }
+                )
+
+            # Add smart parent suggestion note if used
+            if auto_suggest_parent and final_parent_task_id:
+                initial_notes.append(
+                    {
+                        "timestamp": created_at_iso,
+                        "author": "system",
+                        "content": f"🧠 Smart assignment: Parent task suggested based on content similarity",
+                    }
+                )
+
+            # Event-coord PR-1: normalize required_capabilities at write
+            # time. None / missing key ⇒ store NULL ("anyone can claim",
+            # though this is the assigned path so the field is informational
+            # for routing on future reassignment / unassign).
+            from agent_mcp.utils.capability_normalization import normalize_capabilities
+
+            _norm_caps = normalize_capabilities(
+                arguments.get("required_capabilities")
+            )
+            _required_caps_json = json.dumps(_norm_caps) if _norm_caps else None
+
+            # TOCTOU recheck (terminate-reconcile). ``validate_task_placement``
+            # above yields on a RAG await; a concurrent ``terminate_agent``
+            # can commit in that window, after the assignability gate passed
+            # but before this INSERT — pinning the task on a terminated agent.
+            # Re-run the gate in-transaction, immediately before the write,
+            # so the just-terminated agent can't receive the task.
+            if not _agent_assignable(cursor, target_agent_id):
                 return Conflict(
                     reason=(
-                        f"Cannot create root task. A root task already "
-                        f"exists ({existing_root_id}). All new tasks must "
-                        f"have a parent."
+                        f"Cannot assign task to '{target_agent_id}': agent was "
+                        f"terminated during task placement. Re-issue against a "
+                        f"live agent."
                     )
                 )
 
-        # Smart workload validation
-        workload_analysis = None
-        workload_warnings = []
-
-        if validate_agent_workload:
-            workload_analysis = _analyze_agent_workload(cursor, target_agent_id)
-
-            if not workload_analysis["can_take_new_task"]:
-                warning_msg = (
-                    f"⚠️ Agent workload warning: {workload_analysis['capacity_status']} "
-                )
-                warning_msg += (
-                    f"({workload_analysis['total_active_tasks']} active tasks, "
-                )
-                warning_msg += (
-                    f"{workload_analysis['high_priority_tasks']} high priority)"
-                )
-                workload_warnings.append(warning_msg)
-
-                if workload_analysis["recommendations"]:
-                    workload_warnings.extend(
-                        [
-                            f"   💡 {rec}"
-                            for rec in workload_analysis["recommendations"][:2]
-                        ]
-                    )
-
-        # System 8: RAG Pre-Check for Task Placement
-        final_parent_task_id = parent_task_id_arg
-        final_depends_on_tasks = depends_on_tasks_list
-        validation_performed = False
-        validation_message = ""
-
-        if ENABLE_TASK_PLACEMENT_RAG:
-            validation_performed = True
-            validation_result = await validate_task_placement(
-                title=task_title,
-                description=task_description,
-                parent_task_id=parent_task_id_arg,
-                depends_on_tasks=depends_on_tasks_list,
-                created_by="admin",
-                auth_token=admin_auth_token,
+            # SECURITY (AZ-R26-1): capability-routing parity at create time.
+            # This Mode-1 create+assign path tags the new task with
+            # ``required_capabilities`` AND pins it on ``target_agent_id`` in
+            # one call — so a caps-tagged task could land on an under-capable
+            # agent, the same routing-control bypass the reassign paths close.
+            # Enforce the SAME subset check the canonical assign path uses; an
+            # admin/operator caller gets the informative refusal.
+            missing_caps = _missing_capabilities(
+                cursor, _norm_caps, target_agent_id
             )
-
-            suggestion_message = format_suggestions_for_agent(
-                validation_result, parent_task_id_arg, depends_on_tasks_list
-            )
-
-            # For denied status, block creation unless override is allowed.
-            # This is an admin-tier kill switch — runs before the
-            # accept_suggestions opt-in, because an operator with
-            # ALLOW_RAG_OVERRIDE=False is telling the system "never
-            # apply a denied-status suggestion, period".
-            if validation_result["status"] == "denied" and not ALLOW_RAG_OVERRIDE:
+            if missing_caps:
                 return PermissionDenied(
                     reason=(
-                        f"Task creation BLOCKED by RAG validation:\n"
-                        f"{suggestion_message}"
+                        f"Cannot assign task to '{target_agent_id}': agent "
+                        f"lacks required capabilities {missing_caps}."
                     )
                 )
 
-            if validation_result["status"] != "approved":
-                suggestions = validation_result["suggestions"]
-                if not accept_suggestions:
-                    # VULN-004: surface suggestions as text instead of
-                    # mutating the request. The validator's RAG corpus
-                    # can be poisoned via project_context entries, so
-                    # any LLM-driven suggestion must be the caller's
-                    # explicit decision — not an implicit auto-apply.
-                    return Invalid(
-                        field=None,
-                        message=(
-                            "Task placement validator suggests changes. "
-                            "Re-submit with accept_suggestions=true to "
-                            "apply them, or adjust your request based "
-                            f"on these suggestions:\n\n{suggestion_message}"
-                        ),
-                    )
+            # PR 6: task INSERT goes through task_repo with the caller's
+            # cursor so it's atomic with the agent UPDATE and audit log.
+            from ..repositories import agent_repo, task_repo
 
-                # accept_suggestions=True: caller explicitly consented
-                # to apply the validator's suggested parent / deps.
-                validation_message = (
-                    f"\nRAG Validation ({validation_result['status']}):\n"
-                    f"{suggestion_message}\n"
-                )
-                if suggestions.get("parent_task") is not None:
-                    final_parent_task_id = suggestions["parent_task"]
-                    validation_message += (
-                        f"✓ Applied suggested parent: {final_parent_task_id}\n"
-                    )
-                if suggestions.get("dependencies"):
-                    final_depends_on_tasks = suggestions["dependencies"]
-                    validation_message += (
-                        f"✓ Applied suggested dependencies: {final_depends_on_tasks}\n"
-                    )
-
-                logger.info(
-                    f"RAG suggestions applied (explicitly accepted) "
-                    f"for task {new_task_id}"
-                )
-            else:
-                validation_message = "\n✓ RAG validation approved placement\n"
-
-        # Build initial notes with coordination information
-        initial_notes = []
-
-        # Add coordination notes if provided
-        if coordination_notes:
-            initial_notes.append(
+            fresh_task = task_repo.create(
                 {
-                    "timestamp": created_at_iso,
-                    "author": "admin",
-                    "content": f"📋 Coordination: {coordination_notes}",
-                }
-            )
-
-        # Add workload information
-        if workload_analysis:
-            workload_note = (
-                f"👤 Agent workload: {workload_analysis['capacity_status']} "
-            )
-            workload_note += f"({workload_analysis['total_active_tasks']} active tasks)"
-            if estimated_hours:
-                workload_note += f" | Estimated: {estimated_hours}h"
-            initial_notes.append(
-                {
-                    "timestamp": created_at_iso,
-                    "author": "system",
-                    "content": workload_note,
-                }
-            )
-
-        # Add smart parent suggestion note if used
-        if auto_suggest_parent and final_parent_task_id:
-            initial_notes.append(
-                {
-                    "timestamp": created_at_iso,
-                    "author": "system",
-                    "content": f"🧠 Smart assignment: Parent task suggested based on content similarity",
-                }
-            )
-
-        # Event-coord PR-1: normalize required_capabilities at write
-        # time. None / missing key ⇒ store NULL ("anyone can claim",
-        # though this is the assigned path so the field is informational
-        # for routing on future reassignment / unassign).
-        from agent_mcp.utils.capability_normalization import normalize_capabilities
-
-        _norm_caps = normalize_capabilities(
-            arguments.get("required_capabilities")
-        )
-        _required_caps_json = json.dumps(_norm_caps) if _norm_caps else None
-
-        # TOCTOU recheck (terminate-reconcile). ``validate_task_placement``
-        # above yields on a RAG await; a concurrent ``terminate_agent``
-        # can commit in that window, after the assignability gate passed
-        # but before this INSERT — pinning the task on a terminated agent.
-        # Re-run the gate in-transaction, immediately before the write,
-        # so the just-terminated agent can't receive the task.
-        if not _agent_assignable(cursor, target_agent_id):
-            return Conflict(
-                reason=(
-                    f"Cannot assign task to '{target_agent_id}': agent was "
-                    f"terminated during task placement. Re-issue against a "
-                    f"live agent."
-                )
-            )
-
-        # SECURITY (AZ-R26-1): capability-routing parity at create time.
-        # This Mode-1 create+assign path tags the new task with
-        # ``required_capabilities`` AND pins it on ``target_agent_id`` in
-        # one call — so a caps-tagged task could land on an under-capable
-        # agent, the same routing-control bypass the reassign paths close.
-        # Enforce the SAME subset check the canonical assign path uses; an
-        # admin/operator caller gets the informative refusal.
-        missing_caps = _missing_capabilities(
-            cursor, _norm_caps, target_agent_id
-        )
-        if missing_caps:
-            return PermissionDenied(
-                reason=(
-                    f"Cannot assign task to '{target_agent_id}': agent "
-                    f"lacks required capabilities {missing_caps}."
-                )
-            )
-
-        # PR 6: task INSERT goes through task_repo with the caller's
-        # cursor so it's atomic with the agent UPDATE and audit log.
-        from ..repositories import agent_repo, task_repo
-
-        fresh_task = task_repo.create(
-            {
-                "task_id": new_task_id,
-                "title": task_title,
-                "description": task_description,
-                "assigned_to": target_agent_id,
-                "created_by": "admin",
-                "status": status,
-                "priority": priority,
-                "parent_task": final_parent_task_id,
-                "child_tasks": [],
-                "depends_on_tasks": final_depends_on_tasks or [],
-                "notes": initial_notes,
-                "required_capabilities": (
-                    _norm_caps if _norm_caps else None
-                ),
-            },
-            connection=cursor,
-        )
-
-        # BL-2: maintain the parent's child_tasks mirror.
-        parent_mirror_updated = _link_child_to_parent(
-            cursor, final_parent_task_id, new_task_id
-        )
-
-        # Update agent's current task in DB if they don't have one (main.py:1376-1387)
-        should_update_agent_current_task = False
-        if (
-            assigned_agent_active_token
-            and assigned_agent_active_token in g.active_agents
-        ):
-            if g.active_agents[assigned_agent_active_token].get("current_task") is None:
-                should_update_agent_current_task = True
-        else:  # Agent not in active memory, check DB
-            cursor.execute(
-                "SELECT current_task FROM agents WHERE agent_id = ?", (target_agent_id,)
-            )
-            agent_row = cursor.fetchone()
-            if agent_row and agent_row["current_task"] is None:
-                should_update_agent_current_task = True
-
-        if should_update_agent_current_task:
-            # PR 6: routed through agent_repo with caller's cursor.
-            agent_repo.update_field(
-                target_agent_id, "current_task", new_task_id,
+                    "task_id": new_task_id,
+                    "title": task_title,
+                    "description": task_description,
+                    "assigned_to": target_agent_id,
+                    "created_by": "admin",
+                    "status": status,
+                    "priority": priority,
+                    "parent_task": final_parent_task_id,
+                    "child_tasks": [],
+                    "depends_on_tasks": final_depends_on_tasks or [],
+                    "notes": initial_notes,
+                    "required_capabilities": (
+                        _norm_caps if _norm_caps else None
+                    ),
+                },
                 connection=cursor,
             )
 
-        log_agent_action_to_db(
-            cursor,
-            "admin",
-            "assigned_task",
-            task_id=new_task_id,
-            details={"agent_id": target_agent_id, "title": task_title},
-        )
-        conn.commit()
+            # BL-2: maintain the parent's child_tasks mirror.
+            parent_mirror_updated = _link_child_to_parent(
+                cursor, final_parent_task_id, new_task_id
+            )
+
+            # Update agent's current task in DB if they don't have one (main.py:1376-1387)
+            should_update_agent_current_task = False
+            if (
+                assigned_agent_active_token
+                and assigned_agent_active_token in g.active_agents
+            ):
+                if g.active_agents[assigned_agent_active_token].get("current_task") is None:
+                    should_update_agent_current_task = True
+            else:  # Agent not in active memory, check DB
+                cursor.execute(
+                    "SELECT current_task FROM agents WHERE agent_id = ?", (target_agent_id,)
+                )
+                agent_row = cursor.fetchone()
+                if agent_row and agent_row["current_task"] is None:
+                    should_update_agent_current_task = True
+
+            if should_update_agent_current_task:
+                # PR 6: routed through agent_repo with caller's cursor.
+                agent_repo.update_field(
+                    target_agent_id, "current_task", new_task_id,
+                    connection=cursor,
+                )
+
+            log_agent_action_to_db(
+                cursor,
+                "admin",
+                "assigned_task",
+                task_id=new_task_id,
+                details={"agent_id": target_agent_id, "title": task_title},
+            )
+        # <-- uow scope ends here: commit happens on clean exit; the tail
+        # below runs post-commit (skipped if the scope rolled back).
 
         # Post-commit cache reconciliation.
         task_repo.upsert_cache(fresh_task)
@@ -2175,24 +2181,18 @@ async def assign_task_tool_impl(
         return Ok(message="\n".join(response_parts))
 
     except sqlite3.Error as e_sql:
-        if conn:
-            conn.rollback()
+        # The unit-of-work already rolled back + closed the connection.
         logger.error(
             f"Database error assigning task to agent {target_agent_id}: {e_sql}",
             exc_info=True,
         )
         return Failed(message=f"Database error assigning task: {e_sql}")
     except Exception as e:
-        if conn:
-            conn.rollback()
         logger.error(
             f"Unexpected error assigning task to agent {target_agent_id}: {e}",
             exc_info=True,
         )
         return Failed(message=f"Unexpected error assigning task: {e}")
-    finally:
-        if conn:
-            conn.close()
 
 
 # --- create_self_task tool ---
@@ -2237,241 +2237,247 @@ async def create_self_task_tool_impl(
     if actual_parent_task_id is None and agent_auth_token in g.active_agents:
         actual_parent_task_id = g.active_agents[agent_auth_token].get("current_task")
 
-    conn = None
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        # D1: the unit-of-work owns the transaction; the DB audit row is
+        # written atomically via ``u.cursor`` inside the scope. The
+        # post-commit tail (cache upsert, RAG reindex, in-memory reconcile
+        # + audit) runs in the after-``with`` block — reached ONLY on a
+        # clean commit (a rollback re-raises into ``except`` and skips it),
+        # so emit-iff-commit holds.
+        with unit_of_work() as u:
+            cursor = u.cursor
 
-        # Hierarchy Validation - Agents can NEVER create root tasks
-        if requesting_agent_id != "admin" and actual_parent_task_id is None:
-            logger.error(
-                f"Agent '{requesting_agent_id}' attempted to create a root task"
-            )
-
-            # Find a suitable parent task for the agent
-            cursor.execute(
-                """
-                SELECT task_id, title FROM tasks
-                WHERE assigned_to = ? OR created_by = ?
-                ORDER BY created_at DESC LIMIT 1
-            """,
-                (requesting_agent_id, requesting_agent_id),
-            )
-
-            suggested_parent = cursor.fetchone()
-            suggestion_text = ""
-            if suggested_parent:
-                suggestion_text = f"\nSuggested parent: {suggested_parent['task_id']} ({suggested_parent['title']})"
-
-            return Conflict(
-                reason=(
-                    f"Agents cannot create root tasks. Every task must have "
-                    f"a parent.{suggestion_text}\nPlease specify a parent_task_id."
-                )
-            )
-
-        # Additional check for single root rule even for admin
-        if actual_parent_task_id is None:
-            cursor.execute(
-                "SELECT COUNT(*) as count, MIN(task_id) as root_id FROM tasks WHERE parent_task IS NULL"
-            )
-            result = cursor.fetchone()
-            root_count = result["count"]
-            existing_root_id = result["root_id"]
-
-            if root_count > 0:
+            # Hierarchy Validation - Agents can NEVER create root tasks
+            if requesting_agent_id != "admin" and actual_parent_task_id is None:
                 logger.error(
-                    f"Attempt to create second root task. Existing root: {existing_root_id}"
+                    f"Agent '{requesting_agent_id}' attempted to create a root task"
                 )
+
+                # Find a suitable parent task for the agent
+                cursor.execute(
+                    """
+                    SELECT task_id, title FROM tasks
+                    WHERE assigned_to = ? OR created_by = ?
+                    ORDER BY created_at DESC LIMIT 1
+                """,
+                    (requesting_agent_id, requesting_agent_id),
+                )
+
+                suggested_parent = cursor.fetchone()
+                suggestion_text = ""
+                if suggested_parent:
+                    suggestion_text = f"\nSuggested parent: {suggested_parent['task_id']} ({suggested_parent['title']})"
+
                 return Conflict(
                     reason=(
-                        f"Cannot create root task. A root task already "
-                        f"exists ({existing_root_id}). All new tasks must "
-                        f"have a parent."
+                        f"Agents cannot create root tasks. Every task must have "
+                        f"a parent.{suggestion_text}\nPlease specify a parent_task_id."
                     )
                 )
 
-        # Generate task ID and timestamps first
-        new_task_id = _generate_task_id()
-        created_at_iso = datetime.datetime.now().isoformat()
-        status = "pending"
+            # Additional check for single root rule even for admin
+            if actual_parent_task_id is None:
+                cursor.execute(
+                    "SELECT COUNT(*) as count, MIN(task_id) as root_id FROM tasks WHERE parent_task IS NULL"
+                )
+                result = cursor.fetchone()
+                root_count = result["count"]
+                existing_root_id = result["root_id"]
 
-        # System 8: RAG Pre-Check for Task Placement
-        final_parent_task_id = actual_parent_task_id
-        final_depends_on_tasks = depends_on_tasks_list
-        validation_message = ""
+                if root_count > 0:
+                    logger.error(
+                        f"Attempt to create second root task. Existing root: {existing_root_id}"
+                    )
+                    return Conflict(
+                        reason=(
+                            f"Cannot create root task. A root task already "
+                            f"exists ({existing_root_id}). All new tasks must "
+                            f"have a parent."
+                        )
+                    )
 
-        if ENABLE_TASK_PLACEMENT_RAG:
-            validation_result = await validate_task_placement(
-                title=task_title,
-                description=task_description,
-                parent_task_id=actual_parent_task_id,
-                depends_on_tasks=depends_on_tasks_list,
-                created_by=requesting_agent_id,
-                auth_token=agent_auth_token,
-            )
+            # Generate task ID and timestamps first
+            new_task_id = _generate_task_id()
+            created_at_iso = datetime.datetime.now().isoformat()
+            status = "pending"
 
-            suggestion_message = format_suggestions_for_agent(
-                validation_result, actual_parent_task_id, depends_on_tasks_list
-            )
+            # System 8: RAG Pre-Check for Task Placement
+            final_parent_task_id = actual_parent_task_id
+            final_depends_on_tasks = depends_on_tasks_list
+            validation_message = ""
 
-            # Check for denial — agent path always blocks; there is no
-            # ALLOW_RAG_OVERRIDE escape for self-task creation.
-            if validation_result["status"] == "denied":
-                return PermissionDenied(
+            if ENABLE_TASK_PLACEMENT_RAG:
+                validation_result = await validate_task_placement(
+                    title=task_title,
+                    description=task_description,
+                    parent_task_id=actual_parent_task_id,
+                    depends_on_tasks=depends_on_tasks_list,
+                    created_by=requesting_agent_id,
+                    auth_token=agent_auth_token,
+                )
+
+                suggestion_message = format_suggestions_for_agent(
+                    validation_result, actual_parent_task_id, depends_on_tasks_list
+                )
+
+                # Check for denial — agent path always blocks; there is no
+                # ALLOW_RAG_OVERRIDE escape for self-task creation.
+                if validation_result["status"] == "denied":
+                    return PermissionDenied(
+                        reason=(
+                            f"Task creation BLOCKED by RAG validation:\n"
+                            f"{suggestion_message}"
+                        )
+                    )
+
+                if validation_result["status"] != "approved":
+                    suggestions = validation_result["suggestions"]
+                    if not accept_suggestions:
+                        # VULN-004: surface suggestions as text instead of
+                        # mutating the request. The validator's RAG corpus
+                        # can be poisoned via project_context entries, so
+                        # any LLM-driven suggestion must be the caller's
+                        # explicit decision — not an implicit auto-apply.
+                        return Invalid(
+                            field=None,
+                            message=(
+                                "Task placement validator suggests changes. "
+                                "Re-submit with accept_suggestions=true to "
+                                "apply them, or adjust your request based "
+                                f"on these suggestions:\n\n{suggestion_message}"
+                            ),
+                        )
+
+                    # accept_suggestions=True: caller explicitly consented.
+                    validation_message = (
+                        f"\nRAG Validation ({validation_result['status']}):\n"
+                        f"{suggestion_message}\n"
+                    )
+                    if suggestions.get("parent_task") is not None:
+                        final_parent_task_id = suggestions["parent_task"]
+                        validation_message += (
+                            f"✓ Applied suggested parent: {final_parent_task_id}\n"
+                        )
+                    if suggestions.get("dependencies"):
+                        final_depends_on_tasks = suggestions["dependencies"]
+                        validation_message += (
+                            f"✓ Applied suggested dependencies: {final_depends_on_tasks}\n"
+                        )
+
+                    logger.info(
+                        f"Agent {requesting_agent_id} explicitly accepted "
+                        f"RAG suggestions for task {new_task_id}"
+                    )
+
+                    # Check if escalation is needed
+                    if should_escalate_to_admin(validation_result, requesting_agent_id):
+                        logger.warning(
+                            f"Task {new_task_id} flagged for admin review: {validation_result.get('message')}"
+                        )
+                        validation_message += "⚠️ Task flagged for admin review\n"
+                else:
+                    validation_message = "\n✓ RAG validation approved placement\n"
+
+            # TOCTOU recheck (terminate-reconcile). ``validate_task_placement``
+            # above yields on a RAG await; a concurrent ``terminate_agent``
+            # can commit in that window and revoke this agent before the row
+            # is written — leaving a task self-assigned to a terminated
+            # identity. Re-run the assignability gate in-transaction,
+            # immediately before the INSERT. ``admin`` is exempt: it has no
+            # standard assignable agent row and creates coordination tasks.
+            if requesting_agent_id != "admin" and not _agent_assignable(
+                cursor, requesting_agent_id
+            ):
+                return Conflict(
                     reason=(
-                        f"Task creation BLOCKED by RAG validation:\n"
-                        f"{suggestion_message}"
+                        f"Cannot create task for '{requesting_agent_id}': agent "
+                        f"was terminated during task placement."
                     )
                 )
 
-            if validation_result["status"] != "approved":
-                suggestions = validation_result["suggestions"]
-                if not accept_suggestions:
-                    # VULN-004: surface suggestions as text instead of
-                    # mutating the request. The validator's RAG corpus
-                    # can be poisoned via project_context entries, so
-                    # any LLM-driven suggestion must be the caller's
-                    # explicit decision — not an implicit auto-apply.
-                    return Invalid(
-                        field=None,
-                        message=(
-                            "Task placement validator suggests changes. "
-                            "Re-submit with accept_suggestions=true to "
-                            "apply them, or adjust your request based "
-                            f"on these suggestions:\n\n{suggestion_message}"
-                        ),
-                    )
-
-                # accept_suggestions=True: caller explicitly consented.
-                validation_message = (
-                    f"\nRAG Validation ({validation_result['status']}):\n"
-                    f"{suggestion_message}\n"
-                )
-                if suggestions.get("parent_task") is not None:
-                    final_parent_task_id = suggestions["parent_task"]
-                    validation_message += (
-                        f"✓ Applied suggested parent: {final_parent_task_id}\n"
-                    )
-                if suggestions.get("dependencies"):
-                    final_depends_on_tasks = suggestions["dependencies"]
-                    validation_message += (
-                        f"✓ Applied suggested dependencies: {final_depends_on_tasks}\n"
-                    )
-
-                logger.info(
-                    f"Agent {requesting_agent_id} explicitly accepted "
-                    f"RAG suggestions for task {new_task_id}"
-                )
-
-                # Check if escalation is needed
-                if should_escalate_to_admin(validation_result, requesting_agent_id):
-                    logger.warning(
-                        f"Task {new_task_id} flagged for admin review: {validation_result.get('message')}"
-                    )
-                    validation_message += "⚠️ Task flagged for admin review\n"
-            else:
-                validation_message = "\n✓ RAG validation approved placement\n"
-
-        # TOCTOU recheck (terminate-reconcile). ``validate_task_placement``
-        # above yields on a RAG await; a concurrent ``terminate_agent``
-        # can commit in that window and revoke this agent before the row
-        # is written — leaving a task self-assigned to a terminated
-        # identity. Re-run the assignability gate in-transaction,
-        # immediately before the INSERT. ``admin`` is exempt: it has no
-        # standard assignable agent row and creates coordination tasks.
-        if requesting_agent_id != "admin" and not _agent_assignable(
-            cursor, requesting_agent_id
-        ):
-            return Conflict(
-                reason=(
-                    f"Cannot create task for '{requesting_agent_id}': agent "
-                    f"was terminated during task placement."
-                )
+            # AZ-R19-1 (class-sweep sibling of the Mode-0 fix): a worker may
+            # only parent its self-task under a task it OWNS (assigned_to ==
+            # itself). An unguarded parent link lets a worker inject an
+            # attacker-titled child under ANY foreign parent, mutating that
+            # parent's child_tasks JSON mirror (a cross-agent stored-injection
+            # primitive — the victim sees an unexpected child appear under
+            # their task). A FOREIGN *or* NONEXISTENT parent collapses to the
+            # SAME phantom NotFound the Mode-0 / add_task_note /
+            # request_assistance gates return (no existence oracle).
+            # Supervision-tier callers (``tasks.assign``: operator / manager /
+            # sysadmin) are exempt, mirroring the Mode-0 gate's
+            # ``is_admin_request`` exemption. Checks ``final_parent_task_id``
+            # so an accepted RAG re-parent suggestion is covered too.
+            _is_privileged = principal is not None and principal.has_capability(
+                "tasks.assign"
             )
-
-        # AZ-R19-1 (class-sweep sibling of the Mode-0 fix): a worker may
-        # only parent its self-task under a task it OWNS (assigned_to ==
-        # itself). An unguarded parent link lets a worker inject an
-        # attacker-titled child under ANY foreign parent, mutating that
-        # parent's child_tasks JSON mirror (a cross-agent stored-injection
-        # primitive — the victim sees an unexpected child appear under
-        # their task). A FOREIGN *or* NONEXISTENT parent collapses to the
-        # SAME phantom NotFound the Mode-0 / add_task_note /
-        # request_assistance gates return (no existence oracle).
-        # Supervision-tier callers (``tasks.assign``: operator / manager /
-        # sysadmin) are exempt, mirroring the Mode-0 gate's
-        # ``is_admin_request`` exemption. Checks ``final_parent_task_id``
-        # so an accepted RAG re-parent suggestion is covered too.
-        _is_privileged = principal is not None and principal.has_capability(
-            "tasks.assign"
-        )
-        if not _is_privileged and final_parent_task_id is not None:
-            cursor.execute(
-                "SELECT assigned_to FROM tasks WHERE task_id = ?",
-                (final_parent_task_id,),
-            )
-            _prow = cursor.fetchone()
-            if _prow is None or _prow["assigned_to"] != requesting_agent_id:
-                return NotFound(
-                    resource="task", identifier=final_parent_task_id
+            if not _is_privileged and final_parent_task_id is not None:
+                cursor.execute(
+                    "SELECT assigned_to FROM tasks WHERE task_id = ?",
+                    (final_parent_task_id,),
                 )
+                _prow = cursor.fetchone()
+                if _prow is None or _prow["assigned_to"] != requesting_agent_id:
+                    return NotFound(
+                        resource="task", identifier=final_parent_task_id
+                    )
 
-        # PR 6: task INSERT via task_repo with the caller's cursor.
-        from ..repositories import agent_repo, task_repo
-        fresh_task = task_repo.create(
-            {
-                "task_id": new_task_id,
-                "title": task_title,
-                "description": task_description,
-                "assigned_to": requesting_agent_id,
-                "created_by": requesting_agent_id,  # Agent creates for self
-                "status": status,
-                "priority": priority,
-                "parent_task": final_parent_task_id,
-                "child_tasks": [],
-                "depends_on_tasks": final_depends_on_tasks or [],
-                "notes": [],
-            },
-            connection=cursor,
-        )
-
-        # BL-2: maintain the parent's child_tasks mirror.
-        parent_mirror_updated = _link_child_to_parent(
-            cursor, final_parent_task_id, new_task_id
-        )
-
-        # Update agent's current task in DB if they don't have one (main.py:1455-1469)
-        should_update_agent_current_task = False
-        if agent_auth_token in g.active_agents:  # Check memory first
-            if g.active_agents[agent_auth_token].get("current_task") is None:
-                should_update_agent_current_task = True
-        elif (
-            requesting_agent_id != "admin"
-        ):  # If not admin and not in active_agents (e.g. loaded from DB only)
-            cursor.execute(
-                "SELECT current_task FROM agents WHERE agent_id = ?",
-                (requesting_agent_id,),
-            )
-            agent_row = cursor.fetchone()
-            if agent_row and agent_row["current_task"] is None:
-                should_update_agent_current_task = True
-        # Admin agents don't have a persistent 'current_task' in the agents table.
-
-        if should_update_agent_current_task and requesting_agent_id != "admin":
-            agent_repo.update_field(
-                requesting_agent_id, "current_task", new_task_id,
+            # PR 6: task INSERT via task_repo with the caller's cursor.
+            from ..repositories import agent_repo, task_repo
+            fresh_task = task_repo.create(
+                {
+                    "task_id": new_task_id,
+                    "title": task_title,
+                    "description": task_description,
+                    "assigned_to": requesting_agent_id,
+                    "created_by": requesting_agent_id,  # Agent creates for self
+                    "status": status,
+                    "priority": priority,
+                    "parent_task": final_parent_task_id,
+                    "child_tasks": [],
+                    "depends_on_tasks": final_depends_on_tasks or [],
+                    "notes": [],
+                },
                 connection=cursor,
             )
 
-        log_agent_action_to_db(
-            cursor,
-            requesting_agent_id,
-            "created_self_task",
-            task_id=new_task_id,
-            details={"title": task_title},
-        )
-        conn.commit()
+            # BL-2: maintain the parent's child_tasks mirror.
+            parent_mirror_updated = _link_child_to_parent(
+                cursor, final_parent_task_id, new_task_id
+            )
+
+            # Update agent's current task in DB if they don't have one (main.py:1455-1469)
+            should_update_agent_current_task = False
+            if agent_auth_token in g.active_agents:  # Check memory first
+                if g.active_agents[agent_auth_token].get("current_task") is None:
+                    should_update_agent_current_task = True
+            elif (
+                requesting_agent_id != "admin"
+            ):  # If not admin and not in active_agents (e.g. loaded from DB only)
+                cursor.execute(
+                    "SELECT current_task FROM agents WHERE agent_id = ?",
+                    (requesting_agent_id,),
+                )
+                agent_row = cursor.fetchone()
+                if agent_row and agent_row["current_task"] is None:
+                    should_update_agent_current_task = True
+            # Admin agents don't have a persistent 'current_task' in the agents table.
+
+            if should_update_agent_current_task and requesting_agent_id != "admin":
+                agent_repo.update_field(
+                    requesting_agent_id, "current_task", new_task_id,
+                    connection=cursor,
+                )
+
+            log_agent_action_to_db(
+                cursor,
+                requesting_agent_id,
+                "created_self_task",
+                task_id=new_task_id,
+                details={"title": task_title},
+            )
+        # <-- uow scope ends here: commit on clean exit; the tail below
+        # runs post-commit (skipped if the scope rolled back).
 
         # Post-commit: reconcile caches through repos.
         task_repo.upsert_cache(fresh_task)
@@ -2508,24 +2514,18 @@ async def create_self_task_tool_impl(
         return Ok(message=response_text)
 
     except sqlite3.Error as e_sql:
-        if conn:
-            conn.rollback()
+        # The unit-of-work already rolled back + closed the connection.
         logger.error(
             f"Database error creating self task for agent {requesting_agent_id}: {e_sql}",
             exc_info=True,
         )
         return Failed(message=f"Database error creating self task: {e_sql}")
     except Exception as e:
-        if conn:
-            conn.rollback()
         logger.error(
             f"Unexpected error creating self task for agent {requesting_agent_id}: {e}",
             exc_info=True,
         )
         return Failed(message=f"Unexpected error creating self task: {e}")
-    finally:
-        if conn:
-            conn.close()
 
 
 # --- update_task_status tool ---
@@ -2591,98 +2591,106 @@ async def update_task_status_tool_impl(
             message=f"Invalid status: {new_status}. Valid: {', '.join(valid_statuses)}",
         )
 
-    conn = None
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        # D1: the unit-of-work owns the transaction; the per-task
+        # ``update_task_status`` DB audit rows are written atomically via
+        # ``u.cursor`` inside the scope. The post-commit tail (assignee
+        # wake, RAG reindex, aggregate in-memory ``log_audit``) runs in the
+        # after-``with`` block — reached ONLY on a clean commit, so
+        # emit-iff-commit holds. The per-task DB rows and the single
+        # aggregate g.audit_log summary keep their exact cardinality (they
+        # diverge, so they are NOT collapsed through ``u.audit``).
+        with unit_of_work() as u:
+            cursor = u.cursor
 
-        # Process tasks (bulk or single)
-        results = []
-        tasks_to_cascade = []
+            # Process tasks (bulk or single)
+            results = []
+            tasks_to_cascade = []
 
-        # Phase 1: Update primary tasks
-        for task_id in task_ids_to_process:
-            result = await _update_single_task(
-                cursor,
-                task_id,
-                new_status,
-                requesting_agent_id,
-                is_admin_request,
-                notes_content,
-                new_title,
-                new_description,
-                new_priority,
-                new_assigned_to,
-                new_depends_on_tasks,
-            )
-            results.append(result)
-
-            if result["success"] and cascade_to_children:
-                tasks_to_cascade.extend(result["child_tasks"])
-
-            # Log individual task action
-            if result["success"]:
-                log_details = {"status": new_status, "old_status": result["old_status"]}
-                if notes_content:
-                    log_details["notes_added"] = True
-                log_agent_action_to_db(
+            # Phase 1: Update primary tasks
+            for task_id in task_ids_to_process:
+                result = await _update_single_task(
                     cursor,
+                    task_id,
+                    new_status,
                     requesting_agent_id,
-                    "update_task_status",
-                    task_id=task_id,
-                    details=log_details,
+                    is_admin_request,
+                    notes_content,
+                    new_title,
+                    new_description,
+                    new_priority,
+                    new_assigned_to,
+                    new_depends_on_tasks,
                 )
+                results.append(result)
 
-        # Phase 2: Smart cascade to children if requested
-        cascade_results = []
-        if cascade_to_children and tasks_to_cascade:
-            for child_task_id in tasks_to_cascade:
-                # Only cascade certain status changes to avoid breaking workflows
-                if new_status in ["cancelled", "failed"]:  # Cascade blocking states
-                    child_result = await _update_single_task(
+                if result["success"] and cascade_to_children:
+                    tasks_to_cascade.extend(result["child_tasks"])
+
+                # Log individual task action
+                if result["success"]:
+                    log_details = {"status": new_status, "old_status": result["old_status"]}
+                    if notes_content:
+                        log_details["notes_added"] = True
+                    log_agent_action_to_db(
                         cursor,
-                        child_task_id,
-                        new_status,
                         requesting_agent_id,
-                        is_admin_request,
-                        f"Auto-cascaded from parent task status change",
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        # BL-R29-1: system-driven child-cascade must cross
-                        # agent ownership — a child of the caller's task
-                        # may be owned by a different agent.
-                        system_transition=True,
+                        "update_task_status",
+                        task_id=task_id,
+                        details=log_details,
                     )
-                    cascade_results.append(child_result)
 
-        # Phase 3: Smart dependency updates if requested. The advance
-        # logic is shared with the bulk path via
-        # ``_advance_dependents_after_completion`` (BL-R26-1) so both
-        # surfaces unblock dependents identically.
-        dependency_updates = []
-        if auto_update_dependencies:
-            for result in results:
-                if result["success"] and new_status == "completed":
-                    dependency_updates.extend(
-                        await _advance_dependents_after_completion(
+            # Phase 2: Smart cascade to children if requested
+            cascade_results = []
+            if cascade_to_children and tasks_to_cascade:
+                for child_task_id in tasks_to_cascade:
+                    # Only cascade certain status changes to avoid breaking workflows
+                    if new_status in ["cancelled", "failed"]:  # Cascade blocking states
+                        child_result = await _update_single_task(
                             cursor,
-                            result["task_id"],
+                            child_task_id,
+                            new_status,
                             requesting_agent_id,
                             is_admin_request,
+                            f"Auto-cascaded from parent task status change",
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            # BL-R29-1: system-driven child-cascade must cross
+                            # agent ownership — a child of the caller's task
+                            # may be owned by a different agent.
+                            system_transition=True,
                         )
-                    )
+                        cascade_results.append(child_result)
 
-        # Wave 7 PR 3 (coordinator transition): the "Phase 3.5
-        # auto-launch testing agents on task completion" hook is gone.
-        # agent-mcp no longer spawns claude processes — if an operator
-        # wants a follow-up testing agent, they register it via
-        # ``register_agent`` and start their own claude session.
+            # Phase 3: Smart dependency updates if requested. The advance
+            # logic is shared with the bulk path via
+            # ``_advance_dependents_after_completion`` (BL-R26-1) so both
+            # surfaces unblock dependents identically.
+            dependency_updates = []
+            if auto_update_dependencies:
+                for result in results:
+                    if result["success"] and new_status == "completed":
+                        dependency_updates.extend(
+                            await _advance_dependents_after_completion(
+                                cursor,
+                                result["task_id"],
+                                requesting_agent_id,
+                                is_admin_request,
+                            )
+                        )
 
-        # Commit all changes
-        conn.commit()
+            # Wave 7 PR 3 (coordinator transition): the "Phase 3.5
+            # auto-launch testing agents on task completion" hook is gone.
+            # agent-mcp no longer spawns claude processes — if an operator
+            # wants a follow-up testing agent, they register it via
+            # ``register_agent`` and start their own claude session.
+
+            # Commit all changes
+        # <-- uow scope ends here: commit on clean exit; the wake/reindex/
+        # audit tail below runs post-commit (skipped on rollback).
 
         # Phase 2 + 4: wake each touched task's assignee and re-index
         # the mutated tasks. Both run AFTER commit (re-reads observe the
@@ -2778,18 +2786,12 @@ async def update_task_status_tool_impl(
         return Ok(message="\n".join(response_parts))
 
     except sqlite3.Error as e_sql:
-        if conn:
-            conn.rollback()
+        # The unit-of-work already rolled back + closed the connection.
         logger.error(f"Database error updating tasks: {e_sql}", exc_info=True)
         return Failed(message=f"Database error updating tasks: {e_sql}")
     except Exception as e:
-        if conn:
-            conn.rollback()
         logger.error(f"Unexpected error updating tasks: {e}", exc_info=True)
         return Failed(message=f"Unexpected error updating tasks: {e}")
-    finally:
-        if conn:
-            conn.close()
 
 
 # --- view_tasks tool ---
@@ -3695,12 +3697,15 @@ async def bulk_task_operations_tool_impl(
             message="operations list is required and must be a non-empty array",
         )
 
-    # Process operations in a single transaction. PR A (round 2): the
-    # whole "open conn → loop writes → log audit → commit → close"
-    # boilerplate collapses into one `atomic_with_audit` block. Per-op
-    # validation failures still go into `results` via `continue`; only
-    # an actual sqlite/Python exception aborts the transaction.
-    from ..db.atomic import atomic_with_audit
+    # Process operations in a single transaction. D1: reconciled onto the
+    # unit-of-work (from the earlier ``atomic_with_audit`` seam) so the
+    # whole write path shares the D-family scope. Per-op validation
+    # failures still go into `results` via `continue`; only an actual
+    # sqlite/Python exception aborts the transaction. The single
+    # ``bulk_task_operations`` DB audit row is written explicitly at scope
+    # end (once ``success_count`` is known); the aggregate in-memory
+    # ``log_audit`` + the wake/reindex tail run post-commit in the
+    # after-``with`` block (emit-iff-commit — skipped on rollback).
     results: List[str] = []
     updated_at_iso = datetime.datetime.now().isoformat()
     # Mutated in-place during the loop; the seam reads it at block
@@ -3718,11 +3723,8 @@ async def bulk_task_operations_tool_impl(
     completed_task_ids: List[str] = []
     mutated_task_ids: List[str] = []
     try:
-        with atomic_with_audit(
-            operation="bulk_task_operations",
-            actor=requesting_agent_id,
-            details=audit_details,
-        ) as cursor:
+        with unit_of_work() as u:
+            cursor = u.cursor
             for i, op in enumerate(operations):
                 if not isinstance(op, dict):
                     results.append(
@@ -4113,10 +4115,19 @@ async def bulk_task_operations_tool_impl(
                 )
 
             # Final success_count is patched onto the audit-row details
-            # dict; `atomic_with_audit` reads the same dict at block
-            # exit and emits one agent_actions row before committing.
+            # dict, then the single ``bulk_task_operations`` agent_actions
+            # row is written via ``u.cursor`` — atomic with the op writes,
+            # exactly as the retired ``atomic_with_audit`` seam did at its
+            # block exit.
             audit_details["success_count"] = len(
                 [r for r in results if "Error" not in r]
+            )
+            log_agent_action_to_db(
+                cursor,
+                agent_id=requesting_agent_id,
+                action_type="bulk_task_operations",
+                task_id=None,
+                details=audit_details,
             )
 
         # BL-R26-1 Phase-2 + 4: POST-commit (the ``with`` block committed
@@ -4140,8 +4151,8 @@ async def bulk_task_operations_tool_impl(
         return Ok(message=response_text)
 
     except sqlite3.Error as e_sql:
-        # `atomic_with_audit` already rolled back + closed before
-        # re-raising; we just translate to a user-facing error.
+        # The unit-of-work already rolled back + closed before re-raising;
+        # we just translate to a user-facing error.
         logger.error(f"Database error in bulk task operations: {e_sql}", exc_info=True)
         return Failed(message=f"Database error in bulk operations: {e_sql}")
     except Exception as e:
