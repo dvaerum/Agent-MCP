@@ -437,7 +437,6 @@ async def test_request_assistance_rollback_fires_zero_side_effects(
     no child task committed, and no ``request_assistance`` DB audit row.
     Emit-iff-commit replaces the retired ``atomic_with_audit`` seam."""
     async with mcp_session(tmp_path) as admin:
-        from agent_mcp.core import globals as g
         from agent_mcp.tools import task_tools
 
         alice = await admin.create_worker("alice")
