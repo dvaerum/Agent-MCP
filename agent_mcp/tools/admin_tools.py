@@ -96,19 +96,13 @@ def _is_confirmed_operator_tier(principal: Optional[Principal]) -> bool:
 
 
 
-# --- register_agent tool (Wave 7 PR 0 — coordinator transition) ---
+# --- register_agent tool ---
 #
-# The register-only sibling of :func:`create_agent_tool_impl`. Mints an
-# agent identity (DB row + bearer token) WITHOUT spawning a claude
-# process. The plan calls this the "coordinator" shape: agent-mcp stops
-# owning user-side claude processes; the user owns them; agent-mcp
-# mints the token and hands the operator a ready-to-paste ``.mcp.json``
-# snippet they drop into the user's claude config.
-#
-# Co-existence: PR 0 ships ``register_agent`` ALONGSIDE the legacy
-# ``create_agent`` (which still spawns via tmux). PR 1 migrates test
-# fixtures to register-only; PR 3 deletes the spawn block + the
-# ``agent_mcp/runtime/agent_runtime.py`` module entirely.
+# Mints an agent identity (DB row + bearer token) WITHOUT spawning a
+# claude process: agent-mcp does not own the user's claude session.
+# The operator hands the returned ready-to-paste ``.mcp.json`` snippet
+# to the user, who starts their own ``claude`` process and points it
+# at the snippet.
 #
 # Architectural directive: ``feedback_agent_mcp_coordinator_not_spawner``
 # in user memory. Future fixes to runtime code must follow this shape.
@@ -258,11 +252,6 @@ async def register_agent_tool_impl(
     for starting their own claude session and pointing it at the
     snippet — agent-mcp never owns the claude process.
 
-    Wave 7 PR 0 (coordinator transition). The legacy
-    :func:`create_agent_tool_impl` (which spawns via tmux) stays in
-    this PR to keep old tests / old workflows working; PR 3 deletes
-    the spawn block + the runtime module entirely.
-
     Arguments:
         name: agent_id for the new row. Required. Same slug regex
             ``create_agent`` uses (enforced by ``agent_repo.create``).
@@ -301,10 +290,10 @@ async def register_agent_tool_impl(
             message="`role` must be 'worker' or 'manager'.",
         )
 
-    # Mirror create_agent_tool_impl's defence-in-depth tombstone-
-    # bracket guard. The repo would also catch this via its slug
-    # regex; returning a clean Invalid here gives the operator a
-    # precise reason instead of a generic regex-mismatch.
+    # Defence-in-depth tombstone-bracket guard. The repo would also
+    # catch this via its slug regex; returning a clean Invalid here
+    # gives the operator a precise reason instead of a generic
+    # regex-mismatch.
     if "[" in agent_id or "]" in agent_id:
         return Invalid(
             field="name",
@@ -523,6 +512,14 @@ async def view_status_tool_impl(
     )  # main.py:1249
 
     # Build agent status from g.active_agents and g.agent_working_dirs (main.py:1251-1259)
+    # arch-r5 #7: this iterates the SAME state.active_agents cache that
+    # owns "which agents are active" everywhere else (main_app.
+    # _bearer_is_active, AgentRepository.active_agent_ids) — a full-row
+    # scan, not just the id-set, because the payload below needs
+    # per-agent status/task/capabilities/color. Reading the cache
+    # directly here (rather than via active_agent_ids(), which only
+    # returns ids) still agrees with those callers by construction:
+    # one cache, no second query.
     agent_status_dict = {}
     for agent_tkn, agent_data in g.active_agents.items():
         agent_id = agent_data.get("agent_id")
@@ -842,13 +839,10 @@ async def terminate_agent_tool_impl(
                         f"Released {files_released_count} files held by terminated agent {agent_id_to_terminate}."
                     )
 
-                # Wave 7 PR 3 (coordinator transition): the spawn machinery
-                # is gone — agent-mcp never owned the user's claude process,
-                # so terminate is just "revoke the token + flip status". The
-                # user's local claude session keeps running until they close
-                # it themselves. The tmux-session tracking globals + the
-                # ``tmux_killed`` response field PR 0 left as back-compat are
-                # both retired here.
+                # agent-mcp never owns the user's claude process, so
+                # terminate is just "revoke the token + flip status". The
+                # user's local claude session keeps running until they
+                # close it themselves.
 
                 log_audit(
                     actor_label,
@@ -1718,12 +1712,8 @@ async def get_agent_tokens_tool_impl(
 
 # --- Register all admin tools ---
 def register_admin_tools():
-    # Wave 7 PR 3 (coordinator transition) — ``register_agent`` is the
-    # only agent-creation surface. The legacy ``create_agent`` tool
-    # (which spawned a claude via tmux + ``--dangerously-skip-permissions``
-    # and orphan-stormed processes through the SIGHUP-ignore bug) was
-    # deleted along with the runtime module that implemented it. agent-mcp
-    # never starts a claude process now — the operator pastes the
+    # ``register_agent`` is the only agent-creation surface. agent-mcp
+    # does not start a claude process: the operator pastes the
     # returned ``mcp_snippet`` into the user's ``.mcp.json`` and the
     # user owns their own claude session.
     register_tool(
@@ -2033,14 +2023,11 @@ def register_admin_tools():
         visibility="operator",
     )
 
-    # Wave 7 PR 3 (coordinator transition): the ``relaunch_agent``
-    # tool (which sent ``/clear`` to the agent's tmux session and
-    # pushed a new prompt) was deleted with the rest of the spawn
-    # machinery. Under the coordinator model agent-mcp doesn't own
-    # the user's claude process, so "relaunch" is the user's
-    # business (close the session, paste the snippet again,
-    # ``claude``). Operators who want a fresh bearer for an existing
-    # row use ``register_agent`` to mint a new identity.
+    # There is no ``relaunch_agent`` tool: agent-mcp doesn't own the
+    # user's claude process, so relaunching is the user's business
+    # (close the session, paste the snippet again, ``claude``).
+    # Operators who want a fresh bearer for an existing row use
+    # ``register_agent`` to mint a new identity.
 
 
 # Call registration when this module is imported

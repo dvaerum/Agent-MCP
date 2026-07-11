@@ -1197,6 +1197,13 @@ def _bearer_is_active(bearer: str) -> bool:
     and the per-request tool-dispatch path rely on; the GET /mcp SSE
     pump re-checks it every heartbeat so a stream opened BEFORE
     revocation is torn down rather than surviving it (AC-R29-1).
+
+    arch-r5 #7: this is the token-keyed sibling of
+    :meth:`agent_mcp.repositories.agent_repository.AgentRepository.active_agent_ids`
+    (the agent_id-keyed owner used by ``view_status`` / worker-to-worker
+    messaging). Both read the identical ``state.active_agents`` dict —
+    one bearer at a time here, the full id-set there — so "is this
+    bearer active" and "which agents are active" can never disagree.
     """
     from ..core import globals as _g
 

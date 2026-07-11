@@ -573,8 +573,42 @@ class AgentRepository:
         guarantee a full snapshot if startup-time hydration was
         skipped. Callers that need the full list (lifespan startup,
         dashboard ``/api/all-data``) go through here.
+
+        Reserved for reconciliation / warm / boot paths (arch-r5 #7).
+        Anything asking "is agent X active right now" for an
+        auth-adjacent decision must go through :meth:`active_agent_ids`
+        instead — this method's fresh DB read can disagree with the
+        ``state.active_agents`` cache the ``/mcp`` auth gate trusts
+        (e.g. mid-flight between a terminate's DB commit and its
+        cache eviction), and that DB/cache pair is exactly the
+        two-sources-of-truth split #7 closes for every OTHER caller.
         """
         return get_all_active_agents_from_db()
+
+    def active_agent_ids(self) -> set[str]:
+        """Set of ``agent_id`` for every agent in the LIVE auth cache.
+
+        The single owner of "which agents are active" (arch-r5 #7).
+        Projects ``state.active_agents`` — the SAME cache
+        ``app.main_app._bearer_is_active`` gates ``/mcp`` auth against
+        and ``admin_tools.view_status`` / the broadcast fan-out iterate
+        directly — from its token-keyed shape down to the ``agent_id``
+        set callers actually want. Because every one of those reads the
+        identical in-memory dict, they cannot disagree with each other:
+        there is one cache, one owner method for the id-set projection
+        of it, and every "is X active" / "which agents are active"
+        question resolves through the same object.
+
+        Deliberately NOT a DB query — see :meth:`list_active` for the
+        DB-authoritative counterpart reserved for reconciliation/warm/
+        boot, where a fresh snapshot (rather than auth-cache agreement)
+        is the point.
+        """
+        return {
+            data["agent_id"]
+            for data in state.active_agents.values()
+            if data.get("agent_id")
+        }
 
     def query(
         self,
