@@ -937,17 +937,27 @@ class AgentRepository:
 
         Returns True when the agent row exists (rowcount > 0), False on
         unknown agent, empty ``cursor_value``, or DB error. Refreshes the
-        caches + publishes ``agent.updated`` to match the side effects
-        :meth:`update_field` produced for this field before the flip.
+        caches and publishes ``agent.updated`` ONLY when the watermark
+        actually moved — a no-op advance (equal/lower cursor) publishes
+        nothing, so it can't self-wake every sibling ``wait_for_events``
+        waiter under fan-out (arch-r2 #2a).
         """
         if not cursor_value:
             return False
 
-        from sqlalchemy import func, update as sa_update
+        from sqlalchemy import func, select as sa_select, update as sa_update
 
         now = datetime.datetime.now().isoformat()
         try:
             with get_session() as session:
+                # Read the prior watermark in the same session so we can
+                # tell a real advance from a no-op (MAX keeps the higher
+                # value, so a stale/equal cursor changes nothing).
+                prev_value = session.execute(
+                    sa_select(Agent.last_event_seen_at).where(
+                        Agent.agent_id == agent_id
+                    )
+                ).scalar_one_or_none()
                 result = session.execute(
                     sa_update(Agent)
                     .where(Agent.agent_id == agent_id)
@@ -982,15 +992,26 @@ class AgentRepository:
             if wd:
                 state.agent_working_dirs[agent_id] = wd
 
-        _publish(
-            agent_id,
-            "agent.updated",
-            {
-                "agent_id": agent_id,
-                "field": "last_event_seen_at",
-                "value": fresh.get("last_event_seen_at"),
-            },
-        )
+        # SELF-WAKE FIX (arch-r2 #2a): only publish ``agent.updated`` when
+        # the watermark ACTUALLY moved. ``last_event_seen_at`` is a
+        # poll-internal high-water mark nobody consumes as an agent event;
+        # publishing it wakes every sibling ``wait_for_events`` waiter
+        # (agent.updated → state.notify_waiters) to re-query for nothing.
+        # Under fan-out, N concurrent waiters each re-write the same cursor
+        # → O(N) spurious wakes per event round. Emitting only on a real
+        # value change collapses the no-op re-writes to zero wakes while
+        # preserving the notify on a genuine advance.
+        new_value = fresh.get("last_event_seen_at")
+        if new_value != prev_value:
+            _publish(
+                agent_id,
+                "agent.updated",
+                {
+                    "agent_id": agent_id,
+                    "field": "last_event_seen_at",
+                    "value": new_value,
+                },
+            )
         return True
 
     def _update_field_with_cursor(
