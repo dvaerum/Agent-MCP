@@ -216,6 +216,7 @@ def resolve_capabilities(
     agent_role: Optional["AgentRole"],
     project_role: Optional[str],
     kind: "PrincipalKind",
+    groups: Optional[set[str]] = None,
 ) -> frozenset[str]:
     """Compute the capability set for a Principal at middleware time.
 
@@ -246,6 +247,16 @@ def resolve_capabilities(
     router.db still produces the bundle-only subset rather than
     raising. The same defence lets the agent-side per-project backend
     (which has no router.db handle) call this safely.
+
+    ``groups`` (arch-deepening R4 #3): pass the caller's already-
+    resolved transitive group set to skip the internal
+    ``resolve_user_groups`` walk — the request-scoped seam in
+    ``router/auth_middleware.py`` resolves the graph once (for the
+    sysadmin + project-role checks) and threads it through here too,
+    so a single request pays for exactly one walk instead of a fourth.
+    ``None`` (the default) self-resolves, preserving the original
+    behaviour for every other caller (the FastAPI bearer /
+    forwarding-header seam in ``app/main_app.py`` among them).
     """
     if sysadmin:
         return frozenset({SYSADMIN_WILDCARD})
@@ -259,11 +270,14 @@ def resolve_capabilities(
     caps: set[str] = set()
     if user_id:
         try:
-            from ..router.group_resolver import resolve_user_groups
             from ..repositories.group_capability_repository import (
                 fetch as _gcap_fetch,
             )
-            group_ids = resolve_user_groups(user_id)
+            if groups is None:
+                from ..router.group_resolver import resolve_user_groups
+                group_ids = resolve_user_groups(user_id)
+            else:
+                group_ids = groups
             for gid in group_ids:
                 # SEC (Finding 2, 2026-07-08): defense-in-depth. Group
                 # rows are data — a migration, repair script, second

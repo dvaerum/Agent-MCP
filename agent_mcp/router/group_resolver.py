@@ -233,14 +233,18 @@ def _any_group_is_sysadmin_on(
 
 
 def _resolve_user_is_sysadmin_on(
-    conn: sqlite3.Connection, user_id: str
+    conn: sqlite3.Connection,
+    user_id: str,
+    groups: Optional[set[str]] = None,
 ) -> bool:
     row = conn.execute(
         "SELECT is_sysadmin FROM users WHERE user_id = ?", (user_id,)
     ).fetchone()
     if row is not None and row["is_sysadmin"]:
         return True
-    return _any_group_is_sysadmin_on(conn, _resolve_user_groups_on(conn, user_id))
+    if groups is None:
+        groups = _resolve_user_groups_on(conn, user_id)
+    return _any_group_is_sysadmin_on(conn, groups)
 
 
 def _group_is_transitively_sysadmin_on(
@@ -282,7 +286,10 @@ def _group_resolved_project_roles_on(
 
 
 def _resolve_user_project_role_on(
-    conn: sqlite3.Connection, user_id: str, project_name: str
+    conn: sqlite3.Connection,
+    user_id: str,
+    project_name: str,
+    groups: Optional[set[str]] = None,
 ) -> Optional[Literal["operator", "viewer"]]:
     candidates: list[str] = []
     cur = conn.execute(
@@ -291,7 +298,8 @@ def _resolve_user_project_role_on(
         (project_name, user_id),
     )
     candidates.extend(row["role"] for row in cur.fetchall())
-    groups = _resolve_user_groups_on(conn, user_id)
+    if groups is None:
+        groups = _resolve_user_groups_on(conn, user_id)
     if groups:
         placeholders = ",".join("?" for _ in groups)
         cur = conn.execute(
@@ -368,12 +376,24 @@ def resolve_group_ancestors(
 
 
 def resolve_user_is_sysadmin(
-    user_id: str, conn: Optional[sqlite3.Connection] = None
+    user_id: str,
+    conn: Optional[sqlite3.Connection] = None,
+    groups: Optional[set[str]] = None,
 ) -> bool:
     """True iff the user is a sysadmin directly OR via any group in their
-    transitive membership."""
+    transitive membership.
+
+    ``groups`` (arch-deepening R4 #3): pass the caller's already-
+    resolved transitive group set (e.g. from :func:`resolve_user_groups`)
+    to skip the internal walk — the request-scoped seam in
+    ``router/auth_middleware.py`` resolves the graph once and threads
+    it through every consumer that needs it instead of re-walking
+    ``group_membership`` per call. ``None`` (the default) self-resolves,
+    preserving the original single-call behaviour for every other
+    caller.
+    """
     with _conn_ctx(conn) as c:
-        return _resolve_user_is_sysadmin_on(c, user_id)
+        return _resolve_user_is_sysadmin_on(c, user_id, groups=groups)
 
 
 def group_is_transitively_sysadmin(
@@ -389,12 +409,21 @@ def resolve_user_project_role(
     user_id: str,
     project_name: str,
     conn: Optional[sqlite3.Connection] = None,
+    groups: Optional[set[str]] = None,
 ) -> Optional[Literal["operator", "viewer"]]:
     """Return the user's effective role for ``project_name`` — the highest
     tier (``operator`` > ``viewer``) across the user's direct rows and any
-    of their groups' rows, or ``None`` when no row covers them."""
+    of their groups' rows, or ``None`` when no row covers them.
+
+    ``groups`` (arch-deepening R4 #3): same reuse hook as
+    :func:`resolve_user_is_sysadmin` — pass an already-resolved
+    transitive group set to skip the internal walk. ``None`` self-
+    resolves.
+    """
     with _conn_ctx(conn) as c:
-        return _resolve_user_project_role_on(c, user_id, project_name)
+        return _resolve_user_project_role_on(
+            c, user_id, project_name, groups=groups
+        )
 
 
 def group_resolved_project_roles(
