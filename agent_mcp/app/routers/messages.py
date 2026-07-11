@@ -34,6 +34,7 @@ from ..deps import caller_identity, require_operator_session
 from ...core.config import logger
 from ...db.actions.agent_actions_db import log_agent_action_to_db
 from ...db.connection import get_db_connection
+from ...db.unit_of_work import unit_of_work
 from ...repositories.message_repository import ParentMessageNotFound
 from ...utils.json_utils import get_sanitized_json_body
 
@@ -42,6 +43,21 @@ router = APIRouter(
     prefix="/api/messages",
     tags=["messages"],
 )
+
+
+class _MessageStoreFailed(RuntimeError):
+    """Internal signal: ``message_repo.send`` returned ``None`` inside the
+    ``unit_of_work`` scope (SD-R10-1 / PF-R32-1).
+
+    Raised so the exception propagates out of the scope and rolls the
+    whole unit back — no orphan audit row for a message that was never
+    stored. Caught in ``create_message_api_route`` and mapped to a 500;
+    never a false 200 success.
+    """
+
+    def __init__(self, message_id: str) -> None:
+        self.message_id = message_id
+        super().__init__(f"message store returned None for {message_id!r}")
 
 
 # --- Messages CRUD endpoints (Phase 6 PR #20 / issue P) ---
@@ -353,9 +369,6 @@ async def create_message_api_route(
         timestamp = datetime.datetime.now().isoformat()
         sender_id = caller_identity(auth)
 
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
         # PR 9 (Message flip): single import covers both the broadcast
         # bulk_send below and the single-recipient send further down.
         from ...repositories import message_repo
@@ -364,7 +377,16 @@ async def create_message_api_route(
         # (admin excluded), mirroring the broadcast_message MCP tool.
         # One INSERT per recipient so the messages show up in the
         # listing keyed by their real recipient_id.
+        #
+        # The broadcast branch keeps its own hand-managed connection:
+        # ``bulk_send`` owns its message INSERTs + per-recipient
+        # ``message.created`` publishes on a separate session, so only
+        # the audit-log row is committed on ``cursor`` here. The
+        # single-recipient path below runs on the write-path
+        # ``unit_of_work`` instead (D2).
         if recipient_id == "*":
+            conn = get_db_connection()
+            cursor = conn.cursor()
             from ...core import globals as _g
             recipients: list[str] = []
             for _tok, agent_data in _g.active_agents.items():
@@ -436,64 +458,79 @@ async def create_message_api_route(
                     content[:50] + "..." if len(content) > 50 else content
                 )
 
-        # PR 6: single-recipient message INSERT goes through message_repo
-        # with the caller's cursor so it's atomic with the audit log.
-        stored = message_repo.send(
-            message_id=message_id,
-            sender_id=sender_id,
-            recipient_id=recipient_id,
-            message_content=content,
-            message_type=message_type,
-            priority=priority,
-            timestamp=timestamp,
-            subject=effective_subject,
-            parent_message_id=parent_message_id,
-            connection=cursor,
-        )
-        # SD-R10-1: send() returns None when the INSERT failed (bad
-        # bind, FK violation, DB error) — it swallows the exception
-        # internally. Must NOT commit a "sent" audit entry nor report
-        # success for a message that was never stored. Roll back and
-        # 500 BEFORE the audit-log INSERT so no false trace survives.
-        if stored is None:
-            conn.rollback()
-            logger.error(
-                "message_repo.send returned None for message %s to %s "
-                "(store failed); reporting 500, no audit entry committed",
-                message_id, recipient_id,
+        # D2: the single-recipient send runs on the write-path
+        # unit-of-work. The message INSERT + the audit-log row are
+        # written on ``u.cursor`` (atomic under one commit); the
+        # recipient inbox wake is *registered* on ``u`` and flushes only
+        # after a successful commit. On any exception inside the scope
+        # (send() → None, ParentMessageNotFound, unknown-recipient
+        # LookupError) the uow rolls back and fires NOTHING — no message
+        # row, no audit row, no wake (SD-R10-1 / PF-R32-1 re-guard).
+        with unit_of_work() as u:
+            # PR 6: single-recipient message INSERT goes through
+            # message_repo on the uow cursor so it's atomic with the
+            # audit log.
+            stored = message_repo.send(
+                message_id=message_id,
+                sender_id=sender_id,
+                recipient_id=recipient_id,
+                message_content=content,
+                message_type=message_type,
+                priority=priority,
+                timestamp=timestamp,
+                subject=effective_subject,
+                parent_message_id=parent_message_id,
+                connection=u.cursor,
             )
-            return JSONResponse(
-                {"error": "Failed to send message"}, status_code=500
+            # SD-R10-1: send() returns None when the INSERT failed (bad
+            # bind, FK violation, DB error) — it swallows the exception
+            # internally. Must NOT commit a "sent" audit entry nor report
+            # success for a message that was never stored. Raise to roll
+            # the whole unit back BEFORE the audit-log INSERT so no false
+            # trace survives; mapped to a 500 below.
+            if stored is None:
+                raise _MessageStoreFailed(message_id)
+            # Audit row on the uow cursor — DB sink only, committed
+            # atomically with the message INSERT (matches the prior
+            # ``log_agent_action_to_db`` + ``conn.commit()`` behaviour).
+            log_agent_action_to_db(
+                u.cursor, sender_id, "sent_message_via_dashboard",
+                details={"message_id": message_id, "recipient": recipient_id},
             )
-        log_agent_action_to_db(
-            cursor, sender_id, "sent_message_via_dashboard",
-            details={"message_id": message_id, "recipient": recipient_id},
-        )
-        conn.commit()
 
-        # BL-R8-1: message_repo.send(connection=cursor) DELIBERATELY
-        # suppresses its own ``message.created`` publish while the caller
-        # cursor is open (a subscriber must never observe an uncommitted
-        # row). Every other send path re-fires the wake post-commit — the
-        # MCP send_agent_message tool calls g.notify_agent_inbox(), the
-        # broadcast branch above publishes via bulk_send. Mirror that here
-        # so a recipient blocked in wait_for_events is woken for a
-        # dashboard-composed direct message. Defensive: the row is already
-        # committed, so a failed wake must not fail the request.
-        try:
-            from ...core import globals as _g
-            _g.notify_agent_inbox(recipient_id)
-        except Exception as notify_exc:  # pragma: no cover - defensive
-            logger.warning(
-                "notify_agent_inbox(%s) raised after dashboard message "
-                "send: %s", recipient_id, notify_exc,
-            )
+            # BL-R8-1: message_repo.send(connection=...) DELIBERATELY
+            # suppresses its own ``message.created`` publish while the
+            # cursor's transaction is open (a subscriber must never
+            # observe an uncommitted row). Every other send path re-fires
+            # the wake post-commit — the MCP send_agent_message tool and
+            # the broadcast branch above. Register the wake on the uow so
+            # a recipient blocked in wait_for_events is woken for a
+            # dashboard-composed direct message, only after commit. The
+            # uow's post-commit flush isolates a failed wake so it can't
+            # fail the already-committed request.
+            def _wake_recipient(rid: str = recipient_id) -> None:
+                from ...core import globals as _g
+                _g.notify_agent_inbox(rid)
+
+            u.on_commit(_wake_recipient)
 
         return JSONResponse({
             "success": True,
             "message_id": message_id,
             "message": f"Message sent to {recipient_id}",
         })
+    except _MessageStoreFailed as e:
+        # SD-R10-1: send() returned None; the uow rolled back and fired
+        # no effects, so no audit row / wake survived. Report 500 — never
+        # a false 200 for a message that was never stored.
+        logger.error(
+            "message_repo.send returned None for message %s to %s "
+            "(store failed); reporting 500, no audit entry committed",
+            e.message_id, recipient_id,
+        )
+        return JSONResponse(
+            {"error": "Failed to send message"}, status_code=500
+        )
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     except ParentMessageNotFound as e:
