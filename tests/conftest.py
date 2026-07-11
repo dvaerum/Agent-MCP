@@ -10,6 +10,7 @@ SQLite DB.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Iterator
 
@@ -19,7 +20,7 @@ import pytest
 # Module-level isolation: keep tests from accidentally hitting real APIs
 # or reading the user's home OPENAI_API_KEY.
 @pytest.fixture(autouse=True)
-def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # Empty key → openai_service.initialize_openai_client() short-circuits
     # to None (graceful degrade); no models.list() call goes out.
     monkeypatch.setenv("OPENAI_API_KEY", "")
@@ -32,6 +33,21 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
     # settle delay — zero it so create_agent tests aren't dominated by
     # blocking sleeps.
     monkeypatch.setenv("AGENT_MCP_AGENT_SETUP_DELAY", "0")
+    # Router-DB isolation FLOOR. ``migrations_runner.get_router_db_path()``
+    # falls back to the PRODUCTION default ``/var/lib/agent-mcp/router.db``
+    # when ``AGENT_MCP_ROUTER_DB`` is unset — a system path that is shared
+    # across every pytest-xdist worker (and unwritable on most machines).
+    # Any test that touches router code without setting its own DB would
+    # either crash on that path or, worse, share one file across workers.
+    # Guarantee a per-test temp floor so no test can ever fall through to
+    # the system default. Router tests that need a specific DB still
+    # override this via their own ``monkeypatch.setenv`` (last write wins;
+    # this autouse fixture runs first). Set only when absent so an
+    # already-configured (e.g. session-level) override is respected.
+    if not os.environ.get("AGENT_MCP_ROUTER_DB"):
+        monkeypatch.setenv(
+            "AGENT_MCP_ROUTER_DB", str(tmp_path / "router-floor.db")
+        )
 
 
 @pytest.fixture
