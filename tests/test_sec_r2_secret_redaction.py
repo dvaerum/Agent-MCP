@@ -148,7 +148,8 @@ async def test_ask_project_rag_redacts_round1_gap_keys(
 
         cap = _Cap()
         monkeypatch.setattr(query_mod, "completion_client", lambda: cap)
-        monkeypatch.setattr(query_mod, "get_openai_client", lambda: object())
+        # vss disabled → the embedding seam is never reached; no need to
+        # stub embedding_client (the old get_openai_client guard is gone).
         monkeypatch.setattr(query_mod, "is_vss_loadable", lambda: False)
 
         await query_rag_system("what api keys does the project use?")

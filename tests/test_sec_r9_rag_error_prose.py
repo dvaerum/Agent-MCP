@@ -113,7 +113,7 @@ def _assert_generic(answer: str, *leaks: str) -> None:
 
 
 async def test_sql_error_not_reflected_to_caller(monkeypatch, caplog) -> None:
-    monkeypatch.setattr(query_mod, "get_openai_client", lambda: object())
+    monkeypatch.setattr(query_mod, "embedding_client", lambda: object())
 
     def _boom() -> object:
         raise sqlite3.OperationalError(_SQL_LEAK)
@@ -134,7 +134,7 @@ async def test_sql_error_not_reflected_to_caller(monkeypatch, caplog) -> None:
 
 
 async def test_unexpected_oserror_path_not_reflected(monkeypatch, caplog) -> None:
-    monkeypatch.setattr(query_mod, "get_openai_client", lambda: object())
+    monkeypatch.setattr(query_mod, "embedding_client", lambda: object())
 
     def _boom() -> object:
         raise OSError(_PATH_LEAK)
@@ -154,7 +154,7 @@ async def test_unexpected_oserror_path_not_reflected(monkeypatch, caplog) -> Non
 
 
 async def test_openai_error_body_not_reflected(monkeypatch, caplog) -> None:
-    monkeypatch.setattr(query_mod, "get_openai_client", lambda: object())
+    monkeypatch.setattr(query_mod, "embedding_client", lambda: object())
 
     def _boom() -> object:
         raise _openai_error()
@@ -191,7 +191,7 @@ async def test_completion_config_error_not_reflected(
         )
         assert r.status_code == 200, r.text
 
-        monkeypatch.setattr(query_mod, "get_openai_client", lambda: object())
+        monkeypatch.setattr(query_mod, "embedding_client", lambda: object())
         monkeypatch.setattr(query_mod, "is_vss_loadable", lambda: False)
 
         def _raise_cfg() -> object:
@@ -212,7 +212,7 @@ async def test_completion_config_error_not_reflected(
 
 
 async def test_with_model_error_not_reflected(monkeypatch, caplog) -> None:
-    monkeypatch.setattr(query_mod, "get_openai_client", lambda: object())
+    monkeypatch.setattr(query_mod, "embedding_client", lambda: object())
 
     def _boom() -> object:
         raise sqlite3.OperationalError(_SQL_LEAK)
@@ -233,7 +233,7 @@ async def test_with_model_error_not_reflected(monkeypatch, caplog) -> None:
 
 async def test_successful_query_returns_real_answer(tmp_path, monkeypatch) -> None:
     async with mcp_session(tmp_path):
-        monkeypatch.setattr(query_mod, "get_openai_client", lambda: object())
+        monkeypatch.setattr(query_mod, "embedding_client", lambda: object())
         monkeypatch.setattr(query_mod, "is_vss_loadable", lambda: False)
 
         class _Client:

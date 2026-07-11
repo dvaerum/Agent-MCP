@@ -78,10 +78,18 @@ def _user_content(cap: _CapturingClient) -> str:
     return next(m["content"] for m in cap.messages if m["role"] == "user")
 
 
+class _StubEmbedder:
+    """Deterministic stand-in for the embedding seam so the query path
+    resolves a query vector without touching the network."""
+
+    def embed(self, texts):
+        return [[0.0] * 8 for _ in texts]
+
+
 def _wire_capture(monkeypatch, *, vss: bool = False) -> _CapturingClient:
     cap = _CapturingClient()
     monkeypatch.setattr(query_mod, "completion_client", lambda: cap)
-    monkeypatch.setattr(query_mod, "get_openai_client", lambda: object())
+    monkeypatch.setattr(query_mod, "embedding_client", lambda: _StubEmbedder())
     monkeypatch.setattr(query_mod, "is_vss_loadable", lambda: vss)
     return cap
 
