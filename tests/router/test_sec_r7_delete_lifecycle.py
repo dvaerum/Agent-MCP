@@ -129,7 +129,6 @@ async def test_delete_systemctl_runs_off_event_loop(
             time.sleep(BLOCK_SEC)  # bounded: no permanent hang on regress
         return subprocess.CompletedProcess(list(args), 0, "", "")
 
-    monkeypatch.setattr(router_module, "_systemctl", _blocking_systemctl)
     from agent_mcp.router import project_orchestrator as _po
     monkeypatch.setattr(_po, "_systemctl", _blocking_systemctl)
 

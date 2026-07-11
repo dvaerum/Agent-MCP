@@ -64,7 +64,6 @@ async def test_rename_systemctl_runs_off_event_loop(
             time.sleep(BLOCK_SEC)  # bounded: no permanent hang on regress
         return subprocess.CompletedProcess(list(args), 0, "", "")
 
-    monkeypatch.setattr(router_module, "_systemctl", _blocking_systemctl)
     from agent_mcp.router import project_orchestrator as _po
     monkeypatch.setattr(_po, "_systemctl", _blocking_systemctl)
 
@@ -129,9 +128,8 @@ async def test_stop_project_systemctl_runs_off_event_loop(
             time.sleep(BLOCK_SEC)  # bounded: no permanent hang on regress
         return subprocess.CompletedProcess(list(args), 0, "", "")
 
-    monkeypatch.setattr(router_module, "_systemctl", _blocking_systemctl)
-    monkeypatch.setattr(router_module, "_is_active", lambda unit: True)
     from agent_mcp.router import project_orchestrator as _po
+    monkeypatch.setattr(_po, "_is_active", lambda unit: True)
     monkeypatch.setattr(_po, "_systemctl", _blocking_systemctl)
 
     loop_free_at: list[float] = []

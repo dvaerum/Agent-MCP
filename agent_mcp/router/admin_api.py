@@ -399,21 +399,20 @@ async def rename_project_handler(req: web.Request) -> web.Response:
         # while holding ``_ensure_lock`` stalls the single aiohttp event
         # loop — every other concurrent router request — for the duration.
         await asyncio.to_thread(
-            _app._systemctl, "stop", _app._unit_name(old_name, "backend"),
+            _app._po._systemctl, "stop", _app._unit_name(old_name, "backend"),
         )
         # BL-R35-1 (mirrors delete's BL-R7-2): purge the per-OLD-name
-        # orchestrator lifecycle state, inside the lock (atomic with
-        # stop+registry rename) so a warm-start that raced in before we
-        # acquired the lock can't leave stale old-name state, and a
-        # ``_schedule_backend_warm`` for a same-name RE-created project isn't
-        # skipped by the ``(name,"backend") in last_active`` dedup. After the
-        # registry rename lands, ``old_name`` is an inactive alias and
+        # orchestrator lifecycle state via the single ``forget`` clear
+        # path, inside the lock (atomic with stop+registry rename) so a
+        # warm-start that raced in before we acquired the lock can't leave
+        # stale old-name state, and a ``_schedule_backend_warm`` for a
+        # same-name RE-created project isn't skipped by the
+        # ``(name,"backend") in last_active`` dedup. After the registry
+        # rename lands, ``old_name`` is an inactive alias and
         # ``_ensure(old_name)`` 404s, so none of these get repopulated.
-        _app.last_active.pop((old_name, "backend"), None)
-        _app.ensure_failures.pop((old_name, "backend"), None)
-        _app.active_conns.pop(old_name, None)
-        _app._po.unit_start_times.pop((old_name, "backend"), None)
-        _app._po.forwarding_hmac_keys.pop(old_name, None)
+        # ``keep_lock=True``: the ``_ensure`` lock is held right now and is
+        # dropped separately AFTER release below (SC-R8-1).
+        _app._po.forget(old_name, keep_lock=True)
         workspace = Path(old_row.get("workspace", ""))
         new_workspace: Path | None = None
         if workspace.name == old_name and workspace.exists():
@@ -662,29 +661,26 @@ async def delete_project_handler(req: web.Request) -> web.Response:
         # directly while holding ``_ensure_lock`` stalls every other
         # tenant's request on this single event loop for the duration.
         await asyncio.to_thread(
-            _app._systemctl, "stop", _app._unit_name(name, "backend"),
+            _app._po._systemctl, "stop", _app._unit_name(name, "backend"),
         )
         try:
             _app._REGISTRY.unregister(name)
         except KeyError:
             pass
-        # BL-R7-2: purge the per-name orchestrator lifecycle state.
-        # This handler stops the unit directly instead of routing
-        # through ``orchestrator.stop()`` (which pops ``last_active``),
-        # so without this the deleted project lingered in
-        # ``last_active`` / ``list_active()`` until the idle reaper —
-        # and ``_schedule_backend_warm``'s ``(name,"backend") in
-        # last_active`` dedup would then skip warm-starts for a
-        # same-name RE-created project. Pop every sibling map keyed by
-        # this name, inside the lock (atomic with stop+unregister) so a
-        # concurrent ``_ensure`` that just released can't repopulate
-        # them. ``_ensure``'s inside-lock registry re-check (BL-R6-1)
+        # BL-R7-2: purge the per-name orchestrator lifecycle state via the
+        # single ``forget`` clear path. This handler stops the unit
+        # directly instead of routing through ``orchestrator.stop()`` (which
+        # clears ``last_active``), so without this the deleted project
+        # lingered in ``last_active`` / ``list_active()`` until the idle
+        # reaper — and ``_schedule_backend_warm``'s ``(name,"backend") in
+        # last_active`` dedup would then skip warm-starts for a same-name
+        # RE-created project. Cleared inside the lock (atomic with
+        # stop+unregister) so a concurrent ``_ensure`` that just released
+        # can't repopulate; its inside-lock registry re-check (BL-R6-1)
         # aborts before it writes any of these once we've unregistered.
-        _app.last_active.pop((name, "backend"), None)
-        _app.ensure_failures.pop((name, "backend"), None)
-        _app.active_conns.pop(name, None)
-        _app._po.unit_start_times.pop((name, "backend"), None)
-        _app._po.forwarding_hmac_keys.pop(name, None)
+        # ``keep_lock=True``: the ``_ensure`` lock is held right now and is
+        # dropped separately AFTER release below (SC-R8-1).
+        _app._po.forget(name, keep_lock=True)
     # SC-R8-1: drop the per-name ``_ensure`` lock too — but only AFTER
     # the ``async with _ensure_lock(...)`` block above has RELEASED it.
     # Popping while holding would break the lock's release semantics, so
@@ -800,8 +796,8 @@ async def stop_project_handler(req: web.Request) -> web.Response:
         # every other concurrent router request — for the duration. Run
         # both off-loop via ``asyncio.to_thread`` (mirrors the
         # orchestrator's BL-R6-2b and delete's BL-R7-3).
-        if await asyncio.to_thread(_app._is_active, unit):
-            r = await asyncio.to_thread(_app._systemctl, "stop", unit)
+        if await asyncio.to_thread(_app._po._is_active, unit):
+            r = await asyncio.to_thread(_app._po._systemctl, "stop", unit)
             if r.returncode != 0:
                 # SD-R15-1: sibling of SC-R8-2 (project_orchestrator._ensure).
                 # Reachable via the delegatable ``system.projects.manage``
@@ -826,15 +822,14 @@ async def stop_project_handler(req: web.Request) -> web.Response:
         # isn't skipped by the ``(name,"backend") in last_active`` dedup.
         # Cleared unconditionally (even when the unit was already inactive)
         # — the stale-timestamp bug is exactly the already-stopped case.
-        # ``active_conns``/``ensure_failures`` are popped too (delete's
-        # superset): the ``conns > 0`` guard above already refused a busy
-        # project, so the pop is a no-op there, and dropping any recorded
-        # ensure-failure lets the next explicit start be measured fresh.
-        _app.last_active.pop((name, "backend"), None)
-        _app.ensure_failures.pop((name, "backend"), None)
-        _app.active_conns.pop(name, None)
-        _app._po.unit_start_times.pop((name, "backend"), None)
-        _app._po.forwarding_hmac_keys.pop(name, None)
+        # ``forget`` clears delete's full superset (active_conns/
+        # ensure_failures included): the ``conns > 0`` guard above already
+        # refused a busy project, so clearing the counter is a no-op there,
+        # and dropping any recorded ensure-failure lets the next explicit
+        # start be measured fresh. ``keep_lock=True``: unlike delete/rename
+        # the project still EXISTS after a stop, so we KEEP the ``_ensure``
+        # lock (never dropped here) and DON'T touch the registry.
+        _app._po.forget(name, keep_lock=True)
     return _app._success_envelope({"stopped": name})
 
 

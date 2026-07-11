@@ -127,7 +127,6 @@ async def test_concurrent_rename_same_new_name_loser_returns_409_not_500(
             return subprocess.CompletedProcess(list(args), 3, "", "")
         return subprocess.CompletedProcess(list(args), 0, "", "")
 
-    monkeypatch.setattr(router_module, "_systemctl", _stub_systemctl)
     monkeypatch.setattr(_po, "_systemctl", _stub_systemctl)
 
     client = await aiohttp_client(router_app)
@@ -196,7 +195,6 @@ async def test_rename_racing_create_of_new_name_returns_409_not_500(
             return subprocess.CompletedProcess(list(args), 3, "", "")
         return subprocess.CompletedProcess(list(args), 0, "", "")
 
-    monkeypatch.setattr(router_module, "_systemctl", _stub_systemctl)
     monkeypatch.setattr(_po, "_systemctl", _stub_systemctl)
 
     client = await aiohttp_client(router_app)

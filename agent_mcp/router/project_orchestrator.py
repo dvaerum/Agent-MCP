@@ -33,10 +33,17 @@ single-tenant N=1 uses the same code path as multi-tenant, the
 ``make_app`` in ``router/app.py`` is the only place that branches on
 ``SINGLE_TENANT_NAME``.
 
-Shared module-level state lives HERE; ``router/app.py`` re-exports
-``last_active``, ``active_conns``, ``ensure_locks``, ``IDLE_SEC``,
+Shared per-project state lives HERE, in ONE value object
+(``ProjectRuntime``) held by ``runtime: dict[str, ProjectRuntime]``.
+The seven maps that used to be separate module globals (``last_active``,
+``active_conns``, ``unit_start_times``, ``ensure_failures``,
+``ensure_locks``, ``forwarding_hmac_keys``, and ``router/app``'s
+``_warm_inflight``) are its fields now, and ``forget()`` is the single
+clear-on-lifecycle-end path — closing the drift where three copy-pasted
+clear blocks each wiped a DIFFERENT subset. ``router/app.py`` re-exports
+compat views (``last_active``, ``active_conns``, …) plus ``IDLE_SEC``,
 ``_systemctl``, ``_ensure``, ``reaper``, etc. so the existing test
-surface (``router_module.last_active``, ``router_module._systemctl``,
+surface (``router_module.last_active``, ``project_orchestrator._systemctl``,
 …) keeps working without churn.
 """
 
@@ -48,7 +55,8 @@ import logging
 import os
 import subprocess
 import time
-from collections import defaultdict
+from collections.abc import MutableMapping
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -67,63 +75,265 @@ SOCK_DIR = Path(os.environ["AGENT_MCP_SOCK_DIR"])
 IDLE_SEC = int(os.environ.get("AGENT_MCP_IDLE_SEC", str(4 * 60 * 60)))
 
 
-# ── Shared module-level state ───────────────────────────────────────
-# These were ``router.app`` globals before PR-C; they now live here
-# and ``router/app.py`` re-exports the names so existing tests and
-# call sites (e.g. ``router_module.last_active``,
-# ``router_module._systemctl``) keep working without modification.
+# ── Per-project runtime state (one value object) ────────────────────
+# All per-project lifecycle state used to live in seven separate module
+# globals, each keyed by the same per-project identity ((name, "backend")
+# or name) and each cleared by its OWN copy-pasted "on lifecycle end"
+# block — blocks that had DRIFTED to clear different subsets. They are
+# fields of one ``ProjectRuntime`` now, held by ``runtime``; ``forget()``
+# is the single clear path, so the drift is structurally impossible.
 
-# Activity timestamps per (name, role). role is always "backend"
-# today (the dashboard is static, served by the router itself), but
-# the dict shape is kept tuple-keyed so a future sidecar role
-# drops in cleanly.
-last_active: dict[tuple[str, str], float] = {}
 
-# Per-project in-flight connection counter. Incremented when a proxied
-# request enters ``_proxy_to_backend`` (router/app.py), decremented
-# when it leaves. ``stop()`` refuses to act while the counter is
-# non-zero so an SSE session isn't yanked mid-stream.
-active_conns: dict[str, int] = defaultdict(int)
+@dataclass
+class ProjectRuntime:
+    """The mutable per-project lifecycle row (one per project name).
 
-# SC-R7-1: monotonic timestamp of the most recent start/restart the
-# router issued (or adopted) for each (name, role). Feeds ``_ensure``'s
-# boot-aware restart decision: an ``active`` unit whose socket is absent
-# but which entered its start window within ``BOOT_GRACE_SEC`` is "still
-# booting" — keep polling the socket, DON'T restart. A backend cold boot
-# (~44 s of embedding/DB init) far exceeds ``ENSURE_FAILURE_COOLDOWN_SEC``
-# (5 s), so without this a member polling every ≥5 s during a cold boot
-# would ``systemctl restart`` the still-booting backend on every call,
-# resetting its clock and denying it to co-members (an authenticated,
-# same-project availability DoS — FLAG-2). Overwritten on every start/
-# restart; popped on stop/delete/reap so a later autonomous systemd
-# restart of a since-stopped unit doesn't inherit a stale (past-grace)
-# timestamp.
-unit_start_times: dict[tuple[str, str], float] = {}
+    Fields that were ``(name, role)``-keyed maps become ``role``-keyed
+    sub-dicts here. ``role`` is always ``"backend"`` today (the dashboard
+    is served by the router itself), but the sub-dict shape keeps a
+    future sidecar role dropping in cleanly.
+    """
 
-# Per-(name, role) lock serialising ``_ensure``. The dashboard fires
-# several parallel API calls on first load; without this each one
-# raced systemctl independently — fastest wins, the rest see the unit
-# in a transient state and issue a ``restart``, causing a stop/start
-# storm and a ~10 s window where requests 504.
-ensure_locks: dict[tuple[str, str], asyncio.Lock] = {}
+    # Activity timestamp per role. Feeds the idle reaper and the
+    # overview's ``last_activity_ts``.
+    last_active: dict[str, float] = field(default_factory=dict)
 
-# Recent-failure cache for ``_ensure`` (P005 cascade-fix, 2026-06-19).
-# Maps (name, role) → (monotonic_failed_at, reason). When ``_ensure``
-# fails to bring the backend's UDS up within the socket-wait budget,
-# we record the failure here. Subsequent calls within
-# ``ENSURE_FAILURE_COOLDOWN_SEC`` short-circuit with the same 504
-# instead of paying another full socket-wait. Without this cap, a
-# dashboard's first-paint fan-out (6 parallel reads, see the lock
-# comment above) serialises through ``ensure_locks`` and pays N × 20 s
-# behind a backend that's failing to come up — every per-project fetch
-# aborts client-side at 30 s and the page renders empty.
-#
-# Cooldown window is intentionally short so transient
-# systemctl-races recover quickly. The reaper (`_reaper_tick`) and
-# any successful `_ensure` evict the entry; tests can patch the
-# constant or call `_clear_ensure_failures()` to reset between
-# scenarios.
-ensure_failures: dict[tuple[str, str], tuple[float, str]] = {}
+    # In-flight proxied-connection counter (per name; role-agnostic).
+    # Incremented on entry to ``_proxy_to_backend`` (router/app.py),
+    # decremented on exit. ``stop()`` refuses to act while non-zero so
+    # an SSE session isn't yanked mid-stream.
+    active_conns: int = 0
+
+    # SC-R7-1: monotonic start/restart timestamp per role, feeding
+    # ``_ensure``'s boot-aware restart decision — an ``active`` unit whose
+    # socket is absent but which entered its start window within
+    # ``BOOT_GRACE_SEC`` is "still booting" (keep polling, DON'T restart).
+    # A cold boot (~44 s) far exceeds ``ENSURE_FAILURE_COOLDOWN_SEC`` (5 s),
+    # so without this a member polling every ≥5 s during a cold boot would
+    # ``systemctl restart`` the still-booting backend on every call —
+    # an authenticated same-project availability DoS (FLAG-2). Popped on
+    # stop/delete/reap so a later autonomous systemd restart of a
+    # since-stopped unit doesn't inherit a stale (past-grace) timestamp.
+    unit_start_times: dict[str, float] = field(default_factory=dict)
+
+    # P005 (2026-06-19) recent-``_ensure``-failure cache per role →
+    # (monotonic_failed_at, generic reason). Calls within
+    # ``ENSURE_FAILURE_COOLDOWN_SEC`` short-circuit with the same 504
+    # instead of paying another full socket-wait, so a dashboard
+    # first-paint fan-out behind a failing backend doesn't serialise
+    # N × 20 s. The reaper and any successful ``_ensure`` evict the entry.
+    ensure_failures: dict[str, tuple[float, str]] = field(default_factory=dict)
+
+    # Per-role lock serialising ``_ensure``. The dashboard fires several
+    # parallel API calls on first load; without this each raced systemctl
+    # independently — a stop/start storm and a ~10 s 504 window.
+    ensure_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+
+    # F015 v4: cached forwarding-header HMAC key bytes. The systemd unit's
+    # ExecStartPre OWNS generation; the router only ever READS + caches
+    # (see the ownership note below). ``None`` until first read off disk.
+    forwarding_hmac_key: bytes | None = None
+
+    # BL-R6-2a: True while a warm-start task for this project is in-flight,
+    # so a flood of shell-only ``/app/<name>/`` GETs dedups to at most one
+    # pending warm-start.
+    warm_inflight: bool = False
+
+    def is_empty(self) -> bool:
+        """True when the row carries no live state and can be dropped."""
+        return (
+            not self.last_active
+            and self.active_conns == 0
+            and not self.unit_start_times
+            and not self.ensure_failures
+            and not self.ensure_locks
+            and self.forwarding_hmac_key is None
+            and not self.warm_inflight
+        )
+
+
+runtime: dict[str, ProjectRuntime] = {}
+
+
+def _rt(name: str) -> ProjectRuntime:
+    """Return ``name``'s runtime row, creating it on demand."""
+    rt = runtime.get(name)
+    if rt is None:
+        rt = ProjectRuntime()
+        runtime[name] = rt
+    return rt
+
+
+def _gc(name: str) -> None:
+    """Drop ``name``'s row once it carries no live state, so emptied
+    projects don't leak ``ProjectRuntime`` instances."""
+    rt = runtime.get(name)
+    if rt is not None and rt.is_empty():
+        runtime.pop(name, None)
+
+
+def forget(name: str, *, keep_hmac: bool = False, keep_lock: bool = False) -> None:
+    """Clear ALL per-project runtime state for ``name`` in one step.
+
+    The single "on lifecycle end" clear path — it replaces the three
+    copy-pasted (and drifted) clear blocks in ``admin_api`` plus
+    ``ProjectOrchestrator.stop`` and the idle reaper.
+
+      * ``keep_hmac=True`` retains the cached HMAC key — the idle reaper's
+        deliberate F015 v4 retention: the on-disk key file survives the
+        stop (``RuntimeDirectoryPreserve``), so the cache stays valid and
+        need not be re-read on the next start.
+      * ``keep_lock=True`` retains the ``_ensure`` lock, for callers that
+        clear state while HOLDING that lock (delete/rename/stop) and drop
+        it separately AFTER releasing — popping a held lock's map entry
+        early would let a concurrent ``_ensure`` mint a fresh lock and
+        skip serialisation.
+    """
+    rt = runtime.get(name)
+    if rt is None:
+        return
+    rt.last_active.clear()
+    rt.active_conns = 0
+    rt.unit_start_times.clear()
+    rt.ensure_failures.clear()
+    rt.warm_inflight = False
+    if not keep_hmac:
+        rt.forwarding_hmac_key = None
+    if not keep_lock:
+        rt.ensure_locks.clear()
+    _gc(name)
+
+
+# ── Compat views over ``runtime`` (one source of truth) ─────────────
+# The seven legacy module globals are views over ``runtime`` so the
+# router's call sites and its large test surface keep addressing state
+# by ``(name, role)`` / ``name`` unchanged. Every write routes through
+# the one ``runtime`` dict.
+
+
+class _RoleMap(MutableMapping):
+    """``(name, role)``-keyed view over ``runtime[name].<attr>[role]``."""
+
+    __slots__ = ("_attr",)
+
+    def __init__(self, attr: str) -> None:
+        self._attr = attr
+
+    def __getitem__(self, key):
+        name, role = key
+        rt = runtime.get(name)
+        sub = None if rt is None else getattr(rt, self._attr)
+        if sub is None or role not in sub:
+            raise KeyError(key)
+        return sub[role]
+
+    def __setitem__(self, key, value):
+        name, role = key
+        getattr(_rt(name), self._attr)[role] = value
+
+    def __delitem__(self, key):
+        name, role = key
+        rt = runtime.get(name)
+        sub = None if rt is None else getattr(rt, self._attr)
+        if sub is None or role not in sub:
+            raise KeyError(key)
+        del sub[role]
+        _gc(name)
+
+    def __iter__(self):
+        for name, rt in list(runtime.items()):
+            for role in list(getattr(rt, self._attr)):
+                yield (name, role)
+
+    def __len__(self):
+        return sum(len(getattr(rt, self._attr)) for rt in runtime.values())
+
+
+class _ConnMap:
+    """``name``-keyed int view (defaultdict(int) semantics) over
+    ``runtime[name].active_conns``."""
+
+    def __getitem__(self, name):
+        rt = runtime.get(name)
+        return rt.active_conns if rt is not None else 0
+
+    def __setitem__(self, name, value):
+        _rt(name).active_conns = value
+
+    def __contains__(self, name):
+        rt = runtime.get(name)
+        return rt is not None and rt.active_conns != 0
+
+    def get(self, name, default=0):
+        rt = runtime.get(name)
+        return rt.active_conns if rt is not None else default
+
+    def pop(self, name, default=None):
+        rt = runtime.get(name)
+        if rt is None:
+            return default
+        val = rt.active_conns
+        rt.active_conns = 0
+        _gc(name)
+        return val
+
+
+class _HmacMap:
+    """``name``-keyed bytes view over ``runtime[name].forwarding_hmac_key``."""
+
+    def __getitem__(self, name):
+        rt = runtime.get(name)
+        if rt is None or rt.forwarding_hmac_key is None:
+            raise KeyError(name)
+        return rt.forwarding_hmac_key
+
+    def __setitem__(self, name, value):
+        _rt(name).forwarding_hmac_key = value
+
+    def __contains__(self, name):
+        rt = runtime.get(name)
+        return rt is not None and rt.forwarding_hmac_key is not None
+
+    def get(self, name, default=None):
+        rt = runtime.get(name)
+        if rt is None or rt.forwarding_hmac_key is None:
+            return default
+        return rt.forwarding_hmac_key
+
+    def pop(self, name, default=None):
+        rt = runtime.get(name)
+        if rt is None or rt.forwarding_hmac_key is None:
+            return default
+        val = rt.forwarding_hmac_key
+        rt.forwarding_hmac_key = None
+        _gc(name)
+        return val
+
+
+class _WarmSet:
+    """``name``-membership view over ``runtime[name].warm_inflight``."""
+
+    def __contains__(self, name):
+        rt = runtime.get(name)
+        return rt is not None and rt.warm_inflight
+
+    def add(self, name):
+        _rt(name).warm_inflight = True
+
+    def discard(self, name):
+        rt = runtime.get(name)
+        if rt is not None:
+            rt.warm_inflight = False
+            _gc(name)
+
+
+last_active = _RoleMap("last_active")
+unit_start_times = _RoleMap("unit_start_times")
+ensure_failures = _RoleMap("ensure_failures")
+ensure_locks = _RoleMap("ensure_locks")
+active_conns = _ConnMap()
+forwarding_hmac_keys = _HmacMap()
+_warm_inflight = _WarmSet()
 
 # How long a failed ``_ensure`` stays cached. Read at every call so
 # tests can monkeypatch the module-level value mid-test without
@@ -162,7 +372,8 @@ def _clear_ensure_failures() -> None:
     the next successful ``_ensure`` or after the cooldown window
     expires. Tests reset between scenarios.
     """
-    ensure_failures.clear()
+    for rt in runtime.values():
+        rt.ensure_failures.clear()
 
 
 # ── Backend lifecycle primitives ────────────────────────────────────
@@ -206,10 +417,10 @@ def _sock_path(name: str, role: str) -> Path:
 # Operators who want to rotate the key delete
 # ``/run/agent-mcp/<name>/forwarding_hmac`` and restart the unit;
 # the next ExecStartPre regenerates.
-
-# {project_name: HMAC key bytes (32 bytes of os.urandom, written by
-# the systemd unit's ExecStartPre)}
-forwarding_hmac_keys: dict[str, bytes] = {}
+#
+# The cached bytes live on ``ProjectRuntime.forwarding_hmac_key``; the
+# ``forwarding_hmac_keys`` name (a ``_HmacMap`` view over ``runtime``,
+# defined above) preserves the ``{project_name: bytes}`` mapping surface.
 
 
 def _forwarding_hmac_path(name: str) -> Path:
@@ -247,9 +458,9 @@ def ensure_forwarding_hmac_key(name: str) -> bytes | None:
          the next cookie-path call to ``get_forwarding_hmac_key``
          picks it up off disk.
     """
-    cached = forwarding_hmac_keys.get(name)
-    if cached is not None:
-        return cached
+    rt = runtime.get(name)
+    if rt is not None and rt.forwarding_hmac_key is not None:
+        return rt.forwarding_hmac_key
     try:
         existing = _forwarding_hmac_path(name).read_bytes()
     except FileNotFoundError:
@@ -261,7 +472,7 @@ def ensure_forwarding_hmac_key(name: str) -> bytes | None:
         return None
     if not existing:
         return None
-    forwarding_hmac_keys[name] = existing
+    _rt(name).forwarding_hmac_key = existing
     return existing
 
 
@@ -336,11 +547,11 @@ def _is_active(unit: str) -> bool:
 
 
 def _ensure_lock(name: str, role: str) -> asyncio.Lock:
-    key = (name, role)
-    lock = ensure_locks.get(key)
+    rt = _rt(name)
+    lock = rt.ensure_locks.get(role)
     if lock is None:
         lock = asyncio.Lock()
-        ensure_locks[key] = lock
+        rt.ensure_locks[role] = lock
     return lock
 
 
@@ -353,13 +564,15 @@ async def _track_connection(name: str):
     the one observability point that gates lifecycle operations
     behind active client traffic.
     """
-    active_conns[name] += 1
+    rt = _rt(name)
+    rt.active_conns += 1
     try:
         yield
     finally:
-        active_conns[name] -= 1
-        if active_conns[name] <= 0:
-            active_conns.pop(name, None)
+        rt.active_conns -= 1
+        if rt.active_conns <= 0:
+            rt.active_conns = 0
+            _gc(name)
 
 
 async def _ensure(name: str, role: str) -> Path:
@@ -622,21 +835,16 @@ async def _reaper_tick() -> None:
             # reaped again. Don't stop-and-forget a re-activated unit.
             if last_active.get(key) != ts:
                 continue
-            last_active.pop(key, None)
-            # SC-R7-1: drop the boot-window record so a later start (or
-            # an autonomous systemd restart) of this unit is measured
-            # from its own fresh start, not this now-stopped instance.
-            unit_start_times.pop(key, None)
-            # F015 v4: no HMAC-cache pop here. The on-disk key file
-            # is owned by the systemd unit (RuntimeDirectoryPreserve
-            # keeps it across stop; ExecStartPre regenerates if
-            # missing), so the router's cache can stay populated
-            # across the reaper's stop with no consistency risk —
-            # the file the backend reloaded on the next start is the
-            # same bytes the router cached. The previous (F015 v3)
-            # cache-pop was symmetry plumbing for the router-as-
-            # writer model; F015 v4's read-only router doesn't need
-            # it.
+            # The single clear path (``forget``) drops last_active, the
+            # SC-R7-1 boot-window record (so a later start is measured
+            # fresh), and every other per-project map for this name.
+            # ``keep_hmac=True`` preserves the F015 v4 retention: the
+            # on-disk key file is owned by the systemd unit
+            # (RuntimeDirectoryPreserve keeps it across stop, ExecStartPre
+            # regenerates if missing), so the router's cache stays valid
+            # across the reaper's stop — no need to re-read on next start.
+            name, _role = key
+            forget(name, keep_hmac=True)
 
 
 # ── Alias-grace reaper (ADR-0010) ───────────────────────────────────
@@ -829,20 +1037,12 @@ class ProjectOrchestrator:
                     "reason": "systemctl_failed",
                     "message": "failed to stop project backend",
                 }
-        last_active.pop((name, "backend"), None)
-        # SC-R7-1: drop the boot-window record on an explicit stop for
-        # the same reason as the reaper — the next start is measured
-        # fresh.
-        unit_start_times.pop((name, "backend"), None)
-        # F015 v4: drop the in-memory HMAC cache entry so the next
-        # spawn re-reads from disk. The on-disk file is owned by the
-        # systemd unit (ExecStartPre regenerates if missing,
-        # RuntimeDirectoryPreserve=yes keeps it otherwise), so the
-        # bytes the next ``_ensure`` reads are whatever the next
-        # unit start guarantees. No functional change vs leaving the
-        # cache populated — but popping keeps the router's view in
-        # sync with the on-disk source-of-truth (cleaner reasoning).
-        forwarding_hmac_keys.pop(name, None)
+        # The single clear path: drops last_active, the SC-R7-1
+        # boot-window record (next start measured fresh), the in-memory
+        # HMAC cache (re-read from disk on next spawn), and every other
+        # per-project map for this name. This method holds no
+        # ``_ensure`` lock, so ``keep_lock`` isn't needed.
+        forget(name)
         return {"stopped": True}
 
     # ── list_active ───────────────────────────────────────────────

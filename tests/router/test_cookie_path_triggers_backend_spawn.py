@@ -310,7 +310,6 @@ async def cold_backend(router_env, monkeypatch):
         # ↓ Implementation: bind via runner_box during the test.
 
     stub = _ExecStartPreSystemctl(on_start_or_restart=_exec_start_pre)
-    monkeypatch.setattr(router, "_systemctl", stub)
     monkeypatch.setattr(_po, "_systemctl", stub)
 
     async def _noop(app):

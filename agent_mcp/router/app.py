@@ -100,7 +100,6 @@ import json
 import logging
 import os
 import re
-import subprocess
 import time
 from pathlib import Path
 from urllib.parse import quote
@@ -619,29 +618,16 @@ def _validate_name(name: str, existing: dict[str, str]) -> str | None:
 
 
 # ── Backend lifecycle helpers ────────────────────────────────────────
-# Delegated to ``project_orchestrator`` (PR-C). The aliases here keep
-# the existing local-name call sites in this file working without
-# textual churn; tests that ``monkeypatch.setattr(router, "_systemctl",
-# stub)`` still hit the same stub via the orchestrator because the
-# router-test conftest patches both attribute bindings.
+# Delegated to ``project_orchestrator`` (PR-C). ``_sock_path`` /
+# ``_unit_name`` are pure functions aliased for local call sites.
+#
+# ``_systemctl`` / ``_is_active`` are NOT re-bound here: the seam lives
+# in ONE module (``project_orchestrator``) so a test patches a single
+# ``monkeypatch.setattr(project_orchestrator, "_systemctl", stub)``.
+# This module's call sites reach it as ``_po._systemctl`` /
+# ``_po._is_active`` so the patch takes effect without a second binding.
 _sock_path = _po._sock_path
 _unit_name = _po._unit_name
-
-
-def _systemctl(*args: str) -> subprocess.CompletedProcess:
-    """Thin re-export of ``project_orchestrator._systemctl``.
-
-    Kept as a function (rather than a name alias like ``_sock_path``)
-    so legacy tests that ``monkeypatch.setattr(router, "_systemctl",
-    stub)`` see their stub used by every call site in *this* module;
-    call sites inside ``project_orchestrator`` use the orchestrator's
-    own binding, which the router-test conftest patches in parallel.
-    """
-    return _po._systemctl(*args)
-
-
-def _is_active(unit: str) -> bool:
-    return _systemctl("is-active", unit).returncode == 0
 
 
 async def _ensure(name: str, role: str) -> Path:
@@ -1377,8 +1363,11 @@ async def _warm_backend(name: str) -> None:
 # BL-R6-2a: names with an in-flight warm-start task. A flood of
 # ``/app/<name>/`` GETs (each serving only the static shell, no JS)
 # would otherwise spawn one untracked warm task per request; we dedup
-# so at most one warm-start is pending per project at a time.
-_warm_inflight: set[str] = set()
+# so at most one warm-start is pending per project at a time. Folded
+# into ``ProjectRuntime.warm_inflight``; re-exported here as a
+# set-membership view over ``runtime`` so the call sites below (and
+# any ``name in router._warm_inflight`` test) keep working.
+_warm_inflight = _po._warm_inflight
 
 
 def _schedule_backend_warm(req: web.Request, name: str) -> None:
@@ -1710,7 +1699,7 @@ def _build_overview_envelope() -> dict:
         name = row["name"]
         workspace = row["workspace"]
         unit = _unit_name(name, "backend")
-        running = _is_active(unit)
+        running = _po._is_active(unit)
         ts = last_active.get((name, "backend"))
         counts = _project_counts(workspace)
         projects_out.append(

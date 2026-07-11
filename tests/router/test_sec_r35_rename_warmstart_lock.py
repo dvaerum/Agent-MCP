@@ -67,7 +67,6 @@ async def test_rename_holds_ensure_lock_during_stop(
             return subprocess.CompletedProcess(list(args), 3, "", "")
         return subprocess.CompletedProcess(list(args), 0, "", "")
 
-    monkeypatch.setattr(router_module, "_systemctl", _stub_systemctl)
     monkeypatch.setattr(_po, "_systemctl", _stub_systemctl)
 
     client = await aiohttp_client(router_app)
@@ -119,7 +118,6 @@ async def test_concurrent_warmstart_during_rename_does_not_start_backend(
             return subprocess.CompletedProcess(list(args), 3, "", "")
         return subprocess.CompletedProcess(list(args), 0, "", "")
 
-    monkeypatch.setattr(router_module, "_systemctl", _stub_systemctl)
     monkeypatch.setattr(_po, "_systemctl", _stub_systemctl)
 
     client = await aiohttp_client(router_app)

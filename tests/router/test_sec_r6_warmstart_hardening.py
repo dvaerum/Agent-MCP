@@ -237,7 +237,6 @@ async def test_systemctl_start_runs_off_event_loop(
         return subprocess.CompletedProcess(list(args), 0, "", "")
 
     monkeypatch.setattr(_po, "_systemctl", _blocking_systemctl)
-    monkeypatch.setattr(router_module, "_systemctl", _blocking_systemctl)
 
     loop_free_at: list[float] = []
 

@@ -138,7 +138,6 @@ async def test_stop_holds_ensure_lock_during_systemctl_stop(
             observed["locked_during_stop"] = lock.locked()
         return subprocess.CompletedProcess(list(args), 0, "", "")
 
-    monkeypatch.setattr(router_module, "_systemctl", _stub_systemctl)
     monkeypatch.setattr(_po, "_systemctl", _stub_systemctl)
 
     client = await aiohttp_client(router_app)
@@ -187,7 +186,6 @@ async def test_concurrent_rename_loser_returns_404_not_500(
             return subprocess.CompletedProcess(list(args), 3, "", "")
         return subprocess.CompletedProcess(list(args), 0, "", "")
 
-    monkeypatch.setattr(router_module, "_systemctl", _stub_systemctl)
     monkeypatch.setattr(_po, "_systemctl", _stub_systemctl)
 
     client = await aiohttp_client(router_app)

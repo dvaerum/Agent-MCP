@@ -135,7 +135,6 @@ async def test_spawn_failure_response_is_generic(
         return subprocess.CompletedProcess(list(args), 0, "", "")
 
     monkeypatch.setattr(_po, "_systemctl", _failing_systemctl)
-    monkeypatch.setattr(router_module, "_systemctl", _failing_systemctl)
 
     with caplog.at_level("ERROR"):
         with pytest.raises(web.HTTPInternalServerError) as excinfo:
@@ -179,7 +178,6 @@ async def test_spawn_failure_cooldown_replay_is_generic(
         return subprocess.CompletedProcess(list(args), 0, "", "")
 
     monkeypatch.setattr(_po, "_systemctl", _failing_systemctl)
-    monkeypatch.setattr(router_module, "_systemctl", _failing_systemctl)
 
     with pytest.raises(web.HTTPInternalServerError):
         await _po._ensure("spawnfail2", "backend")
