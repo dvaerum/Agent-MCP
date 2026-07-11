@@ -30,9 +30,13 @@ now the single definition; both call sites import it.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from .principal import AgentRole, Principal, PrincipalKind
+
+#: The role vocabulary the MCP catalog surfaces (tools/list,
+#: prompts/list, prompts/get, resources/list, resources/read) filter on.
+CatalogRole = Literal["admin", "worker", "anonymous"]
 
 
 def normalize_agent_role(raw: object) -> Optional[AgentRole]:
@@ -168,6 +172,38 @@ def is_operator_tier(principal: Principal) -> bool:
     )
 
 
+def catalog_role(principal: Optional[Principal]) -> CatalogRole:
+    """The single source of truth for a caller's MCP-catalog role.
+
+    Every MCP catalog surface — ``tools/list`` (via
+    :func:`agent_mcp.tools.registry.list_available_tools`),
+    ``prompts/list`` + ``prompts/get`` (via ``_principal_role``), and
+    ``resources/list`` + ``resources/read`` — filters what a caller sees
+    by this role. Before arch-r3 #1+5 PR-B the three surfaces each
+    re-derived it from the Principal DIFFERENTLY and disagreed: a
+    viewer-tier ``forwarding_header`` caller resolved to ``"anonymous"``
+    for ``tools/list``, ``"worker"`` for prompts, and an ``agent_id``
+    string-match for resources. Routing all of them through this one
+    function removes the drift.
+
+    Mapping:
+
+    * ``None`` (no authenticated Principal in flight) → ``"anonymous"``.
+    * operator-tier (:func:`is_operator_tier` — carries the operator
+      write marker ``system.config.write`` via the sysadmin wildcard or
+      the operator project-role bundle, OR the legacy ``agent_id ==
+      "admin"`` pseudo-agent) → ``"admin"``.
+    * any other authenticated Principal (agent bearer, or a viewer-tier
+      operator / forwarding-header caller) → ``"worker"``: an
+      authenticated non-admin. A viewer carries read capabilities, so
+      the worker-tier catalog is exactly what it can act on; anonymous
+      would wrongly hide those.
+    """
+    if principal is None:
+        return "anonymous"
+    return "admin" if is_operator_tier(principal) else "worker"
+
+
 def _resolve_can_wake_loop(agent_id: str) -> bool:
     """Return the wake-loop eligibility for a bearer's ``agent_id``.
 
@@ -204,8 +240,10 @@ def _resolve_can_wake_loop(agent_id: str) -> bool:
 
 
 __all__ = [
+    "CatalogRole",
     "build_agent_bearer_principal",
     "build_operator_principal",
+    "catalog_role",
     "is_operator_tier",
     "normalize_agent_role",
 ]

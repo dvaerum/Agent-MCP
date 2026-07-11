@@ -528,73 +528,52 @@ MCPLowLevelServer.create_initialization_options = (  # type: ignore[assignment]
 )
 
 
+def _effective_catalog_principal():
+    """Resolve the Principal every MCP catalog surface filters on.
+
+    The MCP wire handlers are bare framework callbacks with no Request
+    handle, so they read the per-request Principal from
+    :data:`request_principal` (stamped by ``AuthHeaderMiddleware``).
+    In-process / test callers may stamp only :data:`request_auth_token`
+    (the bearer); for them we build the ``agent_bearer`` Principal
+    locally so the role resolves the same way production would. Returns
+    ``None`` when neither is set (anonymous).
+    """
+    principal = request_principal.get()
+    if principal is not None:
+        return principal
+    try:
+        bearer = request_auth_token.get()
+    except LookupError:
+        bearer = None
+    if bearer:
+        return _build_principal_from_request(
+            request=None,
+            bearer_token=bearer,
+            forwarding_operator=None,
+        )
+    return None
+
+
 @mcp_app_instance.list_tools()
 async def mcp_list_tools_handler() -> List[mcp_types.Tool]:
     """MCP endpoint to list available tools."""
-    principal = request_principal.get()
-    if principal is None:
-        # Fallback for in-process / test callers that haven't stamped
-        # request_principal but did stamp request_auth_token: build an
-        # agent_bearer Principal locally so the visibility filter
-        # resolves the same role label production would.
-        try:
-            bearer = request_auth_token.get()
-        except LookupError:
-            bearer = None
-        if bearer:
-            principal = _build_principal_from_request(
-                request=None,
-                bearer_token=bearer,
-                forwarding_operator=None,
-            )
-    return await list_available_tools(principal=principal)
+    return await list_available_tools(principal=_effective_catalog_principal())
 
 
 def _principal_role() -> str:
-    """Resolve the calling Principal's role for visibility filtering.
+    """Resolve the calling Principal's MCP-catalog role.
 
-    Returns ``"admin"`` for operator-tier callers, ``"worker"`` for
-    any agent bearer, ``"anonymous"`` when no Principal is in flight.
-
-    Falls back to a synthesized ``agent_bearer`` Principal built from
-    :data:`request_auth_token` for in-process callers (tests, scripts)
-    that haven't stamped :data:`request_principal` directly.
-
-    Wave 9 PR 6: the operator-tier check is the typed Principal's own
-    discriminators (``sysadmin`` flag or operator-kind seam) rather
-    than the deleted ``has_role("admin")`` bridge.
-
-    SEC-1 (2026-07): an operator-tier Principal only maps to ``admin``
-    when it actually holds the operator role (or is a sysadmin). A
-    viewer-tier operator (``project_role == "viewer"``) is NOT admin —
-    mapping every ``forwarding_header`` / ``operator_session`` caller
-    to ``admin`` regardless of role let a viewer see admin-only
-    Prompt Book entries, the same escalation class as the capability
-    collapse this fix closes. A viewer maps to ``worker`` (an
-    authenticated non-admin) so admin-only prompts stay hidden.
+    arch-r3 #1+5 PR-B: a thin adapter over the single
+    :func:`agent_mcp.core.principal_builder.catalog_role` so this
+    surface (prompts/list + prompts/get) resolves the SAME role
+    tools/list and resources do for a given Principal. The
+    SEC-1 viewer→worker mapping and the sysadmin→admin / operator→admin
+    mapping now live in that one function.
     """
-    principal = request_principal.get()
-    if principal is None:
-        try:
-            bearer = request_auth_token.get()
-        except LookupError:
-            bearer = None
-        if bearer:
-            agent_id = get_agent_id(bearer)
-            if agent_id == "admin":
-                return "admin"
-            if agent_id:
-                return "worker"
-        return "anonymous"
-    if principal.sysadmin:
-        return "admin"
-    if principal.kind in ("operator_session", "forwarding_header"):
-        # Operator-tier: admin only for the operator role; a viewer is
-        # a non-admin authenticated caller.
-        return "admin" if principal.project_role == "operator" else "worker"
-    if principal.kind == "agent_bearer":
-        return "worker"
-    return "anonymous"
+    from ..core.principal_builder import catalog_role
+
+    return catalog_role(_effective_catalog_principal())
 
 
 @mcp_app_instance.list_prompts()
@@ -674,19 +653,25 @@ async def mcp_list_resources_handler() -> List[mcp_types.Resource]:
     Each entry in `resource_registry` is scoped to the calling
     bearer's agent_id (admin sees their own admin-scoped pair;
     workers see their own). Cross-agent reads are rejected at
-    `resources/read` time. Unauthenticated callers see an empty
-    list — same UX choice as `tools/list` for anonymous role.
+    `resources/read` time. Unauthenticated callers — and operator /
+    forwarding-header callers, who carry no per-agent inbox — see an
+    empty list.
+
+    arch-r3 #1+5 PR-B: the role is derived by the shared
+    :func:`agent_mcp.core.principal_builder.catalog_role` (as for
+    tools/list + prompts), not a bare ``agent_id == "admin"`` string
+    test. The URI is scoped by the caller's own ``agent_id``.
     """
-    from ..core.auth import get_agent_id
+    from ..core.principal_builder import catalog_role
     from ..resources import resource_registry
     from pydantic_core import Url
 
-    token = request_auth_token.get()
-    agent_id = get_agent_id(token) if token else None
+    principal = _effective_catalog_principal()
+    agent_id = principal.agent_id if principal is not None else None
     if not agent_id:
         return []
 
-    role = "admin" if agent_id == "admin" else "worker"
+    role = catalog_role(principal)
     resources: List[mcp_types.Resource] = []
     for entry in resource_registry.list_visible(role):
         resources.append(
@@ -710,7 +695,9 @@ async def mcp_read_resource_handler(uri):
     if/elif chain to update here.
 
     Cross-agent reads are rejected; admin can read any agent's
-    resources (operational visibility).
+    resources (operational visibility) — determined by the shared
+    :func:`agent_mcp.core.principal_builder.catalog_role` (arch-r3
+    #1+5 PR-B), not a bare ``agent_id == "admin"`` string test.
     """
     from ..resources import resource_registry
     from mcp.server.lowlevel.helper_types import ReadResourceContents
@@ -719,7 +706,11 @@ async def mcp_read_resource_handler(uri):
     token = request_auth_token.get()
     # `read()` raises ValueError on auth mismatch / unknown URI —
     # the framework surfaces the message verbatim as a JSON-RPC error.
-    text = resource_registry.read(uri_str, token)
+    # Thread the resolved Principal so the cross-agent admin gate uses
+    # the same catalog_role every other surface does.
+    text = resource_registry.read(
+        uri_str, token, principal=_effective_catalog_principal()
+    )
 
     entry = resource_registry.find_by_uri(uri_str)
     mime = entry.meta.mime_type if entry else "application/json"

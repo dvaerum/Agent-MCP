@@ -42,10 +42,13 @@ through `wait_for_events`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from ..core.auth import get_agent_id
 from ..core.registry import Registry, RegistryEntry
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ..core.principal import Principal
 
 # Two URI prefixes scoped per-agent.
 INBOX_URI_PREFIX = "agent-mcp://inbox/"
@@ -87,7 +90,13 @@ class ResourceRegistry(Registry[ResourceReader]):
                 return entry
         return None
 
-    def read(self, uri: str, caller_token: Optional[str]) -> str:
+    def read(
+        self,
+        uri: str,
+        caller_token: Optional[str],
+        *,
+        principal: Optional["Principal"] = None,
+    ) -> str:
         """Resolve agent_id from the URI + bearer, then invoke the
         matching reader.
 
@@ -98,11 +107,18 @@ class ResourceRegistry(Registry[ResourceReader]):
         entry = self.find_by_uri(uri)
         if entry is None:
             raise ValueError(f"Unknown resource URI: {uri}")
-        agent_id = resolve_agent_id_for_uri(uri, caller_token)
+        agent_id = resolve_agent_id_for_uri(
+            uri, caller_token, principal=principal
+        )
         return entry.meta.render(agent_id)
 
 
-def resolve_agent_id_for_uri(uri: str, caller_token: Optional[str]) -> str:
+def resolve_agent_id_for_uri(
+    uri: str,
+    caller_token: Optional[str],
+    *,
+    principal: Optional["Principal"] = None,
+) -> str:
     """Resolve which agent_id a `resources/read` URI is addressing,
     given the calling bearer.
 
@@ -113,9 +129,26 @@ def resolve_agent_id_for_uri(uri: str, caller_token: Optional[str]) -> str:
     exception into a JSON-RPC error.
 
     Admin can read any agent's resource (operational visibility);
-    workers may only read their own.
+    workers may only read their own. arch-r3 #1+5 PR-B: "admin" is now
+    the shared :func:`agent_mcp.core.principal_builder.catalog_role`
+    decision (which folds in the legacy ``agent_id == "admin"`` label
+    via :func:`is_operator_tier`), not a bare string test — the same
+    admin determination every other MCP catalog surface uses. When the
+    handler didn't thread a Principal (in-process / test callers with
+    only a bearer), one is built from the token so the decision is
+    identical.
     """
-    bearer_agent_id = get_agent_id(caller_token) if caller_token else None
+    from ..core.principal_builder import build_agent_bearer_principal, catalog_role
+
+    if principal is None and caller_token:
+        principal = build_agent_bearer_principal(caller_token)
+
+    # The bearer's own agent_id scopes "read your own"; fall back to the
+    # token resolver when the Principal carries no agent_id (it's the
+    # same lookup get_agent_id would do).
+    bearer_agent_id = principal.agent_id if principal is not None else None
+    if not bearer_agent_id and caller_token:
+        bearer_agent_id = get_agent_id(caller_token)
     if not bearer_agent_id:
         raise ValueError("Unauthorized: token does not resolve to an agent")
 
@@ -131,9 +164,9 @@ def resolve_agent_id_for_uri(uri: str, caller_token: Optional[str]) -> str:
     if uri_agent_id is None:
         raise ValueError(f"Unknown resource URI: {uri}")
 
-    # Admin can read any agent's resource (operational visibility).
-    # Other callers may only read their own.
-    if bearer_agent_id == "admin":
+    # Admin (per the shared catalog_role) can read any agent's resource
+    # (operational visibility). Other callers may only read their own.
+    if catalog_role(principal) == "admin":
         return uri_agent_id
     if uri_agent_id != bearer_agent_id:
         raise ValueError(
