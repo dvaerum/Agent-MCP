@@ -33,9 +33,8 @@ import datetime as _dt
 
 import pytest
 
-from agent_mcp.core.principal import Principal
 from agent_mcp.core.tool_result import Ok
-from tests.harness import mcp_session, with_principal
+from tests.harness import make_principal, mcp_session, with_principal
 
 pytestmark = pytest.mark.asyncio
 
@@ -99,7 +98,7 @@ async def test_add_task_note_via_dispatch_returns_ok_with_data(tmp_path) -> None
     async with mcp_session(tmp_path):
         _insert_task("wave6-demo-1")
 
-        p = Principal(
+        p = make_principal(
             kind="operator_session",
             user_id="alice",
             agent_id=None,
@@ -288,7 +287,7 @@ async def test_with_principal_helper_stamps_request_principal(tmp_path) -> None:
     async with mcp_session(tmp_path):
         _insert_task("wave6-demo-helper-1")
 
-        p = Principal(
+        p = make_principal(
             kind="operator_session",
             user_id="bob",
             agent_id=None,

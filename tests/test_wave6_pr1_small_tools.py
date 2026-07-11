@@ -41,7 +41,7 @@ from agent_mcp.core.tool_result import (
     Ok,
     PermissionDenied,
 )
-from tests.harness import mcp_session
+from tests.harness import make_principal, mcp_session
 
 pytestmark = pytest.mark.asyncio
 
@@ -58,7 +58,7 @@ def _operator_principal(user_id: str = "alice") -> Principal:
     decisions resolve correctly without needing the harness's
     legacy ContextVar stamps.
     """
-    return Principal(
+    return make_principal(
         kind="operator_session",
         user_id=user_id,
         agent_id=None,
@@ -84,7 +84,7 @@ def _agent_principal(
     ``agents.agent_role`` column; pass ``"manager"`` for
     supervision-tier tests.
     """
-    return Principal(
+    return make_principal(
         kind="agent_bearer",
         user_id=None,
         agent_id=agent_id,

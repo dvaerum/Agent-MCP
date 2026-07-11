@@ -47,7 +47,7 @@ from agent_mcp.features.rag.query import (
     query_rag_system_with_model,
 )
 from agent_mcp.tools.rag_tools import ask_project_rag_tool_impl
-from tests.harness import mcp_session
+from tests.harness import make_principal, mcp_session
 
 pytestmark = pytest.mark.asyncio
 
@@ -61,7 +61,7 @@ _CONFIG_LEAK = "OPENAI_MODEL unset; internal-config-path=/etc/agentmcp/x"
 
 
 def _worker_principal(agent_id: str = "w1") -> Principal:
-    return Principal(
+    return make_principal(
         kind="agent_bearer",
         user_id=None,
         agent_id=agent_id,

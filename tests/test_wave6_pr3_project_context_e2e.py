@@ -40,7 +40,7 @@ from agent_mcp.core.tool_result import (
     Ok,
     PermissionDenied,
 )
-from tests.harness import mcp_session
+from tests.harness import make_principal, mcp_session
 
 pytestmark = pytest.mark.asyncio
 
@@ -60,7 +60,7 @@ def _operator_principal(
     is the operator-tier gate every migrated tool uses for
     is-admin branching.
     """
-    return Principal(
+    return make_principal(
         kind="operator_session",
         user_id=user_id,
         agent_id=None,
@@ -83,7 +83,7 @@ def _worker_principal(
     don't bypass operator-only gates) and ``has_role("manager")``
     also returns False (the row's ``agent_role`` is ``"worker"``).
     """
-    return Principal(
+    return make_principal(
         kind="agent_bearer",
         user_id=None,
         agent_id=agent_id,

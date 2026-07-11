@@ -39,7 +39,7 @@ from typing import Any, Dict, List
 
 import pytest
 
-from tests.harness import mcp_session
+from tests.harness import make_principal, mcp_session
 
 
 pytestmark = pytest.mark.asyncio
@@ -312,11 +312,10 @@ async def test_admin_cannot_forge_worker_created_by(tmp_path) -> None:
     pops the key on the admin/manager branch, so attribution stays
     ``admin``."""
     from agent_mcp.tools.task_tools import assign_task_tool_impl
-    from agent_mcp.core.principal import Principal
 
     async with mcp_session(tmp_path) as admin:
         forged_title = "unassigned task with forged provenance"
-        principal = Principal(
+        principal = make_principal(
             kind="agent_bearer",
             user_id="op",
             agent_id="admin",

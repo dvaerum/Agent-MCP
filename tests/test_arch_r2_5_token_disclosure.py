@@ -31,6 +31,7 @@ with identical information — the per-agent bearer.
 from __future__ import annotations
 
 from agent_mcp.core.principal import Principal
+from tests.harness import make_principal
 
 
 def _rest_answer(auth: dict) -> bool:
@@ -48,7 +49,7 @@ def _mcp_answer(principal: Principal) -> bool:
 def _manager_bearer_principal() -> Principal:
     """A per-agent MANAGER bearer — the MCP twin of REST's
     ``operator_bearer`` auth dict."""
-    return Principal(
+    return make_principal(
         kind="agent_bearer",
         user_id=None,
         agent_id="mgr-agent",
@@ -62,7 +63,7 @@ def _manager_bearer_principal() -> Principal:
 
 
 def _worker_bearer_principal() -> Principal:
-    return Principal(
+    return make_principal(
         kind="agent_bearer",
         user_id=None,
         agent_id="wkr-agent",

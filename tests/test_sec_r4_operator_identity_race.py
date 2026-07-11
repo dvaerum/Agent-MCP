@@ -49,6 +49,7 @@ from agent_mcp.app.main_app import AuthHeaderMiddleware
 from agent_mcp.core import globals as g
 from agent_mcp.core.principal import Principal
 from starlette.requests import Request
+from tests.harness import make_principal
 
 
 pytestmark = pytest.mark.asyncio
@@ -84,7 +85,7 @@ def _make_request(path: str = "/api/all-data", header_value: str | None = None) 
 
 
 def _forwarding_principal(operator_id: str) -> Principal:
-    return Principal(
+    return make_principal(
         kind="forwarding_header",
         user_id=operator_id,
         agent_id=None,

@@ -39,6 +39,7 @@ from agent_mcp.app.deps import (
     require_operator_session,
 )
 from agent_mcp.core.principal import Principal
+from tests.harness import make_principal
 
 
 pytestmark = pytest.mark.asyncio
@@ -81,7 +82,7 @@ class _FakeRequest:
 def _forwarding_principal(role: Optional[str], *, user_id: str = "op-1") -> Principal:
     """A ``forwarding_header`` Principal as the auth middleware would build
     it — carrying the operator's REAL signed ``project_role``."""
-    return Principal(
+    return make_principal(
         kind="forwarding_header",
         user_id=user_id,
         agent_id=None,

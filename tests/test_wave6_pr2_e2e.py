@@ -35,7 +35,7 @@ from agent_mcp.core.tool_result import (
     Ok,
     PermissionDenied,
 )
-from tests.harness import mcp_session, with_principal
+from tests.harness import make_principal, mcp_session, with_principal
 
 pytestmark = pytest.mark.asyncio
 
@@ -44,7 +44,7 @@ pytestmark = pytest.mark.asyncio
 
 
 def _operator_principal(user_id: str = "alice") -> Principal:
-    return Principal(
+    return make_principal(
         kind="operator_session",
         user_id=user_id,
         agent_id=None,
@@ -58,7 +58,7 @@ def _operator_principal(user_id: str = "alice") -> Principal:
 
 
 def _worker_principal(agent_id: str, token: str) -> Principal:
-    return Principal(
+    return make_principal(
         kind="agent_bearer",
         user_id=None,
         agent_id=agent_id,

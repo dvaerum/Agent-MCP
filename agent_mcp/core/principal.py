@@ -28,24 +28,31 @@ deprecated ``@requires`` / ``@requires_role`` decorators; the
 capability vocabulary (:meth:`Principal.has_capability` consulting
 :data:`agent_mcp.core.capabilities.KNOWN_CAPABILITIES`) is now the
 single authorization surface.
+
+arch-r5 #1: the Wave 9 PR 0 migration-window bridge (a ``_CAPS_UNSET``
+sentinel + a ``__post_init__`` back-fill that resolved capabilities
+from identity fields when the caller omitted ``capabilities=``) has
+been retired now that PR 6 closed the migration window. It was a
+silent SECOND capability-resolution path: the back-fill could not
+accept a ``groups=`` argument (a bare ``Principal(...)`` call has no
+group context), so for a group-privileged identity it resolved a
+STRICTLY SMALLER cap set than :func:`agent_mcp.core.principal_builder.build_operator_principal`
+mints for the same identity — silently, with no error. ``capabilities``
+is now a required field: every construction site must resolve caps
+through :func:`agent_mcp.core.capabilities.resolve_capabilities` (or
+one of the two builders in ``principal_builder.py`` that wrap it)
+itself, so "same identity -> same caps regardless of construction
+site" is enforced structurally rather than by convention.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal, Optional
 
 
 PrincipalKind = Literal["operator_session", "agent_bearer", "forwarding_header"]
 AgentRole = Literal["worker", "manager"]
-
-
-# Sentinel used to distinguish "caller did not pass capabilities="
-# from "caller passed an explicitly empty set". Module-private; never
-# stored on a Principal. Wave 9 PR 0 — when the migration window
-# closes in PR 6 the dataclass switches to a required field and the
-# sentinel disappears.
-_CAPS_UNSET: frozenset[str] = frozenset({"__capabilities_unset_sentinel__"})
 
 
 @dataclass(frozen=True)
@@ -108,45 +115,13 @@ class Principal:
     agent_role: Optional[AgentRole]
     can_wake_loop: bool
     source_token: Optional[str]
-    # Wave 9 PR 0: capability set resolved at middleware time. Default
-    # is the ``_CAPS_UNSET`` sentinel so ``__post_init__`` can detect
-    # "caller did not supply" and back-fill via
-    # ``resolve_capabilities`` from the identity fields. Pre-Wave-9
-    # construction sites (~30 places across tests, app routers, and
-    # in-process synthesis) keep working unchanged — they get the
-    # capabilities their identity shape implies. Explicit
-    # ``capabilities=frozenset(...)`` overrides the back-fill so the
-    # auth middleware can pass the result of ``resolve_capabilities``
-    # (which also consults group caps from router.db) verbatim.
-    capabilities: frozenset[str] = field(default=_CAPS_UNSET)
-
-    def __post_init__(self) -> None:
-        """Back-fill ``capabilities`` from identity fields when unset.
-
-        Wave 9 PR 0 — bridge: pre-Wave-9 Principal construction sites
-        don't yet pass ``capabilities=``. Rather than touch every one
-        of them in PR 0 (the scope is foundation + bridge, not call-
-        site migration), we resolve from the identity shape here. The
-        production middleware path already calls
-        :func:`resolve_capabilities` with the full identity + group
-        context and passes the result explicitly, so this back-fill
-        only fires for in-process synthesis (tests, dispatcher
-        fallbacks).
-        """
-        if self.capabilities is _CAPS_UNSET:
-            from .capabilities import resolve_capabilities
-            object.__setattr__(
-                self,
-                "capabilities",
-                resolve_capabilities(
-                    user_id=self.user_id,
-                    agent_id=self.agent_id,
-                    sysadmin=self.sysadmin,
-                    agent_role=self.agent_role,
-                    project_role=self.project_role,
-                    kind=self.kind,
-                ),
-            )
+    # Required — arch-r5 #1 retired the back-fill bridge. Every caller
+    # must resolve this itself via
+    # :func:`agent_mcp.core.capabilities.resolve_capabilities` (or one
+    # of the ``principal_builder.py`` builders that wrap it) so there
+    # is exactly ONE capability-resolution path, not a production path
+    # plus a silently-narrower fallback.
+    capabilities: frozenset[str]
 
     # ── Authorization helpers ────────────────────────────────────
 

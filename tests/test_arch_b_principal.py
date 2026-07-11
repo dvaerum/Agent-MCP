@@ -33,13 +33,14 @@ from agent_mcp.core.principal_builder import (
     build_operator_principal,
     is_operator_tier,
 )
+from tests.harness import make_principal
 
 
 def _admin_labelled_manager() -> Principal:
     """The harness's manager-role row labelled ``admin`` — the exact
     identity whose classification the two predicate copies disagreed on.
     """
-    return Principal(
+    return make_principal(
         kind="agent_bearer",
         user_id=None,
         agent_id="admin",
@@ -83,12 +84,12 @@ def test_operator_tier_predicate_consistent_for_admin_manager() -> None:
 def test_operator_tier_predicate_excludes_plain_manager_and_viewer() -> None:
     """A non-admin manager bearer and a viewer operator are NOT
     operator-tier (regression guard on the reconciled definition)."""
-    manager = Principal(
+    manager = make_principal(
         kind="agent_bearer", user_id=None, agent_id="w1", sysadmin=False,
         project_name=None, project_role=None, agent_role="manager",
         can_wake_loop=False, source_token="t",
     )
-    viewer = Principal(
+    viewer = make_principal(
         kind="forwarding_header", user_id="op", agent_id=None, sysadmin=False,
         project_name=None, project_role="viewer", agent_role=None,
         can_wake_loop=False, source_token=None,
@@ -171,3 +172,115 @@ def test_agent_bearer_builder_returns_none_for_no_bearer(monkeypatch) -> None:
     assert build_agent_bearer_principal("") is None
     monkeypatch.setattr(auth, "get_agent_id", lambda tok: None)
     assert build_agent_bearer_principal("bogus") is None
+
+
+# ── arch-r5 #1: capabilities is required — no silent back-fill ──────
+
+
+def test_principal_requires_capabilities_no_back_fill() -> None:
+    """``Principal(...)`` without ``capabilities=`` now raises
+    ``TypeError`` — the Wave 9 PR 0 ``__post_init__`` back-fill (which
+    resolved caps from identity fields when the caller omitted
+    ``capabilities=``) is gone. Structurally closes the class of bug
+    this file's RED cases below exercise: there is no construction
+    path left that can silently resolve a caps set without going
+    through :func:`resolve_capabilities` (or a builder that wraps it)
+    explicitly.
+    """
+    import pytest
+
+    with pytest.raises(TypeError):
+        Principal(  # type: ignore[call-arg]
+            kind="agent_bearer",
+            user_id=None,
+            agent_id="x",
+            sysadmin=False,
+            project_name=None,
+            project_role=None,
+            agent_role=None,
+            can_wake_loop=False,
+            source_token=None,
+        )
+
+
+def test_group_privileged_identity_builder_matches_direct_resolver(
+    monkeypatch,
+) -> None:
+    """arch-r5 #1 — the property the deleted back-fill made impossible
+    to hold: for a group-privileged identity, the builder's caps and a
+    direct :func:`resolve_capabilities` call with the SAME ``groups=``
+    are bit-for-bit identical (exactly one resolution path), AND a
+    resolution that can't see the caller's groups — the shape the
+    ``__post_init__`` back-fill was permanently stuck in, since a bare
+    ``Principal(...)`` call has no way to thread ``groups=`` through —
+    is a STRICT SUBSET of the full resolution.
+
+    RED before this candidate: the back-fill called
+    ``resolve_capabilities(...)`` from ``Principal.__post_init__``
+    WITHOUT a ``groups=`` argument (it had no way to receive one — a
+    bare dataclass constructor call carries no group context). Any
+    caller that built a Principal directly for a group-privileged
+    identity — instead of going through
+    :func:`build_operator_principal` — silently got the narrower,
+    groups-blind set below (``blind``) while believing it had the
+    caller's full grant (``built``). ``capabilities`` being required
+    now makes that impossible: you cannot construct a Principal at all
+    without deciding how to resolve caps, so the narrower path can no
+    longer happen silently.
+    """
+    import agent_mcp.repositories.group_capability_repository as gcr
+    import agent_mcp.router.group_resolver as gr
+
+    # Model a router.db-blind resolution context — self-resolving via
+    # ``resolve_user_groups`` (what a bare/back-filled Principal was
+    # stuck with) finds nothing for this identity.
+    monkeypatch.setattr(gr, "resolve_user_groups", lambda user_id: set())
+    monkeypatch.setattr(
+        gcr,
+        "fetch",
+        lambda gid: frozenset({"system.groups.manage"}) if gid == "g1" else frozenset(),
+    )
+
+    # The caller (e.g. the router auth middleware) already resolved
+    # the identity's transitive group set through its own means and
+    # threads it through explicitly.
+    groups = {"g1"}
+
+    built = build_operator_principal(
+        user_id="grouped-operator",
+        kind="operator_session",
+        project_role="viewer",
+        sysadmin=False,
+        groups=groups,
+    )
+    direct = resolve_capabilities(
+        user_id="grouped-operator",
+        agent_id=None,
+        sysadmin=False,
+        agent_role=None,
+        project_role="viewer",
+        kind="operator_session",
+        groups=groups,
+    )
+    assert built.capabilities == direct
+    assert "system.groups.manage" in built.capabilities
+
+    # The groups-blind shape: no groups= passed at all — self-resolve
+    # via (the monkeypatched) resolve_user_groups, which finds nothing
+    # for this identity. This is exactly what the deleted
+    # __post_init__ back-fill produced for every bare Principal(...)
+    # call — it could never pass groups= because it had none to pass.
+    blind = resolve_capabilities(
+        user_id="grouped-operator",
+        agent_id=None,
+        sysadmin=False,
+        agent_role=None,
+        project_role="viewer",
+        kind="operator_session",
+    )
+    assert blind < built.capabilities, (
+        "a groups-blind resolution must be a STRICT SUBSET of the "
+        "groups-aware one for a group-privileged identity — this is "
+        "the gap the deleted __post_init__ back-fill silently opened"
+    )
+    assert "system.groups.manage" not in blind

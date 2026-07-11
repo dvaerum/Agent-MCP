@@ -30,7 +30,7 @@ import pytest
 
 from agent_mcp.features.rag import query as query_mod
 from agent_mcp.features.rag.query import query_rag_system
-from tests.harness import mcp_session
+from tests.harness import make_principal, mcp_session
 
 
 _SECRET_VALUE = "SENTINEL-R2-SECRET-4c8e"
@@ -254,7 +254,6 @@ async def test_view_context_clamps_negative_max_results(tmp_path) -> None:
     optional. This drives the impl DIRECTLY (the jsonschema-absent path)
     and asserts the in-code clamp caps the result at a single row despite
     three rows existing."""
-    from agent_mcp.core.principal import Principal
     from agent_mcp.tools.project_context_tools import (
         view_project_context_tool_impl,
     )
@@ -264,7 +263,7 @@ async def test_view_context_clamps_negative_max_results(tmp_path) -> None:
         _seed(admin, key="r2_clamp_b", value="bbb")
         _seed(admin, key="r2_clamp_c", value="ccc")
 
-        principal = Principal(
+        principal = make_principal(
             kind="agent_bearer",
             user_id="op",
             agent_id="admin",
