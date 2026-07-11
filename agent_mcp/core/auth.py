@@ -42,8 +42,9 @@ def query_agent_status(token: str) -> Optional[Dict[str, Any]]:
     Purpose
     -------
     The in-memory ``g.active_agents`` map is rebuilt on startup from
-    rows whose ``status != 'terminated'``. A bearer for a terminated
-    agent therefore fails the per-request auth check and is
+    live rows only (the canonical ``LIVE_AGENT_SQL`` predicate —
+    excludes both ``'terminated'`` and ``'tombstone'``). A bearer for a
+    terminated agent therefore fails the per-request auth check and is
     indistinguishable from a freshly-invented unknown token — both
     produce the same generic 401.
 

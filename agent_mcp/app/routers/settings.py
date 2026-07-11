@@ -127,9 +127,16 @@ async def tokens_api_route(
             status_code=403,
         )
     try:
+        # arch-deepening F: use the canonical live-agent predicate. The
+        # old ``!= 'terminated'`` filter was the WEAKER variant and let a
+        # 'tombstone' entry (`[deleted-<id>]`, reserved ``__tombstone_*``
+        # token) leak its bearer here if one ever reached the in-memory
+        # allow-list. ``is_live_status`` excludes tombstone too.
+        from ...repositories.agent_repository import is_live_status
+
         agent_tokens_list = []
         for token, data in g.active_agents.items():
-            if data.get("status") != "terminated":
+            if is_live_status(data.get("status")):
                 agent_tokens_list.append({"agent_id": data.get("agent_id"), "token": token})
         return JSONResponse({"agent_tokens": agent_tokens_list})
     except Exception as e:

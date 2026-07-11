@@ -140,8 +140,9 @@ def _generate_message_id() -> str:
 def _agents_active_by_id() -> set[str]:
     """Set of agent_ids currently registered as active.
 
-    PR-W2c: routed through AgentRepository so terminated agents are
-    excluded by DB-level filter (status != 'terminated') and tokens
+    PR-W2c: routed through AgentRepository so non-live agents are
+    excluded by the canonical DB-level filter (LIVE_AGENT_SQL —
+    excludes 'terminated' AND 'tombstone') and tokens
     aren't part of the projection. The cache shape (token-keyed) is
     irrelevant to callers — they want the set of *agent_ids* for
     membership tests.

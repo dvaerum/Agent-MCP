@@ -84,6 +84,45 @@ from ..core.config import logger
 from ..db.engine import get_session
 from ..db.models import Agent
 
+# ---------------------------------------------------------------------------
+# Canonical "is this a live agent?" predicate (arch-deepening F).
+#
+# WHY this exists: the same concept was expressed two ways across the
+# codebase and the two variants DRIFTED. The strict form
+# ``status NOT IN ('terminated', 'tombstone')`` correctly excludes both
+# soft-deleted agents AND ``[deleted-<id>]`` tombstone rows (purge-cascade
+# FK artefacts, reserved ``__tombstone_*`` tokens — see ``insert_tombstone``).
+# A weaker ``status != 'terminated'`` variant lingered on a few surfaces and
+# LET TOMBSTONE ROWS LEAK THROUGH (e.g. a tombstone bearer surfacing on the
+# operator token listing). One fragment + one helper is the single source of
+# truth so the weak variant cannot re-appear.
+#
+# ``LIVE_AGENT_SQL`` is a WHERE-clause fragment built ONLY from trusted
+# literals (no interpolation of caller input) — safe to f-string into raw
+# SQL. ``TERMINAL_AGENT_STATUSES`` is the Python-side companion for
+# in-memory status checks. ``is_live_agent`` is the raw-cursor point lookup.
+TERMINAL_AGENT_STATUSES: Tuple[str, ...] = ("terminated", "tombstone")
+LIVE_AGENT_SQL = "status NOT IN ('terminated', 'tombstone')"
+
+
+def is_live_status(status: Optional[str]) -> bool:
+    """True iff ``status`` denotes a live agent (not terminated/tombstone)."""
+    return status not in TERMINAL_AGENT_STATUSES
+
+
+def is_live_agent(agent_id: str, cursor: Any) -> bool:
+    """True iff a live (non-terminated, non-tombstone) agent row exists.
+
+    ``cursor`` is a raw sqlite cursor (the caller owns the connection).
+    Uses :data:`LIVE_AGENT_SQL` so this predicate can never drift from
+    the other converged sites.
+    """
+    cursor.execute(
+        f"SELECT 1 FROM agents WHERE agent_id = ? AND {LIVE_AGENT_SQL}",
+        (agent_id,),
+    )
+    return cursor.fetchone() is not None
+
 
 def _publish(addressee: str, event: str, payload: Dict[str, Any]) -> None:
     """Lazy-import shim around ``_event_bus_shim.publish``.
@@ -282,7 +321,7 @@ def get_all_active_agents_from_db() -> List[Dict[str, Any]]:
         with get_session() as session:
             rows = (
                 session.query(Agent)
-                .filter(Agent.status.notin_(("terminated", "tombstone")))
+                .filter(Agent.status.notin_(TERMINAL_AGENT_STATUSES))
                 .all()
             )
             return [_agent_to_dict(r) for r in rows]
@@ -463,7 +502,7 @@ class AgentRepository:
         if (
             row is not None
             and not self._cache_disabled
-            and row.get("status") not in ("terminated", "tombstone")
+            and row.get("status") not in TERMINAL_AGENT_STATUSES
         ):
             token = row.get("token")
             if token:
@@ -494,7 +533,7 @@ class AgentRepository:
         if (
             row is not None
             and not self._cache_disabled
-            and row.get("status") not in ("terminated", "tombstone")
+            and row.get("status") not in TERMINAL_AGENT_STATUSES
         ):
             state.active_agents[token] = row
             agent_id = row.get("agent_id")
@@ -1097,15 +1136,15 @@ class AgentRepository:
             # terminatable — flipping it to 'terminated' would leak the
             # artefact into the terminated-agents listing. Treat it (and
             # an already-terminated row) as not-found.
-            if row_status in ("terminated", "tombstone"):
+            if row_status in TERMINAL_AGENT_STATUSES:
                 return False
             token = row_token
             cur.execute(
-                """
+                f"""
                 UPDATE agents
                 SET status = ?, terminated_at = ?, updated_at = ?,
                     current_task = NULL
-                WHERE agent_id = ? AND status NOT IN ('terminated', 'tombstone')
+                WHERE agent_id = ? AND {LIVE_AGENT_SQL}
                 """,
                 ("terminated", terminated_at, terminated_at, agent_id),
             )
@@ -1119,7 +1158,7 @@ class AgentRepository:
                     .filter(Agent.agent_id == agent_id)
                     # BL-R31-3b: exclude 'tombstone' (purge FK artefact)
                     # too — it is not a live, terminatable agent.
-                    .filter(Agent.status.notin_(("terminated", "tombstone")))
+                    .filter(Agent.status.notin_(TERMINAL_AGENT_STATUSES))
                     .one_or_none()
                 )
                 if row is None:
@@ -1145,7 +1184,7 @@ class AgentRepository:
                         .filter(Agent.agent_id == agent_id)
                         # BL-R31-3b: exclude 'tombstone' too — not a
                         # live, terminatable agent.
-                        .filter(Agent.status.notin_(("terminated", "tombstone")))
+                        .filter(Agent.status.notin_(TERMINAL_AGENT_STATUSES))
                         .one_or_none()
                     )
                     if row is None:

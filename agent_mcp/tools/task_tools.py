@@ -332,12 +332,11 @@ def _agent_assignable(cursor, agent_id: str) -> bool:
     BL-R31-3b): a tombstone is not an agent at all, so pinning work
     onto it is unreachable work attributed to a deleted identity.
     """
-    cursor.execute(
-        "SELECT 1 FROM agents WHERE agent_id = ? "
-        "AND status NOT IN ('terminated', 'tombstone')",
-        (agent_id,),
-    )
-    return cursor.fetchone() is not None
+    # arch-deepening F: canonical live-agent predicate (single source of
+    # truth for the strict status filter; see agent_repository).
+    from ..repositories.agent_repository import is_live_agent
+
+    return is_live_agent(agent_id, cursor)
 
 
 def _missing_capabilities(
@@ -373,9 +372,11 @@ def _missing_capabilities(
     # A terminated/tombstone/absent agent has no live capabilities row,
     # so the whole required set is reported missing (BL-R31-3b: a
     # tombstone `[deleted-<id>]` is not a live agent).
+    from ..repositories.agent_repository import LIVE_AGENT_SQL
+
     cursor.execute(
         "SELECT capabilities FROM agents WHERE agent_id = ? "
-        "AND status NOT IN ('terminated', 'tombstone')",
+        f"AND {LIVE_AGENT_SQL}",
         (target_agent_id,),
     )
     row = cursor.fetchone()
@@ -1177,9 +1178,11 @@ async def _assign_to_existing_tasks(
         # (`[deleted-<id>]` purge FK artefact) is not an agent at all
         # (BL-R31-3b). This is the existence gate for this assign path
         # (it does not route through ``_agent_assignable``).
+        from ..repositories.agent_repository import LIVE_AGENT_SQL
+
         cursor.execute(
             "SELECT capabilities FROM agents WHERE agent_id = ? "
-            "AND status NOT IN ('terminated', 'tombstone')",
+            f"AND {LIVE_AGENT_SQL}",
             (target_agent_id,),
         )
         agent_caps_row = cursor.fetchone()
@@ -1757,9 +1760,11 @@ async def assign_task_tool_impl(
             # (`[deleted-<id>]`) rows — a tombstone is never an
             # assignment target (BL-R31-3b). The unconditional
             # ``_agent_assignable`` gate below enforces the same.
+            from ..repositories.agent_repository import LIVE_AGENT_SQL
+
             cursor.execute(
                 "SELECT token FROM agents WHERE agent_id = ? "
-                "AND status NOT IN ('terminated', 'tombstone')",
+                f"AND {LIVE_AGENT_SQL}",
                 (target_agent_id,),
             )
             row = cursor.fetchone()

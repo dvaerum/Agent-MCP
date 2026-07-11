@@ -46,9 +46,11 @@ async def fetch_graph_data_logic(
         # render as a visible graph node — mirrors the REST/ORM listing
         # filter (BL-R31-3b; see agent_repository.get_all_active_agents_from_db).
         # Original dashboard_api.py: lines 53-68
+        from ...repositories.agent_repository import LIVE_AGENT_SQL
+
         cursor.execute(
             "SELECT agent_id, status, color, working_directory, current_task "
-            "FROM agents WHERE status NOT IN ('terminated', 'tombstone')"
+            f"FROM agents WHERE {LIVE_AGENT_SQL}"
         )
         agent_rows = cursor.fetchall()
         for row in agent_rows:

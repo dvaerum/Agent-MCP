@@ -649,9 +649,11 @@ async def terminate_agent_tool_impl(
             # Exclude tombstone rows (`[deleted-<id>]` purge FK
             # artefacts, BL-R31-3b): a tombstone is not a live agent, so
             # it is not a terminate target — treat it as not-found.
+            from ..repositories.agent_repository import LIVE_AGENT_SQL
+
             cursor.execute(
                 "SELECT token FROM agents WHERE agent_id = ? "
-                "AND status NOT IN ('terminated', 'tombstone')",
+                f"AND {LIVE_AGENT_SQL}",
                 (agent_id_to_terminate,),
             )
             row = cursor.fetchone()

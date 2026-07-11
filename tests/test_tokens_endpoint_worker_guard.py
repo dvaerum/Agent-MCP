@@ -103,3 +103,42 @@ async def test_tokens_endpoint_with_worker_bearer_returns_401(tmp_path) -> None:
             "worker bearer received the admin token in response body — "
             "escalation"
         )
+
+
+async def test_tokens_endpoint_excludes_tombstone_entry(tmp_path) -> None:
+    """A 'tombstone' entry in g.active_agents must NOT leak via /api/tokens.
+
+    arch-deepening F (live-agent predicate): the listing loop filtered
+    only ``status != 'terminated'`` — the WEAKER of the two drifted
+    variants — so a ``status='tombstone'`` row (a `[deleted-<id>]`
+    purge-cascade FK artefact with a reserved ``__tombstone_*`` token)
+    would slip through and expose that bearer to an operator. The load
+    path already excludes tombstones from the auth allow-list, so this
+    is defense-in-depth: if a tombstone ever reaches the in-memory map
+    (e.g. a stale cache write), the listing endpoint must still not
+    emit it. Converging the filter onto the strict predicate
+    (LIVE_AGENT_SQL semantics) closes the leak.
+    """
+    from agent_mcp.core import globals as g
+
+    async with mcp_session(tmp_path) as admin:
+        tombstone_token = "__tombstone_leaktest"
+        g.active_agents[tombstone_token] = {
+            "agent_id": "[deleted-leaktest]",
+            "status": "tombstone",
+        }
+        try:
+            r = admin.client.get(
+                "/api/tokens",
+                headers={"Authorization": f"Bearer {admin.admin_token}"},
+            )
+            assert r.status_code == 200, r.text
+            body = r.text
+            assert tombstone_token not in body, (
+                "tombstone bearer leaked via /api/tokens listing"
+            )
+            assert "[deleted-leaktest]" not in body, (
+                "tombstone agent_id leaked via /api/tokens listing"
+            )
+        finally:
+            g.active_agents.pop(tombstone_token, None)
