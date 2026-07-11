@@ -515,12 +515,15 @@ def notify_unassigned_task_appeared(
                 # delete_task; not our problem.)
                 return
 
+            # "Active" excludes BOTH 'terminated' AND 'tombstone'
+            # (purge-cascade FK artefacts) — a tombstone row must
+            # never receive an unassigned-task fan-out (BL-R31-3b).
+            # arch-deepening F: function-level import avoids the
+            # state<->agent_repository module-load cycle.
+            from ..repositories.agent_repository import LIVE_AGENT_SQL
+
             cursor.execute(
-                # "Active" excludes BOTH 'terminated' AND 'tombstone'
-                # (purge-cascade FK artefacts) — a tombstone row must
-                # never receive an unassigned-task fan-out (BL-R31-3b).
-                "SELECT agent_id, capabilities FROM agents "
-                "WHERE status NOT IN ('terminated', 'tombstone')",
+                f"SELECT agent_id, capabilities FROM agents WHERE {LIVE_AGENT_SQL}",
             )
             agent_rows = cursor.fetchall()
         finally:

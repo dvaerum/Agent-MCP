@@ -151,10 +151,12 @@ async def application_startup(
         # 'admin' row is gone (migration 0014), so the earlier
         # `agent_id != 'admin'` filter is redundant.
         active_agents_count = 0
+        from ..repositories.agent_repository import LIVE_AGENT_SQL
+
         cursor.execute(
-            """
+            f"""
             SELECT token, agent_id, capabilities, created_at, status, current_task, working_directory, color
-            FROM agents WHERE status NOT IN ('terminated', 'tombstone')
+            FROM agents WHERE {LIVE_AGENT_SQL}
         """,
         )
         for row in cursor.fetchall():
