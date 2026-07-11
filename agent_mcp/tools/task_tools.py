@@ -2782,6 +2782,333 @@ async def update_task_status_tool_impl(
         return Failed(message=f"Unexpected error updating tasks: {e}")
 
 
+# --- update_task tool (arch-r4 #1) ------------------------------------
+#
+# Collapses the dashboard-only title / description / priority /
+# assigned_to / notes mutation surface
+# (``app/routers/composition.py::update_task_details_api_route``, ~440
+# lines pre-refactor) onto the SAME invariant engine
+# ``update_task_status`` already uses: terminal-sink transition guard
+# (``_is_status_transition_allowed`` / ``_TERMINAL_TASK_STATUSES``),
+# assignability (``_agent_assignable``), capability-routing parity
+# (``_missing_capabilities``), and ``current_task`` reconcile
+# (``reconcile_current_task_on_reassign``) — all via ``_update_single_task``.
+# Before this tool, ONLY ``status`` routed through ``_update_single_task``
+# (via ``update_task_status``); the REST route hand-reimplemented the
+# other five fields inline, and drifted out of parity with the canonical
+# path repeatedly (the BL-R7-1 / BL-R12-1 / BL-R13-1 / BL-R16-1 /
+# BL-R17-1 / BL-R18-1 / BL-R30-1 / AZ-R26-1 ledger — each a discovered
+# drift bug that got patched IN THE DUPLICATE rather than by unifying).
+#
+# ``status`` is OPTIONAL here (unlike ``update_task_status``, where it's
+# required): when the caller omits it, the task's CURRENT status is
+# threaded into ``_update_single_task`` unchanged so the terminal-sink
+# guard still applies uniformly — a completed/cancelled/failed task now
+# refuses EVERY admin-field edit routed through this tool (title,
+# description, priority, notes, reassign), not just an explicit status
+# write or a reassign. That is a DELIBERATE TIGHTENING vs. the
+# pre-refactor dashboard route, which only guarded status writes
+# (BL-R12-1) and reassign (BL-R18-1) on a terminal task — it allowed
+# editing title/description/priority/notes on already-terminal work.
+# See the arch-r4 #1 PR description for the full before/after.
+#
+# ``assigned_to`` CLEARING (null / "" / "unassigned") is handled OUTSIDE
+# ``_update_single_task`` — the helper has no representation for "clear
+# the assignment" (it only writes ``assigned_to`` when the new value is
+# non-None), so the BL-R16-1 / BL-R17-1 clear-assignment choreography
+# (flip to ``status='unassigned'`` + fan out
+# ``notify_unassigned_task_appeared`` on a NON-terminal task; keep the
+# terminal status + fire NO fanout on a terminal one — clearing a
+# terminal task's assignee stays allowed, unlike reassigning it to a
+# live agent) stays a dedicated code path here, structurally unchanged
+# from the pre-refactor route, just relocated off the REST router so
+# an MCP caller gets the identical guarantee.
+@requires_capability("tasks.assign")
+async def update_task_tool_impl(
+    arguments: Dict[str, Any],
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    task_id = arguments.get("task_id")
+    if not task_id:
+        return Invalid(field="task_id", message="task_id is a required field.")
+
+    # No upfront "at least one editable field" gate here (unlike the
+    # REST route, which checks the RAW JSON body before dispatch): by
+    # the time ``arguments`` reaches this tool, ``dispatch_tool_call``'s
+    # schema-cleaning step has already stripped every ``null``-valued
+    # key (the Q6e ``token: null`` tolerance rule, applied uniformly to
+    # all args — see ``_clean_arguments_for_schema``). A caller-present-
+    # but-null field (e.g. ``{"status": null}``) is therefore
+    # indistinguishable here from an omitted one, so re-checking key
+    # PRESENCE at this layer would wrongly 400 a request the REST route
+    # already accepted as a harmless no-op. The natural fallback below
+    # (``admin_fields_requested or clearing`` — computed from actually
+    # MEANINGFUL values, not raw key presence) already collapses every
+    # true no-op to the SAME "nothing to write" 200 the pre-refactor
+    # route returned; it makes this check both redundant and wrong.
+    requesting_agent_id = principal.agent_id or principal.user_id or "admin"
+
+    explicit_status = arguments.get("status") or None
+    if explicit_status is not None:
+        valid_statuses = ["pending", "in_progress", "completed", "cancelled", "failed"]
+        if explicit_status not in valid_statuses:
+            return Invalid(
+                field="status",
+                message=(
+                    f"Invalid status: {explicit_status}. Valid: "
+                    f"{', '.join(valid_statuses)}"
+                ),
+            )
+
+    # Field-truthiness rules mirror the pre-refactor route exactly:
+    # title/description accept an explicit empty string (clears the
+    # field — ``is not None``, not truthiness); priority/notes require
+    # a truthy value (a blank Save is a no-op, not an error).
+    new_title = (
+        arguments.get("title")
+        if "title" in arguments and arguments.get("title") is not None
+        else None
+    )
+    new_description = (
+        arguments.get("description")
+        if "description" in arguments and arguments.get("description") is not None
+        else None
+    )
+    raw_priority = arguments.get("priority")
+    new_priority = raw_priority if raw_priority else None
+    raw_notes = arguments.get("notes")
+    notes_content = (
+        raw_notes.strip()
+        if isinstance(raw_notes, str) and raw_notes.strip()
+        else None
+    )
+
+    # assigned_to: null / "" / "unassigned" clears; any other non-empty
+    # string is a reassignment target (verbatim, matching the pre-refactor
+    # route's normalisation).
+    assigned_to_present = "assigned_to" in arguments
+    raw_assigned = arguments.get("assigned_to")
+    clearing = assigned_to_present and (
+        raw_assigned is None
+        or (isinstance(raw_assigned, str) and raw_assigned.strip() in ("", "unassigned"))
+    )
+    reassign_target = (
+        str(raw_assigned).strip() if assigned_to_present and not clearing else None
+    )
+
+    # Whether ANYTHING routes through ``_update_single_task`` this call.
+    admin_fields_requested = bool(
+        explicit_status
+        or new_title is not None
+        or new_description is not None
+        or new_priority
+        or notes_content
+        or reassign_target
+    )
+
+    try:
+        with unit_of_work() as u:
+            cursor = u.cursor
+            cursor.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+            prior_row = cursor.fetchone()
+            if prior_row is None:
+                return NotFound(resource="task", identifier=task_id)
+            prior_data = dict(prior_row)
+            prior_status = prior_data.get("status")
+            prior_assignee = prior_data.get("assigned_to")
+
+            log_details: Dict[str, Any] = {}
+            changed_fields: List[str] = []
+
+            if admin_fields_requested:
+                # No explicit status ⇒ thread the CURRENT status through
+                # unchanged so the terminal-sink guard still gates every
+                # other admin field (see the module-level docstring above
+                # for why this is a deliberate tightening).
+                final_status = explicit_status or prior_status
+                result = await _update_single_task(
+                    cursor,
+                    task_id,
+                    final_status,
+                    requesting_agent_id,
+                    True,  # is_admin_request — gated by @requires_capability
+                    notes_content,
+                    new_title,
+                    new_description,
+                    new_priority,
+                    reassign_target,
+                )
+                if not result["success"]:
+                    error = result.get("error") or "Task update failed"
+                    lower = error.lower()
+                    if "not found" in lower:
+                        return NotFound(resource="task", identifier=task_id)
+                    if "invalid status transition" in lower:
+                        return Conflict(reason=error)
+                    if (
+                        "lacks required capabilities" in lower
+                        or "does not exist or is terminated" in lower
+                    ):
+                        return Invalid(field="assigned_to", message=error)
+                    return Failed(message=error)
+
+                if explicit_status:
+                    log_details["status_updated_to"] = explicit_status
+                    changed_fields.append("status")
+                if new_title is not None:
+                    log_details["title_changed"] = True
+                    changed_fields.append("title")
+                if new_description is not None:
+                    log_details["description_changed"] = True
+                    changed_fields.append("description")
+                if new_priority:
+                    log_details["priority_changed"] = True
+                    changed_fields.append("priority")
+                if notes_content:
+                    log_details["notes_added"] = True
+                    changed_fields.append("notes")
+                if reassign_target:
+                    log_details["assigned_to_changed"] = reassign_target
+                    changed_fields.append("assigned_to")
+
+            clearing_fanout_needed = False
+            required_caps_for_fanout: Any = None
+            if clearing:
+                from ..repositories import task_repo as _task_repo
+                from ..repositories import agent_repo as _agent_repo
+
+                clear_fields: Dict[str, Any] = {"assigned_to": None}
+                # NOTE (pre-existing, preserved verbatim from the
+                # pre-refactor route): this terminal check reads
+                # ``prior_status`` — the status BEFORE this call, not
+                # the status the ``admin_fields_requested`` branch above
+                # may have JUST written in the SAME transaction. A
+                # combined ``{status: "completed", assigned_to: null}``
+                # request therefore still sets ``clearing_fanout_needed``
+                # from the OLD (non-terminal) status and fires the
+                # unassigned-fanout on a task that is now terminal — the
+                # pre-refactor route had the exact same gap (its
+                # ``prior_status`` was captured once, up front, before
+                # either branch ran). Left as-is: fixing the ORDER
+                # dependency is a genuine behavior change outside this
+                # PR's collapse-onto-the-canonical-tool scope; flagged
+                # in the PR description as a good follow-up.
+                if prior_status not in _TERMINAL_TASK_STATUSES:
+                    clearing_fanout_needed = True
+                    if not explicit_status:
+                        clear_fields["status"] = "unassigned"
+                _task_repo.update_fields(task_id, clear_fields, connection=cursor)
+                if task_id in g.tasks:
+                    g.tasks[task_id]["assigned_to"] = None
+                    if "status" in clear_fields:
+                        g.tasks[task_id]["status"] = clear_fields["status"]
+                # BL-R30-1: reconcile the losing agent's current_task.
+                # ``_update_single_task`` already does this for the
+                # REASSIGN branch above; clearing never reaches it (it
+                # only writes ``assigned_to`` when the new value is
+                # non-None), so it needs the same reconcile here.
+                _agent_repo.reconcile_current_task_on_reassign(
+                    task_id, prior_assignee, None, connection=cursor,
+                )
+                required_caps_for_fanout = prior_data.get("required_capabilities")
+                log_details["assigned_to_changed"] = None
+                changed_fields.append("assigned_to")
+
+            # Mirror the pre-refactor route: it logged an
+            # ``updated_task_dashboard`` audit row on EVERY request that
+            # passed the "at least one editable field" gate, even a
+            # request whose only supplied field was itself a no-op (e.g.
+            # a blank ``priority``) — audit unconditionally, then only
+            # register the write-observable effects (publish/wake/
+            # unassigned-fanout) when something actually landed.
+            u.audit(
+                requesting_agent_id, "updated_task_dashboard",
+                task_id=task_id, details=log_details,
+            )
+
+            if not (admin_fields_requested or clearing):
+                # Every supplied field was a no-op — nothing was
+                # written, so no publish/wake/fanout either.
+                return Ok(message="Task updated successfully.")
+
+            # BL-R7-1: publish ``task.updated`` + wake the touched
+            # assignee(s) post-commit. On a reassign/clear both the new
+            # AND prior assignee are woken (the task entered/left their
+            # queue); a pure field edit (no assignment change) wakes only
+            # the CURRENT assignee (or nobody, if unassigned).
+            reassigned = bool(reassign_target) or clearing
+            current_assignee = (
+                reassign_target if reassign_target
+                else (None if clearing else prior_assignee)
+            )
+            u.emit(
+                current_assignee, "task.updated",
+                {"task_id": task_id, "fields": changed_fields},
+            )
+
+            to_wake: List[str] = []
+            if current_assignee:
+                to_wake.append(current_assignee)
+            if reassigned and prior_assignee and prior_assignee != current_assignee:
+                to_wake.append(prior_assignee)
+
+            def _wake(ids=tuple(to_wake)) -> None:
+                woken: set = set()
+                for aid in ids:
+                    if not aid or aid in woken:
+                        continue
+                    try:
+                        g.notify_agent_inbox(aid)
+                        woken.add(aid)
+                    except Exception as exc:  # pragma: no cover - defensive
+                        logger.warning(
+                            "notify_agent_inbox(%s) raised after task "
+                            "update: %s", aid, exc,
+                        )
+
+            u.on_commit(_wake)
+
+            # BL-R16-1 / BL-R17-1: unassigned-fanout parity — only when
+            # clearing landed a NON-terminal task back to 'unassigned'.
+            if clearing_fanout_needed:
+                raw_caps = required_caps_for_fanout
+                if isinstance(raw_caps, str):
+                    try:
+                        caps_list = json.loads(raw_caps or "[]")
+                    except json.JSONDecodeError:
+                        caps_list = []
+                elif isinstance(raw_caps, list):
+                    caps_list = raw_caps
+                else:
+                    caps_list = []
+
+                def _notify_unassigned(tid=task_id, caps=caps_list) -> None:
+                    try:
+                        g.notify_unassigned_task_appeared(tid, caps or [])
+                    except Exception as exc:  # pragma: no cover - defensive
+                        logger.warning(
+                            "notify_unassigned_task_appeared(%s) raised: %s",
+                            tid, exc,
+                        )
+
+                u.on_commit(_notify_unassigned)
+
+            return Ok(message="Task updated successfully.")
+
+    except sqlite3.Error as e_sql:
+        # The unit-of-work already rolled back + closed the connection.
+        logger.error(
+            f"Database error updating task {task_id}: {e_sql}", exc_info=True
+        )
+        return Failed(message=f"Database error updating task: {e_sql}")
+    except Exception as e:
+        logger.error(
+            f"Unexpected error updating task {task_id}: {e}", exc_info=True
+        )
+        return Failed(message=f"Unexpected error updating task: {e}")
+
+
 # --- view_tasks tool ---
 # Original logic from main.py: lines 1586-1655 (view_tasks_tool function)
 # Wave 9 PR 2: @requires("any") → @requires_capability("tasks.view").
@@ -4717,6 +5044,71 @@ def register_task_tools():
         visibility=(
             "worker-if-toggled:config_allow_worker_update_own_status"
         ),
+    )
+
+    register_tool(
+        name="update_task",
+        description=(
+            "Admin/manager task-field editor: mutate title, description, "
+            "priority, assigned_to, and/or append a note, with status "
+            "OPTIONAL (unlike update_task_status, where it's required). "
+            "Enforces the same terminal-sink / assignability / "
+            "capability-routing invariants update_task_status does. "
+            "Backs the dashboard's Edit-task modal."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "token": {
+                    "type": "string",
+                    "description": "Authentication token (admin/manager). Optional if Authorization: Bearer header is supplied (recommended).",
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": "ID of the task to update.",
+                },
+                "status": {
+                    "type": "string",
+                    "description": "New status for the task (optional — omit to leave status unchanged).",
+                    "enum": [
+                        "pending",
+                        "in_progress",
+                        "completed",
+                        "cancelled",
+                        "failed",
+                    ],
+                },
+                "title": {
+                    "type": "string",
+                    "description": "New title for the task.",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "New description for the task.",
+                },
+                "priority": {
+                    "type": "string",
+                    "description": "New priority.",
+                    "enum": ["low", "medium", "high"],
+                },
+                "assigned_to": {
+                    "type": "string",
+                    "description": (
+                        "New agent id to assign the task to, or "
+                        "'unassigned' (or an empty string) to clear the "
+                        "assignment."
+                    ),
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "A new note to append (append-only; blank is ignored).",
+                },
+            },
+            "required": ["task_id"],
+            "additionalProperties": False,
+        },
+        implementation=update_task_tool_impl,
+        visibility="operator",
     )
 
     register_tool(

@@ -40,14 +40,28 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
-from .._dispatch_helpers import _dispatch_through_tool, handle_options
+from .._dispatch_helpers import (
+    _build_route_principal,
+    _dispatch_through_tool,
+    handle_options,
+)
 from ..deps import caller_identity, require_operator_session
+from ...core.authorize import AuthRejected
 from ...core.config import logger
 from ...core import globals as g
 from ...core.operator_tier import (
     is_confirmed_operator_tier as _shared_is_confirmed_operator_tier,
 )
-from ...db.actions.agent_actions_db import log_agent_action_to_db
+from ...core.tool_result import (
+    Conflict,
+    Failed,
+    Invalid,
+    NotFound,
+    Ok,
+    PermissionDenied,
+    ToolResult,
+    tool_result_to_http,
+)
 from ...db.connection import get_db_connection
 from ...db.engine import SessionLocal
 from ...db.models import ProjectContext
@@ -56,6 +70,7 @@ from ...features.dashboard.api import (
     fetch_task_tree_data_logic,
 )
 from ...tools.project_context_tools import is_secret_key
+from ...tools.registry import ToolInputValidationError, dispatch_tool_call
 from ...utils.json_utils import get_sanitized_json_body
 from .agents import _mcp_presence_for
 
@@ -727,29 +742,51 @@ async def terminate_agent_dashboard_api_route(
     )
 
 
+def _update_task_error_detail(result: ToolResult) -> str:
+    """Human-readable error string for the legacy ``{"error": ...}``
+    envelope this route returns, given a non-``Ok`` ``update_task``
+    result. Kept in the legacy envelope (not the shared
+    :func:`tool_result_to_http` body) because the dashboard pins this
+    shape. STATUS comes from the shared adapter; only the body wording
+    lives here.
+    """
+    if isinstance(result, NotFound):
+        return "Task not found"
+    if isinstance(result, (Conflict, PermissionDenied)):
+        return result.reason
+    if isinstance(result, Invalid):
+        return result.message
+    return "Failed to update task."
+
+
 @router.api_route("/update-task-dashboard", methods=["POST", "OPTIONS"])
 async def update_task_details_api_route(
     request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
-    """Dashboard task edit endpoint.
+    """Dashboard task edit endpoint — thin adapter over the ``update_task``
+    MCP tool.
 
-    Originally required (task_id, status) and used `status` as the
-    only mandatory field. The dashboard's Edit modal needs to mutate
-    individual fields independently (title-only, priority-only, …)
-    and to manage assignment, so the rules are:
-      - task_id still required.
-      - status is now OPTIONAL (status-only updates still supported).
-      - At least one editable field must be supplied (otherwise the
-        UPDATE is a no-op and 400 is clearer than success).
-      - assigned_to: new field. <agent_id> assigns; null/empty
-        string clears the assignment (NULL in DB).
+    arch-r4 #1 (arch-deepening round 4): the ~440-line hand-reimplemented
+    invariant surface (terminal-sink transition guard, assignability,
+    capability-routing parity, ``current_task`` reconcile,
+    unassigned-fanout parity, ``task.updated`` publish + assignee wake —
+    the BL-R7-1 / BL-R12-1 / BL-R13-1 / BL-R16-1 / BL-R17-1 / BL-R18-1 /
+    BL-R30-1 / AZ-R26-1 drift-bug ledger) now lives ONCE in
+    :func:`agent_mcp.tools.task_tools.update_task_tool_impl` on the
+    unit-of-work, wrapping the SAME ``_update_single_task`` helper
+    ``update_task_status`` uses. This handler keeps only the HTTP-wire
+    concerns — body sanitization, the SEC-round-9 type-confusion guards,
+    and the "at least one editable field" no-op rejection — then
+    dispatches and maps the ``ToolResult`` to the legacy response shape.
 
-    PR D (prancy-napping-pie): auth moved to require_operator_session.
-    The handler no longer reads or verifies an admin token from the
-    body; the dep accepts cookie OR Authorization-bearer OR
-    legacy body-token paths.
+    Rules (unchanged from the pre-refactor route):
+      - task_id required.
+      - status is OPTIONAL (status-only updates still supported).
+      - At least one editable field must be supplied.
+      - assigned_to: <agent_id> assigns; null/empty/'unassigned' clears.
 
+    PR D (prancy-napping-pie): auth via require_operator_session.
     Wave 8 PR 1 placement: lives on the composition router (not the
     tasks router) because the URL is ``/api/update-task-dashboard``
     and doesn't match the tasks router's ``/api/tasks`` prefix. URL
@@ -760,416 +797,108 @@ async def update_task_details_api_route(
         return await handle_options(request)
     if request.method != 'POST':
         return JSONResponse({"error": "Method not allowed"}, status_code=405)
-    conn = None
+
     try:
-        import sqlite3
         data = await get_sanitized_json_body(request)
-        task_id_to_update = data.get('task_id')
-        new_status = data.get('status')
-        if not task_id_to_update:
-            return JSONResponse({"error": "task_id is a required field."}, status_code=400)
-        # The set of recognised editable fields. At least one must be
-        # supplied; otherwise the request is a no-op and rejected.
-        EDITABLE_KEYS = {"status", "title", "description", "priority", "notes", "assigned_to"}
-        supplied_editable = [k for k in EDITABLE_KEYS if k in data]
-        if not supplied_editable:
-            return JSONResponse(
-                {"error": "at least one editable field is required (status, title, description, priority, notes, assigned_to)."},
-                status_code=400,
-            )
-
-        # SEC round-9: reject structured JSON in the string fields BEFORE
-        # they reach task_repo.update_fields. Without this a dict/list
-        # value raises inside the repo's SQLite bind, is swallowed
-        # (returns False), and the handler still commits + returns a
-        # misleading 200 success — a silent no-op. ``task_id`` binds into
-        # the WHERE clause; ``notes`` is already isinstance-guarded below
-        # (non-str notes are ignored, not an error, preserving behaviour).
-        for _field in ("task_id", "status", "title", "description",
-                       "priority", "assigned_to"):
-            _err = _require_str(data.get(_field), _field)
-            if _err is not None:
-                return _err
-
-        requesting_admin_id = caller_identity(auth)
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT notes, assigned_to, status, required_capabilities FROM tasks WHERE task_id = ?", (task_id_to_update,))
-        task_row = cursor.fetchone()
-        if not task_row:
-            return JSONResponse({"error": "Task not found"}, status_code=404)
-        existing_notes_str = task_row["notes"]
-        # AZ-R26-1: the task's capability tag, captured before the UPDATE,
-        # so the reassign branch below can enforce the same
-        # ``required_capabilities ⊆ agent.capabilities`` routing control the
-        # canonical MCP assign path enforces (``_missing_capabilities``).
-        prior_required_capabilities = task_row["required_capabilities"]
-        # BL-R7-1: capture the PRIOR assignee before the UPDATE so a
-        # reassignment can wake the old assignee (task left their queue)
-        # in addition to the new one — see the post-commit publish/notify
-        # block below.
-        prior_assignee = task_row["assigned_to"]
-        # BL-R17-1: the task's CURRENT status, captured before the UPDATE,
-        # so the clear-assignment branch below can carve out TERMINAL tasks
-        # (completed/cancelled/failed) exactly as the canonical unassign
-        # producers do — see the guard where ``assigned_to`` is cleared.
-        prior_status = task_row["status"]
-
-        # BL-R12-1: the ``status`` transition must NOT be direct-written
-        # here — that bypassed all four invariants the canonical MCP path
-        # (``update_task_status`` tool → ``_update_single_task``) enforces:
-        # (1) the terminal-state transition guard (a ``completed`` task
-        # could be resurrected to ``in_progress`` behind a misleading
-        # 200), (2) ``clear_current_task_for`` (a completed task left
-        # ``agents.current_task`` pinned, leaking a stale pointer into
-        # ``/api/all-data``), (3) the parent subtask-completion note, and
-        # (4) status-enum validation. Route the status change through the
-        # SAME tool the MCP wire uses so all four apply uniformly, rather
-        # than duplicating the invariant logic inline. Non-status fields
-        # (title/description/priority/assigned_to/notes) keep the direct
-        # path below. We pre-check the transition with the canonical
-        # ``_is_status_transition_allowed`` so an illegal transition gets a
-        # clean 409 (the tool reports a rejected transition as an ``Ok``
-        # envelope carrying a "Failed …" message → HTTP 200, so the tool
-        # alone can't surface the right status code; the DB write is still
-        # correctly refused either way).
-        if new_status:
-            from ...tools.task_tools import _is_status_transition_allowed
-
-            old_status = task_row["status"]
-            if not _is_status_transition_allowed(old_status, new_status):
-                return JSONResponse(
-                    {
-                        "error": (
-                            f"Invalid status transition: "
-                            f"'{old_status}' -> '{new_status}' is not allowed."
-                        )
-                    },
-                    status_code=409,
-                )
-            status_resp = await _dispatch_through_tool(
-                "update_task_status",
-                {"task_id": task_id_to_update, "status": new_status},
-                bearer_token=None,
-                operator_session=True,
-                operator_user_id=requesting_admin_id,
-            )
-            # Enum-invalid status → Invalid → 400; any other non-2xx →
-            # propagate verbatim. On success the tool has already applied
-            # the status write + current_task clear + parent note.
-            if status_resp.status_code not in (200, 201):
-                return status_resp
-
-        # PR 7 (Task flip): build the field dict the same way the
-        # legacy code built its SET clause, then hand it to
-        # task_repo.update_fields(connection=cursor). The repo's
-        # _MUTABLE_FIELDS allowlist + JSON-serialisation rule (for
-        # `notes`) live in one place now; the route stops carrying
-        # them as inline SQL fragments.
-        #
-        # BL-R12-1: ``status`` is intentionally absent here — it is
-        # applied above via the canonical ``update_task_status`` tool.
-        fields_to_update: Dict[str, Any] = {}
-        log_details: Dict[str, Any] = {}
-        # BL-R16-1: set when this edit CLEARS the assignment (raw value is
-        # null / '' / 'unassigned') so the post-commit block can mirror the
-        # canonical unassign producers — status flip + unassigned fanout.
-        clearing_assignment = False
-        if new_status:
-            log_details["status_updated_to"] = new_status
-        if 'title' in data and data['title'] is not None:
-            fields_to_update["title"] = data['title']
-            log_details["title_changed"] = True
-        if 'description' in data and data['description'] is not None:
-            fields_to_update["description"] = data['description']
-            log_details["description_changed"] = True
-        if 'priority' in data and data['priority']:
-            fields_to_update["priority"] = data['priority']
-            log_details["priority_changed"] = True
-        if 'assigned_to' in data:
-            # null / '' / 'unassigned' clears the assignment; any other
-            # value is stored verbatim as the agent_id.
-            raw_assigned = data['assigned_to']
-            new_assigned: Any
-            if raw_assigned is None or (isinstance(raw_assigned, str) and raw_assigned.strip() in ('', 'unassigned')):
-                new_assigned = None
-            else:
-                new_assigned = str(raw_assigned).strip()
-            # BL-R13-1: a non-empty reassignment target must satisfy the
-            # assignability invariant the canonical MCP path enforces
-            # (``_update_single_task`` → ``_agent_assignable`` — the agent
-            # exists AND is not terminated). Writing ``assigned_to``
-            # directly here bypassed it, so a task could be re-pinned on a
-            # nonexistent / terminated agent behind a 200. Clearing the
-            # assignment (new_assigned is None) stays allowed.
-            if new_assigned is not None:
-                # BL-R18-1: TERMINAL is a sink on the ASSIGN axis too. A
-                # completed/cancelled/failed task must NOT be reassigned to
-                # a real agent — that re-pins finished work onto an active
-                # worker's queue, RESURRECTING it exactly as a direct
-                # completed->in_progress status write would (which the
-                # BL-R12-1 terminal-sink transition guard above 409s). The
-                # canonical unassign producers keep terminal as a sink on
-                # the clear branch (BL-R17-1, below); this closes the same
-                # invariant on the reassign branch. Mirror the status-path
-                # illegal-transition response shape: 409 Conflict. Checked
-                # BEFORE _agent_assignable so the task's own terminal state
-                # is reported regardless of the target agent's liveness.
-                from ...tools.task_tools import _TERMINAL_TASK_STATUSES
-                if prior_status in _TERMINAL_TASK_STATUSES:
-                    return JSONResponse(
-                        {
-                            "error": (
-                                f"Cannot reassign task '{task_id_to_update}': "
-                                f"its status '{prior_status}' is terminal "
-                                f"(completed/cancelled/failed). A terminal "
-                                f"task is a sink and may not be reassigned."
-                            )
-                        },
-                        status_code=409,
-                    )
-                from ...tools.task_tools import _agent_assignable
-                if not _agent_assignable(cursor, new_assigned):
-                    return JSONResponse(
-                        {
-                            "error": (
-                                f"Cannot reassign task '{task_id_to_update}' "
-                                f"to '{new_assigned}': agent does not exist "
-                                f"or is terminated."
-                            )
-                        },
-                        status_code=400,
-                    )
-                # AZ-R26-1: capability-routing parity. The canonical MCP
-                # assign path refuses to pin a capability-tagged task onto
-                # an under-capable agent; the dashboard reassign must
-                # enforce the SAME control or it becomes a bypass. Checked
-                # after assignability so a live-but-under-capable target is
-                # reported on the capability axis.
-                from ...tools.task_tools import _missing_capabilities
-                missing_caps = _missing_capabilities(
-                    cursor, prior_required_capabilities, new_assigned
-                )
-                if missing_caps:
-                    return JSONResponse(
-                        {
-                            "error": (
-                                f"Cannot reassign task "
-                                f"'{task_id_to_update}' to '{new_assigned}': "
-                                f"agent lacks required capabilities "
-                                f"{missing_caps}."
-                            )
-                        },
-                        status_code=400,
-                    )
-            fields_to_update["assigned_to"] = new_assigned
-            log_details["assigned_to_changed"] = new_assigned
-            # BL-R16-1: notify-parity for the CLEAR-ASSIGNMENT path. When
-            # the assignment is cleared (new_assigned is None), the task must
-            # land in the SAME terminal state the three canonical unassign
-            # producers produce — ``status='unassigned'`` AND a
-            # ``notify_unassigned_task_appeared`` fanout — so an idle worker
-            # blocked in ``wait_for_events`` (or a GET /mcp streaming
-            # subscriber) is edge-woken that the task became claimable:
-            #   * agent-terminate (tools/admin_tools.py),
-            #   * agent-purge     (app/routers/agents.py),
-            #   * REST create-unassigned, BL-R15-1 (app/routers/tasks.py).
-            # Reassignment to a real agent (new_assigned is not None) keeps
-            # its existing behavior untouched. The status write is a direct
-            # write mirroring the canonical unassign SQL (they also skip the
-            # transition guard); it is suppressed when the caller ALSO sent an
-            # explicit ``status`` (already routed through update_task_status
-            # above per BL-R12-1) so we don't clobber their choice.
-            if new_assigned is None:
-                # BL-R17-1: terminal tasks (completed/cancelled/failed) are
-                # SINKS — carve them out here to mirror the canonical unassign
-                # producers. agent-terminate (tools/admin_tools.py) filters
-                # ``status NOT IN (terminal)`` before its unassign UPDATE;
-                # REST create-unassigned (app/routers/tasks.py) only ever
-                # produces fresh non-terminal tasks. Without this guard,
-                # clearing (or editing) a terminal task's assignee flipped its
-                # status back to 'unassigned' and fired
-                # notify_unassigned_task_appeared — RESURRECTING finished work
-                # (a worker re-executes an already-completed task) and
-                # bypassing the BL-R12-1 terminal-sink transition guard (which
-                # correctly 409s a direct completed->unassigned status write on
-                # the canonical path). For a terminal task we still allow
-                # clearing ``assigned_to`` but keep the terminal status intact
-                # and fire NO unassigned fanout. The non-terminal
-                # (pending/in_progress) clear keeps its BL-R16-1 behavior.
-                from ...tools.task_tools import _TERMINAL_TASK_STATUSES
-                if prior_status not in _TERMINAL_TASK_STATUSES:
-                    clearing_assignment = True
-                    if not new_status:
-                        fields_to_update["status"] = "unassigned"
-                        log_details["status_unassigned"] = True
-        if 'notes' in data and data['notes'] and isinstance(data['notes'], str) and data['notes'].strip():
-            try:
-                current_notes_list = json.loads(existing_notes_str or "[]")
-            except json.JSONDecodeError:
-                current_notes_list = []
-            new_note_entry = {"timestamp": datetime.datetime.now().isoformat(), "author": requesting_admin_id, "content": data['notes'].strip()}
-            current_notes_list.append(new_note_entry)
-            # The repo serialises list fields with json.dumps internally;
-            # pass the Python list directly.
-            fields_to_update["notes"] = current_notes_list
-            log_details["notes_added"] = True
-        if fields_to_update:
-            from ...repositories import task_repo as _task_repo
-            _task_repo.update_fields(
-                task_id_to_update,
-                fields_to_update,
-                connection=cursor,
-            )
-        # BL-R30-1: reconcile agents.current_task on the rebind. A
-        # dashboard edit that changed ``assigned_to`` (reassign to another
-        # agent, or clear-assignment to none) left the LOSING agent's
-        # current_task pointing at a task it no longer owns and never set
-        # the GAINING agent's. Mirror the MCP reassign paths: clear the
-        # loser, set the gainer if idle. Runs inside the same cursor/txn as
-        # the write above, before commit. ``prior_assignee`` was captured
-        # from the pre-update row; the new assignee is the value just
-        # written (``None`` on a clear-assignment, which clears only the
-        # loser).
-        if "assigned_to" in fields_to_update:
-            from ...repositories import agent_repo as _agent_repo
-            _agent_repo.reconcile_current_task_on_reassign(
-                task_id_to_update,
-                prior_assignee,
-                fields_to_update["assigned_to"],
-                connection=cursor,
-            )
-        log_agent_action_to_db(cursor, requesting_admin_id, "updated_task_dashboard", task_id=task_id_to_update, details=log_details)
-        conn.commit()
-        if task_id_to_update in g.tasks:
-            cursor.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id_to_update,))
-            updated_task_for_cache = cursor.fetchone()
-            if updated_task_for_cache:
-                g.tasks[task_id_to_update] = dict(updated_task_for_cache)
-                for field_key in ["child_tasks", "depends_on_tasks", "notes"]:
-                    if isinstance(g.tasks[task_id_to_update].get(field_key), str):
-                        try:
-                            g.tasks[task_id_to_update][field_key] = json.loads(g.tasks[task_id_to_update][field_key] or "[]")
-                        except json.JSONDecodeError:
-                            g.tasks[task_id_to_update][field_key] = []
-            else:
-                del g.tasks[task_id_to_update]
-        # BL-R7-1: task_repo.update_fields(connection=cursor) DELIBERATELY
-        # defers the cache-write AND the EventBus publish to the caller
-        # (the connection= path returns a thin dict, no _publish — a
-        # subscriber must never observe an uncommitted / rolled-back row).
-        # Every OTHER mutation path reconciles both after commit: REST
-        # create publishes task.created + wakes the assignee (tasks.py,
-        # round-5 BL-1); MCP update_task_status wakes each touched task's
-        # assignee (task_tools.py). Without this, a dashboard edit that
-        # reassigns / re-statuses a task never wakes an agent blocked in
-        # wait_for_events and never fans resources/updated to /mcp
-        # subscribers. Mirror the create path — publish task.updated and
-        # wake the assignee — on the successful-commit path only.
-        if fields_to_update:
-            # Post-update assignee, cache-first (reconciled above) with a
-            # DB fallback for tasks not held in g.tasks.
-            current_assignee = None
-            if task_id_to_update in g.tasks:
-                current_assignee = g.tasks[task_id_to_update].get("assigned_to")
-            else:
-                cursor.execute(
-                    "SELECT assigned_to FROM tasks WHERE task_id = ?",
-                    (task_id_to_update,),
-                )
-                fresh_row = cursor.fetchone()
-                if fresh_row:
-                    current_assignee = fresh_row["assigned_to"]
-            from ...core import event_bus_shim
-            event_bus_shim.publish(
-                current_assignee or "*",
-                "task.updated",
-                {
-                    "task_id": task_id_to_update,
-                    "fields": list(fields_to_update.keys()),
-                },
-            )
-            # Wake wait_for_events waiters. The current assignee learns
-            # their task changed; on reassignment the prior assignee also
-            # learns the task left their queue. Dedupe to avoid a double
-            # wake when nothing moved.
-            reassigned = "assigned_to" in fields_to_update
-            to_wake: list[str] = []
-            if current_assignee:
-                to_wake.append(current_assignee)
-            if reassigned and prior_assignee and prior_assignee != current_assignee:
-                to_wake.append(prior_assignee)
-            woken: set = set()
-            for aid in to_wake:
-                if not aid or aid in woken:
-                    continue
-                try:
-                    g.notify_agent_inbox(aid)
-                    woken.add(aid)
-                except Exception as notify_exc:  # pragma: no cover - defensive
-                    logger.warning(
-                        "notify_agent_inbox(%s) raised after dashboard "
-                        "task edit: %s",
-                        aid, notify_exc,
-                    )
-            # BL-R16-1: clear-assignment notify parity. When this edit
-            # cleared the assignment the task just became a first-class
-            # ``unassigned`` task; mirror the canonical producers and fan out
-            # ``unassigned_task_appeared`` so idle / streaming workers learn
-            # it is claimable now (not on the next ~2s DB recheck). Carry the
-            # task's required_capabilities (cache-first, DB fallback) so the
-            # matcher wakes only qualifying agents. Best-effort — a notify
-            # failure must never poison the already-committed write.
-            if clearing_assignment:
-                raw_caps: Any = None
-                if task_id_to_update in g.tasks:
-                    raw_caps = g.tasks[task_id_to_update].get(
-                        "required_capabilities"
-                    )
-                else:
-                    cursor.execute(
-                        "SELECT required_capabilities FROM tasks "
-                        "WHERE task_id = ?",
-                        (task_id_to_update,),
-                    )
-                    caps_row = cursor.fetchone()
-                    if caps_row:
-                        raw_caps = caps_row["required_capabilities"]
-                if isinstance(raw_caps, str):
-                    try:
-                        caps_list = json.loads(raw_caps or "[]")
-                    except json.JSONDecodeError:
-                        caps_list = []
-                elif isinstance(raw_caps, list):
-                    caps_list = raw_caps
-                else:
-                    caps_list = []
-                try:
-                    g.notify_unassigned_task_appeared(
-                        task_id_to_update, caps_list or []
-                    )
-                except Exception as notify_exc:  # pragma: no cover - defensive
-                    logger.warning(
-                        "notify_unassigned_task_appeared(%s) raised after "
-                        "dashboard clear-assignment: %s",
-                        task_id_to_update, notify_exc,
-                    )
-        return JSONResponse({"success": True, "message": "Task updated successfully via dashboard."})
     except ValueError as e_val:
         return JSONResponse({"error": str(e_val)}, status_code=400)
-    except sqlite3.Error as e_sql:
-        if conn:
-            conn.rollback()
-        logger.error(f"DB error updating task via dashboard: {e_sql}", exc_info=True)
-        return JSONResponse({"error": "Failed to update task (DB)."}, status_code=500)
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        logger.error(f"Error updating task via dashboard: {e}", exc_info=True)
-        return JSONResponse({"error": "Failed to update task."}, status_code=500)
-    finally:
-        if conn:
-            conn.close()
+
+    task_id = data.get('task_id')
+    if not task_id:
+        return JSONResponse({"error": "task_id is a required field."}, status_code=400)
+
+    # The set of recognised editable fields. At least one must be
+    # supplied; otherwise the request is a no-op and rejected. Kept as a
+    # wire-level check (not delegated to the tool) so the response body
+    # stays byte-identical to the pre-refactor route.
+    EDITABLE_KEYS = {"status", "title", "description", "priority", "notes", "assigned_to"}
+    if not any(k in data for k in EDITABLE_KEYS):
+        return JSONResponse(
+            {"error": "at least one editable field is required (status, title, description, priority, notes, assigned_to)."},
+            status_code=400,
+        )
+
+    # SEC round-9: reject structured JSON in the string fields BEFORE
+    # dispatch. Without this a dict/list value reaches the tool's own
+    # string handling and either raises (500) or is silently coerced —
+    # neither is the clean 400 a caller-error deserves. Wire-level input
+    # hygiene, kept local per the round-9 scope (the MCP path validates
+    # the same via the tool's inputSchema).
+    for _field in ("task_id", "status", "title", "description",
+                   "priority", "assigned_to"):
+        _err = _require_str(data.get(_field), _field)
+        if _err is not None:
+            return _err
+
+    # dispatch_tool_call's schema-cleaning step (``_clean_arguments_for_
+    # schema``) treats ANY top-level ``null`` argument as absent — it
+    # strips the key entirely before the tool ever sees it (the Q6e
+    # ``token: null`` tolerance rule applies uniformly, not just to
+    # ``token``). ``assigned_to: null`` is how this endpoint's caller
+    # spells "clear the assignment", which is semantically DIFFERENT
+    # from "omit — leave unchanged"; a bare ``None`` here would collapse
+    # both into "not supplied" and silently break clearing. Normalize a
+    # supplied-but-clearing value to the ``"unassigned"`` sentinel string
+    # (which the tool already treats as "clear", alongside "" and a
+    # supplied empty string) so the clear intent survives the null-strip.
+    assigned_to_arg: Any = None
+    if "assigned_to" in data:
+        raw_assigned_to = data.get("assigned_to")
+        if raw_assigned_to is None or (
+            isinstance(raw_assigned_to, str)
+            and raw_assigned_to.strip() in ("", "unassigned")
+        ):
+            assigned_to_arg = "unassigned"
+        else:
+            assigned_to_arg = raw_assigned_to
+
+    arguments = {
+        "task_id": task_id,
+        "status": data.get("status"),
+        "title": data.get("title"),
+        "description": data.get("description"),
+        "priority": data.get("priority"),
+        "assigned_to": assigned_to_arg,
+        "notes": data.get("notes"),
+    }
+
+    principal = _build_route_principal(
+        bearer_token=None,
+        operator_session=True,
+        operator_user_id=caller_identity(auth),
+    )
+
+    try:
+        result = await dispatch_tool_call(
+            "update_task", arguments, principal=principal,
+        )
+    except AuthRejected as e:
+        return JSONResponse({"error": e.reason}, status_code=403)
+    except ToolInputValidationError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:  # pragma: no cover - defensive
+        # SD-R7-1: a raw ``str(e)`` can leak internals; log server-side,
+        # return the STATIC generic 500 body this route has always used.
+        logger.error(f"Error dispatching update_task: {e}", exc_info=True)
+        return JSONResponse(
+            {"error": "Failed to update task."}, status_code=500
+        )
+
+    if isinstance(result, Ok):
+        return JSONResponse(
+            {
+                "success": True,
+                "message": result.message or "Task updated successfully via dashboard.",
+            },
+            status_code=200,
+        )
+
+    status, _ = tool_result_to_http(result)
+    if isinstance(result, Failed):
+        return JSONResponse({"error": "Failed to update task."}, status_code=status)
+    return JSONResponse(
+        {"error": _update_task_error_detail(result)}, status_code=status
+    )
 
 
 # --- Test/Demo Data Endpoint ---
