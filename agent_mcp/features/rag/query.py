@@ -1,6 +1,6 @@
 # Agent-MCP/mcp_template/mcp_server_src/features/rag/query.py
 import sqlite3  # For type hinting and error handling
-from typing import List, Dict, Any, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 # Imports from our project
 from ...core.config import (
@@ -35,28 +35,19 @@ def _is_secret_key(key: Optional[str]) -> bool:
     return is_secret_key(key)
 
 
-# Canonical embedded-secret VALUE scanner, reused (not duplicated) from
-# the index path so the live-context query filter applies the SAME skip
-# the indexer does: a secret in the VALUE of a non-secret-named key
-# (e.g. ``deploy_notes`` holding an AWS key) must not reach the LLM. Still
-# used by the query_rag_system_with_model raw ``SELECT ... FROM
-# project_context`` path below, which reads the table directly rather than
-# through the redaction-owning ``rag_repo.fetch_recent_context`` seam.
-from .indexing import _value_has_embedded_secret  # noqa: E402
-
-
 # SECRET REDACTION OWNERSHIP: the retrieval SEAM
-# (``rag_repo.search_similar`` + ``rag_repo.fetch_recent_context``) now
-# owns secret redaction — the seam that returns the data drops the
-# secrets. The former by-hand live-context filter here is gone (the seam's
-# fetch_recent_context enforces it). Two thin filters remain as explicit
-# defense-in-depth, NOT as the primary guard:
-#   * ``_drop_secret_context_chunks`` around ``search_similar`` — protects
-#     callers that inject/mock the repo and bypass the real seam.
-#   * the ``_is_secret_key`` / ``_value_has_embedded_secret`` filter on the
-#     raw ``SELECT ... FROM project_context`` in
-#     ``query_rag_system_with_model``, which does NOT read through the
-#     seam at all.
+# (``rag_repo.search_similar`` + ``rag_repo.fetch_recent_context``) owns
+# secret redaction — the seam that returns the data drops the secrets.
+# Both query_rag_system and query_rag_system_with_model read live
+# context through ``rag_repo.fetch_recent_context`` (arch-r5 #4
+# collapsed the second, hand-rolled ``SELECT ... FROM project_context``
+# + inline filter that query_rag_system_with_model used to carry — see
+# git history for the pre-collapse duplicate). One redaction
+# enforcement point, one seam, one thing to keep correct.
+#
+# ``_drop_secret_context_chunks`` below is explicit defense-in-depth,
+# NOT the primary guard: it protects callers that inject/mock the repo
+# and bypass the real ``search_similar`` seam.
 def _drop_secret_context_chunks(
     results: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
@@ -76,7 +67,156 @@ def _drop_secret_context_chunks(
     ]
 
 
+# ── Shared assembly helpers ───────────────────────────────────────────
+#
+# query_rag_system and query_rag_system_with_model both run the same
+# 4-stage pipeline (fetch live context → fetch live tasks → vector-search
+# chunks → assemble under a token budget → chat completion). The three
+# helpers below centralise the pieces that were byte-for-byte duplicated
+# between the two functions; the genuinely different pieces (retrieval
+# preambles, task filters, section headers, system prompts) stay in each
+# public function.
+
+
+def _append_within_budget(
+    parts: List[str], entry_text: str, count: int, limit: int
+) -> Optional[int]:
+    """Append ``entry_text`` to ``parts`` if it fits the token budget.
+
+    This is the 6x-duplicated accumulation-loop body (three sections x
+    two query functions). Preserves the exact pre-existing boundary
+    semantics: an entry that would bring the running count to exactly
+    ``limit`` is rejected (strict ``<``, not ``<=``) — see
+    ``tests/test_arch_r5_4_rag_query_dedup.py`` for the boundary pin.
+
+    Returns the new running token count on success, or ``None`` if the
+    entry did not fit (the caller should stop adding further entries to
+    this section and may append its own truncation marker).
+    """
+    entry_tokens = len(entry_text.split())  # Approximation
+    if count + entry_tokens < limit:
+        parts.append(entry_text)
+        return count + entry_tokens
+    return None
+
+
+def _render_chunk(i: int, item: Dict[str, Any]) -> str:
+    """Render one retrieved vector-search chunk into its RAG context
+    text block. Byte-for-byte identical between the two query
+    functions pre-refactor (metadata/source-info builder + entry
+    format)."""
+    chunk_text = item["chunk_text"]
+    source_type = item["source_type"]
+    source_ref = item["source_ref"]
+    metadata = item.get("metadata", {})
+    distance = item.get("distance", "N/A")
+
+    # Enhanced source info with metadata
+    source_info = f"Source Type: {source_type}, Reference: {source_ref}"
+
+    # Add code-specific metadata if available
+    if metadata and source_type in ["code", "code_summary"]:
+        if metadata.get("language"):
+            source_info += f", Language: {metadata['language']}"
+        if metadata.get("section_type"):
+            source_info += f", Section: {metadata['section_type']}"
+        if metadata.get("entities"):
+            entity_names = [e.get("name", "") for e in metadata["entities"]]
+            if entity_names:
+                source_info += f", Contains: {', '.join(entity_names[:3])}"
+                if len(entity_names) > 3:
+                    source_info += f" (+{len(entity_names)-3} more)"
+
+    return (
+        f"Retrieved Chunk {i+1} (Similarity/Distance: {distance}):\n"
+        f"{source_info}\nContent:\n{chunk_text}\n"
+    )
+
+
+async def _assemble_and_answer(
+    context_parts: List[str],
+    current_token_count: int,
+    query_text: str,
+    *,
+    system_prompt: str,
+    answer_instruction: str,
+    log_label: str,
+    on_client_ready: Optional[Callable[[Any], None]] = None,
+) -> str:
+    """Stage 4 (final join) + stage 5 (chat completion) — shared by both
+    query functions.
+
+    ``answer_instruction`` and ``log_label`` carry the two functions'
+    genuine wording differences (the "*only*" emphasis in
+    query_rag_system's user message; the "(task analysis)" log-message
+    suffix in query_rag_system_with_model) so both functions' external
+    behaviour — including log text — is unchanged by the extraction.
+    ``on_client_ready`` lets query_rag_system_with_model log the
+    provider/model it resolved, which query_rag_system does not do.
+    """
+    if not context_parts:
+        logger.info(
+            f"{log_label}: No relevant information found for query: '{query_text}'"
+        )
+        return (
+            "No relevant information found in the project knowledge base "
+            "or live data for your query."
+        )
+
+    combined_context_str = "\n\n".join(context_parts)
+    user_message_for_llm = (
+        f"CONTEXT:\n{combined_context_str}\n\nQUERY:\n{query_text}\n\n"
+        f"{answer_instruction}"
+    )
+
+    # SECURITY (round-3): do NOT log the assembled context / prompt
+    # excerpt — even after the secret filters above, a low-signal
+    # credential could survive the heuristics and land in DEBUG logs.
+    # Log only non-sensitive size metrics.
+    logger.debug(
+        f"{log_label}: assembled context for LLM "
+        "(approx tokens: %d, context chars: %d, prompt chars: %d)",
+        current_token_count,
+        len(combined_context_str),
+        len(user_message_for_llm),
+    )
+
+    # Provider-agnostic chat call. completion_client() picks Ollama vs
+    # OpenAI from env vars; both implement .chat().
+    try:
+        cc = completion_client()
+    except CompletionConfigError as e_cfg:
+        # SECURITY (round 9, SD-R9-1): do NOT reflect the config
+        # exception text — it can carry env-var names / internal paths
+        # and this string is returned verbatim to any worker via
+        # ask_project_rag's Ok(message=...). Detail is logged
+        # server-side; the caller gets a static category.
+        logger.error(f"{log_label}: completion config error: {e_cfg}")
+        return "RAG Error: completion provider is not configured"
+
+    if on_client_ready is not None:
+        on_client_ready(cc)
+
+    return await cc.chat(
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message_for_llm},
+        ],
+        temperature=0.4,
+    )
+
+
 # Original location: main.py lines 1432 - 1566 (ask_project_rag_tool function body)
+
+_SYSTEM_PROMPT_GENERAL = """You are an AI assistant answering questions about a software project. 
+Use the provided context, which may include recently updated live data (like project context keys or tasks) and information retrieved from an indexed knowledge base (like documentation or code summaries), to answer the user's query. 
+Prioritize information from the 'Live' sections if available and relevant for time-sensitive data. 
+Answer using *only* the information given in the context. If the context doesn't contain the answer, state that clearly.
+
+Be VERBOSE and comprehensive in your responses. It's better to give too much context than too little. 
+When answering, please also suggest additional context entries and queries that might be helpful for understanding this topic better.
+For example, suggest related files to examine, related project context keys to check, or follow-up questions that could provide more insight.
+Always err on the side of providing more detailed explanations and comprehensive information rather than brief responses."""
 
 
 async def query_rag_system(query_text: str) -> str:
@@ -243,12 +383,12 @@ async def query_rag_system(query_text: str) -> str:
             context_parts.append("--- Recently Updated Project Context (Live) ---")
             for item in live_context_results:
                 entry_text = f"Key: {item['context_key']}\nValue: {item['value']}\nDescription: {item.get('description', 'N/A')}\n(Updated: {item['updated_at']})\n"
-                entry_tokens = len(entry_text.split())  # Approximation
-                if current_token_count + entry_tokens < MAX_CONTEXT_TOKENS:
-                    context_parts.append(entry_text)
-                    current_token_count += entry_tokens
-                else:
+                new_count = _append_within_budget(
+                    context_parts, entry_text, current_token_count, MAX_CONTEXT_TOKENS
+                )
+                if new_count is None:
                     break
+                current_token_count = new_count
             context_parts.append("---------------------------------------------")
 
         # Add Live Tasks
@@ -256,12 +396,12 @@ async def query_rag_system(query_text: str) -> str:
             context_parts.append("--- Potentially Relevant Tasks (Live) ---")
             for task in live_task_results:
                 entry_text = f"Task ID: {task['task_id']}\nTitle: {task['title']}\nStatus: {task['status']}\nDescription: {task.get('description', 'N/A')}\n(Updated: {task['updated_at']})\n"
-                entry_tokens = len(entry_text.split())
-                if current_token_count + entry_tokens < MAX_CONTEXT_TOKENS:
-                    context_parts.append(entry_text)
-                    current_token_count += entry_tokens
-                else:
+                new_count = _append_within_budget(
+                    context_parts, entry_text, current_token_count, MAX_CONTEXT_TOKENS
+                )
+                if new_count is None:
                     break
+                current_token_count = new_count
             context_parts.append("---------------------------------------")
 
         # Add Indexed Knowledge (Vector Search Results)
@@ -270,95 +410,33 @@ async def query_rag_system(query_text: str) -> str:
                 "--- Indexed Project Knowledge (Vector Search Results) ---"
             )
             for i, item in enumerate(vector_search_results):
-                chunk_text = item["chunk_text"]
-                source_type = item["source_type"]
-                source_ref = item["source_ref"]
-                metadata = item.get("metadata", {})
-                distance = item.get("distance", "N/A")
-
-                # Enhanced source info with metadata
-                source_info = f"Source Type: {source_type}, Reference: {source_ref}"
-
-                # Add code-specific metadata if available
-                if metadata and source_type in ["code", "code_summary"]:
-                    if metadata.get("language"):
-                        source_info += f", Language: {metadata['language']}"
-                    if metadata.get("section_type"):
-                        source_info += f", Section: {metadata['section_type']}"
-                    if metadata.get("entities"):
-                        entity_names = [e.get("name", "") for e in metadata["entities"]]
-                        if entity_names:
-                            source_info += f", Contains: {', '.join(entity_names[:3])}"
-                            if len(entity_names) > 3:
-                                source_info += f" (+{len(entity_names)-3} more)"
-
-                entry_text = f"Retrieved Chunk {i+1} (Similarity/Distance: {distance}):\n{source_info}\nContent:\n{chunk_text}\n"
-                chunk_tokens = len(entry_text.split())
-                if current_token_count + chunk_tokens < MAX_CONTEXT_TOKENS:
-                    context_parts.append(entry_text)
-                    current_token_count += chunk_tokens
-                else:
+                entry_text = _render_chunk(i, item)
+                new_count = _append_within_budget(
+                    context_parts, entry_text, current_token_count, MAX_CONTEXT_TOKENS
+                )
+                if new_count is None:
                     context_parts.append(
                         "--- [Indexed knowledge truncated due to token limit] ---"
                     )
                     break
+                current_token_count = new_count
             context_parts.append(
                 "-------------------------------------------------------"
             )
 
-        if not context_parts:
-            logger.info(
-                f"RAG Query: No relevant information found for query: '{query_text}'"
-            )
-            answer = "No relevant information found in the project knowledge base or live data for your query."
-        else:
-            combined_context_str = "\n\n".join(context_parts)
-
-            # --- 5. Call Chat Completion API ---
-            # Original main.py: lines 1550 - 1562
-            system_prompt_for_llm = """You are an AI assistant answering questions about a software project. 
-Use the provided context, which may include recently updated live data (like project context keys or tasks) and information retrieved from an indexed knowledge base (like documentation or code summaries), to answer the user's query. 
-Prioritize information from the 'Live' sections if available and relevant for time-sensitive data. 
-Answer using *only* the information given in the context. If the context doesn't contain the answer, state that clearly.
-
-Be VERBOSE and comprehensive in your responses. It's better to give too much context than too little. 
-When answering, please also suggest additional context entries and queries that might be helpful for understanding this topic better.
-For example, suggest related files to examine, related project context keys to check, or follow-up questions that could provide more insight.
-Always err on the side of providing more detailed explanations and comprehensive information rather than brief responses."""
-
-            user_message_for_llm = f"CONTEXT:\n{combined_context_str}\n\nQUERY:\n{query_text}\n\nBased *only* on the CONTEXT provided above, please answer the QUERY."
-
-            # SECURITY (round-3): do NOT log the assembled context /
-            # prompt excerpt — even after the secret filters above, a
-            # low-signal credential could survive the heuristics and land
-            # in DEBUG logs. Log only non-sensitive size metrics.
-            logger.debug(
-                "RAG Query: assembled context for LLM "
-                "(approx tokens: %d, context chars: %d, prompt chars: %d)",
-                current_token_count,
-                len(combined_context_str),
-                len(user_message_for_llm),
-            )
-
-            # Provider-agnostic chat call. completion_client() picks
-            # Ollama vs OpenAI from env vars; both implement .chat().
-            try:
-                cc = completion_client()
-            except CompletionConfigError as e_cfg:
-                # SECURITY (round 9, SD-R9-1): do NOT reflect the config
-                # exception text — it can carry env-var names / internal
-                # paths and this string is returned verbatim to any
-                # worker via ask_project_rag's Ok(message=...). Detail is
-                # logged server-side; the caller gets a static category.
-                logger.error(f"RAG Query: completion config error: {e_cfg}")
-                return "RAG Error: completion provider is not configured"
-            answer = await cc.chat(
-                messages=[
-                    {"role": "system", "content": system_prompt_for_llm},
-                    {"role": "user", "content": user_message_for_llm},
-                ],
-                temperature=0.4,
-            )
+        # --- 5. Call Chat Completion API ---
+        # Original main.py: lines 1509 - 1562
+        answer = await _assemble_and_answer(
+            context_parts,
+            current_token_count,
+            query_text,
+            system_prompt=_SYSTEM_PROMPT_GENERAL,
+            answer_instruction=(
+                "Based *only* on the CONTEXT provided above, please "
+                "answer the QUERY."
+            ),
+            log_label="RAG Query",
+        )
 
     # SECURITY (round 9, SD-R9-1): these arms return VERBATIM to any
     # worker via ask_project_rag's Ok(message=...)/data. Never embed the
@@ -379,6 +457,18 @@ Always err on the side of providing more detailed explanations and comprehensive
             conn.close()
 
     return answer
+
+
+_SYSTEM_PROMPT_TASK_ANALYSIS = """You are an AI assistant specializing in task hierarchy analysis and project structure optimization. 
+You must CRITICALLY THINK about task placement, dependencies, and hierarchical relationships.
+Use the provided context to make intelligent recommendations about task organization.
+Be strict about the single root task rule and logical task relationships.
+
+Be VERBOSE and comprehensive in your analysis. It's better to give too much context than too little.
+When making recommendations, suggest additional context entries and queries that might be helpful for understanding task relationships better.
+Consider suggesting related files to examine, project context keys to check, or follow-up questions for deeper task analysis.
+Provide detailed explanations for your reasoning and comprehensive information rather than brief responses.
+Answer in the exact JSON format requested, but include thorough explanations in your reasoning sections."""
 
 
 async def query_rag_system_with_model(
@@ -404,7 +494,7 @@ async def query_rag_system_with_model(
     context_limit = max_tokens if max_tokens else MAX_CONTEXT_TOKENS
 
     conn = None
-    answer = "An unexpected error occurred during the RAG query."
+    answer = "An unexpected error occurred during the RAG task-analysis query."
 
     try:
         conn = get_db_connection()
@@ -414,32 +504,37 @@ async def query_rag_system_with_model(
         live_task_results: List[Dict[str, Any]] = []
         vector_search_results: List[Dict[str, Any]] = []
 
-        # Get live context (same as regular RAG). Phase 7b renamed
+        # Get live context (same as regular RAG), through the SAME
+        # retrieval seam query_rag_system uses. arch-r5 #4: this used
+        # to be a hand-rolled ``SELECT ... FROM project_context`` with
+        # its own inline ``_is_secret_key`` / ``_value_has_embedded_
+        # secret`` filter — a second, independently-maintained
+        # redaction enforcement point. Routing through
+        # rag_repo.fetch_recent_context collapses that to the ONE seam
+        # query_rag_system already uses. ``since`` = epoch and
+        # ``limit=None`` reproduce this function's original unbounded,
+        # un-windowed read (it never had a "recently changed" time
+        # filter, unlike query_rag_system): every row (updated_at is
+        # NOT NULL, so every real timestamp compares greater than the
+        # epoch string) with no SQL row cap, matching the pre-refactor
+        # behaviour exactly. Phase 7b renamed
         # project_context.last_updated -> updated_at; this path still
         # referenced the old name and threw "no such column" on every
         # call, silently returning an empty live-context section. Fixed
-        # to updated_at so the section works — and is secret-filtered.
-        cursor.execute(
-            "SELECT context_key, value, description, updated_at FROM project_context ORDER BY updated_at DESC"
+        # to updated_at so the section works.
+        from ...repositories import rag_repo
+
+        live_context_results = rag_repo.fetch_recent_context(
+            since="1970-01-01T00:00:00Z", limit=None,
         )
-        live_context_results = [dict(row) for row in cursor.fetchall()]
-        # SECURITY: drop secret-keyed rows before they reach the LLM
-        # (same policy as query_rag_system / view_project_context).
-        live_context_results = [
-            r for r in live_context_results
-            if not _is_secret_key(r.get("context_key"))
-            and not _value_has_embedded_secret(
-                r.get("value"), r.get("description")
-            )
-        ]
 
         # Get live tasks (same as regular RAG)
         cursor.execute(
             """
-            SELECT task_id, title, description, status, created_by, assigned_to, 
-                   priority, parent_task, depends_on_tasks, created_at, updated_at 
-            FROM tasks 
-            WHERE status IN ('pending', 'in_progress') 
+            SELECT task_id, title, description, status, created_by, assigned_to,
+                   priority, parent_task, depends_on_tasks, created_at, updated_at
+            FROM tasks
+            WHERE status IN ('pending', 'in_progress')
             ORDER BY updated_at DESC
         """
         )
@@ -450,8 +545,6 @@ async def query_rag_system_with_model(
         # k=13 retrieval window as the main RAG path.
         if is_vss_loadable():
             try:
-                from ...repositories import rag_repo
-
                 query_embedding = embedding_client().embed([query_text])[0]
                 # search_similar (the seam) already drops secret context
                 # chunks; the wrap here is defense-in-depth for an
@@ -473,7 +566,7 @@ async def query_rag_system_with_model(
                 )
 
         # Build context (same structure as regular RAG)
-        context_parts = []
+        context_parts: List[str] = []
         current_token_count = 0
 
         # Include live context
@@ -481,15 +574,15 @@ async def query_rag_system_with_model(
             context_parts.append("=== Live Project Context ===")
             for item in live_context_results:
                 entry_text = f"Key: {item['context_key']}\nDescription: {item['description']}\nValue: {item['value']}\nLast Updated: {item['updated_at']}\n"
-                chunk_tokens = len(entry_text.split())
-                if current_token_count + chunk_tokens < context_limit:
-                    context_parts.append(entry_text)
-                    current_token_count += chunk_tokens
-                else:
+                new_count = _append_within_budget(
+                    context_parts, entry_text, current_token_count, context_limit
+                )
+                if new_count is None:
                     context_parts.append(
                         "--- [Live context truncated due to token limit] ---"
                     )
                     break
+                current_token_count = new_count
 
         # Include live tasks
         if live_task_results:
@@ -501,99 +594,52 @@ async def query_rag_system_with_model(
                 entry_text += (
                     f"Created: {item['created_at']}\nUpdated: {item['updated_at']}\n"
                 )
-                chunk_tokens = len(entry_text.split())
-                if current_token_count + chunk_tokens < context_limit:
-                    context_parts.append(entry_text)
-                    current_token_count += chunk_tokens
-                else:
+                new_count = _append_within_budget(
+                    context_parts, entry_text, current_token_count, context_limit
+                )
+                if new_count is None:
                     context_parts.append(
                         "--- [Live tasks truncated due to token limit] ---"
                     )
                     break
+                current_token_count = new_count
 
         # Include vector search results
         if vector_search_results:
             context_parts.append("\n=== Retrieved from Indexed Knowledge ===")
             for i, item in enumerate(vector_search_results):
-                chunk_text = item["chunk_text"]
-                source_type = item["source_type"]
-                source_ref = item["source_ref"]
-                metadata = item.get("metadata", {})
-                distance = item.get("distance", "N/A")
-
-                # Enhanced source info with metadata (matching working implementation)
-                source_info = f"Source Type: {source_type}, Reference: {source_ref}"
-
-                # Add code-specific metadata if available
-                if metadata and source_type in ["code", "code_summary"]:
-                    if metadata.get("language"):
-                        source_info += f", Language: {metadata['language']}"
-                    if metadata.get("section_type"):
-                        source_info += f", Section: {metadata['section_type']}"
-                    if metadata.get("entities"):
-                        entity_names = [e.get("name", "") for e in metadata["entities"]]
-                        if entity_names:
-                            source_info += f", Contains: {', '.join(entity_names[:3])}"
-                            if len(entity_names) > 3:
-                                source_info += f" (+{len(entity_names)-3} more)"
-
-                entry_text = f"Retrieved Chunk {i+1} (Similarity/Distance: {distance}):\n{source_info}\nContent:\n{chunk_text}\n"
-                chunk_tokens = len(entry_text.split())
-                if current_token_count + chunk_tokens < context_limit:
-                    context_parts.append(entry_text)
-                    current_token_count += chunk_tokens
-                else:
+                entry_text = _render_chunk(i, item)
+                new_count = _append_within_budget(
+                    context_parts, entry_text, current_token_count, context_limit
+                )
+                if new_count is None:
                     context_parts.append(
                         "--- [Indexed knowledge truncated due to token limit] ---"
                     )
                     break
+                current_token_count = new_count
 
-        if not context_parts:
-            logger.info(
-                f"RAG Query: No relevant information found for query: '{query_text}'"
-            )
-            answer = "No relevant information found in the project knowledge base or live data for your query."
-        else:
-            combined_context_str = "\n\n".join(context_parts)
-
-            # Call Chat Completion API with specified model
-            system_prompt_for_llm = """You are an AI assistant specializing in task hierarchy analysis and project structure optimization. 
-You must CRITICALLY THINK about task placement, dependencies, and hierarchical relationships.
-Use the provided context to make intelligent recommendations about task organization.
-Be strict about the single root task rule and logical task relationships.
-
-Be VERBOSE and comprehensive in your analysis. It's better to give too much context than too little.
-When making recommendations, suggest additional context entries and queries that might be helpful for understanding task relationships better.
-Consider suggesting related files to examine, project context keys to check, or follow-up questions for deeper task analysis.
-Provide detailed explanations for your reasoning and comprehensive information rather than brief responses.
-Answer in the exact JSON format requested, but include thorough explanations in your reasoning sections."""
-
-            user_message_for_llm = f"CONTEXT:\n{combined_context_str}\n\nQUERY:\n{query_text}\n\nBased on the CONTEXT provided above, please answer the QUERY."
-
-            # Provider-agnostic chat call (v5.0.44). The
-            # ``model_name`` arg is now informational only — env vars
-            # select the provider & model. Log it so operators can
-            # see what context_limit was requested.
-            try:
-                cc = completion_client()
-            except CompletionConfigError as e_cfg:
-                # SECURITY (round 9, SD-R9-1): static string, no e_cfg
-                # (consistency with query_rag_system's arm above).
-                logger.error(
-                    f"RAG Query (task analysis): completion config error: {e_cfg}"
-                )
-                return "RAG Error: completion provider is not configured"
+        # Call Chat Completion API with specified model. The
+        # ``model_name`` arg is now informational only — env vars
+        # select the provider & model. Log it so operators can see
+        # what context_limit was requested (via on_client_ready).
+        def _log_provider(cc: Any) -> None:
             logger.info(
                 f"Task Analysis Query: using {cc.provider}/{cc.model} "
                 f"(context_limit={context_limit})"
             )
-            answer = await cc.chat(
-                messages=[
-                    {"role": "system", "content": system_prompt_for_llm},
-                    {"role": "user", "content": user_message_for_llm},
-                ],
-                temperature=0.4,
-            )
+
+        answer = await _assemble_and_answer(
+            context_parts,
+            current_token_count,
+            query_text,
+            system_prompt=_SYSTEM_PROMPT_TASK_ANALYSIS,
+            answer_instruction=(
+                "Based on the CONTEXT provided above, please answer the QUERY."
+            ),
+            log_label="RAG Query (task analysis)",
+            on_client_ready=_log_provider,
+        )
 
     except Exception as e:
         # SECURITY (round 9, SD-R9-1): static string, no str(e).

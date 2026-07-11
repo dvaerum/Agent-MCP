@@ -714,7 +714,7 @@ class RagRepository:
         self,
         since: str,
         *,
-        limit: int = 5,
+        limit: Optional[int] = 5,
     ) -> List[Dict[str, Any]]:
         """Return ``project_context`` rows whose ``updated_at > since``.
 
@@ -722,6 +722,13 @@ class RagRepository:
         entries alongside the kNN search results (the "live context"
         section in :func:`query_rag_system`). Returned in descending
         ``updated_at`` order, capped at ``limit``.
+
+        ``limit=None`` removes the SQL ``LIMIT`` clause entirely
+        (unbounded read) — used by :func:`query_rag_system_with_model`,
+        which historically read the *whole* ``project_context`` table
+        with no time window or row cap. Passing ``since="1970-01-01T
+        00:00:00Z"`` together with ``limit=None`` reproduces that
+        unbounded read through this seam instead of a bespoke query.
 
         Returns a list of dicts with keys ``context_key``, ``value``,
         ``description``, ``updated_at``.
@@ -736,14 +743,23 @@ class RagRepository:
         conn = get_db_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute(
-                "SELECT context_key, value, description, updated_at "
-                "FROM project_context "
-                "WHERE updated_at > ? "
-                "ORDER BY updated_at DESC "
-                "LIMIT ?",
-                (since, limit),
-            )
+            if limit is None:
+                cursor.execute(
+                    "SELECT context_key, value, description, updated_at "
+                    "FROM project_context "
+                    "WHERE updated_at > ? "
+                    "ORDER BY updated_at DESC",
+                    (since,),
+                )
+            else:
+                cursor.execute(
+                    "SELECT context_key, value, description, updated_at "
+                    "FROM project_context "
+                    "WHERE updated_at > ? "
+                    "ORDER BY updated_at DESC "
+                    "LIMIT ?",
+                    (since, limit),
+                )
             rows = [dict(r) for r in cursor.fetchall()]
             # SECURITY: the seam never surfaces secret-keyed rows
             # (config_*_token etc.) or rows whose VALUE embeds a
