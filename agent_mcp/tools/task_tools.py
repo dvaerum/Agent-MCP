@@ -25,6 +25,7 @@ from ..core.tool_result import (
 )
 from ..utils.audit_utils import log_audit
 from ..db.connection import get_db_connection, execute_db_write
+from ..db.unit_of_work import unit_of_work
 from ..db.actions.agent_actions_db import log_agent_action_to_db
 from ..features.task_placement.validator import validate_task_placement
 from ..features.task_placement.suggestions import (
@@ -49,6 +50,22 @@ from .agent_communication_tools import send_agent_message_tool_impl
 # follow-up agent via ``register_agent`` and the user starts their
 # own claude session.
 from ..utils.prompt_templates import build_agent_prompt  # still used by other paths
+
+
+class _DeleteRolledBack(Exception):
+    """Internal signal: force a unit-of-work rollback while carrying the
+    caller-facing :class:`ToolResult` to return.
+
+    Raised inside a ``unit_of_work()`` scope when a write must be undone
+    (e.g. the main DELETE unexpectedly failed after partial cascade
+    writes). The uow rolls back + fires zero effects; the outer handler
+    unwraps ``.result`` and returns it — so the caller sees the intended
+    ``Failed``/``Conflict`` rather than a generic error, with the partial
+    writes discarded."""
+
+    def __init__(self, result: "ToolResult") -> None:
+        super().__init__(getattr(result, "message", "delete rolled back"))
+        self.result = result
 
 
 def _publish_task_event(
@@ -4993,311 +5010,333 @@ async def delete_task_tool_impl(
     if not task_id:
         return Invalid(field="task_id", message="task_id is required")
 
-    conn = None
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        # D0: the unit-of-work owns the transaction AND the post-commit
+        # side effects (cache eviction, EventBus publish, audit). Effects
+        # are only *registered* on ``u`` during the scope and flushed
+        # after a successful commit — a rollback fires NOTHING, so the
+        # "forgot to notify" class (BL-R26-1) is structurally impossible.
+        with unit_of_work() as u:
+            cursor = u.cursor
 
-        # Check if task exists
-        cursor.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
-        task_row = cursor.fetchone()
+            # Check if task exists
+            cursor.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+            task_row = cursor.fetchone()
 
-        if not task_row:
-            return NotFound(resource="task", identifier=task_id)
+            if not task_row:
+                # Read-only scope: the __exit__ commit is a no-op; no
+                # effects were registered.
+                return NotFound(resource="task", identifier=task_id)
 
-        task_data = dict(task_row)
+            task_data = dict(task_row)
 
-        from ..repositories import task_repo as _task_repo
+            from ..repositories import task_repo as _task_repo
 
-        # BL-2: enumerate children authoritatively from the
-        # ``parent_task`` FK column — the source of truth — NOT the
-        # ``child_tasks`` JSON mirror (which historically drifted when a
-        # creation path failed to append the back-reference). A cascade
-        # driven by the stale mirror missed real children, so the main
-        # DELETE tripped the ``tasks.parent_task`` self-FK and
-        # ``force_delete`` did not actually force.
-        cursor.execute(
-            "SELECT task_id FROM tasks WHERE parent_task = ?", (task_id,)
-        )
-        direct_child_ids = [r["task_id"] for r in cursor.fetchall()]
-
-        # Check for child tasks
-        if direct_child_ids and not force_delete:
-            return Conflict(
-                reason=(
-                    f"Task '{task_id}' has {len(direct_child_ids)} child tasks: "
-                    f"{direct_child_ids}. Use force_delete=true to cascade delete."
-                )
-            )
-
-        # Check for tasks that depend on this one
-        cursor.execute(
-            "SELECT task_id, title FROM tasks WHERE json_extract(depends_on_tasks, '$') LIKE ?",
-            (f'%"{task_id}"%',),
-        )
-        dependent_tasks = cursor.fetchall()
-
-        if dependent_tasks and not force_delete:
-            dependent_list = [
-                f"{row['task_id']} ({row['title']})" for row in dependent_tasks
-            ]
-            return Conflict(
-                reason=(
-                    f"{len(dependent_tasks)} tasks depend on '{task_id}': "
-                    f"{dependent_list}. Use force_delete=true to cascade delete."
-                )
-            )
-
-        # BL-3: the ``agents.current_task → tasks.task_id`` FK. A task
-        # referenced by some agent's ``current_task`` cannot be DELETEd
-        # while the pointer stands. Non-force: refuse with a clear message
-        # (mirrors the child / dependent refusals above) instead of letting
-        # the DELETE trip a raw ``FOREIGN KEY constraint failed``. Force:
-        # the pointers across the whole delete set are NULLed below, in the
-        # same transaction, before any DELETE.
-        cursor.execute(
-            "SELECT agent_id FROM agents WHERE current_task = ?", (task_id,)
-        )
-        agents_on_task = [r["agent_id"] for r in cursor.fetchall()]
-        if agents_on_task and not force_delete:
-            return Conflict(
-                reason=(
-                    f"Task '{task_id}' is the current task of "
-                    f"{len(agents_on_task)} agent(s): {agents_on_task}. "
-                    f"Use force_delete=true to clear it and cascade delete."
-                )
-            )
-
-        # Begin cascade deletion operations
-        cascade_operations = []
-        # BL-1: (task_id, assigned_to) rows to evict from g.tasks +
-        # publish ``task.deleted`` for, AFTER commit. ``task_repo.delete``
-        # on the connection= path defers cache + publish to the caller so
-        # a subscriber never observes an uncommitted / rolled-back delete.
-        deleted_events: List[tuple] = [
-            (task_id, task_data.get("assigned_to"))
-        ]
-        parent_to_refresh: Optional[str] = None
-        deps_to_refresh: set = set()
-
-        # Update parent task to remove this child (JSON mirror upkeep).
-        if task_data.get("parent_task"):
-            parent_id = task_data["parent_task"]
+            # BL-2: enumerate children authoritatively from the
+            # ``parent_task`` FK column — the source of truth — NOT the
+            # ``child_tasks`` JSON mirror (which historically drifted when
+            # a creation path failed to append the back-reference). A
+            # cascade driven by the stale mirror missed real children, so
+            # the main DELETE tripped the ``tasks.parent_task`` self-FK and
+            # ``force_delete`` did not actually force.
             cursor.execute(
-                "SELECT child_tasks FROM tasks WHERE task_id = ?", (parent_id,)
+                "SELECT task_id FROM tasks WHERE parent_task = ?", (task_id,)
             )
-            parent_row = cursor.fetchone()
+            direct_child_ids = [r["task_id"] for r in cursor.fetchall()]
 
-            if parent_row:
-                parent_children = json.loads(parent_row["child_tasks"] or "[]")
-                if task_id in parent_children:
-                    parent_children.remove(task_id)
-                    _task_repo.update_fields(
-                        parent_id,
-                        {"child_tasks": parent_children},
-                        connection=cursor,
+            # Check for child tasks
+            if direct_child_ids and not force_delete:
+                return Conflict(
+                    reason=(
+                        f"Task '{task_id}' has {len(direct_child_ids)} child tasks: "
+                        f"{direct_child_ids}. Use force_delete=true to cascade delete."
                     )
-                    parent_to_refresh = parent_id
-                    cascade_operations.append(
-                        f"Updated parent task '{parent_id}' to remove child reference"
-                    )
-
-        # Handle child tasks — force-cascade the whole subtree, deepest
-        # descendant first (authoritative FK order) so no DELETE trips the
-        # self-FK. Route each through task_repo.delete so the cache +
-        # publish contract is honoured post-commit.
-        if force_delete:
-            descendants = _collect_task_descendants(cursor, task_id)
-
-            # BL-3: NULL ``agents.current_task`` for every agent whose
-            # pointer is anywhere in the delete set (target + descendants)
-            # BEFORE the DELETEs. Otherwise the
-            # ``agents.current_task → tasks.task_id`` FK aborts the
-            # ``DELETE FROM tasks`` and ``force_delete`` fails to force.
-            # Routed through the repo (one UPDATE ... IN (...)) so the
-            # in-memory agent cache mirror stays consistent with the DB.
-            from ..repositories import agent_repo as _agent_repo
-            delete_set_ids = [task_id] + [d_id for d_id, _ in descendants]
-            _agent_repo.clear_current_task_for_many(
-                delete_set_ids, connection=cursor
-            )
-
-            for descendant_id, descendant_assignee in descendants:
-                if _task_repo.delete(descendant_id, connection=cursor):
-                    deleted_events.append(
-                        (descendant_id, descendant_assignee)
-                    )
-                    cascade_operations.append(
-                        f"Deleted child task '{descendant_id}'"
-                    )
-
-        # Handle dependent tasks.
-        #
-        # BL-R19-1: reconcile dangling ``depends_on_tasks`` references
-        # across the WHOLE deleted set (root + every cascade-deleted
-        # descendant), not just the root. Previously only tasks depending
-        # on the ROOT were cleaned; an OUTSIDE task depending on a
-        # cascade-deleted DESCENDANT kept a reference to a now-absent id.
-        # ``auto_update_dependencies`` only advances a dependent when a
-        # dependency *completes* — it never fires for a *deleted*
-        # dependency — so that outside task stalled at ``pending`` forever
-        # (silent workflow stall). Same "delete must reconcile references"
-        # class as BL-2 / BL-R4-1, extended from the root to the subtree.
-        reeval_candidates: set = set()
-        if force_delete:
-            deleted_id_set = set(delete_set_ids)  # root + all descendants
-
-            # Gather every OUTSIDE task referencing any deleted id in its
-            # deps. Read all rows first (before any write) so a task that
-            # references two deleted ids is captured with its ORIGINAL
-            # dep list exactly once.
-            affected_deps: Dict[str, List[str]] = {}
-            for deleted_id in delete_set_ids:
-                cursor.execute(
-                    "SELECT task_id, depends_on_tasks FROM tasks "
-                    "WHERE json_extract(depends_on_tasks, '$') LIKE ?",
-                    (f'%"{deleted_id}"%',),
                 )
-                for dep_row in cursor.fetchall():
-                    dep_id = dep_row["task_id"]
-                    if dep_id in deleted_id_set:
-                        continue  # itself being deleted — no reconcile
-                    affected_deps.setdefault(
-                        dep_id,
-                        json.loads(dep_row["depends_on_tasks"] or "[]"),
-                    )
 
-            for dep_id, dep_dependencies in affected_deps.items():
-                pruned = [
-                    d for d in dep_dependencies if d not in deleted_id_set
+            # Check for tasks that depend on this one
+            cursor.execute(
+                "SELECT task_id, title FROM tasks WHERE json_extract(depends_on_tasks, '$') LIKE ?",
+                (f'%"{task_id}"%',),
+            )
+            dependent_tasks = cursor.fetchall()
+
+            if dependent_tasks and not force_delete:
+                dependent_list = [
+                    f"{row['task_id']} ({row['title']})" for row in dependent_tasks
                 ]
-                if pruned != dep_dependencies:
-                    _task_repo.update_fields(
-                        dep_id,
-                        {"depends_on_tasks": pruned},
-                        connection=cursor,
+                return Conflict(
+                    reason=(
+                        f"{len(dependent_tasks)} tasks depend on '{task_id}': "
+                        f"{dependent_list}. Use force_delete=true to cascade delete."
                     )
-                    deps_to_refresh.add(dep_id)
-                    reeval_candidates.add(dep_id)
-                    cascade_operations.append(
-                        f"Updated task '{dep_id}' to remove dependency on "
-                        f"deleted task(s) in the '{task_id}' cascade"
-                    )
-
-            # BL-R19-1: re-evaluate each unblocked task. A ``pending`` task
-            # whose remaining deps are all completed advances to
-            # ``in_progress`` — mirrors the auto-advance in the
-            # update_task_status path (auto_update_dependencies). Without
-            # this a task whose last blocking dependency was deleted would
-            # never progress on its own (deletion, unlike completion, never
-            # triggers the advance).
-            for dep_id in reeval_candidates:
-                cursor.execute(
-                    "SELECT status, depends_on_tasks FROM tasks "
-                    "WHERE task_id = ?",
-                    (dep_id,),
                 )
-                row = cursor.fetchone()
-                if row is None or row["status"] != "pending":
-                    continue
-                remaining = json.loads(row["depends_on_tasks"] or "[]")
-                all_completed = True
-                for rid in remaining:
-                    cursor.execute(
-                        "SELECT status FROM tasks WHERE task_id = ?", (rid,)
+
+            # BL-3: the ``agents.current_task → tasks.task_id`` FK. A task
+            # referenced by some agent's ``current_task`` cannot be DELETEd
+            # while the pointer stands. Non-force: refuse with a clear
+            # message (mirrors the child / dependent refusals above)
+            # instead of letting the DELETE trip a raw ``FOREIGN KEY
+            # constraint failed``. Force: the pointers across the whole
+            # delete set are NULLed below, in the same transaction, before
+            # any DELETE.
+            cursor.execute(
+                "SELECT agent_id FROM agents WHERE current_task = ?", (task_id,)
+            )
+            agents_on_task = [r["agent_id"] for r in cursor.fetchall()]
+            if agents_on_task and not force_delete:
+                return Conflict(
+                    reason=(
+                        f"Task '{task_id}' is the current task of "
+                        f"{len(agents_on_task)} agent(s): {agents_on_task}. "
+                        f"Use force_delete=true to clear it and cascade delete."
                     )
-                    r2 = cursor.fetchone()
-                    if r2 is None or r2["status"] != "completed":
-                        all_completed = False
-                        break
-                if all_completed:
-                    advance = await _update_single_task(
-                        cursor,
-                        dep_id,
-                        "in_progress",
-                        "admin",
-                        True,
-                        "Auto-advanced: blocking dependency deleted",
-                    )
-                    if advance.get("success"):
+                )
+
+            # Begin cascade deletion operations
+            cascade_operations = []
+            # BL-1: (task_id, assigned_to) rows to evict from g.tasks +
+            # publish ``task.deleted`` for, AFTER commit. The unit-of-work
+            # registers these effects (below) so a subscriber never
+            # observes an uncommitted / rolled-back delete.
+            deleted_events: List[tuple] = [
+                (task_id, task_data.get("assigned_to"))
+            ]
+            parent_to_refresh: Optional[str] = None
+            deps_to_refresh: set = set()
+
+            # Update parent task to remove this child (JSON mirror upkeep).
+            if task_data.get("parent_task"):
+                parent_id = task_data["parent_task"]
+                cursor.execute(
+                    "SELECT child_tasks FROM tasks WHERE task_id = ?", (parent_id,)
+                )
+                parent_row = cursor.fetchone()
+
+                if parent_row:
+                    parent_children = json.loads(parent_row["child_tasks"] or "[]")
+                    if task_id in parent_children:
+                        parent_children.remove(task_id)
+                        _task_repo.update_fields(
+                            parent_id,
+                            {"child_tasks": parent_children},
+                            connection=cursor,
+                        )
+                        parent_to_refresh = parent_id
                         cascade_operations.append(
-                            f"Auto-advanced task '{dep_id}' to in_progress "
-                            f"(blocking dependency deleted)"
+                            f"Updated parent task '{parent_id}' to remove child reference"
                         )
 
-        # Delete the main task through the repo (cache + publish deferred
-        # to post-commit per the connection= contract).
-        if not _task_repo.delete(task_id, connection=cursor):
-            return Failed(message=f"Failed to delete task '{task_id}'")
+            # Handle child tasks — force-cascade the whole subtree, deepest
+            # descendant first (authoritative FK order) so no DELETE trips
+            # the self-FK. Route each through task_repo.delete so the cache
+            # + publish contract is honoured post-commit.
+            if force_delete:
+                descendants = _collect_task_descendants(cursor, task_id)
 
-        # BL-R4-1: prune each deleted task's RAG chunk + hash watermark
-        # in the SAME transaction as the row delete. The incremental
-        # indexer keys on ``updated_at`` and never sweeps orphans, so a
-        # deleted task's ``source_type='task'`` chunk would otherwise
-        # stay queryable via ``ask_project_rag`` forever. ``deleted_events``
-        # holds the whole delete set (target + every force-cascaded
-        # descendant), so this covers the cascade too. Clearing the hash
-        # lets a future task with the same id re-index cleanly.
-        from ..repositories import rag_repo as _rag_repo
-        for deleted_id, _ in deleted_events:
-            _rag_repo.purge_source("task", deleted_id, connection=cursor)
+                # BL-3: NULL ``agents.current_task`` for every agent whose
+                # pointer is anywhere in the delete set (target +
+                # descendants) BEFORE the DELETEs. Otherwise the
+                # ``agents.current_task → tasks.task_id`` FK aborts the
+                # ``DELETE FROM tasks`` and ``force_delete`` fails to force.
+                # Routed through the repo (one UPDATE ... IN (...)) so the
+                # in-memory agent cache mirror stays consistent with the DB.
+                from ..repositories import agent_repo as _agent_repo
+                delete_set_ids = [task_id] + [d_id for d_id, _ in descendants]
+                _agent_repo.clear_current_task_for_many(
+                    delete_set_ids, connection=cursor
+                )
 
-        # Log the deletion action
-        log_agent_action_to_db(
-            cursor=cursor,
-            agent_id="admin",
-            action_type="deleted_task",
-            task_id=task_id,
-            details={
-                "task_title": task_data.get("title"),
-                "force_delete": force_delete,
-                "cascade_operations": cascade_operations,
-            },
-        )
+                for descendant_id, descendant_assignee in descendants:
+                    if _task_repo.delete(descendant_id, connection=cursor):
+                        deleted_events.append(
+                            (descendant_id, descendant_assignee)
+                        )
+                        cascade_operations.append(
+                            f"Deleted child task '{descendant_id}'"
+                        )
 
-        conn.commit()
+            # Handle dependent tasks.
+            #
+            # BL-R19-1: reconcile dangling ``depends_on_tasks`` references
+            # across the WHOLE deleted set (root + every cascade-deleted
+            # descendant), not just the root. Previously only tasks
+            # depending on the ROOT were cleaned; an OUTSIDE task depending
+            # on a cascade-deleted DESCENDANT kept a reference to a
+            # now-absent id. ``auto_update_dependencies`` only advances a
+            # dependent when a dependency *completes* — it never fires for a
+            # *deleted* dependency — so that outside task stalled at
+            # ``pending`` forever (silent workflow stall). Same "delete must
+            # reconcile references" class as BL-2 / BL-R4-1, extended from
+            # the root to the subtree.
+            reeval_candidates: set = set()
+            if force_delete:
+                deleted_id_set = set(delete_set_ids)  # root + all descendants
 
-        # BL-1: post-commit cache reconciliation + EventBus publish. Evict
-        # every deleted row from g.tasks and publish ``task.deleted``;
-        # refresh the parent + dependents whose JSON mirrors we mutated
-        # (update_fields(connection=) also deferred their cache write).
-        for deleted_id, deleted_assignee in deleted_events:
-            _task_repo.evict_from_cache(deleted_id)
-            _publish_task_event(
-                deleted_assignee,
-                "task.deleted",
-                {"task_id": deleted_id, "assigned_to": deleted_assignee},
+                # Gather every OUTSIDE task referencing any deleted id in
+                # its deps. Read all rows first (before any write) so a task
+                # that references two deleted ids is captured with its
+                # ORIGINAL dep list exactly once.
+                affected_deps: Dict[str, List[str]] = {}
+                for deleted_id in delete_set_ids:
+                    cursor.execute(
+                        "SELECT task_id, depends_on_tasks FROM tasks "
+                        "WHERE json_extract(depends_on_tasks, '$') LIKE ?",
+                        (f'%"{deleted_id}"%',),
+                    )
+                    for dep_row in cursor.fetchall():
+                        dep_id = dep_row["task_id"]
+                        if dep_id in deleted_id_set:
+                            continue  # itself being deleted — no reconcile
+                        affected_deps.setdefault(
+                            dep_id,
+                            json.loads(dep_row["depends_on_tasks"] or "[]"),
+                        )
+
+                for dep_id, dep_dependencies in affected_deps.items():
+                    pruned = [
+                        d for d in dep_dependencies if d not in deleted_id_set
+                    ]
+                    if pruned != dep_dependencies:
+                        _task_repo.update_fields(
+                            dep_id,
+                            {"depends_on_tasks": pruned},
+                            connection=cursor,
+                        )
+                        deps_to_refresh.add(dep_id)
+                        reeval_candidates.add(dep_id)
+                        cascade_operations.append(
+                            f"Updated task '{dep_id}' to remove dependency on "
+                            f"deleted task(s) in the '{task_id}' cascade"
+                        )
+
+                # BL-R19-1: re-evaluate each unblocked task. A ``pending``
+                # task whose remaining deps are all completed advances to
+                # ``in_progress`` — mirrors the auto-advance in the
+                # update_task_status path (auto_update_dependencies).
+                # Without this a task whose last blocking dependency was
+                # deleted would never progress on its own (deletion, unlike
+                # completion, never triggers the advance).
+                for dep_id in reeval_candidates:
+                    cursor.execute(
+                        "SELECT status, depends_on_tasks FROM tasks "
+                        "WHERE task_id = ?",
+                        (dep_id,),
+                    )
+                    row = cursor.fetchone()
+                    if row is None or row["status"] != "pending":
+                        continue
+                    remaining = json.loads(row["depends_on_tasks"] or "[]")
+                    all_completed = True
+                    for rid in remaining:
+                        cursor.execute(
+                            "SELECT status FROM tasks WHERE task_id = ?", (rid,)
+                        )
+                        r2 = cursor.fetchone()
+                        if r2 is None or r2["status"] != "completed":
+                            all_completed = False
+                            break
+                    if all_completed:
+                        advance = await _update_single_task(
+                            cursor,
+                            dep_id,
+                            "in_progress",
+                            "admin",
+                            True,
+                            "Auto-advanced: blocking dependency deleted",
+                        )
+                        if advance.get("success"):
+                            cascade_operations.append(
+                                f"Auto-advanced task '{dep_id}' to in_progress "
+                                f"(blocking dependency deleted)"
+                            )
+
+            # Delete the main task through the repo. The repo defers cache
+            # + publish to the caller on the connection= path; the uow
+            # registers those effects below.
+            if not _task_repo.delete(task_id, connection=cursor):
+                # Force a rollback of any partial cascade writes by raising
+                # out of the scope — the uow fires NOTHING on exception.
+                raise _DeleteRolledBack(
+                    Failed(message=f"Failed to delete task '{task_id}'")
+                )
+
+            # BL-R4-1: prune each deleted task's RAG chunk + hash watermark
+            # in the SAME transaction as the row delete. The incremental
+            # indexer keys on ``updated_at`` and never sweeps orphans, so a
+            # deleted task's ``source_type='task'`` chunk would otherwise
+            # stay queryable via ``ask_project_rag`` forever.
+            # ``deleted_events`` holds the whole delete set (target + every
+            # force-cascaded descendant), so this covers the cascade too.
+            # Clearing the hash lets a future task with the same id re-index
+            # cleanly.
+            from ..repositories import rag_repo as _rag_repo
+            for deleted_id, _ in deleted_events:
+                _rag_repo.purge_source("task", deleted_id, connection=cursor)
+
+            # Register the deletion audit (both sinks — DB agent_actions +
+            # in-memory g.audit_log) to fire after commit.
+            u.audit(
+                "admin",
+                "deleted_task",
+                task_id=task_id,
+                details={
+                    "task_title": task_data.get("title"),
+                    "force_delete": force_delete,
+                    "cascade_operations": cascade_operations,
+                },
             )
-        _refresh_parent_cache(parent_to_refresh)
-        for dep_id in deps_to_refresh:
-            fresh_dep = _task_repo.get_by_id(dep_id)
-            if fresh_dep is not None:
-                _task_repo.upsert_cache(fresh_dep)
 
-        # Prepare response
-        response_parts = [
-            f"Task '{task_id}' ({task_data.get('title', 'Untitled')}) deleted successfully."
-        ]
+            # BL-1: register post-commit cache reconciliation + EventBus
+            # publish. Evict every deleted row from g.tasks and publish
+            # ``task.deleted``; refresh the parent + dependents whose JSON
+            # mirrors we mutated (update_fields(connection=) also deferred
+            # their cache write). The uow fires these only on a clean
+            # commit — emit-iff-commit.
+            for deleted_id, deleted_assignee in deleted_events:
+                u.on_commit(
+                    lambda did=deleted_id: _task_repo.evict_from_cache(did)
+                )
+                u.emit(
+                    deleted_assignee,
+                    "task.deleted",
+                    {"task_id": deleted_id, "assigned_to": deleted_assignee},
+                )
+            if parent_to_refresh is not None:
+                u.on_commit(
+                    lambda pid=parent_to_refresh: _refresh_parent_cache(pid)
+                )
+            for dep_id in deps_to_refresh:
+                def _refresh_dep_cache(d=dep_id) -> None:
+                    fresh_dep = _task_repo.get_by_id(d)
+                    if fresh_dep is not None:
+                        _task_repo.upsert_cache(fresh_dep)
 
-        if cascade_operations:
-            response_parts.append("\nCascade Operations:")
-            for op in cascade_operations:
-                response_parts.append(f"  • {op}")
+                u.on_commit(_refresh_dep_cache)
 
-        response_parts.append(
-            f"\nDeletion completed at: {datetime.datetime.now().isoformat()}"
-        )
+            # Prepare response
+            response_parts = [
+                f"Task '{task_id}' ({task_data.get('title', 'Untitled')}) deleted successfully."
+            ]
 
-        return Ok(message="\n".join(response_parts))
+            if cascade_operations:
+                response_parts.append("\nCascade Operations:")
+                for op in cascade_operations:
+                    response_parts.append(f"  • {op}")
 
+            response_parts.append(
+                f"\nDeletion completed at: {datetime.datetime.now().isoformat()}"
+            )
+
+            # Returning here runs the uow __exit__: commit, then flush the
+            # registered audit + cache + event effects in order.
+            return Ok(message="\n".join(response_parts))
+
+    except _DeleteRolledBack as rb:
+        return rb.result
     except Exception as e:
-        if conn:
-            conn.rollback()
+        # The unit-of-work already rolled back + closed the connection.
         logger.error(f"Error in delete_task_tool_impl: {e}", exc_info=True)
         return Failed(message=f"Error deleting task: {str(e)}")
-    finally:
-        if conn:
-            conn.close()
 
 
 # Call registration when this module is imported
