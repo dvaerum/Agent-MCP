@@ -352,3 +352,41 @@ STATUS_SYMBOLS = {
     'arrow_down': '↓',  # Down arrow
     'arrow_up': '↑',    # Up arrow
 }
+
+# --- Startup "reach the dashboard" derivations ------------------------
+# Shared by the no-TUI startup banner (server_bootstrap._print_startup_banner)
+# and the TUI's "Next Steps" panel (tui.runtime.tui_display_loop) — both
+# used to independently compute the same dashboard_path ternary and
+# hardcode the same ":3847" dev-server port literal. Consolidated here
+# (arch-r4 #11a) so there's one place to change either.
+#
+# 3847 is the dashboard's `npm run dev` (Vite) port, not the MCP
+# backend's own --port — the two are unrelated, so this is a constant,
+# not derived from ServerConfig.port.
+DASHBOARD_DEV_PORT = 3847
+
+
+def dashboard_path(project_dir: str) -> str:
+    """Where an operator should `cd` to run the dashboard's dev server,
+    relative to how the MCP backend was invoked."""
+    return (
+        f"{project_dir}/agent_mcp/dashboard"
+        if project_dir != "."
+        else "agent_mcp/dashboard"
+    )
+
+
+def next_steps_lines(project_dir: str, port: int = DASHBOARD_DEV_PORT) -> list:
+    """Plain-text, unnumbered "how to reach the dashboard" steps.
+
+    Used verbatim by the no-TUI startup banner (numbered 1..N as-is).
+    The TUI's Next Steps panel has its own multi-line, colorized layout
+    for the same information and draws on ``dashboard_path`` +
+    ``DASHBOARD_DEV_PORT`` directly rather than this list, since its
+    step boundaries don't line up 1:1 with these three lines.
+    """
+    return [
+        f"Open new terminal → cd {dashboard_path(project_dir)}",
+        "Run: npm run dev",
+        f"Open: http://localhost:{port}",
+    ]

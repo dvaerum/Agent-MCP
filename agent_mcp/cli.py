@@ -53,53 +53,45 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 # transitive one through server_bootstrap — locks in the env state
 # at that point. So we walk the .env discovery as the very first
 # thing, then import the rest.
+#
+# The walk itself lives in ``core.env_boot`` (arch-r4 #11a — it used
+# to be duplicated here AND in ``__main__.py`` with two different
+# search depths). That module is dependency-free w.r.t. the rest of
+# ``agent_mcp``, so importing it here doesn't trigger ``core.config``
+# early. We keep the printing here (not in env_boot) since VULN-002
+# established the presence-only/count-only shape these prints must
+# have, and that's a caller-facing concern, not the walk's.
 import os
 import sys
 import sqlite3
 import warnings
 from pathlib import Path
 
-from dotenv import dotenv_values, load_dotenv
+from .core.env_boot import discover_and_load_dotenv
 
-_script_dir = Path(__file__).resolve().parent
-for _parent_level in range(3):
-    _env_path = (_script_dir / ("../" * _parent_level) / ".env").resolve()
-    print(f"Trying to load .env from: {_env_path}")
-    if _env_path.exists():
-        print(f"Found .env at: {_env_path}")
-        _env_vars = dotenv_values(str(_env_path))
-        # VULN-002: don't enumerate the loaded variable names. The
-        # .env typically holds OPENAI_API_KEY alongside other secret-
-        # bearing names (AUTH_*, SMTP_*, OIDC_*); logging the set
-        # gives a journal reader the inventory of what's worth stealing.
-        # Count-only keeps the "we loaded something" signal.
-        print(f"Loaded {len(_env_vars)} environment variable(s) from .env")
-        # VULN-002: never log a prefix of OPENAI_API_KEY — see
-        # __main__.py for the rationale. Presence-only.
-        _printable_key = _env_vars.get("OPENAI_API_KEY") or ""
-        print(f"OPENAI_API_KEY from file: {'present' if _printable_key else 'NOT FOUND'}")
-        for _key, _value in _env_vars.items():
-            if _value is not None:
-                os.environ[_key] = _value
-        if os.environ.get("OPENAI_API_KEY"):
-            print("OPENAI_API_KEY successfully loaded from environment")
-        else:
-            print("OPENAI_API_KEY not found in environment")
-        break
+_dotenv_result = discover_and_load_dotenv(Path(__file__).resolve().parent, max_levels=3)
+if _dotenv_result.path is not None:
+    print(f"Found .env at: {_dotenv_result.path}")
+    # VULN-002: don't enumerate the loaded variable names. The .env
+    # typically holds OPENAI_API_KEY alongside other secret-bearing
+    # names (AUTH_*, SMTP_*, OIDC_*); logging the set gives a journal
+    # reader the inventory of what's worth stealing. Count-only keeps
+    # the "we loaded something" signal.
+    print(f"Loaded {_dotenv_result.var_count} environment variable(s) from .env")
+    # VULN-002: never log a prefix of OPENAI_API_KEY — see
+    # __main__.py's history for the rationale. Presence-only.
+    print(
+        "OPENAI_API_KEY from file: "
+        f"{'present' if os.environ.get('OPENAI_API_KEY') else 'NOT FOUND'}"
+    )
+    if os.environ.get("OPENAI_API_KEY"):
+        print("OPENAI_API_KEY successfully loaded from environment")
+    else:
+        print("OPENAI_API_KEY not found in environment")
+else:
+    print("No .env file found in parent directories")
 
-# Also try cwd-relative load_dotenv in case the deploy repo's
-# wrapper script puts the .env somewhere this walk doesn't find.
-load_dotenv()
-
-# Cleanup of loop locals so a future reader doesn't mistake them for
-# config surface.
-del _script_dir, _parent_level
-for _local in ("_env_path", "_env_vars", "_printable_key", "_key", "_value", "_local"):
-    if _local in dir():
-        try:
-            del globals()[_local]
-        except KeyError:
-            pass
+del _dotenv_result
 
 # --- Now safe to import core.config (it reads env at import time) ----
 from typing import Optional  # noqa: E402

@@ -588,7 +588,7 @@ def _print_startup_banner(config: ServerConfig) -> None:
     ``--no-tui`` or ``--debug`` still want a one-shot summary of where
     the server is listening + how to reach the dashboard.
     """
-    from .tui.colors import get_responsive_agent_mcp_banner
+    from .tui.colors import get_responsive_agent_mcp_banner, next_steps_lines
 
     print()
     print(get_responsive_agent_mcp_banner())
@@ -606,14 +606,8 @@ def _print_startup_banner(config: ServerConfig) -> None:
     print()
     if config.transport != "stdio":
         print("Next steps:")
-        dashboard_path = (
-            f"{config.project_dir}/agent_mcp/dashboard"
-            if config.project_dir != "."
-            else "agent_mcp/dashboard"
-        )
-        print(f"1. Open new terminal → cd {dashboard_path}")
-        print("2. Run: npm run dev")
-        print("3. Open: http://localhost:3847")
+        for step_num, line in enumerate(next_steps_lines(config.project_dir), start=1):
+            print(f"{step_num}. {line}")
         print()
     print("Keep this server running. Press Ctrl+C to quit.")
 
