@@ -469,11 +469,17 @@ def find_or_create_sso_user(
         candidate = f"{base}-{suffix}"
         suffix += 1
 
-    user_id = _create_passwordless_user(
+    # SSO-only row: no password at all (``password_hash`` stays NULL).
+    # ``identity.create_user`` owns the first-user membership/sysadmin
+    # bootstrap; the passwordless fork it used to have (this module's
+    # ``_create_passwordless_user``) was deleted in arch-deepening R2 #1b.
+    user_id = identity.create_user(
         username=candidate,
+        password=None,
         email=email,
-        subject=subject,
+        password_hash=None,
         is_sysadmin=default_is_sysadmin,
+        sso_subject=subject,
         bootstrap_sysadmin=bootstrap_sysadmin,
     )
     identity.touch_last_login(user_id)
@@ -547,70 +553,6 @@ def _stamp_subject_if_absent(user_id: str, subject: str) -> None:
             (subject, user_id),
         )
         conn.commit()
-
-
-def _create_passwordless_user(
-    *, username: str, email: str | None, is_sysadmin: bool,
-    subject: str | None = None,
-    bootstrap_sysadmin: bool = False,
-) -> str:
-    """Insert a NULL-password user row directly.
-
-    ``identity.create_user`` hashes a password into ``password_hash``;
-    SSO-only users have no password at all. We bypass the helper for
-    the INSERT.
-
-    The "first user in an empty table gets membership in every project"
-    promotion is ALWAYS applied (so the bootstrap operator can reach the
-    existing projects). The "…AND is a sysadmin" half is gated behind
-    ``bootstrap_sysadmin`` (round-9 AC-R9-2) and DEFAULTS OFF: a fresh
-    SSO deploy's first IdP user is NOT silently minted as sysadmin. The
-    OIDC callback threads its ``AGENT_MCP_SSO_OIDC_DEFAULT_SYSADMIN``
-    flag through here so an operator can deliberately opt the first user
-    in. The proxy-header path leaves this default (its sysadmin bit
-    rides on ``is_sysadmin`` / ``default_is_sysadmin`` instead, gated at
-    its own call site ``extract_proxy_header_user``), so its behaviour
-    is unchanged.
-    """
-    from . import identity
-    from datetime import datetime, timezone
-
-    user_id = secrets.token_hex(8)
-    created_at = datetime.now(timezone.utc).isoformat(
-        timespec="milliseconds",
-    )
-    with sqlite3.connect(str(identity.get_router_db_path())) as conn:
-        conn.row_factory = sqlite3.Row
-        was_empty = (
-            conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is None
-        )
-        conn.execute(
-            """
-            INSERT INTO users
-                (user_id, username, email, password_hash, created_at,
-                 last_login_at, is_sysadmin, sso_subject)
-            VALUES (?, ?, ?, NULL, ?, NULL, ?, ?)
-            """,
-            (
-                user_id, username, email, created_at,
-                1 if (is_sysadmin or (was_empty and bootstrap_sysadmin))
-                else 0,
-                subject,
-            ),
-        )
-        if was_empty:
-            existing = identity._list_registered_projects()
-            for project_name in existing:
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO project_membership
-                        (project_name, user_id)
-                    VALUES (?, ?)
-                    """,
-                    (project_name, user_id),
-                )
-        conn.commit()
-    return user_id
 
 
 # ── Group mapping ──────────────────────────────────────────────────
@@ -812,24 +754,29 @@ def _ensure_group(name: str) -> str | None:
 
 
 def _add_user_to_group_idempotent(group_id: str, user_id: str) -> bool:
-    """Insert a user→group edge; return True iff a row was added."""
+    """Insert a user→group edge; return True iff a row was added.
+
+    The INSERT routes through ``store.add_group_member`` (arch-deepening
+    R2 #1b) so ``group_membership`` has one writer. The pre-check keeps
+    the idempotent "was it newly added?" return contract
+    ``apply_group_mapping`` depends on, and the ``OperationalError``
+    fallback still silently no-ops on a backlevel deploy whose groups
+    tables haven't been migrated in.
+    """
     from . import identity
+    from .router_store import store
 
     try:
-        with sqlite3.connect(str(identity.get_router_db_path())) as conn:
+        with identity._connect() as conn:
             cur = conn.execute(
                 "SELECT 1 FROM group_membership WHERE group_id = ? "
                 "AND member_user_id = ?", (group_id, user_id),
             )
             if cur.fetchone() is not None:
                 return False
-            conn.execute(
-                "INSERT INTO group_membership "
-                "(group_id, member_user_id, member_group_id, added_at) "
-                "VALUES (?, ?, NULL, datetime('now'))",
-                (group_id, user_id),
+            store.add_group_member(
+                group_id, member_user_id=user_id, conn=conn,
             )
-            conn.commit()
             return True
     except sqlite3.OperationalError:
         return False

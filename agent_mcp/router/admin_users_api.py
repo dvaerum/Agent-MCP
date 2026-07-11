@@ -1282,14 +1282,17 @@ async def add_group_member_handler(req: web.Request) -> web.Response:
                     ),
                     status=409,
                 )
-            conn.execute(
-                "INSERT INTO group_membership "
-                "(group_id, member_user_id, member_group_id, added_at) "
-                "VALUES (?, ?, ?, ?)",
-                (
-                    parent_group_id, member_user_id, member_group_id,
-                    _now_iso(),
-                ),
+            # Route through the single group_membership writer (arch R2
+            # #1b), enlisted in this BEGIN IMMEDIATE via ``conn=``. The
+            # amplification/cycle guards above already ran on this same
+            # connection, so the store's own cycle check is a redundant
+            # no-op here; ``sqlite3.IntegrityError`` from the idempotency
+            # UNIQUE index still propagates to the handler below → 409.
+            store.add_group_member(
+                parent_group_id,
+                member_user_id=member_user_id,
+                member_group_id=member_group_id,
+                conn=conn,
             )
             conn.execute("COMMIT")
         except sqlite3.IntegrityError as e:
@@ -1499,18 +1502,17 @@ async def add_project_membership_handler(req: web.Request) -> web.Response:
     conn = _connect()
     try:
         try:
+            # Route both grant shapes through the single project_membership
+            # writer (arch R2 #1b), enlisted in this connection via
+            # ``conn=``. Plain INSERT (``or_ignore`` defaults False) so a
+            # duplicate raises ``IntegrityError`` → the 409 below.
             if user_id:
-                conn.execute(
-                    "INSERT INTO project_membership "
-                    "(project_name, user_id, role) VALUES (?, ?, ?)",
-                    (project_name, user_id, role),
+                store.add_project_membership(
+                    project_name, user_id=user_id, role=role, conn=conn,
                 )
             else:
-                conn.execute(
-                    "INSERT INTO project_membership "
-                    "(project_name, user_id, group_id, role) "
-                    "VALUES (?, NULL, ?, ?)",
-                    (project_name, group_id, role),
+                store.add_project_membership(
+                    project_name, group_id=group_id, role=role, conn=conn,
                 )
             conn.commit()
         except sqlite3.IntegrityError as e:

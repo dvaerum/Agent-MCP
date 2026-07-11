@@ -73,6 +73,7 @@ __all__ = [
     "get_user_by_username",
     "hash_password",
     "init_router_db",
+    "insert_project_membership",
     "is_project_member",
     "list_user_projects",
     "prune_expired_sessions",
@@ -162,6 +163,25 @@ def _now_iso() -> str:
     without dragging timezone library deps in.
     """
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+@contextmanager
+def _conn_ctx(
+    conn: sqlite3.Connection | None,
+) -> Iterator[sqlite3.Connection]:
+    """Yield a usable connection: the caller's if given, else a freshly
+    self-opened autocommit one (arch-deepening R2 #1b).
+
+    When ``conn`` is provided the caller owns the transaction — we do
+    NOT commit or close it, we merely run our writes on it so a handler
+    inside ``BEGIN IMMEDIATE`` enlists everything in one snapshot. When
+    ``conn`` is ``None`` we borrow ``_connect`` (commit-on-exit).
+    """
+    if conn is not None:
+        yield conn
+    else:
+        with _connect() as owned:
+            yield owned
 
 
 # ── Password hashing ───────────────────────────────────────────────
@@ -277,35 +297,61 @@ def _users_table_is_empty() -> bool:
 
 def create_user(
     username: str,
-    password: str,
+    password: str | None = None,
     email: str | None = None,
+    *,
+    password_hash: str | None = None,
+    is_sysadmin: bool = False,
+    sso_subject: str | None = None,
+    bootstrap_sysadmin: bool = True,
 ) -> str:
     """Create a user; return the assigned user_id.
 
-    Side effect: if this is the FIRST user in an otherwise empty
-    users table AND one or more projects are registered in the
-    project registry, the new user gets a `project_membership` row
-    for every project. This is the pre-Phase-1-deployment migration
-    story — existing operators inherit access to every project they
-    were already implicitly admins of.
+    Password vs. passwordless (arch-deepening R2 #1b): pass ``password``
+    for a normal operator (it is argon2-hashed into ``password_hash``);
+    pass ``password_hash=None`` with no ``password`` for an SSO-only row
+    (``password_hash`` stays NULL — session-anchored, no password login).
+    ``sso_subject`` stamps the stable reconciliation key on the row. This
+    unifies what ``sso._create_passwordless_user`` used to fork verbatim.
+
+    First-user bootstrap: if this is the FIRST user in an otherwise empty
+    users table it is granted a ``project_membership`` row for every
+    registered project (the pre-Phase-1 migration story). It is ALSO
+    promoted to sysadmin when ``bootstrap_sysadmin`` is True (the default
+    — the password path always promotes the first operator; the SSO path
+    threads its opt-in flag through here so a fresh IdP deploy's first
+    user is only auto-crowned when the operator opted in). ``is_sysadmin``
+    forces the bit on regardless of table emptiness (the proxy-header
+    ``default_is_sysadmin`` path).
     """
     user_id = secrets.token_hex(8)  # 16 hex chars
-    password_hash = hash_password(password)
+    if password_hash is None and password is not None:
+        password_hash = hash_password(password)
     created_at = _now_iso()
 
     with _connect() as conn:
         was_empty = (
             conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is None
         )
+        # The first operator on an empty table is implicitly the
+        # sysadmin (fresh-deployment bootstrap rule) unless the caller
+        # opted out via ``bootstrap_sysadmin=False``. ``is_sysadmin``
+        # forces the bit on independently. Written in the SAME INSERT
+        # (and same transaction) as the membership grants so no reader
+        # sees a "first operator, no sysadmin" half-state.
+        sysadmin_bit = 1 if (is_sysadmin or (was_empty and bootstrap_sysadmin)) else 0
         try:
             conn.execute(
                 """
                 INSERT INTO users
                     (user_id, username, email, password_hash, created_at,
-                     last_login_at)
-                VALUES (?, ?, ?, ?, ?, NULL)
+                     last_login_at, is_sysadmin, sso_subject)
+                VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
                 """,
-                (user_id, username, email, password_hash, created_at),
+                (
+                    user_id, username, email, password_hash, created_at,
+                    sysadmin_bit, sso_subject,
+                ),
             )
         except sqlite3.IntegrityError as e:
             # UNIQUE(username) is the only constraint that can fail
@@ -317,30 +363,14 @@ def create_user(
             ) from e
 
         if was_empty:
-            # Phase 3 Wave 2 (v5.0.69): the FIRST operator is also
-            # implicitly the sysadmin. This is the fresh-deployment
-            # bootstrap rule (the Wave-1a Alembic migration handles
-            # the upgrade-existing path; this handles the brand-new
-            # router). Same transaction as the membership grants so
-            # no concurrent reader sees a "first operator, no
-            # sysadmin" half-state.
-            conn.execute(
-                "UPDATE users SET is_sysadmin = 1 WHERE user_id = ?",
-                (user_id,),
-            )
             # First operator: grant membership in every registered
             # project. Done inside the same transaction so a
             # half-state (user without memberships) can't be observed
             # by a concurrent reader.
             existing = _list_registered_projects()
             for project_name in existing:
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO project_membership
-                        (project_name, user_id)
-                    VALUES (?, ?)
-                    """,
-                    (project_name, user_id),
+                insert_project_membership(
+                    project_name, user_id=user_id, or_ignore=True, conn=conn,
                 )
             if existing:
                 logger.info(
@@ -480,17 +510,62 @@ def prune_expired_sessions() -> int:
 # ── Project membership ─────────────────────────────────────────────
 
 
-def add_project_membership(user_id: str, project_name: str) -> None:
-    """Grant `user_id` access to `project_name`. Idempotent."""
-    with _connect() as conn:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO project_membership
-                (project_name, user_id)
-            VALUES (?, ?)
-            """,
-            (project_name, user_id),
+def insert_project_membership(
+    project_name: str,
+    *,
+    user_id: str | None = None,
+    group_id: str | None = None,
+    role: str | None = None,
+    or_ignore: bool = False,
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    """Canonical connection-injectable ``project_membership`` writer
+    (arch-deepening R2 #1b) — the single home the four inline INSERTs
+    (this module's grant + first-user loop, the admin user- and
+    group-grant handlers, the SSO first-user loop) route through.
+
+    Exactly one of ``user_id`` / ``group_id`` must be set (mirrors the
+    table's CHECK); a clean ``ValueError`` surfaces the misuse. ``role``
+    is omitted from the column list when None so the DB default
+    (``'operator'``) applies — byte-identical to the historic
+    ``(project_name, user_id)`` insert. ``or_ignore`` selects
+    ``INSERT OR IGNORE`` (the idempotent grant paths) vs a plain
+    ``INSERT`` whose ``sqlite3.IntegrityError`` the admin handler maps to
+    a 409. Pass ``conn`` to enlist in a caller's open transaction.
+    """
+    if (user_id is None) == (group_id is None):
+        raise ValueError(
+            "insert_project_membership requires exactly one of "
+            "user_id or group_id"
         )
+    # ``user_id`` is always listed (NULL for a group grant) so the row
+    # shape matches the admin group-grant INSERT's explicit
+    # ``(project_name, user_id, group_id, role) VALUES (?, NULL, ?, ?)``.
+    columns = ["project_name", "user_id"]
+    values: list[Any] = [project_name, user_id]
+    if group_id is not None:
+        columns.append("group_id")
+        values.append(group_id)
+    if role is not None:
+        columns.append("role")
+        values.append(role)
+    verb = "INSERT OR IGNORE" if or_ignore else "INSERT"
+    sql = (
+        f"{verb} INTO project_membership ({', '.join(columns)}) "
+        f"VALUES ({', '.join('?' for _ in values)})"
+    )
+    with _conn_ctx(conn) as c:
+        c.execute(sql, tuple(values))
+
+
+def add_project_membership(user_id: str, project_name: str) -> None:
+    """Grant `user_id` access to `project_name`. Idempotent.
+
+    Thin back-compat wrapper over :func:`insert_project_membership` (the
+    canonical writer); keeps the positional ``(user_id, project_name)``
+    signature its many callers depend on.
+    """
+    insert_project_membership(project_name, user_id=user_id, or_ignore=True)
 
 
 def remove_project_membership(user_id: str, project_name: str) -> None:
