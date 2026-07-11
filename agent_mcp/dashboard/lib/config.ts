@@ -1,18 +1,12 @@
 // Configuration for the dashboard
 export const config = {
-  // Dashboard configuration
-  dashboard: {
-    port: 3847, // Fixed port for the dashboard
-    url: 'http://localhost:3847'
-  },
-  
   // Default server configuration
   defaultServer: {
     host: process.env.NEXT_PUBLIC_DEFAULT_SERVER_HOST || 'localhost',
     port: parseInt(process.env.NEXT_PUBLIC_DEFAULT_SERVER_PORT || '8080'),
     name: process.env.NEXT_PUBLIC_DEFAULT_SERVER_NAME || 'Local Development'
   },
-  
+
   // Auto-detection configuration
   autoDetect: {
     enabled: process.env.NEXT_PUBLIC_AUTO_CONNECT !== 'false',
@@ -22,21 +16,6 @@ export const config = {
       .map(p => parseInt(p.trim()))
       .filter(p => !isNaN(p) && p !== 3847) // Exclude dashboard port
   },
-  
-  // API configuration with enhanced CORS support
-  api: {
-    timeout: 10000, // 10 seconds timeout for API calls
-    retryCount: 3,
-    retryDelay: 1000, // 1 second between retries
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-    },
-    cors: {
-      mode: 'cors' as RequestMode,
-      credentials: 'include' as RequestCredentials
-    }
-  }
 }
 
 // Helper to get all possible server configurations for auto-detection

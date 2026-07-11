@@ -37,15 +37,13 @@ What stays elsewhere (deliberate):
 Reading order:
 
   1. ``ServerConfig`` — frozen dataclass; describes "what to boot".
-  2. ``load_project_dotenv`` — discovery step; populates env before
-     any module reads it.
-  3. ``apply_runtime_flags`` — translates the ``advanced`` / ``git`` /
+  2. ``apply_runtime_flags`` — translates the ``advanced`` / ``git`` /
      ``no_index`` / ``debug`` flags into the side effects the rest of
      the codebase reads (``core.config`` knobs, ``MCP_DEBUG`` env var,
      worktree feature toggle).
-  4. ``bootstrap_server`` — builds the Starlette app (sse) or returns
+  3. ``bootstrap_server`` — builds the Starlette app (sse) or returns
      ``(None, teardown)`` (stdio).
-  5. ``run_server`` — async runners (sse uvicorn + bg tasks, stdio
+  4. ``run_server`` — async runners (sse uvicorn + bg tasks, stdio
      mcp pump). Called by the CLI subcommand callback after
      ``ServerConfig.from_cli_args``.
 
@@ -61,8 +59,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
-
-from dotenv import dotenv_values, load_dotenv
 
 from .core.config import logger
 
@@ -149,60 +145,6 @@ class ServerConfig:
             git=bool(git),
             no_index=bool(no_index),
         )
-
-
-# --- .env discovery --------------------------------------------------
-
-# Legacy ``cli.py`` walked up to 3 parent levels from its own
-# location, dotenv-loading each ``.env`` it found and re-exporting
-# every variable into ``os.environ``. Pulled out here so the test
-# suite can drive it with a ``search_from`` seam rather than having
-# to relocate ``cli.py`` itself.
-
-_DEFAULT_ENV_PARENT_LEVELS = 3
-
-
-def load_project_dotenv(
-    *,
-    search_from: Optional[Path] = None,
-    max_parents: int = _DEFAULT_ENV_PARENT_LEVELS,
-) -> None:
-    """Walk parents of ``search_from`` looking for ``.env`` files.
-
-    Mirrors the legacy ``cli.py`` import-time block: scan up to
-    ``max_parents`` levels, ``dotenv_values`` each match, write each
-    key into ``os.environ``. Finally call plain ``load_dotenv()`` so
-    the standard discovery (cwd) also runs — some deploy setups don't
-    co-locate ``.env`` with the source tree.
-
-    ``search_from`` defaults to this module's directory (matching
-    legacy behaviour); tests inject a fixture path.
-    """
-    base = (search_from or Path(__file__).resolve().parent).resolve()
-    # Range is inclusive of "this directory" — match the legacy
-    # ``parent_level in range(3)`` exactly so an .env one level up
-    # from the package still wins.
-    for parent_level in range(max_parents + 1):
-        env_path = (base / ("../" * parent_level) / ".env").resolve()
-        if env_path.exists():
-            try:
-                values = dotenv_values(str(env_path))
-            except Exception as exc:  # pragma: no cover - dotenv parse errors
-                logger.warning(
-                    "load_project_dotenv: failed to parse %s (%s); skipping.",
-                    env_path,
-                    exc,
-                )
-                continue
-            for key, value in values.items():
-                if value is not None:
-                    os.environ[key] = value
-            logger.info("load_project_dotenv: loaded %s", env_path)
-            break
-
-    # Fall back to the default discovery (cwd) for setups that don't
-    # co-locate .env with the package source tree.
-    load_dotenv()
 
 
 # --- runtime-flag → side-effect translation --------------------------
@@ -722,6 +664,5 @@ __all__ = [
     "ServerConfig",
     "apply_runtime_flags",
     "bootstrap_server",
-    "load_project_dotenv",
     "run_server",
 ]

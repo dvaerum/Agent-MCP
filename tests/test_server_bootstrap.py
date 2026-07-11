@@ -149,40 +149,14 @@ def test_server_config_normalizes_project_dir_to_absolute(tmp_path: Path) -> Non
 
 
 # --- .env discovery ---------------------------------------------------
-
-
-def test_load_dotenv_walks_parent_chain(tmp_path: Path, monkeypatch) -> None:
-    """``load_project_dotenv`` walks up to N parent levels from the
-    bootstrap module's location and exports every variable it finds.
-
-    Legacy ``cli.py`` had the .env discovery inlined at module import;
-    keeping the behaviour intact (so existing OPENAI_API_KEY-in-.env
-    deployments don't suddenly stop working) is part of the contract.
-    """
-    from agent_mcp import server_bootstrap
-
-    # Stage a .env right next to the project dir
-    env_file = tmp_path / ".env"
-    env_file.write_text("AGENT_MCP_BOOTSTRAP_TEST=hello\n", encoding="utf-8")
-    monkeypatch.delenv("AGENT_MCP_BOOTSTRAP_TEST", raising=False)
-
-    # Discovery starts from the path we pass; this is the test seam.
-    server_bootstrap.load_project_dotenv(search_from=tmp_path / "child")
-    assert os.environ.get("AGENT_MCP_BOOTSTRAP_TEST") == "hello"
-    monkeypatch.delenv("AGENT_MCP_BOOTSTRAP_TEST", raising=False)
-
-
-def test_load_dotenv_is_safe_when_no_env_file_exists(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """Missing .env is a no-op, not an error — many CI environments
-    don't ship one."""
-    from agent_mcp import server_bootstrap
-
-    monkeypatch.delenv("AGENT_MCP_BOOTSTRAP_TEST", raising=False)
-    # Pointing at a fully empty dir; walking parents finds nothing.
-    server_bootstrap.load_project_dotenv(search_from=tmp_path, max_parents=0)
-    # If we got here without raising, contract holds.
+#
+# ``test_load_dotenv_walks_parent_chain`` and
+# ``test_load_dotenv_is_safe_when_no_env_file_exists`` were deleted
+# (arch-r3 #6b): both exercised only
+# ``server_bootstrap.load_project_dotenv``, which was itself removed
+# as dead code — it was a dead duplicate of the .env walk already
+# inlined at the top of ``cli.py``; nothing called the
+# ``server_bootstrap`` copy.
 
 
 # --- Embedding-mode + indexing flag propagation -----------------------

@@ -49,7 +49,6 @@ from .agent_communication_tools import send_agent_message_tool_impl
 # longer spawns claude processes — the operator registers any
 # follow-up agent via ``register_agent`` and the user starts their
 # own claude session.
-from ..utils.prompt_templates import build_agent_prompt  # still used by other paths
 
 
 class _DeleteRolledBack(Exception):

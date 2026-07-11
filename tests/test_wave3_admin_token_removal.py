@@ -562,35 +562,13 @@ async def test_edit_task_note_admits_worker_author(tmp_path) -> None:
 
 
 # ── Section 4: agent-prompt plumbing no longer references admin_token
-
-
-def test_build_agent_prompt_signature_drops_admin_token() -> None:
-    """``build_agent_prompt`` must no longer accept an ``admin_token``
-    parameter. Wave 3 removes it from the prompt plumbing — the
-    ``admin_agent`` template's ``{admin_token}`` substitution is gone
-    too, so nothing downstream needs the value any more."""
-    import inspect
-
-    from agent_mcp.utils.prompt_templates import build_agent_prompt
-
-    sig = inspect.signature(build_agent_prompt)
-    assert "admin_token" not in sig.parameters, (
-        f"build_agent_prompt must not accept admin_token any more; "
-        f"signature: {sig}"
-    )
-
-
-def test_admin_agent_template_does_not_reference_admin_token() -> None:
-    """The ``admin_agent`` template body must no longer substitute
-    ``{admin_token}``. Wave 4 may delete the template entirely; Wave 3
-    just removes the substitution so the parameter drop above is
-    consistent."""
-    from agent_mcp.utils.prompt_templates import PROMPT_TEMPLATES
-
-    body = PROMPT_TEMPLATES.get("admin_agent", "")
-    assert "{admin_token}" not in body, (
-        f"admin_agent template must not reference {{admin_token}}; got: {body!r}"
-    )
+#
+# ``test_build_agent_prompt_signature_drops_admin_token`` and
+# ``test_admin_agent_template_does_not_reference_admin_token`` were
+# deleted (arch-r3 #6b): both exercised only
+# ``agent_mcp/utils/prompt_templates.py`` (``build_agent_prompt`` /
+# ``PROMPT_TEMPLATES``), which was itself removed as dead code —
+# ``build_agent_prompt`` had zero production callers.
 
 
 def test_generate_system_prompt_signature_drops_admin_token_runtime() -> None:
