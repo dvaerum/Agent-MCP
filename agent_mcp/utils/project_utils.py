@@ -125,7 +125,7 @@ def generate_system_prompt(
     working_dir = agent_repo.get_working_directory(agent_id) or os.getcwd()
 
     # Base prompt content from original main.py lines 1208-1224
-    base_prompt = f"""You are an AI agent running in Cursor, connected to a Multi-Agent Collaboration Protocol (MCP) server.
+    base_prompt = f"""You are an AI agent connected to a Multi-Agent Collaboration Protocol (MCP) server.
 
 Your goal is to complete tasks efficiently and collaboratively using a shared, persistent knowledge base.
 
@@ -160,79 +160,34 @@ Your working directory is: {working_dir}
 Agent Type: {agent_type}
 """
 
-    # Connection code snippet for the agent to use
-    # (Original main.py lines 1229-1237 for connection code structure)
-    # The agent's connection example uses the Streamable HTTP /mcp
-    # endpoint (spec rev 2025-03-26); the old /messages/ paired-endpoint
-    # transport was removed (see main_app.py:_MIGRATION_BODY).
+    # Tool-access note.
     #
-    # Pre-v5.0.53 this honoured an MCP_SERVER_URL env override, but
-    # nothing else in the codebase reads that variable — leaving the
-    # override in place would let a stray export inject an attacker-
-    # controlled URL into every worker's system prompt. The PORT env
-    # var (which the server itself binds to) is the only knob.
-    mcp_server_url_for_client = (
-        f"http://localhost:{os.environ.get('PORT', '8080')}/mcp"
+    # This prompt is delivered to an agent that is ALREADY connected to
+    # this server through a real MCP client (a spawned/registered worker).
+    # The client owns the wire protocol — JSON-RPC framing, transport, and
+    # the bearer credential are all handled by the client, not by anything
+    # the agent hand-writes.
+    #
+    # Historically this block baked a ~40-line hand-rolled ``call_mcp_tool``
+    # snippet (a ``requests.post`` of a ``{"type": "tool_call", ...}`` body
+    # to a ``/mcp`` endpoint) and told the agent it was "running in Cursor".
+    # That protocol is FICTIONAL — it is not how MCP works — so every worker
+    # received wrong tool-calling instructions in its live system prompt.
+    # Re-teaching a (wrong) protocol in the system prompt is both incorrect
+    # and unnecessary: the correct move is to point the agent at the tools it
+    # can call and let its MCP client do the talking. ``agent_token_for_prompt``
+    # is kept in the signature for call-site compatibility but is no longer
+    # echoed into the prompt — the client already holds the agent's credential.
+    tool_access_note = (
+        "**Tool access:** Your tools are available directly through your "
+        "MCP connection. The MCP client handles the protocol (transport, "
+        "framing, and authentication) for you, so call each tool by name "
+        "(for example `view_tasks`, `update_task_status`, `ask_project_rag`) "
+        "the same way you use any other tool — you do not need to build HTTP "
+        "requests or manage tokens yourself. Consult your client's tool "
+        "listing to discover the full set of tools available to you."
     )
-
-    # The original connection code snippet in main.py was quite extensive and specific.
-    # For 1-to-1, we should replicate that structure.
-    # It assumed the agent would use 'requests' and provided a `call_mcp_tool` like function.
-    # The token used in HEADERS should be `agent_token_for_prompt`.
-    connection_code_lines = [
-        f'MCP_SERVER_URL = "{mcp_server_url_for_client}"  # Adjust if your server\'s tool endpoint is different',
-        f'AGENT_TOKEN = "{agent_token_for_prompt}" # This is your unique agent token',
-        "",
-        "HEADERS = {",
-        '    "Content-Type": "application/json",',
-        # The original prompt had a complex way of deciding which token to use in Authorization.
-        # It should always be the AGENT_TOKEN for the agent's own calls.
-        '    "Authorization": f"Bearer {{AGENT_TOKEN}}"',
-        "}",
-        "",
-        "def call_mcp_tool(tool_name: str, arguments: dict) -> dict:",
-        "    payload = {",
-        '        "id": f"call_{{requests.compat.urlencode(arguments)[:10]}}", # Example unique ID',
-        '        "type": "tool_call",',
-        '        "tool": tool_name,',
-        '        "arguments": arguments',
-        "    }",
-        '    print(f"Calling tool: {{tool_name}} with args: {{arguments}}") # Debug print',
-        "    try:",
-        "        response = requests.post(MCP_SERVER_URL, headers=HEADERS, json=payload, timeout=60)",
-        "        response.raise_for_status()  # Raise an HTTPError for bad responses (4XX or 5XX)",
-        "        # The MCP server is expected to return a list of content blocks.",
-        "        # We need to parse the 'text' from the first TextContent block.",
-        "        response_data = response.json()",
-        "        if isinstance(response_data, list) and len(response_data) > 0:",
-        "            first_item = response_data[0]",
-        "            if isinstance(first_item, dict) and first_item.get('type') == 'text':",
-        "                return {{'text_response': first_item.get('text', '')}}",
-        "        return {{'raw_response': response_data}} # Fallback",
-        "    except requests.exceptions.Timeout:",
-        '        print(f"Timeout calling MCP tool {{tool_name}}")',
-        "        return {{'error': 'Timeout'}}"
-        "    except requests.exceptions.RequestException as e:",
-        '        print(f"Error calling MCP tool {{tool_name}}: {{e}}")',
-        "        if e.response is not None:",
-        '            print(f"Response content: {{e.response.text}}")',
-        "            return {{'error': str(e), 'response_text': e.response.text}}",
-        "        return {{'error': str(e)}}",
-        "",
-        "# Example usage:",
-        '# result = call_mcp_tool("view_tasks", {{"token": AGENT_TOKEN}})',
-        "# if result and 'error' not in result: print(json.dumps(result, indent=2))",
-    ]
-    connection_code_str = "\n".join(connection_code_lines)
 
     # Construct full prompt (Original main.py line 1238)
-    full_prompt = (
-        base_prompt
-        + agent_details_str
-        + "\nCopy-paste this Python code into your environment to connect and interact with the MCP server:\n"
-        + "```python\nimport requests\nimport json\n\n"
-        + connection_code_str
-        + "\n```\n\n"
-        + "Use the available tools (the server will list them or consult documentation) via `call_mcp_tool` to manage your work."
-    )
+    full_prompt = base_prompt + agent_details_str + "\n" + tool_access_note
     return full_prompt
