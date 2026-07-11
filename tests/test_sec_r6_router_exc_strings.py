@@ -67,14 +67,21 @@ async def test_tasks_create_500_is_generic_on_unexpected_error(
     500 body is exercised the same way the sibling handlers below are —
     by monkeypatching the DB seam to raise an SQL-sentinel error after
     the validation guards have passed.
+
+    E1 (arch-deepening): the route is now a thin adapter over the
+    ``create_task`` tool, whose write goes through the unit-of-work — so
+    the DB seam to poison is ``db.unit_of_work.get_db_connection`` (the
+    router no longer opens its own connection). The tool catches the
+    error → ``Failed`` → the route maps it to the same static generic
+    500 body.
     """
-    import agent_mcp.app.routers.tasks as tasks_router
+    import agent_mcp.db.unit_of_work as uow_mod
 
     def _boom(*_a, **_k):
         raise sqlite3.OperationalError(_SENTINEL_SQL)
 
     async with mcp_session(tmp_path) as admin:
-        monkeypatch.setattr(tasks_router, "get_db_connection", _boom)
+        monkeypatch.setattr(uow_mod, "get_db_connection", _boom)
         r = admin.client.post(
             "/api/tasks",
             json={

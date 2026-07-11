@@ -4998,6 +4998,73 @@ def register_task_tools():
         visibility="operator",
     )
 
+    # E1 (arch-deepening): the real tool behind ``POST /api/tasks``. The
+    # REST route is a thin adapter that dispatches here (like
+    # ``delete_task_api_route`` → ``delete_task``). Auth is
+    # ``@requires_capability("tasks.create")`` on the impl — the same
+    # capability the route's ``require_operator_session`` resolves to.
+    # ``visibility="operator"`` keeps it out of a worker's tools/list.
+    register_tool(
+        name="create_task",
+        description=(
+            "Create a single task, optionally assigned to an agent and/or "
+            "parented under an existing task. Operator-tier task creation "
+            "with assignability + capability-routing safety checks."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "token": {
+                    "type": "string",
+                    "description": (
+                        "Admin authentication token. Optional if "
+                        "Authorization: Bearer header is supplied "
+                        "(recommended)."
+                    ),
+                },
+                "task_title": {
+                    "type": "string",
+                    "description": "Title of the task to create (required).",
+                },
+                "task_description": {
+                    "type": "string",
+                    "description": "Free-text task description.",
+                },
+                "priority": {
+                    "type": "string",
+                    "description": "Task priority (default: medium).",
+                },
+                "assigned_to": {
+                    "type": "string",
+                    "description": (
+                        "Agent id to assign the task to. Must be a live "
+                        "agent that satisfies required_capabilities. Omit "
+                        "for an unassigned task."
+                    ),
+                },
+                "parent_task": {
+                    "type": "string",
+                    "description": (
+                        "Existing task id to parent this task under. Must "
+                        "exist. Omit for a top-level task."
+                    ),
+                },
+                "required_capabilities": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Free-text capability labels an agent must hold to "
+                        "be assigned/claim this task."
+                    ),
+                },
+            },
+            "required": ["task_title"],
+            "additionalProperties": False,
+        },
+        implementation=create_task_tool_impl,
+        visibility="operator",
+    )
+
 
 # Wave 9 PR 2: @requires_role("operator") → @requires_capability("tasks.delete").
 # Operator-tier callers carry ``tasks.delete`` via
@@ -5348,6 +5415,201 @@ async def delete_task_tool_impl(
         # The unit-of-work already rolled back + closed the connection.
         logger.error(f"Error in delete_task_tool_impl: {e}", exc_info=True)
         return Failed(message=f"Error deleting task: {str(e)}")
+
+
+# E1 (arch-deepening): @requires_capability("tasks.create"). Operator-tier
+# callers carry ``tasks.create`` via
+# :data:`PROJECT_ROLE_BUNDLES["operator"]`; sysadmins wildcard-admit. This
+# is the SAME capability the ``POST /api/tasks`` REST route's
+# ``require_operator_session`` dep resolves to, so exposing this tool on the
+# MCP wire is auth-equivalent to the pre-existing REST surface.
+@requires_capability("tasks.create")
+async def create_task_tool_impl(
+    arguments: Dict[str, Any],
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    """Create a single task (optionally assigned + parented).
+
+    E1: the CANONICAL create-a-task implementation, shared by the
+    ``create_task`` MCP tool and the ``POST /api/tasks`` REST route
+    (which is now a thin adapter over this). Before E1 the REST handler
+    hand-reimplemented this choreography and imported ``_``-prefixed tool
+    internals to stay in parity (the BL-R13-1 / AZ-R26-1 / BL-R15-1 /
+    BL-R30-1 comment ledger) — one implementation, not two.
+
+    Built on the unit-of-work: the task INSERT, the parent
+    ``child_tasks`` mirror (BL-2), the gaining agent's ``current_task``
+    reconcile (BL-R30-1), and the single ``created_task`` DB audit row
+    all commit in ONE transaction on ``u.cursor``. The ``g.tasks`` cache
+    upsert (BL-1), the ``task.created`` EventBus publish, and the
+    assignee / unassigned wake register as post-commit effects
+    (emit-iff-commit — a rollback fires nothing).
+
+    Audit: the REST handler wrote ONLY the DB sink
+    (``log_agent_action_to_db`` with action ``"created_task"``) and NO
+    in-memory ``log_audit``. Per the D3 finding we keep that exactly —
+    the DB row is written inside the scope on ``u.cursor`` (like the
+    assign paths), NOT via ``u.audit`` (which would add the in-memory
+    sink the handler never wrote).
+    """
+    raw_title = arguments.get("task_title")
+    description = arguments.get("task_description", "")
+    priority = arguments.get("priority", "medium")
+    assigned_to = arguments.get("assigned_to")  # nullable
+    parent_task = arguments.get("parent_task")  # nullable
+
+    title = raw_title.strip() if isinstance(raw_title, str) else ""
+    if not title:
+        return Invalid(field="task_title", message="task_title is required")
+
+    from ..utils.capability_normalization import normalize_capabilities
+
+    # Event-coord: normalize the optional capability gate at write time
+    # (lowercase + strip + dedupe). Empty/missing => stored as NULL.
+    _norm_caps = normalize_capabilities(arguments.get("required_capabilities"))
+
+    # Provenance: the audit actor + ``created_by`` name whoever called
+    # (operator username on the REST path, agent id on the MCP wire) —
+    # the REST handler resolved this from ``caller_identity(auth)``, which
+    # the route now threads in as the Principal.
+    requesting_admin_id = (
+        principal.actor_label() if principal is not None else "admin"
+    )
+    task_id = _generate_task_id()
+    status = "pending" if assigned_to else "unassigned"
+
+    try:
+        with unit_of_work() as u:
+            cursor = u.cursor
+
+            # PF-R32-1b: pre-validate ``parent_task`` existence BEFORE the
+            # INSERT. ``tasks.parent_task`` is a declared self-FK; a
+            # well-formed but NONEXISTENT parent would otherwise trip the
+            # FK at INSERT and surface as a generic 500. Missing → NotFound
+            # (the REST adapter maps it to 404).
+            if parent_task:
+                cursor.execute(
+                    "SELECT 1 FROM tasks WHERE task_id = ?", (parent_task,)
+                )
+                if cursor.fetchone() is None:
+                    return NotFound(resource="task", identifier=parent_task)
+
+            # BL-R13-1 / AZ-R26-1: a directly-assigned task must target a
+            # LIVE agent (exists + not terminated/tombstone) that satisfies
+            # the task's required capabilities — the same controls the
+            # canonical MCP assign path enforces. Empty/absent assignment
+            # falls through as unassigned.
+            if assigned_to:
+                if not _agent_assignable(cursor, assigned_to):
+                    return Invalid(
+                        message=(
+                            f"Cannot assign task to '{assigned_to}': agent "
+                            f"does not exist or is terminated."
+                        )
+                    )
+                missing_caps = _missing_capabilities(
+                    cursor, _norm_caps, assigned_to
+                )
+                if missing_caps:
+                    return Invalid(
+                        message=(
+                            f"Cannot assign task to '{assigned_to}': agent "
+                            f"lacks required capabilities {missing_caps}."
+                        )
+                    )
+
+            from ..repositories import task_repo as _task_repo
+
+            fresh = _task_repo.create(
+                {
+                    "task_id": task_id,
+                    "title": title,
+                    "description": description,
+                    "assigned_to": assigned_to,
+                    "created_by": requesting_admin_id,
+                    "status": status,
+                    "priority": priority,
+                    "parent_task": parent_task,
+                    "child_tasks": [],
+                    "depends_on_tasks": [],
+                    "notes": [],
+                    "required_capabilities": _norm_caps if _norm_caps else None,
+                },
+                connection=cursor,
+            )
+
+            # BL-R30-1: set the gaining agent's ``current_task`` on a
+            # create-with-assignee (prior=None → SETs only when idle).
+            if assigned_to:
+                from ..repositories import agent_repo as _agent_repo
+
+                _agent_repo.reconcile_current_task_on_reassign(
+                    task_id, None, assigned_to, connection=cursor,
+                )
+
+            # DB-sink audit ('created_task') inside the txn on u.cursor —
+            # single sink, matching the REST handler exactly (see docstring).
+            log_agent_action_to_db(
+                cursor,
+                requesting_admin_id,
+                "created_task",
+                task_id=task_id,
+                details={"title": title, "assigned_to": assigned_to},
+            )
+
+            # BL-2: maintain the parent's child_tasks back-reference mirror
+            # in the same transaction.
+            parent_mirror_updated = _link_child_to_parent(
+                cursor, parent_task, task_id
+            )
+
+            # BL-1: post-commit cache reconciliation (the connection= path
+            # defers the g.tasks write). Registered on the uow so it flushes
+            # only after a clean commit.
+            def _reconcile_cache() -> None:
+                if fresh is not None:
+                    _task_repo.upsert_cache(fresh)
+                if parent_mirror_updated:
+                    _refresh_parent_cache(parent_task)
+
+            u.on_commit(_reconcile_cache)
+
+            # ``task.created`` publish (u.emit normalizes a falsy addressee
+            # to "*", matching the repo's ``assigned_to or "*"`` contract).
+            u.emit(
+                assigned_to,
+                "task.created",
+                {
+                    "task_id": task_id,
+                    "status": status,
+                    "assigned_to": assigned_to,
+                },
+            )
+
+            # Wake so the task is delivered without polling. BL-R15-1: the
+            # unassigned branch edge-wakes idle workers + streaming
+            # subscribers via ``notify_unassigned_task_appeared`` (publishing
+            # under the literal "*" above is NOT a wildcard wake).
+            if assigned_to:
+                u.on_commit(
+                    lambda a=assigned_to: g.notify_agent_inbox(a)
+                )
+            else:
+                u.on_commit(
+                    lambda t=task_id, c=list(_norm_caps or []):
+                    g.notify_unassigned_task_appeared(t, c)
+                )
+
+            return Ok(
+                data={"task_id": task_id},
+                message=f"Task '{title}' created successfully",
+            )
+
+    except Exception as e:
+        # The unit-of-work already rolled back + closed the connection.
+        logger.error(f"Error in create_task_tool_impl: {e}", exc_info=True)
+        return Failed(message=f"Error creating task: {e}")
 
 
 # Call registration when this module is imported
