@@ -21,14 +21,14 @@ import datetime as _dt
 import pytest
 
 from agent_mcp.core.principal import Principal
-from tests.harness import mcp_session, seed_agent_rows
+from tests.harness import make_principal, mcp_session, seed_agent_rows
 
 
 pytestmark = pytest.mark.asyncio
 
 
 def _agent_principal(agent_id: str) -> Principal:
-    return Principal(
+    return make_principal(
         kind="agent_bearer",
         user_id=None,
         agent_id=agent_id,

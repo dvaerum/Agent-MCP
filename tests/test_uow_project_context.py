@@ -43,7 +43,7 @@ import pytest
 
 from agent_mcp.core.principal import Principal
 from agent_mcp.core.tool_result import Conflict, Failed, NotFound, Ok, PermissionDenied
-from tests.harness import mcp_session
+from tests.harness import make_principal, mcp_session
 
 
 pytestmark = pytest.mark.asyncio
@@ -53,7 +53,7 @@ pytestmark = pytest.mark.asyncio
 
 
 def _operator_principal(user_id: str = "r4-6-operator") -> Principal:
-    return Principal(
+    return make_principal(
         kind="operator_session",
         user_id=user_id,
         agent_id=None,
@@ -67,7 +67,7 @@ def _operator_principal(user_id: str = "r4-6-operator") -> Principal:
 
 
 def _worker_principal(agent_id: str) -> Principal:
-    return Principal(
+    return make_principal(
         kind="agent_bearer",
         user_id=None,
         agent_id=agent_id,

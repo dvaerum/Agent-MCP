@@ -41,6 +41,7 @@ import pytest
 
 from agent_mcp.core.authorize import AuthRejected
 from agent_mcp.core.principal import Principal
+from tests.harness import make_principal
 
 
 pytestmark = pytest.mark.asyncio
@@ -59,7 +60,7 @@ def _operator_session_with_caps(*caps: str) -> Principal:
     gate in :meth:`Principal.has_capability` admits for the
     non-``system.*`` caps.
     """
-    return Principal(
+    return make_principal(
         kind="operator_session",
         user_id="pr2-test-operator",
         agent_id=None,

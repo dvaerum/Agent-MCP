@@ -53,13 +53,13 @@ async def test_requires_policy_admin_always_allowed(reset_globals) -> None:
     path without consulting the policy toggle.
     """
     from agent_mcp.core.authorize import requires_policy
-    from agent_mcp.core.principal import Principal
+    from tests.harness import make_principal
 
     @requires_policy("config_some_toggle", default=False)
     async def my_tool(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
         return [mcp_types.TextContent(type="text", text="admin in")]
 
-    p = Principal(
+    p = make_principal(
         kind="operator_session",
         user_id="alice",
         agent_id=None,
@@ -140,13 +140,13 @@ async def test_requires_policy_worker_allowed_when_any_toggle_on(
 def _forwarding_principal(project_role, *, sysadmin=False):
     """Build a forwarding-header Principal with the given project role.
 
-    Caps back-fill from ``resolve_capabilities`` via ``__post_init__``,
-    so a ``"viewer"`` role yields the read-only bundle and ``"operator"``
+    ``make_principal`` resolves caps via ``resolve_capabilities``, so a
+    ``"viewer"`` role yields the read-only bundle and ``"operator"``
     yields the write bundle (which carries ``system.config.write``).
     """
-    from agent_mcp.core.principal import Principal
+    from tests.harness import make_principal
 
-    return Principal(
+    return make_principal(
         kind="forwarding_header",
         user_id="op-user",
         agent_id=None,

@@ -36,7 +36,7 @@ from agent_mcp.core.principal import Principal
 from agent_mcp.core.tool_result import NotFound, Ok, PermissionDenied
 from agent_mcp.tools.rag_tools import ask_project_rag_tool_impl
 from agent_mcp.tools.task_notes_tools import add_task_note_tool_impl
-from tests.harness import mcp_session
+from tests.harness import make_principal, mcp_session
 
 pytestmark = pytest.mark.asyncio
 
@@ -45,7 +45,7 @@ pytestmark = pytest.mark.asyncio
 
 
 def _agent(*, agent_id: str, role: str | None) -> Principal:
-    return Principal(
+    return make_principal(
         kind="agent_bearer",
         user_id=None,
         agent_id=agent_id,
@@ -59,7 +59,7 @@ def _agent(*, agent_id: str, role: str | None) -> Principal:
 
 
 def _operator(*, user_id: str = "op", project_role: str = "operator") -> Principal:
-    return Principal(
+    return make_principal(
         kind="operator_session",
         user_id=user_id,
         agent_id=None,

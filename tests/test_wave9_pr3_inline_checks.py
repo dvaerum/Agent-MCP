@@ -33,7 +33,7 @@ from __future__ import annotations
 import pytest
 
 from agent_mcp.core.principal import Principal
-from tests.harness import with_capabilities
+from tests.harness import make_principal, with_capabilities
 
 
 # ── Principal builders shared across tests ────────────────────────
@@ -47,11 +47,11 @@ def _agent_bearer(
 ) -> Principal:
     """Agent-bearer Principal with the named role's bundle resolved.
 
-    Used to assert the cap-gate behaviour for the agent path; the
-    ``__post_init__`` back-fill resolves capabilities from
-    ``AGENT_ROLE_BUNDLES[agent_role]``.
+    Used to assert the cap-gate behaviour for the agent path;
+    ``make_principal`` resolves capabilities via ``resolve_capabilities``,
+    which pulls ``AGENT_ROLE_BUNDLES[agent_role]``.
     """
-    return Principal(
+    return make_principal(
         kind="agent_bearer",
         user_id=None,
         agent_id=agent_id,
@@ -67,7 +67,7 @@ def _agent_bearer(
 def _operator_principal(
     *, project_role: str | None = "operator",
 ) -> Principal:
-    return Principal(
+    return make_principal(
         kind="operator_session",
         user_id="alice",
         agent_id=None,
@@ -81,7 +81,7 @@ def _operator_principal(
 
 
 def _sysadmin_principal() -> Principal:
-    return Principal(
+    return make_principal(
         kind="operator_session",
         user_id="root",
         agent_id=None,
@@ -262,7 +262,7 @@ def test_requires_authenticated_caller_admits_all_authenticated_identities() -> 
     assert _requires_authenticated_caller(_sysadmin_principal()) is None
 
     # Forwarding-header also admits.
-    fwd = Principal(
+    fwd = make_principal(
         kind="forwarding_header",
         user_id="bob",
         agent_id=None,

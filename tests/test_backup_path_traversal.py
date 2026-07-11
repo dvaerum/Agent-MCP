@@ -43,7 +43,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.harness import mcp_session
+from tests.harness import make_principal, mcp_session
 
 
 pytestmark = pytest.mark.asyncio
@@ -196,7 +196,6 @@ async def test_path_containment_defense_in_depth_when_schema_bypassed(
     ``backup_project_context_tool_impl`` directly bypass the
     dispatcher's jsonschema validation. The impl's own resolve() +
     relative_to() containment check must still catch traversal."""
-    from agent_mcp.core.principal import Principal
     from agent_mcp.core.tool_result import Invalid
     from agent_mcp.tools.project_context_tools import (
         backup_project_context_tool_impl,
@@ -206,7 +205,7 @@ async def test_path_containment_defense_in_depth_when_schema_bypassed(
     pre_existed = pwned_target.exists()
 
     async with mcp_session(tmp_path):
-        admin_principal = Principal(
+        admin_principal = make_principal(
             kind="agent_bearer",
             user_id="test-harness-operator",
             agent_id="admin",

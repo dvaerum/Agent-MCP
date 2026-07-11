@@ -42,14 +42,14 @@ from agent_mcp.core import globals as g
 from agent_mcp.core.principal import Principal
 from agent_mcp.core.tool_result import Conflict, Ok
 from agent_mcp.tools.registry import dispatch_tool_call
-from tests.harness import mcp_session
+from tests.harness import make_principal, mcp_session
 
 pytestmark = pytest.mark.asyncio
 
 
 def _worker(agent_id: str) -> Principal:
     """agent_bearer worker Principal — carries ``files.use``."""
-    return Principal(
+    return make_principal(
         kind="agent_bearer",
         user_id=None,
         agent_id=agent_id,

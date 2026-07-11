@@ -30,7 +30,7 @@ from agent_mcp.core.tool_result import (
     NotFound,
     Ok,
 )
-from tests.harness import mcp_session
+from tests.harness import make_principal, mcp_session
 
 
 pytestmark = pytest.mark.asyncio
@@ -127,7 +127,7 @@ def _seed_assigned_task(
 
 def _admin_principal() -> Principal:
     """Operator-session-style Principal for explicit-dispatch tests."""
-    return Principal(
+    return make_principal(
         kind="operator_session",
         user_id="test-harness-operator",
         agent_id=None,
@@ -567,7 +567,7 @@ async def test_bulk_task_operations_admin_succeeds(tmp_path) -> None:
 
 def _agent_bearer_principal(agent_id: str, token: str) -> Principal:
     """Manager-role agent_bearer principal — mirrors the admin harness."""
-    return Principal(
+    return make_principal(
         kind="agent_bearer",
         user_id=None,
         agent_id=agent_id,

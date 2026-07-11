@@ -30,7 +30,7 @@ import pytest
 from agent_mcp.core.principal import Principal
 from agent_mcp.core.tool_result import Ok, PermissionDenied
 from agent_mcp.tools.registry import dispatch_tool_call
-from tests.harness import mcp_session
+from tests.harness import make_principal, mcp_session
 
 pytestmark = pytest.mark.asyncio
 
@@ -42,7 +42,7 @@ def _bearer(agent_id: str, *, role: str | None) -> Principal:
     """agent_bearer Principal. ``role=None`` yields an empty cap set
     (no ``files.use``); ``role="worker"`` carries ``files.use`` via the
     worker bundle."""
-    return Principal(
+    return make_principal(
         kind="agent_bearer",
         user_id=None,
         agent_id=agent_id,
@@ -58,7 +58,7 @@ def _bearer(agent_id: str, *, role: str | None) -> Principal:
 def _viewer_operator(user_id: str = "vic") -> Principal:
     """operator_session with viewer role — read-only bundle, no
     ``files.use``."""
-    return Principal(
+    return make_principal(
         kind="operator_session",
         user_id=user_id,
         agent_id=None,

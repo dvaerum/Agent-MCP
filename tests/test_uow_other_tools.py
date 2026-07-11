@@ -33,7 +33,7 @@ import pytest
 
 from agent_mcp.core.principal import Principal
 from agent_mcp.core.tool_result import Failed, Ok
-from tests.harness import mcp_session
+from tests.harness import make_principal, mcp_session
 
 
 pytestmark = pytest.mark.asyncio
@@ -43,7 +43,7 @@ pytestmark = pytest.mark.asyncio
 
 
 def _operator_principal(user_id: str = "d3-operator") -> Principal:
-    return Principal(
+    return make_principal(
         kind="operator_session",
         user_id=user_id,
         agent_id=None,

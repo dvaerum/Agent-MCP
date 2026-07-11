@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.harness import mcp_session
+from tests.harness import make_principal, mcp_session
 
 
 pytestmark = pytest.mark.asyncio
@@ -138,12 +138,11 @@ async def test_dispatch_admits_view_status_with_operator_session_contextvar(
         dispatch_tool_call,
         request_auth_token,
     )
-    from agent_mcp.core.principal import Principal
     from agent_mcp.core.tool_result import Ok
 
     async with mcp_session(tmp_path):
         request_auth_token.set(None)
-        principal = Principal(
+        principal = make_principal(
             kind="operator_session",
             user_id="op",
             agent_id=None,

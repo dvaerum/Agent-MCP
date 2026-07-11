@@ -41,7 +41,7 @@ from agent_mcp.tools.project_context_tools import (
     delete_project_context_tool_impl,
     update_project_context_tool_impl,
 )
-from tests.harness import mcp_session
+from tests.harness import make_principal, mcp_session
 
 
 pytestmark = pytest.mark.asyncio
@@ -51,7 +51,7 @@ pytestmark = pytest.mark.asyncio
 
 
 def _operator(*, project_role: str, kind: str = "operator_session") -> Principal:
-    return Principal(
+    return make_principal(
         kind=kind,  # type: ignore[arg-type]
         user_id="alice",
         agent_id=None,
@@ -65,7 +65,7 @@ def _operator(*, project_role: str, kind: str = "operator_session") -> Principal
 
 
 def _worker(*, agent_id: str = "wkr") -> Principal:
-    return Principal(
+    return make_principal(
         kind="agent_bearer",
         user_id=None,
         agent_id=agent_id,

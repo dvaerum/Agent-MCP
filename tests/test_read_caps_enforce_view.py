@@ -30,7 +30,7 @@ import pytest
 
 from agent_mcp.core.principal import Principal
 from agent_mcp.core.tool_result import PermissionDenied
-from tests.harness import mcp_session
+from tests.harness import make_principal, mcp_session
 
 pytestmark = pytest.mark.asyncio
 
@@ -38,7 +38,7 @@ pytestmark = pytest.mark.asyncio
 def _empty_cap_bearer(agent_id: str = "ghost", token: str = "ghost-tok") -> Principal:
     """An ``agent_bearer`` that identifies an agent but carries NO caps
     (``agent_role=None`` → empty bundle) — the malformed-token over-admit."""
-    return Principal(
+    return make_principal(
         kind="agent_bearer",
         user_id=None,
         agent_id=agent_id,
@@ -52,7 +52,7 @@ def _empty_cap_bearer(agent_id: str = "ghost", token: str = "ghost-tok") -> Prin
 
 
 def _worker_bearer(agent_id: str, token: str) -> Principal:
-    return Principal(
+    return make_principal(
         kind="agent_bearer",
         user_id=None,
         agent_id=agent_id,

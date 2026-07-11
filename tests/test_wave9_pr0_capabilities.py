@@ -31,8 +31,7 @@ from agent_mcp.core.capabilities import (
     SYSADMIN_WILDCARD,
     resolve_capabilities,
 )
-from agent_mcp.core.principal import Principal
-from tests.harness import with_capabilities
+from tests.harness import make_principal, with_capabilities
 
 
 # ── Vocabulary shape ───────────────────────────────────────────────
@@ -132,7 +131,7 @@ def test_sysadmin_wildcard_admits_every_cap():
     """``has_capability`` short-circuits on the wildcard sentinel; a
     sysadmin admits ``"any"`` (and any other arbitrary string) without
     materialising the full 27-cap set onto the Principal."""
-    p = Principal(
+    p = make_principal(
         kind="operator_session",
         user_id="alice",
         agent_id=None,
@@ -143,7 +142,7 @@ def test_sysadmin_wildcard_admits_every_cap():
         can_wake_loop=False,
         source_token=None,
     )
-    # The __post_init__ back-fill resolves sysadmin → wildcard set.
+    # make_principal resolves sysadmin -> wildcard set via resolve_capabilities.
     assert SYSADMIN_WILDCARD in p.capabilities
     assert p.has_capability("any")
     assert p.has_capability("agents.create")  # not even a real cap
@@ -168,7 +167,7 @@ def test_operator_with_project_role_viewer_denies_write_cap():
     """A viewer's bundle covers reads only — ``agents.register`` is
     not in PROJECT_ROLE_BUNDLES['viewer'] so ``has_capability`` denies
     regardless of project_role."""
-    p = Principal(
+    p = make_principal(
         kind="operator_session",
         user_id="alice",
         agent_id=None,
@@ -187,7 +186,7 @@ def test_operator_with_project_role_viewer_denies_write_cap():
 def test_sysadmin_admits_system_users_manage_regardless_of_project_role():
     """``system.*`` caps don't require project membership AND the
     sysadmin wildcard short-circuits the cap-set check anyway."""
-    p = Principal(
+    p = make_principal(
         kind="operator_session",
         user_id="alice",
         agent_id=None,
@@ -223,7 +222,7 @@ def test_has_capability_denies_resource_cap_without_project_role():
     the caller has no project membership AND isn't an agent_bearer.
     Models the forwarding-header case where the per-project backend
     has no router.db handle to resolve project role."""
-    p = Principal(
+    p = make_principal(
         kind="forwarding_header",
         user_id="alice",
         agent_id=None,
@@ -341,7 +340,7 @@ def test_resolve_capabilities_drops_wildcard_from_group_data(monkeypatch):
     # The legitimate, KNOWN cap from the group still comes through.
     assert "tasks.assign" in caps
     # And the wildcard did not smuggle in blanket admit.
-    p = Principal(
+    p = make_principal(
         kind="operator_session",
         user_id="alice",
         agent_id=None,

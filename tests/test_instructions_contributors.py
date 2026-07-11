@@ -168,12 +168,12 @@ def test_byte_identical_wake_loop_output() -> None:
     """
     from agent_mcp.app import instructions_contributors as ic
     from agent_mcp.app.event_loop_instructions import WAKE_LOOP_INSTRUCTIONS
-    from agent_mcp.core.principal import Principal
+    from tests.harness import make_principal
 
     # Wave 6 PR 6: the contributor reads ``principal.can_wake_loop``
     # directly. Build a Principal with the bit on and pass it via
     # the ``InitContext``; no monkeypatching needed.
-    p = Principal(
+    p = make_principal(
         kind="agent_bearer",
         user_id=None,
         agent_id="alice",

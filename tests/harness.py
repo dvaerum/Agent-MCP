@@ -79,11 +79,14 @@ import time
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, List, Optional
+from typing import TYPE_CHECKING, Any, AsyncIterator, List, Optional
 
 import httpx
 import mcp.types as mcp_types
 import pytest
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from agent_mcp.core.principal import AgentRole, Principal, PrincipalKind
 
 
 async def assert_ran_off_event_loop(
@@ -425,10 +428,8 @@ class WorkerSession:
         driving the MCP framework handler so the wire path sees the
         same identity a real HTTP request would.
         """
-        from agent_mcp.core.principal import Principal
-
         if self.is_admin_caller:
-            return Principal(
+            return make_principal(
                 kind="agent_bearer",
                 user_id=_HARNESS_OPERATOR_ID,
                 agent_id=self.agent_id,
@@ -436,7 +437,6 @@ class WorkerSession:
                 project_name="harness",
                 project_role="operator",
                 agent_role="manager",
-                can_wake_loop=False,
                 source_token=self.token,
             )
         # Resolve the worker's actual agent_role from the in-memory
@@ -455,15 +455,10 @@ class WorkerSession:
         normalized_role = (
             cached_role if cached_role in ("worker", "manager") else None
         )
-        return Principal(
+        return make_principal(
             kind="agent_bearer",
-            user_id=None,
             agent_id=self.agent_id,
-            sysadmin=False,
-            project_name=None,
-            project_role=None,
             agent_role=normalized_role,
-            can_wake_loop=False,
             source_token=self.token,
         )
 
@@ -959,6 +954,84 @@ class AdminClient(WorkerSession):
 # --- Public entry point ---
 
 
+def make_principal(
+    *,
+    kind: "PrincipalKind",
+    user_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    sysadmin: bool = False,
+    project_name: Optional[str] = None,
+    project_role: Optional[str] = None,
+    agent_role: "Optional[AgentRole]" = None,
+    can_wake_loop: bool = False,
+    source_token: Optional[str] = None,
+    groups: Optional[frozenset] = frozenset(),
+    capabilities: Optional[frozenset] = None,
+) -> "Principal":
+    """Construct a test :class:`Principal` with HONEST capabilities.
+
+    arch-r5 #1: replaces the ~30 test-local ``_worker_principal`` /
+    ``_operator_principal`` / bare ``Principal(...)`` helpers that used
+    to rely on the now-deleted ``__post_init__`` back-fill bridge. That
+    bridge could not accept a ``groups=`` argument, so any test
+    constructing a group-privileged identity via a bare ``Principal(...)``
+    silently got a SMALLER cap set than
+    :func:`agent_mcp.core.principal_builder.build_operator_principal`
+    mints for the same identity in production — a bare-Principal test
+    would pass with a plausible-but-wrong cap set.
+
+    This factory closes that gap by funnelling through the SAME
+    resolver the production builders call
+    (:func:`agent_mcp.core.capabilities.resolve_capabilities`) unless
+    the caller supplies an explicit ``capabilities=`` override (for
+    tests that deliberately want a specific, possibly-nonsensical cap
+    set to isolate one gate). ``groups`` defaults to an empty frozenset
+    (not ``None``) so tests are deterministic by default — ``None``
+    would make ``resolve_capabilities`` self-resolve transitive groups
+    via ``router.db``, which isn't available in most test processes.
+
+    Usage::
+
+        from tests.harness import make_principal
+        worker = make_principal(kind="agent_bearer", agent_id="w1", agent_role="worker")
+        op = make_principal(kind="operator_session", user_id="alice", project_role="operator")
+        sysadmin = make_principal(kind="operator_session", user_id="root", sysadmin=True)
+
+    Pass ``capabilities=frozenset({...})`` to override resolution
+    entirely — the same escape hatch :func:`with_capabilities` (below)
+    provides pre-packaged for the common "operator carrying exactly
+    these caps" shape.
+    """
+    from agent_mcp.core.capabilities import resolve_capabilities
+    from agent_mcp.core.principal import Principal
+
+    caps = (
+        capabilities
+        if capabilities is not None
+        else resolve_capabilities(
+            user_id=user_id,
+            agent_id=agent_id,
+            sysadmin=sysadmin,
+            agent_role=agent_role,
+            project_role=project_role,
+            kind=kind,
+            groups=groups,
+        )
+    )
+    return Principal(
+        kind=kind,
+        user_id=user_id,
+        agent_id=agent_id,
+        sysadmin=sysadmin,
+        project_name=project_name,
+        project_role=project_role,
+        agent_role=agent_role,
+        can_wake_loop=can_wake_loop,
+        source_token=source_token,
+        capabilities=caps,
+    )
+
+
 def with_capabilities(*caps: str):
     """Construct a test :class:`Principal` carrying exactly ``caps``.
 
@@ -968,9 +1041,8 @@ def with_capabilities(*caps: str):
     middleware resolution chain. The returned Principal is
     ``operator_session`` shaped with ``project_role="operator"`` so
     the non-``system.*`` cap gate's project-membership requirement
-    admits; ``capabilities`` is the exact frozenset passed in
-    (overriding the auto-resolve from identity fields that
-    :class:`Principal.__post_init__` would otherwise perform).
+    admits; ``capabilities`` is the exact frozenset passed in — a thin
+    wrapper over :func:`make_principal`'s ``capabilities=`` override.
 
     Pass :data:`agent_mcp.core.capabilities.SYSADMIN_WILDCARD` to
     model a sysadmin (``has_capability`` short-circuits on the
@@ -986,18 +1058,11 @@ def with_capabilities(*caps: str):
     Returns the Principal directly (not a context manager) — for
     ContextVar-stamping, wrap in :func:`with_principal`.
     """
-    from agent_mcp.core.principal import Principal
-
-    return Principal(
+    return make_principal(
         kind="operator_session",
         user_id="harness-operator",
-        agent_id=None,
-        sysadmin=False,
         project_name="harness",
         project_role="operator",
-        agent_role=None,
-        can_wake_loop=False,
-        source_token=None,
         capabilities=frozenset(caps),
     )
 
@@ -1016,19 +1081,13 @@ def with_principal(principal):
 
     Usage::
 
-        from agent_mcp.core.principal import Principal
-        from tests.harness import with_principal
+        from tests.harness import make_principal, with_principal
 
-        p = Principal(
+        p = make_principal(
             kind="operator_session",
             user_id="alice",
-            agent_id=None,
-            sysadmin=False,
             project_name="proj-a",
             project_role="operator",
-            agent_role=None,
-            can_wake_loop=False,
-            source_token=None,
         )
         with with_principal(p):
             ... # in-process tool calls see p as the calling Principal

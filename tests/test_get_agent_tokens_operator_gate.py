@@ -34,7 +34,7 @@ import pytest
 from agent_mcp.core import globals as g
 from agent_mcp.core.principal import Principal
 from agent_mcp.core.tool_result import Ok, PermissionDenied
-from tests.harness import mcp_session
+from tests.harness import make_principal, mcp_session
 
 
 pytestmark = pytest.mark.asyncio
@@ -44,7 +44,7 @@ pytestmark = pytest.mark.asyncio
 
 
 def _operator_principal(user_id: str = "op-user") -> Principal:
-    return Principal(
+    return make_principal(
         kind="operator_session",
         user_id=user_id,
         agent_id=None,
@@ -60,7 +60,7 @@ def _operator_principal(user_id: str = "op-user") -> Principal:
 def _viewer_principal(user_id: str = "viewer-user") -> Principal:
     """Read-only operator — holds ``agents.view`` via the viewer bundle
     but not the operator-only gate cap."""
-    return Principal(
+    return make_principal(
         kind="operator_session",
         user_id=user_id,
         agent_id=None,
@@ -83,7 +83,7 @@ def _viewer_with_operator_group_grant(user_id: str = "viewer-grp") -> Principal:
     confirmed operator tier and must receive masked tokens. This is the
     defense-in-depth layer that mirrors ``is_confirmed_operator_tier``.
     """
-    return Principal(
+    return make_principal(
         kind="operator_session",
         user_id=user_id,
         agent_id=None,
@@ -106,7 +106,7 @@ def _viewer_with_operator_group_grant(user_id: str = "viewer-grp") -> Principal:
 
 
 def _worker_principal(agent_id: str = "wkr") -> Principal:
-    return Principal(
+    return make_principal(
         kind="agent_bearer",
         user_id=None,
         agent_id=agent_id,

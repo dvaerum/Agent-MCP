@@ -38,13 +38,13 @@ import pytest
 
 from agent_mcp.core.principal import Principal
 from agent_mcp.core.tool_result import Invalid, Ok
-from tests.harness import mcp_session
+from tests.harness import make_principal, mcp_session
 
 pytestmark = pytest.mark.asyncio
 
 
 def _operator_principal(project_name: str = "demo-project") -> Principal:
-    return Principal(
+    return make_principal(
         kind="operator_session",
         user_id="test-operator",
         agent_id=None,
