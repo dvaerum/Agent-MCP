@@ -61,6 +61,7 @@ import contextlib
 import datetime
 import json
 import secrets
+import sqlite3
 from typing import Any, Dict, Iterator, List, Optional
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -122,6 +123,35 @@ _JSON_LIST_FIELDS: set[str] = {
     "depends_on_tasks",
     "notes",
 }
+
+
+def _sanitise_fields(task_id: str, fields: Dict[str, Any]) -> Dict[str, Any]:
+    """Allowlist-filter ``fields`` and JSON-encode the list-typed ones.
+
+    The single source of truth for the ``_MUTABLE_FIELDS`` allowlist
+    plus the ``_JSON_LIST_FIELDS`` json.dumps rule. Before arch-r5 #3
+    this block was duplicated 3x (the standalone own-session writer,
+    the shared-cursor writer, and a dead shared-session writer that no
+    caller ever exercised). Both surviving writers call this so the
+    invariant can't drift between them again.
+
+    Unknown fields are dropped (with a warning), matching the legacy
+    per-copy behaviour — this is an allowlist, not a validator that
+    raises.
+    """
+    sanitised: Dict[str, Any] = {}
+    for field, value in fields.items():
+        if field not in _MUTABLE_FIELDS:
+            logger.warning(
+                f"Attempted to update invalid task field: {field} for "
+                f"task {task_id}. Skipping."
+            )
+            continue
+        if field in _JSON_LIST_FIELDS:
+            sanitised[field] = json.dumps(value or [])
+        else:
+            sanitised[field] = value
+    return sanitised
 
 
 def _generate_task_id() -> str:
@@ -321,18 +351,7 @@ def update_task_fields_in_db(
     # Pre-filter to the allowlist so the ORM ``setattr`` loop can't
     # touch anything off-limits. Mirrors the legacy
     # safe_field_mapping[field] KeyError-on-unknown guard.
-    sanitised: Dict[str, Any] = {}
-    for field, value in fields_to_update.items():
-        if field not in _MUTABLE_FIELDS:
-            logger.warning(
-                f"Attempted to update invalid task field: {field} for "
-                f"task {task_id}. Skipping."
-            )
-            continue
-        if field in _JSON_LIST_FIELDS:
-            sanitised[field] = json.dumps(value or [])
-        else:
-            sanitised[field] = value
+    sanitised = _sanitise_fields(task_id, fields_to_update)
 
     if not sanitised:
         logger.info(f"No valid fields to update for task {task_id}.")
@@ -669,16 +688,24 @@ class TaskRepository:
         task_id: str,
         fields: Dict[str, Any],
         *,
-        connection: Any = None,
+        connection: Optional[sqlite3.Cursor] = None,
     ) -> Optional[Dict[str, Any]]:
         """UPDATE a task via the allowlisted writer; refresh cache; publish.
 
         ``connection`` is the Risk #1 hook: a handler that already
-        holds an open SQLAlchemy ``Session`` (or future ``Connection``)
-        in a wider transaction can pass it in to keep the write
-        atomic with its surrounding statements. When ``None`` (the
-        normal case), the call opens its own session via the existing
+        holds an open raw ``sqlite3.Cursor`` in a wider transaction
+        (its own BEGIN/COMMIT) can pass it in to keep the write atomic
+        with its surrounding statements. When ``None`` (the normal
+        case), the call opens its own session via the existing
         ``update_task_fields_in_db`` helper.
+
+        arch-r5 #3: a SQLAlchemy ``Session`` overload used to be
+        accepted here too (disambiguated via ``hasattr(connection,
+        "query")``), but a grep of every ``update_fields(...,
+        connection=...)`` call site across ``agent_mcp/`` and
+        ``tests/`` turned up zero Session-shaped callers — every one
+        passes a raw cursor. Removed the dead branch and typed the
+        parameter honestly.
 
         Returns the post-update dict, or ``None`` if the row was
         unknown / no valid fields supplied / DB error. Matches the
@@ -686,7 +713,7 @@ class TaskRepository:
         return don't need to change.
         """
         # sqlite3 cursor path (PR #152) — caller owns BEGIN/COMMIT.
-        if connection is not None and not hasattr(connection, "query"):
+        if connection is not None:
             ok = self._update_fields_with_cursor(
                 connection, task_id, fields,
             )
@@ -697,12 +724,7 @@ class TaskRepository:
             # fields so the caller can wire them into their response.
             return {"task_id": task_id, **fields}
 
-        if connection is not None:
-            ok = self._update_fields_with_session(
-                connection, task_id, fields,
-            )
-        else:
-            ok = update_task_fields_in_db(task_id, fields)
+        ok = update_task_fields_in_db(task_id, fields)
         if not ok:
             return None
 
@@ -722,33 +744,21 @@ class TaskRepository:
 
     def _update_fields_with_cursor(
         self,
-        cursor: Any,
+        cursor: sqlite3.Cursor,
         task_id: str,
         fields: Dict[str, Any],
     ) -> bool:
         """Internal helper for the sqlite3.Cursor seam path.
 
-        Mirrors the allowlist + JSON-serialisation logic the standalone
-        ``update_task_fields_in_db`` does, but writes via raw SQL
-        against the caller's cursor so the wider BEGIN/COMMIT stays
-        atomic.
+        Uses :func:`_sanitise_fields` — the same allowlist + JSON-
+        serialisation logic the standalone ``update_task_fields_in_db``
+        uses — but writes via raw SQL against the caller's cursor so
+        the wider BEGIN/COMMIT stays atomic.
         """
         if not task_id or not fields:
             return False
 
-        sanitised: Dict[str, Any] = {}
-        for field, value in fields.items():
-            if field not in _MUTABLE_FIELDS:
-                logger.warning(
-                    f"Attempted to update invalid task field via cursor: "
-                    f"{field} for task {task_id}. Skipping."
-                )
-                continue
-            if field in _JSON_LIST_FIELDS:
-                sanitised[field] = json.dumps(value or [])
-            else:
-                sanitised[field] = value
-
+        sanitised = _sanitise_fields(task_id, fields)
         if not sanitised:
             return False
 
@@ -766,62 +776,6 @@ class TaskRepository:
             logger.error(
                 f"Database error updating task '{task_id}' via shared "
                 f"cursor: {e}",
-                exc_info=True,
-            )
-            return False
-
-    def _update_fields_with_session(
-        self,
-        session: Any,
-        task_id: str,
-        fields: Dict[str, Any],
-    ) -> bool:
-        """Internal helper for the ``connection=`` overload.
-
-        Mirrors the same allowlist + JSON-serialisation logic the
-        standalone ``update_task_fields_in_db`` does, but against
-        the caller-provided session so the wider transaction stays
-        intact. Kept private because the public API is
-        ``update_fields(task_id, fields, connection=)`` — exposing
-        the session-shaped variant directly would leak a transient
-        implementation detail.
-        """
-        if not task_id or not fields:
-            return False
-
-        sanitised: Dict[str, Any] = {}
-        for field, value in fields.items():
-            if field not in _MUTABLE_FIELDS:
-                logger.warning(
-                    f"Attempted to update invalid task field: {field} "
-                    f"for task {task_id}. Skipping."
-                )
-                continue
-            if field in _JSON_LIST_FIELDS:
-                sanitised[field] = json.dumps(value or [])
-            else:
-                sanitised[field] = value
-
-        if not sanitised:
-            return False
-
-        try:
-            row = (
-                session.query(Task)
-                .filter(Task.task_id == task_id)
-                .one_or_none()
-            )
-            if row is None:
-                return False
-            for field, value in sanitised.items():
-                setattr(row, field, value)
-            row.updated_at = datetime.datetime.now().isoformat()
-            session.flush()
-            return True
-        except SQLAlchemyError as e:
-            logger.error(
-                f"Database error updating task '{task_id}' via shared "
-                f"session: {e}",
                 exc_info=True,
             )
             return False

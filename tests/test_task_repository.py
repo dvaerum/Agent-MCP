@@ -609,3 +609,104 @@ def test_delete_with_sqlite_cursor_returns_false_for_missing_row(
             conn.commit()
         finally:
             conn.close()
+
+
+# --- _sanitise_fields (arch-r5 #3) ----------------------------------------
+#
+# Before this PR the allowlist + JSON-list-field serialisation lived
+# 3x: the standalone own-session writer (``update_task_fields_in_db``),
+# the shared-cursor writer (``_update_fields_with_cursor``), and a
+# shared-session writer (``_update_fields_with_session``) that a grep
+# of every ``update_fields(..., connection=...)`` call site in
+# ``agent_mcp/`` and ``tests/`` showed was never exercised by any real
+# caller — every site passes a raw ``sqlite3.Cursor``. That dead
+# branch has been deleted; ``_sanitise_fields`` is now the single
+# place the two surviving writers (cursor + standalone session) both
+# call. These tests pin its contract directly so the invariant the
+# dead path made hard to isolate is covered without spinning up the
+# app harness.
+
+_SANITISE_FIELDS_CASES = [
+    # (fields_in, expected_out)
+    ({"title": "new title"}, {"title": "new title"}),
+    ({"description": "new desc"}, {"description": "new desc"}),
+    ({"assigned_to": "agent-x"}, {"assigned_to": "agent-x"}),
+    ({"status": "completed"}, {"status": "completed"}),
+    ({"priority": "high"}, {"priority": "high"}),
+    ({"parent_task": "task_parent"}, {"parent_task": "task_parent"}),
+    # JSON-list fields are json.dumps'd.
+    ({"child_tasks": ["a", "b"]}, {"child_tasks": '["a", "b"]'}),
+    ({"depends_on_tasks": ["x"]}, {"depends_on_tasks": '["x"]'}),
+    ({"notes": [{"a": 1}]}, {"notes": '[{"a": 1}]'}),
+    # A falsy/None JSON-list value serialises to an empty list, not "null".
+    ({"child_tasks": None}, {"child_tasks": "[]"}),
+    ({"depends_on_tasks": []}, {"depends_on_tasks": "[]"}),
+    # Unknown fields are dropped, not raised.
+    ({"not_a_real_field": "x"}, {}),
+    ({"task_id": "cannot-rename"}, {}),
+    ({"created_by": "cannot-reassign"}, {}),
+    ({"created_at": "cannot-backdate"}, {}),
+    ({"updated_at": "cannot-set-directly"}, {}),
+    # Mixed: allowlisted fields survive, unknown ones are dropped, list
+    # fields get serialised alongside scalar ones untouched.
+    (
+        {"title": "t", "notes": ["n1"], "bogus": "z"},
+        {"title": "t", "notes": '["n1"]'},
+    ),
+]
+
+
+@pytest.mark.parametrize("fields_in, expected_out", _SANITISE_FIELDS_CASES)
+def test_sanitise_fields(fields_in, expected_out):
+    """Table-driven pin of the allowlist + JSON-list serialisation.
+
+    Doesn't need the app harness — ``_sanitise_fields`` is a pure
+    function of ``(task_id, fields)``.
+    """
+    from agent_mcp.repositories.task_repository import _sanitise_fields
+
+    assert _sanitise_fields("t-sanitise", fields_in) == expected_out
+
+
+def test_sanitise_fields_empty_input_returns_empty_dict():
+    from agent_mcp.repositories.task_repository import _sanitise_fields
+
+    assert _sanitise_fields("t-empty", {}) == {}
+
+
+def test_update_fields_via_cursor_and_standalone_agree(
+    project_dir, reset_globals,
+):
+    """The cursor writer and the standalone writer both route through
+    ``_sanitise_fields`` — this pins that they produce the SAME
+    serialised value for the same input, which is the exact invariant
+    the (now-deleted) dead session writer put at risk of drifting.
+    """
+    with _make_client(project_dir):
+        from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import task_repo
+
+        _seed_task("task-cursor-san")
+        _seed_task("task-standalone-san")
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN")
+            result = task_repo.update_fields(
+                "task-cursor-san", {"notes": ["n1", "n2"]},
+                connection=cursor,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        assert result is not None
+
+        result2 = task_repo.update_fields(
+            "task-standalone-san", {"notes": ["n1", "n2"]},
+        )
+        assert result2 is not None
+
+        cursor_row = task_repo.get_by_id("task-cursor-san")
+        standalone_row = task_repo.get_by_id("task-standalone-san")
+        assert cursor_row["notes"] == standalone_row["notes"] == ["n1", "n2"]
