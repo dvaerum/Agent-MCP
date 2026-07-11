@@ -29,7 +29,6 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
-from .._dispatch_helpers import handle_options
 from ..deps import caller_identity, require_operator_session
 from ...core.config import logger
 from ...db.actions.agent_actions_db import log_agent_action_to_db
@@ -71,7 +70,7 @@ _MESSAGE_TYPES = ("text", "system", "notification", "task_update",
 _MESSAGE_PRIORITIES = ("low", "normal", "high", "urgent")
 
 
-@router.api_route("/query", methods=["POST", "OPTIONS"])
+@router.post("/query")
 async def list_messages_api_route(
     request: Request,
     auth: dict = Depends(require_operator_session),
@@ -97,11 +96,6 @@ async def list_messages_api_route(
       q              content substring (LIKE %q%)
       limit/offset   pagination (default 50 / 0)
     """
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
-    if request.method != 'POST':
-        return JSONResponse({"error": "Method not allowed"}, status_code=405)
-
     try:
         data = await get_sanitized_json_body(request)
 
@@ -164,7 +158,7 @@ async def list_messages_api_route(
         )
 
 
-@router.api_route("/participants", methods=["POST", "OPTIONS"])
+@router.post("/participants")
 async def list_participants_api_route(
     request: Request,
     auth: dict = Depends(require_operator_session),
@@ -195,11 +189,6 @@ async def list_participants_api_route(
     writes when an agent is permanently removed. Sorted lexicographically
     so the dropdown order is stable. Empty list until PR C lands.
     """
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
-    if request.method != 'POST':
-        return JSONResponse({"error": "Method not allowed"}, status_code=405)
-
     try:
         _ = await get_sanitized_json_body(request)
 
@@ -224,7 +213,7 @@ async def list_participants_api_route(
         )
 
 
-@router.api_route("/suggest-subject", methods=["POST", "OPTIONS"])
+@router.post("/suggest-subject")
 async def suggest_subject_api_route(
     request: Request,
     auth: dict = Depends(require_operator_session),
@@ -243,11 +232,6 @@ async def suggest_subject_api_route(
     down, the user types a subject by hand; we don't want to colour
     that "subject is empty" path as an error in the network panel.
     """
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
-    if request.method != 'POST':
-        return JSONResponse({"error": "Method not allowed"}, status_code=405)
-
     try:
         data = await get_sanitized_json_body(request)
     except ValueError as e:
@@ -281,7 +265,7 @@ async def suggest_subject_api_route(
     return JSONResponse({"subject": subject})
 
 
-@router.api_route("", methods=["POST", "OPTIONS"])
+@router.post("")
 async def create_message_api_route(
     request: Request,
     auth: dict = Depends(require_operator_session),
@@ -300,11 +284,6 @@ async def create_message_api_route(
       * `parent_message_id` — when set, this message is a reply to
         the named root; subject is forced NULL regardless of input.
     """
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
-    if request.method != 'POST':
-        return JSONResponse({"error": "Method not allowed"}, status_code=405)
-
     conn = None
     try:
         data = await get_sanitized_json_body(request)
@@ -572,28 +551,29 @@ async def create_message_api_route(
             conn.close()
 
 
-@router.api_route("/{message_id}", methods=["PATCH", "DELETE", "OPTIONS"])
+@router.patch("/{message_id}")
+@router.delete("/{message_id}")
 async def patch_message_api_route(
+    message_id: str,
     request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
     """PATCH/DELETE /api/messages/{message_id}.
 
     PATCH flips read/delivered. DELETE removes the row (used by the
-    dashboard's row-level + bulk delete actions).
+    dashboard's row-level + bulk delete actions). Both methods share
+    this one handler — ``request.method`` still selects the DELETE vs.
+    PATCH business logic below (that's a real behavioral branch, not
+    wire-shape boilerplate).
 
     PR D (prancy-napping-pie): auth via ``require_operator_session``.
+
+    arch-r4 #10: ``message_id`` is now a typed path parameter, replacing
+    the hand-rolled ``request.url.path.split('/')`` extraction. Stacking
+    ``@router.patch`` + ``@router.delete`` on one function registers the
+    same handler for both methods (PUT/GET/etc. now 405 at the framework
+    level instead of falling into the old ``methods not in (...)`` check).
     """
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
-    if request.method not in ('PATCH', 'DELETE'):
-        return JSONResponse({"error": "Method not allowed"}, status_code=405)
-
-    path_parts = request.url.path.split('/')
-    if len(path_parts) < 4 or not path_parts[-1]:
-        return JSONResponse({"error": "message_id is required in URL"}, status_code=400)
-    message_id = path_parts[-1]
-
     conn = None
     try:
         data = await get_sanitized_json_body(request)

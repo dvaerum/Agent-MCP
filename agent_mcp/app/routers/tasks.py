@@ -29,7 +29,6 @@ from starlette.requests import Request
 from .._dispatch_helpers import (
     _build_route_principal,
     _dispatch_through_tool,
-    handle_options,
 )
 from ._wire_validation import require_str as _require_str
 from ._wire_validation import require_str_list as _require_str_list
@@ -61,7 +60,7 @@ router = APIRouter(
 # NOT consolidate" scope boundary is settled.
 
 
-@router.api_route("", methods=["GET", "OPTIONS"])
+@router.get("")
 async def all_tasks_api_route(request: Request) -> JSONResponse:
     # GET /api/tasks[?assigned_to=<agent_id>][?unassigned=true]
     #
@@ -78,9 +77,6 @@ async def all_tasks_api_route(request: Request) -> JSONResponse:
     # by nature — IS NULL never matches a literal agent_id).
     #
     # Phase 7c, Q7.2 in plan.
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
-
     assigned_to_filter: Optional[str] = request.query_params.get('assigned_to')
     unassigned_raw = request.query_params.get('unassigned', '')
     unassigned_filter: bool = unassigned_raw.lower() in ('true', '1', 'yes')
@@ -111,7 +107,7 @@ async def all_tasks_api_route(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Failed to fetch all tasks"}, status_code=500)
 
 
-@router.api_route("", methods=["POST", "OPTIONS"])
+@router.post("")
 async def create_task_api_route(
     request: Request,
     auth: dict = Depends(require_operator_session),
@@ -135,11 +131,6 @@ async def create_task_api_route(
            "assigned_to"?, "parent_task"?, "required_capabilities"?}
     Returns: {"success": true, "task_id": "...", "message": "..."}
     """
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
-    if request.method != 'POST':
-        return JSONResponse({"error": "Method not allowed"}, status_code=405)
-
     try:
         data = await get_sanitized_json_body(request)
     except ValueError as e:
@@ -261,33 +252,30 @@ async def create_task_api_route(
     )
 
 
-@router.api_route("/{task_id}", methods=["DELETE", "OPTIONS"])
+@router.delete("/{task_id}")
 async def delete_task_api_route(
+    task_id: str,
     request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
     """DELETE /api/tasks/<task_id> — admin deletes a task.
 
     Thin adapter over the ``delete_task`` MCP tool (Candidate C,
-    2026-06-02 architecture review). Validation
-    (``task_id`` required) and admin-only auth live in the tool's
-    ``inputSchema`` + ``@requires("admin")``. Cascade safety (children
-    / dependents) is handled by the tool impl. Wire-shape parity is
+    2026-06-02 architecture review). Admin-only auth lives in the
+    tool's ``@requires("admin")``. Cascade safety (children /
+    dependents) is handled by the tool impl. Wire-shape parity is
     pinned by tests/test_rest_mcp_tool_parity.py.
 
     PR D (prancy-napping-pie): auth via ``require_operator_session``.
+
+    arch-r4 #10: ``task_id`` is now a typed path parameter — FastAPI's
+    routing already guarantees a non-empty value (the ``str`` convertor
+    requires 1+ chars), so ``DELETE /api/tasks/`` (empty id) now 404s
+    at the framework level instead of reaching a hand-written 400. The
+    only test that touches this
+    (``test_delete_task_missing_task_id_returns_400``) accepts
+    400/404/405 for exactly this reason — still green.
     """
-    if request.method == 'OPTIONS':
-        return await handle_options(request)
-    if request.method != 'DELETE':
-        return JSONResponse({"error": "Method not allowed"}, status_code=405)
-
-    # Extract task_id from URL path (last segment).
-    path_parts = request.url.path.split('/')
-    if len(path_parts) < 4 or not path_parts[-1]:
-        return JSONResponse({"error": "task_id is required in URL"}, status_code=400)
-    task_id = path_parts[-1]
-
     try:
         _ = await get_sanitized_json_body(request)
     except ValueError as e:
