@@ -228,15 +228,11 @@ def _read_ctx(key: str) -> Optional[str]:
 
 
 def _read_bool(key: str, default: bool) -> bool:
-    raw = _read_ctx(key)
-    if raw is None:
-        return default
-    s = raw.lower()
-    if s in ("true", "1", "yes", "on"):
-        return True
-    if s in ("false", "0", "no", "off"):
-        return False
-    return default
+    # Route through the canonical config-read seam in tools.access so the
+    # bool-coercion table lives in exactly one place (was duplicated here).
+    from ..tools.access import _get_config_bool
+
+    return _get_config_bool(key, default)
 
 
 def _read_int(key: str, default: int) -> int:

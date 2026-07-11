@@ -10,7 +10,7 @@ design context (locked 2026-06-30 via ``/grill-me``).
 What lives here
 ---------------
 
-* :data:`KNOWN_CAPABILITIES` — the exact 27-element frozenset of
+* :data:`KNOWN_CAPABILITIES` — the exact 28-element frozenset of
   capability strings the system recognises. Any cap string used in
   decorators, in-body checks, or DB rows MUST be drawn from this set.
   Adding the 28th cap is a design change that re-opens the Wave 9
@@ -63,9 +63,21 @@ logger = logging.getLogger(__name__)
 # ── Capability vocabulary ───────────────────────────────────────────
 
 
-#: The exact 27-element frozenset of capability strings the system
+#: The exact 28-element frozenset of capability strings the system
 #: recognises. Locked by Wave 9 grilling (2026-06-30); adding /
 #: removing entries is a design change that needs a new wave.
+#:
+#: NOTE (arch round-2 #6, 2026-07-11): a review flagged 8 of these
+#: (agents.view, agents.use, memories.view, messages.view,
+#: messages.send, coordination.wait, system.view, rag.rebuild) as
+#: "checked by nothing" and candidate for pruning. They were KEPT:
+#: every one is live, admin-assignable group-capability vocabulary
+#: surfaced by the dashboard groups UI
+#: (``dashboard/lib/capability-descriptions.ts``, bidirectionally
+#: CI-coupled to this set) and validated by the group-capabilities
+#: API (``router/admin_users_api.py``). Absence of a Python
+#: enforcement gate does not make the vocabulary dead — an admin can
+#: grant any of these to a group today.
 KNOWN_CAPABILITIES: frozenset[str] = frozenset({
     # MCP wire / agent operations
     "mcp.connect",              # fundamental gate to use MCP wire
