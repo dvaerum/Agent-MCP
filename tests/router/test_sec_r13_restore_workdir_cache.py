@@ -18,7 +18,7 @@ from __future__ import annotations
 import pytest
 
 from agent_mcp.core import globals as g
-from agent_mcp.core.repositories import agent_repo
+from agent_mcp.repositories import agent_repo
 from tests.harness import mcp_session
 
 

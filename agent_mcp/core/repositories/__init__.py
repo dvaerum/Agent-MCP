@@ -1,43 +1,33 @@
 # Agent-MCP/agent_mcp/core/repositories/__init__.py
-"""Per-concept repositories that own the cache+DB-as-truth invariant.
+"""Residual package for the retired module-of-functions repositories.
 
-Each repo (Task, Agent, Message, Context) provides:
+Historically this package held the PR #137 "per-concept repositories"
+as a *module of functions* (``agent_repo`` / ``task_repo`` /
+``message_repo`` / ``context_repo``). The architecture review ruled
+those shadowed the canonical class-based repositories under
+:mod:`agent_mcp.repositories` — same tables, same
+``state.active_agents`` / ``state.agent_working_dirs`` caches — wired
+through an *inverted* ``db/actions`` re-export shim. The four modules
+were deleted (arch-deepening R3 #2a); every call site now imports the
+canonical singleton form::
 
-1. **Read interface** — ``get_*`` / ``list_*`` calls that consult the
-   in-memory cache from :mod:`agent_mcp.core.state` first, then fall
-   through to the database on miss (warm-on-miss populates the cache
-   for next time).
-2. **Write interface** — ``create_*`` / ``update_*`` calls that write
-   the DB FIRST, then update/invalidate the cache, then publish to the
-   :class:`EventBus` (if :mod:`agent_mcp.core.event_bus` is available;
-   gracefully no-op otherwise).
-3. **Test mode** — ``disable_cache()`` context manager that suspends
-   the cache for the duration of the ``with`` block so tests can
-   exercise DB-only behaviour without dealing with cache state.
+    from agent_mcp.repositories import agent_repo  # AgentRepository singleton
+    agent = agent_repo.get_by_token(bearer_token)
 
-PR-W2c introduces these alongside the existing legacy callsites that
-still touch ``state.tasks`` / ``state.active_agents`` directly. The
-legacy cache stays — repos *maintain* it — until a follow-up PR can
-mechanically delete it once no callers remain.
+The eager ``from . import agent_repo, …`` that used to live here was
+also the head of the circular-import cycle documented in
+``agent_mcp/repositories/agent_repository.py`` (the shim → db/actions →
+TOP repo loop). Removing it removes the cycle.
 
-Design notes:
-
-* The repos delegate DB I/O to ``agent_mcp.db.actions.*_db`` for
-  tasks / agents / messages (those modules already wrap the
-  SQLAlchemy ORM models). :class:`ContextRepository` is ORM-aware
-  directly because the actions-layer placeholder is a stub.
-* Cache invalidation strategy is "update on write, evict on delete":
-  the repo writes the new row, then mutates the cache in-place so
-  every caller — including the legacy ones still doing
-  ``state.tasks[task_id]`` — sees the new value. Eviction (``del``)
-  matches the legacy ``del`` pattern from the tools.
-* EventBus is a *soft* dependency. The repos use
-  ``importlib.import_module("agent_mcp.core.event_bus")`` inside a
-  try/except so that this PR can land before or after the W2b PR
-  that creates the bus.
+Only :mod:`_event_bus_shim` remains under this package — a
+soft-dependency EventBus adapter still consumed by
+``repositories.agent_repository``, ``repositories.rag_repository``,
+``db.unit_of_work``, ``tools.task_tools`` and
+``app.routers.composition``. It is imported directly as a submodule
+(``from agent_mcp.core.repositories import _event_bus_shim``), so this
+``__init__`` deliberately imports nothing. Relocating the shim to a
+non-``repositories`` home is left to #2b.
 """
 from __future__ import annotations
 
-from . import agent_repo, context_repo, message_repo, task_repo
-
-__all__ = ["agent_repo", "context_repo", "message_repo", "task_repo"]
+__all__: list[str] = []

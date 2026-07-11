@@ -453,8 +453,8 @@ class WorkerSession:
         row = _g.active_agents.get(self.token) or {}
         cached_role = row.get("agent_role")
         if cached_role not in ("worker", "manager"):
-            from agent_mcp.core.repositories import agent_repo as _agent_repo
-            db_row = _agent_repo.get_agent_by_token(self.token)
+            from agent_mcp.repositories import agent_repo as _agent_repo
+            db_row = _agent_repo.get_by_token(self.token)
             if isinstance(db_row, dict):
                 cached_role = db_row.get("agent_role")
         normalized_role = (

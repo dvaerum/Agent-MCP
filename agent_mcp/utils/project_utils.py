@@ -120,7 +120,7 @@ def generate_system_prompt(
     # Determine working directory for the prompt
     # Fallback to CWD if agent_id is unknown to the repo, though it
     # should be known by the time this is called.
-    from ..core.repositories import agent_repo
+    from ..repositories import agent_repo
 
     working_dir = agent_repo.get_working_directory(agent_id) or os.getcwd()
 
@@ -152,7 +152,7 @@ Your working directory is: {working_dir}
     # token-equality comparison against the system bearer. Manager
     # agents render as "Admin" in the prompt for back-compat with the
     # pre-Wave-3 wording — Wave 4 may revisit this label vocabulary.
-    agent_row = agent_repo.get_agent_by_id(agent_id) or {}
+    agent_row = agent_repo.get_by_id(agent_id) or {}
     agent_role = agent_row.get("agent_role", "worker")
     agent_type = "Admin" if agent_role == "manager" else "Worker"
 

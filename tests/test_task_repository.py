@@ -174,12 +174,12 @@ def test_list_all_returns_every_task(project_dir, reset_globals):
 
 def test_list_by_agent_without_status_filter(project_dir, reset_globals):
     with _make_client(project_dir):
-        from agent_mcp.core.repositories import agent_repo
+        from agent_mcp.repositories import agent_repo
         from agent_mcp.repositories import task_repo
 
         # FK from tasks.assigned_to -> agents.agent_id requires the
         # agent row first (PR #96 declared the constraint).
-        agent_repo.create_agent(
+        agent_repo.create(
             token="tok-w1",
             agent_id="worker-1",
             capabilities=[],
@@ -198,10 +198,10 @@ def test_list_by_agent_without_status_filter(project_dir, reset_globals):
 
 def test_list_by_agent_with_status_filter(project_dir, reset_globals):
     with _make_client(project_dir):
-        from agent_mcp.core.repositories import agent_repo
+        from agent_mcp.repositories import agent_repo
         from agent_mcp.repositories import task_repo
 
-        agent_repo.create_agent(
+        agent_repo.create(
             token="tok-w2",
             agent_id="worker-2",
             capabilities=[],

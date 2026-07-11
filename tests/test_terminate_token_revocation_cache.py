@@ -76,14 +76,14 @@ def test_get_agent_by_token_does_not_cache_terminated_row(
     ``state.active_agents`` write is the auth gate and must exclude it."""
     with _make_client(project_dir):
         from agent_mcp.core import state
-        from agent_mcp.core.repositories import agent_repo
+        from agent_mcp.repositories import agent_repo
 
         _insert_agent_via_db(
             agent_id="ghost", token="tok-terminated", status="terminated",
         )
         assert "tok-terminated" not in state.active_agents
 
-        row = agent_repo.get_agent_by_token("tok-terminated")
+        row = agent_repo.get_by_token("tok-terminated")
 
         # Audit read may see the row...
         assert row is not None
@@ -99,13 +99,13 @@ def test_get_agent_by_id_does_not_cache_terminated_row(
     assign_task ownership check)."""
     with _make_client(project_dir):
         from agent_mcp.core import state
-        from agent_mcp.core.repositories import agent_repo
+        from agent_mcp.repositories import agent_repo
 
         _insert_agent_via_db(
             agent_id="ghost2", token="tok-terminated-2", status="terminated",
         )
 
-        row = agent_repo.get_agent_by_id("ghost2")
+        row = agent_repo.get_by_id("ghost2")
 
         assert row is not None
         assert row["status"] == "terminated"
@@ -143,14 +143,14 @@ def test_active_agent_token_still_caches(project_dir, reset_globals):
     token is still warmed into the cache on read."""
     with _make_client(project_dir):
         from agent_mcp.core import state
-        from agent_mcp.core.repositories import agent_repo
+        from agent_mcp.repositories import agent_repo
 
         _insert_agent_via_db(
             agent_id="live", token="tok-live", status="active",
         )
         assert "tok-live" not in state.active_agents
 
-        row = agent_repo.get_agent_by_token("tok-live")
+        row = agent_repo.get_by_token("tok-live")
 
         assert row is not None
         assert "tok-live" in state.active_agents
