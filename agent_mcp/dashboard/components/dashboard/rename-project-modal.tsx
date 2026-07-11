@@ -20,6 +20,7 @@
 
 import React, { useState } from "react"
 import { appUrl, routerProjectUrl } from "@/lib/urls"
+import { routerApi } from "@/lib/router-api"
 import { Loader2, Pencil } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import {
@@ -87,26 +88,13 @@ export function RenameProjectModal({
       // {name, grace_days}. The unified envelope's ``message`` field
       // is the human-readable error string; ``error`` is the
       // discriminator code.
-      const r = await fetch(
-        routerProjectUrl(projectName),
-        {
-          method: "PATCH",
-          body: JSON.stringify({
-            name: newName,
-            grace_days: graceInt,
-          }),
-          headers: {
-            "Accept": "application/vnd.agent-mcp.v1+json",
-            "Content-Type": "application/json",
-          },
-        },
-      )
-      const body = await r.json().catch(() => ({} as any))
-      if (!r.ok || body.success === false) {
-        throw new Error(
-          body.message || body.error || `HTTP ${r.status}`,
-        )
-      }
+      await routerApi.request(routerProjectUrl(projectName), {
+        method: "PATCH",
+        body: JSON.stringify({
+          name: newName,
+          grace_days: graceInt,
+        }),
+      })
       await fetchOverview()
       close()
       // Navigate to the new project URL so the URL bar matches the

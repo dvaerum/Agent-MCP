@@ -33,11 +33,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { routerUsersUrl, routerUserUrl } from "@/lib/urls"
-
-const STRICT_HEADERS = {
-  Accept: "application/vnd.agent-mcp.v1+json",
-  "Content-Type": "application/json",
-}
+import { routerApi } from "@/lib/router-api"
 
 // Client-side hint that MUST be kept in sync with the server's canonical
 // policy: `identity.PASSWORD_MIN_LENGTH` / `validate_password_strength`
@@ -61,21 +57,8 @@ interface ListResponse {
   users: UserRow[]
 }
 
-interface ErrorResponse {
-  success: false
-  error: string
-  message: string
-}
-
 async function fetchUsers(): Promise<UserRow[]> {
-  const r = await fetch(routerUsersUrl(), {
-    headers: { Accept: STRICT_HEADERS.Accept },
-    credentials: "include",
-  })
-  if (!r.ok) {
-    throw new Error(`HTTP ${r.status}`)
-  }
-  const body: ListResponse = await r.json()
+  const body = await routerApi.request<ListResponse>(routerUsersUrl())
   return body.users || []
 }
 
@@ -250,10 +233,8 @@ function AddUserModal({
     setSubmitting(true)
     setError(null)
     try {
-      const r = await fetch(routerUsersUrl(), {
+      await routerApi.request(routerUsersUrl(), {
         method: "POST",
-        headers: STRICT_HEADERS,
-        credentials: "include",
         body: JSON.stringify({
           username,
           password,
@@ -261,16 +242,6 @@ function AddUserModal({
           is_sysadmin: isSysadmin,
         }),
       })
-      const body = (await r.json().catch(() => ({}))) as
-        | ErrorResponse
-        | { success: true }
-      if (!r.ok || (body as ErrorResponse).success === false) {
-        throw new Error(
-          (body as ErrorResponse).message ||
-            (body as ErrorResponse).error ||
-            `HTTP ${r.status}`,
-        )
-      }
       await onCreated()
       reset()
       onOpenChange(false)
@@ -391,25 +362,13 @@ function EditUserModal({
     setSubmitting(true)
     setError(null)
     try {
-      const r = await fetch(routerUserUrl(user.user_id), {
+      await routerApi.request(routerUserUrl(user.user_id), {
         method: "PATCH",
-        headers: STRICT_HEADERS,
-        credentials: "include",
         body: JSON.stringify({
           is_sysadmin: isSysadmin,
           email: email || null,
         }),
       })
-      const body = (await r.json().catch(() => ({}))) as
-        | ErrorResponse
-        | { success: true }
-      if (!r.ok || (body as ErrorResponse).success === false) {
-        throw new Error(
-          (body as ErrorResponse).message ||
-            (body as ErrorResponse).error ||
-            `HTTP ${r.status}`,
-        )
-      }
       await onSaved()
       onOpenChange(false)
     } catch (e) {
@@ -491,21 +450,9 @@ function DeleteUserModal({
     setSubmitting(true)
     setError(null)
     try {
-      const r = await fetch(routerUserUrl(user.user_id), {
+      await routerApi.request(routerUserUrl(user.user_id), {
         method: "DELETE",
-        headers: { Accept: STRICT_HEADERS.Accept },
-        credentials: "include",
       })
-      const body = (await r.json().catch(() => ({}))) as
-        | ErrorResponse
-        | { success: true }
-      if (!r.ok || (body as ErrorResponse).success === false) {
-        throw new Error(
-          (body as ErrorResponse).message ||
-            (body as ErrorResponse).error ||
-            `HTTP ${r.status}`,
-        )
-      }
       await onDeleted()
       onOpenChange(false)
     } catch (e) {

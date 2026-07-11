@@ -33,6 +33,7 @@ import {
   projectClientConfigUrl,
   projectInstallerUrl,
 } from "@/lib/urls"
+import { routerApi } from "@/lib/router-api"
 
 interface ClientConfig {
   mcpServers: {
@@ -119,15 +120,10 @@ function ProjectWiringPanel({
       // when called without an `?agent=` parameter, which is the
       // cheapest way to surface it without hitting the per-project
       // backend directly. It returns the .mcp.json JSON body.
-      const r = await fetch(
+      const body = await routerApi.request<ClientConfig>(
         projectClientConfigUrl(projectName),
-        {
-          cache: "no-store",
-          headers: { Accept: "application/vnd.agent-mcp.v1+json" },
-        },
+        { cache: "no-store" },
       )
-      if (!r.ok) throw new Error(`HTTP ${r.status}`)
-      const body = (await r.json()) as ClientConfig
       const auth = body?.mcpServers?.["agent-mcp"]?.headers?.Authorization ?? ""
       const m = auth.match(/^Bearer\s+(.+)$/)
       if (m && m[1] && m[1] !== "REPLACE_WITH_YOUR_AGENT_TOKEN") {

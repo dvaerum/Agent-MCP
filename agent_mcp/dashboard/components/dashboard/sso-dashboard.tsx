@@ -20,10 +20,8 @@ import { Loader2, ShieldAlert, ShieldCheck, Server } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { routerSsoConfigUrl } from "@/lib/urls"
-
-const STRICT_HEADERS = {
-  Accept: "application/vnd.agent-mcp.v1+json",
-}
+import { routerApi } from "@/lib/router-api"
+import { ApiError } from "@/lib/api"
 
 type SSOMode = "builtin" | "oidc" | "proxy_header"
 
@@ -67,21 +65,20 @@ export function SsoDashboard() {
     setError(null)
     setForbidden(false)
     try {
-      const resp = await fetch(routerSsoConfigUrl(), {
-        headers: STRICT_HEADERS,
-        credentials: "include",
-      })
-      if (resp.status === 403) {
-        setForbidden(true)
-        return
-      }
-      const body = (await resp.json()) as SSOConfigResponse
-      if (!resp.ok || !body.success || !body.config) {
-        setError(body.message ?? `HTTP ${resp.status}`)
+      const body = await routerApi.request<SSOConfigResponse>(
+        routerSsoConfigUrl(),
+      )
+      if (!body.success || !body.config) {
+        setError(body.message ?? "SSO config unavailable")
         return
       }
       setConfig(body.config)
     } catch (e) {
+      // 403 = not sysadmin: render the "sysadmin only" card, not an error.
+      if (e instanceof ApiError && e.status === 403) {
+        setForbidden(true)
+        return
+      }
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setLoading(false)

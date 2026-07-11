@@ -19,6 +19,8 @@
 import React, { useState } from "react"
 import { AlertTriangle, Loader2, Trash2 } from "lucide-react"
 import { routerProjectUrl } from "@/lib/urls"
+import { routerApi } from "@/lib/router-api"
+import { ApiError } from "@/lib/api"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -78,29 +80,35 @@ export function RemoveProjectModal({
       const url = deleteWorkspace
         ? routerProjectUrl(projectName, "delete_workspace=true")
         : routerProjectUrl(projectName)
-      const r = await fetch(url, {
-        method: "DELETE",
-        headers: { "Accept": "application/vnd.agent-mcp.v1+json" },
-      })
-      const body = await r.json().catch(() => ({} as any))
-      if (r.status === 409 && body.error === "active_sessions") {
-        setActiveConns(
-          typeof body.active_connections === "number"
-            ? body.active_connections
-            : 0,
-        )
-        setError(body.message || "Active sessions block removal.")
-        setSubmitting(false)
-        return
-      }
-      if (!r.ok || body.success === false) {
-        throw new Error(
-          body.message || body.error || `HTTP ${r.status}`,
-        )
-      }
+      await routerApi.request(url, { method: "DELETE" })
       await fetchOverview()
       close()
     } catch (err) {
+      // 409 active_sessions: the router refuses removal while agents are
+      // connected. Re-parse the ApiError body to surface the connection
+      // count instead of a generic error string.
+      if (err instanceof ApiError && err.status === 409) {
+        let body: {
+          error?: string
+          active_connections?: number
+          message?: string
+        } = {}
+        try {
+          body = JSON.parse(err.body)
+        } catch {
+          /* non-JSON body — fall through to the generic handler */
+        }
+        if (body.error === "active_sessions") {
+          setActiveConns(
+            typeof body.active_connections === "number"
+              ? body.active_connections
+              : 0,
+          )
+          setError(body.message || "Active sessions block removal.")
+          setSubmitting(false)
+          return
+        }
+      }
       setError(err instanceof Error ? err.message : String(err))
       setSubmitting(false)
     }
