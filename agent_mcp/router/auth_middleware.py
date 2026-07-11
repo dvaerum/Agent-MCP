@@ -36,6 +36,7 @@ from urllib.parse import quote
 from aiohttp import web
 
 from .login import resolve_current_user
+from .single_tenant import bypasses_operator_gate
 
 
 logger = logging.getLogger(__name__)
@@ -117,22 +118,6 @@ _NON_PROJECT_API_SEGMENTS = frozenset({"router"})
 
 
 # ── Helpers ────────────────────────────────────────────────────────
-
-
-def _single_tenant_mode() -> bool:
-    """Return True iff the router is running in single-tenant mode.
-
-    Lazy import so this module stays free of app-level import-time
-    side effects. Single-tenant deploys (ADR-0008) are pinned to one
-    operator-owned host; Phase 1 of the operator-login plan does not
-    gate that audience — Phase 3 will revisit when groups + system
-    perms arrive.
-    """
-    try:
-        from . import app as _app
-        return _app.SINGLE_TENANT_NAME is not None
-    except Exception:  # pragma: no cover - defensive
-        return False
 
 
 def _path_is_unauth(path: str) -> bool:
@@ -357,7 +342,7 @@ async def require_operator_session_middleware(
     # perms arrive. Skipping the gate also lets the existing 410
     # "endpoint disabled in single-tenant mode" responses surface for
     # __create/__unregister/__rename (covered by nix/tests/single-tenant.nix).
-    if _single_tenant_mode():
+    if bypasses_operator_gate():
         # SC-R6-1: single-tenant is an authorized audience (ADR-0008,
         # one operator-owned host), so the ``/app/`` dashboard warm-
         # start side-effect is permitted here. The flag is read by

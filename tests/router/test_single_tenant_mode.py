@@ -108,6 +108,30 @@ async def test_single_tenant_disables_rename(
     }
 
 
+# ── 3b. remove-alias disabled ───────────────────────────────────────
+
+
+async def test_single_tenant_disables_remove_alias(
+    aiohttp_client, single_tenant_app, router_module,
+) -> None:
+    """The fourth ``disables_write_endpoint()`` consumer
+    (``remove_alias_handler``) — previously untested for the
+    single-tenant 410 behaviour that create/delete/rename already
+    pinned above."""
+    router_module._REGISTRY.add_alias("only-project", "old-alias")
+    client = await aiohttp_client(single_tenant_app)
+    resp = await client.delete(
+        "/agent-mcp/api/router/projects/only-project/aliases/old-alias",
+        headers=_STRICT_ACCEPT,
+    )
+    assert resp.status == 410
+    body = await resp.json()
+    assert body == {
+        "error": "endpoint_disabled_in_single_tenant_mode",
+        "single_tenant_name": "only-project",
+    }
+
+
 # ── 4. W1 redirect — dashboard ─────────────────────────────────────
 
 

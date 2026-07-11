@@ -64,6 +64,7 @@ from aiohttp import web
 
 from . import identity
 from .router_store import store
+from .single_tenant import bypasses_operator_gate
 
 
 logger = logging.getLogger(__name__)
@@ -314,12 +315,8 @@ def _caller_is_sysadmin(req: web.Request) -> bool:
     the per-request Principal there, so treat that operator as sysadmin
     (mirrors ``perm_gates.require_capability``'s single-tenant bypass).
     """
-    try:
-        from . import app as _app
-        if _app.SINGLE_TENANT_NAME is not None:
-            return True
-    except Exception:  # pragma: no cover - defensive
-        pass
+    if bypasses_operator_gate():
+        return True
     principal = req.get("principal")
     if principal is not None and getattr(principal, "sysadmin", False):
         return True
