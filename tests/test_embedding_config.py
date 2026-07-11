@@ -63,10 +63,15 @@ def test_simple_embedding_dimension_overridable_via_env(
 # `server_bootstrap.apply_runtime_flags` for `--advanced` mode.
 # Attribute-access readers (`_config.EMBEDDING_DIMENSION`) saw the
 # rebind; `from ...core.config import EMBEDDING_DIMENSION` readers (e.g.
-# `db/schema.py`, `db/migrations/add_code_support.py`,
-# `features/rag/indexing.py`) froze the pre-mutation (simple-mode) value
-# at THEIR OWN import time — an unenforced import-order dependency that
-# could build the sqlite-vec column at the wrong dimension.
+# `db/schema.py`, `features/rag/indexing.py`) froze the pre-mutation
+# (simple-mode) value at THEIR OWN import time — an unenforced
+# import-order dependency that could build the sqlite-vec column at
+# the wrong dimension. (A third reader, the hand-run
+# `db/migrations/add_code_support.py` script, derived the dimension a
+# 3rd way via hardcoded string matching; deleted in arch-r5 #9 as
+# orphaned — nothing imported it, and its 3 effects are now owned by
+# ORM `create_all`, `_DEFAULT_RAG_META_ENTRIES`, and
+# `check_embedding_dimension_compatibility`.)
 #
 # `embedding_settings()` is a function: every call re-resolves from
 # current state, so there is no name-binding to freeze. These are PURE

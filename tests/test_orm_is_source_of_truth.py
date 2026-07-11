@@ -229,6 +229,108 @@ def test_orm_create_all_matches_init_database_table_set(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Test F: the migration chain (0001->head) run atop `init_database()`
+# produces a schema byte-identical (columns/types/nullable/indexes) to
+# `Base.metadata.create_all()` alone — the claim 0011's docstring makes.
+# ---------------------------------------------------------------------------
+
+
+def _reflect_schema(engine) -> dict:
+    """Reflect an engine into `{table: {"columns": ..., "indexes": ...}}`.
+
+    Drops the sqlite-vec `rag_embeddings` virtual table (and its
+    `rag_embeddings_*` shadow tables) and `alembic_version` — neither
+    is part of the ORM cut-over, matching the exclusion the rest of
+    this file already applies.
+    """
+    import sqlalchemy as sa
+
+    inspector = sa.inspect(engine)
+    schema: dict = {}
+    for table_name in inspector.get_table_names():
+        if table_name.startswith("sqlite_"):
+            continue
+        if table_name == "rag_embeddings" or table_name.startswith(
+            "rag_embeddings_"
+        ):
+            continue
+        if table_name == "alembic_version":
+            continue
+        columns = {
+            col["name"]: (str(col["type"]), bool(col["nullable"]))
+            for col in inspector.get_columns(table_name)
+        }
+        indexes = sorted(
+            (idx["name"], tuple(idx["column_names"]), bool(idx["unique"]))
+            for idx in inspector.get_indexes(table_name)
+        )
+        schema[table_name] = {"columns": columns, "indexes": indexes}
+    return schema
+
+
+def test_migration_chain_matches_create_all_schema(tmp_path, monkeypatch) -> None:
+    """0011's docstring claims the on-disk schema produced by
+    `init_database()` + migrations 0001-0010 is byte-identical to
+    `Base.metadata.create_all()`. Enforce it: a fresh `create_all()`
+    DB and the production bootstrap path (`init_database()` then
+    `run_migrations_upgrade()` walking 0001->head) must reflect to
+    the same columns, types, nullability, and indexes for every
+    shared table.
+    """
+    import sqlalchemy as sa
+
+    from agent_mcp.db.engine import Base
+    from agent_mcp.db import models  # noqa: F401  (force registration)
+
+    # DB A: ORM-only, no migrations involved.
+    db_a = tmp_path / "create_all_only.db"
+    engine_a = sa.create_engine(f"sqlite:///{db_a}", future=True)
+    Base.metadata.create_all(engine_a)
+
+    # DB B: the real production bootstrap sequence — init_database()
+    # (which itself calls create_all()) followed by the Alembic chain,
+    # mirroring `server_lifecycle.application_startup`.
+    project_dir = tmp_path / "legacy_project"
+    (project_dir / ".agent").mkdir(parents=True)
+    db_b = project_dir / ".agent" / "mcp_state.db"
+
+    monkeypatch.setenv("MCP_PROJECT_DIR", str(project_dir))
+    from agent_mcp.db import engine as _engine_mod
+
+    _engine_mod.reset_engine_cache()
+
+    from agent_mcp.db.schema import init_database
+    from agent_mcp.db.migrations_runner import run_migrations_upgrade
+
+    init_database()
+    run_migrations_upgrade()
+
+    engine_b = sa.create_engine(f"sqlite:///{db_b}", future=True)
+
+    try:
+        schema_a = _reflect_schema(engine_a)
+        schema_b = _reflect_schema(engine_b)
+
+        assert schema_a.keys() == schema_b.keys(), (
+            f"Table-set drift: create_all()={sorted(schema_a)} "
+            f"vs migration chain={sorted(schema_b)}"
+        )
+
+        diffs = [
+            f"{table}: create_all()={schema_a[table]} "
+            f"!= migration chain={schema_b[table]}"
+            for table in sorted(schema_a)
+            if schema_a[table] != schema_b[table]
+        ]
+        assert not diffs, "Schema drift between create_all() and the " \
+            "migration chain:\n" + "\n".join(diffs)
+    finally:
+        engine_a.dispose()
+        engine_b.dispose()
+        _engine_mod.reset_engine_cache()
+
+
 def test_round_trip_orm_to_pydantic_to_orm() -> None:
     """For every ORM model, building an instance with all-default
     column values then dumping through the Pydantic mirror must

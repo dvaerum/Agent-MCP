@@ -15,13 +15,13 @@
 // 403 envelope and we render an explanatory message rather than the
 // config table.
 
-import React, { useCallback, useEffect, useState } from "react"
+import React, { useCallback } from "react"
 import { Loader2, ShieldAlert, ShieldCheck, Server } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { routerSsoConfigUrl } from "@/lib/urls"
 import { routerApi } from "@/lib/router-api"
-import { ApiError } from "@/lib/api"
+import { useRouterQuery } from "@/hooks/use-router-query"
 
 type SSOMode = "builtin" | "oidc" | "proxy_header"
 
@@ -55,39 +55,24 @@ interface SSOConfigResponse {
 }
 
 export function SsoDashboard() {
-  const [config, setConfig] = useState<SSOConfig | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const [forbidden, setForbidden] = useState(false)
-
-  const refresh = useCallback(async () => {
-    setLoading(true)
-    setError(null)
-    setForbidden(false)
-    try {
+  const {
+    data: config,
+    loading,
+    error: fetchError,
+    forbidden,
+  } = useRouterQuery<SSOConfig>(
+    useCallback(async (signal) => {
       const body = await routerApi.request<SSOConfigResponse>(
         routerSsoConfigUrl(),
+        { signal },
       )
       if (!body.success || !body.config) {
-        setError(body.message ?? "SSO config unavailable")
-        return
+        throw new Error(body.message ?? "SSO config unavailable")
       }
-      setConfig(body.config)
-    } catch (e) {
-      // 403 = not sysadmin: render the "sysadmin only" card, not an error.
-      if (e instanceof ApiError && e.status === 403) {
-        setForbidden(true)
-        return
-      }
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setLoading(false)
-    }
-  }, [])
-
-  useEffect(() => {
-    void refresh()
-  }, [refresh])
+      return body.config
+    }, []),
+  )
+  const error = fetchError?.message ?? null
 
   if (loading) {
     return (

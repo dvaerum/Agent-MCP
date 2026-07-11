@@ -1044,25 +1044,6 @@ class _McpAsgiApp:
             bearer_token=bearer,
             alias_used=alias_name,
         )
-        # Cache the Principal alongside the runtime queue so the
-        # per-tool-call dispatcher (which runs in a task spawned
-        # past the middleware return) can read identity without
-        # re-deriving. The Principal is built fresh here against the
-        # same bearer that opened the stream — it lives until the
-        # session dies in the cleanup finally below.
-        try:
-            principal = _build_principal_from_request(
-                request=None,
-                bearer_token=bearer,
-                forwarding_operator=None,
-            )
-            if principal is not None:
-                session_registry.attach_principal(session_id, principal)
-        except Exception:  # pragma: no cover - defensive
-            logger.exception(
-                "session_registry: failed to cache principal for session=%s",
-                session_id,
-            )
         # The queue size is intentionally bounded — if a client's
         # consumption falls behind by more than this many notifications
         # we drop oldest and log. 256 fits a worker that's been

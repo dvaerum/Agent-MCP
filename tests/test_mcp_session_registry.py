@@ -313,3 +313,22 @@ async def test_fanout_to_all_enqueues_to_every_attached_session(
         assert {sid_a, sid_b}.issubset(set(delivered_to))
         assert qa.get_nowait() == payload
         assert qb.get_nowait() == payload
+
+
+def test_cached_principal_seam_stays_deleted() -> None:
+    """arch-r5 #2: the cached-Principal seam (``attach_principal`` /
+    ``get_principal`` / ``_runtime_principals`` / ``SessionHandle.principal``)
+    claimed to thread the GET /mcp open-time Principal through every tool
+    call, but POST /mcp runs stateless StreamableHTTP with no
+    `Mcp-Session-Id` correlation back to the registry's `session_id` — there
+    was no key to look this cache up by, and tool calls read identity from
+    the `request_principal` ContextVar instead (`main_app.py`). Grep-verified
+    zero production readers before deletion; this guard pins the absence so
+    the phantom can't silently regrow.
+    """
+    from agent_mcp.core import session_registry as reg
+
+    assert not hasattr(reg, "attach_principal")
+    assert not hasattr(reg, "get_principal")
+    assert not hasattr(reg, "_runtime_principals")
+    assert "principal" not in reg.SessionHandle.__dataclass_fields__
