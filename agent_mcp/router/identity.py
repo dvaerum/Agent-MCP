@@ -64,9 +64,12 @@ __all__ = [
     "UsernameAlreadyExistsError",
     "WeakPasswordError",
     "add_project_membership",
+    "bootstrap_first_operator",
     "create_session",
     "create_user",
     "delete_session",
+    "find_linkable_user_by_email",
+    "find_user_by_sso_subject",
     "get_router_db_path",
     "get_session",
     "get_user_by_id",
@@ -76,10 +79,13 @@ __all__ = [
     "insert_project_membership",
     "is_project_member",
     "list_user_projects",
+    "open_connection",
     "prune_expired_sessions",
     "remove_project_membership",
     "run_router_migrations_upgrade",
+    "stamp_sso_subject_if_absent",
     "touch_last_login",
+    "users_table_is_empty",
     "validate_password_strength",
     "verify_password",
 ]
@@ -130,6 +136,26 @@ _HASHER = PasswordHasher()
 # ── Connection helpers ─────────────────────────────────────────────
 
 
+def open_connection() -> sqlite3.Connection:
+    """THE single low-level router.db connection factory.
+
+    Opens ``router.db`` with ``row_factory = sqlite3.Row`` and
+    ``PRAGMA foreign_keys=ON``, creating the parent dir first. The
+    caller owns the lifecycle (commit / close). This is the one home
+    the three drifted connection helpers collapsed into
+    (arch-deepening R2 #1c): the autocommit context-manager
+    (:func:`_connect`) wraps it, and the store's transactional
+    ``connect()`` (which ``admin_users_api._connect`` now routes
+    through) hands it out raw.
+    """
+    db_path = get_router_db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
 @contextmanager
 def _connect() -> Iterator[sqlite3.Connection]:
     """Open a router.db connection with row-factory + FK enabled.
@@ -137,13 +163,11 @@ def _connect() -> Iterator[sqlite3.Connection]:
     Yields a context-managed connection that commits on clean exit
     and rolls back on exception. SQLite-level isolation is the
     default (transactional autobegin); we don't need explicit
-    BEGIN/COMMIT around single-statement writes.
+    BEGIN/COMMIT around single-statement writes. Builds on the single
+    :func:`open_connection` factory (arch-deepening R2 #1c) so the
+    connection shape (row factory, FK pragma) has one definition.
     """
-    db_path = get_router_db_path()
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
+    conn = open_connection()
     try:
         yield conn
         conn.commit()
@@ -248,7 +272,7 @@ def init_router_db() -> None:
 
     if bootstrap_username and bootstrap_password:
         try:
-            if _users_table_is_empty():
+            if users_table_is_empty():
                 create_user(
                     username=bootstrap_username,
                     password=bootstrap_password,
@@ -278,18 +302,87 @@ def init_router_db() -> None:
     # to create the first operator — same SQL, same idempotency
     # guarantee (never demotes, never crowns a second sysadmin).
     try:
-        from . import group_resolver
-        group_resolver.bootstrap_first_operator_as_sysadmin()
+        from .router_store import store
+        store.bootstrap_first_operator_as_sysadmin()
     except Exception:  # pragma: no cover - defensive
         logger.exception(
             "bootstrap_first_operator_as_sysadmin failed post-init",
         )
 
 
-def _users_table_is_empty() -> bool:
-    with _connect() as conn:
-        cur = conn.execute("SELECT 1 FROM users LIMIT 1")
-        return cur.fetchone() is None
+def users_table_is_empty(
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """True iff the ``users`` table has zero rows (or doesn't exist yet).
+
+    THE single empty-table probe (arch-deepening R2 #1c) — the five
+    drifted copies (this module's old ``_users_table_is_empty``, the
+    setup wizard's, sso's, and two inline ``SELECT 1 FROM users`` sites)
+    all route here via ``store.users_table_is_empty``. Pass ``conn`` to
+    read inside a caller's open transaction (e.g. ``create_user``'s
+    first-user check must see its own uncommitted INSERT snapshot);
+    ``conn=None`` self-opens.
+
+    A missing ``users`` table reads as empty — that's the pre-migration
+    fresh-deploy state, which presents the same operator-facing "you
+    need to set up" UX as a freshly-migrated empty table.
+    """
+    try:
+        with _conn_ctx(conn) as c:
+            return c.execute(
+                "SELECT 1 FROM users LIMIT 1"
+            ).fetchone() is None
+    except sqlite3.OperationalError:
+        return True
+
+
+def bootstrap_first_operator(
+    user_id: str,
+    *,
+    grant_sysadmin: bool,
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    """Apply the first-operator bootstrap invariant to ``user_id``.
+
+    THE single store-owned routine (arch-deepening R2 #1c) for the
+    security-critical rule *"the first user on an otherwise-empty users
+    table becomes sysadmin and gets membership in every registered
+    project."* ``create_user`` calls this — inside its own INSERT
+    transaction via ``conn`` — the moment it detects an empty table, so
+    the invariant lives in exactly one place.
+
+    * ``grant_sysadmin`` (True on the password/CLI path, and on the SSO
+      path only when the operator opted in) flips ``is_sysadmin = 1``.
+      When False the first user is created WITHOUT sysadmin (the SSO
+      opt-out path — a fresh IdP deploy's first user is not silently
+      crowned). Running the UPDATE inside the caller's transaction keeps
+      it atomic with the INSERT: a concurrent reader on another
+      connection never sees a "first operator, no sysadmin" half-state.
+    * Membership in every registered project is granted unconditionally
+      (the pre-Phase-1 migration story — existing single-tenant deploys
+      upgrade smoothly because the first operator inherits access to
+      every project they already had), routed through the single
+      ``insert_project_membership`` writer on the same connection.
+    """
+    with _conn_ctx(conn) as c:
+        if grant_sysadmin:
+            c.execute(
+                "UPDATE users SET is_sysadmin = 1 WHERE user_id = ?",
+                (user_id,),
+            )
+        existing = _list_registered_projects()
+        for project_name in existing:
+            insert_project_membership(
+                project_name, user_id=user_id, or_ignore=True, conn=c,
+            )
+        if existing:
+            logger.info(
+                "First operator (user_id=%s) granted membership in %d "
+                "pre-existing project(s): %s",
+                user_id,
+                len(existing),
+                ", ".join(existing),
+            )
 
 
 # ── User CRUD ──────────────────────────────────────────────────────
@@ -330,16 +423,14 @@ def create_user(
     created_at = _now_iso()
 
     with _connect() as conn:
-        was_empty = (
-            conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is None
-        )
-        # The first operator on an empty table is implicitly the
-        # sysadmin (fresh-deployment bootstrap rule) unless the caller
-        # opted out via ``bootstrap_sysadmin=False``. ``is_sysadmin``
-        # forces the bit on independently. Written in the SAME INSERT
-        # (and same transaction) as the membership grants so no reader
-        # sees a "first operator, no sysadmin" half-state.
-        sysadmin_bit = 1 if (is_sysadmin or (was_empty and bootstrap_sysadmin)) else 0
+        was_empty = users_table_is_empty(conn=conn)
+        # ``is_sysadmin`` forces the bit on independently of table
+        # emptiness (the proxy-header ``default_is_sysadmin`` path). The
+        # FIRST-operator sysadmin promotion is NOT decided here — it is
+        # owned by the single ``bootstrap_first_operator`` routine below,
+        # which runs inside this same transaction so the whole
+        # "first user → sysadmin + all-project membership" invariant
+        # commits atomically (no reader sees a half-state).
         try:
             conn.execute(
                 """
@@ -350,7 +441,7 @@ def create_user(
                 """,
                 (
                     user_id, username, email, password_hash, created_at,
-                    sysadmin_bit, sso_subject,
+                    1 if is_sysadmin else 0, sso_subject,
                 ),
             )
         except sqlite3.IntegrityError as e:
@@ -363,23 +454,14 @@ def create_user(
             ) from e
 
         if was_empty:
-            # First operator: grant membership in every registered
-            # project. Done inside the same transaction so a
-            # half-state (user without memberships) can't be observed
-            # by a concurrent reader.
-            existing = _list_registered_projects()
-            for project_name in existing:
-                insert_project_membership(
-                    project_name, user_id=user_id, or_ignore=True, conn=conn,
-                )
-            if existing:
-                logger.info(
-                    "First operator %r granted membership in %d "
-                    "pre-existing project(s): %s",
-                    username,
-                    len(existing),
-                    ", ".join(existing),
-                )
+            # First operator on an empty table: apply the bootstrap
+            # invariant (sysadmin unless the SSO opt-out declined it,
+            # plus membership in every registered project) via the one
+            # store-owned routine, enlisted in THIS transaction.
+            from .router_store import store
+            store.bootstrap_first_operator(
+                user_id, grant_sysadmin=bootstrap_sysadmin, conn=conn,
+            )
 
     return user_id
 
@@ -416,6 +498,72 @@ def touch_last_login(user_id: str) -> None:
         conn.execute(
             "UPDATE users SET last_login_at = ? WHERE user_id = ?",
             (_now_iso(), user_id),
+        )
+
+
+# ── SSO user reconciliation reads/writes (via RouterStore) ─────────
+
+
+def find_user_by_sso_subject(
+    subject: str, conn: sqlite3.Connection | None = None,
+) -> dict[str, Any] | None:
+    """Return the users row whose ``sso_subject`` == ``subject``, or None.
+
+    Connection-injectable home (arch-deepening R2 #1c) for sso.py's
+    former inline ``sqlite3.connect`` in ``_find_user_by_subject`` — the
+    stable-subject reconciliation lookup.
+    """
+    with _conn_ctx(conn) as c:
+        row = c.execute(
+            "SELECT * FROM users WHERE sso_subject = ? LIMIT 1",
+            (subject,),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def find_linkable_user_by_email(
+    email: str, conn: sqlite3.Connection | None = None,
+) -> dict[str, Any] | None:
+    """Return a LINK-eligible local row for ``email`` (case-insensitive).
+
+    Connection-injectable home (arch-deepening R2 #1c) for sso.py's
+    former inline ``sqlite3.connect`` in ``_find_linkable_user_by_email``.
+    Only a password-backed local operator (``password_hash IS NOT NULL``)
+    or a legacy pre-subject SSO row (``sso_subject IS NULL``) is eligible;
+    password users are preferred when both shapes share an email. The
+    predicate is unchanged from the inline query it replaces.
+    """
+    with _conn_ctx(conn) as c:
+        row = c.execute(
+            """
+            SELECT * FROM users
+            WHERE LOWER(email) = LOWER(?)
+              AND (password_hash IS NOT NULL OR sso_subject IS NULL)
+            ORDER BY (password_hash IS NULL) ASC
+            LIMIT 1
+            """,
+            (email,),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def stamp_sso_subject_if_absent(
+    user_id: str,
+    subject: str,
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    """Bind ``subject`` to ``user_id`` iff the row has no subject yet.
+
+    Connection-injectable home (arch-deepening R2 #1c) for sso.py's
+    former inline ``sqlite3.connect`` in ``_stamp_subject_if_absent``.
+    Idempotent + race-safe: the ``sso_subject IS NULL`` guard means a
+    second, different subject can never overwrite an already-bound row.
+    """
+    with _conn_ctx(conn) as c:
+        c.execute(
+            "UPDATE users SET sso_subject = ? "
+            "WHERE user_id = ? AND sso_subject IS NULL",
+            (subject, user_id),
         )
 
 

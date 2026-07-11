@@ -33,7 +33,8 @@ empty-probe / inline-connect collapses.
 from __future__ import annotations
 
 import sqlite3
-from typing import Literal, Optional
+from contextlib import contextmanager
+from typing import Any, Iterator, Literal, Optional
 
 from . import group_resolver as _gr
 from . import identity as _identity
@@ -158,6 +159,133 @@ class RouterStore:
             role=role,
             or_ignore=or_ignore,
             conn=conn,
+        )
+
+    # ── connection factory (3 helpers → 1) ─────────────────────────
+
+    def connect(self) -> sqlite3.Connection:
+        """Hand out a RAW router.db connection (row_factory + FK on);
+        the caller owns commit + close.
+
+        The transactional-mode factory (arch-deepening R2 #1c): the
+        admin handlers that drive an explicit ``BEGIN IMMEDIATE`` call
+        this (``admin_users_api._connect`` now delegates here) so their
+        multi-statement transaction runs on one connection they manage.
+        Built on the single :func:`identity.open_connection` factory the
+        three drifted connection helpers collapsed into.
+        """
+        return _identity.open_connection()
+
+    @contextmanager
+    def connection(self) -> Iterator[sqlite3.Connection]:
+        """Yield a self-opened autocommit-on-exit connection (the
+        counterpart to :meth:`connect`, wrapping ``identity._connect``).
+
+        Commits on clean exit, rolls back on exception, always closes —
+        the "self-open" mode of the one connection factory.
+        """
+        with _identity._connect() as c:
+            yield c
+
+    # ── empty-table probe (5 helpers → 1) ──────────────────────────
+
+    def users_table_is_empty(
+        self, *, conn: Optional[sqlite3.Connection] = None
+    ) -> bool:
+        """True iff the ``users`` table has no rows (or doesn't exist).
+
+        The single empty-table probe the five drifted copies route
+        through. Pass ``conn`` to read inside a caller's transaction.
+        """
+        return _identity.users_table_is_empty(conn=conn)
+
+    # ── first-operator bootstrap (3 sites → 1) ─────────────────────
+
+    def bootstrap_first_operator(
+        self,
+        user_id: str,
+        *,
+        grant_sysadmin: bool,
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> None:
+        """Apply the first-operator invariant to ``user_id``: sysadmin
+        (when ``grant_sysadmin``) + membership in every registered
+        project. THE single owner of *"first user on an empty table →
+        sysadmin + all-project membership"* — ``create_user`` calls this
+        inside its INSERT transaction via ``conn``.
+        """
+        _identity.bootstrap_first_operator(
+            user_id, grant_sysadmin=grant_sysadmin, conn=conn,
+        )
+
+    def bootstrap_first_operator_as_sysadmin(
+        self, *, conn: Optional[sqlite3.Connection] = None
+    ) -> None:
+        """Idempotent repair: promote the earliest operator to sysadmin
+        when the table has users but none is sysadmin (the
+        ``init_router_db`` re-run). No-op on an empty table or when a
+        sysadmin already exists."""
+        _gr.bootstrap_first_operator_as_sysadmin(conn=conn)
+
+    # ── SSO user reconciliation reads/writes (sso inline connects) ──
+
+    def find_user_by_sso_subject(
+        self, subject: str, *, conn: Optional[sqlite3.Connection] = None
+    ) -> Optional[dict[str, Any]]:
+        """Stable-subject reconciliation lookup (was
+        ``sso._find_user_by_subject``'s inline connect)."""
+        return _identity.find_user_by_sso_subject(subject, conn=conn)
+
+    def find_linkable_user_by_email(
+        self, email: str, *, conn: Optional[sqlite3.Connection] = None
+    ) -> Optional[dict[str, Any]]:
+        """Verified-email link target lookup (was
+        ``sso._find_linkable_user_by_email``'s inline connect)."""
+        return _identity.find_linkable_user_by_email(email, conn=conn)
+
+    def stamp_sso_subject_if_absent(
+        self,
+        user_id: str,
+        subject: str,
+        *,
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> None:
+        """Bind ``subject`` to ``user_id`` iff unset (was
+        ``sso._stamp_subject_if_absent``'s inline connect)."""
+        _identity.stamp_sso_subject_if_absent(user_id, subject, conn=conn)
+
+    # ── SSO group reads/writes (sso inline connects) ───────────────
+
+    def ensure_group(
+        self, name: str, *, conn: Optional[sqlite3.Connection] = None
+    ) -> Optional[str]:
+        """Return ``group_id`` for ``name``, JIT-creating if missing (was
+        ``sso._ensure_group``'s inline connect)."""
+        return _gr.ensure_group(name, conn=conn)
+
+    def remove_group_member(
+        self,
+        group_id: str,
+        user_id: str,
+        *,
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> bool:
+        """Delete a user→group edge; True iff a row went (was
+        ``sso._remove_user_from_group``'s inline connect)."""
+        return _gr.remove_group_member(group_id, user_id, conn=conn)
+
+    def user_group_memberships_by_name_prefix(
+        self,
+        user_id: str,
+        name_prefix: str,
+        *,
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> dict[str, str]:
+        """``{group_name: group_id}`` for the user's DIRECT memberships in
+        groups whose name starts with ``name_prefix`` (was
+        ``sso._user_oidc_group_memberships``'s inline connect)."""
+        return _gr.user_group_memberships_by_name_prefix(
+            user_id, name_prefix, conn=conn,
         )
 
     # ── ranking ─────────────────────────────────────────────────────

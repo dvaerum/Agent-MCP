@@ -529,20 +529,17 @@ def _membership_grant_denied(
 
 
 def _connect() -> sqlite3.Connection:
-    """Open a router.db connection with FK + row factory enabled.
+    """Hand out a raw router.db connection (row factory + FK enabled)
+    the handler manages across multiple statements (e.g. an
+    insert-then-select, or an explicit ``BEGIN IMMEDIATE``).
 
-    Local helper rather than reusing ``identity._connect`` (a
-    private context-manager) so the handlers can hold the
-    connection across multiple statements when needed (e.g. an
-    insert-then-select). Callers MUST close the connection — use
-    ``try / finally`` or wrap with ``with``.
+    Delegates to the single store-owned connection factory
+    (``store.connect``) — the local duplicate open+PRAGMA body was
+    retired in arch-deepening R2 #1c so the three drifted connection
+    helpers share one definition. Callers MUST close the connection —
+    use ``try / finally`` or wrap with ``with``.
     """
-    db_path = identity.get_router_db_path()
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    return store.connect()
 
 
 # ── Pydantic-style body validators (lightweight, no extra dep) ─────
