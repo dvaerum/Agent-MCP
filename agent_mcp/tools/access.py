@@ -62,6 +62,7 @@ default).
 """
 from __future__ import annotations
 
+import json
 from typing import Dict, Iterator, Optional
 
 from ..core.config import logger
@@ -280,6 +281,49 @@ def _get_config_bool(key: str, default: bool) -> bool:
         if s in ("false", "0", "no", "off"):
             return False
     return default
+
+
+def _get_config_int(key: str, default: int) -> int:
+    """Read an integer knob from ``project_context``.
+
+    Numeric companion to :func:`_get_config_bool`; this is the single
+    canonical config-read seam for int-typed toggles (message
+    retention, AoE timeouts, …) so the ``SELECT value FROM
+    project_context`` + coercion isn't re-typed per feature module.
+
+    ``project_context.value`` is JSON-encoded on write, but tests /
+    external tools may push a raw string, so parse liberally: JSON
+    first, then ``int()``. Returns ``default`` when the key is absent,
+    the store is unreachable (early bootstrap before the DB exists),
+    or the value is not coercible to an int. Callers own any further
+    policy (``<= 0`` handling, upper clamps).
+    """
+    try:
+        from ..db.connection import get_db_connection
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT value FROM project_context WHERE context_key = ?",
+            (key,),
+        )
+        row = cursor.fetchone()
+        conn.close()
+    except Exception:
+        return default
+    if not row:
+        return default
+    raw = row["value"]
+    # JSON is the canonical write format; fall back to the raw value so
+    # a bare string push (tests / external tools) still coerces.
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        parsed = raw
+    try:
+        return int(parsed)
+    except (TypeError, ValueError):
+        return default
 
 
 def is_visible_to_role(tool_name: str, role: str) -> bool:

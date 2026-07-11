@@ -19,12 +19,10 @@ from __future__ import annotations
 
 import asyncio
 import datetime
-import json
 from typing import NoReturn
 
 from ..core.config import logger
 from ..core import globals as g
-from ..db.connection import get_db_connection
 from ..repositories import message_repo
 
 
@@ -51,31 +49,13 @@ def _read_retention_days() -> int:
     Be liberal in what we accept — project_context.value is JSON-encoded
     on write but tests / external tools may push raw strings.
     """
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT value FROM project_context WHERE context_key = ?",
-            ("config_message_retention_days",),
-        )
-        row = cursor.fetchone()
-        conn.close()
-    except Exception:
-        return 0
-    if not row:
-        return 0
+    # Read through the canonical config-read seam in tools.access; the
+    # SELECT + JSON/int coercion used to be a third copy of that logic.
+    # The <=0 and upper-clamp below are retention-specific policy and
+    # stay here.
+    from ..tools.access import _get_config_int
 
-    raw = row["value"]
-    # First try parsing as JSON (the canonical write format).
-    try:
-        parsed = json.loads(raw) if isinstance(raw, str) else raw
-    except (json.JSONDecodeError, TypeError):
-        parsed = raw
-
-    try:
-        days = int(parsed)
-    except (TypeError, ValueError):
-        return 0
+    days = _get_config_int("config_message_retention_days", 0)
     if days <= 0:
         return 0
     # Upper-clamp before the caller feeds this into timedelta(days=...)
