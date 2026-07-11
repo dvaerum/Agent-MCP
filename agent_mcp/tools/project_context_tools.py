@@ -639,6 +639,19 @@ async def view_project_context_tool_impl(
     if denied is not None:
         return denied
 
+    # Reads require the ``memories.view`` capability. This is a no-op for
+    # every legitimate caller — viewer + operator project-role bundles carry
+    # it, so do the worker + manager agent-role bundles, and sysadmin holds
+    # the wildcard. What it DENIES is the one real over-admit the identity-
+    # only gate above let through: an ``agent_bearer`` whose ``agent_role``
+    # is ``None`` (a malformed token → empty capability bundle) could read
+    # project context with zero caps. This mirrors the ``rag.query`` gate
+    # ``ask_project_rag`` already added to close the same empty-bearer class.
+    if not principal.has_capability("memories.view"):
+        return PermissionDenied(
+            reason="memories.view capability required to read project context"
+        )
+
     context_key_filter = arguments.get("context_key")  # Optional specific key
     search_query_filter = arguments.get("search_query")  # Optional search query
 
