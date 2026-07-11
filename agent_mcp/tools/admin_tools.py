@@ -35,7 +35,7 @@ from ..core.tool_result import (
     ToolResult,
 )
 from ..utils.audit_utils import log_audit
-from ..db.connection import get_db_connection
+from ..db.unit_of_work import unit_of_work
 from ..db.actions.agent_actions_db import log_agent_action_to_db  # For DB logging
 
 
@@ -221,6 +221,21 @@ def _build_mcp_config_snippet(
     return json.dumps(snippet, indent=2)
 
 
+class _UnitOfWorkAbort(Exception):
+    """Internal signal: force a ``unit_of_work()`` rollback while
+    carrying the caller-facing :class:`ToolResult` to return.
+
+    Raised inside a uow scope when a write must be undone but the caller
+    should still see a specific typed result (e.g. a repo-side
+    ``ValueError`` on a duplicate agent name → :class:`Invalid`) rather
+    than a generic ``Failed``. The uow rolls back + fires zero effects;
+    the outer handler unwraps ``.result``."""
+
+    def __init__(self, result: "ToolResult") -> None:
+        super().__init__(getattr(result, "message", "unit-of-work aborted"))
+        self.result = result
+
+
 async def register_agent_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -316,147 +331,158 @@ async def register_agent_tool_impl(
             reason=f"Agent '{agent_id}' already exists (in active memory).",
         )
 
-    conn = None
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        # D3: the unit-of-work owns the transaction. The agent INSERT
+        # (repo write on ``u.cursor``) and its ``registered_agent``
+        # DB-audit row commit atomically; the post-commit cache upsert
+        # and the in-memory ``register_agent`` audit are *registered* on
+        # ``u`` and flushed only after a clean commit (emit-iff-commit).
+        with unit_of_work() as u:
+            cursor = u.cursor
 
-        cursor.execute(
-            "SELECT agent_id FROM agents WHERE agent_id = ?", (agent_id,)
-        )
-        if cursor.fetchone():
-            return Conflict(
-                reason=f"Agent '{agent_id}' already exists (in database).",
+            cursor.execute(
+                "SELECT agent_id FROM agents WHERE agent_id = ?", (agent_id,)
             )
+            if cursor.fetchone():
+                return Conflict(
+                    reason=f"Agent '{agent_id}' already exists (in database).",
+                )
 
-        new_agent_token = generate_token()
-        created_at_iso = datetime.datetime.now().isoformat()
+            new_agent_token = generate_token()
+            created_at_iso = datetime.datetime.now().isoformat()
 
-        # Working directory mirrors create_agent's "all agents share
-        # the project dir" semantics. Wave 7's coordinator model
-        # doesn't actually run an agent process here — the
-        # working_directory column is informational metadata for
-        # dashboards / audit logs.
-        project_dir_env = os.environ.get("MCP_PROJECT_DIR")
-        if not project_dir_env:
-            logger.error(
-                "MCP_PROJECT_DIR not set; register_agent cannot resolve "
-                "the working directory for agent %r.",
-                agent_id,
-            )
-            return Failed(
-                message="Server configuration error: MCP_PROJECT_DIR not set.",
-            )
-        agent_working_dir_abs = os.path.abspath(project_dir_env)
+            # Working directory mirrors create_agent's "all agents share
+            # the project dir" semantics. Wave 7's coordinator model
+            # doesn't actually run an agent process here — the
+            # working_directory column is informational metadata for
+            # dashboards / audit logs.
+            project_dir_env = os.environ.get("MCP_PROJECT_DIR")
+            if not project_dir_env:
+                logger.error(
+                    "MCP_PROJECT_DIR not set; register_agent cannot resolve "
+                    "the working directory for agent %r.",
+                    agent_id,
+                )
+                return Failed(
+                    message="Server configuration error: MCP_PROJECT_DIR not set.",
+                )
+            agent_working_dir_abs = os.path.abspath(project_dir_env)
 
-        agent_color = AGENT_COLORS[g.agent_color_index % len(AGENT_COLORS)]
-        g.agent_color_index += 1
+            agent_color = AGENT_COLORS[g.agent_color_index % len(AGENT_COLORS)]
+            g.agent_color_index += 1
 
-        from ..repositories import agent_repo
+            from ..repositories import agent_repo
 
-        try:
-            agent_repo.create(
-                token=new_agent_token,
-                agent_id=agent_id,
-                capabilities=[],
-                status="created",
-                current_task=None,
-                working_directory=agent_working_dir_abs,
-                color=agent_color,
-                agent_role=role,
-                connection=cursor,
-            )
-        except ValueError as ve:
+            # A duplicate-name / validation failure raises ValueError; the
+            # sentinel rolls the uow back (zero effects) and surfaces the
+            # caller-facing Invalid unchanged.
             try:
-                conn.rollback()
-            except Exception:
-                pass
-            return Invalid(field="name", message=str(ve))
+                agent_repo.create(
+                    token=new_agent_token,
+                    agent_id=agent_id,
+                    capabilities=[],
+                    status="created",
+                    current_task=None,
+                    working_directory=agent_working_dir_abs,
+                    color=agent_color,
+                    agent_role=role,
+                    connection=cursor,
+                )
+            except ValueError as ve:
+                raise _UnitOfWorkAbort(
+                    Invalid(field="name", message=str(ve))
+                )
 
-        log_agent_action_to_db(
-            cursor,
-            principal.actor_label() if principal else "operator",
-            "registered_agent",
-            details={
-                "agent_id": agent_id,
-                "role": role,
-            },
-        )
-        conn.commit()
+            actor_label = principal.actor_label() if principal else "operator"
 
-        # Post-commit cache reconciliation through the repo (mirrors
-        # create_agent's pattern — keeps cache + DB in lockstep).
-        agent_repo.upsert_cache({
-            "token": new_agent_token,
-            "agent_id": agent_id,
-            "capabilities": [],
-            "created_at": created_at_iso,
-            "status": "created",
-            "current_task": None,
-            "color": agent_color,
-            "working_directory": agent_working_dir_abs,
-            "terminated_at": None,
-            "updated_at": created_at_iso,
-            "agent_role": role,
-        })
+            log_agent_action_to_db(
+                cursor,
+                actor_label,
+                "registered_agent",
+                details={
+                    "agent_id": agent_id,
+                    "role": role,
+                },
+            )
 
-        log_audit(
-            principal.actor_label() if principal else "operator",
-            "register_agent",
-            {
-                "agent_id": agent_id,
-                "role": role,
-            },
-        )
-
-        project_for_snippet = _resolve_snippet_project(arguments, principal)
-        host_for_snippet = _resolve_snippet_host(arguments)
-        snippet = _build_mcp_config_snippet(
-            project=project_for_snippet,
-            token=new_agent_token,
-            host=host_for_snippet,
-        )
-
-        logger.info(
-            "Agent %r registered via register_agent (role=%s). No claude "
-            "spawned — operator hands the snippet to the user.",
-            agent_id, role,
-        )
-
-        return Ok(
-            data={
-                "agent_id": agent_id,
+            # Post-commit cache reconciliation through the repo (mirrors
+            # create_agent's pattern — keeps cache + DB in lockstep). The
+            # in-memory audit sink keeps its present-tense
+            # ``register_agent`` action (pinned by the view_audit_log
+            # tests) distinct from the DB sink's ``registered_agent``
+            # above — both are registered post-commit so a rolled-back
+            # registration leaves neither the cache row nor either audit.
+            agent_cache_row = {
                 "token": new_agent_token,
+                "agent_id": agent_id,
+                "capabilities": [],
+                "created_at": created_at_iso,
+                "status": "created",
+                "current_task": None,
+                "color": agent_color,
+                "working_directory": agent_working_dir_abs,
+                "terminated_at": None,
+                "updated_at": created_at_iso,
                 "agent_role": role,
-                "mcp_snippet": snippet,
-                "project_name": project_for_snippet,
-            },
-            message=(
-                f"Agent '{agent_id}' registered. Paste the snippet into "
-                "the user's claude .mcp.json — agent-mcp no longer "
-                "spawns the claude session itself."
-            ),
-        )
+            }
+            u.on_commit(lambda: agent_repo.upsert_cache(agent_cache_row))
+            u.on_commit(
+                lambda: log_audit(
+                    actor_label,
+                    "register_agent",
+                    {
+                        "agent_id": agent_id,
+                        "role": role,
+                    },
+                )
+            )
 
+            project_for_snippet = _resolve_snippet_project(arguments, principal)
+            host_for_snippet = _resolve_snippet_host(arguments)
+            snippet = _build_mcp_config_snippet(
+                project=project_for_snippet,
+                token=new_agent_token,
+                host=host_for_snippet,
+            )
+
+            logger.info(
+                "Agent %r registered via register_agent (role=%s). No claude "
+                "spawned — operator hands the snippet to the user.",
+                agent_id, role,
+            )
+
+            # Returning here runs the uow __exit__: commit the INSERT +
+            # audit row, then flush the cache upsert + in-memory audit.
+            return Ok(
+                data={
+                    "agent_id": agent_id,
+                    "token": new_agent_token,
+                    "agent_role": role,
+                    "mcp_snippet": snippet,
+                    "project_name": project_for_snippet,
+                },
+                message=(
+                    f"Agent '{agent_id}' registered. Paste the snippet into "
+                    "the user's claude .mcp.json — agent-mcp no longer "
+                    "spawns the claude session itself."
+                ),
+            )
+
+    except _UnitOfWorkAbort as ab:
+        return ab.result
     except sqlite3.Error as e_sql:
-        if conn:
-            conn.rollback()
+        # The unit-of-work already rolled back + closed the connection.
         logger.error(
             "Database error registering agent %s: %s",
             agent_id, e_sql, exc_info=True,
         )
         return Failed(message=f"Database error registering agent: {e_sql}")
     except Exception as e:
-        if conn:
-            conn.rollback()
         logger.error(
             "Unexpected error registering agent %s: %s",
             agent_id, e, exc_info=True,
         )
         return Failed(message=f"Unexpected error registering agent: {e}")
-    finally:
-        if conn:
-            conn.close()
 
 
 # --- view_status tool ---
@@ -639,204 +665,220 @@ async def terminate_agent_tool_impl(
             found_agent_token = tkn
             break
 
-    conn = None
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        # D3: the unit-of-work owns the transaction. The status flip
+        # (repo write on ``u.cursor``), the active-task unassign UPDATE,
+        # and the ``terminated_agent`` DB-audit row commit atomically;
+        # cache eviction, stream teardown, task reconciliation, file
+        # release and the in-memory ``terminate_agent`` audit are
+        # *registered* on ``u`` and flushed only after a clean commit
+        # (emit-iff-commit) — a rollback tears down nothing.
+        with unit_of_work() as u:
+            cursor = u.cursor
 
-        if not found_agent_token:
-            # Check DB if not found in memory (main.py:1285-1290).
-            # Exclude tombstone rows (`[deleted-<id>]` purge FK
-            # artefacts, BL-R31-3b): a tombstone is not a live agent, so
-            # it is not a terminate target — treat it as not-found.
-            from ..repositories.agent_repository import LIVE_AGENT_SQL
+            if not found_agent_token:
+                # Check DB if not found in memory (main.py:1285-1290).
+                # Exclude tombstone rows (`[deleted-<id>]` purge FK
+                # artefacts, BL-R31-3b): a tombstone is not a live agent, so
+                # it is not a terminate target — treat it as not-found.
+                from ..repositories.agent_repository import LIVE_AGENT_SQL
 
-            cursor.execute(
-                "SELECT token FROM agents WHERE agent_id = ? "
-                f"AND {LIVE_AGENT_SQL}",
-                (agent_id_to_terminate,),
-            )
-            row = cursor.fetchone()
-            if row:
-                # Agent exists in DB but not active memory. Proceed to terminate in DB.
-                logger.warning(
-                    f"Agent {agent_id_to_terminate} found in DB (token: {row['token']}) but not in active memory. Proceeding with DB termination."
+                cursor.execute(
+                    "SELECT token FROM agents WHERE agent_id = ? "
+                    f"AND {LIVE_AGENT_SQL}",
+                    (agent_id_to_terminate,),
                 )
-                # We don't have its token to remove from g.active_agents if it's not there.
-            else:
+                row = cursor.fetchone()
+                if row:
+                    # Agent exists in DB but not active memory. Proceed to terminate in DB.
+                    logger.warning(
+                        f"Agent {agent_id_to_terminate} found in DB (token: {row['token']}) but not in active memory. Proceeding with DB termination."
+                    )
+                    # We don't have its token to remove from g.active_agents if it's not there.
+                else:
+                    return NotFound(
+                        resource="agent",
+                        identifier=agent_id_to_terminate,
+                    )
+
+            # PR 6: terminate UPDATE goes through agent_repo with the
+            # caller's cursor so it stays atomic with the agent_actions
+            # audit-log INSERT below. The repo defers cache eviction +
+            # `agent.terminated` publish to the post-commit step.
+            from ..repositories import agent_repo
+            ok = agent_repo.terminate(
+                agent_id_to_terminate, connection=cursor,
+            )
+
+            if (
+                not ok and not found_agent_token
+            ):  # If DB check didn't find it initially and update affected 0 rows
                 return NotFound(
                     resource="agent",
                     identifier=agent_id_to_terminate,
                 )
 
-        # PR 6: terminate UPDATE goes through agent_repo with the
-        # caller's cursor so it stays atomic with the agent_actions
-        # audit-log INSERT below. The repo defers cache eviction +
-        # `agent.terminated` publish to the post-commit step.
-        from ..repositories import agent_repo
-        ok = agent_repo.terminate(
-            agent_id_to_terminate, connection=cursor,
-        )
+            # Wave-B: reconcile tasks so no ACTIVE task is stranded on a
+            # terminated agent that will never run it. Terminal tasks
+            # (completed/cancelled/failed) keep their attribution —
+            # terminate is a soft-delete (the row still exists), and
+            # reverting a completed task to unassigned would destroy
+            # completion history. Runs on the caller's cursor so it stays
+            # atomic with the status flip + audit INSERT. Mirrors the
+            # purge-cascade convention in app/routers/agents.py, minus the
+            # terminal-status carve-out (purge is a hard delete).
+            from ..tools.task_tools import _TERMINAL_TASK_STATUSES
 
-        if (
-            not ok and not found_agent_token
-        ):  # If DB check didn't find it initially and update affected 0 rows
-            return NotFound(
-                resource="agent",
-                identifier=agent_id_to_terminate,
+            terminal_placeholders = ",".join("?" * len(_TERMINAL_TASK_STATUSES))
+            # BL-R10-1/2: capture the rows we're about to reassign BEFORE the
+            # bulk UPDATE so we can reconcile them post-commit. We grab
+            # required_capabilities here too — the unassign UPDATE doesn't
+            # touch that column and the cache projection drops it, so this is
+            # the cheapest place to read it for the capability-matched wake.
+            cursor.execute(
+                "SELECT task_id, required_capabilities FROM tasks "
+                f"WHERE assigned_to = ? AND status NOT IN ({terminal_placeholders})",
+                (
+                    agent_id_to_terminate,
+                    *sorted(_TERMINAL_TASK_STATUSES),
+                ),
             )
-
-        # Wave-B: reconcile tasks so no ACTIVE task is stranded on a
-        # terminated agent that will never run it. Terminal tasks
-        # (completed/cancelled/failed) keep their attribution —
-        # terminate is a soft-delete (the row still exists), and
-        # reverting a completed task to unassigned would destroy
-        # completion history. Runs on the caller's cursor so it stays
-        # atomic with the status flip + audit INSERT. Mirrors the
-        # purge-cascade convention in app/routers/agents.py, minus the
-        # terminal-status carve-out (purge is a hard delete).
-        from ..tools.task_tools import _TERMINAL_TASK_STATUSES
-
-        terminal_placeholders = ",".join("?" * len(_TERMINAL_TASK_STATUSES))
-        # BL-R10-1/2: capture the rows we're about to reassign BEFORE the
-        # bulk UPDATE so we can reconcile them post-commit. We grab
-        # required_capabilities here too — the unassign UPDATE doesn't
-        # touch that column and the cache projection drops it, so this is
-        # the cheapest place to read it for the capability-matched wake.
-        cursor.execute(
-            "SELECT task_id, required_capabilities FROM tasks "
-            f"WHERE assigned_to = ? AND status NOT IN ({terminal_placeholders})",
-            (
-                agent_id_to_terminate,
-                *sorted(_TERMINAL_TASK_STATUSES),
-            ),
-        )
-        reassigned_tasks = [
-            (r["task_id"], r["required_capabilities"])
-            for r in cursor.fetchall()
-        ]
-        cursor.execute(
-            "UPDATE tasks SET assigned_to = NULL, status = 'unassigned', "
-            "updated_at = ? "
-            f"WHERE assigned_to = ? AND status NOT IN ({terminal_placeholders})",
-            (
-                datetime.datetime.now().isoformat(),
-                agent_id_to_terminate,
-                *sorted(_TERMINAL_TASK_STATUSES),
-            ),
-        )
-        tasks_unassigned = cursor.rowcount
-        if tasks_unassigned:
-            logger.info(
-                "Unassigned %d active task(s) from terminated agent %s.",
-                tasks_unassigned, agent_id_to_terminate,
+            reassigned_tasks = [
+                (r["task_id"], r["required_capabilities"])
+                for r in cursor.fetchall()
+            ]
+            cursor.execute(
+                "UPDATE tasks SET assigned_to = NULL, status = 'unassigned', "
+                "updated_at = ? "
+                f"WHERE assigned_to = ? AND status NOT IN ({terminal_placeholders})",
+                (
+                    datetime.datetime.now().isoformat(),
+                    agent_id_to_terminate,
+                    *sorted(_TERMINAL_TASK_STATUSES),
+                ),
             )
-
-        log_agent_action_to_db(
-            cursor,
-            "admin",
-            "terminated_agent",
-            details={"agent_id": agent_id_to_terminate},
-        )
-        conn.commit()
-
-        # Post-commit cache reconciliation through the repo. Mirrors
-        # the manual evictions the legacy code did inline; the repo's
-        # `evict_from_cache` handles both the token-keyed and
-        # agent_id-keyed maps in lockstep.
-        agent_repo.evict_from_cache(
-            agent_id_to_terminate, token=found_agent_token,
-        )
-
-        # AC-R29-1: an already-open GET /mcp SSE push stream
-        # authenticates its bearer once at open then pumps indefinitely;
-        # without an active nudge it would survive revocation until its
-        # next heartbeat self-validation tick. Signal every open stream
-        # for this agent to re-validate NOW (cache eviction above already
-        # made the bearer read as revoked), so teardown is immediate.
-        # The pump's own per-heartbeat self-validation is the backstop if
-        # a stream can't be signalled here (queue full / not yet
-        # reconnected).
-        try:
-            from ..core import session_registry
-
-            closed_streams = session_registry.close_streams_for_agent(
-                agent_id_to_terminate
-            )
-            if closed_streams:
+            tasks_unassigned = cursor.rowcount
+            if tasks_unassigned:
                 logger.info(
-                    "Signalled %d open MCP stream(s) to close for "
-                    "terminated agent %s.",
-                    len(closed_streams), agent_id_to_terminate,
+                    "Unassigned %d active task(s) from terminated agent %s.",
+                    tasks_unassigned, agent_id_to_terminate,
                 )
-        except Exception:  # pragma: no cover - defensive
-            logger.warning(
-                "Failed to signal open MCP streams for terminated agent "
-                "%s (pump self-validation will still tear them down).",
-                agent_id_to_terminate, exc_info=True,
+
+            log_agent_action_to_db(
+                cursor,
+                "admin",
+                "terminated_agent",
+                details={"agent_id": agent_id_to_terminate},
             )
 
-        # BL-R10-1/2: reconcile the tasks we just unassigned — refresh
-        # their g.tasks cache entries (so view_tasks stops pinning them
-        # to the dead agent) and wake capability-matched workers.
-        _reconcile_reassigned_tasks(reassigned_tasks)
+            actor_label = principal.actor_label() if principal else "operator"
 
-        # Release any files held by this agent from g.file_map
-        files_released_count = 0
-        for filepath, info in list(g.file_map.items()):  # Iterate over a copy
-            if info.get("agent_id") == agent_id_to_terminate:
-                del g.file_map[filepath]
-                files_released_count += 1
-        if files_released_count > 0:
-            logger.info(
-                f"Released {files_released_count} files held by terminated agent {agent_id_to_terminate}."
+            # Post-commit reconciliation, registered as one ordered hook
+            # so the legacy inline post-commit sequence (cache eviction →
+            # stream teardown → task reconcile → file release → in-memory
+            # audit) fires in exactly its historical order, and only on a
+            # clean commit.
+            def _post_terminate_effects() -> None:
+                # Post-commit cache reconciliation through the repo.
+                # Mirrors the manual evictions the legacy code did inline;
+                # the repo's `evict_from_cache` handles both the
+                # token-keyed and agent_id-keyed maps in lockstep.
+                agent_repo.evict_from_cache(
+                    agent_id_to_terminate, token=found_agent_token,
+                )
+
+                # AC-R29-1: an already-open GET /mcp SSE push stream
+                # authenticates its bearer once at open then pumps
+                # indefinitely; without an active nudge it would survive
+                # revocation until its next heartbeat self-validation
+                # tick. Signal every open stream for this agent to
+                # re-validate NOW (cache eviction above already made the
+                # bearer read as revoked), so teardown is immediate. The
+                # pump's own per-heartbeat self-validation is the backstop
+                # if a stream can't be signalled here (queue full / not yet
+                # reconnected).
+                try:
+                    from ..core import session_registry
+
+                    closed_streams = session_registry.close_streams_for_agent(
+                        agent_id_to_terminate
+                    )
+                    if closed_streams:
+                        logger.info(
+                            "Signalled %d open MCP stream(s) to close for "
+                            "terminated agent %s.",
+                            len(closed_streams), agent_id_to_terminate,
+                        )
+                except Exception:  # pragma: no cover - defensive
+                    logger.warning(
+                        "Failed to signal open MCP streams for terminated agent "
+                        "%s (pump self-validation will still tear them down).",
+                        agent_id_to_terminate, exc_info=True,
+                    )
+
+                # BL-R10-1/2: reconcile the tasks we just unassigned —
+                # refresh their g.tasks cache entries (so view_tasks stops
+                # pinning them to the dead agent) and wake
+                # capability-matched workers.
+                _reconcile_reassigned_tasks(reassigned_tasks)
+
+                # Release any files held by this agent from g.file_map
+                files_released_count = 0
+                for filepath, info in list(g.file_map.items()):  # Iterate over a copy
+                    if info.get("agent_id") == agent_id_to_terminate:
+                        del g.file_map[filepath]
+                        files_released_count += 1
+                if files_released_count > 0:
+                    logger.info(
+                        f"Released {files_released_count} files held by terminated agent {agent_id_to_terminate}."
+                    )
+
+                # Wave 7 PR 3 (coordinator transition): the spawn machinery
+                # is gone — agent-mcp never owned the user's claude process,
+                # so terminate is just "revoke the token + flip status". The
+                # user's local claude session keeps running until they close
+                # it themselves. The tmux-session tracking globals + the
+                # ``tmux_killed`` response field PR 0 left as back-compat are
+                # both retired here.
+
+                log_audit(
+                    actor_label,
+                    "terminate_agent",
+                    {"agent_id": agent_id_to_terminate},
+                )  # main.py:1313
+                logger.info(
+                    f"Agent '{agent_id_to_terminate}' terminated successfully."
+                )
+
+            u.on_commit(_post_terminate_effects)
+
+            # Returning here runs the uow __exit__: commit the status flip
+            # + unassign + audit row, then flush _post_terminate_effects.
+            return Ok(
+                data={
+                    "agent_id": agent_id_to_terminate,
+                    "status": "terminated",
+                },
+                message=(
+                    f"Agent '{agent_id_to_terminate}' terminated. The token "
+                    "is revoked, but your local claude session is still "
+                    "running — close it manually if you want it to stop."
+                ),
             )
-
-        # Wave 7 PR 3 (coordinator transition): the spawn machinery is
-        # gone — agent-mcp never owned the user's claude process, so
-        # terminate is just "revoke the token + flip status". The
-        # user's local claude session keeps running until they close
-        # it themselves. The tmux-session tracking globals + the
-        # ``tmux_killed`` response field PR 0 left as back-compat are
-        # both retired here.
-
-        log_audit(
-            principal.actor_label() if principal else "operator",
-            "terminate_agent",
-            {"agent_id": agent_id_to_terminate},
-        )  # main.py:1313
-        logger.info(f"Agent '{agent_id_to_terminate}' terminated successfully.")
-        return Ok(
-            data={
-                "agent_id": agent_id_to_terminate,
-                "status": "terminated",
-            },
-            message=(
-                f"Agent '{agent_id_to_terminate}' terminated. The token "
-                "is revoked, but your local claude session is still "
-                "running — close it manually if you want it to stop."
-            ),
-        )
 
     except sqlite3.Error as e_sql:
-        if conn:
-            conn.rollback()
+        # The unit-of-work already rolled back + closed the connection.
         logger.error(
             f"Database error terminating agent {agent_id_to_terminate}: {e_sql}",
             exc_info=True,
         )
         return Failed(message=f"Database error terminating agent: {e_sql}")
     except Exception as e:
-        if conn:
-            conn.rollback()
         logger.error(
             f"Unexpected error terminating agent {agent_id_to_terminate}: {e}",
             exc_info=True,
         )
         return Failed(message=f"Unexpected error terminating agent: {e}")
-    finally:
-        if conn:
-            conn.close()
 
 
 # --- view_audit_log tool ---

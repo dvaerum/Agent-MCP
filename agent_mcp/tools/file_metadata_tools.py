@@ -37,6 +37,7 @@ from ..core.tool_result import (
 )
 from ..utils.audit_utils import log_audit
 from ..db.connection import get_db_connection
+from ..db.unit_of_work import unit_of_work
 from ..db.actions.agent_actions_db import log_agent_action_to_db
 
 
@@ -233,53 +234,60 @@ async def update_file_metadata_tool_impl(
             message=f"Provided metadata is not JSON serializable: {e_type}",
         )
 
-    conn = None
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        updated_at_iso = datetime.datetime.now().isoformat()
+        # D3: the unit-of-work owns the transaction. The metadata write
+        # AND its ``updated_file_metadata`` DB-audit row run on the
+        # scope's cursor so they commit (or roll back) atomically —
+        # exactly the pairing the hand-sequenced ``conn.commit()`` gave,
+        # now structural. The in-memory ``log_audit`` sink stays above
+        # (pre-write, present-tense ``update_file_metadata`` action with
+        # its richer detail bag) so both the DB and in-memory audit
+        # records keep their exact historical content.
+        with unit_of_work() as u:
+            cursor = u.cursor
+            updated_at_iso = datetime.datetime.now().isoformat()
 
-        cursor.execute(
-            """
-            INSERT OR REPLACE INTO file_metadata (filepath, metadata, last_updated, updated_by)
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                normalized_filepath_str,
-                metadata_json_str,
-                updated_at_iso,
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO file_metadata (filepath, metadata, last_updated, updated_by)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    normalized_filepath_str,
+                    metadata_json_str,
+                    updated_at_iso,
+                    requesting_admin_id,
+                ),
+            )
+
+            log_agent_action_to_db(
+                cursor,
                 requesting_admin_id,
-            ),
-        )
+                "updated_file_metadata",
+                details={"filepath": normalized_filepath_str, "action": "set/update"},
+            )
 
-        log_agent_action_to_db(
-            cursor,
-            requesting_admin_id,
-            "updated_file_metadata",
-            details={"filepath": normalized_filepath_str, "action": "set/update"},
-        )
-        conn.commit()
-
-        logger.info(
-            f"File metadata for '{normalized_filepath_str}' updated by "
-            f"'{requesting_admin_id}'."
-        )
-        return Ok(
-            data={
-                "filepath": normalized_filepath_str,
-                "original_path": filepath_arg,
-                "updated_by": requesting_admin_id,
-                "last_updated": updated_at_iso,
-            },
-            message=(
-                f"File metadata updated successfully for "
-                f"'{filepath_arg}' (normalized: {normalized_filepath_str})."
-            ),
-        )
+            logger.info(
+                f"File metadata for '{normalized_filepath_str}' updated by "
+                f"'{requesting_admin_id}'."
+            )
+            # Returning here runs the uow __exit__: commit the INSERT +
+            # audit row together.
+            return Ok(
+                data={
+                    "filepath": normalized_filepath_str,
+                    "original_path": filepath_arg,
+                    "updated_by": requesting_admin_id,
+                    "last_updated": updated_at_iso,
+                },
+                message=(
+                    f"File metadata updated successfully for "
+                    f"'{filepath_arg}' (normalized: {normalized_filepath_str})."
+                ),
+            )
 
     except sqlite3.Error as e_sql:
-        if conn:
-            conn.rollback()
+        # The unit-of-work already rolled back + closed the connection.
         logger.error(
             f"Database error updating file metadata for "
             f"'{normalized_filepath_str}': {e_sql}",
@@ -287,17 +295,12 @@ async def update_file_metadata_tool_impl(
         )
         return Failed(message=f"Database error updating file metadata: {e_sql}")
     except Exception as e:
-        if conn:
-            conn.rollback()
         logger.error(
             f"Unexpected error updating file metadata for "
             f"'{normalized_filepath_str}': {e}",
             exc_info=True,
         )
         return Failed(message=f"Unexpected error updating file metadata: {e}")
-    finally:
-        if conn:
-            conn.close()
 
 
 # --- Register file metadata tools ---
