@@ -44,6 +44,9 @@ from .._dispatch_helpers import _dispatch_through_tool, handle_options
 from ..deps import caller_identity, require_operator_session
 from ...core.config import logger
 from ...core import globals as g
+from ...core.operator_tier import (
+    is_confirmed_operator_tier as _shared_is_confirmed_operator_tier,
+)
 from ...db.actions.agent_actions_db import log_agent_action_to_db
 from ...db.connection import get_db_connection
 from ...db.engine import SessionLocal
@@ -147,15 +150,24 @@ def is_confirmed_operator_tier(auth: Dict[str, Any]) -> bool:
         project-role handle (by design — role gating is the router
         middleware's job; see ``app/deps.py`` + ``main_app`` Principal
         construction). So for these paths the tier is UNVERIFIABLE from
-        the backend — it could be a read-only viewer.
+        the backend — it could be a read-only viewer. The auth dict
+        carries no verifiable role, so this seam passes only ``kind`` to
+        the shared predicate and a session is conservatively NOT
+        confirmed.
 
     Endpoints that return agent bearer tokens use this to withhold them
     from the unverifiable-tier paths, closing the viewer→agent token
     disclosure / privilege-escalation surface. Operators who need agent
     tokens use the operator-tier bearer path (agent CLI / admin scripts)
     or a dedicated operator-gated endpoint.
+
+    The policy itself lives in
+    ``core/operator_tier.is_confirmed_operator_tier`` so this REST surface
+    and the MCP ``tools/admin_tools`` surface cannot drift (they did — see
+    that module). This thin adapter maps the auth dict onto the shared
+    predicate's keyword fields.
     """
-    return auth.get("kind") == "operator_bearer"
+    return _shared_is_confirmed_operator_tier(kind=auth.get("kind"))
 
 
 # --- Composition reads (cross-resource) ---
