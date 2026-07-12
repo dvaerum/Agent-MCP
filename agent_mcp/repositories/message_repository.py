@@ -1511,7 +1511,9 @@ class MessageRepository:
 
     # --- Read interface: list_participants ------------------------------
 
-    def list_participants(self) -> Dict[str, Any]:
+    def list_participants(
+        self, *, limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
         """Return the participant lists that source the Messages-tab dropdowns.
 
         Reads agents whose status is neither ``terminated`` nor
@@ -1527,6 +1529,15 @@ class MessageRepository:
         :func:`agent_mcp.app.routers.messages.list_participants_api_route`
         1:1.
 
+        ``limit`` (pentest R4-F2): hard-caps ALL three reads in SQL —
+        the live-agent ``.all()`` AND the two ``[deleted-`` ``DISTINCT``
+        scans over ``agent_messages`` — so a project with thousands of
+        agents / tombstone markers can't materialise an unbounded payload
+        on every Messages-tab poll. The route passes an already-clamped
+        value (``_clamp_section_limit``, ``[1, 5000]``, default 500) so
+        the repo never has to import a router helper. ``None`` preserves
+        the historical unbounded read for any non-HTTP caller.
+
         Returns ``{"live": [...], "tombstones": [...]}``. On DB error
         returns ``{"live": [], "tombstones": []}`` and logs at error.
         """
@@ -1534,7 +1545,7 @@ class MessageRepository:
             with get_session() as session:
                 # Live agents — excludes terminated AND tombstone rows.
                 # Mirrors the WHERE clause in routes.py exactly.
-                live_rows = (
+                live_q = (
                     session.query(Agent.agent_id, Agent.status)
                     .filter(
                         or_(
@@ -1543,8 +1554,10 @@ class MessageRepository:
                         )
                     )
                     .order_by(Agent.agent_id.asc())
-                    .all()
                 )
+                if limit is not None:
+                    live_q = live_q.limit(limit)
+                live_rows = live_q.all()
                 live = [
                     {"agent_id": r.agent_id, "status": r.status}
                     for r in live_rows
@@ -1556,20 +1569,27 @@ class MessageRepository:
                     live.insert(0, {"agent_id": "admin", "status": "system"})
 
                 # Tombstones: distinct sender_id ∪ recipient_id values
-                # beginning with "[deleted-". UNION dedupes.
-                senders = (
+                # beginning with "[deleted-". UNION dedupes. Each DISTINCT
+                # scan is LIMITed too (R4-F2) so the tombstone side can't
+                # full-table-scan agent_messages unbounded.
+                senders_q = (
                     session.query(distinct(AgentMessage.sender_id))
                     .filter(AgentMessage.sender_id.like("[deleted-%"))
-                    .all()
                 )
-                recipients = (
+                recipients_q = (
                     session.query(distinct(AgentMessage.recipient_id))
                     .filter(AgentMessage.recipient_id.like("[deleted-%"))
-                    .all()
                 )
+                if limit is not None:
+                    senders_q = senders_q.limit(limit)
+                    recipients_q = recipients_q.limit(limit)
+                senders = senders_q.all()
+                recipients = recipients_q.all()
                 tombstones = sorted(
                     {r[0] for r in senders} | {r[0] for r in recipients}
                 )
+                if limit is not None:
+                    tombstones = tombstones[:limit]
                 return {"live": live, "tombstones": tombstones}
         except SQLAlchemyError as e:
             logger.error(

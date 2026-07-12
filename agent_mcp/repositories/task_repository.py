@@ -308,6 +308,41 @@ def get_all_tasks_from_db(
         return []
 
 
+def count_tasks_by_status_from_db() -> Dict[str, int]:
+    """Return ``{status: count}`` over all tasks via a SQL ``GROUP BY``.
+
+    pentest R4-F1: ``GET /api/status`` used to count task statuses by
+    materialising the WHOLE tasks table into Python
+    (``get_all_tasks_from_db(limit=None)``) and running ``len()`` /
+    filter comprehensions — an unbounded read on every dashboard poll.
+    A ``LIMIT`` can't fix a count (it would under-count), so the fix is
+    a SQL aggregate: ``SELECT status, COUNT(*) FROM tasks GROUP BY
+    status``. The caller derives ``total`` (sum) and any per-status
+    count (``.get(status, 0)``) from the returned dict without reading a
+    single row into Python. On DB error returns ``{}`` and logs at error.
+    """
+    from sqlalchemy import func
+
+    try:
+        with get_session() as session:
+            rows = (
+                session.query(Task.status, func.count(Task.task_id))
+                .group_by(Task.status)
+                .all()
+            )
+            return {status: int(count) for status, count in rows}
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error counting tasks by status: {e}", exc_info=True,
+        )
+        return {}
+    except Exception as e:
+        logger.error(
+            f"Unexpected error counting tasks by status: {e}", exc_info=True,
+        )
+        return {}
+
+
 def get_tasks_by_agent_id(
     agent_id: str,
     status_filter: Optional[str] = None,
@@ -499,6 +534,15 @@ class TaskRepository:
         the historical full read.
         """
         return get_all_tasks_from_db(limit=limit)
+
+    def count_by_status(self) -> Dict[str, int]:
+        """Return ``{status: count}`` over all tasks via a SQL aggregate.
+
+        DB-authoritative. Used by ``GET /api/status`` so a dashboard
+        poll counts task statuses without materialising the tasks table
+        (pentest R4-F1 — see :func:`count_tasks_by_status_from_db`).
+        """
+        return count_tasks_by_status_from_db()
 
     def list_by_agent(
         self,
