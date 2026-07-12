@@ -5866,6 +5866,37 @@ async def create_task_tool_impl(
     assign paths), NOT via ``u.audit`` (which would add the in-memory
     sink the handler never wrote).
     """
+    # SECURITY (pentest R1-F5): ``visibility="operator"`` on this tool's
+    # registration hides it from a worker's ``tools/list`` — but
+    # ``@requires_capability("tasks.create")`` alone doesn't ENFORCE that
+    # tier: ``tasks.create`` is also in ``AGENT_ROLE_BUNDLES["worker"]``
+    # (core/capabilities.py), so a worker bearer could still
+    # `tools/call create_task` by NAME and get operator-only behavior the
+    # worker-facing ``create_self_task`` explicitly forbids (root-task
+    # creation with no parent, and an arbitrary ``assigned_to`` — the
+    # worker path for the latter, ``assign_task``, denies cross-agent
+    # assignment). Visibility governs tools/list only; it is not an
+    # authorization gate, so the gate has to live here.
+    #
+    # Gate on ``tasks.assign`` — the same "is_admin_request" predicate
+    # every other worker/operator split in this module uses (see e.g.
+    # the ``target_agent_id_alias`` check above in
+    # ``assign_task_tool_impl``). Operator (``PROJECT_ROLE_BUNDLES["operator"]``)
+    # and manager (``AGENT_ROLE_BUNDLES["manager"]``) both carry
+    # ``tasks.assign``; plain worker does not, and sysadmin's wildcard
+    # short-circuits ``has_capability`` before the set-membership check —
+    # so this denies workers only, with no change for operator / manager
+    # / sysadmin callers. ``@requires_capability("tasks.create")``
+    # guarantees a valid caller principal at the decorator layer (see
+    # the identical comment in ``create_self_task_tool_impl``).
+    if not principal.has_capability("tasks.assign"):
+        return PermissionDenied(
+            reason=(
+                "create_task is operator/manager-tier task creation; "
+                "workers must use create_self_task"
+            )
+        )
+
     raw_title = arguments.get("task_title")
     description = arguments.get("task_description", "")
     priority = arguments.get("priority", "medium")
