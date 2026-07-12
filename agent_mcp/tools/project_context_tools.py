@@ -231,17 +231,58 @@ async def emit_context_write_wakes(context_key: str) -> None:
             )
 
 
-def _config_key_error() -> str:
-    return (
-        "Unauthorized: config_* keys are admin-only; "
-        "workers cannot create or modify policy/secret entries"
+async def emit_context_write_wakes_bulk(context_keys) -> None:
+    """Bulk sibling of :func:`emit_context_write_wakes` (arch-r6 #1).
+
+    A bulk write touches N keys in one call; fire each wake AT MOST
+    ONCE for the whole batch (not once per matching key) if ANY key in
+    the batch matches, using the SAME predicates
+    (`_is_worker_policy_toggle` / `_is_loop_toggle`) and the SAME
+    underlying calls as the single-key seam above — so the two seams
+    can't drift on what counts as a toggle or how the wake fires.
+
+    Both bulk write surfaces (`_handle_bulk_context_update`, the
+    write-queue path, and the standalone
+    `bulk_update_project_context_tool_impl`, the inline path) must
+    route through this so they fire the SAME wake set as each other
+    and as the single-key `update_project_context` surface. Before
+    this helper the two bulk surfaces hand-rolled the fan-out and
+    drifted: `_handle_bulk_context_update` fired both halves, but
+    `bulk_update_project_context_tool_impl` fired only the
+    worker-policy half — a `config_auto_event_loop_global` flip via
+    the standalone bulk tool left in-flight `wait_for_events` waiters
+    hanging. This is the REST-vs-MCP notify-parity class BL-R14-1
+    (see the docstring above) reintroduced on the third write surface.
+    """
+    keys = list(context_keys)
+    if any(_is_worker_policy_toggle(k) for k in keys):
+        await _emit_tools_list_changed("__bulk__")
+    if any(_is_loop_toggle(k) for k in keys):
+        try:
+            g.wake_all_for_flag_recheck()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "wake_all_for_flag_recheck failed after bulk "
+                "loop-toggle write: %s",
+                e,
+            )
+
+
+def _config_key_error() -> "PermissionDenied":
+    return PermissionDenied(
+        reason=(
+            "config_* keys are admin-only; workers cannot create or "
+            "modify policy/secret entries"
+        )
     )
 
 
-def _creator_mismatch_error(context_key: str, creator: str) -> str:
-    return (
-        f"Unauthorized: key '{context_key}' was created by "
-        f"'{creator}'; only its creator or admin can modify it"
+def _creator_mismatch_error(context_key: str, creator: str) -> "PermissionDenied":
+    return PermissionDenied(
+        reason=(
+            f"key '{context_key}' was created by '{creator}'; only "
+            f"its creator or admin can modify it"
+        )
     )
 
 from sqlalchemy import func, or_, select
@@ -563,9 +604,10 @@ def _check_write_authorization(
     context_key: str,
     *,
     is_admin: bool,
-) -> Optional[str]:
+) -> Optional[PermissionDenied]:
     """Return None if the caller may write/delete `context_key`, else
-    a specific human-readable error message.
+    a :class:`PermissionDenied` carrying a specific human-readable
+    denial reason.
 
     Rules (Phase 7b):
     - Admin: always authorized.
@@ -579,6 +621,15 @@ def _check_write_authorization(
     sees pending changes inside the same open transaction (was a
     SQLAlchemy session query pre-migration; same in-transaction
     visibility guarantee, now on the raw-sqlite seam).
+
+    Returns the TYPED denial directly (round-3 arch-deepening #3) —
+    callers propagate it as-is instead of round-tripping through a
+    ``"Unauthorized: "``-prefixed string that they then strip and
+    re-wrap in :class:`PermissionDenied`. The MCP wire renderer
+    (``core/tool_result.py::render_as_text_content``) already prefixes
+    every ``PermissionDenied`` with ``"Unauthorized: "``, so the old
+    round trip was a dead no-op that just duplicated the 4-line
+    strip-and-rewrap at every call site.
     """
     if is_admin:
         return None
@@ -1001,8 +1052,8 @@ def _single_update_inline(
     description_for_context: Optional[str],
     *,
     is_admin: bool,
-) -> Optional[str]:
-    """Sync single-update body — returns an error message or None.
+) -> Optional[PermissionDenied]:
+    """Sync single-update body — returns a typed denial or None.
 
     arch-r4 #6: the unit-of-work owns the transaction. The upsert (via
     ``project_context_repo``) and its ``updated_context`` DB-audit row
@@ -1126,14 +1177,10 @@ async def _handle_single_context_update(
         return Failed(message=f"Unexpected error updating project context: {e}")
 
     if err is not None:
-        # ``_single_update_inline`` returns the formatted
-        # "Unauthorized: ..." string from ``_check_write_authorization``
-        # — strip the "Unauthorized: " prefix so the renderer doesn't
-        # double-stamp it (PermissionDenied → "Unauthorized: {reason}").
-        reason = err
-        if reason.lower().startswith("unauthorized:"):
-            reason = reason[len("Unauthorized:"):].lstrip()
-        return PermissionDenied(reason=reason)
+        # ``_single_update_inline`` propagates the typed
+        # :class:`PermissionDenied` straight from
+        # ``_check_write_authorization`` — no string round trip.
+        return err
 
     # BL-R14-1: fire the full wake set this key requires — worker-policy
     # toggle → tools/list_changed, loop toggle → wake_all_for_flag_recheck.
@@ -1188,35 +1235,19 @@ async def _handle_bulk_context_update(
         logger.error(f"Unexpected error in bulk context update: {e}", exc_info=True)
         return Failed(message=f"Unexpected error in bulk update: {e}")
     if err is not None:
-        reason = err
-        if reason.lower().startswith("unauthorized:"):
-            reason = reason[len("Unauthorized:"):].lstrip()
-        return PermissionDenied(reason=reason)
+        # ``_bulk_update_inline`` propagates the typed
+        # :class:`PermissionDenied` straight from
+        # ``_check_write_authorization`` — no string round trip.
+        return err
 
-    # Phase 4: if the bulk write touched any worker-policy toggle,
-    # emit a single tools/list_changed notification — workers care
-    # whether the set of visible tools changed, not which key
-    # flipped it.
-    if any(
-        _is_worker_policy_toggle(u.get("context_key", ""))
-        for u in updates_list
-    ):
-        await _emit_tools_list_changed("__bulk__")
-
-    # BL-R14-1: bulk parity — if any entry flipped the global loop
-    # toggle, wake in-flight waiters (mirrors the single-update path).
-    if any(
-        _is_loop_toggle(u.get("context_key", ""))
-        for u in updates_list
-    ):
-        try:
-            g.wake_all_for_flag_recheck()
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning(
-                "wake_all_for_flag_recheck failed after bulk "
-                "loop-toggle write: %s",
-                e,
-            )
+    # arch-r6 #1: fire the full wake set this batch requires —
+    # worker-policy toggle → tools/list_changed, loop toggle →
+    # wake_all_for_flag_recheck — via the SAME seam the single-key
+    # path uses, so the two bulk surfaces can't drift from each other
+    # or from `update_project_context`.
+    await emit_context_write_wakes_bulk(
+        u.get("context_key", "") for u in updates_list
+    )
 
     return Ok(
         data={
@@ -1298,13 +1329,13 @@ def _bulk_update_inline(
     updates_list: List[Dict[str, Any]],
     *,
     is_admin: bool,
-) -> Tuple[Optional[str], List[str]]:
+) -> Tuple[Optional[PermissionDenied], List[str]]:
     """Sync bulk-update body shared by the queued + inline entry points.
 
-    Returns (error_message, response_parts). On the unauthorized path
-    the error_message is non-None and response_parts is empty. On the
-    success path error_message is None and response_parts is the
-    rendered per-entry summary.
+    Returns (denial, response_parts). On the unauthorized path the
+    denial is a non-None :class:`PermissionDenied` and response_parts
+    is empty. On the success path denial is None and response_parts is
+    the rendered per-entry summary.
 
     Both `_handle_bulk_context_update` (queued) and the standalone
     `bulk_update_project_context_tool_impl` (inline) call this so the
@@ -1473,18 +1504,21 @@ async def bulk_update_project_context_tool_impl(
     except Exception as e:
         return Failed(message=f"Unexpected error in bulk update: {e}")
     if err is not None:
-        reason = err
-        if reason.lower().startswith("unauthorized:"):
-            reason = reason[len("Unauthorized:"):].lstrip()
-        return PermissionDenied(reason=reason)
+        # ``_bulk_update_inline`` propagates the typed
+        # :class:`PermissionDenied` straight from
+        # ``_check_write_authorization`` — no string round trip.
+        return err
 
-    # Phase 4: emit tools/list_changed once if any update was a
-    # worker-policy toggle.
-    if any(
-        _is_worker_policy_toggle(u.get("context_key", ""))
-        for u in updates
-    ):
-        await _emit_tools_list_changed("__bulk__")
+    # arch-r6 #1: fire the full wake set this batch requires — was
+    # worker-policy-toggle-only (the standalone bulk tool never woke
+    # in-flight `wait_for_events` waiters when a batch flipped
+    # `config_auto_event_loop_global`, unlike the queued bulk path and
+    # the single-key `update_project_context`). Routes through the
+    # same seam as both siblings so the three write surfaces can't
+    # drift again.
+    await emit_context_write_wakes_bulk(
+        u.get("context_key", "") for u in updates
+    )
 
     return Ok(
         data={
@@ -1529,10 +1563,9 @@ def _create_context_inline(
             cursor, requesting_agent_id, context_key, is_admin=is_admin
         )
         if err is not None:
-            reason = err
-            if reason.lower().startswith("unauthorized:"):
-                reason = reason[len("Unauthorized:"):].lstrip()
-            return PermissionDenied(reason=reason)
+            # ``_check_write_authorization`` returns the typed
+            # :class:`PermissionDenied` directly — no string round trip.
+            return err
 
         row = project_context_repo.create_new(
             context_key,
@@ -2322,10 +2355,10 @@ async def delete_project_context_tool_impl(
                     cursor, requesting_agent_id, key, is_admin=is_admin
                 )
                 if err is not None:
-                    reason = err
-                    if reason.lower().startswith("unauthorized:"):
-                        reason = reason[len("Unauthorized:"):].lstrip()
-                    return PermissionDenied(reason=reason)
+                    # ``_check_write_authorization`` returns the typed
+                    # :class:`PermissionDenied` directly — no string
+                    # round trip.
+                    return err
 
             deleted_rows = project_context_repo.delete_many(
                 keys_to_delete, connection=cursor,
