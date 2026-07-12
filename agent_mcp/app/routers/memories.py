@@ -372,6 +372,21 @@ async def delete_memory_api_route(
 
         session.commit()
 
+        # pentest R1-F3 (SEC-C class-sweep MISS): fire the SAME wake
+        # seam every other project_context write/delete surface uses
+        # (REST POST/PUT, MCP create/update/delete) — this REST DELETE
+        # handler, the dashboard's PRIMARY delete path, was the last
+        # one that bypassed it entirely. Deleting
+        # `config_auto_event_loop_global` reverted the flag to its
+        # default without waking in-flight `wait_for_events` callers,
+        # and deleting a `config_allow_worker_*` key reverted worker
+        # tool visibility without pushing
+        # `notifications/tools/list_changed`. Placed AFTER
+        # `session.commit()`, matching the emit-after-commit placement
+        # of every sibling write surface (see the PUT handler above
+        # and `delete_project_context_tool_impl`).
+        await emit_context_write_wakes(context_key)
+
         return JSONResponse({
             "success": True,
             "message": f"Memory '{context_key}' deleted successfully",

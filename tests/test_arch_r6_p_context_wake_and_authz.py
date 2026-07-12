@@ -30,6 +30,18 @@ emit-after-commit placement) and ``delete_via_tool`` is added to
 ``WRITE_SURFACES`` below so the parametrized invariant becomes "every
 project_context write AND delete surface fires the matching wake".
 
+pentest R1-F3 (class-sweep MISS follow-up, this PR) — SEC-C's commit
+claimed "REST /api/memories fires it" but only checked REST POST/PUT;
+the REST **DELETE** handler (``delete_memory_api_route`` in
+``app/routers/memories.py``) writes the DB directly via
+``session.delete(row)`` + ``session.commit()`` and — unlike its POST
+and PUT siblings, and unlike the MCP ``delete_project_context`` tool
+this SEC-C commit fixed — never called ``emit_context_write_wakes``.
+It is the dashboard's PRIMARY delete path. The fix adds the missing
+call right after ``session.commit()``, and ``delete_via_rest`` is
+added to ``WRITE_SURFACES`` below so the parametrized invariant now
+covers every REST AND MCP write/delete surface.
+
 #3 — leaky/dup: the "Unauthorized: " prefix round trip. The MCP wire
 renderer (``core/tool_result.py::render_as_text_content``) already
 prefixes every ``PermissionDenied`` with ``"Unauthorized: "``,  so the
@@ -256,11 +268,59 @@ async def _delete_via_tool(admin, key: str, value) -> None:
     )
 
 
+async def _delete_via_rest(admin, key: str, value) -> None:
+    """The REST DELETE surface (pentest R1-F3) — the dashboard's
+    PRIMARY delete path, and the one this PR fixes.
+    ``delete_memory_api_route`` committed the row delete directly via
+    SQLAlchemy and returned WITHOUT ever calling
+    ``emit_context_write_wakes``/``emit_context_write_wakes_bulk`` —
+    the last unwaked project_context write/delete surface after the
+    SEC-C fix closed the MCP delete tool's version of the same gap.
+
+    Seeds the row directly via the ORM — deliberately NOT through
+    ``update_project_context`` — so the seed write can't itself trip
+    the ``_emit_tools_list_changed``/``wake_all_for_flag_recheck``
+    mocks the shared parametrized test patches; only the REST DELETE
+    call below is allowed to make them fire.
+    """
+    import datetime as _dt
+    import json as _json
+
+    from agent_mcp.db.engine import SessionLocal
+    from agent_mcp.db.models import ProjectContext
+
+    now = _dt.datetime.now().isoformat()
+    sess = SessionLocal()
+    try:
+        sess.add(
+            ProjectContext(
+                context_key=key,
+                value=_json.dumps(value),
+                created_at=now,
+                created_by="r6-p-operator",
+                updated_at=now,
+                updated_by="r6-p-operator",
+                description="seed for REST delete-wake parity test",
+            )
+        )
+        sess.commit()
+    finally:
+        sess.close()
+
+    r = admin.client.request(
+        "DELETE",
+        f"/api/memories/{key}",
+        json={"token": admin.admin_token},
+    )
+    assert r.status_code == 200, r.text
+
+
 WRITE_SURFACES = [
     ("single_update", _single_update),
     ("bulk_via_update", _bulk_via_update),
     ("bulk_via_bulk_tool", _bulk_via_bulk_tool),
     ("delete_via_tool", _delete_via_tool),
+    ("delete_via_rest", _delete_via_rest),
 ]
 
 TOGGLES = [
