@@ -53,6 +53,36 @@ def _post_mcp(client, body: dict, headers: dict | None = None):
     return client.post("/mcp", json=body, headers=hdrs)
 
 
+def _post_mcp_raw(client, raw: bytes, headers: dict | None = None):
+    """POST a raw, already-encoded JSON-RPC body.
+
+    Used instead of `_post_mcp` (which round-trips the body through
+    `json.dumps` on the *client* side too) for the deep-nesting tests
+    below: building the nested payload as a real Python `list` and
+    handing it to httpx's `json=` kwarg would itself blow the client's
+    recursion limit while *encoding* it. Building the raw bytes by
+    string concatenation sidesteps that — the depth only matters to the
+    *server's* `json.loads`, which is exactly what's under test.
+    """
+    hdrs = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    if headers:
+        hdrs.update(headers)
+    return client.post("/mcp", content=raw, headers=hdrs)
+
+
+def _nested_array_body(depth: int, *, request_id: int = 1) -> bytes:
+    """Build a JSON-RPC `tools/call` body whose `arguments` field is an
+    array nested `depth` levels deep, as raw bytes (see `_post_mcp_raw`)."""
+    nested = ("[" * depth) + "1" + ("]" * depth)
+    return (
+        '{"jsonrpc":"2.0","id":%d,"method":"tools/call",'
+        '"params":{"name":"x","arguments":%s}}' % (request_id, nested)
+    ).encode("utf-8")
+
+
 def _parse_sse_payload(body_text: str) -> dict:
     """Parse the first SSE `data:` frame body as JSON."""
     for line in body_text.splitlines():
@@ -115,6 +145,76 @@ async def test_post_mcp_without_authorization_returns_401(tmp_path) -> None:
             {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
         )
         assert r.status_code == 401, r.text
+
+
+# ---------- pentest R1-F2: pre-parse recursion-depth guard -----------
+#
+# The MCP SDK's own `streamable_http.py::_handle_post_request` wraps its
+# `json.loads(body)` in `except json.JSONDecodeError` only — a deeply
+# nested body blows Python's recursion limit and raises `RecursionError`
+# (a `RuntimeError`, NOT a `JSONDecodeError`/`ValueError` subclass), which
+# escapes uncaught and surfaces as HTTP 500. The identical class of input
+# hits every REST/router JSON-parse surface's `except (ValueError,
+# RecursionError)` guard and returns a clean 400 instead. These tests pin
+# the `_McpAsgiApp.__call__` pre-parse guard (`_drain_body` +
+# `_MCP_DEPTH_GUARD_BODY` in `agent_mcp/app/main_app.py`) that closes that
+# gap — the last unguarded JSON-parse surface in the codebase.
+
+
+async def test_post_mcp_deeply_nested_body_returns_400_not_500(tmp_path) -> None:
+    """A body nested far past Python's recursion limit must be rejected
+    with a clean 400 JSON-RPC parse error, not crash the SDK's parser
+    into an HTTP 500 (pentest R1-F2)."""
+    async with mcp_session(tmp_path) as admin:
+        r = _post_mcp_raw(
+            admin.client,
+            _nested_array_body(50_000),
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
+        assert r.status_code == 400, r.text
+        payload = r.json()
+        assert payload.get("jsonrpc") == "2.0", payload
+        assert payload["error"]["code"] == -32700, payload
+        assert payload["error"]["message"] == "Parse error", payload
+        # No recursion-limit / interpreter detail in the response body.
+        assert "recursion" not in r.text.lower()
+
+
+async def test_post_mcp_under_limit_nested_body_is_accepted(tmp_path) -> None:
+    """A legitimately-nested-but-under-the-limit body must NOT be
+    rejected by the depth guard — only a body that actually blows the
+    recursion limit should trip it."""
+    async with mcp_session(tmp_path) as admin:
+        r = _post_mcp_raw(
+            admin.client,
+            _nested_array_body(100),
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
+        # The tool ("x") doesn't exist, so this may come back as an
+        # in-band JSON-RPC error — the point under test is that it is
+        # NOT rejected by the depth guard (400 with code -32700) and did
+        # NOT crash the server (500).
+        assert r.status_code not in (400, 500), r.text
+        payload = _extract_jsonrpc_result(r)
+        assert payload.get("id") == 1, payload
+
+
+async def test_post_mcp_normal_depth_body_still_works(tmp_path) -> None:
+    """No-regression check: an ordinary, shallow JSON-RPC body posted as
+    raw bytes through the same code path as the two tests above must
+    still round-trip normally."""
+    async with mcp_session(tmp_path) as admin:
+        r = _post_mcp_raw(
+            admin.client,
+            b'{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
+        assert r.status_code == 200, r.text
+        payload = _extract_jsonrpc_result(r)
+        assert payload.get("id") == 1, payload
+        assert "result" in payload, payload
+        tools = payload["result"].get("tools")
+        assert isinstance(tools, list) and len(tools) > 0, payload
 
 
 # ---------- GET /mcp -------------------------------------------------

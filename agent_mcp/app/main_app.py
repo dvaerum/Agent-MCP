@@ -954,6 +954,83 @@ class _JsonRpcErrorSanitizer:
         await self._send(message)
 
 
+# --- MCP pre-parse recursion-depth guard (pentest R1-F2) ------------
+#
+# Every other JSON-parse surface in this codebase wraps its `json.loads`
+# in `except (ValueError, RecursionError)` and turns a deeply-nested body
+# into a clean 400: `router/app.py::_parse_json_body`,
+# `router/admin_users_api.py::_json_body`, `app/deps.py::_legacy_body_token`,
+# `utils/json_utils.py::get_sanitized_json_body`. The `/mcp` transport was
+# the one surface left unguarded: the MCP SDK's own
+# `streamable_http.py::_handle_post_request` only catches
+# `json.JSONDecodeError` around its `json.loads(body)` — `RecursionError`
+# is a `RuntimeError`, not a `ValueError` subclass, so it escapes uncaught
+# and turns into an HTTP 500 (identical input returns 400 on every
+# REST/router path). `_JsonRpcErrorSanitizer` above scrubs the resulting
+# error *message* but preserves the 500 *status*, so it can't fix this —
+# the SDK has already blown its stack by the time the sanitizer sees the
+# response.
+#
+# The fix has to sit in front of the SDK's parse, not patch its output:
+# drain the body ourselves, attempt the same `json.loads` at the same
+# ambient recursion limit the other guards rely on, and reject a
+# RecursionError with a clean 400 before the SDK ever touches the bytes.
+# A merely-malformed (not deeply-nested) body is deliberately left alone —
+# the SDK already turns that into its own well-formed -32700 response —
+# so the drained bytes are replayed to it unchanged via a synthetic
+# `receive`.
+_MCP_DEPTH_GUARD_BODY = json.dumps({
+    "jsonrpc": "2.0",
+    "id": "server-error",  # mirrors the SDK's own id for parse-stage errors
+    "error": {"code": -32700, "message": _JSONRPC_TERSE_MESSAGES[-32700]},
+}).encode("utf-8")
+
+
+async def _drain_body(receive) -> tuple[bytes, bool]:
+    """Fully drain an ASGI HTTP request body via `receive`.
+
+    Returns ``(body_bytes, disconnected)``. ``disconnected`` is True if
+    the client hung up mid-upload (an `http.disconnect` arrived before
+    `more_body: False`) — the same signal Starlette's own
+    `Request.stream()` watches for and turns into `ClientDisconnect`.
+    """
+    body = bytearray()
+    while True:
+        message = await receive()
+        if message.get("type") == "http.disconnect":
+            return bytes(body), True
+        body.extend(message.get("body", b"") or b"")
+        if not message.get("more_body", False):
+            return bytes(body), False
+
+
+def _replay_receive(body: bytes, disconnected: bool):
+    """Build an ASGI `receive` callable that replays an already-drained
+    body exactly once.
+
+    `receive` is a single-use channel — the depth guard in
+    `_McpAsgiApp.__call__` has to drain it fully to check nesting depth
+    before the MCP SDK's own request parsing ever sees it, so the SDK is
+    handed this replay instead of the (now-exhausted) live channel. A
+    mid-upload disconnect is replayed as `http.disconnect` (rather than
+    the partial body) so Starlette's `Request.stream()` still raises
+    `ClientDisconnect` at the same point it would have without this guard
+    in front of it.
+    """
+    sent = False
+
+    async def _receive():
+        nonlocal sent
+        if not sent:
+            sent = True
+            if disconnected:
+                return {"type": "http.disconnect"}
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    return _receive
+
+
 class _McpAsgiApp:
     """ASGI app that delegates to a StreamableHTTP session manager.
 
@@ -1001,6 +1078,29 @@ class _McpAsgiApp:
         if scope.get("type") == "http" and scope.get("method") == "GET":
             await self._handle_get(scope, receive, send)
             return
+        if scope.get("type") == "http" and scope.get("method") == "POST":
+            # Pre-parse recursion-depth guard (pentest R1-F2) — see the
+            # comment block above `_drain_body`. Only POST reaches the
+            # SDK's own `json.loads(body)`; DELETE never reads a body
+            # (stateless mode returns 405 for it) and GET is handled
+            # entirely in-house above, so neither needs this.
+            body, disconnected = await _drain_body(receive)
+            print('DEBUG drain', repr(body[:80]), disconnected, flush=True)
+            if not disconnected:
+                try:
+                    json.loads(body)
+                except RecursionError:
+                    await _send_simple_response(
+                        send, 400, _MCP_DEPTH_GUARD_BODY
+                    )
+                    return
+                except Exception:
+                    # Any other parse failure (malformed-but-not-deep
+                    # JSON) is left for the SDK's own `json.loads` to
+                    # reject with its normal -32700 response below —
+                    # replay the exact same bytes, untouched.
+                    pass
+            receive = _replay_receive(body, disconnected)
         # POST/DELETE → SDK. Wrap ``send`` so a malformed-request
         # JSON-RPC error envelope (which the SDK fills with a raw
         # pydantic ValidationError dump) is rewritten to a terse
