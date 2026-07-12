@@ -1378,6 +1378,20 @@ async def purge_agent_tool_impl(
                 "UPDATE agent_actions SET agent_id = ? WHERE agent_id = ?",
                 (tombstone, agent_id),
             )
+            # AC-R29-1 symmetry (SEC-B/F3): snapshot this agent's open
+            # `mcp_sessions` ids BEFORE the cascade DELETE below removes
+            # them — `session_registry.close_streams_for_agent` looks
+            # rows up fresh from the DB, so calling it post-commit (after
+            # the delete below has committed) would find nothing and
+            # silently signal no one. `_purge_post_commit` uses this
+            # captured list with `close_streams` instead.
+            from ..core import session_registry
+
+            purge_session_ids = [
+                h.session_id
+                for h in session_registry.sessions_for_agent(agent_id)
+            ]
+
             # BL-R4-2: mcp_sessions / claude_code_sessions FK agents.agent_id;
             # a session row still referencing this agent at DELETE time makes
             # the final DELETE FROM agents raise FOREIGN KEY constraint
@@ -1418,6 +1432,39 @@ async def purge_agent_tool_impl(
                 for filepath, info in list(g.file_map.items()):
                     if info.get("agent_id") == agent_id:
                         del g.file_map[filepath]
+
+                # AC-R29-1 symmetry (SEC-B/F3): purge, like terminate, drops
+                # this agent's bearer from `active_agents` above — an
+                # already-open GET /mcp SSE stream would otherwise survive
+                # until its next heartbeat self-validation tick (up to
+                # `_HEARTBEAT_INTERVAL_SECONDS`). Signal every open stream
+                # for this agent to re-validate NOW so teardown is
+                # immediate, mirroring `_post_terminate_effects` above. Uses
+                # `close_streams` with the ids captured BEFORE the cascade
+                # DELETE (not `close_streams_for_agent`, which re-queries
+                # `mcp_sessions` and would find nothing — purge already
+                # deleted those rows in the same committed transaction).
+                # The pump's own per-heartbeat self-validation is the
+                # backstop if a stream can't be signalled here.
+                try:
+                    from ..core import session_registry
+
+                    closed_streams = session_registry.close_streams(
+                        purge_session_ids
+                    )
+                    if closed_streams:
+                        logger.info(
+                            "Signalled %d open MCP stream(s) to close for "
+                            "purged agent %s.",
+                            len(closed_streams), agent_id,
+                        )
+                except Exception:  # pragma: no cover - defensive
+                    logger.warning(
+                        "Failed to signal open MCP streams for purged agent "
+                        "%s (pump self-validation will still tear them down).",
+                        agent_id, exc_info=True,
+                    )
+
                 # BL-R10-1/2: reconcile reassigned tasks' cache + wake
                 # capability-matched workers (shared with the terminate path).
                 _reconcile_reassigned_tasks(reassigned_tasks)

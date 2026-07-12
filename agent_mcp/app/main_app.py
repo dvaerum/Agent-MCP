@@ -1173,6 +1173,21 @@ class _McpAsgiApp:
             if payload is session_registry.CLOSE_STREAM:
                 continue
 
+            # Re-validate again post-dequeue: a data payload may have
+            # been queued BEFORE revocation and only reach the front
+            # of the FIFO after CLOSE_STREAM was enqueued behind it
+            # (or before revocation happened at all). Without this
+            # check the loop would still wire-write one already-queued
+            # payload to a bearer that left `active_agents` between
+            # the top-of-loop check and here.
+            if not _bearer_is_active(bearer):
+                logger.info(
+                    "session_registry: bearer revoked — discarding "
+                    "queued payload, closing GET /mcp stream "
+                    "session=%s", session_id,
+                )
+                return
+
             data = json.dumps(payload).encode("utf-8")
             await send({
                 "type": "http.response.body",

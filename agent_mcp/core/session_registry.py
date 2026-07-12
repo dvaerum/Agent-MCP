@@ -42,6 +42,8 @@ API summary:
     get_runtime_queue(session_id) -> asyncio.Queue | None
     fanout_to_agent(agent_id, payload) -> list[str]
     fanout_to_all(payload) -> list[str]
+    close_streams_for_agent(agent_id) -> list[str]
+    close_streams(session_ids) -> list[str]
 
 `bearer_token` is never stored raw; we keep `sha256(bearer)` so the
 registry stays opaque about credential bytes.
@@ -329,14 +331,41 @@ def fanout_to_all(payload: Any) -> List[str]:
 CLOSE_STREAM = object()
 
 
+def close_streams(session_ids: Iterable[str]) -> List[str]:
+    """Wake every open GET /mcp stream in ``session_ids`` so its pump
+    re-validates the bearer now. Returns the session_ids signalled.
+
+    Enqueues :data:`CLOSE_STREAM` onto each attached runtime queue — see
+    :func:`close_streams_for_agent` for the pump-side contract. This is
+    the explicit-ids sibling: callers whose transaction DELETEs the
+    ``mcp_sessions`` row(s) in the same commit that revokes the agent
+    (purge's cascade, required by the ``agents.agent_id`` FK) can't rely
+    on a post-commit `close_streams_for_agent` — its own DB lookup would
+    find nothing once the row is gone. Capture the session_ids via
+    :func:`sessions_for_agent` BEFORE the delete, then signal them
+    directly here after commit.
+    """
+    signalled: List[str] = []
+    for session_id in session_ids:
+        q = _runtime_queues.get(session_id)
+        if q is None:
+            continue
+        try:
+            q.put_nowait(CLOSE_STREAM)
+        except asyncio.QueueFull:
+            continue
+        signalled.append(session_id)
+    return signalled
+
+
 def close_streams_for_agent(agent_id: str) -> List[str]:
     """Wake every open GET /mcp stream for ``agent_id`` so its pump
     re-validates the bearer now. Returns the session_ids signalled.
 
-    Enqueues :data:`CLOSE_STREAM` onto each attached runtime queue. The
-    pump recognises the sentinel, re-checks liveness (cache-only), and —
-    for a terminated / revoked agent — tears the stream down immediately
-    rather than after the next ≤heartbeat-interval self-validation tick.
+    The pump recognises the :data:`CLOSE_STREAM` sentinel, re-checks
+    liveness (cache-only), and — for a terminated / revoked agent —
+    tears the stream down immediately rather than after the next
+    ≤heartbeat-interval self-validation tick.
 
     Best-effort: a session whose queue is full isn't signalled here, but
     it is still torn down on its next heartbeat's self-validation check
@@ -344,15 +373,12 @@ def close_streams_for_agent(agent_id: str) -> List[str]:
     an attached runtime queue (registered by a prior backend process,
     client not yet reconnected) are skipped — there's no live pump to
     signal, and a reconnect re-derives auth at the gate.
+
+    Looks up ``agent_id``'s sessions fresh from the DB — a caller whose
+    own transaction already deleted those rows (e.g. purge's cascade)
+    must use :func:`close_streams` with ids captured before the delete
+    instead, since this lookup would find nothing post-commit.
     """
-    signalled: List[str] = []
-    for handle in sessions_for_agent(agent_id):
-        q = _runtime_queues.get(handle.session_id)
-        if q is None:
-            continue
-        try:
-            q.put_nowait(CLOSE_STREAM)
-        except asyncio.QueueFull:
-            continue
-        signalled.append(handle.session_id)
-    return signalled
+    return close_streams(
+        handle.session_id for handle in sessions_for_agent(agent_id)
+    )
