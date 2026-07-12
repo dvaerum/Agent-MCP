@@ -468,16 +468,19 @@ def router_cmd(
     # Lazy import — the router module reads env at top level, so
     # importing it before the os.environ assignments above would
     # bind to stale (likely missing) values.
-    from .router.app import make_app
+    from .router.app import make_app, _resolve_bind_host
     from aiohttp import web
 
     app = make_app(
         single_tenant_name=single_tenant_name,
         single_tenant_workspace=single_tenant_workspace,
     )
-    # Same env-override-on-bind-host pattern as router.app.main —
-    # used by the VM tests' module so qemu hostfwd can route in.
-    host = os.environ.get("AGENT_MCP_ROUTER_HOST", "127.0.0.1")
+    # Resolve the bind host through the SHARED helper (R6-F1) so the
+    # string bound here is byte-for-byte what ``make_app``'s fail-closed
+    # guard classified — an empty/whitespace AGENT_MCP_ROUTER_HOST can't
+    # slip past the single-tenant guard as "loopback" then bind all
+    # interfaces at runtime.
+    host = _resolve_bind_host()
     # ``shutdown_timeout=3.0`` matches ``router.app.main()`` — capping
     # the aiohttp drain window paired with the ``_drain_proxy_tasks``
     # on_shutdown hook keeps the SIGTERM-to-exit window inside

@@ -1269,8 +1269,17 @@ _MIME = {
 
 
 def _safe_dashboard_path(rest: str) -> Path | None:
-    """Resolve `rest` against the dashboard root, refusing escapes."""
-    candidate = (_DASHBOARD_ROOT / rest).resolve()
+    """Resolve `rest` against the dashboard root, refusing escapes.
+
+    ``.resolve()`` raises ``ValueError: embedded null byte`` on a NUL
+    in the path (R6-F3) — and ``OSError`` on other resolve-time OS
+    failures. Both map to the existing "unsafe → None" path, which the
+    callers turn into a clean 404 rather than an unhandled 500.
+    """
+    try:
+        candidate = (_DASHBOARD_ROOT / rest).resolve()
+    except (ValueError, OSError):
+        return None
     try:
         candidate.relative_to(_DASHBOARD_ROOT)
     except ValueError:
@@ -2113,13 +2122,24 @@ async def _init_router_identity_on_startup(app: web.Application) -> None:
 
 
 def _resolve_bind_host() -> str:
-    """Return the host the router will bind, mirroring the entrypoints.
+    """Return the exact host string handed to ``web.run_app``.
 
-    Both ``main()`` and the CLI's ``router_cmd`` resolve the bind host
-    from ``AGENT_MCP_ROUTER_HOST`` (default ``127.0.0.1``). ``make_app``
-    reads the SAME env var so the fail-closed guard sees exactly what
-    ``web.run_app`` will bind, regardless of which entrypoint built the
-    app.
+    This is the ONE place that turns ``AGENT_MCP_ROUTER_HOST`` (default
+    ``127.0.0.1``) into the bind host. BOTH the fail-closed startup
+    guard (``_assert_startup_safe`` → ``_host_is_loopback``) AND every
+    runtime entrypoint (``main()`` here, ``cli.router_cmd``) call this,
+    so the string the guard *classifies* is byte-for-byte the string
+    the runtime *binds* — they can never diverge.
+
+    Whitespace is stripped so a present-but-empty / whitespace-only env
+    value (``Environment=AGENT_MCP_ROUTER_HOST=`` in a unit file, or
+    ``docker -e AGENT_MCP_ROUTER_HOST=``) collapses to ``""`` — the
+    same string aiohttp/asyncio bind to ALL interfaces. Classification
+    (below) treats that as non-loopback, so the single-tenant guard
+    fails closed rather than silently publishing an auth-disabled
+    dashboard. We do NOT rewrite ``""`` → ``127.0.0.1``: the "empty =
+    bind all" idiom stays valid for multi-tenant, which HAS the auth
+    gate.
     """
     return os.environ.get("AGENT_MCP_ROUTER_HOST", "127.0.0.1").strip()
 
@@ -2127,13 +2147,20 @@ def _resolve_bind_host() -> str:
 def _host_is_loopback(host: str) -> bool:
     """True iff ``host`` binds only the loopback interface (or a UDS).
 
-    An empty host / a unix-socket path (``unix:...`` or an absolute
-    path) is treated as loopback-equivalent — it isn't a network
-    listener. A hostname that isn't a bare IP (e.g. ``localhost``) is
-    resolved conservatively: only the literal ``localhost`` counts.
+    A unix-socket path (``unix:...`` or an absolute path) is treated as
+    loopback-equivalent — it isn't a network listener. A hostname that
+    isn't a bare IP is resolved conservatively: only the literal
+    ``localhost`` counts.
+
+    An empty / whitespace-only host is NOT loopback: aiohttp/asyncio
+    bind ``""`` to every interface (``0.0.0.0`` + ``::``), exactly like
+    an explicit ``0.0.0.0``. Classifying it as loopback is the R6-F1
+    hole — the guard would pass while the runtime published all
+    interfaces. Fail closed instead.
     """
+    host = host.strip()
     if not host:
-        return True
+        return False
     if host.startswith("unix:") or host.startswith("/"):
         return True
     if host.lower() == "localhost":
@@ -2443,7 +2470,9 @@ def main() -> None:
     # user-mode hostfwd packets (which arrive on the guest's primary
     # IP, not loopback) can be served. Production deploys keep the
     # 127.0.0.1 default and front the router with nginx/Tailscale.
-    host = os.environ.get("AGENT_MCP_ROUTER_HOST", "127.0.0.1")
+    # Resolve through the SHARED helper so the string bound here is the
+    # same one the fail-closed guard classified (R6-F1).
+    host = _resolve_bind_host()
     # `shutdown_timeout=3.0` caps the window aiohttp waits for
     # in-flight handlers to drain after `on_shutdown` fires. The
     # `_drain_proxy_tasks` hook cancels every tracked proxy task
