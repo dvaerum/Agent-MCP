@@ -30,6 +30,7 @@ from .._dispatch_helpers import (
     _build_route_principal,
     _dispatch_through_tool,
 )
+from ._read_limits import _clamp_section_limit
 from ._wire_validation import require_str as _require_str
 from ._wire_validation import require_str_list as _require_str_list
 from ..deps import caller_identity, require_operator_session
@@ -81,23 +82,36 @@ async def all_tasks_api_route(request: Request) -> JSONResponse:
     unassigned_raw = request.query_params.get('unassigned', '')
     unassigned_filter: bool = unassigned_raw.lower() in ('true', '1', 'yes')
 
+    # pentest R3-F3: bound this list read. Before this the default (no
+    # filter) branch did an unbounded ``SELECT … FROM tasks`` — a project
+    # with thousands of tasks materialised the whole table on every call.
+    # Reuse the SAME ``?limit`` clamp the composition ``*-data`` reads use
+    # (single source of truth in ``._read_limits``): honored, clamped to
+    # ``[1, _ALL_DATA_MAX_LIMIT]``, defaulting to ``_ALL_DATA_DEFAULT_LIMIT``,
+    # applied as ``ORDER BY created_at DESC LIMIT ?`` in SQL. A small corpus
+    # returns in full; the response shape (a JSON array of task dicts) is
+    # unchanged.
+    limit = _clamp_section_limit(request)
+
     try:
         # PR #146: route reads through TaskRepository. The `unassigned`
         # branch is the only one without a direct repo method
         # (`list_by_agent` takes an agent_id, not "no agent"), so it
-        # filters the full listing in Python — fine for the listing
-        # cardinality this endpoint serves (≤ thousands).
+        # filters the bounded listing in Python — the clamp is applied in
+        # SQL first, so this reads at most ``limit`` rows (a bounded
+        # superset of the unassigned subset, which is the intended DoS
+        # bound, not an unbounded scan).
         from ...repositories import task_repo
 
         if unassigned_filter:
             tasks_data = [
-                t for t in task_repo.list_all()
+                t for t in task_repo.list_all(limit=limit)
                 if t.get("assigned_to") in (None, "")
             ]
         elif assigned_to_filter is not None:
-            tasks_data = task_repo.list_by_agent(assigned_to_filter)
+            tasks_data = task_repo.list_by_agent(assigned_to_filter, limit=limit)
         else:
-            tasks_data = task_repo.list_all()
+            tasks_data = task_repo.list_all(limit=limit)
         return JSONResponse(tasks_data)
     except Exception as e:
         logger.error(f"Error fetching all tasks: {e}", exc_info=True)

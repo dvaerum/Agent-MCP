@@ -398,35 +398,17 @@ async def node_details_api_route(
 
 
 # --- Comprehensive Data Endpoint ---
-# Default per-section LIMIT for /api/all-data; bounded by the 2026-06-02
-# database review (item 2) so a project with thousands of rows no longer
-# materialises an unbounded payload on every dashboard refresh. Callers
-# that want more can pass `?limit=N`, but `_ALL_DATA_MAX_LIMIT` clamps
-# the upper bound to keep the JSON shape sane.
-_ALL_DATA_DEFAULT_LIMIT = 500
-_ALL_DATA_MAX_LIMIT = 5000
-
-
-def _clamp_section_limit(request: Request) -> int:
-    """Parse the optional ``?limit`` query param and clamp it to
-    ``[1, _ALL_DATA_MAX_LIMIT]``, defaulting to
-    ``_ALL_DATA_DEFAULT_LIMIT`` when absent or unparseable.
-
-    Single source of truth for the bounded-read clamp. ``/api/all-data``
-    grew this clamp first (db review item 2); pentest R2-F2 converged the
-    sibling composition reads (``/api/graph-data``,
-    ``/api/task-tree-data``, ``/api/context-data``) onto this same helper
-    so the four dashboard reads share ONE default + upper bound and can't
-    drift. Callers that want more rows pass ``?limit=N`` but never escape
-    the upper bound.
-    """
-    try:
-        requested_limit = int(
-            request.query_params.get("limit", _ALL_DATA_DEFAULT_LIMIT)
-        )
-    except (TypeError, ValueError):
-        requested_limit = _ALL_DATA_DEFAULT_LIMIT
-    return max(1, min(requested_limit, _ALL_DATA_MAX_LIMIT))
+# The bounded-read clamp (`_ALL_DATA_DEFAULT_LIMIT` / `_ALL_DATA_MAX_LIMIT`
+# / `_clamp_section_limit`) now lives in `._read_limits` — its single
+# source of truth — so the standalone `/api/tasks` + `/api/agents` list
+# reads (pentest R3-F3) can share it without an `agents`→`composition`
+# import cycle. Re-imported here (and re-exported) so callers and tests
+# that import these names from `composition` keep working unchanged.
+from ._read_limits import (  # noqa: E402
+    _ALL_DATA_DEFAULT_LIMIT as _ALL_DATA_DEFAULT_LIMIT,  # noqa: F401 (re-export)
+    _ALL_DATA_MAX_LIMIT as _ALL_DATA_MAX_LIMIT,  # noqa: F401 (re-export)
+    _clamp_section_limit,
+)
 
 
 @router.get("/all-data")
