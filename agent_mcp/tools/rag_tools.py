@@ -58,12 +58,24 @@ async def ask_project_rag_tool_impl(
         f"'{query_text[:100]}...'"
     )
 
+    # SECURITY (R4-F4): thread the caller's task-visibility into the RAG
+    # query so search can't surface a task the caller couldn't read
+    # directly via ``view_tasks``. ``tasks.assign`` is the supervision-
+    # tier marker (operator / manager / sysadmin) that ``view_tasks``
+    # uses to grant the all-tasks view; a worker lacks it and is scoped
+    # to its own assigned tasks.
+    can_view_all_tasks = principal.has_capability("tasks.assign")
+
     try:
         # query_rag_system handles its own errors and always returns
         # a string (possibly an error-prose string). Pass through as
         # the human-facing message; data carries the same text so
         # REST consumers can read it programmatically too.
-        answer_text = await query_rag_system(query_text)
+        answer_text = await query_rag_system(
+            query_text,
+            requesting_agent_id=requesting_agent_id,
+            can_view_all_tasks=can_view_all_tasks,
+        )
         return Ok(data={"answer": answer_text}, message=answer_text)
     except Exception as e:
         # Defensive — query_rag_system catches its own errors; this
