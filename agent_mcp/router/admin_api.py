@@ -935,6 +935,51 @@ async def installer_handler(req: web.Request) -> web.Response:
 # ── Alias usage / removal ───────────────────────────────────────────
 
 
+def _deny_cross_tenant_project_read(
+    req: web.Request, project_name: str,
+) -> web.Response | None:
+    """R4-F3: scope a per-project READ to members + close the existence oracle.
+
+    Mirrors ``list_project_memberships_handler`` (R3-F1, #468). The coarse
+    deployment-wide ``system.projects.manage`` cap that gates the alias
+    routes is DELEGABLE: a sysadmin can grant it (Wave-9 group model) to a
+    group whose members are NOT members of the target project. Without an
+    extra per-project scope a delegated-cap-only non-member could read a
+    project's alias usage (the agent_ids that used it + its expiry) — a
+    cross-tenant disclosure of a project hidden from their own ``/projects``
+    + ``/overview`` views.
+
+    After confirming the project exists, admit only a sysadmin OR a caller
+    with a resolved role on ``project_name``; otherwise return the SAME 404
+    ``unknown_project`` envelope a non-member sees for a nonexistent slug, so
+    "exists but I'm not a member" is indistinguishable from "doesn't exist"
+    (the reach-the-handler / 404 differential was a project-existence
+    oracle). Returns the 404 ``web.Response`` to short-circuit with, or
+    ``None`` when the caller may proceed.
+    """
+    from . import app as _app
+    from .admin_users_api import _ERROR_NOT_FOUND, _caller_is_sysadmin, _error
+    from .router_store import store
+
+    not_found = _error(
+        error=_ERROR_NOT_FOUND,
+        message=f"unknown project: {project_name!r}",
+        status=404,
+    )
+    if project_name not in _app._projects_dict():
+        return not_found
+    if _caller_is_sysadmin(req):
+        return None
+    principal = req.get("principal")
+    caller_id = getattr(principal, "user_id", None) if principal else None
+    if (
+        caller_id is None
+        or store.resolve_user_project_role(caller_id, project_name) is None
+    ):
+        return not_found
+    return None
+
+
 async def alias_usage_handler(req: web.Request) -> web.Response:
     """``GET /agent-mcp/api/router/projects/<name>/aliases?alias=<n>``.
 
@@ -946,6 +991,15 @@ async def alias_usage_handler(req: web.Request) -> web.Response:
     from . import app as _app
 
     project_name = req.match_info["name"]
+    # R4-F3: scope this cross-tenant READ (it discloses the agent_ids that
+    # used the alias + its expiry) to project members and close the
+    # existence oracle — mirror list_project_memberships_handler (R3-F1,
+    # #468). A non-sysadmin holding only the deployment-wide
+    # ``system.projects.manage`` cap with NO membership on this project must
+    # not reach the alias roster.
+    denied = _deny_cross_tenant_project_read(req, project_name)
+    if denied is not None:
+        return denied
     alias = (req.rel_url.query.get("alias") or "").strip()
     if not alias:
         raise web.HTTPBadRequest(reason="missing 'alias' query parameter")
@@ -1010,6 +1064,15 @@ async def remove_alias_handler(req: web.Request) -> web.Response:
     alias = req.match_info["alias"]
     if not name or not alias:
         raise web.HTTPBadRequest(reason="missing 'name' or 'alias'")
+    # R4-F3 (class-sweep, write side): the alias DELETE shares the alias
+    # READ's coarse ``project_lifecycle_gate`` (deployment-wide
+    # ``system.projects.manage``), so a delegated-cap-only non-member could
+    # expire an alias on a project hidden from their own views AND read the
+    # 200-vs-404 existence oracle. Scope it to members exactly like
+    # ``alias_usage_handler`` above.
+    denied = _deny_cross_tenant_project_read(req, name)
+    if denied is not None:
+        return denied
     row = _app._REGISTRY.get(name)
     if row is None:
         # Fixed reason phrase — see client_config_handler (SEC4 pattern).
