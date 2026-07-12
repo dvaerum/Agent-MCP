@@ -196,8 +196,19 @@ async def list_participants_api_route(
         # repo owns the filter rules (excludes terminated/tombstone,
         # prepends synthetic admin, mines tombstones from DISTINCT
         # sender/recipient UNION).
+        #
+        # PERF/DOS (pentest R4-F2): bound the read with the SAME shared
+        # clamp every other /api list read uses (_clamp_section_limit,
+        # [1, 5000], default 500) so a project with thousands of agents /
+        # tombstone markers can't full-table-scan agents + agent_messages
+        # on each Messages-tab poll. ``?limit=`` overrides within bounds.
+        # The clamped int is passed to the repo — the router owns the
+        # request-parsing, the repo owns the SQL.
+        from ._read_limits import _clamp_section_limit
         from ...repositories import message_repo
-        result = message_repo.list_participants()
+        result = message_repo.list_participants(
+            limit=_clamp_section_limit(request)
+        )
         return JSONResponse(result)
     except ValueError as e:
         # PF-R12-1: a non-object body (list / string / scalar) now raises

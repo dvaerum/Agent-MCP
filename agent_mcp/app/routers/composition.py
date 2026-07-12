@@ -198,27 +198,29 @@ async def simple_status_api_route(
     # (UDS) surface served system status unauthenticated — the direct-UDS
     # defense-in-depth tier PRs #280 / #281 closed on the sibling reads.
     try:
-        # Get system status
-        from ...repositories.agent_repository import get_all_active_agents_from_db
-        from ...repositories import task_repo
+        # PERF/DOS (pentest R4-F1): count via SQL aggregates, never a
+        # full-table materialise-then-``len()``. The previous handler
+        # read the WHOLE tasks table (``task_repo.list_all()``) AND the
+        # WHOLE non-terminal agents set (``get_all_active_agents_from_db``)
+        # into Python on every dashboard poll purely to compute three
+        # counts. A ``LIMIT`` can't fix a count (it under-counts), so the
+        # reads are replaced with ``GROUP BY status`` aggregates on both
+        # tables. ``count_by_status`` (all tasks) and
+        # ``count_active_by_status`` (non-terminal agents) preserve the
+        # exact previous semantics: ``total_*`` is the sum of the grouped
+        # counts, and each named count is ``.get(status, 0)``.
+        from ...repositories import agent_repo, task_repo
 
-        agents = get_all_active_agents_from_db()
-        # PR #146: route the listing through the class-based
-        # TaskRepository so future per-instance hooks (audit, metrics)
-        # apply uniformly to dashboard reads too.
-        tasks = task_repo.list_all()
-
-        # Count task statuses
-        pending_tasks = len([t for t in tasks if t.get('status') == 'pending'])
-        completed_tasks = len([t for t in tasks if t.get('status') == 'completed'])
+        task_counts = task_repo.count_by_status()
+        agent_counts = agent_repo.count_active_by_status()
 
         return JSONResponse({
             "server_running": True,
-            "total_agents": len(agents),
-            "active_agents": len([a for a in agents if a.get('status') == 'active']),
-            "total_tasks": len(tasks),
-            "pending_tasks": pending_tasks,
-            "completed_tasks": completed_tasks,
+            "total_agents": sum(agent_counts.values()),
+            "active_agents": agent_counts.get('active', 0),
+            "total_tasks": sum(task_counts.values()),
+            "pending_tasks": task_counts.get('pending', 0),
+            "completed_tasks": task_counts.get('completed', 0),
             "last_updated": datetime.datetime.now().isoformat()
         })
     except Exception as e:

@@ -379,6 +379,45 @@ def get_all_active_agents_from_db() -> List[Dict[str, Any]]:
         return []
 
 
+def count_active_agents_by_status_from_db() -> Dict[str, int]:
+    """Return ``{status: count}`` over the non-terminal (active-set)
+    agents via a SQL ``GROUP BY`` — never materialises the rows.
+
+    pentest R4-F1: ``GET /api/status`` used to count agents by
+    materialising every non-terminal agent
+    (:func:`get_all_active_agents_from_db`, a bare ``.all()``) and
+    running ``len()`` / filter comprehensions on the result. This mirrors
+    that function's ``WHERE status NOT IN ('terminated','tombstone')``
+    filter (``TERMINAL_AGENT_STATUSES``) but counts in SQL, so the
+    caller derives ``total_agents`` (sum of the values) and
+    ``active_agents`` (``.get('active', 0)``) without reading a single
+    agent row into Python. On DB error returns ``{}`` and logs at error.
+    """
+    from sqlalchemy import func
+
+    try:
+        with get_session() as session:
+            rows = (
+                session.query(Agent.status, func.count(Agent.token))
+                .filter(Agent.status.notin_(TERMINAL_AGENT_STATUSES))
+                .group_by(Agent.status)
+                .all()
+            )
+            return {status: int(count) for status, count in rows}
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error counting active agents by status: {e}",
+            exc_info=True,
+        )
+        return {}
+    except Exception as e:
+        logger.error(
+            f"Unexpected error counting active agents by status: {e}",
+            exc_info=True,
+        )
+        return {}
+
+
 def update_agent_db_field(
     agent_id: str, field_name: str, new_value: Any,
 ) -> bool:
@@ -584,6 +623,21 @@ class AgentRepository:
         two-sources-of-truth split #7 closes for every OTHER caller.
         """
         return get_all_active_agents_from_db()
+
+    def count_active_by_status(self) -> Dict[str, int]:
+        """Return ``{status: count}`` over the non-terminal (active-set)
+        agents via a SQL aggregate.
+
+        DB-authoritative. Used by ``GET /api/status`` so a dashboard
+        poll counts agents without materialising the agents table
+        (pentest R4-F1 — see
+        :func:`count_active_agents_by_status_from_db`). The caller reads
+        ``total_agents`` as the sum of the values and ``active_agents``
+        as ``.get('active', 0)`` — identical semantics to the previous
+        ``len(list_active())`` / ``len([a for a in ... if
+        a['status']=='active'])`` counts.
+        """
+        return count_active_agents_by_status_from_db()
 
     def active_agent_ids(self) -> set[str]:
         """Set of ``agent_id`` for every agent in the LIVE auth cache.
