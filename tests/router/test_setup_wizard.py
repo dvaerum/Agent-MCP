@@ -225,3 +225,97 @@ async def test_setup_post_blocked_when_users_exist(
     # no user was created.
     assert resp.status in (303, 409)
     assert _identity_module().get_user_by_username("sneaky") is None
+
+
+# ── Setup CSRF: Origin / Sec-Fetch-Site validation (R9-F1) ─────────
+#
+# The setup POST also MINTS a session cookie (bootstrapping the first
+# operator). It is currently gated by the users-empty check so the
+# cross-site window is first-boot only, but it belongs to the same
+# cookie-minting class as /login and gets the same Origin guard so a
+# future refactor of the empty-check can't silently reopen it.
+
+
+async def test_setup_rejects_cross_site_origin(
+    aiohttp_client, router_app,
+) -> None:
+    """Cross-site Origin on /setup (users-empty) → 403, no user, no
+    cookie (R9-F1)."""
+    _identity_module()  # migrate so the users table exists + is empty
+    client = await aiohttp_client(router_app)
+    resp = await client.post(
+        "/agent-mcp/setup",
+        data={
+            "username": "evil_first_op",
+            "password": "secret-pw-1234",
+            "password_confirm": "secret-pw-1234",
+        },
+        headers={"Origin": "https://evil.example"},
+        allow_redirects=False,
+    )
+    assert resp.status == 403, await resp.text()
+    set_cookie = resp.headers.get("Set-Cookie")
+    assert set_cookie is None or "agent_mcp_session" not in set_cookie
+    assert _identity_module().get_user_by_username("evil_first_op") is None
+
+
+async def test_setup_rejects_cross_site_sec_fetch_site(
+    aiohttp_client, router_app,
+) -> None:
+    """Sec-Fetch-Site: cross-site (no Origin) on /setup → 403, no user."""
+    _identity_module()
+    client = await aiohttp_client(router_app)
+    resp = await client.post(
+        "/agent-mcp/setup",
+        data={
+            "username": "evil_sfs_op",
+            "password": "secret-pw-1234",
+            "password_confirm": "secret-pw-1234",
+        },
+        headers={"Sec-Fetch-Site": "cross-site"},
+        allow_redirects=False,
+    )
+    assert resp.status == 403, await resp.text()
+    assert _identity_module().get_user_by_username("evil_sfs_op") is None
+
+
+async def test_setup_accepts_same_origin(
+    aiohttp_client, router_app,
+) -> None:
+    """Same-origin Origin on /setup → normal 303 + user created."""
+    _identity_module()
+    client = await aiohttp_client(router_app)
+    same_origin = str(client.make_url("/agent-mcp/setup").origin())
+    resp = await client.post(
+        "/agent-mcp/setup",
+        data={
+            "username": "good_first_op",
+            "password": "secret-pw-1234",
+            "password_confirm": "secret-pw-1234",
+        },
+        headers={"Origin": same_origin, "Sec-Fetch-Site": "same-origin"},
+        allow_redirects=False,
+    )
+    assert resp.status == 303, await resp.text()
+    assert "agent_mcp_session" in resp.headers.get("Set-Cookie", "")
+    assert _identity_module().get_user_by_username("good_first_op") is not None
+
+
+async def test_setup_accepts_no_origin_curl(
+    aiohttp_client, router_app,
+) -> None:
+    """No Origin / no Sec-Fetch-Site (curl / CLI) on /setup → allowed."""
+    _identity_module()
+    client = await aiohttp_client(router_app)
+    resp = await client.post(
+        "/agent-mcp/setup",
+        data={
+            "username": "curl_first_op",
+            "password": "secret-pw-1234",
+            "password_confirm": "secret-pw-1234",
+        },
+        allow_redirects=False,
+    )
+    assert resp.status == 303, await resp.text()
+    assert "agent_mcp_session" in resp.headers.get("Set-Cookie", "")
+    assert _identity_module().get_user_by_username("curl_first_op") is not None
