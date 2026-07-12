@@ -75,6 +75,11 @@ def _make_validator_mock(
         depends_on_tasks: list[str] | None,
         created_by: str,
         auth_token: str,
+        # R5-F1: the real validator now threads the caller's RAG scope
+        # (requesting_agent_id + can_view_all_tasks). Accept them so this
+        # stand-in keeps the same signature as the patched target.
+        requesting_agent_id: str | None = None,
+        can_view_all_tasks: bool = True,
     ) -> Dict[str, Any]:
         return {
             "status": status,

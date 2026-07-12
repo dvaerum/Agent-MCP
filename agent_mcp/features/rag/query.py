@@ -668,7 +668,12 @@ Answer in the exact JSON format requested, but include thorough explanations in 
 
 
 async def query_rag_system_with_model(
-    query_text: str, model_name: Optional[str] = None, max_tokens: int = None
+    query_text: str,
+    model_name: Optional[str] = None,
+    max_tokens: int = None,
+    *,
+    requesting_agent_id: Optional[str] = None,
+    can_view_all_tasks: bool = True,
 ) -> str:
     """
     Processes a query using the RAG system with a specific completion model.
@@ -682,6 +687,17 @@ async def query_rag_system_with_model(
             is now selected by env vars via completion_client(); this
             argument is ignored.
         max_tokens: The maximum context tokens for this model
+        requesting_agent_id: The agent_id of the caller (from the resolved
+            Principal). Used to ownership-scope task retrieval for
+            non-privileged callers (R5-F1 — the missed R4-F4 sibling on
+            this twin entry point).
+        can_view_all_tasks: Whether the caller holds ``tasks.assign``
+            (operator / manager / sysadmin). Defaults to ``True`` so
+            behaviour is unchanged for any internal call site that doesn't
+            pass a caller scope — mirrors ``query_rag_system``. The sole
+            worker-reachable caller (``validate_task_placement`` on the
+            ``create_self_task`` path) ALWAYS threads the real value from
+            the Principal, so a worker's placement analysis is scoped.
 
     Returns:
         A string containing the answer or an error message.
@@ -725,14 +741,28 @@ async def query_rag_system_with_model(
         )
 
         # Get live tasks (same as regular RAG)
+        # SECURITY (R5-F1): ownership-scope this stage-2 live-task SELECT to
+        # the caller's ``view_tasks`` visibility, IDENTICALLY to
+        # query_rag_system's stage 2. This twin entry point was the missed
+        # R4-F4 sibling — reached by the WORKER ``create_self_task`` path
+        # via ``validate_task_placement`` — and previously fetched EVERY
+        # pending/in_progress task with no owner filter, disclosing another
+        # agent's task metadata (id/title/description) through the
+        # placement-validator duplicate check. Wrap the status predicate in
+        # parens before AND-ing the ownership clause so the ``AND`` binds to
+        # the whole disjunction, not just the last term (no OR-leak).
+        ownership_sql, ownership_params = _task_ownership_sql(
+            requesting_agent_id, can_view_all_tasks
+        )
         cursor.execute(
-            """
+            f"""
             SELECT task_id, title, description, status, created_by, assigned_to,
                    priority, parent_task, depends_on_tasks, created_at, updated_at
             FROM tasks
-            WHERE status IN ('pending', 'in_progress')
+            WHERE (status IN ('pending', 'in_progress')){ownership_sql}
             ORDER BY updated_at DESC
-        """
+        """,
+            ownership_params,
         )
         # SECURITY (R2-F3b): same raw-task-fetch drop as query_rag_system's
         # stage 2 — a secret in a task title/description must not reach the
@@ -755,6 +785,17 @@ async def query_rag_system_with_model(
                         query_embedding=query_embedding,
                         limit=13,
                     )
+                )
+                # SECURITY (R5-F1): drop task-sourced chunks the caller
+                # can't read directly — IDENTICAL to query_rag_system.
+                # Only ``source_type == "task"`` chunks are ownership-
+                # scoped; project-wide context / code / markdown chunks
+                # are left intact.
+                vector_search_results = _drop_unowned_task_chunks(
+                    vector_search_results,
+                    cursor=cursor,
+                    requesting_agent_id=requesting_agent_id,
+                    can_view_all_tasks=can_view_all_tasks,
                 )
             except openai.APIError as e_openai_emb:
                 logger.error(
