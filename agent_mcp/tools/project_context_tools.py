@@ -99,6 +99,20 @@ def is_secret_key(key: Optional[str]) -> bool:
 # new visibility on their next periodic `tools/list` call).
 _WORKER_POLICY_TOGGLE_RE = re.compile(r"^config_allow_worker_", re.IGNORECASE)
 
+# config_aoe_* configures a MACHINE-level outbound integration, not a
+# per-project policy: the AoE notify client reads config_aoe_base_url as
+# the request base_url and config_aoe_bearer_token as its Authorization
+# header (see features/aoe_notify.py). A per-project OPERATOR carries
+# system.config.write and so passes the general config_* gate — but
+# choosing WHERE the shared host sends its outbound request (and which
+# host receives the bearer) is a host-owner decision, not an operator's:
+# an operator who could set config_aoe_base_url could aim it at an
+# internal/link-local/metadata address (SSRF) and exfiltrate the bearer.
+# So config_aoe_* create/update/delete requires SYSADMIN, one tier above
+# the operator-writable config_* namespace. Prefix regex (not the literal
+# 6-key set) so future config_aoe_* keys inherit the gate automatically.
+_CONFIG_AOE_KEY_RE = re.compile(r"^config_aoe_", re.IGNORECASE)
+
 
 def _is_worker_policy_toggle(context_key: str) -> bool:
     """True if `context_key` controls worker tool visibility per
@@ -277,6 +291,16 @@ def _config_key_error() -> "PermissionDenied":
     )
 
 
+def _aoe_config_sysadmin_error() -> "PermissionDenied":
+    return PermissionDenied(
+        reason=(
+            "config_aoe_* keys configure a machine-level outbound "
+            "integration target and are sysadmin-only; a per-project "
+            "operator cannot create, modify, or delete them"
+        )
+    )
+
+
 def _creator_mismatch_error(context_key: str, creator: str) -> "PermissionDenied":
     return PermissionDenied(
         reason=(
@@ -404,6 +428,34 @@ def _deny_viewer_tier_write(
                 "(read-only project membership)"
             )
         )
+    return None
+
+
+def _deny_non_sysadmin_aoe_config(
+    principal: Optional[Principal],
+    context_keys: List[Optional[str]],
+) -> Optional[PermissionDenied]:
+    """Reject any non-sysadmin write/delete touching a config_aoe_* key.
+
+    A tier-gate that sits ABOVE the per-key creator-ownership matrix
+    (:func:`_check_write_authorization`), mirroring the SEC1
+    :func:`_deny_viewer_tier_write` gate's placement — it is called at
+    each project_context write boundary (create / update / bulk-update /
+    delete). See :data:`_CONFIG_AOE_KEY_RE` for WHY config_aoe_* is
+    sysadmin-only (machine-level outbound integration target → SSRF /
+    bearer-exfil surface if a per-project operator could set it).
+
+    A sysadmin passes unconditionally. Any other principal (operator,
+    manager, worker, viewer, or an unattributable ``None``) is denied the
+    moment any candidate key matches the config_aoe_* prefix — so a bulk
+    batch that mixes an AoE key with innocuous keys is rejected wholesale
+    before any write lands.
+    """
+    if principal is not None and principal.sysadmin:
+        return None
+    for key in context_keys:
+        if key and _CONFIG_AOE_KEY_RE.match(key):
+            return _aoe_config_sysadmin_error()
     return None
 
 
@@ -1292,6 +1344,18 @@ async def update_project_context_tool_impl(
     requesting_agent_id = _actor_label(principal)
     is_admin = _is_admin_principal(principal)
 
+    # config_aoe_* is sysadmin-only (machine-level outbound integration
+    # target — see _CONFIG_AOE_KEY_RE). Gate BEFORE the per-key ownership
+    # matrix, covering both the single and bulk shapes of this tool.
+    candidate_keys: List[Optional[str]] = (
+        [u.get("context_key") if isinstance(u, dict) else None for u in updates_list]
+        if isinstance(updates_list, list)
+        else [context_key_to_update]
+    )
+    aoe_denied = _deny_non_sysadmin_aoe_config(principal, candidate_keys)
+    if aoe_denied is not None:
+        return aoe_denied
+
     # Determine operation mode
     is_bulk_operation = updates_list is not None
 
@@ -1465,6 +1529,16 @@ async def bulk_update_project_context_tool_impl(
     updates = arguments.get("updates", [])  # List of update operations
     requesting_agent_id = _actor_label(principal)
 
+    # config_aoe_* is sysadmin-only (see _CONFIG_AOE_KEY_RE) — reject the
+    # whole batch before any write if a non-sysadmin includes such a key.
+    if isinstance(updates, list):
+        aoe_denied = _deny_non_sysadmin_aoe_config(
+            principal,
+            [u.get("context_key") if isinstance(u, dict) else None for u in updates],
+        )
+        if aoe_denied is not None:
+            return aoe_denied
+
     if not updates or not isinstance(updates, list):
         return Invalid(
             field="updates", message="updates array is required."
@@ -1636,6 +1710,11 @@ async def create_project_context_tool_impl(
         return Invalid(
             field="context_key", message="context_key is required"
         )
+
+    # config_aoe_* is sysadmin-only (see _CONFIG_AOE_KEY_RE).
+    aoe_denied = _deny_non_sysadmin_aoe_config(principal, [context_key])
+    if aoe_denied is not None:
+        return aoe_denied
 
     requesting_agent_id = _actor_label(principal)
     is_admin = _is_admin_principal(principal)
@@ -2310,6 +2389,13 @@ async def delete_project_context_tool_impl(
             field="context_key",
             message="No context keys specified for deletion",
         )
+
+    # config_aoe_* is sysadmin-only (see _CONFIG_AOE_KEY_RE) — a
+    # per-project operator cannot delete the machine-level integration
+    # config either. Gate before any deletion runs.
+    aoe_denied = _deny_non_sysadmin_aoe_config(principal, keys_to_delete)
+    if aoe_denied is not None:
+        return aoe_denied
 
     # Critical system keys that require force_delete. The legacy
     # ``config_admin_token`` is kept alongside ``config_system_token``
