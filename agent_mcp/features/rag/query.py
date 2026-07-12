@@ -48,16 +48,18 @@ def _is_secret_key(key: Optional[str]) -> bool:
 # ``_drop_secret_chunks`` below is explicit defense-in-depth,
 # NOT the primary guard: it protects callers that inject/mock the repo
 # and bypass the real ``search_similar`` seam.
-def _value_has_embedded_secret(text: Optional[str]) -> bool:
+def _value_has_embedded_secret(*texts: Optional[str]) -> bool:
     """Lazy wrapper over the canonical embedded-secret VALUE scanner.
 
     Imported lazily (not at module top) to sidestep the tools/rag import
     cycle. Reused (not duplicated) from the index path so this filter
-    applies the SAME skip the ingest choke-point does.
+    applies the SAME skip the ingest choke-point does. Variadic to mirror
+    the underlying scanner: a single call can screen every text field of a
+    row (e.g. a task ``title`` AND ``description``) in one pass.
     """
     from .indexing import _value_has_embedded_secret as _scan
 
-    return _scan(text)
+    return _scan(*texts)
 
 
 def _drop_secret_chunks(
@@ -85,6 +87,49 @@ def _drop_secret_chunks(
             or _value_has_embedded_secret(r.get("chunk_text"))
         )
     ]
+
+
+def _drop_secret_tasks(
+    tasks: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Drop live-task rows whose ``title`` or ``description`` embeds a
+    credential (R2-F3b).
+
+    ``query_rag_system`` stage 2 (and its ``_with_model`` sibling) fetch
+    tasks with a raw ``SELECT ... FROM tasks`` and render them straight
+    into the LLM context. That fetch is NOT the ``rag_chunks`` ingest
+    choke-point #463 hardened, nor the ``search_similar`` retrieval seam
+    ``_drop_secret_chunks`` guards — a secret pasted into a task
+    description reached ``ask_project_rag`` verbatim (live RE_VERIFY of
+    ``ghp_R2ReVerify1111closedCHECKzzzz9999``). This mirrors, for the
+    live-task source, exactly how stage-1 live-context
+    (``fetch_recent_context``) and stage-3 chunks (``_drop_secret_chunks``)
+    are already filtered: DROP the offending row, uniform with the other
+    seams. Reuses the same ``_value_has_embedded_secret`` scanner the
+    ingest choke-point uses — one detector, one policy.
+    """
+    return [
+        t
+        for t in tasks
+        if not _value_has_embedded_secret(t.get("title"), t.get("description"))
+    ]
+
+
+def _scrub_secret_parts(parts: List[str]) -> List[str]:
+    """SECURITY (R2-F3b) — the final assembly-seam scrub.
+
+    This is the single choke-point every RAG context source flows through
+    before it reaches the LLM (``_assemble_and_answer`` joins ``parts`` into
+    the prompt). Stages 1-3 each have their own upstream filter, but the
+    original R2-F3 miss proved a per-stage sweep can be left incomplete:
+    stage 2 (live tasks) shipped unscanned and re-leaked a token. Scanning
+    every assembled part HERE makes secret redaction by-construction — it
+    covers all four current stages AND any future 5th context source added
+    upstream, so this class can never silently reopen. DROP the offending
+    part (uniform with the other seams' drop semantics); each task/chunk is
+    its own part, so dropping one leaks-bearing entry keeps the rest.
+    """
+    return [p for p in parts if not _value_has_embedded_secret(p)]
 
 
 # ── Shared assembly helpers ───────────────────────────────────────────
@@ -174,6 +219,11 @@ async def _assemble_and_answer(
     ``on_client_ready`` lets query_rag_system_with_model log the
     provider/model it resolved, which query_rag_system does not do.
     """
+    # SECURITY (R2-F3b): final assembly-seam scrub. See _scrub_secret_parts
+    # — this one seam covers every current AND future context source, so a
+    # secret can never reach the LLM even if an upstream stage's own filter
+    # is missing or a new source is added without one.
+    context_parts = _scrub_secret_parts(context_parts)
     if not context_parts:
         logger.info(
             f"{log_label}: No relevant information found for query: '{query_text}'"
@@ -339,7 +389,14 @@ async def query_rag_system(query_text: str) -> str:
                             LIMIT 5
                         """
                         cursor.execute(task_query_sql, sql_params_tasks)
-                    live_task_results = [dict(row) for row in cursor.fetchall()]
+                    # SECURITY (R2-F3b): this raw task fetch is NOT the
+                    # rag_chunks ingest choke-point nor the search_similar
+                    # retrieval seam, so it must apply the SAME embedded-
+                    # secret drop the other stages do — a token in a task
+                    # title/description reached the LLM verbatim otherwise.
+                    live_task_results = _drop_secret_tasks(
+                        [dict(row) for row in cursor.fetchall()]
+                    )
         except sqlite3.Error as e_live_task:
             logger.warning(
                 f"RAG Query: Failed to fetch live tasks based on query keywords: {e_live_task}"
@@ -558,7 +615,12 @@ async def query_rag_system_with_model(
             ORDER BY updated_at DESC
         """
         )
-        live_task_results = [dict(row) for row in cursor.fetchall()]
+        # SECURITY (R2-F3b): same raw-task-fetch drop as query_rag_system's
+        # stage 2 — a secret in a task title/description must not reach the
+        # LLM through the task-analysis path either.
+        live_task_results = _drop_secret_tasks(
+            [dict(row) for row in cursor.fetchall()]
+        )
 
         # Get vector search results if VSS is available.
         # PR F: rag_repo.search_similar owns the vec0 dialect; same
