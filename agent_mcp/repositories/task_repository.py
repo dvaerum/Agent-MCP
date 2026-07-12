@@ -275,19 +275,26 @@ def get_task_by_id(task_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def get_all_tasks_from_db() -> List[Dict[str, Any]]:
+def get_all_tasks_from_db(
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     """Fetch all tasks from the database, newest first.
 
     Used by ``application_startup`` (populates ``g.tasks``) and by the
     ``/api/all-data`` dashboard route.
+
+    ``limit`` (pentest R3-F3): when supplied, applies ``LIMIT`` in SQL
+    so the newest ``limit`` rows are read — never a full-table
+    materialise-then-slice. Callers that need a bounded read
+    (``GET /api/tasks``) pass an already-clamped value; ``None``
+    preserves the historical unbounded read (startup snapshot / count).
     """
     try:
         with get_session() as session:
-            rows = (
-                session.query(Task)
-                .order_by(Task.created_at.desc())
-                .all()
-            )
+            query = session.query(Task).order_by(Task.created_at.desc())
+            if limit is not None:
+                query = query.limit(limit)
+            rows = query.all()
             return [_task_to_dict(r) for r in rows]
     except SQLAlchemyError as e:
         logger.error(
@@ -302,16 +309,26 @@ def get_all_tasks_from_db() -> List[Dict[str, Any]]:
 
 
 def get_tasks_by_agent_id(
-    agent_id: str, status_filter: Optional[str] = None,
+    agent_id: str,
+    status_filter: Optional[str] = None,
+    limit: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Fetch tasks assigned to a specific agent, optionally filtered
-    by status. Parses JSON fields for each task."""
+    by status. Parses JSON fields for each task.
+
+    ``limit`` (pentest R3-F3): bounds the read in SQL when supplied so
+    the ``?assigned_to=`` branch of ``GET /api/tasks`` is bounded too;
+    ``None`` keeps the historical unbounded read.
+    """
     try:
         with get_session() as session:
             query = session.query(Task).filter(Task.assigned_to == agent_id)
             if status_filter:
                 query = query.filter(Task.status == status_filter)
-            rows = query.order_by(Task.created_at.desc()).all()
+            query = query.order_by(Task.created_at.desc())
+            if limit is not None:
+                query = query.limit(limit)
+            rows = query.all()
             return [_task_to_dict(r) for r in rows]
     except SQLAlchemyError as e:
         logger.error(
@@ -466,28 +483,40 @@ class TaskRepository:
             state.tasks[task_id] = row
         return row
 
-    def list_all(self) -> List[Dict[str, Any]]:
-        """Return every task in the DB, newest first.
+    def list_all(
+        self, *, limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return tasks from the DB, newest first.
 
         DB-authoritative — ``state.tasks`` is keyed by task_id and
         doesn't preserve insertion order. Callers that need the full
         list (dashboard, startup load) read through here.
+
+        ``limit`` (pentest R3-F3): bounds the read in SQL. The
+        ``GET /api/tasks`` route passes an already-clamped value so a
+        project with thousands of tasks can't materialise an unbounded
+        payload; ``None`` (startup snapshot / status counts) preserves
+        the historical full read.
         """
-        return get_all_tasks_from_db()
+        return get_all_tasks_from_db(limit=limit)
 
     def list_by_agent(
         self,
         agent_id: str,
         *,
         status_filter: Optional[str] = None,
+        limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Return tasks assigned to ``agent_id``, optionally filtered by status.
 
         DB-authoritative; same rationale as ``list_all``. Used by
         the dashboard's per-agent task panel and by future API
-        endpoints that need a filtered listing.
+        endpoints that need a filtered listing. ``limit`` bounds the
+        read in SQL (pentest R3-F3); ``None`` keeps the full read.
         """
-        return get_tasks_by_agent_id(agent_id, status_filter=status_filter)
+        return get_tasks_by_agent_id(
+            agent_id, status_filter=status_filter, limit=limit,
+        )
 
     # --- Write interface: create ----------------------------------------
 

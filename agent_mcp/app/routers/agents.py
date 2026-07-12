@@ -29,6 +29,7 @@ from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
 from .._dispatch_helpers import _build_route_principal
+from ._read_limits import _clamp_section_limit
 from ._wire_validation import require_str as _require_str
 from ._wire_validation import require_str_list as _require_str_list
 from ..deps import (
@@ -153,6 +154,16 @@ async def agents_list_api_route(request: Request) -> JSONResponse:
     # the router's `list_agents` synthetic tool (Phase 7c, Q7.2 in
     # plan).
     status_filter: Optional[str] = request.query_params.get('status')
+    # pentest R3-F3: bound this list read. Before this the query did an
+    # unbounded ``SELECT … FROM agents`` + ``fetchall()`` — a project with
+    # thousands of agent rows materialised the whole table on every call.
+    # Reuse the SAME ``?limit`` clamp the composition ``*-data`` reads use
+    # (single source of truth in ``._read_limits``): honored, clamped to
+    # ``[1, _ALL_DATA_MAX_LIMIT]``, defaulting to ``_ALL_DATA_DEFAULT_LIMIT``,
+    # applied as ``ORDER BY created_at DESC LIMIT ?`` in SQL. A small corpus
+    # returns in full; the response shape (a JSON array of agent dicts) is
+    # unchanged.
+    limit = _clamp_section_limit(request)
     agents_list_data: List[Dict[str, Any]] = []
     conn = None
     try:
@@ -169,14 +180,15 @@ async def agents_list_api_route(request: Request) -> JSONResponse:
             cursor.execute(
                 "SELECT agent_id, status, color, created_at, current_task "
                 "FROM agents WHERE status != 'tombstone' "
-                "ORDER BY created_at DESC"
+                "ORDER BY created_at DESC LIMIT ?",
+                (limit,),
             )
         else:
             cursor.execute(
                 "SELECT agent_id, status, color, created_at, current_task "
                 "FROM agents WHERE status = ? AND status != 'tombstone' "
-                "ORDER BY created_at DESC",
-                (status_filter,),
+                "ORDER BY created_at DESC LIMIT ?",
+                (status_filter, limit),
             )
         for row in cursor.fetchall():
             agent_dict = dict(row)
