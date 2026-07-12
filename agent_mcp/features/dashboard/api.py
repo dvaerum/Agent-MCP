@@ -2,7 +2,7 @@
 import sqlite3
 import json
 from pathlib import Path # For Path().name in file map processing
-from typing import List, Dict, Any, Callable, Set, Tuple # Added Set, Tuple
+from typing import List, Dict, Any, Callable, Optional, Set, Tuple # Added Set, Tuple
 
 # Import from our project structure
 from ...core.config import logger # Central logger
@@ -12,6 +12,134 @@ from .styles import get_node_style # Import the styling function from this packa
 # Note: The original dashboard_api.py had a logger instance:
 # logger = logging.getLogger("mcp_dashboard_api")
 # We will use the central logger from core.config for consistency.
+
+# ---------------------------------------------------------------------------
+# Shared task node/edge shaping.
+#
+# fetch_graph_data_logic (full physics graph) and fetch_task_tree_data_logic
+# (hierarchical tree) each render the SAME task-row data as vis.js nodes and
+# edges. The three helpers below hold the parts that are genuinely identical
+# between the two builders. Where the two callers differ in more than just
+# edge color (see each helper's docstring), that difference is threaded
+# through as a caller-supplied parameter rather than silently unified.
+# ---------------------------------------------------------------------------
+
+
+def _truncate_field(text: Optional[str], limit: int, *, na_if_empty: bool = False) -> str:
+    """The '<=limit chars, else first `limit` + \"...\"' rule used for both
+    a task's short node label (title, non-null) and its tooltip
+    description (nullable, falls back to 'N/A' when `na_if_empty=True`).
+    """
+    if na_if_empty:
+        return text[:limit] + '...' if text and len(text) > limit else (text or 'N/A')
+    return text[:limit] + '...' if len(text) > limit else text
+
+
+def _task_node(row: sqlite3.Row, *, title: str, mass: Optional[float] = None) -> Dict[str, Any]:
+    """Assemble a vis.js task node from the fields genuinely shared by both
+    graph builders: id, truncated label, group, and status-derived style
+    (`get_node_style('task', row['status'])`).
+
+    The tooltip `title` text and physics `mass` are NOT identical between
+    callers, so they're supplied by the caller instead of being forced
+    together here:
+      - the full graph's tooltip adds 'Assigned'/'Created by' lines and
+        sets mass=2 (task nodes are physics-simulated alongside agents);
+      - the task tree's tooltip omits those two lines, labels the
+        description line 'Desc' instead of 'Description', and omits
+        'mass' entirely (hierarchical layout doesn't use physics mass).
+    """
+    task_id_val = row['task_id']
+    style = get_node_style('task', row['status'])
+    node: Dict[str, Any] = {
+        'id': f"task_{task_id_val}",
+        'label': _truncate_field(row['title'], 20),
+        'group': 'task',
+        'title': title,
+    }
+    if mass is not None:
+        node['mass'] = mass
+    node.update(style)
+    return node
+
+
+def _parent_edge(
+    row: sqlite3.Row,
+    node_ids: Set[str],
+    *,
+    title: str,
+    style: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Build a task's parent-child edge, shared guard logic: no edge when
+    `parent_task` is unset, and no edge unless BOTH the parent and child
+    task nodes already exist in `node_ids`. Returns None when there's
+    nothing to draw.
+
+    The edge `title` text and `style` (color/width/dashes/smooth/arrows/
+    length) are caller-supplied — the full graph phrases it "Parent of
+    X" (green, includes a physics `length` hint) while the task tree
+    phrases it "X is sub-task of Y" (darker green, hierarchical-layout
+    smooth hints, no `length` — hierarchical layout doesn't use it).
+    """
+    parent_task_id_val = row['parent_task']
+    if not parent_task_id_val:
+        return None
+    task_id_val = row['task_id']
+    node_id_str = f"task_{task_id_val}"
+    parent_node_id_str = f"task_{parent_task_id_val}"
+    if parent_node_id_str not in node_ids or node_id_str not in node_ids:
+        return None
+    return {
+        'from': parent_node_id_str,
+        'to': node_id_str,
+        'title': title,
+        **style,
+    }
+
+
+def _dependency_edges(
+    row: sqlite3.Row,
+    node_ids: Set[str],
+    *,
+    style: Dict[str, Any],
+    context: str = "",
+) -> List[Dict[str, Any]]:
+    """Build a task's 'depends_on_tasks' edges, shared parse/guard logic:
+    JSON-decode the column, skip entirely when empty, and only emit an
+    edge when both the dependency and dependent task nodes already exist
+    in `node_ids`. A malformed JSON payload is logged and swallowed
+    (returns whatever was built so far), exactly as both builders did
+    before extraction — `context` distinguishes the two builders' log
+    messages (e.g. "in task tree") without changing anything else.
+
+    The edge `style` (color/width/dashes/smooth/arrows/length) is
+    caller-supplied — the only thing that differs between the full
+    graph's pink/magenta dependency edges (with a physics `length`
+    hint) and the task tree's red hierarchical-layout edges.
+    """
+    task_id_val = row['task_id']
+    node_id_str = f"task_{task_id_val}"
+    edges: List[Dict[str, Any]] = []
+    try:
+        depends_list_str = row['depends_on_tasks']
+        if depends_list_str:
+            depends_task_ids = json.loads(depends_list_str)
+            for dep_task_id in depends_task_ids:
+                dep_node_id_str = f"task_{dep_task_id}"
+                if dep_node_id_str in node_ids and node_id_str in node_ids:
+                    edges.append({
+                        'from': dep_node_id_str,
+                        'to': node_id_str,
+                        'title': f'{task_id_val} depends on {dep_task_id}',
+                        **style,
+                    })
+    except json.JSONDecodeError:
+        suffix = f" {context}" if context else ""
+        logger.warning(
+            f"Could not parse depends_on_tasks JSON for task {task_id_val}{suffix}: '{row['depends_on_tasks']}'"
+        )
+    return edges
+
 
 # Original location: dashboard_api.py lines 46-173 (get_graph_data function)
 async def fetch_graph_data_logic(
@@ -96,19 +224,11 @@ async def fetch_graph_data_logic(
             parent_task_id_val = row['parent_task'] # Get parent_task ID
 
             if node_id_str not in node_ids:
-                style = get_node_style('task', row['status'])
-                short_title = row['title'][:20] + '...' if len(row['title']) > 20 else row['title']
-                nodes.append({
-                    'id': node_id_str,
-                    'label': short_title, # Simpler label for physics layout
-                    'group': 'task',
-                    'title': (f"Task: {row['title']}\nID: {task_id_val}\nStatus: {row['status']}\n"
+                task_title = (f"Task: {row['title']}\nID: {task_id_val}\nStatus: {row['status']}\n"
                               f"Assigned: {row['assigned_to'] or 'None'}\nCreated by: {row['created_by']}\n"
                               f"Parent: {parent_task_id_val or 'None'}\n"
-                              f"Description: {row['description'][:100] + '...' if row['description'] and len(row['description']) > 100 else (row['description'] or 'N/A')}"),
-                    'mass': 2, # Default mass for tasks
-                    **style
-                })
+                              f"Description: {_truncate_field(row['description'], 100, na_if_empty=True)}")
+                nodes.append(_task_node(row, title=task_title, mass=2)) # Default mass for tasks
                 node_ids.add(node_id_str)
 
             # Edge: Creator -> Task (Original dashboard_api.py: lines 93-98)
@@ -118,7 +238,7 @@ async def fetch_graph_data_logic(
                 potential_agent_creator_node_id = f"agent_{creator_id}"
                 if potential_agent_creator_node_id in node_ids: # Check if agent node exists
                     creator_node_id_str = potential_agent_creator_node_id
-            
+
             if creator_node_id_str in node_ids: # Ensure creator node exists
                  edges.append({
                      'from': creator_node_id_str,
@@ -130,45 +250,36 @@ async def fetch_graph_data_logic(
                  })
 
             # *** NEW: Add Parent-Child Edges for Tasks ***
-            if parent_task_id_val:
-                parent_node_id_str = f"task_{parent_task_id_val}"
-                if parent_node_id_str in node_ids and node_id_str in node_ids: # Ensure both parent and child nodes exist
-                    edges.append({
-                        'from': parent_node_id_str,
-                        'to': node_id_str,
-                        'title': f'Parent of {task_id_val}',
-                        'color': {'color': '#6AB04C', 'opacity': 0.9}, # Distinct color (e.g., green)
-                        'width': 2, # Slightly thicker for hierarchy
-                        'dashes': False, # Solid line
-                        'smooth': {'type': 'cubicBezier', 'forceDirection': 'vertical', 'roundness': 0.4}, # Suggests hierarchy
-                        'arrows': {'to': {'enabled': True, 'scaleFactor': 0.7, 'type': 'arrow'}},
-                        # Physics properties for stronger hierarchical grouping
-                        'length': 100, # Shorter preferred length for parent-child
-                        # 'strength': 0.5 # (vis.js default is 0.1, higher is stiffer) - adjust as needed
-                    })
+            parent_edge = _parent_edge(
+                row, node_ids,
+                title=f'Parent of {task_id_val}',
+                style={
+                    'color': {'color': '#6AB04C', 'opacity': 0.9}, # Distinct color (e.g., green)
+                    'width': 2, # Slightly thicker for hierarchy
+                    'dashes': False, # Solid line
+                    'smooth': {'type': 'cubicBezier', 'forceDirection': 'vertical', 'roundness': 0.4}, # Suggests hierarchy
+                    'arrows': {'to': {'enabled': True, 'scaleFactor': 0.7, 'type': 'arrow'}},
+                    # Physics properties for stronger hierarchical grouping
+                    'length': 100, # Shorter preferred length for parent-child
+                    # 'strength': 0.5 # (vis.js default is 0.1, higher is stiffer) - adjust as needed
+                },
+            )
+            if parent_edge:
+                edges.append(parent_edge)
 
             # Edges for Dependencies (Original dashboard_api.py: lines 100-105)
-            try:
-                depends_list_str = row['depends_on_tasks']
-                if depends_list_str:
-                    depends_task_ids = json.loads(depends_list_str)
-                    for dep_task_id in depends_task_ids:
-                        dep_node_id_str = f"task_{dep_task_id}"
-                        if dep_node_id_str in node_ids and node_id_str in node_ids: # Ensure both nodes exist
-                            edges.append({
-                                'from': dep_node_id_str,
-                                'to': node_id_str,
-                                'title': f'{task_id_val} depends on {dep_task_id}',
-                                'color': {'color': '#E84393', 'opacity': 0.7}, # Distinct color (e.g., pink/magenta)
-                                'width': 1,
-                                'dashes': [5, 5], # Dashed line for dependency
-                                'smooth': {'type': 'curvedCW', 'roundness': 0.2}, # Different curve
-                                'arrows': {'to': {'enabled': True, 'scaleFactor': 0.6, 'type': 'vee'}},
-                                'length': 200, # Allow more length for dependencies
-                                # 'strength': 0.05
-                            })
-            except json.JSONDecodeError:
-                logger.warning(f"Could not parse depends_on_tasks JSON for task {task_id_val}: '{row['depends_on_tasks']}'")
+            edges.extend(_dependency_edges(
+                row, node_ids,
+                style={
+                    'color': {'color': '#E84393', 'opacity': 0.7}, # Distinct color (e.g., pink/magenta)
+                    'width': 1,
+                    'dashes': [5, 5], # Dashed line for dependency
+                    'smooth': {'type': 'curvedCW', 'roundness': 0.2}, # Different curve
+                    'arrows': {'to': {'enabled': True, 'scaleFactor': 0.6, 'type': 'vee'}},
+                    'length': 200, # Allow more length for dependencies
+                    # 'strength': 0.05
+                },
+            ))
 
         # 3. Agent Actions -> Link Agent to Task (Main interaction edges)
         # Original dashboard_api.py: lines 108-132
@@ -314,57 +425,41 @@ async def fetch_task_tree_data_logic() -> Dict[str, List[Dict[str, Any]]]:
             parent_task_id_val = row['parent_task'] # Get parent_task ID
 
             if node_id_str not in node_ids:
-                style = get_node_style('task', row['status']) # Get task style
-                short_title = row['title'][:20] + '...' if len(row['title']) > 20 else row['title']
-                nodes.append({
-                    'id': node_id_str,
-                    'label': short_title,
-                    'group': 'task', # Group for styling
-                    'title': (f"Task: {row['title']}\nID: {task_id_val}\nStatus: {row['status']}\n"
+                task_title = (f"Task: {row['title']}\nID: {task_id_val}\nStatus: {row['status']}\n"
                               f"Parent: {parent_task_id_val or 'None'}\n"
-                              f"Desc: {row['description'][:100] + '...' if row['description'] and len(row['description']) > 100 else (row['description'] or 'N/A')}"),
-                    **style # Spread style attributes
-                })
+                              f"Desc: {_truncate_field(row['description'], 100, na_if_empty=True)}")
+                nodes.append(_task_node(row, title=task_title)) # No 'mass' for hierarchical layout
                 node_ids.add(node_id_str)
 
             # *** NEW: Add Parent-Child Edges for Task Tree View ***
-            if parent_task_id_val:
-                parent_node_id_str = f"task_{parent_task_id_val}"
-                if parent_node_id_str in node_ids and node_id_str in node_ids:
-                    edges.append({
-                        'from': parent_node_id_str,
-                        'to': node_id_str,
-                        'arrows': {'to': {'enabled': True, 'scaleFactor': 0.9, 'type': 'arrow'}},
-                        'color': {'color': '#27AE60', 'opacity': 1.0}, # Strong green for hierarchy
-                        'width': 2.5,
-                        'dashes': False, # Solid line
-                        'smooth': {'enabled': True, 'type': 'cubicBezier', 'forceDirection': 'vertical', 'roundness': 0.4}, # For tree layout
-                        'title': f'{task_id_val} is sub-task of {parent_task_id_val}'
-                        # No 'length' or 'strength' here as hierarchical layout handles positioning
-                    })
-            
+            parent_edge = _parent_edge(
+                row, node_ids,
+                title=f'{task_id_val} is sub-task of {parent_task_id_val}',
+                style={
+                    'arrows': {'to': {'enabled': True, 'scaleFactor': 0.9, 'type': 'arrow'}},
+                    'color': {'color': '#27AE60', 'opacity': 1.0}, # Strong green for hierarchy
+                    'width': 2.5,
+                    'dashes': False, # Solid line
+                    'smooth': {'enabled': True, 'type': 'cubicBezier', 'forceDirection': 'vertical', 'roundness': 0.4}, # For tree layout
+                    # No 'length' or 'strength' here as hierarchical layout handles positioning
+                },
+            )
+            if parent_edge:
+                edges.append(parent_edge)
+
             # Edges for Dependencies (Original dashboard_api.py: lines 202-214)
-            try:
-                depends_list_str = row['depends_on_tasks']
-                if depends_list_str:
-                    depends_task_ids = json.loads(depends_list_str)
-                    for dep_task_id in depends_task_ids:
-                        dep_node_id_str = f"task_{dep_task_id}"
-                        # Only add edge if dependent task node exists (was added to nodes list)
-                        if dep_node_id_str in node_ids and node_id_str in node_ids:
-                            edges.append({
-                                'from': dep_node_id_str, 
-                                'to': node_id_str, 
-                                'arrows': {'to': {'enabled': True, 'scaleFactor': 0.7, 'type': 'vee'}}, 
-                                'color': {'color': '#e74c3c', 'opacity': 0.7}, # Dependency color (red-ish)
-                                'width': 1.5,
-                                'dashes': [4, 4], # Dashed for dependency
-                                'smooth': {'enabled': True, 'type': 'curvedCW', 'roundness': 0.15},
-                                'title': f'{task_id_val} depends on {dep_task_id}'
-                            })
-            except json.JSONDecodeError:
-                logger.warning(f"Could not parse depends_on_tasks JSON for task {task_id_val} in task tree: '{row['depends_on_tasks']}'")
-        
+            edges.extend(_dependency_edges(
+                row, node_ids,
+                style={
+                    'arrows': {'to': {'enabled': True, 'scaleFactor': 0.7, 'type': 'vee'}},
+                    'color': {'color': '#e74c3c', 'opacity': 0.7}, # Dependency color (red-ish)
+                    'width': 1.5,
+                    'dashes': [4, 4], # Dashed for dependency
+                    'smooth': {'enabled': True, 'type': 'curvedCW', 'roundness': 0.15},
+                },
+                context="in task tree",
+            ))
+
         return {'nodes': nodes, 'edges': edges}
 
     except Exception as e:
