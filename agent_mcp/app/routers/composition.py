@@ -232,8 +232,19 @@ async def graph_data_api_route(
 ) -> JSONResponse:
     # SECURITY (AZ-R28-1): gated to match the sibling composition reads —
     # see simple_status_api_route.
+    #
+    # SECURITY (pentest R1-F1): thread the confirmed-operator-tier signal
+    # into the graph builder so a project_context node's description is
+    # redacted for the same non-confirmed (viewer-tier / cookie /
+    # forwarding) callers that /api/all-data, /api/context-data, and
+    # /api/node-details already redact for — see
+    # ``fetch_graph_data_logic``'s ``expose_secrets`` param and
+    # ``is_confirmed_operator_tier`` above.
     try:
-        data = await fetch_graph_data_logic(g.file_map.copy())
+        expose_secrets = is_confirmed_operator_tier(auth)
+        data = await fetch_graph_data_logic(
+            g.file_map.copy(), expose_secrets=expose_secrets
+        )
         return JSONResponse(data)
     except Exception as e:
         logger.error(f"Error serving graph data: {e}", exc_info=True)
