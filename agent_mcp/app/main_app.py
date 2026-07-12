@@ -1004,9 +1004,9 @@ async def _drain_body(receive) -> tuple[bytes, bool]:
             return bytes(body), False
 
 
-def _replay_receive(body: bytes, disconnected: bool):
+def _replay_receive(raw_receive, body: bytes, disconnected: bool):
     """Build an ASGI `receive` callable that replays an already-drained
-    body exactly once.
+    body exactly once, then delegates to the real channel.
 
     `receive` is a single-use channel — the depth guard in
     `_McpAsgiApp.__call__` has to drain it fully to check nesting depth
@@ -1016,6 +1016,13 @@ def _replay_receive(body: bytes, disconnected: bool):
     the partial body) so Starlette's `Request.stream()` still raises
     `ClientDisconnect` at the same point it would have without this guard
     in front of it.
+
+    After the first (replayed) event, subsequent reads DELEGATE to the
+    real `raw_receive` channel — the SDK reads `receive` more than once
+    (e.g. to observe `http.disconnect` after consuming the body), so
+    returning a synthetic disconnect on the second call would break the
+    normal request lifecycle. The single drained body event is replayed
+    once; everything after it comes from the live channel unchanged.
     """
     sent = False
 
@@ -1026,7 +1033,8 @@ def _replay_receive(body: bytes, disconnected: bool):
             if disconnected:
                 return {"type": "http.disconnect"}
             return {"type": "http.request", "body": body, "more_body": False}
-        return {"type": "http.disconnect"}
+        # Past the first call: hand back the real channel's events.
+        return await raw_receive()
 
     return _receive
 
@@ -1084,8 +1092,8 @@ class _McpAsgiApp:
             # SDK's own `json.loads(body)`; DELETE never reads a body
             # (stateless mode returns 405 for it) and GET is handled
             # entirely in-house above, so neither needs this.
-            body, disconnected = await _drain_body(receive)
-            print('DEBUG drain', repr(body[:80]), disconnected, flush=True)
+            raw_receive = receive
+            body, disconnected = await _drain_body(raw_receive)
             if not disconnected:
                 try:
                     json.loads(body)
@@ -1100,7 +1108,7 @@ class _McpAsgiApp:
                     # reject with its normal -32700 response below —
                     # replay the exact same bytes, untouched.
                     pass
-            receive = _replay_receive(body, disconnected)
+            receive = _replay_receive(raw_receive, body, disconnected)
         # POST/DELETE → SDK. Wrap ``send`` so a malformed-request
         # JSON-RPC error envelope (which the SDK fills with a raw
         # pydantic ValidationError dump) is rewritten to a terse
