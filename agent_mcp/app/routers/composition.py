@@ -33,7 +33,6 @@ gate is deferred to a follow-up PR.
 from __future__ import annotations
 
 import datetime
-import json
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends
@@ -930,86 +929,74 @@ async def create_sample_memories_route(
     ``POST /api/memories/sample`` alongside dashboard updates.
 
     SECURITY: this route previously had NO auth dep — an unauthenticated
-    caller (or a read-only viewer) could WRITE project_context rows.
-    ``require_operator_session`` authenticates AND enforces the
-    mutation gate (POST is a mutation method, so viewer-tier callers are
-    rejected — only operator tier may write).
+    caller could WRITE project_context rows. ``require_operator_session``
+    authenticates the caller.
+
+    R9-F2 (pentest, class-sweep): the route used to write the
+    ``project_context`` table ORM-DIRECT, which bypassed the tool-layer
+    ``_deny_viewer_tier_write`` gate — the backend dep admits a signed
+    VIEWER forwarding header (only the ROUTER proxy 403s viewer
+    mutations), so a read-only viewer reaching the backend directly could
+    still seed these rows (a RAG-poisoning primitive, same class as the
+    memories PUT/DELETE bypass). The write now dispatches through the
+    gated ``bulk_update_project_context`` tool, so every project_context
+    write surface goes through ONE enforcement path: viewers are denied,
+    and the sample keys are attributed to the operator (not a spoofable
+    hard-coded ``updated_by``).
     """
-    session = SessionLocal()
+    # Sample memory entries — hard-coded, non-``config_*`` keys. Values
+    # are the RAW JSON-serialisable objects; the tool ``json.dumps`` them.
+    sample_memories = [
+        {
+            "context_key": "api.config.base_url",
+            "context_value": "https://api.example.com",
+            "description": "Main API base URL for external services",
+        },
+        {
+            "context_key": "app.settings.theme",
+            "context_value": {"theme": "dark", "accent": "blue"},
+            "description": "Application theme preferences",
+        },
+        {
+            "context_key": "database.connection.timeout",
+            "context_value": 30,
+            "description": "Database connection timeout in seconds",
+        },
+        {
+            "context_key": "cache.redis.config",
+            "context_value": {"host": "localhost", "port": 6379, "ttl": 3600},
+            "description": "Redis cache configuration",
+        },
+    ]
+
+    principal = _build_route_principal(
+        bearer_token=None,
+        operator_session=True,
+        operator_user_id=caller_identity(auth),
+    )
+
     try:
-        # Sample memory entries
-        sample_memories = [
-            {
-                'context_key': 'api.config.base_url',
-                'value': json.dumps('https://api.example.com'),
-                'description': 'Main API base URL for external services',
-                'updated_by': 'system'
-            },
-            {
-                'context_key': 'app.settings.theme',
-                'value': json.dumps({'theme': 'dark', 'accent': 'blue'}),
-                'description': 'Application theme preferences',
-                'updated_by': 'admin'
-            },
-            {
-                'context_key': 'database.connection.timeout',
-                'value': json.dumps(30),
-                'description': 'Database connection timeout in seconds',
-                'updated_by': 'system'
-            },
-            {
-                'context_key': 'cache.redis.config',
-                'value': json.dumps({
-                    'host': 'localhost',
-                    'port': 6379,
-                    'ttl': 3600
-                }),
-                'description': 'Redis cache configuration',
-                'updated_by': 'admin'
-            }
-        ]
+        result = await dispatch_tool_call(
+            "bulk_update_project_context",
+            {"updates": sample_memories},
+            principal=principal,
+        )
+    except ToolInputValidationError as e:
+        return JSONResponse({"success": False, "error": str(e)}, status_code=400)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.error(f"Error creating sample memories: {e}", exc_info=True)
+        return JSONResponse(
+            {"success": False, "error": "Failed to create sample memories."},
+            status_code=500,
+        )
 
-        current_time = datetime.datetime.now().isoformat()
-        created_count = 0
-
-        for memory in sample_memories:
-            existing = (
-                session.query(ProjectContext)
-                .filter(ProjectContext.context_key == memory['context_key'])
-                .one_or_none()
-            )
-            if existing is None:
-                session.add(
-                    ProjectContext(
-                        context_key=memory['context_key'],
-                        value=memory['value'],
-                        created_at=current_time,
-                        updated_at=current_time,
-                        updated_by=memory['updated_by'],
-                        description=memory['description'],
-                    )
-                )
-            else:
-                existing.value = memory['value']
-                existing.updated_at = current_time
-                existing.updated_by = memory['updated_by']
-                existing.description = memory['description']
-            created_count += 1
-
-        session.commit()
-
+    if isinstance(result, Ok):
         return JSONResponse({
             "success": True,
-            "message": f"Created {created_count} sample memory entries",
-            "created_count": created_count
+            "message": f"Created {len(sample_memories)} sample memory entries",
+            "created_count": len(sample_memories),
         })
 
-    except Exception as e:
-        session.rollback()
-        logger.error(f"Error creating sample memories: {e}", exc_info=True)
-        return JSONResponse({
-            "success": False,
-            "error": "Failed to create sample memories."
-        }, status_code=500)
-    finally:
-        session.close()
+    # Error variants (viewer-tier denial → 403, etc.) via the shared adapter.
+    status, body = tool_result_to_http(result)
+    return JSONResponse(body, status_code=status)

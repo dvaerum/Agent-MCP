@@ -170,26 +170,6 @@ _LEAKY_MESSAGE = (
 )
 
 
-class _BoomSession:
-    """A stand-in Session whose ``query`` raises a leaky SQLAlchemyError.
-
-    Enough surface for the handlers' try/except/finally: they call
-    ``query`` first (which blows up), then ``rollback`` + ``close``.
-    """
-
-    def query(self, *args, **kwargs):
-        raise SQLAlchemyError(_LEAKY_MESSAGE)
-
-    def add(self, *args, **kwargs):  # pragma: no cover - not reached
-        raise SQLAlchemyError(_LEAKY_MESSAGE)
-
-    def rollback(self):
-        pass
-
-    def close(self):
-        pass
-
-
 def _assert_generic_no_leak(body: dict, generic: str) -> None:
     err = body.get("error", "")
     assert err == generic, body
@@ -204,17 +184,27 @@ def _assert_generic_no_leak(body: dict, generic: str) -> None:
 async def test_delete_memory_db_error_returns_generic_message(
     tmp_path, monkeypatch
 ):
-    """A SQLAlchemyError in the delete handler yields a 500 whose body is
+    """A SQLAlchemyError in the delete path yields a 500 whose body is
     a generic message — never the SQL/params/str(e).
+
+    R9-F2: the DELETE handler is now a thin adapter over the
+    ``delete_project_context`` tool (routed there so the tool-layer
+    authorization gates apply on the REST surface too). Patch the repo's
+    delete entry point so it raises the same leaky-looking error a real
+    DB fault would; the tool returns ``Failed`` and the adapter maps that
+    to a STATIC generic 500 body (no SQL/params/table-name leak).
 
     RED against origin/main: body was
     ``"Failed to delete memory: (sqlite3...) [SQL: ...] [parameters: ...]"``.
     """
     async with mcp_session(tmp_path) as admin:
-        import agent_mcp.app.routers.memories as memories_mod
+        import agent_mcp.tools.project_context_tools as pctx_mod
+
+        def _boom_delete_many(*args, **kwargs):
+            raise SQLAlchemyError(_LEAKY_MESSAGE)
 
         monkeypatch.setattr(
-            memories_mod, "SessionLocal", lambda: _BoomSession()
+            pctx_mod.project_context_repo, "delete_many", _boom_delete_many
         )
 
         r = admin.client.request(
@@ -260,11 +250,18 @@ async def test_create_memory_db_error_returns_generic_message(
 async def test_update_memory_db_error_returns_generic_message(
     tmp_path, monkeypatch
 ):
+    """R9-F2: the PUT handler is now a thin adapter over the
+    ``update_project_context`` tool. Patch the repo's upsert entry point
+    so it raises; the tool returns ``Failed`` and the adapter maps that to
+    a STATIC generic 500 body (no SQL/params/table-name leak)."""
     async with mcp_session(tmp_path) as admin:
-        import agent_mcp.app.routers.memories as memories_mod
+        import agent_mcp.tools.project_context_tools as pctx_mod
+
+        def _boom_upsert(*args, **kwargs):
+            raise SQLAlchemyError(_LEAKY_MESSAGE)
 
         monkeypatch.setattr(
-            memories_mod, "SessionLocal", lambda: _BoomSession()
+            pctx_mod.project_context_repo, "upsert", _boom_upsert
         )
 
         r = admin.client.request(

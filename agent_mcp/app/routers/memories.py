@@ -21,9 +21,6 @@ gate is deferred to a follow-up PR.
 
 from __future__ import annotations
 
-import datetime
-import json
-
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from starlette.requests import Request
@@ -37,10 +34,6 @@ from ...core.tool_result import (
     tool_result_error_message,
     tool_result_to_http,
 )
-from ...db.actions.agent_actions_db import log_agent_action_to_db
-from ...db.engine import SessionLocal
-from ...db.models import ProjectContext
-from ...tools.project_context_tools import emit_context_write_wakes
 from ...tools.registry import ToolInputValidationError, dispatch_tool_call
 from ...utils.json_utils import get_sanitized_json_body
 from ...utils.string_utils import (
@@ -55,13 +48,20 @@ router = APIRouter(
 )
 
 
-# SEC round-9 (type-confusion 400-not-500): these direct-SQL handlers
-# bypass the schema-validating MCP tool dispatch. ``context_key`` binds
-# straight into a WHERE clause / the ORM column, and ``description`` is
-# a TEXT column — a structured JSON type in either used to 500 (or, for
-# a non-str ``context_key``, slip past ``has_unsafe_unicode_for_identifier``
-# which returns False for non-str). ``context_value`` is intentionally
-# arbitrary JSON (``json.dumps``-serialised), so it is NOT guarded here.
+# R9-F2 (pentest): all three handlers (CREATE / UPDATE / DELETE) now
+# dispatch through the gated MCP project_context tools so the tool-layer
+# authorization gates — the ``config_aoe_*`` sysadmin gate (R8-F1), the
+# viewer-tier write guard (SEC1), the per-key creator-ownership matrix,
+# and the critical-key / ``force_delete`` guard — are enforced on the
+# REST surface too. Before this fix UPDATE + DELETE wrote the table
+# ORM-DIRECT and bypassed every one of them.
+#
+# SEC round-9 (type-confusion 400-not-500): ``description`` is a TEXT
+# column — a structured JSON type used to 500. The ``_require_str``
+# wire-hygiene guard on ``description`` is kept LOCAL to the CREATE +
+# UPDATE handlers (the MCP path validates the same via the tool's
+# inputSchema). ``context_value`` is intentionally arbitrary JSON
+# (``json.dumps``-serialised inside the tool), so it is NOT guarded here.
 #
 # arch-r4 #10: ``_require_str`` now lives once in ``._wire_validation``
 # (imported above) — the round-9 "kept local, do NOT consolidate" scope
@@ -183,10 +183,24 @@ async def update_memory_api_route(
     request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
-    """Update an existing memory entry. PR D: auth via require_operator_session.
+    """Update a memory entry — thin adapter over ``update_project_context``.
 
-    arch-r4 #10: ``context_key`` is now a typed path parameter, replacing
-    the hand-rolled ``request.url.path.split('/')`` extraction.
+    R9-F2 (pentest): this handler used to write the ``project_context``
+    table ORM-DIRECT after the ``require_operator_session`` gate, which
+    BYPASSED every authorization gate that lives inside the MCP tool
+    impl — the ``config_aoe_*`` sysadmin gate (R8-F1), the viewer-tier
+    write guard (SEC1), and the per-key creator-ownership matrix. A
+    non-sysadmin per-project operator could therefore re-point the
+    outbound AoE client via ``config_aoe_base_url`` (SSRF; the R8-F1
+    vuln reopened via UPDATE) even though the POST create surface
+    already 403s it. The write now dispatches through the gated
+    ``update_project_context`` tool exactly as the CREATE handler above
+    dispatches ``create_project_context`` — ONE enforcement path. The
+    partial-description-preservation (BL-R22-1) + the BL-R14-1 post-write
+    wake set now live entirely in the tool, so this handler keeps only
+    the HTTP-wire concerns.
+
+    arch-r4 #10: ``context_key`` is a typed path parameter.
     """
     # F005 verify-all-v6 MUTATING #3: reject keys with Unicode
     # control / bidi-override / invisible chars. Matches the
@@ -198,75 +212,67 @@ async def update_memory_api_route(
     if has_unsafe_unicode_for_identifier(context_key):
         return JSONResponse(UNSAFE_KEY_ERROR, status_code=400)
 
-    session = None
     try:
         data = await get_sanitized_json_body(request)
-        context_value = data.get('context_value')
-        description = data.get('description')
-
-        # SEC round-9: ``description`` binds into the TEXT column — reject
-        # structured JSON. ``context_value`` is arbitrary JSON (json.dumps
-        # -serialised) so it stays unguarded, matching the CREATE handler.
-        _err = _require_str(description, "description")
-        if _err is not None:
-            return _err
-
-        requesting_admin_id = caller_identity(auth)
-
-        session = SessionLocal()
-
-        # Check if memory exists
-        row = (
-            session.query(ProjectContext)
-            .filter(ProjectContext.context_key == context_key)
-            .one_or_none()
-        )
-        if row is None:
-            return JSONResponse({"error": "Memory not found"}, status_code=404)
-
-        current_time = datetime.datetime.now().isoformat()
-
-        # Apply partial-update semantics: only overwrite the fields the
-        # caller actually supplied. Matches the legacy raw-SQL behavior.
-        # created_at / created_by stay untouched on an UPDATE.
-        row.updated_at = current_time
-        row.updated_by = requesting_admin_id
-        if context_value is not None:
-            row.value = json.dumps(context_value)
-        if description is not None:
-            row.description = description
-
-        session.flush()
-
-        # Log the action
-        raw_conn = session.connection().connection
-        cursor = raw_conn.cursor()
-        log_agent_action_to_db(cursor, requesting_admin_id, "updated_memory", details={"context_key": context_key})
-        session.commit()
-
-        # BL-R14-1: fire the full post-write wake set this key requires
-        # (loop toggle → wake_all_for_flag_recheck; worker-capability
-        # toggle → tools/list_changed). Shared with the MCP write
-        # surface so both fire the SAME wakes. See the create handler.
-        await emit_context_write_wakes(context_key)
-
-        return JSONResponse({
-            "success": True,
-            "message": f"Memory '{context_key}' updated successfully"
-        })
-
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
-    except Exception as e:
-        if session is not None:
-            session.rollback()
-        logger.error(f"Error updating memory: {e}", exc_info=True)
-        # BL-R5-2: generic message — ``str(e)`` on a SQLAlchemyError
-        # embeds SQL text + bound params (schema disclosure).
+
+    context_value = data.get('context_value')
+    description = data.get('description')
+
+    # SEC round-9: ``description`` binds into the TEXT column — reject
+    # structured JSON up front (wire-level hygiene kept local; the MCP
+    # path validates the same via the tool's inputSchema). ``context_value``
+    # is arbitrary JSON so it stays unguarded, matching the CREATE handler.
+    _err = _require_str(description, "description")
+    if _err is not None:
+        return _err
+
+    # Operator-session Principal (a forwarding VIEWER gets a viewer-role
+    # Principal the tool's capability gate denies — SEC1). Mirrors the
+    # CREATE handler above.
+    principal = _build_route_principal(
+        bearer_token=None,
+        operator_session=True,
+        operator_user_id=caller_identity(auth),
+    )
+
+    # Only thread ``description`` when the caller supplied it so the tool's
+    # partial-update semantics preserve an existing description (BL-R22-1).
+    arguments: dict = {"context_key": context_key, "context_value": context_value}
+    if description is not None:
+        arguments["description"] = description
+
+    try:
+        result = await dispatch_tool_call(
+            "update_project_context",
+            arguments,
+            principal=principal,
+        )
+    except ToolInputValidationError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:  # pragma: no cover - defensive
+        # SD-R7-1: a raw ``str(e)`` can leak internals; log server-side,
+        # return the STATIC generic 500 body this route has always used.
+        logger.error(f"Error dispatching update_project_context: {e}", exc_info=True)
         return JSONResponse({"error": "Failed to update memory"}, status_code=500)
-    finally:
-        if session is not None:
-            session.close()
+
+    if isinstance(result, Ok):
+        return JSONResponse({
+            "success": True,
+            "message": f"Memory '{context_key}' updated successfully",
+        })
+
+    # Error variants: STATUS from the shared adapter; body kept in the
+    # legacy ``{"error": ...}`` envelope. ``Failed`` falls back to the
+    # static "Failed to update memory" this route has always used — the
+    # tool impl already logged the real detail server-side (BL-R5-2 / no
+    # exception-detail leak).
+    status, _ = tool_result_to_http(result)
+    return JSONResponse(
+        {"error": tool_result_error_message(result, "Failed to update memory")},
+        status_code=status,
+    )
 
 
 @router.delete("/{context_key}")
@@ -275,134 +281,80 @@ async def delete_memory_api_route(
     request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
-    """DELETE /api/memories/<context_key> — operator deletes a memory.
+    """DELETE /api/memories/<context_key> — thin adapter over
+    ``delete_project_context``.
 
-    Writes the DB directly via SQLAlchemy, mirroring the sibling
-    CREATE (``create_memory_api_route``) and UPDATE
-    (``update_memory_api_route``) handlers above. Auth: the outer
-    ``require_operator_session`` dep accepts cookie / signed
-    forwarding-header / operator-tier bearer; if we reached the
-    handler the caller is authorised.
+    R9-F2 (pentest): this route wrote the ``project_context`` table
+    ORM-DIRECT (its prior docstring even noted it "never enforced the
+    critical-keys guard"), so — like the UPDATE sibling — it BYPASSED
+    every gate inside the MCP tool: the ``config_aoe_*`` sysadmin gate
+    (R8-F1; a non-sysadmin operator could delete ``config_aoe_bearer_token``),
+    the viewer-tier write guard (SEC1), the per-key creator-ownership
+    matrix, AND the critical-key / ``force_delete`` guard. It now
+    dispatches through the gated ``delete_project_context`` tool exactly
+    as the CREATE handler dispatches ``create_project_context`` — ONE
+    enforcement path. The RAG chunk-purge (BL-R5-1) and the post-delete
+    wake set (R1-F3 / BL-R14-1) live entirely in the tool now.
 
-    F005 (verify-all-v4) fix — 2026-06-25
-    -----------------------------------------
-    This route previously dispatched through the
-    ``delete_project_context`` MCP tool via ``_dispatch_through_tool``.
-    That tool is gated by ``@requires("any")``, whose ``_check_role``
-    branch intentionally rejects operator-session callers that don't
-    carry a per-agent token (audit attribution needs an
-    ``agent_id``; see ``agent_mcp/core/authorize.py:120-125``).
-    The dashboard's DELETE body is ``{}`` (no token field; cf.
-    ``agent_mcp/dashboard/lib/api.ts:844-849``) and the cookie path
-    intentionally doesn't synthesise a god-key bearer post
-    retire-system-token Wave 1 — so the dispatch returned
-    ``Unauthorized: Valid token required`` (403) for every
-    cookie-authenticated operator.
+    ``force_delete`` is read from the JSON body (default ``False``) and
+    threaded to the tool, so the critical-key guard is ENFORCED on this
+    surface: deleting a critical system key (any ``config_*`` key, plus
+    ``server_*`` / ``database_version`` / ``system_config`` /
+    ``mcp_server_url``) now requires an explicit ``force_delete: true``
+    — it no longer silently succeeds. The MCP tool keeps its own gates
+    for non-REST callers — untouched.
 
-    The CREATE and UPDATE siblings never had this regression because
-    they write the project_context table directly after the
-    ``require_operator_session`` gate; this handler now follows the
-    same shape. The MCP tool keeps its own ``@requires("any")`` guard
-    for non-REST callers — untouched. ``force_delete=true`` semantics
-    are preserved by virtue of the REST layer never enforcing the
-    critical-keys guard (it never did; the comment that lived here
-    before explained that we passed ``force_delete=true`` to the tool
-    to preserve that legacy behavior). Wire-shape parity is pinned by
-    ``tests/test_rest_mcp_tool_parity.py``.
-
-    arch-r4 #10: ``context_key`` is now a typed path parameter, replacing
-    the hand-rolled ``request.url.path.split('/')`` extraction.
+    Auth: the outer ``require_operator_session`` dep accepts cookie /
+    signed forwarding-header / operator-tier bearer. arch-r4 #10:
+    ``context_key`` is a typed path parameter.
     """
-    # Consume the JSON body if present (validates that it parses, and
-    # — historically — gave the dep the body-token. We no longer act
-    # on it here; the dep has already authorised the caller.)
     try:
-        await get_sanitized_json_body(request)
+        data = await get_sanitized_json_body(request)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-    requesting_admin_id = caller_identity(auth)
+    force_delete = bool(data.get("force_delete", False)) if isinstance(data, dict) else False
 
-    session = None
+    # Operator-session Principal (a forwarding VIEWER gets a viewer-role
+    # Principal the tool's capability gate denies — SEC1). Mirrors the
+    # CREATE / UPDATE handlers.
+    principal = _build_route_principal(
+        bearer_token=None,
+        operator_session=True,
+        operator_user_id=caller_identity(auth),
+    )
+
     try:
-        session = SessionLocal()
-
-        row = (
-            session.query(ProjectContext)
-            .filter(ProjectContext.context_key == context_key)
-            .one_or_none()
+        result = await dispatch_tool_call(
+            "delete_project_context",
+            {"context_key": context_key, "force_delete": force_delete},
+            principal=principal,
         )
-        if row is None:
-            return JSONResponse(
-                {
-                    "success": False,
-                    "error": f"Memory '{context_key}' not found",
-                    "message": f"Memory '{context_key}' not found",
-                },
-                status_code=404,
-            )
+    except ToolInputValidationError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:  # pragma: no cover - defensive
+        # SD-R7-1: a raw ``str(e)`` can leak internals; log server-side,
+        # return the STATIC generic 500 body this route has always used.
+        logger.error(f"Error dispatching delete_project_context: {e}", exc_info=True)
+        return JSONResponse({"error": "Failed to delete memory"}, status_code=500)
 
-        session.delete(row)
-        session.flush()
-
-        # Audit attribution. Same shape as CREATE/UPDATE — log through
-        # the session's raw connection so it lands in the same
-        # transaction as the row delete.
-        raw_conn = session.connection().connection
-        cursor = raw_conn.cursor()
-        log_agent_action_to_db(
-            cursor,
-            requesting_admin_id,
-            "deleted_memory",
-            details={"context_key": context_key},
-        )
-
-        # BL-R5-1: prune the deleted memory's RAG chunk + hash watermark
-        # in the SAME transaction as the row delete, mirroring the MCP
-        # ``delete_project_context`` tool (project_context_tools.py). The
-        # REST surface (the dashboard's primary delete path) previously
-        # skipped this, so a ``source_type='context'`` chunk for the
-        # deleted key survived and stayed retrievable via
-        # ``ask_project_rag`` forever — the incremental indexer keys on
-        # ``updated_at`` and never sweeps orphans. Purging on the shared
-        # cursor means a purge failure rolls back the row delete too.
-        from ...repositories import rag_repo
-
-        rag_repo.purge_source("context", context_key, connection=cursor)
-
-        session.commit()
-
-        # pentest R1-F3 (SEC-C class-sweep MISS): fire the SAME wake
-        # seam every other project_context write/delete surface uses
-        # (REST POST/PUT, MCP create/update/delete) — this REST DELETE
-        # handler, the dashboard's PRIMARY delete path, was the last
-        # one that bypassed it entirely. Deleting
-        # `config_auto_event_loop_global` reverted the flag to its
-        # default without waking in-flight `wait_for_events` callers,
-        # and deleting a `config_allow_worker_*` key reverted worker
-        # tool visibility without pushing
-        # `notifications/tools/list_changed`. Placed AFTER
-        # `session.commit()`, matching the emit-after-commit placement
-        # of every sibling write surface (see the PUT handler above
-        # and `delete_project_context_tool_impl`).
-        await emit_context_write_wakes(context_key)
-
+    if isinstance(result, Ok):
         return JSONResponse({
             "success": True,
             "message": f"Memory '{context_key}' deleted successfully",
         })
 
-    except Exception as e:
-        if session is not None:
-            session.rollback()
-        logger.error(f"Error deleting memory: {e}", exc_info=True)
-        # BL-R5-2: return a generic message — ``str(e)`` on a
-        # SQLAlchemyError embeds the SQL text + bound parameters
-        # (schema disclosure). The details are in the server log above.
-        return JSONResponse(
-            {"error": "Failed to delete memory"},
-            status_code=500,
-        )
-    finally:
-        if session is not None:
-            session.close()
+    # Error variants: STATUS from the shared adapter; body kept in the
+    # legacy ``{"error": ...}`` envelope. ``NotFound`` keeps the legacy
+    # "Memory '<key>' not found" wording via ``not_found_label``; ``Failed``
+    # falls back to the static "Failed to delete memory" (BL-R5-2 — no
+    # exception-detail leak; the tool impl already logged the real detail).
+    status, _ = tool_result_to_http(result)
+    return JSONResponse(
+        {
+            "error": tool_result_error_message(
+                result, "Failed to delete memory", not_found_label="Memory"
+            )
+        },
+        status_code=status,
+    )
