@@ -57,8 +57,10 @@ Because `mcp_session` mutates module-level singletons
 (`agent_mcp.core.globals`, the write queue, the SQLAlchemy engine
 cache), tests using it must not run concurrently in the same process.
 pytest-xdist runs each worker in its own process — that's fine. Inside
-a worker, the harness's exit hook snapshots/restores per the same
-convention as `conftest.py::reset_globals`.
+a worker, the harness's exit hook snapshots/restores via
+`tests.conftest.reset_and_snapshot_globals` — the same seam
+`conftest.py::reset_globals` uses (arch-r6 #2: this used to be a
+standalone byte-for-byte copy; see that module's docstring).
 
 Co-existence with the older pattern
 -----------------------------------
@@ -81,9 +83,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator, List, Optional
 
-import httpx
 import mcp.types as mcp_types
 import pytest
+
+from tests.conftest import (
+    install_mock_ollama,
+    reset_and_snapshot_globals,
+    seed_agent_row,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from agent_mcp.core.principal import AgentRole, Principal, PrincipalKind
@@ -132,129 +139,12 @@ async def assert_ran_off_event_loop(
 
 
 # --- Internal helpers (mirroring the patterns scattered across tests/) ---
-
-
-def _install_mock_ollama_transport(monkeypatch_or_stack: ExitStack) -> None:
-    """Install the same in-process httpx mock transport that
-    `conftest.py::mock_ollama` installs. Implemented against an
-    AsyncExitStack so the harness can roll it back on exit without
-    requiring callers to depend on the pytest `monkeypatch` fixture.
-    """
-    DIM = 1024
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/embeddings"):
-            body = request.read()
-            import json as _json
-
-            data = _json.loads(body) if body else {}
-            inputs = data.get("input", "")
-            if isinstance(inputs, str):
-                inputs = [inputs]
-            return httpx.Response(
-                200,
-                json={
-                    "object": "list",
-                    "data": [
-                        {
-                            "object": "embedding",
-                            "embedding": [0.0] * DIM,
-                            "index": i,
-                        }
-                        for i in range(len(inputs))
-                    ],
-                    "model": data.get("model", "mock-embed"),
-                    "usage": {"prompt_tokens": 0, "total_tokens": 0},
-                },
-            )
-        return httpx.Response(404, json={"error": "not found"})
-
-    transport = httpx.MockTransport(_handler)
-    original_client_init = httpx.Client.__init__
-    original_async_init = httpx.AsyncClient.__init__
-
-    def _patched_client_init(self, *args, **kwargs):
-        kwargs.setdefault("transport", transport)
-        original_client_init(self, *args, **kwargs)
-
-    def _patched_async_init(self, *args, **kwargs):
-        kwargs.setdefault("transport", transport)
-        original_async_init(self, *args, **kwargs)
-
-    httpx.Client.__init__ = _patched_client_init  # type: ignore[assignment]
-    httpx.AsyncClient.__init__ = _patched_async_init  # type: ignore[assignment]
-
-    def _restore() -> None:
-        httpx.Client.__init__ = original_client_init  # type: ignore[assignment]
-        httpx.AsyncClient.__init__ = original_async_init  # type: ignore[assignment]
-
-    monkeypatch_or_stack.callback(_restore)
-
-
-def _snapshot_and_reset_globals(stack: ExitStack) -> None:
-    """Mirror of `conftest.py::reset_globals`. Snapshots the
-    module-level singletons agent-mcp relies on so the harness's
-    teardown restores them — keeps mcp_session safe to use multiple
-    times per test process (across consecutive `async with`)."""
-    from agent_mcp.core import globals as g
-    from agent_mcp.db import engine as _engine
-
-    _engine.reset_engine_cache()
-    # `agent_event_signals` holds asyncio.Event objects bound to
-    # whatever loop created them. Pytest-asyncio gives each test its
-    # own loop; an Event leftover from a prior test cannot be awaited
-    # in a new loop ("Event is bound to a different event loop").
-    # Clear unconditionally — `signal_for(agent_id)` recreates lazily.
-    g.agent_event_signals.clear()
-    # PR-2 event-coord: per-agent serialization locks and out-of-band
-    # event queues. Locks share the event-loop binding concern with
-    # signals; queues are transient by design.
-    g.agent_event_locks.clear()
-    g.agent_event_queues.clear()
-    # PR-B / v5.0.24: per-waiter queue registry (asyncio.Queue is also
-    # loop-bound — same recreation pattern as signals).
-    g.agent_event_waiters.clear()
-    # Same loop-binding concern applies to `startup_complete_event`;
-    # rebuild it so the lifespan inside `mcp_session` signals on the
-    # current loop and bg-task waiters can `await` without raising.
-    g.reset_startup_complete_event()
-
-    snapshot = {
-        "connections": dict(g.connections),
-        "active_agents": dict(g.active_agents),
-        "tasks": dict(g.tasks),
-        "file_map": dict(g.file_map),
-        "agent_working_dirs": dict(g.agent_working_dirs),
-        "audit_log": list(g.audit_log),
-        "global_vss_load_tested": g.global_vss_load_tested,
-        "global_vss_load_successful": g.global_vss_load_successful,
-    }
-
-    def _restore() -> None:
-        g.connections.clear()
-        g.connections.update(snapshot["connections"])
-        g.active_agents.clear()
-        g.active_agents.update(snapshot["active_agents"])
-        g.tasks.clear()
-        g.tasks.update(snapshot["tasks"])
-        g.file_map.clear()
-        g.file_map.update(snapshot["file_map"])
-        g.agent_working_dirs.clear()
-        g.agent_working_dirs.update(snapshot["agent_working_dirs"])
-        g.audit_log.clear()
-        g.audit_log.extend(snapshot["audit_log"])
-        g.global_vss_load_tested = snapshot["global_vss_load_tested"]
-        g.global_vss_load_successful = snapshot["global_vss_load_successful"]
-        _engine.reset_engine_cache()
-        # Drop any signals created during this test so the next test
-        # (different event loop) starts with a fresh registry.
-        g.agent_event_signals.clear()
-        g.agent_event_locks.clear()
-        g.agent_event_queues.clear()
-        g.agent_event_waiters.clear()
-        g.reset_startup_complete_event()
-
-    stack.callback(_restore)
+#
+# arch-r6 #2: the globals-reset and mock-ollama-transport helpers that
+# used to live here are now `tests.conftest.reset_and_snapshot_globals`
+# and `tests.conftest.install_mock_ollama` (imported above) — this file
+# had standalone byte-for-byte copies of both; see conftest.py's module
+# docstring for why that was a problem.
 
 
 # --- Session classes ---
@@ -299,27 +189,16 @@ def seed_agent_rows(*agent_ids: str) -> None:
 
     if not agent_ids:
         return
-    now = _dt.datetime.now().isoformat()
     conn = get_db_connection()
     try:
-        cursor = conn.cursor()
         for agent_id in agent_ids:
-            cursor.execute(
-                "INSERT OR IGNORE INTO agents (token, agent_id, "
-                "capabilities, created_at, status, working_directory, "
-                "color, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    f"__test_seed_{agent_id}",
-                    agent_id,
-                    "[]",
-                    now,
-                    "active",
-                    "/tmp",
-                    "#888",
-                    now,
-                ),
+            seed_agent_row(
+                conn,
+                agent_id,
+                token=f"__test_seed_{agent_id}",
+                role=None,
+                or_ignore=True,
             )
-        conn.commit()
     finally:
         conn.close()
 
@@ -671,24 +550,13 @@ def _seed_harness_admin_agent() -> str:
             token = existing["token"]
         else:
             token = secrets.token_hex(16)
-            cursor.execute(
-                "INSERT INTO agents (token, agent_id, capabilities, "
-                "created_at, status, working_directory, color, "
-                "updated_at, agent_role) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    token,
-                    _HARNESS_ADMIN_AGENT_ID,
-                    "[]",
-                    now,
-                    "active",
-                    "/tmp",
-                    "#888",
-                    now,
-                    "manager",
-                ),
+            seed_agent_row(
+                conn,
+                _HARNESS_ADMIN_AGENT_ID,
+                token=token,
+                role="manager",
+                created_at=now,
             )
-            conn.commit()
     finally:
         conn.close()
 
@@ -862,26 +730,16 @@ class AdminClient(WorkerSession):
         now = _dt.datetime.now().isoformat()
 
         conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO agents (token, agent_id, capabilities, "
-            "created_at, status, working_directory, color, "
-            "updated_at, agent_role) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                worker_token,
+        try:
+            seed_agent_row(
+                conn,
                 agent_id,
-                "[]",
-                now,
-                "active",
-                "/tmp",
-                "#888",
-                now,
-                "worker",
-            ),
-        )
-        conn.commit()
-        conn.close()
+                token=worker_token,
+                role="worker",
+                created_at=now,
+            )
+        finally:
+            conn.close()
 
         g.active_agents[worker_token] = {
             "agent_id": agent_id,
@@ -1147,8 +1005,12 @@ async def mcp_session(tmp_path: Path) -> AsyncIterator[AdminClient]:
     try:
         # Reset and snapshot globals so the harness is safe to nest
         # under tests that don't use conftest's reset_globals fixture.
-        _snapshot_and_reset_globals(stack)
-        _install_mock_ollama_transport(stack)
+        # `reset_and_snapshot_globals()` runs the reset immediately and
+        # returns the restore closure; `stack.callback` schedules that
+        # closure to run at `stack.close()` — same shape ExitStack
+        # already expects.
+        stack.callback(reset_and_snapshot_globals())
+        install_mock_ollama(stack.callback)
 
         project_dir = tmp_path / "project"
         project_dir.mkdir(exist_ok=True)
