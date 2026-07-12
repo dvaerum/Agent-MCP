@@ -142,7 +142,13 @@ async def test_validate_task_placement_maps_parent_and_dependency_suggestions(
     assert the parent-suggestion / dependency-suggestion mapping — the
     genuinely advisory work this validator keeps."""
 
-    async def _fake_query_rag_system_with_model(*, query_text: str, max_tokens: int) -> str:
+    async def _fake_query_rag_system_with_model(
+        *,
+        query_text: str,
+        max_tokens: int,
+        requesting_agent_id: str | None = None,
+        can_view_all_tasks: bool = True,
+    ) -> str:
         return _canned_rag_response(
             recommended_parent="task_parent001",
             add_deps=["task_dep001"],
@@ -177,7 +183,13 @@ async def test_validate_task_placement_maps_duplicate_detection(monkeypatch) -> 
     must survive the strip-down — assert the mapping from the RAG
     response's ``duplication_check`` block into ``result["duplicates"]``."""
 
-    async def _fake_query_rag_system_with_model(*, query_text: str, max_tokens: int) -> str:
+    async def _fake_query_rag_system_with_model(
+        *,
+        query_text: str,
+        max_tokens: int,
+        requesting_agent_id: str | None = None,
+        can_view_all_tasks: bool = True,
+    ) -> str:
         return _canned_rag_response(
             recommended_parent=None,
             similar_tasks=[
@@ -225,7 +237,13 @@ async def test_validate_task_placement_root_proposal_never_denied_by_hierarchy(
     ``if hierarchy_violation and parent_task_id is None: status =
     "denied"`` override."""
 
-    async def _fake_query_rag_system_with_model(*, query_text: str, max_tokens: int) -> str:
+    async def _fake_query_rag_system_with_model(
+        *,
+        query_text: str,
+        max_tokens: int,
+        requesting_agent_id: str | None = None,
+        can_view_all_tasks: bool = True,
+    ) -> str:
         return _canned_rag_response(
             recommended_parent=None,
             overall_recommendation="proceed",

@@ -11,7 +11,9 @@ async def validate_task_placement(
     parent_task_id: Optional[str],
     depends_on_tasks: Optional[List[str]],
     created_by: str,
-    auth_token: str
+    auth_token: str,
+    requesting_agent_id: Optional[str] = None,
+    can_view_all_tasks: bool = True,
 ) -> Dict[str, Any]:
     """
     Advisory-only task placement analysis via the RAG system.
@@ -34,8 +36,27 @@ async def validate_task_placement(
         description: Proposed task description
         parent_task_id: Proposed parent task ID (if any)
         depends_on_tasks: List of proposed dependency task IDs
-        created_by: Agent ID creating the task
+        created_by: Agent ID recorded as the task's author. NOTE: this is
+            the authorship field, NOT necessarily the RAG-scope identity —
+            the ``assign_task`` path authors as ``"admin"`` while the real
+            caller may be a worker, so ``requesting_agent_id`` is threaded
+            separately for the ownership scope.
         auth_token: Authentication token for RAG query
+        requesting_agent_id: The agent_id whose ``view_tasks`` visibility
+            scopes the RAG duplicate-check search (R5-F1). Defaults to
+            ``created_by`` when not given — on the ``create_self_task``
+            path the author IS the caller, so the two coincide. The
+            ``assign_task`` path passes the real caller explicitly because
+            it authors tasks as ``"admin"``; scoping to ``"admin"`` there
+            for a fell-through worker would instead expose admin's tasks.
+        can_view_all_tasks: Whether the caller holds ``tasks.assign``
+            (operator / manager / sysadmin). Threaded into
+            ``query_rag_system_with_model`` so a non-privileged worker's
+            placement analysis is ownership-scoped to its own tasks —
+            search must not disclose a task the caller couldn't read
+            directly via ``view_tasks`` (R5-F1, the R4-F4 sibling on this
+            RAG entry point). Defaults ``True`` (unscoped) to match the
+            fallback semantics of both RAG entry points.
 
     Returns:
         Dictionary with validation results:
@@ -127,9 +148,23 @@ async def validate_task_placement(
         else:
             # v5.0.44: model selection moved into completion_service;
             # the ``model_name`` parameter is now informational only.
+            # SECURITY (R5-F1): the RAG scope keys on the REAL caller, not
+            # the authorship field. Falls back to ``created_by`` only when
+            # no explicit ``requesting_agent_id`` is supplied (the
+            # create_self_task path, where they coincide).
+            rag_requesting_agent_id = (
+                requesting_agent_id
+                if requesting_agent_id is not None
+                else created_by
+            )
             response_text = await query_rag_system_with_model(
                 query_text=query,
                 max_tokens=TASK_ANALYSIS_MAX_TOKENS,
+                # SECURITY (R5-F1): thread the caller's task visibility so
+                # the placement analysis can't surface a task the worker
+                # couldn't read directly via ``view_tasks``.
+                requesting_agent_id=rag_requesting_agent_id,
+                can_view_all_tasks=can_view_all_tasks,
             )
             rag_response = [mcp_types.TextContent(type="text", text=response_text)]
         

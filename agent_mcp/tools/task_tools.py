@@ -1869,6 +1869,19 @@ async def assign_task_tool_impl(
 
             if ENABLE_TASK_PLACEMENT_RAG:
                 validation_performed = True
+                # SECURITY (R5-F1): scope the placement validator's RAG
+                # query to the CALLER's task visibility, IDENTICALLY to the
+                # create_self_task path. This tool is reachable by a
+                # non-privileged caller who falls through to
+                # ``_authorize_assign_task`` (e.g. a self-claim), so the
+                # duplicate-check search must not disclose a task the caller
+                # couldn't read directly. ``is_admin_request`` is the
+                # ``tasks.assign`` marker; a supervisor keeps the unscoped
+                # search. ``created_by`` (the task-authorship field) stays
+                # ``"admin"`` — only the RAG scope reflects the real caller.
+                _rag_requesting_agent_id = (
+                    principal.agent_id if principal is not None else None
+                )
                 validation_result = await validate_task_placement(
                     title=task_title,
                     description=task_description,
@@ -1876,6 +1889,8 @@ async def assign_task_tool_impl(
                     depends_on_tasks=depends_on_tasks_list,
                     created_by="admin",
                     auth_token=admin_auth_token,
+                    requesting_agent_id=_rag_requesting_agent_id,
+                    can_view_all_tasks=is_admin_request,
                 )
 
                 suggestion_message = format_suggestions_for_agent(
@@ -2309,6 +2324,16 @@ async def create_self_task_tool_impl(
             validation_message = ""
 
             if ENABLE_TASK_PLACEMENT_RAG:
+                # SECURITY (R5-F1): thread the caller's task visibility into
+                # the placement validator's RAG query so a worker's
+                # duplicate-check analysis is scoped to tasks it can already
+                # read. ``tasks.assign`` is the supervision-tier marker
+                # (operator / manager / sysadmin) that grants the all-tasks
+                # view — the SAME capability ``ask_project_rag`` keys on.
+                _rag_can_view_all_tasks = (
+                    principal is not None
+                    and principal.has_capability("tasks.assign")
+                )
                 validation_result = await validate_task_placement(
                     title=task_title,
                     description=task_description,
@@ -2316,6 +2341,7 @@ async def create_self_task_tool_impl(
                     depends_on_tasks=depends_on_tasks_list,
                     created_by=requesting_agent_id,
                     auth_token=agent_auth_token,
+                    can_view_all_tasks=_rag_can_view_all_tasks,
                 )
 
                 suggestion_message = format_suggestions_for_agent(
