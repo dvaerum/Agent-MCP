@@ -168,6 +168,45 @@ def _first_text(result: List[mcp_types.TextContent]) -> str:
     return getattr(result[0], "text", "") or ""
 
 
+def seed_config_context_as_sysadmin(key: str, value: Any) -> None:
+    """Seed a ``project_context`` row the way a SYSADMIN write would land.
+
+    ``config_aoe_*`` keys became sysadmin-only to write (pentest R8-F1:
+    they configure a machine-level outbound integration target). The
+    per-project-operator REST seam (``admin.client.post("/api/memories",
+    {"token": admin_token, ...})``) now 403s on those keys, so feature /
+    redaction tests that merely need the row PRESENT seed it here instead
+    of through the operator path.
+
+    Writes directly on the test DB via the same repository + JSON value
+    encoding the tool uses (``json.dumps`` — project_context stores every
+    value JSON-encoded), stamping ``created_by="sysadmin"``. Faithful to a
+    sysadmin ``update_project_context`` for the READ paths these tests
+    exercise (``_read_ctx`` / live-context / ``/api/context-data``).
+    """
+    import json as _json
+
+    from agent_mcp.db.connection import get_db_connection
+    from agent_mcp.repositories import project_context_repository as _pc_repo
+
+    conn = get_db_connection()
+    try:
+        # The repo reads/writes through an open CURSOR (so pending writes
+        # are visible within the txn) — mirror the tool's ``u.cursor`` seam.
+        cursor = conn.cursor()
+        _pc_repo.upsert(
+            key,
+            _json.dumps(value),
+            None,
+            description_provided=False,
+            actor="sysadmin",
+            connection=cursor,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def seed_agent_rows(*agent_ids: str) -> None:
     """INSERT OR IGNORE a minimal `agents` row for each id.
 

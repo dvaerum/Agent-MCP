@@ -38,7 +38,7 @@ from agent_mcp.features.rag.query import (
     query_rag_system,
     query_rag_system_with_model,
 )
-from tests.harness import mcp_session
+from tests.harness import mcp_session, seed_config_context_as_sysadmin
 
 
 pytestmark = pytest.mark.asyncio
@@ -74,6 +74,11 @@ def _user_content(cap: _CapturingClient) -> str:
 
 
 def _seed(admin, *, key: str, value: str) -> None:
+    # config_aoe_* is sysadmin-only to write (pentest R8-F1) — seed those
+    # keys as a sysadmin would; other keys flow through the REST seam.
+    if key.lower().startswith("config_aoe_"):
+        seed_config_context_as_sysadmin(key, value)
+        return
     r = admin.client.post(
         "/api/memories",
         json={

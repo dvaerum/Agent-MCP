@@ -27,7 +27,7 @@ import secrets
 
 import pytest
 
-from tests.harness import mcp_session
+from tests.harness import mcp_session, seed_config_context_as_sysadmin
 
 
 pytestmark = pytest.mark.asyncio
@@ -37,6 +37,11 @@ _SECRET_VALUE = "SENTINEL-CTX-SECRET-7b21"
 
 
 def _seed_ctx(admin, *, key: str, value: str) -> None:
+    # config_aoe_* is sysadmin-only to write (pentest R8-F1) — seed those
+    # keys as a sysadmin would; other keys flow through the REST seam.
+    if key.lower().startswith("config_aoe_"):
+        seed_config_context_as_sysadmin(key, value)
+        return
     r = admin.client.post(
         "/api/memories",
         json={
