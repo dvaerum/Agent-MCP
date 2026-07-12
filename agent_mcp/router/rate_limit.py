@@ -252,6 +252,27 @@ def _is_trusted_proxy(request: web.Request, cfg: RateLimitConfig) -> bool:
     return _is_trusted_ip(peer, cfg)
 
 
+def request_from_trusted_proxy(request: web.Request) -> bool:
+    """True iff the direct peer is a trusted proxy that may set
+    ``X-Forwarded-*`` headers.
+
+    Reuses the limiter's trusted-proxy determination — loopback + UDS
+    trusted by default (the ``nginx-on-loopback`` / Unix-socket posture),
+    unioned with ``AGENT_MCP_RATELIMIT_TRUSTED_PROXIES`` and the SSO
+    proxy-header trusted-IP set. This is the SAME trust boundary that
+    decides whether ``X-Forwarded-For`` may be honoured, so it is the
+    correct gate for whether ``X-Forwarded-Host`` / ``X-Forwarded-Proto``
+    may be trusted when deriving the router's own external origin
+    (login same-origin check, SSO redirect_uri, cookie-Secure). Callers
+    that trust these headers from an UNTRUSTED peer let a client forge
+    the router's computed self-origin (OBS7).
+
+    Reads config from env on each call (login/SSO POSTs are rare), the
+    same lazy pattern ``_is_trusted_ip`` already uses for the SSO IPs.
+    """
+    return _is_trusted_proxy(request, RateLimitConfig.from_env())
+
+
 def resolve_client_ip(request: web.Request, cfg: RateLimitConfig) -> str:
     """Best-effort client IP for rate-limit keying.
 

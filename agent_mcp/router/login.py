@@ -147,11 +147,14 @@ def cookie_secure_flag(request: web.Request) -> bool:
     ``AGENT_MCP_REQUIRE_SECURE_COOKIES`` is set the flag is always
     True (see ``_require_secure_cookies``).
 
-    Otherwise honours ``X-Forwarded-Proto`` first — production deploys
+    Otherwise honours ``X-Forwarded-Proto`` — production deploys
     terminate TLS at nginx / tailscale and forward plain HTTP to the
-    router via a Unix socket / loopback. Falls back to
-    ``request.url.scheme`` so a direct HTTPS hit (no proxy) also gets
-    the flag.
+    router via a Unix socket / loopback — but ONLY when the direct peer
+    is a trusted proxy (``rate_limit.request_from_trusted_proxy``): the
+    header is client-settable, so an untrusted peer must not drive the
+    Secure decision (OBS7 class-sweep — self-affecting, but gated for
+    consistency). Falls back to ``request.url.scheme`` so a direct HTTPS
+    hit (no proxy) also gets the flag.
 
     Defaults to False so the plain-HTTP VM smoke + local-dev flows
     can still set the cookie; the operator-facing production deploy
@@ -159,11 +162,12 @@ def cookie_secure_flag(request: web.Request) -> bool:
     """
     if _require_secure_cookies():
         return True
-    forwarded = request.headers.get("X-Forwarded-Proto", "").lower()
-    if forwarded == "https":
-        return True
-    if forwarded == "http":
-        return False
+    if _forwarded_headers_trusted(request):
+        forwarded = request.headers.get("X-Forwarded-Proto", "").lower()
+        if forwarded == "https":
+            return True
+        if forwarded == "http":
+            return False
     return request.url.scheme == "https"
 
 
@@ -295,25 +299,50 @@ def _safe_next(raw: str | None) -> str:
 # ── Login-CSRF: same-origin enforcement (R9-F1) ────────────────────
 
 
+def _forwarded_headers_trusted(request: web.Request) -> bool:
+    """True iff ``X-Forwarded-*`` on this request may be trusted.
+
+    The forwarding headers are client-settable, so they are only
+    trustworthy when the DIRECT peer is a trusted proxy. Delegates to
+    ``rate_limit.request_from_trusted_proxy`` — the same trust boundary
+    that gates ``X-Forwarded-For`` — so loopback / UDS (the real
+    nginx-on-loopback tailnet posture) is trusted by default and the set
+    is unioned with the operator's configured trusted proxies. Imported
+    lazily to keep the module import graph light and cycle-free.
+    """
+    from . import rate_limit
+
+    return rate_limit.request_from_trusted_proxy(request)
+
+
 def _external_origin(request: web.Request) -> str:
     """Return the origin (``scheme://host[:port]``) the browser sees.
 
     TLS is terminated at nginx / tailscale and plain HTTP is forwarded
     to the router, so ``request.url.scheme`` / ``request.host`` reflect
     the loopback hop, NOT what the operator typed. Honour
-    ``X-Forwarded-Proto`` / ``X-Forwarded-Host`` first — same precedence
-    as the SSO redirect_uri builder (``sso._default_redirect_url``) and
-    the cookie-Secure logic — so the same-origin comparison is against
-    the EXTERNAL origin.
+    ``X-Forwarded-Proto`` / ``X-Forwarded-Host`` — same precedence as the
+    SSO redirect_uri builder (``sso._default_redirect_url``) and the
+    cookie-Secure logic — so the same-origin comparison is against the
+    EXTERNAL origin.
+
+    Security (OBS7): those headers are client-settable, so we trust them
+    ONLY when the direct peer is a trusted proxy
+    (``_forwarded_headers_trusted``). From an UNTRUSTED source we fall
+    back to the real transport ``request.url.scheme`` / ``request.host``
+    that an attacker can't forge — otherwise a request carrying
+    ``Origin: http://evil`` + ``X-Forwarded-Host: evil`` would make the
+    computed self-origin EQUAL the attacker origin and slip past
+    ``enforce_same_origin``. This preserves the real tailnet-behind-nginx
+    deployment (the proxy forwards over loopback → trusted → XFH honoured
+    → login keeps working) while closing the latent gap for a direct
+    (untrusted) hit.
     """
-    proto = (
-        request.headers.get("X-Forwarded-Proto")
-        or request.url.scheme
-    )
-    host = (
-        request.headers.get("X-Forwarded-Host")
-        or request.host
-    )
+    proto = request.url.scheme
+    host = request.host
+    if _forwarded_headers_trusted(request):
+        proto = request.headers.get("X-Forwarded-Proto") or proto
+        host = request.headers.get("X-Forwarded-Host") or host
     return f"{proto.lower()}://{host.lower()}"
 
 

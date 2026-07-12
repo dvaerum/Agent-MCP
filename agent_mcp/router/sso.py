@@ -899,15 +899,23 @@ def _default_redirect_url(request: web.Request) -> str:
     handed to the IdP matches what the operator saw in the address
     bar (the IdP enforces an exact match against the registered
     redirect URI).
+
+    Security (OBS7 class-sweep): the forwarding headers are
+    client-settable, so they are trusted ONLY when the direct peer is a
+    trusted proxy (``rate_limit.request_from_trusted_proxy``); an
+    untrusted hit falls back to the real transport values. The IdP's
+    exact registered-URI match already backstops a forged host, but the
+    gate keeps this site consistent with ``login._external_origin``.
+    Reached only when neither ``AGENT_MCP_SSO_OIDC_REDIRECT_URL`` nor
+    ``AGENT_MCP_EXTERNAL_URL`` is set (see ``_resolve_redirect_url``).
     """
-    proto = (
-        request.headers.get("X-Forwarded-Proto")
-        or request.url.scheme
-    )
-    host = (
-        request.headers.get("X-Forwarded-Host")
-        or request.host
-    )
+    from . import rate_limit
+
+    proto = request.url.scheme
+    host = request.host
+    if rate_limit.request_from_trusted_proxy(request):
+        proto = request.headers.get("X-Forwarded-Proto") or proto
+        host = request.headers.get("X-Forwarded-Host") or host
     return f"{proto}://{host}/agent-mcp/sso/callback"
 
 

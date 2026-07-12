@@ -284,6 +284,178 @@ async def test_login_accepts_no_origin_curl(
     assert "agent_mcp_session" in resp.headers.get("Set-Cookie", "")
 
 
+# ── OBS7: X-Forwarded-Host trust gated on a trusted-proxy source ────
+#
+# ``_external_origin`` derives the router's OWN external origin so
+# ``enforce_same_origin`` can compare it against the request ``Origin``.
+# Behind a reverse proxy the transport host/scheme reflect the loopback
+# hop, so the proxy's ``X-Forwarded-Host`` / ``X-Forwarded-Proto`` carry
+# the external values. But those headers are client-settable: if we trust
+# them from an UNTRUSTED peer, a request with ``Origin: http://evil`` +
+# ``X-Forwarded-Host: evil`` makes the computed self-origin EQUAL the
+# attacker origin, so the same-origin check passes. Gate XFH/XFP trust on
+# the direct peer being a trusted proxy (loopback / UDS by default, the
+# real nginx-on-loopback tailnet posture). Not browser-exploitable today
+# (a cross-site form can't set headers; a header-setting fetch is
+# CORS-preflight-blocked; a victim's browser sends a truthful Origin and
+# no attacker XFH), but a latent robustness gap. See OBS7.
+
+
+def _mocked_request(remote: str | None, headers: dict[str, str]):
+    """A POST /login request with a chosen peer IP and headers.
+
+    ``remote=None`` models a UDS / in-process peer (empty
+    ``request.remote``) which the trusted-proxy check treats as trusted
+    loopback. A dotted-quad models a direct (untrusted) client hit.
+    """
+    from unittest import mock
+
+    from aiohttp.test_utils import make_mocked_request
+
+    transport = mock.Mock()
+    peername = (remote, 40000) if remote else None
+    transport.get_extra_info = lambda key, default=None: (
+        peername if key == "peername" else default
+    )
+    return make_mocked_request(
+        "POST", "/agent-mcp/login", headers=headers, transport=transport,
+    )
+
+
+async def test_external_origin_trusts_xfh_from_trusted_proxy() -> None:
+    """Trusted-proxy peer → XFH/XFP ARE honoured (preserves the real
+    tailnet-behind-nginx deployment: login must keep working)."""
+    from agent_mcp.router import login
+
+    req = _mocked_request(
+        "127.0.0.1",
+        {
+            "Host": "loopback:1337",
+            "X-Forwarded-Host": "agent.tailnet.ts.net",
+            "X-Forwarded-Proto": "https",
+        },
+    )
+    assert login._external_origin(req) == "https://agent.tailnet.ts.net"
+
+
+async def test_external_origin_trusts_xfh_from_uds_peer() -> None:
+    """UDS / empty-remote peer (Unix-socket reverse proxy) is trusted
+    loopback → XFH honoured."""
+    from agent_mcp.router import login
+
+    req = _mocked_request(
+        None,
+        {
+            "Host": "loopback",
+            "X-Forwarded-Host": "agent.tailnet.ts.net",
+            "X-Forwarded-Proto": "https",
+        },
+    )
+    assert login._external_origin(req) == "https://agent.tailnet.ts.net"
+
+
+async def test_external_origin_ignores_xfh_from_untrusted_source() -> None:
+    """Untrusted direct peer → a forged XFH/XFP is IGNORED; the real
+    transport host/scheme win (the OBS7 hardening)."""
+    from agent_mcp.router import login
+
+    req = _mocked_request(
+        "203.0.113.7",
+        {
+            "Host": "real.host:1337",
+            "X-Forwarded-Host": "evil.example",
+            "X-Forwarded-Proto": "https",
+        },
+    )
+    assert login._external_origin(req) == "http://real.host:1337"
+
+
+async def test_enforce_same_origin_rejects_forged_xfh_from_untrusted() -> None:
+    """The exploit shape: untrusted peer sends Origin: http://evil +
+    X-Forwarded-Host: evil. The forged XFH no longer makes the computed
+    self-origin equal the attacker origin, so the same-origin check
+    rejects it with 403."""
+    from aiohttp import web
+
+    from agent_mcp.router import login
+
+    req = _mocked_request(
+        "203.0.113.7",
+        {
+            "Host": "real.host:1337",
+            "Origin": "http://evil.example",
+            "X-Forwarded-Host": "evil.example",
+        },
+    )
+    with pytest.raises(web.HTTPForbidden):
+        login.enforce_same_origin(req)
+
+
+async def test_enforce_same_origin_accepts_proxy_forwarded_origin() -> None:
+    """Trusted proxy forwards the external Origin + XFH; they match, so
+    the same-origin check passes (tailnet login preserved)."""
+    from agent_mcp.router import login
+
+    req = _mocked_request(
+        "127.0.0.1",
+        {
+            "Host": "loopback:1337",
+            "Origin": "https://agent.tailnet.ts.net",
+            "X-Forwarded-Host": "agent.tailnet.ts.net",
+            "X-Forwarded-Proto": "https",
+        },
+    )
+    # Returns None (no raise) when same-origin.
+    assert login.enforce_same_origin(req) is None
+
+
+async def test_cookie_secure_flag_ignores_forged_xfp_from_untrusted() -> None:
+    """A forged X-Forwarded-Proto: https from an untrusted peer must not
+    drive the Secure decision; the real (http) transport scheme wins."""
+    from agent_mcp.router import login
+
+    req = _mocked_request(
+        "203.0.113.7",
+        {"Host": "real.host", "X-Forwarded-Proto": "https"},
+    )
+    assert login.cookie_secure_flag(req) is False
+
+
+async def test_cookie_secure_flag_honours_xfp_from_trusted_proxy() -> None:
+    """XFP from a trusted proxy still drives Secure (tailnet TLS)."""
+    from agent_mcp.router import login
+
+    req = _mocked_request(
+        "127.0.0.1",
+        {"Host": "loopback", "X-Forwarded-Proto": "https"},
+    )
+    assert login.cookie_secure_flag(req) is True
+
+
+async def test_sso_default_redirect_url_ignores_forged_xfh_from_untrusted() -> None:
+    """The sibling XFH-trust site: sso._default_redirect_url honours XFH
+    only from a trusted proxy (IdP exact-match already backstops it, but
+    we gate consistently)."""
+    from agent_mcp.router import sso
+
+    untrusted = _mocked_request(
+        "203.0.113.7",
+        {"Host": "real.host", "X-Forwarded-Host": "evil.example",
+         "X-Forwarded-Proto": "https"},
+    )
+    assert sso._default_redirect_url(untrusted) == (
+        "http://real.host/agent-mcp/sso/callback"
+    )
+    trusted = _mocked_request(
+        "127.0.0.1",
+        {"Host": "loopback", "X-Forwarded-Host": "agent.tailnet.ts.net",
+         "X-Forwarded-Proto": "https"},
+    )
+    assert sso._default_redirect_url(trusted) == (
+        "https://agent.tailnet.ts.net/agent-mcp/sso/callback"
+    )
+
+
 # ── Logout ─────────────────────────────────────────────────────────
 
 
