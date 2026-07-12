@@ -282,6 +282,13 @@ async def _delete_via_rest(admin, key: str, value) -> None:
     the ``_emit_tools_list_changed``/``wake_all_for_flag_recheck``
     mocks the shared parametrized test patches; only the REST DELETE
     call below is allowed to make them fire.
+
+    R9-F2: the REST DELETE handler now routes through the gated
+    ``delete_project_context`` tool, which treats every ``config_*`` key
+    as a critical system key requiring ``force_delete=true`` (both toggle
+    keys under test are ``config_*``). The body now carries
+    ``force_delete: true`` — the same value the ``_delete_via_tool`` path
+    passes — so the delete lands and the wake fires.
     """
     import datetime as _dt
     import json as _json
@@ -310,7 +317,7 @@ async def _delete_via_rest(admin, key: str, value) -> None:
     r = admin.client.request(
         "DELETE",
         f"/api/memories/{key}",
-        json={"token": admin.admin_token},
+        json={"token": admin.admin_token, "force_delete": True},
     )
     assert r.status_code == 200, r.text
 

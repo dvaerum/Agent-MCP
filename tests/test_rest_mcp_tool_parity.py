@@ -244,10 +244,11 @@ async def test_delete_memory_rest_matches_mcp_tool(tmp_path) -> None:
 
     NOTE: the MCP ``delete_project_context`` tool refuses to delete
     "critical" keys (``config_*``, ``server_*``, ``mcp_*``, etc.)
-    without ``force_delete=true``. The REST adapter passes
-    ``force_delete=true`` unconditionally to match the legacy
-    behavior (REST today imposes no such guard). The test uses a
-    non-critical key so the difference doesn't muddy this parity.
+    without ``force_delete=true``. R9-F2 routed the REST DELETE handler
+    through that gated tool, so the REST surface now ENFORCES the same
+    guard: ``force_delete`` is read from the request body (default
+    ``False``) — it is no longer auto-passed. The test uses a
+    non-critical key so the guard doesn't apply on either surface.
     """
     async with mcp_session(tmp_path) as admin:
         _seed_memory("mem.rest.k1", {"hello": "world"}, "admin")
