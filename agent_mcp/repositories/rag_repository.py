@@ -188,20 +188,33 @@ def _value_has_embedded_secret(*texts: Optional[str]) -> bool:
     return _scan(*texts)
 
 
-def _drop_secret_context_chunks(
+def _drop_secret_chunks(
     results: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Drop retrieved vector chunks that carry a secret project_context
-    row. Defense against a STALE index that embedded a secret before the
-    index-time skip (indexing.py) was in place: the chunk's
-    ``source_ref`` is the context_key for ``source_type == "context"``.
+    """Drop retrieved vector chunks that carry a credential — for ANY
+    source type.
+
+    Defense-in-depth against a STALE index that embedded a secret before
+    the ``bulk_index_chunks`` choke-point existed. Two drop rules, both
+    retained:
+
+    * secret-KEYED ``project_context`` row — the chunk's ``source_ref``
+      is the context_key for ``source_type == "context"`` (the original
+      round-2 rule).
+    * secret in the chunk TEXT itself — a credential pasted into a task
+      description/title, a code file, or a markdown doc (R2-F3). This is
+      keyed on the ``chunk_text`` VALUE, so it covers every source type,
+      not just ``context``.
     """
     return [
         r
         for r in results
         if not (
-            r.get("source_type") == "context"
-            and _is_secret_key(r.get("source_ref"))
+            (
+                r.get("source_type") == "context"
+                and _is_secret_key(r.get("source_ref"))
+            )
+            or _value_has_embedded_secret(r.get("chunk_text"))
         )
     ]
 
@@ -271,6 +284,26 @@ class RagRepository:
             for chunk in chunks:
                 chunk_text = chunk.get("chunk_text")
                 if not chunk_text:
+                    continue
+                # SECURITY (R2-F3): the ingest CHOKE-POINT. Scan every
+                # chunk's text for an embedded credential — for ALL source
+                # types, not just ``context`` — and skip a secret-bearing
+                # chunk so it is never embedded. Any agent with rag.query
+                # can retrieve indexed chunks via ask_project_rag, so a
+                # token pasted into a task description/title, a code file,
+                # or a markdown doc would otherwise be echoed to the LLM.
+                # This one seam covers the periodic indexer, index_task_data
+                # and any future ingester. Reuses the same value scanner
+                # the context path uses so the policy can't drift. The
+                # high-entropy heuristic may over-drop a chunk holding a
+                # long hash (e.g. a git SHA in code) — an accepted trade
+                # for closing a live secret-exfiltration.
+                if _value_has_embedded_secret(chunk_text):
+                    logger.warning(
+                        "Skipping RAG embedding for %s:%s chunk: text "
+                        "matched an embedded-secret pattern.",
+                        source_type, source_ref,
+                    )
                     continue
                 metadata = chunk.get("metadata")
                 metadata_json = json.dumps(metadata) if metadata else None
@@ -665,11 +698,13 @@ class RagRepository:
                 results.append(d)
                 if len(results) >= limit:
                     break
-            # SECURITY: the seam drops secret-keyed context chunks before
-            # they reach any caller — retrieval-time defense against a
-            # stale index that embedded a secret context row before the
-            # index-time skip existed. See _drop_secret_context_chunks.
-            return _drop_secret_context_chunks(results)
+            # SECURITY: the seam drops any chunk that carries a credential
+            # — secret-keyed context rows AND chunks of any source type
+            # whose TEXT embeds a secret — before they reach any caller.
+            # Retrieval-time defense against a stale index that embedded a
+            # secret before the bulk_index_chunks choke-point existed. See
+            # _drop_secret_chunks.
+            return _drop_secret_chunks(results)
         except sqlite3.Error as e:
             logger.error(
                 f"Database error during vector search: {e}", exc_info=True,

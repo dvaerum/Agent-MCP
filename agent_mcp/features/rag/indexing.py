@@ -116,6 +116,75 @@ def _value_has_embedded_secret(*texts: Optional[str]) -> bool:
 # eviction of pre-existing context vectors is required.
 _CTX_SECRET_PURGE_META_KEY = "security_context_secret_purge_v1"
 
+# rag_meta flag marking that the one-time ALL-SOURCE secret purge has run
+# (R2-F3). Sibling to the context purge above: it evicts already-indexed
+# chunks of ANY source type (task/code/markdown/code_summary) whose TEXT
+# embeds a credential — chunks written before the bulk_index_chunks
+# choke-point existed. Bump the suffix to force a fresh eviction if the
+# secret scanner broadens again.
+_ALLSOURCE_SECRET_PURGE_META_KEY = "security_allsource_secret_purge_v1"
+
+
+def _purge_secret_bearing_chunks(cursor: sqlite3.Cursor) -> int:
+    """Scan EVERY ``rag_chunks`` row and delete those whose ``chunk_text``
+    embeds a credential — for ALL source types. Returns the count deleted.
+
+    Selective per-chunk (not a blanket source wipe): only the chunks that
+    actually carry a secret are removed, so this does NOT force a full
+    re-index of the codebase. A source whose hash is unchanged is not
+    re-processed; even if it were, the ``bulk_index_chunks`` choke-point
+    would skip the secret chunk again. Reuses ``_value_has_embedded_secret``
+    so the eviction policy matches the ingest choke-point exactly.
+
+    The embeddings delete is guarded on the vec0 table's presence and
+    keyed by ``rowid == chunk_id`` (the rag_chunks↔rag_embeddings link).
+    """
+    from ...repositories.rag_repository import _embeddings_table_exists
+
+    cursor.execute("SELECT chunk_id, chunk_text FROM rag_chunks")
+    secret_ids = [
+        row["chunk_id"]
+        for row in cursor.fetchall()
+        if _value_has_embedded_secret(row["chunk_text"])
+    ]
+    if not secret_ids:
+        return 0
+    id_params = [(cid,) for cid in secret_ids]
+    if _embeddings_table_exists(cursor):
+        cursor.executemany(
+            "DELETE FROM rag_embeddings WHERE rowid = ?", id_params
+        )
+    cursor.executemany(
+        "DELETE FROM rag_chunks WHERE chunk_id = ?", id_params
+    )
+    return len(secret_ids)
+
+
+def _run_all_source_secret_purge(
+    cursor: sqlite3.Cursor, rag_meta_data: Dict[str, str]
+) -> int:
+    """One-time guarded wrapper around :func:`_purge_secret_bearing_chunks`.
+
+    Runs the all-source secret eviction exactly once per project: when the
+    ``_ALLSOURCE_SECRET_PURGE_META_KEY`` flag is already present it returns
+    ``-1`` (skipped) without touching the tables. Otherwise it purges the
+    secret-bearing chunks, stamps the flag, and returns the number purged.
+
+    The caller owns commit/rollback (the periodic indexer runs this inside
+    its per-cycle transaction, mirroring the context-purge block).
+    """
+    if _ALLSOURCE_SECRET_PURGE_META_KEY in rag_meta_data:
+        return -1
+    purged = _purge_secret_bearing_chunks(cursor)
+    cursor.execute(
+        "INSERT OR REPLACE INTO rag_meta (meta_key, meta_value) VALUES (?, ?)",
+        (
+            _ALLSOURCE_SECRET_PURGE_META_KEY,
+            datetime.datetime.now().isoformat(),
+        ),
+    )
+    return purged
+
 
 # Increased concurrency for Tier 3 pricing (5000 RPM)
 # Original main.py: 654
@@ -403,6 +472,43 @@ async def run_rag_indexing_periodically(
                         "Security context purge failed (will retry next "
                         "cycle): %s",
                         e_purge,
+                        exc_info=True,
+                    )
+                    try:
+                        conn.rollback()
+                    except sqlite3.Error:
+                        pass
+
+            # ── One-time ALL-SOURCE secret purge (R2-F3) ──
+            # Sibling to the context purge above: evict already-indexed
+            # chunks of ANY source type (task/code/markdown/code_summary)
+            # whose TEXT embeds a credential and was indexed before the
+            # bulk_index_chunks choke-point existed. Selective per-chunk
+            # (not a blanket source wipe) so it does not force a full
+            # re-index. Gated on its own rag_meta flag so it runs once.
+            if _ALLSOURCE_SECRET_PURGE_META_KEY not in rag_meta_data:
+                try:
+                    purged_secret = _run_all_source_secret_purge(
+                        cursor, rag_meta_data
+                    )
+                    conn.commit()
+                    if purged_secret > 0:
+                        logger.warning(
+                            "Security: one-time RAG all-source secret purge "
+                            "evicted %d chunk(s) whose text embedded a "
+                            "credential.",
+                            purged_secret,
+                        )
+                    # Refresh the meta snapshot so the flag is seen as set
+                    # for the rest of this cycle. No watermark/hash was
+                    # reset (selective delete), so the last_indexed_* /
+                    # hash_* partitions below need no rebuild.
+                    rag_meta_data = rag_repo.get_all_meta()
+                except sqlite3.Error as e_purge2:
+                    logger.error(
+                        "Security all-source secret purge failed (will "
+                        "retry next cycle): %s",
+                        e_purge2,
                         exc_info=True,
                     )
                     try:
