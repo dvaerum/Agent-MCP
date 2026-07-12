@@ -28,6 +28,39 @@ def test_single_tenant_nonloopback_bind_refuses_to_start(
         router_module.make_app(single_tenant_name="only")
 
 
+def test_single_tenant_empty_host_refuses_to_start(
+    router_module, monkeypatch,
+) -> None:
+    """R6-F1: a present-but-empty AGENT_MCP_ROUTER_HOST (the
+    ``Environment=AGENT_MCP_ROUTER_HOST=`` / ``docker -e …=`` "bind all
+    interfaces" idiom) binds 0.0.0.0+:: at runtime. Single-tenant must
+    fail closed exactly as it does for an explicit 0.0.0.0 — the guard
+    must NOT mis-classify "" as loopback."""
+    monkeypatch.setenv("AGENT_MCP_ROUTER_HOST", "")
+    with pytest.raises(RuntimeError, match="single-tenant"):
+        router_module.make_app(single_tenant_name="only")
+
+
+def test_single_tenant_whitespace_host_refuses_to_start(
+    router_module, monkeypatch,
+) -> None:
+    """R6-F1: whitespace-only host collapses to "" (bind all) too."""
+    monkeypatch.setenv("AGENT_MCP_ROUTER_HOST", "   ")
+    with pytest.raises(RuntimeError, match="single-tenant"):
+        router_module.make_app(single_tenant_name="only")
+
+
+def test_multi_tenant_empty_host_starts(
+    router_module, monkeypatch,
+) -> None:
+    """R6-F1: multi-tenant HAS the operator-session gate, so the
+    documented "empty = bind all interfaces" idiom stays legal — the
+    guard must not turn into a blanket refusal of empty-host binds."""
+    monkeypatch.setenv("AGENT_MCP_ROUTER_HOST", "")
+    app = router_module.make_app()  # multi-tenant (no single_tenant_name)
+    assert app is not None
+
+
 def test_single_tenant_loopback_bind_starts(
     router_module, monkeypatch,
 ) -> None:
@@ -65,10 +98,25 @@ def test_host_is_loopback_classification(router_module) -> None:
     assert is_lb("127.0.0.1") is True
     assert is_lb("::1") is True
     assert is_lb("localhost") is True
-    assert is_lb("") is True  # UDS / no listener
+    # R6-F1: empty / whitespace-only host binds ALL interfaces, same as
+    # 0.0.0.0 — NOT loopback.
+    assert is_lb("") is False
+    assert is_lb("   ") is False
     assert is_lb("/run/agent-mcp/router.sock") is True
     assert is_lb("0.0.0.0") is False
     assert is_lb("192.168.1.10") is False
+
+
+def test_resolve_bind_host_collapses_empty(router_module, monkeypatch) -> None:
+    """R6-F1: the SHARED resolver both the guard and the runtime
+    entrypoints call collapses a present-but-empty / whitespace-only
+    env value to "" — so the string classified == the string bound."""
+    monkeypatch.setenv("AGENT_MCP_ROUTER_HOST", "")
+    assert router_module._resolve_bind_host() == ""
+    monkeypatch.setenv("AGENT_MCP_ROUTER_HOST", "   ")
+    assert router_module._resolve_bind_host() == ""
+    monkeypatch.delenv("AGENT_MCP_ROUTER_HOST", raising=False)
+    assert router_module._resolve_bind_host() == "127.0.0.1"
 
 
 # ── Secure-cookie fail-closed flag ─────────────────────────────────
