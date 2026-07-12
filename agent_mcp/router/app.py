@@ -95,6 +95,7 @@ Configuration (all via environment variables):
 
 import asyncio
 import contextlib
+import hashlib
 import ipaddress
 import json
 import logging
@@ -758,53 +759,144 @@ async def _proxy_to_backend(
     # upstream. Reading first guarantees the full body reaches the
     # backend before we wait on its response.
     req_body = await req.read()
+    # R8-F2: `GET /mcp` is the SSE verb/path — the backend answers it
+    # with an INFINITE `text/event-stream` (a `: ping` heartbeat every
+    # 15 s, forever). Buffering that with `await up.read()` never
+    # returns: the client never sees headers/frames, the router→backend
+    # UDS conn stays ESTABLISHED, and `_track_connection` never
+    # decrements `active_conns` — so ONE abandoned SSE pins the backend
+    # against the idle reaper for the agent bearer's whole lifetime.
+    # Detect streaming up front (the SSE verb/path) and cap concurrency
+    # BEFORE opening the upstream; the response Content-Type is a
+    # belt-and-suspenders second signal below for any streaming POST.
+    is_stream_request = req.method == "GET" and backend_path == "/mcp"
+    stream_cap = (
+        _po._track_streaming_proxy(_sse_agent_key(headers))
+        if is_stream_request
+        else contextlib.nullcontext(True)
+    )
     async with _track_proxy_task(req.app), _track_connection(name):
-        async with ClientSession(connector=connector, timeout=timeout) as sess:
-            async with sess.request(
-                req.method,
-                url,
-                headers=headers,
-                data=req_body,
-                params=req.rel_url.query,
-            ) as up:
-                # Pure pass-through: read the full upstream body, hand
-                # it back as a complete `web.Response`. aiohttp then
-                # serialises the outbound response with a correct
-                # Content-Length and no chunked-transfer involvement,
-                # so strict HTTP clients (curl, Claude Code's MCP
-                # client) see a cleanly-terminated transfer.
-                #
-                # Why pure pass-through and not streaming: the legacy
-                # SSE transport's manual pump (decode chunks, re-encode
-                # on the way out) was a workaround from before we
-                # owned the fork — it had to splice `data: /messages/`
-                # bytes mid-stream. Streamable HTTP (PR #61) made the
-                # /mcp URL stable so no rewriting is needed; without
-                # rewriting, streaming bought nothing but a fragile
-                # chunked-transfer interaction with aiohttp.
-                #
-                # Trade-off: tools that emit mid-response SSE progress
-                # events are buffered until the tool completes (the
-                # client sees nothing in the meantime). Agent-MCP's
-                # tools don't do this today; if a future tool needs
-                # incremental streaming, switch this caller to a
-                # framing-preserving variant. See
-                # tests/test_mcp_streaming.py for the regression guard.
-                #
-                # Disconnect detection still works: the surrounding
-                # `_track_connection` context manager bumps/decrements
-                # the active-connection counter for the lifecycle
-                # reaper, and a client that drops mid-`await up.read()`
-                # raises ConnectionResetError out of this scope.
-                body = await up.read()
-                last_active[(name, "backend")] = time.time()
-                out_headers = {
-                    k: v for k, v in up.headers.items()
-                    if k.lower() not in ("transfer-encoding", "content-length")
-                }
-                return web.Response(
-                    body=body, status=up.status, headers=out_headers,
-                )
+        async with stream_cap as admitted:
+            if not admitted:
+                # Over the per-agent / global concurrent-SSE cap. Reject
+                # cleanly instead of hanging or leaking another pinned
+                # upstream. See `_po._track_streaming_proxy`.
+                return _too_many_streams_response()
+            async with ClientSession(
+                connector=connector, timeout=timeout,
+            ) as sess:
+                async with sess.request(
+                    req.method,
+                    url,
+                    headers=headers,
+                    data=req_body,
+                    params=req.rel_url.query,
+                ) as up:
+                    last_active[(name, "backend")] = time.time()
+                    ctype = up.headers.get("Content-Type", "")
+                    is_streaming = (
+                        is_stream_request
+                        or ctype.startswith("text/event-stream")
+                    )
+                    out_headers = {
+                        k: v for k, v in up.headers.items()
+                        if k.lower()
+                        not in ("transfer-encoding", "content-length")
+                    }
+                    if is_streaming:
+                        # Framing-preserving pump: forward chunks as they
+                        # arrive so bytes flow to the client incrementally
+                        # instead of buffering an unbounded body. The
+                        # upstream's lifetime is tied to the client —
+                        # returning from here (client gone, or upstream
+                        # ended) exits the `async with sess.request(...)`
+                        # scope, closes `up`, and lets `_track_connection`
+                        # decrement so the reaper works again.
+                        return await _stream_upstream_to_client(
+                            req, up, name, out_headers,
+                        )
+                    # Pure pass-through for terminating responses: read
+                    # the full upstream body and hand it back as a
+                    # complete `web.Response`. aiohttp then serialises a
+                    # correct Content-Length with no chunked-transfer
+                    # involvement, so strict HTTP clients (curl, Claude
+                    # Code's MCP client) see a cleanly-terminated
+                    # transfer. A client that drops mid-`await up.read()`
+                    # raises ConnectionResetError out of this scope, which
+                    # tears the upstream down via the same context exit.
+                    body = await up.read()
+                    return web.Response(
+                        body=body, status=up.status, headers=out_headers,
+                    )
+
+
+def _sse_agent_key(headers: dict[str, str]) -> str:
+    """Per-agent cap key for a streaming proxy: a short hash of the
+    forwarded bearer (never the raw token, for log/hygiene safety).
+
+    `GET /mcp` always carries a bearer — the cookie-only GET path is
+    405'd upstream in `backend_mcp_handler` — so the ``"anon"`` fallback
+    is defensive only.
+    """
+    auth = headers.get("Authorization", "")
+    if not auth:
+        return "anon"
+    return hashlib.sha256(auth.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _too_many_streams_response() -> web.Response:
+    """Clean 429 for a streaming proxy rejected at the concurrency cap.
+
+    Fixed, project-agnostic body/reason — never reflect the caller's
+    project name (SEC4 pattern) and give no existence oracle beyond the
+    401/404 gates the request already cleared.
+    """
+    return web.Response(
+        status=429,
+        headers={"Retry-After": "5"},
+        text="Too many concurrent streams; retry shortly.",
+    )
+
+
+async def _stream_upstream_to_client(
+    req: web.Request,
+    up,
+    name: str,
+    out_headers: dict[str, str],
+) -> web.StreamResponse:
+    """Pump an SSE (`text/event-stream`) upstream to the client chunk by
+    chunk, tying the upstream's lifetime to the downstream client.
+
+    The backend's `GET /mcp` stream never ends on its own, so the only
+    teardown signal is the client leaving: a write to a departed client
+    raises `ConnectionResetError` (or the handler task is cancelled),
+    both of which unwind past the caller's `async with sess.request`,
+    close `up`, and let `_track_connection` decrement `active_conns`.
+    We also poll `request.transport.is_closing()` after each write so a
+    disconnect detected between upstream chunks tears down promptly
+    rather than waiting for the next heartbeat write to fail.
+    """
+    resp = web.StreamResponse(status=up.status, headers=out_headers)
+    await resp.prepare(req)
+    try:
+        async for chunk in up.content.iter_any():
+            last_active[(name, "backend")] = time.time()
+            await resp.write(chunk)
+            transport = req.transport
+            if transport is None or transport.is_closing():
+                # Client is gone — stop pumping. Returning exits the
+                # caller's `async with sess.request(...)` scope and
+                # closes the upstream connection.
+                return resp
+    except ConnectionResetError:
+        # Downstream client disconnected mid-write. Fall through and
+        # return; the upstream closes as the request scope unwinds.
+        return resp
+    # Upstream ended naturally (rare for /mcp). Flush a clean EOF; the
+    # client may already be gone, so a reset here is non-fatal.
+    with contextlib.suppress(ConnectionResetError):
+        await resp.write_eof()
+    return resp
 
 
 # ── Streamable HTTP transport ────────────────────────────────────

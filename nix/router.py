@@ -3,6 +3,14 @@
 # Single intentional fork from upstream: _systemctl honours
 # AGENT_MCP_SYSTEMCTL_MODE so we can run as a system service in the
 # NixOS VM (where there's no user systemd instance to talk to).
+#
+# NOT the deployed router (OBS1 vendored drift): every VM/module goes
+# nix/vm.nix → nix/module.nix → nix/packages.nix `agentMcpRouterWrapper`
+# → `python -m agent_mcp.cli router` → agent_mcp/router/app.py. This
+# file is only exposed as the `agent-mcp-router` flake output and runs
+# nowhere. The R8-F2 SSE-streaming proxy fix therefore lands in the
+# package (agent_mcp/router/{app,project_orchestrator}.py), not here;
+# fully de-vendoring this stale copy is tracked separately (OBS1).
 """
 agent-mcp-router
 
