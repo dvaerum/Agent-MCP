@@ -865,3 +865,245 @@ def test_rotate_token_does_not_rewarm_terminal_row(project_dir, reset_globals):
             "rotate_token re-warmed the auth cache with a terminal row "
             "under the new token"
         )
+
+
+# --- pentest R1-F4: upsert_cache + create gated on non-terminal status ---
+#
+# SEC-A (#454) pinned "no AgentRepository write path may leave a row
+# with status in TERMINAL_AGENT_STATUSES in state.active_agents" and
+# gated the five re-warm sites it enumerated (get_by_id, get_by_token,
+# update_field, advance_event_cursor, rotate_token). A follow-up
+# class-sweep of every ``state.active_agents[...] = `` writer in
+# ``agent_mcp/`` found the invariant was incomplete: ``upsert_cache``
+# writes a caller-supplied row straight into the cache with no status
+# check at all, and ``create()`` has the identical shape — its own
+# cache write is unconditional on the ``status`` parameter it accepts.
+# Neither is exploitable via a live caller today (``upsert_cache``'s
+# only caller is ``register_agent``'s post-commit warm, which always
+# hands it ``status="created"``; ``create()``'s only caller passes the
+# same hardcoded default) but both are public repository methods that
+# a future caller could hand a terminal row to, silently reactivating
+# a revoked bearer — the exact SEC-A bug class. Gated both the same
+# way as the other five.
+
+
+def test_upsert_cache_does_not_cache_terminal_row(project_dir, reset_globals):
+    """``upsert_cache`` must not warm the auth cache with a row whose
+    status is terminal."""
+    with _make_client(project_dir):
+        from agent_mcp.app.main_app import _bearer_is_active
+        from agent_mcp.core import state
+        from agent_mcp.repositories import agent_repo
+
+        agent_repo.upsert_cache({
+            "token": "tok-upsert-term",
+            "agent_id": "agent-upsert-term",
+            "status": "terminated",
+            "working_directory": "/tmp/upsert-term",
+        })
+
+        assert "tok-upsert-term" not in state.active_agents, (
+            "upsert_cache cached a row with status='terminated'"
+        )
+        assert _bearer_is_active("tok-upsert-term") is False
+
+
+def test_upsert_cache_does_not_cache_tombstone_row(project_dir, reset_globals):
+    """Same gate, other terminal status (BL-R31-3b tombstone rows)."""
+    with _make_client(project_dir):
+        from agent_mcp.core import state
+        from agent_mcp.repositories import agent_repo
+
+        agent_repo.upsert_cache({
+            "token": "tok-upsert-tomb",
+            "agent_id": "agent-upsert-tomb",
+            "status": "tombstone",
+            "working_directory": "/tmp/upsert-tomb",
+        })
+
+        assert "tok-upsert-tomb" not in state.active_agents, (
+            "upsert_cache cached a row with status='tombstone'"
+        )
+
+
+def test_upsert_cache_still_caches_active_row(project_dir, reset_globals):
+    """No regression: the real caller (``register_agent``'s post-commit
+    warm, always ``status="created"``) must still land in the cache."""
+    with _make_client(project_dir):
+        from agent_mcp.core import state
+        from agent_mcp.repositories import agent_repo
+
+        agent_repo.upsert_cache({
+            "token": "tok-upsert-live",
+            "agent_id": "agent-upsert-live",
+            "status": "created",
+            "working_directory": "/tmp/upsert-live",
+        })
+
+        assert state.active_agents.get("tok-upsert-live", {}).get(
+            "agent_id"
+        ) == "agent-upsert-live"
+        assert state.agent_working_dirs.get("agent-upsert-live") == (
+            "/tmp/upsert-live"
+        )
+
+
+def test_create_does_not_cache_terminal_row(project_dir, reset_globals):
+    """``create()`` accepts a ``status`` parameter (default 'created')
+    and must not warm the auth cache when a caller hands it a terminal
+    one. The row is still written to the DB (create's job); only the
+    cache write is gated."""
+    with _make_client(project_dir):
+        from agent_mcp.app.main_app import _bearer_is_active
+        from agent_mcp.core import state
+        from agent_mcp.repositories import agent_repo
+
+        entity = agent_repo.create(
+            token="tok-create-term",
+            agent_id="agent-create-term",
+            status="terminated",
+            working_directory="/tmp/create-term",
+        )
+
+        assert entity["agent_id"] == "agent-create-term"
+        assert "tok-create-term" not in state.active_agents, (
+            "create() cached a row with status='terminated'"
+        )
+        assert _bearer_is_active("tok-create-term") is False
+
+
+def test_create_still_caches_non_terminal_row(project_dir, reset_globals):
+    """No regression: the default/real-caller path (``status="created"``)
+    still lands in both caches."""
+    with _make_client(project_dir):
+        from agent_mcp.core import state
+        from agent_mcp.repositories import agent_repo
+
+        agent_repo.create(
+            token="tok-create-live",
+            agent_id="agent-create-live",
+            status="created",
+            working_directory="/tmp/create-live",
+        )
+
+        assert "tok-create-live" in state.active_agents
+        assert state.agent_working_dirs.get("agent-create-live") == (
+            "/tmp/create-live"
+        )
+
+
+# --- class-sweep: EVERY active_agents writer refuses a terminal row ------
+#
+# Strengthens the individual SEC-A regression tests above into one
+# parametrized guard that drives every known AgentRepository write path
+# into a terminal-status scenario and asserts none of them leave the
+# token cached. A future writer that forgets the gate fails loudly here
+# instead of shipping silently past the individually-named tests.
+
+
+def _sweep_create(agent_repo, state, token, agent_id):
+    agent_repo.create(
+        token=token, agent_id=agent_id, status="terminated",
+        working_directory="/tmp/sweep",
+    )
+    return [token]
+
+
+def _sweep_upsert_cache(agent_repo, state, token, agent_id):
+    agent_repo.upsert_cache({
+        "token": token, "agent_id": agent_id, "status": "terminated",
+        "working_directory": "/tmp/sweep",
+    })
+    return [token]
+
+
+def _sweep_get_by_id(agent_repo, state, token, agent_id):
+    _seed_agent(
+        agent_id, token=token, status="terminated",
+        working_directory="/tmp/sweep",
+    )
+    agent_repo.get_by_id(agent_id)
+    return [token]
+
+
+def _sweep_get_by_token(agent_repo, state, token, agent_id):
+    _seed_agent(
+        agent_id, token=token, status="terminated",
+        working_directory="/tmp/sweep",
+    )
+    agent_repo.get_by_token(token)
+    return [token]
+
+
+def _sweep_update_field(agent_repo, state, token, agent_id):
+    _seed_agent(
+        agent_id, token=token, status="active",
+        working_directory="/tmp/sweep",
+    )
+    agent_repo.get_by_token(token)
+    agent_repo.terminate(agent_id)
+    agent_repo.update_field(agent_id, "auto_event_loop", 0)
+    return [token]
+
+
+def _sweep_advance_event_cursor(agent_repo, state, token, agent_id):
+    _seed_agent(
+        agent_id, token=token, status="active",
+        working_directory="/tmp/sweep",
+    )
+    agent_repo.get_by_token(token)
+    agent_repo.terminate(agent_id)
+    agent_repo.advance_event_cursor(agent_id, "2026-01-01T00:00:00")
+    return [token]
+
+
+def _sweep_rotate_token(agent_repo, state, token, agent_id):
+    _seed_agent(
+        agent_id, token=token, status="terminated",
+        working_directory="/tmp/sweep",
+    )
+    state.active_agents[token] = {
+        "agent_id": agent_id, "token": token, "status": "terminated",
+    }
+    new_token = f"{token}-new"
+    agent_repo.rotate_token(agent_id, new_token)
+    return [token, new_token]
+
+
+_ACTIVE_AGENTS_WRITER_SWEEP = [
+    ("create", _sweep_create),
+    ("upsert_cache", _sweep_upsert_cache),
+    ("get_by_id", _sweep_get_by_id),
+    ("get_by_token", _sweep_get_by_token),
+    ("update_field", _sweep_update_field),
+    ("advance_event_cursor", _sweep_advance_event_cursor),
+    ("rotate_token", _sweep_rotate_token),
+]
+
+
+@pytest.mark.parametrize(
+    "case_name,driver",
+    _ACTIVE_AGENTS_WRITER_SWEEP,
+    ids=[c[0] for c in _ACTIVE_AGENTS_WRITER_SWEEP],
+)
+def test_every_active_agents_writer_refuses_terminal_row(
+    case_name, driver, project_dir, reset_globals,
+):
+    """Every write path that can populate ``state.active_agents`` must
+    refuse to cache a row whose status is terminal. Covers all seven
+    known writers (the five SEC-A gated + the two pentest R1-F4 gated)
+    so the invariant is pinned against the complete writer set, not
+    just the ones enumerated to date."""
+    with _make_client(project_dir):
+        from agent_mcp.core import state
+        from agent_mcp.repositories import agent_repo
+
+        token = f"tok-sweep-{case_name}"
+        agent_id = f"agent-sweep-{case_name}"
+        tokens_to_check = driver(agent_repo, state, token, agent_id)
+
+        for t in tokens_to_check:
+            assert t not in state.active_agents, (
+                f"{case_name} left a terminal-status row cached in "
+                f"state.active_agents under token {t!r}"
+            )
