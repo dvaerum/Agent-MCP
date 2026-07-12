@@ -115,6 +115,89 @@ def _drop_secret_tasks(
     ]
 
 
+# SECURITY (R4-F4): ownership-scope RAG task retrieval.
+#
+# The RAG secret-detector (``_value_has_embedded_secret``) is a denylist
+# that cannot catch every low-entropy / natural-language / non-ASCII
+# credential. The operator ruled the real bug is that ``query_rag_system``
+# searched ALL tasks with NO ownership filter — so a worker could pull
+# content (secrets included) out of another agent's task it could never
+# read directly via ``view_tasks``. The security contract is: **search
+# must not grant access the agent didn't already have.**
+#
+# ``view_tasks`` (``agent_mcp/tools/task_tools.py`` ~:3206-3238) scopes a
+# non-``tasks.assign`` caller by handing ``TaskQueryEngine`` an
+# ``agent_id=requesting_agent_id`` filter, which drops every row whose
+# ``assigned_to != requesting_agent_id`` (``task_queries.py`` ``_matches``)
+# — an EXACT match, so unassigned/NULL tasks are NOT worker-visible.
+# ``tasks.assign`` holders (operator / manager / sysadmin) get the
+# unscoped view. We MIRROR that exact rule here for the two task-bearing
+# RAG retrieval paths rather than refactoring task_tools.py (a sibling PR
+# owns that file); the predicate is small enough to replicate with this
+# signpost. See ``tests/test_sec_r4_f4_rag_task_ownership_scope.py``.
+def _task_ownership_sql(
+    requesting_agent_id: Optional[str],
+    can_view_all_tasks: bool,
+) -> tuple[str, List[str]]:
+    """Return the ``(sql_fragment, params)`` that scopes a live-task
+    ``SELECT`` to the caller's ``view_tasks`` visibility.
+
+    A ``tasks.assign`` caller (``can_view_all_tasks``) gets an empty
+    fragment (unscoped). A worker gets ``AND assigned_to = ?`` bound to
+    their own agent_id — the SAME exact-match filter ``view_tasks``
+    applies, which excludes both other agents' tasks AND the unassigned
+    (NULL) pool. A missing agent_id degrades closed (``= ''`` matches no
+    row).
+    """
+    if can_view_all_tasks:
+        return "", []
+    return " AND assigned_to = ?", [requesting_agent_id or ""]
+
+
+def _drop_unowned_task_chunks(
+    results: List[Dict[str, Any]],
+    *,
+    cursor: Any,
+    requesting_agent_id: Optional[str],
+    can_view_all_tasks: bool,
+) -> List[Dict[str, Any]]:
+    """Drop vector-search chunks sourced from a task the caller cannot
+    read directly (R4-F4).
+
+    Only ``source_type == "task"`` chunks are ownership-scoped — their
+    ``source_ref`` is the ``task_id`` (see ``index_task_data`` in
+    ``features/rag/indexing.py``). Context / code / markdown chunks are
+    project-wide and always kept. A ``tasks.assign`` caller keeps every
+    chunk. For a worker, a task chunk survives iff the underlying task's
+    ``assigned_to`` equals the caller — the same exact-match rule
+    ``view_tasks`` applies (unassigned/NULL tasks are NOT visible).
+    """
+    if can_view_all_tasks:
+        return results
+    task_refs = {
+        r.get("source_ref")
+        for r in results
+        if r.get("source_type") == "task" and r.get("source_ref")
+    }
+    visible_refs: set = set()
+    if task_refs:
+        placeholders = ",".join("?" for _ in task_refs)
+        cursor.execute(
+            f"SELECT task_id FROM tasks "
+            f"WHERE assigned_to = ? AND task_id IN ({placeholders})",
+            [requesting_agent_id or "", *task_refs],
+        )
+        visible_refs = {row[0] for row in cursor.fetchall()}
+    return [
+        r
+        for r in results
+        if not (
+            r.get("source_type") == "task"
+            and r.get("source_ref") not in visible_refs
+        )
+    ]
+
+
 def _scrub_secret_parts(parts: List[str]) -> List[str]:
     """SECURITY (R2-F3b) — the final assembly-seam scrub.
 
@@ -289,7 +372,12 @@ For example, suggest related files to examine, related project context keys to c
 Always err on the side of providing more detailed explanations and comprehensive information rather than brief responses."""
 
 
-async def query_rag_system(query_text: str) -> str:
+async def query_rag_system(
+    query_text: str,
+    *,
+    requesting_agent_id: Optional[str] = None,
+    can_view_all_tasks: bool = True,
+) -> str:
     """
     Processes a natural language query using the RAG system.
     Fetches relevant context from live data and indexed knowledge,
@@ -297,6 +385,16 @@ async def query_rag_system(query_text: str) -> str:
 
     Args:
         query_text: The natural language question from the user.
+        requesting_agent_id: The agent_id of the caller (from the
+            resolved Principal). Used to ownership-scope task retrieval
+            for non-privileged callers (R4-F4).
+        can_view_all_tasks: Whether the caller holds ``tasks.assign``
+            (operator / manager / sysadmin). Defaults to ``True`` so the
+            behaviour is unchanged for the few internal call sites that
+            don't pass a caller scope; ``ask_project_rag`` (the only
+            worker-facing entry point) ALWAYS threads the real value from
+            the Principal, so a worker's search is scoped. See
+            ``rag_tools.ask_project_rag_tool_impl``.
 
     Returns:
         A string containing the answer or an error message.
@@ -381,10 +479,21 @@ async def query_rag_system(query_text: str) -> str:
 
                     if safe_conditions:
                         where_clause = " OR ".join(safe_conditions)
+                        # SECURITY (R4-F4): scope the live-task keyword
+                        # search to the caller's view_tasks visibility so
+                        # search can't surface a task the caller couldn't
+                        # read directly. Wrap the LIKE disjunction in
+                        # parens before AND-ing the ownership clause, else
+                        # ``a OR b AND owner`` would bind as
+                        # ``a OR (b AND owner)`` and leak on a title match.
+                        ownership_sql, ownership_params = _task_ownership_sql(
+                            requesting_agent_id, can_view_all_tasks
+                        )
+                        sql_params_tasks.extend(ownership_params)
                         task_query_sql = f"""
                             SELECT task_id, title, status, description, updated_at
                             FROM tasks
-                            WHERE {where_clause}
+                            WHERE ({where_clause}){ownership_sql}
                             ORDER BY updated_at DESC
                             LIMIT 5
                         """
@@ -427,6 +536,16 @@ async def query_rag_system(query_text: str) -> str:
                         query_embedding=query_embedding,
                         limit=13,
                     )
+                )
+                # SECURITY (R4-F4): drop task-sourced chunks the caller
+                # can't read directly. Only ``source_type == "task"``
+                # chunks are ownership-scoped; project-wide context / code
+                # / markdown chunks are left intact.
+                vector_search_results = _drop_unowned_task_chunks(
+                    vector_search_results,
+                    cursor=cursor,
+                    requesting_agent_id=requesting_agent_id,
+                    can_view_all_tasks=can_view_all_tasks,
                 )
             except (
                 openai.APIError
