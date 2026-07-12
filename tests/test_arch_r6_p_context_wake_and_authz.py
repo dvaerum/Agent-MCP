@@ -17,6 +17,19 @@ the third write surface.
 The fix adds ``emit_context_write_wakes_bulk`` next to the single-key
 seam and routes BOTH bulk paths through it.
 
+SEC-C / F5 (round-6 wake-parity gap follow-up) — ``delete_project_context_tool_impl``
+was the last project_context write/delete surface that never routed
+through the shared wake seam at all: deleting
+``config_auto_event_loop_global`` reverted the flag to its default
+without calling ``wake_all_for_flag_recheck``, and deleting a
+``config_allow_worker_*`` key reverted worker tool visibility without
+pushing ``notifications/tools/list_changed``. The fix routes the
+delete path through ``emit_context_write_wakes_bulk`` (fired only
+after the DB transaction commits, matching every other surface's
+emit-after-commit placement) and ``delete_via_tool`` is added to
+``WRITE_SURFACES`` below so the parametrized invariant becomes "every
+project_context write AND delete surface fires the matching wake".
+
 #3 — leaky/dup: the "Unauthorized: " prefix round trip. The MCP wire
 renderer (``core/tool_result.py::render_as_text_content``) already
 prefixes every ``PermissionDenied`` with ``"Unauthorized: "``,  so the
@@ -193,10 +206,61 @@ async def _bulk_via_bulk_tool(admin, key: str, value) -> None:
     )
 
 
+async def _delete_via_tool(admin, key: str, value) -> None:
+    """The DELETE surface (SEC-C / F5) — before this fix
+    ``delete_project_context_tool_impl`` was the ONLY project_context
+    write/delete surface that never routed through
+    ``emit_context_write_wakes``/``emit_context_write_wakes_bulk``, so
+    deleting a toggle key silently reverted it to its default WITHOUT
+    firing the matching wake.
+
+    Seeds the row directly via the ORM — deliberately NOT through
+    ``update_project_context`` — so the seed write can't itself trip
+    the ``_emit_tools_list_changed``/``wake_all_for_flag_recheck``
+    mocks the shared parametrized test patches; only the delete call
+    below is allowed to make them fire.
+
+    ``config_*`` keys also match the tool's "critical system key"
+    guard (any key starting with ``config_`` needs
+    ``force_delete=True`` — see ``delete_project_context_tool_impl``'s
+    ``critical_keys`` matching), so the delete call passes it
+    unconditionally; both toggle keys under test are ``config_*``.
+    """
+    import datetime as _dt
+    import json as _json
+
+    from agent_mcp.db.engine import SessionLocal
+    from agent_mcp.db.models import ProjectContext
+
+    now = _dt.datetime.now().isoformat()
+    sess = SessionLocal()
+    try:
+        sess.add(
+            ProjectContext(
+                context_key=key,
+                value=_json.dumps(value),
+                created_at=now,
+                created_by="r6-p-operator",
+                updated_at=now,
+                updated_by="r6-p-operator",
+                description="seed for delete-wake parity test",
+            )
+        )
+        sess.commit()
+    finally:
+        sess.close()
+
+    await admin.assert_tool_succeeds(
+        "delete_project_context",
+        {"context_key": key, "force_delete": True},
+    )
+
+
 WRITE_SURFACES = [
     ("single_update", _single_update),
     ("bulk_via_update", _bulk_via_update),
     ("bulk_via_bulk_tool", _bulk_via_bulk_tool),
+    ("delete_via_tool", _delete_via_tool),
 ]
 
 TOGGLES = [

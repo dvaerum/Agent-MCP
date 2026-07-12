@@ -2413,40 +2413,54 @@ async def delete_project_context_tool_impl(
                     "context", detail["key"], connection=cursor,
                 )
 
-            # Prepare response
-            response_parts = [
-                f"Deleted {deleted_count} project context entries successfully:"
-            ]
+        # SEC-C / F5: fire the SAME wake seam every other project_context
+        # write surface uses (single update, queued bulk, inline bulk,
+        # create) — this delete path was the last one that bypassed it
+        # entirely, so deleting `config_auto_event_loop_global` reverted
+        # the flag to its default without waking in-flight
+        # `wait_for_events` callers, and deleting a `config_allow_worker_*`
+        # key reverted worker tool visibility without pushing
+        # `notifications/tools/list_changed`. Placed AFTER the `with
+        # unit_of_work()` block exits cleanly (== committed), matching the
+        # emit-after-commit placement of every sibling write surface.
+        await emit_context_write_wakes_bulk(
+            detail["key"] for detail in deletion_details
+        )
 
-            for detail in deletion_details:
-                key_info = f"  • {detail['key']}"
-                if detail["description"]:
-                    key_info += f" ({detail['description']})"
-                if detail["was_critical"]:
-                    key_info += " [CRITICAL]"
-                response_parts.append(key_info)
+        # Prepare response
+        response_parts = [
+            f"Deleted {deleted_count} project context entries successfully:"
+        ]
 
-            if critical_keys_found:
-                response_parts.append(
-                    f"\n⚠️  WARNING: {len(critical_keys_found)} critical system keys were deleted!"
-                )
-                response_parts.append(
-                    "System functionality may be affected. Consider backing up before restart."
-                )
+        for detail in deletion_details:
+            key_info = f"  • {detail['key']}"
+            if detail["description"]:
+                key_info += f" ({detail['description']})"
+            if detail["was_critical"]:
+                key_info += " [CRITICAL]"
+            response_parts.append(key_info)
 
+        if critical_keys_found:
             response_parts.append(
-                f"\nDeletion completed at: {datetime.datetime.now().isoformat()}"
+                f"\n⚠️  WARNING: {len(critical_keys_found)} critical system keys were deleted!"
+            )
+            response_parts.append(
+                "System functionality may be affected. Consider backing up before restart."
             )
 
-            return Ok(
-                data={
-                    "deleted_count": deleted_count,
-                    "deleted_keys": [d["key"] for d in deletion_details],
-                    "critical_keys_deleted": critical_keys_found,
-                    "force_delete": force_delete,
-                },
-                message="\n".join(response_parts),
-            )
+        response_parts.append(
+            f"\nDeletion completed at: {datetime.datetime.now().isoformat()}"
+        )
+
+        return Ok(
+            data={
+                "deleted_count": deleted_count,
+                "deleted_keys": [d["key"] for d in deletion_details],
+                "critical_keys_deleted": critical_keys_found,
+                "force_delete": force_delete,
+            },
+            message="\n".join(response_parts),
+        )
 
     except Exception as e:
         # The unit-of-work already rolled back + closed the connection.
