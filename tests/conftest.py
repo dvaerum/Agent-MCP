@@ -6,13 +6,26 @@ TestClient (which handles lifespan startup/shutdown), assert behavior.
 
 No systemd, no real Ollama, no network. Each test gets a fresh tmpdir
 SQLite DB.
+
+arch-r6 #2: this module is the single owner of the test-isolation
+contract (`reset_and_snapshot_globals`, `install_mock_ollama`,
+`seed_agent_row`) — see each function's docstring for why. Before this
+refactor, `tests/harness.py` carried standalone byte-for-byte copies of
+the globals-reset and mock-ollama logic (labelled "mirror of
+conftest.py" in its own comments) plus three more copies of the
+agent-row seed SQL; a change to any one invariant (e.g. a new
+NOT-NULL `agents` column, or a new module-level global needing reset)
+had to be applied in every copy independently or tests would leak
+state / break in ways that were hard to attribute to a specific
+fixture vs. the harness. `tests/harness.py` now imports these seams
+instead of re-implementing them.
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Callable, Iterator, Optional
 
 import pytest
 
@@ -50,14 +63,19 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         )
 
 
-@pytest.fixture
-def reset_globals() -> Iterator[None]:
-    """Reset agent_mcp.core.globals state between tests.
+def reset_and_snapshot_globals() -> Callable[[], None]:
+    """Reset `agent_mcp.core.globals` state; return a restore closure.
+
+    Single owner of "what mutable state must be isolated between
+    tests" — the sole invariant every caller needs, and the one that
+    used to be duplicated between the ``reset_globals`` fixture below
+    and ``tests.harness.mcp_session`` (see module docstring). Both call
+    this function; the fixture restores via ``yield``/teardown, the
+    harness registers the returned closure on its ``ExitStack``.
 
     agent-mcp uses module-level singletons (in-memory task/agent
-    caches, etc.). Tests that build their own app instances must reset
+    caches, etc). Anything that builds its own app instance must reset
     these or state leaks across tests in surprising ways.
-
     """
     from agent_mcp.core import globals as g
     from agent_mcp.db import engine as _engine
@@ -85,9 +103,10 @@ def reset_globals() -> Iterator[None]:
         "connections": dict(g.connections),
         "active_agents": dict(g.active_agents),
         # retire-system-token Wave 3: ``g.admin_token`` is deleted as a
-        # declared global. The conftest ``client`` fixture still sets it
-        # dynamically as an attribute (see fixture docstring); capture
-        # defensively so the snapshot survives when no test has set it.
+        # declared global. The ``client`` fixture below (and the
+        # harness's ``AdminClient``) still set it dynamically as an
+        # attribute; capture defensively so the snapshot survives when
+        # no caller has set it.
         "admin_token": getattr(g, "admin_token", None),
         "tasks": dict(g.tasks),
         "file_map": dict(g.file_map),
@@ -96,36 +115,51 @@ def reset_globals() -> Iterator[None]:
         "global_vss_load_tested": g.global_vss_load_tested,
         "global_vss_load_successful": g.global_vss_load_successful,
     }
+
+    def _restore() -> None:
+        # Dicts/lists are mutated in place, so clear then update.
+        g.connections.clear()
+        g.connections.update(snapshot["connections"])
+        g.active_agents.clear()
+        g.active_agents.update(snapshot["active_agents"])
+        # retire-system-token Wave 3: only restore admin_token if a
+        # prior caller dynamically set it; otherwise leave the attr
+        # absent so reads via ``getattr(g, "admin_token", ...)``
+        # behave consistently across tests.
+        if snapshot["admin_token"] is not None:
+            g.admin_token = snapshot["admin_token"]
+        elif hasattr(g, "admin_token"):
+            delattr(g, "admin_token")
+        g.tasks.clear()
+        g.tasks.update(snapshot["tasks"])
+        g.file_map.clear()
+        g.file_map.update(snapshot["file_map"])
+        g.agent_working_dirs.clear()
+        g.agent_working_dirs.update(snapshot["agent_working_dirs"])
+        g.audit_log.clear()
+        g.audit_log.extend(snapshot["audit_log"])
+        g.global_vss_load_tested = snapshot["global_vss_load_tested"]
+        g.global_vss_load_successful = snapshot["global_vss_load_successful"]
+        _engine.reset_engine_cache()
+        g.agent_event_signals.clear()
+        g.agent_event_locks.clear()
+        g.agent_event_queues.clear()
+        g.agent_event_waiters.clear()
+        g.reset_startup_complete_event()
+
+    return _restore
+
+
+@pytest.fixture
+def reset_globals() -> Iterator[None]:
+    """Reset agent_mcp.core.globals state between tests.
+
+    Thin pytest wrapper around :func:`reset_and_snapshot_globals` — see
+    that function's docstring for what it resets and why.
+    """
+    restore = reset_and_snapshot_globals()
     yield
-    # Restore. Dicts/lists are mutated in place, so clear then update.
-    g.connections.clear()
-    g.connections.update(snapshot["connections"])
-    g.active_agents.clear()
-    g.active_agents.update(snapshot["active_agents"])
-    # retire-system-token Wave 3: only restore admin_token if a prior
-    # test (via the ``client`` fixture) dynamically set it; otherwise
-    # leave the attr absent so reads via ``getattr(g, "admin_token", ...)``
-    # behave consistently across tests.
-    if snapshot["admin_token"] is not None:
-        g.admin_token = snapshot["admin_token"]
-    elif hasattr(g, "admin_token"):
-        delattr(g, "admin_token")
-    g.tasks.clear()
-    g.tasks.update(snapshot["tasks"])
-    g.file_map.clear()
-    g.file_map.update(snapshot["file_map"])
-    g.agent_working_dirs.clear()
-    g.agent_working_dirs.update(snapshot["agent_working_dirs"])
-    g.audit_log.clear()
-    g.audit_log.extend(snapshot["audit_log"])
-    g.global_vss_load_tested = snapshot["global_vss_load_tested"]
-    g.global_vss_load_successful = snapshot["global_vss_load_successful"]
-    _engine.reset_engine_cache()
-    g.agent_event_signals.clear()
-    g.agent_event_locks.clear()
-    g.agent_event_queues.clear()
-    g.agent_event_waiters.clear()
-    g.reset_startup_complete_event()
+    restore()
 
 
 @pytest.fixture
@@ -154,6 +188,84 @@ def app(project_dir: Path, reset_globals: None):
     return create_app(project_dir=str(project_dir))
 
 
+def seed_agent_row(
+    conn: Any,
+    agent_id: str,
+    *,
+    token: Optional[str] = None,
+    role: Optional[str] = "worker",
+    status: str = "active",
+    working_directory: str = "/tmp",
+    color: str = "#888",
+    or_ignore: bool = False,
+    created_at: Optional[str] = None,
+) -> str:
+    """INSERT a minimal `agents` row directly via raw SQL. Returns the token.
+
+    Single owner of the "what does a synthetic test agent row look
+    like" shape — before this refactor, four call sites (this
+    module's ``client`` fixture, and three sites in
+    ``tests/harness.py``) each re-listed the same 8-9 columns with the
+    literals ``"[]"``, ``"active"``, ``"/tmp"``, ``"#888"``.
+
+    Deliberately bypasses ``agent_repo.create()``:
+
+    * that repo method rejects ``agent_id`` values matching
+      ``_RESERVED_AGENT_ID_PREFIXES`` (``"admin"`` is reserved), but
+      several call sites need to seed exactly that id.
+    * it always raises on a duplicate row; some call sites need
+      idempotent re-seeding (``or_ignore=True``) across repeated calls
+      in the same test process.
+    * it validates ``agent_id`` against a slug regex; some call sites
+      (e.g. ``tests/test_rest_messages_endpoints.py``'s
+      ``"[deleted-old-worker-1]"``) deliberately seed ids that would
+      fail that regex.
+
+    ``token`` defaults to a fresh ``secrets.token_hex(16)`` when not
+    supplied. ``role=None`` omits the ``agent_role`` column entirely
+    (relies on the schema default) — used by bare FK-satisfying rows
+    that don't care about auth. ``created_at`` lets a caller thread the
+    same timestamp it also uses to populate an in-memory
+    ``g.active_agents`` cache entry, so the DB row and the cache entry
+    agree.
+
+    Caller owns the connection: this commits but does not close it.
+    """
+    import datetime as _dt
+    import secrets as _secrets
+
+    tok = token if token is not None else _secrets.token_hex(16)
+    now = created_at or _dt.datetime.now().isoformat()
+    verb = "INSERT OR IGNORE" if or_ignore else "INSERT"
+    cursor = conn.cursor()
+    if role is not None:
+        cursor.execute(
+            f"{verb} INTO agents (token, agent_id, capabilities, "
+            "created_at, status, working_directory, color, updated_at, "
+            "agent_role) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                tok,
+                agent_id,
+                "[]",
+                now,
+                status,
+                working_directory,
+                color,
+                now,
+                role,
+            ),
+        )
+    else:
+        cursor.execute(
+            f"{verb} INTO agents (token, agent_id, capabilities, "
+            "created_at, status, working_directory, color, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (tok, agent_id, "[]", now, status, working_directory, color, now),
+        )
+    conn.commit()
+    return tok
+
+
 @pytest.fixture
 def client(app):
     """An httpx TestClient against the in-process app.
@@ -176,8 +288,8 @@ def client(app):
     assignment works on the state module without prior declaration) so
     the many tests that read ``g.admin_token`` as their operator-tier
     bearer continue to function without per-callsite edits. The
-    snapshot/restore plumbing in ``reset_globals`` reads it
-    defensively via ``getattr``.
+    snapshot/restore plumbing in ``reset_and_snapshot_globals`` reads
+    it defensively via ``getattr``.
     """
     import datetime as _dt
     import secrets as _secrets
@@ -198,25 +310,14 @@ def client(app):
         now = _dt.datetime.now().isoformat()
         conn = get_db_connection()
         try:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT OR IGNORE INTO agents (token, agent_id, "
-                "capabilities, created_at, status, working_directory, "
-                "color, updated_at, agent_role) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    token,
-                    "admin",
-                    "[]",
-                    now,
-                    "active",
-                    "/tmp",
-                    "#888",
-                    now,
-                    "manager",
-                ),
+            seed_agent_row(
+                conn,
+                "admin",
+                token=token,
+                role="manager",
+                or_ignore=True,
+                created_at=now,
             )
-            conn.commit()
         finally:
             conn.close()
         g.active_agents[token] = {
@@ -230,16 +331,23 @@ def client(app):
         yield test_client
 
 
-@pytest.fixture
-def mock_ollama(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Replace the OpenAI-shaped embeddings endpoint with an in-process fake.
+def install_mock_ollama(
+    register: Callable[[Callable[[], None]], None],
+) -> None:
+    """Install the in-process httpx mock transport shared by the
+    `mock_ollama` fixture (below) and `tests.harness.mcp_session`.
 
-    Tests that exercise RAG/indexing flows opt in by depending on this
-    fixture. Returns deterministic 1024-dim zero-vectors (matching the
+    Replaces the OpenAI-shaped embeddings endpoint with a deterministic
+    fake so RAG/indexing test flows don't reach a real Ollama instance.
+    Returns deterministic 1024-dim zero-vectors (matching the
     `qwen3-embedding:0.6b` dimension used by the deployment).
 
-    Not strictly needed for Phase 1's smoke test, but provided so Phase
-    3+ tests don't each invent their own mock.
+    ``register`` takes a single zero-arg cleanup callable and is
+    responsible for scheduling it to run at teardown. Both call sites'
+    native teardown mechanisms have exactly that shape, so one
+    implementation serves both: pytest's
+    ``FixtureRequest.addfinalizer`` (LIFO at fixture-scope teardown) or
+    ``contextlib.ExitStack.callback`` (LIFO at ``stack.close()``).
     """
     import httpx
 
@@ -285,5 +393,25 @@ def mock_ollama(monkeypatch: pytest.MonkeyPatch) -> None:
         kwargs.setdefault("transport", transport)
         original_async_init(self, *args, **kwargs)
 
-    monkeypatch.setattr(httpx.Client, "__init__", _patched_client_init)
-    monkeypatch.setattr(httpx.AsyncClient, "__init__", _patched_async_init)
+    httpx.Client.__init__ = _patched_client_init  # type: ignore[assignment]
+    httpx.AsyncClient.__init__ = _patched_async_init  # type: ignore[assignment]
+
+    def _restore() -> None:
+        httpx.Client.__init__ = original_client_init  # type: ignore[assignment]
+        httpx.AsyncClient.__init__ = original_async_init  # type: ignore[assignment]
+
+    register(_restore)
+
+
+@pytest.fixture
+def mock_ollama(request: pytest.FixtureRequest) -> None:
+    """Replace the OpenAI-shaped embeddings endpoint with an in-process fake.
+
+    Tests that exercise RAG/indexing flows opt in by depending on this
+    fixture. See :func:`install_mock_ollama` for the shared
+    implementation this delegates to.
+
+    Not strictly needed for Phase 1's smoke test, but provided so Phase
+    3+ tests don't each invent their own mock.
+    """
+    install_mock_ollama(request.addfinalizer)
