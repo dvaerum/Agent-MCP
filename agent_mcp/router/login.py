@@ -30,9 +30,15 @@ Plus two helpers consumed by the empty-users redirect middleware
     named public surface so PR D's auth dependency can ``touch +
     resolve`` without juggling the side-effect contract.
 
-CSRF protection is deliberately deferred to PR D; the
-``SameSite=Lax`` cookie attribute provides a meaningful baseline
-against cross-origin form posts in the interim.
+Login-CSRF (session forcing): the ``POST /login`` (and the
+setup-wizard ``POST /setup``) MINT a session cookie rather than
+consuming one, so ``SameSite=Lax`` — which only stops an
+*existing* cookie from riding a cross-site request — gives them no
+protection. ``enforce_same_origin`` closes this class server-side:
+a request with a cross-site ``Origin`` (or ``Sec-Fetch-Site:
+cross-site`` when ``Origin`` is absent) is rejected with ``403``
+before any session is minted. Non-browser clients (curl, CLI) send
+neither header and are unaffected. See R9-F1.
 
 Cookie ``Secure`` flag: conditional. On for HTTPS, OFF for plain
 HTTP. The VM smoke runs over plain HTTP localhost, so the cookie
@@ -286,6 +292,73 @@ def _safe_next(raw: str | None) -> str:
     return raw
 
 
+# ── Login-CSRF: same-origin enforcement (R9-F1) ────────────────────
+
+
+def _external_origin(request: web.Request) -> str:
+    """Return the origin (``scheme://host[:port]``) the browser sees.
+
+    TLS is terminated at nginx / tailscale and plain HTTP is forwarded
+    to the router, so ``request.url.scheme`` / ``request.host`` reflect
+    the loopback hop, NOT what the operator typed. Honour
+    ``X-Forwarded-Proto`` / ``X-Forwarded-Host`` first — same precedence
+    as the SSO redirect_uri builder (``sso._default_redirect_url``) and
+    the cookie-Secure logic — so the same-origin comparison is against
+    the EXTERNAL origin.
+    """
+    proto = (
+        request.headers.get("X-Forwarded-Proto")
+        or request.url.scheme
+    )
+    host = (
+        request.headers.get("X-Forwarded-Host")
+        or request.host
+    )
+    return f"{proto.lower()}://{host.lower()}"
+
+
+def enforce_same_origin(request: web.Request) -> None:
+    """Reject a cross-site browser POST before any state change.
+
+    ``POST /login`` and ``POST /setup`` MINT a session cookie; they do
+    not consume one. ``SameSite=Lax`` only stops an *existing* cookie
+    from riding a cross-site request, so it gives a cookie-minting POST
+    no protection — an attacker page can auto-submit a cross-site form
+    with the ATTACKER's credentials and silently log the victim into the
+    attacker's account (login CSRF / session forcing). Guard both
+    cookie-minting POSTs with a server-side same-origin check.
+
+    Policy (idiomatic, token-free):
+
+      * ``Origin`` present → must equal the request's own external
+        origin (``scheme://host``); a mismatch raises ``403`` and no
+        session is minted. ``Origin`` is preferred because it is the
+        header the browser attaches to cross-site form posts and cannot
+        be spoofed by page JS.
+      * ``Origin`` absent → fall back to ``Sec-Fetch-Site``; reject
+        ``cross-site`` / ``cross-origin``.
+      * Both absent → allow. Non-browser clients (curl, the CLI, the
+        pentest harness) send neither and are not subject to CSRF.
+
+    Raises ``web.HTTPForbidden`` on a cross-site request; returns None
+    when the request is safe to proceed.
+    """
+    origin = request.headers.get("Origin")
+    if origin:
+        # A well-formed same-origin post carries Origin == our external
+        # origin. Compare case-insensitively on scheme+host (browsers
+        # already normalise the Origin to scheme://host[:port] with no
+        # path). "null" (sandboxed iframe / opaque origin) never matches
+        # and is correctly rejected.
+        if origin.strip().lower() != _external_origin(request):
+            raise web.HTTPForbidden(reason="Cross-origin request rejected")
+        return
+    sec_fetch_site = request.headers.get("Sec-Fetch-Site", "").strip().lower()
+    if sec_fetch_site in ("cross-site", "cross-origin"):
+        raise web.HTTPForbidden(reason="Cross-origin request rejected")
+    return
+
+
 # ── Handlers ───────────────────────────────────────────────────────
 
 
@@ -343,6 +416,10 @@ def _resolve_sso_provider_name() -> str | None:
 
 async def login_post_handler(request: web.Request) -> web.StreamResponse:
     """POST /agent-mcp/login — validate, set cookie, redirect."""
+    # Login-CSRF guard (R9-F1): this POST mints a session cookie, so
+    # SameSite=Lax does not protect it. Reject a cross-site Origin
+    # before touching credentials or minting anything.
+    enforce_same_origin(request)
     next_url = request.rel_url.query.get("next", "")
     try:
         form = await request.post()

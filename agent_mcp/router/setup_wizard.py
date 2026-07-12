@@ -34,6 +34,7 @@ from .login import (
     _form_str,
     _render,
     _set_session_cookie,
+    enforce_same_origin,
 )
 
 
@@ -127,6 +128,12 @@ async def setup_get_handler(request: web.Request) -> web.Response:
 
 async def setup_post_handler(request: web.Request) -> web.StreamResponse:
     """POST /agent-mcp/setup — validate + create the first operator."""
+    # Login-CSRF guard (R9-F1): like /login, this POST mints a session
+    # cookie (bootstrapping the first operator), so SameSite=Lax does
+    # not cover it. The users-empty check below already narrows the
+    # window to first-boot, but guarding here keeps this handler in the
+    # same cookie-minting class so a future refactor can't reopen it.
+    enforce_same_origin(request)
     if not users_table_is_empty():
         # A POST after the wizard's already been completed — most
         # likely a back-button replay. Bounce to /login rather than

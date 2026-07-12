@@ -204,6 +204,86 @@ async def test_login_unknown_user_runs_equal_argon2_work(
     assert "Invalid username or password." in body_missing
 
 
+# ── Login CSRF: Origin / Sec-Fetch-Site validation (R9-F1) ─────────
+#
+# POST /login MINTS a session cookie; it does not consume one. So
+# SameSite=Lax (which only stops the *authenticated* cookie from riding
+# a cross-site request) gives this endpoint no protection at all — an
+# attacker page can auto-submit a cross-site login form with the
+# ATTACKER's creds and silently log the victim into the attacker's
+# account (login CSRF / session forcing). The server therefore rejects a
+# cross-site Origin before minting anything.
+
+
+async def test_login_rejects_cross_site_origin(
+    aiohttp_client, router_app,
+) -> None:
+    """Cross-site Origin → 403, NO session cookie minted (R9-F1)."""
+    _seed_user(username="csrf_bob", password="csrf-bob-pw")
+    client = await aiohttp_client(router_app)
+    resp = await client.post(
+        "/agent-mcp/login",
+        data={"username": "csrf_bob", "password": "csrf-bob-pw"},
+        headers={"Origin": "https://evil.example"},
+        allow_redirects=False,
+    )
+    assert resp.status == 403, await resp.text()
+    set_cookie = resp.headers.get("Set-Cookie")
+    assert set_cookie is None or "agent_mcp_session" not in set_cookie, (
+        "cross-site login must NOT mint a session cookie"
+    )
+
+
+async def test_login_rejects_cross_site_sec_fetch_site(
+    aiohttp_client, router_app,
+) -> None:
+    """Sec-Fetch-Site: cross-site (no Origin) → 403, no cookie (R9-F1)."""
+    _seed_user(username="csrf_sfs", password="csrf-sfs-pw")
+    client = await aiohttp_client(router_app)
+    resp = await client.post(
+        "/agent-mcp/login",
+        data={"username": "csrf_sfs", "password": "csrf-sfs-pw"},
+        headers={"Sec-Fetch-Site": "cross-site"},
+        allow_redirects=False,
+    )
+    assert resp.status == 403, await resp.text()
+    set_cookie = resp.headers.get("Set-Cookie")
+    assert set_cookie is None or "agent_mcp_session" not in set_cookie
+
+
+async def test_login_accepts_same_origin(
+    aiohttp_client, router_app,
+) -> None:
+    """A same-origin Origin (matching host) → normal 303 + cookie."""
+    _seed_user(username="csrf_same", password="csrf-same-pw")
+    client = await aiohttp_client(router_app)
+    same_origin = str(client.make_url("/agent-mcp/login").origin())
+    resp = await client.post(
+        "/agent-mcp/login",
+        data={"username": "csrf_same", "password": "csrf-same-pw"},
+        headers={"Origin": same_origin, "Sec-Fetch-Site": "same-origin"},
+        allow_redirects=False,
+    )
+    assert resp.status == 303, await resp.text()
+    assert "agent_mcp_session" in resp.headers.get("Set-Cookie", "")
+
+
+async def test_login_accepts_no_origin_curl(
+    aiohttp_client, router_app,
+) -> None:
+    """No Origin + no Sec-Fetch-Site (curl / CLI / pentest harness) →
+    allowed. These are not browser-driven and carry no CSRF risk."""
+    _seed_user(username="csrf_curl", password="csrf-curl-pw")
+    client = await aiohttp_client(router_app)
+    resp = await client.post(
+        "/agent-mcp/login",
+        data={"username": "csrf_curl", "password": "csrf-curl-pw"},
+        allow_redirects=False,
+    )
+    assert resp.status == 303, await resp.text()
+    assert "agent_mcp_session" in resp.headers.get("Set-Cookie", "")
+
+
 # ── Logout ─────────────────────────────────────────────────────────
 
 
