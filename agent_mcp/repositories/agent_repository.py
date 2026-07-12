@@ -889,7 +889,17 @@ class AgentRepository:
         # subscribers or persist after rollback. Caller is responsible
         # for calling :meth:`upsert_cache` after their own commit.
         if connection is None:
-            if not self._cache_disabled:
+            # SECURITY (terminate-revocation): see get_by_id / get_by_token
+            # above. ``status`` defaults to 'created' and today's only
+            # caller (``register_agent``) always passes that, but the
+            # write path itself must not rely on caller discipline — a
+            # future caller handing ``create()`` a terminal status must
+            # not land the row in the cache-only auth gate (pentest
+            # R1-F4 class-sweep; ``upsert_cache`` had the identical gap).
+            if (
+                not self._cache_disabled
+                and status not in TERMINAL_AGENT_STATUSES
+            ):
                 state.active_agents[token] = fresh
                 state.agent_working_dirs[agent_id] = working_directory
 
@@ -2015,6 +2025,16 @@ class AgentRepository:
                 "agent_repo.upsert_cache called without token or agent_id; "
                 "ignoring"
             )
+            return
+        # SECURITY (terminate-revocation): see get_by_id / get_by_token
+        # above. A caller-supplied row headed straight for the cache-only
+        # auth gate must not carry a terminal status — caching a
+        # status='terminated' (or 'tombstone' — BL-R31-3b) row would
+        # silently reactivate a revoked bearer. Today's only caller
+        # (``register_agent``'s post-commit warm) always passes
+        # status='created', but the gate belongs on the write path, not
+        # on caller discipline (pentest R1-F4).
+        if row.get("status") in TERMINAL_AGENT_STATUSES:
             return
         state.active_agents[token] = row
         wd = row.get("working_directory")
