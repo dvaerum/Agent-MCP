@@ -575,6 +575,64 @@ async def _track_connection(name: str):
             _gc(name)
 
 
+# ── SSE (GET /mcp) concurrency caps (R8-F2) ─────────────────────────
+# The backend's ``GET /mcp`` handler returns an INFINITE
+# ``text/event-stream`` (a ``: ping`` heartbeat forever). Each admitted
+# stream therefore pins a router→backend UDS connection + proxy task +
+# a slot in ``active_conns`` for the whole lifetime of the stream. The
+# router streams these (``_proxy_to_backend``) and tears the upstream
+# down on client disconnect, but WITHOUT a cap a single valid agent
+# bearer could still open unbounded concurrent streams — exhausting the
+# router's fd/task budget and pinning backends against the idle reaper
+# (which only stops a project when ``active_conns == 0``). Cap both the
+# per-agent (per-bearer) and the global count of simultaneous streaming
+# proxies; over the cap the caller returns a clean 429 instead of
+# hanging. Defaults are generous for legitimate use (a client keeps
+# roughly one notification stream per session) but finite; override via
+# env for unusual deployments.
+MAX_STREAMS_PER_AGENT = int(os.environ.get("AGENT_MCP_MAX_SSE_PER_AGENT", "4"))
+MAX_STREAMS_GLOBAL = int(os.environ.get("AGENT_MCP_MAX_SSE_GLOBAL", "64"))
+
+# Live streaming-proxy counters. Module-global (not per-``ProjectRuntime``)
+# because the global cap spans every project and the per-agent key is a
+# bearer hash, not a project name.
+_streaming_proxies_global: int = 0
+_streaming_proxies_per_agent: dict[str, int] = {}
+
+
+@contextlib.asynccontextmanager
+async def _track_streaming_proxy(agent_key: str):
+    """Admit-or-reject a streaming (SSE) proxy under the concurrency caps.
+
+    Yields ``True`` when the stream is admitted (and holds a slot in
+    both counters for the ``with`` body's duration), or ``False`` when
+    either the per-agent or the global cap is already saturated — the
+    caller must then reject the request (429) rather than proxy it.
+
+    ``MAX_STREAMS_*`` are read by name at call time so tests (and env
+    overrides applied before import) take effect without re-wiring.
+    """
+    global _streaming_proxies_global
+    per = _streaming_proxies_per_agent.get(agent_key, 0)
+    if (
+        _streaming_proxies_global >= MAX_STREAMS_GLOBAL
+        or per >= MAX_STREAMS_PER_AGENT
+    ):
+        yield False
+        return
+    _streaming_proxies_global += 1
+    _streaming_proxies_per_agent[agent_key] = per + 1
+    try:
+        yield True
+    finally:
+        _streaming_proxies_global -= 1
+        remaining = _streaming_proxies_per_agent.get(agent_key, 1) - 1
+        if remaining <= 0:
+            _streaming_proxies_per_agent.pop(agent_key, None)
+        else:
+            _streaming_proxies_per_agent[agent_key] = remaining
+
+
 async def _ensure(name: str, role: str) -> Path:
     """Make sure the backend for (name, role) is running; return its sock.
 
