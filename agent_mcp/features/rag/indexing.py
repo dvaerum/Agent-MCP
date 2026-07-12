@@ -77,8 +77,37 @@ IGNORE_DIRS_FOR_INDEXING = [
 # well-known token shapes plus long high-entropy runs; scanning is
 # scoped to the ``context`` source only (markdown/code legitimately
 # contain long tokens like commit hashes).
+#
+# SECURITY (R3-F2) — this is the ONE shared detector every RAG consumer
+# imports (ingest choke-point, the search_similar retrieval seam,
+# _drop_secret_tasks / _scrub_secret_parts assembly seams,
+# project_context_tools + composition backstops). Its "by-construction"
+# redaction guarantee is therefore only as strong as this table: a live
+# pentest showed a lowest-privilege worker exfiltrating real credentials
+# VERBATIM through ask_project_rag simply by using formats the denylist
+# did not match — a DB connection URL (``postgres://user:pass@host``) and
+# a Stripe ``sk_live_`` key (underscore; the old ``sk-`` pattern is
+# hyphen/OpenAI-style), plus base32 TOTP seeds, short (<40 char) hex
+# keys, HTTP basic-auth URLs, and ``key: value`` credential lines.
+#
+# A denylist can never be complete, so this table is deliberately
+# AGGRESSIVE and errs toward OVER-redaction: over-redacting a RAG answer
+# is harmless (the worker just gets a slightly thinner context), while
+# leaking a credential is not. We accept false positives — commit SHAs,
+# long opaque identifiers, all-caps runs — as the safe failure mode.
+# The DURABLE fix is write-time marking of secret-bearing rows so
+# retrieval never has to re-derive "is this a secret?" from text; that is
+# an accepted architectural follow-up, tracked separately. Until then,
+# broaden HERE (one source of truth) and every consumer benefits at once.
 _EMBEDDED_SECRET_PATTERNS = (
+    # URL-embedded credentials, ANY scheme: ``scheme://user:pass@host``
+    # or ``scheme://:pass@host`` (postgres/postgresql/mysql/redis/https…).
+    re.compile(r"://[^/\s:@]*:[^@/\s]+@"),
     re.compile(r"sk-[A-Za-z0-9_-]{16,}"),                 # OpenAI-style key
+    # Stripe & similar prefixed keys (underscore): sk_live_ / sk_test_ /
+    # pk_live_ / rk_live_ …  — distinct from the hyphenated OpenAI shape.
+    re.compile(r"(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{10,}"),
+    re.compile(r"whsec_[A-Za-z0-9]{16,}"),               # Stripe webhook secret
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),           # GitHub PAT / OAuth
     re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),         # GitHub fine-grained PAT
     re.compile(r"AKIA[0-9A-Z]{16}"),                     # AWS access key id
@@ -86,28 +115,58 @@ _EMBEDDED_SECRET_PATTERNS = (
     re.compile(                                          # JWT (header.payload.sig)
         r"eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}"
     ),
+    # base32 secret run (TOTP/MFA seeds, base32-encoded keys). No 0/1/8/9.
+    re.compile(r"[A-Z2-7]{16,}"),
+    # ``key: value`` / ``key=value`` credential lines — a very common
+    # paste shape (``db_password: Tr0ub4dor``, ``API_KEY = ...``).
+    re.compile(
+        r"(?i)(?:password|passwd|secret|api[_-]?key|token)\s*[:=]\s*\S{6,}"
+    ),
 )
-# A long run of credential-ish characters. Applied with an entropy
-# guard (must mix letters + digits) so prose / long words don't trip it.
-_HIGH_ENTROPY_RE = re.compile(r"[A-Za-z0-9+/=_-]{40,}")
+# Two high-entropy runs, both with the old "must mix letters AND digits"
+# guard DROPPED (a leaked secret can be pure-hex or pure-alpha) — over-
+# redaction is the accepted safe failure mode (see the R3-F2 note above):
+#
+#  * a DENSE run (no ``-``/``_`` separators) with a LOW 24-char floor
+#    (was 40): a solid block of base64/hex/alnum is almost always a
+#    credential (hex API key, base64 blob, opaque token). Excluding the
+#    separators is deliberate — otherwise kebab/snake-case human
+#    identifiers (``deploy-marker-value-7c1a``) agglomerate into one long
+#    run and get false-flagged.
+#  * a LONG run that MAY contain ``-``/``_`` (base64url-style) at the
+#    original 40-char floor: catches long separator-bearing token blobs
+#    while staying above the length of ordinary hyphenated identifiers.
+#
+# Commit SHAs and long opaque identifiers trip the dense run by design;
+# that over-redaction is tolerated, not a bug.
+_HIGH_ENTROPY_DENSE_RE = re.compile(r"[A-Za-z0-9+/=]{24,}")
+_HIGH_ENTROPY_LONG_RE = re.compile(r"[A-Za-z0-9+/=_-]{40,}")
 
 
 def _value_has_embedded_secret(*texts: Optional[str]) -> bool:
     """Best-effort scan of a project_context value/description for an
     embedded credential (belt-and-suspenders alongside is_secret_key,
     which only inspects the KEY). Returns True if any text matches a
-    well-known token prefix or a long high-entropy token."""
+    well-known token prefix, a URL-embedded credential, a ``key: value``
+    credential line, or a long high-entropy / base32 token.
+
+    SECURITY (R3-F2): deliberately over-redacts — see the module-level
+    note on ``_EMBEDDED_SECRET_PATTERNS``. This is the single detector all
+    RAG consumers share, so broadening it closes the leak at every seam.
+    """
     for text in texts:
         if not text:
             continue
         for pat in _EMBEDDED_SECRET_PATTERNS:
             if pat.search(text):
                 return True
-        for token in _HIGH_ENTROPY_RE.findall(text):
-            if any(c.isdigit() for c in token) and any(
-                c.isalpha() for c in token
-            ):
-                return True
+        # Any sufficiently long credential-ish run. No letter/digit guard:
+        # a leaked secret can be pure-hex or pure-alpha, and over-redacting
+        # a benign long token is the safe direction to fail.
+        if _HIGH_ENTROPY_DENSE_RE.search(text) or _HIGH_ENTROPY_LONG_RE.search(
+            text
+        ):
+            return True
     return False
 
 
