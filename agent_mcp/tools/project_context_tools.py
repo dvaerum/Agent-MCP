@@ -1771,11 +1771,17 @@ async def backup_project_context_tool_impl(
             # stolen-operator-cookie + the VULN-001 CORS exploit vector,
             # where an attacker who has reached this tool could otherwise
             # write arbitrary JSON anywhere the server process can write.
-            backup_path_resolved = Path(backup_dir, backup_filename).resolve()
-            backup_dir_resolved = Path(backup_dir).resolve()
             try:
+                # ``.resolve()`` raises ValueError on an embedded-null-byte
+                # path (R6-F3 class completion) — fold it into the same
+                # Invalid path as the containment check below rather than let
+                # it propagate to an unhandled 500. The schema `pattern` on
+                # backup_name is the primary gate; this is the in-process /
+                # test-caller belt-and-suspenders.
+                backup_path_resolved = Path(backup_dir, backup_filename).resolve()
+                backup_dir_resolved = Path(backup_dir).resolve()
                 backup_path_resolved.relative_to(backup_dir_resolved)
-            except ValueError:
+            except (ValueError, OSError):
                 return Invalid(
                     field="backup_name",
                     message=(

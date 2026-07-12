@@ -1487,12 +1487,21 @@ async def add_project_membership_handler(req: web.Request) -> web.Response:
     """
     _ensure_wave1a_schema()
     project_name = req.match_info["name"]
-    if not _project_exists(project_name):
-        return _error(
-            error=_ERROR_NOT_FOUND,
-            message=f"unknown project: {project_name!r}",
-            status=404,
-        )
+    # R7-F1: close the project-existence ORACLE. Routing through the shared
+    # ``_deny_cross_tenant_project_read`` (sysadmin-admit → non-member gets the
+    # SAME 404 ``unknown_project`` for an existing-hidden project as for a
+    # nonexistent one) makes "exists but I'm not a member" indistinguishable
+    # from "doesn't exist". Previously ``_project_exists``→404 then
+    # ``_membership_grant_denied``→403 gave a non-member a 403-vs-404
+    # differential (the 403 body leaked the project name + the caller's own
+    # held role) — the missed WRITE-side sibling of the R6-F2 sweep (#478). The
+    # ``_membership_grant_denied`` role-rank 403 below now only ever fires for
+    # an actual MEMBER (you can't confer a role above your own).
+    from .admin_api import _deny_cross_tenant_project_read
+
+    denied = _deny_cross_tenant_project_read(req, project_name)
+    if denied is not None:
+        return denied
     body = await _json_body(req)
     user_id = body.get("user_id")
     group_id = body.get("group_id")
@@ -1564,12 +1573,13 @@ async def change_project_membership_role_handler(
     _ensure_wave1a_schema()
     project_name = req.match_info["name"]
     membership_id = req.match_info["membership_id"]
-    if not _project_exists(project_name):
-        return _error(
-            error=_ERROR_NOT_FOUND,
-            message=f"unknown project: {project_name!r}",
-            status=404,
-        )
+    # R7-F1: close the project-existence oracle — uniform 404 for a non-member
+    # (existing-hidden ≡ nonexistent). See add_project_membership_handler.
+    from .admin_api import _deny_cross_tenant_project_read
+
+    denied = _deny_cross_tenant_project_read(req, project_name)
+    if denied is not None:
+        return denied
     parsed = _split_membership_id(membership_id)
     if parsed is None:
         return _error(
@@ -1810,12 +1820,13 @@ async def delete_project_membership_handler(
     _ensure_wave1a_schema()
     project_name = req.match_info["name"]
     membership_id = req.match_info["membership_id"]
-    if not _project_exists(project_name):
-        return _error(
-            error=_ERROR_NOT_FOUND,
-            message=f"unknown project: {project_name!r}",
-            status=404,
-        )
+    # R7-F1: close the project-existence oracle — uniform 404 for a non-member
+    # (existing-hidden ≡ nonexistent). See add_project_membership_handler.
+    from .admin_api import _deny_cross_tenant_project_read
+
+    denied = _deny_cross_tenant_project_read(req, project_name)
+    if denied is not None:
+        return denied
     parsed = _split_membership_id(membership_id)
     if parsed is None:
         return _error(

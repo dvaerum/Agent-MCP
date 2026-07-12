@@ -167,7 +167,12 @@ async def test_delegate_cannot_self_add_operator_membership(
 ) -> None:
     """A non-sysadmin holding only ``system.projects.manage`` with NO
     membership on the project must NOT be able to POST themselves an
-    operator membership — that self-writes cross-tenant data access."""
+    operator membership — that self-writes cross-tenant data access.
+
+    R7-F1: the non-member response is now a uniform 404 ``not_found`` (was
+    403 ``forbidden``) so an existing-hidden project is indistinguishable
+    from a nonexistent one (project-existence oracle closed). The mutation
+    is still fully blocked — 404 denies the write just as 403 did."""
     register_project(_PROJ)
     client, cookie, alice_id, _ = await _delegated_client(
         aiohttp_client, router_app, "system.projects.manage",
@@ -181,10 +186,10 @@ async def test_delegate_cannot_self_add_operator_membership(
         allow_redirects=False,
     )
 
-    assert resp.status == 403, await resp.text()
+    assert resp.status == 404, await resp.text()
     body = await resp.json()
     assert body["success"] is False
-    assert body["error"] == "forbidden"
+    assert body["error"] == "not_found"
 
 
 # ── AZ-R5-1: group-indirection ─────────────────────────────────────
@@ -195,7 +200,10 @@ async def test_delegate_cannot_self_add_operator_via_own_group(
 ) -> None:
     """Group-indirection must be guarded too: a delegate with no membership
     may not add a GROUP THEY BELONG TO as operator (they would inherit the
-    operator data access through that group). Expect 403."""
+    operator data access through that group).
+
+    R7-F1: uniform 404 ``not_found`` for the non-member (was 403) — the
+    write is still blocked, and the existence oracle is closed."""
     register_project(_PROJ)
     client, cookie, _alice_id, group_id = await _delegated_client(
         aiohttp_client, router_app, "system.projects.manage",
@@ -209,10 +217,10 @@ async def test_delegate_cannot_self_add_operator_via_own_group(
         allow_redirects=False,
     )
 
-    assert resp.status == 403, await resp.text()
+    assert resp.status == 404, await resp.text()
     body = await resp.json()
     assert body["success"] is False
-    assert body["error"] == "forbidden"
+    assert body["error"] == "not_found"
 
 
 # ── AZ-R5-1: viewer→operator self-PATCH ────────────────────────────

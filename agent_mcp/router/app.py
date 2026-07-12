@@ -1914,7 +1914,11 @@ def _is_within_default_workspace(workspace_path: Path) -> bool:
     try:
         workspace_resolved = workspace_path.resolve()
         parent_resolved = DEFAULT_WORKSPACE_PARENT.resolve()
-    except OSError:
+    except (ValueError, OSError):
+        # R6-F3 class-completion: ``.resolve()`` raises ValueError on an
+        # embedded-null-byte path, not just OSError. Fail closed (deny the
+        # hard rm) rather than let it propagate to a 500. Latent today (the
+        # workspace path is server-side), but completes the fail-closed class.
         return False
     try:
         workspace_resolved.relative_to(parent_resolved)
