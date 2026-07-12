@@ -957,7 +957,16 @@ class AgentRepository:
         if fresh is None:
             return None
 
-        if not self._cache_disabled:
+        # SECURITY (terminate-revocation): see get_by_id / get_by_token
+        # above. A row read back after an update must not be re-warmed
+        # into the cache-only auth gate once it's terminal — e.g. a
+        # concurrent terminate flipped status underneath this write.
+        # Row still RETURNED for the caller; only the cache write is
+        # gated.
+        if (
+            not self._cache_disabled
+            and fresh.get("status") not in TERMINAL_AGENT_STATUSES
+        ):
             token = fresh.get("token")
             if token:
                 state.active_agents[token] = fresh
@@ -1044,7 +1053,18 @@ class AgentRepository:
         if fresh is None:
             return False
 
-        if not self._cache_disabled:
+        # SECURITY (terminate-revocation): see get_by_id / get_by_token
+        # above. An in-flight ``wait_for_events`` waiter can resume
+        # after its agent was terminated and land here (via
+        # ``_write_last_event_seen_at``) — the row it reads back is now
+        # terminal and must NOT be re-warmed into the cache-only auth
+        # gate, or the termination's revocation is silently undone.
+        # Row still RETURNED (rowcount semantics unchanged); only the
+        # cache write is gated.
+        if (
+            not self._cache_disabled
+            and fresh.get("status") not in TERMINAL_AGENT_STATUSES
+        ):
             token = fresh.get("token")
             if token:
                 state.active_agents[token] = fresh
@@ -1714,16 +1734,41 @@ class AgentRepository:
 
         # Re-key the cache only on the standalone path. With a
         # ``connection=`` the caller's transaction is still open; the
-        # cache re-key + publish are deferred to the caller's
-        # post-commit step. (For the relaunch flow, the caller's own
-        # cache write after commit covers this; this method's job is
-        # the DB write + the public method's contract.)
+        # cache re-key + publish — and the stream teardown below — are
+        # deferred to the caller's post-commit step (they must also
+        # tear down the old bearer's live streams themselves).
         if connection is None:
             if not self._cache_disabled and old_token is not None:
                 cached = state.active_agents.pop(old_token, None)
-                if cached is not None:
+                # SECURITY (terminate-revocation): see get_by_id /
+                # get_by_token above. Don't carry a terminal row
+                # forward under the new token — that would re-warm the
+                # cache-only auth gate for a bearer that should stay
+                # revoked.
+                if (
+                    cached is not None
+                    and cached.get("status") not in TERMINAL_AGENT_STATUSES
+                ):
                     cached["token"] = new_token
                     state.active_agents[new_token] = cached
+
+            # AC-R29-1: the old bearer's already-open GET /mcp streams
+            # authenticated once at open and pump indefinitely; without
+            # an active nudge they'd survive the rotation until their
+            # next heartbeat self-validation tick. Signal them to
+            # re-validate now, same as ``terminate``.
+            try:
+                from ..core import session_registry
+
+                session_registry.close_streams_for_agent(agent_id)
+            except Exception:  # pragma: no cover - defensive
+                logger.warning(
+                    "Failed to signal stream close for agent '%s' "
+                    "after token rotation.",
+                    agent_id,
+                    exc_info=True,
+                )
+
             _publish(
                 agent_id,
                 "agent.updated",
