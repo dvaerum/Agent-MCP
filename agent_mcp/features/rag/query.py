@@ -45,24 +45,44 @@ def _is_secret_key(key: Optional[str]) -> bool:
 # git history for the pre-collapse duplicate). One redaction
 # enforcement point, one seam, one thing to keep correct.
 #
-# ``_drop_secret_context_chunks`` below is explicit defense-in-depth,
+# ``_drop_secret_chunks`` below is explicit defense-in-depth,
 # NOT the primary guard: it protects callers that inject/mock the repo
 # and bypass the real ``search_similar`` seam.
-def _drop_secret_context_chunks(
+def _value_has_embedded_secret(text: Optional[str]) -> bool:
+    """Lazy wrapper over the canonical embedded-secret VALUE scanner.
+
+    Imported lazily (not at module top) to sidestep the tools/rag import
+    cycle. Reused (not duplicated) from the index path so this filter
+    applies the SAME skip the ingest choke-point does.
+    """
+    from .indexing import _value_has_embedded_secret as _scan
+
+    return _scan(text)
+
+
+def _drop_secret_chunks(
     results: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Drop retrieved vector chunks that carry a secret project_context
-    row. Defense-in-depth mirroring ``rag_repo.search_similar``'s own
-    seam-level drop, for the case where a caller injects/mocks the repo
-    and bypasses the real seam. The chunk's ``source_ref`` is the
-    context_key for ``source_type == "context"``.
+    """Drop retrieved vector chunks that carry a credential — for ANY
+    source type. Defense-in-depth mirroring ``rag_repo.search_similar``'s
+    own seam-level drop, for the case where a caller injects/mocks the
+    repo and bypasses the real seam. Two drop rules, both retained:
+
+    * secret-KEYED ``project_context`` row (``source_ref`` is the
+      context_key for ``source_type == "context"``).
+    * secret in the chunk TEXT itself — a credential in a task
+      description/title, code file, or markdown doc (R2-F3); covers every
+      source type, not just ``context``.
     """
     return [
         r
         for r in results
         if not (
-            r.get("source_type") == "context"
-            and _is_secret_key(r.get("source_ref"))
+            (
+                r.get("source_type") == "context"
+                and _is_secret_key(r.get("source_ref"))
+            )
+            or _value_has_embedded_secret(r.get("chunk_text"))
         )
     ]
 
@@ -345,7 +365,7 @@ async def query_rag_system(query_text: str) -> str:
                 # search_similar (the seam) already drops secret context
                 # chunks; the wrap here is defense-in-depth for an
                 # injected/mocked repo that bypasses the real seam.
-                vector_search_results = _drop_secret_context_chunks(
+                vector_search_results = _drop_secret_chunks(
                     rag_repo.search_similar(
                         query_embedding=query_embedding,
                         limit=13,
@@ -549,7 +569,7 @@ async def query_rag_system_with_model(
                 # search_similar (the seam) already drops secret context
                 # chunks; the wrap here is defense-in-depth for an
                 # injected/mocked repo that bypasses the real seam.
-                vector_search_results = _drop_secret_context_chunks(
+                vector_search_results = _drop_secret_chunks(
                     rag_repo.search_similar(
                         query_embedding=query_embedding,
                         limit=13,
