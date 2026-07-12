@@ -174,6 +174,89 @@ def _can_agents_communicate(sender_id: str, recipient_id: str, is_admin: bool) -
     return False, "Communication not permitted between these agents"
 
 
+def check_send_message_permission(
+    principal: Principal,
+    *,
+    recipient_id: str,
+    message_content: str,
+    message_type: str,
+) -> Optional[ToolResult]:
+    """Shared authorization gate for an outgoing agent message.
+
+    Returns ``None`` when the send is permitted, or the denial
+    :data:`ToolResult` (``PermissionDenied`` / ``Invalid``) when a gate
+    rejects it.
+
+    OBS6 (one-enforcement-path parity): BOTH the MCP ``send_agent_message``
+    tool below AND the dashboard REST create handler
+    (:func:`agent_mcp.app.routers.messages.create_message_api_route`) call
+    this, so the same gate set runs on ONE code path regardless of surface.
+    Before OBS6 the REST handler wrote the message ORM-direct after only
+    the operator-session gate and enforced none of these — a future
+    router/dep change that let a lower-tier principal reach the handler
+    could silently reopen the gap. This mirrors the memories #483 fix
+    (routing the REST memory writes through the gated project_context
+    tool). Gates, in order:
+
+      * worker-to-worker toggle (``config_allow_worker_to_worker``) for
+        non-operator ``agent_bearer`` callers, and an outright deny for a
+        non-operator, non-``agent_bearer`` principal (e.g. a forwarding
+        viewer that reaches the REST handler);
+      * the 4000-character message cap;
+      * the ``stop_command`` admin-only gate;
+      * the per-pair :func:`_can_agents_communicate` delivery rules.
+
+    Callers validate ``recipient_id`` / ``message_content`` presence
+    themselves before calling this — the field-level ``Invalid`` wording
+    differs by surface (``message`` vs ``message_content``).
+    """
+    is_admin = _is_operator_tier(principal)
+    sender_id = _sender_label(principal)
+
+    # Auth gate (formerly @requires_policy("config_allow_worker_to_worker"))
+    # Admin / operator: always permitted, no toggle read needed.
+    # Agent-bearer (worker or manager): gated on the project toggle.
+    # Note: pre-Wave-6 the decorator treated agent-role 'manager' as a
+    # worker for this gate too (the check was `verify_token(token,
+    # "admin")` which is operator-tier-only), so we preserve that.
+    if not is_admin:
+        if principal.kind != "agent_bearer":
+            return PermissionDenied(reason="Valid token required")
+        if not _access._get_config_bool(
+            "config_allow_worker_to_worker", default=False
+        ):
+            return PermissionDenied(
+                reason=(
+                    "worker access denied by project policy "
+                    "(config_allow_worker_to_worker is off). Ask admin "
+                    "to enable it in dashboard Settings."
+                )
+            )
+
+    if len(message_content) > 4000:  # Reasonable message size limit
+        return Invalid(
+            field="message",
+            message="Message too long (max 4000 characters)",
+        )
+
+    # Admin-only check for stop commands. Operator-tier (or the legacy
+    # "admin" pseudo-agent) is the only caller permitted to send a
+    # stop_command; bridge-derived workers are rejected even if the
+    # worker-to-worker toggle is on.
+    if message_type == "stop_command" and not is_admin:
+        return PermissionDenied(reason="Only admin can send stop commands")
+
+    # Per-pair delivery rules — admin bypass + worker-to-worker active
+    # set + admin recipient label.
+    can_communicate, reason = _can_agents_communicate(
+        sender_id, recipient_id, is_admin
+    )
+    if not can_communicate:
+        return PermissionDenied(reason=f"Communication denied: {reason}")
+
+    return None
+
+
 async def send_agent_message_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -199,27 +282,6 @@ async def send_agent_message_tool_impl(
         )
 
     sender_id = _sender_label(principal)
-    is_admin = _is_operator_tier(principal)
-
-    # Auth gate (formerly @requires_policy("config_allow_worker_to_worker"))
-    # Admin / operator: always permitted, no toggle read needed.
-    # Agent-bearer (worker or manager): gated on the project toggle.
-    # Note: pre-Wave-6 the decorator treated agent-role 'manager' as a
-    # worker for this gate too (the check was `verify_token(token,
-    # "admin")` which is operator-tier-only), so we preserve that.
-    if not is_admin:
-        if principal.kind != "agent_bearer":
-            return PermissionDenied(reason="Valid token required")
-        if not _access._get_config_bool(
-            "config_allow_worker_to_worker", default=False
-        ):
-            return PermissionDenied(
-                reason=(
-                    "worker access denied by project policy "
-                    "(config_allow_worker_to_worker is off). Ask admin "
-                    "to enable it in dashboard Settings."
-                )
-            )
 
     recipient_id = arguments.get("recipient_id")
     message_content = arguments.get("message")
@@ -252,28 +314,20 @@ async def send_agent_message_tool_impl(
             message="message is required",
         )
 
-    if len(message_content) > 4000:  # Reasonable message size limit
-        return Invalid(
-            field="message",
-            message="Message too long (max 4000 characters)",
-        )
-
-    # Admin-only check for stop commands. Operator-tier (or the legacy
-    # "admin" pseudo-agent) is the only caller permitted to send a
-    # stop_command; bridge-derived workers are rejected even if the
-    # worker-to-worker toggle is on.
-    if message_type == "stop_command" and not is_admin:
-        return PermissionDenied(reason="Only admin can send stop commands")
-
-    # Per-pair delivery rules — admin bypass + worker-to-worker active
-    # set + admin recipient label.
-    can_communicate, reason = _can_agents_communicate(
-        sender_id, recipient_id, is_admin
+    # OBS6: the five authorization gates (worker-to-worker toggle,
+    # non-agent_bearer deny, 4000-char cap, stop_command admin gate, and
+    # the per-pair _can_agents_communicate rules) now live once in
+    # ``check_send_message_permission`` so the REST create handler
+    # enforces the identical set — one enforcement path.
+    denial = check_send_message_permission(
+        principal,
+        recipient_id=recipient_id,
+        message_content=message_content,
+        message_type=message_type,
     )
+    if denial is not None:
+        return denial
 
-    if not can_communicate:
-        return PermissionDenied(reason=f"Communication denied: {reason}")
-    
     # Create message data
     message_id = _generate_message_id()
     timestamp = datetime.datetime.now().isoformat()
