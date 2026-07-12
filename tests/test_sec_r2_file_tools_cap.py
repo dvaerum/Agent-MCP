@@ -28,7 +28,7 @@ from __future__ import annotations
 import pytest
 
 from agent_mcp.core.principal import Principal
-from agent_mcp.core.tool_result import Ok, PermissionDenied
+from agent_mcp.core.tool_result import Invalid, Ok, PermissionDenied
 from agent_mcp.tools.registry import dispatch_tool_call
 from tests.harness import make_principal, mcp_session
 
@@ -130,6 +130,47 @@ async def test_file_tool_denies_viewer_operator(
         assert isinstance(result, PermissionDenied), (
             f"{tool_name}: viewer operator should be denied, got {result!r}"
         )
+
+
+@pytest.mark.parametrize(
+    "tool_name,arguments",
+    [
+        ("view_file_metadata", {"filepath": "/tmp/bad\x00path.txt"}),
+        (
+            "update_file_metadata",
+            {"filepath": "/tmp/bad\x00path.txt", "metadata": {"k": "v"}},
+        ),
+    ],
+)
+async def test_file_tool_null_byte_path_fails_closed(
+    tmp_path, tool_name, arguments
+) -> None:
+    """R6-F3 class completion: a null-byte filepath makes ``Path.resolve()``
+    raise ``ValueError: embedded null byte``. The tool must map that to a
+    controlled ``Invalid`` result (fail closed), NOT propagate to an
+    unhandled 500. A worker carries ``files.use``; update_file_metadata needs
+    ``system.config.write`` — use a sysadmin-equivalent operator for it."""
+    async with mcp_session(tmp_path):
+        if tool_name == "view_file_metadata":
+            p = _bearer("alice", role="worker")
+        else:
+            p = make_principal(
+                kind="operator_session",
+                user_id="op",
+                agent_id=None,
+                sysadmin=True,
+                project_name="demo",
+                project_role="operator",
+                agent_role=None,
+                can_wake_loop=False,
+                source_token=None,
+            )
+        result = await dispatch_tool_call(tool_name, arguments, principal=p)
+        assert isinstance(result, Invalid), (
+            f"{tool_name}: null-byte path should fail closed to Invalid, "
+            f"got {result!r}"
+        )
+        assert result.field == "filepath"
 
 
 async def test_worker_can_round_trip_after_cap_gate(tmp_path) -> None:

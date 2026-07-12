@@ -173,12 +173,15 @@ async def _delegated_client(aiohttp_client, router_app, *caps: str):
 async def test_delegate_cannot_revoke_project_membership_with_no_role(
     aiohttp_client, router_app, register_project,
 ) -> None:
-    """RED (AZ-R12-1 #1): a non-sysadmin holding only
-    ``system.projects.manage`` with NO membership on ``proj-r12`` must NOT
-    be able to DELETE a victim's operator membership — that is cross-tenant
-    revoke of data access the delegate has no authority over. Expect 403.
+    """AZ-R12-1 #1: a non-sysadmin holding only ``system.projects.manage``
+    with NO membership on ``proj-r12`` must NOT be able to DELETE a victim's
+    operator membership — that is cross-tenant revoke of data access the
+    delegate has no authority over.
 
-    On origin/main the DELETE path is unguarded and returns 200."""
+    R7-F1: the non-member response is now a uniform 404 ``not_found`` (was
+    403 ``forbidden``) so an existing-hidden project is indistinguishable
+    from a nonexistent one (project-existence oracle closed). The revoke is
+    still fully blocked — 404 denies it just as 403 did."""
     register_project(_PROJ)
     client, cookie, _alice = await _delegated_client(
         aiohttp_client, router_app, "system.projects.manage",
@@ -193,10 +196,19 @@ async def test_delegate_cannot_revoke_project_membership_with_no_role(
         allow_redirects=False,
     )
 
-    assert resp.status == 403, await resp.text()
+    assert resp.status == 404, await resp.text()
     body = await resp.json()
     assert body["success"] is False
-    assert body["error"] == "forbidden"
+    assert body["error"] == "not_found"
+    # The revoke was blocked — the victim row survives.
+    identity = _identity_module()
+    with identity._connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM project_membership "
+            "WHERE project_name = ? AND user_id = ?",
+            (_PROJ, victim_id),
+        ).fetchone()
+    assert row is not None
 
 
 async def test_viewer_delegate_cannot_revoke_operator_membership(

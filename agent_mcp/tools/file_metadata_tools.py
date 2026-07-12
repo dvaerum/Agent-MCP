@@ -41,10 +41,18 @@ from ..db.unit_of_work import unit_of_work
 from ..db.actions.agent_actions_db import log_agent_action_to_db
 
 
-def _normalize_filepath(filepath_arg: str, agent_id_for_wd: Optional[str]) -> str:
+def _normalize_filepath(
+    filepath_arg: str, agent_id_for_wd: Optional[str]
+) -> Optional[str]:
     """
     Resolves a filepath to an absolute, normalized POSIX path.
     Uses the agent's working directory if the path is relative.
+
+    Returns ``None`` when the (tool-arg-derived) path can't be resolved —
+    e.g. an embedded null byte makes ``Path.resolve()`` raise ``ValueError``.
+    Callers map ``None`` to their existing ``Invalid`` path so a malformed
+    path is a controlled 4xx-style tool error, not an unhandled 500
+    (R6-F3 ``.resolve()``-ValueError class completion).
     """
     if not os.path.isabs(filepath_arg):
         working_dir = os.getcwd()  # Default to CWD if no agent context
@@ -63,9 +71,13 @@ def _normalize_filepath(filepath_arg: str, agent_id_for_wd: Optional[str]) -> st
     else:
         resolved_path = Path(filepath_arg)
 
-    return (
-        resolved_path.resolve().as_posix()
-    )  # Resolve to absolute and normalize to POSIX
+    try:
+        # Resolve to absolute and normalize to POSIX. ``.resolve()`` raises
+        # ValueError on an embedded-null-byte path (and OSError on other bad
+        # paths) — fail closed to None rather than propagate to a 500.
+        return resolved_path.resolve().as_posix()
+    except (ValueError, OSError):
+        return None
 
 
 # --- view_file_metadata tool ---
@@ -100,6 +112,11 @@ async def view_file_metadata_tool_impl(
 
     requesting_agent_id = principal.agent_id or ""
     normalized_filepath_str = _normalize_filepath(filepath_arg, requesting_agent_id)
+    if normalized_filepath_str is None:
+        return Invalid(
+            field="filepath",
+            message="filepath could not be resolved to a valid path.",
+        )
 
     log_audit(
         requesting_agent_id,
@@ -211,6 +228,11 @@ async def update_file_metadata_tool_impl(
     normalized_filepath_str = _normalize_filepath(
         filepath_arg, principal.agent_id
     )
+    if normalized_filepath_str is None:
+        return Invalid(
+            field="filepath",
+            message="filepath could not be resolved to a valid path.",
+        )
 
     log_audit(
         requesting_admin_id,
