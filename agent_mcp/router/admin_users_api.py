@@ -1416,6 +1416,29 @@ async def list_project_memberships_handler(req: web.Request) -> web.Response:
             message=f"unknown project: {project_name!r}",
             status=404,
         )
+    # R3-F1: scope the READ like its mutation siblings (AZ-R5-1 swept the
+    # three membership WRITE handlers via ``_membership_grant_denied`` but
+    # missed this LIST — it stayed on the coarse deployment-wide
+    # ``system.projects.manage`` gate alone). Without per-project scoping a
+    # non-sysadmin delegate holding that cap could read the FULL roster of a
+    # project hidden from their own ``/projects`` + ``/overview`` views —
+    # cross-tenant disclosure. Admit only a sysadmin OR a caller with a
+    # resolved role on this project; otherwise return the SAME 404
+    # ``unknown_project`` a non-member sees from the data middleware
+    # (auth_middleware PF-1) so "exists but I'm not a member" is
+    # indistinguishable from "doesn't exist" — the 200-roster/404
+    # differential was a project-existence oracle.
+    principal = req.get("principal")
+    caller_id = getattr(principal, "user_id", None) if principal else None
+    if not _caller_is_sysadmin(req) and (
+        caller_id is None
+        or store.resolve_user_project_role(caller_id, project_name) is None
+    ):
+        return _error(
+            error=_ERROR_NOT_FOUND,
+            message=f"unknown project: {project_name!r}",
+            status=404,
+        )
     conn = _connect()
     try:
         rows = conn.execute(
