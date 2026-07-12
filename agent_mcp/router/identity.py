@@ -422,15 +422,33 @@ def create_user(
         password_hash = hash_password(password)
     created_at = _now_iso()
 
-    with _connect() as conn:
+    # Manual BEGIN IMMEDIATE so the first-user emptiness PROBE, the
+    # INSERT, and the ``bootstrap_first_operator`` sysadmin/membership
+    # grant are ONE atomic unit under a single write-lock. Python's
+    # default autocommit does NOT enlist a bare ``SELECT`` with the later
+    # INSERT's deferred transaction, so ``was_empty`` was read outside
+    # any lock: two ``create_user`` calls racing on an empty table could
+    # BOTH read ``was_empty=True`` and BOTH bootstrap a sysadmin
+    # (dual-sysadmin), and a wizard double-submit could mint a second
+    # operator past the empty-table gate. This is serialised away on the
+    # current single-process aiohttp loop (``create_user`` is fully
+    # synchronous), but arms under a multi-worker deploy (anticipated in
+    # ``rate_limit.py``) or a future ``asyncio.to_thread(create_user, …)``
+    # refactor. ``BEGIN IMMEDIATE`` takes the write-lock up front so a
+    # concurrent second creator blocks, then re-reads ``was_empty=False``
+    # and is neither crowned nor bootstrapped — mirroring the check-then-
+    # act sites in ``admin_users_api.py`` (edit/delete user,
+    # add_group_member). ``isolation_level = None`` hands transaction
+    # control fully to us (the default DML autobegin would fight the
+    # explicit BEGIN). ``is_sysadmin`` still forces the bit on
+    # independently of emptiness (the proxy-header ``default_is_sysadmin``
+    # path); the FIRST-operator promotion is owned solely by
+    # ``bootstrap_first_operator`` below, enlisted in THIS transaction.
+    conn = open_connection()
+    conn.isolation_level = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
         was_empty = users_table_is_empty(conn=conn)
-        # ``is_sysadmin`` forces the bit on independently of table
-        # emptiness (the proxy-header ``default_is_sysadmin`` path). The
-        # FIRST-operator sysadmin promotion is NOT decided here — it is
-        # owned by the single ``bootstrap_first_operator`` routine below,
-        # which runs inside this same transaction so the whole
-        # "first user → sysadmin + all-project membership" invariant
-        # commits atomically (no reader sees a half-state).
         try:
             conn.execute(
                 """
@@ -448,7 +466,8 @@ def create_user(
             # UNIQUE(username) is the only constraint that can fail
             # here; surface it as a typed error so CLI/HTTP callers
             # can render a clean "username taken" message rather than
-            # a stack trace.
+            # a stack trace. The blanket rollback below unwinds the
+            # open IMMEDIATE transaction before the error propagates.
             raise UsernameAlreadyExistsError(
                 f"username {username!r} already exists"
             ) from e
@@ -462,6 +481,21 @@ def create_user(
             store.bootstrap_first_operator(
                 user_id, grant_sysadmin=bootstrap_sysadmin, conn=conn,
             )
+        conn.execute("COMMIT")
+    except BaseException:
+        # Any exit before COMMIT leaves the IMMEDIATE transaction open;
+        # roll it back so the write-lock is released and no half-state
+        # persists. Guard the "no transaction is active" case for the
+        # rare path where ``BEGIN IMMEDIATE`` itself failed (e.g. the
+        # loser of a lock race under a zero busy_timeout) — we must let
+        # that original error propagate, not mask it.
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+        raise
+    finally:
+        conn.close()
 
     return user_id
 
