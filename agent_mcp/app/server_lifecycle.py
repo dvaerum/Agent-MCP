@@ -40,6 +40,53 @@ from ..utils.signal_utils import register_signal_handlers  # For graceful shutdo
 # block, and the `g.system_token` global it populated).
 
 
+def _hydrate_active_agents_cache() -> int:
+    """Rebuild the ``g.active_agents`` auth cache (and its
+    ``g.agent_working_dirs`` companion) from the DB's live agent rows.
+
+    "Live" excludes BOTH ``'terminated'`` (soft-deleted) AND
+    ``'tombstone'`` (BL-R31-3b): a purge inserts a durable
+    ``status='tombstone'`` agents row (``[deleted-<id>]``, reserved
+    ``__tombstone_<id>`` token) as an FK target, and that row SURVIVES
+    restarts — so a plain ``status != 'terminated'`` load would pull it
+    into the auth allow-list on the next boot after a purge, from where
+    the operator token listing (which filters only ``!= 'terminated'``)
+    would leak it. Wave 4: the synthetic ``'admin'`` row is gone
+    (migration 0014), so the earlier ``agent_id != 'admin'`` filter is
+    redundant.
+
+    Returns the number of agents loaded. Extracted from
+    ``application_startup`` so the hydration → principal-resolution path
+    is unit-testable end-to-end (pentest R5-F2).
+
+    SECURITY / AVAILABILITY (pentest R5-F2, fail-closed): the rows are
+    built THROUGH the repository's canonical row-builder
+    (:func:`get_all_active_agents_from_db` → ``_agent_to_dict``) so the
+    cached row carries ``agent_role`` — the SAME shape the auth hot path
+    (``get_by_token``) and the register/restore cache-writes use. The
+    prior hand-rolled ``SELECT`` omitted ``agent_role``, so a restarted
+    agent's cached row was roleless; because ``get_by_token`` returns on
+    a cache HIT, the DB fallback that WOULD have carried ``agent_role``
+    never fired, and ``resolve_capabilities(agent_role=None)`` collapsed
+    EVERY worker/manager verb to an empty set until the agent
+    re-registered. Routing through the one row-builder closes it and
+    keeps hydration from drifting off the auth path again — the missed
+    sibling of the class already fixed for the restore cache-write in
+    ``admin_tools`` ("Omitting it made a restored manager transiently
+    resolve to worker capabilities").
+    """
+    from ..repositories.agent_repository import get_all_active_agents_from_db
+
+    active_agents_count = 0
+    for agent_row in get_all_active_agents_from_db():
+        g.active_agents[agent_row["token"]] = agent_row
+        g.agent_working_dirs[agent_row["agent_id"]] = agent_row[
+            "working_directory"
+        ]
+        active_agents_count += 1
+    return active_agents_count
+
+
 # This function encapsulates the logic originally in main() before server run.
 async def application_startup(
     project_dir_path_str: str,
@@ -137,39 +184,11 @@ async def application_startup(
         conn_load_state = get_db_connection()
         cursor = conn_load_state.cursor()
 
-        # Load Active Agents into the g.active_agents auth cache.
-        # "Active" excludes BOTH 'terminated' (soft-deleted) AND
-        # 'tombstone' (BL-R31-3b): a purge inserts a durable
-        # status='tombstone' agents row (`[deleted-<id>]`, reserved
-        # `__tombstone_<id>` token) as an FK target, and that row
-        # SURVIVES restarts — so a plain `status != 'terminated'` load
-        # would pull it into the auth allow-list on the next boot after
-        # a purge, from where the operator token listing (which filters
-        # only `!= 'terminated'`) would leak it. Wave 4: the synthetic
-        # 'admin' row is gone (migration 0014), so the earlier
-        # `agent_id != 'admin'` filter is redundant.
-        active_agents_count = 0
-        from ..repositories.agent_repository import LIVE_AGENT_SQL
-
-        cursor.execute(
-            f"""
-            SELECT token, agent_id, capabilities, created_at, status, current_task, working_directory, color
-            FROM agents WHERE {LIVE_AGENT_SQL}
-        """,
-        )
-        for row in cursor.fetchall():
-            agent_token_val = row["token"]
-            agent_id_val = row["agent_id"]
-            g.active_agents[agent_token_val] = {
-                "agent_id": agent_id_val,
-                "capabilities": json.loads(row["capabilities"] or "[]"),
-                "created_at": row["created_at"],
-                "status": row["status"],
-                "current_task": row["current_task"],
-                "color": row["color"],  # Added color loading
-            }
-            g.agent_working_dirs[agent_id_val] = row["working_directory"]
-            active_agents_count += 1
+        # Load Active Agents into the g.active_agents auth cache. The
+        # hydration (including its live/tombstone rationale) lives in
+        # _hydrate_active_agents_cache so the cache-row shape has ONE
+        # source of truth shared with the auth hot path.
+        active_agents_count = _hydrate_active_agents_cache()
         logger.info(f"Loaded {active_agents_count} active agents from database.")
         # Echo to stderr so operators see this in `journalctl` without
         # needing MCP_DEBUG=true. This is the single most important
