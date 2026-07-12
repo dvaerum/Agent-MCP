@@ -29,12 +29,15 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
+from .._dispatch_helpers import _build_route_principal
 from ..deps import caller_identity, require_operator_session
 from ...core.config import logger
+from ...core.tool_result import tool_result_to_http
 from ...db.actions.agent_actions_db import log_agent_action_to_db
 from ...db.connection import get_db_connection
 from ...db.unit_of_work import unit_of_work
 from ...repositories.message_repository import ParentMessageNotFound
+from ...tools.agent_communication_tools import check_send_message_permission
 from ...utils.json_utils import get_sanitized_json_body
 
 
@@ -354,6 +357,38 @@ async def create_message_api_route(
             return JSONResponse(
                 {"error": f"priority must be one of {_MESSAGE_PRIORITIES}"},
                 status_code=400,
+            )
+
+        # OBS6 (defense-in-depth parity): run the SAME authorization gate
+        # the MCP send_agent_message tool uses — the stop_command admin
+        # gate, the worker-to-worker toggle, the per-pair
+        # _can_agents_communicate rules, and the 4000-char cap — via the
+        # shared ``check_send_message_permission`` helper. Before this the
+        # handler wrote the DB ORM-direct after only the operator-session
+        # gate and enforced none of them. This surface is operator-only
+        # today (require_operator_session), so the gate is a no-op for a
+        # legitimate operator (admin-tier) sending a normal message; the
+        # point is ONE enforcement path, so a future router/dep change
+        # that lets a lower-tier principal reach this handler can't
+        # silently reopen the gap (mirrors the memories #483 fix). The
+        # gate runs before both the broadcast ("*") and single-recipient
+        # branches so the cap + stop-command rules apply to each.
+        principal = _build_route_principal(
+            bearer_token=None,
+            operator_session=True,
+            operator_user_id=caller_identity(auth),
+        )
+        denial = check_send_message_permission(
+            principal,
+            recipient_id=recipient_id,
+            message_content=content,
+            message_type=message_type,
+        )
+        if denial is not None:
+            status, body = tool_result_to_http(denial)
+            return JSONResponse(
+                {"error": body.get("message", "Message rejected")},
+                status_code=status,
             )
 
         timestamp = datetime.datetime.now().isoformat()
