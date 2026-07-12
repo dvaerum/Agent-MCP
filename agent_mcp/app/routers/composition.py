@@ -228,6 +228,7 @@ async def simple_status_api_route(
 
 @router.get("/graph-data")
 async def graph_data_api_route(
+    request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
     # SECURITY (AZ-R28-1): gated to match the sibling composition reads —
@@ -240,10 +241,18 @@ async def graph_data_api_route(
     # /api/node-details already redact for — see
     # ``fetch_graph_data_logic``'s ``expose_secrets`` param and
     # ``is_confirmed_operator_tier`` above.
+    #
+    # PERF/DOS (pentest R2-F2): bound the per-section reads with the SAME
+    # clamp ``/api/all-data`` uses (``_clamp_section_limit``) so this
+    # sibling can't full-table-scan tasks / project_context /
+    # agent_actions on every dashboard refresh. ``?limit=`` overrides
+    # within ``[1, _ALL_DATA_MAX_LIMIT]``.
     try:
         expose_secrets = is_confirmed_operator_tier(auth)
         data = await fetch_graph_data_logic(
-            g.file_map.copy(), expose_secrets=expose_secrets
+            g.file_map.copy(),
+            expose_secrets=expose_secrets,
+            limit=_clamp_section_limit(request),
         )
         return JSONResponse(data)
     except Exception as e:
@@ -253,12 +262,19 @@ async def graph_data_api_route(
 
 @router.get("/task-tree-data")
 async def task_tree_data_api_route(
+    request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
     # SECURITY (AZ-R28-1): gated to match the sibling composition reads —
     # see simple_status_api_route.
+    #
+    # PERF/DOS (pentest R2-F2): bound the task read with the SAME clamp
+    # ``/api/all-data`` uses (``_clamp_section_limit``); ``?limit=``
+    # overrides within ``[1, _ALL_DATA_MAX_LIMIT]``.
     try:
-        data = await fetch_task_tree_data_logic()
+        data = await fetch_task_tree_data_logic(
+            limit=_clamp_section_limit(request)
+        )
         return JSONResponse(data)
     except Exception as e:
         logger.error(f"Error serving task tree data: {e}", exc_info=True)
@@ -391,6 +407,28 @@ _ALL_DATA_DEFAULT_LIMIT = 500
 _ALL_DATA_MAX_LIMIT = 5000
 
 
+def _clamp_section_limit(request: Request) -> int:
+    """Parse the optional ``?limit`` query param and clamp it to
+    ``[1, _ALL_DATA_MAX_LIMIT]``, defaulting to
+    ``_ALL_DATA_DEFAULT_LIMIT`` when absent or unparseable.
+
+    Single source of truth for the bounded-read clamp. ``/api/all-data``
+    grew this clamp first (db review item 2); pentest R2-F2 converged the
+    sibling composition reads (``/api/graph-data``,
+    ``/api/task-tree-data``, ``/api/context-data``) onto this same helper
+    so the four dashboard reads share ONE default + upper bound and can't
+    drift. Callers that want more rows pass ``?limit=N`` but never escape
+    the upper bound.
+    """
+    try:
+        requested_limit = int(
+            request.query_params.get("limit", _ALL_DATA_DEFAULT_LIMIT)
+        )
+    except (TypeError, ValueError):
+        requested_limit = _ALL_DATA_DEFAULT_LIMIT
+    return max(1, min(requested_limit, _ALL_DATA_MAX_LIMIT))
+
+
 @router.get("/all-data")
 async def all_data_api_route(
     request: Request,
@@ -421,12 +459,8 @@ async def all_data_api_route(
         # of agents/tasks/file_metadata rows no longer ships an
         # unbounded blob on every dashboard refresh (db review item 2).
         # Default to `_ALL_DATA_DEFAULT_LIMIT`; allow `?limit=` to
-        # override within `[1, _ALL_DATA_MAX_LIMIT]`.
-        try:
-            requested_limit = int(request.query_params.get("limit", _ALL_DATA_DEFAULT_LIMIT))
-        except (TypeError, ValueError):
-            requested_limit = _ALL_DATA_DEFAULT_LIMIT
-        section_limit = max(1, min(requested_limit, _ALL_DATA_MAX_LIMIT))
+        # override within `[1, _ALL_DATA_MAX_LIMIT]` (shared clamp).
+        section_limit = _clamp_section_limit(request)
 
         # SECURITY: agent bearer tokens are only attached for CONFIRMED
         # operator-tier callers. The router admits viewer-tier operators
@@ -618,6 +652,7 @@ async def all_data_api_route(
 
 @router.get("/context-data")
 async def context_data_api_route(
+    request: Request,
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
     """Get only context data.
@@ -637,14 +672,23 @@ async def context_data_api_route(
     admits viewer-tier operators on GET, and the backend can't verify
     the tier of a cookie/forwarding caller — so those paths get the
     redacted view).
+
+    PERF/DOS (pentest R2-F2): bound the project_context read with the
+    SAME clamp ``/api/all-data`` uses (``_clamp_section_limit``) so this
+    sibling can't materialise every context row on each dashboard
+    refresh. ``?limit=`` overrides within ``[1, _ALL_DATA_MAX_LIMIT]``;
+    the ORDER BY + LIMIT runs in SQL so the newest rows survive the
+    clamp (not a full-materialise-then-slice).
     """
     expose_secrets = is_confirmed_operator_tier(auth)
+    section_limit = _clamp_section_limit(request)
 
     try:
         with SessionLocal() as session:
             rows = (
                 session.query(ProjectContext)
                 .order_by(ProjectContext.updated_at.desc())
+                .limit(section_limit)
                 .all()
             )
             # Round-4: redact on the TWO-part filter (secret KEY OR an

@@ -13,6 +13,26 @@ from .styles import get_node_style # Import the styling function from this packa
 # logger = logging.getLogger("mcp_dashboard_api")
 # We will use the central logger from core.config for consistency.
 
+def _resolve_section_limit(limit: Optional[int]) -> int:
+    """Resolve the per-section row cap for the dashboard graph builders.
+
+    ``None`` (a direct call that didn't thread a limit) falls back to the
+    canonical ``_ALL_DATA_DEFAULT_LIMIT`` — the single source of truth in
+    ``app/routers/composition.py`` that ``/api/all-data`` and the R2-F2
+    clamp helper (``_clamp_section_limit``) both use. The REST routes hand
+    us an already-clamped value; a ``None`` default keeps a direct
+    in-process caller (e.g. a test) from accidentally issuing an unbounded
+    read. Imported lazily because composition.py imports THIS module at its
+    top level, so a top-level import back would be circular; by the time
+    this runs composition.py is fully loaded.
+    """
+    if limit is None:
+        from ...app.routers.composition import _ALL_DATA_DEFAULT_LIMIT
+
+        return _ALL_DATA_DEFAULT_LIMIT
+    return limit
+
+
 # ---------------------------------------------------------------------------
 # Shared task node/edge shaping.
 #
@@ -147,6 +167,7 @@ async def fetch_graph_data_logic(
     current_file_map_snapshot: Dict[str, Dict[str, Any]],
     *,
     expose_secrets: bool = False,
+    limit: Optional[int] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
     Fetches and formats data for graph visualization (Physics Layout).
@@ -161,6 +182,12 @@ async def fetch_graph_data_logic(
             caller who forgets to thread the tier signal fails closed,
             not open. See the context-node redaction below (pentest
             R1-F1).
+        limit: Per-section row cap (pentest R2-F2). Bounds the tasks and
+            project_context reads, and (via ``min(100, limit)``) the
+            agent_actions scan — mirroring ``/api/all-data``. ``None``
+            defaults to the canonical ``_ALL_DATA_DEFAULT_LIMIT`` so a
+            direct caller can't accidentally full-table-scan; the REST
+            route hands a value already clamped by ``_clamp_section_limit``.
 
     Returns:
         A dictionary with 'nodes' and 'edges' lists.
@@ -170,6 +197,7 @@ async def fetch_graph_data_logic(
     edges: List[Dict[str, Any]] = []
     node_ids: Set[str] = set() # To keep track of added nodes and prevent duplicates
     agent_colors: Dict[str, str] = {} # To store agent colors for consistent edge coloring if needed
+    section_limit = _resolve_section_limit(limit)
 
     conn = None
     try:
@@ -224,7 +252,18 @@ async def fetch_graph_data_logic(
             node_ids.add(admin_node_id_str)
 
         # 2. Tasks (Original dashboard_api.py: lines 78-105)
-        cursor.execute("SELECT task_id, title, status, assigned_to, created_by, parent_task, depends_on_tasks, description FROM tasks")
+        # PERF/DOS (pentest R2-F2): bounded to the newest `section_limit`
+        # rows (ORDER BY + LIMIT in SQL, not a full-table materialise),
+        # mirroring `/api/all-data`'s `ORDER BY created_at DESC LIMIT ?`.
+        # Parent/dependency edges below are already best-effort — they
+        # only draw when BOTH endpoints are in `node_ids` — so dropping
+        # out-of-window tasks can't emit a dangling edge.
+        cursor.execute(
+            "SELECT task_id, title, status, assigned_to, created_by, "
+            "parent_task, depends_on_tasks, description FROM tasks "
+            "ORDER BY created_at DESC LIMIT ?",
+            (section_limit,),
+        )
         task_rows = cursor.fetchall()
         # task_node_map: Dict[str, str] = {} # Not strictly needed if nodes are added to node_ids immediately
         for row in task_rows:
@@ -293,20 +332,38 @@ async def fetch_graph_data_logic(
         # 3. Agent Actions -> Link Agent to Task (Main interaction edges)
         # Original dashboard_api.py: lines 108-132
         agent_task_links: Dict[Tuple[str, str], str] = {} # (agent_node, task_node) -> latest_action_type
-        # Fetch actions that link agents to tasks
-        cursor.execute("""
-            SELECT agent_id, task_id, action_type, timestamp 
-            FROM agent_actions 
-            WHERE task_id IS NOT NULL AND agent_id != 'admin' 
-            ORDER BY timestamp ASC
-        """)
+        # Fetch actions that link agents to tasks.
+        # PERF/DOS (pentest R2-F2): bounded to the newest `min(100, limit)`
+        # rows, mirroring `/api/all-data`'s recent-actions cap. This closes
+        # the old full-table scan + full in-memory sort: the query was
+        # `ORDER BY timestamp ASC` with NO limit, materialising every
+        # agent_action row on each dashboard refresh.
+        #
+        # The ordering flips to DESC because the cap must keep the NEWEST
+        # actions; `setdefault` then preserves the pre-clamp "latest action
+        # wins" semantics (the FIRST row seen for a pair under DESC is the
+        # latest, so we keep it instead of letting an older row overwrite —
+        # the old ASC scan achieved the same by overwriting with each newer
+        # row).
+        actions_cap = min(100, section_limit)
+        cursor.execute(
+            """
+            SELECT agent_id, task_id, action_type, timestamp
+            FROM agent_actions
+            WHERE task_id IS NOT NULL AND agent_id != 'admin'
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """,
+            (actions_cap,),
+        )
         for action_row in cursor.fetchall():
             agent_node_str = f"agent_{action_row['agent_id']}"
             task_node_str = f"task_{action_row['task_id']}"
             if agent_node_str in node_ids and task_node_str in node_ids:
                 link_key = (agent_node_str, task_node_str)
-                # Store the latest action type for this agent-task pair
-                agent_task_links[link_key] = action_row['action_type']
+                # Keep the latest action type for this agent-task pair
+                # (first-seen under DESC = latest).
+                agent_task_links.setdefault(link_key, action_row['action_type'])
 
         for (agent_node_str, task_node_str), action_type in agent_task_links.items():
             edge_color_val = '#CCCCCC' # Default light grey
@@ -348,7 +405,15 @@ async def fetch_graph_data_logic(
         # lazily to avoid a router->feature import at module load time
         # (composition.py imports this module at the top level); by the
         # time this function runs, composition.py is already loaded.
-        cursor.execute("SELECT context_key, value, description FROM project_context")
+        # PERF/DOS (pentest R2-F2): bounded to the newest `section_limit`
+        # rows (ORDER BY updated_at DESC LIMIT ? in SQL), mirroring
+        # `/api/all-data` and `/api/context-data`. Previously an unbounded
+        # full scan of project_context on every dashboard refresh.
+        cursor.execute(
+            "SELECT context_key, value, description FROM project_context "
+            "ORDER BY updated_at DESC LIMIT ?",
+            (section_limit,),
+        )
         from ...app.routers.composition import (
             _REDACTED_VALUE,
             _context_value_should_redact,
@@ -432,10 +497,18 @@ async def fetch_graph_data_logic(
 
 
 # Original location: dashboard_api.py lines 175-214 (get_task_tree_data function)
-async def fetch_task_tree_data_logic() -> Dict[str, List[Dict[str, Any]]]:
+async def fetch_task_tree_data_logic(
+    *,
+    limit: Optional[int] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
     """
     Fetches only task data formatted for a hierarchical tree view.
     This is the core logic, separated from the Starlette JSONResponse.
+
+    Args:
+        limit: Per-section row cap (pentest R2-F2). ``None`` defaults to
+            the canonical ``_ALL_DATA_DEFAULT_LIMIT``; the REST route
+            hands a value already clamped by ``_clamp_section_limit``.
 
     Returns:
         A dictionary with 'nodes' and 'edges' lists.
@@ -444,6 +517,7 @@ async def fetch_task_tree_data_logic() -> Dict[str, List[Dict[str, Any]]]:
     nodes: List[Dict[str, Any]] = []
     edges: List[Dict[str, Any]] = []
     node_ids: Set[str] = set() # To track added nodes
+    section_limit = _resolve_section_limit(limit)
 
     conn = None
     try:
@@ -451,8 +525,17 @@ async def fetch_task_tree_data_logic() -> Dict[str, List[Dict[str, Any]]]:
         cursor = conn.cursor()
 
         # 1. Tasks (Original dashboard_api.py: lines 182-200)
-        # Order by created_at for potential layout hints or consistent processing
-        cursor.execute("SELECT task_id, title, status, parent_task, depends_on_tasks, description, created_at FROM tasks ORDER BY created_at ASC")
+        # Order by created_at for layout hints / consistent processing.
+        # PERF/DOS (pentest R2-F2): bounded with LIMIT (ORDER BY + LIMIT in
+        # SQL, not a full-table materialise). The ASC ordering is retained
+        # (the tree's hierarchy hints depend on it), so the clamp keeps the
+        # OLDEST `section_limit` tasks — favouring parents (created first),
+        # which is the right bounded set for a hierarchical view.
+        cursor.execute(
+            "SELECT task_id, title, status, parent_task, depends_on_tasks, "
+            "description, created_at FROM tasks ORDER BY created_at ASC LIMIT ?",
+            (section_limit,),
+        )
         task_rows = cursor.fetchall()
         # task_node_map: Dict[str, str] = {} # Not strictly needed if using node_ids set
 
