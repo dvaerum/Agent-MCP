@@ -144,7 +144,9 @@ def _dependency_edges(
 # Original location: dashboard_api.py lines 46-173 (get_graph_data function)
 async def fetch_graph_data_logic(
     # get_db_connection_func: Callable[[], sqlite3.Connection], # Replaced by direct import
-    current_file_map_snapshot: Dict[str, Dict[str, Any]]
+    current_file_map_snapshot: Dict[str, Dict[str, Any]],
+    *,
+    expose_secrets: bool = False,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
     Fetches and formats data for graph visualization (Physics Layout).
@@ -152,6 +154,13 @@ async def fetch_graph_data_logic(
 
     Args:
         current_file_map_snapshot: A snapshot of the current g.file_map.
+        expose_secrets: True iff the caller is CONFIRMED operator tier
+            (``is_confirmed_operator_tier`` in
+            ``app/routers/composition.py``). Mirrors ``/api/all-data``
+            and ``/api/context-data``: defaults to False (redact) so a
+            caller who forgets to thread the tier signal fails closed,
+            not open. See the context-node redaction below (pentest
+            R1-F1).
 
     Returns:
         A dictionary with 'nodes' and 'edges' lists.
@@ -321,17 +330,45 @@ async def fetch_graph_data_logic(
             })
 
         # 4. Project Context (Original dashboard_api.py: lines 135-145)
-        cursor.execute("SELECT context_key, description FROM project_context")
+        #
+        # SECURITY (pentest R1-F1): this reader used to select and render
+        # ``description`` verbatim in the node tooltip with no call into
+        # the shared redaction seam (``_context_value_should_redact`` in
+        # ``app/routers/composition.py``) — the ONE authority every other
+        # project_context reader (node-details, all-data, context-data,
+        # MCP view_project_context, RAG) consults. A secret pasted into a
+        # benign-keyed row's description leaked verbatim to a viewer-tier
+        # / cookie / forwarding caller (unverifiable tier — see
+        # ``is_confirmed_operator_tier``), even though the sibling reads
+        # redacted the identical row. ``value`` is also fetched now
+        # (still never rendered) because the predicate scans both value
+        # and description to catch a credential regardless of which
+        # field it was pasted into — selecting only description would
+        # under-redact relative to the seam. The predicate is imported
+        # lazily to avoid a router->feature import at module load time
+        # (composition.py imports this module at the top level); by the
+        # time this function runs, composition.py is already loaded.
+        cursor.execute("SELECT context_key, value, description FROM project_context")
+        from ...app.routers.composition import (
+            _REDACTED_VALUE,
+            _context_value_should_redact,
+        )
+
         for context_row in cursor.fetchall():
             key = context_row['context_key']
             node_id_str = f"context_{key}"
             if node_id_str not in node_ids:
                 style = get_node_style('context')
+                description_val = context_row['description']
+                if not expose_secrets and _context_value_should_redact(
+                    key, context_row['value'], description_val
+                ):
+                    description_val = _REDACTED_VALUE
                 nodes.append({
                     'id': node_id_str,
                     'label': key[:20] + '...' if len(key) > 20 else key,
                     'group': 'context',
-                    'title': f"Context Key: {key}\nDescription: {context_row['description'] or 'N/A'}",
+                    'title': f"Context Key: {key}\nDescription: {description_val or 'N/A'}",
                     'mass': 0.5, # Lower mass for peripheral nodes
                     **style
                 })
