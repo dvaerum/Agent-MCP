@@ -2424,6 +2424,32 @@ async def create_self_task_tool_impl(
                         resource="task", identifier=final_parent_task_id
                     )
 
+            # R4-F5 (class-sweep sibling of the AZ-R19-1 parent gate above):
+            # the ``depends_on`` edge is as load-bearing as ``parent_task``
+            # and was the missed sibling. An unguarded dependency link lets a
+            # worker create a self-task depending on a task owned by ANOTHER
+            # agent; when that foreign task later completes,
+            # ``_advance_dependents_after_completion`` auto-advances this task
+            # via a ``system_transition`` (which bypasses the ownership gate
+            # by design for legit deps) and ``_wake_task_assignees`` wakes the
+            # injector — a cross-principal completion oracle (it learns when
+            # the victim finished a task it can't even see via ``view_tasks``).
+            # Each dependency is validated EXACTLY like the parent: a FOREIGN
+            # *or* NONEXISTENT dep collapses to the SAME phantom NotFound (no
+            # existence oracle). Covers ``final_depends_on_tasks`` so an
+            # accepted RAG dependency suggestion is gated too.
+            # Supervision-tier callers (``tasks.assign``) are exempt, mirroring
+            # the parent gate's ``_is_privileged`` exemption.
+            if not _is_privileged and final_depends_on_tasks:
+                for _dep_id in final_depends_on_tasks:
+                    cursor.execute(
+                        "SELECT assigned_to FROM tasks WHERE task_id = ?",
+                        (_dep_id,),
+                    )
+                    _drow = cursor.fetchone()
+                    if _drow is None or _drow["assigned_to"] != requesting_agent_id:
+                        return NotFound(resource="task", identifier=_dep_id)
+
             # PR 6: task INSERT via task_repo with the caller's cursor.
             from ..repositories import agent_repo, task_repo
             fresh_task = task_repo.create(
