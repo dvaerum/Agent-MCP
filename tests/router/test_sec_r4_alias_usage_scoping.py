@@ -292,3 +292,65 @@ async def test_sysadmin_can_read_alias_usage(
     body = await resp.json()
     assert body["alias"] == _ALIAS
     assert body["agents"] == ["agent-secret"]
+
+
+# ── R4-F3 class-sweep: the alias DELETE shares the same coarse gate ──
+
+
+async def _delete_alias(client, cookie, project: str, alias: str = _ALIAS):
+    return await client.delete(
+        f"/agent-mcp/api/router/projects/{project}/aliases/{alias}",
+        headers=_REST_HEADERS,
+        cookies={"agent_mcp_session": cookie},
+        allow_redirects=False,
+    )
+
+
+async def test_delegate_without_membership_cannot_remove_alias(
+    aiohttp_client, router_app, register_project, router_module,
+) -> None:
+    """The alias DELETE is the write-side sibling of the read finding — it
+    shares the coarse ``project_lifecycle_gate``. A non-sysadmin holding only
+    ``system.projects.manage`` with NO membership must NOT expire an alias on
+    a project hidden from its views, and must get the SAME 404 as a
+    nonexistent slug (no 200-vs-404 existence oracle, no cross-tenant write)."""
+    workspace = register_project(_PROJ)
+    _seed_alias_with_usage(router_module, workspace)
+    client, cookie, _alice_id, _ = await _delegated_client(
+        aiohttp_client, router_app, "system.projects.manage",
+    )
+
+    real = await _delete_alias(client, cookie, _PROJ)
+    bogus = await _delete_alias(client, cookie, "no-such-slug-xyz")
+
+    assert real.status == bogus.status == 404, await real.text()
+    real_body = await real.json()
+    assert real_body["success"] is False
+    assert real_body["error"] == "not_found"
+    # The alias must still be present — the unauthorized DELETE was a no-op.
+    _sysadmin = _seed_user("root2", is_sysadmin=True)
+    sclient = await aiohttp_client(router_app)
+    scookie = await _login(sclient, "root2")
+    still = await _get_aliases(sclient, scookie, _PROJ)
+    assert still.status == 200
+    assert (await still.json())["agents"] == ["agent-secret"]
+
+
+async def test_member_delegate_can_remove_alias(
+    aiohttp_client, router_app, register_project, router_module,
+) -> None:
+    """A delegate WITH a resolved role on the project may still remove its
+    alias — the scoping guard must not over-reject a legitimate member."""
+    workspace = register_project(_PROJ)
+    _seed_alias_with_usage(router_module, workspace)
+    client, cookie, alice_id, _ = await _delegated_client(
+        aiohttp_client, router_app, "system.projects.manage",
+    )
+    _seed_project_membership(_PROJ, user_id=alice_id, role="operator")
+
+    resp = await _delete_alias(client, cookie, _PROJ)
+
+    assert resp.status == 200, await resp.text()
+    body = await resp.json()
+    assert body["removed"] == _ALIAS
+    assert body["project"] == _PROJ

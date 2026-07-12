@@ -1064,6 +1064,15 @@ async def remove_alias_handler(req: web.Request) -> web.Response:
     alias = req.match_info["alias"]
     if not name or not alias:
         raise web.HTTPBadRequest(reason="missing 'name' or 'alias'")
+    # R4-F3 (class-sweep, write side): the alias DELETE shares the alias
+    # READ's coarse ``project_lifecycle_gate`` (deployment-wide
+    # ``system.projects.manage``), so a delegated-cap-only non-member could
+    # expire an alias on a project hidden from their own views AND read the
+    # 200-vs-404 existence oracle. Scope it to members exactly like
+    # ``alias_usage_handler`` above.
+    denied = _deny_cross_tenant_project_read(req, name)
+    if denied is not None:
+        return denied
     row = _app._REGISTRY.get(name)
     if row is None:
         # Fixed reason phrase — see client_config_handler (SEC4 pattern).
