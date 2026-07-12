@@ -858,6 +858,17 @@ def _too_many_streams_response() -> web.Response:
     )
 
 
+# R9-F3: how often the independent disconnect watcher polls the
+# downstream transport for a client FIN/RST, decoupled from the
+# backend's ~15 s SSE heartbeat. This is the WORST-CASE teardown
+# latency after the client leaves — small enough that a reconnecting
+# agent's slot frees almost immediately, large enough to be negligible
+# overhead per live stream. Overridable for tests / unusual deployments.
+_SSE_DISCONNECT_POLL_SEC = float(
+    os.environ.get("AGENT_MCP_SSE_DISCONNECT_POLL_SEC", "0.5")
+)
+
+
 async def _stream_upstream_to_client(
     req: web.Request,
     up,
@@ -867,35 +878,64 @@ async def _stream_upstream_to_client(
     """Pump an SSE (`text/event-stream`) upstream to the client chunk by
     chunk, tying the upstream's lifetime to the downstream client.
 
-    The backend's `GET /mcp` stream never ends on its own, so the only
-    teardown signal is the client leaving: a write to a departed client
-    raises `ConnectionResetError` (or the handler task is cancelled),
-    both of which unwind past the caller's `async with sess.request`,
-    close `up`, and let `_track_connection` decrement `active_conns`.
-    We also poll `request.transport.is_closing()` after each write so a
-    disconnect detected between upstream chunks tears down promptly
-    rather than waiting for the next heartbeat write to fail.
+    The backend's `GET /mcp` stream never ends on its own and only
+    writes on its ~15 s heartbeat, so a write-failure alone is a
+    heartbeat-bound disconnect signal: a client that leaves mid-interval
+    would pin its concurrency slot (R8-F2 cap) for up to one heartbeat.
+    To free the slot on the actual TCP FIN/RST instead, we race the pump
+    against an INDEPENDENT disconnect watcher that polls the downstream
+    transport (`request.transport.is_closing()`) on its own short
+    interval (`_SSE_DISCONNECT_POLL_SEC`), decoupled from the heartbeat.
+    Whichever finishes first cancels the other; returning here exits the
+    caller's `async with sess.request(...)` scope, closes `up`, and lets
+    `_track_connection` (and the streaming-proxy cap) decrement — within
+    ~`_SSE_DISCONNECT_POLL_SEC` of the disconnect, not a heartbeat.
+
+    A write to a departed client still raises `ConnectionResetError`
+    (or the pump task is cancelled); that path is preserved as a second,
+    write-side disconnect signal alongside the watcher.
     """
     resp = web.StreamResponse(status=up.status, headers=out_headers)
     await resp.prepare(req)
-    try:
+
+    async def _pump() -> None:
         async for chunk in up.content.iter_any():
             last_active[(name, "backend")] = time.time()
             await resp.write(chunk)
+        # Upstream ended naturally (rare for /mcp). Flush a clean EOF;
+        # the client may already be gone, so a reset here is non-fatal.
+        with contextlib.suppress(ConnectionResetError):
+            await resp.write_eof()
+
+    async def _watch_disconnect() -> None:
+        # Independent of the upstream's write cadence: a FIN/RST flips
+        # `transport.is_closing()` on the read side, which this loop sees
+        # within one poll interval even while the backend is silent.
+        while True:
             transport = req.transport
             if transport is None or transport.is_closing():
-                # Client is gone — stop pumping. Returning exits the
-                # caller's `async with sess.request(...)` scope and
-                # closes the upstream connection.
-                return resp
-    except ConnectionResetError:
-        # Downstream client disconnected mid-write. Fall through and
-        # return; the upstream closes as the request scope unwinds.
-        return resp
-    # Upstream ended naturally (rare for /mcp). Flush a clean EOF; the
-    # client may already be gone, so a reset here is non-fatal.
-    with contextlib.suppress(ConnectionResetError):
-        await resp.write_eof()
+                return
+            await asyncio.sleep(_SSE_DISCONNECT_POLL_SEC)
+
+    pump = asyncio.ensure_future(_pump())
+    watcher = asyncio.ensure_future(_watch_disconnect())
+    try:
+        await asyncio.wait(
+            {pump, watcher}, return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        # Cancel the loser (and, on the caller unwinding, both). Then
+        # re-await the pump so a benign client-gone error is swallowed
+        # here while any genuine pump failure still propagates.
+        watcher.cancel()
+        if not pump.done():
+            pump.cancel()
+        with contextlib.suppress(
+            asyncio.CancelledError, ConnectionResetError,
+        ):
+            await pump
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
     return resp
 
 

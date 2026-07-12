@@ -33,6 +33,7 @@ on the VM (RE_VERIFY); these seam tests pin the code paths that fix.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 
 import pytest
@@ -59,9 +60,21 @@ class _StreamingBackend:
 
     HEARTBEAT_SEC = 0.02
 
-    def __init__(self) -> None:
+    def __init__(self, heartbeat_sec: float | None = None) -> None:
         self.handler_exited = asyncio.Event()
         self.get_started = asyncio.Event()
+        # Per-instance override so a test can make the backend go QUIET
+        # after the initial frames (a long heartbeat ≈ no further writes
+        # for the whole test window), isolating the router's own
+        # disconnect detection from any write-triggered teardown.
+        self.heartbeat_sec = (
+            heartbeat_sec if heartbeat_sec is not None else self.HEARTBEAT_SEC
+        )
+        # Count of heartbeat writes emitted AFTER the two opening frames.
+        # A disconnect test asserts this is still 0 when the slot frees,
+        # proving teardown happened without waiting for a subsequent
+        # upstream write.
+        self.heartbeats_written = 0
 
     def app(self) -> web.Application:
         app = web.Application()
@@ -83,8 +96,9 @@ class _StreamingBackend:
             await resp.write(b"data: frame-2\n\n")
             # Infinite heartbeat — never terminates on its own.
             while True:
-                await asyncio.sleep(self.HEARTBEAT_SEC)
+                await asyncio.sleep(self.heartbeat_sec)
                 await resp.write(b": ping\n\n")
+                self.heartbeats_written += 1
         except (ConnectionResetError, asyncio.CancelledError):
             # Router closed the upstream (client disconnected). Fall
             # through to signal the handler is unwinding.
@@ -106,18 +120,46 @@ async def _start_backend_on_uds(
     return runner
 
 
+async def _make_streaming_backend(
+    router_module, router_env, systemctl_stub, heartbeat_sec=None,
+):
+    """Register project 'proj', seed its bearer, and start an infinite-SSE
+    backend on its UDS. Returns ``(backend, runner)`` — caller cleans up
+    the runner."""
+    name = "proj"
+    router_module._REGISTRY.register(name, str(router_env.root / "ws"))
+    router_module._agent_token_cache["proj"] = (9.9e18, {"tok-1234": "Admin"})
+    sock = router_env.sock_dir / name / "backend.sock"
+    backend = _StreamingBackend(heartbeat_sec=heartbeat_sec)
+    runner = await _start_backend_on_uds(backend, sock)
+    systemctl_stub.active_units.add(f"agent-mcp@{name}.service")
+    return backend, runner
+
+
 @pytest_asyncio.fixture
 async def streaming_backend(router_module, router_env, systemctl_stub):
     """Infinite-SSE backend for project 'proj', pre-registered + active,
     with the agent-token cache seeded so a bearer clears the router
     edge without a real ``/api/tokens`` round-trip."""
-    name = "proj"
-    router_module._REGISTRY.register(name, str(router_env.root / "ws"))
-    router_module._agent_token_cache["proj"] = (9.9e18, {"tok-1234": "Admin"})
-    sock = router_env.sock_dir / name / "backend.sock"
-    backend = _StreamingBackend()
-    runner = await _start_backend_on_uds(backend, sock)
-    systemctl_stub.active_units.add(f"agent-mcp@{name}.service")
+    backend, runner = await _make_streaming_backend(
+        router_module, router_env, systemctl_stub,
+    )
+    try:
+        yield backend
+    finally:
+        await runner.cleanup()
+
+
+@pytest_asyncio.fixture
+async def quiet_streaming_backend(router_module, router_env, systemctl_stub):
+    """Like ``streaming_backend`` but goes QUIET after the two opening
+    frames — a heartbeat far longer than any test window, so the backend
+    emits NO further writes. Used to prove the router tears the stream
+    down on the client's FIN/RST via its OWN disconnect watcher, not by
+    a heartbeat write happening to fail."""
+    backend, runner = await _make_streaming_backend(
+        router_module, router_env, systemctl_stub, heartbeat_sec=30.0,
+    )
     try:
         yield backend
     finally:
@@ -254,3 +296,106 @@ async def test_concurrent_sse_capped_per_agent(
     finally:
         for r in held:
             r.close()
+
+
+# ── R9-F3: teardown on FIN/RST must NOT wait for the next write ──────
+#
+# The aiohttp *TestClient* used above does not surface ``resp.close()``
+# as a real socket close to the server (it pools/keeps the connection),
+# so ``request.transport.is_closing()`` never flips for it and the only
+# observable teardown signal under TestClient is a *write* failing. That
+# is exactly the write-bound path #480 relied on — useless for pinning
+# "released WITHOUT a subsequent write". These tests therefore drive the
+# router over a REAL loopback TCP socket with a raw client, where a
+# genuine FIN/RST is delivered and an independent disconnect watcher can
+# observe it between upstream writes.
+
+
+async def _serve_router_on_tcp(router_app):
+    """Run ``router_app`` on a real 127.0.0.1 TCP port. Returns
+    ``(runner, port)``; caller must ``await runner.cleanup()``."""
+    runner = web.AppRunner(router_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]  # noqa: SLF001
+    return runner, port
+
+
+async def _raw_sse_open(port, path="/agent-mcp/mcp/proj"):
+    """Open a raw SSE request over loopback TCP and read up to the first
+    ``data:`` frame. Returns ``(reader, writer)`` — the caller owns the
+    writer and can ``write_eof()`` (FIN) or ``transport.abort()`` (RST)
+    to model a real client disconnect."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(
+        f"GET {path} HTTP/1.1\r\n"
+        "Host: 127.0.0.1\r\n"
+        "Authorization: Bearer tok-1234\r\n"
+        "Accept: text/event-stream\r\n"
+        "\r\n".encode()
+    )
+    await writer.drain()
+    buf = b""
+    while b"data: frame-1" not in buf:
+        chunk = await asyncio.wait_for(reader.read(4096), timeout=4.0)
+        if not chunk:
+            raise AssertionError(f"stream closed before first frame: {buf!r}")
+        buf += chunk
+    assert b"200" in buf.split(b"\r\n", 1)[0], f"bad status line: {buf!r}"
+    return reader, writer
+
+
+async def test_client_disconnect_frees_slot_without_a_subsequent_write(
+    router_app, quiet_streaming_backend, router_module,
+) -> None:
+    """R9-F3: a disconnected SSE client's concurrency slot must free on
+    the TCP FIN/RST — NOT only when the next upstream write fails.
+
+    The backend goes quiet after the two opening frames (a 30 s
+    heartbeat ≈ no further writes for the whole test). With write-bound
+    detection (#480) the router notices the disconnect only on the next
+    write, so ``active_conns`` stays pinned at 1 for ~a heartbeat → this
+    test times out at 3 s (RED). An independent disconnect watcher frees
+    the slot within its own short poll interval, with the backend having
+    emitted ZERO heartbeat writes (GREEN).
+    """
+    _po = router_module._po
+    backend = quiet_streaming_backend
+    runner, port = await _serve_router_on_tcp(router_app)
+    try:
+        reader, writer = await _raw_sse_open(port)
+        assert _po.active_conns["proj"] == 1, "stream should count as one conn"
+        assert backend.heartbeats_written == 0, "backend must be quiet"
+
+        # Client vanishes: half-close sends a FIN with no further bytes.
+        writer.write_eof()
+
+        freed = await _poll_until(
+            lambda: _po.active_conns["proj"] == 0, timeout=3.0,
+        )
+        # The slot must be back well under one (30 s) heartbeat AND the
+        # backend must not have written anything since the frames — i.e.
+        # teardown was driven by the disconnect watcher, not a write.
+        assert backend.heartbeats_written == 0, (
+            "backend emitted a heartbeat — teardown may be write-bound, "
+            "not disconnect-driven"
+        )
+        assert freed, (
+            "slot not freed on FIN — teardown is write-bound (waits for the "
+            "next heartbeat) instead of racing an independent disconnect "
+            "watcher"
+        )
+        # NB: we do NOT assert on ``backend.handler_exited`` here. The
+        # router closes the upstream UDS socket the instant the slot
+        # frees (that decrement happens on the ``ClientSession`` context
+        # exit), but this quiet backend is parked in a 30 s sleep and
+        # only observes its now-closed upstream on its next write — a
+        # backend-side limitation, not the router's. The fast-heartbeat
+        # ``test_client_disconnect_tears_down_upstream`` covers the
+        # handler-exit signal.
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    finally:
+        await runner.cleanup()
