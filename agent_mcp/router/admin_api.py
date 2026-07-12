@@ -267,6 +267,14 @@ async def rename_project_handler(req: web.Request) -> web.Response:
     if disables_write_endpoint():
         return _app._single_tenant_disabled_response()
     old_name = req.match_info["name"]
+    # R6-F2: scope this cross-tenant MUTATION to project members and close
+    # the existence oracle — mirror the alias routes (R4-F3). A non-sysadmin
+    # holding only the deployment-wide ``system.projects.manage`` cap with NO
+    # membership on ``old_name`` must not rename another tenant's project, and
+    # must get the SAME 404 as a nonexistent slug (no 200-vs-404 oracle).
+    denied = _deny_cross_tenant_project_read(req, old_name)
+    if denied is not None:
+        return denied
     body = await _app._parse_json_body(req)
     raw_new_name = body.get("name")
     bad = _reject_non_str_name(raw_new_name)
@@ -586,6 +594,14 @@ async def delete_project_handler(req: web.Request) -> web.Response:
     if disables_write_endpoint():
         return _app._single_tenant_disabled_response()
     name = req.match_info["name"]
+    # R6-F2: scope this cross-tenant MUTATION to project members and close
+    # the existence oracle — mirror the alias routes (R4-F3). A non-sysadmin
+    # holding only the deployment-wide ``system.projects.manage`` cap with NO
+    # membership on this project must not destroy another tenant's project,
+    # and must get the SAME 404 as a nonexistent slug (no 200-vs-404 oracle).
+    denied = _deny_cross_tenant_project_read(req, name)
+    if denied is not None:
+        return denied
     projects = _app._projects_dict()
     if name not in projects:
         return _app._error_envelope(
@@ -759,6 +775,14 @@ async def stop_project_handler(req: web.Request) -> web.Response:
     from . import app as _app
 
     name = req.match_info["name"]
+    # R6-F2: scope this cross-tenant MUTATION to project members and close
+    # the existence oracle — mirror the alias routes (R4-F3). A non-sysadmin
+    # holding only the deployment-wide ``system.projects.manage`` cap with NO
+    # membership on this project must not DoS another tenant's backend, and
+    # must get the SAME 404 as a nonexistent slug (no 200-vs-404 oracle).
+    denied = _deny_cross_tenant_project_read(req, name)
+    if denied is not None:
+        return denied
     if name not in _app._projects_dict():
         return _app._error_envelope(
             error=_app._ERROR_NOT_REGISTERED,
@@ -938,7 +962,7 @@ async def installer_handler(req: web.Request) -> web.Response:
 def _deny_cross_tenant_project_read(
     req: web.Request, project_name: str,
 ) -> web.Response | None:
-    """R4-F3: scope a per-project READ to members + close the existence oracle.
+    """R4-F3/R6-F2: scope a per-project op to members + close the oracle.
 
     Mirrors ``list_project_memberships_handler`` (R3-F1, #468). The coarse
     deployment-wide ``system.projects.manage`` cap that gates the alias
@@ -949,13 +973,26 @@ def _deny_cross_tenant_project_read(
     cross-tenant disclosure of a project hidden from their own ``/projects``
     + ``/overview`` views.
 
-    After confirming the project exists, admit only a sysadmin OR a caller
-    with a resolved role on ``project_name``; otherwise return the SAME 404
-    ``unknown_project`` envelope a non-member sees for a nonexistent slug, so
-    "exists but I'm not a member" is indistinguishable from "doesn't exist"
-    (the reach-the-handler / 404 differential was a project-existence
-    oracle). Returns the 404 ``web.Response`` to short-circuit with, or
-    ``None`` when the caller may proceed.
+    Admit a sysadmin OR a caller with a resolved role on ``project_name``;
+    otherwise return the SAME 404 ``unknown_project`` envelope a non-member
+    sees for a nonexistent slug, so "exists but I'm not a member" is
+    indistinguishable from "doesn't exist" (the reach-the-handler / 404
+    differential was a project-existence oracle). Returns the 404
+    ``web.Response`` to short-circuit with, or ``None`` when the caller may
+    proceed.
+
+    R6-F2 (class-sweep, mutation side): the three lifecycle MUTATIONS —
+    ``stop`` / ``rename`` / ``delete`` — were gated ONLY on the coarse
+    deployable ``system.projects.manage`` cap, so a delegated-cap-only
+    non-member could stop / rename / destroy a project hidden from its own
+    views AND read the 200-vs-404 existence oracle. They now share this same
+    guard, completing the sweep so ALL six per-project routes are coherent.
+
+    The sysadmin admit runs BEFORE the existence probe so a genuine
+    nonexistent slug still falls through to each handler's own not-found
+    path (the lifecycle handlers answer ``not_registered``) — the oracle
+    only needs closing on the non-member path below, where existing and
+    nonexistent must be indistinguishable.
     """
     from . import app as _app
     from .admin_users_api import _ERROR_NOT_FOUND, _caller_is_sysadmin, _error
@@ -966,10 +1003,10 @@ def _deny_cross_tenant_project_read(
         message=f"unknown project: {project_name!r}",
         status=404,
     )
-    if project_name not in _app._projects_dict():
-        return not_found
     if _caller_is_sysadmin(req):
         return None
+    if project_name not in _app._projects_dict():
+        return not_found
     principal = req.get("principal")
     caller_id = getattr(principal, "user_id", None) if principal else None
     if (
