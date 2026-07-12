@@ -745,3 +745,123 @@ def test_update_field_via_cursor_and_standalone_agree(
             standalone_row = agent_repo.get_by_id("agent-standalone")
         assert cursor_row["capabilities"] == standalone_row["capabilities"]
         assert cursor_row["capabilities"] == ["foo"]
+
+
+# --- SEC-A: auth-cache re-warm gated on non-terminal status --------------
+#
+# ``get_by_id`` and ``get_by_token`` gate their cache re-warm on
+# ``row.get("status") not in TERMINAL_AGENT_STATUSES`` — caching a
+# 'terminated' row would silently reactivate a revoked bearer, since
+# ``app.main_app._bearer_is_active`` (the ``/mcp`` auth gate) is
+# cache-only. ``advance_event_cursor`` and ``update_field``'s
+# own-connection path independently re-read + re-warm the same
+# ``state.active_agents`` cache but, before this fix, lacked the same
+# gate: an agent mid-``wait_for_events`` long-poll that gets terminated
+# out from under it can still resume and call ``advance_event_cursor``
+# (via ``_write_last_event_seen_at``), which re-reads the now-terminated
+# row and re-inserts it into the cache — undoing the termination's
+# revocation. ``terminate`` can't fix this after the fact either: it
+# short-circuits on an already-terminal row, so the re-poisoned entry is
+# never re-evicted. The invariant pinned here: no ``AgentRepository``
+# write path may leave a row with status in ``TERMINAL_AGENT_STATUSES``
+# in ``state.active_agents``.
+
+
+def test_advance_event_cursor_does_not_rewarm_terminal_row(
+    project_dir, reset_globals,
+):
+    """A cursor advance for a just-terminated agent must not resurrect
+    its bearer in the auth cache (simulates an in-flight
+    ``wait_for_events`` waiter resuming after termination)."""
+    with _make_client(project_dir):
+        from agent_mcp.app.main_app import _bearer_is_active
+        from agent_mcp.core import state
+        from agent_mcp.repositories import agent_repo
+
+        _seed_agent(
+            "agent-cursor-term", token="tok-cursor-term", status="active",
+            working_directory="/tmp/cursor-term",
+        )
+        agent_repo.get_by_token("tok-cursor-term")
+        assert "tok-cursor-term" in state.active_agents
+
+        assert agent_repo.terminate("agent-cursor-term") is True
+        assert "tok-cursor-term" not in state.active_agents
+
+        # In-flight waiter resumes post-termination and advances its
+        # cursor. The row still exists (terminated, not deleted), so
+        # the watermark UPDATE still matches a row and returns True —
+        # only the cache WRITE must be suppressed.
+        advanced = agent_repo.advance_event_cursor(
+            "agent-cursor-term", "2026-01-01T00:00:00",
+        )
+        assert advanced is True
+
+        assert "tok-cursor-term" not in state.active_agents, (
+            "advance_event_cursor re-warmed the auth cache with a "
+            "terminated row"
+        )
+        assert _bearer_is_active("tok-cursor-term") is False
+
+
+def test_update_field_does_not_rewarm_terminal_row(project_dir, reset_globals):
+    """``update_field``'s own-connection path (``connection=None``) must
+    not resurrect a terminated agent's bearer in the auth cache."""
+    with _make_client(project_dir):
+        from agent_mcp.app.main_app import _bearer_is_active
+        from agent_mcp.core import state
+        from agent_mcp.repositories import agent_repo
+
+        _seed_agent(
+            "agent-upd-term", token="tok-upd-term", status="active",
+            working_directory="/tmp/upd-term",
+        )
+        agent_repo.get_by_token("tok-upd-term")
+        assert "tok-upd-term" in state.active_agents
+
+        assert agent_repo.terminate("agent-upd-term") is True
+        assert "tok-upd-term" not in state.active_agents
+
+        result = agent_repo.update_field(
+            "agent-upd-term", "auto_event_loop", 0,
+        )
+        assert result is not None
+
+        assert "tok-upd-term" not in state.active_agents, (
+            "update_field re-warmed the auth cache with a terminated row"
+        )
+        assert _bearer_is_active("tok-upd-term") is False
+
+
+def test_rotate_token_does_not_rewarm_terminal_row(project_dir, reset_globals):
+    """``rotate_token``'s cache re-key (own-connection path) must not
+    insert the new token for a terminal row.
+
+    ``rotate_token`` has zero live callers today (the admin-relaunch
+    flow it exists for hasn't landed yet) but pins the same invariant
+    now so a future caller inherits it for free. Seeds a stale cache
+    entry under the OLD token to simulate a warm race that left a
+    terminated row cached (the scenario the re-key would otherwise
+    carry forward under the new token).
+    """
+    with _make_client(project_dir):
+        from agent_mcp.core import state
+        from agent_mcp.repositories import agent_repo
+
+        _seed_agent(
+            "agent-rot-term", token="tok-rot-old", status="terminated",
+            working_directory="/tmp/rot-term",
+        )
+        state.active_agents["tok-rot-old"] = {
+            "agent_id": "agent-rot-term",
+            "token": "tok-rot-old",
+            "status": "terminated",
+        }
+
+        assert agent_repo.rotate_token("agent-rot-term", "tok-rot-new") is True
+
+        assert "tok-rot-old" not in state.active_agents
+        assert "tok-rot-new" not in state.active_agents, (
+            "rotate_token re-warmed the auth cache with a terminal row "
+            "under the new token"
+        )
