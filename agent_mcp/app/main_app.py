@@ -972,13 +972,15 @@ class _JsonRpcErrorSanitizer:
 # response.
 #
 # The fix has to sit in front of the SDK's parse, not patch its output:
-# drain the body ourselves, attempt the same `json.loads` at the same
-# ambient recursion limit the other guards rely on, and reject a
-# RecursionError with a clean 400 before the SDK ever touches the bytes.
-# A merely-malformed (not deeply-nested) body is deliberately left alone —
-# the SDK already turns that into its own well-formed -32700 response —
-# so the drained bytes are replayed to it unchanged via a synthetic
-# `receive`.
+# drain the body ourselves and reject an over-deeply-nested body with a
+# clean 400 before the SDK ever touches the bytes. We do NOT rely on
+# `json.loads` raising `RecursionError` for this — Python 3.14's json no
+# longer raises on deep nesting (it parses it), so that would be a version-
+# fragile guard. Instead `_body_nesting_exceeds` byte-scans the bracket
+# depth (version-independent, short-circuiting). A merely-malformed (not
+# deeply-nested) body is deliberately left alone — the SDK turns that into
+# its own well-formed -32700 response — so the drained bytes are replayed
+# to it unchanged via a synthetic `receive`.
 _MCP_DEPTH_GUARD_BODY = json.dumps({
     "jsonrpc": "2.0",
     "id": "server-error",  # mirrors the SDK's own id for parse-stage errors
@@ -1002,6 +1004,46 @@ async def _drain_body(receive) -> tuple[bytes, bool]:
         body.extend(message.get("body", b"") or b"")
         if not message.get("more_body", False):
             return bytes(body), False
+
+
+#: Max JSON bracket-nesting depth accepted on the /mcp transport. Legit MCP
+#: payloads are shallow; anything past this is a nesting-DoS probe. Chosen
+#: well above any real payload and well below the depth that blows a parser.
+_MCP_MAX_BODY_NESTING_DEPTH = 1000
+
+
+def _body_nesting_exceeds(body: bytes, limit: int) -> bool:
+    """True if the JSON `body`'s bracket-nesting depth exceeds `limit`.
+
+    A version-independent pre-parse guard: Python 3.14's ``json.loads`` no
+    longer raises ``RecursionError`` on a deeply-nested body (it parses it),
+    so relying on catching that error is not portable. This scans the raw
+    bytes, counting ``[``/``{`` depth (ignoring brackets inside string
+    literals), and short-circuits as soon as the limit is crossed — so a
+    hostile 50k-deep body costs ``limit`` iterations, not a full parse.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for ch in body:  # iterating bytes yields ints
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == 0x5C:  # backslash
+                escaped = True
+            elif ch == 0x22:  # closing quote
+                in_string = False
+            continue
+        if ch == 0x22:  # opening quote
+            in_string = True
+        elif ch == 0x5B or ch == 0x7B:  # [ or {
+            depth += 1
+            if depth > limit:
+                return True
+        elif ch == 0x5D or ch == 0x7D:  # ] or }
+            if depth > 0:
+                depth -= 1
+    return False
 
 
 def _replay_receive(raw_receive, body: bytes, disconnected: bool):
@@ -1094,20 +1136,15 @@ class _McpAsgiApp:
             # entirely in-house above, so neither needs this.
             raw_receive = receive
             body, disconnected = await _drain_body(raw_receive)
-            if not disconnected:
-                try:
-                    json.loads(body)
-                except RecursionError:
-                    await _send_simple_response(
-                        send, 400, _MCP_DEPTH_GUARD_BODY
-                    )
-                    return
-                except Exception:
-                    # Any other parse failure (malformed-but-not-deep
-                    # JSON) is left for the SDK's own `json.loads` to
-                    # reject with its normal -32700 response below —
-                    # replay the exact same bytes, untouched.
-                    pass
+            if not disconnected and _body_nesting_exceeds(
+                body, _MCP_MAX_BODY_NESTING_DEPTH
+            ):
+                # Over-deep body → clean 400 before the SDK parses it.
+                # A merely-malformed (not deeply-nested) body is left
+                # for the SDK's own -32700 handling — its exact bytes
+                # are replayed unchanged via the synthetic `receive`.
+                await _send_simple_response(send, 400, _MCP_DEPTH_GUARD_BODY)
+                return
             receive = _replay_receive(raw_receive, body, disconnected)
         # POST/DELETE → SDK. Wrap ``send`` so a malformed-request
         # JSON-RPC error envelope (which the SDK fills with a raw
