@@ -14,6 +14,48 @@ from typing import List, Dict, Any, Optional, Tuple
 # are redacted (see :func:`is_secret_key`).
 _CONFIG_KEY_RE = re.compile(r"^config_", re.IGNORECASE)
 
+# NON-secret POLICY carve-out (F009). These ``config_*`` keys hold
+# booleans/ints an operator legitimately READS — the worker-visibility
+# toggles + the Settings-dashboard switches (settings-dashboard.tsx) — NOT
+# credentials. They are matched in :func:`is_secret_key` BEFORE the blanket
+# ``config_*`` rule so a per-project operator whose tier the backend cannot
+# confirm (a cookie/forwarding session — see
+# ``composition.is_confirmed_operator_tier``) reads their true value
+# instead of ``_REDACTED_VALUE``. Before this carve-out the blanket rule
+# redacted them, and the dashboard's ``coerceBool('[redacted]', default)``
+# fell back to the default, so a toggle stored ``true`` rendered OFF.
+#
+# KEY-name allowlist ONLY. Every redaction seam still runs the
+# value-scan backstop (``_value_has_embedded_secret``) alongside
+# ``is_secret_key``, so a credential pasted INTO one of these keys' VALUE
+# still redacts.
+#
+# Scope is a deliberate literal set, NOT a prefix:
+#   * the blanket ``config_*`` rule stays the DEFAULT for every UNLISTED
+#     config key (defense-in-depth);
+#   * ``config_aoe_bearer_token`` / ``config_aoe_bearer_token_file`` are
+#     NOT here — they stay secret (also independently matched by
+#     ``_SECRET_SUFFIX_RE``'s bearer/token vocab);
+#   * the rest of the ``config_aoe_*`` namespace (``base_url`` /
+#     ``notify_template`` / ``timeout_ms``) is intentionally EXCLUDED —
+#     it is configured via the Memories tab, not the Settings toggles, and
+#     stays redacted for defense-in-depth in the SSRF-sensitive
+#     ``config_aoe_`` namespace (see ``_CONFIG_AOE_KEY_RE``). Only the
+#     ``config_aoe_notify_enabled`` toggle is carved out of it.
+# This carve-out is READ-only; it does NOT touch the sysadmin-only WRITE
+# gate (``_CONFIG_AOE_KEY_RE``).
+_NON_SECRET_POLICY_KEYS = frozenset(
+    {
+        "config_allow_worker_to_worker",
+        "config_allow_worker_self_assign",
+        "config_allow_worker_update_own_status",
+        "config_allow_worker_create_unassigned",
+        "config_auto_event_loop_global",
+        "config_aoe_notify_enabled",
+        "config_message_retention_days",
+    }
+)
+
 # Secret-ish vocabulary that marks a NON-config key as holding a
 # credential (e.g. ``openai_api_key``, ``db_password``, ``github_pat``,
 # ``session_cookie``, ``jwt_secret``). Matched only as a delimited
@@ -63,12 +105,16 @@ def is_secret_key(key: Optional[str]) -> bool:
     composition endpoints (``app/routers/composition.py``). Keeping the
     check here means the surfaces can't drift out of sync.
 
-    Two rules (round-2 broadening; round-3 extended the vocab +
-    camelCase handling):
+    Rules (round-2 broadening; round-3 extended the vocab + camelCase
+    handling; F009 added the policy carve-out that wins first):
 
-    * ANY ``config_*`` key is secret — the ``config_`` namespace holds
-      the project's policy + credential rows and non-operators must not
-      read their values regardless of suffix.
+    * A key in :data:`_NON_SECRET_POLICY_KEYS` is NOT secret — the
+      worker-visibility + Settings-dashboard toggles are booleans/ints an
+      operator legitimately reads. Checked FIRST so it wins over the
+      blanket ``config_*`` rule below.
+    * ANY other ``config_*`` key is secret — the ``config_`` namespace
+      holds the project's policy + credential rows and non-operators must
+      not read their values regardless of suffix.
     * Any other key carrying a delimited secret-word segment
       (``token``, ``secret``, ``password``, ``pwd``, ``api_key``,
       ``pat``, ``bearer``, ``jwt``, ``auth``, ``cookie``, ``seed``,
@@ -80,6 +126,10 @@ def is_secret_key(key: Optional[str]) -> bool:
       lowerUpper boundary first so they match too.
     """
     if not key:
+        return False
+    # Policy carve-out (F009) — wins over the blanket ``config_*`` rule.
+    # Key-name only; the value-scan backstop still runs at every seam.
+    if key.lower() in _NON_SECRET_POLICY_KEYS:
         return False
     if _CONFIG_KEY_RE.match(key):
         return True
