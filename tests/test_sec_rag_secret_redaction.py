@@ -115,6 +115,10 @@ def _wire_capture(monkeypatch, *, vss: bool = False) -> _CapturingClient:
 async def test_is_secret_key_matches_config_token_family() -> None:
     from agent_mcp.tools.project_context_tools import is_secret_key
 
+    # ADR-0016 nuance: these match via the secret-word VOCAB (token /
+    # secret / password / api_key / key), not the config_ prefix — the
+    # blanket config_* rule is deleted (config rows can no longer exist
+    # in project_context).
     assert is_secret_key("config_aoe_bearer_token")
     assert is_secret_key("config_openai_secret")
     assert is_secret_key("config_db_password")

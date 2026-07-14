@@ -22,9 +22,13 @@ Wave 11 (ADR-0016): the ROOT-CAUSE fix — ``config_*`` rows moved out of
 ``project_context`` into the dedicated ``project_settings`` store, so
 the readback seam is now ``GET /api/settings-data`` (the composition
 reads no longer carry config rows at all). The REST tests below assert
-the same two-sided guarantee against the new seam; the ``is_secret_key``
-unit tests keep pinning the read-side carve-out until the redaction
-machinery is deleted in the ADR-0016 follow-up PR.
+the same two-sided guarantee against the new seam. The config-specific
+redaction machinery (the blanket ``config_*`` rule + the F009
+``_NON_SECRET_POLICY_KEYS`` carve-out) is DELETED — ``is_secret_key``
+is a pure secret-word vocabulary check now, and the unit tests below
+pin that config keys are no longer special to it (settings-store
+secrets are classified by ``_SECRET_SETTING_KEYS`` in
+``tools/project_settings_tools.py`` instead).
 """
 
 from __future__ import annotations
@@ -123,31 +127,37 @@ async def test_config_rows_absent_from_composition_reads(tmp_path) -> None:
 # ── is_secret_key unit boundary ──────────────────────────────────────
 
 
-def test_is_secret_key_policy_carveout() -> None:
-    """Each policy key is NOT secret; the blanket ``config_*`` default and
-    the AoE credential gate still hold."""
+def test_is_secret_key_config_keys_not_special() -> None:
+    """Post-ADR-0016 ``is_secret_key`` is vocabulary-only: a ``config_``
+    prefix neither redacts (old blanket rule) nor exempts (old F009
+    carve-out). Config rows cannot exist in ``project_context`` anymore
+    (migration 0016 moved them; the write path rejects the namespace),
+    so only the secret-word vocab matters — and it still catches
+    credential-NAMED keys wherever they appear."""
     from agent_mcp.tools.project_context_tools import is_secret_key
 
     for key in _POLICY_SEEDS:
-        assert not is_secret_key(key), f"{key} must be readable (policy)"
-        # Case-insensitive: the redaction regexes are IGNORECASE, so the
-        # carve-out must be too.
+        assert not is_secret_key(key), f"{key} has no secret-word segment"
+        # Case-insensitive vocab: still no match when upper-cased.
         assert not is_secret_key(key.upper()), f"{key.upper()} (case)"
 
-    # HARD CONSTRAINT — the AoE bearer stays secret (blanket rule AND the
-    # bearer/token vocab in _SECRET_SUFFIX_RE both cover it).
+    # The AoE bearer keys STAY secret — via the bearer/token vocab in
+    # _SECRET_SUFFIX_RE, independent of the deleted config_* blanket.
     assert is_secret_key("config_aoe_bearer_token")
     assert is_secret_key("config_aoe_bearer_token_file")
 
-    # Unlisted config_* keys still redact — blanket default is intact.
+    # Vocab-less config_* keys are NOT secret to is_secret_key anymore —
+    # the blanket rule is gone with the store split (such rows can't
+    # exist in project_context; the settings store does its own masking
+    # via _SECRET_SETTING_KEYS in tools/project_settings_tools.py).
     for key in ("config_zzz", "config_foo", "config_aoe_base_url",
                 "config_aoe_notify_template", "config_aoe_timeout_ms"):
-        assert is_secret_key(key), f"{key} must stay secret (blanket)"
+        assert not is_secret_key(key), f"{key}: config_* blanket removed"
 
 
 def test_is_secret_key_gates_on_key_name_not_value() -> None:
-    """The carve-out is KEY-name only: the value-scan backstop still
-    redacts a credential pasted into a policy key's VALUE."""
+    """``is_secret_key`` is KEY-name only: the value-scan backstop still
+    redacts a credential pasted into a vocab-less key's VALUE."""
     from agent_mcp.features.rag.indexing import _value_has_embedded_secret
 
     # A policy key's NAME is not secret ...

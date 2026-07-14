@@ -6,57 +6,15 @@ import sqlite3
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
-# Keys reserved for admin-only writes/deletes (Phase 7b), and — since
-# the round-2 secret-redaction fix — the primary secret-read gate too:
-# ANY `config_*` key is treated as policy or secret data regardless of
-# suffix. Workers attempting to create or modify a config_* entry are
-# rejected at the tool boundary; non-operator READS of config_* values
-# are redacted (see :func:`is_secret_key`).
+# ADR-0016: the ``config_*`` namespace lives in the ``project_settings``
+# store (tools/project_settings_tools.py), NOT in project_context. This
+# regex backs the WRITE/DELETE rejection only — ``_check_write_authorization``
+# and the bulk-delete guard reject the whole namespace for every caller
+# (admin included) with a pointer to the settings tools. It plays no part
+# in secret READ classification (see :func:`is_secret_key`).
 _CONFIG_KEY_RE = re.compile(r"^config_", re.IGNORECASE)
 
-# NON-secret POLICY carve-out (F009). These ``config_*`` keys hold
-# booleans/ints an operator legitimately READS — the worker-visibility
-# toggles + the Settings-dashboard switches (settings-dashboard.tsx) — NOT
-# credentials. They are matched in :func:`is_secret_key` BEFORE the blanket
-# ``config_*`` rule so a per-project operator whose tier the backend cannot
-# confirm (a cookie/forwarding session — see
-# ``composition.is_confirmed_operator_tier``) reads their true value
-# instead of ``_REDACTED_VALUE``. Before this carve-out the blanket rule
-# redacted them, and the dashboard's ``coerceBool('[redacted]', default)``
-# fell back to the default, so a toggle stored ``true`` rendered OFF.
-#
-# KEY-name allowlist ONLY. Every redaction seam still runs the
-# value-scan backstop (``_value_has_embedded_secret``) alongside
-# ``is_secret_key``, so a credential pasted INTO one of these keys' VALUE
-# still redacts.
-#
-# Scope is a deliberate literal set, NOT a prefix:
-#   * the blanket ``config_*`` rule stays the DEFAULT for every UNLISTED
-#     config key (defense-in-depth);
-#   * ``config_aoe_bearer_token`` / ``config_aoe_bearer_token_file`` are
-#     NOT here — they stay secret (also independently matched by
-#     ``_SECRET_SUFFIX_RE``'s bearer/token vocab);
-#   * the rest of the ``config_aoe_*`` namespace (``base_url`` /
-#     ``notify_template`` / ``timeout_ms``) is intentionally EXCLUDED —
-#     it is configured via the Memories tab, not the Settings toggles, and
-#     stays redacted for defense-in-depth in the SSRF-sensitive
-#     ``config_aoe_`` namespace (see ``_CONFIG_AOE_KEY_RE``). Only the
-#     ``config_aoe_notify_enabled`` toggle is carved out of it.
-# This carve-out is READ-only; it does NOT touch the sysadmin-only WRITE
-# gate (``_CONFIG_AOE_KEY_RE``).
-_NON_SECRET_POLICY_KEYS = frozenset(
-    {
-        "config_allow_worker_to_worker",
-        "config_allow_worker_self_assign",
-        "config_allow_worker_update_own_status",
-        "config_allow_worker_create_unassigned",
-        "config_auto_event_loop_global",
-        "config_aoe_notify_enabled",
-        "config_message_retention_days",
-    }
-)
-
-# Secret-ish vocabulary that marks a NON-config key as holding a
+# Secret-ish vocabulary that marks a key as holding a
 # credential (e.g. ``openai_api_key``, ``db_password``, ``github_pat``,
 # ``session_cookie``, ``jwt_secret``). Matched only as a delimited
 # segment — bounded by start/end of the key or one of ``_ - .`` — so we
@@ -105,39 +63,31 @@ def is_secret_key(key: Optional[str]) -> bool:
     composition endpoints (``app/routers/composition.py``). Keeping the
     check here means the surfaces can't drift out of sync.
 
-    Rules (round-2 broadening; round-3 extended the vocab + camelCase
-    handling; F009 added the policy carve-out that wins first):
+    Rule (round-2 broadening; round-3 extended the vocab + camelCase
+    handling): a key carrying a delimited secret-word segment
+    (``token``, ``secret``, ``password``, ``pwd``, ``api_key``,
+    ``pat``, ``bearer``, ``jwt``, ``auth``, ``cookie``, ``seed``,
+    ``mnemonic``, ``privkey``, ``dsn``, ``conn_str``,
+    ``database_url``, ``credential``, …) is secret — catches
+    credentials stored under knowledge keys (``openai_api_key``,
+    ``db_password``, ``github_pat``). camelCase keys
+    (``clientSecret``, ``accessToken``) are segmented at the
+    lowerUpper boundary first so they match too.
 
-    * A key in :data:`_NON_SECRET_POLICY_KEYS` is NOT secret — the
-      worker-visibility + Settings-dashboard toggles are booleans/ints an
-      operator legitimately reads. Checked FIRST so it wins over the
-      blanket ``config_*`` rule below.
-    * ANY other ``config_*`` key is secret — the ``config_`` namespace
-      holds the project's policy + credential rows and non-operators must
-      not read their values regardless of suffix.
-    * Any other key carrying a delimited secret-word segment
-      (``token``, ``secret``, ``password``, ``pwd``, ``api_key``,
-      ``pat``, ``bearer``, ``jwt``, ``auth``, ``cookie``, ``seed``,
-      ``mnemonic``, ``privkey``, ``dsn``, ``conn_str``,
-      ``database_url``, ``credential``, …) is secret too — catches
-      credentials stored outside the ``config_`` namespace
-      (``openai_api_key``, ``db_password``, ``github_pat``). camelCase
-      keys (``clientSecret``, ``accessToken``) are segmented at the
-      lowerUpper boundary first so they match too.
+    ADR-0016: config moved to the ``project_settings`` store, so the old
+    config-specific tiers (blanket "any ``config_*`` is secret" + the
+    F009 ``_NON_SECRET_POLICY_KEYS`` carve-out) are deleted — settings
+    secrets are classified by ``_SECRET_SETTING_KEYS`` in
+    ``tools/project_settings_tools.py`` instead.
     """
     if not key:
         return False
-    # Policy carve-out (F009) — wins over the blanket ``config_*`` rule.
-    # Key-name only; the value-scan backstop still runs at every seam.
-    if key.lower() in _NON_SECRET_POLICY_KEYS:
-        return False
-    if _CONFIG_KEY_RE.match(key):
-        return True
     # Segment camelCase (``clientSecret`` -> ``client_Secret``) so a
     # lowerUpper transition counts as a word boundary for the delimited
     # vocab match — otherwise ``accessToken`` / ``apiSecret`` slip past.
     segmented = _CAMEL_BOUNDARY_RE.sub("_", key)
     return _SECRET_SUFFIX_RE.search(segmented) is not None
+
 
 # Worker-policy toggle keys (Phase 4). Writing one of these flips the
 # tools/list visibility for worker bearers (PR #55 reads the toggle
@@ -148,22 +98,6 @@ def is_secret_key(key: Optional[str]) -> bool:
 # enumeration of OTHER sessions to fan out to — clients still see the
 # new visibility on their next periodic `tools/list` call).
 _WORKER_POLICY_TOGGLE_RE = re.compile(r"^config_allow_worker_", re.IGNORECASE)
-
-# config_aoe_* configures a MACHINE-level outbound integration, not a
-# per-project policy: the AoE notify client reads config_aoe_base_url as
-# the request base_url and config_aoe_bearer_token as its Authorization
-# header (see features/aoe_notify.py). Choosing WHERE the shared host
-# sends its outbound request (and which host receives the bearer) is a
-# host-owner decision (SSRF / bearer-exfil surface), so config_aoe_*
-# create/update/delete requires SYSADMIN.
-#
-# ADR-0016 (Wave 11): the WRITE gate itself moved to
-# ``tools/project_settings_tools.py`` (the settings store owns config
-# writes now; this module rejects the whole config_* namespace). The
-# regex stays here only because the READ-side redaction docs above
-# (``_NON_SECRET_POLICY_KEYS`` / ``is_secret_key``) reference it — that
-# machinery is deleted wholesale in the ADR-0016 follow-up PR.
-_CONFIG_AOE_KEY_RE = re.compile(r"^config_aoe_", re.IGNORECASE)
 
 
 def _is_worker_policy_toggle(context_key: str) -> bool:

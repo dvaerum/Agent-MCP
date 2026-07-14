@@ -28,11 +28,11 @@ def _seed(admin, *, key: str, value: str) -> None:
     """Seed a project_context row DIRECTLY via the repository.
 
     Wave 11 (ADR-0016): the write path rejects config_* keys for every
-    caller, so these read-side redaction tests (which deliberately pin
-    the legacy is_secret_key behaviour on rows that could only exist in
-    a pre-cutover DB) seed raw. The whole config branch of the
-    redaction machinery — and these config-key assertions with it — is
-    deleted in the ADR-0016 follow-up PR.
+    caller, so the config-named rows here are seeded raw — they pin the
+    read-side redaction on legacy/tampered DB shapes the live write
+    path can no longer create. The keys redact via the secret-word
+    VOCABULARY (``token`` / ``secret`` segments in _SECRET_SUFFIX_RE);
+    the old blanket config_* rule is deleted.
     """
     import json as _json
 
