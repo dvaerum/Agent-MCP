@@ -17,14 +17,17 @@ bearer to it.
 AoE is a MACHINE-level integration (default ``http://127.0.0.1:8181``);
 deciding WHERE the host points it is a host-owner (sysadmin) decision,
 not a per-project operator's. So ``config_aoe_*`` create / update /
-delete now requires sysadmin. Other ``config_*`` keys (worker-policy
-toggles, event-loop policy) stay operator-writable — this change is
+delete requires sysadmin. Other ``config_*`` keys (worker-policy
+toggles, event-loop policy) stay operator-writable — the gate is
 scoped to the ``config_aoe_`` prefix only.
 
-RED (on origin/main): the operator-denied tests below SUCCEED (the
-operator write lands as ``Ok``). After the fix they return
-``PermissionDenied``. The sysadmin-allowed + non-AoE-operator-allowed
-tests are the GREEN guardrails that keep the change tightly scoped.
+Wave 11 (ADR-0016): the ``config_*`` namespace moved to the dedicated
+``project_settings`` store, and the R8-F1 sysadmin tier-gate moved with
+it onto the settings write tools (``update_project_settings`` /
+``delete_project_settings``). These tests exercise the gate at its new
+home; the context tools now reject the whole config namespace for every
+caller (pinned separately in
+``tests/test_wave11_project_settings_store.py``).
 """
 
 from __future__ import annotations
@@ -87,7 +90,7 @@ async def test_operator_denied_creating_config_aoe_base_url(tmp_path) -> None:
 
     async with mcp_session(tmp_path):
         result = await dispatch_tool_call(
-            "update_project_context",
+            "update_project_settings",
             {
                 "context_key": "config_aoe_base_url",
                 "context_value": "http://169.254.169.254/latest/meta-data/",
@@ -111,7 +114,7 @@ async def test_operator_denied_creating_config_aoe_notify_enabled(
 
     async with mcp_session(tmp_path):
         result = await dispatch_tool_call(
-            "update_project_context",
+            "update_project_settings",
             {"context_key": "config_aoe_notify_enabled", "context_value": True},
             principal=_operator_principal(),
         )
@@ -127,7 +130,7 @@ async def test_operator_denied_creating_config_aoe_uppercase(tmp_path) -> None:
 
     async with mcp_session(tmp_path):
         result = await dispatch_tool_call(
-            "update_project_context",
+            "update_project_settings",
             {"context_key": "CONFIG_AOE_BASE_URL", "context_value": "http://x"},
             principal=_operator_principal(),
         )
@@ -135,9 +138,11 @@ async def test_operator_denied_creating_config_aoe_uppercase(tmp_path) -> None:
     assert isinstance(result, PermissionDenied)
 
 
-async def test_operator_denied_bulk_update_with_config_aoe(tmp_path) -> None:
-    """A bulk update whose batch contains a ``config_aoe_*`` key is
-    rejected wholesale (bulk write path)."""
+async def test_bulk_context_update_with_config_aoe_rejected(tmp_path) -> None:
+    """A context bulk update whose batch contains a ``config_aoe_*`` key
+    is rejected wholesale — post-ADR-0016 the context tools reject the
+    entire config namespace, so the AoE key can't be smuggled through
+    the bulk path either."""
     from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path):
@@ -154,15 +159,15 @@ async def test_operator_denied_bulk_update_with_config_aoe(tmp_path) -> None:
     assert isinstance(result, PermissionDenied)
 
 
-async def test_operator_denied_create_project_context_config_aoe(
+async def test_operator_denied_creating_config_aoe_bearer(
     tmp_path,
 ) -> None:
-    """The INSERT-only ``create_project_context`` path is gated too."""
+    """The credential key itself is gated too."""
     from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path):
         result = await dispatch_tool_call(
-            "create_project_context",
+            "update_project_settings",
             {"context_key": "config_aoe_bearer_token", "context_value": "s3cr3t"},
             principal=_operator_principal(),
         )
@@ -177,7 +182,7 @@ async def test_operator_denied_deleting_config_aoe(tmp_path) -> None:
 
     async with mcp_session(tmp_path):
         seeded = await dispatch_tool_call(
-            "update_project_context",
+            "update_project_settings",
             {
                 "context_key": "config_aoe_base_url",
                 "context_value": "http://127.0.0.1:8181",
@@ -187,7 +192,7 @@ async def test_operator_denied_deleting_config_aoe(tmp_path) -> None:
         assert isinstance(seeded, Ok)
 
         result = await dispatch_tool_call(
-            "delete_project_context",
+            "delete_project_settings",
             {"context_key": "config_aoe_base_url"},
             principal=_operator_principal(),
         )
@@ -206,7 +211,7 @@ async def test_sysadmin_allowed_creating_config_aoe_base_url(tmp_path) -> None:
 
     async with mcp_session(tmp_path):
         result = await dispatch_tool_call(
-            "update_project_context",
+            "update_project_settings",
             {
                 "context_key": "config_aoe_base_url",
                 "context_value": "http://127.0.0.1:8181",
@@ -230,7 +235,7 @@ async def test_operator_still_writes_non_aoe_config_key(tmp_path) -> None:
 
     async with mcp_session(tmp_path):
         result = await dispatch_tool_call(
-            "update_project_context",
+            "update_project_settings",
             {
                 "context_key": "config_allow_worker_r8_probe",
                 "context_value": True,

@@ -17,6 +17,14 @@ of the class boundary on the SAME response:
   * the policy keys read back their real value (not ``[redacted]``), and
   * ``config_aoe_bearer_token`` (a credential) STAYS ``[redacted]`` —
     proving the fix does not re-open the pentest-hardened secret.
+
+Wave 11 (ADR-0016): the ROOT-CAUSE fix — ``config_*`` rows moved out of
+``project_context`` into the dedicated ``project_settings`` store, so
+the readback seam is now ``GET /api/settings-data`` (the composition
+reads no longer carry config rows at all). The REST tests below assert
+the same two-sided guarantee against the new seam; the ``is_secret_key``
+unit tests keep pinning the read-side carve-out until the redaction
+machinery is deleted in the ADR-0016 follow-up PR.
 """
 
 from __future__ import annotations
@@ -25,7 +33,7 @@ import json
 
 import pytest
 
-from tests.harness import mcp_session, seed_config_context_as_sysadmin
+from tests.harness import mcp_session, seed_config_setting_as_sysadmin
 
 
 _REDACTED = "[redacted]"
@@ -47,9 +55,9 @@ _POLICY_SEEDS: dict[str, object] = {
 
 def _seed_all() -> None:
     for key, value in _POLICY_SEEDS.items():
-        seed_config_context_as_sysadmin(key, value)
+        seed_config_setting_as_sysadmin(key, value)
     # Paired guard: a real credential in the same namespace.
-    seed_config_context_as_sysadmin("config_aoe_bearer_token", _BEARER_SECRET)
+    seed_config_setting_as_sysadmin("config_aoe_bearer_token", _BEARER_SECRET)
 
 
 def _row(context: list[dict], key: str) -> dict:
@@ -60,20 +68,21 @@ def _row(context: list[dict], key: str) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_all_data_policy_toggles_readable_to_session_operator(
+async def test_settings_data_policy_toggles_readable_to_session_operator(
     tmp_path,
 ) -> None:
-    """``/api/all-data`` as a cookie/forwarding (non-confirmed) operator:
-    policy toggles carry their real value; the AoE bearer stays redacted."""
+    """``/api/settings-data`` as a cookie/forwarding (non-confirmed)
+    operator: policy toggles carry their real value; the AoE bearer stays
+    redacted. This is the F009 guarantee at its post-ADR-0016 seam."""
     async with mcp_session(tmp_path) as admin:
         _seed_all()
 
-        r = admin.get("/api/all-data")  # signed forwarding header
+        r = admin.get("/api/settings-data")  # signed forwarding header
         assert r.status_code == 200, r.text
-        context = r.json()["context"]
+        rows = r.json()["settings"]
 
         for key, value in _POLICY_SEEDS.items():
-            row = _row(context, key)
+            row = _row(rows, key)
             assert row["value"] != _REDACTED, (
                 f"policy key {key} redacted to a session operator (F009)"
             )
@@ -82,37 +91,33 @@ async def test_all_data_policy_toggles_readable_to_session_operator(
             )
 
         # PAIRED GUARD — the credential MUST stay redacted on this call.
-        bearer = _row(context, "config_aoe_bearer_token")
+        bearer = _row(rows, "config_aoe_bearer_token")
         assert bearer["value"] == _REDACTED, (
             "config_aoe_bearer_token leaked to a non-confirmed operator"
         )
-        assert _BEARER_SECRET not in r.text, "bearer secret in all-data body"
+        assert _BEARER_SECRET not in r.text, "bearer secret in settings-data body"
 
 
 @pytest.mark.asyncio
-async def test_context_data_policy_toggles_readable_to_session_operator(
-    tmp_path,
-) -> None:
-    """Same guarantee on ``/api/context-data`` (the sibling read seam)."""
+async def test_config_rows_absent_from_composition_reads(tmp_path) -> None:
+    """Post-cutover: config rows no longer pollute the memory read seams
+    at all — ``/api/all-data`` and ``/api/context-data`` carry neither
+    the toggles nor the AoE bearer (in any form)."""
     async with mcp_session(tmp_path) as admin:
         _seed_all()
 
-        r = admin.get("/api/context-data")  # signed forwarding header
+        r = admin.get("/api/all-data")
         assert r.status_code == 200, r.text
-        context = r.json()
+        context_keys = {c.get("context_key") for c in r.json()["context"]}
+        assert not (set(_POLICY_SEEDS) & context_keys)
+        assert "config_aoe_bearer_token" not in context_keys
+        assert _BEARER_SECRET not in r.text
 
-        for key, value in _POLICY_SEEDS.items():
-            row = _row(context, key)
-            assert row["value"] != _REDACTED, (
-                f"policy key {key} redacted to a session operator (F009)"
-            )
-            assert json.loads(row["value"]) == value
-
-        bearer = _row(context, "config_aoe_bearer_token")
-        assert bearer["value"] == _REDACTED, (
-            "config_aoe_bearer_token leaked to a non-confirmed operator"
-        )
-        assert _BEARER_SECRET not in r.text, "bearer secret in context-data body"
+        r = admin.get("/api/context-data")
+        assert r.status_code == 200, r.text
+        context_keys = {c.get("context_key") for c in r.json()}
+        assert not (set(_POLICY_SEEDS) & context_keys)
+        assert _BEARER_SECRET not in r.text
 
 
 # ── is_secret_key unit boundary ──────────────────────────────────────

@@ -38,6 +38,37 @@ _PUBLIC_VALUE = "public-r2-info"
 
 
 def _seed(admin, *, key: str, value: str) -> None:
+    """Seed a project_context row.
+
+    Wave 11 (ADR-0016): the memories write path rejects config_* keys
+    for every caller, so the config-keyed rows these read-side
+    redaction tests pin (legacy pre-cutover shapes) are seeded raw via
+    the repository; knowledge keys keep flowing through the REST seam.
+    The config branch of the redaction machinery — and these config-key
+    assertions — go away in the ADR-0016 follow-up PR.
+    """
+    if key.lower().startswith("config_"):
+        import json as _json
+
+        from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import (
+            project_context_repository as _pc_repo,
+        )
+
+        conn = get_db_connection()
+        try:
+            _pc_repo.upsert(
+                key,
+                _json.dumps(value),
+                None,
+                description_provided=False,
+                actor="admin",
+                connection=conn.cursor(),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return
     r = admin.client.post(
         "/api/memories",
         json={

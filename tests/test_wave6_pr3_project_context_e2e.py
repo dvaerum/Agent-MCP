@@ -133,6 +133,34 @@ async def test_view_project_context_returns_ok_with_entries(tmp_path) -> None:
     assert "pr3.view.ok" in (result.message or "")
 
 
+def _seed_legacy_context_row(key: str, value) -> None:
+    """Seed a project_context row RAW via the repository.
+
+    Wave 11 (ADR-0016): the write path rejects config_* keys for every
+    caller, so tests pinning the legacy read-side redaction on
+    config-keyed rows (pre-cutover DB shapes) seed directly. The config
+    branch of that machinery is deleted in the ADR-0016 follow-up PR.
+    """
+    import json as _json
+
+    from agent_mcp.db.connection import get_db_connection
+    from agent_mcp.repositories import project_context_repository as _pc_repo
+
+    conn = get_db_connection()
+    try:
+        _pc_repo.upsert(
+            key,
+            _json.dumps(value),
+            None,
+            description_provided=False,
+            actor="admin",
+            connection=conn.cursor(),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 async def test_view_project_context_admin_sees_secret_keys(tmp_path) -> None:
     """An operator-tier Principal bypasses the
     ``_SECRET_KEY_RE`` redaction — pinned so the migration's
@@ -142,15 +170,8 @@ async def test_view_project_context_admin_sees_secret_keys(tmp_path) -> None:
     """
     from agent_mcp.tools.registry import dispatch_tool_call
 
-    async with mcp_session(tmp_path) as admin:
-        admin.client.post(
-            "/api/memories",
-            json={
-                "token": admin.admin_token,
-                "context_key": "config_pr3_secret_token",
-                "context_value": "shhh",
-            },
-        )
+    async with mcp_session(tmp_path):
+        _seed_legacy_context_row("config_pr3_secret_token", "shhh")
 
         result = await dispatch_tool_call(
             "view_project_context",
@@ -175,15 +196,8 @@ async def test_view_project_context_worker_redacts_secret_keys(
     through this surface."""
     from agent_mcp.tools.registry import dispatch_tool_call
 
-    async with mcp_session(tmp_path) as admin:
-        admin.client.post(
-            "/api/memories",
-            json={
-                "token": admin.admin_token,
-                "context_key": "config_pr3_redact_token",
-                "context_value": "shhh",
-            },
-        )
+    async with mcp_session(tmp_path):
+        _seed_legacy_context_row("config_pr3_redact_token", "shhh")
 
         # The worker principal builder doesn't insert an agents row;
         # call directly with explicit Principal (the bridge's
@@ -467,9 +481,12 @@ async def test_delete_project_context_critical_without_force_returns_invalid(
     from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path):
+        # ADR-0016: config_* deletes are category-rejected on the context
+        # path now, so the critical-key guard is exercised via a
+        # non-config critical key.
         result = await dispatch_tool_call(
             "delete_project_context",
-            {"context_key": "config_system_token"},
+            {"context_key": "server_startup"},
             principal=_operator_principal(),
         )
 
@@ -596,19 +613,19 @@ async def test_explicit_operator_principal_admits_config_write(
     tmp_path,
 ) -> None:
     """An explicit operator-session :class:`Principal` admits
-    :func:`_is_admin_principal` and the config_* write succeeds.
+    :func:`_is_admin_principal` and a config_* write succeeds — on the
+    SETTINGS store (ADR-0016: the context path rejects the namespace
+    for everyone; ``update_project_settings`` is the config surface).
 
     Wave 6 PR 6: the ContextVar bridge is gone — callers thread the
-    Principal explicitly. This pins the contract that an operator
-    Principal still satisfies the operator-tier gate on the
-    migrated ``update_project_context`` impl.
+    Principal explicitly.
     """
     from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path):
         op = _operator_principal(user_id="bridge-tester")
         result = await dispatch_tool_call(
-            "update_project_context",
+            "update_project_settings",
             {
                 "context_key": "config_pr3_bridge_op",
                 "context_value": "via-bridge",

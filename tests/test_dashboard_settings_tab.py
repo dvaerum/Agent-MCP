@@ -44,9 +44,18 @@ def test_settings_dashboard_component_exists() -> None:
         "expected the component to expose the config_allow_worker_create_unassigned "
         "toggle (Q6d — workers filing into the unassigned pool)"
     )
-    # Must reference the memory CRUD endpoint it's backed by.
-    assert "/memories" in src, (
-        "expected the component to PUT/POST to the /memories endpoint"
+    # Must be backed by the settings endpoints (ADR-0016: config_*
+    # lives in project_settings; writes go through updateSetting /
+    # createSetting → PUT/POST /api/settings...).
+    assert "updateSetting" in src and "createSetting" in src, (
+        "expected the component to write via updateSetting/createSetting"
+    )
+    assert "getSettingsData" in src, (
+        "expected the component to read via getSettingsData (settings-data)"
+    )
+    assert "updateMemory" not in src and "createMemory" not in src, (
+        "the Settings tab must no longer write through the memories API "
+        "(ADR-0016)"
     )
 
 
@@ -82,7 +91,8 @@ def test_settings_dashboard_exposes_message_retention_input() -> None:
     """Phase 6 follow-up (issue Q): admins can configure how many days
     of read agent_messages to keep before the background pruner deletes
     them. The Settings tab must surface this knob alongside the
-    permission toggles. Stored as project_context["config_message_retention_days"].
+    permission toggles. Stored as
+    project_settings["config_message_retention_days"] (ADR-0016).
     """
     src = _read("components/dashboard/settings-dashboard.tsx")
     assert "config_message_retention_days" in src, (

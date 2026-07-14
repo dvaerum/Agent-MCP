@@ -315,7 +315,7 @@ def _set_retention_days(days: int) -> None:
     try:
         cur = conn.cursor()
         cur.execute(
-            "INSERT OR REPLACE INTO project_context "
+            "INSERT OR REPLACE INTO project_settings "
             "(context_key, value, description, created_at, created_by, "
             "updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
             ("config_message_retention_days", json.dumps(days),

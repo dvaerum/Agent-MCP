@@ -195,10 +195,11 @@ def test_migration_0015_leaves_unrelated_rows_alone(tmp_path) -> None:
     )
 
 
-def test_migration_0015_is_in_alembic_head(tmp_path) -> None:
-    """After ``upgrade head`` the alembic_version table holds
-    ``0015_drop_config_system_token`` — pins that the migration is
-    in the chain and gets applied as part of a normal lifespan boot."""
+def test_migration_0015_is_in_alembic_chain(tmp_path) -> None:
+    """After ``upgrade head`` the chain has passed through 0015 — the
+    head moved on to 0016 (Wave 11's project_settings cutover), so pin
+    that the walk reached at least the post-0015 lineage by asserting
+    the applied head's ``down_revision`` chain includes 0015."""
     db_path = _bootstrap_fresh_db(tmp_path)
     conn = sqlite3.connect(db_path)
     try:
@@ -208,7 +209,21 @@ def test_migration_0015_is_in_alembic_head(tmp_path) -> None:
     finally:
         conn.close()
     assert row is not None, "alembic_version table is empty"
-    assert row[0] == "0015_drop_config_system_token", (
-        f"alembic head is {row[0]!r}; expected "
-        f"'0015_drop_config_system_token'."
+    # Walk the revision lineage from the applied head back to base and
+    # assert 0015 is on it (robust to future head bumps).
+    import os as _os
+
+    import agent_mcp
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    cfg = Config()
+    cfg.set_main_option(
+        "script_location",
+        _os.path.join(_os.path.dirname(agent_mcp.__file__), "migrations"),
+    )
+    script = ScriptDirectory.from_config(cfg)
+    lineage = {rev.revision for rev in script.walk_revisions("base", row[0])}
+    assert "0015_drop_config_system_token" in lineage, (
+        f"0015 missing from applied lineage ending at {row[0]!r}"
     )

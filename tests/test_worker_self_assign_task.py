@@ -43,7 +43,7 @@ def _set_toggle(key: str, value: bool) -> None:
     cursor = conn.cursor()
     now_iso = _dt.datetime.now().isoformat()
     cursor.execute(
-        "INSERT OR REPLACE INTO project_context "
+        "INSERT OR REPLACE INTO project_settings "
         "(context_key, value, description, created_at, created_by, "
         "updated_at, updated_by) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",

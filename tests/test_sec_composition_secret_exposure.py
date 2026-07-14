@@ -27,7 +27,7 @@ import secrets
 
 import pytest
 
-from tests.harness import mcp_session, seed_config_context_as_sysadmin
+from tests.harness import mcp_session, seed_config_setting_as_sysadmin
 
 
 pytestmark = pytest.mark.asyncio
@@ -40,7 +40,7 @@ def _seed_ctx(admin, *, key: str, value: str) -> None:
     # config_aoe_* is sysadmin-only to write (pentest R8-F1) — seed those
     # keys as a sysadmin would; other keys flow through the REST seam.
     if key.lower().startswith("config_aoe_"):
-        seed_config_context_as_sysadmin(key, value)
+        seed_config_setting_as_sysadmin(key, value)
         return
     r = admin.client.post(
         "/api/memories",
@@ -110,16 +110,26 @@ async def test_context_data_redacts_secret_for_non_confirmed_operator(
         assert "public-info" in r.text
 
 
-async def test_context_data_confirmed_operator_sees_secret(tmp_path) -> None:
+async def test_settings_data_confirmed_operator_sees_secret(tmp_path) -> None:
     """A confirmed operator-tier bearer still receives the secret value —
-    the legitimate admin path must not regress."""
+    the legitimate admin path must not regress. Wave 11 (ADR-0016): the
+    AoE bearer lives in the ``project_settings`` store, so the read seam
+    is ``/api/settings-data`` (config rows no longer appear in
+    ``/api/context-data`` at all)."""
     async with mcp_session(tmp_path) as admin:
         _seed_ctx(admin, key="config_aoe_bearer_token", value=_SECRET_VALUE)
 
-        r = admin.client.get("/api/context-data", headers=_bearer(admin))
+        r = admin.client.get("/api/settings-data", headers=_bearer(admin))
         assert r.status_code == 200, r.text
         assert _SECRET_VALUE in r.text, (
             "confirmed operator must still see the secret value"
+        )
+
+        # And the non-confirmed forwarding path stays masked.
+        r = admin.get("/api/settings-data")
+        assert r.status_code == 200, r.text
+        assert _SECRET_VALUE not in r.text, (
+            "AoE bearer leaked to a non-confirmed operator via settings-data"
         )
 
 

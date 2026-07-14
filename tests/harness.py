@@ -168,33 +168,37 @@ def _first_text(result: List[mcp_types.TextContent]) -> str:
     return getattr(result[0], "text", "") or ""
 
 
-def seed_config_context_as_sysadmin(key: str, value: Any) -> None:
-    """Seed a ``project_context`` row the way a SYSADMIN write would land.
+def seed_config_setting_as_sysadmin(key: str, value: Any) -> None:
+    """Seed a ``project_settings`` row the way a SYSADMIN write would land.
 
-    ``config_aoe_*`` keys became sysadmin-only to write (pentest R8-F1:
-    they configure a machine-level outbound integration target). The
-    per-project-operator REST seam (``admin.client.post("/api/memories",
-    {"token": admin_token, ...})``) now 403s on those keys, so feature /
-    redaction tests that merely need the row PRESENT seed it here instead
-    of through the operator path.
+    Wave 11 (ADR-0016): ``config_*`` rows live in the dedicated
+    ``project_settings`` store now — this helper (formerly
+    ``seed_config_context_as_sysadmin``, which wrote ``project_context``)
+    follows the cutover. ``config_aoe_*`` keys stay sysadmin-only to
+    write (pentest R8-F1: machine-level outbound integration target), so
+    feature / redaction tests that merely need the row PRESENT seed it
+    here instead of through the operator path.
 
     Writes directly on the test DB via the same repository + JSON value
-    encoding the tool uses (``json.dumps`` — project_context stores every
-    value JSON-encoded), stamping ``created_by="sysadmin"``. Faithful to a
-    sysadmin ``update_project_context`` for the READ paths these tests
-    exercise (``_read_ctx`` / live-context / ``/api/context-data``).
+    encoding the tool uses (``json.dumps`` — the settings store keeps
+    project_context's JSON-encoded-value convention), stamping
+    ``created_by="sysadmin"``. Faithful to a sysadmin
+    ``update_project_settings`` for the READ paths these tests exercise
+    (``_read_ctx`` / ``_get_config_bool`` / ``/api/settings-data``).
     """
     import json as _json
 
     from agent_mcp.db.connection import get_db_connection
-    from agent_mcp.repositories import project_context_repository as _pc_repo
+    from agent_mcp.repositories import (
+        project_settings_repository as _ps_repo,
+    )
 
     conn = get_db_connection()
     try:
         # The repo reads/writes through an open CURSOR (so pending writes
         # are visible within the txn) — mirror the tool's ``u.cursor`` seam.
         cursor = conn.cursor()
-        _pc_repo.upsert(
+        _ps_repo.upsert(
             key,
             _json.dumps(value),
             None,
@@ -812,28 +816,21 @@ class AdminClient(WorkerSession):
             is_admin_caller=True,
         )
 
-    # --- Builder helpers for common project_context shapes ---
+    # --- Builder helpers for common project_settings shapes ---
 
     def set_toggle(self, key: str, value: str) -> None:
-        """Seed or update a `config_*` toggle via the REST memory API
-        (same pattern existing tests use)."""
-        r = self.client.post(
-            "/api/memories",
-            json={
-                "token": self.admin_token,
-                "context_key": key,
-                "context_value": value,
-            },
+        """Seed or update a `config_*` toggle via the REST settings API.
+
+        Wave 11 (ADR-0016): toggles live in the ``project_settings``
+        store — the write goes through ``PUT /api/settings/<key>``
+        (upsert semantics; the gated ``update_project_settings`` tool
+        underneath), authenticated via the signed forwarding header.
+        """
+        r = self.request(
+            "PUT",
+            f"/api/settings/{key}",
+            json={"context_value": value},
         )
-        if r.status_code == 409:
-            r = self.client.request(
-                "PUT",
-                f"/api/memories/{key}",
-                json={
-                    "token": self.admin_token,
-                    "context_value": value,
-                },
-            )
         assert r.status_code == 200, r.text
 
     def task_row(self, task_id: str) -> dict | None:

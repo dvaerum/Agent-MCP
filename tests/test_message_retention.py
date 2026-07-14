@@ -3,7 +3,7 @@
 The agent_messages table grows unbounded — rows are only ever marked
 `read=1`, never deleted. This adds a per-project knob:
 
-  project_context["config_message_retention_days"]:
+  project_settings["config_message_retention_days"] (ADR-0016):
     absent or 0   -> unbounded retention (no pruning)
     positive int N -> delete rows where read=1 AND timestamp older than
                       now() - N days
@@ -58,14 +58,14 @@ def _seed_message(
 
 
 def _set_retention_days(days: int) -> None:
-    """Write config_message_retention_days into project_context."""
+    """Write config_message_retention_days into project_settings (ADR-0016)."""
     from agent_mcp.db.connection import get_db_connection
 
     now = _dt.datetime.now().isoformat()
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT OR REPLACE INTO project_context "
+        "INSERT OR REPLACE INTO project_settings "
         "(context_key, value, description, created_at, created_by, "
         "updated_at, updated_by) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -182,7 +182,7 @@ async def test_prune_ignores_bad_config_value(tmp_path) -> None:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT OR REPLACE INTO project_context "
+            "INSERT OR REPLACE INTO project_settings "
             "(context_key, value, description, created_at, created_by, "
             "updated_at, updated_by) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",

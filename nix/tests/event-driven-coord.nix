@@ -249,8 +249,9 @@ pkgs.testers.nixosTest {
     # fetch_events_since returns empty. The gate reads this live per-call
     # (tools/access._get_config_bool), so no restart is needed — but we
     # seed it here in the backend-stopped SQL window alongside the agents.
+    # ADR-0016 (Wave 11): config_* rows live in project_settings.
     sql(
-        "INSERT INTO project_context (context_key, value, description, "
+        "INSERT INTO project_settings (context_key, value, description, "
         "created_at, created_by, updated_at, updated_by) VALUES "
         "('config_allow_worker_to_worker', 'true', 'wkr-policy seed', "
         " '2026-01-01T00:00:00', 'vm-test', "
@@ -397,8 +398,9 @@ pkgs.testers.nixosTest {
     sql("UPDATE agents SET auto_event_loop = 1 WHERE agent_id = 'worker-backend'")
 
     # ── Test 10: global toggle OFF → stop_listening for everyone ──
+    # ADR-0016 (Wave 11): the loop toggle lives in project_settings.
     sql(
-        "INSERT OR REPLACE INTO project_context "
+        "INSERT OR REPLACE INTO project_settings "
         "(context_key, value, created_at, updated_at, "
         " created_by, updated_by) VALUES "
         "('config_auto_event_loop_global', 'false', "
@@ -412,7 +414,7 @@ pkgs.testers.nixosTest {
             e.get("type") == "stop_listening" for e in env.get("events", [])
         ), f"{who}: expected stop_listening when global flag OFF; got {env}"
     sql(
-        "UPDATE project_context SET value = 'true' "
+        "UPDATE project_settings SET value = 'true' "
         "WHERE context_key = 'config_auto_event_loop_global'"
     )
 

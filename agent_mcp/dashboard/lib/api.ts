@@ -157,6 +157,20 @@ export interface Memory {
   }
 }
 
+// A project_settings row (ADR-0016: config_* keys live in the dedicated
+// settings store, not project_context). `value` is the raw JSON-encoded
+// string the store carries; secret keys arrive as the literal string
+// "[redacted]" for non-confirmed tiers.
+export interface ProjectSetting {
+  context_key: string
+  value: string
+  description?: string | null
+  created_at?: string | null
+  created_by?: string | null
+  updated_at: string
+  updated_by: string
+}
+
 export interface MemoryHealthAnalysis {
   status: 'excellent' | 'good' | 'needs_attention' | 'critical' | 'no_data'
   health_score: number
@@ -888,6 +902,43 @@ class ApiClient {
 
   async deleteMemory(context_key: string): Promise<{ success: boolean; message: string }> {
     return this.request(`/memories/${encodeURIComponent(context_key)}`, {
+      method: 'DELETE',
+      body: JSON.stringify({})
+    })
+  }
+
+  // Project settings endpoints (ADR-0016). The Settings tab's store —
+  // config_* toggles/knobs live in project_settings, written via the
+  // gated update/delete_project_settings tools (system.config.write
+  // cap; config_aoe_* additionally sysadmin-only). Same cookie-session
+  // auth story as the memory endpoints above.
+  async getSettingsData(): Promise<{ settings: ProjectSetting[] }> {
+    return this.request('/settings-data')
+  }
+
+  async createSetting(data: {
+    context_key: string
+    context_value: any
+    description?: string
+  }): Promise<{ success: boolean; message: string }> {
+    return this.request('/settings', {
+      method: 'POST',
+      body: JSON.stringify(data)
+    })
+  }
+
+  async updateSetting(context_key: string, data: {
+    context_value: any
+    description?: string
+  }): Promise<{ success: boolean; message: string }> {
+    return this.request(`/settings/${encodeURIComponent(context_key)}`, {
+      method: 'PUT',
+      body: JSON.stringify(data)
+    })
+  }
+
+  async deleteSetting(context_key: string): Promise<{ success: boolean; message: string }> {
+    return this.request(`/settings/${encodeURIComponent(context_key)}`, {
       method: 'DELETE',
       body: JSON.stringify({})
     })

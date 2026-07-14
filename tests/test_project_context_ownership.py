@@ -191,36 +191,37 @@ async def test_6_worker_cannot_create_config_key(tmp_path) -> None:
         )
         msg = r[0].text
         assert "Unauthorized" in msg, msg
-        assert "config_* keys are admin-only" in msg, msg
+        assert "project settings store" in msg, msg
         assert _row("config_foo") is None
 
 
-async def test_7_admin_can_create_config_key(tmp_path) -> None:
+async def test_7_admin_cannot_create_config_key_either(tmp_path) -> None:
+    """Wave 11 (ADR-0016): config_* is rejected on the knowledge write
+    path for EVERYONE — admin included (the settings store owns the
+    namespace; use update_project_settings)."""
     async with mcp_session(tmp_path) as admin:
         r = await admin.call(
             "update_project_context",
             {"context_key": "config_foo", "context_value": "v"},
         )
-        assert "successfully" in r[0].text.lower(), r[0].text
-        row = _row("config_foo")
-        assert row is not None
-        assert row["created_by"] == "admin"
+        msg = r[0].text
+        assert "Unauthorized" in msg, msg
+        assert "project settings store" in msg, msg
+        assert _row("config_foo") is None
 
 
-async def test_8_worker_cannot_edit_admin_owned_config_key(tmp_path) -> None:
+async def test_8_worker_cannot_write_config_key_owned_or_not(tmp_path) -> None:
+    """The rejection is unconditional — ownership doesn't matter for
+    config_* on the knowledge path (ADR-0016)."""
     async with mcp_session(tmp_path) as admin:
         worker_a = await admin.create_worker("worker-A")
-        await admin.call(
-            "update_project_context",
-            {"context_key": "config_foo", "context_value": "v"},
-        )
         r = await worker_a.call(
             "update_project_context",
             {"context_key": "config_foo", "context_value": "hacked"},
         )
         msg = r[0].text
         assert "Unauthorized" in msg, msg
-        assert "config_* keys are admin-only" in msg, msg
+        assert "project settings store" in msg, msg
 
 
 async def test_9_worker_deletes_own_key(tmp_path) -> None:

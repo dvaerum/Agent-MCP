@@ -29,6 +29,7 @@ from .claude_code_session import ClaudeCodeSession
 from .file_metadata import FileMetadata
 from .mcp_session import McpSession
 from .project_context import ProjectContext
+from .project_settings import ProjectSettings
 from .rag_chunk import RagChunk
 from .rag_meta import RagMeta
 from .task import Task
@@ -42,6 +43,7 @@ __all__ = [
     "FileMetadata",
     "McpSession",
     "ProjectContext",
+    "ProjectSettings",
     "RagChunk",
     "RagMeta",
     "Task",
