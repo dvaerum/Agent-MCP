@@ -42,6 +42,7 @@ EXPECTED_TABLES = {
     "task_notes",
     "agent_actions",
     "project_context",
+    "project_settings",
     "file_metadata",
     "rag_chunks",
     "rag_meta",

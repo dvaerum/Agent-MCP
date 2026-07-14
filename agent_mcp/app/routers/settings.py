@@ -1,8 +1,17 @@
-"""Settings router — non-CRUD, router-config-shaped endpoints.
+"""Settings router — the project_settings store + config-shaped reads.
 
 Wave 8 PR 1 of prancy-napping-pie: the configuration-shaped reads
 mechanically moved out of ``app/routes.py`` onto this router:
 ``tokens``, ``aoe_health``, ``prompts_catalog``.
+
+Wave 11 PR 0 (ADR-0016): the router also owns the CRUD surface for
+the dedicated ``project_settings`` store — ``GET /api/settings-data``
+plus ``POST/PUT/DELETE /api/settings...`` — thin adapters that
+dispatch the gated MCP settings tools
+(``tools/project_settings_tools.py``) exactly the way
+``routers/memories.py`` dispatches the context tools: ONE enforcement
+path (the ``system.config.write`` cap gate + the ``config_aoe_*``
+sysadmin tier-gate live in the tool, never re-implemented here).
 
 The router uses the bare ``/api`` prefix (rather than a
 per-resource sub-prefix) and each handler registers its own
@@ -22,11 +31,23 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
-from .._dispatch_helpers import handle_options
-from ..deps import require_operator_session
+from .._dispatch_helpers import _build_route_principal, handle_options
+from ._wire_validation import require_str as _require_str
+from ..deps import caller_identity, require_operator_session
 from .composition import is_confirmed_operator_tier
 from ...core.config import logger
 from ...core import globals as g
+from ...core.tool_result import (
+    Ok,
+    tool_result_error_message,
+    tool_result_to_http,
+)
+from ...tools.registry import ToolInputValidationError, dispatch_tool_call
+from ...utils.json_utils import get_sanitized_json_body
+from ...utils.string_utils import (
+    UNSAFE_KEY_ERROR,
+    has_unsafe_unicode_for_identifier,
+)
 
 
 router = APIRouter(
@@ -213,6 +234,212 @@ async def prompts_catalog_api_route(request: Request) -> JSONResponse:
         return await handle_options(request)
     from ...prompts import load_catalog
     return JSONResponse(load_catalog())
+
+
+# --- project_settings store (ADR-0016, Wave 11) ---
+#
+# CRITICAL (F009): the read endpoint must NOT gate the whole response on
+# ``is_confirmed_operator_tier`` — cookie/forwarding operator sessions
+# are conservatively NON-confirmed (the per-project backend can't verify
+# their project role), and a blanket 403/redaction is exactly the bug
+# that broke the Settings toggles. Real values go out to every admitted
+# operator; ONLY the two genuinely secret keys
+# (``_SECRET_SETTING_KEYS`` — the store's own literal classification)
+# redact for non-confirmed tiers.
+
+
+@router.api_route("/settings-data", methods=["GET", "OPTIONS"])
+async def settings_data_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    """GET /api/settings-data — every ``project_settings`` row.
+
+    The Settings dashboard's read seam (replaces its former
+    ``getAllData().context`` filtering — config rows no longer live in
+    ``project_context``). Row shape matches the memories rows
+    (``context_key`` / ``value`` / ``description`` / ownership stamps);
+    ``value`` stays the raw JSON-encoded string the store carries.
+    """
+    if request.method == 'OPTIONS':
+        return await handle_options(request)
+
+    from ...db.unit_of_work import unit_of_work
+    from ...repositories import project_settings_repository as settings_repo
+    from ...tools.project_settings_tools import redact_settings_row
+
+    try:
+        with unit_of_work() as u:
+            rows = settings_repo.list_all(connection=u.cursor)
+    except Exception as e:
+        logger.error(f"Error reading project settings: {e}", exc_info=True)
+        return JSONResponse(
+            {"error": "Failed to read project settings"}, status_code=500,
+        )
+
+    confirmed = is_confirmed_operator_tier(auth)
+    return JSONResponse(
+        {
+            "settings": [
+                redact_settings_row(r, confirmed_operator_tier=confirmed)
+                for r in rows
+            ]
+        }
+    )
+
+
+async def _dispatch_settings_write(
+    request: Request,
+    auth: dict,
+    context_key: str,
+    data: dict,
+) -> JSONResponse:
+    """Shared upsert adapter for POST /api/settings and
+    PUT /api/settings/{context_key} — both dispatch the gated
+    ``update_project_settings`` tool (upsert semantics), mirroring how
+    ``routers/memories.py`` dispatches the context tools."""
+    # Wire hygiene, matching the memories handlers: a structured JSON
+    # ``context_key``/``description`` must 400, not 500; unsafe-unicode
+    # keys are spoofing vectors (F005).
+    _err = _require_str(context_key, "context_key")
+    if _err is not None:
+        return _err
+    description = data.get("description")
+    _err = _require_str(description, "description")
+    if _err is not None:
+        return _err
+    if has_unsafe_unicode_for_identifier(context_key):
+        return JSONResponse(UNSAFE_KEY_ERROR, status_code=400)
+
+    principal = _build_route_principal(
+        bearer_token=None,
+        operator_session=True,
+        operator_user_id=caller_identity(auth),
+    )
+
+    arguments: dict = {
+        "context_key": context_key,
+        "context_value": data.get("context_value"),
+    }
+    if description is not None:
+        arguments["description"] = description
+
+    try:
+        result = await dispatch_tool_call(
+            "update_project_settings", arguments, principal=principal,
+        )
+    except ToolInputValidationError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.error(
+            f"Error dispatching update_project_settings: {e}", exc_info=True,
+        )
+        return JSONResponse(
+            {"error": "Failed to update setting"}, status_code=500,
+        )
+
+    if isinstance(result, Ok):
+        return JSONResponse(
+            {
+                "success": True,
+                "message": (
+                    result.message
+                    or f"Setting '{context_key}' updated successfully"
+                ),
+            }
+        )
+
+    status, _ = tool_result_to_http(result)
+    return JSONResponse(
+        {"error": tool_result_error_message(result, "Failed to update setting")},
+        status_code=status,
+    )
+
+
+@router.post("/settings")
+async def create_setting_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    """POST /api/settings — upsert a setting (body carries the key)."""
+    try:
+        data = await get_sanitized_json_body(request)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    context_key = data.get("context_key")
+    if not context_key:
+        return JSONResponse(
+            {"error": "context_key is required"}, status_code=400,
+        )
+    return await _dispatch_settings_write(request, auth, context_key, data)
+
+
+@router.put("/settings/{context_key}")
+async def update_setting_api_route(
+    context_key: str,
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    """PUT /api/settings/<context_key> — upsert a setting."""
+    try:
+        data = await get_sanitized_json_body(request)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return await _dispatch_settings_write(request, auth, context_key, data)
+
+
+@router.delete("/settings/{context_key}")
+async def delete_setting_api_route(
+    context_key: str,
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    """DELETE /api/settings/<context_key> — thin adapter over the gated
+    ``delete_project_settings`` tool (cap + AoE sysadmin gates live in
+    the tool; the post-delete wake set fires there too)."""
+    if has_unsafe_unicode_for_identifier(context_key):
+        return JSONResponse(UNSAFE_KEY_ERROR, status_code=400)
+
+    principal = _build_route_principal(
+        bearer_token=None,
+        operator_session=True,
+        operator_user_id=caller_identity(auth),
+    )
+
+    try:
+        result = await dispatch_tool_call(
+            "delete_project_settings",
+            {"context_key": context_key},
+            principal=principal,
+        )
+    except ToolInputValidationError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.error(
+            f"Error dispatching delete_project_settings: {e}", exc_info=True,
+        )
+        return JSONResponse(
+            {"error": "Failed to delete setting"}, status_code=500,
+        )
+
+    if isinstance(result, Ok):
+        return JSONResponse(
+            {
+                "success": True,
+                "message": f"Setting '{context_key}' deleted successfully",
+            }
+        )
+
+    status, _ = tool_result_to_http(result)
+    return JSONResponse(
+        {
+            "error": tool_result_error_message(
+                result, "Failed to delete setting", not_found_label="Setting",
+            )
+        },
+        status_code=status,
+    )
 
 
 # --- Catch-all OPTIONS handler ---

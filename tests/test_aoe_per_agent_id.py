@@ -33,7 +33,7 @@ from typing import Any
 import httpx
 import pytest
 
-from tests.harness import mcp_session, seed_config_context_as_sysadmin
+from tests.harness import mcp_session, seed_config_setting_as_sysadmin
 
 
 pytestmark = pytest.mark.asyncio
@@ -70,7 +70,7 @@ def _set_ctx(admin, key: str, value: Any) -> None:
     # operator-tier REST seam below now 403s on it, so seed it as a
     # sysadmin would. Other config/context keys stay on the REST path.
     if key.lower().startswith("config_aoe_"):
-        seed_config_context_as_sysadmin(key, value)
+        seed_config_setting_as_sysadmin(key, value)
         return
     r = admin.client.post(
         "/api/memories",

@@ -104,6 +104,17 @@ export interface ProjectContextMirror {
   updated_by: string
 }
 
+/** Pydantic mirror of the `project_settings` table. */
+export interface ProjectSettingsMirror {
+  context_key: string
+  value: string
+  description?: string | null
+  created_at?: string | null
+  created_by?: string | null
+  updated_at: string
+  updated_by: string
+}
+
 /** Pydantic mirror of the `rag_chunks` table. */
 export interface RagChunkMirror {
   chunk_id: number
@@ -156,6 +167,7 @@ export const MIRROR_TABLE_NAMES = [
   "file_metadata",
   "mcp_sessions",
   "project_context",
+  "project_settings",
   "rag_chunks",
   "rag_meta",
   "task_notes",

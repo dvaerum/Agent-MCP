@@ -25,11 +25,34 @@ pytestmark = pytest.mark.asyncio
 
 
 def _seed(admin, *, key: str, value: str) -> None:
-    r = admin.client.post(
-        "/api/memories",
-        json={"token": admin.admin_token, "context_key": key, "context_value": value},
-    )
-    assert r.status_code == 200, r.text
+    """Seed a project_context row DIRECTLY via the repository.
+
+    Wave 11 (ADR-0016): the write path rejects config_* keys for every
+    caller, so these read-side redaction tests (which deliberately pin
+    the legacy is_secret_key behaviour on rows that could only exist in
+    a pre-cutover DB) seed raw. The whole config branch of the
+    redaction machinery — and these config-key assertions with it — is
+    deleted in the ADR-0016 follow-up PR.
+    """
+    import json as _json
+
+    from agent_mcp.db.connection import get_db_connection
+    from agent_mcp.repositories import project_context_repository as _pc_repo
+
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        _pc_repo.upsert(
+            key,
+            _json.dumps(value),
+            None,
+            description_provided=False,
+            actor="admin",
+            connection=cursor,
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 async def test_admin_sees_config_system_token(tmp_path) -> None:

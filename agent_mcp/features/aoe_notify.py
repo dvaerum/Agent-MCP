@@ -28,12 +28,13 @@ Design notes:
   ``{content}``, ``{body}``, ``{message}`` and any case-variant is
   rejected, leaving only ``{sender}``, ``{recipient}``, ``{message_id}``.
 
-* Per-project config (project_context keys):
+* Per-project config (``project_settings`` keys — ADR-0016 moved the
+  ``config_*`` namespace out of ``project_context``):
 
   - ``config_aoe_notify_enabled``  (bool, default ``false``)
   - ``config_aoe_base_url``        (str, default ``http://127.0.0.1:8181``)
-  - ``config_aoe_bearer_token``    (str, **secret** — matches the
-    ``_SECRET_KEY_RE`` redaction filter so workers can't read it)
+  - ``config_aoe_bearer_token``    (str, **secret** — listed in
+    ``_SECRET_SETTING_KEYS`` so non-confirmed tiers read ``[redacted]``)
   - ``config_aoe_notify_template`` (str, default below)
   - ``config_aoe_timeout_ms``      (int, default 2000)
 
@@ -204,16 +205,21 @@ def _get_stored_aoe_session_id(agent_id: str) -> Optional[str]:
 
 
 def _read_ctx(key: str) -> Optional[str]:
-    """Return the raw project_context value for ``key`` (or None).
+    """Return the raw ``project_settings`` value for ``key`` (or None).
 
-    Strips one outer pair of double quotes (project_context stores
-    everything as JSON-encoded strings, so a bare string ``"foo"``
-    becomes the literal ``"foo"`` here).
+    Strips one outer pair of double quotes (the settings store keeps
+    project_context's JSON-encoded-string convention, so a bare string
+    ``"foo"`` becomes the literal ``"foo"`` here).
+
+    Wave 11 (ADR-0016): ``config_aoe_*`` rows moved from
+    ``project_context`` to ``project_settings`` — this direct-SELECT
+    seam is the second of the two the cutover repointed (the other is
+    ``tools/access.py``'s ``_get_config_bool`` / ``_get_config_int``).
     """
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT value FROM project_context WHERE context_key = ?", (key,))
+        cur.execute("SELECT value FROM project_settings WHERE context_key = ?", (key,))
         row = cur.fetchone()
         conn.close()
     except Exception as e:  # pragma: no cover — DB outage unlikely in tests

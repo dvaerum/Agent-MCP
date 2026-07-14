@@ -1,5 +1,12 @@
 """BL-R14-1: REST-vs-MCP post-write NOTIFY PARITY on the two
-operator-reachable ``project_context`` write surfaces.
+operator-reachable settings write surfaces.
+
+Wave 11 (ADR-0016): the ``config_*`` toggles live in the dedicated
+``project_settings`` store now — the REST surface is
+``PUT /api/settings/<key>`` and the MCP surface is
+``update_project_settings`` (the context tools reject the config
+namespace outright). The parity invariant is unchanged; only the
+surfaces moved.
 
 Both write surfaces must fire the SAME wake set for the key they
 changed:
@@ -43,25 +50,14 @@ pytestmark = pytest.mark.asyncio
 
 
 def _rest_upsert(admin, key: str, value):
-    """Upsert a project_context row through the REST write surface —
-    POST (create), falling back to PUT (update) if the key exists.
-    Both handlers are the operator-reachable write surface under test.
-    """
-    r = admin.client.post(
-        "/api/memories",
-        json={
-            "token": admin.admin_token,
-            "context_key": key,
-            "context_value": value,
-        },
+    """Upsert a settings row through the REST write surface —
+    ``PUT /api/settings/<key>`` (upsert semantics; dispatches the gated
+    ``update_project_settings`` tool underneath)."""
+    return admin.request(
+        "PUT",
+        f"/api/settings/{key}",
+        json={"context_value": value},
     )
-    if r.status_code == 409:
-        r = admin.client.request(
-            "PUT",
-            f"/api/memories/{key}",
-            json={"token": admin.admin_token, "context_value": value},
-        )
-    return r
 
 
 # ── Direction 1: REST worker-policy write → tools/list_changed ───────
@@ -70,8 +66,8 @@ def _rest_upsert(admin, key: str, value):
 async def test_rest_worker_toggle_pushes_tools_list_changed(
     tmp_path: Path,
 ) -> None:
-    """RED before fix: granting a worker capability via REST
-    ``/api/memories`` (``config_allow_worker_*``) must push
+    """Granting a worker capability via REST
+    ``/api/settings`` (``config_allow_worker_*``) must push
     ``tools/list_changed`` so connected workers refetch ``tools/list``.
     On main the REST surface omitted this call entirely."""
     import agent_mcp.tools.project_context_tools as pct
@@ -106,7 +102,7 @@ async def test_mcp_loop_toggle_wakes_waiters(tmp_path: Path) -> None:
             g, "wake_all_for_flag_recheck", autospec=True
         ) as wake:
             await admin.assert_tool_succeeds(
-                "update_project_context",
+                "update_project_settings",
                 {
                     "context_key": "config_auto_event_loop_global",
                     "context_value": False,
@@ -150,7 +146,7 @@ async def test_mcp_worker_toggle_still_pushes(tmp_path: Path) -> None:
             pct, "_emit_tools_list_changed", autospec=True
         ) as emit:
             await admin.assert_tool_succeeds(
-                "update_project_context",
+                "update_project_settings",
                 {
                     "context_key": "config_allow_worker_self_assign",
                     "context_value": True,
@@ -179,7 +175,7 @@ async def test_mcp_worker_toggle_does_not_wake_waiters(
             g, "wake_all_for_flag_recheck", autospec=True
         ) as wake:
             await admin.assert_tool_succeeds(
-                "update_project_context",
+                "update_project_settings",
                 {
                     "context_key": "config_allow_worker_self_assign",
                     "context_value": True,
@@ -226,7 +222,10 @@ async def test_unrelated_rest_write_fires_neither_wake(
         ) as emit, patch.object(
             g, "wake_all_for_flag_recheck", autospec=True
         ) as wake:
-            r = _rest_upsert(admin, "team_motto", "ship the v1")
+            r = admin.post(
+                "/api/memories",
+                json={"context_key": "team_motto", "context_value": "ship the v1"},
+            )
             assert r.status_code == 200, r.text
             assert not emit.called, (
                 "unrelated write must not push tools/list_changed; "

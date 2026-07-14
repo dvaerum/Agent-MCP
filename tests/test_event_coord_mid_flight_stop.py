@@ -99,19 +99,19 @@ async def test_global_toggle_off_wakes_all_in_flight(tmp_path: Path) -> None:
         try:
             cur = conn.cursor()
             cur.execute(
-                "SELECT context_key FROM project_context "
+                "SELECT context_key FROM project_settings "
                 "WHERE context_key = ?",
                 ("config_auto_event_loop_global",),
             )
             if cur.fetchone():
                 cur.execute(
-                    "UPDATE project_context SET value = 'false', "
+                    "UPDATE project_settings SET value = 'false', "
                     "updated_at = ? WHERE context_key = ?",
                     (now, "config_auto_event_loop_global"),
                 )
             else:
                 cur.execute(
-                    "INSERT INTO project_context "
+                    "INSERT INTO project_settings "
                     "(context_key, value, created_at, updated_at, "
                     " created_by, updated_by) "
                     "VALUES (?, 'false', ?, ?, 'admin', 'admin')",

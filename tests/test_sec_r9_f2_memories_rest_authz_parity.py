@@ -38,7 +38,7 @@ import json
 
 import pytest
 
-from tests.harness import mcp_session, seed_config_context_as_sysadmin
+from tests.harness import mcp_session, seed_config_setting_as_sysadmin
 
 pytestmark = pytest.mark.asyncio
 
@@ -73,16 +73,18 @@ def _seed_memory(key: str, value: object, created_by: str = "seed-owner") -> Non
         sess.close()
 
 
-def _row_value(key: str):
+def _row_value(key: str, table: str = "project_context"):
     """Return the JSON-decoded stored value for ``key`` or ``None`` if the
-    row is absent."""
+    row is absent. ``table`` selects the store — Wave 11 (ADR-0016)
+    moved ``config_*`` rows to ``project_settings``."""
     from agent_mcp.db.connection import get_db_connection
 
+    assert table in ("project_context", "project_settings")
     conn = get_db_connection()
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT value FROM project_context WHERE context_key = ?", (key,)
+            f"SELECT value FROM {table} WHERE context_key = ?", (key,)
         )
         r = cur.fetchone()
     finally:
@@ -92,14 +94,15 @@ def _row_value(key: str):
     return json.loads(r["value"])
 
 
-def _row_exists(key: str) -> bool:
+def _row_exists(key: str, table: str = "project_context") -> bool:
     from agent_mcp.db.connection import get_db_connection
 
+    assert table in ("project_context", "project_settings")
     conn = get_db_connection()
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT 1 FROM project_context WHERE context_key = ?", (key,)
+            f"SELECT 1 FROM {table} WHERE context_key = ?", (key,)
         )
         return cur.fetchone() is not None
     finally:
@@ -111,40 +114,44 @@ def _row_exists(key: str) -> bool:
 
 async def test_rest_put_config_aoe_denied_for_operator(tmp_path) -> None:
     """PUT-updating an existing ``config_aoe_base_url`` as a non-sysadmin
-    operator is DENIED (403) — the direct-write handler used to let this
-    re-point the outbound AoE client (SSRF). RED on main: 200."""
+    operator is DENIED (403) — a per-project operator must not re-point
+    the outbound AoE client (SSRF). Wave 11 (ADR-0016): the gate lives on
+    the settings write surface (``PUT /api/settings/...``) now; the
+    memories surface rejects the whole config_* namespace outright."""
     async with mcp_session(tmp_path) as admin:
-        seed_config_context_as_sysadmin(
+        seed_config_setting_as_sysadmin(
             "config_aoe_base_url", "http://127.0.0.1:8181"
         )
 
         r = admin.request(
             "PUT",
-            "/api/memories/config_aoe_base_url",
+            "/api/settings/config_aoe_base_url",
             json={"context_value": "http://attacker.evil:9999"},
         )
 
         assert r.status_code == 403, r.text
         # The malicious value must NOT have landed.
-        assert _row_value("config_aoe_base_url") == "http://127.0.0.1:8181"
+        assert _row_value(
+            "config_aoe_base_url", table="project_settings"
+        ) == "http://127.0.0.1:8181"
 
 
 async def test_rest_delete_config_aoe_denied_for_operator(tmp_path) -> None:
     """DELETE of a ``config_aoe_*`` key as a non-sysadmin operator is
-    DENIED (403). RED on main: 200 (the bearer/base_url got deleted)."""
+    DENIED (403) — on the settings surface post-ADR-0016."""
     async with mcp_session(tmp_path) as admin:
-        seed_config_context_as_sysadmin(
+        seed_config_setting_as_sysadmin(
             "config_aoe_bearer_token", "s3cr3t-bearer"
         )
 
         r = admin.request(
             "DELETE",
-            "/api/memories/config_aoe_bearer_token",
+            "/api/settings/config_aoe_bearer_token",
             json={},
         )
 
         assert r.status_code == 403, r.text
-        assert _row_exists("config_aoe_bearer_token")
+        assert _row_exists("config_aoe_bearer_token", table="project_settings")
 
 
 # ── (2) viewer-tier operator DENIED on the REST write surfaces ──────

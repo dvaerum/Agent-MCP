@@ -152,15 +152,17 @@ _WORKER_POLICY_TOGGLE_RE = re.compile(r"^config_allow_worker_", re.IGNORECASE)
 # config_aoe_* configures a MACHINE-level outbound integration, not a
 # per-project policy: the AoE notify client reads config_aoe_base_url as
 # the request base_url and config_aoe_bearer_token as its Authorization
-# header (see features/aoe_notify.py). A per-project OPERATOR carries
-# system.config.write and so passes the general config_* gate — but
-# choosing WHERE the shared host sends its outbound request (and which
-# host receives the bearer) is a host-owner decision, not an operator's:
-# an operator who could set config_aoe_base_url could aim it at an
-# internal/link-local/metadata address (SSRF) and exfiltrate the bearer.
-# So config_aoe_* create/update/delete requires SYSADMIN, one tier above
-# the operator-writable config_* namespace. Prefix regex (not the literal
-# 6-key set) so future config_aoe_* keys inherit the gate automatically.
+# header (see features/aoe_notify.py). Choosing WHERE the shared host
+# sends its outbound request (and which host receives the bearer) is a
+# host-owner decision (SSRF / bearer-exfil surface), so config_aoe_*
+# create/update/delete requires SYSADMIN.
+#
+# ADR-0016 (Wave 11): the WRITE gate itself moved to
+# ``tools/project_settings_tools.py`` (the settings store owns config
+# writes now; this module rejects the whole config_* namespace). The
+# regex stays here only because the READ-side redaction docs above
+# (``_NON_SECRET_POLICY_KEYS`` / ``is_secret_key``) reference it — that
+# machinery is deleted wholesale in the ADR-0016 follow-up PR.
 _CONFIG_AOE_KEY_RE = re.compile(r"^config_aoe_", re.IGNORECASE)
 
 
@@ -333,20 +335,15 @@ async def emit_context_write_wakes_bulk(context_keys) -> None:
 
 
 def _config_key_error() -> "PermissionDenied":
+    # ADR-0016 (Wave 11): the config_* namespace lives in the dedicated
+    # project_settings store — the knowledge write path rejects it for
+    # EVERYONE (admin included), so config can't be smuggled back into
+    # the memory store (where it would be RAG-indexed and re-open the
+    # F009 redaction class).
     return PermissionDenied(
         reason=(
-            "config_* keys are admin-only; workers cannot create or "
-            "modify policy/secret entries"
-        )
-    )
-
-
-def _aoe_config_sysadmin_error() -> "PermissionDenied":
-    return PermissionDenied(
-        reason=(
-            "config_aoe_* keys configure a machine-level outbound "
-            "integration target and are sysadmin-only; a per-project "
-            "operator cannot create, modify, or delete them"
+            "config_* keys moved to the project settings store "
+            "(ADR-0016); use update_project_settings"
         )
     )
 
@@ -478,34 +475,6 @@ def _deny_viewer_tier_write(
                 "(read-only project membership)"
             )
         )
-    return None
-
-
-def _deny_non_sysadmin_aoe_config(
-    principal: Optional[Principal],
-    context_keys: List[Optional[str]],
-) -> Optional[PermissionDenied]:
-    """Reject any non-sysadmin write/delete touching a config_aoe_* key.
-
-    A tier-gate that sits ABOVE the per-key creator-ownership matrix
-    (:func:`_check_write_authorization`), mirroring the SEC1
-    :func:`_deny_viewer_tier_write` gate's placement — it is called at
-    each project_context write boundary (create / update / bulk-update /
-    delete). See :data:`_CONFIG_AOE_KEY_RE` for WHY config_aoe_* is
-    sysadmin-only (machine-level outbound integration target → SSRF /
-    bearer-exfil surface if a per-project operator could set it).
-
-    A sysadmin passes unconditionally. Any other principal (operator,
-    manager, worker, viewer, or an unattributable ``None``) is denied the
-    moment any candidate key matches the config_aoe_* prefix — so a bulk
-    batch that mixes an AoE key with innocuous keys is rejected wholesale
-    before any write lands.
-    """
-    if principal is not None and principal.sysadmin:
-        return None
-    for key in context_keys:
-        if key and _CONFIG_AOE_KEY_RE.match(key):
-            return _aoe_config_sysadmin_error()
     return None
 
 
@@ -711,12 +680,14 @@ def _check_write_authorization(
     a :class:`PermissionDenied` carrying a specific human-readable
     denial reason.
 
-    Rules (Phase 7b):
-    - Admin: always authorized.
-    - Non-admin + config_* key: forbidden (admin-only safety invariant).
+    Rules (Phase 7b, amended by ADR-0016):
+    - config_* key: forbidden for EVERYONE (admin included) — the
+      config namespace lives in the project_settings store now; this
+      write path only holds agent-authored knowledge.
+    - Admin: otherwise always authorized.
     - Non-admin + existing key + creator != self: forbidden.
-    - Non-admin + new key (no row yet) + non-config: allowed.
-    - Non-admin + existing key + creator == self + non-config: allowed.
+    - Non-admin + new key (no row yet): allowed.
+    - Non-admin + existing key + creator == self: allowed.
 
     arch-r4 #6: reads `created_by` via ``project_context_repo.get()``
     against the caller's open ``unit_of_work().cursor``, so the check
@@ -733,10 +704,12 @@ def _check_write_authorization(
     round trip was a dead no-op that just duplicated the 4-line
     strip-and-rewrap at every call site.
     """
-    if is_admin:
-        return None
+    # ADR-0016: checked BEFORE the admin early-return — config_* is
+    # rejected for every caller on the knowledge write path.
     if _CONFIG_KEY_RE.match(context_key):
         return _config_key_error()
+    if is_admin:
+        return None
     existing = project_context_repo.get(context_key, connection=connection)
     if existing is None:
         return None
@@ -1394,17 +1367,11 @@ async def update_project_context_tool_impl(
     requesting_agent_id = _actor_label(principal)
     is_admin = _is_admin_principal(principal)
 
-    # config_aoe_* is sysadmin-only (machine-level outbound integration
-    # target — see _CONFIG_AOE_KEY_RE). Gate BEFORE the per-key ownership
-    # matrix, covering both the single and bulk shapes of this tool.
-    candidate_keys: List[Optional[str]] = (
-        [u.get("context_key") if isinstance(u, dict) else None for u in updates_list]
-        if isinstance(updates_list, list)
-        else [context_key_to_update]
-    )
-    aoe_denied = _deny_non_sysadmin_aoe_config(principal, candidate_keys)
-    if aoe_denied is not None:
-        return aoe_denied
+    # ADR-0016: the config_aoe_* sysadmin gate that used to sit here is
+    # unreachable now — _check_write_authorization rejects the WHOLE
+    # config_* namespace (admin included) before any write; the AoE
+    # tier-gate lives on the settings write path
+    # (tools/project_settings_tools.py).
 
     # Determine operation mode
     is_bulk_operation = updates_list is not None
@@ -1579,15 +1546,9 @@ async def bulk_update_project_context_tool_impl(
     updates = arguments.get("updates", [])  # List of update operations
     requesting_agent_id = _actor_label(principal)
 
-    # config_aoe_* is sysadmin-only (see _CONFIG_AOE_KEY_RE) — reject the
-    # whole batch before any write if a non-sysadmin includes such a key.
-    if isinstance(updates, list):
-        aoe_denied = _deny_non_sysadmin_aoe_config(
-            principal,
-            [u.get("context_key") if isinstance(u, dict) else None for u in updates],
-        )
-        if aoe_denied is not None:
-            return aoe_denied
+    # ADR-0016: the batch-level config_aoe_* sysadmin gate is gone —
+    # _check_write_authorization (run per-entry before any write lands)
+    # rejects every config_* key for every caller now.
 
     if not updates or not isinstance(updates, list):
         return Invalid(
@@ -1761,10 +1722,8 @@ async def create_project_context_tool_impl(
             field="context_key", message="context_key is required"
         )
 
-    # config_aoe_* is sysadmin-only (see _CONFIG_AOE_KEY_RE).
-    aoe_denied = _deny_non_sysadmin_aoe_config(principal, [context_key])
-    if aoe_denied is not None:
-        return aoe_denied
+    # ADR-0016: config_* (AoE gate included) is rejected wholesale by
+    # _check_write_authorization inside _create_context_inline.
 
     requesting_agent_id = _actor_label(principal)
     is_admin = _is_admin_principal(principal)
@@ -2440,20 +2399,22 @@ async def delete_project_context_tool_impl(
             message="No context keys specified for deletion",
         )
 
-    # config_aoe_* is sysadmin-only (see _CONFIG_AOE_KEY_RE) — a
-    # per-project operator cannot delete the machine-level integration
-    # config either. Gate before any deletion runs.
-    aoe_denied = _deny_non_sysadmin_aoe_config(principal, keys_to_delete)
-    if aoe_denied is not None:
-        return aoe_denied
+    # ADR-0016: config_* rows live in the project_settings store and can
+    # no longer exist in project_context (migration 0016 moved them; the
+    # write path rejects them for everyone). Reject a config_* delete up
+    # front with the same pointer the write path gives — checked BEFORE
+    # the critical-key guard so the caller gets the category error, not
+    # a misleading force_delete hint. This also retires the AoE
+    # sysadmin delete-gate here (it lives on delete_project_settings).
+    for key in keys_to_delete:
+        if key and _CONFIG_KEY_RE.match(key):
+            return _config_key_error()
 
     # Critical system keys that require force_delete. The legacy
-    # ``config_admin_token`` is kept alongside ``config_system_token``
-    # so an operator's force-delete on a pre-v5.0.62 DB (before the
-    # row was migrated) still trips the guard.
+    # ``config_system_token`` / ``config_admin_token`` entries are gone:
+    # migration 0015 deleted the rows and the config_* rejection above
+    # makes any config-key delete unreachable past this point.
     critical_keys = [
-        "config_system_token",
-        "config_admin_token",
         "server_startup",
         "database_version",
         "system_config",

@@ -312,13 +312,17 @@ TOOL_ACCESS = _DerivedAccessMap()
 
 
 def _get_config_bool(key: str, default: bool) -> bool:
-    """Read a boolean toggle from project_context.
+    """Read a boolean toggle from the ``project_settings`` store.
 
     Identical semantics to the per-module helpers in
     ``agent_communication_tools.py`` / ``task_tools.py``; kept here
     so the filter doesn't reach across modules into private helpers.
-    If the project_context store is unreachable (e.g. during very
-    early bootstrap before the DB exists), defaults are returned.
+    If the settings store is unreachable (e.g. during very early
+    bootstrap before the DB exists), defaults are returned.
+
+    Wave 11 (ADR-0016): ``config_*`` rows moved from ``project_context``
+    to the dedicated ``project_settings`` table — this is one of the two
+    canonical read seams the cutover repointed.
     """
     try:
         from ..db.connection import get_db_connection
@@ -326,7 +330,7 @@ def _get_config_bool(key: str, default: bool) -> bool:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT value FROM project_context WHERE context_key = ?",
+            "SELECT value FROM project_settings WHERE context_key = ?",
             (key,),
         )
         row = cursor.fetchone()
@@ -346,19 +350,22 @@ def _get_config_bool(key: str, default: bool) -> bool:
 
 
 def _get_config_int(key: str, default: int) -> int:
-    """Read an integer knob from ``project_context``.
+    """Read an integer knob from the ``project_settings`` store.
 
     Numeric companion to :func:`_get_config_bool`; this is the single
     canonical config-read seam for int-typed toggles (message
     retention, AoE timeouts, …) so the ``SELECT value FROM
-    project_context`` + coercion isn't re-typed per feature module.
+    project_settings`` + coercion isn't re-typed per feature module.
 
-    ``project_context.value`` is JSON-encoded on write, but tests /
+    ``project_settings.value`` is JSON-encoded on write, but tests /
     external tools may push a raw string, so parse liberally: JSON
     first, then ``int()``. Returns ``default`` when the key is absent,
     the store is unreachable (early bootstrap before the DB exists),
     or the value is not coercible to an int. Callers own any further
     policy (``<= 0`` handling, upper clamps).
+
+    Wave 11 (ADR-0016): repointed from ``project_context`` alongside
+    :func:`_get_config_bool`.
     """
     try:
         from ..db.connection import get_db_connection
@@ -366,7 +373,7 @@ def _get_config_int(key: str, default: int) -> int:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT value FROM project_context WHERE context_key = ?",
+            "SELECT value FROM project_settings WHERE context_key = ?",
             (key,),
         )
         row = cursor.fetchone()

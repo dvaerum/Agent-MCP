@@ -382,15 +382,16 @@ async def test_update_project_context_manager_config_key_rejected(
         )
 
 
-async def test_update_project_context_operator_config_key_admitted(
+async def test_update_project_settings_operator_config_key_admitted(
     tmp_path,
 ) -> None:
-    """Operator writes ``config_*`` → not Unauthorized."""
+    """Operator writes ``config_*`` → not Unauthorized (ADR-0016: on the
+    settings store; the context path rejects the namespace outright)."""
     from tests.harness import _first_text, _is_unauthorized
 
     async with mcp_session(tmp_path) as admin:
         result = await admin.call(
-            "update_project_context",
+            "update_project_settings",
             {
                 "context_key": "config_operator_only",
                 "context_value": "operator can land config_* keys",

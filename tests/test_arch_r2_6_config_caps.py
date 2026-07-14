@@ -77,14 +77,15 @@ def test_reviewed_caps_are_retained_not_pruned() -> None:
 
 
 def _seed_ctx(key: str, stored_value: str) -> None:
-    """Write a raw project_context row (value stored verbatim)."""
+    """Write a raw project_settings row (value stored verbatim) —
+    ADR-0016: the config-read seams consult project_settings."""
     from agent_mcp.db.connection import get_db_connection
 
     now = _dt.datetime.now().isoformat()
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
-        "INSERT OR REPLACE INTO project_context "
+        "INSERT OR REPLACE INTO project_settings "
         "(context_key, value, description, created_at, created_by, "
         "updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (key, stored_value, "arch-r2-6 test", now, "test", now, "test"),

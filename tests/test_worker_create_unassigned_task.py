@@ -41,16 +41,16 @@ pytestmark = pytest.mark.asyncio
 
 
 def _set_toggle(value: bool) -> None:
-    """Set config_allow_worker_create_unassigned in project_context."""
+    """Set config_allow_worker_create_unassigned in project_settings (ADR-0016)."""
     from agent_mcp.db.connection import get_db_connection
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    # project_context post-Phase-7b schema (key, value, description,
+    # project_settings schema (same shape as project_context: key, value,
     # created_at, created_by, updated_at, updated_by)
     now_iso = _dt.datetime.now().isoformat()
     cursor.execute(
-        "INSERT OR REPLACE INTO project_context "
+        "INSERT OR REPLACE INTO project_settings "
         "(context_key, value, description, created_at, created_by, "
         "updated_at, updated_by) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",

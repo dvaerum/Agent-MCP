@@ -26,6 +26,7 @@ from . import task_tools
 from . import task_notes_tools  # PR-H — side-table notes tools
 from . import file_management_tools
 from . import project_context_tools
+from . import project_settings_tools  # noqa: E402,F401 — ADR-0016 settings store
 from . import file_metadata_tools
 from . import agent_tools
 from . import rag_tools

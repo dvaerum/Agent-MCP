@@ -11,24 +11,26 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
-import { apiClient } from "@/lib/api"
+import { apiClient, type ProjectSetting } from "@/lib/api"
 
 // Per-project agent_messages retention. Stored as an integer count of
-// days in project_context["config_message_retention_days"]; absent or 0
-// means "keep forever" (upstream behavior). The background pruner in
+// days in project_settings["config_message_retention_days"]; absent or
+// 0 means "keep forever" (upstream behavior). The background pruner in
 // features.message_retention enforces it.
 const MESSAGE_RETENTION_KEY = "config_message_retention_days"
 
-// Per-project worker-permission policies. Each lives in the
-// project_context store under a `config_*` key. The dashboard runs as
-// admin per ADR-0003 — the PUT /memories/<key> and POST /memories
-// calls authenticate via the operator session cookie set on
-// /agent-mcp/login (see lib/api.ts: createMemory / updateMemory).
+// Per-project worker-permission policies. Each lives in the dedicated
+// project_settings store under a `config_*` key (ADR-0016 — settings
+// are operational config, separate from the agent-authored memories in
+// project_context). Reads come from GET /api/settings-data; writes go
+// through PUT /settings/<key> / POST /settings (see lib/api.ts:
+// updateSetting / createSetting), authenticated via the operator
+// session cookie set on /agent-mcp/login.
 interface PolicySpec {
   key: string
   title: string
   description: string
-  // What the system does when the key is absent from project_context.
+  // What the system does when the key is absent from project_settings.
   // Mirrors the defaults applied by the backend tool gates.
   default: boolean
 }
@@ -66,7 +68,7 @@ const POLICIES: PolicySpec[] = [
     key: "config_aoe_notify_enabled",
     title: "Notify Agents-of-Empires on new messages",
     description:
-      "When on, send_agent_message also POSTs a tmux-pane wake-up to a local Agents-of-Empires (AoE) instance so the recipient notices the message even between polls. Disabled by default. Configure config_aoe_base_url, config_aoe_bearer_token (secret), and config_aoe_notify_template via the Memories tab. The message body itself is never forwarded — only {sender}, {recipient}, {message_id} are interpolated.",
+      "When on, send_agent_message also POSTs a tmux-pane wake-up to a local Agents-of-Empires (AoE) instance so the recipient notices the message even between polls. Disabled by default. Configure config_aoe_base_url, config_aoe_bearer_token (secret), and config_aoe_notify_template in the AoE integration card below (sysadmin-only). The message body itself is never forwarded — only {sender}, {recipient}, {message_id} are interpolated.",
     default: false,
   },
   {
@@ -89,7 +91,7 @@ const POLICIES: PolicySpec[] = [
 
 interface PolicyState {
   value: boolean
-  exists: boolean   // true once we've seen the key in project_context
+  exists: boolean   // true once we've seen the key in project_settings
   pending: boolean  // true while a PUT/POST is in flight
 }
 
@@ -98,7 +100,7 @@ interface PolicyState {
 // set on /agent-mcp/login — the browser attaches it to every
 // ``apiClient`` call automatically.
 
-// project_context stores values as JSON-serialised strings. Booleans
+// project_settings stores values as JSON-serialised strings. Booleans
 // arrive as either the bare boolean `true` / `false`, the string
 // "true" / "false", or wrapped inside an object. Be liberal in what
 // we accept.
@@ -119,7 +121,7 @@ function coerceBool(raw: unknown, fallback: boolean): boolean {
   return fallback
 }
 
-// project_context stores retention as a JSON-encoded integer. Tolerate
+// project_settings stores retention as a JSON-encoded integer. Tolerate
 // quoted strings and floats; clamp to >= 0.
 function coerceNonNegInt(raw: unknown): number {
   let n: number
@@ -183,6 +185,9 @@ export function SettingsDashboard() {
     exists: false,
     pending: false,
   })
+  // The raw project_settings rows from the last refresh — the AoE
+  // integration card reads its keys out of this list.
+  const [settingsRows, setSettingsRows] = useState<ProjectSetting[]>([])
   // Show the inline validation hint only after the field has been
   // blurred (UX-09), so we don't nag mid-typing.
   const [retentionTouched, setRetentionTouched] = useState(false)
@@ -200,8 +205,17 @@ export function SettingsDashboard() {
     setLoading(true)
     setError(null)
     try {
-      const all = await apiClient.getAllData()
-      const contexts = all.context ?? []
+      // ADR-0016: toggles/knobs come from the project_settings store
+      // (GET /api/settings-data), not from getAllData().context — the
+      // config rows no longer live in project_context at all. The
+      // agents list (for the in-wait counter) still comes from
+      // /api/all-data.
+      const [settingsRes, all] = await Promise.all([
+        apiClient.getSettingsData(),
+        apiClient.getAllData(),
+      ])
+      const rows = settingsRes.settings ?? []
+      setSettingsRows(rows)
       const agents = (all.agents ?? []) as Array<{ wait_for_events_in_flight?: boolean }>
       setAgentsInWait(
         agents.filter((a) => a.wait_for_events_in_flight === true).length,
@@ -209,7 +223,7 @@ export function SettingsDashboard() {
       setState((prev) => {
         const next = { ...prev }
         for (const p of POLICIES) {
-          const row = contexts.find((c: any) => c.context_key === p.key)
+          const row = rows.find((c) => c.context_key === p.key)
           if (row) {
             next[p.key] = {
               value: coerceBool(row.value, p.default),
@@ -222,8 +236,8 @@ export function SettingsDashboard() {
         }
         return next
       })
-      const retRow = contexts.find(
-        (c: any) => c.context_key === MESSAGE_RETENTION_KEY,
+      const retRow = rows.find(
+        (c) => c.context_key === MESSAGE_RETENTION_KEY,
       )
       if (retRow) {
         const days = coerceNonNegInt(retRow.value)
@@ -255,11 +269,11 @@ export function SettingsDashboard() {
     setError(null)
     try {
       if (retention.exists) {
-        await apiClient.updateMemory(MESSAGE_RETENTION_KEY, {
+        await apiClient.updateSetting(MESSAGE_RETENTION_KEY, {
           context_value: next,
         })
       } else {
-        await apiClient.createMemory({
+        await apiClient.createSetting({
           context_key: MESSAGE_RETENTION_KEY,
           context_value: next,
           description:
@@ -290,11 +304,11 @@ export function SettingsDashboard() {
     setError(null)
     try {
       if (prevState.exists) {
-        await apiClient.updateMemory(policy.key, {
+        await apiClient.updateSetting(policy.key, {
           context_value: nextValue,
         })
       } else {
-        await apiClient.createMemory({
+        await apiClient.createSetting({
           context_key: policy.key,
           context_value: nextValue,
           description: policy.title,
@@ -461,8 +475,199 @@ export function SettingsDashboard() {
         </CardContent>
       </Card>
 
+      <AoeConfigCard rows={settingsRows} onSaved={refresh} />
+
       <AoeHealthCard />
     </div>
+  )
+}
+
+// ── AoE integration config (ADR-0016 feature parity) ────────────────
+//
+// The config_aoe_* keys were previously edited via the Memories tab;
+// after the settings-store cutover they no longer appear there, so
+// this card is their editing surface. Server-side the keys are
+// SYSADMIN-only to write (SSRF / bearer-exfil rationale — see
+// tools/project_settings_tools.py); a non-sysadmin operator's save
+// surfaces the 403 error inline. The bearer token is write-only: the
+// server returns "[redacted]" for non-confirmed tiers, which renders
+// as "value set — enter a new value to replace".
+
+const REDACTED = "[redacted]"
+
+interface AoeFieldSpec {
+  key: string
+  label: string
+  placeholder: string
+  secret?: boolean
+}
+
+const AOE_FIELDS: AoeFieldSpec[] = [
+  {
+    key: "config_aoe_base_url",
+    label: "Base URL",
+    placeholder: "http://127.0.0.1:8181",
+  },
+  {
+    key: "config_aoe_bearer_token",
+    label: "Bearer token",
+    placeholder: "paste a token (stored, never displayed)",
+    secret: true,
+  },
+  {
+    key: "config_aoe_bearer_token_file",
+    label: "Bearer token file",
+    placeholder: "/run/secrets/aoe-token (rotation-friendly)",
+    secret: true,
+  },
+  {
+    key: "config_aoe_notify_template",
+    label: "Notify template",
+    placeholder: "{sender} → {recipient} ({message_id})",
+  },
+  {
+    key: "config_aoe_timeout_ms",
+    label: "Timeout (ms)",
+    placeholder: "2000",
+  },
+]
+
+// project_settings values are JSON-encoded strings — unwrap one layer
+// for display ("\"http://x\"" → "http://x"; numbers → their digits).
+function coerceDisplayString(raw: unknown): string {
+  if (raw == null) return ""
+  if (typeof raw !== "string") return String(raw)
+  try {
+    const parsed = JSON.parse(raw)
+    if (typeof parsed === "string") return parsed
+    if (typeof parsed === "number" || typeof parsed === "boolean") {
+      return String(parsed)
+    }
+  } catch {
+    /* stored as a bare string */
+  }
+  return raw
+}
+
+function AoeConfigCard({
+  rows,
+  onSaved,
+}: {
+  rows: ProjectSetting[]
+  onSaved: () => void
+}) {
+  const [drafts, setDrafts] = useState<Record<string, string>>({})
+  const [pendingKey, setPendingKey] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  const rowFor = (key: string) => rows.find((r) => r.context_key === key)
+
+  const save = async (field: AoeFieldSpec) => {
+    const draft = drafts[field.key]
+    if (draft === undefined) return
+    setPendingKey(field.key)
+    setError(null)
+    try {
+      // Timeout is an integer knob; everything else is a string.
+      const value =
+        field.key === "config_aoe_timeout_ms"
+          ? Number(draft)
+          : draft
+      await apiClient.updateSetting(field.key, {
+        context_value: value,
+        description: `AoE integration: ${field.label}`,
+      })
+      setDrafts((d) => {
+        const next = { ...d }
+        delete next[field.key]
+        return next
+      })
+      onSaved()
+    } catch (e: any) {
+      // The server-side sysadmin gate is authoritative — a 403 lands
+      // here with the tool's SSRF-rationale message.
+      setError(e?.message ?? String(e))
+    } finally {
+      setPendingKey(null)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">AoE integration</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <p className="text-xs text-muted-foreground">
+          Where the server sends Agents-of-Empires wake-up notifications.
+          These keys are <span className="font-medium">sysadmin-only</span>{" "}
+          — they point the host&apos;s outbound requests, so a per-project
+          operator&apos;s save is rejected by the server.
+        </p>
+        {error && (
+          <div
+            className="rounded-md border border-destructive/30 bg-destructive/10 text-destructive p-3 text-sm"
+            role="alert"
+          >
+            {error}
+          </div>
+        )}
+        {AOE_FIELDS.map((field) => {
+          const row = rowFor(field.key)
+          const stored = row ? row.value : undefined
+          const isRedacted = stored === REDACTED
+          const displayValue = field.secret
+            ? "" // write-only — never prefill a credential input
+            : coerceDisplayString(stored)
+          const draft = drafts[field.key]
+          const inputValue = draft !== undefined ? draft : displayValue
+          const isSet = row !== undefined
+          return (
+            <div
+              key={field.key}
+              className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 py-2 border-b last:border-b-0"
+            >
+              <div className="flex-1 min-w-0">
+                <div className="font-medium text-sm">{field.label}</div>
+                <div className="text-[10px] text-muted-foreground mt-1 font-mono break-all">
+                  {field.key}
+                  {!isSet && <span className="ml-2 italic">(not set)</span>}
+                  {field.secret && isSet && (
+                    <span className="ml-2 italic">
+                      {isRedacted
+                        ? "(value set — enter a new value to replace)"
+                        : "(value set)"}
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div className="flex items-center gap-2 flex-shrink-0">
+                <Input
+                  type={field.secret ? "password" : "text"}
+                  autoComplete={field.secret ? "new-password" : undefined}
+                  value={inputValue}
+                  placeholder={field.placeholder}
+                  disabled={pendingKey === field.key}
+                  onChange={(e) =>
+                    setDrafts((d) => ({ ...d, [field.key]: e.target.value }))
+                  }
+                  className="w-56"
+                  aria-label={`AoE ${field.label}`}
+                />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => save(field)}
+                  disabled={pendingKey === field.key || draft === undefined}
+                >
+                  Save
+                </Button>
+              </div>
+            </div>
+          )
+        })}
+      </CardContent>
+    </Card>
   )
 }
 

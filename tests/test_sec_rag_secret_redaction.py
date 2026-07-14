@@ -38,7 +38,7 @@ from agent_mcp.features.rag.query import (
     query_rag_system,
     query_rag_system_with_model,
 )
-from tests.harness import mcp_session, seed_config_context_as_sysadmin
+from tests.harness import mcp_session, seed_config_setting_as_sysadmin
 
 
 pytestmark = pytest.mark.asyncio
@@ -74,10 +74,11 @@ def _user_content(cap: _CapturingClient) -> str:
 
 
 def _seed(admin, *, key: str, value: str) -> None:
-    # config_aoe_* is sysadmin-only to write (pentest R8-F1) — seed those
-    # keys as a sysadmin would; other keys flow through the REST seam.
-    if key.lower().startswith("config_aoe_"):
-        seed_config_context_as_sysadmin(key, value)
+    # Wave 11 (ADR-0016): config_* keys live in the project_settings
+    # store (which the RAG never scans) — seed them there as a sysadmin
+    # would; knowledge keys flow through the REST memories seam.
+    if key.lower().startswith("config_"):
+        seed_config_setting_as_sysadmin(key, value)
         return
     r = admin.client.post(
         "/api/memories",
@@ -155,7 +156,11 @@ async def test_advanced_live_context_drops_secret_rows(
     tmp_path, monkeypatch
 ) -> None:
     async with mcp_session(tmp_path) as admin:
+        # A config row (settings store — never RAG-scanned, ADR-0016) AND
+        # a secret-suffixed KNOWLEDGE row (project_context — dropped by
+        # the is_secret_key filter on the live-context scan).
         _seed(admin, key="config_service_secret", value=_SECRET_VALUE)
+        _seed(admin, key="openai_api_key", value=_SECRET_VALUE)
         _seed(admin, key="project_readme", value=_PUBLIC_VALUE)
         cap = _wire_capture(monkeypatch)
 
@@ -166,6 +171,7 @@ async def test_advanced_live_context_drops_secret_rows(
             "secret VALUE leaked into advanced RAG live-context"
         )
         assert "config_service_secret" not in user
+        assert "openai_api_key" not in user
         assert _PUBLIC_VALUE in user
 
 

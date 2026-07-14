@@ -4,7 +4,8 @@
 Per `/home/dennis/.knl_unused_intentionally`... no — per
 `/home/dennis/.claude/plans/prancy-napping-pie.md` Phase 4:
 
-* Admin writes a `config_allow_worker_*` key to project_context →
+* Admin writes a `config_allow_worker_*` key to the settings store
+  (`project_settings` post-ADR-0016, via `update_project_settings`) →
   worker tool visibility changes (PR #55 filter reads the toggle
   live) → server emits `notifications/tools/list_changed` so any
   subscribed client immediately re-fetches `tools/list`.
@@ -12,7 +13,7 @@ Per `/home/dennis/.knl_unused_intentionally`... no — per
 Note on transport reality (stateless StreamableHTTP, per PR #61):
 
 The notification can only be pushed onto the session of the request
-that's currently in flight. For an admin calling `update_project_context`
+that's currently in flight. For an admin calling `update_project_settings`
 via MCP, that's the admin's response stream — not the worker's open
 GET /mcp. Cross-request fan-out to all subscribed workers requires
 a custom session registry (same issue as Phase 3's deferred
@@ -37,7 +38,8 @@ pytestmark = pytest.mark.asyncio
 async def test_toggle_write_invokes_emitter(tmp_path: Path) -> None:
     """Writing `config_allow_worker_self_assign` (a worker-policy
     toggle) invokes the `_emit_tools_list_changed` helper after the
-    project_context row is committed.
+    project_settings row is committed (ADR-0016: toggles live in the
+    settings store; the write goes through `update_project_settings`).
 
     This is the foundation for the spec-standard notification — the
     push side requires session enumeration not yet built, but the
@@ -52,7 +54,7 @@ async def test_toggle_write_invokes_emitter(tmp_path: Path) -> None:
             pct, "_emit_tools_list_changed", autospec=True
         ) as emit:
             await admin.assert_tool_succeeds(
-                "update_project_context",
+                "update_project_settings",
                 {
                     "context_key": "config_allow_worker_self_assign",
                     "context_value": True,

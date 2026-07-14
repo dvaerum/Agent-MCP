@@ -2,7 +2,7 @@
 
 Spec (PR-2 event-coord):
   * On every `wait_for_events` call, check
-    `project_context["config_auto_event_loop_global"]` AND
+    `project_settings["config_auto_event_loop_global"]` (ADR-0016) AND
     `agents.auto_event_loop` for the calling agent. If either is OFF,
     return immediately with a single `stop_listening` event.
   * `serverInfo.instructions` wake-loop bootstrap is gated on BOTH
@@ -41,7 +41,7 @@ def _set_per_agent_flag(agent_id: str, value: bool) -> None:
 
 
 def _set_global_flag(value: bool) -> None:
-    """Insert/update the project_context row directly to avoid the
+    """Insert/update the project_settings row directly to avoid the
     REST roundtrip (which has its own coverage in test_routes_*)."""
     from agent_mcp.db.connection import get_db_connection
     import datetime as _dt
@@ -52,19 +52,19 @@ def _set_global_flag(value: bool) -> None:
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT context_key FROM project_context "
+            "SELECT context_key FROM project_settings "
             "WHERE context_key = ?",
             ("config_auto_event_loop_global",),
         )
         if cur.fetchone():
             cur.execute(
-                "UPDATE project_context SET value = ?, updated_at = ? "
+                "UPDATE project_settings SET value = ?, updated_at = ? "
                 "WHERE context_key = ?",
                 (raw, now, "config_auto_event_loop_global"),
             )
         else:
             cur.execute(
-                "INSERT INTO project_context "
+                "INSERT INTO project_settings "
                 "(context_key, value, created_at, updated_at, "
                 " created_by, updated_by) "
                 "VALUES (?, ?, ?, ?, ?, ?)",

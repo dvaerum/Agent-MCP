@@ -50,6 +50,15 @@ prefixes every ``PermissionDenied`` with ``"Unauthorized: "``,  so the
 ``PermissionDenied`` were performing a dead round trip. The fix makes
 ``_check_write_authorization`` (and the two error factories it calls)
 return the typed ``PermissionDenied`` directly.
+
+Wave 11 (ADR-0016): ``config_*`` toggles live in the ``project_settings``
+store and the project_context write path rejects the namespace for
+EVERYONE — so the wake-parity invariant now applies to the SETTINGS
+write/delete surfaces (MCP ``update_project_settings`` /
+``delete_project_settings``, REST ``PUT/DELETE /api/settings...``).
+The parametrized matrix below is retargeted accordingly; the context
+bulk-tool tests became rejection guards (a config toggle can no longer
+be flipped through the context tools at all, so no wake may fire).
 """
 
 from __future__ import annotations
@@ -68,19 +77,22 @@ pytestmark = pytest.mark.asyncio
 # ── toggle waiters, matching its two write-surface siblings. ─────────
 
 
-async def test_bulk_tool_loop_toggle_wakes_waiters(tmp_path: Path) -> None:
-    """RED before the fix: flipping ``config_auto_event_loop_global``
-    via the STANDALONE ``bulk_update_project_context`` tool must call
-    ``wake_all_for_flag_recheck`` — on main it silently did not, so an
-    in-flight ``wait_for_events`` caller would hang past a global
-    loop-off flip made through this specific surface."""
+async def test_bulk_tool_config_toggle_rejected_and_fires_no_wake(
+    tmp_path: Path,
+) -> None:
+    """Wave 11 (ADR-0016): a config toggle can no longer be flipped via
+    ``bulk_update_project_context`` at all — the write is rejected for
+    every caller, so NEITHER wake may fire (nothing changed)."""
+    import agent_mcp.tools.project_context_tools as pct
     from agent_mcp.core import globals as g
 
     async with mcp_session(tmp_path) as admin:
         with patch.object(
+            pct, "_emit_tools_list_changed", autospec=True
+        ) as emit, patch.object(
             g, "wake_all_for_flag_recheck", autospec=True
         ) as wake:
-            await admin.assert_tool_succeeds(
+            result = await admin.call(
                 "bulk_update_project_context",
                 {
                     "updates": [
@@ -91,39 +103,15 @@ async def test_bulk_tool_loop_toggle_wakes_waiters(tmp_path: Path) -> None:
                     ]
                 },
             )
-            assert wake.called, (
-                "bulk_update_project_context flipping "
-                "config_auto_event_loop_global must call "
-                "wake_all_for_flag_recheck; it was never called"
+            text = result[0].text if result else ""
+            assert admin._last_is_error, (
+                f"bulk context write of config_* must be rejected: {text}"
             )
-
-
-async def test_bulk_tool_worker_toggle_still_pushes_tools_list(
-    tmp_path: Path,
-) -> None:
-    """Parity guard: the standalone bulk tool's pre-existing
-    worker-policy push must survive the fix (don't regress the half
-    that already worked)."""
-    import agent_mcp.tools.project_context_tools as pct
-
-    async with mcp_session(tmp_path) as admin:
-        with patch.object(
-            pct, "_emit_tools_list_changed", autospec=True
-        ) as emit:
-            await admin.assert_tool_succeeds(
-                "bulk_update_project_context",
-                {
-                    "updates": [
-                        {
-                            "context_key": "config_allow_worker_self_assign",
-                            "context_value": True,
-                        },
-                    ]
-                },
+            assert not wake.called, (
+                "a rejected config write must not wake waiters"
             )
-            assert emit.called, (
-                "bulk_update_project_context flipping a worker-policy "
-                "toggle must still push tools/list_changed"
+            assert not emit.called, (
+                "a rejected config write must not push tools/list_changed"
             )
 
 
@@ -159,173 +147,88 @@ async def test_bulk_tool_unrelated_write_fires_neither_wake(
             )
 
 
-# ── #1 parametrized: the SAME wake set fires on all three write ──────
-# ── surfaces for each toggle class. ───────────────────────────────────
+# ── #1 parametrized: the SAME wake set fires on every settings ───────
+# ── write/delete surface for each toggle class (post-ADR-0016 the ────
+# ── toggles live in project_settings; the context tools reject them). ─
 
 WORKER_TOGGLE_KEY = "config_allow_worker_self_assign"
 LOOP_TOGGLE_KEY = "config_auto_event_loop_global"
 
 
+def _seed_setting_row(key: str, value) -> None:
+    """Seed a ``project_settings`` row directly via the repository —
+    deliberately NOT through ``update_project_settings`` — so the seed
+    write can't itself trip the ``_emit_tools_list_changed`` /
+    ``wake_all_for_flag_recheck`` mocks the shared parametrized test
+    patches; only the surface call under test may make them fire."""
+    import json as _json
+
+    from agent_mcp.db.connection import get_db_connection
+    from agent_mcp.repositories import (
+        project_settings_repository as _ps_repo,
+    )
+
+    conn = get_db_connection()
+    try:
+        _ps_repo.upsert(
+            key,
+            _json.dumps(value),
+            "seed for wake parity test",
+            description_provided=True,
+            actor="r6-p-operator",
+            connection=conn.cursor(),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 async def _single_update(admin, key: str, value) -> None:
     await admin.assert_tool_succeeds(
-        "update_project_context",
+        "update_project_settings",
         {"context_key": key, "context_value": value},
     )
 
 
-async def _bulk_via_update(admin, key: str, value) -> None:
-    """The queued bulk path (``_handle_bulk_context_update``) —
-    ``update_project_context_tool_impl`` called with an ``updates``
-    list instead of a single ``context_key``/``context_value`` pair.
-
-    The registered MCP tool schema for ``update_project_context``
-    declares ``context_key``/``context_value`` required and
-    ``additionalProperties: False``, so this shape can't reach the
-    tool through the jsonschema-validated dispatcher
-    (``admin.call``/``assert_tool_succeeds``) — it calls the impl
-    function directly, same pattern as
-    ``tests/test_uow_project_context.py``'s bulk-atomicity tests.
-    """
-    from agent_mcp.core.tool_result import Ok
-    from agent_mcp.tools.project_context_tools import (
-        update_project_context_tool_impl,
+async def _update_via_rest(admin, key: str, value) -> None:
+    """The REST PUT surface — dispatches the same gated
+    ``update_project_settings`` tool (single enforcement path), so the
+    wake set must match the MCP surface exactly (BL-R14-1)."""
+    r = admin.request(
+        "PUT",
+        f"/api/settings/{key}",
+        json={"context_value": value},
     )
-    from tests.harness import make_principal
-
-    operator = make_principal(
-        kind="operator_session",
-        user_id="r6-p-operator",
-        agent_id=None,
-        sysadmin=False,
-        project_name=None,
-        project_role="operator",
-        agent_role=None,
-        can_wake_loop=False,
-        source_token=None,
-    )
-    result = await update_project_context_tool_impl(
-        {"updates": [{"context_key": key, "context_value": value}]},
-        principal=operator,
-    )
-    assert isinstance(result, Ok), f"expected Ok, got {result!r}"
-
-
-async def _bulk_via_bulk_tool(admin, key: str, value) -> None:
-    """The standalone inline bulk path — the one this PR fixes."""
-    await admin.assert_tool_succeeds(
-        "bulk_update_project_context",
-        {"updates": [{"context_key": key, "context_value": value}]},
-    )
+    assert r.status_code == 200, r.text
 
 
 async def _delete_via_tool(admin, key: str, value) -> None:
-    """The DELETE surface (SEC-C / F5) — before this fix
-    ``delete_project_context_tool_impl`` was the ONLY project_context
-    write/delete surface that never routed through
-    ``emit_context_write_wakes``/``emit_context_write_wakes_bulk``, so
-    deleting a toggle key silently reverted it to its default WITHOUT
-    firing the matching wake.
-
-    Seeds the row directly via the ORM — deliberately NOT through
-    ``update_project_context`` — so the seed write can't itself trip
-    the ``_emit_tools_list_changed``/``wake_all_for_flag_recheck``
-    mocks the shared parametrized test patches; only the delete call
-    below is allowed to make them fire.
-
-    ``config_*`` keys also match the tool's "critical system key"
-    guard (any key starting with ``config_`` needs
-    ``force_delete=True`` — see ``delete_project_context_tool_impl``'s
-    ``critical_keys`` matching), so the delete call passes it
-    unconditionally; both toggle keys under test are ``config_*``.
-    """
-    import datetime as _dt
-    import json as _json
-
-    from agent_mcp.db.engine import SessionLocal
-    from agent_mcp.db.models import ProjectContext
-
-    now = _dt.datetime.now().isoformat()
-    sess = SessionLocal()
-    try:
-        sess.add(
-            ProjectContext(
-                context_key=key,
-                value=_json.dumps(value),
-                created_at=now,
-                created_by="r6-p-operator",
-                updated_at=now,
-                updated_by="r6-p-operator",
-                description="seed for delete-wake parity test",
-            )
-        )
-        sess.commit()
-    finally:
-        sess.close()
-
+    """The MCP DELETE surface — a deleted toggle reverts to its
+    default, so the delete must fire the same wake set as an update
+    (the SEC-C / F5 invariant, carried to the settings store)."""
+    _seed_setting_row(key, value)
     await admin.assert_tool_succeeds(
-        "delete_project_context",
-        {"context_key": key, "force_delete": True},
+        "delete_project_settings",
+        {"context_key": key},
     )
 
 
 async def _delete_via_rest(admin, key: str, value) -> None:
-    """The REST DELETE surface (pentest R1-F3) — the dashboard's
-    PRIMARY delete path, and the one this PR fixes.
-    ``delete_memory_api_route`` committed the row delete directly via
-    SQLAlchemy and returned WITHOUT ever calling
-    ``emit_context_write_wakes``/``emit_context_write_wakes_bulk`` —
-    the last unwaked project_context write/delete surface after the
-    SEC-C fix closed the MCP delete tool's version of the same gap.
-
-    Seeds the row directly via the ORM — deliberately NOT through
-    ``update_project_context`` — so the seed write can't itself trip
-    the ``_emit_tools_list_changed``/``wake_all_for_flag_recheck``
-    mocks the shared parametrized test patches; only the REST DELETE
-    call below is allowed to make them fire.
-
-    R9-F2: the REST DELETE handler now routes through the gated
-    ``delete_project_context`` tool, which treats every ``config_*`` key
-    as a critical system key requiring ``force_delete=true`` (both toggle
-    keys under test are ``config_*``). The body now carries
-    ``force_delete: true`` — the same value the ``_delete_via_tool`` path
-    passes — so the delete lands and the wake fires.
-    """
-    import datetime as _dt
-    import json as _json
-
-    from agent_mcp.db.engine import SessionLocal
-    from agent_mcp.db.models import ProjectContext
-
-    now = _dt.datetime.now().isoformat()
-    sess = SessionLocal()
-    try:
-        sess.add(
-            ProjectContext(
-                context_key=key,
-                value=_json.dumps(value),
-                created_at=now,
-                created_by="r6-p-operator",
-                updated_at=now,
-                updated_by="r6-p-operator",
-                description="seed for REST delete-wake parity test",
-            )
-        )
-        sess.commit()
-    finally:
-        sess.close()
-
-    r = admin.client.request(
+    """The REST DELETE surface — the dashboard's delete path; routes
+    through the gated ``delete_project_settings`` tool (pentest R1-F3
+    invariant, carried to the settings store)."""
+    _seed_setting_row(key, value)
+    r = admin.request(
         "DELETE",
-        f"/api/memories/{key}",
-        json={"token": admin.admin_token, "force_delete": True},
+        f"/api/settings/{key}",
+        json={},
     )
     assert r.status_code == 200, r.text
 
 
 WRITE_SURFACES = [
     ("single_update", _single_update),
-    ("bulk_via_update", _bulk_via_update),
-    ("bulk_via_bulk_tool", _bulk_via_bulk_tool),
+    ("update_via_rest", _update_via_rest),
     ("delete_via_tool", _delete_via_tool),
     ("delete_via_rest", _delete_via_rest),
 ]
@@ -353,9 +256,9 @@ async def test_write_surfaces_fire_same_wake_set(
     expect_emit: bool,
     expect_wake: bool,
 ) -> None:
-    """Every one of the three write surfaces must fire the SAME wake
-    set for a given toggle class: worker-policy → tools/list_changed
-    only; loop → wake_all_for_flag_recheck only."""
+    """Every settings write/delete surface must fire the SAME wake set
+    for a given toggle class: worker-policy → tools/list_changed only;
+    loop → wake_all_for_flag_recheck only."""
     import agent_mcp.tools.project_context_tools as pct
     from agent_mcp.core import globals as g
 
@@ -401,7 +304,8 @@ async def test_config_key_denial_is_typed_permission_denied() -> None:
         f"reason must not carry its own Unauthorized prefix (the "
         f"renderer adds it once); got {denied.reason!r}"
     )
-    assert "config_* keys are admin-only" in denied.reason
+    # ADR-0016: the denial points the caller at the settings store.
+    assert "project settings store" in denied.reason
 
 
 async def test_config_key_wire_text_has_exactly_one_unauthorized_prefix(

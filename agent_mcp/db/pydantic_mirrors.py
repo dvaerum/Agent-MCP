@@ -163,6 +163,18 @@ class ProjectContextMirror(BaseModel):
     updated_by: str
 
 
+class ProjectSettingsMirror(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    context_key: str
+    value: str
+    description: Optional[str] = None
+    created_at: Optional[str] = None
+    created_by: Optional[str] = None
+    updated_at: str
+    updated_by: str
+
+
 class RagChunkMirror(BaseModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
@@ -224,6 +236,7 @@ MIRRORS: dict[str, type[BaseModel]] = {
     "file_metadata": FileMetadataMirror,
     "mcp_sessions": McpSessionMirror,
     "project_context": ProjectContextMirror,
+    "project_settings": ProjectSettingsMirror,
     "rag_chunks": RagChunkMirror,
     "rag_meta": RagMetaMirror,
     "task_notes": TaskNoteMirror,
@@ -240,6 +253,7 @@ __all__ = [
     "McpSessionMirror",
     "MIRRORS",
     "ProjectContextMirror",
+    "ProjectSettingsMirror",
     "RagChunkMirror",
     "RagMetaMirror",
     "TaskMirror",
