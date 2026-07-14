@@ -129,7 +129,7 @@ Concretely:
 
 ## Follow-ups
 
-* **PR 1 (next, pure subtraction):** delete the now-dead config
+* **PR 1 (done — pure subtraction):** delete the now-dead config
   branches of `is_secret_key` — `_CONFIG_KEY_RE`'s blanket rule, the
   `_NON_SECRET_POLICY_KEYS` F009 carve-out — and simplify the RAG
   indexing comment; migrate the read-side redaction tests that still

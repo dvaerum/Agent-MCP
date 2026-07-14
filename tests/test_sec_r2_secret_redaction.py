@@ -10,9 +10,12 @@ through the worker-reachable RAG side-channel and the dashboard reads.
 
 This round-2 suite pins:
 
-  (1) the broadened ``is_secret_key`` vocabulary (config_* is always
-      secret; non-config keys with a delimited secret-word segment are
-      secret) WITHOUT over-redacting innocent keys;
+  (1) the broadened ``is_secret_key`` vocabulary (any key with a
+      delimited secret-word segment is secret) WITHOUT over-redacting
+      innocent keys. Wave 11 (ADR-0016) deleted the blanket
+      "``config_*`` is always secret" rule — config rows live in the
+      ``project_settings`` store now and can no longer exist in
+      ``project_context``;
   (2) worker ``view_project_context`` + ``ask_project_rag`` no longer
       echo the newly-covered keys' values;
   (3) ``/api/all-data`` and ``/api/node-details`` redact secret context
@@ -38,37 +41,13 @@ _PUBLIC_VALUE = "public-r2-info"
 
 
 def _seed(admin, *, key: str, value: str) -> None:
-    """Seed a project_context row.
+    """Seed a project_context knowledge row through the live REST seam.
 
-    Wave 11 (ADR-0016): the memories write path rejects config_* keys
-    for every caller, so the config-keyed rows these read-side
-    redaction tests pin (legacy pre-cutover shapes) are seeded raw via
-    the repository; knowledge keys keep flowing through the REST seam.
-    The config branch of the redaction machinery — and these config-key
-    assertions — go away in the ADR-0016 follow-up PR.
+    Wave 11 (ADR-0016): config_* keys can no longer exist in
+    project_context (the write path rejects the namespace; migration
+    0016 moved the rows), so this suite only seeds knowledge keys —
+    the redaction contract under test is the secret-word vocabulary.
     """
-    if key.lower().startswith("config_"):
-        import json as _json
-
-        from agent_mcp.db.connection import get_db_connection
-        from agent_mcp.repositories import (
-            project_context_repository as _pc_repo,
-        )
-
-        conn = get_db_connection()
-        try:
-            _pc_repo.upsert(
-                key,
-                _json.dumps(value),
-                None,
-                description_provided=False,
-                actor="admin",
-                connection=conn.cursor(),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        return
     r = admin.client.post(
         "/api/memories",
         json={
@@ -91,7 +70,10 @@ def _bearer(admin) -> dict[str, str]:
 def test_is_secret_key_covers_round1_gaps() -> None:
     from agent_mcp.tools.project_context_tools import is_secret_key
 
-    # config_* is ALWAYS secret now, regardless of suffix shape.
+    # Credential-NAMED keys are caught by the delimited secret-word
+    # vocab — including the round-1-gap config_* shapes, which the vocab
+    # covers on its own merits (api_key / secret / token / pat / key)
+    # now that the blanket config_* rule is deleted (ADR-0016).
     for key in (
         "config_api_key",
         "config_secret",
@@ -99,12 +81,6 @@ def test_is_secret_key_covers_round1_gaps() -> None:
         "config_apikey",
         "config_github_pat",
         "config_encryption_key",
-        "config_foo",  # any config_* — policy/credential namespace
-    ):
-        assert is_secret_key(key), f"{key} should be secret (config_*)"
-
-    # Non-config credential keys are caught by the delimited secret-word.
-    for key in (
         "openai_api_key",
         "db_password",
         "github_pat",
@@ -115,6 +91,12 @@ def test_is_secret_key_covers_round1_gaps() -> None:
         "user_passphrase",
     ):
         assert is_secret_key(key), f"{key} should be secret (secret-word)"
+
+    # ADR-0016: a vocab-less config_* key is NOT secret to is_secret_key
+    # anymore — the blanket namespace rule is gone because config rows
+    # cannot exist in project_context (the settings store masks its own
+    # secrets via _SECRET_SETTING_KEYS in tools/project_settings_tools).
+    assert not is_secret_key("config_foo")
 
 
 def test_is_secret_key_does_not_over_redact() -> None:
@@ -140,13 +122,13 @@ def test_is_secret_key_does_not_over_redact() -> None:
 @pytest.mark.asyncio
 async def test_worker_view_context_redacts_round1_gap_keys(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
-        _seed(admin, key="config_api_key", value=_SECRET_VALUE)
+        _seed(admin, key="db_password", value=_SECRET_VALUE)
         _seed(admin, key="openai_api_key", value=_SECRET_VALUE + "-2")
         _seed(admin, key="project_notes", value=_PUBLIC_VALUE)
         worker = await admin.create_worker("r2-worker")
 
         text = (await worker.call("view_project_context", {}))[0].text
-        assert "config_api_key" not in text
+        assert "db_password" not in text
         assert "openai_api_key" not in text
         assert _SECRET_VALUE not in text
         # Non-secret content still visible (no over-filtering).
@@ -173,7 +155,7 @@ async def test_ask_project_rag_redacts_round1_gap_keys(
             return "ANSWER"
 
     async with mcp_session(tmp_path) as admin:
-        _seed(admin, key="config_api_key", value=_SECRET_VALUE)
+        _seed(admin, key="db_password", value=_SECRET_VALUE)
         _seed(admin, key="openai_api_key", value=_SECRET_VALUE + "-2")
         _seed(admin, key="project_readme", value=_PUBLIC_VALUE)
 
@@ -188,7 +170,7 @@ async def test_ask_project_rag_redacts_round1_gap_keys(
         assert cap.messages is not None, "LLM never invoked"
         user = next(m["content"] for m in cap.messages if m["role"] == "user")
         assert _SECRET_VALUE not in user
-        assert "config_api_key" not in user
+        assert "db_password" not in user
         assert "openai_api_key" not in user
         assert _PUBLIC_VALUE in user
 
@@ -199,7 +181,7 @@ async def test_ask_project_rag_redacts_round1_gap_keys(
 @pytest.mark.asyncio
 async def test_all_data_redacts_secret_context_value(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
-        _seed(admin, key="config_api_key", value=_SECRET_VALUE)
+        _seed(admin, key="db_password", value=_SECRET_VALUE)
         _seed(admin, key="project_readme", value=_PUBLIC_VALUE)
 
         # Non-confirmed operator (forwarding header) → redacted.
@@ -222,9 +204,9 @@ async def test_all_data_redacts_secret_context_value(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_node_details_redacts_secret_context_value(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
-        _seed(admin, key="config_api_key", value=_SECRET_VALUE)
+        _seed(admin, key="db_password", value=_SECRET_VALUE)
 
-        node = "context_config_api_key"
+        node = "context_db_password"
         r = admin.get(f"/api/node-details?node_id={node}")
         assert r.status_code == 200, r.text
         assert _SECRET_VALUE not in r.text, (

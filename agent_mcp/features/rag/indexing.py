@@ -173,6 +173,10 @@ def _value_has_embedded_secret(*texts: Optional[str]) -> bool:
 # rag_meta flag marking that the one-time context-secret purge has run.
 # Bump the suffix if the secret policy ever broadens again and a fresh
 # eviction of pre-existing context vectors is required.
+# ADR-0016: kept as a LEGACY one-time backstop — a DB that never ran the
+# purge may still hold context vectors embedded under the pre-round-2
+# policy (including pre-cutover config_* rows, which no longer index at
+# all); the purge evicts them once, then the flag makes it a no-op.
 _CTX_SECRET_PURGE_META_KEY = "security_context_secret_purge_v1"
 
 # rag_meta flag marking that the one-time ALL-SOURCE secret purge has run
@@ -713,12 +717,14 @@ async def run_rag_indexing_periodically(
 
             for row in cursor.fetchall():
                 key = row["context_key"]
-                # SECURITY: never embed secret-keyed rows (config_*_token
-                # etc.) into the RAG index — otherwise ask_project_rag
-                # can retrieve and echo the secret to any worker. The
-                # query path also filters at retrieval time (defense
-                # against a stale index), but not embedding them in the
-                # first place is the primary control.
+                # SECURITY: never embed secret-NAMED knowledge rows
+                # (openai_api_key, db_password, …) into the RAG index —
+                # otherwise ask_project_rag can retrieve and echo the
+                # secret to any worker. The query path also filters at
+                # retrieval time (defense against a stale index), but not
+                # embedding them in the first place is the primary
+                # control. ADR-0016: config_* rows live in the
+                # project_settings store and never reach this scan.
                 if is_secret_key(key):
                     continue
                 value_str = row["value"]  # Already a JSON string in DB

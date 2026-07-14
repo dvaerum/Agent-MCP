@@ -133,36 +133,12 @@ def _user_content(cap: _CapturingClient) -> str:
 
 
 def _seed(admin, *, key: str, value: str) -> None:
-    """Seed a project_context row.
+    """Seed a project_context knowledge row through the live REST seam.
 
-    Wave 11 (ADR-0016): the memories write path rejects config_* keys
-    for every caller — the config-keyed secret row this test pins (a
-    legacy pre-cutover shape the read-side redaction must still drop)
-    is seeded raw via the repository; knowledge keys keep flowing
-    through the REST seam.
+    Wave 11 (ADR-0016): config_* keys can no longer exist in
+    project_context, so the secret row this test pins is a secret-NAMED
+    knowledge key (vocab match) seeded through the normal write path.
     """
-    if key.lower().startswith("config_"):
-        import json as _json
-
-        from agent_mcp.db.connection import get_db_connection
-        from agent_mcp.repositories import (
-            project_context_repository as _pc_repo,
-        )
-
-        conn = get_db_connection()
-        try:
-            _pc_repo.upsert(
-                key,
-                _json.dumps(value),
-                None,
-                description_provided=False,
-                actor="admin",
-                connection=conn.cursor(),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        return
     r = admin.client.post(
         "/api/memories",
         json={
@@ -196,7 +172,7 @@ async def test_rag_secret_redaction_shared_across_both_query_paths(
     per-function-only tests could (one path's filter could be fixed
     without the other's)."""
     async with mcp_session(tmp_path) as admin:
-        _seed(admin, key="config_shared_seam_secret", value=_SECRET_VALUE)
+        _seed(admin, key="shared_seam_secret", value=_SECRET_VALUE)
         _seed(admin, key="project_readme", value=_PUBLIC_VALUE)
         cap = _wire_capture(monkeypatch)
 
@@ -206,7 +182,7 @@ async def test_rag_secret_redaction_shared_across_both_query_paths(
         assert _SECRET_VALUE not in user, (
             f"secret VALUE leaked into RAG context via {query_fn.__name__}"
         )
-        assert "config_shared_seam_secret" not in user, (
+        assert "shared_seam_secret" not in user, (
             f"secret KEY leaked into RAG context via {query_fn.__name__}"
         )
         # Non-secret context must still flow through (no over-filtering).
