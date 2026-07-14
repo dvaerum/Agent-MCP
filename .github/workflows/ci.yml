@@ -128,10 +128,13 @@ jobs:
           purge-primary-key: never
 
       - name: Build VM tests
-        # Builds only the nixosTest VM checks (vm-single-tenant, vm-multi-tenant)
+        # Builds all four nixosTest VM checks (vm-single-tenant,
+        # vm-multi-tenant, vm-event-driven-coord, vm-no-auto-cleanup)
         # rather than the full `nix flake check`, because the other checks
         # (agent-mcp Python build, agent-mcp-dashboard Next.js build) duplicate
-        # the `python` and `dashboard` jobs above. The VM checks exercise the
+        # the `python` and `dashboard` jobs above. All four are gated here so
+        # a VM check can't silently rot (event-driven-coord + no-auto-cleanup
+        # were previously ungated and drifted — see #489). The VM checks exercise the
         # full server boot + HTTP assertions (including the Path A asset-prefix
         # sentinel regression guard from #166) which nothing else covers.
         # First run ~30 min; subsequent runs ~5-10 min via cache-nix-action.
@@ -143,6 +146,8 @@ jobs:
           # class of flake that sank the old magic-nix-cache setup.
           nix build .#checks.x86_64-linux.vm-single-tenant \
                     .#checks.x86_64-linux.vm-multi-tenant \
+                    .#checks.x86_64-linux.vm-event-driven-coord \
+                    .#checks.x86_64-linux.vm-no-auto-cleanup \
                     -L --print-build-logs --fallback
 
   dependency-audit:
