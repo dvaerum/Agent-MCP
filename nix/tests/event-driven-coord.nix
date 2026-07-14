@@ -230,6 +230,32 @@ pkgs.testers.nixosTest {
         " '2026-01-01T00:00:00', 'active', '/tmp', '#888', "
         " '2026-01-01T00:00:00', 1)"
     )
+    # Seed a manager agent — Test 9 creates a ROOT task via assign_task,
+    # which workers can't do (they must file under a parent_task_id).
+    # agent_role is set here so it hydrates as manager at backend startup.
+    sql(
+        "INSERT INTO agents (token, agent_id, capabilities, "
+        "created_at, status, working_directory, color, updated_at, "
+        "auto_event_loop, agent_role) VALUES "
+        "('tokmgr', 'mgr-norm', '[\\\"backend\\\"]', "
+        " '2026-01-01T00:00:00', 'active', '/tmp', '#888', "
+        " '2026-01-01T00:00:00', 1, 'manager')"
+    )
+
+    # Enable worker-to-worker messaging. config_allow_worker_to_worker
+    # defaults OFF (the worker-policy security default); without this,
+    # Test 6's worker-backend → worker-backend self-message is denied by
+    # the send-message gate, so no message event is published and
+    # fetch_events_since returns empty. The gate reads this live per-call
+    # (tools/access._get_config_bool), so no restart is needed — but we
+    # seed it here in the backend-stopped SQL window alongside the agents.
+    sql(
+        "INSERT INTO project_context (context_key, value, description, "
+        "created_at, created_by, updated_at, updated_by) VALUES "
+        "('config_allow_worker_to_worker', 'true', 'wkr-policy seed', "
+        " '2026-01-01T00:00:00', 'vm-test', "
+        " '2026-01-01T00:00:00', 'vm-test')"
+    )
 
     # The auth allow-list is loaded at backend startup; restart so
     # the two newly-inserted tokens are accepted.
@@ -345,9 +371,13 @@ pkgs.testers.nixosTest {
     sql("UPDATE agents SET auto_event_loop = 1 WHERE agent_id = 'worker-backend'")
 
     # ── Test 6: fetch_events_since catch-up (the simplest path) ──
-    # Send a message to worker-backend, then call fetch_events_since;
-    # expect one event in the catch-up envelope.
-    tool_call("tokbe", "send_agent_message", {
+    # worker-frontend sends a message to worker-backend, then
+    # worker-backend calls fetch_events_since and expects the received
+    # message event in the catch-up envelope. NOTE: the sender must be a
+    # DIFFERENT agent (self-communication is denied), and worker→worker
+    # messaging requires config_allow_worker_to_worker=true (seeded
+    # above) — otherwise the send is denied and no event is published.
+    tool_call("tokfe", "send_agent_message", {
         "recipient_id": "worker-backend",
         "message": "catch up test",
         "deliver_method": "store",
@@ -388,8 +418,13 @@ pkgs.testers.nixosTest {
 
     # ── Test 9: lowercase normalization (verify via SQL) ──────────
     # PR-1 normalizes at write time; verify the column shape on
-    # task-create through the assign_task tool.
-    tool_call("tokbe", "assign_task", {
+    # task-create through the assign_task tool. Workers cannot create
+    # ROOT tasks (must specify parent_task_id), so use the seeded
+    # manager agent (mgr-norm / tokmgr) — agent_role is hydrated into
+    # the backend's active-agent set at startup, so the manager must be
+    # seeded before the backend restart above (a live SQL role flip is
+    # not picked up by the running backend).
+    tool_call("tokmgr", "assign_task", {
         "task_title": "cap-norm task",
         "task_description": "x",
         "required_capabilities": ["Backend", "DB"],
