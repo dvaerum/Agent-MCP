@@ -191,9 +191,13 @@ export function MemoryValueView({ value, className }: MemoryValueViewProps) {
       {/* Body — no inner vertical scroll: the value block grows to its
           natural height and the modal (DialogContent max-h-[90vh]
           overflow-y-auto) is the single vertical scroller, so large JSON
-          no longer produces a nested "double scroll". Wide lines still
-          scroll horizontally inside each <pre> (overflow-x-auto), which
-          preserves JSON indentation. */}
+          no longer produces a nested "double scroll". The value <pre>s
+          wrap long lines (whitespace-pre-wrap) rather than using
+          overflow-x-auto — an inner horizontal scroller computes
+          overflow-y to auto too (CSS spec), making the value a stray
+          vertical scroll target that swallows the first wheel event
+          before it chains to the modal. Wrapping removes that container
+          entirely: one scroller (the modal), no wheel-swallow. */}
       <div className="bg-muted/30 border border-border rounded-lg p-3">
         <MemoryValueBody decoded={decoded} effective={effective} />
       </div>
@@ -211,7 +215,7 @@ function MemoryValueBody({
   // Raw ALWAYS shows the exact stored string verbatim.
   if (effective === "raw") {
     return (
-      <pre className="font-mono text-xs text-foreground overflow-x-auto whitespace-pre">
+      <pre className="font-mono text-xs text-foreground whitespace-pre-wrap break-words">
         {decoded.raw}
       </pre>
     )
@@ -228,7 +232,7 @@ function MemoryValueBody({
       pretty = decoded.raw
     }
     return (
-      <pre className="font-mono text-xs text-foreground overflow-x-auto whitespace-pre">
+      <pre className="font-mono text-xs text-foreground whitespace-pre-wrap break-words">
         {pretty}
       </pre>
     )
