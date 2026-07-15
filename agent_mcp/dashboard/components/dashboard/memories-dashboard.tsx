@@ -118,7 +118,10 @@ const MemoryRow = ({ memory, onView, onEdit, onDelete }: {
   }
 
   return (
-    <TableRow className="border-border/50 hover:bg-muted/30 group transition-all duration-200">
+    <TableRow
+      className="border-border/50 hover:bg-muted/30 group transition-all duration-200 cursor-pointer"
+      onClick={() => onView(memory)}
+    >
       {/* Memory Key - More compact */}
       <TableCell className="py-2 px-2 sm:px-4">
         <div className="flex items-center gap-2">
@@ -184,7 +187,7 @@ const MemoryRow = ({ memory, onView, onEdit, onDelete }: {
           <Button 
             variant="ghost" 
             size="sm" 
-            onClick={() => onView(memory)}
+            onClick={(e) => { e.stopPropagation(); onView(memory) }}
             className="h-6 w-6 p-0 text-muted-foreground hover:text-foreground hover:bg-muted"
             title="View details"
           >
@@ -193,7 +196,7 @@ const MemoryRow = ({ memory, onView, onEdit, onDelete }: {
           <Button 
             variant="ghost" 
             size="sm" 
-            onClick={() => onEdit(memory)}
+            onClick={(e) => { e.stopPropagation(); onEdit(memory) }}
             className="h-6 w-6 p-0 text-muted-foreground hover:text-foreground hover:bg-muted"
             title="Edit memory"
           >
@@ -202,7 +205,7 @@ const MemoryRow = ({ memory, onView, onEdit, onDelete }: {
           <Button 
             variant="ghost" 
             size="sm" 
-            onClick={() => onDelete(memory)}
+            onClick={(e) => { e.stopPropagation(); onDelete(memory) }}
             className="h-6 w-6 p-0 text-destructive hover:text-destructive/80 hover:bg-destructive/10"
             title="Delete memory"
           >
