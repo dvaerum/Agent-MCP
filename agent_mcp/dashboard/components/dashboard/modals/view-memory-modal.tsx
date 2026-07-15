@@ -1,7 +1,6 @@
 "use client"
 
-import React from 'react'
-import { Copy, Eye, Clock, User, Database, AlertTriangle, CheckCircle2 } from 'lucide-react'
+import { Copy, Eye, Clock, User, Database, AlertTriangle, CheckCircle2, Pencil, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import {
@@ -11,7 +10,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { cn } from '@/lib/utils'
 import type { Memory } from '@/lib/api'
 import { MemoryValueView } from '@/components/dashboard/memory-value-view'
 import { decodeMemoryValue } from '@/lib/memory-value'
@@ -20,9 +18,14 @@ interface ViewMemoryModalProps {
   memory: Memory | null
   open: boolean
   onOpenChange: (open: boolean) => void
+  // Optional in-modal actions. When provided, the parent wires these to
+  // close this view dialog and open the sibling edit/delete confirm
+  // dialog (close-then-open avoids stacked-dialog issues).
+  onEdit?: () => void
+  onDelete?: () => void
 }
 
-export function ViewMemoryModal({ memory, open, onOpenChange }: ViewMemoryModalProps) {
+export function ViewMemoryModal({ memory, open, onOpenChange, onEdit, onDelete }: ViewMemoryModalProps) {
   if (!memory) return null
 
   // ADR-0017 (Wave 12 PR B): no content-based secret redaction. memory
@@ -260,8 +263,20 @@ export function ViewMemoryModal({ memory, open, onOpenChange }: ViewMemoryModalP
           </div>
         </div>
 
-        {/* Footer with copy actions */}
+        {/* Footer with copy + edit/delete actions */}
         <div className="flex justify-end gap-2 pt-4 border-t border-border">
+          {onEdit && (
+            <Button variant="outline" size="sm" onClick={onEdit}>
+              <Pencil className="h-4 w-4 mr-1" />
+              Edit
+            </Button>
+          )}
+          {onDelete && (
+            <Button variant="destructive" size="sm" onClick={onDelete}>
+              <Trash2 className="h-4 w-4 mr-1" />
+              Delete
+            </Button>
+          )}
           <Button
             variant="outline"
             size="sm"
