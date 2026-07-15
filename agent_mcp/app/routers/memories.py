@@ -177,7 +177,7 @@ async def create_memory_api_route(
     )
 
 
-@router.put("/{context_key}")
+@router.put("/{context_key:path}")
 async def update_memory_api_route(
     context_key: str,
     request: Request,
@@ -275,7 +275,7 @@ async def update_memory_api_route(
     )
 
 
-@router.delete("/{context_key}")
+@router.delete("/{context_key:path}")
 async def delete_memory_api_route(
     context_key: str,
     request: Request,
