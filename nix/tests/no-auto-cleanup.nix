@@ -231,7 +231,12 @@ pkgs.testers.nixosTest {
     # (>10 min idle) would have flagged it on every poll. status
     # is the same shape used elsewhere in tests.
     machine.succeed(
-        f"sqlite3 {db} \"INSERT INTO agents "
+        # -cmd '.timeout 5000': the backend holds the WAL write-lock in
+        # short bursts; without a busy-timeout this direct INSERT races it
+        # and fails intermittently with "database is locked (5)" (a
+        # recurring CI flake). 5s busy-timeout makes sqlite wait for the
+        # lock instead of erroring instantly.
+        f"sqlite3 -cmd '.timeout 5000' {db} \"INSERT INTO agents "
         "(token, agent_id, capabilities, created_at, status, "
         "working_directory, color, updated_at) VALUES "
         "('__test_token_old', 'old-worker', '[]', "
@@ -241,7 +246,7 @@ pkgs.testers.nixosTest {
 
     # Sanity: the row exists and is not terminated.
     initial = machine.succeed(
-        f"sqlite3 {db} \"SELECT status FROM agents WHERE "
+        f"sqlite3 -cmd '.timeout 5000' {db} \"SELECT status FROM agents WHERE "
         "agent_id='old-worker';\""
     ).strip()
     assert initial == "created", (
@@ -270,7 +275,7 @@ pkgs.testers.nixosTest {
     # terminated_at MUST still be NULL — proves the server has no
     # auto-terminate code path.
     final_status = machine.succeed(
-        f"sqlite3 {db} \"SELECT status FROM agents WHERE "
+        f"sqlite3 -cmd '.timeout 5000' {db} \"SELECT status FROM agents WHERE "
         "agent_id='old-worker';\""
     ).strip()
     assert final_status == "created", (
@@ -281,7 +286,7 @@ pkgs.testers.nixosTest {
     )
 
     final_terminated_at = machine.succeed(
-        f"sqlite3 {db} \"SELECT IFNULL(terminated_at, '<null>') "
+        f"sqlite3 -cmd '.timeout 5000' {db} \"SELECT IFNULL(terminated_at, '<null>') "
         "FROM agents WHERE agent_id='old-worker';\""
     ).strip()
     assert final_terminated_at == "<null>", (
