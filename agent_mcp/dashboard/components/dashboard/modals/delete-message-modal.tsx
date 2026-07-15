@@ -15,6 +15,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
+import { onEnterSubmit } from '@/lib/keyboard'
 import type { Message } from '@/lib/api'
 
 interface DeleteMessageModalProps {
@@ -162,6 +163,7 @@ export function DeleteMessageModal({
                 id="confirmation"
                 value={confirmationText}
                 onChange={(e) => setConfirmationText(e.target.value)}
+                onKeyDown={onEnterSubmit(isConfirmed && !loading, handleDelete)}
                 placeholder={`Type "${requiredConfirmation}" to confirm`}
                 className={cn(
                   "bg-background border-border text-foreground font-mono",
