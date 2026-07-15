@@ -36,14 +36,20 @@ Confirmed operator tier iff EITHER:
      flag, or ``project_role == "operator"``.
 
 Cookie-session / signed-forwarding callers are confirmed ONLY through
-clause 2, and ONLY when the seam actually supplies the role. The REST
-composition seam's auth dict carries no verifiable project role for a
-cookie session (the per-project backend has no router.db role handle), so
-REST passes neither ``sysadmin`` nor ``project_role`` and a session is
-conservatively NOT confirmed — least-privilege where the tier is
-unverifiable. The MCP ``Principal`` carries a signed role, so a genuine
-operator over the wire is confirmed. That asymmetry is input availability,
-not policy drift: one predicate, fed what each seam can prove.
+clause 2, and ONLY when the seam actually supplies the role. Since PR #280
+the per-project backend DOES have a router.db role handle: its
+``app/deps._authorize_session_for_project`` resolves the cookie caller's
+``project_role`` + ``sysadmin`` before admitting, and Wave 12 PR A carries
+them in the ``require_operator_session`` auth dict. So the REST composition
+seam now feeds a real role for the COOKIE (``kind == "session"``) path — a
+genuine operator/sysadmin is confirmed and reads their own project's data,
+a viewer stays unconfirmed. The signed-FORWARDING path still passes only
+``kind`` here (its role rides a task-local carrier consumed by the dispatch
+seam, not this auth dict), so a forwarding caller is conservatively not
+confirmed at this predicate. The MCP ``Principal`` carries a signed role,
+so a genuine operator over the wire is confirmed. Any remaining asymmetry
+is input availability, not policy drift: one predicate, fed what each seam
+can prove.
 """
 
 from __future__ import annotations

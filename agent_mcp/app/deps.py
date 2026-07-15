@@ -203,9 +203,12 @@ def _backend_project_name() -> str | None:
     return None
 
 
-def _authorize_session_for_project(user: dict[str, Any], request: Request) -> None:
+def _authorize_session_for_project(
+    user: dict[str, Any], request: Request
+) -> tuple[str | None, bool]:
     """Enforce project membership + the read/mutation split on the
-    cookie/session path — the AUTHORIZE step the dep previously skipped.
+    cookie/session path — the AUTHORIZE step the dep previously skipped —
+    and RETURN the caller's resolved ``(project_role, sysadmin)``.
 
     Mirrors ``router/auth_middleware.require_operator_session_middleware``:
 
@@ -216,26 +219,38 @@ def _authorize_session_for_project(user: dict[str, Any], request: Request) -> No
 
     The normal router-proxied path is unaffected: the router already
     gated membership with the same resolver before forwarding the
-    cookie, so this re-resolves the identical role and admits. When the
-    backend cannot determine its own project name, we return without
-    enforcing (see :func:`_backend_project_name`).
+    cookie, so this re-resolves the identical role and admits.
+
+    Return contract (Wave 12 PR A — feed, don't discard, the resolved
+    tier so ``is_confirmed_operator_tier`` can confirm a genuine cookie
+    operator instead of redacting them from their own project):
+
+      * sysadmin bypass                    → ``(None, True)``
+      * admitted member                    → ``(role, False)`` where
+        ``role`` is ``"operator"`` or ``"viewer"``
+      * backend can't name its own project, or the session row carries
+        no ``user_id`` (ad-hoc / test harness — see
+        :func:`_backend_project_name`) → ``(None, False)``, i.e.
+        conservatively UNCONFIRMED (fail-closed: a caller whose tier we
+        cannot resolve is treated as non-operator, so secrets stay
+        masked rather than exposed on an unverifiable path).
 
     Raises ``HTTPException`` (401 / 403) on denial.
     """
     project = _backend_project_name()
     if project is None:
-        return
+        return (None, False)
 
     user_id = user.get("user_id")
     if user_id is None:  # pragma: no cover - session rows always carry one
-        return
+        return (None, False)
     user_id = str(user_id)
 
     from ..router import group_resolver
 
     try:
         if group_resolver.resolve_user_is_sysadmin(user_id):
-            return
+            return (None, True)
     except Exception:  # pragma: no cover - defensive; mirror router (non-sysadmin)
         pass
 
@@ -277,6 +292,12 @@ def _authorize_session_for_project(user: dict[str, Any], request: Request) -> No
                 ),
             },
         )
+
+    # Admitted. Carry the resolved role forward so the confirmed-tier
+    # predicate can distinguish a genuine operator (un-redacted) from a
+    # viewer (still redacted). A cookie session is never sysadmin here —
+    # that path returned above.
+    return (role, False)
 
 
 # ── The dep ───────────────────────────────────────────────────────
@@ -359,8 +380,24 @@ async def require_operator_session(request: Request) -> dict[str, Any]:
             # project so a cookie for another project (or a viewer
             # mutating) can't walk in when the backend is reached
             # directly. Raises 401/403 on denial.
-            _authorize_session_for_project(user, request)
-            return {"kind": "session", "user": user}
+            #
+            # Wave 12 PR A: capture the resolved (project_role, sysadmin)
+            # and carry them in the auth dict so
+            # ``is_confirmed_operator_tier`` can confirm a genuine cookie
+            # operator instead of redacting them from their own project.
+            # Additive keys — no handler unpacks a fixed session-dict
+            # shape (the verbatim-shape assertion in
+            # tests/test_sec_r4_operator_identity_race.py pins the
+            # FORWARDING dict, not this one).
+            project_role, sysadmin = _authorize_session_for_project(
+                user, request
+            )
+            return {
+                "kind": "session",
+                "user": user,
+                "project_role": project_role,
+                "sysadmin": sysadmin,
+            }
 
     # 2. Forwarding-header path — retire-system-token Wave 1. The
     #    ``AuthHeaderMiddleware`` already verified the header and built
