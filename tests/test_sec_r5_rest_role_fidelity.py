@@ -193,10 +193,13 @@ async def test_cookie_admit_resets_stale_forwarding_role(monkeypatch):
         "_resolve_session_user",
         lambda sid: {"user_id": "u1", "username": "alice"},
     )
+    # Wave 12 PR A: the authorize helper now RETURNS the resolved
+    # ``(project_role, sysadmin)`` instead of ``None``. This test only
+    # cares about the carrier reset, so a benign admit tuple suffices.
     monkeypatch.setattr(
         deps,
         "_authorize_session_for_project",
-        lambda user, request: None,
+        lambda user, request: (None, False),
     )
     cookie_req = _FakeRequest(
         principal=None,

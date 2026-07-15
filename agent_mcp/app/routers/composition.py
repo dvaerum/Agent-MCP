@@ -158,30 +158,39 @@ def is_confirmed_operator_tier(auth: Dict[str, Any]) -> bool:
       * ``"operator_bearer"`` — a per-agent bearer that resolved to a
         manager/admin agent row (worker tokens are rejected). Operator
         tier is CONFIRMED.
-      * ``"session"`` / ``"forwarding"`` — cookie or signed-header
-        operator identity. The router admits viewer-tier operators on
-        GET requests, and the per-project backend has no router.db
-        project-role handle (by design — role gating is the router
-        middleware's job; see ``app/deps.py`` + ``main_app`` Principal
-        construction). So for these paths the tier is UNVERIFIABLE from
-        the backend — it could be a read-only viewer. The auth dict
-        carries no verifiable role, so this seam passes only ``kind`` to
-        the shared predicate and a session is conservatively NOT
-        confirmed.
+      * ``"session"`` — cookie operator identity. Since PR #280 the
+        per-project backend DOES resolve the caller's ``project_role``
+        and ``sysadmin`` flag against router.db (in
+        ``app/deps._authorize_session_for_project``); Wave 12 PR A stops
+        discarding them and carries them in the auth dict. So a genuine
+        cookie OPERATOR (or sysadmin) is now CONFIRMED and reads their
+        own project's secrets, while a cookie VIEWER (``project_role ==
+        "viewer"``) stays NOT confirmed → still redacted.
+      * ``"forwarding"`` — signed-header operator identity. The REST auth
+        dict carries no role for this path (the forwarding role rides the
+        task-local ``_forwarding_route_role`` carrier consumed by the
+        dispatch seam, not this dict), so it passes only ``kind`` and a
+        forwarding caller is conservatively NOT confirmed here.
 
     Endpoints that return agent bearer tokens use this to withhold them
     from the unverifiable-tier paths, closing the viewer→agent token
-    disclosure / privilege-escalation surface. Operators who need agent
-    tokens use the operator-tier bearer path (agent CLI / admin scripts)
-    or a dedicated operator-gated endpoint.
+    disclosure / privilege-escalation surface. A confirmed cookie
+    operator, an operator-tier bearer (agent CLI / admin scripts), or a
+    sysadmin may read them.
 
     The policy itself lives in
     ``core/operator_tier.is_confirmed_operator_tier`` so this REST surface
     and the MCP ``tools/admin_tools`` surface cannot drift (they did — see
     that module). This thin adapter maps the auth dict onto the shared
-    predicate's keyword fields.
+    predicate's keyword fields. Absent keys (forwarding, or a harness path
+    that couldn't resolve a role) default to least-privilege in the
+    predicate, so a session with ``project_role=None`` stays unconfirmed.
     """
-    return _shared_is_confirmed_operator_tier(kind=auth.get("kind"))
+    return _shared_is_confirmed_operator_tier(
+        kind=auth.get("kind"),
+        sysadmin=auth.get("sysadmin", False),
+        project_role=auth.get("project_role"),
+    )
 
 
 # --- Composition reads (cross-resource) ---
