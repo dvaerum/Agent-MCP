@@ -52,19 +52,23 @@ from typing import Optional
 import httpx
 
 from ..core.config import logger
+from ..core.settings_schema import (
+    DEFAULT_BASE_URL,
+    DEFAULT_TEMPLATE,
+    DEFAULT_TIMEOUT_MS,
+)
 from ..db.connection import get_db_connection
 
 
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-
-DEFAULT_BASE_URL = "http://127.0.0.1:8181"
-DEFAULT_TEMPLATE = (
-    "[agent-mcp] New message from {sender}. "
-    "Call get_agent_messages to read."
-)
-DEFAULT_TIMEOUT_MS = 2000
+#
+# ADR-0018: DEFAULT_BASE_URL / DEFAULT_TEMPLATE / DEFAULT_TIMEOUT_MS are
+# owned by the single-source schema registry (``core/settings_schema``)
+# and imported back here so the AoE defaults have exactly one owner.
+# They are re-exported under their historical names for callers/tests
+# that import them from this module.
 
 # Placeholders that MUST NOT appear in the template. Matched
 # case-insensitively because AoE just types whatever we give it; we

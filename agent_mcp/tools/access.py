@@ -84,6 +84,7 @@ import json
 from typing import Dict, Iterator, Optional
 
 from ..core.config import logger
+from ..core.settings_schema import SETTINGS_SCHEMA, default_for
 
 
 # Restrictiveness rank of a visibility level, lowest = fewest roles
@@ -125,18 +126,15 @@ def _visibility_for_capability(cap: str) -> str:
     return "operator"
 
 
-# Default truthiness for each toggle when the project_context row is
-# absent. Mirrors what each tool's own impl passes to
-# `_get_config_bool(..., default=...)` (and what `@requires_policy`'s
-# `default=` kwarg sets), so the tools/list filter and the call-time
-# gate agree on "is this on?" without crossing module boundaries.
+# Default truthiness for each toggle when the project_settings row is
+# absent. ADR-0018: DERIVED from the single-source schema registry
+# (``core/settings_schema.SETTINGS_SCHEMA``) rather than hand-maintained
+# here — every bool setting's default is owned in exactly one place, so
+# the tools/list filter and the call-time gate can never drift from it.
+# Covers all bool keys (the old hand-list omitted 2, e.g.
+# ``config_auto_event_loop_global``).
 _TOGGLE_DEFAULTS: Dict[str, bool] = {
-    # Default-deny worker→worker (PR #16).
-    "config_allow_worker_to_worker": False,
-    # Default-allow worker self-assign / self-file / own-status updates.
-    "config_allow_worker_self_assign": True,
-    "config_allow_worker_create_unassigned": True,
-    "config_allow_worker_update_own_status": True,
+    s.key: bool(s.default) for s in SETTINGS_SCHEMA if s.type == "bool"
 }
 
 
@@ -311,7 +309,7 @@ class _DerivedAccessMap:
 TOOL_ACCESS = _DerivedAccessMap()
 
 
-def _get_config_bool(key: str, default: bool) -> bool:
+def _get_config_bool(key: str, default: Optional[bool] = None) -> bool:
     """Read a boolean toggle from the ``project_settings`` store.
 
     Identical semantics to the per-module helpers in
@@ -320,10 +318,17 @@ def _get_config_bool(key: str, default: bool) -> bool:
     If the settings store is unreachable (e.g. during very early
     bootstrap before the DB exists), defaults are returned.
 
+    ADR-0018: ``default`` is optional. When the caller omits it, the
+    default is resolved from the single-source schema registry
+    (``core/settings_schema.default_for``) — no reader carries its own
+    hardcoded default literal.
+
     Wave 11 (ADR-0016): ``config_*`` rows moved from ``project_context``
     to the dedicated ``project_settings`` table — this is one of the two
     canonical read seams the cutover repointed.
     """
+    if default is None:
+        default = bool(default_for(key))
     try:
         from ..db.connection import get_db_connection
 
@@ -349,7 +354,7 @@ def _get_config_bool(key: str, default: bool) -> bool:
     return default
 
 
-def _get_config_int(key: str, default: int) -> int:
+def _get_config_int(key: str, default: Optional[int] = None) -> int:
     """Read an integer knob from the ``project_settings`` store.
 
     Numeric companion to :func:`_get_config_bool`; this is the single
@@ -364,9 +369,15 @@ def _get_config_int(key: str, default: int) -> int:
     or the value is not coercible to an int. Callers own any further
     policy (``<= 0`` handling, upper clamps).
 
+    ADR-0018: ``default`` is optional — omit it and the default is
+    resolved from the single-source schema registry
+    (``core/settings_schema.default_for``).
+
     Wave 11 (ADR-0016): repointed from ``project_context`` alongside
     :func:`_get_config_bool`.
     """
+    if default is None:
+        default = int(default_for(key))
     try:
         from ..db.connection import get_db_connection
 

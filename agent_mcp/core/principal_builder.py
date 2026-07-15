@@ -229,7 +229,7 @@ def _resolve_can_wake_loop(agent_id: str) -> bool:
         from ..db.connection import get_db_connection
 
         if not _access._get_config_bool(
-            "config_auto_event_loop_global", default=True
+            "config_auto_event_loop_global"
         ):
             return False
         conn = get_db_connection()

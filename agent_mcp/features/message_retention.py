@@ -55,7 +55,7 @@ def _read_retention_days() -> int:
     # stay here.
     from ..tools.access import _get_config_int
 
-    days = _get_config_int("config_message_retention_days", 0)
+    days = _get_config_int("config_message_retention_days")
     if days <= 0:
         return 0
     # Upper-clamp before the caller feeds this into timedelta(days=...)

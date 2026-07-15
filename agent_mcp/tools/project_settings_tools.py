@@ -39,6 +39,7 @@ from ..core.operator_tier import (
     is_confirmed_operator_tier as _shared_is_confirmed_operator_tier,
 )
 from ..core.principal import Principal
+from ..core.settings_schema import SECRET_SETTING_KEYS
 from ..core.tool_result import (
     Failed,
     Invalid,
@@ -54,15 +55,15 @@ from ..utils.audit_utils import log_audit
 
 
 # The settings store's OWN secret classification: a literal set, not a
-# prefix heuristic — the store knows its schema (ADR-0016). These two
-# keys carry the AoE credential (or the path to it); every other
-# ``config_*`` row is an operator-readable toggle/knob.
-_SECRET_SETTING_KEYS = frozenset(
-    {
-        "config_aoe_bearer_token",
-        "config_aoe_bearer_token_file",
-    }
-)
+# prefix heuristic — the store knows its schema (ADR-0016). These keys
+# carry the AoE credential (or the path to it); every other ``config_*``
+# row is an operator-readable toggle/knob.
+#
+# ADR-0018: derived from the single-source schema registry
+# (``core/settings_schema.SECRET_SETTING_KEYS`` = every spec with
+# ``type == "secret"``), so the secret classification and the schema's
+# type column can never drift.
+_SECRET_SETTING_KEYS = SECRET_SETTING_KEYS
 
 _REDACTED_VALUE = "[redacted]"
 
