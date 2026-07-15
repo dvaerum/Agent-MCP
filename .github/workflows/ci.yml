@@ -22,14 +22,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # PRs run the floor + ceiling only (fast feedback, less runner
-        # congestion when several PRs are open); push-to-main runs the
-        # full set of every CPython release still receiving updates, so
-        # the merge gate keeps full-matrix coverage. Version-specific
-        # breakage almost always shows at the oldest or newest release,
-        # which the PR subset covers. (3.10 reached EOL 2026-10-31 and
-        # was dropped with it.)
-        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.11", "3.14"]') || fromJSON('["3.11", "3.12", "3.13", "3.14"]') }}
+        # Every CPython release still receiving updates as of the floor
+        # bump (3.10 reaches EOL 2026-10-31 and was dropped with it).
+        # These four jobs run in parallel with the four Nix VM shards
+        # below — GitHub schedules all jobs concurrently, bounded only by
+        # the runner pool, so the full matrix costs no extra wall-clock on
+        # a single run.
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
