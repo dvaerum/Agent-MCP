@@ -1,7 +1,18 @@
 "use client"
 
 import React, { useCallback, useEffect, useMemo, useState } from "react"
-import { MessageSquare, Send, RefreshCw, X, Trash2, MailOpen, Mail } from "lucide-react"
+import {
+  MessageSquare,
+  Send,
+  RefreshCw,
+  X,
+  Trash2,
+  MailOpen,
+  Mail,
+  Plus,
+  Search,
+  CheckSquare,
+} from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -27,62 +38,19 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
-import { apiClient, type Agent } from "@/lib/api"
+import { apiClient, type Message } from "@/lib/api"
+import { cn } from "@/lib/utils"
 import { useDialog } from "@/hooks/use-dialog"
 import { useFilters } from "@/hooks/use-filters"
 import { usePagedQuery } from "@/hooks/use-paged-query"
+import { useServerStore } from "@/lib/stores/server-store"
 import { Skeleton } from "@/components/ui/skeleton"
 import { EmptyState } from "@/components/dashboard/shared/empty-state"
 import { AgentSelect } from "@/components/dashboard/shared/agent-select"
 import { MessagesMobileList } from "@/components/dashboard/messages-mobile-list"
-
-// Render a relative-time hint like "5 hours ago" / "in 3 minutes" so
-// admins don't have to do the timezone math themselves. Falls back to
-// the raw value if it can't be parsed.
-function relativeTime(iso: string): string {
-  const t = Date.parse(iso)
-  if (Number.isNaN(t)) return iso
-  const deltaMs = t - Date.now()
-  const abs = Math.abs(deltaMs)
-  const sec = Math.round(abs / 1000)
-  const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" })
-  const sign = deltaMs >= 0 ? 1 : -1
-  if (sec < 60) return rtf.format(sign * sec, "second")
-  const min = Math.round(sec / 60)
-  if (min < 60) return rtf.format(sign * min, "minute")
-  const hr = Math.round(min / 60)
-  if (hr < 24) return rtf.format(sign * hr, "hour")
-  const day = Math.round(hr / 24)
-  if (day < 30) return rtf.format(sign * day, "day")
-  const month = Math.round(day / 30)
-  if (month < 12) return rtf.format(sign * month, "month")
-  return rtf.format(sign * Math.round(month / 12), "year")
-}
-
-// Message row shape returned by POST /api/messages/query.
-// v5.0.22: subject (root-only) + parent_message_id (NULL for roots,
-// reply→root.message_id for replies).
-interface Message {
-  message_id: string
-  sender_id: string
-  recipient_id: string
-  message_content: string
-  message_type: string
-  priority: string
-  timestamp: string
-  delivered: number | boolean
-  read: number | boolean
-  subject: string | null
-  parent_message_id: string | null
-}
+import { ViewMessageModal } from "@/components/dashboard/modals/view-message-modal"
+import { DeleteMessageModal } from "@/components/dashboard/modals/delete-message-modal"
+import { toastError, toastSuccess } from "@/components/ui/toast"
 
 interface Filters {
   from: string
@@ -156,32 +124,135 @@ async function callMessages(
   return res.json()
 }
 
+// Stats card component — matches the Agents/Tasks/Memories StatsCard
+// (plain Tailwind sizing + rounded-lg + semantic tokens + tabular-nums).
+const StatsCard = ({ icon: Icon, label, value, change, trend }: {
+  icon: React.ComponentType<{ className?: string }>
+  label: string
+  value: number
+  change?: string
+  trend?: 'up' | 'down' | 'neutral'
+}) => (
+  <div className="bg-card border border-border rounded-lg p-3 sm:p-5 hover:bg-muted/30 transition-colors duration-150 group">
+    <div className="flex items-center justify-between">
+      <div>
+        <div className="flex items-center gap-2 mb-2">
+          <Icon className="h-4 w-4 text-muted-foreground transition-colors" />
+          <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">{label}</span>
+        </div>
+        <div className="text-2xl sm:text-3xl font-semibold text-foreground tabular-nums mb-1">{value}</div>
+        {change && (
+          <div className={cn(
+            "text-xs font-medium tabular-nums",
+            trend === 'up' && "text-emerald-500",
+            trend === 'down' && "text-destructive",
+            trend === 'neutral' && "text-muted-foreground"
+          )}>
+            {change}
+          </div>
+        )}
+      </div>
+    </div>
+  </div>
+)
+
+// Message table row — extracted for parity with memories' <MemoryRow>.
+// Row-body click opens the detail modal; the checkbox + delete cells
+// stopPropagation so they don't also fire the row-open.
+const MessageRow = ({
+  message: m,
+  selected,
+  onToggle,
+  onOpenDetail,
+  onDelete,
+  labelForParent,
+}: {
+  message: Message
+  selected: boolean
+  onToggle: (id: string) => void
+  onOpenDetail: (m: Message) => void
+  onDelete: (m: Message) => void
+  labelForParent: (parentId: string | null) => string
+}) => {
+  // v5.0.22: rows whose parent_message_id is non-null are replies.
+  // Visual cue = subtle left border + "↳ reply to: <parent>" prefix in
+  // the Subject column.
+  const isReply = !!m.parent_message_id
+  const isRead = m.read === 1 || m.read === true
+  return (
+    <TableRow
+      className={
+        "cursor-pointer" +
+        (isReply ? " border-l-2 border-l-muted-foreground/30" : "")
+      }
+      onClick={() => onOpenDetail(m)}
+    >
+      <TableCell onClick={(e) => e.stopPropagation()}>
+        <input
+          type="checkbox"
+          aria-label={`select message ${m.message_id}`}
+          checked={selected}
+          onChange={() => onToggle(m.message_id)}
+        />
+      </TableCell>
+      <TableCell className="text-xs font-mono tabular-nums">
+        {/* Per-row entity glyph (matches memories' <Brain> convention). */}
+        <div className="flex items-center gap-2">
+          <MessageSquare className="h-3 w-3 text-primary flex-shrink-0" />
+          <span>{m.timestamp.slice(0, 19)}</span>
+        </div>
+      </TableCell>
+      <TableCell><Badge variant="outline">{m.sender_id}</Badge></TableCell>
+      <TableCell><Badge variant="outline">{m.recipient_id}</Badge></TableCell>
+      <TableCell className="text-xs max-w-[200px] truncate">
+        {m.subject ? (
+          m.subject
+        ) : isReply ? (
+          // v5.0.24 polish: human-readable parent label instead of the
+          // opaque message_id.
+          <span className="text-muted-foreground">
+            ↳ reply to:{" "}
+            <span className="text-foreground">
+              {labelForParent(m.parent_message_id)}
+            </span>
+          </span>
+        ) : (
+          <span className="text-muted-foreground/50">—</span>
+        )}
+      </TableCell>
+      <TableCell className="text-xs">{m.message_type}</TableCell>
+      <TableCell className="text-xs">{m.priority}</TableCell>
+      <TableCell>{isRead ? "✓" : ""}</TableCell>
+      <TableCell className="max-w-[400px] truncate text-xs">
+        {m.message_content}
+      </TableCell>
+      <TableCell onClick={(e) => e.stopPropagation()}>
+        <Button
+          variant="ghost"
+          size="sm"
+          aria-label="delete message"
+          className="text-destructive hover:text-destructive hover:bg-destructive/10"
+          onClick={() => onDelete(m)}
+        >
+          <Trash2 className="h-4 w-4" />
+        </Button>
+      </TableCell>
+    </TableRow>
+  )
+}
+
 export function MessagesDashboard() {
-  // v5.0.31: ``messages`` / ``total`` / ``loading`` / data-side
-  // ``error`` are now owned by ``usePagedQuery<Message>`` (PR 5 of the
-  // 2026-06-09 architecture review). The hook subsumes the bespoke
-  // ``callMessages POST query`` listing fetch + the four
-  // ``useState`` slots that used to mirror its result. We keep a
-  // separate ``actionError`` slot below for compose / mark-read /
-  // delete failures, since those code paths talk to other endpoints
-  // (``POST /api/messages``, ``PATCH /api/messages/<id>``,
-  // ``DELETE /api/messages/<id>``) and aren't the hook's
-  // responsibility.
-  const [actionError, setActionError] = useState<string | null>(null)
+  // Server-online indicator (matches Agents/Tasks/Memories header).
+  const { servers, activeServerId } = useServerStore()
+  const activeServer = servers.find((s) => s.id === activeServerId)
 
   // v5.0.26: pagination cursor. Total comes from the hook. Declared
   // before `filters` because the useFilters() `onReset` callback below
-  // closes over `setCurrentOffset` — the legacy
-  // `useEffect(() => setCurrentOffset(0), [filters])` block is gone;
-  // useFilters fires `onReset` on every filter change instead.
+  // closes over `setCurrentOffset`.
   const [currentOffset, setCurrentOffset] = useState(0)
 
-  // Filter state — owned by useFilters<Filters> (PR 4 of the
-  // 2026-06-09 architecture review). The hook collapses the
-  // useState-per-field + per-field updater + clearAll + filter-
-  // watching effect quartet shared with tasks-/agents-dashboard.tsx.
-  // `onReset` preserves the v5.0.26 "filter changed -> page 1"
-  // semantics that used to live in a dedicated useEffect.
+  // Filter state — owned by useFilters<Filters>. `onReset` preserves
+  // the v5.0.26 "filter changed -> page 1" semantics.
   const {
     filters,
     setFilter,
@@ -210,39 +281,17 @@ export function MessagesDashboard() {
   const [composePriority, setComposePriority] = useState("normal")
   const [composing, setComposing] = useState(false)
   // v5.0.22 subject + reply state.
-  //   * composeSubject — user-typed or Suggest-populated root subject.
-  //     Hidden + ignored when replying.
-  //   * composeReplyParentId — non-empty means this is a reply to the
-  //     named root message_id; the backend force-NULLs subject in that
-  //     case, and we hide the subject input.
-  //   * suggestLoading — guards the Suggest button so it can't double-fire.
   const [composeSubject, setComposeSubject] = useState("")
   const [composeReplyParentId, setComposeReplyParentId] = useState<string | null>(
     null,
   )
   const [suggestLoading, setSuggestLoading] = useState(false)
 
-  // Participants drive the Compose recipient dropdown only.
-  //
-  // History (pre-feat/agent-select-dropdown):
-  //   - The old code sourced from apiClient.getAgents(), which returns
-  //     EVERY row including status='terminated' — leaking ghost agents
-  //     into the From/To filters and Compose recipient.
-  //   - PR #N introduced /api/messages/participants returning
-  //     {live, tombstones}; Compose used `live` only, From/To filters
-  //     concatenated `live + tombstones` so admins could grep history
-  //     for purged agents.
-  //
-  // Now (feat/agent-select-dropdown):
-  //   - The From/To filter dropdowns use the shared <AgentSelect>
-  //     which reads live agents directly from the data-store. They no
-  //     longer surface tombstones; see the comment block on the
-  //     filter <AgentSelect>s below for the tradeoff and follow-up.
-  //   - The Compose recipient still uses /api/messages/participants
-  //     because it needs the BROADCAST option ("*") which is NOT an
-  //     agent and is outside <AgentSelect>'s contract. The hardcoded
-  //     "admin" entry mirrors data-store::shouldDisplayAgent so the
-  //     compose UX matches the rest of the dashboard.
+  // Participants drive the Compose recipient dropdown only (needs the
+  // BROADCAST "*" option, which is NOT an agent and is outside
+  // <AgentSelect>'s contract; the hardcoded "admin" entry mirrors
+  // data-store::shouldDisplayAgent so the compose UX matches the rest
+  // of the dashboard).
   const [liveParticipants, setLiveParticipants] = useState<
     { agent_id: string; status?: string }[]
   >([])
@@ -271,9 +320,8 @@ export function MessagesDashboard() {
   }, [liveParticipants])
 
   // Build the spread-filter slice for the POST body. Empty-string
-  // fields are dropped so the backend doesn't have to special-case
-  // them; ``read`` is converted from its tri-state string form
-  // ("" | "true" | "false") into the real boolean the API wants.
+  // fields are dropped; ``read`` is converted from its tri-state string
+  // form ("" | "true" | "false") into the real boolean the API wants.
   const queryFilters = useMemo<Record<string, unknown>>(() => {
     const f: Record<string, unknown> = {}
     if (filters.from) f.from = filters.from
@@ -285,24 +333,14 @@ export function MessagesDashboard() {
     return f
   }, [filters])
 
-  // v5.0.31: paginated listing fetch — was a bespoke
-  // ``callMessages POST query`` flow with its own
-  // useState/loading/error plumbing; now owned by ``usePagedQuery<T>``
-  // (PR 5 of the 2026-06-09 architecture review). The hook handles
-  // POST body construction (``{limit, offset, ...filters}``),
-  // AbortController cancellation on filter/cursor change, and
-  // surfaces ``data`` / ``total`` / ``loading`` / ``error`` /
-  // ``refresh`` directly.
-  //
-  // Wave 2 (cleanup-wave-2): no ``token`` field threaded through —
-  // the operator session cookie carries auth via the hook's
-  // ``credentials: "include"`` opt-in.
+  // v5.0.31: paginated listing fetch owned by ``usePagedQuery<T>``.
   const {
     data: messages,
     total,
     loading,
     error: queryError,
     refresh: refreshQuery,
+    lastFetch,
   } = usePagedQuery<Message>({
     endpoint: "/messages/query",
     filters: queryFilters,
@@ -310,57 +348,43 @@ export function MessagesDashboard() {
     offset: currentOffset,
   })
 
-  // Surface either an action error (compose / mark / delete) OR the
-  // hook's query error — whichever is freshest. The UI just wants
-  // the most-recent failure string.
-  const error: string | null =
-    actionError ?? (queryError ? queryError.message : null)
+  // Surface the hook's query error via the shared toast (matches
+  // Agents/Tasks/Memories — no more in-page red banner).
+  useEffect(() => {
+    if (queryError) toastError(queryError, "Failed to load messages")
+  }, [queryError])
 
-  // Wrapper that also re-pulls participants + clears selection. The
-  // hook owns the actual listing fetch; this wrapper preserves the
-  // pre-migration ``refresh()`` semantics where every refresh also
-  // re-syncs tombstones and drops the selection set.
+  // Wrapper that also re-pulls participants + clears selection.
   const refresh = useCallback(() => {
     refreshQuery()
     setSelectedIds(new Set())
     void loadParticipants()
   }, [refreshQuery])
 
-  // Detail modal — opened by clicking a row's content area (not the
-  // checkbox / per-row action cells, which stopPropagation). Live-
-  // lookup useDialog (Candidate D, 2026-06-02) stores only the
-  // message_id and asks the selector for the current row on every
-  // render — so when the local messages list is reloaded (e.g. after
-  // a mark-read PATCH) the open dialog re-renders with the fresh
-  // row instead of a snapshot from when it was opened. Declared
-  // after ``usePagedQuery`` so the selector closure captures the
-  // hook-owned ``messages`` array.
+  // Live-lookup selector shared by the detail + delete dialogs — reads
+  // the current row from the hook-owned ``messages`` array on every
+  // render, so a mark-read PATCH (or a delete elsewhere) re-renders the
+  // open dialog against fresh data.
   const messageSelector = useCallback(
     (id: string | null) =>
       id ? messages.find((m) => m.message_id === id) ?? null : null,
     [messages],
   )
   const detailDialog = useDialog<Message>(messageSelector)
+  const deleteDialog = useDialog<Message>(messageSelector)
+  // Bulk-delete confirm has no single message key — a boolean drives it.
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false)
 
-  // Deleted-while-open: if the row is removed from the list (delete
-  // from any source — this tab, another tab, server-side cleanup),
-  // the selector returns null. Auto-close so the user isn't stuck
-  // on an empty modal. Explicit detailDialog.close() in deleteOne is
-  // redundant but kept for code clarity.
+  // Deleted-while-open: if the row is removed from the list, the
+  // selector returns null. Auto-close so the user isn't stranded.
   useEffect(() => {
     if (detailDialog.isOpen && detailDialog.data === null) detailDialog.close()
   }, [detailDialog.isOpen, detailDialog.data, detailDialog.close])
+  useEffect(() => {
+    if (deleteDialog.isOpen && deleteDialog.data === null) deleteDialog.close()
+  }, [deleteDialog.isOpen, deleteDialog.data, deleteDialog.close])
 
   // v5.0.24 polish: human-readable label for a parent message id.
-  // Used by the reply chip + the in-table reply marker so the user
-  // sees "reply to: Build debug help" instead of the opaque
-  // "reply to: msg_a04d4d5666e5c19d".
-  //
-  // Lookup order:
-  //   1. If we have the parent in the current page (messages map),
-  //      return its subject; else first 40 chars of its content.
-  //   2. Otherwise fall back to the message_id — the page just
-  //      didn't load that far back, but the link is still valid.
   const labelForParent = useCallback(
     (parentId: string | null): string => {
       if (!parentId) return ""
@@ -380,16 +404,10 @@ export function MessagesDashboard() {
   const send = async () => {
     if (!composeRecipient || !composeContent) return
     setComposing(true)
-    setActionError(null)
     try {
       // BROADCAST sentinel maps to recipient_id="*" on the backend.
       const recipient =
         composeRecipient === BROADCAST ? "*" : composeRecipient
-      // v5.0.22 — wire the new fields through. Reply mode pins
-      // parent_message_id and lets the backend force-NULL the subject;
-      // otherwise we either pass the typed subject (verbatim) or omit
-      // the key entirely so the backend can pick suggest_subject /
-      // truncated body.
       const body: Record<string, unknown> = {
         recipient_id: recipient,
         message_content: composeContent,
@@ -407,26 +425,20 @@ export function MessagesDashboard() {
       setComposeReplyParentId(null)
       setComposeOpen(false)
       await refresh()
-    } catch (e: any) {
-      setActionError(e.message ?? String(e))
+      toastSuccess("Message sent.")
+    } catch (e) {
+      toastError(e, "Failed to send message")
     } finally {
       setComposing(false)
     }
   }
 
   // v5.0.22: ask the backend (which delegates to Ollama if
-  // AGENT_MCP_SUBJECT_MODEL is configured) to propose a subject from
-  // the current compose body. Returns {subject: string | null}.
-  //
-  // v5.0.24 polish: when the response is null (Ollama unconfigured
-  // OR helper returned empty), surface a transient hint so the user
-  // knows the silence is intentional, not a hang. The hint clears on
-  // the next Suggest attempt or when the user types into the field.
+  // AGENT_MCP_SUBJECT_MODEL is configured) to propose a subject.
   const [suggestHint, setSuggestHint] = useState<string | null>(null)
   const suggestSubject = async () => {
     if (!composeContent.trim()) return
     setSuggestLoading(true)
-    setActionError(null)
     setSuggestHint(null)
     try {
       const data = await callMessages("POST", "/suggest-subject", {
@@ -440,18 +452,15 @@ export function MessagesDashboard() {
             "(or set AGENT_MCP_SUBJECT_MODEL server-side to enable Ollama).",
         )
       }
-    } catch (e: any) {
+    } catch (e) {
       // Soft-fail — the user can still type a subject manually.
-      setActionError(e.message ?? String(e))
+      toastError(e, "Failed to suggest a subject")
     } finally {
       setSuggestLoading(false)
     }
   }
 
   // Open the compose form pre-wired for a reply to the given message.
-  // Mirrors how an email client's "Reply" button works: prefill the
-  // recipient (other party of the parent thread), pin parent_message_id,
-  // hide the subject input.
   const openReply = (parent: Message) => {
     const me = "admin" // dashboard runs as admin per ADR-0003
     const otherParty =
@@ -464,18 +473,15 @@ export function MessagesDashboard() {
   }
 
   const toggleRead = async (m: Message) => {
+    const nextRead = !(m.read === 1 || m.read === true)
     try {
-      const nextRead = !(m.read === 1 || m.read === true)
-      await callMessages("PATCH", `/${m.message_id}`, {
-        read: nextRead,
-      })
-      // Live-lookup useDialog (Candidate D, 2026-06-02): no explicit
-      // dialog-sync hack needed. The dialog reads the row live from
-      // `messages`; refreshing the list propagates the new read state
-      // into the open modal automatically.
+      await callMessages("PATCH", `/${m.message_id}`, { read: nextRead })
+      // Live-lookup useDialog: refreshing the list propagates the new
+      // read state into the open modal automatically (modal stays open).
       await refresh()
-    } catch (e: any) {
-      setActionError(e.message ?? String(e))
+      toastSuccess(nextRead ? "Marked as read." : "Marked as unread.")
+    } catch (e) {
+      toastError(e, "Failed to update message")
     }
   }
 
@@ -494,9 +500,6 @@ export function MessagesDashboard() {
     messages.length > 0 && selectedIds.size === messages.length
 
   const toggleAllVisible = () => {
-    // selectAllVisible: toggle every row currently rendered (the rows
-    // that pass the active filter, since the table renders the full
-    // filtered list — no pagination is applied client-side).
     if (allVisibleSelected) {
       setSelectedIds(new Set())
     } else {
@@ -506,7 +509,7 @@ export function MessagesDashboard() {
 
   const bulkMark = async (read: boolean) => {
     if (selectedIds.size === 0) return
-    setActionError(null)
+    const n = selectedIds.size
     try {
       await Promise.all(
         Array.from(selectedIds).map((id) =>
@@ -514,30 +517,44 @@ export function MessagesDashboard() {
         )
       )
       await refresh()
-    } catch (e: any) {
-      setActionError(e.message ?? String(e))
+      toastSuccess(`Marked ${n} message${n === 1 ? "" : "s"} as ${read ? "read" : "unread"}.`)
+    } catch (e) {
+      toastError(e, "Failed to update messages")
     }
   }
 
-  const bulkDelete = async () => {
-    if (selectedIds.size === 0) return
-    setActionError(null)
+  // Confirmed single delete — the onConfirm handler for the
+  // DeleteMessageModal opened from a row / mobile row / the detail
+  // modal's Delete button. Re-throws on failure so the confirm dialog
+  // stays open (mirrors memories' handleDeleteMemory).
+  const handleConfirmDelete = async () => {
+    const m = deleteDialog.data
+    if (!m) return
     try {
-      await Promise.all(
-        Array.from(selectedIds).map((id) =>
-          callMessages("DELETE", `/${id}`, {})
-        )
-      )
+      await callMessages("DELETE", `/${m.message_id}`, {})
       await refresh()
-    } catch (e: any) {
-      setActionError(e.message ?? String(e))
+      toastSuccess("Message deleted.")
+    } catch (e) {
+      toastError(e, "Failed to delete message")
+      throw e
     }
   }
 
-  // v5.0.26 pagination handlers. Disabled-state in the JSX guards
-  // against overshoot, so these don't need to clamp defensively beyond
-  // the Math.max on Newer (which prevents a negative offset when
-  // PAGE_SIZE changes).
+  // Confirmed bulk delete — onConfirm for the bulk DeleteMessageModal.
+  const handleConfirmBulkDelete = async () => {
+    const ids = Array.from(selectedIds)
+    if (ids.length === 0) return
+    try {
+      await Promise.all(ids.map((id) => callMessages("DELETE", `/${id}`, {})))
+      await refresh()
+      toastSuccess(`${ids.length} message${ids.length === 1 ? "" : "s"} deleted.`)
+    } catch (e) {
+      toastError(e, "Failed to delete messages")
+      throw e
+    }
+  }
+
+  // v5.0.26 pagination handlers.
   const goNewest = () => setCurrentOffset(0)
   const goNewer = () =>
     setCurrentOffset(Math.max(0, currentOffset - PAGE_SIZE))
@@ -550,45 +567,91 @@ export function MessagesDashboard() {
   const rangeStart = total === 0 ? 0 : currentOffset + 1
   const rangeEnd = Math.min(currentOffset + PAGE_SIZE, total)
 
-  const deleteOne = async (m: Message) => {
-    setActionError(null)
-    try {
-      await callMessages("DELETE", `/${m.message_id}`, {})
-      // Close the detail modal if it was showing the deleted row, so
-      // we don't strand the user on a record that no longer exists.
-      if (detailDialog.data?.message_id === m.message_id) {
-        detailDialog.close()
-      }
-      await refresh()
-    } catch (e: any) {
-      setActionError(e.message ?? String(e))
-    }
-  }
+  // Page-scoped read/unread counts for the stats row. Total is the
+  // server-reported global count; unread/read are honestly labelled
+  // "on this page" since the list is paginated (100/page).
+  const unreadOnPage = messages.filter(
+    (m) => !(m.read === 1 || m.read === true),
+  ).length
+  const readOnPage = messages.length - unreadOnPage
 
   return (
-    <div className="p-6 space-y-4">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold flex items-center gap-2">
-          <MessageSquare className="h-6 w-6 text-primary" />
-          Messages
-        </h1>
-        <div className="flex gap-2">
-          <Button variant="outline" size="sm" onClick={refresh} disabled={loading}>
-            <RefreshCw className={`h-4 w-4 mr-1 ${loading ? "animate-spin" : ""}`} />
+    <div className="w-full p-4 sm:p-6 space-y-4 sm:space-y-6">
+      {/* Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+        <div>
+          <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight text-foreground">Messages</h1>
+          <p className="text-muted-foreground text-sm sm:text-base mt-1">Inspect and route inter-agent messages</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2 sm:gap-3">
+          {activeServer && (
+            <Badge variant="outline" className="text-xs bg-primary/15 text-primary border-primary/30 font-medium">
+              <span aria-hidden className="w-2 h-2 bg-primary rounded-full mr-2" />
+              {activeServer.name}
+            </Badge>
+          )}
+          {lastFetch && (
+            <span className="text-xs text-muted-foreground">
+              Last updated: {new Date(lastFetch).toLocaleTimeString()}
+            </span>
+          )}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={refresh}
+            disabled={loading}
+            className="text-xs"
+          >
+            <RefreshCw className={cn("h-3.5 w-3.5 mr-1.5", loading && "animate-spin")} />
             Refresh
           </Button>
           <Button size="sm" onClick={() => setComposeOpen((v) => !v)}>
-            <Send className="h-4 w-4 mr-1" />
-            {composeOpen ? "Close" : "Compose"}
+            {composeOpen ? (
+              <>
+                <X className="h-4 w-4 mr-1" />
+                Close
+              </>
+            ) : (
+              <>
+                <Plus className="h-4 w-4 mr-1" />
+                New Message
+              </>
+            )}
           </Button>
         </div>
       </div>
 
-      {error && (
-        <div className="rounded-md border border-destructive/30 bg-destructive/10 text-destructive p-3 text-sm">
-          {error}
-        </div>
-      )}
+      {/* Stats */}
+      <div className="grid gap-3 sm:gap-4 grid-cols-2 xl:grid-cols-4">
+        <StatsCard
+          icon={MessageSquare}
+          label="Total"
+          value={total}
+          change={total > 0 ? `${messages.length} on this page` : undefined}
+          trend="neutral"
+        />
+        <StatsCard
+          icon={Mail}
+          label="Unread"
+          value={unreadOnPage}
+          change="on this page"
+          trend={unreadOnPage > 0 ? "down" : "neutral"}
+        />
+        <StatsCard
+          icon={MailOpen}
+          label="Read"
+          value={readOnPage}
+          change="on this page"
+          trend="up"
+        />
+        <StatsCard
+          icon={CheckSquare}
+          label="Selected"
+          value={selectedIds.size}
+          change={selectedIds.size > 0 ? "ready to act" : "none"}
+          trend="neutral"
+        />
+      </div>
 
       {composeOpen && (
         <Card>
@@ -644,9 +707,6 @@ export function MessagesDashboard() {
                 schema contract. */}
             {composeReplyParentId ? (
               <div className="rounded-md border border-muted bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-                {/* v5.0.24 polish: show the parent's subject (or a
-                    content snippet) instead of the opaque
-                    message_id. */}
                 ↳ reply to:{" "}
                 <span className="font-medium text-foreground">
                   {labelForParent(composeReplyParentId)}
@@ -669,8 +729,6 @@ export function MessagesDashboard() {
                     value={composeSubject}
                     onChange={(e) => {
                       setComposeSubject(e.target.value)
-                      // v5.0.24 polish: typing into the field clears
-                      // any stale "no suggestion" hint.
                       if (suggestHint) setSuggestHint(null)
                     }}
                   />
@@ -702,6 +760,7 @@ export function MessagesDashboard() {
             </div>
             <div className="flex justify-end">
               <Button onClick={send} disabled={composing || !composeRecipient || !composeContent}>
+                <Send className="h-4 w-4 mr-1" />
                 {composing ? "Sending…" : "Send"}
               </Button>
             </div>
@@ -709,98 +768,75 @@ export function MessagesDashboard() {
         </Card>
       )}
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Filters</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {/* CC-22 audit 2026-06-02: filter grid stepping was
-              `grid-cols-1 md:grid-cols-6` — 6 cols on tablet (768)
-              squished SelectTriggers to where the value text
-              ("priority", "any sender") didn't fit. Now stepped
-              1 → 2 → 3 → 6 so each step keeps comfortable widths. */}
-          <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-6">
-            {/*
-              Migrated 2026-06-04 (feat/agent-select-dropdown): the
-              From/To filter dropdowns now share <AgentSelect> with
-              every other agent-input site in the dashboard.
-              noneLabel="— Any —" because filter semantics differ from
-              task assignment ("Unassigned"): an empty filter means
-              "no filter".
-
-              Tradeoff acknowledged in the PR body: the previous
-              implementation sourced from `filterOptions` which
-              appended `tombstones` (sender_id / recipient_id strings
-              starting with "[deleted-...") so an admin could still
-              grep history for purged agents. <AgentSelect> sources
-              live agents only — per the locked design decision in
-              the prancy-napping-pie plan. If the lost-tombstone-
-              search affordance matters in practice, a follow-up PR
-              should add a parallel "Tombstones" search box or extend
-              <AgentSelect> with an explicit `extraItems` prop. For
-              now, consistency wins.
-            */}
-            <AgentSelect
-              value={filters.from || null}
-              onChange={(v) => setFilter("from", v ?? "")}
-              noneLabel="— Any —"
-              placeholder="from"
-            />
-            <AgentSelect
-              value={filters.to || null}
-              onChange={(v) => setFilter("to", v ?? "")}
-              noneLabel="— Any —"
-              placeholder="to"
-            />
-            {/* Retain the underlying ALL sentinel constant for the
-                non-agent filter dropdowns below (type / priority /
-                read?). Those have their own enums and are not
-                migration targets for <AgentSelect>. */}
-            <Select
-              value={filters.type || ALL}
-              onValueChange={(v) => setFilter("type", v === ALL ? "" : v)}
-            >
-              <SelectTrigger><SelectValue placeholder="type" /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ALL}>all types</SelectItem>
-                {MESSAGE_TYPES.map((t) => (<SelectItem key={t} value={t}>{t}</SelectItem>))}
-              </SelectContent>
-            </Select>
-            <Select
-              value={filters.priority || ALL}
-              onValueChange={(v) => setFilter("priority", v === ALL ? "" : v)}
-            >
-              <SelectTrigger><SelectValue placeholder="priority" /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ALL}>any priority</SelectItem>
-                {PRIORITIES.map((p) => (<SelectItem key={p} value={p}>{p}</SelectItem>))}
-              </SelectContent>
-            </Select>
-            <Select
-              value={filters.read || ALL}
-              onValueChange={(v) => setFilter("read", v === ALL ? "" : (v as "true" | "false"))}
-            >
-              <SelectTrigger><SelectValue placeholder="read?" /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ALL}>any</SelectItem>
-                <SelectItem value="false">unread</SelectItem>
-                <SelectItem value="true">read</SelectItem>
-              </SelectContent>
-            </Select>
-            <Input
-              placeholder="content (substring)"
-              value={filters.q}
-              onChange={(e) => setFilter("q", e.target.value)}
-            />
-          </div>
-          <div className="flex justify-end mt-2">
-            <Button variant="ghost" size="sm" onClick={clearFilters}>
-              <X className="h-4 w-4 mr-1" />
-              Clear
-            </Button>
-          </div>
-        </CardContent>
-      </Card>
+      {/* Controls — un-boxed filter bar matching Memories/Tasks (no
+          Card wrapper). */}
+      <div className="flex flex-col sm:flex-row sm:flex-wrap items-stretch sm:items-center gap-2 sm:gap-3">
+        <div className="relative flex-1 sm:max-w-xs">
+          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            placeholder="Search content..."
+            value={filters.q}
+            onChange={(e) => setFilter("q", e.target.value)}
+            className="pl-10"
+          />
+        </div>
+        {/*
+          From/To filter dropdowns share <AgentSelect> with every other
+          agent-input site. noneLabel="— Any —" because an empty filter
+          means "no filter".
+        */}
+        <div className="w-full sm:w-40">
+          <AgentSelect
+            value={filters.from || null}
+            onChange={(v) => setFilter("from", v ?? "")}
+            noneLabel="— Any —"
+            placeholder="from"
+          />
+        </div>
+        <div className="w-full sm:w-40">
+          <AgentSelect
+            value={filters.to || null}
+            onChange={(v) => setFilter("to", v ?? "")}
+            noneLabel="— Any —"
+            placeholder="to"
+          />
+        </div>
+        <Select
+          value={filters.type || ALL}
+          onValueChange={(v) => setFilter("type", v === ALL ? "" : v)}
+        >
+          <SelectTrigger className="w-full sm:w-40"><SelectValue placeholder="type" /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value={ALL}>all types</SelectItem>
+            {MESSAGE_TYPES.map((t) => (<SelectItem key={t} value={t}>{t}</SelectItem>))}
+          </SelectContent>
+        </Select>
+        <Select
+          value={filters.priority || ALL}
+          onValueChange={(v) => setFilter("priority", v === ALL ? "" : v)}
+        >
+          <SelectTrigger className="w-full sm:w-36"><SelectValue placeholder="priority" /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value={ALL}>any priority</SelectItem>
+            {PRIORITIES.map((p) => (<SelectItem key={p} value={p}>{p}</SelectItem>))}
+          </SelectContent>
+        </Select>
+        <Select
+          value={filters.read || ALL}
+          onValueChange={(v) => setFilter("read", v === ALL ? "" : (v as "true" | "false"))}
+        >
+          <SelectTrigger className="w-full sm:w-32"><SelectValue placeholder="read?" /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value={ALL}>any</SelectItem>
+            <SelectItem value="false">unread</SelectItem>
+            <SelectItem value="true">read</SelectItem>
+          </SelectContent>
+        </Select>
+        <Button variant="ghost" size="sm" onClick={clearFilters}>
+          <X className="h-4 w-4 mr-1" />
+          Clear
+        </Button>
+      </div>
 
       <Card>
         <CardHeader className="flex flex-row items-center justify-between space-y-0">
@@ -822,7 +858,7 @@ export function MessagesDashboard() {
                 <Mail className="h-4 w-4 mr-1" />
                 Mark unread
               </Button>
-              <Button variant="destructive" size="sm" onClick={bulkDelete}>
+              <Button variant="destructive" size="sm" onClick={() => setBulkDeleteOpen(true)}>
                 <Trash2 className="h-4 w-4 mr-1" />
                 Delete
               </Button>
@@ -830,14 +866,6 @@ export function MessagesDashboard() {
           )}
         </CardHeader>
         <CardContent>
-          {/* CC-3/CC-6/CC-7/CC-20 audit 2026-06-02: Skeleton during
-              the initial load, shared EmptyState body when empty (was
-              just a blank table region under "0 messages"), and a
-              mobile <MessagesMobileList> sibling for narrow viewports
-              where the 9-column table overflows horizontally. Also
-              fixed the desktop column labels — "Pri" / "R" were
-              truncated abbreviations; now full "Priority" / "Read?"
-              at sm:+ and the columns dropped from the mobile view. */}
           {loading && messages.length === 0 ? (
             <div className="space-y-2">
               {Array.from({ length: 6 }).map((_, i) => (
@@ -874,9 +902,6 @@ export function MessagesDashboard() {
                       <TableHead>Time</TableHead>
                       <TableHead>From</TableHead>
                       <TableHead>To</TableHead>
-                      {/* v5.0.22: subject column between To and Type so
-                          the most-scanned thread label sits next to
-                          the participants. */}
                       <TableHead>Subject</TableHead>
                       <TableHead>Type</TableHead>
                       <TableHead>Priority</TableHead>
@@ -886,72 +911,17 @@ export function MessagesDashboard() {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {messages.map((m) => {
-                      const checked = selectedIds.has(m.message_id)
-                      // v5.0.22: rows whose parent_message_id is non-null
-                      // are replies. Visual cue = subtle left border +
-                      // indent + "↳ reply to: <parent_id>" prefix in
-                      // the Subject column.
-                      const isReply = !!m.parent_message_id
-                      return (
-                        <TableRow
-                          key={m.message_id}
-                          className={
-                            "cursor-pointer" +
-                            (isReply ? " border-l-2 border-l-muted-foreground/30" : "")
-                          }
-                          onClick={() => detailDialog.open(m.message_id)}
-                        >
-                          <TableCell onClick={(e) => e.stopPropagation()}>
-                            <input
-                              type="checkbox"
-                              aria-label={`select message ${m.message_id}`}
-                              checked={checked}
-                              onChange={() => toggleOne(m.message_id)}
-                            />
-                          </TableCell>
-                          <TableCell className="text-xs font-mono tabular-nums">
-                            {m.timestamp.slice(0, 19)}
-                          </TableCell>
-                          <TableCell><Badge variant="outline">{m.sender_id}</Badge></TableCell>
-                          <TableCell><Badge variant="outline">{m.recipient_id}</Badge></TableCell>
-                          <TableCell className="text-xs max-w-[200px] truncate">
-                            {m.subject ? (
-                              m.subject
-                            ) : isReply ? (
-                              // v5.0.24 polish: human-readable parent
-                              // label instead of the opaque message_id.
-                              <span className="text-muted-foreground">
-                                ↳ reply to:{" "}
-                                <span className="text-foreground">
-                                  {labelForParent(m.parent_message_id)}
-                                </span>
-                              </span>
-                            ) : (
-                              <span className="text-muted-foreground/50">—</span>
-                            )}
-                          </TableCell>
-                          <TableCell className="text-xs">{m.message_type}</TableCell>
-                          <TableCell className="text-xs">{m.priority}</TableCell>
-                          <TableCell>
-                            {m.read === 1 || m.read === true ? "✓" : ""}
-                          </TableCell>
-                          <TableCell className="max-w-[400px] truncate text-xs">
-                            {m.message_content}
-                          </TableCell>
-                          <TableCell onClick={(e) => e.stopPropagation()}>
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              aria-label="delete message"
-                              onClick={() => deleteOne(m)}
-                            >
-                              <Trash2 className="h-4 w-4" />
-                            </Button>
-                          </TableCell>
-                        </TableRow>
-                      )
-                    })}
+                    {messages.map((m) => (
+                      <MessageRow
+                        key={m.message_id}
+                        message={m}
+                        selected={selectedIds.has(m.message_id)}
+                        onToggle={toggleOne}
+                        onOpenDetail={(msg) => detailDialog.open(msg.message_id)}
+                        onDelete={(msg) => deleteDialog.open(msg.message_id)}
+                        labelForParent={labelForParent}
+                      />
+                    ))}
                   </TableBody>
                 </Table>
               </div>
@@ -962,7 +932,7 @@ export function MessagesDashboard() {
                   selectedIds={selectedIds}
                   toggleOne={toggleOne}
                   openDetail={(m) => detailDialog.open(m.message_id)}
-                  deleteOne={deleteOne}
+                  deleteOne={(m) => deleteDialog.open(m.message_id)}
                   labelForParent={labelForParent}
                   currentOffset={currentOffset}
                   total={total}
@@ -975,10 +945,7 @@ export function MessagesDashboard() {
               </div>
             </>
           )}
-          {/* v5.0.26: pagination footer — desktop only. Hidden on
-              mobile because <MessagesMobileList> renders its own
-              stacked-vertical variant (the desktop flex row doesn't
-              fit narrow viewports comfortably). */}
+          {/* v5.0.26: pagination footer — desktop only. */}
           {total > 0 && (
             <div className="hidden sm:flex items-center justify-between gap-2 mt-4 pt-3 border-t">
               <div className="flex items-center gap-2">
@@ -1027,139 +994,46 @@ export function MessagesDashboard() {
         </CardContent>
       </Card>
 
-      <Dialog
+      {/* Detail modal (extracted <ViewMessageModal>). Mark-read stays
+          inline (modal stays open); Delete routes through the confirm
+          dialog below. */}
+      <ViewMessageModal
+        message={detailDialog.data}
         open={detailDialog.isOpen}
-        onOpenChange={(open) => {
-          if (!open) detailDialog.close()
+        onOpenChange={(open) => { if (!open) detailDialog.close() }}
+        onReply={() => {
+          const m = detailDialog.data
+          if (!m) return
+          openReply(m)
+          detailDialog.close()
         }}
-      >
-        <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-2xl">
-          {/* Local alias keeps the rest of the JSX untouched — every
-              reference to `detailMessage` below reads the hook's data. */}
-          {detailDialog.data && (() => { const detailMessage = detailDialog.data; return (
-            <>
-              <DialogHeader>
-                <DialogTitle className="flex items-center gap-2">
-                  <MessageSquare className="h-5 w-5 text-primary" />
-                  Message detail
-                </DialogTitle>
-                <DialogDescription>
-                  {new Date(detailMessage.timestamp).toLocaleString()} ·{" "}
-                  {relativeTime(detailMessage.timestamp)}
-                </DialogDescription>
-              </DialogHeader>
+        onToggleRead={() => {
+          const m = detailDialog.data
+          if (m) void toggleRead(m)
+        }}
+        onDelete={() => {
+          const m = detailDialog.data
+          if (!m) return
+          detailDialog.close()
+          deleteDialog.open(m.message_id)
+        }}
+      />
 
-              <div className="grid grid-cols-2 gap-x-4 gap-y-3 text-sm">
-                <div>
-                  <div className="text-xs text-muted-foreground">Sender</div>
-                  <div className="font-mono break-all">
-                    {detailMessage.sender_id}
-                  </div>
-                </div>
-                <div>
-                  <div className="text-xs text-muted-foreground">Recipient</div>
-                  <div className="font-mono break-all">
-                    {detailMessage.recipient_id}
-                  </div>
-                </div>
-                <div>
-                  <div className="text-xs text-muted-foreground">Type</div>
-                  <div>
-                    <Badge variant="outline">{detailMessage.message_type}</Badge>
-                  </div>
-                </div>
-                <div>
-                  <div className="text-xs text-muted-foreground">Priority</div>
-                  <div>
-                    <Badge variant="outline">{detailMessage.priority}</Badge>
-                  </div>
-                </div>
-                <div>
-                  <div className="text-xs text-muted-foreground">Delivered</div>
-                  <div>
-                    {detailMessage.delivered === 1 ||
-                    detailMessage.delivered === true ? (
-                      <Badge variant="secondary">✓ delivered</Badge>
-                    ) : (
-                      <Badge variant="outline">✗ pending</Badge>
-                    )}
-                  </div>
-                </div>
-                <div>
-                  <div className="text-xs text-muted-foreground">Read</div>
-                  <div>
-                    {detailMessage.read === 1 ||
-                    detailMessage.read === true ? (
-                      <Badge variant="secondary">✓ read</Badge>
-                    ) : (
-                      <Badge variant="outline">✗ unread</Badge>
-                    )}
-                  </div>
-                </div>
-              </div>
+      {/* Single-message delete confirmation (type-DELETE-to-confirm). */}
+      <DeleteMessageModal
+        message={deleteDialog.data}
+        open={deleteDialog.isOpen}
+        onOpenChange={(open) => { if (!open) deleteDialog.close() }}
+        onConfirm={handleConfirmDelete}
+      />
 
-              <div className="space-y-1">
-                <div className="text-xs text-muted-foreground">Content</div>
-                <pre className="whitespace-pre-wrap break-words rounded-md border bg-muted/50 p-3 font-mono text-xs max-h-[40vh] overflow-auto">
-                  {detailMessage.message_content}
-                </pre>
-              </div>
-
-              <div className="text-[10px] font-mono text-muted-foreground break-all">
-                Message ID: {detailMessage.message_id}
-              </div>
-
-              <DialogFooter>
-                {/* v5.0.22: Reply opens the compose form pre-wired
-                    with parent_message_id pinned to this row. */}
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => {
-                    openReply(detailMessage)
-                    detailDialog.close()
-                  }}
-                >
-                  <Send className="h-4 w-4 mr-1" />
-                  Reply
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => toggleRead(detailMessage)}
-                >
-                  {detailMessage.read === 1 || detailMessage.read === true ? (
-                    <>
-                      <Mail className="h-4 w-4 mr-1" />
-                      Mark unread
-                    </>
-                  ) : (
-                    <>
-                      <MailOpen className="h-4 w-4 mr-1" />
-                      Mark read
-                    </>
-                  )}
-                </Button>
-                <Button
-                  variant="destructive"
-                  size="sm"
-                  onClick={() => deleteOne(detailMessage)}
-                >
-                  <Trash2 className="h-4 w-4 mr-1" />
-                  Delete
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => detailDialog.close()}
-                >
-                  Close
-                </Button>
-              </DialogFooter>
-            </>
-          ); })()}
-        </DialogContent>
-      </Dialog>
+      {/* Bulk delete confirmation. */}
+      <DeleteMessageModal
+        count={selectedIds.size}
+        open={bulkDeleteOpen}
+        onOpenChange={setBulkDeleteOpen}
+        onConfirm={handleConfirmBulkDelete}
+      />
     </div>
   )
 }
