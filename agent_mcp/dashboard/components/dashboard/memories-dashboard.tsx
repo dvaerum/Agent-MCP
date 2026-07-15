@@ -616,6 +616,18 @@ export function MemoriesDashboard() {
         memory={viewDialog.data}
         open={viewDialog.isOpen}
         onOpenChange={(open) => { if (!open) viewDialog.close() }}
+        onEdit={() => {
+          const memory = viewDialog.data
+          if (!memory) return
+          viewDialog.close()
+          handleEdit(memory)
+        }}
+        onDelete={() => {
+          const memory = viewDialog.data
+          if (!memory) return
+          viewDialog.close()
+          handleDelete(memory)
+        }}
       />
 
       {/* Edit Memory Modal (shared standalone component) */}

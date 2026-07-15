@@ -582,7 +582,15 @@ interface RowDialogProps {
 
 // ---------- View dialog (read-only) -------------------------------
 
-const ViewTaskDialog = React.memo(({ task, onOpenChange }: RowDialogProps) => {
+interface ViewTaskDialogProps extends RowDialogProps {
+  // Optional in-modal actions. When provided, the parent wires these to
+  // close this view dialog and open the sibling edit/delete confirm
+  // dialog (close-then-open avoids stacked-dialog issues).
+  onEdit?: () => void
+  onDelete?: () => void
+}
+
+const ViewTaskDialog = React.memo(({ task, onOpenChange, onEdit, onDelete }: ViewTaskDialogProps) => {
   const open = task !== null
 
   // Parse JSON-shaped optional fields safely.
@@ -827,6 +835,18 @@ const ViewTaskDialog = React.memo(({ task, onOpenChange }: RowDialogProps) => {
             </div>
 
             <DialogFooter className="px-6 py-4 border-t border-border flex-shrink-0">
+              {onEdit && (
+                <Button variant="outline" size="sm" onClick={onEdit}>
+                  <Pencil className="h-4 w-4 mr-1" />
+                  Edit
+                </Button>
+              )}
+              {onDelete && (
+                <Button variant="destructive" size="sm" onClick={onDelete}>
+                  <Trash2 className="h-4 w-4 mr-1" />
+                  Delete
+                </Button>
+              )}
               <Button variant="outline" size="sm" onClick={() => onOpenChange(false)}>Close</Button>
             </DialogFooter>
           </>
@@ -1501,6 +1521,18 @@ export function TasksDashboard() {
       <ViewTaskDialog
         task={viewDialog.data}
         onOpenChange={(open) => { if (!open) viewDialog.close() }}
+        onEdit={() => {
+          const task = viewDialog.data
+          if (!task) return
+          viewDialog.close()
+          openEdit(task.task_id)
+        }}
+        onDelete={() => {
+          const task = viewDialog.data
+          if (!task) return
+          viewDialog.close()
+          openDelete(task.task_id)
+        }}
       />
       <EditTaskDialog
         task={editDialog.data}

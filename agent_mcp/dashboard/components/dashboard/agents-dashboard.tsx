@@ -1455,11 +1455,22 @@ const AgentDetailDialog = ({
   open,
   onOpenChange,
   onTaskClick,
+  onEdit,
+  onTerminate,
+  onPurge,
 }: {
   agent: Agent | null
   open: boolean
   onOpenChange: (open: boolean) => void
   onTaskClick: (task: Task) => void
+  // Optional in-modal actions. When provided, the parent wires these to
+  // close this detail dialog and open the sibling edit/terminate/purge
+  // confirm dialog (close-then-open avoids stacked-dialog issues). The
+  // render conditionals below mirror the row actions: Edit hidden for
+  // Admin; Terminate only for a live agent; Purge only once terminated.
+  onEdit?: () => void
+  onTerminate?: () => void
+  onPurge?: () => void
 }) => {
   const [revealToken, setRevealToken] = useState(false)
   const [copied, setCopied] = useState(false)
@@ -1862,6 +1873,24 @@ const AgentDetailDialog = ({
         </div>
 
         <DialogFooter className="px-6 py-4 border-t border-border flex-shrink-0">
+          {onEdit && agent.agent_id !== 'Admin' && (
+            <Button type="button" variant="outline" size="sm" onClick={onEdit}>
+              <Pencil className="h-4 w-4 mr-1" />
+              Edit
+            </Button>
+          )}
+          {onTerminate && agent.status !== 'terminated' && agent.agent_id !== 'Admin' && (
+            <Button type="button" variant="destructive" size="sm" onClick={onTerminate}>
+              <Trash2 className="h-4 w-4 mr-1" />
+              Terminate
+            </Button>
+          )}
+          {onPurge && agent.status === 'terminated' && agent.agent_id !== 'Admin' && (
+            <Button type="button" variant="destructive" size="sm" onClick={onPurge}>
+              <Trash2 className="h-4 w-4 mr-1" />
+              Purge
+            </Button>
+          )}
           <Button
             type="button"
             variant="outline"
@@ -2286,6 +2315,27 @@ export function AgentsDashboard() {
         }}
         onTaskClick={(task) => {
           handleTaskClick(task)
+        }}
+        onEdit={() => {
+          const agent = detailDialog.data
+          if (!agent) return
+          detailDialog.close()
+          setSelectedAgent(null)
+          handleEditAgent(agent)
+        }}
+        onTerminate={() => {
+          const agent = detailDialog.data
+          if (!agent) return
+          detailDialog.close()
+          setSelectedAgent(null)
+          handleTerminateConfirm(agent.agent_id)
+        }}
+        onPurge={() => {
+          const agent = detailDialog.data
+          if (!agent) return
+          detailDialog.close()
+          setSelectedAgent(null)
+          handlePurgeAgent(agent.agent_id)
         }}
       />
 
