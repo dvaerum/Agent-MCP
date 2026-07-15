@@ -54,6 +54,11 @@ class TaskFilterSpec:
     agent_id: Optional[str] = None
     parent_task_id: Optional[str] = None
     blocked_only: bool = False
+    # When ``agent_id`` is set, ``include_unassigned`` widens the match
+    # to ``assigned_to == agent_id OR assigned_to IS NULL`` — the
+    # worker-facing "my tasks + the claimable pool" visibility rule.
+    # Ignored when ``agent_id`` is None (no ownership filter to widen).
+    include_unassigned: bool = False
 
 
 @dataclass(frozen=True)
@@ -239,11 +244,19 @@ class TaskQueryEngine:
             return False
         if filters.priority and task.get("priority") != filters.priority:
             return False
-        if (
-            filters.agent_id
-            and task.get("assigned_to") != filters.agent_id
-        ):
-            return False
+        if filters.agent_id:
+            assignee = task.get("assigned_to")
+            if filters.include_unassigned:
+                # Worker pool visibility: own tasks OR the unassigned
+                # (claimable) pool. Foreign-owned rows still fail the
+                # match — cross-worker isolation (AZ-R17-1 / PF-1) holds.
+                if (
+                    assignee != filters.agent_id
+                    and assignee not in (None, "")
+                ):
+                    return False
+            elif assignee != filters.agent_id:
+                return False
         if (
             filters.parent_task_id
             and task.get("parent_task") != filters.parent_task_id

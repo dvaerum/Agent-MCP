@@ -217,6 +217,41 @@ def test_filter_combined_status_and_agent(engine: TaskQueryEngine) -> None:
     assert ids == {"t4", "t8"}, ids
 
 
+def test_filter_by_agent_excludes_unassigned_by_default() -> None:
+    """Default ``agent_id`` filter is strict equality: an unassigned
+    (``assigned_to IS NULL``) row does NOT match — the pre-fix behavior
+    stays the default for admins filtering by a specific agent."""
+    snap = {
+        "own": _task("own", assigned_to="alice"),
+        "pool": _task("pool", assigned_to=None),
+        "other": _task("other", assigned_to="bob"),
+    }
+    engine = TaskQueryEngine(task_source=lambda: snap)
+    result = engine.query(filters=TaskFilterSpec(agent_id="alice"))
+    ids = {t["task_id"] for t in result.tasks}
+    assert ids == {"own"}, ids
+
+
+def test_filter_include_unassigned_widens_to_pool() -> None:
+    """``include_unassigned=True`` widens an ``agent_id`` filter to
+    'my tasks OR the unassigned pool' — the worker visibility rule. A
+    foreign-owned row (assigned to another agent) still never matches,
+    preserving cross-worker isolation."""
+    snap = {
+        "own": _task("own", assigned_to="alice"),
+        "pool_null": _task("pool_null", assigned_to=None),
+        "pool_empty": _task("pool_empty", assigned_to=""),
+        "other": _task("other", assigned_to="bob"),
+    }
+    engine = TaskQueryEngine(task_source=lambda: snap)
+    result = engine.query(
+        filters=TaskFilterSpec(agent_id="alice", include_unassigned=True)
+    )
+    ids = {t["task_id"] for t in result.tasks}
+    assert ids == {"own", "pool_null", "pool_empty"}, ids
+    assert "other" not in ids, "cross-worker isolation regressed"
+
+
 # --- 2. Sort rules ----------------------------------------------------
 
 

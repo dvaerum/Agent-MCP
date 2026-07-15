@@ -3284,6 +3284,15 @@ async def view_tasks_tool_impl(
             agent_id=target_agent_id_for_filter,
             parent_task_id=filter_parent_task,
             blocked_only=bool(show_blocked_tasks),
+            # A non-admin worker sees its own tasks PLUS the unassigned
+            # (claimable) pool — so the documented self-claim loop can
+            # actually discover a task_id. Pool visibility is
+            # unconditional for workers (NOT gated on
+            # config_allow_worker_self_assign, which only gates the
+            # write-side claim). Foreign-owned rows stay hidden.
+            # An admin filtering by a specific agent_id wants exactly
+            # that agent's tasks, so this stays off for admins.
+            include_unassigned=not is_admin_request,
         ),
         sort=TaskSortSpec(by=sort_by),
     )
@@ -4626,9 +4635,17 @@ async def search_tasks_tool_impl(
     # Get tasks user can see
     candidate_tasks = []
     for task_id, task_data in g.tasks.items():
-        # Permission check
-        if not is_admin_request and task_data.get("assigned_to") != requesting_agent_id:
-            continue
+        # Permission check. A non-admin worker sees its own tasks PLUS
+        # the unassigned (claimable) pool — mirrors view_tasks so the
+        # self-claim loop can discover a task_id. Foreign-owned rows
+        # (assigned_to == another worker) stay hidden, preserving the
+        # cross-worker isolation invariant (AZ-R17-1 / PF-1). Pool
+        # visibility is unconditional (not gated on
+        # config_allow_worker_self_assign, which only gates the claim).
+        if not is_admin_request:
+            assignee = task_data.get("assigned_to")
+            if assignee != requesting_agent_id and assignee not in (None, ""):
+                continue
 
         # Status filter
         if status_filter and task_data.get("status") != status_filter:
