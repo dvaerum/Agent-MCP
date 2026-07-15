@@ -40,6 +40,7 @@ import { useDataStore } from '@/lib/stores/data-store'
 import { useServerStore } from '@/lib/stores/server-store'
 import { useDialog } from '@/hooks/use-dialog'
 import { apiClient, type Memory } from '@/lib/api'
+import { decodeMemoryValue, memoryValuePreview } from '@/lib/memory-value'
 import { CreateMemoryModal } from './modals/create-memory-modal'
 import { ViewMemoryModal } from './modals/view-memory-modal'
 import { SmartValueEditor } from './modals/smart-value-editor'
@@ -102,17 +103,15 @@ const MemoryRow = ({ memory, onView, onEdit, onDelete }: {
   // that used to hide "secret-looking" rows (and, wrongly, the
   // operator's own legitimate notes) is gone. Real secrets belong in
   // the operator-only project_settings store, never in memory.
-  const formatValue = (value: any, _key?: string) => {
-    if (typeof value === 'string') {
-      return value.length > 30 ? value.substring(0, 30) + '...' : value
-    }
-    return JSON.stringify(value).length > 30
-      ? JSON.stringify(value).substring(0, 30) + '...'
-      : JSON.stringify(value)
+  //
+  // Wave 13: the value cell shows a compact type badge + one-line
+  // snippet of the human-readable content; the full rich view is the
+  // modal (View action).
+  const preview = memoryValuePreview(decodeMemoryValue(memory.value))
+  const valueTooltip = (value: any): string => {
+    const raw = typeof value === 'string' ? value : JSON.stringify(value)
+    return raw
   }
-
-  const valueTooltip = (value: any, _key?: string): string =>
-    JSON.stringify(value)
 
   const formatKey = (key: string) => {
     return key.length > 25 ? key.substring(0, 25) + '...' : key
@@ -137,10 +136,16 @@ const MemoryRow = ({ memory, onView, onEdit, onDelete }: {
         </div>
       </TableCell>
       
-      {/* Value - Hidden on mobile, shown on tablet+ */}
+      {/* Value - Hidden on mobile, shown on tablet+. Compact preview:
+          type badge + one-line snippet (full rich view is the modal). */}
       <TableCell className="py-2 px-2 hidden md:table-cell">
-        <div className="font-mono text-xs text-foreground truncate max-w-[150px]" title={valueTooltip(memory.value, memory.context_key)}>
-          {formatValue(memory.value, memory.context_key)}
+        <div className="flex items-center gap-2 max-w-[220px]" title={valueTooltip(memory.value)}>
+          <Badge variant="outline" className="text-xs px-1.5 py-0 flex-shrink-0 whitespace-nowrap">
+            {preview.label}
+          </Badge>
+          <span className="text-xs text-muted-foreground truncate">
+            {preview.snippet}
+          </span>
         </div>
       </TableCell>
       

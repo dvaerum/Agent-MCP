@@ -13,6 +13,8 @@ import {
 } from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
 import type { Memory } from '@/lib/api'
+import { MemoryValueView } from '@/components/dashboard/memory-value-view'
+import { decodeMemoryValue } from '@/lib/memory-value'
 
 interface ViewMemoryModalProps {
   memory: Memory | null
@@ -27,11 +29,19 @@ export function ViewMemoryModal({ memory, open, onOpenChange }: ViewMemoryModalP
   // is shared project knowledge, rendered AS-IS — the key-name masking
   // is gone. Real secrets belong in the operator-only project_settings
   // store, never in memory.
+  // Human-readable copy string for the footer "Copy Value" / "Copy All"
+  // actions: pretty JSON for JSON values, otherwise the decoded logical
+  // string. The in-panel MemoryValueView owns its own format-aware Copy.
   const formatValue = (value: any) => {
-    if (typeof value === 'string') {
-      return value
+    const decoded = decodeMemoryValue(value)
+    if (decoded.format === 'json') {
+      try {
+        return JSON.stringify(decoded.payload, null, 2)
+      } catch {
+        return decoded.raw
+      }
     }
-    return JSON.stringify(value, null, 2)
+    return typeof decoded.payload === 'string' ? decoded.payload : decoded.raw
   }
 
   const copyToClipboard = async (text: string, type: string) => {
@@ -116,24 +126,11 @@ export function ViewMemoryModal({ memory, open, onOpenChange }: ViewMemoryModalP
             </div>
           )}
 
-          {/* Value */}
+          {/* Value — rich, auto-detected rendering with a format selector
+              and a Raw escape hatch (Wave 13). */}
           <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-medium text-foreground">Value</h3>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => copyToClipboard(formatValue(memory.value), 'Memory value')}
-                className="h-6 w-6 p-0"
-              >
-                <Copy className="h-3 w-3" />
-              </Button>
-            </div>
-            <div className="bg-muted/30 border border-border rounded-lg p-3 max-h-64 overflow-y-auto">
-              <pre className="font-mono text-sm text-foreground whitespace-pre-wrap break-words">
-                {formatValue(memory.value)}
-              </pre>
-            </div>
+            <h3 className="text-sm font-medium text-foreground">Value</h3>
+            <MemoryValueView value={memory.value} />
           </div>
 
           {/* Metadata */}
