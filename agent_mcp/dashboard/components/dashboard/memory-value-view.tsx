@@ -188,8 +188,13 @@ export function MemoryValueView({ value, className }: MemoryValueViewProps) {
         <CopyButton text={copyText} />
       </div>
 
-      {/* Body */}
-      <div className="bg-muted/30 border border-border rounded-lg p-3 max-h-96 overflow-y-auto">
+      {/* Body — no inner vertical scroll: the value block grows to its
+          natural height and the modal (DialogContent max-h-[90vh]
+          overflow-y-auto) is the single vertical scroller, so large JSON
+          no longer produces a nested "double scroll". Wide lines still
+          scroll horizontally inside each <pre> (overflow-x-auto), which
+          preserves JSON indentation. */}
+      <div className="bg-muted/30 border border-border rounded-lg p-3">
         <MemoryValueBody decoded={decoded} effective={effective} />
       </div>
     </div>
