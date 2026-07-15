@@ -37,8 +37,10 @@ from ...core.tool_result import (
 from ...tools.registry import ToolInputValidationError, dispatch_tool_call
 from ...utils.json_utils import get_sanitized_json_body
 from ...utils.string_utils import (
+    MEMORY_KEY_ERROR,
     UNSAFE_KEY_ERROR,
     has_unsafe_unicode_for_identifier,
+    is_valid_memory_key,
 )
 
 
@@ -121,6 +123,14 @@ async def create_memory_api_route(
     if has_unsafe_unicode_for_identifier(context_key):
         return JSONResponse(UNSAFE_KEY_ERROR, status_code=400)
 
+    # Positive allowlist: memory keys are URL path segments, so they must be
+    # ASCII + URL-safe; the namespacing '/' is allowed (routes accept it via
+    # {context_key:path}). Subsumes the bidi check above but keeps that
+    # check's specific spoofing message for the bidi case. See
+    # ``string_utils.MEMORY_KEY_RE``.
+    if not is_valid_memory_key(context_key):
+        return JSONResponse(MEMORY_KEY_ERROR, status_code=400)
+
     # Operator-session Principal (a forwarding VIEWER gets a viewer-role
     # Principal the tool's capability gate denies — AC-R5-1). Mirrors the
     # task / agent thin adapters.
@@ -177,7 +187,7 @@ async def create_memory_api_route(
     )
 
 
-@router.put("/{context_key}")
+@router.put("/{context_key:path}")
 async def update_memory_api_route(
     context_key: str,
     request: Request,
@@ -211,6 +221,14 @@ async def update_memory_api_route(
     # decoder has already let the unsafe payload in).
     if has_unsafe_unicode_for_identifier(context_key):
         return JSONResponse(UNSAFE_KEY_ERROR, status_code=400)
+
+    # Positive allowlist: memory keys are URL path segments, so they must be
+    # ASCII + URL-safe; the namespacing '/' is allowed (routes accept it via
+    # {context_key:path}). Subsumes the bidi check above but keeps that
+    # check's specific spoofing message for the bidi case. See
+    # ``string_utils.MEMORY_KEY_RE``.
+    if not is_valid_memory_key(context_key):
+        return JSONResponse(MEMORY_KEY_ERROR, status_code=400)
 
     try:
         data = await get_sanitized_json_body(request)
@@ -275,7 +293,7 @@ async def update_memory_api_route(
     )
 
 
-@router.delete("/{context_key}")
+@router.delete("/{context_key:path}")
 async def delete_memory_api_route(
     context_key: str,
     request: Request,

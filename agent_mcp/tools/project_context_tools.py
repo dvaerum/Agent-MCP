@@ -1575,6 +1575,20 @@ async def create_project_context_tool_impl(
             field="context_key", message="context_key is required"
         )
 
+    # Positive key allowlist (string_utils.MEMORY_KEY_RE): letters, digits,
+    # and . _ / - only. '/' is the allowed namespacing convention. Enforced
+    # here so MCP-wire agents get the same gate as the REST create handler.
+    from ..utils.string_utils import is_valid_memory_key
+
+    if not is_valid_memory_key(context_key):
+        return Invalid(
+            field="context_key",
+            message=(
+                "context_key may contain only letters, digits, and . _ / - "
+                "(A-Z a-z 0-9 . _ / -)."
+            ),
+        )
+
     # ADR-0016: config_* (AoE gate included) is rejected wholesale by
     # _check_write_authorization inside _create_context_inline.
 

@@ -94,24 +94,24 @@ async def test_create_memory_rejects_unsafe_unicode_key(
             sess.close()
 
 
-# ── Legitimate inputs (must 200, regression guard) ───────────────────
+# ── Allowed inputs (must 200) ────────────────────────────────────────
+# The memory-key charset is now the ASCII allowlist ^[A-Za-z0-9._/-]+$
+# (string_utils.MEMORY_KEY_RE) — tighter than the old bidi-only denylist.
+# '/' is allowed (namespacing); '.' '_' '-' too.
 
 _ALLOWED_KEYS = [
-    ("ascii_dotted",       "a.b.c"),
-    ("latin1_accent",      "caf\xe9.config"),
-    ("cjk",                "测试.key"),
-    ("emoji",              "emoji.\U0001f680.key"),
+    ("ascii_dotted",   "a.b.c"),
+    ("slashed",        "ios/repo"),
+    ("hyphen_under",   "a-b_c.d"),
 ]
 
 
 @pytest.mark.parametrize("label,good_key", _ALLOWED_KEYS, ids=[t[0] for t in _ALLOWED_KEYS])
-async def test_create_memory_accepts_legitimate_unicode_key(
+async def test_create_memory_accepts_conforming_key(
     tmp_path, label: str, good_key: str,
 ) -> None:
-    """POST /api/memories with normal Unicode (accents, CJK, emoji)
-    must continue to succeed — the validator only rejects
-    control/bidi/invisible chars, not "I have a non-ASCII codepoint"
-    in general."""
+    """POST /api/memories with an ASCII-allowlist-conforming key
+    (letters/digits/. _ / -) succeeds and the row lands."""
     async with mcp_session(tmp_path) as admin:
         r = admin.client.post(
             "/api/memories",
@@ -122,7 +122,6 @@ async def test_create_memory_accepts_legitimate_unicode_key(
             f"{label}: expected 200 for key {good_key!r}, "
             f"got {r.status_code} body={r.text!r}"
         )
-        # Sanity: the row landed.
         from agent_mcp.db.engine import SessionLocal
         from agent_mcp.db.models import ProjectContext
 
@@ -135,6 +134,52 @@ async def test_create_memory_accepts_legitimate_unicode_key(
             )
             assert row is not None, (
                 f"{label}: 200 was returned but the row did not commit"
+            )
+        finally:
+            sess.close()
+
+
+# ── Non-ASCII inputs now REJECTED (contract change: ASCII-only) ──────
+# Accents / CJK / emoji were permitted by the old bidi-only denylist but
+# are rejected by the ASCII allowlist (operator decision 2026-07-15:
+# keys are URL path segments; ASCII-only removes homograph/encoding
+# ambiguity like café vs cafe).
+
+_NON_ASCII_KEYS = [
+    ("latin1_accent",  "caf\xe9.config"),
+    ("cjk",            "测试.key"),
+    ("emoji",          "emoji.\U0001f680.key"),
+]
+
+
+@pytest.mark.parametrize("label,bad_key", _NON_ASCII_KEYS, ids=[t[0] for t in _NON_ASCII_KEYS])
+async def test_create_memory_rejects_non_ascii_key(
+    tmp_path, label: str, bad_key: str,
+) -> None:
+    """POST /api/memories with a non-ASCII key must now 400 (ASCII
+    allowlist) and no row lands."""
+    async with mcp_session(tmp_path) as admin:
+        r = admin.client.post(
+            "/api/memories",
+            json={"context_key": bad_key, "context_value": "val"},
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
+        )
+        assert r.status_code == 400, (
+            f"{label}: expected 400 for non-ASCII key {bad_key!r}, "
+            f"got {r.status_code} body={r.text!r}"
+        )
+        from agent_mcp.db.engine import SessionLocal
+        from agent_mcp.db.models import ProjectContext
+
+        sess = SessionLocal()
+        try:
+            row = (
+                sess.query(ProjectContext)
+                .filter(ProjectContext.context_key == bad_key)
+                .one_or_none()
+            )
+            assert row is None, (
+                f"{label}: 400 returned but the row was committed: {row!r}"
             )
         finally:
             sess.close()
