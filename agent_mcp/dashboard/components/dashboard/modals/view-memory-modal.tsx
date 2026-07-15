@@ -23,19 +23,11 @@ interface ViewMemoryModalProps {
 export function ViewMemoryModal({ memory, open, onOpenChange }: ViewMemoryModalProps) {
   if (!memory) return null
 
-  // Same secret-key redaction as memories-dashboard.tsx. The Copy
-  // buttons in this modal also copy the masked value so the admin
-  // token can't leak through the clipboard either. See
-  // UPSTREAM_ISSUES.md issue B.
-  const SECRET_KEY_RE = /(token|secret|password|api[_-]?key|priv(?:ate)?[_-]?key)/i
-  const NON_SECRET_RE = /(token[_-]?(count|limit|usage|stats|description|name|kind))/i
-  const isSecretKey = (key: string): boolean =>
-    SECRET_KEY_RE.test(key) && !NON_SECRET_RE.test(key)
-
+  // ADR-0017 (Wave 12 PR B): no content-based secret redaction. memory
+  // is shared project knowledge, rendered AS-IS — the key-name masking
+  // is gone. Real secrets belong in the operator-only project_settings
+  // store, never in memory.
   const formatValue = (value: any) => {
-    if (memory && isSecretKey(memory.context_key)) {
-      return '(redacted — secret-looking key. Read it from systemd journal if needed.)'
-    }
     if (typeof value === 'string') {
       return value
     }

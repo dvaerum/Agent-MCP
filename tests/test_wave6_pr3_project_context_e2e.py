@@ -162,11 +162,10 @@ def _seed_legacy_context_row(key: str, value) -> None:
 
 
 async def test_view_project_context_admin_sees_secret_keys(tmp_path) -> None:
-    """An operator-tier Principal bypasses the
-    ``_SECRET_KEY_RE`` redaction — pinned so the migration's
-    ``principal.has_role("admin")`` check stays equivalent to the
-    pre-migration ``verify_token(.., "admin")`` for operator-tier
-    callers.
+    """An operator-tier Principal sees every memory row (baseline).
+
+    ADR-0017 (Wave 12 PR B): there is no content-based secret redaction on
+    this surface — operators and workers alike see rows in full.
     """
     from agent_mcp.tools.registry import dispatch_tool_call
 
@@ -187,13 +186,13 @@ async def test_view_project_context_admin_sees_secret_keys(tmp_path) -> None:
     assert "config_pr3_secret_token" in (result.message or "")
 
 
-async def test_view_project_context_worker_redacts_secret_keys(
+async def test_view_project_context_worker_sees_secret_keys(
     tmp_path,
 ) -> None:
-    """A worker-tier Principal still gets the
-    ``_SECRET_KEY_RE`` redaction. Issue I parity — workers must
-    not see ``config_*_token`` / ``_secret`` / ``_password`` keys
-    through this surface."""
+    """ADR-0017 (Wave 12 PR B): a worker-tier Principal sees a
+    secret-named memory row AS-IS. memory is shared project content,
+    returned in full to any authorized reader — there is no content-based
+    secret redaction on this surface any more."""
     from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path):
@@ -210,10 +209,10 @@ async def test_view_project_context_worker_redacts_secret_keys(
 
     assert isinstance(result, Ok)
     keys = {e["key"] for e in (result.data.get("entries") or [])}
-    assert "config_pr3_redact_token" not in keys, (
-        "worker-tier Principal must NOT see secret-pattern keys"
+    assert "config_pr3_redact_token" in keys, (
+        "ADR-0017: worker sees the memory row in full"
     )
-    assert "config_pr3_redact_token" not in (result.message or "")
+    assert "config_pr3_redact_token" in (result.message or "")
 
 
 async def test_view_project_context_anonymous_rejected(tmp_path) -> None:

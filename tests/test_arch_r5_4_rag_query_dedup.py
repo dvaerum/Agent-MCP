@@ -161,16 +161,14 @@ def _wire_capture(monkeypatch) -> _CapturingClient:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("query_fn", [query_rag_system, query_rag_system_with_model])
-async def test_rag_secret_redaction_shared_across_both_query_paths(
+async def test_rag_returns_row_in_full_across_both_query_paths(
     tmp_path, monkeypatch, query_fn
 ) -> None:
-    """A secret-keyed project_context row is redacted before it reaches
-    the LLM, regardless of which public query function is called. Both
-    functions now source live context through the SAME
-    ``rag_repo.fetch_recent_context`` seam, so this single test
-    guarantees the two paths cannot silently diverge the way the old
-    per-function-only tests could (one path's filter could be fixed
-    without the other's)."""
+    """ADR-0017: a project_context row reaches the LLM AS-IS, regardless of
+    which public query function is called. Both functions source live
+    context through the SAME ``rag_repo.fetch_recent_context`` seam, so
+    this single test guarantees the two paths can't silently diverge —
+    and there is no content-based secret redaction on either."""
     async with mcp_session(tmp_path) as admin:
         _seed(admin, key="shared_seam_secret", value=_SECRET_VALUE)
         _seed(admin, key="project_readme", value=_PUBLIC_VALUE)
@@ -179,13 +177,12 @@ async def test_rag_secret_redaction_shared_across_both_query_paths(
         await query_fn("what secrets does the project use?")
 
         user = _user_content(cap)
-        assert _SECRET_VALUE not in user, (
-            f"secret VALUE leaked into RAG context via {query_fn.__name__}"
+        assert _SECRET_VALUE in user, (
+            f"row VALUE must reach the LLM via {query_fn.__name__}"
         )
-        assert "shared_seam_secret" not in user, (
-            f"secret KEY leaked into RAG context via {query_fn.__name__}"
+        assert "shared_seam_secret" in user, (
+            f"row KEY must reach the LLM via {query_fn.__name__}"
         )
-        # Non-secret context must still flow through (no over-filtering).
         assert _PUBLIC_VALUE in user
         assert "project_readme" in user
 

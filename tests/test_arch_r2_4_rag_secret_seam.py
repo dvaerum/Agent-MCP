@@ -1,23 +1,16 @@
-"""Arch round-2 #4: the RAG retrieval SEAM owns secret redaction.
+"""ADR-0017 (Wave 12 PR B): the RAG retrieval SEAM returns rows in FULL.
 
-FINDING (latent): ``RagRepository.search_similar`` and
-``RagRepository.fetch_recent_context`` are the single retrieval seam
-for the RAG query path, but they returned RAW rows — including
-secret-keyed ``project_context`` rows and chunks embedded from a stale
-index. Redaction was re-applied BY HAND at every ``features/rag/query.py``
-call site (``_drop_secret_context_chunks`` / ``_is_secret_key`` /
-``_value_has_embedded_secret``). Any NEW caller of the seam would leak
-secrets to the LLM/worker.
+This suite pinned the retrieval seam (``RagRepository.search_similar`` /
+``fetch_recent_context``) as the owner of secret redaction. Wave 12 PR B
+removes content-based secret detection entirely — the seam returns
+``project_context`` rows and chunks AS-IS. Protection is by authorization
+(RAG is per-project and, for tasks, ownership-scoped), not by guessing
+content. Real secrets belong in the operator-only, non-RAG
+project_settings store.
 
-Fix: move the redaction INSIDE the two retrieval methods so the seam
-that owns "what you get back" also owns "with secrets removed." These
-tests assert the redaction AT THE REPOSITORY BOUNDARY — a direct call
-to ``rag_repo.search_similar`` / ``rag_repo.fetch_recent_context``
-returns no secret, independent of the query layer.
-
-RED on ``main`` (the repo returns secrets raw); GREEN after the seam
-enforces the filter. The pre-existing query-layer secret tests
-(``test_sec_rag_secret_redaction.py``) stay green regardless.
+The former "the seam drops the secret row/chunk" assertions are inverted
+here to "the seam returns it in full", asserted directly at the repository
+boundary.
 """
 
 from __future__ import annotations
@@ -67,14 +60,14 @@ def _emb(values):
     return out[:dim]
 
 
-# --- fetch_recent_context: the seam drops secret rows ------------------
+# --- fetch_recent_context: the seam returns rows in full ---------------
 
 
-def test_fetch_recent_context_drops_secret_keyed_row(
+def test_fetch_recent_context_returns_secret_keyed_row(
     project_dir, reset_globals,
 ):
-    """A direct ``fetch_recent_context`` call must NOT return a
-    secret-keyed (``config_*_token``) project_context row."""
+    """A direct ``fetch_recent_context`` call returns a secret-named
+    project_context row AS-IS (ADR-0017)."""
     with _make_client(project_dir):
         from agent_mcp.repositories import rag_repo
         from agent_mcp.db.connection import get_db_connection
@@ -105,27 +98,20 @@ def test_fetch_recent_context_drops_secret_keyed_row(
         keys = [r["context_key"] for r in results]
         values = [r.get("value") for r in results]
 
-        assert "config_aoe_bearer_token" not in keys, (
-            "secret-keyed row leaked out of the fetch_recent_context seam"
-        )
-        assert all(_SECRET_VALUE not in str(v) for v in values), (
-            "secret VALUE leaked out of the fetch_recent_context seam"
-        )
-        # Public row survives (no over-filtering).
+        assert "config_aoe_bearer_token" in keys
+        assert any(_SECRET_VALUE in str(v) for v in values)
         assert "project_readme" in keys
 
 
-def test_fetch_recent_context_drops_embedded_secret_value(
+def test_fetch_recent_context_returns_embedded_secret_value(
     project_dir, reset_globals,
 ):
-    """A non-secret KEY whose VALUE embeds a credential must also be
-    dropped by the seam (belt-and-suspenders, same as the index/query
-    embedded-secret scan)."""
+    """A non-secret KEY whose VALUE embeds a credential is returned AS-IS
+    by the seam (ADR-0017 — no content scan)."""
     with _make_client(project_dir):
         from agent_mcp.repositories import rag_repo
         from agent_mcp.db.connection import get_db_connection
 
-        # A recognisable embedded credential (GitHub PAT prefix).
         embedded = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
         conn = get_db_connection()
         try:
@@ -151,22 +137,18 @@ def test_fetch_recent_context_drops_embedded_secret_value(
             since="2099-06-01T00:00:00Z", limit=10,
         )
         keys = [r["context_key"] for r in results]
-        assert "deploy_notes" not in keys, (
-            "row with an embedded credential VALUE leaked out of the seam"
-        )
+        assert "deploy_notes" in keys
         assert "project_readme" in keys
 
 
-# --- search_similar: the seam drops secret context chunks --------------
+# --- search_similar: the seam returns context chunks in full -----------
 
 
-def test_search_similar_drops_secret_context_chunk(
+def test_search_similar_returns_secret_context_chunk(
     project_dir, reset_globals,
 ):
-    """A ``source_type == 'context'`` chunk whose ``source_ref`` is a
-    secret key (embedded into the index before the index-time skip
-    existed) must be dropped by the search seam. Non-secret chunks
-    survive."""
+    """A ``source_type == 'context'`` chunk keyed on a secret-named ref is
+    returned AS-IS by the search seam (ADR-0017)."""
     with _make_client(project_dir):
         if not _vss_available():
             pytest.skip("sqlite-vec not loadable on this host")
@@ -205,11 +187,6 @@ def test_search_similar_drops_secret_context_chunk(
         source_refs = [r["source_ref"] for r in results]
         texts = " ".join(r.get("chunk_text", "") for r in results)
 
-        assert "config_aoe_bearer_token" not in source_refs, (
-            "secret context chunk leaked out of the search_similar seam"
-        )
-        assert _SECRET_VALUE not in texts, (
-            "secret VALUE leaked out of the search_similar seam"
-        )
-        # Non-secret code chunk survives.
+        assert "config_aoe_bearer_token" in source_refs
+        assert _SECRET_VALUE in texts
         assert "app/util.py" in source_refs

@@ -124,46 +124,8 @@ async def test_config_rows_absent_from_composition_reads(tmp_path) -> None:
         assert _BEARER_SECRET not in r.text
 
 
-# ── is_secret_key unit boundary ──────────────────────────────────────
-
-
-def test_is_secret_key_config_keys_not_special() -> None:
-    """Post-ADR-0016 ``is_secret_key`` is vocabulary-only: a ``config_``
-    prefix neither redacts (old blanket rule) nor exempts (old F009
-    carve-out). Config rows cannot exist in ``project_context`` anymore
-    (migration 0016 moved them; the write path rejects the namespace),
-    so only the secret-word vocab matters — and it still catches
-    credential-NAMED keys wherever they appear."""
-    from agent_mcp.tools.project_context_tools import is_secret_key
-
-    for key in _POLICY_SEEDS:
-        assert not is_secret_key(key), f"{key} has no secret-word segment"
-        # Case-insensitive vocab: still no match when upper-cased.
-        assert not is_secret_key(key.upper()), f"{key.upper()} (case)"
-
-    # The AoE bearer keys STAY secret — via the bearer/token vocab in
-    # _SECRET_SUFFIX_RE, independent of the deleted config_* blanket.
-    assert is_secret_key("config_aoe_bearer_token")
-    assert is_secret_key("config_aoe_bearer_token_file")
-
-    # Vocab-less config_* keys are NOT secret to is_secret_key anymore —
-    # the blanket rule is gone with the store split (such rows can't
-    # exist in project_context; the settings store does its own masking
-    # via _SECRET_SETTING_KEYS in tools/project_settings_tools.py).
-    for key in ("config_zzz", "config_foo", "config_aoe_base_url",
-                "config_aoe_notify_template", "config_aoe_timeout_ms"):
-        assert not is_secret_key(key), f"{key}: config_* blanket removed"
-
-
-def test_is_secret_key_gates_on_key_name_not_value() -> None:
-    """``is_secret_key`` is KEY-name only: the value-scan backstop still
-    redacts a credential pasted into a vocab-less key's VALUE."""
-    from agent_mcp.features.rag.indexing import _value_has_embedded_secret
-
-    # A policy key's NAME is not secret ...
-    from agent_mcp.tools.project_context_tools import is_secret_key
-
-    assert not is_secret_key("config_allow_worker_to_worker")
-    # ... but a secret pasted into its value still trips the value scan,
-    # which every redaction seam runs alongside is_secret_key.
-    assert _value_has_embedded_secret("ghp_0123456789abcdefghijABCDEFG", None)
+# ADR-0017 (Wave 12 PR B): the ``is_secret_key`` /
+# ``_value_has_embedded_secret`` unit boundary tests are deleted — the
+# content-detection machinery is gone. The store-separation invariants
+# above (config_* rows live in the non-RAG project_settings store and are
+# absent from the memory composition reads) survive and are exercised.

@@ -1,14 +1,16 @@
-"""view_project_context must not leak the system token to non-admin callers.
+"""ADR-0017 (Wave 12 PR B): view_project_context returns rows in FULL.
 
-UPSTREAM_ISSUES.md issue I: any agent with a valid token can call
-view_project_context and read ``config_system_token`` (formerly
-``config_admin_token`` before the Phase 2 Wave 1b rename) — the
-project's router-internal authority bearer. That's a direct
-worker→system privilege escalation through the tool surface.
+This suite was UPSTREAM_ISSUES.md issue I — filter secret-named rows
+(``config_*_token`` / ``config_*_secret``) from non-admin callers. Wave 12
+PR B removes content-based secret detection: project_context is shared
+project knowledge, returned AS-IS to any authorized reader (workers
+included). Real secrets belong in the operator-only, non-RAG
+project_settings store — where the settings-store redaction survives — not
+in memory. The config_* namespace can no longer be written to memory at
+all (ADR-0016), but a legacy/tampered DB shape is still returned verbatim.
 
-Fix: filter rows whose context_key matches a sensitive pattern
-(``config_*_token``, ``config_*_secret``, etc.) when caller is not
-admin. Admins continue to see everything.
+The former "worker does NOT see secret-named keys" tests are inverted here
+to "worker sees them in full".
 
 Migrated to ``tests/harness.py::mcp_session`` (Candidate F from
 architecture review 2026-06-02).
@@ -73,37 +75,29 @@ async def test_admin_sees_config_system_token(tmp_path) -> None:
         )
 
 
-async def test_worker_does_not_see_config_system_token(tmp_path) -> None:
-    """Workers must NOT see config_system_token — privilege escalation
-    otherwise."""
+async def test_worker_sees_config_system_token(tmp_path) -> None:
+    """ADR-0017: a worker sees a secret-named memory row AS-IS — memory is
+    shared project content, protection is by authorization not content."""
     async with mcp_session(tmp_path) as admin:
         _seed(admin, key="config_system_token", value="sentinel-system-token")
         worker = await admin.create_worker("test-worker")
 
         result = await worker.call("view_project_context", {})
         text = result[0].text
-        assert "config_system_token" not in text, (
-            "worker token can read config_system_token via "
-            "view_project_context — privilege escalation (issue I). "
-            "Got:\n" + text[:1000]
-        )
-        # And the seeded value must not appear either.
-        assert "sentinel-system-token" not in text, (
-            "worker can read the literal system token value (issue I)"
-        )
+        assert "config_system_token" in text
+        assert "sentinel-system-token" in text
 
 
-async def test_worker_does_not_see_other_config_secrets(tmp_path) -> None:
-    """The redaction applies to any config_*_token / _secret / _password
-    key."""
+async def test_worker_sees_other_config_secrets(tmp_path) -> None:
+    """ADR-0017: any secret-named memory row is returned in full."""
     async with mcp_session(tmp_path) as admin:
         _seed(admin, key="config_openai_secret", value="sk-very-secret-12345")
         worker = await admin.create_worker("test-worker")
 
         result = await worker.call("view_project_context", {})
         text = result[0].text
-        assert "config_openai_secret" not in text
-        assert "sk-very-secret-12345" not in text
+        assert "config_openai_secret" in text
+        assert "sk-very-secret-12345" in text
 
 
 async def test_worker_still_sees_non_secret_keys(tmp_path) -> None:

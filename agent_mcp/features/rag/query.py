@@ -18,112 +18,24 @@ from ...external.completion_service import (
 import openai
 
 
-def _is_secret_key(key: Optional[str]) -> bool:
-    """Thin lazy wrapper over the canonical
-    :func:`agent_mcp.tools.project_context_tools.is_secret_key`.
-
-    Imported lazily (not at module top) to sidestep the import cycle:
-    ``tools/__init__`` imports ``rag_tools`` which imports this module,
-    so a top-level ``from ...tools...`` here can hit a half-initialised
-    tools package. The RAG side-channel must apply the SAME secret-key
-    policy as ``view_project_context`` so a worker can't read a
-    ``config_*_token`` value by asking ``ask_project_rag`` — see
-    ``tests/test_sec_rag_secret_redaction.py``.
-    """
-    from ...tools.project_context_tools import is_secret_key
-
-    return is_secret_key(key)
-
-
-# SECRET REDACTION OWNERSHIP: the retrieval SEAM
-# (``rag_repo.search_similar`` + ``rag_repo.fetch_recent_context``) owns
-# secret redaction — the seam that returns the data drops the secrets.
-# Both query_rag_system and query_rag_system_with_model read live
-# context through ``rag_repo.fetch_recent_context`` (arch-r5 #4
-# collapsed the second, hand-rolled ``SELECT ... FROM project_context``
-# + inline filter that query_rag_system_with_model used to carry — see
-# git history for the pre-collapse duplicate). One redaction
-# enforcement point, one seam, one thing to keep correct.
-#
-# ``_drop_secret_chunks`` below is explicit defense-in-depth,
-# NOT the primary guard: it protects callers that inject/mock the repo
-# and bypass the real ``search_similar`` seam.
-def _value_has_embedded_secret(*texts: Optional[str]) -> bool:
-    """Lazy wrapper over the canonical embedded-secret VALUE scanner.
-
-    Imported lazily (not at module top) to sidestep the tools/rag import
-    cycle. Reused (not duplicated) from the index path so this filter
-    applies the SAME skip the ingest choke-point does. Variadic to mirror
-    the underlying scanner: a single call can screen every text field of a
-    row (e.g. a task ``title`` AND ``description``) in one pass.
-    """
-    from .indexing import _value_has_embedded_secret as _scan
-
-    return _scan(*texts)
-
-
-def _drop_secret_chunks(
-    results: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Drop retrieved vector chunks that carry a credential — for ANY
-    source type. Defense-in-depth mirroring ``rag_repo.search_similar``'s
-    own seam-level drop, for the case where a caller injects/mocks the
-    repo and bypasses the real seam. Two drop rules, both retained:
-
-    * secret-KEYED ``project_context`` row (``source_ref`` is the
-      context_key for ``source_type == "context"``).
-    * secret in the chunk TEXT itself — a credential in a task
-      description/title, code file, or markdown doc (R2-F3); covers every
-      source type, not just ``context``.
-    """
-    return [
-        r
-        for r in results
-        if not (
-            (
-                r.get("source_type") == "context"
-                and _is_secret_key(r.get("source_ref"))
-            )
-            or _value_has_embedded_secret(r.get("chunk_text"))
-        )
-    ]
-
-
-def _drop_secret_tasks(
-    tasks: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Drop live-task rows whose ``title`` or ``description`` embeds a
-    credential (R2-F3b).
-
-    ``query_rag_system`` stage 2 (and its ``_with_model`` sibling) fetch
-    tasks with a raw ``SELECT ... FROM tasks`` and render them straight
-    into the LLM context. That fetch is NOT the ``rag_chunks`` ingest
-    choke-point #463 hardened, nor the ``search_similar`` retrieval seam
-    ``_drop_secret_chunks`` guards — a secret pasted into a task
-    description reached ``ask_project_rag`` verbatim (live RE_VERIFY of
-    ``ghp_R2ReVerify1111closedCHECKzzzz9999``). This mirrors, for the
-    live-task source, exactly how stage-1 live-context
-    (``fetch_recent_context``) and stage-3 chunks (``_drop_secret_chunks``)
-    are already filtered: DROP the offending row, uniform with the other
-    seams. Reuses the same ``_value_has_embedded_secret`` scanner the
-    ingest choke-point uses — one detector, one policy.
-    """
-    return [
-        t
-        for t in tasks
-        if not _value_has_embedded_secret(t.get("title"), t.get("description"))
-    ]
+# ADR-0017 (Wave 12 PR B): content-based secret detection is GONE. The
+# RAG secret helpers (``_is_secret_key`` / ``_value_has_embedded_secret``
+# / ``_drop_secret_chunks`` / ``_drop_secret_tasks`` / ``_scrub_secret_
+# parts``) that used to drop "secret-looking" context rows, task rows,
+# chunks, and assembled parts are deleted. memory, tasks, code, and
+# markdown are shared project content, retrieved AS-IS. Protection is by
+# AUTHORIZATION — RAG is per-project, and task retrieval stays ownership-
+# scoped (``_drop_unowned_task_chunks`` / ``_task_ownership_sql`` below).
 
 
 # SECURITY (R4-F4): ownership-scope RAG task retrieval.
 #
-# The RAG secret-detector (``_value_has_embedded_secret``) is a denylist
-# that cannot catch every low-entropy / natural-language / non-ASCII
-# credential. The operator ruled the real bug is that ``query_rag_system``
-# searched ALL tasks with NO ownership filter — so a worker could pull
-# content (secrets included) out of another agent's task it could never
-# read directly via ``view_tasks``. The security contract is: **search
-# must not grant access the agent didn't already have.**
+# ``query_rag_system`` used to search ALL tasks with NO ownership filter —
+# so a worker could pull content out of another agent's task it could
+# never read directly via ``view_tasks``. The security contract is:
+# **search must not grant access the agent didn't already have.** This is
+# an AUTHORIZATION control (who owns the task), not content-guessing, so
+# it SURVIVES ADR-0017.
 #
 # ``view_tasks`` (``agent_mcp/tools/task_tools.py`` ~:3206-3238) scopes a
 # non-``tasks.assign`` caller by handing ``TaskQueryEngine`` an
@@ -196,23 +108,6 @@ def _drop_unowned_task_chunks(
             and r.get("source_ref") not in visible_refs
         )
     ]
-
-
-def _scrub_secret_parts(parts: List[str]) -> List[str]:
-    """SECURITY (R2-F3b) — the final assembly-seam scrub.
-
-    This is the single choke-point every RAG context source flows through
-    before it reaches the LLM (``_assemble_and_answer`` joins ``parts`` into
-    the prompt). Stages 1-3 each have their own upstream filter, but the
-    original R2-F3 miss proved a per-stage sweep can be left incomplete:
-    stage 2 (live tasks) shipped unscanned and re-leaked a token. Scanning
-    every assembled part HERE makes secret redaction by-construction — it
-    covers all four current stages AND any future 5th context source added
-    upstream, so this class can never silently reopen. DROP the offending
-    part (uniform with the other seams' drop semantics); each task/chunk is
-    its own part, so dropping one leaks-bearing entry keeps the rest.
-    """
-    return [p for p in parts if not _value_has_embedded_secret(p)]
 
 
 # ── Shared assembly helpers ───────────────────────────────────────────
@@ -302,11 +197,9 @@ async def _assemble_and_answer(
     ``on_client_ready`` lets query_rag_system_with_model log the
     provider/model it resolved, which query_rag_system does not do.
     """
-    # SECURITY (R2-F3b): final assembly-seam scrub. See _scrub_secret_parts
-    # — this one seam covers every current AND future context source, so a
-    # secret can never reach the LLM even if an upstream stage's own filter
-    # is missing or a new source is added without one.
-    context_parts = _scrub_secret_parts(context_parts)
+    # ADR-0017 (Wave 12 PR B): no assembly-seam secret scrub — RAG
+    # context (memory / tasks / code / markdown) is shared project
+    # content, assembled AS-IS.
     if not context_parts:
         logger.info(
             f"{log_label}: No relevant information found for query: '{query_text}'"
@@ -427,10 +320,8 @@ async def query_rag_system(
                 rag_repo.get_last_indexed("context")
                 or "1970-01-01T00:00:00Z"
             )
-            # SECURITY: fetch_recent_context is the retrieval seam and
-            # owns secret redaction — secret-keyed rows (config_*_token
-            # etc.) and embedded-credential values are already dropped
-            # before they return here.
+            # ADR-0017: fetch_recent_context returns project_context rows
+            # AS-IS — no content-based secret redaction on the seam.
             live_context_results = rag_repo.fetch_recent_context(
                 since=last_indexed_context_time, limit=5,
             )
@@ -499,13 +390,13 @@ async def query_rag_system(
                         """
                         cursor.execute(task_query_sql, sql_params_tasks)
                     # SECURITY (R2-F3b): this raw task fetch is NOT the
-                    # rag_chunks ingest choke-point nor the search_similar
-                    # retrieval seam, so it must apply the SAME embedded-
-                    # secret drop the other stages do — a token in a task
-                    # title/description reached the LLM verbatim otherwise.
-                    live_task_results = _drop_secret_tasks(
-                        [dict(row) for row in cursor.fetchall()]
-                    )
+                    # ADR-0017: no content-based secret drop — task rows
+                    # are shared project content, returned AS-IS (ownership
+                    # scoping on the SELECT above is the authorization
+                    # control that survives).
+                    live_task_results = [
+                        dict(row) for row in cursor.fetchall()
+                    ]
         except sqlite3.Error as e_live_task:
             logger.warning(
                 f"RAG Query: Failed to fetch live tasks based on query keywords: {e_live_task}"
@@ -527,15 +418,11 @@ async def query_rag_system(
                 query_embedding = embedding_client().embed([query_text])[0]
                 # k=13 is the legacy knn-results constant the previous
                 # raw SQL used; preserved exactly so retrieval quality
-                # is unchanged across the migration.
-                # search_similar (the seam) already drops secret context
-                # chunks; the wrap here is defense-in-depth for an
-                # injected/mocked repo that bypasses the real seam.
-                vector_search_results = _drop_secret_chunks(
-                    rag_repo.search_similar(
-                        query_embedding=query_embedding,
-                        limit=13,
-                    )
+                # is unchanged across the migration. ADR-0017: no
+                # content-based secret drop on chunks.
+                vector_search_results = rag_repo.search_similar(
+                    query_embedding=query_embedding,
+                    limit=13,
                 )
                 # SECURITY (R4-F4): drop task-sourced chunks the caller
                 # can't read directly. Only ``source_type == "task"``
@@ -719,9 +606,8 @@ async def query_rag_system_with_model(
         # Get live context (same as regular RAG), through the SAME
         # retrieval seam query_rag_system uses. arch-r5 #4: this used
         # to be a hand-rolled ``SELECT ... FROM project_context`` with
-        # its own inline ``_is_secret_key`` / ``_value_has_embedded_
-        # secret`` filter — a second, independently-maintained
-        # redaction enforcement point. Routing through
+        # its own inline filter — a second, independently-maintained
+        # read path. Routing through
         # rag_repo.fetch_recent_context collapses that to the ONE seam
         # query_rag_system already uses. ``since`` = epoch and
         # ``limit=None`` reproduce this function's original unbounded,
@@ -764,12 +650,10 @@ async def query_rag_system_with_model(
         """,
             ownership_params,
         )
-        # SECURITY (R2-F3b): same raw-task-fetch drop as query_rag_system's
-        # stage 2 — a secret in a task title/description must not reach the
-        # LLM through the task-analysis path either.
-        live_task_results = _drop_secret_tasks(
-            [dict(row) for row in cursor.fetchall()]
-        )
+        # ADR-0017: no content-based secret drop — task rows are shared
+        # project content, returned AS-IS (ownership scoping on the SELECT
+        # above is the authorization control that survives).
+        live_task_results = [dict(row) for row in cursor.fetchall()]
 
         # Get vector search results if VSS is available.
         # PR F: rag_repo.search_similar owns the vec0 dialect; same
@@ -777,14 +661,10 @@ async def query_rag_system_with_model(
         if is_vss_loadable():
             try:
                 query_embedding = embedding_client().embed([query_text])[0]
-                # search_similar (the seam) already drops secret context
-                # chunks; the wrap here is defense-in-depth for an
-                # injected/mocked repo that bypasses the real seam.
-                vector_search_results = _drop_secret_chunks(
-                    rag_repo.search_similar(
-                        query_embedding=query_embedding,
-                        limit=13,
-                    )
+                # ADR-0017: no content-based secret drop on chunks.
+                vector_search_results = rag_repo.search_similar(
+                    query_embedding=query_embedding,
+                    limit=13,
                 )
                 # SECURITY (R5-F1): drop task-sourced chunks the caller
                 # can't read directly — IDENTICAL to query_rag_system.

@@ -97,21 +97,12 @@ const MemoryRow = ({ memory, onView, onEdit, onDelete }: {
 }) => {
   const metadata = memory._metadata
 
-  // Mask values for keys that smell like a secret. Agent-MCP stores
-  // its own admin_token under a project_context key (e.g.
-  // `config_admin_token`) and without redaction the cell text, the
-  // title tooltip, AND the Copy button leak admin-level credentials
-  // to anyone with dashboard access. Match is purely on the key
-  // name; the value type doesn't matter. NON_SECRET_RE whitelists
-  // common false positives (token_count, token_limit, etc).
-  // UPSTREAM_ISSUES.md issue B.
-  const SECRET_KEY_RE = /(token|secret|password|api[_-]?key|priv(?:ate)?[_-]?key)/i
-  const NON_SECRET_RE = /(token[_-]?(count|limit|usage|stats|description|name|kind))/i
-  const isSecretKey = (key: string): boolean =>
-    SECRET_KEY_RE.test(key) && !NON_SECRET_RE.test(key)
-
-  const formatValue = (value: any, key?: string) => {
-    if (key && isSecretKey(key)) return '••••••••'
+  // ADR-0017 (Wave 12 PR B): no content-based secret redaction. memory
+  // is shared project knowledge, rendered AS-IS — the key-name masking
+  // that used to hide "secret-looking" rows (and, wrongly, the
+  // operator's own legitimate notes) is gone. Real secrets belong in
+  // the operator-only project_settings store, never in memory.
+  const formatValue = (value: any, _key?: string) => {
     if (typeof value === 'string') {
       return value.length > 30 ? value.substring(0, 30) + '...' : value
     }
@@ -120,8 +111,8 @@ const MemoryRow = ({ memory, onView, onEdit, onDelete }: {
       : JSON.stringify(value)
   }
 
-  const valueTooltip = (value: any, key?: string): string =>
-    key && isSecretKey(key) ? '(redacted — secret-looking key)' : JSON.stringify(value)
+  const valueTooltip = (value: any, _key?: string): string =>
+    JSON.stringify(value)
 
   const formatKey = (key: string) => {
     return key.length > 25 ? key.substring(0, 25) + '...' : key
