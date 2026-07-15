@@ -120,7 +120,7 @@ let
     # upstream (rare). On hash mismatch, nix prints the correct
     # value; paste it here. Updated 2026-07-02 for the next
     # 15.3.4 -> 15.5.20 security bump + npm audit fix lockfile changes.
-    npmDepsHash = "sha256-HGTu2BUl71FCHwJbCKWTpxnMZJP95MePG6tVPFgGtwc=";
+    npmDepsHash = "sha256-R1UVHjh4Vcc6Q6lzJy6Z+v9OYdX5OiwLd6r+0PDoPH8=";
     NEXT_PUBLIC_AUTO_CONNECT = "false";
     NEXT_PUBLIC_DEFAULT_SERVER_HOST = "";
     NEXT_PUBLIC_DEFAULT_SERVER_PORT = "";
