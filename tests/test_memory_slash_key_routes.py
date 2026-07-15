@@ -12,7 +12,6 @@ GREEN after ``/{context_key:path}``.
 
 from __future__ import annotations
 
-import json as _json
 
 import pytest
 

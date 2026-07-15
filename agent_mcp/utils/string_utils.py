@@ -108,6 +108,65 @@ UNSAFE_KEY_ERROR = {
 }
 
 
+# --- Memory-key allowlist (positive charset) -------------------------------
+#
+# Beyond the invisible/bidi denylist above, memory keys are constrained to a
+# small ASCII charset: letters, digits, and the four punctuation marks the
+# existing keys already use (``.`` ``_`` ``/`` ``-``). ``/`` is deliberately
+# allowed — it is the namespacing convention (``ios/repo``,
+# ``backend-dev/status``) and the REST routes accept it via ``:path``.
+#
+# WHY an ASCII allowlist (tighter than the denylist): keys are URL path
+# segments, so they must round-trip cleanly through the REST routes;
+# ASCII-only also removes homograph/encoding ambiguity (``café`` vs ``cafe``).
+# A scan of every project's keys found ZERO outside this set, so enforcing it
+# renames nothing existing — it is a forward-looking invariant.
+MEMORY_KEY_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
+
+#: The single character disallowed key chars are converted to by the
+#: sanitizing migration.
+MEMORY_KEY_REPLACEMENT = "_"
+
+
+def is_valid_memory_key(value: object) -> bool:
+    """True iff ``value`` is a non-empty string matching :data:`MEMORY_KEY_RE`
+    (``A-Z a-z 0-9 . _ / -``). Empty / non-str / any other character → False."""
+    if not isinstance(value, str) or not value:
+        return False
+    return MEMORY_KEY_RE.match(value) is not None
+
+
+def sanitize_memory_key(value: str) -> str:
+    """Return ``value`` with every character disallowed by
+    :data:`MEMORY_KEY_RE` replaced by :data:`MEMORY_KEY_REPLACEMENT`
+    (``_``). A conforming key is returned unchanged. Used by the
+    key-sanitizing migration; never mutates in place.
+
+    Examples:
+        >>> sanitize_memory_key("ios/improvements-doc")
+        'ios/improvements-doc'
+        >>> sanitize_memory_key("ns:key with space")
+        'ns_key_with_space'
+        >>> sanitize_memory_key("caf\\u00e9.config")
+        'caf_.config'
+    """
+    if not isinstance(value, str):
+        return value
+    return re.sub(r"[^A-Za-z0-9._/-]", MEMORY_KEY_REPLACEMENT, value)
+
+
+# Positive-allowlist rejection envelope for the create/write surfaces
+# (distinct from UNSAFE_KEY_ERROR, which is the narrower invisible/bidi
+# denylist message). One voice across the REST router + MCP tool.
+MEMORY_KEY_ERROR = {
+    "error": "invalid_key_character",
+    "message": (
+        "Memory key may contain only letters, digits, and . _ / - "
+        "(A-Z a-z 0-9 . _ / -)."
+    ),
+}
+
+
 def camel_to_snake_case(camel_string: str) -> str:
     """
     Converts a camelCase string to snake_case.
