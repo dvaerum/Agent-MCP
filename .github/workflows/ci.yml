@@ -24,6 +24,10 @@ jobs:
       matrix:
         # Every CPython release still receiving updates as of the floor
         # bump (3.10 reaches EOL 2026-10-31 and was dropped with it).
+        # These four jobs run in parallel with the four Nix VM shards
+        # below — GitHub schedules all jobs concurrently, bounded only by
+        # the runner pool, so the full matrix costs no extra wall-clock on
+        # a single run.
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -86,9 +90,28 @@ jobs:
         run: npm run build
 
   nix-flake-check:
-    name: Nix flake check (VM tests)
+    # Sharded: each of the four nixosTest VMs builds on its own runner in
+    # parallel, so the job's wall-clock is a single VM (~4-6 min warm)
+    # instead of four serialized on one runner (~9 min). fail-fast:false
+    # so one VM's failure still lets the others report. All four stay
+    # gated so a VM check can't silently rot (event-driven-coord +
+    # no-auto-cleanup were previously ungated and drifted — see #489). The
+    # VM checks exercise the full server boot + HTTP assertions (including
+    # the Path A asset-prefix sentinel regression guard from #166) which
+    # nothing else covers. The agent-mcp Python build + dashboard Next.js
+    # build are NOT gated here — the `python` and `dashboard` jobs above
+    # cover those.
+    name: Nix VM (${{ matrix.vm }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        vm:
+          - vm-single-tenant
+          - vm-multi-tenant
+          - vm-event-driven-coord
+          - vm-no-auto-cleanup
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
@@ -114,40 +137,32 @@ jobs:
       - name: Cache /nix/store
         uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
         with:
-          # Save a fresh cache each run (unique run_id suffix) and restore
-          # the closest prior one sharing the flake/nix-input hash prefix.
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**') }}-${{ github.run_id }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**') }}-
-          # Trim the store before saving so the upload stays within budget.
-          gc-max-store-size-linux: 5G
-          # Keep the cache list bounded: drop older entries sharing our
-          # prefix, but never the key we're about to save.
+          # Per-VM cache lineage: each shard keys on ``matrix.vm`` so the
+          # four parallel shards don't collide on one shared ``run_id``
+          # key, and each cache holds only its own VM closure.
+          primary-key: nix-${{ runner.os }}-${{ matrix.vm }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**') }}-${{ github.run_id }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-${{ matrix.vm }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**') }}-
+          # Trim each shard's store to ~3 GB before saving so the four
+          # per-VM lineages stay near the 10 GB per-repo budget. If GitHub
+          # LRU-evicts one, that shard just re-substitutes from
+          # cache.nixos.org next run (still faster than the un-sharded job).
+          gc-max-store-size-linux: 3G
+          # Keep each lineage bounded: drop this VM's older entries, but
+          # never the key we're about to save. Scoped to the per-VM prefix
+          # so one shard's purge never evicts a sibling VM's cache.
           purge: true
-          purge-prefixes: nix-${{ runner.os }}-
+          purge-prefixes: nix-${{ runner.os }}-${{ matrix.vm }}-
           purge-created: 0
           purge-primary-key: never
 
-      - name: Build VM tests
-        # Builds all four nixosTest VM checks (vm-single-tenant,
-        # vm-multi-tenant, vm-event-driven-coord, vm-no-auto-cleanup)
-        # rather than the full `nix flake check`, because the other checks
-        # (agent-mcp Python build, agent-mcp-dashboard Next.js build) duplicate
-        # the `python` and `dashboard` jobs above. All four are gated here so
-        # a VM check can't silently rot (event-driven-coord + no-auto-cleanup
-        # were previously ungated and drifted — see #489). The VM checks exercise the
-        # full server boot + HTTP assertions (including the Path A asset-prefix
-        # sentinel regression guard from #166) which nothing else covers.
-        # First run ~30 min; subsequent runs ~5-10 min via cache-nix-action.
+      - name: Build VM test
+        # --fallback: if a binary-cache substitution fails (flaky
+        # cache.nixos.org), build that path from source instead of
+        # hard-failing the job. With download-attempts=3 above, this
+        # makes the shard resilient to transient cache failures — the
+        # class of flake that sank the old magic-nix-cache setup.
         run: |
-          # --fallback: if a binary-cache substitution fails (flaky
-          # cache.nixos.org), build that path from source instead of
-          # hard-failing the job. With download-attempts=3 above, this
-          # makes the job resilient to transient cache failures — the
-          # class of flake that sank the old magic-nix-cache setup.
-          nix build .#checks.x86_64-linux.vm-single-tenant \
-                    .#checks.x86_64-linux.vm-multi-tenant \
-                    .#checks.x86_64-linux.vm-event-driven-coord \
-                    .#checks.x86_64-linux.vm-no-auto-cleanup \
+          nix build .#checks.x86_64-linux.${{ matrix.vm }} \
                     -L --print-build-logs --fallback
 
   dependency-audit:
