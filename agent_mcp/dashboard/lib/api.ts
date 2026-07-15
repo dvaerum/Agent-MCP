@@ -157,6 +157,25 @@ export interface Memory {
   }
 }
 
+// A message row returned by POST /api/messages/query.
+// v5.0.22: subject (root-only) + parent_message_id (NULL for roots,
+// reply→root.message_id for replies). Canonical home for the shape
+// shared by messages-dashboard, its row/modal components, and the
+// messages mobile list.
+export interface Message {
+  message_id: string
+  sender_id: string
+  recipient_id: string
+  message_content: string
+  message_type: string
+  priority: string
+  timestamp: string
+  delivered: number | boolean
+  read: number | boolean
+  subject: string | null
+  parent_message_id: string | null
+}
+
 // A project_settings row (ADR-0016: config_* keys live in the dedicated
 // settings store, not project_context). `value` is the raw JSON-encoded
 // string the store carries; secret keys arrive as the literal string

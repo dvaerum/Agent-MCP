@@ -181,6 +181,10 @@ _EXPECTED_CONSUMERS = {
     ],
     "components/dashboard/messages-dashboard.tsx": [
         "detailDialog",
+        # Added by the Messages-page-parity PR: single-row / in-modal /
+        # mobile delete all route through this confirm dialog instead of
+        # firing an unconfirmed DELETE.
+        "deleteDialog",
     ],
     # NOTE: overview-dashboard.tsx no longer carries a ``nodeDialog``
     # consumer. The mobile-load PR (#232) replaced the page's
@@ -193,9 +197,10 @@ _EXPECTED_CONSUMERS = {
     "components/dashboard/prompt-book-dashboard.tsx": [
         "builderDialog",
     ],
-    "components/dashboard/agent-details-panel.tsx": [
-        "taskDialog",
-    ],
+    # NOTE: agent-details-panel.tsx was deleted by the Messages-page-
+    # parity PR — it was dead code (imported/rendered nowhere; the live
+    # agent detail is <AgentDetailDialog> inside agents-dashboard.tsx).
+    # Its former ``taskDialog`` consumer entry is removed accordingly.
 }
 
 

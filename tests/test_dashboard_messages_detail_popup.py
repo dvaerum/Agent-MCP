@@ -17,16 +17,26 @@ from pathlib import Path
 
 DASHBOARD = Path("agent_mcp/dashboard")
 
+# Messages-page-parity PR: the detail popup was extracted out of
+# messages-dashboard.tsx into its own <ViewMessageModal> (parity with
+# memories' <ViewMemoryModal>). The modal-content guards below read the
+# modal file; the row-interaction guards still read the dashboard.
+MODAL = "components/dashboard/modals/view-message-modal.tsx"
+
 
 def _read(rel: str) -> str:
     return (DASHBOARD / rel).read_text()
+
+
+def _read_modal() -> str:
+    return _read(MODAL)
 
 
 # ---------- Modal primitives ------------------------------------
 
 
 def test_detail_popup_imports_dialog_primitives() -> None:
-    src = _read("components/dashboard/messages-dashboard.tsx")
+    src = _read_modal()
     # We reuse the existing shadcn Dialog (already in
     # components/ui/dialog.tsx) so we don't add a new modal stack.
     for name in (
@@ -80,7 +90,7 @@ def test_checkbox_cell_stops_propagation() -> None:
 
 
 def test_detail_popup_shows_full_content_block() -> None:
-    src = _read("components/dashboard/messages-dashboard.tsx")
+    src = _read_modal()
     # Full content must be rendered in a pre-wrap / monospace block —
     # not truncated. We accept whitespace-pre-wrap (Tailwind) as the
     # marker; the row table cell still uses `truncate`.
@@ -91,7 +101,7 @@ def test_detail_popup_shows_full_content_block() -> None:
 
 
 def test_detail_popup_renders_all_fields() -> None:
-    src = _read("components/dashboard/messages-dashboard.tsx")
+    src = _read_modal()
     # The modal labels every field — these are user-facing strings.
     for label in (
         "Message ID",
@@ -110,28 +120,41 @@ def test_detail_popup_renders_all_fields() -> None:
 
 
 def test_detail_popup_has_mark_read_toggle() -> None:
-    src = _read("components/dashboard/messages-dashboard.tsx")
+    src = _read_modal()
     # The single button toggles between "Mark read" and "Mark unread"
     # based on the current row's read flag — both strings must appear
-    # so either branch can render.
+    # so either branch can render. Mark-read stays inline (the modal
+    # stays open — live-lookup re-renders it with the fresh row).
     assert "Mark read" in src and "Mark unread" in src, (
         "expected the detail modal footer to expose a Mark read / "
-        "Mark unread toggle button (also reused by bulk actions)"
+        "Mark unread toggle button"
     )
 
 
-def test_detail_popup_has_delete_button() -> None:
-    src = _read("components/dashboard/messages-dashboard.tsx")
-    # Delete from the modal calls the same DELETE endpoint and then
-    # closes the modal + refreshes the list.
-    assert "deleteOne" in src, (
-        "expected the modal Delete button to call deleteOne (the "
-        "existing per-row delete helper)"
+def test_detail_popup_delete_routes_through_confirm() -> None:
+    # Messages-page-parity PR: the modal Delete no longer fires an
+    # unconfirmed DELETE. It routes through the shared confirm dialog
+    # (<DeleteMessageModal>, type-DELETE-to-confirm) — closing the
+    # real no-confirm gap the audit flagged.
+    import re
+
+    modal = _read_modal()
+    assert re.search(r"\bDelete\b\s*</Button>", modal), (
+        "expected a Delete button in the detail modal footer"
+    )
+    assert "onDelete" in modal, (
+        "expected the modal Delete button to defer to the parent via "
+        "an onDelete prop (parent opens the confirm dialog)"
+    )
+    dash = _read("components/dashboard/messages-dashboard.tsx")
+    assert "DeleteMessageModal" in dash and "deleteDialog.open" in dash, (
+        "expected the dashboard to route deletes through the "
+        "DeleteMessageModal confirm dialog (no unconfirmed delete)"
     )
 
 
 def test_detail_popup_has_close_button() -> None:
-    src = _read("components/dashboard/messages-dashboard.tsx")
+    src = _read_modal()
     # "Close" footer button is explicit (in addition to the Dialog's
     # built-in X close affordance). Tolerate whitespace between the
     # opening Button tag and the literal text.
