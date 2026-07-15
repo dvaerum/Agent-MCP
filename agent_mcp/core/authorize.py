@@ -185,16 +185,19 @@ def requires_capability(cap: str) -> Callable[[ToolImpl], ToolImpl]:
 
 def requires_policy(
     *config_keys: str,
-    default: bool,
+    default: Optional[bool] = None,
 ) -> Callable[[ToolImpl], ToolImpl]:
     """Authorise a tool entry point with the worker-toggle pattern.
 
     Operator-tier callers (cookie / forwarding-header / sysadmin)
     always pass. Worker tokens pass iff *at least one* of the listed
-    ``config_keys`` resolves truthy in ``project_context``; the
-    per-key default (used when the row is absent) is supplied here
-    and must match what
-    :data:`agent_mcp.tools.access._TOGGLE_DEFAULTS` declares.
+    ``config_keys`` resolves truthy in ``project_settings``; the
+    per-key default (used when the row is absent) is resolved from the
+    single-source schema registry (ADR-0018) unless ``default=`` is
+    passed explicitly. ``_get_config_bool`` performs the registry
+    fallback, so the per-key default can never drift from
+    :data:`agent_mcp.tools.access._TOGGLE_DEFAULTS` (both derive from
+    ``core/settings_schema``).
 
     Any-key (rather than all-key) semantics mirror
     :func:`agent_mcp.tools.access.is_visible_to_role`: if the worker

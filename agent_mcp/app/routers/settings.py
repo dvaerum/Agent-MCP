@@ -288,6 +288,79 @@ async def settings_data_api_route(
     )
 
 
+def _schema_as_json() -> list[dict]:
+    """Serialise the single-source settings schema for the wire.
+
+    One row per :class:`agent_mcp.core.settings_schema.SettingSpec`,
+    in registry order. Secret specs carry ``default: null`` — a secret
+    has no plaintext default to disclose.
+    """
+    from ...core.settings_schema import SETTINGS_SCHEMA
+
+    return [
+        {
+            "key": s.key,
+            "type": s.type,
+            "default": s.default,
+            "tier": s.tier,
+            "group": s.group,
+            "title": s.title,
+            "description": s.description,
+            "widget": s.widget,
+        }
+        for s in SETTINGS_SCHEMA
+    ]
+
+
+@router.api_route("/settings-schema", methods=["GET", "OPTIONS"])
+async def settings_schema_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    """GET /api/settings-schema — the single-source settings schema.
+
+    ADR-0018: the backend registry (``core/settings_schema``) is the one
+    owner of every ``config_*`` setting's default / group / tier / human
+    copy. The Settings dashboard fetches this to render its controls
+    data-driven (type→widget) instead of hardcoding the schema, so the
+    FE and BE can no longer drift.
+
+    Auth mirrors the ``/api/tokens`` pattern: ``require_operator_session``
+    admits the caller, then a CONFIRMED operator-tier check gates the
+    body — a non-confirmed (viewer / bare-forwarding) caller gets 403.
+    The schema itself is not sensitive, but gating it to confirmed
+    operators keeps it consistent with the settings-store read surface.
+
+    The ``caller`` block lets the frontend disable sysadmin-tier widgets
+    for a non-sysadmin operator (fixing the silent-403 mis-tier) without
+    a second round-trip.
+    """
+    if request.method == 'OPTIONS':
+        return await handle_options(request)
+
+    if not is_confirmed_operator_tier(auth):
+        return JSONResponse(
+            {
+                "error": "forbidden",
+                "message": (
+                    "The settings schema is operator-tier only. Use an "
+                    "operator-tier session or bearer to read it."
+                ),
+            },
+            status_code=403,
+        )
+
+    return JSONResponse(
+        {
+            "schema": _schema_as_json(),
+            "caller": {
+                "sysadmin": auth.get("sysadmin", False),
+                "confirmed_operator": is_confirmed_operator_tier(auth),
+            },
+        }
+    )
+
+
 async def _dispatch_settings_write(
     request: Request,
     auth: dict,

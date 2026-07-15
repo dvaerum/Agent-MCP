@@ -1,0 +1,273 @@
+"""Settings-schema registry — the single source of truth for every
+per-project ``config_*`` setting (ADR-0018).
+
+Before this module the schema for each setting — its default, its group,
+its human title/description, its tier — was declared in TWO places: the
+frontend (``settings-dashboard.tsx``'s hardcoded ``POLICIES`` /
+``AOE_FIELDS`` arrays) AND, partially, the backend
+(``tools/access._TOGGLE_DEFAULTS`` — only 4 of 6 bool keys — plus
+scattered ``default=`` literals per tool + ``aoe_notify``'s own
+``DEFAULT_*`` constants). Two owners of the same fact drift; the UI's
+"(using default: …)" hint could silently lie.
+
+This registry makes the BACKEND the single owner. Every default reader
+resolves through :func:`default_for`; the frontend consumes the schema
+over ``GET /api/settings-schema``; the DEFAULT_* constants
+``features/aoe_notify.py`` used to own now live here and are imported
+back.
+
+Tier-enforcement is HYBRID (ADR-0018): the proven ``_CONFIG_AOE_KEY_RE``
+sysadmin gate in ``tools/project_settings_tools.py`` stays the ENFORCER
+(safe-by-default: any future ``config_aoe_*`` key is sysadmin-gated
+automatically). :attr:`SettingSpec.tier` drives the UI + the agreement
+guarantee — a CI invariant test asserts ``schema.tier`` agrees with the
+regex for every key — but it never relocates the live gate.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal, Optional
+
+
+SettingType = Literal["bool", "int", "string", "secret"]
+SettingTier = Literal["operator", "sysadmin"]
+SettingGroup = Literal["worker_permissions", "event_loop", "retention", "aoe"]
+SettingWidget = Literal[
+    "switch",
+    "int_days",
+    "int_ms",
+    "url",
+    "secret",
+    "secret_path",
+    "template",
+]
+
+
+# ---------------------------------------------------------------------------
+# AoE default constants — owned HERE (single source), imported back by
+# ``features/aoe_notify.py``. Moving them out of that module is what makes
+# the registry the single owner of the ``config_aoe_*`` defaults.
+# ---------------------------------------------------------------------------
+
+DEFAULT_BASE_URL = "http://127.0.0.1:8181"
+DEFAULT_TEMPLATE = (
+    "[agent-mcp] New message from {sender}. "
+    "Call get_agent_messages to read."
+)
+DEFAULT_TIMEOUT_MS = 2000
+
+
+@dataclass(frozen=True)
+class SettingSpec:
+    """Schema for one per-project ``config_*`` setting.
+
+    ``default`` MUST equal the value the backend resolved before the
+    registry existed (no behaviour change). ``title`` / ``description``
+    are the human copy lifted verbatim from the former frontend
+    declarations so the backend now owns that copy. ``widget`` is an
+    optional render hint the frontend maps to a control.
+    """
+
+    key: str
+    type: SettingType
+    default: object
+    tier: SettingTier
+    group: SettingGroup
+    title: str
+    description: str
+    widget: Optional[SettingWidget] = None
+
+
+SETTINGS_SCHEMA: tuple[SettingSpec, ...] = (
+    SettingSpec(
+        key="config_allow_worker_to_worker",
+        type="bool",
+        default=False,
+        tier="operator",
+        group="worker_permissions",
+        title="Allow worker-to-worker messaging",
+        description=(
+            "When off (default), workers can only send messages to the "
+            "admin. When on, workers may use send_agent_message with any "
+            "agent as recipient."
+        ),
+        widget="switch",
+    ),
+    SettingSpec(
+        key="config_allow_worker_self_assign",
+        type="bool",
+        default=True,
+        tier="operator",
+        group="worker_permissions",
+        title="Allow workers to self-assign tasks",
+        description=(
+            "When on (default), workers may call assign_task using their "
+            "own agent_token. When off, only the admin may assign tasks."
+        ),
+        widget="switch",
+    ),
+    SettingSpec(
+        key="config_allow_worker_create_unassigned",
+        type="bool",
+        default=True,
+        tier="operator",
+        group="worker_permissions",
+        title="Allow workers to file unassigned tasks",
+        description=(
+            "When on (default), workers may call assign_task with no "
+            "agent_token to file work into the unassigned pool for any "
+            "peer to claim. When off, only the admin may create tasks."
+        ),
+        widget="switch",
+    ),
+    SettingSpec(
+        key="config_allow_worker_update_own_status",
+        type="bool",
+        default=True,
+        tier="operator",
+        group="worker_permissions",
+        title="Allow workers to update their own task status",
+        description=(
+            "When on (default), workers may call update_task_status on "
+            "tasks they are assigned to. When off, only the admin may "
+            "transition task status."
+        ),
+        widget="switch",
+    ),
+    SettingSpec(
+        key="config_auto_event_loop_global",
+        type="bool",
+        default=True,
+        tier="operator",
+        group="event_loop",
+        title="Agent event-loop (wake on inbox / task events)",
+        description=(
+            "When on (default), worker agents are instructed to call "
+            "wait_for_events on session start and after each event, so "
+            "they wake automatically when messages or tasks arrive. When "
+            "off, the wake-loop bootstrap text is omitted from "
+            "serverInfo.instructions for every agent — workers fall back "
+            "to human-prompted polling. Per-agent overrides live on the "
+            "Agents tab (disabled here also disables every per-agent "
+            "toggle)."
+        ),
+        widget="switch",
+    ),
+    SettingSpec(
+        key="config_message_retention_days",
+        type="int",
+        default=0,
+        tier="operator",
+        group="retention",
+        title="Auto-delete read messages older than",
+        description=(
+            "The background pruner runs once every 24 hours and deletes "
+            "rows from agent_messages where read=1 and timestamp is older "
+            "than the configured window. Unread messages are never "
+            "pruned. Set to 0 to disable (keep forever)."
+        ),
+        widget="int_days",
+    ),
+    SettingSpec(
+        key="config_aoe_notify_enabled",
+        type="bool",
+        default=False,
+        tier="sysadmin",
+        group="aoe",
+        title="Notify Agents-of-Empires on new messages",
+        description=(
+            "When on, send_agent_message also POSTs a tmux-pane wake-up "
+            "to a local Agents-of-Empires (AoE) instance so the recipient "
+            "notices the message even between polls. Disabled by default. "
+            "Configure config_aoe_base_url, config_aoe_bearer_token "
+            "(secret), and config_aoe_notify_template in the AoE "
+            "integration card below (sysadmin-only). The message body "
+            "itself is never forwarded — only {sender}, {recipient}, "
+            "{message_id} are interpolated."
+        ),
+        widget="switch",
+    ),
+    SettingSpec(
+        key="config_aoe_base_url",
+        type="string",
+        default=DEFAULT_BASE_URL,
+        tier="sysadmin",
+        group="aoe",
+        title="Base URL",
+        description="",
+        widget="url",
+    ),
+    SettingSpec(
+        key="config_aoe_bearer_token",
+        type="secret",
+        default=None,
+        tier="sysadmin",
+        group="aoe",
+        title="Bearer token",
+        description="",
+        widget="secret",
+    ),
+    SettingSpec(
+        key="config_aoe_bearer_token_file",
+        type="secret",
+        default=None,
+        tier="sysadmin",
+        group="aoe",
+        title="Bearer token file",
+        description="",
+        widget="secret_path",
+    ),
+    SettingSpec(
+        key="config_aoe_notify_template",
+        type="string",
+        default=DEFAULT_TEMPLATE,
+        tier="sysadmin",
+        group="aoe",
+        title="Notify template",
+        description="",
+        widget="template",
+    ),
+    SettingSpec(
+        key="config_aoe_timeout_ms",
+        type="int",
+        default=DEFAULT_TIMEOUT_MS,
+        tier="sysadmin",
+        group="aoe",
+        title="Timeout (ms)",
+        description="",
+        widget="int_ms",
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
+# Derived indexes + helpers
+# ---------------------------------------------------------------------------
+
+_SPEC_BY_KEY: dict[str, SettingSpec] = {s.key: s for s in SETTINGS_SCHEMA}
+
+#: Every setting key the backend knows about.
+KNOWN_SETTING_KEYS: frozenset[str] = frozenset(_SPEC_BY_KEY)
+
+#: The genuinely-secret keys, derived from the schema (single source).
+#: ``tools/project_settings_tools._SECRET_SETTING_KEYS`` binds to this.
+SECRET_SETTING_KEYS: frozenset[str] = frozenset(
+    s.key for s in SETTINGS_SCHEMA if s.type == "secret"
+)
+
+
+def spec_for(key: str) -> Optional[SettingSpec]:
+    """Return the :class:`SettingSpec` for ``key`` (or None if unknown)."""
+    return _SPEC_BY_KEY.get(key)
+
+
+def default_for(key: str) -> object:
+    """Return the registered default for ``key``.
+
+    Raises :class:`KeyError` for an unknown key — a config reader that
+    asks for a default the schema doesn't declare is a bug (the reader
+    and the schema have drifted), and failing loudly beats silently
+    resolving a wrong default.
+    """
+    return _SPEC_BY_KEY[key].default

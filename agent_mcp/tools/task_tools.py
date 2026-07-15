@@ -233,7 +233,7 @@ def _authorize_assign_task(
     # Mode 0: worker files an unassigned task.
     if not target_agent_token:
         if not _access._get_config_bool(
-            "config_allow_worker_create_unassigned", default=True
+            "config_allow_worker_create_unassigned"
         ):
             return (
                 "Unauthorized: worker self-filing of unassigned tasks "
@@ -270,7 +270,7 @@ def _authorize_assign_task(
         )
 
     if not _access._get_config_bool(
-        "config_allow_worker_self_assign", default=True
+        "config_allow_worker_self_assign"
     ):
         return (
             "Unauthorized: worker self-assignment is disabled "
@@ -1453,7 +1453,6 @@ async def _create_and_assign_multiple_tasks(
 @requires_policy(
     "config_allow_worker_self_assign",
     "config_allow_worker_create_unassigned",
-    default=True,
 )
 async def assign_task_tool_impl(
     arguments: Dict[str, Any],
@@ -2594,7 +2593,7 @@ async def create_self_task_tool_impl(
 
 # --- update_task_status tool ---
 # Original logic from main.py: lines 1477-1583 (update_task_status_tool function)
-@requires_policy("config_allow_worker_update_own_status", default=True)
+@requires_policy("config_allow_worker_update_own_status")
 async def update_task_status_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -4202,7 +4201,6 @@ async def bulk_task_operations_tool_impl(
                         # decorator's operator-tier bypass.
                         if not is_admin_request and not _access._get_config_bool(
                             "config_allow_worker_update_own_status",
-                            default=True,
                         ):
                             results.append(
                                 f"Operation {i+1}: worker status updates "

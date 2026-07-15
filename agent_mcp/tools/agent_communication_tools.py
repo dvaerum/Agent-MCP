@@ -163,7 +163,7 @@ def _can_agents_communicate(sender_id: str, recipient_id: str, is_admin: bool) -
     # Worker→worker: gated by per-project toggle (issue K).
     # Default-deny preserves upstream behavior; admin opts in via
     # project_context[config_allow_worker_to_worker].
-    if not _access._get_config_bool("config_allow_worker_to_worker", default=False):
+    if not _access._get_config_bool("config_allow_worker_to_worker"):
         return False, "Worker-to-worker messaging disabled by policy"
 
     # Toggle is on. Permit when both sides are currently active agents.
@@ -223,7 +223,7 @@ def check_send_message_permission(
         if principal.kind != "agent_bearer":
             return PermissionDenied(reason="Valid token required")
         if not _access._get_config_bool(
-            "config_allow_worker_to_worker", default=False
+            "config_allow_worker_to_worker"
         ):
             return PermissionDenied(
                 reason=(
@@ -1220,7 +1220,7 @@ def _check_auto_event_loop_flags(agent_id: str) -> tuple[bool, Optional[str]]:
     # Global flag — default TRUE (opt-out, not opt-in). Operators who
     # don't know about the toggle should still get the new behavior.
     global_on = _access._get_config_bool(
-        "config_auto_event_loop_global", default=True,
+        "config_auto_event_loop_global",
     )
     if not global_on:
         return False, "config_auto_event_loop_global is OFF"
