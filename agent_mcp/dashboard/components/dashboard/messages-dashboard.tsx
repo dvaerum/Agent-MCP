@@ -424,7 +424,7 @@ export function MessagesDashboard() {
       setComposeSubject("")
       setComposeReplyParentId(null)
       setComposeOpen(false)
-      await refresh()
+      refresh()
       toastSuccess("Message sent.")
     } catch (e) {
       toastError(e, "Failed to send message")
@@ -478,7 +478,7 @@ export function MessagesDashboard() {
       await callMessages("PATCH", `/${m.message_id}`, { read: nextRead })
       // Live-lookup useDialog: refreshing the list propagates the new
       // read state into the open modal automatically (modal stays open).
-      await refresh()
+      refresh()
       toastSuccess(nextRead ? "Marked as read." : "Marked as unread.")
     } catch (e) {
       toastError(e, "Failed to update message")
@@ -516,7 +516,7 @@ export function MessagesDashboard() {
           callMessages("PATCH", `/${id}`, { read })
         )
       )
-      await refresh()
+      refresh()
       toastSuccess(`Marked ${n} message${n === 1 ? "" : "s"} as ${read ? "read" : "unread"}.`)
     } catch (e) {
       toastError(e, "Failed to update messages")
@@ -532,7 +532,7 @@ export function MessagesDashboard() {
     if (!m) return
     try {
       await callMessages("DELETE", `/${m.message_id}`, {})
-      await refresh()
+      refresh()
       toastSuccess("Message deleted.")
     } catch (e) {
       toastError(e, "Failed to delete message")
@@ -546,7 +546,7 @@ export function MessagesDashboard() {
     if (ids.length === 0) return
     try {
       await Promise.all(ids.map((id) => callMessages("DELETE", `/${id}`, {})))
-      await refresh()
+      refresh()
       toastSuccess(`${ids.length} message${ids.length === 1 ? "" : "s"} deleted.`)
     } catch (e) {
       toastError(e, "Failed to delete messages")

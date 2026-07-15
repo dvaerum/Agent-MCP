@@ -1925,11 +1925,6 @@ export function AgentsDashboard() {
     initial: { searchTerm: '', statusFilter: 'all' },
   })
   const { searchTerm, statusFilter } = filters
-  // selectedAgent is the "current selection" marker the header chip
-  // and the detail dialog both observe; the detail dialog's
-  // open/close drives it via useDialog (see handleSelectAgent / the
-  // dialog's onOpenChange below).
-  const [selectedAgent, setSelectedAgent] = useState<Agent | null>(null)
   // Five row-action dialogs use the live-lookup useDialog<T> hook
   // (Candidate D, architecture review 2026-06-02). Each dialog stores
   // a key (agent_id / task_id) and asks the matching selector for the
@@ -2074,7 +2069,6 @@ export function AgentsDashboard() {
   }
 
   const handleSelectAgent = (agent: Agent) => {
-    setSelectedAgent(agent)
     detailDialog.open(agent.agent_id)
   }
 
@@ -2310,7 +2304,6 @@ export function AgentsDashboard() {
         onOpenChange={(open) => {
           if (!open) {
             detailDialog.close()
-            setSelectedAgent(null)
           }
         }}
         onTaskClick={(task) => {
@@ -2320,21 +2313,18 @@ export function AgentsDashboard() {
           const agent = detailDialog.data
           if (!agent) return
           detailDialog.close()
-          setSelectedAgent(null)
           handleEditAgent(agent)
         }}
         onTerminate={() => {
           const agent = detailDialog.data
           if (!agent) return
           detailDialog.close()
-          setSelectedAgent(null)
           handleTerminateConfirm(agent.agent_id)
         }}
         onPurge={() => {
           const agent = detailDialog.data
           if (!agent) return
           detailDialog.close()
-          setSelectedAgent(null)
           handlePurgeAgent(agent.agent_id)
         }}
       />
