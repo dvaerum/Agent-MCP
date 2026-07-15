@@ -1,6 +1,5 @@
 "use client"
 
-import React from 'react'
 import { Copy, Eye, Clock, User, Database, AlertTriangle, CheckCircle2, Pencil, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -11,7 +10,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { cn } from '@/lib/utils'
 import type { Memory } from '@/lib/api'
 import { MemoryValueView } from '@/components/dashboard/memory-value-view'
 import { decodeMemoryValue } from '@/lib/memory-value'
