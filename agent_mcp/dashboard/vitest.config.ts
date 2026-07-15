@@ -1,4 +1,5 @@
 import { defineConfig } from "vitest/config"
+import react from "@vitejs/plugin-react"
 import path from "node:path"
 
 // Minimal Vitest setup — added in Wave 2 (cleanup-wave-2) to back the
@@ -14,8 +15,14 @@ import path from "node:path"
 // Future runtime tests can layer jsdom + RTL on top without
 // disturbing this baseline.
 export default defineConfig({
+  // The XSS-inertness test (tests/memory-value-xss.test.ts) imports the
+  // markdown component (memory-value-view.tsx) and renders it to a static
+  // string via react-dom/server. The app's tsconfig sets `jsx: preserve`
+  // (for Next's SWC), so vitest's own transform can't compile that JSX on
+  // its own — the react plugin handles the JSX→JS transform for tests.
+  plugins: [react()],
   test: {
-    include: ["tests/**/*.test.ts"],
+    include: ["tests/**/*.test.ts", "tests/**/*.test.tsx"],
     environment: "node",
   },
   resolve: {
