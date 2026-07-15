@@ -443,43 +443,22 @@ def test_normalize_capabilities_lowercases_and_dedupes() -> None:
 
 
 def test_global_event_loop_config_key_defaults_to_true() -> None:
-    """The dashboard reads ``config_auto_event_loop_global`` from
-    ``project_context`` and falls back to True when the row is missing.
+    """``config_auto_event_loop_global`` defaults to True when the row
+    is missing (defaults are applied at read time; the migration must
+    NOT pre-seed the row).
 
-    PR-1 ships the key in the dashboard's POLICIES list with
-    default=True; PR-2 will gate ``serverInfo.instructions`` on the
-    same key with the same default. The contract checked here is the
-    one source of truth — the POLICIES list. The migration must NOT
-    pre-seed the row (defaults are applied at read time, mirroring
-    the existing ``config_allow_worker_*`` keys).
+    ADR-0018: the default is owned by the backend registry
+    (``agent_mcp.core.settings_schema``) — the single source of truth —
+    not the frontend's former hardcoded POLICIES list. Assert against
+    the registry via ``default_for``.
     """
-    # Read the dashboard's POLICIES list. It's a TSX file, so we just
-    # grep — keeps the test out of a Node/TSX runtime entirely.
-    import pathlib
+    from agent_mcp.core.settings_schema import KNOWN_SETTING_KEYS, default_for
 
-    tsx = pathlib.Path(
-        "agent_mcp/dashboard/components/dashboard/settings-dashboard.tsx"
+    assert "config_auto_event_loop_global" in KNOWN_SETTING_KEYS, (
+        "the settings-schema registry must register the global "
+        "event-loop key"
     )
-    text = tsx.read_text()
-    assert '"config_auto_event_loop_global"' in text or \
-           "'config_auto_event_loop_global'" in text, (
-        "settings-dashboard.tsx must register the global event-loop "
-        "policy key"
-    )
-    # The default field for the key must be `true`. We look for the
-    # idiomatic shape (matches the existing keys exactly).
-    # Acceptable encodings: `default: true,` on a nearby line.
-    # Robust check: locate the key occurrence and assert there's a
-    # `default: true` within the next 10 lines.
-    lines = text.splitlines()
-    target = None
-    for i, line in enumerate(lines):
-        if "config_auto_event_loop_global" in line:
-            target = i
-            break
-    assert target is not None
-    window = "\n".join(lines[target : target + 12])
-    assert "default: true" in window, (
-        f"default for config_auto_event_loop_global must be true; "
-        f"window=\n{window}"
+    assert default_for("config_auto_event_loop_global") is True, (
+        "default for config_auto_event_loop_global must be True "
+        "(registry is the single source of truth)"
     )
