@@ -22,7 +22,16 @@ export default defineConfig({
   // its own — the react plugin handles the JSX→JS transform for tests.
   plugins: [react()],
   test: {
-    include: ["tests/**/*.test.ts", "tests/**/*.test.tsx"],
+    // The global env stays `node` so the 135 pure-Node tests are
+    // unaffected. UI tests that need a DOM opt in per-file with a
+    // `// @vitest-environment jsdom` docblock (see
+    // components/dashboard/modals/delete-confirm-enter.test.tsx).
+    include: [
+      "tests/**/*.test.ts",
+      "tests/**/*.test.tsx",
+      "lib/**/*.test.ts",
+      "components/**/*.test.tsx",
+    ],
     environment: "node",
   },
   resolve: {

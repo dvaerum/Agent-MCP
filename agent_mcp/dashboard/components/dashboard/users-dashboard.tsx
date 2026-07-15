@@ -35,6 +35,7 @@ import {
 } from "@/components/ui/table"
 import { routerUsersUrl, routerUserUrl } from "@/lib/urls"
 import { routerApi } from "@/lib/router-api"
+import { onEnterSubmit } from "@/lib/keyboard"
 import { useRouterQuery } from "@/hooks/use-router-query"
 
 // Client-side hint that MUST be kept in sync with the server's canonical
@@ -431,7 +432,7 @@ function EditUserModal({
 }
 
 
-function DeleteUserModal({
+export function DeleteUserModal({
   user,
   open,
   onOpenChange,
@@ -486,6 +487,7 @@ function DeleteUserModal({
             id="delete-user-confirm"
             value={confirmText}
             onChange={(e) => setConfirmText(e.target.value)}
+            onKeyDown={onEnterSubmit(confirmed && !submitting, handleDelete)}
             placeholder={user.username}
             autoComplete="off"
             autoFocus

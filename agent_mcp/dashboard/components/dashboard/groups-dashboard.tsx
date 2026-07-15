@@ -45,6 +45,7 @@ import {
   groupCapabilitiesByResource,
 } from "@/lib/capability-descriptions"
 import { routerApi } from "@/lib/router-api"
+import { onEnterSubmit } from "@/lib/keyboard"
 import { ApiError } from "@/lib/api"
 import { useRouterQuery } from "@/hooks/use-router-query"
 
@@ -849,7 +850,7 @@ function EditGroupModal({
 }
 
 
-function DeleteGroupModal({
+export function DeleteGroupModal({
   group,
   open,
   onOpenChange,
@@ -915,6 +916,7 @@ function DeleteGroupModal({
             id="delete-group-confirm"
             value={confirmText}
             onChange={(e) => setConfirmText(e.target.value)}
+            onKeyDown={onEnterSubmit(confirmed && !submitting, handleDelete)}
             placeholder={group.name}
             autoComplete="off"
             disabled={submitting}

@@ -87,7 +87,7 @@ let
     # on hash mismatch; paste it back here. Updated 2026-07-02 for the
     # next 15.3.4 -> 15.5.20 security bump + npm audit fix lockfile
     # changes.
-    npmDepsHash = "sha256-R1UVHjh4Vcc6Q6lzJy6Z+v9OYdX5OiwLd6r+0PDoPH8=";
+    npmDepsHash = "sha256-QD/2W1cmlSWBqbvx43nLsDlRR9o7HS/l4o/IPP4qBR4=";
     NEXT_PUBLIC_AUTO_CONNECT = "false";
     NEXT_PUBLIC_DEFAULT_SERVER_HOST = "";
     NEXT_PUBLIC_DEFAULT_SERVER_PORT = "";

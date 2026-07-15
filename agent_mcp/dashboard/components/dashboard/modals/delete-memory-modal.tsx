@@ -14,6 +14,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
+import { onEnterSubmit } from '@/lib/keyboard'
 import type { Memory } from '@/lib/api'
 
 interface DeleteMemoryModalProps {
@@ -153,6 +154,7 @@ export function DeleteMemoryModal({
                 id="confirmation"
                 value={confirmationText}
                 onChange={(e) => setConfirmationText(e.target.value)}
+                onKeyDown={onEnterSubmit(isConfirmed && !loading, handleDelete)}
                 placeholder={`Type "${requiredConfirmation}" to confirm`}
                 className={cn(
                   "bg-background border-border text-foreground font-mono",
