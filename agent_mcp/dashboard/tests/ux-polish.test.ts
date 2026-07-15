@@ -65,25 +65,34 @@ describe("UX-09: message-retention validation", () => {
   })
 
   it("refuses to save when the draft is invalid (no silent coerce)", () => {
-    // saveRetention must consult validateRetention and bail before it
-    // ever calls coerceNonNegInt — that's the whole point of UX-09.
+    // ADR-0018: the generic saveField must consult validateRetention
+    // for the int_days widget and bail before it ever coerces — that's
+    // the whole point of UX-09.
     const saveBody = src.match(
-      /const saveRetention = async \(\) => \{([\s\S]*?)\n  \}/,
+      /const saveField = async \(entry: SettingsSchemaEntry\) => \{([\s\S]*?)\n  \}/,
     )
-    expect(saveBody, "saveRetention must be declared").not.toBeNull()
+    expect(saveBody, "saveField must be declared").not.toBeNull()
     expect(
-      /validateRetention\(retention\.draft\) !== null/.test(saveBody![1]),
-      "saveRetention must validate before coercing",
+      /kind === "int_days" && validateRetention\(draft\) !== null/.test(
+        saveBody![1],
+      ),
+      "saveField must validate the int_days draft before coercing",
     ).toBe(true)
   })
 
   it("shows an inline hint after blur and disables Save when invalid", () => {
+    // The int_days control marks itself touched on blur and only then
+    // renders the validation hint.
     expect(
-      /onBlur=\{\(\) => setRetentionTouched\(true\)\}/.test(src),
-      "retention input must mark itself touched on blur",
+      /onBlur=\{onBlur\}/.test(src),
+      "int_days input must mark itself touched on blur",
     ).toBe(true)
     expect(
-      /retentionTouched && validateRetention\(retention\.draft\)/.test(src),
+      /setTouched\(\(t\) => \(\{ \.\.\.t, \[entry\.key\]: true \}\)\)/.test(src),
+      "the blur handler must flip the entry's touched flag",
+    ).toBe(true)
+    expect(
+      /touched && invalid && \(/.test(src),
       "an inline hint must render when touched and invalid",
     ).toBe(true)
   })

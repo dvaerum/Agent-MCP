@@ -190,6 +190,41 @@ export interface ProjectSetting {
   updated_by: string
 }
 
+// A single setting's schema entry, as returned by
+// GET /api/settings-schema (ADR-0018). The backend registry
+// (agent_mcp/core/settings_schema.py) is the single source of truth
+// for every setting's default / grouping / tier / copy; the Settings
+// dashboard renders itself from this list via a type→widget registry
+// rather than hardcoding the spec table.
+export interface SettingsSchemaEntry {
+  key: string
+  type: 'bool' | 'int' | 'string' | 'secret'
+  default: unknown
+  tier: 'operator' | 'sysadmin'
+  group: 'worker_permissions' | 'event_loop' | 'retention' | 'aoe'
+  title: string
+  description: string
+  widget:
+    | 'switch'
+    | 'int_days'
+    | 'int_ms'
+    | 'url'
+    | 'secret'
+    | 'secret_path'
+    | 'template'
+}
+
+// GET /api/settings-schema envelope. `caller` reports the requesting
+// operator's tier so the UI can render sysadmin-tier controls disabled
+// for a plain operator (instead of letting the save 403).
+export interface SettingsSchemaResponse {
+  schema: SettingsSchemaEntry[]
+  caller: {
+    sysadmin: boolean
+    confirmed_operator: boolean
+  }
+}
+
 export interface MemoryHealthAnalysis {
   status: 'excellent' | 'good' | 'needs_attention' | 'critical' | 'no_data'
   health_score: number
@@ -933,6 +968,15 @@ class ApiClient {
   // auth story as the memory endpoints above.
   async getSettingsData(): Promise<{ settings: ProjectSetting[] }> {
     return this.request('/settings-data')
+  }
+
+  // Settings schema (ADR-0018). The backend registry owns every
+  // setting's default / grouping / tier / copy; the Settings dashboard
+  // renders itself from this list. `caller.sysadmin` drives tier-aware
+  // rendering (sysadmin-tier controls disabled for a plain operator).
+  // Reads only — writes still go through create/update/deleteSetting.
+  async getSettingsSchema(): Promise<SettingsSchemaResponse> {
+    return this.request('/settings-schema')
   }
 
   async createSetting(data: {

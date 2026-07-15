@@ -30,23 +30,30 @@ def test_settings_dashboard_component_exists() -> None:
         "export function SettingsDashboard" in src
         or "export const SettingsDashboard" in src
     )
-    # Must reference all three canonical worker-permission policy keys.
-    assert "config_allow_worker_to_worker" in src, (
-        "expected the component to expose the config_allow_worker_to_worker toggle"
+    # ADR-0018: the canonical worker-permission policy keys are no longer
+    # hardcoded in the frontend — the backend registry
+    # (agent_mcp.core.settings_schema) is the single source of truth, and
+    # the dashboard renders itself data-driven from GET /api/settings-schema.
+    # Assert the keys against the registry rather than the frontend copy.
+    from agent_mcp.core.settings_schema import KNOWN_SETTING_KEYS
+
+    for key in (
+        "config_allow_worker_to_worker",
+        "config_allow_worker_self_assign",
+        "config_allow_worker_update_own_status",
+        "config_allow_worker_create_unassigned",
+    ):
+        assert key in KNOWN_SETTING_KEYS, (
+            f"expected {key} in the settings-schema registry "
+            "(KNOWN_SETTING_KEYS)"
+        )
+    # Must consume the schema (ADR-0018) and be backed by the settings
+    # endpoints (ADR-0016: config_* lives in project_settings; writes go
+    # through updateSetting / createSetting → PUT/POST /api/settings...).
+    assert "getSettingsSchema" in src, (
+        "expected the component to read the schema via getSettingsSchema "
+        "(settings-schema) — ADR-0018 data-driven rendering"
     )
-    assert "config_allow_worker_self_assign" in src, (
-        "expected the component to expose the config_allow_worker_self_assign toggle"
-    )
-    assert "config_allow_worker_update_own_status" in src, (
-        "expected the component to expose the config_allow_worker_update_own_status toggle"
-    )
-    assert "config_allow_worker_create_unassigned" in src, (
-        "expected the component to expose the config_allow_worker_create_unassigned "
-        "toggle (Q6d — workers filing into the unassigned pool)"
-    )
-    # Must be backed by the settings endpoints (ADR-0016: config_*
-    # lives in project_settings; writes go through updateSetting /
-    # createSetting → PUT/POST /api/settings...).
     assert "updateSetting" in src and "createSetting" in src, (
         "expected the component to write via updateSetting/createSetting"
     )
@@ -94,12 +101,24 @@ def test_settings_dashboard_exposes_message_retention_input() -> None:
     permission toggles. Stored as
     project_settings["config_message_retention_days"] (ADR-0016).
     """
-    src = _read("components/dashboard/settings-dashboard.tsx")
-    assert "config_message_retention_days" in src, (
-        "expected the component to expose the config_message_retention_days "
-        "input"
+    # ADR-0018: the retention key + its type are owned by the backend
+    # registry, not hardcoded in the frontend. Assert the knob against
+    # the schema (single source of truth).
+    from agent_mcp.core.settings_schema import KNOWN_SETTING_KEYS, spec_for
+
+    assert "config_message_retention_days" in KNOWN_SETTING_KEYS, (
+        "expected config_message_retention_days in the settings-schema "
+        "registry (KNOWN_SETTING_KEYS)"
     )
-    # Must be a numeric input (not a Switch) — retention is an integer count.
+    spec = spec_for("config_message_retention_days")
+    assert spec is not None and spec.type == "int", (
+        "config_message_retention_days must be an int-typed setting "
+        f"(retention is an integer day count); got {spec}"
+    )
+    # The int widget still renders a numeric input (not a Switch) in the
+    # data-driven frontend.
+    src = _read("components/dashboard/settings-dashboard.tsx")
     assert 'type="number"' in src or "type='number'" in src, (
-        "expected a numeric <input type=\"number\"> for retention days"
+        "expected a numeric <input type=\"number\"> for the int widget "
+        "(retention days)"
     )
