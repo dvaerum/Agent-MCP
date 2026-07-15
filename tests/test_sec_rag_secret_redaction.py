@@ -1,32 +1,20 @@
-"""Security: the RAG side-channel must not leak project_context secrets.
+"""ADR-0017 (Wave 12 PR B): the RAG side-channel returns memory rows in FULL.
 
-FINDING (owner-authorized security review, 2026-07, HIGH, confirmed):
-``ask_project_rag`` is callable by any worker (``agent_bearer``).
-``query_rag_system`` (features/rag/query.py) previously dumped
-project_context Key/Value pairs into the LLM context with NO secret
-redaction, through three paths:
+This suite pinned the RAG secret-redaction seam (secret-keyed rows dropped
+at index + query time). Wave 12 PR B removes content-based secret
+detection: project_context is shared project knowledge, returned AS-IS
+through ``ask_project_rag``. Protection is by authorization — RAG is
+per-project and (for tasks) ownership-scoped — not by guessing content.
 
-  1. ``fetch_recent_context`` — the "live context" window.
-  2. the advanced ``SELECT context_key, value ...`` in
-     ``query_rag_system_with_model`` (task-placement analysis).
-  3. retrieved vector chunks whose ``source_type == "context"`` (a
-     secret that was embedded into the index at index time).
-
-``view_project_context`` already redacts secret-keyed rows for
-non-admin callers via ``_SECRET_KEY_RE``; the RAG surface bypassed
-that gate. A worker could ask ``ask_project_rag("what is
-config_aoe_bearer_token?")`` and the LLM would echo the secret.
-
-Fix (single source of truth): a shared ``is_secret_key`` helper in
-``tools/project_context_tools.py`` (reusing ``_SECRET_KEY_RE``) is
-imported by the RAG index + query paths. Secret-keyed rows are
-skipped at index time AND dropped at every query-time
-context-assembly site (defense against a stale index that already
-embedded a secret).
+What SURVIVES and is still exercised here: the store separation from
+ADR-0016. ``config_*`` keys live in the operator-only ``project_settings``
+store, which the RAG NEVER scans — so a ``config_*`` secret genuinely
+never enters the RAG context. Knowledge keys in ``project_context`` are
+now returned verbatim (the former "dropped" assertions are inverted).
 
 These tests drive ``query_rag_system`` / ``query_rag_system_with_model``
-directly with a captured LLM client so we can assert on the exact
-context text handed to the model.
+directly with a captured LLM client so we can assert on the exact context
+text handed to the model.
 """
 
 from __future__ import annotations
@@ -45,6 +33,7 @@ pytestmark = pytest.mark.asyncio
 
 
 _SECRET_VALUE = "SENTINEL-SECRET-VALUE-9f3a"
+_SETTINGS_SECRET = "SETTINGS-STORE-SECRET-1a2b"
 _PUBLIC_VALUE = "public-readme-info"
 
 
@@ -67,8 +56,7 @@ class _CapturingClient:
 def _user_content(cap: _CapturingClient) -> str:
     assert cap.messages is not None, (
         "LLM was never invoked — the assembled context was empty, so "
-        "this test cannot prove the secret was filtered (vs. simply "
-        "absent). Seed data / patches are wrong."
+        "this test cannot prove the row was returned (vs. simply absent)."
     )
     return next(m["content"] for m in cap.messages if m["role"] == "user")
 
@@ -102,68 +90,45 @@ class _StubEmbedder:
 def _wire_capture(monkeypatch, *, vss: bool = False) -> _CapturingClient:
     cap = _CapturingClient()
     monkeypatch.setattr(query_mod, "completion_client", lambda: cap)
-    # Route the query embedding through a deterministic stub seam so the
-    # assembly + filter code runs without a live embedding endpoint.
     monkeypatch.setattr(query_mod, "embedding_client", lambda: _StubEmbedder())
     monkeypatch.setattr(query_mod, "is_vss_loadable", lambda: vss)
     return cap
 
 
-# ── is_secret_key helper (single source of truth) ────────────────────
+# ── store separation: a config_* settings secret never enters the RAG ─
 
 
-async def test_is_secret_key_matches_config_token_family() -> None:
-    from agent_mcp.tools.project_context_tools import is_secret_key
-
-    # ADR-0016 nuance: these match via the secret-word VOCAB (token /
-    # secret / password / api_key / key), not the config_ prefix — the
-    # blanket config_* rule is deleted (config rows can no longer exist
-    # in project_context).
-    assert is_secret_key("config_aoe_bearer_token")
-    assert is_secret_key("config_openai_secret")
-    assert is_secret_key("config_db_password")
-    assert is_secret_key("config_stripe_api_key")
-    assert is_secret_key("config_signing_private_key")
-    # Non-secret keys must not match (no over-filtering).
-    assert not is_secret_key("project_readme")
-    assert not is_secret_key("app.settings.theme")
-    assert not is_secret_key("")
-
-
-# ── (1) live-context path in query_rag_system ────────────────────────
-
-
-async def test_live_context_drops_secret_rows(tmp_path, monkeypatch) -> None:
+async def test_settings_store_secret_never_enters_rag(
+    tmp_path, monkeypatch
+) -> None:
+    """ADR-0016 store separation SURVIVES: a ``config_*`` secret lives in
+    the non-RAG project_settings store, so it never reaches the LLM — not
+    because the RAG scans content, but because it isn't in the corpus."""
     async with mcp_session(tmp_path) as admin:
-        _seed(admin, key="config_aoe_bearer_token", value=_SECRET_VALUE)
+        _seed(admin, key="config_aoe_bearer_token", value=_SETTINGS_SECRET)
         _seed(admin, key="project_readme", value=_PUBLIC_VALUE)
         cap = _wire_capture(monkeypatch)
 
         await query_rag_system("tell me about the project tokens")
 
         user = _user_content(cap)
-        assert _SECRET_VALUE not in user, (
-            "secret VALUE leaked into RAG live-context handed to the LLM"
-        )
-        assert "config_aoe_bearer_token" not in user, (
-            "secret KEY leaked into RAG live-context handed to the LLM"
-        )
-        # Non-secret context must still flow through (no over-filtering).
+        assert _SETTINGS_SECRET not in user
+        assert "config_aoe_bearer_token" not in user
+        # Knowledge content flows through.
         assert _PUBLIC_VALUE in user
         assert "project_readme" in user
 
 
-# ── (2) advanced SELECT path in query_rag_system_with_model ──────────
+# ── knowledge rows in project_context are returned in FULL ───────────
 
 
-async def test_advanced_live_context_drops_secret_rows(
+async def test_advanced_live_context_returns_knowledge_secret_named_row(
     tmp_path, monkeypatch
 ) -> None:
     async with mcp_session(tmp_path) as admin:
-        # A config row (settings store — never RAG-scanned, ADR-0016) AND
-        # a secret-suffixed KNOWLEDGE row (project_context — dropped by
-        # the is_secret_key filter on the live-context scan).
-        _seed(admin, key="config_service_secret", value=_SECRET_VALUE)
+        # config_* → settings store (never RAG-scanned); openai_api_key is
+        # a KNOWLEDGE key in project_context → returned AS-IS (ADR-0017).
+        _seed(admin, key="config_service_secret", value=_SETTINGS_SECRET)
         _seed(admin, key="openai_api_key", value=_SECRET_VALUE)
         _seed(admin, key="project_readme", value=_PUBLIC_VALUE)
         cap = _wire_capture(monkeypatch)
@@ -171,34 +136,30 @@ async def test_advanced_live_context_drops_secret_rows(
         await query_rag_system_with_model("analyse task placement")
 
         user = _user_content(cap)
-        assert _SECRET_VALUE not in user, (
-            "secret VALUE leaked into advanced RAG live-context"
-        )
+        # The knowledge row (key + value) is returned in full.
+        assert _SECRET_VALUE in user
+        assert "openai_api_key" in user
+        # The settings-store secret is still absent (store separation).
+        assert _SETTINGS_SECRET not in user
         assert "config_service_secret" not in user
-        assert "openai_api_key" not in user
         assert _PUBLIC_VALUE in user
 
 
-# ── (3) retrieved-chunk path (defense against a stale index) ─────────
-
-
-async def test_retrieved_context_chunk_secret_dropped(
+async def test_retrieved_context_chunk_returned_in_full(
     tmp_path, monkeypatch
 ) -> None:
-    """Even if a secret was already embedded into the vector index
-    (source_type == 'context'), the retrieval loop must drop it before
-    it reaches the LLM. Non-secret chunks survive."""
+    """A retrieved vector chunk is returned AS-IS — no content-based drop
+    (ADR-0017)."""
     async with mcp_session(tmp_path):
         cap = _wire_capture(monkeypatch, vss=True)
 
         fake_results = [
             {
                 "chunk_text": (
-                    f"Context Key: config_aoe_bearer_token\n"
-                    f"Value: {_SECRET_VALUE}"
+                    f"Context Key: api_bearer_token\nValue: {_SECRET_VALUE}"
                 ),
                 "source_type": "context",
-                "source_ref": "config_aoe_bearer_token",
+                "source_ref": "api_bearer_token",
                 "metadata": {},
                 "distance": 0.1,
             },
@@ -216,35 +177,10 @@ async def test_retrieved_context_chunk_secret_dropped(
         monkeypatch.setattr(
             get_rag_repo(), "search_similar", lambda **kw: fake_results
         )
-        # Embedding call: the seam is already stubbed by _wire_capture
-        # (_StubEmbedder) so the vector-search path runs without network.
 
         await query_rag_system("what tokens does the project use?")
 
         user = _user_content(cap)
-        assert _SECRET_VALUE not in user, (
-            "secret embedded as a context chunk leaked at retrieval time"
-        )
-        assert "config_aoe_bearer_token" not in user
-        # The non-secret code chunk must survive.
+        assert _SECRET_VALUE in user
+        assert "api_bearer_token" in user
         assert "def hello()" in user
-
-
-# ── (4) index-time skip (don't embed secrets in the first place) ─────
-
-
-async def test_indexer_skips_secret_context_rows() -> None:
-    """The context-scan in the periodic indexer must apply is_secret_key
-    so secret rows are never embedded. The scan lives inside the
-    NoReturn ``run_rag_indexing_periodically`` loop (not unit-callable),
-    so guard the control at the module level: the retrieval-time filter
-    (tested above) is the load-bearing defense; this guards the
-    index-time optimisation against a silent refactor drop."""
-    import inspect
-
-    from agent_mcp.features.rag import indexing as indexing_mod
-
-    src = inspect.getsource(indexing_mod.run_rag_indexing_periodically)
-    assert "is_secret_key" in src, (
-        "index-time secret-row skip was removed from the context scan"
-    )

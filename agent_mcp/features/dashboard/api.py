@@ -166,7 +166,6 @@ async def fetch_graph_data_logic(
     # get_db_connection_func: Callable[[], sqlite3.Connection], # Replaced by direct import
     current_file_map_snapshot: Dict[str, Dict[str, Any]],
     *,
-    expose_secrets: bool = False,
     limit: Optional[int] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
@@ -175,13 +174,6 @@ async def fetch_graph_data_logic(
 
     Args:
         current_file_map_snapshot: A snapshot of the current g.file_map.
-        expose_secrets: True iff the caller is CONFIRMED operator tier
-            (``is_confirmed_operator_tier`` in
-            ``app/routers/composition.py``). Mirrors ``/api/all-data``
-            and ``/api/context-data``: defaults to False (redact) so a
-            caller who forgets to thread the tier signal fails closed,
-            not open. See the context-node redaction below (pentest
-            R1-F1).
         limit: Per-section row cap (pentest R2-F2). Bounds the tasks and
             project_context reads, and (via ``min(100, limit)``) the
             agent_actions scan — mirroring ``/api/all-data``. ``None``
@@ -388,35 +380,20 @@ async def fetch_graph_data_logic(
 
         # 4. Project Context (Original dashboard_api.py: lines 135-145)
         #
-        # SECURITY (pentest R1-F1): this reader used to select and render
-        # ``description`` verbatim in the node tooltip with no call into
-        # the shared redaction seam (``_context_value_should_redact`` in
-        # ``app/routers/composition.py``) — the ONE authority every other
-        # project_context reader (node-details, all-data, context-data,
-        # MCP view_project_context, RAG) consults. A secret pasted into a
-        # benign-keyed row's description leaked verbatim to a viewer-tier
-        # / cookie / forwarding caller (unverifiable tier — see
-        # ``is_confirmed_operator_tier``), even though the sibling reads
-        # redacted the identical row. ``value`` is also fetched now
-        # (still never rendered) because the predicate scans both value
-        # and description to catch a credential regardless of which
-        # field it was pasted into — selecting only description would
-        # under-redact relative to the seam. The predicate is imported
-        # lazily to avoid a router->feature import at module load time
-        # (composition.py imports this module at the top level); by the
-        # time this function runs, composition.py is already loaded.
+        # ADR-0017 (Wave 12 PR B): project_context is shared project
+        # knowledge — the node tooltip renders the description AS-IS. The
+        # content-based redaction that used to gate this on
+        # ``_context_value_should_redact`` / confirmed-operator tier is
+        # gone (unreliable both directions; real secrets belong in the
+        # operator-only project_settings store).
         # PERF/DOS (pentest R2-F2): bounded to the newest `section_limit`
         # rows (ORDER BY updated_at DESC LIMIT ? in SQL), mirroring
         # `/api/all-data` and `/api/context-data`. Previously an unbounded
         # full scan of project_context on every dashboard refresh.
         cursor.execute(
-            "SELECT context_key, value, description FROM project_context "
+            "SELECT context_key, description FROM project_context "
             "ORDER BY updated_at DESC LIMIT ?",
             (section_limit,),
-        )
-        from ...app.routers.composition import (
-            _REDACTED_VALUE,
-            _context_value_should_redact,
         )
 
         for context_row in cursor.fetchall():
@@ -425,10 +402,6 @@ async def fetch_graph_data_logic(
             if node_id_str not in node_ids:
                 style = get_node_style('context')
                 description_val = context_row['description']
-                if not expose_secrets and _context_value_should_redact(
-                    key, context_row['value'], description_val
-                ):
-                    description_val = _REDACTED_VALUE
                 nodes.append({
                     'id': node_id_str,
                     'label': key[:20] + '...' if len(key) > 20 else key,

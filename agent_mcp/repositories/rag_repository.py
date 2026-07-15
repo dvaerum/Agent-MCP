@@ -143,80 +143,14 @@ def _embeddings_table_exists(cursor: sqlite3.Cursor) -> bool:
     return cursor.fetchone() is not None
 
 
-# ---------------------------------------------------------------------------
-# Secret redaction — owned by the retrieval SEAM.
-#
-# ``search_similar`` and ``fetch_recent_context`` are the single seam the
-# RAG query path reads through. The seam that owns "what you get back"
-# must own "with secrets removed" — otherwise any NEW caller of these
-# methods echoes project_context secrets (``config_*_token`` etc.) to the
-# LLM/worker, bypassing ``view_project_context``'s redaction. This used to
-# be re-applied by hand at every ``features/rag/query.py`` call site; it
-# now lives here so the guarantee travels with the data.
-#
-# Both helpers import lazily (not at module top) to sidestep the import
-# cycle: ``tools/__init__`` -> ``rag_tools`` -> ``features/rag/query`` ->
-# ``repositories`` -> this module, and ``features/rag/indexing`` also
-# reaches back into ``repositories``. Deferring the import to call time
-# keeps module load acyclic — the same shape ``features/rag/query`` uses.
-# ---------------------------------------------------------------------------
-
-
-def _is_secret_key(key: Optional[str]) -> bool:
-    """Lazy wrapper over the canonical secret-key policy.
-
-    Single source of truth is
-    :func:`agent_mcp.tools.project_context_tools.is_secret_key`; every
-    project_context surface (tool boundary, RAG index + query, dashboard
-    composition) applies the SAME rule so they can't drift.
-    """
-    from ..tools.project_context_tools import is_secret_key
-
-    return is_secret_key(key)
-
-
-def _value_has_embedded_secret(*texts: Optional[str]) -> bool:
-    """Lazy wrapper over the canonical embedded-secret VALUE scanner.
-
-    Catches a credential stored in the VALUE of a non-secret-named key
-    (e.g. ``deploy_notes`` holding a GitHub PAT). Reused (not duplicated)
-    from the index path so the retrieval filter applies the SAME skip the
-    indexer does.
-    """
-    from ..features.rag.indexing import _value_has_embedded_secret as _scan
-
-    return _scan(*texts)
-
-
-def _drop_secret_chunks(
-    results: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Drop retrieved vector chunks that carry a credential — for ANY
-    source type.
-
-    Defense-in-depth against a STALE index that embedded a secret before
-    the ``bulk_index_chunks`` choke-point existed. Two drop rules, both
-    retained:
-
-    * secret-KEYED ``project_context`` row — the chunk's ``source_ref``
-      is the context_key for ``source_type == "context"`` (the original
-      round-2 rule).
-    * secret in the chunk TEXT itself — a credential pasted into a task
-      description/title, a code file, or a markdown doc (R2-F3). This is
-      keyed on the ``chunk_text`` VALUE, so it covers every source type,
-      not just ``context``.
-    """
-    return [
-        r
-        for r in results
-        if not (
-            (
-                r.get("source_type") == "context"
-                and _is_secret_key(r.get("source_ref"))
-            )
-            or _value_has_embedded_secret(r.get("chunk_text"))
-        )
-    ]
+# ADR-0017 (Wave 12 PR B): content-based secret detection is GONE. The
+# retrieval-seam secret helpers (``_is_secret_key`` /
+# ``_value_has_embedded_secret`` / ``_drop_secret_chunks``) that dropped
+# "secret-looking" context rows and chunks from ``search_similar`` /
+# ``fetch_recent_context`` are deleted. project_context, tasks, code, and
+# markdown are shared project content, returned AS-IS. Protection is by
+# authorization (RAG is per-project); real secrets belong in sops refs or
+# the operator-only, non-RAG project_settings store.
 
 
 class RagRepository:
@@ -285,26 +219,10 @@ class RagRepository:
                 chunk_text = chunk.get("chunk_text")
                 if not chunk_text:
                     continue
-                # SECURITY (R2-F3): the ingest CHOKE-POINT. Scan every
-                # chunk's text for an embedded credential — for ALL source
-                # types, not just ``context`` — and skip a secret-bearing
-                # chunk so it is never embedded. Any agent with rag.query
-                # can retrieve indexed chunks via ask_project_rag, so a
-                # token pasted into a task description/title, a code file,
-                # or a markdown doc would otherwise be echoed to the LLM.
-                # This one seam covers the periodic indexer, index_task_data
-                # and any future ingester. Reuses the same value scanner
-                # the context path uses so the policy can't drift. The
-                # high-entropy heuristic may over-drop a chunk holding a
-                # long hash (e.g. a git SHA in code) — an accepted trade
-                # for closing a live secret-exfiltration.
-                if _value_has_embedded_secret(chunk_text):
-                    logger.warning(
-                        "Skipping RAG embedding for %s:%s chunk: text "
-                        "matched an embedded-secret pattern.",
-                        source_type, source_ref,
-                    )
-                    continue
+                # ADR-0017 (Wave 12 PR B): the ingest choke-point no longer
+                # scans chunk text for embedded secrets — every chunk is
+                # indexed AS-IS. Content is shared project knowledge; real
+                # secrets belong in sops refs / the project_settings store.
                 metadata = chunk.get("metadata")
                 metadata_json = json.dumps(metadata) if metadata else None
                 cursor.execute(
@@ -636,12 +554,10 @@ class RagRepository:
         inside this method — callers describe what they want, never
         spell the SQL.
 
-        SECURITY: this seam owns secret redaction. Chunks carrying a
-        secret ``project_context`` row (``source_type == "context"`` with
-        a secret ``source_ref``) are dropped here so no caller — current
-        or future — echoes a ``config_*_token`` value to the LLM/worker.
-        This is retrieval-time defense against a stale index that
-        embedded the secret before the index-time skip existed.
+        ADR-0017 (Wave 12 PR B): chunks are returned AS-IS — there is no
+        content-based secret redaction on this seam. RAG is per-project
+        and (for tasks) ownership-scoped by the query layer; protection is
+        by authorization, not by guessing content.
 
         ``source_type_filter`` is applied as a Python-side filter
         AFTER the vec0 join. vec0's ``WHERE`` clause only supports its
@@ -698,13 +614,9 @@ class RagRepository:
                 results.append(d)
                 if len(results) >= limit:
                     break
-            # SECURITY: the seam drops any chunk that carries a credential
-            # — secret-keyed context rows AND chunks of any source type
-            # whose TEXT embeds a secret — before they reach any caller.
-            # Retrieval-time defense against a stale index that embedded a
-            # secret before the bulk_index_chunks choke-point existed. See
-            # _drop_secret_chunks.
-            return _drop_secret_chunks(results)
+            # ADR-0017 (Wave 12 PR B): the seam returns chunks AS-IS — no
+            # content-based secret drop.
+            return results
         except sqlite3.Error as e:
             logger.error(
                 f"Database error during vector search: {e}", exc_info=True,
@@ -768,12 +680,10 @@ class RagRepository:
         Returns a list of dicts with keys ``context_key``, ``value``,
         ``description``, ``updated_at``.
 
-        SECURITY: this seam owns secret redaction. Secret-keyed rows
-        (``config_*_token`` etc.) and rows whose VALUE embeds a
-        credential are dropped here — the RAG live-context section is
-        readable by any worker via ``ask_project_rag``, bypassing
-        ``view_project_context``'s redaction, so the same policy is
-        enforced at the seam rather than re-applied by each caller.
+        ADR-0017 (Wave 12 PR B): rows are returned AS-IS — no
+        content-based secret redaction. project_context is shared project
+        knowledge; real secrets belong in the operator-only, non-RAG
+        project_settings store.
         """
         conn = get_db_connection()
         try:
@@ -795,20 +705,9 @@ class RagRepository:
                     "LIMIT ?",
                     (since, limit),
                 )
-            rows = [dict(r) for r in cursor.fetchall()]
-            # SECURITY: the seam never surfaces secret-keyed rows
-            # (config_*_token etc.) or rows whose VALUE embeds a
-            # credential. The RAG live-context section is readable by any
-            # worker via ask_project_rag, bypassing view_project_context's
-            # redaction — so the same policy is enforced here at the seam.
-            return [
-                r
-                for r in rows
-                if not _is_secret_key(r.get("context_key"))
-                and not _value_has_embedded_secret(
-                    r.get("value"), r.get("description")
-                )
-            ]
+            # ADR-0017 (Wave 12 PR B): the seam returns project_context
+            # rows AS-IS — no content-based secret redaction.
+            return [dict(r) for r in cursor.fetchall()]
         except sqlite3.Error as e:
             logger.error(
                 f"Database error fetching recent context: {e}",

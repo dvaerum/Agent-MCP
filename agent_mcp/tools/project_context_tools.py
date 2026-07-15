@@ -11,82 +11,19 @@ from typing import List, Dict, Any, Optional, Tuple
 # regex backs the WRITE/DELETE rejection only — ``_check_write_authorization``
 # and the bulk-delete guard reject the whole namespace for every caller
 # (admin included) with a pointer to the settings tools. It plays no part
-# in secret READ classification (see :func:`is_secret_key`).
+# in the config write/delete rejection only.
 _CONFIG_KEY_RE = re.compile(r"^config_", re.IGNORECASE)
 
-# Secret-ish vocabulary that marks a key as holding a
-# credential (e.g. ``openai_api_key``, ``db_password``, ``github_pat``,
-# ``session_cookie``, ``jwt_secret``). Matched only as a delimited
-# segment — bounded by start/end of the key or one of ``_ - .`` — so we
-# don't over-redact innocent keys that merely CONTAIN these letters
-# (``monkey`` ⊅ ``key``, ``passenger`` ⊅ ``pass``, ``author`` ⊅
-# ``auth``). A trailing ``s`` is tolerated so plurals (``credentials``,
-# ``cookies``, ``keys``) still match. Round-2 fix: the pre-fix pattern
-# required a ``config_`` prefix AND a second ``_`` before one of only 5
-# suffixes, so ``config_api_key`` / ``config_secret`` / ``openai_api_key``
-# / ``db_password`` all slipped through as NOT-secret and leaked via the
-# RAG side-channel + dashboard reads.
-_SECRET_SUFFIX_RE = re.compile(
-    r"(?:^|[_\-.])"
-    r"(?:"
-    # credential / password family
-    r"credential|cred|passphrase|password|passwd|pass|pwd|pw|"
-    # api key / secret / token / auth family
-    r"api[_-]?key|apikey|secret|bearertoken|bearer|token|jwt|auth|pat|"
-    # cookie / key family
-    r"sessioncookie|cookie|privkey|key|"
-    # wallet / crypto material
-    r"seed|mnemonic|"
-    # connection-string / DSN key names (credential-bearing URLs)
-    r"dsn|conn[_-]?str|connection[_-]?string|database[_-]?url|db[_-]?url"
-    r")"
-    r"s?"
-    r"(?:$|[_\-.])",
-    re.IGNORECASE,
-)
 
-# lowerUpper camelCase transition — normalized to a delimiter before the
-# vocab match so ``clientSecret`` -> ``client_Secret`` matches ``secret``
-# (round-3 fix: the delimited regex above never saw camelCase keys like
-# ``accessToken`` / ``refreshToken`` as carrying a secret segment).
-_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z])(?=[A-Z])")
-
-
-def is_secret_key(key: Optional[str]) -> bool:
-    """Return True if ``key`` names a project_context secret.
-
-    Single source of truth for the secret-key policy, shared across
-    every surface that exposes project_context: the tool boundary
-    (``view_project_context`` redaction, below), the RAG index + query
-    paths (``features/rag/{indexing,query}.py`` — the RAG side-channel
-    otherwise echoes secrets to any worker), and the dashboard
-    composition endpoints (``app/routers/composition.py``). Keeping the
-    check here means the surfaces can't drift out of sync.
-
-    Rule (round-2 broadening; round-3 extended the vocab + camelCase
-    handling): a key carrying a delimited secret-word segment
-    (``token``, ``secret``, ``password``, ``pwd``, ``api_key``,
-    ``pat``, ``bearer``, ``jwt``, ``auth``, ``cookie``, ``seed``,
-    ``mnemonic``, ``privkey``, ``dsn``, ``conn_str``,
-    ``database_url``, ``credential``, …) is secret — catches
-    credentials stored under knowledge keys (``openai_api_key``,
-    ``db_password``, ``github_pat``). camelCase keys
-    (``clientSecret``, ``accessToken``) are segmented at the
-    lowerUpper boundary first so they match too.
-
-    ADR-0016: config moved to the ``project_settings`` store, so the old
-    config-specific tiers (blanket "any ``config_*`` is secret" + the
-    F009 ``_NON_SECRET_POLICY_KEYS`` carve-out) are deleted — settings
-    secrets are classified by ``_SECRET_SETTING_KEYS`` in
-    ``tools/project_settings_tools.py`` instead.
-    """
-    if not key:
-        return False
-    # Segment camelCase (``clientSecret`` -> ``client_Secret``) so a
-    # lowerUpper transition counts as a word boundary for the delimited
-    # vocab match — otherwise ``accessToken`` / ``apiSecret`` slip past.
-    segmented = _CAMEL_BOUNDARY_RE.sub("_", key)
-    return _SECRET_SUFFIX_RE.search(segmented) is not None
+# ADR-0017 (Wave 12 PR B): content-based secret detection is GONE.
+# ``is_secret_key`` and the value/description embedded-secret scanner
+# used to redact project_context reads + skip RAG indexing here. Both
+# were unreliable in both directions (false positives hid legitimate
+# memory notes; false negatives gave false confidence) and are deleted.
+# memory (project_context), tasks, code, and markdown are shared project
+# content — indexed and returned AS-IS. Real secrets live in sops refs
+# or the operator-only, non-RAG project_settings store; protection is by
+# AUTHORIZATION (who may read the project), not by guessing content.
 
 
 # Worker-policy toggle keys (Phase 4). Writing one of these flips the
@@ -694,10 +631,10 @@ async def view_project_context_tool_impl(
 
     Policy: was ``@requires("any")`` — any authenticated caller
     admits. Now expressed via :func:`_requires_authenticated_caller`
-    which admits agent bearers + operator-tier callers. The
-    admin-vs-worker secret-key redaction below now consults
-    :func:`_is_admin_principal` instead of
-    ``verify_token(.., "admin")``.
+    which admits agent bearers + operator-tier callers, then gated on
+    the ``memories.view`` capability. ADR-0017: project_context is
+    shared knowledge — there is no content-based secret redaction on the
+    read path any more.
     """
     denied = _requires_authenticated_caller(principal)
     if denied is not None:
@@ -743,9 +680,8 @@ async def view_project_context_tool_impl(
     if sort_by == "last_updated":
         sort_by = "updated_at"
 
-    # Wave 6 PR 3: identity for audit + the admin-vs-worker
-    # secret-key redaction below (issue I) comes from the Principal,
-    # not a ``get_agent_id(token)`` resolve.
+    # Wave 6 PR 3: identity for audit comes from the Principal, not a
+    # ``get_agent_id(token)`` resolve.
     requesting_agent_id = _actor_label(principal)
 
     # Log audit (main.py:1417)
@@ -814,28 +750,11 @@ async def view_project_context_tool_impl(
 
             rows = session.execute(stmt).all()
 
-            # Redact secret-looking keys for non-admin callers (issue I).
-            # Admins continue to see everything; workers see everything
-            # EXCEPT keys where is_secret_key() is True. Wave 6 PR 3:
-            # ``verify_token(.., "admin")`` → :func:`_is_admin_principal`
-            # which prefers the Principal's typed role and falls back to
-            # the legacy ``operator_session_active`` ContextVar during
-            # the bridge window.
-            if not _is_admin_principal(principal):
-                # Defense-in-depth (round-3): also drop a row whose VALUE /
-                # DESCRIPTION carries an embedded credential under a benign
-                # KEY name, mirroring the RAG index-time value scan so a
-                # secret pasted into a non-secret key never leaks at the tool
-                # boundary either. Import the single canonical predicate
-                # lazily to avoid the tools <-> rag import cycle.
-                from ..features.rag.indexing import _value_has_embedded_secret
-
-                rows = [
-                    r
-                    for r in rows
-                    if not is_secret_key(r.context_key)
-                    and not _value_has_embedded_secret(r.value, r.description)
-                ]
+            # ADR-0017 (Wave 12 PR B): no content-based secret redaction.
+            # project_context is shared project knowledge, returned in full
+            # to any authenticated caller (read gated on ``memories.view``
+            # above). Real secrets belong in the operator-only
+            # project_settings store, not memory.
 
             # Process results with enhanced information
             for row_data in rows:

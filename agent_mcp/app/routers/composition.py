@@ -69,38 +69,27 @@ from ...features.dashboard.api import (
     fetch_graph_data_logic,
     fetch_task_tree_data_logic,
 )
-from ...tools.project_context_tools import is_secret_key
 from ...tools.registry import ToolInputValidationError, dispatch_tool_call
 from ...utils.json_utils import get_sanitized_json_body
 from .agents import _mcp_presence_for
 
 
-#: Placeholder shown in place of a secret project_context value when the
-#: caller is not confirmed operator tier. Keeps the key visible (so the
-#: dashboard can show that a secret exists) while withholding the value.
-_REDACTED_VALUE = "[redacted]"
+def _context_row_to_dict(row: Any) -> Dict[str, Any]:
+    """Serialise a ``ProjectContext`` ORM row for the dashboard reads.
 
-
-def _redact_context_row(row: Any, *, redact: bool) -> Dict[str, Any]:
-    """Serialise a ``ProjectContext`` ORM row for the dashboard reads,
-    blanking BOTH ``value`` AND ``description`` when ``redact`` is True.
-
-    Round-5: the redaction filter (``_context_value_should_redact``)
-    inspects the value *and* the description, so a credential pasted into
-    either field trips it — and both must therefore be withheld. Masking
-    the value alone leaked a secret sitting in the description. The KEY
-    stays visible so the dashboard can still show that a secret exists.
-    Shared by ``/api/all-data`` and ``/api/context-data`` so the two
-    reads never drift on redaction shape.
+    ADR-0017 (Wave 12 PR B): project_context is shared project knowledge,
+    returned AS-IS — there is no content-based secret redaction. Shared by
+    ``/api/all-data`` and ``/api/context-data`` so the two reads never
+    drift on serialisation shape.
     """
     return {
         "context_key": row.context_key,
-        "value": _REDACTED_VALUE if redact else row.value,
+        "value": row.value,
         "updated_at": row.updated_at,
         "updated_by": row.updated_by,
         "created_at": row.created_at,
         "created_by": row.created_by,
-        "description": _REDACTED_VALUE if redact else row.description,
+        "description": row.description,
     }
 
 
@@ -125,29 +114,12 @@ router = APIRouter(
 # just-completed dispatch-through-tool refactor) is untouched.
 
 
-def _context_value_should_redact(
-    context_key: Any, value: Any, description: Any
-) -> bool:
-    """True iff a ``project_context`` row must be withheld from a
-    non-confirmed-operator caller.
-
-    TWO-part filter, identical to the tool boundary
-    (``project_context_tools``) and the RAG surfaces
-    (``rag/indexing.py`` / ``rag/query.py``): redact when the KEY name is
-    secret OR the VALUE / DESCRIPTION carries an embedded credential
-    (round-4 backstop — a secret pasted into a benign-named key). Without
-    the value backstop, the dashboard REST reads leaked such a secret to
-    every viewer-tier / cookie / forwarding operator (which
-    ``is_confirmed_operator_tier`` cannot verify).
-
-    The predicate is imported lazily — exactly as the tool does — to
-    avoid the tools <-> rag import cycle. Do NOT reimplement it here.
-    """
-    if is_secret_key(context_key):
-        return True
-    from ...features.rag.indexing import _value_has_embedded_secret
-
-    return _value_has_embedded_secret(value, description)
+# ADR-0017 (Wave 12 PR B): ``_context_value_should_redact`` (the
+# content-based redaction predicate for project_context dashboard reads)
+# is deleted. project_context is shared project knowledge, returned AS-IS.
+# ``is_confirmed_operator_tier`` below stays — it still gates the agent
+# BEARER-token exposure on /api/all-data + /api/tokens (an authorization
+# control on real credentials, not content-guessing).
 
 
 def is_confirmed_operator_tier(auth: Dict[str, Any]) -> bool:
@@ -244,13 +216,9 @@ async def graph_data_api_route(
     # SECURITY (AZ-R28-1): gated to match the sibling composition reads —
     # see simple_status_api_route.
     #
-    # SECURITY (pentest R1-F1): thread the confirmed-operator-tier signal
-    # into the graph builder so a project_context node's description is
-    # redacted for the same non-confirmed (viewer-tier / cookie /
-    # forwarding) callers that /api/all-data, /api/context-data, and
-    # /api/node-details already redact for — see
-    # ``fetch_graph_data_logic``'s ``expose_secrets`` param and
-    # ``is_confirmed_operator_tier`` above.
+    # ADR-0017 (Wave 12 PR B): project_context node descriptions render
+    # AS-IS — no content-based redaction, so no confirmed-operator-tier
+    # signal is threaded into the graph builder any more.
     #
     # PERF/DOS (pentest R2-F2): bound the per-section reads with the SAME
     # clamp ``/api/all-data`` uses (``_clamp_section_limit``) so this
@@ -258,10 +226,8 @@ async def graph_data_api_route(
     # agent_actions on every dashboard refresh. ``?limit=`` overrides
     # within ``[1, _ALL_DATA_MAX_LIMIT]``.
     try:
-        expose_secrets = is_confirmed_operator_tier(auth)
         data = await fetch_graph_data_logic(
             g.file_map.copy(),
-            expose_secrets=expose_secrets,
             limit=_clamp_section_limit(request),
         )
         return JSONResponse(data)
@@ -364,28 +330,10 @@ async def node_details_api_route(
             cursor.execute("SELECT * FROM project_context WHERE context_key = ?", (actual_id_from_node,))
             row = cursor.fetchone()
             if row:
-                data = dict(row)
-                # SECURITY (round-2/4/5): the router admits viewer-tier
-                # operators on GET and the backend can't verify a
-                # cookie/forwarding caller's tier, so redact secrets unless
-                # the caller is CONFIRMED operator tier. Round-4: redact on
-                # the TWO-part filter (secret KEY name OR an embedded
-                # credential in the VALUE/DESCRIPTION), matching the tool
-                # boundary — not is_secret_key alone, which let a secret
-                # pasted into a benign key leak verbatim here. Round-5:
-                # blank the DESCRIPTION too, not just the value — the filter
-                # scans both fields, so a credential pasted into the
-                # description tripped the predicate yet leaked verbatim.
-                if not is_confirmed_operator_tier(auth) and (
-                    _context_value_should_redact(
-                        data.get('context_key'),
-                        data.get('value'),
-                        data.get('description'),
-                    )
-                ):
-                    data['value'] = _REDACTED_VALUE
-                    data['description'] = _REDACTED_VALUE
-                details['data'] = data
+                # ADR-0017 (Wave 12 PR B): project_context is shared
+                # project knowledge — returned AS-IS, no content-based
+                # secret redaction.
+                details['data'] = dict(row)
             cursor.execute("SELECT timestamp, agent_id, action_type FROM agent_actions WHERE (action_type = 'updated_context' OR action_type = 'update_project_context') AND details LIKE ? ORDER BY timestamp DESC LIMIT 5", (f'%"{actual_id_from_node}"%',))
             details['actions'] = [dict(r) for r in cursor.fetchall()]
         elif node_type_from_id == 'file':
@@ -570,29 +518,12 @@ async def all_data_api_route(
                 .limit(section_limit)
                 .all()
             )
-            # SECURITY (round-2/4/5): redact secrets for callers that are
-            # not CONFIRMED operator tier. ``expose_tokens`` is the same
-            # confirmed-operator gate used for agent bearers above; the
-            # router admits viewer-tier operators on GET and the backend
-            # can't verify a cookie/forwarding caller's tier, so those
-            # paths get the redacted view. Mirrors ``/api/context-data``.
-            # Round-4: redact on the TWO-part filter (secret KEY OR
-            # embedded-secret VALUE/DESCRIPTION) so a credential pasted
-            # into a benign key can't leak either. Round-5: the verdict is
-            # computed once and blanks BOTH value AND description — the
-            # filter scans both, so a secret in the description tripped the
-            # predicate yet shipped verbatim when only the value was masked
-            # (matches the tool boundary, which drops the whole row).
-            context_data = [
-                _redact_context_row(
-                    r,
-                    redact=not expose_tokens
-                    and _context_value_should_redact(
-                        r.context_key, r.value, r.description
-                    ),
-                )
-                for r in ctx_rows
-            ]
+            # ADR-0017 (Wave 12 PR B): project_context is shared project
+            # knowledge — serialised AS-IS, no content-based secret
+            # redaction. (Agent bearer tokens above are still gated by
+            # ``expose_tokens`` — that's an authorization control on real
+            # credentials, unaffected by this wave.)
+            context_data = [_context_row_to_dict(r) for r in ctx_rows]
 
         # Recent agent actions: capped at min(100, section_limit). Keeps
         # the pre-existing "last 100" behavior when no `?limit=` is
@@ -655,15 +586,12 @@ async def context_data_api_route(
     not ``/api/memories``. URL stability wins; a future PR can
     migrate to ``/api/memories`` GET alongside dashboard updates.
 
-    SECURITY: this route previously had NO auth dep and returned the
-    raw project_context — any project member (including a read-only
-    viewer) could read ``config_*_token`` / ``config_*_secret`` values.
-    Now gated behind ``require_operator_session`` and secret-keyed
-    VALUES are redacted for callers that are not CONFIRMED operator
-    tier (mirrors ``/api/all-data``'s agent-bearer gate; the router
-    admits viewer-tier operators on GET, and the backend can't verify
-    the tier of a cookie/forwarding caller — so those paths get the
-    redacted view).
+    SECURITY: gated behind ``require_operator_session`` (any project
+    member — viewer or operator). ADR-0017 (Wave 12 PR B): project_context
+    is shared project knowledge, returned AS-IS — there is no
+    content-based secret redaction. Real secrets belong in the
+    operator-only, non-RAG project_settings store (``/api/settings-data``,
+    which keeps its own settings-store redaction).
 
     PERF/DOS (pentest R2-F2): bound the project_context read with the
     SAME clamp ``/api/all-data`` uses (``_clamp_section_limit``) so this
@@ -672,7 +600,6 @@ async def context_data_api_route(
     the ORDER BY + LIMIT runs in SQL so the newest rows survive the
     clamp (not a full-materialise-then-slice).
     """
-    expose_secrets = is_confirmed_operator_tier(auth)
     section_limit = _clamp_section_limit(request)
 
     try:
@@ -683,23 +610,10 @@ async def context_data_api_route(
                 .limit(section_limit)
                 .all()
             )
-            # Round-4: redact on the TWO-part filter (secret KEY OR an
-            # embedded credential in the VALUE/DESCRIPTION), matching the
-            # tool boundary and ``/api/all-data`` — is_secret_key alone let
-            # a secret pasted into a benign key leak to viewer-tier here.
-            # Round-5: ``_redact_context_row`` blanks BOTH value AND
-            # description on a redaction verdict — masking the value alone
-            # leaked a secret pasted into the description.
-            context_data = [
-                _redact_context_row(
-                    r,
-                    redact=not expose_secrets
-                    and _context_value_should_redact(
-                        r.context_key, r.value, r.description
-                    ),
-                )
-                for r in rows
-            ]
+            # ADR-0017 (Wave 12 PR B): project_context is shared project
+            # knowledge — serialised AS-IS, no content-based secret
+            # redaction.
+            context_data = [_context_row_to_dict(r) for r in rows]
 
         # VULN-001 (security audit 2026-06-29): see /all-data above —
         # static wildcard CORS headers dropped; CORSMiddleware owns

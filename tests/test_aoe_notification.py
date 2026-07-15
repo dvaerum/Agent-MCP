@@ -388,27 +388,32 @@ async def test_invalid_template_is_ignored_and_does_not_error(
 
 
 # ---------------------------------------------------------------------------
-# Secret-key redaction (regression guard)
+# AoE bearer secrecy — by store separation, not content redaction
 # ---------------------------------------------------------------------------
 
 
-async def test_bearer_token_is_redacted_for_workers(tmp_path) -> None:
-    """config_aoe_bearer_token must match the secret-key redaction regex so
-    workers cannot read it via view_project_context.
+async def test_bearer_token_lives_in_settings_store_not_memory(tmp_path) -> None:
+    """ADR-0016/0017: the AoE bearer is a real secret — it lives in the
+    operator-only, non-RAG ``project_settings`` store (masked there via
+    ``_SECRET_SETTING_KEYS``), NEVER in memory. Wave 12 PR B deleted
+    ``is_secret_key`` (content-based memory redaction); the AoE bearer is
+    protected by WHERE it is stored, not by guessing at memory content.
     """
-    from agent_mcp.tools.project_context_tools import is_secret_key
+    from agent_mcp.tools.project_settings_tools import _SECRET_SETTING_KEYS
 
-    assert is_secret_key("config_aoe_bearer_token"), (
-        "config_aoe_bearer_token must match the secret-key filter "
-        "(see project_context_tools.is_secret_key)"
+    assert "config_aoe_bearer_token" in _SECRET_SETTING_KEYS, (
+        "config_aoe_bearer_token must be masked by the settings-store "
+        "redaction (project_settings_tools._SECRET_SETTING_KEYS)"
     )
 
     async with mcp_session(tmp_path) as admin:
+        # _set_ctx routes config_aoe_* to the settings store, so the
+        # bearer is never in project_context / memory in the first place.
         _set_ctx(admin, "config_aoe_bearer_token", "shhh-secret-aoe-token")
 
-        # Make a worker and call view_project_context via the harness.
         worker = await admin.create_worker("wkr")
         res = await worker.call("view_project_context", {})
         text = res[0].text
+        # Absent from memory because it lives in the settings store.
         assert "config_aoe_bearer_token" not in text
         assert "shhh-secret-aoe-token" not in text
