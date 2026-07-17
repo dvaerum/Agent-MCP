@@ -74,10 +74,25 @@ class Ok:
 
 @dataclass(frozen=True)
 class NotFound:
-    """A named resource doesn't exist."""
+    """A named resource doesn't exist.
+
+    ``hint`` is an OPTIONAL, static policy clause appended verbatim after
+    the rendered ``"<resource> '<identifier>' not found"`` on every
+    caller-visible surface (MCP text, HTTP body, legacy error string). It
+    exists so a tool can FUSE "no such resource" with an
+    authorization-shaped rejection into ONE opaque outcome without a
+    second ``ToolResult`` variant — e.g. ``edit_task_note`` deliberately
+    returns the SAME ``NotFound`` for a missing note and a foreign-authored
+    one (PF-1 note-existence oracle) while still telling the worker the
+    author-only edit/delete policy. Keep it a STATIC clause: never
+    interpolate a resource owner's identity into it, or the fused message
+    leaks the very fact the fusion is meant to hide. ``None`` (the default)
+    renders exactly as before.
+    """
 
     resource: str
     identifier: str
+    hint: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -211,7 +226,10 @@ def render_as_text_content(result: ToolResult) -> List[mcp_types.TextContent]:
         return [mcp_types.TextContent(type="text", text=text)]
 
     if isinstance(result, NotFound):
-        text = f"Error: {result.resource} {result.identifier!r} not found."
+        # ``hint`` (when set) replaces the trailing period so the fused
+        # policy clause reads as one sentence — see NotFound.hint.
+        tail = result.hint if result.hint else "."
+        text = f"Error: {result.resource} {result.identifier!r} not found{tail}"
     elif isinstance(result, PermissionDenied):
         text = f"Unauthorized: {result.reason}"
     elif isinstance(result, Invalid):
@@ -295,7 +313,10 @@ def tool_result_to_http(result: ToolResult) -> tuple[int, dict[str, Any]]:
         return status, body
 
     if isinstance(result, NotFound):
-        text = f"{result.resource} {result.identifier!r} not found."
+        # ``hint`` (when set) replaces the trailing period — see
+        # NotFound.hint — so REST consumers see the same fused clause.
+        tail = result.hint if result.hint else "."
+        text = f"{result.resource} {result.identifier!r} not found{tail}"
         return status, {
             "success": False,
             "error": "not_found",
@@ -381,7 +402,10 @@ def tool_result_error_message(
     """
     if isinstance(result, NotFound):
         label = not_found_label if not_found_label is not None else result.resource
-        return f"{label} '{result.identifier}' not found"
+        # ``hint`` (when set) appends the fused policy clause — see
+        # NotFound.hint. This legacy renderer has no trailing period, so
+        # the clause slots straight on.
+        return f"{label} '{result.identifier}' not found{result.hint or ''}"
     if isinstance(result, (Conflict, PermissionDenied)):
         return result.reason
     if isinstance(result, Invalid):
