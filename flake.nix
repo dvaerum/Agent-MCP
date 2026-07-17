@@ -8,7 +8,29 @@
   outputs = { self, nixpkgs, ... }:
     let
       system = "x86_64-linux";
-      pkgs = import nixpkgs { inherit system; };
+
+      # nixpkgs' python3.12-tenacity carries a timing-sensitive
+      # self-test (test_sleeps asserts a ~1s backoff sleep completes in
+      # <1.1s) that flakes under CI load and reddens the Nix VM build,
+      # even though tenacity's runtime behaviour is fine. tenacity is a
+      # transitive build input of our closure only
+      # (agent-mcp-router → sse-starlette → tenacity); we consume the
+      # package, we don't maintain it, so skip just that one flaky test
+      # and keep the rest of its suite running.
+      tenacityTestFix = _final: prev: {
+        python312 = prev.python312.override {
+          packageOverrides = _pyfinal: pyprev: {
+            tenacity = pyprev.tenacity.overridePythonAttrs (old: {
+              disabledTests = (old.disabledTests or [ ]) ++ [ "test_sleeps" ];
+            });
+          };
+        };
+      };
+
+      pkgs = import nixpkgs {
+        inherit system;
+        overlays = [ tenacityTestFix ];
+      };
       lib = nixpkgs.lib;
 
       # ── Production package set (Phase 2) ─────────────────────────
