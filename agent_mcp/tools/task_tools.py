@@ -4335,16 +4335,26 @@ async def bulk_task_operations_tool_impl(
 
                 # Permission check.
                 #
-                # SECURITY (PF-1): mirror the not-found branch above so a
-                # non-owner without ``tasks.assign`` cannot distinguish a
-                # foreign existing task from a nonexistent one (the 403-
-                # vs-404 existence oracle). Same wording as the
-                # missing-row case; never name the owner.
+                # SECURITY (PF-1): a FOREIGN-owned task must still collapse to
+                # the SAME phantom "not found" as the nonexistent branch above
+                # — never distinguish foreign-exists from nonexistent, never
+                # name the owner. But an UNASSIGNED (claimable-pool) task is
+                # already view_tasks-visible (#515), so it gets the actionable
+                # "claim it first" guidance instead of the phantom — the same
+                # split the single path makes via ``_worker_ownership_deny``.
+                # Self-owned (assigned_to == caller) passes this gate.
                 if (
                     task_data.get("assigned_to") != requesting_agent_id
                     and not is_admin_request
                 ):
-                    results.append(f"Operation {i+1}: Task '{task_id}' not found")
+                    results.append(
+                        f"Operation {i+1}: "
+                        + _worker_ownership_deny(
+                            task_id,
+                            task_data.get("assigned_to"),
+                            action="modify it",
+                        )
+                    )
                     continue
 
                 try:
@@ -4390,7 +4400,8 @@ async def bulk_task_operations_tool_impl(
                                 f"Operation {i+1}: worker status updates "
                                 f"disabled by project policy "
                                 f"(config_allow_worker_update_own_status="
-                                f"false)"
+                                f"false). Ask an admin to enable it in "
+                                f"dashboard Settings."
                             )
                             continue
 
@@ -4478,8 +4489,9 @@ async def bulk_task_operations_tool_impl(
                         # sibling reassign op already uses.
                         if not is_admin_request:
                             results.append(
-                                f"Operation {i+1}: Update priority "
-                                f"operation requires admin privileges"
+                                f"Operation {i+1}: priority is an operator/"
+                                f"manager-only field and cannot be set by a "
+                                f"worker; ask a supervisor to reprioritise"
                             )
                             continue
 
@@ -4647,7 +4659,9 @@ async def bulk_task_operations_tool_impl(
                     else:
                         if operation_type == "reassign" and not is_admin_request:
                             results.append(
-                                f"Operation {i+1}: Reassign operation requires admin privileges"
+                                f"Operation {i+1}: reassigning a task to another "
+                                f"agent is an operator/manager-only action; a "
+                                f"worker cannot reassign — ask a supervisor"
                             )
                         else:
                             results.append(

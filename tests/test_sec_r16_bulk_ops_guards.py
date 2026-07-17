@@ -293,7 +293,10 @@ async def test_worker_bulk_reassign_still_denied(tmp_path) -> None:
             ]},
         )
         text = result[0].text
-        assert "requires admin privileges" in text, text
+        # Denial unchanged; wording clarified to a role-limit (round-2
+        # worker-message clarity) instead of the ambiguous "requires admin
+        # privileges" (which read like a retryable per-task auth failure).
+        assert "operator/manager-only" in text or "ask a supervisor" in text, text
         # Ownership unchanged.
         from agent_mcp.db.connection import get_db_connection
 
