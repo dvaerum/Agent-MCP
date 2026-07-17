@@ -204,19 +204,27 @@ async def update_file_status_tool_impl(
         resolved_abs_filepath in g.file_map
         and g.file_map[resolved_abs_filepath].get("agent_id") != requesting_agent_id
     ):
-        current_holder_agent_id = g.file_map[resolved_abs_filepath].get(
-            "agent_id", "another agent"
-        )
+        holder_entry = g.file_map[resolved_abs_filepath]
+        current_holder_agent_id = holder_entry.get("agent_id", "another agent")
+        holder_timestamp = holder_entry.get("timestamp", "N/A")
+        holder_status = holder_entry.get("status", "unknown")
         # Another agent holds the claim. Conflict (HTTP 409) rather
         # than PermissionDenied — the caller's principal is fine,
-        # the state of the file map blocks the operation.
-        verb = "release" if new_status == "released" else "claim"
+        # the state of the file map blocks the operation. The message
+        # mirrors check_file_status (holder id + timestamp are already
+        # public via that tool — the advisory-lock state is intentionally
+        # disclosable), and it spells out the no-auto-expiry semantic so
+        # the worker knows the lock frees only on the holder's release
+        # and how to make progress.
         return Conflict(
             reason=(
                 f"File '{filepath_arg}' (resolved: {resolved_abs_filepath}) "
-                f"is already being used by agent "
-                f"'{current_holder_agent_id}'. Cannot {verb} it with status "
-                f"'{new_status}'."
+                f"is already claimed by agent '{current_holder_agent_id}' "
+                f"since {holder_timestamp} (status: {holder_status}). This "
+                f"is an advisory lock with no auto-expiry — it frees only "
+                f"when '{current_holder_agent_id}' releases it. Use "
+                f"check_file_status for current holder/timestamp, coordinate "
+                f"with that agent, or work on a different file."
             )
         )
 
