@@ -33,7 +33,7 @@ from agent_mcp.core.principal_builder import (
     build_operator_principal,
     is_operator_tier,
 )
-from tests.harness import make_principal
+from tests.harness import make_principal, with_bearer
 
 
 def _admin_labelled_manager() -> Principal:
@@ -119,8 +119,13 @@ def test_agent_bearer_caps_identical_across_construction_sites(
     )
 
     built = build_agent_bearer_principal("tok")
-    synth = authorize._synthesize_principal_from_arguments({"token": "tok"})
-    comm = agent_comm._resolve_principal({"token": "tok"}, None)
+    # token-retirement PR 2 (Phase B): the two fallbacks source the
+    # bearer from the ``request_auth_token`` ContextVar, not
+    # ``arguments["token"]``. Make the bearer visible via the same seam
+    # the middleware / harness set.
+    with with_bearer("tok"):
+        synth = authorize._synthesize_principal_from_arguments({})
+        comm = agent_comm._resolve_principal({}, None)
     rest = _build_route_principal(
         bearer_token="tok", operator_session=False, operator_user_id=None,
     )

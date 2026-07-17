@@ -38,6 +38,7 @@ from typing import Any, Dict
 import pytest
 
 from tests.harness import mcp_session
+from tests.harness import with_bearer
 
 
 pytestmark = pytest.mark.asyncio
@@ -485,19 +486,20 @@ async def test_assign_task_impl_rejects_string_accept_suggestions(
 
         bob = await admin.create_worker("bob")
         victim_title = "victim task with string 'true' consent"
-        result = await assign_task_tool_impl(
-            {
-                "token": admin.admin_token,
-                "agent_token": bob.token,
-                "task_title": victim_title,
-                "task_description": "in-process caller passed string 'true'",
-                "parent_task_id": legit_parent_id,
-                # A string — NOT the True singleton. ``bool("true")``
-                # is True, but the impl uses ``is True`` so the string
-                # is rejected and no consent is inferred.
-                "accept_suggestions": "true",
-            },
-        )
+        with with_bearer(admin.admin_token):
+            result = await assign_task_tool_impl(
+                {
+                    "token": admin.admin_token,
+                    "agent_token": bob.token,
+                    "task_title": victim_title,
+                    "task_description": "in-process caller passed string 'true'",
+                    "parent_task_id": legit_parent_id,
+                    # A string — NOT the True singleton. ``bool("true")``
+                    # is True, but the impl uses ``is True`` so the string
+                    # is rejected and no consent is inferred.
+                    "accept_suggestions": "true",
+                },
+            )
 
         # Result must NOT be Ok (that would mean the mutation happened);
         # extract text from whichever typed variant we got.
@@ -566,17 +568,18 @@ async def test_create_self_task_impl_rejects_int_accept_suggestions(
         )
 
         victim_title = "alice self-task with int 1 consent"
-        result = await create_self_task_tool_impl(
-            {
-                "token": alice.token,
-                "task_title": victim_title,
-                "task_description": "in-process caller passed int 1",
-                "parent_task_id": legit_parent_id,
-                # Integer ``1`` is truthy under ``bool()`` but is
-                # not the True singleton — ``is True`` rejects it.
-                "accept_suggestions": 1,
-            },
-        )
+        with with_bearer(alice.token):
+            result = await create_self_task_tool_impl(
+                {
+                    "token": alice.token,
+                    "task_title": victim_title,
+                    "task_description": "in-process caller passed int 1",
+                    "parent_task_id": legit_parent_id,
+                    # Integer ``1`` is truthy under ``bool()`` but is
+                    # not the True singleton — ``is True`` rejects it.
+                    "accept_suggestions": 1,
+                },
+            )
 
         text = getattr(result, "message", None) or (
             result[0].text if isinstance(result, list) else str(result)

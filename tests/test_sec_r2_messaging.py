@@ -30,6 +30,7 @@ from pathlib import Path
 import pytest
 
 from tests.harness import mcp_session, seed_agent_rows
+from tests.harness import with_bearer
 
 pytestmark = pytest.mark.asyncio
 
@@ -112,11 +113,12 @@ class TestMarkReadScope:
                 "admin", "alice", "STOP", "stop_command", ts
             )
 
-            res = await get_agent_messages_tool_impl({
-                "token": alice.token,
-                "message_type": "text",
-                "mark_as_read": True,
-            })
+            with with_bearer(alice.token):
+                res = await get_agent_messages_tool_impl({
+                    "token": alice.token,
+                    "message_type": "text",
+                    "mark_as_read": True,
+                })
             assert res.data["count"] == 1, res.message
 
             # The 'text' message we actually saw is now read.
@@ -146,11 +148,12 @@ class TestMarkReadScope:
                     _seed_message("admin", "alice", f"m{i}", "text", ts)
                 )
 
-            res = await get_agent_messages_tool_impl({
-                "token": alice.token,
-                "limit": 1,
-                "mark_as_read": True,
-            })
+            with with_bearer(alice.token):
+                res = await get_agent_messages_tool_impl({
+                    "token": alice.token,
+                    "limit": 1,
+                    "mark_as_read": True,
+                })
             assert res.data["count"] == 1, res.message
 
             # Newest (ids[0]) is the single returned + marked-read row.
@@ -177,10 +180,11 @@ class TestMarkReadScope:
             a = _seed_message("admin", "alice", "a", "text", ts)
             b = _seed_message("admin", "alice", "b", "text", ts)
 
-            res = await get_agent_messages_tool_impl({
-                "token": alice.token,
-                "mark_as_read": True,
-            })
+            with with_bearer(alice.token):
+                res = await get_agent_messages_tool_impl({
+                    "token": alice.token,
+                    "mark_as_read": True,
+                })
             assert res.data["count"] == 2, res.message
             assert _read_flag(a) == 1
             assert _read_flag(b) == 1
@@ -202,12 +206,13 @@ class TestMarkReadScope:
             ts = _now_iso()
             sent_id = _seed_message("alice", "bob", "outbound", "text", ts)
 
-            res = await get_agent_messages_tool_impl({
-                "token": alice.token,
-                "include_sent": True,
-                "include_received": True,
-                "mark_as_read": True,
-            })
+            with with_bearer(alice.token):
+                res = await get_agent_messages_tool_impl({
+                    "token": alice.token,
+                    "include_sent": True,
+                    "include_received": True,
+                    "mark_as_read": True,
+                })
             assert res.data["count"] == 1, res.message
             # alice is the SENDER of sent_id, not the recipient — the
             # read flag belongs to bob's inbox view and must be left be.

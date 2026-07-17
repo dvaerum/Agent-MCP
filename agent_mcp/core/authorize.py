@@ -114,13 +114,29 @@ def _synthesize_principal_from_arguments(
     Returns None when no usable bearer is in hand; the wrapper then
     falls through to the cap reject path.
 
+    token-retirement PR 2 (Phase B): the bearer is sourced from the
+    ``request_auth_token`` ContextVar — the same seam the HTTP
+    middleware (``main_app.AuthHeaderMiddleware``), the REST dispatch
+    helper, and the test harness all set — NOT from
+    ``arguments["token"]``. Production always threads an explicit
+    ``principal=`` so this fallback only fires for direct in-process /
+    unit-test calls; those make the bearer visible via the ContextVar
+    (e.g. ``tests.harness.with_bearer``). ``arguments`` is retained in
+    the signature (callers still pass it) but no longer read for the
+    token. Nothing reads ``arguments["token"]`` for identity here.
+
     arch-B: delegates to the shared
     :func:`agent_mcp.core.principal_builder.build_agent_bearer_principal`
     so a synthesized fallback Principal resolves its capabilities through
     the exact same path the seam uses — the fallback never diverges from
     the middleware-built identity.
     """
-    raw_token = arguments.get("token")
+    # Lazy import: ``tools.registry`` imports ``core.authorize`` (for
+    # the dispatcher's principal-synthesis fallback), so a module-level
+    # import here would close an import cycle.
+    from ..tools.registry import request_auth_token
+
+    raw_token = request_auth_token.get()
     if not isinstance(raw_token, str) or not raw_token:
         return None
     return build_agent_bearer_principal(raw_token)
@@ -142,7 +158,8 @@ def requires_capability(cap: str) -> Callable[[ToolImpl], ToolImpl]:
 
     Raises :class:`AuthRejected` on miss. Mirrors the bearer-
     synthesis fallback so direct in-process / unit-test calls that
-    don't supply ``principal=`` keep working via ``arguments["token"]``.
+    don't supply ``principal=`` keep working via the
+    ``request_auth_token`` ContextVar.
     """
     from .capabilities import KNOWN_CAPABILITIES
 
@@ -229,7 +246,8 @@ def requires_policy(
         ) -> Any:
             # Wave 6 PR 6: dispatcher supplies principal; tests that
             # call the wrapped impl directly may not — fall back to
-            # synthesizing one from ``arguments["token"]``.
+            # synthesizing one from the ``request_auth_token``
+            # ContextVar (token-retirement PR 2).
             if principal is None:
                 principal = _synthesize_principal_from_arguments(arguments)
             if principal is None:

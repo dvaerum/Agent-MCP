@@ -7,7 +7,7 @@ import sqlite3
 from typing import List, Dict, Any, Optional
 import os
 
-from .registry import register_tool
+from .registry import register_tool, request_auth_token
 from . import access as _access  # Canonical home for _get_config_bool
 from ..core.config import logger
 from ..core import globals as g
@@ -53,8 +53,8 @@ class _MessageStoreFailed(RuntimeError):
 # plus ``broadcast_admin_message_tool_impl`` fanning out to
 # ``send_agent_message_tool_impl``) invoke the impl as a plain Python
 # function and may not have one in scope; the helper below derives a
-# Principal from ``arguments["token"]`` (a per-agent bearer) so those
-# callers keep working without an explicit kwarg.
+# Principal from the ``request_auth_token`` ContextVar (a per-agent
+# bearer) so those callers keep working without an explicit kwarg.
 
 
 def _resolve_principal(
@@ -66,14 +66,22 @@ def _resolve_principal(
     Order:
 
     1. ``principal`` kwarg (the dispatcher path).
-    2. ``arguments["token"]`` resolved to an active agent row (covers
-       direct-impl test calls that seed ``token=<bearer>`` in the
-       args dict).
+    2. the bearer on the ``request_auth_token`` ContextVar resolved to
+       an active agent row (covers direct-impl test calls that make
+       the bearer visible on the ContextVar, e.g. via
+       ``tests.harness.with_bearer`` — the same seam the HTTP
+       middleware and REST dispatch helper set).
 
     Returns ``None`` if no identity can be derived; the calling tool
     surfaces that as :class:`PermissionDenied` per the new contract.
 
-    arch-B: the ``arguments["token"]`` fallback delegates to the shared
+    token-retirement PR 2 (Phase B): the fallback sources the bearer
+    from the ContextVar, NOT ``arguments["token"]`` — nothing reads
+    ``arguments["token"]`` for identity here. ``arguments`` stays in
+    the signature (callers still pass it) but is no longer read for the
+    token.
+
+    arch-B: the ContextVar fallback delegates to the shared
     :func:`agent_mcp.core.principal_builder.build_agent_bearer_principal`
     so a synthesized identity resolves its capabilities through the exact
     same path the middleware seam uses.
@@ -81,7 +89,7 @@ def _resolve_principal(
     if principal is not None:
         return principal
 
-    token = arguments.get("token")
+    token = request_auth_token.get()
     if token:
         return build_agent_bearer_principal(token)
 

@@ -17,6 +17,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tests.harness import with_bearer
 
 pytestmark = pytest.mark.asyncio
 
@@ -63,12 +64,13 @@ async def test_fetch_events_since_returns_messages(tmp_path: Path) -> None:
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
-        await send_agent_message_tool_impl({
-            "token": admin.admin_token,
-            "recipient_id": "alice",
-            "message": "you missed this",
-            "deliver_method": "store",
-        })
+        with with_bearer(admin.admin_token):
+            await send_agent_message_tool_impl({
+                "token": admin.admin_token,
+                "recipient_id": "alice",
+                "message": "you missed this",
+                "deliver_method": "store",
+            })
 
         blocks = await alice.call("fetch_events_since", {})
         body = json.loads(_content_text(blocks))
@@ -99,12 +101,13 @@ async def test_wait_for_events_persists_last_seen_at(
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
-        await send_agent_message_tool_impl({
-            "token": admin.admin_token,
-            "recipient_id": "alice",
-            "message": "hi",
-            "deliver_method": "store",
-        })
+        with with_bearer(admin.admin_token):
+            await send_agent_message_tool_impl({
+                "token": admin.admin_token,
+                "recipient_id": "alice",
+                "message": "hi",
+                "deliver_method": "store",
+            })
 
         assert _read_last_seen("alice") is None, (
             "precondition: no cursor persisted yet"
@@ -142,12 +145,13 @@ async def test_fetch_events_since_null_cursor_uses_persisted(
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
-        await send_agent_message_tool_impl({
-            "token": admin.admin_token,
-            "recipient_id": "alice",
-            "message": "old news",
-            "deliver_method": "store",
-        })
+        with with_bearer(admin.admin_token):
+            await send_agent_message_tool_impl({
+                "token": admin.admin_token,
+                "recipient_id": "alice",
+                "message": "old news",
+                "deliver_method": "store",
+            })
 
         # Pin the cursor far in the future so the message is "older".
         far_future = "9999-01-01T00:00:00"

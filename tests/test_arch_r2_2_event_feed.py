@@ -29,6 +29,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tests.harness import with_bearer
 
 pytestmark = pytest.mark.asyncio
 
@@ -102,21 +103,23 @@ async def test_inbox_and_wait_for_events_identical_for_same_cursor(
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
 
-        await send_agent_message_tool_impl(
-            {
-                "token": admin.admin_token,
-                "recipient_id": "alice",
-                "message": "hello alice",
-                "deliver_method": "store",
-            }
-        )
+        with with_bearer(admin.admin_token):
+            await send_agent_message_tool_impl(
+                {
+                    "token": admin.admin_token,
+                    "recipient_id": "alice",
+                    "message": "hello alice",
+                    "deliver_method": "store",
+                }
+            )
         _seed_unassigned_task("task-x", updated_at=_ts(500))
 
         since = _ts(-1)
 
-        wait_result = await wait_for_events_tool_impl(
-            {"token": alice.token, "since": since, "timeout_seconds": 1}
-        )
+        with with_bearer(alice.token):
+            wait_result = await wait_for_events_tool_impl(
+                {"token": alice.token, "since": since, "timeout_seconds": 1}
+            )
         wait_events = wait_result.data["events"]
 
         inbox_payload = json.loads(render_inbox("alice", since))

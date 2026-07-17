@@ -36,6 +36,7 @@ from agent_mcp.core.tool_result import (
     PermissionDenied,
 )
 from tests.harness import make_principal, mcp_session, with_principal
+from tests.harness import with_bearer
 
 pytestmark = pytest.mark.asyncio
 
@@ -440,10 +441,11 @@ async def test_with_principal_helper_works_for_send_message(
 async def test_legacy_direct_call_with_token_resolves_to_agent(
     tmp_path,
 ) -> None:
-    """Pre-Wave-6 tests called impls directly with ``token`` in the
-    args dict and no Principal in hand. The :func:`_resolve_principal`
-    fallback in this module derives an ``agent_bearer`` Principal
-    from the token so those callers keep working without a sweep.
+    """Direct impl calls with no Principal in hand keep working via the
+    :func:`_resolve_principal` fallback, which derives an
+    ``agent_bearer`` Principal from the bearer on the
+    ``request_auth_token`` ContextVar (token-retirement PR 2 sourced
+    the fallback from the ContextVar instead of ``arguments["token"]``).
     PR 6 deletes this fallback once every caller passes Principal
     explicitly.
     """
@@ -453,16 +455,17 @@ async def test_legacy_direct_call_with_token_resolves_to_agent(
 
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
-        # No principal kwarg, but token in args → bridge fallback
-        # resolves it to the admin's manager-tier bearer.
-        result = await send_agent_message_tool_impl(
-            {
-                "token": admin.admin_token,
-                "recipient_id": "alice",
-                "message": "via legacy path",
-                "deliver_method": "store",
-            },
-        )
+        # No principal kwarg; the bearer on the ContextVar (set by
+        # ``with_bearer``) resolves to the admin's manager-tier bearer.
+        with with_bearer(admin.admin_token):
+            result = await send_agent_message_tool_impl(
+                {
+                    "token": admin.admin_token,
+                    "recipient_id": "alice",
+                    "message": "via legacy path",
+                    "deliver_method": "store",
+                },
+            )
 
     assert isinstance(result, Ok)
     # The harness seeds the admin token's agent_id as "admin" — the

@@ -962,6 +962,42 @@ def with_capabilities(*caps: str):
 
 
 @contextlib.contextmanager
+def with_bearer(token):
+    """Stamp a raw bearer on ``request_auth_token`` for the block.
+
+    token-retirement PR 2 (Phase B): the auth fallbacks
+    (``core.authorize._synthesize_principal_from_arguments``,
+    ``tools.agent_communication_tools._resolve_principal``) and the
+    dispatcher's principal-synthesis fallback now source the caller's
+    bearer from the ``request_auth_token`` ContextVar instead of
+    ``arguments["token"]``. Direct ``*_tool_impl(...)`` /
+    ``dispatch_tool_call(...)`` test calls that used to seed
+    ``token=<bearer>`` in the args dict make the bearer visible here
+    instead — mirroring exactly what the harness ``.call()`` path and
+    the HTTP / REST seams already do.
+
+    Usage::
+
+        from tests.harness import with_bearer
+
+        with with_bearer(alice_token):
+            result = await create_self_task_tool_impl({"task_title": ...})
+
+    Where a test already has a :class:`Principal` in hand, threading
+    ``principal=`` is equally valid; prefer :func:`with_principal` then.
+
+    Resets on block exit; safe to nest.
+    """
+    from agent_mcp.tools.registry import request_auth_token
+
+    cv = request_auth_token.set(token)
+    try:
+        yield token
+    finally:
+        request_auth_token.reset(cv)
+
+
+@contextlib.contextmanager
 def with_principal(principal):
     """Stamp a :class:`agent_mcp.core.principal.Principal` on the
     request ContextVars for the duration of the ``with`` block.

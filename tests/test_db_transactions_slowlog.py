@@ -25,6 +25,7 @@ from unittest import mock
 import pytest
 
 from tests.harness import mcp_session
+from tests.harness import with_bearer
 
 
 pytestmark = pytest.mark.asyncio
@@ -121,13 +122,14 @@ async def test_assign_existing_tasks_commits_once(tmp_path) -> None:
             # (Ok/Conflict/Failed/...) rather than list[TextContent].
             # Success here is the Ok variant carrying the human-readable
             # message; pre-migration this was a TextContent block.
-            result = await assign_task_tool_impl(
-                {
-                    "token": admin.admin_token,
-                    "agent_id": "worker-bulk",
-                    "task_ids": task_ids,
-                }
-            )
+            with with_bearer(admin.admin_token):
+                result = await assign_task_tool_impl(
+                    {
+                        "token": admin.admin_token,
+                        "agent_id": "worker-bulk",
+                        "task_ids": task_ids,
+                    }
+                )
             assert isinstance(result, Ok), (
                 f"assign_task failed: {result!r}"
             )
