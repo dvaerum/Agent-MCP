@@ -4974,17 +4974,30 @@ async def search_tasks_tool_impl(
 def register_task_tools():
     register_tool(
         name="assign_task",
-        description="Multi-mode task assignment tool. Mode 1: Create single task + assign agent. Mode 2: Create multiple tasks + assign agent. Mode 3: Assign agent to existing unassigned tasks. Includes workload analysis, intelligent parent suggestions, and coordination features.",
+        description=(
+            "Multi-mode task assignment tool. "
+            "Mode 1: create single task + assign agent. "
+            "Mode 2: create multiple tasks + assign agent. "
+            "Mode 3: assign an agent to existing unassigned tasks. "
+            "WORKERS — this is how you take ownership of a task: to CLAIM an "
+            "unassigned (claimable-pool) task for yourself so you can then "
+            "update its status, call Mode 3 with task_ids=['<id>'] and "
+            "agent_token=<your own token> (self-claim). Gated by the project "
+            "policy config_allow_worker_self_assign (on by default). You can "
+            "only self-claim UNASSIGNED tasks, and only for yourself. "
+            "Also includes workload analysis, parent suggestions, and "
+            "coordination features."
+        ),
         input_schema={
             "type": "object",
             "properties": {
                 "token": {
                     "type": "string",
-                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
+                    "description": "Authentication token (admin OR your own agent token). Optional if an Authorization: Bearer header is supplied (recommended).",
                 },
                 "agent_token": {
                     "type": "string",
-                    "description": "Agent token to assign the task(s) to (optional - if not provided, creates unassigned tasks)",
+                    "description": "Agent token to assign the task(s) TO. To self-claim an unassigned task, pass YOUR OWN agent token here (with task_ids=[...], Mode 3). Omit to file the task(s) unassigned (into the claimable pool).",
                 },
                 "agent_id": {
                     "type": "string",
