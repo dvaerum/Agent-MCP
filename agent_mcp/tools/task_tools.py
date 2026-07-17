@@ -415,6 +415,59 @@ def _missing_capabilities(
     return sorted(required - agent_caps)
 
 
+def _worker_ownership_deny(
+    task_id: str, assignee: Optional[str], *, action: str = "update it"
+) -> str:
+    """Return the worker-facing ownership-deny message for a task a
+    worker does NOT own, splitting the two cases that MUST stay distinct.
+
+    - assignee is NULL/empty (UNASSIGNED, in the claimable pool): return
+      an actionable ``"Unauthorized: ... claim it first"`` string that
+      names ``assign_task``. An unassigned task has no owner to hide and
+      is ALREADY publicly listed in the pool via ``view_tasks`` (#515),
+      so naming it and telling the worker to self-claim leaks nothing
+      new. The ``"Unauthorized:"`` prefix lets the single-task error
+      router (~2840) map it to ``PermissionDenied`` with this reason as
+      the wire text.
+
+    - assignee is ANOTHER agent (FOREIGN-owned): return the phantom
+      ``"Task '<id>' not found"`` UNCHANGED. This is the PF-1 / AZ-R17-1
+      existence-oracle control — a worker must not be able to tell
+      "exists but not yours" from "doesn't exist", nor learn the owning
+      agent's id. Do NOT weaken.
+
+    ``action`` tailors the verb to the caller (``"update it"`` for
+    status/field edits, ``"add a note to it"``, ``"request assistance on
+    it"``), keeping the wording consistent in one place.
+    """
+    if assignee is None or (
+        isinstance(assignee, str) and assignee.strip() == ""
+    ):
+        return (
+            f"Unauthorized: task '{task_id}' is unassigned — you must claim "
+            f"it before you can {action}. Call assign_task with "
+            f"task_ids=['{task_id}'] and your own agent_token to self-claim "
+            f"it, then retry."
+        )
+    return f"Task '{task_id}' not found"
+
+
+def _worker_ownership_deny_result(
+    task_id: str, assignee: Optional[str], *, action: str = "update it"
+) -> ToolResult:
+    """ToolResult form of :func:`_worker_ownership_deny` for callsites
+    that return a ``ToolResult`` directly (rather than the ``{"success":
+    False, "error": ...}`` dict ``_update_single_task`` returns).
+
+    Unassigned → ``PermissionDenied`` carrying the claim guidance;
+    foreign-owned → the same phantom ``NotFound`` as before.
+    """
+    msg = _worker_ownership_deny(task_id, assignee, action=action)
+    if msg.startswith("Unauthorized: "):
+        return PermissionDenied(reason=msg.removeprefix("Unauthorized: "))
+    return NotFound(resource="task", identifier=task_id)
+
+
 async def _update_single_task(
     cursor,
     task_id: str,
@@ -450,14 +503,21 @@ async def _update_single_task(
     # Verify permissions.
     #
     # SECURITY (PF-1): a non-owner without ``tasks.assign`` must NOT be
-    # able to tell "task exists but isn't yours" from "task doesn't
-    # exist", and must never see the owning agent's id. Both are
-    # differential-response oracles a worker can exploit — workers
-    # routinely hold foreign task_ids (via ``depends_on_tasks`` /
+    # able to tell "task exists but isn't yours" (FOREIGN-owned) from
+    # "task doesn't exist", and must never see the owning agent's id.
+    # Both are differential-response oracles a worker can exploit —
+    # workers routinely hold foreign task_ids (via ``depends_on_tasks`` /
     # ``parent_task``, coordination messages, ``view_tasks``) and cannot
-    # otherwise enumerate the owning agent's identity. So return the
-    # EXACT not-found result the missing-row branch above returns, with
-    # no ``assigned_to`` interpolation.
+    # otherwise enumerate the owning agent's identity.
+    #
+    # But an UNASSIGNED task (``assigned_to`` NULL/empty) has NO owner to
+    # hide and is already publicly listed in the claimable pool via
+    # ``view_tasks`` (#515), so the phantom-404 rationale does NOT apply
+    # to it — and returning it silently stranded a worker that finished
+    # pool work and couldn't complete it. ``_worker_ownership_deny``
+    # splits the two: unassigned → actionable "claim it first" guidance
+    # (Unauthorized:, mapped to PermissionDenied); foreign-owned → the
+    # UNCHANGED phantom-404.
     #
     # BL-R29-1: a ``system_transition`` (dependency auto-advance /
     # child-cascade fired by the completion path) is an internal
@@ -471,7 +531,12 @@ async def _update_single_task(
         and not is_admin_request
         and not system_transition
     ):
-        return {"success": False, "error": f"Task '{task_id}' not found"}
+        return {
+            "success": False,
+            "error": _worker_ownership_deny(
+                task_id, task_current_data.get("assigned_to")
+            ),
+        }
 
     # Terminal-state / transition guard. Terminal states are sinks; a
     # double-complete would re-fire auto_update_dependencies and an
@@ -2432,6 +2497,13 @@ async def create_self_task_tool_impl(
             # their task). A FOREIGN *or* NONEXISTENT parent collapses to the
             # SAME phantom NotFound the Mode-0 / add_task_note /
             # request_assistance gates return (no existence oracle).
+            # NOTE (claim-first split): this gate is about a DIFFERENT task
+            # than the one being created — the PARENT the worker is
+            # attaching under — so "claim THIS task first" is NOT the
+            # remedy (the worker isn't trying to act on the parent, it's
+            # trying to parent under it). Left as phantom-404 on purpose;
+            # the unassigned-vs-foreign guidance split applies only where
+            # self-claiming the named task is the actual remedy.
             # Supervision-tier callers (``tasks.assign``: operator / manager /
             # sysadmin) are exempt, mirroring the Mode-0 gate's
             # ``is_admin_request`` exemption. Checks ``final_parent_task_id``
@@ -2464,6 +2536,10 @@ async def create_self_task_tool_impl(
             # *or* NONEXISTENT dep collapses to the SAME phantom NotFound (no
             # existence oracle). Covers ``final_depends_on_tasks`` so an
             # accepted RAG dependency suggestion is gated too.
+            # NOTE (claim-first split): like the parent gate above, this is
+            # about a DIFFERENT task (the dependency edge target), not the
+            # task being created — "claim this task first" is not the
+            # remedy, so it stays phantom-404 (no claim guidance).
             # Supervision-tier callers (``tasks.assign``) are exempt, mirroring
             # the parent gate's ``_is_privileged`` exemption.
             if not _is_privileged and final_depends_on_tasks:
@@ -3848,19 +3924,28 @@ async def request_assistance_tool_impl(
     # ownership gate now sources is_admin_request from the principal
     # block above; assignee can always request, admins/managers always.
     #
-    # AZ-R17-1: on the ownership-deny branch return the SAME phantom
-    # NotFound a nonexistent task returns (identical variant + text),
-    # not a PermissionDenied. A distinct 403-vs-404 split leaked a
-    # task-existence oracle — a worker could probe arbitrary task_ids
-    # and read "exists but not yours" (403) vs "doesn't exist" (404),
-    # enumerating foreign tasks project-wide. This is the last sibling
-    # of the uniform-not-found class already closed in
-    # _update_single_task / bulk_task_operations / add_task_note.
+    # AZ-R17-1: for a FOREIGN-owned task the ownership-deny branch returns
+    # the SAME phantom NotFound a nonexistent task returns (identical
+    # variant + text), not a PermissionDenied. A distinct 403-vs-404
+    # split leaked a task-existence oracle — a worker could probe
+    # arbitrary task_ids and read "exists but not yours" (403) vs
+    # "doesn't exist" (404), enumerating foreign tasks project-wide.
+    #
+    # An UNASSIGNED task, however, has no owner to hide and is already
+    # publicly listed in the claimable pool, so the oracle rationale does
+    # not apply: ``_worker_ownership_deny_result`` returns the actionable
+    # "claim it first" PermissionDenied for the unassigned case and keeps
+    # the UNCHANGED phantom-404 for the foreign-owned case (the sibling
+    # split applied in _update_single_task / add_task_note).
     if (
         parent_task_current_data.get("assigned_to") != requesting_agent_id
         and not is_admin_request
     ):
-        return NotFound(resource="task", identifier=parent_task_id)
+        return _worker_ownership_deny_result(
+            parent_task_id,
+            parent_task_current_data.get("assigned_to"),
+            action="request assistance on it",
+        )
 
     try:
         # Create child assistance task (main.py:1694-1696)
@@ -5103,7 +5188,14 @@ def register_task_tools():
 
     register_tool(
         name="update_task_status",
-        description="Smart task status update tool with bulk operations, dependency management, and cascade features. Supports single task or bulk updates with intelligent automation.",
+        description=(
+            "Smart task status update tool with bulk operations, dependency "
+            "management, and cascade features. Supports single task or bulk "
+            "updates with intelligent automation. You must own (be assigned) "
+            "the task to change its status. If the task is unassigned (in the "
+            "claimable pool), claim it first with assign_task(task_ids=[...], "
+            "agent_token=<your own token>), then retry the status update."
+        ),
         input_schema={
             "type": "object",
             "properties": {
@@ -5490,7 +5582,12 @@ def register_task_tools():
 
     register_tool(
         name="request_assistance",  # main.py:1808
-        description="Request assistance with a task. This creates a child task assigned to 'None' and notifies admin.",
+        description=(
+            "Request assistance with a task. This creates a child task "
+            "assigned to 'None' and notifies admin. You must own (be assigned) "
+            "the task; if it is unassigned (in the claimable pool), claim it "
+            "first with assign_task(task_ids=[...], agent_token=<your own>)."
+        ),
         input_schema={  # From main.py:1809-1823
             "type": "object",
             "properties": {
