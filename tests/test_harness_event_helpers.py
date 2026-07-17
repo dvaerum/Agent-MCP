@@ -25,6 +25,7 @@ import datetime as _dt
 from pathlib import Path
 
 import pytest
+from tests.harness import with_bearer
 
 pytestmark = pytest.mark.asyncio
 
@@ -45,14 +46,15 @@ async def test_wait_for_event_helper_returns_envelope(
             _dt.datetime.now() - _dt.timedelta(seconds=1)
         ).isoformat()
 
-        await send_agent_message_tool_impl(
-            {
-                "token": admin.admin_token,
-                "recipient_id": "alice",
-                "message": "via helper",
-                "deliver_method": "store",
-            }
-        )
+        with with_bearer(admin.admin_token):
+            await send_agent_message_tool_impl(
+                {
+                    "token": admin.admin_token,
+                    "recipient_id": "alice",
+                    "message": "via helper",
+                    "deliver_method": "store",
+                }
+            )
 
         env = await alice.wait_for_event(since=since, timeout=2)
         assert "events" in env, f"helper must return envelope; got {env!r}"
@@ -82,14 +84,15 @@ async def test_wait_for_event_helper_wakes_within_one_second(
         await asyncio.sleep(0.1)
 
         start = asyncio.get_event_loop().time()
-        await send_agent_message_tool_impl(
-            {
-                "token": admin.admin_token,
-                "recipient_id": "alice",
-                "message": "wake-helper",
-                "deliver_method": "store",
-            }
-        )
+        with with_bearer(admin.admin_token):
+            await send_agent_message_tool_impl(
+                {
+                    "token": admin.admin_token,
+                    "recipient_id": "alice",
+                    "message": "wake-helper",
+                    "deliver_method": "store",
+                }
+            )
         env = await asyncio.wait_for(task, timeout=5.0)
         elapsed = asyncio.get_event_loop().time() - start
         assert elapsed < 2.0
@@ -106,14 +109,15 @@ async def test_read_inbox_helper(tmp_path: Path) -> None:
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
-        await send_agent_message_tool_impl(
-            {
-                "token": admin.admin_token,
-                "recipient_id": "alice",
-                "message": "for inbox",
-                "deliver_method": "store",
-            }
-        )
+        with with_bearer(admin.admin_token):
+            await send_agent_message_tool_impl(
+                {
+                    "token": admin.admin_token,
+                    "recipient_id": "alice",
+                    "message": "for inbox",
+                    "deliver_method": "store",
+                }
+            )
         env = await alice.read_inbox()
         assert env.get("events"), f"missing events; got {env!r}"
         assert env["events"][0]["data"]["message_content"] == "for inbox"
@@ -132,15 +136,16 @@ async def test_read_status_helper(tmp_path: Path) -> None:
         assert s0["unfinished_tasks"] == 0
         assert s0["unread_messages"] == 0
 
-        await assign_task_tool_impl(
-            {
-                "token": admin.admin_token,
-                "agent_token": alice.token,
-                "task_title": "Brew tea",
-                "task_description": "Two minutes steep.",
-                "priority": "low",
-            }
-        )
+        with with_bearer(admin.admin_token):
+            await assign_task_tool_impl(
+                {
+                    "token": admin.admin_token,
+                    "agent_token": alice.token,
+                    "task_title": "Brew tea",
+                    "task_description": "Two minutes steep.",
+                    "priority": "low",
+                }
+            )
 
         s1 = await alice.read_status()
         assert s1["unfinished_tasks"] == 1, f"got {s1!r}"

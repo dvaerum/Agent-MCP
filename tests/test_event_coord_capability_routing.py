@@ -19,6 +19,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tests.harness import with_bearer
 
 pytestmark = pytest.mark.asyncio
 
@@ -70,12 +71,13 @@ async def test_subset_match_wakes_only_matching_agent(
         fe_task = asyncio.create_task(waiter(worker_frontend))
         await asyncio.sleep(0.2)
 
-        await assign_task_tool_impl({
-            "token": admin.admin_token,
-            "task_title": "Build the API",
-            "task_description": "REST endpoints for /widgets.",
-            "required_capabilities": ["backend"],
-        })
+        with with_bearer(admin.admin_token):
+            await assign_task_tool_impl({
+                "token": admin.admin_token,
+                "task_title": "Build the API",
+                "task_description": "REST endpoints for /widgets.",
+                "required_capabilities": ["backend"],
+            })
 
         be_blocks = await asyncio.wait_for(be_task, timeout=5.0)
         fe_blocks = await asyncio.wait_for(fe_task, timeout=5.0)
@@ -135,11 +137,12 @@ async def test_empty_required_wakes_everyone(tmp_path: Path) -> None:
         fe_task = asyncio.create_task(waiter(worker_frontend))
         await asyncio.sleep(0.2)
 
-        await assign_task_tool_impl({
-            "token": admin.admin_token,
-            "task_title": "Open task — any takers?",
-            "task_description": "First-come, first-served.",
-        })
+        with with_bearer(admin.admin_token):
+            await assign_task_tool_impl({
+                "token": admin.admin_token,
+                "task_title": "Open task — any takers?",
+                "task_description": "First-come, first-served.",
+            })
 
         be_blocks = await asyncio.wait_for(be_task, timeout=5.0)
         fe_blocks = await asyncio.wait_for(fe_task, timeout=5.0)
@@ -180,12 +183,13 @@ async def test_empty_agent_caps_only_matches_empty_required(
         # Case 1: task requires ["backend"] → generalist should NOT wake.
         w_task = asyncio.create_task(waiter())
         await asyncio.sleep(0.2)
-        await assign_task_tool_impl({
-            "token": admin.admin_token,
-            "task_title": "Backend-only",
-            "task_description": "Needs backend caps.",
-            "required_capabilities": ["backend"],
-        })
+        with with_bearer(admin.admin_token):
+            await assign_task_tool_impl({
+                "token": admin.admin_token,
+                "task_title": "Backend-only",
+                "task_description": "Needs backend caps.",
+                "required_capabilities": ["backend"],
+            })
         blocks = await asyncio.wait_for(w_task, timeout=4.0)
         body = json.loads(_content_text(blocks))
         unassigned = [
@@ -200,11 +204,12 @@ async def test_empty_agent_caps_only_matches_empty_required(
         # Case 2: task with empty required → generalist SHOULD wake.
         w_task2 = asyncio.create_task(waiter())
         await asyncio.sleep(0.2)
-        await assign_task_tool_impl({
-            "token": admin.admin_token,
-            "task_title": "Open task",
-            "task_description": "Anyone can do this.",
-        })
+        with with_bearer(admin.admin_token):
+            await assign_task_tool_impl({
+                "token": admin.admin_token,
+                "task_title": "Open task",
+                "task_description": "Anyone can do this.",
+            })
         blocks2 = await asyncio.wait_for(w_task2, timeout=4.0)
         body2 = json.loads(_content_text(blocks2))
         unassigned2 = [
@@ -239,12 +244,13 @@ async def test_lowercase_normalization_idempotent(tmp_path: Path) -> None:
 
         w_task = asyncio.create_task(waiter())
         await asyncio.sleep(0.2)
-        await assign_task_tool_impl({
-            "token": admin.admin_token,
-            "task_title": "Cap case test",
-            "task_description": "Backend + DB.",
-            "required_capabilities": ["Backend", "DB"],
-        })
+        with with_bearer(admin.admin_token):
+            await assign_task_tool_impl({
+                "token": admin.admin_token,
+                "task_title": "Cap case test",
+                "task_description": "Backend + DB.",
+                "required_capabilities": ["Backend", "DB"],
+            })
         blocks = await asyncio.wait_for(w_task, timeout=5.0)
         body = json.loads(_content_text(blocks))
         unassigned = [

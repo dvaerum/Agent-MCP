@@ -16,6 +16,7 @@ from pathlib import Path
 
 import mcp.types as mcp_types
 import pytest
+from tests.harness import with_bearer
 
 pytestmark = pytest.mark.asyncio
 
@@ -87,14 +88,15 @@ async def test_status_unread_counter_increments_after_message(
         assert p0["unread_messages"] == 0
 
         # Send.
-        await send_agent_message_tool_impl(
-            {
-                "token": admin.admin_token,
-                "recipient_id": "alice",
-                "message": "ping",
-                "deliver_method": "store",
-            }
-        )
+        with with_bearer(admin.admin_token):
+            await send_agent_message_tool_impl(
+                {
+                    "token": admin.admin_token,
+                    "recipient_id": "alice",
+                    "message": "ping",
+                    "deliver_method": "store",
+                }
+            )
 
         r1 = await _read_resource(alice, "agent-mcp://status/alice")
         p1 = json.loads(_first_text(r1.contents))
@@ -118,15 +120,16 @@ async def test_status_unfinished_tasks_counter_reflects_assignments(
         p0 = json.loads(_first_text(r0.contents))
         assert p0["unfinished_tasks"] == 0
 
-        await assign_task_tool_impl(
-            {
-                "token": admin.admin_token,
-                "agent_token": alice.token,
-                "task_title": "Read a book",
-                "task_description": "A short one.",
-                "priority": "low",
-            }
-        )
+        with with_bearer(admin.admin_token):
+            await assign_task_tool_impl(
+                {
+                    "token": admin.admin_token,
+                    "agent_token": alice.token,
+                    "task_title": "Read a book",
+                    "task_description": "A short one.",
+                    "priority": "low",
+                }
+            )
 
         r1 = await _read_resource(alice, "agent-mcp://status/alice")
         p1 = json.loads(_first_text(r1.contents))

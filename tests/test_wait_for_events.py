@@ -29,6 +29,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tests.harness import with_bearer
 
 pytestmark = pytest.mark.asyncio
 
@@ -129,14 +130,15 @@ async def test_fast_path_returns_pending_messages(tmp_path: Path) -> None:
         ).isoformat()
 
         # Admin sends a message to alice — direct, persisted.
-        await send_agent_message_tool_impl(
-            {
-                "token": admin.admin_token,
-                "recipient_id": "alice",
-                "message": "hello alice",
-                "deliver_method": "store",
-            }
-        )
+        with with_bearer(admin.admin_token):
+            await send_agent_message_tool_impl(
+                {
+                    "token": admin.admin_token,
+                    "recipient_id": "alice",
+                    "message": "hello alice",
+                    "deliver_method": "store",
+                }
+            )
 
         start = asyncio.get_event_loop().time()
         env = await _wait_for_events_via_admin_session(
@@ -183,14 +185,15 @@ async def test_wake_on_message_within_one_second(tmp_path: Path) -> None:
         await asyncio.sleep(0.1)
 
         start = asyncio.get_event_loop().time()
-        await send_agent_message_tool_impl(
-            {
-                "token": admin.admin_token,
-                "recipient_id": "alice",
-                "message": "wake up",
-                "deliver_method": "store",
-            }
-        )
+        with with_bearer(admin.admin_token):
+            await send_agent_message_tool_impl(
+                {
+                    "token": admin.admin_token,
+                    "recipient_id": "alice",
+                    "message": "wake up",
+                    "deliver_method": "store",
+                }
+            )
 
         env = await asyncio.wait_for(task, timeout=5.0)
         elapsed = asyncio.get_event_loop().time() - start
@@ -229,12 +232,13 @@ async def test_wake_on_broadcast(tmp_path: Path) -> None:
         task = asyncio.create_task(waiter())
         await asyncio.sleep(0.1)
 
-        await broadcast_admin_message_tool_impl(
-            {
-                "token": admin.admin_token,
-                "message": "team announcement",
-            }
-        )
+        with with_bearer(admin.admin_token):
+            await broadcast_admin_message_tool_impl(
+                {
+                    "token": admin.admin_token,
+                    "message": "team announcement",
+                }
+            )
 
         env = await asyncio.wait_for(task, timeout=5.0)
         assert len(env["events"]) >= 1
@@ -271,15 +275,16 @@ async def test_wake_on_task_assigned(tmp_path: Path) -> None:
         task = asyncio.create_task(waiter())
         await asyncio.sleep(0.1)
 
-        await assign_task_tool_impl(
-            {
-                "token": admin.admin_token,
-                "agent_token": alice.token,
-                "task_title": "Write a sonnet",
-                "task_description": "Iambic pentameter, 14 lines.",
-                "priority": "medium",
-            }
-        )
+        with with_bearer(admin.admin_token):
+            await assign_task_tool_impl(
+                {
+                    "token": admin.admin_token,
+                    "agent_token": alice.token,
+                    "task_title": "Write a sonnet",
+                    "task_description": "Iambic pentameter, 14 lines.",
+                    "priority": "medium",
+                }
+            )
 
         env = await asyncio.wait_for(task, timeout=5.0)
         assert len(env["events"]) == 1, f"want 1 event; got: {env}"
@@ -311,24 +316,26 @@ async def test_cursor_advances_between_calls(tmp_path: Path) -> None:
         ).isoformat()
 
         # Pre-seed two messages.
-        await send_agent_message_tool_impl(
-            {
-                "token": admin.admin_token,
-                "recipient_id": "alice",
-                "message": "one",
-                "deliver_method": "store",
-            }
-        )
+        with with_bearer(admin.admin_token):
+            await send_agent_message_tool_impl(
+                {
+                    "token": admin.admin_token,
+                    "recipient_id": "alice",
+                    "message": "one",
+                    "deliver_method": "store",
+                }
+            )
         # Sleep 1ms so timestamps order deterministically.
         await asyncio.sleep(0.01)
-        await send_agent_message_tool_impl(
-            {
-                "token": admin.admin_token,
-                "recipient_id": "alice",
-                "message": "two",
-                "deliver_method": "store",
-            }
-        )
+        with with_bearer(admin.admin_token):
+            await send_agent_message_tool_impl(
+                {
+                    "token": admin.admin_token,
+                    "recipient_id": "alice",
+                    "message": "two",
+                    "deliver_method": "store",
+                }
+            )
 
         env1 = await _wait_for_events_via_admin_session(
             alice, since=since, timeout_seconds=2
@@ -444,14 +451,15 @@ async def test_caller_agent_id_derived_from_token(tmp_path: Path) -> None:
         ).isoformat()
 
         # Admin sends to bob, not alice.
-        await send_agent_message_tool_impl(
-            {
-                "token": admin.admin_token,
-                "recipient_id": "bob",
-                "message": "for bob only",
-                "deliver_method": "store",
-            }
-        )
+        with with_bearer(admin.admin_token):
+            await send_agent_message_tool_impl(
+                {
+                    "token": admin.admin_token,
+                    "recipient_id": "bob",
+                    "message": "for bob only",
+                    "deliver_method": "store",
+                }
+            )
 
         # Alice waits — should NOT see bob's message even though they
         # share the same project DB.

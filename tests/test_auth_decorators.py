@@ -26,6 +26,7 @@ from typing import Any, Dict, List
 import pytest
 
 import mcp.types as mcp_types
+from tests.harness import with_bearer
 
 
 # --- AuthRejected propagation -----------------------------------------------
@@ -101,7 +102,8 @@ async def test_requires_policy_worker_rejected_when_toggle_off(
             return [mcp_types.TextContent(type="text", text="ran")]
 
         with pytest.raises(AuthRejected):
-            await my_tool({"token": "worker-token"})
+            with with_bearer("worker-token"):
+                await my_tool({"token": "worker-token"})
 
 
 @pytest.mark.asyncio
@@ -130,7 +132,8 @@ async def test_requires_policy_worker_allowed_when_any_toggle_on(
         async def my_tool(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
             return [mcp_types.TextContent(type="text", text="worker in")]
 
-        result = await my_tool({"token": "worker-token"})
+        with with_bearer("worker-token"):
+            result = await my_tool({"token": "worker-token"})
         assert result[0].text == "worker in"
 
 
@@ -241,10 +244,11 @@ async def test_dispatcher_translates_authrejected_to_iserror(
     app = create_app(project_dir=str(project_dir))
     with TestClient(app):
         # view_status is operator-tier. Calling with garbage must be rejected.
-        result = await dispatch_tool_call(
-            "view_status",
-            {"token": "deadbeef" * 4},
-        )
+        with with_bearer("deadbeef" * 4):
+            result = await dispatch_tool_call(
+                "view_status",
+                {"token": "deadbeef" * 4},
+            )
         assert isinstance(result, PermissionDenied), (
             f"view_status with garbage token must be rejected; got {result!r}"
         )

@@ -32,6 +32,7 @@ import datetime as _dt
 from pathlib import Path
 
 import pytest
+from tests.harness import with_bearer
 
 pytestmark = pytest.mark.asyncio
 
@@ -148,9 +149,10 @@ async def _fetch(agent_token: str, cursor: str) -> dict:
         fetch_events_since_tool_impl,
     )
 
-    result = await fetch_events_since_tool_impl(
-        {"token": agent_token, "cursor": cursor}
-    )
+    with with_bearer(agent_token):
+        result = await fetch_events_since_tool_impl(
+            {"token": agent_token, "cursor": cursor}
+        )
     # ``Ok.message`` carries the JSON-encoded body (the wire shape).
     return json.loads(result.message)
 

@@ -23,6 +23,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tests.harness import with_bearer
 
 pytestmark = pytest.mark.asyncio
 
@@ -43,12 +44,13 @@ async def test_message_event_keeps_fat_data_shape(tmp_path: Path) -> None:
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
-        await send_agent_message_tool_impl({
-            "token": admin.admin_token,
-            "recipient_id": "alice",
-            "message": "fat payload check",
-            "deliver_method": "store",
-        })
+        with with_bearer(admin.admin_token):
+            await send_agent_message_tool_impl({
+                "token": admin.admin_token,
+                "recipient_id": "alice",
+                "message": "fat payload check",
+                "deliver_method": "store",
+            })
 
         since = (
             _dt.datetime.now() - _dt.timedelta(seconds=2)
@@ -93,13 +95,14 @@ async def test_unassigned_task_event_is_skinny(tmp_path: Path) -> None:
 
         w_task = asyncio.create_task(waiter())
         await asyncio.sleep(0.2)
-        await assign_task_tool_impl({
-            "token": admin.admin_token,
-            "task_title": "Skinny payload check",
-            "task_description": (
-                "This description should NOT appear in the wake event."
-            ),
-        })
+        with with_bearer(admin.admin_token):
+            await assign_task_tool_impl({
+                "token": admin.admin_token,
+                "task_title": "Skinny payload check",
+                "task_description": (
+                    "This description should NOT appear in the wake event."
+                ),
+            })
 
         blocks = await asyncio.wait_for(w_task, timeout=5.0)
         body = json.loads(_content_text(blocks))

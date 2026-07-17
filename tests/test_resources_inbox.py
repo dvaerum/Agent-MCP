@@ -23,6 +23,7 @@ from pathlib import Path
 
 import mcp.types as mcp_types
 import pytest
+from tests.harness import with_bearer
 
 pytestmark = pytest.mark.asyncio
 
@@ -114,14 +115,15 @@ async def test_inbox_read_returns_event_envelope(tmp_path: Path) -> None:
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
 
-        await send_agent_message_tool_impl(
-            {
-                "token": admin.admin_token,
-                "recipient_id": "alice",
-                "message": "in your inbox",
-                "deliver_method": "store",
-            }
-        )
+        with with_bearer(admin.admin_token):
+            await send_agent_message_tool_impl(
+                {
+                    "token": admin.admin_token,
+                    "recipient_id": "alice",
+                    "message": "in your inbox",
+                    "deliver_method": "store",
+                }
+            )
 
         result = await _read_resource(alice, "agent-mcp://inbox/alice")
         text = _first_text(result.contents)
@@ -154,14 +156,15 @@ async def test_worker_cannot_read_anothers_inbox(tmp_path: Path) -> None:
         await admin.create_worker("bob")  # registered as a recipient
 
         # admin sends a message to bob.
-        await send_agent_message_tool_impl(
-            {
-                "token": admin.admin_token,
-                "recipient_id": "bob",
-                "message": "for bob only",
-                "deliver_method": "store",
-            }
-        )
+        with with_bearer(admin.admin_token):
+            await send_agent_message_tool_impl(
+                {
+                    "token": admin.admin_token,
+                    "recipient_id": "bob",
+                    "message": "for bob only",
+                    "deliver_method": "store",
+                }
+            )
 
         # alice attempts to read bob's inbox. Either the read raises,
         # or returns content whose `events` is empty (the impl
