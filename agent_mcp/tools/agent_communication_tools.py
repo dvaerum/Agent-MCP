@@ -76,8 +76,8 @@ def _resolve_principal(
     surfaces that as :class:`PermissionDenied` per the new contract.
 
     token-retirement PR 2 (Phase B): the fallback sources the bearer
-    from the ContextVar, NOT ``arguments["token"]`` — nothing reads
-    ``arguments["token"]`` for identity here. ``arguments`` stays in
+    from the ContextVar, NOT the legacy self-auth token arg — nothing
+    reads a token argument for identity here. ``arguments`` stays in
     the signature (callers still pass it) but is no longer read for the
     token.
 
@@ -552,8 +552,7 @@ async def get_agent_messages_tool_impl(
     The pre-migration ``@requires("any")`` gate admitted any
     valid-agent token; we keep that intent by requiring the Principal
     to identify an agent (either via ``agent_bearer`` or via a legacy
-    operator caller carrying a per-agent bearer in
-    ``arguments["token"]`` — the latter is resolved by
+    operator caller whose bearer is resolved from the ContextVar by
     :func:`_resolve_principal`'s token fallback).
     """
     principal = _resolve_principal(arguments, principal)
@@ -1726,10 +1725,6 @@ def register_agent_communication_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": "Sender's authentication token. Optional if Authorization: Bearer header is supplied (recommended)."
-                },
                 "recipient_id": {
                     "type": "string",
                     "description": "ID of the agent to send message to"
@@ -1796,10 +1791,6 @@ def register_agent_communication_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": "Agent's authentication token. Optional if Authorization: Bearer header is supplied (recommended)."
-                },
                 "include_sent": {
                     "type": "boolean",
                     "description": "Include messages sent by this agent",
@@ -1845,10 +1836,6 @@ def register_agent_communication_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended)."
-                },
                 "message": {
                     "type": "string",
                     "description": "Message content to broadcast"
@@ -1897,14 +1884,6 @@ def register_agent_communication_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": (
-                        "Calling agent's token. Optional if "
-                        "Authorization: Bearer header is supplied "
-                        "(recommended)."
-                    ),
-                },
                 "cursor": {
                     "type": ["string", "null"],
                     "description": (
@@ -1935,14 +1914,6 @@ def register_agent_communication_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": (
-                        "Calling agent's token. Optional if "
-                        "Authorization: Bearer header is supplied "
-                        "(recommended)."
-                    ),
-                },
                 "since": {
                     "type": "string",
                     "description": (

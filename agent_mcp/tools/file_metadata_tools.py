@@ -333,7 +333,6 @@ def register_file_metadata_tools():
         input_schema={  # From main.py:1842-1852
             "type": "object",
             "properties": {
-                "token": {"type": "string", "description": "Authentication token. Optional if Authorization: Bearer header is supplied (recommended)."},
                 "filepath": {
                     "type": "string",
                     "description": "Path to the file (can be relative to agent's CWD or absolute)",
@@ -351,10 +350,6 @@ def register_file_metadata_tools():
         input_schema={  # From main.py:1855-1867
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
-                },
                 "filepath": {
                     "type": "string",
                     "description": "Path to the file (can be relative or absolute)",

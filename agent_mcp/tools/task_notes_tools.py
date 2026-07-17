@@ -305,13 +305,6 @@ def register_task_notes_tools() -> None:
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": (
-                        "Authentication token. Optional if "
-                        "Authorization: Bearer header is supplied."
-                    ),
-                },
                 "task_id": {
                     "type": "string",
                     "description": "Task to attach the note to.",
@@ -335,13 +328,6 @@ def register_task_notes_tools() -> None:
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": (
-                        "Authentication token. Optional if "
-                        "Authorization: Bearer header is supplied."
-                    ),
-                },
                 "note_id": {
                     "type": "integer",
                     "description": "Side-table note_id to edit.",
@@ -373,13 +359,6 @@ def register_task_notes_tools() -> None:
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": (
-                        "Authentication token. Optional if "
-                        "Authorization: Bearer header is supplied."
-                    ),
-                },
                 "note_id": {
                     "type": "integer",
                     "description": "Side-table note_id to delete.",

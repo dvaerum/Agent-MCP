@@ -101,7 +101,6 @@ def register_rag_tools():
         input_schema={ # From main.py:1870-1881
             "type": "object",
             "properties": {
-                "token": {"type": "string", "description": "Authentication token for the agent making the query. Optional if Authorization: Bearer header is supplied (recommended)."},
                 "query": {"type": "string", "description": "The natural language question to ask about the project."}
             },
             "required": ["query"],

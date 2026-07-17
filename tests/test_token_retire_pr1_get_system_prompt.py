@@ -14,10 +14,13 @@ in ``arguments``, the tool
   * derives the requesting agent id from ``principal.agent_id``, and
   * feeds ``principal.source_token`` to the connection-snippet builder,
 
-WITHOUT ever consulting ``arguments["token"]`` / ``get_agent_id`` (the
-stubbed ``get_agent_id`` raises if reached). This is the proof the
-tool no longer depends on the token arg for identity — even though the
-arg stays advertised in the schema this PR (a later PR removes it).
+WITHOUT ever consulting a ``token`` argument. This is the proof the
+tool derives identity solely from the Principal.
+
+Phase C (token-retirement PR 3) removed the ``get_agent_id`` fallback
+import from ``agent_tools`` entirely and dropped the ``token`` property
+from the schema, so the old "``get_agent_id`` must not be called" guard
+is now structurally guaranteed and no longer stubbed here.
 """
 from __future__ import annotations
 
@@ -37,18 +40,8 @@ async def test_get_system_prompt_derives_identity_from_principal(monkeypatch):
         captured["token"] = agent_token_for_prompt
         return f"BODY for {agent_id}"
 
-    def _boom_get_agent_id(token):  # pragma: no cover - must not be called
-        raise AssertionError(
-            "get_system_prompt consulted arguments['token'] via "
-            "get_agent_id; post-migration it must derive identity from "
-            "the threaded Principal"
-        )
-
     monkeypatch.setattr(
         agent_tools_module, "generate_system_prompt", _fake_generate
-    )
-    monkeypatch.setattr(
-        agent_tools_module, "get_agent_id", _boom_get_agent_id
     )
     # log_audit would otherwise touch the DB; the identity contract is
     # what we're pinning here, not the audit write.

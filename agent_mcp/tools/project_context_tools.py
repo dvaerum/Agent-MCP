@@ -1973,7 +1973,6 @@ def register_project_context_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {"type": "string", "description": "Authentication token. Optional if Authorization: Bearer header is supplied (recommended)."},
                 "context_key": {
                     "type": "string",
                     "description": "Exact key to view (optional). If provided, search_query is ignored.",
@@ -2021,10 +2020,6 @@ def register_project_context_tools():
         input_schema={  # From main.py:1826-1839
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": "Authentication token (agent or admin). Optional if Authorization: Bearer header is supplied (recommended).",
-                },
                 "context_key": {
                     "type": "string",
                     "description": "The exact key for the context entry (e.g., 'api.service_x.url').",
@@ -2057,10 +2052,6 @@ def register_project_context_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": "Authentication token (agent or admin). Optional if Authorization: Bearer header is supplied (recommended).",
-                },
                 "context_key": {
                     "type": "string",
                     "description": "The exact key for the new context entry (e.g., 'api.service_x.url').",
@@ -2093,7 +2084,6 @@ def register_project_context_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {"type": "string", "description": "Authentication token. Optional if Authorization: Bearer header is supplied (recommended)."},
                 "updates": {
                     "type": "array",
                     "description": "Array of update operations",
@@ -2137,10 +2127,6 @@ def register_project_context_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
-                },
                 "backup_name": {
                     "type": "string",
                     # VULN-003: pattern rejects path-traversal payloads
@@ -2177,7 +2163,6 @@ def register_project_context_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {"type": "string", "description": "Authentication token. Optional if Authorization: Bearer header is supplied (recommended)."}
             },
             "required": [],
             "additionalProperties": False,
@@ -2191,10 +2176,6 @@ def register_project_context_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
-                },
                 "context_key": {
                     "type": "string",
                     "description": "Single context key to delete (alternative to context_keys)",

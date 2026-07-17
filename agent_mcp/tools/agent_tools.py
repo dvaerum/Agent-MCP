@@ -5,7 +5,6 @@ import mcp.types as mcp_types # Assuming this is your mcp.types path
 
 from .registry import register_tool
 from ..core.config import logger
-from ..core.auth import get_agent_id # verify_token not strictly needed here
 from ..core.authorize import requires_capability
 from ..core.principal import Principal
 from ..utils.audit_utils import log_audit
@@ -27,17 +26,13 @@ async def get_system_prompt_tool_impl(
 ) -> List[mcp_types.TextContent]:
     # Identity + connection-snippet bearer come from the threaded
     # Principal: ``principal.agent_id`` is the caller's id and
-    # ``principal.source_token`` is the same bearer the header back-fill
-    # injects into ``arguments["token"]``. The ``arguments["token"]``
-    # read below is a graceful fallback for direct-call tests that don't
-    # thread a Principal; PR 2 retires it (token-retirement plan Phase A).
-    if principal is not None:
-        requesting_agent_id = principal.agent_id
-        agent_token_for_prompt = principal.source_token
-    else:
-        agent_auth_token = arguments.get("token")  # This is the agent's own token
-        requesting_agent_id = get_agent_id(agent_auth_token)
-        agent_token_for_prompt = agent_auth_token
+    # ``principal.source_token`` is the caller's own bearer. The
+    # dispatcher always synthesizes a Principal from the
+    # ``request_auth_token`` contextvar, so ``principal`` is never None
+    # here (token-retirement plan Phase C — the legacy self-auth token
+    # argument read is retired).
+    requesting_agent_id = principal.agent_id
+    agent_token_for_prompt = principal.source_token
 
     # `generate_system_prompt` takes the agent_id and the agent's own
     # token (for the connection snippet); the "Admin" vs "Worker" label
@@ -64,7 +59,6 @@ def register_agent_tools():
         input_schema={ # From main.py:1774-1786
             "type": "object",
             "properties": {
-                "token": {"type": "string", "description": "Agent authentication token (the agent's own token). Optional if Authorization: Bearer header is supplied (recommended)."}
             },
             "required": [],
             "additionalProperties": False

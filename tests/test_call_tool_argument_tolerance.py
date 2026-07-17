@@ -1,33 +1,30 @@
 """Tools must tolerate the argument shapes real MCP clients actually send.
 
-After PR #40 dropped `token` from `required`, LLM-driven MCP clients
-(Claude Code, Cursor agents, etc.) started exercising the
-"`token` is optional" advertisement by explicitly sending one of:
+LLM-driven MCP clients (Claude Code, Cursor agents, etc.) regularly
+send argument shapes that a strict `additionalProperties: false`
+validator would reject:
 
     {"token": null, ...}                      # JSON null for an absent value
+    {"token": "<legacy-bearer>", ...}         # a stray retired self-auth arg
     {"_meta": {"progressToken": "..."} , ...} # client SDK leaking _meta into arguments
 
 The MCP framework's lowlevel server runs
 `jsonschema.validate(arguments, tool.inputSchema)` BEFORE invoking the
-registered dispatcher. Because every tool's schema declares
-`"token": {"type": "string"}` (no `null` allowed) and
-`"additionalProperties": false`, both shapes get rejected upstream of
-the dispatcher's Q6e bearer-token fallback with:
+registered dispatcher. All three shapes would be rejected upstream:
 
     Input validation error: None is not of type 'string'
     Input validation error: Additional properties are not allowed
+                            ('token' was unexpected)
+    Input validation error: Additional properties are not allowed
                             ('_meta' was unexpected)
 
-The error reaches the client as a CallToolResult.isError=true text
-block — and some clients surface that as JSON-RPC `-32602` (Invalid
-params), which is what Dennis reported in the field for
-`send_agent_message`, `bulk_update_project_context`, and
-`get_agent_messages`.
-
-Fix: the dispatcher pre-sanitizes arguments before validation —
-dropping `null`-valued top-level keys and the well-known `_meta`
-escape hatch — so callers who follow the JSON-RPC spec (and the
-"optional means you may send null") aren't punished.
+token-retirement plan Phase C: the self-auth `token` param is retired
+from every schema. An old client that still sends `token` (null or a
+real value) must not get a hard 400 during the transition — the
+dispatcher's `_clean_arguments_for_schema` treats `token` (and
+`_meta`/`meta`) as reserved keys and strips them before validation, so
+a stray `token` is silently tolerated-and-ignored rather than
+rejected. `null`-valued keys are likewise dropped.
 
 These tests pin the tolerance invariant via the same framework
 handler real MCP clients hit (CallToolRequest → registered handler).
@@ -62,8 +59,9 @@ def _is_validation_error(admin, result_blocks) -> bool:
     return "Input validation error" in _result_text(result_blocks)
 
 
-# --- Class 1: explicit `token: null` from LLM-driven clients ---
+# --- Class 1: a stray retired `token` arg is tolerated-and-stripped ---
 
+@pytest.mark.parametrize("token_value", [None, "stray-legacy-bearer-token"])
 @pytest.mark.parametrize(
     "tool_name,extra_args",
     [
@@ -78,22 +76,25 @@ def _is_validation_error(admin, result_blocks) -> bool:
         ("view_tasks", {}),
     ],
 )
-async def test_token_null_does_not_break_validation(
-    tmp_path, tool_name: str, extra_args: dict
+async def test_stray_token_arg_is_tolerated_and_stripped(
+    tmp_path, tool_name: str, extra_args: dict, token_value
 ) -> None:
-    """`{"token": null, ...}` is what LLMs serialize when they decide
-    to "explicitly pass the optional token as absent". Schema says
-    `"token": {"type": "string"}` so `jsonschema.validate` rejects
-    null. The dispatcher must strip null-valued keys before the
-    framework's validator sees them.
+    """The self-auth `token` param is retired from every schema
+    (token-retirement plan Phase C), so `additionalProperties: false`
+    would reject a stray `token` an old client still sends — whether
+    `null` (model serializing an "absent" optional) or a real bearer
+    value. The dispatcher must strip `token` (a reserved key) before
+    the framework's validator sees it: tolerate-and-ignore, never a
+    hard 400.
     """
     async with mcp_session(tmp_path) as admin:
-        args = {"token": None, **extra_args}
+        args = {"token": token_value, **extra_args}
         result = await admin.call(tool_name, args)
 
         assert not _is_validation_error(admin, result), (
-            f"{tool_name}: framework rejected `token: null` at schema "
-            f"validation: {_result_text(result)}"
+            f"{tool_name}: framework rejected a stray `token={token_value!r}` "
+            f"at schema validation instead of stripping it: "
+            f"{_result_text(result)}"
         )
 
 
@@ -127,9 +128,10 @@ async def test_meta_escape_hatch_does_not_break_validation(
 # --- Class 3: combined — both null-token AND _meta ---
 
 async def test_token_null_and_meta_combined(tmp_path) -> None:
-    """A real-world Claude Code call: both `token: null` (model
-    serializing the optional field as null) and `_meta` (SDK leaking
-    progress token into arguments)."""
+    """A real-world Claude Code call from an old client: both a stray
+    retired `token` and `_meta` (SDK leaking the progress token into
+    arguments). Both are reserved keys the dispatcher strips before
+    validation, so the call is tolerated, not rejected."""
     async with mcp_session(tmp_path) as admin:
         args = {
             "token": None,

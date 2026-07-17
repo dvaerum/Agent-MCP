@@ -103,7 +103,6 @@ async def test_worker_foreign_and_nonexistent_are_indistinguishable(
         foreign_res = await alice.call(
             "request_assistance",
             {
-                "token": alice.token,
                 "task_id": foreign_task,
                 "description": "please help",
             },
@@ -111,7 +110,6 @@ async def test_worker_foreign_and_nonexistent_are_indistinguishable(
         nonexistent_res = await alice.call(
             "request_assistance",
             {
-                "token": alice.token,
                 "task_id": nonexistent_task,
                 "description": "please help",
             },
@@ -160,7 +158,6 @@ async def test_assignee_can_request_assistance_for_own_task(tmp_path) -> None:
         res = await alice.call(
             "request_assistance",
             {
-                "token": alice.token,
                 "task_id": own_task,
                 "description": "stuck on this",
             },
@@ -209,7 +206,6 @@ async def test_mode3_self_claim_audit_actor_is_worker(tmp_path) -> None:
         res = await alice.call(
             "assign_task",
             {
-                "token": alice.token,
                 "agent_token": alice.token,
                 "task_ids": [task_id],
             },

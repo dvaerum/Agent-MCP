@@ -64,57 +64,34 @@ def test_no_tool_lists_token_in_required() -> None:
     )
 
 
-def test_token_still_present_as_optional_property() -> None:
-    """Removing `token` from `required` must keep it as a valid
-    optional property in the schema so the Q6e dispatcher fallback
-    (and explicit-token callers) keep working.
+def test_token_absent_from_every_tool_schema() -> None:
+    """The retirement invariant (token-retirement plan Phase C): the
+    legacy self-auth ``token`` param is gone from EVERY tool's
+    inputSchema. Identity is carried solely by the header-Bearer
+    Principal; a ``token`` argument is no longer advertised to agents.
 
-    We only check tools that actually consume `token` from arguments
-    (i.e. they used to require it).
+    A new tool that re-adds a ``token`` property would re-introduce the
+    confusing redundant-auth arg this refactor removed, so this guard
+    fails the build. ``agent_token`` / ``agent_id`` / ``recipient_id``
+    (which target ANOTHER agent) are intentionally NOT covered here.
     """
     import agent_mcp.tools  # noqa: F401
     from agent_mcp.tools.registry import tool_schemas
 
-    # Tools that historically required `token` per a grep of the
-    # codebase prior to this PR.
-    tools_with_token = {
-        "send_agent_message",
-        "get_agent_messages",
-        "broadcast_admin_message",
-        "view_project_context",
-        "update_project_context",
-        "bulk_update_project_context",
-        "search_project_context",
-        "delete_project_context",
-        "view_tasks",
-        "view_status",
-        "assign_task",
-        "create_self_task",
-        "update_task_status",
-        "request_assistance",
-        "view_file_metadata",
-        "update_file_metadata",
-        "check_file_status",
-        "update_file_status",
-        "ask_project_rag",
-        "get_system_prompt",
-        # Wave 7 PR 3 (coordinator transition): ``create_agent`` +
-        # ``relaunch_agent`` deleted with the spawn machinery. The
-        # ``register_agent`` schema deliberately omits ``token`` (its
-        # auth is the operator-session cookie, not a body bearer).
-        "terminate_agent",
-        "restore_agent",
-        "purge_agent",
-    }
+    assert tool_schemas, "tool registry is empty — registration didn't run"
 
-    by_name = {e["name"]: e for e in tool_schemas}
-    for tn in tools_with_token & by_name.keys():
-        schema = by_name[tn].get("inputSchema") or {}
+    offenders: list[str] = []
+    for entry in tool_schemas:
+        schema = entry.get("inputSchema") or {}
         props = schema.get("properties") or {}
-        assert "token" in props, (
-            f"{tn}: `token` should remain a valid optional property "
-            "(the Q6e bearer-header fallback still injects it)"
-        )
+        if "token" in props:
+            offenders.append(entry["name"])
+
+    assert not offenders, (
+        "These tools still advertise the retired self-auth `token` "
+        "property in inputSchema.properties (token-retirement plan "
+        f"Phase C): {sorted(offenders)}"
+    )
 
 
 # --- End-to-end: framework validates arguments against inputSchema ---

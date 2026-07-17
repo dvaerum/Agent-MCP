@@ -101,7 +101,6 @@ async def test_worker_cannot_attach_child_under_foreign_parent(
         res = await alice.call(
             "assign_task",
             {
-                "token": alice.token,
                 "task_title": "INJECTED malicious child",
                 "task_description": "attacker-controlled body",
                 "parent_task_id": bob_parent,
@@ -140,7 +139,6 @@ async def test_worker_foreign_and_nonexistent_parent_indistinguishable(
         foreign_res = await alice.call(
             "assign_task",
             {
-                "token": alice.token,
                 "task_title": "child A",
                 "task_description": "body",
                 "parent_task_id": foreign_parent,
@@ -149,7 +147,6 @@ async def test_worker_foreign_and_nonexistent_parent_indistinguishable(
         nonexistent_res = await alice.call(
             "assign_task",
             {
-                "token": alice.token,
                 "task_title": "child A",
                 "task_description": "body",
                 "parent_task_id": nonexistent_parent,
@@ -196,7 +193,6 @@ async def test_worker_self_task_cannot_attach_under_foreign_parent(
         res = await alice.call(
             "create_self_task",
             {
-                "token": alice.token,
                 "task_title": "INJECTED self-task",
                 "task_description": "attacker-controlled body",
                 "parent_task_id": bob_parent,
@@ -228,7 +224,6 @@ async def test_worker_self_task_under_own_parent_succeeds(
         res = await alice.call(
             "create_self_task",
             {
-                "token": alice.token,
                 "task_title": "legit self subtask",
                 "task_description": "breaking down my own work",
                 "parent_task_id": own_parent,
@@ -257,7 +252,6 @@ async def test_worker_can_attach_child_under_own_parent(tmp_path) -> None:
         res = await alice.call(
             "assign_task",
             {
-                "token": alice.token,
                 "task_title": "legit subtask",
                 "task_description": "breaking down my own work",
                 "parent_task_id": own_parent,
