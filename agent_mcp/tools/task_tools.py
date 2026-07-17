@@ -1592,8 +1592,10 @@ async def assign_task_tool_impl(
         if not is_admin_request:
             return PermissionDenied(
                 reason=(
-                    "agent_id parameter is admin-only; "
-                    "workers must pass agent_token (their own token)"
+                    "agent_id is admin-only. To take on work as yourself, "
+                    "call assign_task with just task_ids=[...] — you "
+                    "self-claim as the authenticated caller; no agent_token "
+                    "is needed (a worker cannot access its own token)."
                 )
             )
         # PR 6: routed through agent_repo (drops raw cursor that only

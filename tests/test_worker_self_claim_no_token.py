@@ -191,6 +191,28 @@ async def test_worker_claiming_nonexistent_still_phantom(tmp_path) -> None:
         assert "already assigned to you" not in text
 
 
+async def test_worker_agent_id_denial_points_to_token_free_self_claim(tmp_path) -> None:
+    """A worker passing agent_id (admin-only) must NOT be told to "pass
+    agent_token (their own token)" — that's the exact false guidance behind
+    the original bug (a worker cannot access its own token). It must be
+    pointed at the token-free task_ids self-claim path."""
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        pool = f"task_{secrets.token_hex(6)}"
+        _seed_task(pool, "claimable", assigned_to=None)
+        text = _text(
+            await alice.call(
+                "assign_task", {"task_ids": [pool], "agent_id": "alice"}
+            )
+        ).lower()
+        assert "task_ids" in text and "self-claim" in text, (
+            f"denial should point to the token-free task_ids self-claim; got: {text}"
+        )
+        assert "must pass agent_token" not in text and "pass agent_token" not in text, (
+            f"must NOT tell a worker to pass its own token; got: {text}"
+        )
+
+
 async def test_view_tasks_foreign_filter_gives_actionable_hint(tmp_path) -> None:
     """view_tasks(agent_id=<another agent>) is denied for a worker — the
     denial should point at the working path (omit the filter), not just say
