@@ -39,7 +39,7 @@ import openai
 import pytest
 
 from agent_mcp.core.principal import Principal
-from agent_mcp.core.tool_result import Ok
+from agent_mcp.core.tool_result import Failed, Ok
 from agent_mcp.external.completion_service import CompletionConfigError
 from agent_mcp.features.rag import query as query_mod
 from agent_mcp.features.rag.query import (
@@ -80,16 +80,23 @@ def _openai_error() -> openai.APIError:
 
 
 async def _rendered_answer(query: str = "what is the status?") -> str:
-    """Drive the real tool seam and return the string the client sees.
+    """Drive the real tool seam and return the caller-facing string.
 
-    ``ask_project_rag`` wraps the (possibly error-prose) answer in
-    ``Ok(message=..., data={"answer": ...})``; both surfaces render
-    verbatim, so we assert on the message and confirm data matches.
+    The worker-msg fix (``fix/worker-msg-rag-error-envelope``) means a
+    provider/DB/config FAILURE now surfaces as ``Failed`` with a static,
+    category-only message rather than a false-success ``Ok`` whose text
+    started with "Error:". SD-R9-1's property is unchanged and, if
+    anything, stronger: none of these paths reflect exception detail to
+    the caller. Extract the caller-facing message from either variant;
+    the leak assertions below then apply to whatever the worker sees.
+    A genuine ``Ok`` answer still carries its text in ``data["answer"]``.
     """
     result = await ask_project_rag_tool_impl(
         {"query": query}, principal=_worker_principal()
     )
-    assert isinstance(result, Ok), f"expected Ok, got {result!r}"
+    if isinstance(result, Failed):
+        return result.message or ""
+    assert isinstance(result, Ok), f"expected Ok or Failed, got {result!r}"
     msg = result.message or ""
     assert isinstance(result.data, dict)
     assert result.data.get("answer") == msg

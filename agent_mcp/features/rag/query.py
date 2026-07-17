@@ -18,6 +18,40 @@ from ...external.completion_service import (
 import openai
 
 
+# ── RAG failure sentinels ─────────────────────────────────────────────
+#
+# query_rag_system SWALLOWS provider / DB / config failures into a
+# RETURNED error-prose string (it never raises on these paths). Each
+# string is category-only per SD-R9-1 — no provider names, URLs, or
+# exception text. ``ask_project_rag`` matches the returned value against
+# ``RAG_ERROR_SENTINELS`` to surface a ``Failed`` ToolResult instead of a
+# false-success ``Ok`` whose text merely *starts with* "Error:" (the
+# worker-msg bug: a genuine provider outage looked like a successful
+# answer that happened to say "Error: …", so the worker treated the
+# outage as a factual answer or filed a false bug).
+#
+# The genuine "no relevant information" answer is deliberately NOT in this
+# set — an empty knowledge base is a SUCCESSFUL query, not a failure, so
+# it stays an ``Ok``. Exact-match against these named constants (not
+# fragile "startswith Error:" substring matching) is the coupling: keep
+# the except-arm returns below in sync with this set.
+RAG_ERR_PROVIDER_UNAVAILABLE = "Error: RAG provider unavailable"
+RAG_ERR_QUERY_FAILED = "Error: RAG query failed"
+RAG_ERR_PROVIDER_NOT_CONFIGURED = (
+    "RAG Error: completion provider is not configured"
+)
+RAG_ERR_UNEXPECTED = "An unexpected error occurred during the RAG query."
+
+RAG_ERROR_SENTINELS = frozenset(
+    {
+        RAG_ERR_PROVIDER_UNAVAILABLE,
+        RAG_ERR_QUERY_FAILED,
+        RAG_ERR_PROVIDER_NOT_CONFIGURED,
+        RAG_ERR_UNEXPECTED,
+    }
+)
+
+
 # ADR-0017 (Wave 12 PR B): content-based secret detection is GONE. The
 # RAG secret helpers (``_is_secret_key`` / ``_value_has_embedded_secret``
 # / ``_drop_secret_chunks`` / ``_drop_secret_tasks`` / ``_scrub_secret_
@@ -238,7 +272,7 @@ async def _assemble_and_answer(
         # ask_project_rag's Ok(message=...). Detail is logged
         # server-side; the caller gets a static category.
         logger.error(f"{log_label}: completion config error: {e_cfg}")
-        return "RAG Error: completion provider is not configured"
+        return RAG_ERR_PROVIDER_NOT_CONFIGURED
 
     if on_client_ready is not None:
         on_client_ready(cc)
@@ -293,9 +327,7 @@ async def query_rag_system(
         A string containing the answer or an error message.
     """
     conn = None
-    answer = (
-        "An unexpected error occurred during the RAG query."  # Default error message
-    )
+    answer = RAG_ERR_UNEXPECTED  # Default error message
 
     try:
         conn = get_db_connection()
@@ -528,13 +560,13 @@ async def query_rag_system(
     # the caller a static, category-preserving message.
     except openai.APIError as e_openai:  # main.py:1563
         logger.error(f"RAG Query: OpenAI API error: {e_openai}", exc_info=True)
-        answer = "Error: RAG provider unavailable"
+        answer = RAG_ERR_PROVIDER_UNAVAILABLE
     except sqlite3.Error as e_sql:  # main.py:1566
         logger.error(f"RAG Query: Database error: {e_sql}", exc_info=True)
-        answer = "Error: RAG query failed"
+        answer = RAG_ERR_QUERY_FAILED
     except Exception as e_unexpected:  # main.py:1569
         logger.error(f"RAG Query: Unexpected error: {e_unexpected}", exc_info=True)
-        answer = "An unexpected error occurred during the RAG query."
+        answer = RAG_ERR_UNEXPECTED
     finally:
         if conn:
             conn.close()
