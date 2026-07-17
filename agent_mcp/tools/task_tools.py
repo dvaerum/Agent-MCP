@@ -906,7 +906,8 @@ async def _create_unassigned_tasks(
                 return Conflict(
                     reason=(
                         "Workers cannot create root tasks. Every task filed "
-                        "via assign_task must specify a parent_task_id."
+                        "via assign_task must specify a parent_task_id — and "
+                        "the parent must be a task you own."
                     )
                 )
             worker_parent_ids = [t.get("parent_task_id") for t in tasks]
@@ -914,7 +915,8 @@ async def _create_unassigned_tasks(
             return Conflict(
                 reason=(
                     "Workers cannot create root tasks. Specify a "
-                    "parent_task_id when filing an unassigned task."
+                    "parent_task_id — a task you own — when filing an "
+                    "unassigned task."
                 )
             )
         else:
