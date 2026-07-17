@@ -1229,7 +1229,43 @@ async def _assign_to_existing_tasks(
             ]
             if assigned_tasks:
                 if not is_admin_request:
-                    return phantom_not_found
+                    # Split self-owned from foreign. A task assigned to the
+                    # CALLER itself is already in the caller's own view_tasks
+                    # list, so collapsing it to the phantom "not found" is
+                    # gratuitous and misleading — the worker reports a false
+                    # bug (the reported symptom). FOREIGN-owned tasks MUST
+                    # stay phantom: that is the AZ-R17-1/AZ-R18-1 existence
+                    # oracle (never reveal a foreign task exists nor its
+                    # owner). ``target_agent_id`` is the self-claiming worker
+                    # on this path, so ``assigned_to == target_agent_id`` is
+                    # "already mine".
+                    if any(
+                        t["assigned_to"] != target_agent_id for t in assigned_tasks
+                    ):
+                        return phantom_not_found
+                    own_ids = ", ".join(t["task_id"] for t in assigned_tasks)
+                    own_terminal = sorted(
+                        {
+                            t["status"]
+                            for t in assigned_tasks
+                            if t["status"] in _TERMINAL_TASK_STATUSES
+                        }
+                    )
+                    if own_terminal:
+                        return Conflict(
+                            reason=(
+                                f"task(s) {own_ids} are already assigned to you and "
+                                f"in a terminal state ({', '.join(own_terminal)}); "
+                                "they are finished and cannot be re-claimed."
+                            )
+                        )
+                    return Conflict(
+                        reason=(
+                            f"task(s) {own_ids} are already assigned to you — no "
+                            "claim needed. You already own them; call "
+                            "update_task_status to work on them."
+                        )
+                    )
                 assigned_list = [
                     f"{task['task_id']} (assigned to {task['assigned_to']})"
                     for task in assigned_tasks
@@ -3386,8 +3422,9 @@ async def view_tasks_tool_impl(
         elif filter_agent_id != requesting_agent_id:
             return PermissionDenied(
                 reason=(
-                    "Non-admin agents can only view their own tasks or all "
-                    "tasks assigned to them if no agent_id filter is specified."
+                    "Non-admin agents can only view their own tasks. Omit the "
+                    "agent_id filter to see your own tasks plus the unassigned "
+                    "(claimable) pool."
                 )
             )
 

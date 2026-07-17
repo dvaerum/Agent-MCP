@@ -117,3 +117,89 @@ async def test_worker_cannot_self_claim_foreign_task(tmp_path) -> None:
             f"a worker must NOT self-claim a foreign-owned task; "
             f"assignee={assignee!r}"
         )
+
+
+# ── own-task error clarity (assign Mode-3 must split self from foreign) ──
+#
+# The defect: Mode-3's "already assigned" / "terminal" checks tested
+# ``assigned_to is not None`` / ``status in TERMINAL`` WITHOUT comparing to
+# the claiming worker, so a worker re-issuing assign_task on its OWN task —
+# a task plainly in its own view_tasks list — got the phantom "not found".
+# The owner already knows the task exists, so hiding it is gratuitous +
+# misleading. Fix: self-owned → informative; FOREIGN/nonexistent → the
+# UNCHANGED phantom-404 (the AZ-R17/AZ-R18 existence oracle must hold).
+
+
+async def test_worker_claiming_own_active_task_is_informative(tmp_path) -> None:
+    async with mcp_session(tmp_path) as alice_admin:
+        alice = await alice_admin.create_worker("alice")
+        mine = f"task_{secrets.token_hex(6)}"
+        _seed_task(mine, "already mine", assigned_to="alice", status="in_progress")
+
+        text = _text(await alice.call("assign_task", {"task_ids": [mine]})).lower()
+        assert "already assigned to you" in text, (
+            f"claiming a task the worker already owns must say so, not phantom; "
+            f"got: {text}"
+        )
+        assert "not found" not in text, (
+            f"a self-owned task must NOT render the phantom 'not found'; got: {text}"
+        )
+
+
+async def test_worker_claiming_own_terminal_task_is_informative(tmp_path) -> None:
+    async with mcp_session(tmp_path) as alice_admin:
+        alice = await alice_admin.create_worker("alice")
+        done = f"task_{secrets.token_hex(6)}"
+        _seed_task(done, "my finished task", assigned_to="alice", status="completed")
+
+        text = _text(await alice.call("assign_task", {"task_ids": [done]})).lower()
+        assert "already assigned to you" in text, (
+            f"claiming an own terminal task must name it as yours; got: {text}"
+        )
+        # names the terminal state so the worker understands why it can't reclaim
+        assert "completed" in text or "terminal" in text, (
+            f"own terminal task message should name the terminal state; got: {text}"
+        )
+        assert "not found" not in text, f"must not phantom an own task; got: {text}"
+
+
+async def test_worker_claiming_foreign_task_still_phantom(tmp_path) -> None:
+    """SECURITY regression: a FOREIGN-owned task must STILL collapse to the
+    phantom 'not found' — never reveal it exists nor the owner's id."""
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        await admin.create_worker("bob")
+        bobs = f"task_{secrets.token_hex(6)}"
+        _seed_task(bobs, "bob's secret", assigned_to="bob", status="in_progress")
+
+        text = _text(await alice.call("assign_task", {"task_ids": [bobs]})).lower()
+        assert "not found" in text, (
+            f"a foreign task must render the phantom 'not found'; got: {text}"
+        )
+        assert "bob" not in text, (
+            f"the phantom must NOT leak the owning agent id; got: {text}"
+        )
+        assert "already assigned to you" not in text
+
+
+async def test_worker_claiming_nonexistent_still_phantom(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        ghost = f"task_{secrets.token_hex(6)}"
+        text = _text(await alice.call("assign_task", {"task_ids": [ghost]})).lower()
+        assert "not found" in text, f"nonexistent task must phantom; got: {text}"
+        assert "already assigned to you" not in text
+
+
+async def test_view_tasks_foreign_filter_gives_actionable_hint(tmp_path) -> None:
+    """view_tasks(agent_id=<another agent>) is denied for a worker — the
+    denial should point at the working path (omit the filter), not just say
+    no. This is a blanket role check (fires regardless of whether the id
+    names a real agent), so the hint is not an existence oracle."""
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        await admin.create_worker("bob")
+        text = _text(await alice.call("view_tasks", {"agent_id": "bob"})).lower()
+        assert "omit" in text and "agent_id" in text, (
+            f"the denial should point to the omit-filter path; got: {text}"
+        )
