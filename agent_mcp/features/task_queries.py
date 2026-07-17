@@ -68,6 +68,13 @@ class TaskFilterSpec:
     # ``agent_id`` + ``unassigned`` narrows their {mine, pool} view to
     # just the pool).
     unassigned: bool = False
+    # Complement of ``unassigned``: narrow to tasks that HAVE an assignee
+    # (``assigned_to IS NOT NULL``). For a worker (whose visibility is
+    # already {mine, pool}) this yields exactly {mine} — the "just my
+    # tasks, without the pool" view — and pairs with ``status='incomplete'``
+    # for "my open tasks". Setting both ``assigned`` and ``unassigned`` is
+    # contradictory and (by AND) matches nothing.
+    assigned: bool = False
 
 
 @dataclass(frozen=True)
@@ -281,6 +288,8 @@ class TaskQueryEngine:
         ):
             return False
         if filters.unassigned and task.get("assigned_to") not in (None, ""):
+            return False
+        if filters.assigned and task.get("assigned_to") in (None, ""):
             return False
         if filters.agent_id:
             assignee = task.get("assigned_to")

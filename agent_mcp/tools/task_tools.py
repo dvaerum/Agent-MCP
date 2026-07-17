@@ -3205,6 +3205,9 @@ async def view_tasks_tool_impl(
     # so an agent named "unassigned" can't collide.
     filter_created_by = arguments.get("created_by")
     filter_unassigned = bool(arguments.get("unassigned", False))
+    # Complement of unassigned: only tasks that have an assignee. For a
+    # worker this collapses their {mine, pool} view to just {mine}.
+    filter_assigned = bool(arguments.get("assigned", False))
     max_tokens = arguments.get(
         "max_tokens", 25000
     )  # Maximum response tokens (default: 25k)
@@ -3301,6 +3304,7 @@ async def view_tasks_tool_impl(
             include_unassigned=not is_admin_request,
             created_by=filter_created_by,
             unassigned=filter_unassigned,
+            assigned=filter_assigned,
         ),
         sort=TaskSortSpec(by=sort_by),
     )
@@ -3472,6 +3476,12 @@ async def view_tasks_tool_impl(
         response_parts.append(
             "• Use sort_by=[priority|status|updated_at] for different sorting"
         )
+        if not filter_assigned and not filter_unassigned:
+            response_parts.append(
+                "• assigned=true = just your own tasks; add "
+                "status=incomplete for your open tasks; unassigned=true = "
+                "the claimable pool you can self-assign"
+            )
 
         response_text = "\n".join(response_parts)
 
@@ -4595,6 +4605,7 @@ async def search_tasks_tool_impl(
     # magic agent_id, so an agent named "unassigned" can't collide.
     filter_created_by = arguments.get("created_by")
     filter_unassigned = bool(arguments.get("unassigned", False))
+    filter_assigned = bool(arguments.get("assigned", False))
     max_results = arguments.get("max_results", 20)
     # OBS-R28-PF: coerce to int BEFORE the [:max_results] slices below.
     # Same numeric-coercion sibling as view_tasks — an integral float
@@ -4641,12 +4652,13 @@ async def search_tasks_tool_impl(
         and not status_filter
         and not filter_created_by
         and not filter_unassigned
+        and not filter_assigned
     ):
         return Invalid(
             message=(
                 "search_tasks requires at least one of: search_query, "
-                "status_filter, created_by, or unassigned. For an "
-                "unfiltered listing of tasks, use view_tasks instead."
+                "status_filter, created_by, unassigned, or assigned. For "
+                "an unfiltered listing of tasks, use view_tasks instead."
             )
         )
 
@@ -4679,6 +4691,10 @@ async def search_tasks_tool_impl(
 
         # Unassigned-pool filter (assigned_to IS NULL / empty).
         if filter_unassigned and task_data.get("assigned_to") not in (None, ""):
+            continue
+
+        # Assigned filter (complement): only tasks that have an assignee.
+        if filter_assigned and task_data.get("assigned_to") in (None, ""):
             continue
 
         candidate_tasks.append(task_data)
@@ -4854,7 +4870,11 @@ async def search_tasks_tool_impl(
     # Add usage tips
     response_parts.append(f"\n\n💡 Tips:")
     response_parts.append("• Use view_tasks(task_id='ID') for full task details")
-    response_parts.append("• Add status_filter to narrow results")
+    response_parts.append(
+        "• Filters (combine, no query needed): unassigned=true (claimable "
+        "pool), assigned=true (your own tasks), assigned=true + "
+        "status_filter=incomplete (your open tasks), created_by=<agent>"
+    )
     response_parts.append("• Use max_results to control response size")
 
     log_audit(
@@ -5235,7 +5255,17 @@ def register_task_tools():
             "Smart task viewer with dependency analysis, health metrics, "
             "and advanced filtering. For an overview against a project "
             "with many tasks, prefer summary=true (and limit=50) to keep "
-            "the response well under the per-call token cap."
+            "the response well under the per-call token cap.\n"
+            "Common filters (combine freely):\n"
+            "• assigned=true — just YOUR OWN tasks (workers see their own "
+            "tasks + the shared pool by default; this drops the pool).\n"
+            "• assigned=true + status=incomplete — your OPEN tasks "
+            "(pending/in_progress), the usual 'what should I work on'.\n"
+            "• unassigned=true — the claimable POOL (tasks you can pick up "
+            "and self-assign).\n"
+            "• status=incomplete — all non-terminal tasks in one call "
+            "(alias 'active'/'open').\n"
+            "• created_by=<agent_id> — tasks a given agent filed."
         ),
         input_schema={
             "type": "object",
@@ -5278,6 +5308,16 @@ def register_task_tools():
                         "tasks — those with no assignee. This is a boolean, "
                         "not an agent_id value, so it never collides with "
                         "an agent that happens to be named 'unassigned'."
+                    ),
+                    "default": False,
+                },
+                "assigned": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, return only tasks that HAVE an assignee "
+                        "(complement of 'unassigned'). For a worker this is "
+                        "'just my tasks' (the pool is excluded); pair with "
+                        "status='incomplete' for 'my open tasks'."
                     ),
                     "default": False,
                 },
@@ -5367,7 +5407,17 @@ def register_task_tools():
 
     register_tool(
         name="search_tasks",
-        description="Full-text search across task titles, descriptions, and notes — or filter-only listing when no query is supplied. Critical for finding related work, avoiding duplication, and quickly listing tasks by status.",
+        description=(
+            "Full-text search across task titles, descriptions, and notes — "
+            "or filter-only listing when no query is supplied. Critical for "
+            "finding related work, avoiding duplication, and quickly listing "
+            "tasks by status/assignment.\n"
+            "Filter-only recipes (no search_query needed): "
+            "unassigned=true (the claimable pool), assigned=true (your own "
+            "tasks), assigned=true + status_filter=incomplete (your open "
+            "tasks), status_filter=incomplete (all open work), "
+            "created_by=<agent_id> (a given agent's tasks)."
+        ),
         input_schema={
             "type": "object",
             "properties": {
@@ -5408,6 +5458,16 @@ def register_task_tools():
                         "tasks. A boolean, not an agent_id value, so it never "
                         "collides with an agent named 'unassigned'. Valid as "
                         "a filter-only listing (no search_query required)."
+                    ),
+                    "default": False,
+                },
+                "assigned": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, return only tasks that HAVE an assignee "
+                        "(complement of 'unassigned'; for a worker, 'just my "
+                        "tasks'). Valid as a filter-only listing (no "
+                        "search_query required)."
                     ),
                     "default": False,
                 },
