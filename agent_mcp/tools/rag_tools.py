@@ -18,7 +18,7 @@ from ..core.principal import Principal
 from ..core.tool_result import Failed, Invalid, Ok, PermissionDenied, ToolResult
 from ..utils.audit_utils import log_audit
 # Import the core RAG querying logic
-from ..features.rag.query import query_rag_system
+from ..features.rag.query import RAG_ERROR_SENTINELS, query_rag_system
 
 
 # --- ask_project_rag tool ---
@@ -67,15 +67,41 @@ async def ask_project_rag_tool_impl(
     can_view_all_tasks = principal.has_capability("tasks.assign")
 
     try:
-        # query_rag_system handles its own errors and always returns
-        # a string (possibly an error-prose string). Pass through as
-        # the human-facing message; data carries the same text so
-        # REST consumers can read it programmatically too.
+        # query_rag_system handles its own errors and always returns a
+        # string — but on a provider/DB/config FAILURE that string is
+        # category-only error PROSE (a sentinel from
+        # ``RAG_ERROR_SENTINELS``), not an answer. Wrapping it in ``Ok``
+        # regardless of success is the worker-msg bug: a genuine outage
+        # reached the worker as a SUCCESS envelope whose text merely
+        # started with "Error:", so the worker treated the outage as a
+        # factual answer or filed a false bug. Detect the sentinels and
+        # surface a ``Failed`` (isError=True / HTTP 500) so the failure
+        # is classified as a failure. A genuine "no relevant information"
+        # answer is NOT a sentinel and stays a success.
         answer_text = await query_rag_system(
             query_text,
             requesting_agent_id=requesting_agent_id,
             can_view_all_tasks=can_view_all_tasks,
         )
+        if answer_text in RAG_ERROR_SENTINELS:
+            logger.warning(
+                "ask_project_rag: query_rag_system returned an error "
+                "sentinel for agent '%s'; surfacing as Failed (detail "
+                "already logged server-side by the query layer).",
+                requesting_agent_id,
+            )
+            # SD-R9-1: static, category-only message — no provider names,
+            # URLs, or exception text (the query layer already logged the
+            # detail with exc_info).
+            return Failed(
+                message=(
+                    "RAG is temporarily unavailable (provider or index "
+                    "error); retry shortly, or ask an operator to check "
+                    "RAG configuration."
+                )
+            )
+        # data carries the same text so REST consumers can read it
+        # programmatically too.
         return Ok(data={"answer": answer_text}, message=answer_text)
     except Exception as e:
         # Defensive — query_rag_system catches its own errors; this
