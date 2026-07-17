@@ -3205,6 +3205,9 @@ async def view_tasks_tool_impl(
     # so an agent named "unassigned" can't collide.
     filter_created_by = arguments.get("created_by")
     filter_unassigned = bool(arguments.get("unassigned", False))
+    # Complement of unassigned: only tasks that have an assignee. For a
+    # worker this collapses their {mine, pool} view to just {mine}.
+    filter_assigned = bool(arguments.get("assigned", False))
     max_tokens = arguments.get(
         "max_tokens", 25000
     )  # Maximum response tokens (default: 25k)
@@ -3301,6 +3304,7 @@ async def view_tasks_tool_impl(
             include_unassigned=not is_admin_request,
             created_by=filter_created_by,
             unassigned=filter_unassigned,
+            assigned=filter_assigned,
         ),
         sort=TaskSortSpec(by=sort_by),
     )
@@ -4595,6 +4599,7 @@ async def search_tasks_tool_impl(
     # magic agent_id, so an agent named "unassigned" can't collide.
     filter_created_by = arguments.get("created_by")
     filter_unassigned = bool(arguments.get("unassigned", False))
+    filter_assigned = bool(arguments.get("assigned", False))
     max_results = arguments.get("max_results", 20)
     # OBS-R28-PF: coerce to int BEFORE the [:max_results] slices below.
     # Same numeric-coercion sibling as view_tasks — an integral float
@@ -4641,12 +4646,13 @@ async def search_tasks_tool_impl(
         and not status_filter
         and not filter_created_by
         and not filter_unassigned
+        and not filter_assigned
     ):
         return Invalid(
             message=(
                 "search_tasks requires at least one of: search_query, "
-                "status_filter, created_by, or unassigned. For an "
-                "unfiltered listing of tasks, use view_tasks instead."
+                "status_filter, created_by, unassigned, or assigned. For "
+                "an unfiltered listing of tasks, use view_tasks instead."
             )
         )
 
@@ -4679,6 +4685,10 @@ async def search_tasks_tool_impl(
 
         # Unassigned-pool filter (assigned_to IS NULL / empty).
         if filter_unassigned and task_data.get("assigned_to") not in (None, ""):
+            continue
+
+        # Assigned filter (complement): only tasks that have an assignee.
+        if filter_assigned and task_data.get("assigned_to") in (None, ""):
             continue
 
         candidate_tasks.append(task_data)
@@ -5281,6 +5291,16 @@ def register_task_tools():
                     ),
                     "default": False,
                 },
+                "assigned": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, return only tasks that HAVE an assignee "
+                        "(complement of 'unassigned'). For a worker this is "
+                        "'just my tasks' (the pool is excluded); pair with "
+                        "status='incomplete' for 'my open tasks'."
+                    ),
+                    "default": False,
+                },
                 "max_tokens": {
                     "type": "integer",
                     "description": "Maximum response tokens (default: 25000)",
@@ -5408,6 +5428,16 @@ def register_task_tools():
                         "tasks. A boolean, not an agent_id value, so it never "
                         "collides with an agent named 'unassigned'. Valid as "
                         "a filter-only listing (no search_query required)."
+                    ),
+                    "default": False,
+                },
+                "assigned": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, return only tasks that HAVE an assignee "
+                        "(complement of 'unassigned'; for a worker, 'just my "
+                        "tasks'). Valid as a filter-only listing (no "
+                        "search_query required)."
                     ),
                     "default": False,
                 },

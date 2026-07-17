@@ -228,3 +228,63 @@ async def test_agent_named_unassigned_does_not_collide(tmp_path) -> None:
         assert real_pool not in agent_text, (
             "the truly-unassigned task must NOT match agent_id=unassigned"
         )
+
+
+# ── assigned filter (complement of unassigned) ───────────────────────
+
+
+async def test_view_tasks_assigned_only(tmp_path) -> None:
+    """``assigned=true`` returns only tasks that HAVE an assignee."""
+    async with mcp_session(tmp_path) as admin:
+        owned = f"task_{secrets.token_hex(6)}"
+        pool = f"task_{secrets.token_hex(6)}"
+        _seed_task(owned, "owned by carol", assigned_to="carol")
+        _seed_task(pool, "claimable", assigned_to=None)
+        text = _text(await admin.call("view_tasks", {"assigned": True}))
+        assert owned in text, f"assigned=true must include assigned tasks; got {text}"
+        assert pool not in text, "assigned=true must exclude the unassigned pool"
+
+
+async def test_worker_assigned_collapses_view_to_just_mine(tmp_path) -> None:
+    """The gap this closes: a worker's view is {mine + pool}; assigned=true
+    narrows it to just {mine} (the pool is excluded, others already hidden)."""
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        mine = f"task_{secrets.token_hex(6)}"
+        pool = f"task_{secrets.token_hex(6)}"
+        _seed_task(mine, "assigned to alice", assigned_to="alice")
+        _seed_task(pool, "claimable pool", assigned_to=None)
+
+        # Default worker view: both mine + the pool.
+        default_text = _text(await alice.call("view_tasks", {}))
+        assert mine in default_text and pool in default_text, (
+            "worker default view is {mine + pool}"
+        )
+        # assigned=true → just mine.
+        assigned_text = _text(await alice.call("view_tasks", {"assigned": True}))
+        assert mine in assigned_text
+        assert pool not in assigned_text, (
+            "assigned=true must drop the pool from a worker's view"
+        )
+
+
+async def test_worker_assigned_incomplete_is_my_open_tasks(tmp_path) -> None:
+    """assigned=true + status=incomplete = 'my open tasks': excludes my
+    completed tasks AND the unassigned pool."""
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        mine_open = f"task_{secrets.token_hex(6)}"
+        mine_done = f"task_{secrets.token_hex(6)}"
+        pool_open = f"task_{secrets.token_hex(6)}"
+        _seed_task(mine_open, "my open", assigned_to="alice", status="in_progress")
+        _seed_task(mine_done, "my done", assigned_to="alice", status="completed")
+        _seed_task(pool_open, "pool open", assigned_to=None, status="pending")
+
+        text = _text(
+            await alice.call(
+                "view_tasks", {"assigned": True, "status": "incomplete"}
+            )
+        )
+        assert mine_open in text, "my in_progress task must appear"
+        assert mine_done not in text, "my completed task must be excluded"
+        assert pool_open not in text, "the pool must be excluded by assigned=true"
