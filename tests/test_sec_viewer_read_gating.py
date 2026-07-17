@@ -197,12 +197,16 @@ async def test_masked_token_fully_redacted_no_prefix_suffix(tmp_path) -> None:
         assert masked == "***", (
             f"masked token must be fully redacted, got {masked!r}"
         )
-        # Belt-and-braces: no fragment of the real bearer may appear.
-        assert token[:4] not in json.dumps(row), (
-            "no 4-char prefix of the real bearer may leak"
-        )
-        assert token[-4:] not in json.dumps(row), (
-            "no 4-char suffix of the real bearer may leak"
+        # Belt-and-braces: the real bearer must not leak anywhere in the
+        # row. Check the FULL token, not a 4-char prefix/suffix fragment —
+        # a short fragment can coincidentally collide with digits inside a
+        # microsecond timestamp in the serialized row (e.g. suffix "7550"
+        # matching "...12.755016"), a false positive that flaked CI. The
+        # ``masked == "***"`` assertion above already proves the token
+        # field discloses no first/last-N fragment; this guards against
+        # the bearer surfacing in any OTHER field.
+        assert token not in json.dumps(row), (
+            "the real bearer must not leak anywhere in the row"
         )
 
 
