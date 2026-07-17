@@ -114,6 +114,57 @@ export interface Task {
   required_capabilities?: string | string[] | null
 }
 
+/**
+ * Optional server-side filters for `GET /tasks`. All fields are
+ * optional and AND-combined by the backend (the single source of
+ * truth shared with the MCP `view_tasks` tool). Mirrors the REST
+ * contract:
+ *
+ *   - `status`      — one of the task statuses, or the `incomplete`
+ *                     alias (a.k.a. `active`/`open`) meaning every
+ *                     non-terminal task (pending + in_progress).
+ *   - `assigned_to` — exact assignee agent_id.
+ *   - `unassigned`  — the claimable pool (tasks with no assignee).
+ *   - `assigned`    — complement of `unassigned` (tasks WITH an
+ *                     assignee).
+ *   - `created_by`  — tasks filed by that agent.
+ *
+ * Collision-safety: assignment is expressed via the dedicated
+ * `assigned` / `unassigned` booleans, never a magic
+ * `assigned_to="unassigned"` sentinel — so an agent literally named
+ * "unassigned" can't be confused with the claimable-pool filter.
+ */
+export interface TaskFilters {
+  status?: string
+  assigned?: boolean
+  unassigned?: boolean
+  assigned_to?: string
+  created_by?: string
+}
+
+/**
+ * Serialize `TaskFilters` into a query string (including the leading
+ * `?`) for `GET /tasks`. Falsy / empty values are omitted; the
+ * `assigned` / `unassigned` booleans serialize as `true` only when
+ * set (never `false`). Returns `''` when there is nothing to filter,
+ * so `getTasks()` stays byte-for-byte back-compatible.
+ *
+ * Exported for unit testing.
+ */
+export function buildTasksQuery(filters?: TaskFilters): string {
+  if (!filters) return ''
+  const params = new URLSearchParams()
+  if (filters.status) params.set('status', filters.status)
+  if (filters.assigned_to) params.set('assigned_to', filters.assigned_to)
+  if (filters.created_by) params.set('created_by', filters.created_by)
+  // Dedicated booleans — never emit a magic assigned_to="unassigned"
+  // value that an agent named "unassigned" could collide with.
+  if (filters.assigned) params.set('assigned', 'true')
+  if (filters.unassigned) params.set('unassigned', 'true')
+  const qs = params.toString()
+  return qs ? `?${qs}` : ''
+}
+
 export interface GraphNode {
   id: string
   label: string
@@ -734,8 +785,13 @@ class ApiClient {
   }
 
   // Task endpoints
-  async getTasks(): Promise<Task[]> {
-    return this.request<Task[]>('/tasks')
+  //
+  // Optional server-side filters (status / assignment / creator) drive
+  // GET /tasks — the single source of truth shared with the backend +
+  // the MCP `view_tasks` tool. Called with no args it stays a plain
+  // `GET /tasks` (back-compat). See `buildTasksQuery` / `TaskFilters`.
+  async getTasks(filters?: TaskFilters): Promise<Task[]> {
+    return this.request<Task[]>(`/tasks${buildTasksQuery(filters)}`)
   }
 
   async getTask(taskId: string): Promise<Task> {
