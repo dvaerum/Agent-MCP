@@ -445,9 +445,10 @@ def _worker_ownership_deny(
     ):
         return (
             f"Unauthorized: task '{task_id}' is unassigned — you must claim "
-            f"it before you can {action}. Call assign_task with "
-            f"task_ids=['{task_id}'] and your own agent_token to self-claim "
-            f"it, then retry."
+            f"it before you can {action}. Call "
+            f"assign_task(task_ids=['{task_id}']) to self-claim it — you do "
+            f"NOT need to supply a token; you self-claim as the "
+            f"authenticated caller. Then retry."
         )
     return f"Task '{task_id}' not found"
 
@@ -1593,6 +1594,38 @@ async def assign_task_tool_impl(
 
     # Mode 3: Existing task assignment (new)
     task_ids = arguments.get("task_ids")  # List[str] of existing task IDs
+
+    # Worker self-claim ergonomics — the token-echo problem.
+    #
+    # A worker agent (a Claude Code instance) CANNOT see its own bearer
+    # token: the bearer is the transport credential in the MCP client
+    # config, not reachable from the agent's reasoning context. So the
+    # documented "self-claim = pass agent_token=<your own>" flow was
+    # impossible in practice — the agent has no way to produce its own
+    # token as an argument (confirmed by a live worker: "self-assigning
+    # requires my agent_token, which isn't available in my session").
+    #
+    # Fix: the caller is ALREADY authenticated via the bearer, and the
+    # Principal carries it (``source_token``). When an authenticated
+    # worker passes task_ids (existing tasks) WITHOUT agent_token/agent_id,
+    # treat it as a self-claim and resolve the target from the principal's
+    # own bearer. The agent self-claims as ITSELF — no token echo needed.
+    #
+    # Security is unchanged: the effective target IS the caller's own
+    # token, so it can still only self-assign (never to another agent);
+    # Mode 3 still claims ONLY unassigned tasks; and the downstream
+    # ``config_allow_worker_self_assign`` gate still applies. Admins are
+    # unaffected (they carry ``tasks.assign`` and don't take this branch).
+    if (
+        target_agent_token is None
+        and not target_agent_id_alias
+        and task_ids
+        and not is_admin_request
+        and principal is not None
+        and principal.kind == "agent_bearer"
+        and principal.source_token
+    ):
+        target_agent_token = principal.source_token
 
     # Smart coordination features
     auto_suggest_parent = arguments.get(
@@ -4981,8 +5014,9 @@ def register_task_tools():
             "Mode 3: assign an agent to existing unassigned tasks. "
             "WORKERS — this is how you take ownership of a task: to CLAIM an "
             "unassigned (claimable-pool) task for yourself so you can then "
-            "update its status, call Mode 3 with task_ids=['<id>'] and "
-            "agent_token=<your own token> (self-claim). Gated by the project "
+            "update its status, call Mode 3 with just task_ids=['<id>'] "
+            "(self-claim) — you do NOT need to supply agent_token; you "
+            "self-claim as the authenticated caller. Gated by the project "
             "policy config_allow_worker_self_assign (on by default). You can "
             "only self-claim UNASSIGNED tasks, and only for yourself. "
             "Also includes workload analysis, parent suggestions, and "
@@ -4997,7 +5031,7 @@ def register_task_tools():
                 },
                 "agent_token": {
                     "type": "string",
-                    "description": "Agent token to assign the task(s) TO. To self-claim an unassigned task, pass YOUR OWN agent token here (with task_ids=[...], Mode 3). Omit to file the task(s) unassigned (into the claimable pool).",
+                    "description": "Agent token to assign the task(s) TO (admin/manager targeting another agent). WORKERS self-claiming an unassigned task do NOT set this — just pass task_ids=[...] and you self-claim as the authenticated caller. Omit with task_title (no task_ids) to file NEW task(s) unassigned into the claimable pool.",
                 },
                 "agent_id": {
                     "type": "string",
