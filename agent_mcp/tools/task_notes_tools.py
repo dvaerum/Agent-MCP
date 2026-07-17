@@ -138,11 +138,29 @@ async def add_task_note_tool_impl(
     if not principal.has_capability("tasks.assign"):
         owners = {task.get("assigned_to"), task.get("created_by")}
         if not requester or requester not in owners:
-            # SECURITY (PF-1): return the SAME not-found result the
-            # phantom-task branch above returns, so a non-owner worker
-            # cannot use the 403-vs-404 shape to confirm a foreign task
-            # exists. Never interpolate the owner's identity.
-            return NotFound(resource="task", identifier=str(task_id))
+            # SECURITY (PF-1): for a FOREIGN-owned task return the SAME
+            # not-found result the phantom-task branch above returns, so
+            # a non-owner worker cannot use the 403-vs-404 shape to
+            # confirm a foreign task exists, and never interpolate the
+            # owner's identity.
+            #
+            # An UNASSIGNED task (``assigned_to`` NULL/empty) has no owner
+            # to hide and is already publicly listed in the claimable pool
+            # via view_tasks (#515) — so instead of stranding a worker
+            # that wants to annotate pool work, guide it to self-claim the
+            # task first. ``_worker_ownership_deny_result`` (shared with
+            # _update_single_task / request_assistance) returns the
+            # actionable "claim it first" PermissionDenied for the
+            # unassigned case and the UNCHANGED phantom-404 for the
+            # foreign-owned case. Lazy import avoids a heavy/cyclic
+            # module-load dependency on task_tools.
+            from .task_tools import _worker_ownership_deny_result
+
+            return _worker_ownership_deny_result(
+                str(task_id),
+                task.get("assigned_to"),
+                action="add a note to it",
+            )
 
     # Author attribution: agent_bearer → agent_id; operator path →
     # user_id (the operator's username from the session row). The
@@ -279,7 +297,10 @@ def register_task_notes_tools() -> None:
         description=(
             "Add a note to a task via the side table (db-review PR-H). "
             "Returns the new note_id. Notes added this way can be "
-            "edited/deleted by the original author or admin."
+            "edited/deleted by the original author or admin. You must own "
+            "(be assigned to, or have created) the task; if it is unassigned "
+            "(in the claimable pool), claim it first with "
+            "assign_task(task_ids=[...], agent_token=<your own>)."
         ),
         input_schema={
             "type": "object",
