@@ -52,6 +52,20 @@ from ..repositories.task_repository import get_task_by_id
 from .registry import register_tool
 
 
+# Static author-only policy clause appended to the fused NotFound (see
+# _classify_db_error). It ADDS the actionable "who may edit/delete"
+# hint WITHOUT naming the note's author or confirming the note exists —
+# a worker looking at a note that is plainly present in ``view_tasks``
+# but authored by someone else no longer reads a bare "not found" as a
+# bug. Leading ", " continues the "<resource> '<id>' not found" clause
+# the NotFound renderer emits; kept STATIC (no author interpolation) so
+# it is safe to show on both the missing-note and foreign-note branches.
+_AUTHOR_ONLY_HINT = (
+    ", or you are not its author. Only a note's original author "
+    "(or an admin) can edit or delete it."
+)
+
+
 def _classify_db_error(err: str, note_id: int) -> ToolResult:
     """Map ``task_notes_db.edit_note`` / ``delete_note`` error
     strings onto the typed :data:`ToolResult` variants.
@@ -64,25 +78,33 @@ def _classify_db_error(err: str, note_id: int) -> ToolResult:
       SECURITY below
     * anything else (DB error) → :class:`Failed` (REST → 500)
 
-    SECURITY (PF-1): the ownership-failure path must return the SAME
-    :class:`NotFound` as the missing-note path. Otherwise a worker
-    holding a foreign ``note_id`` can distinguish "note exists but
-    isn't yours" (403) from "no such note" (404) — a note-existence
-    oracle — and the DB layer's ``"owned by {author!r}"`` string would
-    leak the authoring agent's id into a caller-visible message. A
-    manager-tier caller never reaches this branch (``is_admin=True``
-    bypasses the ownership check in the DB layer), so collapsing it to
-    NotFound only affects non-owner workers.
+    Both the missing-note and ownership branches return the SAME
+    ``NotFound`` carrying :data:`_AUTHOR_ONLY_HINT`, so the caller sees
+    one opaque message — ``"task note '<id>' not found, or you are not
+    its author. Only a note's original author (or an admin) can edit or
+    delete it."`` — whichever outcome actually occurred.
+
+    SECURITY (PF-1): the ownership-failure path must be INDISTINGUISHABLE
+    from the missing-note path. Otherwise a worker holding a foreign
+    ``note_id`` can tell "note exists but isn't yours" apart from "no
+    such note" — a note-existence oracle. The fused message must not
+    confirm the note exists NOR name the owner: we drop the DB layer's
+    ``"owned by {author!r}"`` string entirely and add only the STATIC
+    author-only policy hint. A manager-tier caller never reaches the
+    ownership branch (``is_admin=True`` bypasses the check in the DB
+    layer), so the fused wording only affects non-owner workers.
 
     Centralised so the two callers (edit, delete) classify
     consistently and the contract with the DB layer is documented
     in one place.
     """
     low = err.lower()
-    if "not found" in low:
-        return NotFound(resource="task note", identifier=str(note_id))
-    if "owned by" in low:
-        return NotFound(resource="task note", identifier=str(note_id))
+    if "not found" in low or "owned by" in low:
+        return NotFound(
+            resource="task note",
+            identifier=str(note_id),
+            hint=_AUTHOR_ONLY_HINT,
+        )
     return Failed(message=err)
 
 
