@@ -157,10 +157,9 @@ async def test_operator_session_create_task_still_succeeds(tmp_path) -> None:
     must still succeed after the tier gate.
     """
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/tasks",
             json={
-                "token": admin.admin_token,
                 "task_title": "operator-created task",
             },
         )

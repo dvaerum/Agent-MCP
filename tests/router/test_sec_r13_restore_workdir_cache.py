@@ -67,9 +67,9 @@ async def test_restore_repopulates_agent_working_dirs_cache(tmp_path) -> None:
         g.agent_working_dirs.pop("alice", None)
 
         # Restore.
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/alice/restore",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert resp.status_code == 200, resp.text
         assert resp.json().get("success") is True, resp.text

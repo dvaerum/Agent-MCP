@@ -157,18 +157,18 @@ async def test_list_participants_non_dict_body_is_400(tmp_path, body) -> None:
 
 async def test_valid_dict_body_still_registers_agent(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/agents/register",
-            json={"token": admin.admin_token, "name": "reg-probe"},
+            json={"name": "reg-probe"},
         )
         assert r.status_code in (200, 201), r.text
 
 
 async def test_valid_dict_body_still_creates_task(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/tasks",
-            json={"token": admin.admin_token, "task_title": "valid dict body"},
+            json={"task_title": "valid dict body"},
         )
         assert r.status_code == 200, r.text
         assert r.json().get("success") is True
@@ -176,10 +176,9 @@ async def test_valid_dict_body_still_creates_task(tmp_path) -> None:
 
 async def test_valid_dict_body_still_creates_memory(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/memories",
             json={
-                "token": admin.admin_token,
                 "context_key": "r12.valid",
                 "context_value": "ok",
             },

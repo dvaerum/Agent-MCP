@@ -32,10 +32,9 @@ async def test_create_message_persists_subject_and_parent(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/messages",
             json={
-                "token": admin.admin_token,
                 "recipient_id": "alice",
                 "message_content": "root body",
                 "subject": "Initial Topic",
@@ -48,10 +47,9 @@ async def test_create_message_persists_subject_and_parent(tmp_path) -> None:
 
         # Reply — supply parent_message_id; subject should be ignored
         # (replies always end up with subject NULL).
-        r2 = admin.client.post(
+        r2 = admin.post(
             "/api/messages",
             json={
-                "token": admin.admin_token,
                 "recipient_id": "alice",
                 "message_content": "reply body",
                 "parent_message_id": root_id,
@@ -64,9 +62,9 @@ async def test_create_message_persists_subject_and_parent(tmp_path) -> None:
         reply_id = r2.json()["message_id"]
 
         # Query: returned rows include the new columns.
-        q = admin.client.post(
+        q = admin.post(
             "/api/messages/query",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert q.status_code == 200, q.text
         rows = {row["message_id"]: row for row in q.json()["messages"]}
@@ -101,10 +99,9 @@ async def test_suggest_subject_returns_helper_value(tmp_path, monkeypatch) -> No
     monkeypatch.setattr(message_suggestions, "suggest_subject", _mock)
 
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/messages/suggest-subject",
             json={
-                "token": admin.admin_token,
                 "content": "please help me debug this build issue",
             },
         )
@@ -122,10 +119,9 @@ async def test_suggest_subject_unconfigured_returns_null(
     monkeypatch.delenv("AGENT_MCP_SUBJECT_MODEL", raising=False)
 
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/messages/suggest-subject",
             json={
-                "token": admin.admin_token,
                 "content": "anything here",
             },
         )

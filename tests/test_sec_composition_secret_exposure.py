@@ -42,10 +42,9 @@ def _seed_ctx(admin, *, key: str, value: str) -> None:
     if key.lower().startswith("config_aoe_"):
         seed_config_setting_as_sysadmin(key, value)
         return
-    r = admin.client.post(
+    r = admin.post(
         "/api/memories",
         json={
-            "token": admin.admin_token,
             "context_key": key,
             "context_value": value,
         },

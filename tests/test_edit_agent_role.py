@@ -50,9 +50,9 @@ async def test_edit_promotes_worker_to_manager(tmp_path) -> None:
         assert row is not None
         assert row["agent_role"] == "worker"
 
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/alice/edit",
-            json={"token": admin.admin_token, "agent_role": "manager"},
+            json={"agent_role": "manager"},
         )
         assert resp.status_code == 200, (
             f"edit with agent_role=manager must succeed; "
@@ -69,15 +69,15 @@ async def test_edit_demotes_manager_back_to_worker(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("bob")
         # Promote first.
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/bob/edit",
-            json={"token": admin.admin_token, "agent_role": "manager"},
+            json={"agent_role": "manager"},
         )
         assert resp.status_code == 200, resp.text
         # Then demote.
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/bob/edit",
-            json={"token": admin.admin_token, "agent_role": "worker"},
+            json={"agent_role": "worker"},
         )
         assert resp.status_code == 200, resp.text
         row = _row("agents", "agent_id = ?", ("bob",))
@@ -91,9 +91,9 @@ async def test_edit_rejects_invalid_agent_role(tmp_path) -> None:
     but the API boundary is the right place to reject)."""
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("charlie")
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/charlie/edit",
-            json={"token": admin.admin_token, "agent_role": "operator"},
+            json={"agent_role": "operator"},
         )
         assert resp.status_code == 422, (
             f"invalid agent_role on edit must 422; "

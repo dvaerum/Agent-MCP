@@ -28,13 +28,12 @@ pytestmark = pytest.mark.asyncio
 
 def _create_task(admin, **overrides) -> str:
     body = {
-        "token": admin.admin_token,
         "task_title": overrides.get("title", "edit-target"),
         "task_description": overrides.get("description", "an edit-target task"),
     }
     if "priority" in overrides:
         body["priority"] = overrides["priority"]
-    r = admin.client.post("/api/tasks", json=body)
+    r = admin.post("/api/tasks", json=body)
     assert r.status_code == 200, r.text
     return r.json()["task_id"]
 
@@ -44,10 +43,9 @@ async def test_update_task_dashboard_accepts_title_only(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         task_id = _create_task(admin)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
             json={
-                "token": admin.admin_token,
                 "task_id": task_id,
                 "title": "new title",
             },
@@ -63,10 +61,9 @@ async def test_update_task_dashboard_accepts_description_only(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         task_id = _create_task(admin)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
             json={
-                "token": admin.admin_token,
                 "task_id": task_id,
                 "description": "freshly edited body",
             },
@@ -78,10 +75,9 @@ async def test_update_task_dashboard_accepts_priority_only(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         task_id = _create_task(admin)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
             json={
-                "token": admin.admin_token,
                 "task_id": task_id,
                 "priority": "high",
             },
@@ -102,10 +98,9 @@ async def test_update_task_dashboard_accepts_assigned_to(tmp_path) -> None:
         await admin.create_worker("edit-target-agent")
         task_id = _create_task(admin)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
             json={
-                "token": admin.admin_token,
                 "task_id": task_id,
                 "assigned_to": "edit-target-agent",
             },
@@ -131,20 +126,18 @@ async def test_update_task_dashboard_unassigns_with_empty_assigned_to(
         task_id = _create_task(admin)
 
         # Assign first.
-        admin.client.post(
+        admin.post(
             "/api/update-task-dashboard",
             json={
-                "token": admin.admin_token,
                 "task_id": task_id,
                 "assigned_to": "to-unassign",
             },
         )
 
         # Now unassign.
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
             json={
-                "token": admin.admin_token,
                 "task_id": task_id,
                 "assigned_to": None,
             },
@@ -172,9 +165,9 @@ async def test_update_task_dashboard_requires_at_least_one_field(
     async with mcp_session(tmp_path) as admin:
         task_id = _create_task(admin)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
-            json={"token": admin.admin_token, "task_id": task_id},
+            json={"task_id": task_id},
         )
         assert r.status_code == 400, r.text
 
@@ -185,10 +178,9 @@ async def test_update_task_dashboard_status_still_works(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         task_id = _create_task(admin)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
             json={
-                "token": admin.admin_token,
                 "task_id": task_id,
                 "status": "in_progress",
             },

@@ -54,9 +54,9 @@ def _terminate(agent_id: str) -> None:
 
 
 async def _create_task(admin, **body_extra):
-    body = {"token": admin.admin_token, "task_title": "assign-probe"}
+    body = {"task_title": "assign-probe"}
     body.update(body_extra)
-    return admin.client.post("/api/tasks", json=body)
+    return admin.post("/api/tasks", json=body)
 
 
 # ===================== create path (tasks.py) ===================== #
@@ -120,10 +120,9 @@ async def test_dashboard_reassign_to_nonexistent_agent_rejected(tmp_path) -> Non
         assert r.status_code == 200, r.text
         task_id = r.json()["task_id"]
 
-        r2 = admin.client.post(
+        r2 = admin.post(
             "/api/update-task-dashboard",
             json={
-                "token": admin.admin_token,
                 "task_id": task_id,
                 "assigned_to": "ghost-does-not-exist",
             },
@@ -146,10 +145,9 @@ async def test_dashboard_reassign_to_terminated_agent_rejected(tmp_path) -> None
         r = await _create_task(admin, assigned_to="alice")
         task_id = r.json()["task_id"]
 
-        r2 = admin.client.post(
+        r2 = admin.post(
             "/api/update-task-dashboard",
             json={
-                "token": admin.admin_token,
                 "task_id": task_id,
                 "assigned_to": "zombie",
             },
@@ -169,10 +167,9 @@ async def test_dashboard_reassign_to_live_agent_succeeds(tmp_path) -> None:
         r = await _create_task(admin, assigned_to="alice")
         task_id = r.json()["task_id"]
 
-        r2 = admin.client.post(
+        r2 = admin.post(
             "/api/update-task-dashboard",
             json={
-                "token": admin.admin_token,
                 "task_id": task_id,
                 "assigned_to": "bob",
             },
@@ -189,10 +186,9 @@ async def test_dashboard_unassign_still_allowed(tmp_path) -> None:
         r = await _create_task(admin, assigned_to="alice")
         task_id = r.json()["task_id"]
 
-        r2 = admin.client.post(
+        r2 = admin.post(
             "/api/update-task-dashboard",
             json={
-                "token": admin.admin_token,
                 "task_id": task_id,
                 "assigned_to": "unassigned",
             },

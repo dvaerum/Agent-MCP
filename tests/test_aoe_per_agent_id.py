@@ -72,19 +72,18 @@ def _set_ctx(admin, key: str, value: Any) -> None:
     if key.lower().startswith("config_aoe_"):
         seed_config_setting_as_sysadmin(key, value)
         return
-    r = admin.client.post(
+    r = admin.post(
         "/api/memories",
         json={
-            "token": admin.admin_token,
             "context_key": key,
             "context_value": value,
         },
     )
     if r.status_code == 409:
-        r = admin.client.request(
+        r = admin.request(
             "PUT",
             f"/api/memories/{key}",
-            json={"token": admin.admin_token, "context_value": value},
+            json={"context_value": value},
         )
     assert r.status_code == 200, r.text
 
@@ -242,10 +241,9 @@ async def test_edit_endpoint_sets_aoe_session_id(tmp_path) -> None:
     """POST /api/agents/<id>/edit must accept aoe_session_id."""
     async with mcp_session(tmp_path) as admin:
         await _make_worker(admin, "alice")
-        r = admin.client.post(
+        r = admin.post(
             "/api/agents/alice/edit",
             json={
-                "token": admin.admin_token,
                 "aoe_session_id": "1234567890abcdef",
             },
         )
@@ -273,9 +271,9 @@ async def test_edit_endpoint_clears_aoe_session_id_with_empty_string(
     async with mcp_session(tmp_path) as admin:
         await _make_worker(admin, "alice", aoe_session_id="cafebabecafebabe")
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/agents/alice/edit",
-            json={"token": admin.admin_token, "aoe_session_id": ""},
+            json={"aoe_session_id": ""},
         )
         assert r.status_code == 200, r.text
 
@@ -304,9 +302,9 @@ async def test_edit_endpoint_validates_aoe_session_id_format(tmp_path) -> None:
             "GHIJKLMNOPQRSTUV",   # not hex
             "abcdefghij123456",   # invalid hex chars
         ):
-            r = admin.client.post(
+            r = admin.post(
                 "/api/agents/alice/edit",
-                json={"token": admin.admin_token, "aoe_session_id": bad},
+                json={"aoe_session_id": bad},
             )
             assert r.status_code == 400, (
                 f"{bad!r} should be rejected: {r.text}"
@@ -421,7 +419,7 @@ async def test_aoe_health_ok(tmp_path, aoe_mock) -> None:
             {"id": "1" * 16, "title": "bob", "status": "Idle"},
         ]
 
-        r = admin.client.get(f"/api/aoe/health?token={admin.admin_token}")
+        r = admin.get("/api/aoe/health")
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["status"] == "ok"
@@ -436,7 +434,7 @@ async def test_aoe_health_bad_token(tmp_path, aoe_mock) -> None:
         _set_ctx(admin, "config_aoe_bearer_token", "stale-token")
         aoe_mock.accepted_tokens = {"the-current-token"}  # NOT "stale-token"
 
-        r = admin.client.get(f"/api/aoe/health?token={admin.admin_token}")
+        r = admin.get("/api/aoe/health")
         assert r.status_code == 200, r.text  # endpoint itself succeeds
         body = r.json()
         assert body["status"] == "unauthorized", body
@@ -460,7 +458,7 @@ async def test_aoe_health_disabled_status(tmp_path, aoe_mock) -> None:
     probe AoE at all)."""
     async with mcp_session(tmp_path) as admin:
         # No config_aoe_notify_enabled set (defaults to off).
-        r = admin.client.get(f"/api/aoe/health?token={admin.admin_token}")
+        r = admin.get("/api/aoe/health")
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["status"] == "disabled", body

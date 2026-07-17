@@ -229,9 +229,9 @@ async def test_composition_reassign_undercapable_denied(tmp_path) -> None:
             "deploy-tagged", "alice", required_capabilities=["deploy"]
         )
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
-            json={"token": admin.admin_token, "task_id": task_id,
+            json={"task_id": task_id,
                   "assigned_to": "bob"},
         )
         assert r.status_code != 200, r.text
@@ -246,9 +246,9 @@ async def test_composition_reassign_capable_agent_succeeds(tmp_path) -> None:
             "deploy-tagged", "alice", required_capabilities=["deploy"]
         )
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
-            json={"token": admin.admin_token, "task_id": task_id,
+            json={"task_id": task_id,
                   "assigned_to": "carol"},
         )
         assert r.status_code == 200, r.text
@@ -267,10 +267,9 @@ async def test_rest_create_undercapable_assign_denied(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         _seed_agent_with_caps("bob", [])
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/tasks",
             json={
-                "token": admin.admin_token,
                 "task_title": "deploy-tagged",
                 "assigned_to": "bob",
                 "required_capabilities": ["deploy"],

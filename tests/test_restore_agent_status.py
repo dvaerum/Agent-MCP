@@ -99,9 +99,9 @@ async def test_restore_clears_terminated_status_and_timestamp(
         assert status == "terminated"
         assert t_at is not None
 
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/backend-dev/restore",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert resp.status_code == 200, resp.text
 
@@ -125,9 +125,9 @@ async def test_restore_multiple_workers_clears_both(tmp_path) -> None:
         _seed_terminated_agent("ios-app-dev")
 
         for aid in ("backend-dev", "ios-app-dev"):
-            resp = admin.client.post(
+            resp = admin.post(
                 f"/api/agents/{aid}/restore",
-                json={"token": admin.admin_token},
+                json={},
             )
             assert resp.status_code == 200, (aid, resp.text)
 

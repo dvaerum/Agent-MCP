@@ -123,8 +123,8 @@ async def test_create_memory_mcp_and_rest_identical(tmp_path) -> None:
         # REST surface.
         resp = admin.client.post(
             "/api/memories",
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
             json={
-                "token": admin.admin_token,
                 "context_key": "mem.rest.k1",
                 "context_value": payload_value,
                 "description": "a shared description",
@@ -162,10 +162,9 @@ async def test_create_memory_duplicate_key_conflicts_both_surfaces(
     on BOTH surfaces — the INSERT-only semantics are shared, not a
     REST-only guard."""
     async with mcp_session(tmp_path) as admin:
-        first = admin.client.post(
+        first = admin.post(
             "/api/memories",
             json={
-                "token": admin.admin_token,
                 "context_key": "mem.dup",
                 "context_value": {"v": 1},
             },
@@ -173,10 +172,9 @@ async def test_create_memory_duplicate_key_conflicts_both_surfaces(
         assert first.status_code == 200, first.text
 
         # REST duplicate → 409 with the exact legacy wording.
-        dup_rest = admin.client.post(
+        dup_rest = admin.post(
             "/api/memories",
             json={
-                "token": admin.admin_token,
                 "context_key": "mem.dup",
                 "context_value": {"v": 2},
             },

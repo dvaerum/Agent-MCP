@@ -84,10 +84,9 @@ async def test_query_offset_first_page_returns_100_with_total_150(
         await admin.create_worker("B")
         _seed_many_messages("A", "B", 150)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/messages/query",
             json={
-                "token": admin.admin_token,
                 "from": "A",
                 "to": "B",
                 "limit": 100,
@@ -113,10 +112,9 @@ async def test_query_offset_100_returns_remaining_50(tmp_path) -> None:
         await admin.create_worker("B")
         _seed_many_messages("A", "B", 150)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/messages/query",
             json={
-                "token": admin.admin_token,
                 "from": "A",
                 "to": "B",
                 "limit": 100,
@@ -137,10 +135,9 @@ async def test_query_offset_at_total_returns_zero_rows(tmp_path) -> None:
         await admin.create_worker("B")
         _seed_many_messages("A", "B", 150)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/messages/query",
             json={
-                "token": admin.admin_token,
                 "from": "A",
                 "to": "B",
                 "limit": 100,
@@ -162,10 +159,9 @@ async def test_query_offset_overshoot_is_graceful(tmp_path) -> None:
         await admin.create_worker("B")
         _seed_many_messages("A", "B", 150)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/messages/query",
             json={
-                "token": admin.admin_token,
                 "from": "A",
                 "to": "B",
                 "limit": 100,

@@ -58,10 +58,9 @@ async def test_edit_working_directory_updates_agent_working_dirs_cache(
         g.agent_working_dirs["alice"] = "/tmp"
         assert agent_repo.get_working_directory("alice") == "/tmp"
 
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/alice/edit",
             json={
-                "token": admin.admin_token,
                 "working_directory": "/tmp/new-wd",
             },
         )
@@ -88,9 +87,9 @@ async def test_edit_non_workdir_field_leaves_agent_working_dirs_untouched(
 
         g.agent_working_dirs["bob"] = "/tmp"
 
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/bob/edit",
-            json={"token": admin.admin_token, "color": "#abcdef"},
+            json={"color": "#abcdef"},
         )
         assert resp.status_code == 200, resp.text
 

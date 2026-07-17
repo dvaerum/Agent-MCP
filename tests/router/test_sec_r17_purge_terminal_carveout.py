@@ -100,11 +100,11 @@ def _install_notify_spy(monkeypatch) -> list[tuple]:
 
 
 def _purge(admin, agent_id: str):
-    return admin.client.request(
+    return admin.request(
         "DELETE",
         f"/api/agents/{agent_id}",
         params={"cascade": "true"},
-        json={"token": admin.admin_token},
+        json={},
     )
 
 

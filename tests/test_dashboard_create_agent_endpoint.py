@@ -75,10 +75,9 @@ async def test_post_api_agents_creates_agent_row(tmp_path) -> None:
     ``require_operator_session`` auth gate.
     """
     async with mcp_session(tmp_path) as admin:
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/register",
             json={
-                "token": admin.admin_token,
                 "agent_id": "e2e-add",
                 "capabilities": ["test"],
             },
@@ -121,8 +120,9 @@ async def test_post_api_agents_rejects_bad_token(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         resp = admin.client.post(
             "/api/agents/register",
+            # Foreign/fake bearer: exercises the operator-tier gate, not no-auth 401.
+            headers={"Authorization": "Bearer definitely-not-admin"},
             json={
-                "token": "definitely-not-admin",
                 "agent_id": "bad-token-attempt",
             },
         )

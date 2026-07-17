@@ -184,10 +184,9 @@ async def test_purge_drops_visible_agent_count_by_one(tmp_path) -> None:
         )
 
         # 1. Register (Wave 7 PR 1: was POST /api/agents — spawn path).
-        r = admin.client.post(
+        r = admin.post(
             "/api/agents/register",
             json={
-                "token": admin.admin_token,
                 "agent_id": "spec-lifecycle-target",
                 "capabilities": ["test"],
             },
@@ -201,10 +200,9 @@ async def test_purge_drops_visible_agent_count_by_one(tmp_path) -> None:
         )
 
         # 2. Terminate (soft-delete — count stays)
-        r = admin.client.post(
+        r = admin.post(
             "/api/terminate-agent",
             json={
-                "token": admin.admin_token,
                 "agent_id": "spec-lifecycle-target",
             },
         )
@@ -218,10 +216,10 @@ async def test_purge_drops_visible_agent_count_by_one(tmp_path) -> None:
         )
 
         # 3. Purge (hard-delete — count MUST drop by exactly 1)
-        r = admin.client.request(
+        r = admin.request(
             "DELETE",
             "/api/agents/spec-lifecycle-target?cascade=true",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert r.status_code == 200, r.text
         after_purge = len(

@@ -48,19 +48,18 @@ def _set_ctx(admin, key: str, value: Any) -> None:
     if key.lower().startswith("config_aoe_"):
         seed_config_setting_as_sysadmin(key, value)
         return
-    r = admin.client.post(
+    r = admin.post(
         "/api/memories",
         json={
-            "token": admin.admin_token,
             "context_key": key,
             "context_value": value,
         },
     )
     if r.status_code == 409:
-        r = admin.client.request(
+        r = admin.request(
             "PUT",
             f"/api/memories/{key}",
-            json={"token": admin.admin_token, "context_value": value},
+            json={"context_value": value},
         )
     assert r.status_code == 200, r.text
 

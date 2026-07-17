@@ -51,12 +51,9 @@ def _row(table: str, where_sql: str, params: tuple) -> dict | None:
 async def test_edit_updates_capabilities(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/alice/edit",
-            json={
-                "token": admin.admin_token,
-                "capabilities": ["code_edit", "file_read"],
-            },
+            json={"capabilities": ["code_edit", "file_read"]},
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -70,9 +67,9 @@ async def test_edit_updates_capabilities(tmp_path) -> None:
 async def test_edit_updates_color(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/alice/edit",
-            json={"token": admin.admin_token, "color": "#abcdef"},
+            json={"color": "#abcdef"},
         )
         assert resp.status_code == 200, resp.text
 
@@ -84,12 +81,9 @@ async def test_edit_updates_color(tmp_path) -> None:
 async def test_edit_updates_working_directory(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/alice/edit",
-            json={
-                "token": admin.admin_token,
-                "working_directory": "/workspace/alice",
-            },
+            json={"working_directory": "/workspace/alice"},
         )
         assert resp.status_code == 200, resp.text
 
@@ -101,10 +95,9 @@ async def test_edit_updates_working_directory(tmp_path) -> None:
 async def test_edit_updates_multiple_fields_at_once(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/alice/edit",
             json={
-                "token": admin.admin_token,
                 "capabilities": ["one", "two"],
                 "color": "#deadbe",
                 "working_directory": "/home/alice",
@@ -126,18 +119,21 @@ async def test_edit_rejects_worker_token(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
         bob = await admin.create_worker("bob")
+        # Worker bearer: exercises the operator-tier gate (a non-operator
+        # bearer must be rejected), not merely the no-auth 401 path.
         resp = admin.client.post(
             "/api/agents/alice/edit",
-            json={"token": bob.token, "color": "#000000"},
+            json={"color": "#000000"},
+            headers={"Authorization": f"Bearer {bob.token}"},
         )
         assert resp.status_code in (401, 403), resp.text
 
 
 async def test_edit_404_when_agent_missing(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/nonexistent/edit",
-            json={"token": admin.admin_token, "color": "#000000"},
+            json={"color": "#000000"},
         )
         assert resp.status_code == 404, resp.text
 
@@ -145,9 +141,9 @@ async def test_edit_404_when_agent_missing(tmp_path) -> None:
 async def test_edit_400_when_no_editable_fields(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/alice/edit",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert resp.status_code == 400, resp.text
 
@@ -158,10 +154,9 @@ async def test_edit_rejects_non_whitelisted_fields(tmp_path) -> None:
     editable through this endpoint."""
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/alice/edit",
             json={
-                "token": admin.admin_token,
                 "status": "terminated",
                 "agent_id": "renamed",
             },

@@ -59,10 +59,9 @@ pytestmark = pytest.mark.asyncio
 @pytest.mark.parametrize("bad", ["ns:key", "has space", "a@b", "q?x"])
 async def test_create_rejects_disallowed_key(tmp_path, bad) -> None:
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/memories",
             json={
-                "token": admin.admin_token,
                 "context_key": bad,
                 "context_value": "v",
                 "description": "d",
@@ -76,10 +75,9 @@ async def test_create_rejects_disallowed_key(tmp_path, bad) -> None:
 async def test_create_allows_slashed_and_normal_keys(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         for key in ("ns/allowed-key", "plain_key.v2", "backend-dev/status"):
-            r = admin.client.post(
+            r = admin.post(
                 "/api/memories",
                 json={
-                    "token": admin.admin_token,
                     "context_key": key,
                     "context_value": "v",
                     "description": "d",

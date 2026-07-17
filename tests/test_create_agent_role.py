@@ -53,10 +53,9 @@ def _row(table: str, where_sql: str, params: tuple) -> dict | None:
 async def test_create_agent_persists_manager_role(tmp_path) -> None:
     """``agent_role='manager'`` round-trips into the agents row."""
     async with mcp_session(tmp_path) as admin:
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/register",
             json={
-                "token": admin.admin_token,
                 "agent_id": "mgr-one",
                 "agent_role": "manager",
             },
@@ -75,10 +74,9 @@ async def test_create_agent_persists_manager_role(tmp_path) -> None:
 async def test_create_agent_persists_worker_role_explicit(tmp_path) -> None:
     """``agent_role='worker'`` (explicit) round-trips into the row."""
     async with mcp_session(tmp_path) as admin:
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/register",
             json={
-                "token": admin.admin_token,
                 "agent_id": "worker-one",
                 "agent_role": "worker",
             },
@@ -97,10 +95,9 @@ async def test_create_agent_defaults_to_worker_role(tmp_path) -> None:
     Wave 1a column default — no behavior change for legacy callers).
     """
     async with mcp_session(tmp_path) as admin:
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/register",
             json={
-                "token": admin.admin_token,
                 "agent_id": "default-worker",
             },
         )
@@ -125,10 +122,9 @@ async def test_create_agent_rejects_invalid_role(tmp_path) -> None:
     sqlite IntegrityError as a 500.
     """
     async with mcp_session(tmp_path) as admin:
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/register",
             json={
-                "token": admin.admin_token,
                 "agent_id": "bad-role",
                 "agent_role": "operator",  # not in {worker, manager}
             },

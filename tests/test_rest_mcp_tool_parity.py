@@ -55,9 +55,9 @@ async def test_terminate_agent_rest_matches_mcp_tool(tmp_path) -> None:
         await admin.create_worker("bob")
 
         # --- REST path ---
-        r = admin.client.post(
+        r = admin.post(
             "/api/terminate-agent",
-            json={"token": admin.admin_token, "agent_id": "alice"},
+            json={"agent_id": "alice"},
         )
         assert r.status_code == 200, r.text
 
@@ -91,9 +91,11 @@ async def test_terminate_agent_rest_matches_mcp_tool(tmp_path) -> None:
 async def test_terminate_agent_rest_rejects_bad_token(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
+        # Fake bearer: exercises the operator-tier gate, not no-auth 401.
         r = admin.client.post(
             "/api/terminate-agent",
-            json={"token": "x" * 32, "agent_id": "alice"},
+            json={"agent_id": "alice"},
+            headers={"Authorization": f"Bearer {'x' * 32}"},
         )
         assert r.status_code in (401, 403), r.text
 
@@ -102,9 +104,9 @@ async def test_terminate_agent_rest_rejects_bad_token(tmp_path) -> None:
 async def test_terminate_agent_rest_404_unknown(tmp_path) -> None:
     """Unknown agent_id returns a non-2xx; both REST and MCP report it."""
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/terminate-agent",
-            json={"token": admin.admin_token, "agent_id": "ghost"},
+            json={"agent_id": "ghost"},
         )
         assert r.status_code in (400, 404), r.text
 
@@ -149,10 +151,10 @@ async def test_delete_task_rest_matches_mcp_tool(tmp_path) -> None:
         _seed_task(get_db_connection, "task_mcp_001", "mcp path", "admin")
 
         # REST
-        r = admin.client.request(
+        r = admin.request(
             "DELETE",
             "/api/tasks/task_rest_001",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert r.status_code == 200, r.text
 
@@ -181,10 +183,12 @@ async def test_delete_task_rest_rejects_bad_token(tmp_path) -> None:
         from agent_mcp.db.connection import get_db_connection
 
         _seed_task(get_db_connection, "task_keep", "keep", "admin")
+        # Fake bearer: exercises the operator-tier gate, not no-auth 401.
         r = admin.client.request(
             "DELETE",
             "/api/tasks/task_keep",
-            json={"token": "x" * 32},
+            json={},
+            headers={"Authorization": f"Bearer {'x' * 32}"},
         )
         assert r.status_code in (401, 403), r.text
 
@@ -201,10 +205,10 @@ async def test_delete_task_rest_rejects_bad_token(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_delete_task_rest_404_unknown(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.request(
+        r = admin.request(
             "DELETE",
             "/api/tasks/task_does_not_exist",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert r.status_code == 404, r.text
 
@@ -255,10 +259,10 @@ async def test_delete_memory_rest_matches_mcp_tool(tmp_path) -> None:
         _seed_memory("mem.mcp.k1", {"foo": "bar"}, "admin")
 
         # REST
-        r = admin.client.request(
+        r = admin.request(
             "DELETE",
             "/api/memories/mem.rest.k1",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert r.status_code == 200, r.text
 
@@ -292,10 +296,12 @@ async def test_delete_memory_rest_matches_mcp_tool(tmp_path) -> None:
 async def test_delete_memory_rest_rejects_bad_token(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         _seed_memory("mem.keep", {"data": 1}, "admin")
+        # Fake bearer: exercises the operator-tier gate, not no-auth 401.
         r = admin.client.request(
             "DELETE",
             "/api/memories/mem.keep",
-            json={"token": "x" * 32},
+            json={},
+            headers={"Authorization": f"Bearer {'x' * 32}"},
         )
         assert r.status_code in (401, 403), r.text
 
@@ -317,10 +323,10 @@ async def test_delete_memory_rest_rejects_bad_token(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_delete_memory_rest_404_unknown(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.request(
+        r = admin.request(
             "DELETE",
             "/api/memories/mem.does.not.exist",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert r.status_code == 404, r.text
 
@@ -334,9 +340,9 @@ async def test_terminate_agent_missing_agent_id_returns_400(tmp_path) -> None:
     REST adapter must surface that as a 400 (not a 500 or silent 200).
     """
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/terminate-agent",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert r.status_code in (400, 404), r.text
 
@@ -344,10 +350,10 @@ async def test_terminate_agent_missing_agent_id_returns_400(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_delete_task_missing_task_id_returns_400(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.request(
+        r = admin.request(
             "DELETE",
             "/api/tasks/",
-            json={"token": admin.admin_token},
+            json={},
         )
         # 400 (handler rejects empty), 404 (no route match), or 405
         # (the trailing-slash GET-only route catches the DELETE) are

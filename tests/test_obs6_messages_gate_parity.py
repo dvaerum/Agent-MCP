@@ -136,10 +136,9 @@ async def test_rest_create_enforces_4000_char_cap(tmp_path) -> None:
     shared gate is in the REST path."""
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
-        r = admin.client.post(
+        r = admin.post(
             "/api/messages",
             json={
-                "token": admin.admin_token,
                 "recipient_id": "alice",
                 "message_content": "a" * 4001,
             },
@@ -153,10 +152,9 @@ async def test_rest_create_normal_message_still_succeeds(tmp_path) -> None:
     REST is unchanged — the gate is a no-op for admin-tier operators."""
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
-        r = admin.client.post(
+        r = admin.post(
             "/api/messages",
             json={
-                "token": admin.admin_token,
                 "recipient_id": "alice",
                 "message_content": "hello alice",
             },
@@ -185,10 +183,9 @@ async def test_rest_create_calls_shared_gate(tmp_path, monkeypatch) -> None:
 
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
-        r = admin.client.post(
+        r = admin.post(
             "/api/messages",
             json={
-                "token": admin.admin_token,
                 "recipient_id": "alice",
                 "message_content": "gated hello",
             },

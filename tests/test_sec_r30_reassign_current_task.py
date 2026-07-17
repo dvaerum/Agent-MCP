@@ -235,9 +235,9 @@ async def test_dashboard_reassign_reconciles_current_task(tmp_path) -> None:
         _seed_agent("alice", current_task=task_id)
         _seed_agent("bob", current_task=None)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
-            json={"token": admin.admin_token, "task_id": task_id,
+            json={"task_id": task_id,
                   "assigned_to": "bob"},
         )
         assert r.status_code == 200, r.text
@@ -253,9 +253,9 @@ async def test_dashboard_clear_assignment_clears_only_loser(tmp_path) -> None:
         task_id = _seed_task("do thing", "alice")
         _seed_agent("alice", current_task=task_id)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
-            json={"token": admin.admin_token, "task_id": task_id,
+            json={"task_id": task_id,
                   "assigned_to": "unassigned"},
         )
         assert r.status_code == 200, r.text
@@ -277,10 +277,9 @@ async def test_rest_create_with_assignee_sets_current_task(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         _seed_agent("bob", current_task=None)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/tasks",
             json={
-                "token": admin.admin_token,
                 "task_title": "fresh task",
                 "task_description": "...",
                 "assigned_to": "bob",
@@ -303,10 +302,9 @@ async def test_rest_create_with_busy_assignee_preserves_current_task(
         busy = _seed_task("bob busy", "bob", status="in_progress")
         _seed_agent("bob", current_task=busy)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/tasks",
             json={
-                "token": admin.admin_token,
                 "task_title": "another",
                 "task_description": "...",
                 "assigned_to": "bob",

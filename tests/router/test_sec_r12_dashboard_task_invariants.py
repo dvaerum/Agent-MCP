@@ -44,17 +44,17 @@ def _row(table: str, where_sql: str, params: tuple) -> dict | None:
 
 
 async def _create_task(admin, **body_extra) -> str:
-    body = {"token": admin.admin_token, "task_title": "invariant-probe"}
+    body = {"task_title": "invariant-probe"}
     body.update(body_extra)
-    r = admin.client.post("/api/tasks", json=body)
+    r = admin.post("/api/tasks", json=body)
     assert r.status_code == 200, r.text
     return r.json()["task_id"]
 
 
 def _set_status(admin, task_id: str, status: str):
-    return admin.client.post(
+    return admin.post(
         "/api/update-task-dashboard",
-        json={"token": admin.admin_token, "task_id": task_id, "status": status},
+        json={"task_id": task_id, "status": status},
     )
 
 
@@ -147,10 +147,9 @@ async def test_dashboard_non_status_edit_still_succeeds(tmp_path) -> None:
     """A non-status field edit (title) keeps working (direct-write path)."""
     async with mcp_session(tmp_path) as admin:
         task_id = await _create_task(admin)
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
             json={
-                "token": admin.admin_token,
                 "task_id": task_id,
                 "title": "renamed via dashboard",
             },

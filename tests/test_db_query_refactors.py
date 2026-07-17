@@ -47,10 +47,9 @@ async def test_all_data_applies_default_limit_per_section(tmp_path) -> None:
         # Seed DEFAULT_LIMIT + OVERSHOOT tasks. They all show up in the
         # tasks table; we only care that the API trims at the cap.
         for i in range(DEFAULT_LIMIT + OVERSHOOT):
-            admin.client.post(
+            admin.post(
                 "/api/tasks",
                 json={
-                    "token": admin.admin_token,
                     "task_title": f"seed-{i}",
                     "task_description": "limit test",
                 },
@@ -70,10 +69,9 @@ async def test_all_data_accepts_limit_query_param(tmp_path) -> None:
     """`?limit=N` overrides the default per-section cap."""
     async with mcp_session(tmp_path) as admin:
         for i in range(10):
-            r = admin.client.post(
+            r = admin.post(
                 "/api/tasks",
                 json={
-                    "token": admin.admin_token,
                     "task_title": f"limit-override-{i}",
                     "task_description": "x",
                 },

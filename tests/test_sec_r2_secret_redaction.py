@@ -31,10 +31,9 @@ _PUBLIC_VALUE = "public-r2-info"
 
 def _seed(admin, *, key: str, value: str) -> None:
     """Seed a project_context knowledge row through the live REST seam."""
-    r = admin.client.post(
+    r = admin.post(
         "/api/memories",
         json={
-            "token": admin.admin_token,
             "context_key": key,
             "context_value": value,
         },

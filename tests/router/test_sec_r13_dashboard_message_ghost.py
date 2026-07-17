@@ -24,10 +24,9 @@ pytestmark = pytest.mark.asyncio
 async def test_dashboard_message_to_ghost_recipient_404(tmp_path) -> None:
     """Sending to a recipient that does not exist must 404, not 500."""
     async with mcp_session(tmp_path) as admin:
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/messages",
             json={
-                "token": admin.admin_token,
                 "recipient_id": "ghost-does-not-exist",
                 "message_content": "hello nobody",
             },
@@ -42,10 +41,9 @@ async def test_dashboard_message_to_valid_recipient_succeeds(tmp_path) -> None:
     """Regression: a message to a live recipient still succeeds."""
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/messages",
             json={
-                "token": admin.admin_token,
                 "recipient_id": "alice",
                 "message_content": "hello alice",
             },
@@ -61,10 +59,9 @@ async def test_dashboard_message_to_admin_label_succeeds(tmp_path) -> None:
         await admin.create_worker("alice")
         # Worker -> admin escalation is always permitted.
         worker = await admin.create_worker("bob")  # noqa: F841
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/messages",
             json={
-                "token": admin.admin_token,
                 "recipient_id": "admin",
                 "message_content": "escalation",
             },

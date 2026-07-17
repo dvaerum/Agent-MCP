@@ -97,14 +97,12 @@ def _latest_message_id_from(sender: str) -> str:
 
 
 def _post(admin, **fields):
-    body = {"token": admin.admin_token}
-    body.update(fields)
-    return admin.client.post("/api/messages", json=body)
+    return admin.post("/api/messages", json=dict(fields))
 
 
 def _query_ids(admin) -> list[str]:
-    r = admin.client.post(
-        "/api/messages/query", json={"token": admin.admin_token}
+    r = admin.post(
+        "/api/messages/query", json={}
     )
     assert r.status_code == 200, r.text
     return [m["message_id"] for m in r.json()["messages"]]

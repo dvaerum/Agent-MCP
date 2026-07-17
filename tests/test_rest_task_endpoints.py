@@ -29,10 +29,9 @@ pytestmark = pytest.mark.asyncio
 async def test_post_tasks_creates_task_with_admin_token(tmp_path) -> None:
     """POST /api/tasks with admin token + minimal body creates a task."""
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/tasks",
             json={
-                "token": admin.admin_token,
                 "task_title": "smoke task",
                 "task_description": "created by integration test",
             },
@@ -54,8 +53,9 @@ async def test_post_tasks_rejects_bad_token(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         r = admin.client.post(
             "/api/tasks",
+            # Fake bearer: exercises the operator-tier gate, not no-auth 401.
+            headers={"Authorization": f"Bearer {'deadbeef' * 4}"},
             json={
-                "token": "deadbeef" * 4,  # 32 hex chars, doesn't match
                 "task_title": "shouldn't be created",
                 "task_description": "...",
             },
@@ -68,9 +68,9 @@ async def test_post_tasks_rejects_missing_title(tmp_path) -> None:
     'task_title is required' error (legitimate missing-field signal,
     unchanged by F004)."""
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/tasks",
-            json={"token": admin.admin_token, "task_description": "no title"},
+            json={"task_description": "no title"},
         )
         assert r.status_code == 400, r.text
         assert r.json().get("error") == "task_title is required", r.json()
@@ -82,10 +82,9 @@ async def test_post_tasks_rejects_whitespace_only_title(tmp_path) -> None:
     the misleading 'task_title is required' message that implies the
     field was omitted entirely (verify-all-v6 MUTATING #3)."""
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/tasks",
             json={
-                "token": admin.admin_token,
                 "task_title": "   ",
                 "task_description": "whitespace only",
             },
@@ -134,10 +133,9 @@ async def test_post_tasks_nonexistent_parent_is_404_not_500(tmp_path) -> None:
     generic ``Failed to create task`` 500 — violating this router's
     SEC-round-9 clean-4xx contract. No task row must be created."""
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/tasks",
             json={
-                "token": admin.admin_token,
                 "task_title": "orphan-parent task",
                 "task_description": "must never be created",
                 "parent_task": "task_does_not_exist_0123",
@@ -156,20 +154,18 @@ async def test_post_tasks_valid_parent_still_creates(tmp_path) -> None:
     """Regression: a child task naming an EXISTING ``parent_task`` still
     creates (200) and is linked into the parent."""
     async with mcp_session(tmp_path) as admin:
-        parent = admin.client.post(
+        parent = admin.post(
             "/api/tasks",
             json={
-                "token": admin.admin_token,
                 "task_title": "parent task",
                 "task_description": "the root",
             },
         ).json()
         parent_id = parent["task_id"]
 
-        child = admin.client.post(
+        child = admin.post(
             "/api/tasks",
             json={
-                "token": admin.admin_token,
                 "task_title": "child task",
                 "task_description": "under parent",
                 "parent_task": parent_id,
@@ -184,10 +180,9 @@ async def test_post_tasks_top_level_no_parent_still_creates(tmp_path) -> None:
     """Regression: a top-level task (``parent_task`` absent/None) still
     creates (200)."""
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/tasks",
             json={
-                "token": admin.admin_token,
                 "task_title": "top-level task",
                 "task_description": "no parent",
                 "parent_task": None,
@@ -200,20 +195,19 @@ async def test_post_tasks_top_level_no_parent_still_creates(tmp_path) -> None:
 async def test_delete_tasks_removes_task_with_admin_token(tmp_path) -> None:
     """DELETE /api/tasks/<id> with admin token removes the task."""
     async with mcp_session(tmp_path) as admin:
-        created = admin.client.post(
+        created = admin.post(
             "/api/tasks",
             json={
-                "token": admin.admin_token,
                 "task_title": "to be deleted",
                 "task_description": "ephemeral",
             },
         ).json()
         task_id = created["task_id"]
 
-        r = admin.client.request(
+        r = admin.request(
             "DELETE",
             f"/api/tasks/{task_id}",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert r.status_code == 200, r.text
         assert r.json().get("success") is True, r.json()
@@ -226,10 +220,9 @@ async def test_delete_tasks_removes_task_with_admin_token(tmp_path) -> None:
 async def test_delete_tasks_rejects_bad_token(tmp_path) -> None:
     """DELETE /api/tasks/<id> with bad token returns 403, task stays."""
     async with mcp_session(tmp_path) as admin:
-        created = admin.client.post(
+        created = admin.post(
             "/api/tasks",
             json={
-                "token": admin.admin_token,
                 "task_title": "should survive",
                 "task_description": "...",
             },
@@ -239,7 +232,9 @@ async def test_delete_tasks_rejects_bad_token(tmp_path) -> None:
         r = admin.client.request(
             "DELETE",
             f"/api/tasks/{task_id}",
-            json={"token": "x" * 32},
+            # Fake bearer: exercises the operator-tier gate, not no-auth 401.
+            headers={"Authorization": f"Bearer {'x' * 32}"},
+            json={},
         )
         assert r.status_code == 401, r.text
 
@@ -247,9 +242,9 @@ async def test_delete_tasks_rejects_bad_token(tmp_path) -> None:
 async def test_delete_tasks_404_on_unknown_id(tmp_path) -> None:
     """DELETE /api/tasks/nonexistent returns 404."""
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.request(
+        r = admin.request(
             "DELETE",
             "/api/tasks/task_does_not_exist",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert r.status_code == 404, r.text

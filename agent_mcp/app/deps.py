@@ -40,7 +40,6 @@ The dep admits:
 from __future__ import annotations
 
 import contextvars
-import json
 import logging
 import sqlite3
 from pathlib import Path
@@ -108,9 +107,9 @@ _MUTATION_METHODS = frozenset({"POST", "PATCH", "DELETE", "PUT"})
 
 
 #: Agent rows whose ``agent_role`` is treated as operator-tier for
-#: the bearer / body-token / query-string admit paths below. The
-#: post-Wave-1 ``manager`` role is the canonical credential; the
-#: legacy ``admin`` role is kept for pre-Wave-4 rows still in the wild.
+#: the ``Authorization: Bearer`` admit path below. The post-Wave-1
+#: ``manager`` role is the canonical credential; the legacy ``admin``
+#: role is kept for pre-Wave-4 rows still in the wild.
 _OPERATOR_TIER_AGENT_ROLES = frozenset({"manager", "admin"})
 
 
@@ -303,38 +302,6 @@ def _authorize_session_for_project(
 # ── The dep ───────────────────────────────────────────────────────
 
 
-async def _legacy_body_token(request: Request) -> str | None:
-    """Return ``body['token']`` if the body is a JSON object with one.
-
-    Read carefully: FastAPI lets a downstream handler consume the
-    body too; we use ``request.body()`` which caches the raw bytes
-    on the Request so subsequent reads (from the handler's Pydantic
-    parser) see the same payload. Non-JSON or non-dict bodies fall
-    back to None.
-    """
-    try:
-        raw = await request.body()
-    except Exception:
-        return None
-    if not raw:
-        return None
-    try:
-        parsed = json.loads(raw)
-    # RecursionError (a RuntimeError, NOT a ValueError subclass) escapes
-    # a narrow (ValueError, JSONDecodeError) guard: a ~10k-deep nested
-    # body would propagate out of this auth-dep fallback as an HTTP 500
-    # before any handler runs. A deep-nested body simply isn't a valid
-    # token body — swallow it and fall through to the other auth methods.
-    # (json.JSONDecodeError is a ValueError subclass; kept explicit for
-    # clarity. Backend-tier sibling of PF-R20-1's router-tier fix.)
-    except (ValueError, json.JSONDecodeError, RecursionError):
-        return None
-    if not isinstance(parsed, dict):
-        return None
-    token = parsed.get("token")
-    return token if isinstance(token, str) else None
-
-
 async def require_operator_session(request: Request) -> dict[str, Any]:
     """FastAPI dep — admit cookie OR forwarding-header OR operator-bearer.
 
@@ -342,7 +309,7 @@ async def require_operator_session(request: Request) -> dict[str, Any]:
 
         {"kind": "session", "user": <user-row>}             # cookie path
         {"kind": "forwarding", "operator_id": <str>}        # signed-header
-        {"kind": "operator_bearer", "user": None}           # bearer / body / qs
+        {"kind": "operator_bearer", "user": None}           # bearer path
 
     On failure raises HTTPException(401).
 
@@ -357,8 +324,11 @@ async def require_operator_session(request: Request) -> dict[str, Any]:
     need to inspect the return value; they can wire the dep via
     ``Depends(require_operator_session)`` and trust the 401 path.
 
-    retire-system-token Wave 1 removed the god-key bearer paths;
-    the bearer / body-token / query-string admits now consult
+    Token delivery on the REST surface is now header/cookie only. The
+    two LEGACY token-delivery doors — a ``token`` field in the JSON
+    body and a ``?token=<>`` query param — were retired (they were the
+    last non-header admits; the MCP tool-schema ``token`` argument went
+    in 5.20.0). The sole bearer admit now consults
     ``_is_operator_tier_bearer`` which checks for a per-agent
     manager-role row in the ``agents`` table. Worker tokens are
     rejected here — see ``tests/test_tokens_endpoint_worker_guard.py``.
@@ -448,17 +418,6 @@ async def require_operator_session(request: Request) -> dict[str, Any]:
         bearer = auth[7:].strip()
         if bearer and _is_operator_tier_bearer(bearer):
             return {"kind": "operator_bearer", "user": None}
-
-    # 4. Body-token path — backwards-compat (the JSON body's
-    #    "token" field). Same operator-tier gate as the bearer path.
-    body_token = await _legacy_body_token(request)
-    if body_token and _is_operator_tier_bearer(body_token):
-        return {"kind": "operator_bearer", "user": None}
-
-    # 5. Query-string ``?token=<>`` path — same shape, same gate.
-    query_token = request.query_params.get("token") if request.query_params else None
-    if query_token and _is_operator_tier_bearer(query_token):
-        return {"kind": "operator_bearer", "user": None}
 
     raise HTTPException(
         status_code=401,

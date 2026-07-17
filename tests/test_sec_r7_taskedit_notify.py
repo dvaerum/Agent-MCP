@@ -42,13 +42,12 @@ pytestmark = pytest.mark.asyncio
 
 def _create_task(admin, assigned_to=None) -> str:
     body = {
-        "token": admin.admin_token,
         "task_title": "r7-edit-target",
         "task_description": "a task edited via the dashboard modal",
     }
     if assigned_to is not None:
         body["assigned_to"] = assigned_to
-    r = admin.client.post("/api/tasks", json=body)
+    r = admin.post("/api/tasks", json=body)
     assert r.status_code == 200, r.text
     return r.json()["task_id"]
 
@@ -82,10 +81,9 @@ async def test_edit_assign_publishes_task_updated_and_wakes_new_assignee(
 
         published, notified = _install_spies(monkeypatch)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
             json={
-                "token": admin.admin_token,
                 "task_id": task_id,
                 "status": "in_progress",
                 "assigned_to": "agent-a",
@@ -117,10 +115,9 @@ async def test_reassignment_wakes_both_new_and_prior_assignee(
 
         published, notified = _install_spies(monkeypatch)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
             json={
-                "token": admin.admin_token,
                 "task_id": task_id,
                 "assigned_to": "agent-b",
             },
@@ -147,10 +144,9 @@ async def test_unassign_wakes_prior_assignee(tmp_path, monkeypatch) -> None:
 
         published, notified = _install_spies(monkeypatch)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
             json={
-                "token": admin.admin_token,
                 "task_id": task_id,
                 "assigned_to": None,
             },
@@ -177,10 +173,9 @@ async def test_noop_field_edit_still_publishes_no_assignee_change(
 
         published, notified = _install_spies(monkeypatch)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
             json={
-                "token": admin.admin_token,
                 "task_id": task_id,
                 "title": "renamed via modal",
             },

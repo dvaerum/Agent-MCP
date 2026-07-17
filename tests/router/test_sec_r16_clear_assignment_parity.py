@@ -76,9 +76,9 @@ def _grant_caps(agent_id: str, caps: list[str]) -> None:
 
 
 async def _create_task(admin, **body_extra) -> str:
-    body = {"token": admin.admin_token, "task_title": "r16-clear-probe"}
+    body = {"task_title": "r16-clear-probe"}
     body.update(body_extra)
-    r = admin.client.post("/api/tasks", json=body)
+    r = admin.post("/api/tasks", json=body)
     assert r.status_code == 200, r.text
     return r.json()["task_id"]
 
@@ -100,10 +100,9 @@ def _install_spies(monkeypatch):
 
 
 def _clear_assignment(admin, task_id: str, value):
-    return admin.client.post(
+    return admin.post(
         "/api/update-task-dashboard",
         json={
-            "token": admin.admin_token,
             "task_id": task_id,
             "assigned_to": value,
         },
@@ -201,10 +200,9 @@ async def test_reassign_to_real_agent_does_not_fire_unassigned(
 
         unassigned, notified = _install_spies(monkeypatch)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
             json={
-                "token": admin.admin_token,
                 "task_id": task_id,
                 "assigned_to": "bob",
             },
@@ -230,10 +228,9 @@ async def test_normal_status_edit_still_succeeds(tmp_path) -> None:
     NOT get force-flipped to unassigned."""
     async with mcp_session(tmp_path) as admin:
         task_id = await _create_task(admin)
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
             json={
-                "token": admin.admin_token,
                 "task_id": task_id,
                 "status": "in_progress",
             },

@@ -70,10 +70,9 @@ async def test_single_recipient_send_wakes_recipient_inbox(
 
         notified, _published = _install_spies(monkeypatch)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/messages",
             json={
-                "token": admin.admin_token,
                 "recipient_id": "alice",
                 "message_content": "hello alice",
             },
@@ -98,10 +97,9 @@ async def test_broadcast_still_wakes_all_recipients(
 
         _notified, published = _install_spies(monkeypatch)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/messages",
             json={
-                "token": admin.admin_token,
                 "recipient_id": "*",
                 "message_content": "everyone read this",
             },
@@ -126,9 +124,9 @@ async def test_suggest_subject_non_string_content_is_400(
     """A dict/list ``content`` on /suggest-subject must be a 400, not a
     500 from ``.strip()`` on a non-string."""
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/messages/suggest-subject",
-            json={"token": admin.admin_token, "content": bad},
+            json={"content": bad},
         )
         assert r.status_code == 400, r.text
         assert "error" in r.json(), r.text
@@ -138,9 +136,9 @@ async def test_suggest_subject_valid_string_still_works(tmp_path) -> None:
     """Regression: a plain-string content still returns 200 with a
     ``subject`` key (null when no subject model configured)."""
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/messages/suggest-subject",
-            json={"token": admin.admin_token, "content": "a real subject"},
+            json={"content": "a real subject"},
         )
         assert r.status_code == 200, r.text
         assert "subject" in r.json(), r.text
@@ -152,10 +150,9 @@ async def test_send_non_string_recipient_is_400(tmp_path, bad) -> None:
     a SQLite bind → 500. Must be 400 instead."""
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
-        r = admin.client.post(
+        r = admin.post(
             "/api/messages",
             json={
-                "token": admin.admin_token,
                 "recipient_id": bad,
                 "message_content": "hi",
             },
@@ -169,10 +166,9 @@ async def test_send_non_string_content_is_400(tmp_path, bad) -> None:
     """A dict/list ``message_content`` must be a 400, not a 500."""
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
-        r = admin.client.post(
+        r = admin.post(
             "/api/messages",
             json={
-                "token": admin.admin_token,
                 "recipient_id": "alice",
                 "message_content": bad,
             },
@@ -185,10 +181,9 @@ async def test_send_valid_string_still_works(tmp_path) -> None:
     """Regression: valid string fields still create the message."""
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
-        r = admin.client.post(
+        r = admin.post(
             "/api/messages",
             json={
-                "token": admin.admin_token,
                 "recipient_id": "alice",
                 "message_content": "hello alice",
             },
