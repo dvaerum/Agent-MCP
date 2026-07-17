@@ -634,7 +634,6 @@ async def test_validate_task_placement_threads_worker_scope(
             parent_task_id=None,
             depends_on_tasks=None,
             created_by="worker-a",
-            auth_token="tok",
             can_view_all_tasks=False,
         )
 
@@ -675,7 +674,6 @@ async def test_validate_task_placement_privileged_sees_all(
             parent_task_id=None,
             depends_on_tasks=None,
             created_by="manager-1",
-            auth_token="tok",
             can_view_all_tasks=True,
         )
 
@@ -722,7 +720,6 @@ async def test_validate_task_placement_scopes_to_caller_not_author(
             parent_task_id=None,
             depends_on_tasks=None,
             created_by="admin",
-            auth_token="tok",
             requesting_agent_id="worker-a",
             can_view_all_tasks=False,
         )

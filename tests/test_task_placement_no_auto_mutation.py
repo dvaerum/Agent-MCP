@@ -74,7 +74,11 @@ def _make_validator_mock(
         parent_task_id: str | None,
         depends_on_tasks: list[str] | None,
         created_by: str,
-        auth_token: str,
+        # token-retirement PR 1: the validator no longer takes an
+        # ``auth_token`` arg; it takes the caller's Principal (forwarded
+        # only to the ImportError-fallback RAG call). Accept it so this
+        # stand-in keeps the same signature as the patched target.
+        principal: Any = None,
         # R5-F1: the real validator now threads the caller's RAG scope
         # (requesting_agent_id + can_view_all_tasks). Accept them so this
         # stand-in keeps the same signature as the patched target.
