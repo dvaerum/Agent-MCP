@@ -179,10 +179,9 @@ async def test_project_context_tool_uses_orm(tmp_path) -> None:
     """The view_project_context tool still works after ORM rewrite."""
     async with mcp_session(tmp_path) as admin:
         # Seed via existing memories endpoint (which also uses ORM after this PR).
-        seed = admin.client.post(
+        seed = admin.post(
             "/api/memories",
             json={
-                "token": admin.admin_token,
                 "context_key": "orm_tool_check",
                 "context_value": {"hello": "from-tool"},
                 "description": "see test_project_context_tool_uses_orm",
@@ -202,10 +201,9 @@ async def test_project_context_tool_uses_orm(tmp_path) -> None:
 async def test_all_data_endpoint_returns_project_context(tmp_path) -> None:
     """/api/all-data still returns the project_context bit after rewrite."""
     async with mcp_session(tmp_path) as admin:
-        admin.client.post(
+        admin.post(
             "/api/memories",
             json={
-                "token": admin.admin_token,
                 "context_key": "all_data_orm_probe",
                 "context_value": "probe-value",
             },
@@ -222,10 +220,9 @@ async def test_all_data_endpoint_returns_project_context(tmp_path) -> None:
 async def test_context_data_endpoint_returns_project_context(tmp_path) -> None:
     """/api/context-data still returns the project_context bit after rewrite."""
     async with mcp_session(tmp_path) as admin:
-        admin.client.post(
+        admin.post(
             "/api/memories",
             json={
-                "token": admin.admin_token,
                 "context_key": "ctx_data_orm_probe",
                 "context_value": "probe-value",
             },

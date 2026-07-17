@@ -40,7 +40,6 @@ pytestmark = pytest.mark.asyncio
 
 def _create_task(admin, assigned_to=None, required_capabilities=None) -> str:
     body = {
-        "token": admin.admin_token,
         "task_title": "r15-notify-target",
         "task_description": "a task created via REST",
     }
@@ -48,7 +47,7 @@ def _create_task(admin, assigned_to=None, required_capabilities=None) -> str:
         body["assigned_to"] = assigned_to
     if required_capabilities is not None:
         body["required_capabilities"] = required_capabilities
-    r = admin.client.post("/api/tasks", json=body)
+    r = admin.post("/api/tasks", json=body)
     assert r.status_code == 200, r.text
     return r.json()["task_id"]
 
@@ -138,9 +137,9 @@ async def test_unassigned_create_still_returns_2xx_and_task_body(
     """Regression: the notify wiring must not disturb the normal
     success response — an unassigned create still returns 2xx + task."""
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/tasks",
-            json={"token": admin.admin_token, "task_title": "r15-shape"},
+            json={"task_title": "r15-shape"},
         )
         assert r.status_code == 200, r.text
         body = r.json()

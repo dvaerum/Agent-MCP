@@ -278,10 +278,10 @@ def test_dashboard_edit_payload_with_notes_round_trips(client) -> None:
     r = client.post(
         "/api/tasks",
         json={
-            "token": token,
             "task_title": "round-trip note target",
             "task_description": "create + edit + verify",
         },
+        headers={"Authorization": f"Bearer {token}"},
     )
     assert r.status_code == 200, r.text
     task_id = r.json()["task_id"]
@@ -289,7 +289,6 @@ def test_dashboard_edit_payload_with_notes_round_trips(client) -> None:
     # The exact payload `EditTaskDialog.handleSave` builds when the
     # admin types a note and clicks Save.
     payload = {
-        "token": token,
         "task_id": task_id,
         "title": "round-trip note target",
         "description": "create + edit + verify",
@@ -298,7 +297,11 @@ def test_dashboard_edit_payload_with_notes_round_trips(client) -> None:
         "assigned_to": None,
         "notes": "first dashboard note",
     }
-    r = client.post("/api/update-task-dashboard", json=payload)
+    r = client.post(
+        "/api/update-task-dashboard",
+        json=payload,
+        headers={"Authorization": f"Bearer {token}"},
+    )
     assert r.status_code == 200, r.text
     assert r.json().get("success") is True
 
@@ -334,11 +337,11 @@ def test_dashboard_edit_payload_appends_multiple_notes(client) -> None:
     token = g.admin_token
     task_id = client.post(
         "/api/tasks",
-        json={"token": token, "task_title": "multi-note target"},
+        json={"task_title": "multi-note target"},
+        headers={"Authorization": f"Bearer {token}"},
     ).json()["task_id"]
 
     base_payload = {
-        "token": token,
         "task_id": task_id,
         "title": "multi-note target",
         "status": "pending",
@@ -349,6 +352,7 @@ def test_dashboard_edit_payload_appends_multiple_notes(client) -> None:
         r = client.post(
             "/api/update-task-dashboard",
             json={**base_payload, "notes": content},
+            headers={"Authorization": f"Bearer {token}"},
         )
         assert r.status_code == 200, r.text
 
@@ -374,14 +378,14 @@ def test_dashboard_edit_payload_empty_notes_does_not_append(client) -> None:
     token = g.admin_token
     task_id = client.post(
         "/api/tasks",
-        json={"token": token, "task_title": "no-spam target"},
+        json={"task_title": "no-spam target"},
+        headers={"Authorization": f"Bearer {token}"},
     ).json()["task_id"]
 
     # Save without the `notes` key — title-only edit.
     r = client.post(
         "/api/update-task-dashboard",
         json={
-            "token": token,
             "task_id": task_id,
             "title": "no-spam target (edited)",
             "description": "",
@@ -389,6 +393,7 @@ def test_dashboard_edit_payload_empty_notes_does_not_append(client) -> None:
             "priority": "medium",
             "assigned_to": None,
         },
+        headers={"Authorization": f"Bearer {token}"},
     )
     assert r.status_code == 200, r.text
 

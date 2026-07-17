@@ -154,9 +154,9 @@ async def test_rest_messages_query_to_filter_only_returns_addressed(
             content="from-bob-to-alice",
         )
 
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/messages/query",
-            json={"token": admin.admin_token, "to": "alice"},
+            json={"to": "alice"},
         )
         assert resp.status_code == 200, resp.text
         rows = resp.json()["messages"]

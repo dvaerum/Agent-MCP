@@ -181,10 +181,9 @@ async def test_completion_config_error_not_reflected(
     ``completion_client()``, which we make raise CompletionConfigError.
     """
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/memories",
             json={
-                "token": admin.admin_token,
                 "context_key": "project_readme",
                 "context_value": "public info the RAG can synthesise over",
             },

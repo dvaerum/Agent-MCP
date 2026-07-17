@@ -57,13 +57,12 @@ def _row(table: str, where_sql: str, params: tuple) -> dict | None:
 async def test_create_task_rejects_structured_field(tmp_path, field, bad) -> None:
     async with mcp_session(tmp_path) as admin:
         body = {
-            "token": admin.admin_token,
             "task_title": "type-confusion probe",
         }
         # description supplies its own key name in the request body.
         request_key = "task_description" if field == "description" else field
         body[request_key] = bad
-        r = admin.client.post("/api/tasks", json=body)
+        r = admin.post("/api/tasks", json=body)
         assert r.status_code == 400, (
             f"{field}={bad!r} should be 400 not {r.status_code}: {r.text}"
         )
@@ -71,10 +70,9 @@ async def test_create_task_rejects_structured_field(tmp_path, field, bad) -> Non
 
 async def test_create_task_rejects_structured_required_capabilities(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/tasks",
             json={
-                "token": admin.admin_token,
                 "task_title": "caps probe",
                 "required_capabilities": {"code_edit": True},
             },
@@ -85,10 +83,9 @@ async def test_create_task_rejects_structured_required_capabilities(tmp_path) ->
 async def test_create_task_description_dict_not_stored(tmp_path) -> None:
     """A dict description must be rejected, never persisted into the column."""
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/tasks",
             json={
-                "token": admin.admin_token,
                 "task_title": "desc probe",
                 "task_description": {"evil": "dict"},
             },
@@ -120,10 +117,9 @@ async def test_create_task_valid_still_works(tmp_path) -> None:
             _conn.commit()
         finally:
             _conn.close()
-        r = admin.client.post(
+        r = admin.post(
             "/api/tasks",
             json={
-                "token": admin.admin_token,
                 "task_title": "valid task",
                 "task_description": "a description",
                 "priority": "high",
@@ -141,10 +137,9 @@ async def test_create_task_valid_still_works(tmp_path) -> None:
 @pytest.mark.parametrize("bad", _BAD_VALUES)
 async def test_create_memory_rejects_structured_context_key(tmp_path, bad) -> None:
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/memories",
             json={
-                "token": admin.admin_token,
                 "context_key": bad,
                 "context_value": {"ok": 1},
             },
@@ -157,10 +152,9 @@ async def test_create_memory_rejects_structured_context_key(tmp_path, bad) -> No
 @pytest.mark.parametrize("bad", _BAD_VALUES)
 async def test_create_memory_rejects_structured_description(tmp_path, bad) -> None:
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/memories",
             json={
-                "token": admin.admin_token,
                 "context_key": "mem.desc.probe",
                 "context_value": {"ok": 1},
                 "description": bad,
@@ -172,10 +166,9 @@ async def test_create_memory_rejects_structured_description(tmp_path, bad) -> No
 async def test_create_memory_valid_still_works(tmp_path) -> None:
     """context_value is arbitrary JSON (dict/list are legitimate here)."""
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/memories",
             json={
-                "token": admin.admin_token,
                 "context_key": "mem.valid",
                 "context_value": {"structured": ["value", "is", "fine"]},
                 "description": "a string description",
@@ -193,9 +186,9 @@ async def test_create_memory_valid_still_works(tmp_path) -> None:
 async def test_edit_agent_rejects_structured_string_field(tmp_path, field, bad) -> None:
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
-        r = admin.client.post(
+        r = admin.post(
             "/api/agents/alice/edit",
-            json={"token": admin.admin_token, field: bad},
+            json={field: bad},
         )
         assert r.status_code == 400, (
             f"{field}={bad!r} should be 400 not {r.status_code}: {r.text}"
@@ -207,9 +200,9 @@ async def test_edit_agent_rejects_dict_capabilities(tmp_path) -> None:
     there behind a misleading 200."""
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
-        r = admin.client.post(
+        r = admin.post(
             "/api/agents/alice/edit",
-            json={"token": admin.admin_token, "capabilities": {"admin": True}},
+            json={"capabilities": {"admin": True}},
         )
         assert r.status_code == 400, r.text
         # The cache / row must NOT have absorbed the dict's keys as caps.
@@ -221,10 +214,9 @@ async def test_edit_agent_rejects_dict_capabilities(tmp_path) -> None:
 async def test_edit_agent_rejects_capabilities_with_nonstr_element(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
-        r = admin.client.post(
+        r = admin.post(
             "/api/agents/alice/edit",
             json={
-                "token": admin.admin_token,
                 "capabilities": ["ok", {"nested": 1}],
             },
         )
@@ -234,10 +226,9 @@ async def test_edit_agent_rejects_capabilities_with_nonstr_element(tmp_path) -> 
 async def test_edit_agent_capabilities_list_of_str_still_works(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
-        r = admin.client.post(
+        r = admin.post(
             "/api/agents/alice/edit",
             json={
-                "token": admin.admin_token,
                 "capabilities": ["code_edit", "file_read"],
             },
         )
@@ -249,9 +240,9 @@ async def test_edit_agent_capabilities_list_of_str_still_works(tmp_path) -> None
 async def test_edit_agent_valid_color_still_works(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
-        r = admin.client.post(
+        r = admin.post(
             "/api/agents/alice/edit",
-            json={"token": admin.admin_token, "color": "#abcdef"},
+            json={"color": "#abcdef"},
         )
         assert r.status_code == 200, r.text
 
@@ -260,9 +251,9 @@ async def test_edit_agent_valid_color_still_works(tmp_path) -> None:
 
 
 async def _create_task(admin) -> str:
-    r = admin.client.post(
+    r = admin.post(
         "/api/tasks",
-        json={"token": admin.admin_token, "task_title": "upd probe"},
+        json={"task_title": "upd probe"},
     )
     assert r.status_code == 200, r.text
     return r.json()["task_id"]
@@ -276,9 +267,9 @@ async def test_update_task_details_rejects_structured_field(tmp_path, field, bad
     origin/main returns."""
     async with mcp_session(tmp_path) as admin:
         task_id = await _create_task(admin)
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
-            json={"token": admin.admin_token, "task_id": task_id, field: bad},
+            json={"task_id": task_id, field: bad},
         )
         assert r.status_code == 400, (
             f"{field}={bad!r} should be 400 not {r.status_code}: {r.text}"
@@ -288,10 +279,9 @@ async def test_update_task_details_rejects_structured_field(tmp_path, field, bad
 async def test_update_task_details_valid_still_works(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         task_id = await _create_task(admin)
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
             json={
-                "token": admin.admin_token,
                 "task_id": task_id,
                 "title": "renamed",
                 "priority": "high",

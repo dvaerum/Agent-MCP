@@ -165,9 +165,9 @@ async def test_restore_flips_status_back_to_created(tmp_path) -> None:
         assert row is not None and row["status"] == "terminated"
         assert row["terminated_at"] is not None
 
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/alice/restore",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -195,8 +195,14 @@ async def test_restore_logs_audit_action(tmp_path) -> None:
         await admin.create_worker("alice")
         await _terminate(admin, "alice")
 
+        # Operator-tier Bearer (not the forwarding header) so the audit
+        # row is attributed to "admin" — caller_identity() falls back to
+        # "admin" on the operator_bearer path, whereas the forwarding
+        # header would attribute the action to the operator id.
         resp = admin.client.post(
-            "/api/agents/alice/restore", json={"token": admin.admin_token}
+            "/api/agents/alice/restore",
+            json={},
+            headers={"Authorization": f"Bearer {admin.admin_token}"},
         )
         assert resp.status_code == 200
 
@@ -215,17 +221,21 @@ async def test_restore_rejects_worker_token(tmp_path) -> None:
         await _terminate(admin, "alice")
         bob = await admin.create_worker("bob")
 
+        # Worker bearer: exercises the operator-tier gate (non-operator
+        # bearer rejected), not merely the no-auth 401 path.
         resp = admin.client.post(
-            "/api/agents/alice/restore", json={"token": bob.token}
+            "/api/agents/alice/restore",
+            json={},
+            headers={"Authorization": f"Bearer {bob.token}"},
         )
         assert resp.status_code in (401, 403), resp.text
 
 
 async def test_restore_404_when_agent_missing(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/nonexistent/restore",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert resp.status_code == 404, resp.text
 
@@ -234,8 +244,8 @@ async def test_restore_rejects_active_agent(tmp_path) -> None:
     """Restoring a non-terminated agent is a no-op; return 409."""
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")  # status='active'
-        resp = admin.client.post(
-            "/api/agents/alice/restore", json={"token": admin.admin_token},
+        resp = admin.post(
+            "/api/agents/alice/restore", json={},
         )
         assert resp.status_code in (400, 409), resp.text
 
@@ -266,8 +276,8 @@ async def test_purge_preview_returns_counts(tmp_path) -> None:
         _insert_action("alice", "created_agent")
         _insert_action("alice", "claimed_task")
 
-        resp = admin.client.get(
-            f"/api/agents/alice/purge-preview?token={admin.admin_token}"
+        resp = admin.get(
+            "/api/agents/alice/purge-preview"
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -286,8 +296,10 @@ async def test_purge_preview_rejects_worker_token(tmp_path) -> None:
         await _terminate(admin, "alice")
         bob = await admin.create_worker("bob")
 
+        # Worker bearer: exercises the operator-tier gate, not no-auth 401.
         resp = admin.client.get(
-            f"/api/agents/alice/purge-preview?token={bob.token}"
+            "/api/agents/alice/purge-preview",
+            headers={"Authorization": f"Bearer {bob.token}"},
         )
         assert resp.status_code in (401, 403), resp.text
 
@@ -325,11 +337,11 @@ async def test_purge_cascade_full(tmp_path) -> None:
         # Actions.
         _insert_action("alice", "claimed_task")
 
-        resp = admin.client.request(
+        resp = admin.request(
             "DELETE",
             "/api/agents/alice",
             params={"cascade": "true"},
-            json={"token": admin.admin_token},
+            json={},
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -398,11 +410,11 @@ async def test_purge_atomic_on_failure(tmp_path) -> None:
         seed_agent_rows("bob")  # PR-G1 FK requires the row
         msg = _insert_message("alice", "bob", "untouched")
 
-        resp = admin.client.request(
+        resp = admin.request(
             "DELETE",
             "/api/agents/ghost",
             params={"cascade": "true"},
-            json={"token": admin.admin_token},
+            json={},
         )
         assert resp.status_code == 404, resp.text
 
@@ -420,10 +432,10 @@ async def test_purge_requires_cascade_flag(tmp_path) -> None:
         await admin.create_worker("alice")
         await _terminate(admin, "alice")
 
-        resp = admin.client.request(
+        resp = admin.request(
             "DELETE",
             "/api/agents/alice",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert resp.status_code == 400, resp.text
 
@@ -433,22 +445,24 @@ async def test_purge_rejects_worker_token(tmp_path) -> None:
         await admin.create_worker("alice")
         await _terminate(admin, "alice")
         bob = await admin.create_worker("bob")
+        # Worker bearer: exercises the operator-tier gate, not no-auth 401.
         resp = admin.client.request(
             "DELETE",
             "/api/agents/alice",
             params={"cascade": "true"},
-            json={"token": bob.token},
+            json={},
+            headers={"Authorization": f"Bearer {bob.token}"},
         )
         assert resp.status_code in (401, 403), resp.text
 
 
 async def test_purge_404_for_missing_agent(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
-        resp = admin.client.request(
+        resp = admin.request(
             "DELETE",
             "/api/agents/nonexistent",
             params={"cascade": "true"},
-            json={"token": admin.admin_token},
+            json={},
         )
         assert resp.status_code == 404, resp.text
 
@@ -496,8 +510,7 @@ async def test_register_agent_dashboard_api_rejects_brackets(tmp_path) -> None:
     status code, same operator experience.
     """
     async with mcp_session(tmp_path) as admin:
-        resp = admin.client.post("/api/agents/register", json={
-            "token": admin.admin_token,
+        resp = admin.post("/api/agents/register", json={
             "agent_id": "[bad]",
         })
         # Should be 400 (validation), not 500 (tool-level rejection).

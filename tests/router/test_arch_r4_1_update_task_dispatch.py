@@ -140,9 +140,9 @@ def _grant_capabilities(agent_id: str, caps: list[str]) -> None:
 
 
 async def _create_task(admin, **body_extra) -> str:
-    body = {"token": admin.admin_token, "task_title": "arch-r4-1-probe"}
+    body = {"task_title": "arch-r4-1-probe"}
     body.update(body_extra)
-    r = admin.client.post("/api/tasks", json=body)
+    r = admin.post("/api/tasks", json=body)
     assert r.status_code == 200, r.text
     return r.json()["task_id"]
 
@@ -167,10 +167,9 @@ async def test_title_edit_on_terminal_task_rejected_via_rest(tmp_path) -> None:
         task_id = await _create_task(admin)
         _force_status(task_id, "completed", None)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
             json={
-                "token": admin.admin_token,
                 "task_id": task_id,
                 "title": "renamed after completion",
             },
@@ -193,10 +192,9 @@ async def test_title_edit_on_active_task_still_succeeds(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         task_id = await _create_task(admin)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
             json={
-                "token": admin.admin_token,
                 "task_id": task_id,
                 "title": "renamed while active",
             },
@@ -223,10 +221,9 @@ async def test_null_valued_editable_field_alone_is_harmless_noop(tmp_path) -> No
     async with mcp_session(tmp_path) as admin:
         task_id = await _create_task(admin)
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/update-task-dashboard",
             json={
-                "token": admin.admin_token,
                 "task_id": task_id,
                 "status": None,
             },
@@ -245,8 +242,8 @@ async def _update_via(surface: str, admin, task_id: str, **fields):
     ``update_task`` tool. Returns ``(ok, detail)`` where ``ok`` is True
     iff the surface reports success."""
     if surface == "rest":
-        body = {"token": admin.admin_token, "task_id": task_id, **fields}
-        r = admin.client.post("/api/update-task-dashboard", json=body)
+        body = {"task_id": task_id, **fields}
+        r = admin.post("/api/update-task-dashboard", json=body)
         return r.status_code == 200, f"{r.status_code}: {r.text}"
 
     assert surface == "mcp"

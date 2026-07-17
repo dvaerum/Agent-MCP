@@ -110,10 +110,9 @@ async def test_view_project_context_returns_ok_with_entries(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         # Seed one row via the REST memory create endpoint — same
         # path the dashboard uses.
-        admin.client.post(
+        admin.post(
             "/api/memories",
             json={
-                "token": admin.admin_token,
                 "context_key": "pr3.view.ok",
                 "context_value": "hello",
             },
@@ -408,10 +407,9 @@ async def test_delete_project_context_returns_ok_with_deleted_keys(
     from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path) as admin:
-        admin.client.post(
+        admin.post(
             "/api/memories",
             json={
-                "token": admin.admin_token,
                 "context_key": "pr3.del.ok",
                 "context_value": "x",
             },
@@ -525,10 +523,9 @@ async def test_validate_context_consistency_reports_issues(
     from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path) as admin:
-        admin.client.post(
+        admin.post(
             "/api/memories",
             json={
-                "token": admin.admin_token,
                 "context_key": "pr3.validate.nodesc",
                 "context_value": "ok",
             },
@@ -584,10 +581,9 @@ async def test_backup_project_context_operator_returns_ok(tmp_path) -> None:
     from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path) as admin:
-        admin.client.post(
+        admin.post(
             "/api/memories",
             json={
-                "token": admin.admin_token,
                 "context_key": "pr3.backup.seed",
                 "context_value": "anything",
             },

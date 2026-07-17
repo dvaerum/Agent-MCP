@@ -256,10 +256,10 @@ async def test_purge_agent_mcp_and_rest_identical_cascade(tmp_path) -> None:
         assert "purged" in result[0].text.lower(), result[0].text
 
         # REST surface.
-        resp = admin.client.request(
+        resp = admin.request(
             "DELETE", "/api/agents/alice_rest",
             params={"cascade": "true"},
-            json={"token": admin.admin_token},
+            json={},
         )
         assert resp.status_code == 200, resp.text
         assert resp.json().get("success") is True
@@ -313,8 +313,8 @@ async def test_restore_agent_mcp_and_rest_identical(tmp_path) -> None:
         mcp_result = await admin.call("restore_agent", {"agent_id": "r_mcp"})
         assert "restored" in mcp_result[0].text.lower(), mcp_result[0].text
 
-        resp = admin.client.post(
-            "/api/agents/r_rest/restore", json={"token": admin.admin_token},
+        resp = admin.post(
+            "/api/agents/r_rest/restore", json={},
         )
         assert resp.status_code == 200, resp.text
 
@@ -341,9 +341,9 @@ async def test_edit_agent_mcp_and_rest_identical(tmp_path) -> None:
         )
         assert "updated" in mcp_result[0].text.lower(), mcp_result[0].text
 
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/e_rest/edit",
-            json={"token": admin.admin_token, "color": "#123456"},
+            json={"color": "#123456"},
         )
         assert resp.status_code == 200, resp.text
 

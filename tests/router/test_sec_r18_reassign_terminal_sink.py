@@ -68,18 +68,17 @@ def _force_status(task_id: str, status: str, assigned_to) -> None:
 
 
 async def _create_task(admin, **body_extra) -> str:
-    body = {"token": admin.admin_token, "task_title": "r18-reassign-probe"}
+    body = {"task_title": "r18-reassign-probe"}
     body.update(body_extra)
-    r = admin.client.post("/api/tasks", json=body)
+    r = admin.post("/api/tasks", json=body)
     assert r.status_code == 200, r.text
     return r.json()["task_id"]
 
 
 def _reassign(admin, task_id: str, value):
-    return admin.client.post(
+    return admin.post(
         "/api/update-task-dashboard",
         json={
-            "token": admin.admin_token,
             "task_id": task_id,
             "assigned_to": value,
         },

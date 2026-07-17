@@ -198,9 +198,9 @@ async def test_restore_repopulates_cache_with_agent_role(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         token = _seed_terminated_agent("mgr", agent_role="manager")
 
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/agents/mgr/restore",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert resp.status_code == 200, resp.text
 

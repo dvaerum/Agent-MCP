@@ -46,11 +46,9 @@ _ACCEPT = {"Accept": "application/vnd.agent-mcp.v1+json"}
 async def test_query_overflow_limit_is_400_not_500(tmp_path) -> None:
     """An infinite ``limit`` (``1e400`` → ``inf``) must 400, not 500."""
     async with mcp_session(tmp_path) as admin:
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/messages/query",
-            content=(
-                '{"token": "%s", "limit": 1e400}' % admin.admin_token
-            ),
+            content='{"limit": 1e400}',
             headers=_JSON_CT,
         )
         assert resp.status_code == 400, (
@@ -62,11 +60,9 @@ async def test_query_overflow_limit_is_400_not_500(tmp_path) -> None:
 async def test_query_overflow_offset_is_400_not_500(tmp_path) -> None:
     """An infinite ``offset`` (``1e400`` → ``inf``) must 400, not 500."""
     async with mcp_session(tmp_path) as admin:
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/messages/query",
-            content=(
-                '{"token": "%s", "offset": 1e400}' % admin.admin_token
-            ),
+            content='{"offset": 1e400}',
             headers=_JSON_CT,
         )
         assert resp.status_code == 400, (
@@ -78,9 +74,9 @@ async def test_query_overflow_offset_is_400_not_500(tmp_path) -> None:
 async def test_query_valid_int_limit_offset_still_succeeds(tmp_path) -> None:
     """Regression: valid integer limit/offset still returns 2xx."""
     async with mcp_session(tmp_path) as admin:
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/messages/query",
-            json={"token": admin.admin_token, "limit": 10, "offset": 0},
+            json={"limit": 10, "offset": 0},
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -91,9 +87,9 @@ async def test_query_valid_int_limit_offset_still_succeeds(tmp_path) -> None:
 async def test_query_string_limit_still_400(tmp_path) -> None:
     """Regression (PF-R14-1): a non-numeric string limit stays 400."""
     async with mcp_session(tmp_path) as admin:
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/messages/query",
-            json={"token": admin.admin_token, "limit": "abc"},
+            json={"limit": "abc"},
         )
         assert resp.status_code == 400, (
             f"non-numeric string limit must be 400, got "
@@ -104,9 +100,9 @@ async def test_query_string_limit_still_400(tmp_path) -> None:
 async def test_query_list_limit_still_400(tmp_path) -> None:
     """Regression (PF-R14-1): a list-typed limit stays a clean 400."""
     async with mcp_session(tmp_path) as admin:
-        resp = admin.client.post(
+        resp = admin.post(
             "/api/messages/query",
-            json={"token": admin.admin_token, "limit": [1, 2]},
+            json={"limit": [1, 2]},
         )
         assert resp.status_code == 400, (
             f"list-typed limit must be 400, got "

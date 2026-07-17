@@ -959,7 +959,7 @@ class _JsonRpcErrorSanitizer:
 # Every other JSON-parse surface in this codebase wraps its `json.loads`
 # in `except (ValueError, RecursionError)` and turns a deeply-nested body
 # into a clean 400: `router/app.py::_parse_json_body`,
-# `router/admin_users_api.py::_json_body`, `app/deps.py::_legacy_body_token`,
+# `router/admin_users_api.py::_json_body`,
 # `utils/json_utils.py::get_sanitized_json_body`. The `/mcp` transport was
 # the one surface left unguarded: the MCP SDK's own
 # `streamable_http.py::_handle_post_request` only catches

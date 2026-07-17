@@ -87,10 +87,9 @@ async def test_agent_current_task_cleared_when_task_reaches_terminal_status(
         # codepath in task_tools.py already sets
         # `agents.current_task = task_id` when the agent has no
         # current task.
-        r = admin.client.post(
+        r = admin.post(
             "/api/tasks",
             json={
-                "token": admin.admin_token,
                 "task_title": "do thing",
                 "task_description": "...",
                 "assigned_to": alice.agent_id,
@@ -138,10 +137,9 @@ async def test_other_agents_current_task_untouched_when_unrelated_task_completes
         bob = await admin.create_worker("bob")
 
         # One task each.
-        r_a = admin.client.post(
+        r_a = admin.post(
             "/api/tasks",
             json={
-                "token": admin.admin_token,
                 "task_title": "alice task",
                 "task_description": "...",
                 "assigned_to": alice.agent_id,
@@ -149,10 +147,9 @@ async def test_other_agents_current_task_untouched_when_unrelated_task_completes
         )
         task_a = r_a.json()["task_id"]
 
-        r_b = admin.client.post(
+        r_b = admin.post(
             "/api/tasks",
             json={
-                "token": admin.admin_token,
                 "task_title": "bob task",
                 "task_description": "...",
                 "assigned_to": bob.agent_id,

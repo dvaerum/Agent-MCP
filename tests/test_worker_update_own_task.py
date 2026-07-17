@@ -35,10 +35,9 @@ async def test_worker_can_update_own_task_status(tmp_path) -> None:
 
         # Admin creates + assigns a task to the worker via REST (same
         # endpoint legacy fixtures hit).
-        r = admin.client.post(
+        r = admin.post(
             "/api/tasks",
             json={
-                "token": admin.admin_token,
                 "task_title": "do thing",
                 "task_description": "...",
                 "assigned_to": alice.agent_id,
@@ -68,10 +67,9 @@ async def test_worker_cannot_update_someone_elses_task(tmp_path) -> None:
         bob = await admin.create_worker("bob")
 
         # Task assigned to alice.
-        r = admin.client.post(
+        r = admin.post(
             "/api/tasks",
             json={
-                "token": admin.admin_token,
                 "task_title": "alice's task",
                 "task_description": "...",
                 "assigned_to": alice.agent_id,

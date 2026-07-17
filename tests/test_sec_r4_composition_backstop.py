@@ -27,10 +27,9 @@ _INNOCENT_VALUE = "public-r4-runbook-info"
 
 
 def _seed(admin, *, key: str, value: str) -> None:
-    r = admin.client.post(
+    r = admin.post(
         "/api/memories",
         json={
-            "token": admin.admin_token,
             "context_key": key,
             "context_value": value,
         },

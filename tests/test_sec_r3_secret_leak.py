@@ -35,10 +35,9 @@ _EMBEDDED_SECRET_VALUE = f"deploy step: export KEY={_EMBEDDED_SECRET}"
 
 
 def _seed(admin, *, key: str, value: str) -> None:
-    r = admin.client.post(
+    r = admin.post(
         "/api/memories",
         json={
-            "token": admin.admin_token,
             "context_key": key,
             "context_value": value,
         },

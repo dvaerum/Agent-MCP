@@ -125,10 +125,10 @@ async def test_rest_delete_memory_purges_rag_chunk_and_hash(tmp_path):
 
         assert _rag_state("context", "deploy_notes") == (1, True)
 
-        r = admin.client.request(
+        r = admin.request(
             "DELETE",
             "/api/memories/deploy_notes",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert r.status_code == 200, r.text
 
@@ -145,10 +145,10 @@ async def test_rest_delete_memory_leaves_other_chunks(tmp_path):
         _seed_rag_chunk("context", "target_key", "content a")
         _seed_rag_chunk("context", "keep_key", "content b")
 
-        r = admin.client.request(
+        r = admin.request(
             "DELETE",
             "/api/memories/target_key",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert r.status_code == 200, r.text
 
@@ -207,10 +207,10 @@ async def test_delete_memory_db_error_returns_generic_message(
             pctx_mod.project_context_repo, "delete_many", _boom_delete_many
         )
 
-        r = admin.client.request(
+        r = admin.request(
             "DELETE",
             "/api/memories/some_key",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert r.status_code == 500, r.text
         _assert_generic_no_leak(r.json(), "Failed to delete memory")
@@ -238,9 +238,9 @@ async def test_create_memory_db_error_returns_generic_message(
             pctx_mod.project_context_repo, "create_new", _boom_create_new
         )
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/memories",
-            json={"token": admin.admin_token, "context_key": "k",
+            json={"context_key": "k",
                   "context_value": {"a": 1}},
         )
         assert r.status_code == 500, r.text
@@ -264,10 +264,10 @@ async def test_update_memory_db_error_returns_generic_message(
             pctx_mod.project_context_repo, "upsert", _boom_upsert
         )
 
-        r = admin.client.request(
+        r = admin.request(
             "PUT",
             "/api/memories/k",
-            json={"token": admin.admin_token, "context_value": {"a": 1}},
+            json={"context_value": {"a": 1}},
         )
         assert r.status_code == 500, r.text
         _assert_generic_no_leak(r.json(), "Failed to update memory")

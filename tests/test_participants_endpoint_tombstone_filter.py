@@ -92,9 +92,9 @@ async def test_participants_live_excludes_tombstones(tmp_path) -> None:
         _insert_tombstone("ghost-1")
         _insert_tombstone("ghost-2")
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/messages/participants",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert r.status_code == 200, r.text
         body = r.json()
@@ -128,9 +128,9 @@ async def test_participants_live_includes_non_terminated_agents(
         await admin.create_worker("bob")
         _insert_tombstone("ghost-3")
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/messages/participants",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert r.status_code == 200, r.text
         live_ids = [a["agent_id"] for a in r.json().get("live", [])]
@@ -147,9 +147,9 @@ async def test_participants_live_still_excludes_terminated(tmp_path) -> None:
         await admin.create_worker("alice")
         await _seed_terminated_worker("bob-terminated")
 
-        r = admin.client.post(
+        r = admin.post(
             "/api/messages/participants",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert r.status_code == 200, r.text
         live_ids = [a["agent_id"] for a in r.json().get("live", [])]

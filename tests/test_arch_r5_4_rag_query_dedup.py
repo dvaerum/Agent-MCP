@@ -139,10 +139,9 @@ def _seed(admin, *, key: str, value: str) -> None:
     project_context, so the secret row this test pins is a secret-NAMED
     knowledge key (vocab match) seeded through the normal write path.
     """
-    r = admin.client.post(
+    r = admin.post(
         "/api/memories",
         json={
-            "token": admin.admin_token,
             "context_key": key,
             "context_value": value,
         },

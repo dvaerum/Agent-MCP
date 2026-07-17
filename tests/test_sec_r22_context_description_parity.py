@@ -216,10 +216,9 @@ async def test_rest_value_only_update_preserves_description(
     PUT preserves the existing description. Guards the reference
     behaviour so the parity target can't silently regress."""
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/memories",
             json={
-                "token": admin.admin_token,
                 "context_key": "r22_rest",
                 "context_value": {"v": 1},
                 "description": "original rest description",
@@ -228,10 +227,10 @@ async def test_rest_value_only_update_preserves_description(
         assert r.status_code == 200, r.text
         assert _read_description("r22_rest") == "original rest description"
 
-        r = admin.client.request(
+        r = admin.request(
             "PUT",
             "/api/memories/r22_rest",
-            json={"token": admin.admin_token, "context_value": {"v": 2}},
+            json={"context_value": {"v": 2}},
         )
         assert r.status_code == 200, r.text
         assert _read_description("r22_rest") == "original rest description"

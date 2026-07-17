@@ -82,10 +82,9 @@ async def test_tasks_create_500_is_generic_on_unexpected_error(
 
     async with mcp_session(tmp_path) as admin:
         monkeypatch.setattr(uow_mod, "get_db_connection", _boom)
-        r = admin.client.post(
+        r = admin.post(
             "/api/tasks",
             json={
-                "token": admin.admin_token,
                 "task_title": "leak probe",
                 "task_description": "a valid string description",
             },
@@ -100,9 +99,9 @@ async def test_tasks_create_400_validation_message_preserved(tmp_path) -> None:
     """Regression: the deliberate missing-title 400 keeps its intended,
     user-facing message (must NOT be genericized)."""
     async with mcp_session(tmp_path) as admin:
-        r = admin.client.post(
+        r = admin.post(
             "/api/tasks",
-            json={"token": admin.admin_token, "task_description": "no title"},
+            json={"task_description": "no title"},
         )
         assert r.status_code == 400, r.text
         assert r.json().get("error") == "task_title is required", r.json()

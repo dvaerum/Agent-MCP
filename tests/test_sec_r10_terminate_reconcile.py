@@ -176,11 +176,11 @@ async def test_purge_reconciles_task_cache(tmp_path):
         _warm_cache("pc-1")
         assert g.tasks["pc-1"]["assigned_to"] == agent_id
 
-        resp = admin.client.request(
+        resp = admin.request(
             "DELETE",
             f"/api/agents/{agent_id}",
             params={"cascade": "true"},
-            json={"token": admin.admin_token},
+            json={},
         )
         assert resp.status_code == 200, resp.text
 

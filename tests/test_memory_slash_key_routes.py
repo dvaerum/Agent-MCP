@@ -41,10 +41,9 @@ def _ctx_row(key: str) -> dict | None:
 
 
 async def _create(admin, key: str, value: str = "orig") -> None:
-    r = admin.client.post(
+    r = admin.post(
         "/api/memories",
         json={
-            "token": admin.admin_token,
             "context_key": key,
             "context_value": value,
             "description": "slash-route test",
@@ -60,10 +59,10 @@ async def _create(admin, key: str, value: str = "orig") -> None:
 async def test_delete_slashed_memory_key(tmp_path, key) -> None:
     async with mcp_session(tmp_path) as admin:
         await _create(admin, key)
-        r = admin.client.request(
+        r = admin.request(
             "DELETE",
             f"/api/memories/{key}",
-            json={"token": admin.admin_token},
+            json={},
         )
         assert r.status_code == 200, (
             f"DELETE of slashed key {key!r} should be 200, got "
@@ -76,10 +75,10 @@ async def test_delete_slashed_memory_key(tmp_path, key) -> None:
 async def test_update_slashed_memory_key(tmp_path, key) -> None:
     async with mcp_session(tmp_path) as admin:
         await _create(admin, key, "orig")
-        r = admin.client.put(
+        r = admin.request(
+            "PUT",
             f"/api/memories/{key}",
             json={
-                "token": admin.admin_token,
                 "context_value": "updated-value",
                 "description": "d",
             },

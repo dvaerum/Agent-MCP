@@ -90,8 +90,8 @@ async def test_rest_and_mcp_create_task_are_one_path(
         }
 
         # --- REST: POST /api/tasks ---
-        r = admin.client.post(
-            "/api/tasks", json={"token": admin.admin_token, **body}
+        r = admin.post(
+            "/api/tasks", json={**body}
         )
         assert r.status_code == 200, r.text
         assert r.json().get("success") is True, r.json()

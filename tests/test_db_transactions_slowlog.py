@@ -56,10 +56,9 @@ async def test_assign_existing_tasks_commits_once(tmp_path) -> None:
         # the dashboard uses).
         task_ids = []
         for i in range(5):
-            r = admin.client.post(
+            r = admin.post(
                 "/api/tasks",
                 json={
-                    "token": admin.admin_token,
                     "task_title": f"bulk-task-{i}",
                     "task_description": "x",
                 },
