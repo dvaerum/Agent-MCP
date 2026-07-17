@@ -38,6 +38,7 @@ from ..features.task_queries import (
     TaskFilterSpec,
     TaskQueryEngine,
     TaskSortSpec,
+    status_filter_matches,
 )
 
 # For request_assistance, generate_id was used. Let's use secrets.token_hex for consistency.
@@ -3199,6 +3200,11 @@ async def view_tasks_tool_impl(
     agent_auth_token = arguments.get("token")
     filter_agent_id = arguments.get("agent_id")  # Optional agent_id to filter by
     filter_status = arguments.get("status")  # Optional status to filter by
+    # New discovery filters: by creator, and the unassigned (claimable)
+    # pool. ``unassigned`` is a dedicated boolean (never a magic agent_id)
+    # so an agent named "unassigned" can't collide.
+    filter_created_by = arguments.get("created_by")
+    filter_unassigned = bool(arguments.get("unassigned", False))
     max_tokens = arguments.get(
         "max_tokens", 25000
     )  # Maximum response tokens (default: 25k)
@@ -3293,6 +3299,8 @@ async def view_tasks_tool_impl(
             # An admin filtering by a specific agent_id wants exactly
             # that agent's tasks, so this stays off for admins.
             include_unassigned=not is_admin_request,
+            created_by=filter_created_by,
+            unassigned=filter_unassigned,
         ),
         sort=TaskSortSpec(by=sort_by),
     )
@@ -4582,6 +4590,11 @@ async def search_tasks_tool_impl(
     agent_auth_token = arguments.get("token")
     search_query = arguments.get("search_query")
     status_filter = arguments.get("status_filter")
+    # New discovery filters (mirror view_tasks): by creator and the
+    # unassigned pool. ``unassigned`` is a dedicated boolean, never a
+    # magic agent_id, so an agent named "unassigned" can't collide.
+    filter_created_by = arguments.get("created_by")
+    filter_unassigned = bool(arguments.get("unassigned", False))
     max_results = arguments.get("max_results", 20)
     # OBS-R28-PF: coerce to int BEFORE the [:max_results] slices below.
     # Same numeric-coercion sibling as view_tasks — an integral float
@@ -4623,12 +4636,17 @@ async def search_tasks_tool_impl(
     # Guidance error: with neither a usable query nor a filter, there
     # is no implicit "everything" semantic — ask the caller to narrow.
     # `view_tasks` is the right tool for unbounded listing.
-    if not has_query and not status_filter:
+    if (
+        not has_query
+        and not status_filter
+        and not filter_created_by
+        and not filter_unassigned
+    ):
         return Invalid(
             message=(
-                "search_tasks requires either a search_query or a "
-                "status_filter. For an unfiltered listing of tasks, "
-                "use view_tasks instead."
+                "search_tasks requires at least one of: search_query, "
+                "status_filter, created_by, or unassigned. For an "
+                "unfiltered listing of tasks, use view_tasks instead."
             )
         )
 
@@ -4647,8 +4665,20 @@ async def search_tasks_tool_impl(
             if assignee != requesting_agent_id and assignee not in (None, ""):
                 continue
 
-        # Status filter
-        if status_filter and task_data.get("status") != status_filter:
+        # Status filter — ``status_filter_matches`` also recognises the
+        # ``incomplete``/``active``/``open`` pseudo-values (any non-terminal
+        # status) so callers can list all open work in one query.
+        if status_filter and not status_filter_matches(
+            status_filter, task_data.get("status")
+        ):
+            continue
+
+        # Creator filter (exact match on the agent that filed the task).
+        if filter_created_by and task_data.get("created_by") != filter_created_by:
+            continue
+
+        # Unassigned-pool filter (assigned_to IS NULL / empty).
+        if filter_unassigned and task_data.get("assigned_to") not in (None, ""):
             continue
 
         candidate_tasks.append(task_data)
@@ -5217,14 +5247,39 @@ def register_task_tools():
                 },
                 "status": {
                     "type": "string",
-                    "description": "Filter tasks by status (optional)",
+                    "description": (
+                        "Filter tasks by status (optional). Accepts a "
+                        "concrete status, or 'incomplete' (alias 'active'/"
+                        "'open') to list all non-terminal work — pending "
+                        "AND in_progress — in one query."
+                    ),
                     "enum": [
                         "pending",
                         "in_progress",
                         "completed",
                         "cancelled",
                         "failed",
+                        "incomplete",
+                        "active",
+                        "open",
                     ],
+                },
+                "created_by": {
+                    "type": "string",
+                    "description": (
+                        "Filter to tasks created by this agent ID (exact "
+                        "match on the task's creator)."
+                    ),
+                },
+                "unassigned": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, return only unassigned (claimable-pool) "
+                        "tasks — those with no assignee. This is a boolean, "
+                        "not an agent_id value, so it never collides with "
+                        "an agent that happens to be named 'unassigned'."
+                    ),
+                    "default": False,
                 },
                 "max_tokens": {
                     "type": "integer",
@@ -5323,14 +5378,38 @@ def register_task_tools():
                 },
                 "status_filter": {
                     "type": "string",
-                    "description": "Optional status filter",
+                    "description": (
+                        "Optional status filter. Accepts a concrete status, "
+                        "or 'incomplete' (alias 'active'/'open') to list all "
+                        "non-terminal work — pending AND in_progress."
+                    ),
                     "enum": [
                         "pending",
                         "in_progress",
                         "completed",
                         "cancelled",
                         "failed",
+                        "incomplete",
+                        "active",
+                        "open",
                     ],
+                },
+                "created_by": {
+                    "type": "string",
+                    "description": (
+                        "Filter to tasks created by this agent ID. Valid as "
+                        "a filter-only listing (no search_query required)."
+                    ),
+                },
+                "unassigned": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, return only unassigned (claimable-pool) "
+                        "tasks. A boolean, not an agent_id value, so it never "
+                        "collides with an agent named 'unassigned'. Valid as "
+                        "a filter-only listing (no search_query required)."
+                    ),
+                    "default": False,
                 },
                 "max_results": {
                     "type": "integer",

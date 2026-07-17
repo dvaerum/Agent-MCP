@@ -59,6 +59,15 @@ class TaskFilterSpec:
     # worker-facing "my tasks + the claimable pool" visibility rule.
     # Ignored when ``agent_id`` is None (no ownership filter to widen).
     include_unassigned: bool = False
+    # Narrow to tasks created by this agent (exact match on ``created_by``).
+    created_by: Optional[str] = None
+    # Narrow to the unassigned (claimable) pool: ``assigned_to IS NULL``
+    # (or empty). A DEDICATED boolean, never a magic ``agent_id`` value,
+    # so an agent literally named "unassigned" cannot collide with the
+    # sentinel. Composes with the other filters by AND (e.g. a worker's
+    # ``agent_id`` + ``unassigned`` narrows their {mine, pool} view to
+    # just the pool).
+    unassigned: bool = False
 
 
 @dataclass(frozen=True)
@@ -129,6 +138,26 @@ _STATUS_ORDER = {
 _REVERSE_SORT_KEYS = {"created_at", "updated_at", "priority", "status"}
 _STALE_DAYS = 7
 _ACTIVE_STATUSES = {"in_progress", "pending"}
+
+#: Status-filter pseudo-values that expand to "any non-terminal status"
+#: (:data:`_ACTIVE_STATUSES` = ``pending`` + ``in_progress``), so a
+#: caller can list all open/claimable work in one query instead of
+#: asking for each active status separately. Collision-safe: task status
+#: is a closed write-time enum (pending/in_progress/completed/cancelled/
+#: failed) that never contains these words, so a real task can never HAVE
+#: one of these as its status.
+INCOMPLETE_STATUS_ALIASES = frozenset({"incomplete", "active", "open"})
+
+
+def status_filter_matches(want: str, actual: Optional[str]) -> bool:
+    """Whether a task whose status is ``actual`` satisfies a ``want``
+    status filter. ``want`` is either a concrete status (exact match) or
+    one of :data:`INCOMPLETE_STATUS_ALIASES` (matches any active status).
+    Shared by ``view_tasks`` (via the engine) and ``search_tasks`` so the
+    two surfaces interpret the pseudo-values identically."""
+    if want in INCOMPLETE_STATUS_ALIASES:
+        return actual in _ACTIVE_STATUSES
+    return actual == want
 
 
 # --- Engine -----------------------------------------------------------
@@ -240,9 +269,18 @@ class TaskQueryEngine:
         all_tasks: Dict[str, Dict[str, Any]],
         blocked_evaluator: Callable[[Dict[str, Any]], bool],
     ) -> bool:
-        if filters.status and task.get("status") != filters.status:
+        if filters.status and not status_filter_matches(
+            filters.status, task.get("status")
+        ):
             return False
         if filters.priority and task.get("priority") != filters.priority:
+            return False
+        if (
+            filters.created_by
+            and task.get("created_by") != filters.created_by
+        ):
+            return False
+        if filters.unassigned and task.get("assigned_to") not in (None, ""):
             return False
         if filters.agent_id:
             assignee = task.get("assigned_to")
