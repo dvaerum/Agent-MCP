@@ -190,7 +190,9 @@ async def test_6_worker_cannot_create_config_key(tmp_path) -> None:
             {"context_key": "config_foo", "context_value": "v"},
         )
         msg = r[0].text
-        assert "Unauthorized" in msg, msg
+        # Worker-message clarity: config_* rejection is Invalid, NOT the
+        # Unauthorized-framed PermissionDenied.
+        assert "Unauthorized" not in msg, msg
         assert "project settings store" in msg, msg
         assert _row("config_foo") is None
 
@@ -198,14 +200,14 @@ async def test_6_worker_cannot_create_config_key(tmp_path) -> None:
 async def test_7_admin_cannot_create_config_key_either(tmp_path) -> None:
     """Wave 11 (ADR-0016): config_* is rejected on the knowledge write
     path for EVERYONE — admin included (the settings store owns the
-    namespace; use update_project_settings)."""
+    namespace)."""
     async with mcp_session(tmp_path) as admin:
         r = await admin.call(
             "update_project_context",
             {"context_key": "config_foo", "context_value": "v"},
         )
         msg = r[0].text
-        assert "Unauthorized" in msg, msg
+        assert "Unauthorized" not in msg, msg
         assert "project settings store" in msg, msg
         assert _row("config_foo") is None
 
@@ -220,7 +222,7 @@ async def test_8_worker_cannot_write_config_key_owned_or_not(tmp_path) -> None:
             {"context_key": "config_foo", "context_value": "hacked"},
         )
         msg = r[0].text
-        assert "Unauthorized" in msg, msg
+        assert "Unauthorized" not in msg, msg
         assert "project settings store" in msg, msg
 
 

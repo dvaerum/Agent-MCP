@@ -344,42 +344,58 @@ async def test_update_project_context_manager_regular_key(tmp_path) -> None:
 async def test_update_project_context_worker_config_key_rejected(
     tmp_path,
 ) -> None:
-    """Worker writing ``config_*`` → Unauthorized.
+    """Worker writing ``config_*`` → rejected.
 
     Already enforced by ``_check_write_authorization`` before Wave 3;
     pinned here so the matrix is end-to-end visible in one file.
+
+    Worker-message clarity: the rejection is ``Invalid`` (not the
+    Unauthorized-framed ``PermissionDenied``) — it steers the worker to a
+    non-config_* key rather than an unfixable auth error — so this asserts
+    on the error+wording, not on the "Unauthorized" prefix.
     """
     async with mcp_session(tmp_path) as admin:
         wkr = await admin.create_worker("wkr-cfg")
-        await wkr.assert_unauthorized(
+        r = await wkr.call(
             "update_project_context",
             {
                 "context_key": "config_secret",
                 "context_value": "should not land",
             },
         )
+        msg = r[0].text
+        assert wkr._last_is_error, msg
+        assert "Unauthorized" not in msg, msg
+        assert "project settings store" in msg, msg
 
 
 async def test_update_project_context_manager_config_key_rejected(
     tmp_path,
 ) -> None:
-    """Manager writing ``config_*`` → Unauthorized.
+    """Manager writing ``config_*`` → rejected.
 
     Managers are NOT operators; the matrix puts ``config_*`` mutation
     in the operator-only column. The existing ``_check_write_authorization``
     treats anything that isn't ``verify_token(token, "admin")`` as a
     worker → that already rejects managers; this test pins the contract.
+
+    Worker-message clarity: rejection is ``Invalid`` (not the
+    Unauthorized-framed ``PermissionDenied``); assert on error+wording.
     """
     async with mcp_session(tmp_path) as admin:
         mgr = await admin.create_worker("mgr-cfg")
         _set_agent_role(mgr.token, "manager")
-        await mgr.assert_unauthorized(
+        r = await mgr.call(
             "update_project_context",
             {
                 "context_key": "config_secret_mgr",
                 "context_value": "should not land",
             },
         )
+        msg = r[0].text
+        assert mgr._last_is_error, msg
+        assert "Unauthorized" not in msg, msg
+        assert "project settings store" in msg, msg
 
 
 async def test_update_project_settings_operator_config_key_admitted(

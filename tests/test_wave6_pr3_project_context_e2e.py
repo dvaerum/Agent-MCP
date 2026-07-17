@@ -325,11 +325,14 @@ async def test_update_project_context_unserializable_value_returns_invalid(
 async def test_update_project_context_config_key_rejected_for_worker(
     tmp_path,
 ) -> None:
-    """A worker creating a ``config_*`` key surfaces as
-    :class:`PermissionDenied` with the config-only message —
-    matches the pre-migration "Unauthorized: config_* keys are
-    admin-only" text after the renderer's ``Unauthorized: ``
-    prefix is added back."""
+    """A worker creating a ``config_*`` key surfaces as :class:`Invalid`
+    with the config-only message.
+
+    Worker-message clarity: the rejection is ``Invalid`` (an
+    unprocessable input) rather than the Unauthorized-framed
+    ``PermissionDenied`` — it steers the worker to a non-config_* key
+    instead of an auth error it can't fix, and names no operator-only
+    tool."""
     from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path):
@@ -345,8 +348,8 @@ async def test_update_project_context_config_key_rejected_for_worker(
             principal=_worker_principal(),
         )
 
-    assert isinstance(result, PermissionDenied)
-    assert "config_*" in result.reason or "config_" in result.reason
+    assert isinstance(result, Invalid)
+    assert "config_*" in result.message or "config_" in result.message
 
 
 # ── bulk_update — Ok / PermissionDenied / Invalid ────────────────

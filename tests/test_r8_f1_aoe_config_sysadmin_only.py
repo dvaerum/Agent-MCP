@@ -35,7 +35,7 @@ from __future__ import annotations
 import pytest
 
 from agent_mcp.core.principal import Principal
-from agent_mcp.core.tool_result import Ok, PermissionDenied
+from agent_mcp.core.tool_result import Invalid, Ok, PermissionDenied
 from tests.harness import make_principal, mcp_session
 
 pytestmark = pytest.mark.asyncio
@@ -142,7 +142,11 @@ async def test_bulk_context_update_with_config_aoe_rejected(tmp_path) -> None:
     """A context bulk update whose batch contains a ``config_aoe_*`` key
     is rejected wholesale — post-ADR-0016 the context tools reject the
     entire config namespace, so the AoE key can't be smuggled through
-    the bulk path either."""
+    the bulk path either.
+
+    Worker-message clarity: the config_* rejection is now ``Invalid``
+    (not the Unauthorized-framed ``PermissionDenied``) — the wholesale
+    rejection is unchanged, only the surfaced variant/wording."""
     from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path):
@@ -156,7 +160,7 @@ async def test_bulk_context_update_with_config_aoe_rejected(tmp_path) -> None:
             principal=_operator_principal(),
         )
 
-    assert isinstance(result, PermissionDenied)
+    assert isinstance(result, Invalid)
 
 
 async def test_operator_denied_creating_config_aoe_bearer(

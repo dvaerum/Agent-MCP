@@ -205,17 +205,29 @@ async def emit_context_write_wakes_bulk(context_keys) -> None:
             )
 
 
-def _config_key_error() -> "PermissionDenied":
+def _config_key_error() -> "Invalid":
     # ADR-0016 (Wave 11): the config_* namespace lives in the dedicated
     # project_settings store — the knowledge write path rejects it for
     # EVERYONE (admin included), so config can't be smuggled back into
     # the memory store (where it would be RAG-indexed and re-open the
     # F009 redaction class).
-    return PermissionDenied(
-        reason=(
-            "config_* keys moved to the project settings store "
-            "(ADR-0016); use update_project_settings"
-        )
+    #
+    # Worker-message clarity: returns Invalid, NOT PermissionDenied. The
+    # MCP renderer prefixes every PermissionDenied with "Unauthorized:",
+    # which reads to a worker as an auth failure it can't fix; the old
+    # text also pointed the worker at ``update_project_settings`` — an
+    # operator-only tool, so following the hint earned a SECOND denial
+    # (the false-bug loop). Invalid renders "Error: invalid context_key:
+    # …" and steers the worker to pick a non-config_* memory key itself,
+    # or escalate to an operator, without naming an unreachable tool.
+    return Invalid(
+        field="context_key",
+        message=(
+            "'config_*' keys are not stored in project memory — they "
+            "live in the operator-managed project settings store. "
+            "Choose a non-config_* key for memory, or ask a project "
+            "operator to set this via project settings."
+        ),
     )
 
 
@@ -250,6 +262,26 @@ from ..db.models import ProjectContext
 from ..db.actions.agent_actions_db import log_agent_action_to_db
 from ..db.unit_of_work import unit_of_work
 from ..repositories import project_context_repository as project_context_repo
+
+
+# Worker-facing generic error text (SD-R9-1 class — same hardening
+# applied to rag/query.py). Every ``Failed`` arm below logs the raw
+# sqlite3 / SQLAlchemy exception server-side (``exc_info=True``) and
+# returns ONE of these generic strings, so schema / column / path
+# internals never reach a worker. The wire renderer already genericizes
+# ``Failed.message`` (SEC-R8-1); keeping the impl generic too is
+# defense-in-depth and keeps the raw exception out of any server-internal
+# consumer of the returned ``ToolResult``.
+_GENERIC_DB_ERROR = (
+    "A database error occurred while processing this request; it has "
+    "been logged. Retry; if it persists, ask an operator to check "
+    "server logs."
+)
+_GENERIC_ERROR = (
+    "An error occurred while processing this request; it has been "
+    "logged. Retry; if it persists, ask an operator to check server "
+    "logs."
+)
 
 
 # ── Wave 6 PR 3 helpers ──────────────────────────────────────────────
@@ -939,9 +971,7 @@ async def view_project_context_tool_impl(
             logger.error(
                 f"Database error viewing project context: {e_sql}", exc_info=True
             )  # main.py:1462
-            return Failed(
-                message=f"Database error viewing project context: {e_sql}"
-            )
+            return Failed(message=_GENERIC_DB_ERROR)
         except (
             json.JSONDecodeError
         ) as e_json:  # Should be caught per-item, but as a fallback
@@ -954,7 +984,7 @@ async def view_project_context_tool_impl(
             )
         except Exception as e:
             logger.error(f"Unexpected error viewing project context: {e}", exc_info=True)
-            return Failed(message=f"An unexpected error occurred: {e}")
+            return Failed(message=_GENERIC_ERROR)
 
     return Ok(
         data={
@@ -1096,13 +1126,13 @@ async def _handle_single_context_update(
             f"Database error updating project context for key '{context_key_to_update}': {e_sql}",
             exc_info=True,
         )
-        return Failed(message=f"Database error updating project context: {e_sql}")
+        return Failed(message=_GENERIC_DB_ERROR)
     except Exception as e:
         logger.error(
             f"Unexpected error updating project context for key '{context_key_to_update}': {e}",
             exc_info=True,
         )
-        return Failed(message=f"Unexpected error updating project context: {e}")
+        return Failed(message=_GENERIC_ERROR)
 
     if err is not None:
         # ``_single_update_inline`` propagates the typed
@@ -1158,10 +1188,10 @@ async def _handle_bulk_context_update(
         )
     except (sqlite3.Error, SQLAlchemyError) as e_sql:
         logger.error(f"Database error in bulk context update: {e_sql}", exc_info=True)
-        return Failed(message=f"Database error in bulk update: {e_sql}")
+        return Failed(message=_GENERIC_DB_ERROR)
     except Exception as e:
         logger.error(f"Unexpected error in bulk context update: {e}", exc_info=True)
-        return Failed(message=f"Unexpected error in bulk update: {e}")
+        return Failed(message=_GENERIC_ERROR)
     if err is not None:
         # ``_bulk_update_inline`` propagates the typed
         # :class:`PermissionDenied` straight from
@@ -1438,9 +1468,15 @@ async def bulk_update_project_context_tool_impl(
             requesting_agent_id, updates, is_admin=is_admin
         )
     except (sqlite3.Error, SQLAlchemyError) as e_sql:
-        return Failed(message=f"Database error in bulk update: {e_sql}")
+        logger.error(
+            f"Database error in bulk context update: {e_sql}", exc_info=True
+        )
+        return Failed(message=_GENERIC_DB_ERROR)
     except Exception as e:
-        return Failed(message=f"Unexpected error in bulk update: {e}")
+        logger.error(
+            f"Unexpected error in bulk context update: {e}", exc_info=True
+        )
+        return Failed(message=_GENERIC_ERROR)
     if err is not None:
         # ``_bulk_update_inline`` propagates the typed
         # :class:`PermissionDenied` straight from
@@ -1513,7 +1549,14 @@ def _create_context_inline(
             connection=cursor,
         )
         if row is None:
-            return Conflict(reason="Memory with this key already exists")
+            return Conflict(
+                reason=(
+                    f"Memory key '{context_key}' already exists. "
+                    f"create_project_context is insert-only — use "
+                    f"update_project_context to change an existing "
+                    f"key's value."
+                )
+            )
 
         # Audit through the same cursor so the action lands in the SAME
         # transaction as the project_context insert.
@@ -1629,18 +1672,14 @@ async def create_project_context_tool_impl(
             f"'{context_key}': {e_sql}",
             exc_info=True,
         )
-        return Failed(
-            message=f"Database error creating project context: {e_sql}"
-        )
+        return Failed(message=_GENERIC_DB_ERROR)
     except Exception as e:
         logger.error(
             f"Unexpected error creating project context for key "
             f"'{context_key}': {e}",
             exc_info=True,
         )
-        return Failed(
-            message=f"Unexpected error creating project context: {e}"
-        )
+        return Failed(message=_GENERIC_ERROR)
 
     if err_result is not None:
         return err_result
@@ -1812,7 +1851,7 @@ async def backup_project_context_tool_impl(
     except Exception as e:
         # The unit-of-work already rolled back + closed the connection.
         logger.error(f"Error creating context backup: {e}", exc_info=True)
-        return Failed(message=f"Error creating backup: {e}")
+        return Failed(message=_GENERIC_ERROR)
 
 
 # --- validate_context_consistency tool ---
@@ -1957,12 +1996,12 @@ async def validate_context_consistency_tool_impl(
             logger.error(
                 f"Database error validating context consistency: {e_sql}", exc_info=True
             )
-            return Failed(message=f"Database error validating context: {e_sql}")
+            return Failed(message=_GENERIC_DB_ERROR)
         except Exception as e:
             logger.error(
                 f"Unexpected error validating context consistency: {e}", exc_info=True
             )
-            return Failed(message=f"Unexpected error validating context: {e}")
+            return Failed(message=_GENERIC_ERROR)
 
 
 # --- Register project context tools ---
@@ -2416,7 +2455,7 @@ async def delete_project_context_tool_impl(
     except Exception as e:
         # The unit-of-work already rolled back + closed the connection.
         logger.error(f"Error in delete_project_context_tool_impl: {e}", exc_info=True)
-        return Failed(message=f"Error deleting project context: {str(e)}")
+        return Failed(message=_GENERIC_ERROR)
 
 
 # Call registration when this module is imported

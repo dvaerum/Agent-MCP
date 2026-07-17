@@ -760,9 +760,15 @@ async def test_context_write_rejects_config_for_admin(tmp_path: Path) -> None:
                 f"{tool}: config_* must be rejected on the context path "
                 f"even for admin; got: {text}"
             )
-            assert "project settings store" in text and "ADR-0016" in text, (
-                f"{tool}: rejection must point at the settings store "
-                f"(ADR-0016); got: {text}"
+            # Worker-message clarity: rejection is Invalid (not the
+            # Unauthorized-framed PermissionDenied) and drops the internal
+            # ADR-0016 jargon; it still points at the settings store.
+            assert "project settings store" in text, (
+                f"{tool}: rejection must point at the settings store; "
+                f"got: {text}"
+            )
+            assert "Unauthorized" not in text, (
+                f"{tool}: must not render as Unauthorized; got: {text}"
             )
 
         # The harness roots the app at tmp_path/"project".
@@ -830,7 +836,12 @@ async def test_context_delete_rejects_config_keys(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_rest_memories_rejects_config_for_operator(tmp_path: Path) -> None:
     """The REST /api/memories surface dispatches the context tools, so
-    the everyone-rejection shows up there as a 403 as well."""
+    the everyone-rejection shows up there too.
+
+    Worker-message clarity: config_* rejection is now ``Invalid`` (an
+    unprocessable input, not an authorization failure), so the REST status
+    is 400 rather than 403 — the caller can't fix it by re-authenticating;
+    they must pick a non-config_* key or use the settings surface."""
     async with mcp_session(tmp_path) as admin:
         r = admin.post(
             "/api/memories",
@@ -839,7 +850,7 @@ async def test_rest_memories_rejects_config_for_operator(tmp_path: Path) -> None
                 "context_value": True,
             },
         )
-        assert r.status_code == 403, r.text
+        assert r.status_code == 400, r.text
         assert "settings" in r.text
 
 
