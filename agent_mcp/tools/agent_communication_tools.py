@@ -159,7 +159,11 @@ def _can_agents_communicate(sender_id: str, recipient_id: str, is_admin: bool) -
 
     # Self-communication not allowed (use internal methods)
     if sender_id == recipient_id:
-        return False, "Self-communication not allowed"
+        return False, (
+            "you cannot message yourself. To record your own "
+            "progress/context on a task, use add_task_note(task_id=..., "
+            "text=...) instead."
+        )
 
     # Admin agent can always be contacted. Match the canonical "admin"
     # identity EXACTLY — a startswith wildcard would let a worker message
@@ -179,7 +183,16 @@ def _can_agents_communicate(sender_id: str, recipient_id: str, is_admin: bool) -
     if sender_id in active_ids and recipient_id in active_ids:
         return True, "Both agents are active"
 
-    return False, "Communication not permitted between these agents"
+    # SECURITY: collapse offline / terminated / nonexistent recipients into
+    # ONE clause — never an existence oracle. A worker cannot tell whether
+    # `recipient_id` is a real-but-offline agent, a terminated one, or was
+    # never registered: all three miss the active-set check identically and
+    # yield this same denial (which also never echoes the probed id back).
+    return False, (
+        "the recipient is not a currently-active agent (it may be "
+        "offline, terminated, or unknown). Only messages between two "
+        "currently-active agents are delivered."
+    )
 
 
 def check_send_message_permission(
@@ -235,9 +248,13 @@ def check_send_message_permission(
         ):
             return PermissionDenied(
                 reason=(
-                    "worker access denied by project policy "
-                    "(config_allow_worker_to_worker is off). Ask admin "
-                    "to enable it in dashboard Settings."
+                    "Communication denied: direct agent-to-agent "
+                    "messaging is disabled for workers by the "
+                    "config_allow_worker_to_worker policy (this also "
+                    "blocks messaging admins). To escalate to a "
+                    "human/admin, use request_assistance(task_id=<your "
+                    "task>, description=...), or ask an admin to enable "
+                    "worker messaging in dashboard Settings."
                 )
             )
 
@@ -252,7 +269,14 @@ def check_send_message_permission(
     # stop_command; bridge-derived workers are rejected even if the
     # worker-to-worker toggle is on.
     if message_type == "stop_command" and not is_admin:
-        return PermissionDenied(reason="Only admin can send stop commands")
+        return PermissionDenied(
+            reason=(
+                "message_type 'stop_command' is admin-only. If you need "
+                "another agent to stop, send a normal 'text' message "
+                "explaining the request, or use request_assistance to "
+                "escalate to an admin."
+            )
+        )
 
     # Per-pair delivery rules — admin bypass + worker-to-worker active
     # set + admin recipient label.
@@ -516,8 +540,13 @@ async def send_agent_message_tool_impl(
     except LookupError as e:
         # Repository rejected an unknown recipient (VM e2e fix
         # 2026-06-16). The unit-of-work already rolled back the message
-        # INSERT and fired no effects. Surface the repo's message
-        # verbatim — it explains live / admin / tombstone semantics.
+        # INSERT and fired no effects. Return a typed NotFound naming the
+        # agent resource. This path is admin/operator-reachable ONLY — a
+        # worker's send is gated by _can_agents_communicate's
+        # active-recipient check (which collapses unknown/offline/
+        # terminated into one non-oracle denial) BEFORE the repo runs, so
+        # a worker never reaches here and no recipient id is leaked in a
+        # worker-facing denial.
         logger.warning(f"send_agent_message rejected: {e}")
         return NotFound(resource="agent", identifier=str(recipient_id))
     except _MessageStoreFailed as e:
