@@ -3476,6 +3476,12 @@ async def view_tasks_tool_impl(
         response_parts.append(
             "• Use sort_by=[priority|status|updated_at] for different sorting"
         )
+        if not filter_assigned and not filter_unassigned:
+            response_parts.append(
+                "• assigned=true = just your own tasks; add "
+                "status=incomplete for your open tasks; unassigned=true = "
+                "the claimable pool you can self-assign"
+            )
 
         response_text = "\n".join(response_parts)
 
@@ -4864,7 +4870,11 @@ async def search_tasks_tool_impl(
     # Add usage tips
     response_parts.append(f"\n\n💡 Tips:")
     response_parts.append("• Use view_tasks(task_id='ID') for full task details")
-    response_parts.append("• Add status_filter to narrow results")
+    response_parts.append(
+        "• Filters (combine, no query needed): unassigned=true (claimable "
+        "pool), assigned=true (your own tasks), assigned=true + "
+        "status_filter=incomplete (your open tasks), created_by=<agent>"
+    )
     response_parts.append("• Use max_results to control response size")
 
     log_audit(
@@ -5245,7 +5255,17 @@ def register_task_tools():
             "Smart task viewer with dependency analysis, health metrics, "
             "and advanced filtering. For an overview against a project "
             "with many tasks, prefer summary=true (and limit=50) to keep "
-            "the response well under the per-call token cap."
+            "the response well under the per-call token cap.\n"
+            "Common filters (combine freely):\n"
+            "• assigned=true — just YOUR OWN tasks (workers see their own "
+            "tasks + the shared pool by default; this drops the pool).\n"
+            "• assigned=true + status=incomplete — your OPEN tasks "
+            "(pending/in_progress), the usual 'what should I work on'.\n"
+            "• unassigned=true — the claimable POOL (tasks you can pick up "
+            "and self-assign).\n"
+            "• status=incomplete — all non-terminal tasks in one call "
+            "(alias 'active'/'open').\n"
+            "• created_by=<agent_id> — tasks a given agent filed."
         ),
         input_schema={
             "type": "object",
@@ -5387,7 +5407,17 @@ def register_task_tools():
 
     register_tool(
         name="search_tasks",
-        description="Full-text search across task titles, descriptions, and notes — or filter-only listing when no query is supplied. Critical for finding related work, avoiding duplication, and quickly listing tasks by status.",
+        description=(
+            "Full-text search across task titles, descriptions, and notes — "
+            "or filter-only listing when no query is supplied. Critical for "
+            "finding related work, avoiding duplication, and quickly listing "
+            "tasks by status/assignment.\n"
+            "Filter-only recipes (no search_query needed): "
+            "unassigned=true (the claimable pool), assigned=true (your own "
+            "tasks), assigned=true + status_filter=incomplete (your open "
+            "tasks), status_filter=incomplete (all open work), "
+            "created_by=<agent_id> (a given agent's tasks)."
+        ),
         input_schema={
             "type": "object",
             "properties": {
