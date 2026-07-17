@@ -30,7 +30,6 @@ from ..repositories import agent_repo
 from ..core.tool_result import (
     Failed,
     Invalid,
-    NotFound,
     Ok,
     PermissionDenied,
     ToolResult,
@@ -134,9 +133,24 @@ async def view_file_metadata_tool_impl(
         )
         row = cursor.fetchone()
         if row is None:
-            return NotFound(
-                resource="file metadata",
-                identifier=normalized_filepath_str,
+            # File metadata is optional and operator-managed. An absent
+            # row is the normal "nothing recorded yet" state, not a
+            # missing-resource error — surface Ok with an empty payload so
+            # a worker reads it as benign rather than a broken/404 lookup.
+            return Ok(
+                data={
+                    "filepath": normalized_filepath_str,
+                    "metadata": None,
+                    "last_updated_by": None,
+                    "last_updated_at": None,
+                    "content_hash": "N/A",
+                },
+                message=(
+                    f"No metadata has been recorded for "
+                    f"'{normalized_filepath_str}' yet. File metadata is "
+                    f"optional and operator-managed; an empty result here "
+                    f"is normal."
+                ),
             )
         try:
             metadata_parsed = json.loads(row["metadata"])
@@ -171,14 +185,28 @@ async def view_file_metadata_tool_impl(
             f"'{normalized_filepath_str}': {e_sql}",
             exc_info=True,
         )
-        return Failed(message=f"Database error viewing file metadata: {e_sql}")
+        # INFO-LEAK: never interpolate the raw exception/SQL into the
+        # caller-facing text (worker-visible). The detail stays in the
+        # server log (exc_info=True above); the caller gets a generic
+        # actionable message.
+        return Failed(
+            message=(
+                "A database error occurred; it has been logged. Retry, or "
+                "ask an operator to check logs."
+            )
+        )
     except Exception as e:
         logger.error(
             f"Unexpected error viewing file metadata for "
             f"'{normalized_filepath_str}': {e}",
             exc_info=True,
         )
-        return Failed(message=f"An unexpected error occurred: {e}")
+        return Failed(
+            message=(
+                "A database error occurred; it has been logged. Retry, or "
+                "ask an operator to check logs."
+            )
+        )
     finally:
         if conn:
             conn.close()
@@ -202,7 +230,11 @@ async def update_file_metadata_tool_impl(
     # ``has_role("operator")`` which over-broadly admitted viewers.
     if principal is None or not principal.has_capability("system.config.write"):
         return PermissionDenied(
-            reason="operator-tier authorization required to update file metadata"
+            reason=(
+                "Updating file metadata is an operator-only action; a worker "
+                "agent cannot record file metadata. Ask a project operator to "
+                "set it. (You can still read metadata with view_file_metadata.)"
+            )
         )
 
     filepath_arg = arguments.get("filepath")
@@ -315,14 +347,26 @@ async def update_file_metadata_tool_impl(
             f"'{normalized_filepath_str}': {e_sql}",
             exc_info=True,
         )
-        return Failed(message=f"Database error updating file metadata: {e_sql}")
+        # INFO-LEAK: keep the raw exception/SQL out of the caller-facing
+        # text; it lives only in the server log (exc_info=True above).
+        return Failed(
+            message=(
+                "A database error occurred; it has been logged. Retry, or "
+                "ask an operator to check logs."
+            )
+        )
     except Exception as e:
         logger.error(
             f"Unexpected error updating file metadata for "
             f"'{normalized_filepath_str}': {e}",
             exc_info=True,
         )
-        return Failed(message=f"Unexpected error updating file metadata: {e}")
+        return Failed(
+            message=(
+                "A database error occurred; it has been logged. Retry, or "
+                "ask an operator to check logs."
+            )
+        )
 
 
 # --- Register file metadata tools ---

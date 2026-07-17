@@ -486,8 +486,14 @@ async def test_check_file_status_rejects_operator(tmp_path) -> None:
 # ── file_metadata_tools.py: view + update ────────────────────────
 
 
-async def test_view_file_metadata_not_found(tmp_path) -> None:
-    """Unknown filepath surfaces as :class:`NotFound`."""
+async def test_view_file_metadata_no_row_returns_ok_benign(tmp_path) -> None:
+    """A filepath with no recorded metadata surfaces as a benign
+    :class:`Ok` with an empty payload — not :class:`NotFound`.
+
+    File metadata is optional and operator-managed, so "nothing
+    recorded yet" is a normal state a worker should read as benign,
+    not a broken/404 lookup. See ``test_worker_msg_file_tools_clarity``
+    for the message-wording assertions."""
     from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path) as admin:
@@ -502,10 +508,9 @@ async def test_view_file_metadata_not_found(tmp_path) -> None:
             principal=p,
         )
 
-        assert isinstance(result, NotFound), (
-            f"expected NotFound, got {result!r}"
-        )
-        assert result.resource == "file metadata"
+        assert isinstance(result, Ok), f"expected Ok, got {result!r}"
+        assert result.data["metadata"] is None
+        assert result.data["filepath"].endswith("/never-recorded.txt")
 
 
 async def test_view_file_metadata_ok_returns_parsed_data(tmp_path) -> None:
