@@ -97,7 +97,8 @@ async def test_gate_denies_stop_command_from_non_admin(tmp_path) -> None:
             message_type="stop_command",
         )
         assert isinstance(denial, PermissionDenied), denial
-        assert "stop command" in denial.reason.lower(), denial.reason
+        assert "stop_command" in denial.reason.lower(), denial.reason
+        assert "admin-only" in denial.reason.lower(), denial.reason
 
 
 async def test_gate_enforces_4000_char_cap_even_for_operator(tmp_path) -> None:
