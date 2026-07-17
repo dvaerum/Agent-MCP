@@ -171,7 +171,8 @@ async def test_create_memory_duplicate_key_conflicts_both_surfaces(
         )
         assert first.status_code == 200, first.text
 
-        # REST duplicate → 409 with the exact legacy wording.
+        # REST duplicate → 409. Worker-message clarity: the reason now
+        # names the key and points at the update tool (insert-only).
         dup_rest = admin.post(
             "/api/memories",
             json={
@@ -180,7 +181,11 @@ async def test_create_memory_duplicate_key_conflicts_both_surfaces(
             },
         )
         assert dup_rest.status_code == 409, dup_rest.text
-        assert dup_rest.json()["error"] == "Memory with this key already exists"
+        err = dup_rest.json()["error"]
+        assert "mem.dup" in err, err
+        assert "already exists" in err, err
+        assert "insert-only" in err, err
+        assert "update_project_context" in err, err
 
         # MCP duplicate → Conflict variant (rendered as a conflict error).
         dup_mcp = await admin.call(

@@ -35,7 +35,7 @@ from __future__ import annotations
 import pytest
 
 from agent_mcp.core.principal import Principal
-from agent_mcp.core.tool_result import Ok, PermissionDenied
+from agent_mcp.core.tool_result import Invalid, Ok, PermissionDenied
 from agent_mcp.tools.project_context_tools import (
     bulk_update_project_context_tool_impl,
     delete_project_context_tool_impl,
@@ -210,14 +210,18 @@ async def test_worker_agent_can_still_delete_own_key(tmp_path) -> None:
 
 
 async def test_worker_still_blocked_on_config_key(tmp_path) -> None:
-    """The pre-existing config_* admin-only guard must survive the fix."""
+    """The pre-existing config_* guard must survive the fix.
+
+    Worker-message clarity: the config_* rejection is now ``Invalid``
+    (not the Unauthorized-framed ``PermissionDenied``) — the block itself
+    is unchanged (no row lands), only the surfaced variant/wording."""
     async with mcp_session(tmp_path):
         worker = _worker(agent_id="wkr-A")
         result = await update_project_context_tool_impl(
             {"context_key": "config_foo", "context_value": "v"},
             principal=worker,
         )
-        assert isinstance(result, PermissionDenied), result
+        assert isinstance(result, Invalid), result
         assert _row("config_foo") is None
 
 

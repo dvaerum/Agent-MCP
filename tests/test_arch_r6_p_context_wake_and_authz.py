@@ -283,12 +283,12 @@ async def test_write_surfaces_fire_same_wake_set(
 # ── #3: typed authz denial, no double-prefix ──────────────────────────
 
 
-async def test_config_key_denial_is_typed_permission_denied() -> None:
-    """``_check_write_authorization`` returns a :class:`PermissionDenied`
-    directly (not a pre-formatted ``"Unauthorized: ..."`` string) and
-    the reason text carries NO leading ``"Unauthorized: "`` — the wire
-    renderer supplies that prefix exactly once."""
-    from agent_mcp.core.tool_result import PermissionDenied
+async def test_config_key_denial_is_typed_invalid() -> None:
+    """``_check_write_authorization`` returns a typed :class:`Invalid` for
+    a config_* key (worker-message clarity: NOT the Unauthorized-framed
+    ``PermissionDenied``), pointing the caller at the settings store and
+    naming no operator-only tool."""
+    from agent_mcp.core.tool_result import Invalid
     from agent_mcp.tools import project_context_tools as pct
 
     denied = pct._check_write_authorization(
@@ -297,33 +297,38 @@ async def test_config_key_denial_is_typed_permission_denied() -> None:
         context_key="config_secret_thing",
         is_admin=False,
     )
-    assert isinstance(denied, PermissionDenied), (
-        f"expected a typed PermissionDenied, got {denied!r}"
+    assert isinstance(denied, Invalid), (
+        f"expected a typed Invalid, got {denied!r}"
     )
-    assert not denied.reason.lower().startswith("unauthorized"), (
-        f"reason must not carry its own Unauthorized prefix (the "
-        f"renderer adds it once); got {denied.reason!r}"
-    )
-    # ADR-0016: the denial points the caller at the settings store.
-    assert "project settings store" in denied.reason
+    # ADR-0016: the denial points the caller at the settings store …
+    assert "project settings store" in denied.message
+    # … but NOT at the operator-only update_project_settings tool.
+    assert "update_project_settings" not in denied.message
 
 
-async def test_config_key_wire_text_has_exactly_one_unauthorized_prefix(
+async def test_creator_mismatch_wire_text_has_exactly_one_unauthorized_prefix(
     tmp_path: Path,
 ) -> None:
-    """End-to-end: a worker denied for writing a config_* key sees
+    """End-to-end: a worker denied for writing ANOTHER worker's key sees
     EXACTLY one ``"Unauthorized: "`` prefix on the MCP wire — pins the
-    renderer-supplies-the-prefix contract this refactor depends on."""
+    renderer-supplies-the-prefix contract this refactor depends on.
+
+    (The vehicle is the creator-mismatch denial, which stays a typed
+    :class:`PermissionDenied`; the config_* denial is now ``Invalid`` and
+    no longer carries the Unauthorized prefix.)"""
     from tests.harness import _first_text
 
     async with mcp_session(tmp_path) as admin:
-        wkr = await admin.create_worker("wkr-authz-r6")
-        result = await wkr.call(
+        worker_a = await admin.create_worker("wkr-authz-r6-A")
+        worker_b = await admin.create_worker("wkr-authz-r6-B")
+        # A creates the key; B (a different creator) is denied on write.
+        await worker_a.call(
             "update_project_context",
-            {
-                "context_key": "config_secret_r6",
-                "context_value": "should not land",
-            },
+            {"context_key": "owned_by_a", "context_value": "v"},
+        )
+        result = await worker_b.call(
+            "update_project_context",
+            {"context_key": "owned_by_a", "context_value": "should not land"},
         )
         text = _first_text(result)
         assert text.startswith("Unauthorized: "), (
