@@ -64,6 +64,12 @@ router = APIRouter(
 @router.get("")
 async def all_tasks_api_route(request: Request) -> JSONResponse:
     # GET /api/tasks[?assigned_to=<agent_id>][?unassigned=true]
+    #     [?assigned=true][?status=<concrete|incomplete|active|open>]
+    #     [?created_by=<agent_id>]
+    #
+    # Operator-gated (the dashboard operator sees ALL tasks) — there is
+    # no worker-visibility gate here; every param NARROWS the operator's
+    # full list. All params are optional and AND-combined.
     #
     # Default (no query params): returns every task row (back-compat
     # with the existing dashboard listing).
@@ -72,15 +78,32 @@ async def all_tasks_api_route(request: Request) -> JSONResponse:
     # column matches exactly. Replaces the router's `list_tasks_for`
     # synthetic.
     #
-    # `?unassigned=true` filters to tasks with assigned_to IS NULL.
-    # Replaces the router's `list_unassigned_tasks` synthetic. If both
-    # params are supplied, `unassigned=true` wins (mutually exclusive
-    # by nature — IS NULL never matches a literal agent_id).
+    # `?unassigned=true` filters to tasks with assigned_to IS NULL/empty.
+    # Replaces the router's `list_unassigned_tasks` synthetic.
+    #
+    # `?assigned=true` is the complement — only tasks that HAVE an
+    # assignee (assigned_to IS NOT NULL/empty). Parsed the same way as
+    # `unassigned`. `assigned=true` + `unassigned=true` is contradictory
+    # (AND) → matches nothing.
+    #
+    # `?status=<value>` filters via the shared
+    # ``status_filter_matches`` helper (single source with the MCP
+    # view_tasks / search_tasks tools): a concrete status
+    # (pending/in_progress/completed/cancelled/failed) is exact-match;
+    # the pseudo-values incomplete/active/open expand to any non-terminal
+    # status (pending + in_progress).
+    #
+    # `?created_by=<agent_id>` filters to tasks whose created_by matches
+    # exactly.
     #
     # Phase 7c, Q7.2 in plan.
     assigned_to_filter: Optional[str] = request.query_params.get('assigned_to')
     unassigned_raw = request.query_params.get('unassigned', '')
     unassigned_filter: bool = unassigned_raw.lower() in ('true', '1', 'yes')
+    assigned_raw = request.query_params.get('assigned', '')
+    assigned_filter: bool = assigned_raw.lower() in ('true', '1', 'yes')
+    status_filter: Optional[str] = request.query_params.get('status')
+    created_by_filter: Optional[str] = request.query_params.get('created_by')
 
     # pentest R3-F3: bound this list read. Before this the default (no
     # filter) branch did an unbounded ``SELECT … FROM tasks`` — a project
@@ -94,24 +117,42 @@ async def all_tasks_api_route(request: Request) -> JSONResponse:
     limit = _clamp_section_limit(request)
 
     try:
-        # PR #146: route reads through TaskRepository. The `unassigned`
-        # branch is the only one without a direct repo method
-        # (`list_by_agent` takes an agent_id, not "no agent"), so it
-        # filters the bounded listing in Python — the clamp is applied in
-        # SQL first, so this reads at most ``limit`` rows (a bounded
-        # superset of the unassigned subset, which is the intended DoS
-        # bound, not an unbounded scan).
+        # PR #146: route reads through TaskRepository. The candidate read
+        # is bounded in SQL FIRST (the ``?limit`` clamp), then the
+        # discovery filters (unassigned / assigned / created_by / status)
+        # are AND-combined in Python over that bounded listing — so we
+        # read at most ``limit`` rows (a bounded superset of any filtered
+        # subset, which is the intended DoS bound, not an unbounded scan).
+        # ``status_filter_matches`` is imported from the shared
+        # ``features.task_queries`` helper so this REST surface interprets
+        # the incomplete/active/open pseudo-values identically to the MCP
+        # view_tasks / search_tasks tools (single source of truth).
         from ...repositories import task_repo
+        from ...features.task_queries import status_filter_matches
 
-        if unassigned_filter:
-            tasks_data = [
-                t for t in task_repo.list_all(limit=limit)
-                if t.get("assigned_to") in (None, "")
-            ]
-        elif assigned_to_filter is not None:
-            tasks_data = task_repo.list_by_agent(assigned_to_filter, limit=limit)
+        if assigned_to_filter is not None:
+            candidates = task_repo.list_by_agent(assigned_to_filter, limit=limit)
         else:
-            tasks_data = task_repo.list_all(limit=limit)
+            candidates = task_repo.list_all(limit=limit)
+
+        def _keep(task: dict) -> bool:
+            assignee = task.get("assigned_to")
+            if unassigned_filter and assignee not in (None, ""):
+                return False
+            if assigned_filter and assignee in (None, ""):
+                return False
+            if (
+                created_by_filter is not None
+                and task.get("created_by") != created_by_filter
+            ):
+                return False
+            if status_filter is not None and not status_filter_matches(
+                status_filter, task.get("status")
+            ):
+                return False
+            return True
+
+        tasks_data = [t for t in candidates if _keep(t)]
         return JSONResponse(tasks_data)
     except Exception as e:
         logger.error(f"Error fetching all tasks: {e}", exc_info=True)
