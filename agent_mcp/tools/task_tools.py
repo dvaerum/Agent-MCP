@@ -1986,7 +1986,7 @@ async def assign_task_tool_impl(
                     parent_task_id=parent_task_id_arg,
                     depends_on_tasks=depends_on_tasks_list,
                     created_by="admin",
-                    auth_token=admin_auth_token,
+                    principal=principal,
                     requesting_agent_id=_rag_requesting_agent_id,
                     can_view_all_tasks=is_admin_request,
                 )
@@ -2342,6 +2342,13 @@ async def create_self_task_tool_impl(
     # set for agent_bearer callers.
     requesting_agent_id = principal.agent_id
 
+    # ``g.active_agents`` is keyed by the caller's bearer token
+    # (admin_tools.py). ``principal.source_token`` IS that bearer; use it
+    # as the cache key and fall back to ``arguments["token"]`` only for
+    # direct-call tests that don't thread a Principal (PR 2 retires the
+    # fallback — token-retirement plan Phase A).
+    cache_key = principal.source_token if principal is not None else agent_auth_token
+
     if not all([task_title, task_description]):
         return Invalid(
             message="task_title and task_description are required.",
@@ -2349,8 +2356,8 @@ async def create_self_task_tool_impl(
 
     # Determine actual parent task ID (main.py:1419-1423)
     actual_parent_task_id = parent_task_id_arg
-    if actual_parent_task_id is None and agent_auth_token in g.active_agents:
-        actual_parent_task_id = g.active_agents[agent_auth_token].get("current_task")
+    if actual_parent_task_id is None and cache_key in g.active_agents:
+        actual_parent_task_id = g.active_agents[cache_key].get("current_task")
 
     try:
         # D1: the unit-of-work owns the transaction; the DB audit row is
@@ -2438,7 +2445,7 @@ async def create_self_task_tool_impl(
                     parent_task_id=actual_parent_task_id,
                     depends_on_tasks=depends_on_tasks_list,
                     created_by=requesting_agent_id,
-                    auth_token=agent_auth_token,
+                    principal=principal,
                     can_view_all_tasks=_rag_can_view_all_tasks,
                 )
 
@@ -2621,8 +2628,8 @@ async def create_self_task_tool_impl(
 
             # Update agent's current task in DB if they don't have one (main.py:1455-1469)
             should_update_agent_current_task = False
-            if agent_auth_token in g.active_agents:  # Check memory first
-                if g.active_agents[agent_auth_token].get("current_task") is None:
+            if cache_key in g.active_agents:  # Check memory first
+                if g.active_agents[cache_key].get("current_task") is None:
                     should_update_agent_current_task = True
             elif (
                 requesting_agent_id != "admin"
@@ -2658,8 +2665,8 @@ async def create_self_task_tool_impl(
         if parent_mirror_updated:
             _refresh_parent_cache(final_parent_task_id)
 
-        if should_update_agent_current_task and agent_auth_token in g.active_agents:
-            g.active_agents[agent_auth_token]["current_task"] = new_task_id
+        if should_update_agent_current_task and cache_key in g.active_agents:
+            g.active_agents[cache_key]["current_task"] = new_task_id
 
         # Build RAG index payload from the fresh dict.
         index_data = dict(fresh_task)
@@ -2709,7 +2716,6 @@ async def update_task_status_tool_impl(
     *,
     principal: Optional[Principal] = None,
 ) -> ToolResult:
-    agent_auth_token = arguments.get("token")
     task_id_to_update = arguments.get("task_id")
     task_ids_bulk = arguments.get(
         "task_ids"
@@ -3306,7 +3312,6 @@ async def view_tasks_tool_impl(
     *,
     principal: Optional[Principal] = None,
 ) -> ToolResult:
-    agent_auth_token = arguments.get("token")
     filter_agent_id = arguments.get("agent_id")  # Optional agent_id to filter by
     filter_status = arguments.get("status")  # Optional status to filter by
     # New discovery filters: by creator, and the unassigned (claimable)
@@ -3910,7 +3915,6 @@ async def request_assistance_tool_impl(
     *,
     principal: Optional[Principal] = None,
 ) -> ToolResult:
-    agent_auth_token = arguments.get("token")
     parent_task_id = arguments.get("task_id")  # Task ID needing assistance
     assistance_description = arguments.get("description")
 
@@ -4141,16 +4145,19 @@ async def request_assistance_tool_impl(
                 f"Notification ID: {notification_id}"
             )
 
-            # Send message to admin using the new communication system
+            # Send message to admin using the new communication system.
+            # Thread the caller's Principal into the nested tool instead of
+            # re-injecting its bearer as a ``token`` arg — the target
+            # authorizes off the Principal (token-retirement plan Phase A).
             message_result = await send_agent_message_tool_impl(
                 {
-                    "token": agent_auth_token,
                     "recipient_id": "admin",
                     "message": admin_message,
                     "message_type": "assistance_request",
                     "priority": "high",
                     "deliver_method": "both",
-                }
+                },
+                principal=principal,
             )
             logger.info(f"Assistance request message sent to admin: {message_result}")
         except Exception as e_msg:
@@ -4222,7 +4229,6 @@ async def bulk_task_operations_tool_impl(
     *,
     principal: Optional[Principal] = None,
 ) -> ToolResult:
-    agent_auth_token = arguments.get("token")
     operations = arguments.get("operations", [])  # List of operation objects
 
     # Wave 9 PR 3: ``is_admin_request`` admits the supervision-tier
@@ -4715,7 +4721,6 @@ async def search_tasks_tool_impl(
     *,
     principal: Optional[Principal] = None,
 ) -> ToolResult:
-    agent_auth_token = arguments.get("token")
     search_query = arguments.get("search_query")
     status_filter = arguments.get("status_filter")
     # New discovery filters (mirror view_tasks): by creator and the

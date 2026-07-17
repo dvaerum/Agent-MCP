@@ -2,6 +2,7 @@
 import json
 from typing import Optional, List, Dict, Any
 from ...tools.rag_tools import ask_project_rag_tool_impl
+from ...core.principal import Principal
 import mcp.types as mcp_types
 from ...core.config import logger, TASK_ANALYSIS_MAX_TOKENS
 
@@ -11,7 +12,7 @@ async def validate_task_placement(
     parent_task_id: Optional[str],
     depends_on_tasks: Optional[List[str]],
     created_by: str,
-    auth_token: str,
+    principal: Optional[Principal] = None,
     requesting_agent_id: Optional[str] = None,
     can_view_all_tasks: bool = True,
 ) -> Dict[str, Any]:
@@ -41,7 +42,11 @@ async def validate_task_placement(
             the ``assign_task`` path authors as ``"admin"`` while the real
             caller may be a worker, so ``requesting_agent_id`` is threaded
             separately for the ownership scope.
-        auth_token: Authentication token for RAG query
+        principal: The caller's threaded Principal, forwarded to the
+            ImportError-fallback RAG call (``ask_project_rag_tool_impl``
+            is principal-authed). The primary path
+            (``query_rag_system_with_model``) needs no auth token — it
+            scopes on ``requesting_agent_id`` + ``can_view_all_tasks``.
         requesting_agent_id: The agent_id whose ``view_tasks`` visibility
             scopes the RAG duplicate-check search (R5-F1). Defaults to
             ``created_by`` when not given — on the ``create_self_task``
@@ -140,11 +145,13 @@ async def validate_task_placement(
         try:
             from ...features.rag.query import query_rag_system_with_model
         except ImportError:
-            # If the function doesn't exist yet, fall back to regular RAG
-            rag_response = await ask_project_rag_tool_impl({
-                "token": auth_token,
-                "query": query
-            })
+            # If the function doesn't exist yet, fall back to regular RAG.
+            # ``ask_project_rag_tool_impl`` authorizes off the Principal
+            # (not a token arg), so thread the caller's Principal through.
+            rag_response = await ask_project_rag_tool_impl(
+                {"query": query},
+                principal=principal,
+            )
         else:
             # v5.0.44: model selection moved into completion_service;
             # the ``model_name`` parameter is now informational only.

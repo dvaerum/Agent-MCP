@@ -166,7 +166,6 @@ async def test_validate_task_placement_maps_parent_and_dependency_suggestions(
         parent_task_id="task_old_dep",  # proposed dep to be removed
         depends_on_tasks=["task_old_dep"],
         created_by="admin",
-        auth_token="unused-in-this-path",
     )
 
     assert result["status"] == "suggest_changes"
@@ -213,7 +212,6 @@ async def test_validate_task_placement_maps_duplicate_detection(monkeypatch) -> 
         parent_task_id="task_parent001",
         depends_on_tasks=None,
         created_by="admin",
-        auth_token="unused-in-this-path",
     )
 
     assert result["duplicates"] == [
@@ -260,7 +258,6 @@ async def test_validate_task_placement_root_proposal_never_denied_by_hierarchy(
         parent_task_id=None,
         depends_on_tasks=None,
         created_by="admin",
-        auth_token="unused-in-this-path",
     )
 
     assert result["status"] == "approved"
