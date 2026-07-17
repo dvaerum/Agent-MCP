@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useCallback, useMemo } from "react"
 import {
   CheckSquare, Clock, AlertCircle, Users,
-  Search, Plus, Eye, Pencil, Trash2,
+  Search, Plus, Eye, Pencil, Trash2, X,
   ArrowUp, ArrowDown, Minus, CheckCircle2, Target, Zap, GitBranch, RefreshCw
 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
@@ -14,7 +14,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
 import { Label } from "@/components/ui/label"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { apiClient, Task } from "@/lib/api"
+import { apiClient, Task, type TaskFilters } from "@/lib/api"
 import { useServerStore } from "@/lib/stores/server-store"
 import { useDialog } from "@/hooks/use-dialog"
 import { useFilters } from "@/hooks/use-filters"
@@ -67,14 +67,20 @@ const parseJsonField = (field: unknown): unknown[] => {
   return []
 }
 
-// v5.0.31: cache TTL + background-refresh interval for the tasks
-// listing. The 30s cache was a module-level Map pre-migration
-// (``tasksCache = new Map(...)``); now it lives inside
-// ``usePagedQuery`` via its ``cacheMs`` option. The 60s interval
+// Background-refresh interval for the tasks listing. The 60s interval
 // keeps the "background refresh while tab open" semantic from
 // pre-migration ``useTasksData`` — the hook itself is reactive only,
 // not interval-driven, so we still wire the timer here.
-const CACHE_DURATION = 30000 // 30 seconds
+//
+// No ``cacheMs`` (was 30s pre task-filters): the GET /tasks fetch is
+// now parameterized by the server-side filter snapshot and re-runs via
+// the hook's ``deps`` when a filter changes. A global TTL on the last
+// response would make ``usePagedQuery`` short-circuit that reactive
+// re-fetch (see its cache-hit guard) and silently serve the *previous*
+// filter's rows — so the filtered fetch must not be cached. The 60s
+// background refresh still forces a fetch (``refresh()`` bypasses any
+// cache), and the reactive effect only fires on server / filter
+// changes, so there's nothing left for a TTL to dedupe here.
 const REFRESH_INTERVAL = 60000 // 1 minute for background refresh
 
 // Tasks-dashboard data hook — delegates the loading/error/lastFetch/
@@ -87,7 +93,7 @@ const REFRESH_INTERVAL = 60000 // 1 minute for background refresh
 // a slow stale fetch can't overwrite a fresh fast one. ``cacheMs``
 // preserves the 30s TTL; the 60s background refresh interval still
 // lives here because the hook is reactive-only by design.
-const useTasksData = () => {
+const useTasksData = (serverFilters: TaskFilters) => {
   const { activeServerId, servers } = useServerStore()
   const activeServer = servers.find(s => s.id === activeServerId)
   const isConnected = !!activeServerId && activeServer?.status === 'connected'
@@ -96,13 +102,19 @@ const useTasksData = () => {
   // (the wrapper short-circuits via fetchFn returning empty). The
   // hook's state machine still runs — that's fine, it just stays at
   // {data: [], total: 0, loading: false, error: null}.
+  //
+  // ``serverFilters`` (status / assignment / creator) drives the
+  // server-side filtered GET /tasks — the single source of truth
+  // shared with the backend + the MCP view_tasks tool. Its serialized
+  // form is threaded into ``deps`` below so a filter change re-runs
+  // the fetch.
   const fetchFn = useCallback(
     async (_signal: AbortSignal): Promise<{ data: Task[]; total: number }> => {
       if (!isConnected) {
         return { data: [], total: 0 }
       }
       try {
-        const tasksData = await apiClient.getTasks()
+        const tasksData = await apiClient.getTasks(serverFilters)
         return { data: tasksData, total: tasksData.length }
       } catch (err) {
         // Pre-migration ``useTasksData`` silenced 'NO_SERVER_CONNECTED'
@@ -115,8 +127,13 @@ const useTasksData = () => {
         throw err
       }
     },
-    [isConnected],
+    [isConnected, serverFilters],
   )
+
+  // Stable serialization of the filter snapshot for the reactive
+  // re-fetch dependency — a fresh object identity every render would
+  // thrash the effect; the value change is what must re-fetch.
+  const serverFiltersKey = JSON.stringify(serverFilters)
 
   const {
     data: tasks,
@@ -126,8 +143,7 @@ const useTasksData = () => {
     lastFetch,
   } = usePagedQuery<Task>({
     fetchFn,
-    cacheMs: CACHE_DURATION,
-    deps: [activeServerId],
+    deps: [activeServerId, serverFiltersKey],
   })
 
   // The pre-migration shape exposed ``error`` as ``string | null``.
@@ -1185,27 +1201,58 @@ const DeleteTaskDialog = React.memo(({ task, onOpenChange, onDeleted }: DeleteTa
 DeleteTaskDialog.displayName = 'DeleteTaskDialog'
 
 export function TasksDashboard() {
-  const { tasks, loading, error, refresh, lastFetch, isConnected } = useTasksData()
   const { servers, activeServerId } = useServerStore()
   const activeServer = servers.find(s => s.id === activeServerId)
-  // Filter state — owned by useFilters<TaskFilters> (PR 4 of the
-  // 2026-06-09 architecture review). Replaces the three sibling
-  // useStates (searchTerm / statusFilter / priorityFilter) shared
-  // with messages-/agents-dashboard.tsx as the same hand-rolled
-  // pattern. Tasks-dashboard doesn't expose a "Clear filters" button
-  // today, so `clearAll` / `isActive` are unused — but the hook still
-  // owns the state shape and the per-field updater (`setFilter`),
-  // and the migration unblocks adding that button uniformly later.
-  // No `onReset` callback: tasks-dashboard has no pagination cursor
-  // to reset; filter changes just re-run the memoised filter pass.
-  const { filters, setFilter } = useFilters<{
+  // Filter state — owned by useFilters (PR 4 of the 2026-06-09
+  // architecture review). Two classes of filter live here:
+  //
+  //   * Client-side (title/description text search + priority): the
+  //     rows are already in memory, so these narrow the list locally
+  //     via the memoised `filteredTasks` pass below. Priority is NOT
+  //     part of the GET /tasks contract, so it stays client-side.
+  //
+  //   * Server-side (status / assignment / creator): these drive the
+  //     GET /tasks query params — the single source of truth shared
+  //     with the backend + the MCP view_tasks tool. They are lifted
+  //     into `serverFilters` (a TaskFilters) and threaded into the
+  //     fetch, so the server does the filtering (and the "incomplete"
+  //     status alias, which can't be expressed by matching a single
+  //     stored status, resolves server-side).
+  //
+  // `clearAll` backs the "Clear" affordance; `isActive` toggles it.
+  const { filters, setFilter, clearAll, isActive } = useFilters<{
     searchTerm: string
-    statusFilter: string
     priorityFilter: string
+    statusFilter: string
+    assignment: string
+    createdBy: string
   }>({
-    initial: { searchTerm: '', statusFilter: 'all', priorityFilter: 'all' },
+    initial: {
+      searchTerm: '',
+      priorityFilter: 'all',
+      statusFilter: 'all',
+      assignment: 'all',
+      createdBy: '',
+    },
   })
-  const { searchTerm, statusFilter, priorityFilter } = filters
+  const { searchTerm, priorityFilter, statusFilter, assignment, createdBy } = filters
+
+  // Lift the server-side dimensions into the TaskFilters shape the
+  // getTasks() query-string builder consumes. Assignment uses the
+  // dedicated `assigned` / `unassigned` booleans — never a magic
+  // assigned_to="unassigned" value — so an agent named "unassigned"
+  // can't collide with the claimable-pool filter.
+  const serverFilters = useMemo<TaskFilters>(() => {
+    const f: TaskFilters = {}
+    if (statusFilter !== 'all') f.status = statusFilter
+    if (assignment === 'assigned') f.assigned = true
+    else if (assignment === 'unassigned') f.unassigned = true
+    const cb = createdBy.trim()
+    if (cb) f.created_by = cb
+    return f
+  }, [statusFilter, assignment, createdBy])
+
+  const { tasks, loading, error, refresh, lastFetch, isConnected } = useTasksData(serverFilters)
   // Row-action dialog state. Each holds the **task_id** of the task
   // being viewed / edited / deleted via the live-lookup useDialog<T>
   // hook (Candidate D, architecture review 2026-06-02). The dialog
@@ -1239,16 +1286,19 @@ export function TasksDashboard() {
     if (deleteDialog.isOpen && deleteDialog.data === null) deleteDialog.close()
   }, [deleteDialog.isOpen, deleteDialog.data, deleteDialog.close])
 
-  // Memoize filtered tasks to prevent unnecessary recalculations
+  // Client-side narrowing only. Status + assignment + creator are
+  // already applied server-side (see `serverFilters`), so `tasks` is
+  // the pre-filtered set; here we only apply the in-memory text search
+  // and the priority filter (priority isn't part of the GET /tasks
+  // contract).
   const filteredTasks = useMemo(() => {
     return tasks.filter(task => {
       const matchesSearch = task.title.toLowerCase().includes(searchTerm.toLowerCase()) ||
                            (task.description && task.description.toLowerCase().includes(searchTerm.toLowerCase()))
-      const matchesStatus = statusFilter === 'all' || task.status === statusFilter
       const matchesPriority = priorityFilter === 'all' || task.priority === priorityFilter
-      return matchesSearch && matchesStatus && matchesPriority
+      return matchesSearch && matchesPriority
     })
-  }, [tasks, searchTerm, statusFilter, priorityFilter])
+  }, [tasks, searchTerm, priorityFilter])
 
   // Memoize stats calculation
   const stats = useMemo(() => ({
@@ -1401,9 +1451,12 @@ export function TasksDashboard() {
         />
       </div>
 
-      {/* Controls — CC-16: plain Tailwind gap. */}
-      <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 sm:gap-3">
-        <div className="relative flex-1 sm:max-w-sm">
+      {/* Controls — un-boxed filter row matching Messages/Memories
+          (no Card wrapper). Search + Priority narrow the in-memory
+          rows client-side; Status + Assignment + Created-by drive the
+          server-side GET /tasks query (single source of truth). */}
+      <div className="flex flex-col sm:flex-row sm:flex-wrap items-stretch sm:items-center gap-2 sm:gap-3">
+        <div className="relative flex-1 sm:max-w-xs">
           {/* CC-1/CC-13 audit 2026-06-02: Search + Select migrated to
               shadcn semantic tokens. Dropped hand-rolled focus:ring-
               teal-* (different color + uses :focus not :focus-visible).
@@ -1417,30 +1470,64 @@ export function TasksDashboard() {
             className="pl-10"
           />
         </div>
+        {/* Status (server-side). "Incomplete (open)" sends
+            status=incomplete — the backend alias for every non-terminal
+            task (pending + in_progress). */}
         <Select value={statusFilter} onValueChange={(v) => setFilter("statusFilter", v)}>
-          <SelectTrigger className="w-full sm:w-36">
+          <SelectTrigger className="w-full sm:w-44">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="all">All Status</SelectItem>
+            <SelectItem value="all">Any status</SelectItem>
+            <SelectItem value="incomplete">Incomplete (open)</SelectItem>
             <SelectItem value="pending">Pending</SelectItem>
             <SelectItem value="in_progress">In Progress</SelectItem>
             <SelectItem value="completed">Completed</SelectItem>
-            <SelectItem value="failed">Failed</SelectItem>
             <SelectItem value="cancelled">Cancelled</SelectItem>
+            <SelectItem value="failed">Failed</SelectItem>
           </SelectContent>
         </Select>
+        {/* Assignment (server-side). Maps to the dedicated
+            assigned=true / unassigned=true booleans — never a magic
+            assigned_to="unassigned" value. */}
+        <Select value={assignment} onValueChange={(v) => setFilter("assignment", v)}>
+          <SelectTrigger className="w-full sm:w-40">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">Any assignment</SelectItem>
+            <SelectItem value="assigned">Assigned</SelectItem>
+            <SelectItem value="unassigned">Unassigned</SelectItem>
+          </SelectContent>
+        </Select>
+        {/* Created by (server-side) → created_by. Live-agents picker
+            (shared <AgentSelect>); noneLabel="— Any —" means no filter. */}
+        <div className="w-full sm:w-44">
+          <AgentSelect
+            value={createdBy || null}
+            onChange={(v) => setFilter("createdBy", v ?? "")}
+            noneLabel="— Any —"
+            placeholder="created by"
+          />
+        </div>
+        {/* Priority (client-side — not part of the GET /tasks contract). */}
         <Select value={priorityFilter} onValueChange={(v) => setFilter("priorityFilter", v)}>
           <SelectTrigger className="w-full sm:w-32">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="all">All Priority</SelectItem>
+            <SelectItem value="all">Any priority</SelectItem>
             <SelectItem value="high">High</SelectItem>
             <SelectItem value="medium">Medium</SelectItem>
             <SelectItem value="low">Low</SelectItem>
           </SelectContent>
         </Select>
+        {isActive && (
+          <Button variant="ghost" size="sm" onClick={clearAll}>
+            <X className="h-4 w-4 mr-1" />
+            Clear
+          </Button>
+        )}
       </div>
 
       {/* Tasks Table — token-clean shadcn card. CC-1/CC-2/CC-4/CC-5
