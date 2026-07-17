@@ -391,13 +391,6 @@ def register_project_settings_tools() -> None:
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": (
-                        "Authentication token. Optional if Authorization: "
-                        "Bearer header is supplied (recommended)."
-                    ),
-                },
             },
             "required": [],
             "additionalProperties": False,
@@ -417,13 +410,6 @@ def register_project_settings_tools() -> None:
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": (
-                        "Authentication token. Optional if Authorization: "
-                        "Bearer header is supplied (recommended)."
-                    ),
-                },
                 "context_key": {
                     "type": "string",
                     "description": (
@@ -460,13 +446,6 @@ def register_project_settings_tools() -> None:
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": (
-                        "Authentication token. Optional if Authorization: "
-                        "Bearer header is supplied (recommended)."
-                    ),
-                },
                 "context_key": {
                     "type": "string",
                     "description": "The config_* key to delete.",

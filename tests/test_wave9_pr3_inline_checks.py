@@ -125,7 +125,6 @@ def test_authorize_assign_task_admin_branch_gated_by_tasks_assign(
 
     principal = principal_factory()
     result = _authorize_assign_task(
-        admin_auth_token=None,
         target_agent_token=None,
         task_ids=None,
         arguments={},
@@ -162,7 +161,6 @@ def test_authorize_assign_task_worker_no_target_admits_via_mode_0() -> None:
     worker = _agent_bearer(agent_role="worker", agent_id="wkr-1")
     arguments: dict = {}
     result = _authorize_assign_task(
-        admin_auth_token=None,
         target_agent_token=None,
         task_ids=None,
         arguments=arguments,

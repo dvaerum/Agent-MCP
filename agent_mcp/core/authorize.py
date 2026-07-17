@@ -117,13 +117,13 @@ def _synthesize_principal_from_arguments(
     token-retirement PR 2 (Phase B): the bearer is sourced from the
     ``request_auth_token`` ContextVar — the same seam the HTTP
     middleware (``main_app.AuthHeaderMiddleware``), the REST dispatch
-    helper, and the test harness all set — NOT from
-    ``arguments["token"]``. Production always threads an explicit
-    ``principal=`` so this fallback only fires for direct in-process /
-    unit-test calls; those make the bearer visible via the ContextVar
-    (e.g. ``tests.harness.with_bearer``). ``arguments`` is retained in
-    the signature (callers still pass it) but no longer read for the
-    token. Nothing reads ``arguments["token"]`` for identity here.
+    helper, and the test harness all set — NOT from a token argument.
+    Production always threads an explicit ``principal=`` so this
+    fallback only fires for direct in-process / unit-test calls; those
+    make the bearer visible via the ContextVar (e.g.
+    ``tests.harness.with_bearer``). ``arguments`` is retained in the
+    signature (callers still pass it) but no longer read for the token
+    — nothing reads a token argument for identity here.
 
     arch-B: delegates to the shared
     :func:`agent_mcp.core.principal_builder.build_agent_bearer_principal`

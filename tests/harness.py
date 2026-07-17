@@ -287,9 +287,11 @@ class WorkerSession:
         """Invoke a tool through the registered CallToolRequest handler.
 
         Same path real SSE/JSON-RPC clients take. Bearer is bound via
-        `request_auth_token` so the dispatcher's Q6e fallback fills
-        `arguments.token` if absent. Returns the raw content blocks;
-        use the `assert_*` helpers for wire-isError semantics.
+        `request_auth_token` and a typed Principal is threaded (below),
+        so identity comes from the header-Bearer seam — not from a
+        `token` argument (retired, token-retirement plan Phase C).
+        Returns the raw content blocks; use the `assert_*` helpers for
+        wire-isError semantics.
 
         Wave 6 PR 6: the harness mints a typed :class:`Principal` per
         session (operator-tier for the admin / admin-caller, worker

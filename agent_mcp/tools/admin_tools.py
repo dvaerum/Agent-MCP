@@ -1828,7 +1828,6 @@ def register_admin_tools():
         input_schema={  # From main.py:1663-1674
             "type": "object",
             "properties": {
-                "token": {"type": "string", "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended)."}
             },
             "required": [],
             "additionalProperties": False,
@@ -1843,10 +1842,6 @@ def register_admin_tools():
         input_schema={  # From main.py:1676-1689
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
-                },
                 "agent_id": {
                     "type": "string",
                     "description": "Unique identifier for the agent to terminate",
@@ -1874,10 +1869,6 @@ def register_admin_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
-                },
                 "agent_id": {
                     "type": "string",
                     "description": "Unique identifier for the terminated agent to restore.",
@@ -1900,10 +1891,6 @@ def register_admin_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
-                },
                 "agent_id": {
                     "type": "string",
                     "description": "Unique identifier for the agent to edit.",
@@ -1952,10 +1939,6 @@ def register_admin_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
-                },
                 "agent_id": {
                     "type": "string",
                     "description": "Unique identifier for the agent to purge.",
@@ -1974,10 +1957,6 @@ def register_admin_tools():
         input_schema={  # From main.py:1788-1810
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
-                },
                 "agent_id": {
                     "type": "string",
                     "description": "Filter audit log by agent ID (optional)",
@@ -2007,10 +1986,6 @@ def register_admin_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
-                },
                 "filter_status": {
                     "type": "string",
                     "description": "Filter by agent status (e.g., 'active', 'terminated', 'created')",

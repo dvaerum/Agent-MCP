@@ -172,7 +172,6 @@ def _collect_task_descendants(cursor, root_task_id) -> list[tuple[str, Any]]:
 
 def _authorize_assign_task(
     *,
-    admin_auth_token: Optional[str],
     target_agent_token: Optional[str],
     task_ids: Optional[List[str]],
     arguments: Dict[str, Any],
@@ -1526,7 +1525,6 @@ async def assign_task_tool_impl(
     *,
     principal: Optional[Principal] = None,
 ) -> ToolResult:
-    admin_auth_token = arguments.get("token")
     target_agent_token = arguments.get("agent_token")
     target_agent_id_alias = arguments.get("agent_id")
 
@@ -1662,7 +1660,6 @@ async def assign_task_tool_impl(
     # of modes, each gated by its own per-project toggle. See
     # `_authorize_assign_task` for the full matrix.
     auth_error = _authorize_assign_task(
-        admin_auth_token=admin_auth_token,
         target_agent_token=target_agent_token,
         task_ids=task_ids,
         arguments=arguments,
@@ -2322,7 +2319,6 @@ async def create_self_task_tool_impl(
     *,
     principal: Optional[Principal] = None,
 ) -> ToolResult:
-    agent_auth_token = arguments.get("token")
     task_title = arguments.get("task_title")
     task_description = arguments.get("task_description")
     priority = arguments.get("priority", "medium")
@@ -2343,11 +2339,11 @@ async def create_self_task_tool_impl(
     requesting_agent_id = principal.agent_id
 
     # ``g.active_agents`` is keyed by the caller's bearer token
-    # (admin_tools.py). ``principal.source_token`` IS that bearer; use it
-    # as the cache key and fall back to ``arguments["token"]`` only for
-    # direct-call tests that don't thread a Principal (PR 2 retires the
-    # fallback — token-retirement plan Phase A).
-    cache_key = principal.source_token if principal is not None else agent_auth_token
+    # (admin_tools.py). ``principal.source_token`` IS that bearer; the
+    # dispatcher always synthesizes a Principal, so use it as the cache
+    # key directly (token-retirement plan Phase C — the legacy
+    # self-auth token argument fallback is retired).
+    cache_key = principal.source_token
 
     if not all([task_title, task_description]):
         return Invalid(
@@ -5030,10 +5026,6 @@ def register_task_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": "Authentication token (admin OR your own agent token). Optional if an Authorization: Bearer header is supplied (recommended).",
-                },
                 "agent_token": {
                     "type": "string",
                     "description": "Agent token to assign the task(s) TO (admin/manager targeting another agent). WORKERS self-claiming an unassigned task do NOT set this — just pass task_ids=[...] and you self-claim as the authenticated caller. Omit with task_title (no task_ids) to file NEW task(s) unassigned into the claimable pool.",
@@ -5194,10 +5186,6 @@ def register_task_tools():
         input_schema={  # From main.py:1727-1750
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": "Agent authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
-                },
                 "task_title": {"type": "string", "description": "Title of the task"},
                 "task_description": {
                     "type": "string",
@@ -5251,10 +5239,6 @@ def register_task_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": "Authentication token (agent or admin). Optional if Authorization: Bearer header is supplied (recommended).",
-                },
                 "task_id": {
                     "type": "string",
                     "description": "ID of the task to update (for single task operations)",
@@ -5341,10 +5325,6 @@ def register_task_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": "Authentication token (admin/manager). Optional if Authorization: Bearer header is supplied (recommended).",
-                },
                 "task_id": {
                     "type": "string",
                     "description": "ID of the task to update.",
@@ -5414,7 +5394,6 @@ def register_task_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {"type": "string", "description": "Authentication token. Optional if Authorization: Bearer header is supplied (recommended)."},
                 "agent_id": {
                     "type": "string",
                     "description": "Filter tasks by agent ID (optional). If non-admin, can only be self.",
@@ -5565,7 +5544,6 @@ def register_task_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {"type": "string", "description": "Authentication token. Optional if Authorization: Bearer header is supplied (recommended)."},
                 "search_query": {
                     "type": "string",
                     "description": "Search terms to find in tasks. Optional — when omitted, the tool returns tasks matching the other filter arguments (e.g. status_filter) without text scoring.",
@@ -5643,10 +5621,6 @@ def register_task_tools():
         input_schema={  # From main.py:1809-1823
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": "Agent authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
-                },
                 "task_id": {
                     "type": "string",
                     "description": "ID of the task for which assistance is needed (parent task).",
@@ -5668,10 +5642,6 @@ def register_task_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": "Authentication token (agent or admin). Optional if Authorization: Bearer header is supplied (recommended).",
-                },
                 "operations": {
                     "type": "array",
                     "description": "List of operations to perform",
@@ -5745,10 +5715,6 @@ def register_task_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": "Admin authentication token. Optional if Authorization: Bearer header is supplied (recommended).",
-                },
                 "task_id": {
                     "type": "string",
                     "description": "ID of the task to delete",
@@ -5782,14 +5748,6 @@ def register_task_tools():
         input_schema={
             "type": "object",
             "properties": {
-                "token": {
-                    "type": "string",
-                    "description": (
-                        "Admin authentication token. Optional if "
-                        "Authorization: Bearer header is supplied "
-                        "(recommended)."
-                    ),
-                },
                 "task_title": {
                     "type": "string",
                     "description": "Title of the task to create (required).",

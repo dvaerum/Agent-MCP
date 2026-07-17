@@ -116,7 +116,6 @@ async def test_worker_self_task_cannot_depend_on_foreign_task(
         res = await alice.call(
             "create_self_task",
             {
-                "token": alice.token,
                 "task_title": "INJECTED oracle self-task",
                 "task_description": "attacker-controlled body",
                 "parent_task_id": own_parent,
@@ -161,7 +160,6 @@ async def test_worker_self_task_foreign_and_nonexistent_dep_indistinguishable(
         foreign_res = await alice.call(
             "create_self_task",
             {
-                "token": alice.token,
                 "task_title": "child A",
                 "task_description": "body",
                 "parent_task_id": own_parent,
@@ -171,7 +169,6 @@ async def test_worker_self_task_foreign_and_nonexistent_dep_indistinguishable(
         nonexistent_res = await alice.call(
             "create_self_task",
             {
-                "token": alice.token,
                 "task_title": "child A",
                 "task_description": "body",
                 "parent_task_id": own_parent,
@@ -205,7 +202,6 @@ async def test_worker_self_task_nonexistent_dep_rejected(
         res = await alice.call(
             "create_self_task",
             {
-                "token": alice.token,
                 "task_title": "dangling dep",
                 "task_description": "body",
                 "parent_task_id": own_parent,
@@ -237,7 +233,6 @@ async def test_worker_self_task_can_depend_on_own_task(
         res = await alice.call(
             "create_self_task",
             {
-                "token": alice.token,
                 "task_title": "legit dependent self-task",
                 "task_description": "sequencing my own work",
                 "parent_task_id": own_parent,

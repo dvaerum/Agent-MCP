@@ -75,24 +75,30 @@ except ImportError:  # pragma: no cover
 # *params* level (CallToolRequestParams.meta / _meta) — when clients
 # put them in arguments instead, drop them silently so the call still
 # reaches the tool.
-_RESERVED_ARG_KEYS = frozenset({"_meta", "meta"})
+# The legacy self-auth ``token`` param is retired (token-retirement
+# plan Phase C): identity comes from the header-Bearer Principal, not
+# from an arg. It's no longer in any tool schema, so
+# ``additionalProperties: false`` would 400 a stray ``token`` sent by
+# an old client. Drop it here instead — tolerate-and-ignore keeps the
+# transition graceful. (``agent_token``/``agent_id``/``recipient_id``
+# target ANOTHER agent and are NOT in this set.)
+_RESERVED_ARG_KEYS = frozenset({"_meta", "meta", "token"})
 
 
 def _clean_arguments_for_schema(
     arguments: Dict[str, Any], schema: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
-    """Make caller-supplied arguments tolerant of two real-world shapes
+    """Make caller-supplied arguments tolerant of the real-world shapes
     that LLM-driven MCP clients regularly produce and that
     `jsonschema.validate(arguments, inputSchema)` would otherwise
     reject:
 
-    1.  `{"token": null, ...}` — models serialize the optional
-        `token` field as JSON null when they decide "I don't have one
-        to send". Schemas declare `token` as a plain `{"type":
-        "string"}` (no `null` accepted), so validation fails with
-        `'None is not of type string'`. Strip any top-level key whose
-        value is `None`; the dispatcher's Q6e bearer-token fallback
-        will fill `token` back in from the Authorization header.
+    1.  `{"token": ..., ...}` — the legacy self-auth `token` param is
+        retired (identity now comes from the header-Bearer Principal),
+        so it's gone from every schema. `additionalProperties: false`
+        would 400 a stray `token` an old client still sends. `token`
+        is a reserved key here → dropped silently (tolerate-and-ignore
+        during the transition).
 
     2.  `{"_meta": {...}, ...}` — some MCP client SDKs leak the
         spec-defined `_meta` field (which belongs at the params
@@ -100,9 +106,16 @@ def _clean_arguments_for_schema(
         `additionalProperties: false`, which rejects it. Drop the
         reserved-name keys before validation.
 
+    3.  `{"anything": null, ...}` — models serialize an optional field
+        as JSON null when they decide "I don't have one to send".
+        Schemas declare typed properties (no `null` accepted), so
+        validation would fail with `'None is not of type ...'`. Strip
+        any top-level key whose value is `None`; the tool's own arg
+        parsing treats absent and null the same.
+
     Schema-driven cleanups go on top:
 
-    3.  If the property is `{"type": "integer"}` and the value is a
+    4.  If the property is `{"type": "integer"}` and the value is a
         string of digits (or a Python bool, which jsonschema would
         accept as integer but most tool impls treat as the bool),
         coerce. Many LLM clients quote integer arguments.
@@ -438,8 +451,9 @@ async def dispatch_tool_call(
     (ContextVar-derived principal + ``list[TextContent]`` auto-wrap)
     is gone. For direct in-process / unit-test callers that haven't
     threaded a Principal through, a narrow fallback synthesizes an
-    ``agent_bearer`` Principal from ``arguments["token"]`` — same
-    contract every per-tool decorator already uses for direct calls.
+    ``agent_bearer`` Principal from the ``request_auth_token``
+    ContextVar — same contract every per-tool decorator already uses
+    for direct calls.
     """
     # Sanitize arguments input (main.py:1863-1877)
     sanitized_arguments: Any
@@ -491,8 +505,8 @@ async def dispatch_tool_call(
             # The original handle_tool had specific .get calls for each tool.
             # This will now be the responsibility of the individual tool_impl functions.
             # For example, create_agent_tool_impl(arguments: Dict) -> ...
-            # inside create_agent_tool_impl: token = arguments.get("token"), agent_id = arguments.get("agent_id")
-            
+            # inside create_agent_tool_impl: agent_id = arguments.get("agent_id")
+
             # This is a key design decision:
             # Option A: Dispatcher unpacks args: `return await func(sanitized_args.get("token"), ...)` (like original)
             # Option B: Dispatcher passes dict: `return await func(sanitized_arguments)` (current choice)
@@ -553,21 +567,11 @@ async def dispatch_tool_call(
                         f"Input validation error: {e.message}"
                     )
 
-            # Q6e: inject token from the Authorization-header contextvar
-            # when the caller didn't put one in arguments (or sent an
-            # empty / null one — `_clean_arguments_for_schema` strips
-            # nulls; we still guard against ""). Explicit non-empty
-            # arguments.token always wins (no silent override).
-            if not sanitized_arguments.get("token"):
-                header_token = request_auth_token.get()
-                if header_token:
-                    sanitized_arguments = {**sanitized_arguments, "token": header_token}
-
             # Direct-call fallback (tests / in-process scripts that
             # didn't thread a Principal through): synthesize one from
-            # ``arguments["token"]``. Production seams always pass an
-            # explicit ``principal=`` so this path is dead weight in
-            # the deployed router.
+            # the ``request_auth_token`` ContextVar. Production seams
+            # always pass an explicit ``principal=`` so this path is
+            # dead weight in the deployed router.
             effective_principal = principal
             if effective_principal is None:
                 from ..core.authorize import _synthesize_principal_from_arguments

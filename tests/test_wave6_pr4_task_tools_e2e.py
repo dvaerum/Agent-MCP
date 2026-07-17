@@ -609,7 +609,6 @@ async def test_update_task_status_invalid_missing_task_id_returns_invalid(tmp_pa
         result = await dispatch_tool_call(
             "update_task_status",
             {
-                "token": admin.admin_token,
                 "status": "pending",
             },
             principal=_agent_bearer_principal(

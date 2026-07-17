@@ -111,7 +111,6 @@ async def test_worker_update_unassigned_task_is_guided_to_claim(
             await alice.call(
                 "update_task_status",
                 {
-                    "token": alice.token,
                     "task_id": pool_id,
                     "status": "completed",
                 },
@@ -150,7 +149,6 @@ async def test_worker_update_foreign_task_stays_phantom_not_found(
             await alice.call(
                 "update_task_status",
                 {
-                    "token": alice.token,
                     "task_id": bobs_id,
                     "status": "completed",
                 },
@@ -187,7 +185,6 @@ async def test_worker_updates_own_task_succeeds(tmp_path) -> None:
             await alice.call(
                 "update_task_status",
                 {
-                    "token": alice.token,
                     "task_id": own_id,
                     "status": "completed",
                 },
@@ -224,7 +221,6 @@ async def test_worker_claims_then_updates_pool_task(tmp_path) -> None:
             await alice.call(
                 "update_task_status",
                 {
-                    "token": alice.token,
                     "task_id": pool_id,
                     "status": "completed",
                 },
@@ -266,7 +262,6 @@ async def test_worker_note_on_unassigned_task_is_guided_to_claim(
             await alice.call(
                 "add_task_note",
                 {
-                    "token": alice.token,
                     "task_id": pool_id,
                     "text": "progress note",
                 },
@@ -296,7 +291,6 @@ async def test_worker_note_on_foreign_task_stays_phantom_not_found(
             await alice.call(
                 "add_task_note",
                 {
-                    "token": alice.token,
                     "task_id": bobs_id,
                     "text": "sneaky note",
                 },
@@ -327,7 +321,6 @@ async def test_worker_assist_on_unassigned_task_is_guided_to_claim(
             await alice.call(
                 "request_assistance",
                 {
-                    "token": alice.token,
                     "task_id": pool_id,
                     "description": "need help here",
                 },

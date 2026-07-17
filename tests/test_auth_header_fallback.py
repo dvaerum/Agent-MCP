@@ -1,16 +1,17 @@
-"""Authorization: Bearer header is a fallback for arguments.token.
+"""Authorization: Bearer header is the sole self-auth path.
 
 Per Q6e in the plan: MCP clients (Claude Code et al.) speak HTTP with
-`Authorization: Bearer <token>` headers; agent-mcp's tool surface
-expects the token in JSON-RPC `arguments.token`. Today the router
-glues the two together via byte-stream rewriting. Moving the glue
-upstream lets the router drop that workaround.
+`Authorization: Bearer <token>` headers. A Starlette middleware
+captures the Authorization header into a `contextvars.ContextVar`;
+`dispatch_tool_call` synthesizes an ``agent_bearer`` Principal from it
+for direct-call sites that don't thread one explicitly.
 
-Implementation: a Starlette middleware captures the Authorization
-header into a `contextvars.ContextVar`. `dispatch_tool_call` checks
-the ContextVar and injects into `arguments.token` if missing. Tests
-exercise the contextvar path directly (the HTTP middleware path is
-trivially correct once the contextvar plumbing works).
+token-retirement plan Phase C: the legacy header→``arguments.token``
+back-fill is GONE (the ``token`` param is retired from every schema).
+These remaining tests exercise the contextvar→Principal path and the
+explicit-Principal seam — neither of which is affected by the
+back-fill removal. The tests that pinned the now-deleted
+arguments-injection behaviour were removed in Phase C.
 
 Migrated to `tests/harness.py::mcp_session` (Candidate F from
 architecture review 2026-06-02).
@@ -26,24 +27,19 @@ from tests.harness import make_principal, mcp_session
 pytestmark = pytest.mark.asyncio
 
 
-async def test_dispatch_uses_contextvar_token_when_arguments_token_missing(
+async def test_dispatch_resolves_bearer_from_contextvar(
     tmp_path,
 ) -> None:
-    """When arguments has no 'token' and the request_auth_token contextvar
-    is set, dispatch_tool_call resolves the bearer (Q6e). After Wave 6
-    PR 0/5 the resolution happens via the principal bridge:
-    ``_derive_principal_from_contextvars`` reads ``request_auth_token``
-    and produces an ``agent_bearer`` principal that downstream tools
-    consume directly — the dispatcher's legacy ``arguments["token"]``
-    injection still happens too, for unmigrated tools that read the
-    token field by hand.
+    """When arguments carries no self-auth token and the
+    ``request_auth_token`` contextvar is set, ``dispatch_tool_call``
+    synthesizes an ``agent_bearer`` Principal from the contextvar and
+    the tool admits the caller. This is the header-Bearer-only path —
+    the sole self-auth surface after the ``token`` param retirement.
 
-    Uses ``view_tasks`` instead of ``view_status``: ``view_tasks`` is
-    an ``"any"``-tier tool that admits any agent bearer, which is what
-    the contextvar fallback produces. ``view_status`` is operator-tier
-    post-Wave-6-PR-5 — a bearer alone no longer satisfies its
-    inline check; that's the migration's intent, not a regression in
-    the Q6e injection.
+    Uses ``view_tasks``: an ``"any"``-tier tool that admits any agent
+    bearer, which is what the contextvar fallback produces.
+    ``view_status`` is operator-tier — a bearer alone no longer
+    satisfies its inline check; that's the migration's intent.
     """
     from agent_mcp.tools.registry import dispatch_tool_call, request_auth_token
 
@@ -53,7 +49,7 @@ async def test_dispatch_uses_contextvar_token_when_arguments_token_missing(
         # view_tasks admits any agent_bearer. With the bearer
         # resolved via the contextvar, dispatch must succeed.
         try:
-            result = await dispatch_tool_call("view_tasks", {})  # no `token`
+            result = await dispatch_tool_call("view_tasks", {})  # no token arg
         except Exception as e:
             raise AssertionError(
                 f"dispatch_tool_call should resolve bearer from contextvar; "
@@ -64,40 +60,7 @@ async def test_dispatch_uses_contextvar_token_when_arguments_token_missing(
         assert isinstance(result, Ok), f"expected Ok, got {result!r}"
         text = result.message or ""
         assert "Unauthorized" not in text, (
-            f"contextvar token not injected (issue Q6e): {text}"
-        )
-
-
-async def test_dispatch_does_not_overwrite_explicit_arguments_token(
-    tmp_path,
-) -> None:
-    """If arguments already has a ``token``, the contextvar must NOT
-    overwrite it. The explicit value is authoritative.
-
-    Wave 6 PR 6: pass no Principal so the dispatcher's
-    arguments-token fallback synthesizes one from the (wrong) token;
-    ``view_status`` returns :class:`PermissionDenied`.
-    """
-    from agent_mcp.tools.registry import (
-        dispatch_tool_call,
-        request_auth_token,
-    )
-    from agent_mcp.core.tool_result import Ok, PermissionDenied
-
-    async with mcp_session(tmp_path):
-        request_auth_token.set("override-this-token-should-not-be-used")
-
-        # Pass an obviously-wrong token in arguments. Should be rejected
-        # (not silently replaced with the contextvar's "valid" token).
-        result = await dispatch_tool_call(
-            "view_status", {"token": "wrong" * 8}
-        )
-        assert isinstance(result, PermissionDenied), (
-            "dispatch_tool_call swallowed the wrong explicit token; "
-            "the contextvar must not override what the caller provided"
-        )
-        assert not isinstance(result, Ok), (
-            "view_status should not succeed with a wrong explicit token"
+            f"contextvar bearer not resolved: {text}"
         )
 
 
