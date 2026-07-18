@@ -26,6 +26,24 @@ This is a breaking change for deploys that relied on the hardcoded
 default. Anyone with ``OPENAI_API_KEY`` set must now also set
 ``OPENAI_MODEL``.
 
+Chat endpoint vs. embedding endpoint
+------------------------------------
+
+``AGENT_MCP_LLM_BASE_URL``, when set, overrides the chat/completion
+endpoint for **both** providers (OpenAI and Ollama). Unset preserves the
+SDK's ``OPENAI_BASE_URL`` behaviour (``base_url=None`` for the OpenAI
+provider). The embedding client
+(:mod:`agent_mcp.external.embedding_service`) deliberately does NOT
+consult ``AGENT_MCP_LLM_BASE_URL`` — it resolves from ``OPENAI_BASE_URL``
+only. So the two knobs are:
+
+* ``AGENT_MCP_LLM_BASE_URL`` → the chat/completion endpoint.
+* ``OPENAI_BASE_URL``        → the embedding (+ SDK fallback) endpoint.
+
+They point independently: RAG answer-generation can run on a fast iGPU
+llama-cpp (``:11435``) while embeddings stay on a CPU Ollama (``:11434``,
+which serves the embedding model).
+
 Why two classes (vs. one OpenAI-SDK wrapper)?
 ---------------------------------------------
 
@@ -140,15 +158,27 @@ class OpenAIChatClient(_BaseChatClient):
     ``openai`` SDK also honours ``OPENAI_BASE_URL`` from the environment
     if we pass ``base_url=None``, so deployments that re-point the SDK
     at a private gateway via that env var keep working transparently.
+
+    ``AGENT_MCP_LLM_BASE_URL``, when set, OVERRIDES the chat endpoint
+    here — the same knob :class:`OllamaChatClient` honours. This lets a
+    deployment point chat/completion at one endpoint (e.g. a fast iGPU
+    llama-cpp on ``:11435``) while embeddings keep resolving from
+    ``OPENAI_BASE_URL`` (e.g. a CPU Ollama on ``:11434``). Unset ⇒
+    ``base_url=None`` and the SDK falls back to ``OPENAI_BASE_URL``, i.e.
+    the historical behaviour.
     """
 
     provider = "openai"
 
     def __init__(self, model: str) -> None:
         api_key = os.environ.get("OPENAI_API_KEY") or ""
-        # base_url=None ⇒ SDK picks up OPENAI_BASE_URL itself (or the
-        # cloud default if unset). Don't second-guess it here.
-        super().__init__(model=model, base_url=None, api_key=api_key)
+        # AGENT_MCP_LLM_BASE_URL is the chat/completion endpoint knob: set
+        # ⇒ override; unset ⇒ base_url=None so the SDK picks up
+        # OPENAI_BASE_URL itself (or the cloud default). Honouring it here
+        # decouples the chat endpoint from the embedding endpoint, which
+        # stays on OPENAI_BASE_URL.
+        base_url = os.environ.get("AGENT_MCP_LLM_BASE_URL", "").strip() or None
+        super().__init__(model=model, base_url=base_url, api_key=api_key)
 
 
 class OllamaChatClient(_BaseChatClient):
