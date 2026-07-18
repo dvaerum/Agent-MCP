@@ -387,6 +387,12 @@ export function MessagesDashboard() {
   const [composeReplyParentId, setComposeReplyParentId] = useState<string | null>(
     null,
   )
+  // feat/reply-as-recipient: when replying, the operator answers AS the
+  // parent message's recipient (e.g. "manager"), back to its sender. This
+  // holds the reply-as identity; null for a fresh compose or when the
+  // operator is replying as themselves (admin — the normal case, which
+  // sends no sender_id override).
+  const [composeReplyAs, setComposeReplyAs] = useState<string | null>(null)
   const [suggestLoading, setSuggestLoading] = useState(false)
 
   // Participants drive the Compose recipient dropdown only (needs the
@@ -544,10 +550,18 @@ export function MessagesDashboard() {
       } else if (composeSubject.trim()) {
         body.subject = composeSubject.trim()
       }
+      // feat/reply-as-recipient: when replying AS an agent (not the
+      // operator's own identity), override the stored sender so the reply
+      // is authored in that agent's voice. The backend validates + audits
+      // this (operator-only). Omitted for a normal send / reply-as-admin.
+      if (composeReplyAs) {
+        body.sender_id = composeReplyAs
+      }
       await callMessages("POST", "", body)
       setComposeContent("")
       setComposeSubject("")
       setComposeReplyParentId(null)
+      setComposeReplyAs(null)
       setComposeOpen(false)
       refresh()
       toastSuccess("Message sent.")
@@ -586,11 +600,36 @@ export function MessagesDashboard() {
   }
 
   // Open the compose form pre-wired for a reply to the given message.
+  //
+  // feat/reply-as-recipient: a reply is the message's RECIPIENT answering
+  // its SENDER. So we reply AS `parent.recipient_id` (`replyAs`) and send
+  // back TO `parent.sender_id` (`replyTo`). Example: a message
+  // `backend-dev → manager` yields "Reply as manager" sending
+  // `manager → backend-dev`.
+  //
+  // A listed row carries a concrete per-recipient `recipient_id` (the
+  // broadcast fan-out is stored per recipient), so `replyAs` is a real
+  // agent. Guard the degenerate broadcast token "*"/empty: fall back to
+  // the old behavior (reply to the other party as the operator) rather
+  // than compose a message authored by "*".
   const openReply = (parent: Message) => {
     const me = "admin" // dashboard runs as admin per ADR-0003
-    const otherParty =
-      parent.sender_id === me ? parent.recipient_id : parent.sender_id
-    setComposeRecipient(otherParty)
+    const replyAs = parent.recipient_id
+    const replyTo = parent.sender_id
+    const broadcastLike = !replyAs || replyAs === "*"
+    if (broadcastLike) {
+      // Degenerate: no concrete recipient to speak as. Reply to the other
+      // party as the operator (legacy behavior), no sender override.
+      const otherParty = parent.sender_id === me ? parent.recipient_id : parent.sender_id
+      setComposeRecipient(otherParty)
+      setComposeReplyAs(null)
+    } else {
+      setComposeRecipient(replyTo)
+      // Only carry an override when actually acting AS an agent (i.e. the
+      // reply-as identity is not the operator's own identity). Replying as
+      // admin is the normal operator-replying-as-themselves case.
+      setComposeReplyAs(replyAs === me ? null : replyAs)
+    }
     setComposeSubject("")
     setComposeContent("")
     setComposeReplyParentId(parent.message_id)
@@ -839,6 +878,16 @@ export function MessagesDashboard() {
                 schema contract. */}
             {composeReplyParentId ? (
               <div className="rounded-md border border-muted bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+                {/* feat/reply-as-recipient: make the operator's voice
+                    explicit — they are replying AS the parent's recipient,
+                    back TO its sender. Shown only when acting as an agent
+                    (composeReplyAs set); a plain reply-as-admin keeps the
+                    ordinary "reply to" line. */}
+                {composeReplyAs ? (
+                  <div className="mb-1 font-medium text-foreground">
+                    Replying as {composeReplyAs} → {composeRecipient}
+                  </div>
+                ) : null}
                 ↳ reply to:{" "}
                 <span className="font-medium text-foreground">
                   {labelForParent(composeReplyParentId)}
@@ -847,7 +896,10 @@ export function MessagesDashboard() {
                   variant="ghost"
                   size="sm"
                   className="ml-2 h-6 px-2"
-                  onClick={() => setComposeReplyParentId(null)}
+                  onClick={() => {
+                    setComposeReplyParentId(null)
+                    setComposeReplyAs(null)
+                  }}
                 >
                   Cancel reply
                 </Button>

@@ -22,7 +22,11 @@ import secrets
 
 import pytest
 
-from tests.harness import mcp_session, seed_agent_rows
+from tests.harness import (
+    _HARNESS_OPERATOR_ID as OPERATOR_ID,
+    mcp_session,
+    seed_agent_rows,
+)
 
 
 pytestmark = pytest.mark.asyncio
@@ -127,6 +131,174 @@ async def test_post_messages_rejects_missing_content(tmp_path) -> None:
         r = admin.post(
             "/api/messages",
             json={"recipient_id": "alice"},
+        )
+        assert r.status_code == 400, r.text
+
+
+# ---------- POST /api/messages — operator sender override -------------
+# "Reply as {recipient}" (feat/reply-as-recipient): the dashboard
+# operator replies AS the message's recipient, back to its sender. The
+# stored message is therefore sent BY an agent while the OPERATOR posts
+# it — so the compose route accepts an optional ``sender_id`` override,
+# operator-only, validated against the project's agents, and audited as
+# impersonation-on-behalf-of.
+
+
+def _latest_action(action_type: str) -> dict | None:
+    """Return the newest ``agent_actions`` row of ``action_type`` as a
+    dict with ``agent_id`` + parsed ``details``, or None."""
+    import json as _json
+
+    from agent_mcp.db.connection import get_db_connection
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT agent_id, details FROM agent_actions "
+        "WHERE action_type = ? ORDER BY timestamp DESC, rowid DESC LIMIT 1",
+        (action_type,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if row is None:
+        return None
+    details = _json.loads(row[1]) if row[1] else {}
+    return {"agent_id": row[0], "details": details}
+
+
+async def test_post_messages_sender_override_stores_agent_as_sender(
+    tmp_path,
+) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        await admin.create_worker("bob")
+
+        # Operator replies AS alice, back to bob.
+        r = admin.post(
+            "/api/messages",
+            json={
+                "recipient_id": "bob",
+                "message_content": "alice answering bob",
+                "sender_id": "alice",
+            },
+        )
+        assert r.status_code == 200, r.text
+        msg_id = r.json()["message_id"]
+
+        listing = admin.post("/api/messages/query", json={}).json()
+        msg = next(
+            m for m in listing["messages"] if m["message_id"] == msg_id
+        )
+        # Stored sender is the acted-as agent, NOT the operator (admin).
+        assert msg["sender_id"] == "alice", msg
+        assert msg["recipient_id"] == "bob", msg
+
+
+async def test_post_messages_sender_override_is_audited(tmp_path) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        await admin.create_worker("bob")
+
+        admin.post(
+            "/api/messages",
+            json={
+                "recipient_id": "bob",
+                "message_content": "audit me",
+                "sender_id": "alice",
+            },
+        )
+
+        action = _latest_action("sent_message_via_dashboard")
+        assert action is not None, "no dashboard-send audit row written"
+        # The real actor (operator) is recorded, and the acted-as agent is
+        # traceable in the details envelope.
+        assert action["agent_id"] == OPERATOR_ID, action
+        assert action["details"].get("acting_as") == "alice", action
+        assert action["details"].get("operator") == OPERATOR_ID, action
+
+
+async def test_post_messages_sender_override_rejects_unknown_agent(
+    tmp_path,
+) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("bob")
+        r = admin.post(
+            "/api/messages",
+            json={
+                "recipient_id": "bob",
+                "message_content": "who am I",
+                "sender_id": "ghost-does-not-exist",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert "sender_id" in r.json().get("error", ""), r.text
+
+
+async def test_post_messages_absent_sender_defaults_to_operator(
+    tmp_path,
+) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        r = admin.post(
+            "/api/messages",
+            json={
+                "recipient_id": "alice",
+                "message_content": "plain send",
+            },
+        )
+        assert r.status_code == 200, r.text
+        msg_id = r.json()["message_id"]
+
+        listing = admin.post("/api/messages/query", json={}).json()
+        msg = next(
+            m for m in listing["messages"] if m["message_id"] == msg_id
+        )
+        # No override → sender is the operator identity, unchanged.
+        assert msg["sender_id"] == OPERATOR_ID, msg
+
+        # And the audit row records NO acting-as (normal send).
+        action = _latest_action("sent_message_via_dashboard")
+        assert action is not None, action
+        assert action["details"].get("acting_as") is None, action
+
+
+async def test_post_messages_sender_override_allows_admin_label(
+    tmp_path,
+) -> None:
+    # "Reply as admin" is the normal operator-replying-as-themselves case
+    # (a message that was sent TO admin). The 'admin' label has no agents
+    # row, so it must be accepted explicitly.
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        r = admin.post(
+            "/api/messages",
+            json={
+                "recipient_id": "alice",
+                "message_content": "admin replying",
+                "sender_id": "admin",
+            },
+        )
+        assert r.status_code == 200, r.text
+        msg_id = r.json()["message_id"]
+        listing = admin.post("/api/messages/query", json={}).json()
+        msg = next(
+            m for m in listing["messages"] if m["message_id"] == msg_id
+        )
+        assert msg["sender_id"] == "admin", msg
+
+
+async def test_post_messages_sender_override_rejects_non_string(
+    tmp_path,
+) -> None:
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        r = admin.post(
+            "/api/messages",
+            json={
+                "recipient_id": "alice",
+                "message_content": "bad type",
+                "sender_id": ["alice"],
+            },
         )
         assert r.status_code == 400, r.text
 

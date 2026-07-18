@@ -353,6 +353,69 @@ describe("MUX-11: badge helper — every type + priority", () => {
   })
 })
 
+// ── MUX-13: reply-as-recipient ────────────────────────────────────
+// feat/reply-as-recipient: replying is the message's RECIPIENT answering
+// its SENDER. openReply must speak AS parent.recipient_id and send back
+// TO parent.sender_id; the modal button names that voice ("Reply as
+// {recipient}"); and the send payload carries a sender_id override only
+// when actually acting as an agent.
+
+describe("MUX-13: reply-as-recipient", () => {
+  it("openReply replies AS the recipient, back TO the sender", () => {
+    // reply-as identity = the message's recipient_id.
+    expect(
+      /const replyAs = parent\.recipient_id/.test(dash),
+      "openReply must derive the reply-as identity from parent.recipient_id",
+    ).toBe(true)
+    // reply-to destination = the message's sender_id.
+    expect(
+      /const replyTo = parent\.sender_id/.test(dash),
+      "openReply must reply back to parent.sender_id",
+    ).toBe(true)
+    // The recipient is set to replyTo (the original sender).
+    expect(
+      /setComposeRecipient\(replyTo\)/.test(dash),
+      "openReply must target replyTo as the recipient",
+    ).toBe(true)
+  })
+
+  it("guards the degenerate broadcast recipient", () => {
+    // A "*"/empty recipient can't be a reply-as voice; fall back rather
+    // than compose a message authored by "*".
+    expect(
+      /replyAs === "\*"/.test(dash),
+      "openReply must guard the broadcast token",
+    ).toBe(true)
+  })
+
+  it("send includes a sender_id override only when acting as an agent", () => {
+    expect(
+      /body\.sender_id = composeReplyAs/.test(dash),
+      "send must attach sender_id from composeReplyAs",
+    ).toBe(true)
+    // Guarded on composeReplyAs being truthy (omitted for a normal send /
+    // reply-as-admin).
+    expect(
+      /if \(composeReplyAs\) \{\s*body\.sender_id = composeReplyAs/.test(dash),
+      "sender_id override must be conditional on composeReplyAs",
+    ).toBe(true)
+  })
+
+  it("compose banner names whose voice the operator is using", () => {
+    expect(
+      /Replying as \{composeReplyAs\} → \{composeRecipient\}/.test(dash),
+      "compose panel must show 'Replying as {who} → {to}'",
+    ).toBe(true)
+  })
+
+  it("the modal reply button label reads 'Reply as {recipient}'", () => {
+    expect(
+      /Reply as \$\{message\.recipient_id\}/.test(modal),
+      "modal footer button must read 'Reply as {message.recipient_id}'",
+    ).toBe(true)
+  })
+})
+
 // ── MUX-12: filter controls carry a visible label ──────────────────
 describe("MUX-12: filter dropdowns have visible labels", () => {
   const src = read("components/dashboard/messages-dashboard.tsx")
