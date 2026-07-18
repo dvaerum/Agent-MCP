@@ -23,6 +23,20 @@
 import { describe, expect, it } from "vitest"
 import { readFileSync } from "node:fs"
 import { resolve } from "node:path"
+import {
+  priorityBadgeClass,
+  messageTypeBadgeClass,
+} from "../components/dashboard/shared/message-badges"
+
+// Keep in sync with the option lists in messages-dashboard.tsx.
+const ALL_TYPES = [
+  "text",
+  "system",
+  "notification",
+  "task_update",
+  "assistance_request",
+]
+const ALL_PRIORITIES = ["low", "normal", "high", "urgent"]
 
 const DASHBOARD_ROOT = resolve(__dirname, "..")
 const read = (rel: string) =>
@@ -242,5 +256,96 @@ describe("MUX-9: search placeholder broadened", () => {
   it("placeholder reads 'Search messages…' not 'Search content'", () => {
     expect(/placeholder="Search messages\.\.\."/.test(dash)).toBe(true)
     expect(/Search content/.test(dash)).toBe(false)
+  })
+})
+
+// ── MUX-10: robust to long / varied messages ──────────────────────
+
+describe("MUX-10: long-content robustness", () => {
+  it("conversation rows wrap long bodies (break-words)", () => {
+    // Both <pre> blocks (conversation row + single-message detail) must
+    // wrap so a 2000-char body or a long unbroken URL/base64 token can't
+    // blow out the modal width. A refactor dropping break-words would
+    // reintroduce horizontal overflow — this guard fails if it does.
+    const preBlocks = modal.match(/<pre[^>]*className="[^"]*"/g) ?? []
+    expect(preBlocks.length).toBeGreaterThanOrEqual(2)
+    for (const pre of preBlocks) {
+      expect(/break-words/.test(pre), `<pre> must break-words: ${pre}`).toBe(
+        true,
+      )
+    }
+    // The conversation row also honors newlines (whitespace-pre-wrap).
+    expect(/whitespace-pre-wrap break-words/.test(modal)).toBe(true)
+  })
+
+  it("conversation scroll container is height-capped", () => {
+    // Tall (wrapped) rows must stay inside the scroll container so the
+    // scroll-to-opened (MUX-1) lands correctly rather than growing the
+    // modal unbounded.
+    expect(/max-h-\[55vh\] overflow-auto/.test(modal)).toBe(true)
+  })
+
+  it("mobile content wraps long tokens (break-words)", () => {
+    expect(/line-clamp-2 break-words/.test(mobile)).toBe(true)
+  })
+
+  it("desktop content + subject cells clip with a tooltip (no overflow)", () => {
+    // Table cells stay single-line via truncate + a title tooltip so a
+    // huge body clips instead of forcing table-wide horizontal overflow.
+    expect(/max-w-\[400px\] truncate/.test(dash)).toBe(true)
+    expect(/max-w-\[200px\] truncate/.test(dash)).toBe(true)
+  })
+
+  it("long sender/recipient ids truncate instead of growing the column", () => {
+    // Desktop From/To cells are width-capped and the badge truncates.
+    expect(
+      (dash.match(/<TableCell className="max-w-\[160px\]">/g) ?? []).length,
+    ).toBeGreaterThanOrEqual(2)
+    // Mobile caps the id badges too.
+    expect(
+      (mobile.match(/max-w-\[40%\]/g) ?? []).length,
+    ).toBeGreaterThanOrEqual(2)
+  })
+})
+
+// ── MUX-11: badge helper covers every type + priority ─────────────
+
+describe("MUX-11: badge helper — every type + priority", () => {
+  it("returns a non-empty class for every message_type", () => {
+    for (const t of ALL_TYPES) {
+      expect(messageTypeBadgeClass(t).trim().length, `type ${t}`).toBeGreaterThan(0)
+    }
+    // Unknown types fall back, never crash / return empty.
+    expect(messageTypeBadgeClass("something_new").trim().length).toBeGreaterThan(0)
+  })
+
+  it("returns a non-empty class for every priority", () => {
+    for (const p of ALL_PRIORITIES) {
+      expect(priorityBadgeClass(p).trim().length, `priority ${p}`).toBeGreaterThan(0)
+    }
+    expect(priorityBadgeClass("whatever").trim().length).toBeGreaterThan(0)
+  })
+
+  it("urgent + high stand out from normal + low", () => {
+    const urgent = priorityBadgeClass("urgent")
+    const high = priorityBadgeClass("high")
+    const normal = priorityBadgeClass("normal")
+    const low = priorityBadgeClass("low")
+    // urgent = destructive tint, high = orange tint — both distinct from
+    // the muted normal/low treatment.
+    expect(urgent).toContain("destructive")
+    expect(high).toContain("orange")
+    expect(urgent).not.toEqual(normal)
+    expect(high).not.toEqual(normal)
+    expect(urgent).not.toEqual(low)
+  })
+
+  it("badges never wrap (whitespace-nowrap comes from the Badge cva)", () => {
+    // The longest labels (assistance_request / notification) must not
+    // wrap oddly — the shared Badge keeps whitespace-nowrap, and the
+    // helper only adds colour utilities, never a wrap/width override.
+    for (const t of ALL_TYPES) {
+      expect(/wrap|w-\[/.test(messageTypeBadgeClass(t))).toBe(false)
+    }
   })
 })

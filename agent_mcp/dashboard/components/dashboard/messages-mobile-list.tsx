@@ -130,12 +130,23 @@ export function MessagesMobileList({
               />
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
-                  <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
-                    {m.sender_id}
+                  {/* Cap long agent ids so a card can't overflow its
+                      width; the inner span truncates + a title reveals
+                      the full id on long-press/hover. */}
+                  <Badge
+                    variant="outline"
+                    className="px-1.5 py-0 text-[10px] max-w-[40%]"
+                    title={m.sender_id}
+                  >
+                    <span className="truncate">{m.sender_id}</span>
                   </Badge>
                   <span aria-hidden>→</span>
-                  <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
-                    {m.recipient_id}
+                  <Badge
+                    variant="outline"
+                    className="px-1.5 py-0 text-[10px] max-w-[40%]"
+                    title={m.recipient_id}
+                  >
+                    <span className="truncate">{m.recipient_id}</span>
                   </Badge>
                   {!isRead && (
                     <span
@@ -181,7 +192,7 @@ export function MessagesMobileList({
                 ) : null}
                 <p
                   className={
-                    "text-sm mt-1 line-clamp-2 " +
+                    "text-sm mt-1 line-clamp-2 break-words " +
                     (isRead ? "text-muted-foreground" : "text-foreground")
                   }
                   title={m.message_content}

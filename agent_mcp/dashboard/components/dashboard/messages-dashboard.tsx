@@ -214,7 +214,7 @@ const MessageRow = ({
           <span>{m.timestamp.slice(0, 19)}</span>
         </div>
       </TableCell>
-      <TableCell>
+      <TableCell className="max-w-[160px]">
         <div className="flex items-center gap-1.5">
           {/* Leading unread dot — mirrors the mobile treatment so an
               unread row is scannable at a glance, not just a ✓ column. */}
@@ -224,15 +224,27 @@ const MessageRow = ({
               className="h-2 w-2 flex-shrink-0 rounded-full bg-primary"
             />
           )}
+          {/* Long agent ids truncate (with a title tooltip) instead of
+              growing the column and forcing table-wide horizontal
+              overflow. */}
           <Badge
             variant="outline"
-            className={cn(!isRead && "font-semibold")}
+            className={cn("min-w-0 max-w-full", !isRead && "font-semibold")}
+            title={m.sender_id}
           >
-            {m.sender_id}
+            <span className="truncate">{m.sender_id}</span>
           </Badge>
         </div>
       </TableCell>
-      <TableCell><Badge variant="outline">{m.recipient_id}</Badge></TableCell>
+      <TableCell className="max-w-[160px]">
+        <Badge
+          variant="outline"
+          className="min-w-0 max-w-full"
+          title={m.recipient_id}
+        >
+          <span className="truncate">{m.recipient_id}</span>
+        </Badge>
+      </TableCell>
       <TableCell
         className={cn(
           "text-xs max-w-[200px] truncate",
