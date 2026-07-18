@@ -5,14 +5,15 @@ from typing import Any, Callable, Dict, List, Optional
 # Imports from our project
 from ...core.config import (
     logger,
-    MAX_CONTEXT_TOKENS,  # From main.py:182
 )
 from ...db.connection import get_db_connection, is_vss_loadable
 from ...external.embedding_service import embedding_client
 from ...external.completion_service import (
     CompletionConfigError,
     completion_client,
+    resolve_chat_base_url,
 )
+from ...external.context_window import resolve_max_context_tokens
 
 # For OpenAI exceptions
 import openai
@@ -484,6 +485,12 @@ async def query_rag_system(
 
         # --- 4. Combine Contexts for LLM ---
         # Original main.py: lines 1509 - 1548
+        # Budget is resolved at query time from the chat model's context
+        # window (context_window.resolve_max_context_tokens): an explicit
+        # AGENT_MCP_MAX_CONTEXT_TOKENS still wins; otherwise it's derived
+        # from the window discovered at the chat endpoint (unbounded when
+        # undiscoverable, e.g. cloud — so behaviour never regresses).
+        context_budget = await resolve_max_context_tokens(resolve_chat_base_url())
         context_parts: List[str] = []
         current_token_count: int = 0  # Approximate token count
 
@@ -499,7 +506,7 @@ async def query_rag_system(
             for item in live_context_results:
                 entry_text = f"Key: {item['context_key']}\nValue: {item['value']}\nDescription: {item.get('description', 'N/A')}\n(Updated: {item['updated_at']})\n"
                 new_count = _append_within_budget(
-                    context_parts, entry_text, current_token_count, MAX_CONTEXT_TOKENS
+                    context_parts, entry_text, current_token_count, context_budget
                 )
                 if new_count is None:
                     break
@@ -512,7 +519,7 @@ async def query_rag_system(
             for task in live_task_results:
                 entry_text = f"Task ID: {task['task_id']}\nTitle: {task['title']}\nStatus: {task['status']}\nDescription: {task.get('description', 'N/A')}\n(Updated: {task['updated_at']})\n"
                 new_count = _append_within_budget(
-                    context_parts, entry_text, current_token_count, MAX_CONTEXT_TOKENS
+                    context_parts, entry_text, current_token_count, context_budget
                 )
                 if new_count is None:
                     break
@@ -527,7 +534,7 @@ async def query_rag_system(
             for i, item in enumerate(vector_search_results):
                 entry_text = _render_chunk(i, item)
                 new_count = _append_within_budget(
-                    context_parts, entry_text, current_token_count, MAX_CONTEXT_TOKENS
+                    context_parts, entry_text, current_token_count, context_budget
                 )
                 if new_count is None:
                     context_parts.append(
@@ -621,8 +628,12 @@ async def query_rag_system_with_model(
     Returns:
         A string containing the answer or an error message.
     """
-    # Use provided max_tokens or default to the configured value
-    context_limit = max_tokens if max_tokens else MAX_CONTEXT_TOKENS
+    # Use the caller-provided max_tokens, or resolve from the chat model's
+    # context window (explicit AGENT_MCP_MAX_CONTEXT_TOKENS override wins;
+    # unbounded when the window is undiscoverable — no cloud regression).
+    context_limit = max_tokens or await resolve_max_context_tokens(
+        resolve_chat_base_url()
+    )
 
     conn = None
     answer = "An unexpected error occurred during the RAG task-analysis query."

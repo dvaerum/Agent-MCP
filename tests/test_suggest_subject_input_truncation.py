@@ -8,8 +8,9 @@ and the completion call would 400 with ``exceed_context_size_error``.
 The helper caps its OUTPUT (``max_tokens=32`` + an 80-char subject
 ceiling) but must ALSO cap its INPUT — a subject only ever needs the
 opening of a message. This module pins that guarantee: no matter how
-large the body, the content handed to the model is head-truncated to
-``_MAX_INPUT_CHARS`` so the call can never overflow the window.
+large the body, the content handed to the model is head-truncated to a
+context-window-aware cap (``context_window.resolve_subject_input_chars``)
+so the call can never overflow the window.
 
 Sibling of the RAG assembler's ``AGENT_MCP_MAX_CONTEXT_TOKENS`` budget
 (``features/rag/query.py::_append_within_budget``): together they bound
@@ -26,7 +27,21 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from agent_mcp.external import context_window as cw
+
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(autouse=True)
+def _pin_window(monkeypatch):
+    # Pin the window via the override so the subject cap resolves
+    # deterministically (cap = ceiling = 4000 at 8192) with NO network
+    # probe. The dynamic shrink/derive behaviour is covered in
+    # tests/test_context_window.py.
+    monkeypatch.setenv("AGENT_MCP_MODEL_CONTEXT_WINDOW", "8192")
+    cw._WINDOW_CACHE.clear()
+    yield
+    cw._WINDOW_CACHE.clear()
 
 
 def _fake_openai_capturing(store: dict) -> MagicMock:
@@ -66,9 +81,9 @@ async def test_oversized_body_is_head_truncated(monkeypatch) -> None:
     assert out == "A Concise Subject"
 
     user_msg = next(m for m in store["messages"] if m["role"] == "user")
-    assert len(user_msg["content"]) <= message_suggestions._MAX_INPUT_CHARS, (
+    assert len(user_msg["content"]) <= cw._SUBJECT_CHARS_CEILING, (
         f"input not truncated: {len(user_msg['content'])} chars "
-        f"> cap {message_suggestions._MAX_INPUT_CHARS}"
+        f"> cap {cw._SUBJECT_CHARS_CEILING}"
     )
     # Head-truncation: keep the OPENING of the message.
     assert huge.startswith(user_msg["content"])
@@ -92,7 +107,7 @@ async def test_spaceless_blob_is_bounded(monkeypatch) -> None:
     await message_suggestions.suggest_subject(blob)
 
     user_msg = next(m for m in store["messages"] if m["role"] == "user")
-    assert len(user_msg["content"]) <= message_suggestions._MAX_INPUT_CHARS
+    assert len(user_msg["content"]) <= cw._SUBJECT_CHARS_CEILING
 
 
 async def test_small_body_is_passed_through_unchanged(monkeypatch) -> None:

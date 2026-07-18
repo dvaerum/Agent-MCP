@@ -228,3 +228,20 @@ def completion_client() -> _BaseChatClient:
     )
     logger.info("completion_service: using Ollama provider with model=%s", model)
     return OllamaChatClient(model=model)
+
+
+def resolve_chat_base_url() -> Optional[str]:
+    """The chat/completion endpoint base URL, for introspection.
+
+    Used by ``external.context_window`` to discover the chat model's
+    context window (probe ``{base_url}/props``). Mirrors the base_url the
+    chat clients resolve: ``AGENT_MCP_LLM_BASE_URL`` if set, else
+    ``OPENAI_BASE_URL`` (the SDK's own fallback), else ``None`` — the
+    cloud default, which isn't introspectable, so callers keep their
+    unbounded/ceiling fallback there.
+    """
+    return (
+        os.environ.get("AGENT_MCP_LLM_BASE_URL", "").strip()
+        or os.environ.get("OPENAI_BASE_URL", "").strip()
+        or None
+    )
