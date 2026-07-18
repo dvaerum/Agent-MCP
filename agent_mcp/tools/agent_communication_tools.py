@@ -25,7 +25,10 @@ from ..core.tool_result import (
     ToolResult,
 )
 from ..features.aoe_notify import notify_aoe as _aoe_notify
-from ..repositories.message_repository import ParentMessageNotFound
+from ..repositories.message_repository import (
+    ParentMessageNotFound,
+    message_subject_view,
+)
 from ..utils.audit_utils import log_audit
 from ..db.connection import get_db_connection
 from ..db.unit_of_work import unit_of_work
@@ -364,43 +367,28 @@ async def send_agent_message_tool_impl(
     message_id = _generate_message_id()
     timestamp = datetime.datetime.now().isoformat()
 
-    # v5.0.22: compute the effective subject. Three branches:
+    # Phase 1 (null-subject placeholder): compute the effective subject.
+    # Three branches:
     #   1. Reply (parent_message_id set) → always NULL. The dashboard
     #      surfaces the root's subject as the thread label; replies
     #      don't carry their own.
-    #   2. Explicit subject supplied → persist verbatim.
-    #   3. Root w/o explicit subject → ask the Ollama helper
-    #      (`suggest_subject`). If unconfigured or it returns None,
-    #      fall back to a truncated body.
+    #   2. Explicit subject supplied → persist verbatim (non-null).
+    #   3. Root w/o explicit subject → store NULL. NULL is the marker
+    #      for "no real subject was ever set". We do NOT call the
+    #      (synchronous, RAM-hungry) `suggest_subject` helper on the send
+    #      path anymore, and we do NOT persist a truncated-body string:
+    #      the read paths compute a 50-char preview on demand via
+    #      `message_subject_view` and flag it `subject_is_placeholder`.
+    #      The `suggest_subject` helper + /api/messages/suggest-subject
+    #      endpoint survive for the dashboard's manual button and the
+    #      upcoming Phase 2 backfill.
     effective_subject: Optional[str]
     if parent_message_id:
         effective_subject = None
     elif explicit_subject:
         effective_subject = explicit_subject
     else:
-        # Two-stage gate so tests / operators can disable Ollama
-        # without paying the import + helper-call cost:
-        #   1. AGENT_MCP_SUBJECT_MODEL unset → straight to fallback.
-        #   2. Model set → call helper; if it returns None (HTTP
-        #      failure, empty completion, etc.) fall back too.
-        suggested: Optional[str] = None
-        if os.environ.get("AGENT_MCP_SUBJECT_MODEL", "").strip():
-            from ..features.message_suggestions import suggest_subject
-
-            suggested = await suggest_subject(message_content)
-
-        if suggested:
-            effective_subject = suggested
-        else:
-            # Truncated-body fallback. 50-char + "..." matches the
-            # locked-in plan and the backfill script's "no Ollama"
-            # branch — so a backfill run on a host without the model
-            # leaves the same shape as the live send path.
-            effective_subject = (
-                message_content[:50] + "..."
-                if len(message_content) > 50
-                else message_content
-            )
+        effective_subject = None
 
     # D2: the send mutation runs on the write-path unit-of-work. The
     # message INSERT drives ``u.cursor``; the recipient inbox wake and
@@ -512,6 +500,17 @@ async def send_agent_message_tool_impl(
 
         response_text += f" (Message ID: {message_id})"
 
+        # Phase 1: surface the DISPLAY subject + placeholder flag so the
+        # sending agent learns whether a real subject was stored or a
+        # computed body preview will stand in. Replies carry no subject.
+        if parent_message_id:
+            display_subject: Optional[str] = None
+            subject_is_placeholder = False
+        else:
+            display_subject, subject_is_placeholder = message_subject_view(
+                effective_subject, message_content
+            )
+
         return Ok(
             data={
                 "message_id": message_id,
@@ -520,7 +519,8 @@ async def send_agent_message_tool_impl(
                 "message_type": message_type,
                 "priority": priority,
                 "delivery_status": delivery_status,
-                "subject": effective_subject,
+                "subject": display_subject,
+                "subject_is_placeholder": subject_is_placeholder,
                 "parent_message_id": parent_message_id,
             },
             message=response_text,
@@ -709,18 +709,33 @@ async def get_agent_messages_tool_impl(
 
             response_lines.append(f"{direction} {read_status} {priority_icon} [{msg['message_type']}] {other_agent}")
             response_lines.append(f"   {msg['timestamp']}")
-            # v5.0.22: surface subject (root) or reply-marker (reply).
-            # sqlite3.Row supports `in` via .keys(); guard for legacy
-            # callers that may not have migrated yet.
+            # v5.0.22 / Phase 1: surface subject (root) or reply-marker
+            # (reply). sqlite3.Row supports `in` via .keys(); guard for
+            # legacy callers that may not have migrated yet.
             row_keys = set(msg.keys()) if hasattr(msg, "keys") else set()
-            subj = msg["subject"] if "subject" in row_keys else None
+            raw_subj = msg["subject"] if "subject" in row_keys else None
             parent_id = (
                 msg["parent_message_id"]
                 if "parent_message_id" in row_keys
                 else None
             )
-            if subj:
-                response_lines.append(f"   Subject: {subj}")
+            # Phase 1: a NULL stored subject on a ROOT message means no
+            # real subject was ever set — compute a 50-char body preview
+            # (never stored) and flag it a placeholder so the agent knows.
+            # Replies stay subject-less (thread-labelled instead).
+            if parent_id:
+                display_subject = None
+                subject_is_placeholder = False
+            else:
+                display_subject, subject_is_placeholder = (
+                    message_subject_view(raw_subj, msg["message_content"])
+                )
+            if display_subject and not subject_is_placeholder:
+                response_lines.append(f"   Subject: {display_subject}")
+            elif display_subject and subject_is_placeholder:
+                # Auto placeholder preview — mark it so a reader can tell
+                # it apart from a sender-chosen subject.
+                response_lines.append(f"   Subject (auto): {display_subject}")
             elif parent_id:
                 response_lines.append(f"   ↳ reply to: {parent_id}")
             response_lines.append(f"   {msg['message_content']}")
@@ -735,7 +750,8 @@ async def get_agent_messages_tool_impl(
                 "timestamp": msg["timestamp"],
                 "delivered": bool(msg["delivered"]),
                 "read": bool(msg["read"]),
-                "subject": subj,
+                "subject": display_subject,
+                "subject_is_placeholder": subject_is_placeholder,
                 "parent_message_id": parent_id,
             })
 
@@ -795,10 +811,11 @@ async def broadcast_admin_message_tool_impl(
     message_content = arguments.get("message")
     message_type = arguments.get("message_type", "broadcast")
     priority = arguments.get("priority", "high")
-    # v5.0.22: broadcasts can carry an explicit subject. Each fan-out
-    # send is a root message, so the per-recipient send_agent_message
-    # call will compute the subject the same way (verbatim if set,
-    # Ollama-suggested otherwise, truncated body as last resort).
+    # v5.0.22 / Phase 1: broadcasts can carry an explicit subject. Each
+    # fan-out send is a root message, so the per-recipient
+    # send_agent_message call computes the subject the same way (verbatim
+    # if set; NULL otherwise — the read paths render a body preview on
+    # demand, no synchronous model call).
     explicit_subject = arguments.get("subject")
 
     if not message_content:

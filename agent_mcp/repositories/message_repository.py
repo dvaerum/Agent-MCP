@@ -156,9 +156,53 @@ def _publish(addressee: str, event: str, payload: Dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def message_subject_view(
+    subject: Optional[str], content: Optional[str],
+) -> Tuple[Optional[str], bool]:
+    """Return ``(display_subject, is_placeholder)`` for a message row.
+
+    Phase 1 (null-subject placeholder). A NULL/empty DB ``subject`` means
+    no real subject was ever set — the send path stores NULL rather than
+    calling the (synchronous, RAM-hungry) Ollama helper. In that case
+    return a first-50-chars preview of the body — computed HERE, NEVER
+    stored — flagged as a placeholder so the UI and agents can tell it
+    apart from a real, sender-chosen subject.
+
+    NULL is the marker: no new DB column, no migration. Callers that
+    serialize a message for a response pass the row's ``subject`` +
+    body and use ``display_subject`` for the ``"subject"`` field and
+    ``is_placeholder`` for the new ``"subject_is_placeholder"`` field.
+
+    Note the reply carve-out lives at the CALL SITE, not here: a reply
+    (``parent_message_id`` set) also has a NULL subject but is a threaded
+    message with no subject by design, so serializers short-circuit
+    replies to ``(None, False)`` before calling this helper — mirroring
+    the read-path spec (preview shown only for roots, not replies).
+    """
+    if subject:
+        return subject, False
+    body = content or ""
+    preview = body[:50] + ("..." if len(body) > 50 else "")
+    return preview, True
+
+
 def _message_to_dict(row: AgentMessage) -> Dict[str, Any]:
     """Project an ``AgentMessage`` ORM row into the dict shape consumers
-    expect. Mirrors the pre-cutover ``dict(sqlite_row)`` projection."""
+    expect. Mirrors the pre-cutover ``dict(sqlite_row)`` projection.
+
+    Phase 1: ``subject`` carries the DISPLAY value (real subject, or a
+    computed 50-char body preview when the stored subject is NULL) and a
+    new ``subject_is_placeholder`` boolean flags the preview case for the
+    UI + agents. Replies (``parent_message_id`` set) keep ``subject=None``
+    / ``placeholder=False`` — they are threaded, not subject-bearing.
+    """
+    if row.parent_message_id:
+        display_subject: Optional[str] = None
+        is_placeholder = False
+    else:
+        display_subject, is_placeholder = message_subject_view(
+            row.subject, row.message_content
+        )
     return {
         "message_id": row.message_id,
         "sender_id": row.sender_id,
@@ -169,8 +213,9 @@ def _message_to_dict(row: AgentMessage) -> Dict[str, Any]:
         "timestamp": row.timestamp,
         "delivered": bool(row.delivered),
         "read": bool(row.read),
-        # v5.0.22 message-threads + subjects.
-        "subject": row.subject,
+        # v5.0.22 message-threads + subjects; Phase 1 null-subject view.
+        "subject": display_subject,
+        "subject_is_placeholder": is_placeholder,
         "parent_message_id": row.parent_message_id,
     }
 
