@@ -6,6 +6,8 @@ import {
   Send,
   Mail,
   MailOpen,
+  CheckCheck,
+  Clock,
   Trash2,
   Loader2,
 } from 'lucide-react'
@@ -58,7 +60,10 @@ interface ViewMessageModalProps {
   // re-renders with the fresh row); Delete routes through the
   // delete-confirm dialog.
   onReply: () => void
-  onToggleRead: () => void
+  // Toggle a SPECIFIC message's read flag (per-row in the conversation,
+  // or the opened message in the single-message view). Takes the message
+  // so a multi-message thread is unambiguous about which one flips.
+  onToggleRead: (msg: Message) => void
   onDelete: () => void
 }
 
@@ -68,14 +73,20 @@ interface ViewMessageModalProps {
 function ConversationRow({
   msg,
   opened,
+  onToggleRead,
 }: {
   msg: Message
   opened: boolean
+  // Toggle THIS message's read flag. Per-row so, in a multi-message
+  // thread, it's unambiguous which message is being marked (unlike a
+  // single footer button that silently targets only the opened one).
+  onToggleRead: (msg: Message) => void
 }) {
   // Direction cue: messages FROM admin lean one way, TO admin the other.
   // Purely visual — a subtle left accent so a back-and-forth reads as a
   // conversation rather than a flat log.
   const fromAdmin = msg.sender_id === 'admin'
+  const isRead = msg.read === 1 || msg.read === true
   return (
     <div
       className={cn(
@@ -83,6 +94,9 @@ function ConversationRow({
         fromAdmin
           ? "border-l-2 border-l-primary/40 bg-muted/30"
           : "border-l-2 border-l-muted-foreground/20",
+        // Unread messages read stronger; read ones fade back, so the
+        // read/unread split is legible at a glance down the thread.
+        !isRead && "border-l-primary",
         opened && "ring-2 ring-primary ring-offset-1 ring-offset-background",
       )}
     >
@@ -97,12 +111,35 @@ function ConversationRow({
             </Badge>
           )}
         </div>
-        <span
-          className="text-[11px] text-muted-foreground whitespace-nowrap"
-          title={new Date(msg.timestamp).toLocaleString()}
-        >
-          {relativeTime(msg.timestamp)}
-        </span>
+        <div className="flex items-center gap-2">
+          {/* Per-message read status + toggle. The button's label IS the
+              current state, and clicking it flips this specific message —
+              so both "which are read" and "what will this toggle" are
+              unambiguous per row. */}
+          <button
+            type="button"
+            onClick={() => onToggleRead(msg)}
+            title={isRead ? "Mark this message unread" : "Mark this message read"}
+            className={cn(
+              "inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium border transition-colors",
+              isRead
+                ? "text-muted-foreground border-transparent hover:bg-muted"
+                : "text-primary border-primary/40 hover:bg-primary/10",
+            )}
+          >
+            {isRead ? (
+              <><MailOpen className="h-3 w-3" /> read</>
+            ) : (
+              <><Mail className="h-3 w-3" /> unread</>
+            )}
+          </button>
+          <span
+            className="text-[11px] text-muted-foreground whitespace-nowrap"
+            title={new Date(msg.timestamp).toLocaleString()}
+          >
+            {relativeTime(msg.timestamp)}
+          </span>
+        </div>
       </div>
       <pre className="whitespace-pre-wrap break-words font-mono text-xs">
         {msg.message_content}
@@ -164,6 +201,19 @@ export function ViewMessageModal({
   // no replies) drops the conversation chrome and shows the normal detail.
   const root = thread.length > 0 ? thread[0] : message
   const isConversation = thread.length > 1
+
+  // Toggle a message's read flag: tell the parent (persists + refreshes
+  // its flat list) AND optimistically flip it in the local thread state so
+  // this modal's per-row indicator updates instantly.
+  const handleToggleRead = (m: Message) => {
+    onToggleRead(m)
+    const nextRead = !(m.read === 1 || m.read === true)
+    setThread((prev) =>
+      prev.map((t) =>
+        t.message_id === m.message_id ? { ...t, read: nextRead } : t,
+      ),
+    )
+  }
   const conversationTitle =
     root.subject && root.subject.trim() ? root.subject : "Conversation"
 
@@ -207,6 +257,7 @@ export function ViewMessageModal({
                 key={msg.message_id}
                 msg={msg}
                 opened={msg.message_id === message.message_id}
+                onToggleRead={handleToggleRead}
               />
             ))}
           </div>
@@ -237,20 +288,36 @@ export function ViewMessageModal({
                 <div className="text-xs text-muted-foreground">Delivered</div>
                 <div>
                   {isDelivered ? (
-                    <Badge variant="secondary">✓ delivered</Badge>
+                    <Badge variant="secondary" className="gap-1">
+                      <CheckCheck className="h-3 w-3" /> delivered
+                    </Badge>
                   ) : (
-                    <Badge variant="outline">✗ pending</Badge>
+                    <Badge variant="outline" className="gap-1 text-muted-foreground">
+                      <Clock className="h-3 w-3" /> pending
+                    </Badge>
                   )}
                 </div>
               </div>
               <div>
                 <div className="text-xs text-muted-foreground">Read</div>
                 <div>
-                  {isRead ? (
-                    <Badge variant="secondary">✓ read</Badge>
-                  ) : (
-                    <Badge variant="outline">✗ unread</Badge>
-                  )}
+                  {/* Envelope: open = read, closed = unread. Click to
+                      toggle this message's read flag. */}
+                  <button
+                    type="button"
+                    onClick={() => handleToggleRead(message)}
+                    title={isRead ? "Mark unread" : "Mark read"}
+                  >
+                    {isRead ? (
+                      <Badge variant="secondary" className="gap-1 cursor-pointer hover:bg-secondary/70">
+                        <MailOpen className="h-3 w-3" /> read
+                      </Badge>
+                    ) : (
+                      <Badge variant="outline" className="gap-1 cursor-pointer border-primary/40 text-primary hover:bg-primary/10">
+                        <Mail className="h-3 w-3" /> unread
+                      </Badge>
+                    )}
+                  </button>
                 </div>
               </div>
             </div>
@@ -276,19 +343,10 @@ export function ViewMessageModal({
             <Send className="h-4 w-4 mr-1" />
             Reply
           </Button>
-          <Button variant="outline" size="sm" onClick={onToggleRead}>
-            {isRead ? (
-              <>
-                <Mail className="h-4 w-4 mr-1" />
-                Mark unread
-              </>
-            ) : (
-              <>
-                <MailOpen className="h-4 w-4 mr-1" />
-                Mark read
-              </>
-            )}
-          </Button>
+          {/* Read-toggle moved onto each message row (the envelope icon:
+              open = read, closed = unread) so it's unambiguous which
+              message flips — a single footer button couldn't say that in a
+              multi-message thread. */}
           <Button variant="destructive" size="sm" onClick={onDelete}>
             <Trash2 className="h-4 w-4 mr-1" />
             Delete
