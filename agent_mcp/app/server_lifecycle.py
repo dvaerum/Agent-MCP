@@ -22,6 +22,10 @@ from ..features.message_retention import (
     DEFAULT_INTERVAL_SECONDS as MESSAGE_RETENTION_INTERVAL_DEFAULT,
     run_message_retention_periodically,
 )
+from ..features.subject_backfill import (
+    DEFAULT_INTERVAL_SECONDS as SUBJECT_BACKFILL_INTERVAL_DEFAULT,
+    run_subject_backfill_periodically,
+)
 from ..features.session_registry_pruner import (
     DEFAULT_INTERVAL_SECONDS as SESSION_REGISTRY_INTERVAL_DEFAULT,
     DEFAULT_THRESHOLD_SECONDS as SESSION_REGISTRY_THRESHOLD_DEFAULT,
@@ -361,6 +365,32 @@ async def start_background_tasks(task_group: anyio.abc.TaskGroup):
         f"Message retention pruner started with interval {retention_interval}s."
     )
 
+    # Start null-subject backfill sweep (Phase 2). Deferred, batched
+    # titling of the NULL-subject root-message backlog so the (RAM-hungry,
+    # socket-activated) subject model is loaded once per sweep and amortised
+    # across many messages, decoupled from the send path. Gated on
+    # AGENT_MCP_SUBJECT_MODEL — with no model configured there's nothing to
+    # generate with, so the loop never runs. Interval (~2 min default) via
+    # MCP_SUBJECT_BACKFILL_INTERVAL_SECONDS; the delay IS the deferral.
+    if os.environ.get("AGENT_MCP_SUBJECT_MODEL", "").strip():
+        subject_backfill_interval = int(
+            os.environ.get(
+                "MCP_SUBJECT_BACKFILL_INTERVAL_SECONDS",
+                str(SUBJECT_BACKFILL_INTERVAL_DEFAULT),
+            )
+        )
+        g.subject_backfill_task_scope = await task_group.start(
+            run_subject_backfill_periodically, subject_backfill_interval
+        )
+        logger.info(
+            "Subject backfill sweep started with interval "
+            f"{subject_backfill_interval}s."
+        )
+    else:
+        logger.info(
+            "Subject backfill sweep disabled (AGENT_MCP_SUBJECT_MODEL unset)."
+        )
+
     # Start session registry pruner (cross-request notification fan-out
     # plumbing — Phase: session-registry). Sweeps mcp_sessions for rows
     # whose `last_seen_at` is older than threshold so a crashed /
@@ -410,6 +440,13 @@ async def application_shutdown():
     ):
         logger.info("Attempting to cancel message retention pruner task...")
         g.message_retention_task_scope.cancel()
+
+    if (
+        getattr(g, "subject_backfill_task_scope", None)
+        and not g.subject_backfill_task_scope.cancel_called
+    ):
+        logger.info("Attempting to cancel subject backfill sweep task...")
+        g.subject_backfill_task_scope.cancel()
 
     if (
         getattr(g, "session_registry_pruner_task_scope", None)

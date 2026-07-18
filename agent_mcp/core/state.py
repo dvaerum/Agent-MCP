@@ -136,6 +136,11 @@ claude_session_task_scope: Optional[anyio.abc.CancelScope] = None
 # Absent or 0 => no pruning. See features.message_retention.
 message_retention_task_scope: Optional[anyio.abc.CancelScope] = None
 
+# Handle for the null-subject backfill sweep background task (Phase 2).
+# Only started when AGENT_MCP_SUBJECT_MODEL is set. Titles the NULL-subject
+# root-message backlog in batches. See features.subject_backfill.
+subject_backfill_task_scope: Optional[anyio.abc.CancelScope] = None
+
 # Handle for the mcp_sessions registry pruner background task. Sweeps
 # rows whose `last_seen_at` is older than the configured threshold so a
 # crashed / disconnected GET /mcp stream's row gets reaped before
