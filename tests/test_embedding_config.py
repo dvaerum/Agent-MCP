@@ -24,7 +24,16 @@ def reload_config():
 
 
 def test_simple_embedding_model_defaults_preserved(monkeypatch, reload_config) -> None:
-    """No env var → upstream's text-embedding-3-large / 1536 stays."""
+    """No embedding env var on the CLOUD path → upstream's
+    text-embedding-3-large / 1536 stays.
+
+    OPENAI_API_KEY is pinned so the Ollama setdefault block is skipped:
+    the fallbacks in the SIMPLE_EMBEDDING_* reads only apply to the
+    OpenAI cloud path. When OPENAI_API_KEY is unset the server seeds
+    Ollama embedding defaults instead (qwen3-embedding:0.6b / 1024) —
+    covered by test_config_embedding_default_order.py.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     monkeypatch.delenv("AGENT_MCP_EMBEDDING_MODEL", raising=False)
     monkeypatch.delenv("AGENT_MCP_EMBEDDING_DIMENSION", raising=False)
 
