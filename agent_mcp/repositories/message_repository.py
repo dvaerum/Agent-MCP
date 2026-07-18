@@ -1449,6 +1449,93 @@ class MessageRepository:
             )
             return 0
 
+    # --- Subject backfill (Phase 2) -------------------------------------
+
+    def fetch_null_subject_roots(self, limit: int) -> List[Dict[str, Any]]:
+        """Root messages still needing a real subject.
+
+        Phase 2 (deferred batched backfill). Returns rows where
+        ``parent_message_id IS NULL AND subject IS NULL`` — ROOT messages
+        the send path stored without a subject (Phase 1 marker). Replies
+        (``parent_message_id`` set) are excluded: they are subjectless by
+        design and must never be titled.
+
+        Ordered OLDEST-first so the backlog drains FIFO — the messages that
+        have waited longest for a subject get titled first, and a steady
+        trickle of new nulls can't starve an old one. Capped at ``limit``
+        so one sweep loads the model once and titles a bounded batch.
+
+        Each row carries ``message_id`` + ``message_content`` (the model
+        input). On DB error returns ``[]`` and logs at error.
+        """
+        try:
+            with get_session() as session:
+                rows = (
+                    session.query(
+                        AgentMessage.message_id,
+                        AgentMessage.message_content,
+                    )
+                    .filter(AgentMessage.parent_message_id.is_(None))
+                    .filter(AgentMessage.subject.is_(None))
+                    .order_by(AgentMessage.timestamp.asc())
+                    .limit(limit)
+                    .all()
+                )
+                return [
+                    {"message_id": r.message_id,
+                     "message_content": r.message_content}
+                    for r in rows
+                ]
+        except SQLAlchemyError as e:
+            logger.error(
+                f"Database error fetching null-subject roots: {e}",
+                exc_info=True,
+            )
+            return []
+        except Exception as e:  # pragma: no cover — defensive
+            logger.error(
+                f"Unexpected error fetching null-subject roots: {e}",
+                exc_info=True,
+            )
+            return []
+
+    def set_message_subject(self, message_id: str, subject: str) -> bool:
+        """Set a message's ``subject`` (NULL -> real).
+
+        Used by the Phase 2 backfill sweep to persist a model-generated
+        subject. A plain UPDATE — only meaningful when the row's subject is
+        currently NULL, but the caller only ever hands us null-subject roots
+        so no extra guard is needed. Reuses the ORM ``row.subject = subject``
+        pattern from the threaded-insert path.
+
+        Returns ``True`` when a row was updated, ``False`` when no row
+        matched or the DB errored (logged at error).
+        """
+        try:
+            with get_session() as session:
+                row = (
+                    session.query(AgentMessage)
+                    .filter(AgentMessage.message_id == message_id)
+                    .one_or_none()
+                )
+                if row is None:
+                    return False
+                row.subject = subject
+                session.commit()
+                return True
+        except SQLAlchemyError as e:
+            logger.error(
+                f"Database error setting subject on '{message_id}': {e}",
+                exc_info=True,
+            )
+            return False
+        except Exception as e:  # pragma: no cover — defensive
+            logger.error(
+                f"Unexpected error setting subject on '{message_id}': {e}",
+                exc_info=True,
+            )
+            return False
+
     # --- Write interface: rename_participant ----------------------------
 
     def rename_participant(
