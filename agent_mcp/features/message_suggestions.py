@@ -55,6 +55,26 @@ _SYSTEM_PROMPT = (
 )
 _MAX_SUBJECT_LEN = 80  # hard ceiling regardless of what the model returns
 
+# Input-overflow guard. A subject line only needs the OPENING of a
+# message, so we hard-cap the model input far below any plausible
+# per-slot context window (llama-cpp `-c / -np`). Without this, a large
+# body overflows the window and the completion call 400s with
+# `exceed_context_size_error` — the caller then falls back to a raw
+# truncated-body subject after a wasted, guaranteed-to-fail GPU round
+# trip.
+#
+# This is a CHARACTER cap, not a word/token count, on purpose: it holds
+# as a true ceiling even for space-less input (a long base64 blob is one
+# "word" but thousands of tokens — a word-count cap would miss it). At a
+# conservative ~2 chars/token this cap is well under ~1k tokens; plus the
+# ~40-token system prompt and 32-token output it cannot approach even a
+# small (2048) window, so `suggest_subject` can never overflow regardless
+# of message size. Sibling of the RAG assembler's
+# AGENT_MCP_MAX_CONTEXT_TOKENS budget
+# (features/rag/query.py::_append_within_budget) — together they bound
+# every variable-size local-model input path.
+_MAX_INPUT_CHARS = 4000
+
 
 def _truncate(subject: str) -> str:
     """Trim whitespace, strip enclosing quotes, cap at _MAX_SUBJECT_LEN."""
@@ -83,6 +103,11 @@ async def suggest_subject(content: str) -> Optional[str]:
     model = os.environ.get("AGENT_MCP_SUBJECT_MODEL", "").strip()
     if not model:
         return None
+
+    # Head-truncate so the input can never overflow the model's context
+    # window (see _MAX_INPUT_CHARS). A subject needs only the opening.
+    if len(content) > _MAX_INPUT_CHARS:
+        content = content[:_MAX_INPUT_CHARS]
 
     try:
         import openai  # local import so the module loads on hosts w/o the dep
