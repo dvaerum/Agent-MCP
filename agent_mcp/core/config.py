@@ -195,13 +195,45 @@ ADVANCED_EMBEDDINGS: bool = False  # Default to simple mode
 # Auto-indexing control - set by CLI
 DISABLE_AUTO_INDEXING: bool = False  # Default to automatic indexing
 
+# --- OpenAI / Ollama defaults --------------------------------------
+# When OPENAI_API_KEY is unset (or empty), default to the bundled
+# local Ollama endpoint. Operators get a functional server out of the
+# box; setting OPENAI_API_KEY to a real key switches over to the
+# OpenAI cloud — we deliberately do NOT touch OPENAI_BASE_URL /
+# OPENAI_MODEL in that branch because clobbering a user-supplied key
+# with Ollama defaults would silently break the cloud path.
+#
+# Uses os.environ.setdefault so an operator who exported some of the
+# vars but not OPENAI_API_KEY still wins where they set a value.
+#
+# ORDERING IS LOAD-BEARING: this block MUST run before the
+# SIMPLE_EMBEDDING_MODEL / SIMPLE_EMBEDDING_DIMENSION reads below.
+# Those constants are bound ONCE at import time from os.environ; if the
+# Ollama setdefaults ran after them (as they used to), the constants
+# froze to the OpenAI fallbacks (text-embedding-3-large / 1536) that
+# Ollama does not serve, and every RAG indexing cycle 404'd.
+_OPENAI_API_KEY_RAW = os.environ.get("OPENAI_API_KEY")
+if not _OPENAI_API_KEY_RAW:
+    os.environ.setdefault("OPENAI_API_KEY", "ollama")
+    os.environ.setdefault("OPENAI_BASE_URL", "http://127.0.0.1:11434/v1")
+    os.environ.setdefault("OPENAI_MODEL", "qwen3:1.7b")
+    os.environ.setdefault("AGENT_MCP_EMBEDDING_MODEL", "qwen3-embedding:0.6b")
+    os.environ.setdefault("AGENT_MCP_EMBEDDING_DIMENSION", "1024")
+    logger.info(
+        "OPENAI_API_KEY not set — defaulting to local Ollama at "
+        "http://127.0.0.1:11434/v1 (qwen3:1.7b). Set OPENAI_API_KEY to "
+        "use a different endpoint."
+    )
+
 # Original/Simple mode configuration (default).
 #
-# Both values are overridable at process start via env vars; defaults
-# preserve upstream behavior (text-embedding-3-large + 1536). Deployments
-# using a different provider (e.g. local Ollama with a small model)
-# set AGENT_MCP_EMBEDDING_MODEL + AGENT_MCP_EMBEDDING_DIMENSION; no
-# code change required.
+# Both values are overridable at process start via env vars. With no
+# provider env set the Ollama defaults seeded just above apply out of
+# the box (qwen3-embedding:0.6b / 1024); with OPENAI_API_KEY set the
+# block above is skipped and these fall back to the OpenAI cloud
+# defaults (text-embedding-3-large / 1536). An explicit
+# AGENT_MCP_EMBEDDING_MODEL + AGENT_MCP_EMBEDDING_DIMENSION always wins
+# (setdefault won't clobber it); no code change required.
 SIMPLE_EMBEDDING_MODEL: str = os.environ.get(
     "AGENT_MCP_EMBEDDING_MODEL", "text-embedding-3-large"
 )
@@ -312,29 +344,6 @@ def get_db_path() -> Path:
     """Gets the full path to the SQLite database file."""
     return get_agent_dir() / DB_FILE_NAME
 
-
-# --- OpenAI / Ollama defaults --------------------------------------
-# When OPENAI_API_KEY is unset (or empty), default to the bundled
-# local Ollama endpoint. Operators get a functional server out of the
-# box; setting OPENAI_API_KEY to a real key switches over to the
-# OpenAI cloud — we deliberately do NOT touch OPENAI_BASE_URL /
-# OPENAI_MODEL in that branch because clobbering a user-supplied key
-# with Ollama defaults would silently break the cloud path.
-#
-# Uses os.environ.setdefault so an operator who exported some of the
-# vars but not OPENAI_API_KEY still wins where they set a value.
-_OPENAI_API_KEY_RAW = os.environ.get("OPENAI_API_KEY")
-if not _OPENAI_API_KEY_RAW:
-    os.environ.setdefault("OPENAI_API_KEY", "ollama")
-    os.environ.setdefault("OPENAI_BASE_URL", "http://127.0.0.1:11434/v1")
-    os.environ.setdefault("OPENAI_MODEL", "qwen3:1.7b")
-    os.environ.setdefault("AGENT_MCP_EMBEDDING_MODEL", "qwen3-embedding:0.6b")
-    os.environ.setdefault("AGENT_MCP_EMBEDDING_DIMENSION", "1024")
-    logger.info(
-        "OPENAI_API_KEY not set — defaulting to local Ollama at "
-        "http://127.0.0.1:11434/v1 (qwen3:1.7b). Set OPENAI_API_KEY to "
-        "use a different endpoint."
-    )
 
 OPENAI_API_KEY_ENV: Optional[str] = os.environ.get("OPENAI_API_KEY")
 
