@@ -99,3 +99,35 @@ describe("MT-3: modal highlights the clicked message", () => {
     ).toBe(true)
   })
 })
+
+// ── MT-4: per-message read status + toggle (envelope: open=read, closed=unread)
+
+describe("MT-4: per-row read status + toggle", () => {
+  const modal = read("components/dashboard/modals/view-message-modal.tsx")
+  const dash = read("components/dashboard/messages-dashboard.tsx")
+
+  it("ConversationRow takes a per-message onToggleRead", () => {
+    expect(/onToggleRead:\s*\(msg:\s*Message\)\s*=>\s*void/.test(modal)).toBe(true)
+  })
+
+  it("each row shows the envelope read state and toggles that message", () => {
+    // closed envelope (Mail) = unread, open (MailOpen) = read; clicking
+    // calls onToggleRead(msg) so it's unambiguous which message flips.
+    expect(/onToggleRead\(msg\)/.test(modal)).toBe(true)
+    expect(/Mail\b/.test(modal) && /MailOpen\b/.test(modal)).toBe(true)
+  })
+
+  it("no ✓/✗ glyphs remain — icons replace them", () => {
+    expect(modal.includes("✓") || modal.includes("✗")).toBe(false)
+  })
+
+  it("the ambiguous no-arg footer Mark-read wiring is gone", () => {
+    // the old single footer button did onClick={onToggleRead} (no arg,
+    // silently the opened message); the per-row toggle replaces it.
+    expect(/onClick=\{onToggleRead\}/.test(modal)).toBe(false)
+  })
+
+  it("parent passes the specific message to onToggleRead", () => {
+    expect(/onToggleRead=\{\(msg\)\s*=>\s*\{?\s*void toggleRead\(msg\)/.test(dash)).toBe(true)
+  })
+})

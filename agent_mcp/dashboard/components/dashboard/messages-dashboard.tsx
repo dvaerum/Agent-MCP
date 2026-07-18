@@ -1021,10 +1021,7 @@ export function MessagesDashboard() {
           openReply(m)
           detailDialog.close()
         }}
-        onToggleRead={() => {
-          const m = detailDialog.data
-          if (m) void toggleRead(m)
-        }}
+        onToggleRead={(msg) => { void toggleRead(msg) }}
         onDelete={() => {
           const m = detailDialog.data
           if (!m) return
