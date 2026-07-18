@@ -2,6 +2,7 @@
 import asyncio
 import json
 import datetime
+import re
 import secrets
 import sqlite3
 from typing import List, Dict, Any, Optional
@@ -292,6 +293,20 @@ def check_send_message_permission(
     return None
 
 
+# Feature 2 (reply-nudge). A subject that begins with "re:" (any case,
+# optional surrounding whitespace, e.g. "RE:", " Re : ") is how agents
+# spell a reply when they haven't discovered parent_message_id. Detect it
+# to append an advisory hint — RE: only; this product has no forward
+# concept.
+_RE_SUBJECT_RE = re.compile(r"^\s*re\s*:", re.IGNORECASE)
+
+_REPLY_HINT_TEXT = (
+    "This looks like a reply — to thread it correctly, use the reply "
+    "function by passing `parent_message_id` (the message you're replying "
+    "to) instead of putting 'RE:' in the subject."
+)
+
+
 async def send_agent_message_tool_impl(
     arguments: Dict[str, Any],
     *,
@@ -511,18 +526,36 @@ async def send_agent_message_tool_impl(
                 effective_subject, message_content
             )
 
+        data = {
+            "message_id": message_id,
+            "sender": sender_id,
+            "recipient_id": recipient_id,
+            "message_type": message_type,
+            "priority": priority,
+            "delivery_status": delivery_status,
+            "subject": display_subject,
+            "subject_is_placeholder": subject_is_placeholder,
+            "parent_message_id": parent_message_id,
+        }
+
+        # Reply-nudge (advisory only). Some agents type "RE:" into the
+        # subject instead of threading via parent_message_id. When an
+        # EXPLICIT subject looks like a reply (leading "re:",
+        # case-/whitespace-insensitive) AND this send is NOT already a
+        # reply (no parent_message_id), append a gentle hint pointing them
+        # at the reply/threading function. RE: only — this product has no
+        # forward/"FW:" concept. The send already succeeded; the hint
+        # neither blocks nor rewrites it.
+        if (
+            not parent_message_id
+            and isinstance(explicit_subject, str)
+            and _RE_SUBJECT_RE.match(explicit_subject)
+        ):
+            data["reply_hint"] = _REPLY_HINT_TEXT
+            response_text += " " + _REPLY_HINT_TEXT
+
         return Ok(
-            data={
-                "message_id": message_id,
-                "sender": sender_id,
-                "recipient_id": recipient_id,
-                "message_type": message_type,
-                "priority": priority,
-                "delivery_status": delivery_status,
-                "subject": display_subject,
-                "subject_is_placeholder": subject_is_placeholder,
-                "parent_message_id": parent_message_id,
-            },
+            data=data,
             message=response_text,
         )
 
@@ -1807,18 +1840,25 @@ def register_agent_communication_tools():
                     "type": ["string", "null"],
                     "description": (
                         "Optional one-line subject for root messages. "
-                        "Ignored for replies (parent_message_id set). "
-                        "If omitted on a root message, an Ollama-backed "
-                        "helper proposes one when AGENT_MCP_SUBJECT_MODEL "
-                        "is configured; otherwise the body is truncated "
-                        "to 50 chars + '...' as a fallback."
+                        "For a reply, use parent_message_id rather than an "
+                        "'RE:' subject — replies are threaded, not "
+                        "subject-bearing (subject is ignored / forced NULL "
+                        "when parent_message_id is set). If omitted on a "
+                        "root message, an Ollama-backed helper proposes one "
+                        "when AGENT_MCP_SUBJECT_MODEL is configured; "
+                        "otherwise the body is truncated to 50 chars + "
+                        "'...' as a fallback."
                     ),
                 },
                 "parent_message_id": {
                     "type": ["string", "null"],
                     "description": (
-                        "If set, this message is a reply to the named "
-                        "root message_id. Replies always have subject = NULL."
+                        "How you reply / thread a message: set this to the "
+                        "message_id you are replying to and this message is "
+                        "linked as a reply under that thread. Prefer this "
+                        "over typing 'RE:' into the subject. Replies always "
+                        "have subject = NULL (the thread shows the root's "
+                        "subject as the conversation title)."
                     ),
                 },
             },

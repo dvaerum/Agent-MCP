@@ -592,6 +592,47 @@ async def create_message_api_route(
             conn.close()
 
 
+@router.get("/{message_id}/thread")
+async def get_message_thread_api_route(
+    message_id: str,
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    """GET /api/messages/{message_id}/thread — the whole conversation.
+
+    Feature 1 (message-threads-ui). Resolves the ROOT of the message's
+    thread (walking ``parent_message_id`` up), then returns every message
+    transitively descending from that root, ordered oldest-first (root
+    first). The repo owns the walk + the recursive-CTE collection
+    (:meth:`MessageRepository.fetch_thread`); the route just funnels the
+    path param through under the same operator-session gate the other
+    message routes use.
+
+    Response: ``{"thread": [ ...message dicts... ]}``. A 404 when the
+    message doesn't exist (``fetch_thread`` returns ``[]``) — mirrors the
+    PATCH/DELETE not-found shape.
+
+    Declared as a distinct ``/{message_id}/thread`` path so it doesn't
+    collide with the ``/{message_id}`` PATCH/DELETE catch-all (different
+    method AND an extra literal segment).
+    """
+    try:
+        from ...repositories import message_repo
+
+        thread = message_repo.fetch_thread(message_id)
+        if not thread:
+            return JSONResponse(
+                {"error": "Message not found"}, status_code=404
+            )
+        return JSONResponse({"thread": thread})
+    except Exception as e:
+        logger.error(f"Error fetching message thread: {e}", exc_info=True)
+        # BL-R5-2 / SD-R6-1: generic message — see list-messages note.
+        return JSONResponse(
+            {"error": "Failed to fetch message thread"}, status_code=500
+        )
+
+
 @router.patch("/{message_id}")
 @router.delete("/{message_id}")
 async def patch_message_api_route(
