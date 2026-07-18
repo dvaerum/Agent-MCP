@@ -290,7 +290,7 @@ async def create_message_api_route(
     PR D (prancy-napping-pie): auth via ``require_operator_session``.
 
     Body: {recipient_id, message_content, message_type?, priority?,
-           subject?, parent_message_id?}
+           subject?, parent_message_id?, sender_id?}
     Returns: {success, message_id, message}
 
     v5.0.22 (message threads + subjects):
@@ -298,6 +298,14 @@ async def create_message_api_route(
         present. Force-NULLed for replies.
       * `parent_message_id` — when set, this message is a reply to
         the named root; subject is forced NULL regardless of input.
+
+    feat/reply-as-recipient (operator sender override):
+      * `sender_id` — optional. When present, the stored message is
+        authored by this agent instead of the operator identity. Honored
+        for operators only (this route is operator-gated); validated to
+        name an existing project agent (or the 'admin' label) — an
+        unknown id is a 400. The operator-acting-as-agent is recorded in
+        the audit log. Absent → sender is the operator (unchanged).
     """
     conn = None
     try:
@@ -309,6 +317,15 @@ async def create_message_api_route(
         # v5.0.22 — message threads + subjects.
         explicit_subject = data.get('subject')
         parent_message_id = data.get('parent_message_id')
+        # feat/reply-as-recipient — operator sender override. The
+        # dashboard "Reply as {recipient}" flow replies AS the message's
+        # recipient (e.g. manager), back to its sender — so the stored
+        # message is authored by an agent while the OPERATOR posts it.
+        # This route is operator-gated (require_operator_session), so only
+        # an operator reaches here; the override is honored only for that
+        # operator identity, validated against the project's agents, and
+        # audited as impersonation-on-behalf-of below.
+        override_sender = data.get('sender_id')
 
         # PF-R8-1: reject non-string ``recipient_id`` / ``message_content``
         # BEFORE the truthiness gate + SQLite bind. A dict/list passes
@@ -340,6 +357,10 @@ async def create_message_api_route(
             return JSONResponse(
                 {"error": "parent_message_id must be a string"},
                 status_code=400,
+            )
+        if override_sender is not None and not isinstance(override_sender, str):
+            return JSONResponse(
+                {"error": "sender_id must be a string"}, status_code=400
             )
         if not recipient_id:
             return JSONResponse(
@@ -393,11 +414,32 @@ async def create_message_api_route(
             )
 
         timestamp = datetime.datetime.now().isoformat()
-        sender_id = caller_identity(auth)
+        operator_id = caller_identity(auth)
 
         # PR 9 (Message flip): single import covers both the broadcast
         # bulk_send below and the single-recipient send further down.
         from ...repositories import message_repo
+
+        # feat/reply-as-recipient — resolve the effective sender. Default
+        # is the operator identity (unchanged behavior). When the operator
+        # supplied a ``sender_id`` override (the "Reply as {recipient}"
+        # flow), validate it names a real message actor — a live/terminated
+        # agent row, a tombstone, or the 'admin' label — reusing the SAME
+        # existence check ``message_repo.send`` applies to recipients. An
+        # unknown id is a 400, never a silent fall-through to the operator.
+        # ``acting_as`` is non-None only for a genuine override and drives
+        # the impersonation audit trail below.
+        sender_id = operator_id
+        acting_as: str | None = None
+        if override_sender:
+            if not message_repo._recipient_exists(override_sender):
+                return JSONResponse(
+                    {"error": "sender_id must be an existing agent in "
+                              "this project"},
+                    status_code=400,
+                )
+            sender_id = override_sender
+            acting_as = override_sender
 
         # Broadcast: recipient_id="*" fans out to every active worker
         # (admin excluded), mirroring the broadcast_message MCP tool.
@@ -445,10 +487,18 @@ async def create_message_api_route(
                     "read": False,
                 })
             message_repo.bulk_send(broadcast_rows)
+            broadcast_details: dict = {
+                "recipients": recipients,
+                "sent_count": len(sent_ids),
+            }
+            if acting_as is not None:
+                # Impersonation trail: the operator broadcast on behalf of
+                # ``acting_as`` (stored sender). Actor stays the operator.
+                broadcast_details["operator"] = operator_id
+                broadcast_details["acting_as"] = acting_as
             log_agent_action_to_db(
-                cursor, sender_id, "broadcast_message_via_dashboard",
-                details={"recipients": recipients,
-                         "sent_count": len(sent_ids)},
+                cursor, operator_id, "broadcast_message_via_dashboard",
+                details=broadcast_details,
             )
             conn.commit()
             return JSONResponse({
@@ -514,9 +564,21 @@ async def create_message_api_route(
             # Audit row on the uow cursor — DB sink only, committed
             # atomically with the message INSERT (matches the prior
             # ``log_agent_action_to_db`` + ``conn.commit()`` behaviour).
+            # feat/reply-as-recipient: the actor is ALWAYS the operator
+            # (the real principal posting the message); when the operator
+            # acted as an agent (``sender_id`` override) the acted-as
+            # identity is recorded in ``details`` so the impersonation is
+            # traceable — WHO really sent it AND on whose behalf.
+            sent_details: dict = {
+                "message_id": message_id,
+                "recipient": recipient_id,
+            }
+            if acting_as is not None:
+                sent_details["operator"] = operator_id
+                sent_details["acting_as"] = acting_as
             log_agent_action_to_db(
-                u.cursor, sender_id, "sent_message_via_dashboard",
-                details={"message_id": message_id, "recipient": recipient_id},
+                u.cursor, operator_id, "sent_message_via_dashboard",
+                details=sent_details,
             )
 
             # BL-R8-1: message_repo.send(connection=...) DELIBERATELY

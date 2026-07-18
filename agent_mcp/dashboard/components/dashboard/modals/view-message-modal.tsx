@@ -379,10 +379,17 @@ export function ViewMessageModal({
         <DialogFooter>
           {/* v5.0.22: Reply opens the compose form pre-wired with
               parent_message_id pinned to this row (threads onto this
-              conversation). */}
+              conversation).
+              feat/reply-as-recipient: a reply is the recipient answering
+              the sender, so the button names WHOSE voice the operator will
+              use — "Reply as {message.recipient_id}". Derived from the
+              opened message directly; a degenerate broadcast recipient
+              ("*"/empty) falls back to a bare "Reply". */}
           <Button variant="outline" size="sm" onClick={onReply}>
             <Send className="h-4 w-4 mr-1" />
-            Reply
+            {message.recipient_id && message.recipient_id !== "*"
+              ? `Reply as ${message.recipient_id}`
+              : "Reply"}
           </Button>
           {/* Read-toggle moved onto each message row (the envelope icon:
               open = read, closed = unread) so it's unambiguous which
