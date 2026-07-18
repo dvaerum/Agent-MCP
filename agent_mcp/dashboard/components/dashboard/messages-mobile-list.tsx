@@ -4,6 +4,10 @@ import * as React from "react"
 import { Trash2 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import {
+  priorityBadgeClass,
+  messageTypeBadgeClass,
+} from "@/components/dashboard/shared/message-badges"
 
 /**
  * Mobile card-list rendering of the messages table (CC-7 audit
@@ -180,20 +184,27 @@ export function MessagesMobileList({
                     "text-sm mt-1 line-clamp-2 " +
                     (isRead ? "text-muted-foreground" : "text-foreground")
                   }
+                  title={m.message_content}
                 >
                   {m.message_content}
                 </p>
-                <div className="flex items-center gap-2 mt-2 text-[11px] text-muted-foreground">
+                <div className="flex flex-wrap items-center gap-1.5 mt-2 text-[11px] text-muted-foreground">
                   <span className="font-mono tabular-nums">
                     {m.timestamp.slice(0, 19)}
                   </span>
-                  <span aria-hidden>·</span>
-                  <span>{m.message_type}</span>
-                  {m.priority && m.priority !== "normal" && (
-                    <>
-                      <span aria-hidden>·</span>
-                      <span>{m.priority}</span>
-                    </>
+                  <Badge
+                    variant="outline"
+                    className={"px-1.5 py-0 text-[10px] " + messageTypeBadgeClass(m.message_type)}
+                  >
+                    {m.message_type}
+                  </Badge>
+                  {m.priority && (
+                    <Badge
+                      variant="outline"
+                      className={"px-1.5 py-0 text-[10px] " + priorityBadgeClass(m.priority)}
+                    >
+                      {m.priority}
+                    </Badge>
                   )}
                 </div>
               </div>

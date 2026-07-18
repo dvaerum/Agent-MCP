@@ -48,6 +48,10 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { EmptyState } from "@/components/dashboard/shared/empty-state"
 import { AgentSelect } from "@/components/dashboard/shared/agent-select"
 import { MessagesMobileList } from "@/components/dashboard/messages-mobile-list"
+import {
+  priorityBadgeClass,
+  messageTypeBadgeClass,
+} from "@/components/dashboard/shared/message-badges"
 import { ViewMessageModal } from "@/components/dashboard/modals/view-message-modal"
 import { DeleteMessageModal } from "@/components/dashboard/modals/delete-message-modal"
 import { toastError, toastSuccess } from "@/components/ui/toast"
@@ -83,6 +87,14 @@ const BROADCAST = "__broadcast"
 // can reach messages past the first 100 rows. Component state only —
 // no URL state, matches the existing filter behavior.
 const PAGE_SIZE = 100
+
+// Background-refresh interval so new inbound messages appear without a
+// manual Refresh (mirrors tasks-dashboard's REFRESH_INTERVAL). The
+// refresh re-runs the paged query in place — it does NOT reset the
+// cursor (currentOffset) or the filters, so the user's page/scroll is
+// preserved. Paused while the compose form is open so a background
+// refresh can't disrupt an in-progress draft.
+const REFRESH_INTERVAL = 60000 // 1 minute
 
 // Wave 2 (cleanup-wave-2): the ``adminToken()`` helper is gone.
 // Dashboard mutations authenticate via the operator session cookie
@@ -202,9 +214,31 @@ const MessageRow = ({
           <span>{m.timestamp.slice(0, 19)}</span>
         </div>
       </TableCell>
-      <TableCell><Badge variant="outline">{m.sender_id}</Badge></TableCell>
+      <TableCell>
+        <div className="flex items-center gap-1.5">
+          {/* Leading unread dot — mirrors the mobile treatment so an
+              unread row is scannable at a glance, not just a ✓ column. */}
+          {!isRead && (
+            <span
+              aria-hidden
+              className="h-2 w-2 flex-shrink-0 rounded-full bg-primary"
+            />
+          )}
+          <Badge
+            variant="outline"
+            className={cn(!isRead && "font-semibold")}
+          >
+            {m.sender_id}
+          </Badge>
+        </div>
+      </TableCell>
       <TableCell><Badge variant="outline">{m.recipient_id}</Badge></TableCell>
-      <TableCell className="text-xs max-w-[200px] truncate">
+      <TableCell
+        className={cn(
+          "text-xs max-w-[200px] truncate",
+          !isRead && "font-semibold text-foreground",
+        )}
+      >
         {m.subject && m.subject_is_placeholder ? (
           // Placeholder: the sender set no subject, so this is an
           // auto-preview of the body (Phase 1). Shown muted + italic with
@@ -220,7 +254,10 @@ const MessageRow = ({
             </span>
           </span>
         ) : m.subject ? (
-          m.subject
+          // Real subject: title reveals the full text on hover when the
+          // cell truncates. (The placeholder branch keeps its own
+          // explanatory title, so we don't clobber it here.)
+          <span title={m.subject}>{m.subject}</span>
         ) : isReply ? (
           // v5.0.24 polish: human-readable parent label instead of the
           // opaque message_id.
@@ -234,10 +271,29 @@ const MessageRow = ({
           <span className="text-muted-foreground/50">—</span>
         )}
       </TableCell>
-      <TableCell className="text-xs">{m.message_type}</TableCell>
-      <TableCell className="text-xs">{m.priority}</TableCell>
-      <TableCell>{isRead ? "✓" : ""}</TableCell>
-      <TableCell className="max-w-[400px] truncate text-xs">
+      <TableCell className="text-xs">
+        <Badge variant="outline" className={messageTypeBadgeClass(m.message_type)}>
+          {m.message_type}
+        </Badge>
+      </TableCell>
+      <TableCell className="text-xs">
+        <Badge variant="outline" className={priorityBadgeClass(m.priority)}>
+          {m.priority}
+        </Badge>
+      </TableCell>
+      <TableCell>
+        {/* Glyph is silent to screen readers; the sr-only text names the
+            state so it's announced. */}
+        <span aria-hidden>{isRead ? "✓" : ""}</span>
+        <span className="sr-only">{isRead ? "read" : "unread"}</span>
+      </TableCell>
+      <TableCell
+        className={cn(
+          "max-w-[400px] truncate text-xs",
+          !isRead && "text-foreground",
+        )}
+        title={m.message_content}
+      >
         {m.message_content}
       </TableCell>
       <TableCell onClick={(e) => e.stopPropagation()}>
@@ -325,13 +381,22 @@ export function MessagesDashboard() {
   }, [])
 
   // Compose recipient list (live-only — admin pinned, then workers).
+  // The currently-selected recipient is always appended if it isn't a
+  // live participant: openReply() can target an agent that has since
+  // gone offline, and a Radix Select with a value that has no matching
+  // <SelectItem> renders a blank trigger. Keeping the selected id in the
+  // list guarantees the value always renders. BROADCAST is its own
+  // hardcoded item, so it's excluded here.
   const recipientOptions = useMemo(() => {
     const ids = new Set<string>(["admin"])
     for (const a of liveParticipants) {
       if (a.agent_id) ids.add(a.agent_id)
     }
+    if (composeRecipient && composeRecipient !== BROADCAST) {
+      ids.add(composeRecipient)
+    }
     return Array.from(ids)
-  }, [liveParticipants])
+  }, [liveParticipants, composeRecipient])
 
   // Build the spread-filter slice for the POST body. Empty-string
   // fields are dropped; ``read`` is converted from its tri-state string
@@ -374,6 +439,20 @@ export function MessagesDashboard() {
     setSelectedIds(new Set())
     void loadParticipants()
   }, [refreshQuery])
+
+  // Background refresh so new inbound messages surface without a manual
+  // Refresh (mirrors tasks-dashboard). Calls ``refreshQuery()`` directly
+  // — the in-place paged refetch at the current offset/filters — instead
+  // of the ``refresh`` wrapper, so a background tick does NOT wipe the
+  // user's row selection or reset their page/scroll. Paused while the
+  // compose form is open so it can't disrupt an in-progress draft.
+  useEffect(() => {
+    if (composeOpen) return
+    const interval = setInterval(() => {
+      refreshQuery()
+    }, REFRESH_INTERVAL)
+    return () => clearInterval(interval)
+  }, [refreshQuery, composeOpen])
 
   // Live-lookup selector shared by the detail + delete dialogs — reads
   // the current row from the hook-owned ``messages`` array on every
@@ -568,6 +647,13 @@ export function MessagesDashboard() {
     }
   }
 
+  // True when any filter is actually set — drives the empty-state copy
+  // (a real "no rows for these filters" vs a plain "no messages yet").
+  const hasActiveFilters = useMemo(
+    () => Object.values(filters).some((v) => v !== ""),
+    [filters],
+  )
+
   // v5.0.26 pagination handlers.
   const goNewest = () => setCurrentOffset(0)
   const goNewer = () =>
@@ -675,12 +761,12 @@ export function MessagesDashboard() {
           <CardContent className="space-y-3">
             <div className="grid gap-3 md:grid-cols-3">
               <div>
-                <Label className="text-xs">Recipient agent_id</Label>
+                <Label htmlFor="compose-recipient" className="text-xs">Recipient agent_id</Label>
                 <Select
                   value={composeRecipient}
                   onValueChange={setComposeRecipient}
                 >
-                  <SelectTrigger>
+                  <SelectTrigger id="compose-recipient" aria-label="Recipient agent_id">
                     <SelectValue placeholder="select agent" />
                   </SelectTrigger>
                   <SelectContent>
@@ -694,9 +780,9 @@ export function MessagesDashboard() {
                 </Select>
               </div>
               <div>
-                <Label className="text-xs">Type</Label>
+                <Label htmlFor="compose-type" className="text-xs">Type</Label>
                 <Select value={composeType} onValueChange={setComposeType}>
-                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectTrigger id="compose-type" aria-label="Message type"><SelectValue /></SelectTrigger>
                   <SelectContent>
                     {MESSAGE_TYPES.map((t) => (
                       <SelectItem key={t} value={t}>{t}</SelectItem>
@@ -705,9 +791,9 @@ export function MessagesDashboard() {
                 </Select>
               </div>
               <div>
-                <Label className="text-xs">Priority</Label>
+                <Label htmlFor="compose-priority" className="text-xs">Priority</Label>
                 <Select value={composePriority} onValueChange={setComposePriority}>
-                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectTrigger id="compose-priority" aria-label="Priority"><SelectValue /></SelectTrigger>
                   <SelectContent>
                     {PRIORITIES.map((p) => (
                       <SelectItem key={p} value={p}>{p}</SelectItem>
@@ -736,9 +822,11 @@ export function MessagesDashboard() {
               </div>
             ) : (
               <div>
-                <Label className="text-xs">Subject</Label>
+                <Label htmlFor="compose-subject" className="text-xs">Subject</Label>
                 <div className="flex gap-2">
                   <Input
+                    id="compose-subject"
+                    aria-label="Subject"
                     placeholder="Subject (optional — Suggest will fill from Ollama)"
                     value={composeSubject}
                     onChange={(e) => {
@@ -764,8 +852,10 @@ export function MessagesDashboard() {
               </div>
             )}
             <div>
-              <Label className="text-xs">Content</Label>
+              <Label htmlFor="compose-content" className="text-xs">Content</Label>
               <textarea
+                id="compose-content"
+                aria-label="Content"
                 className="w-full min-h-[100px] rounded-md border border-input bg-background p-2 text-sm"
                 value={composeContent}
                 onChange={(e) => setComposeContent(e.target.value)}
@@ -788,7 +878,8 @@ export function MessagesDashboard() {
         <div className="relative flex-1 sm:max-w-xs">
           <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
-            placeholder="Search content..."
+            aria-label="Search messages"
+            placeholder="Search messages..."
             value={filters.q}
             onChange={(e) => setFilter("q", e.target.value)}
             className="pl-10"
@@ -805,6 +896,7 @@ export function MessagesDashboard() {
             onChange={(v) => setFilter("from", v ?? "")}
             noneLabel="— Any —"
             placeholder="from"
+            ariaLabel="Filter by sender"
           />
         </div>
         <div className="w-full sm:w-40">
@@ -813,13 +905,14 @@ export function MessagesDashboard() {
             onChange={(v) => setFilter("to", v ?? "")}
             noneLabel="— Any —"
             placeholder="to"
+            ariaLabel="Filter by recipient"
           />
         </div>
         <Select
           value={filters.type || ALL}
           onValueChange={(v) => setFilter("type", v === ALL ? "" : v)}
         >
-          <SelectTrigger className="w-full sm:w-40"><SelectValue placeholder="type" /></SelectTrigger>
+          <SelectTrigger aria-label="Filter by type" className="w-full sm:w-40"><SelectValue placeholder="type" /></SelectTrigger>
           <SelectContent>
             <SelectItem value={ALL}>all types</SelectItem>
             {MESSAGE_TYPES.map((t) => (<SelectItem key={t} value={t}>{t}</SelectItem>))}
@@ -829,7 +922,7 @@ export function MessagesDashboard() {
           value={filters.priority || ALL}
           onValueChange={(v) => setFilter("priority", v === ALL ? "" : v)}
         >
-          <SelectTrigger className="w-full sm:w-36"><SelectValue placeholder="priority" /></SelectTrigger>
+          <SelectTrigger aria-label="Filter by priority" className="w-full sm:w-36"><SelectValue placeholder="priority" /></SelectTrigger>
           <SelectContent>
             <SelectItem value={ALL}>any priority</SelectItem>
             {PRIORITIES.map((p) => (<SelectItem key={p} value={p}>{p}</SelectItem>))}
@@ -839,7 +932,7 @@ export function MessagesDashboard() {
           value={filters.read || ALL}
           onValueChange={(v) => setFilter("read", v === ALL ? "" : (v as "true" | "false"))}
         >
-          <SelectTrigger className="w-full sm:w-32"><SelectValue placeholder="read?" /></SelectTrigger>
+          <SelectTrigger aria-label="Filter by read status" className="w-full sm:w-32"><SelectValue placeholder="read?" /></SelectTrigger>
           <SelectContent>
             <SelectItem value={ALL}>any</SelectItem>
             <SelectItem value="false">unread</SelectItem>
@@ -887,17 +980,26 @@ export function MessagesDashboard() {
               ))}
             </div>
           ) : messages.length === 0 ? (
-            <EmptyState
-              icon={MessageSquare}
-              title="No messages"
-              description="No messages match the current filters."
-              action={
-                <Button variant="outline" size="sm" onClick={clearFilters}>
-                  <X className="h-4 w-4 mr-1" />
-                  Clear filters
-                </Button>
-              }
-            />
+            hasActiveFilters ? (
+              <EmptyState
+                icon={MessageSquare}
+                title="No messages"
+                description="No messages match the current filters."
+                action={
+                  <Button variant="outline" size="sm" onClick={clearFilters}>
+                    <X className="h-4 w-4 mr-1" />
+                    Clear filters
+                  </Button>
+                }
+              />
+            ) : (
+              // No filters active → nothing to clear; just an empty inbox.
+              <EmptyState
+                icon={MessageSquare}
+                title="No messages yet"
+                description="No messages have been sent yet."
+              />
+            )
           ) : (
             <>
               {/* Desktop table */}

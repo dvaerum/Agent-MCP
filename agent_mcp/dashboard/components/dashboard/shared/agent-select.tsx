@@ -102,6 +102,13 @@ export type AgentSelectProps = {
   className?: string
   /** Optional id passed through to the trigger (for `<label htmlFor>` wiring). */
   id?: string
+  /**
+   * Optional accessible name for the trigger. Needed on filter
+   * dropdowns where the visible label vanishes once a value is chosen
+   * (placeholder-only), so screen-reader users still hear what the
+   * control filters.
+   */
+  ariaLabel?: string
 }
 
 /**
@@ -126,6 +133,7 @@ export function AgentSelect({
   placeholder,
   className,
   id,
+  ariaLabel,
 }: AgentSelectProps): React.ReactElement {
   // Read live agents from the store. `getActiveAgents()` is the
   // single source of truth — it filters `status='terminated'` via
@@ -167,6 +175,7 @@ export function AgentSelect({
     >
       <SelectTrigger
         id={id}
+        aria-label={ariaLabel}
         className={cn("w-full bg-background border-border text-foreground", className)}
       >
         <SelectValue placeholder={placeholder ?? "Select agent"} />

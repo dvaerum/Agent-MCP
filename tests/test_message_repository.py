@@ -306,6 +306,48 @@ def test_query_filters_by_type_priority_read_and_substring(
         )} == {"m2"}
 
 
+def test_query_q_matches_subject_and_sender_not_just_content(
+    project_dir, reset_globals,
+):
+    """``q`` broadens beyond content to subject + sender + recipient.
+
+    Regression guard for the Messages-UX search broadening: a search
+    term must match by the subject line and by the sender/recipient
+    ids, not only the message body.
+    """
+    with _make_client(project_dir):
+        from agent_mcp.repositories import message_repo
+
+        _seed_agent("alice")
+        _seed_agent("bob")
+        _seed_agent("charlie")
+        # Body has no match; subject does.
+        _seed_message(
+            "s1", sender_id="alice", recipient_id="bob",
+            content="body text with nothing special",
+            subject="Quarterly deployment plan",
+        )
+        # Body + subject have no match; sender does.
+        _seed_message(
+            "s2", sender_id="charlie", recipient_id="bob",
+            content="unrelated body", subject="misc",
+        )
+        # Nothing matches either term.
+        _seed_message(
+            "s3", sender_id="alice", recipient_id="bob",
+            content="just chatting", subject="hi",
+        )
+
+        # Match by subject (not present in any body).
+        assert {r["message_id"] for r in message_repo.query(
+            {"q": "deployment"}
+        )} == {"s1"}
+        # Match by sender id.
+        assert {r["message_id"] for r in message_repo.query(
+            {"q": "charlie"}
+        )} == {"s2"}
+
+
 def test_query_filters_by_time_window(project_dir, reset_globals):
     """``since`` / ``until`` constrain the timestamp window."""
     with _make_client(project_dir):
