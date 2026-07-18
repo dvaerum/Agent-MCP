@@ -1,27 +1,24 @@
-"""Tools block: `send_agent_message` accepts subject + parent + auto-fills.
+"""Tools block: `send_agent_message` accepts subject + parent.
 
-RED test for behavior block 2 (v5.0.22): the MCP tool layer learns
-about the two new agent_messages columns. Specifically:
+The MCP tool layer handles the two agent_messages threading columns.
+Specifically:
 
 * `send_agent_message` gains optional `subject` and
   `parent_message_id` arguments.
 * When the caller passes `subject`, it is persisted verbatim
   (no LLM call).
 * When the caller omits `subject` for a root message
-  (`parent_message_id` absent / None) and
-  `AGENT_MCP_SUBJECT_MODEL` is set, the implementation calls
-  `agent_mcp.features.message_suggestions.suggest_subject(content)`
-  and stores the returned string.
-* When the caller omits `subject` for a root message and
-  `AGENT_MCP_SUBJECT_MODEL` is unset, the implementation falls back
-  to `content[:50] + "..."` — no LLM call.
+  (`parent_message_id` absent / None), the implementation stores
+  `subject = NULL` — Phase 1 (null-subject placeholder). It does NOT
+  call `suggest_subject` on the send path (that synchronous model call
+  was a latency/RAM problem) and does NOT persist a truncated body; the
+  read paths compute a 50-char preview on demand. NULL is the marker.
 * When the caller is sending a reply
   (`parent_message_id` is set), `subject` stays NULL regardless of
-  the Ollama config — replies don't carry subjects.
+  config — replies don't carry subjects.
 
-Ollama is mocked at the helper level (`message_suggestions.suggest_subject`)
-rather than at the HTTP layer — cheaper and the harness already
-intercepts httpx for embeddings.
+The `suggest_subject` helper is mocked to RAISE where relevant, proving
+the send path never invokes it.
 """
 
 from __future__ import annotations
@@ -99,23 +96,23 @@ async def test_explicit_subject_stored_verbatim(tmp_path, monkeypatch) -> None:
         assert content == "body here"
 
 
-async def test_root_without_subject_uses_ollama_helper(
+async def test_root_without_subject_stores_null_even_with_model(
     tmp_path, monkeypatch
 ) -> None:
-    """Root message + no subject + Ollama configured = helper fills it."""
+    """Root + no subject → NULL stored; suggest_subject NEVER called even
+    when AGENT_MCP_SUBJECT_MODEL is configured (Phase 1)."""
     from agent_mcp.core.config import get_db_path
     from agent_mcp.features import message_suggestions
 
     monkeypatch.setenv("AGENT_MCP_SUBJECT_MODEL", "qwen2.5:3b-instruct")
 
-    called = {"count": 0, "content": None}
+    async def _boom(content: str) -> str | None:  # pragma: no cover
+        raise AssertionError(
+            "suggest_subject must NOT be called on the send path; "
+            f"content={content!r}"
+        )
 
-    async def _mock_suggest(content: str) -> str | None:
-        called["count"] += 1
-        called["content"] = content
-        return "Mocked Subject"
-
-    monkeypatch.setattr(message_suggestions, "suggest_subject", _mock_suggest)
+    monkeypatch.setattr(message_suggestions, "suggest_subject", _boom)
 
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
@@ -131,26 +128,23 @@ async def test_root_without_subject_uses_ollama_helper(
         row = _fetch_message_row(str(get_db_path()), msg_id)
         assert row is not None
         subject, parent_id, _content = row
-        assert subject == "Mocked Subject", subject
+        assert subject is None, f"expected NULL subject, got {subject!r}"
         assert parent_id is None
-        assert called["count"] == 1
-        assert called["content"] == "please help with the build"
 
 
-async def test_root_without_subject_no_ollama_falls_back(
+async def test_root_without_subject_no_model_stores_null(
     tmp_path, monkeypatch
 ) -> None:
-    """Root + no subject + AGENT_MCP_SUBJECT_MODEL unset = truncated body fallback."""
+    """Root + no subject + AGENT_MCP_SUBJECT_MODEL unset → NULL stored
+    (NOT a truncated body). The preview is computed at read time only."""
     from agent_mcp.core.config import get_db_path
     from agent_mcp.features import message_suggestions
 
     monkeypatch.delenv("AGENT_MCP_SUBJECT_MODEL", raising=False)
 
-    # If the helper were called we'd fail loudly.
     async def _boom(content: str) -> str | None:  # pragma: no cover
         raise AssertionError(
-            "suggest_subject must not be invoked when "
-            "AGENT_MCP_SUBJECT_MODEL is unset"
+            "suggest_subject must not be invoked on the send path"
         )
 
     monkeypatch.setattr(message_suggestions, "suggest_subject", _boom)
@@ -171,9 +165,8 @@ async def test_root_without_subject_no_ollama_falls_back(
         assert row is not None
         subject, parent_id, _content = row
         assert parent_id is None
-        # Fallback rule: content[:50] + "..." for any root without an
-        # explicit subject when no Ollama backend is configured.
-        assert subject == long_body[:50] + "...", subject
+        # NULL is the marker — the truncated body is NEVER stored.
+        assert subject is None, f"expected NULL subject, got {subject!r}"
 
 
 async def test_reply_keeps_subject_null_even_with_ollama(

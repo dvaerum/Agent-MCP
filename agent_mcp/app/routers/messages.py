@@ -460,28 +460,23 @@ async def create_message_api_route(
 
         message_id = f"msg_{_secrets.token_hex(8)}"
 
-        # v5.0.22 effective-subject computation. Three branches —
-        # mirrors send_agent_message_tool_impl exactly:
+        # Phase 1 (null-subject placeholder) effective-subject computation.
+        # Mirrors send_agent_message_tool_impl exactly:
         #   1. Reply (parent set) → subject NULL regardless of body.
-        #   2. Explicit subject → verbatim.
-        #   3. Root w/o subject → Ollama suggest_subject if
-        #      AGENT_MCP_SUBJECT_MODEL is set; otherwise truncated body.
+        #   2. Explicit subject → verbatim (non-null).
+        #   3. Root w/o subject → store NULL. NULL is the marker; the read
+        #      paths compute a 50-char preview on demand (never stored)
+        #      and flag it `subject_is_placeholder`. We no longer call the
+        #      synchronous `suggest_subject` helper on the send path — it
+        #      survives for the dashboard's manual Suggest button
+        #      (/api/messages/suggest-subject) and the Phase 2 backfill.
         effective_subject: str | None
         if parent_message_id:
             effective_subject = None
         elif explicit_subject:
             effective_subject = explicit_subject
         else:
-            suggested: str | None = None
-            if os.environ.get("AGENT_MCP_SUBJECT_MODEL", "").strip():
-                from ...features.message_suggestions import suggest_subject
-                suggested = await suggest_subject(content)
-            if suggested:
-                effective_subject = suggested
-            else:
-                effective_subject = (
-                    content[:50] + "..." if len(content) > 50 else content
-                )
+            effective_subject = None
 
         # D2: the single-recipient send runs on the write-path
         # unit-of-work. The message INSERT + the audit-log row are
