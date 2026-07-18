@@ -1449,6 +1449,120 @@ class MessageRepository:
             )
             return 0
 
+    # --- Read interface: fetch_thread -----------------------------------
+
+    #: Hard cap on the parent-walk. Migration-0012's self-FK guarantees a
+    #: reply's parent exists, so a legitimate thread is a finite tree; the
+    #: cap only ever trips on a corrupt chain (a cycle, or a depth no real
+    #: conversation reaches) and turns an unbounded loop into a clean [].
+    _THREAD_WALK_CAP = 10_000
+
+    @staticmethod
+    def _resolve_thread_root(
+        session: Any, message_id: str,
+    ) -> Optional[str]:
+        """Walk ``parent_message_id`` up from ``message_id`` to the ROOT.
+
+        Returns the ``message_id`` of the root (``parent_message_id IS
+        NULL``), or ``None`` when the message doesn't exist, the chain is
+        broken (a parent id names no row), a cycle is detected, or the
+        walk exceeds :data:`_THREAD_WALK_CAP` — every defensive path folds
+        to ``None`` so :meth:`fetch_thread` returns ``[]``.
+        """
+        current: Optional[str] = message_id
+        seen: set[str] = set()
+        for _ in range(MessageRepository._THREAD_WALK_CAP):
+            if current in seen:
+                # Cycle — corrupt data; bail rather than loop forever.
+                return None
+            seen.add(current)
+            row = (
+                session.query(
+                    AgentMessage.message_id,
+                    AgentMessage.parent_message_id,
+                )
+                .filter(AgentMessage.message_id == current)
+                .one_or_none()
+            )
+            if row is None:
+                # Message (or a parent along the chain) doesn't exist.
+                return None
+            if row.parent_message_id is None:
+                return row.message_id
+            current = row.parent_message_id
+        return None
+
+    def fetch_thread(self, message_id: str) -> List[Dict[str, Any]]:
+        """Return the WHOLE thread ``message_id`` belongs to, oldest-first.
+
+        Two steps:
+
+        1. **Resolve the root** — walk ``parent_message_id`` up from
+           ``message_id`` until the row with ``parent_message_id IS NULL``
+           (:meth:`_resolve_thread_root`, cycle/missing-parent guarded).
+        2. **Collect the thread** — a SQLite recursive CTE gathers every
+           message transitively descending from that root, then each row
+           is loaded and projected through the canonical
+           :func:`_message_to_dict` (so thread rows carry the same fields
+           — subject placeholder view, threading columns — as every other
+           message projection) and returned ordered by ``timestamp ASC``
+           (root first, then the conversation in order).
+
+        Returns ``[]`` when ``message_id`` is empty, names no message, or
+        on any DB error (logged at error, mirroring the sibling reads).
+        """
+        if not message_id:
+            return []
+        try:
+            with get_session() as session:
+                root_id = self._resolve_thread_root(session, message_id)
+                if root_id is None:
+                    return []
+
+                # Recursive CTE: root ∪ everything descending from it.
+                from sqlalchemy import text as _sa_text
+
+                cte = _sa_text(
+                    """
+                    WITH RECURSIVE thread(message_id) AS (
+                        SELECT message_id FROM agent_messages
+                        WHERE message_id = :root
+                        UNION
+                        SELECT m.message_id
+                        FROM agent_messages m
+                        JOIN thread t
+                          ON m.parent_message_id = t.message_id
+                    )
+                    SELECT message_id FROM thread
+                    """
+                )
+                ids = [
+                    r[0]
+                    for r in session.execute(cte, {"root": root_id}).all()
+                ]
+                if not ids:
+                    return []
+
+                rows = (
+                    session.query(AgentMessage)
+                    .filter(AgentMessage.message_id.in_(ids))
+                    .order_by(AgentMessage.timestamp.asc())
+                    .all()
+                )
+                return [_message_to_dict(r) for r in rows]
+        except SQLAlchemyError as e:
+            logger.error(
+                f"Database error fetching thread for '{message_id}': {e}",
+                exc_info=True,
+            )
+            return []
+        except Exception as e:  # pragma: no cover — defensive
+            logger.error(
+                f"Unexpected error fetching thread for '{message_id}': {e}",
+                exc_info=True,
+            )
+            return []
+
     # --- Subject backfill (Phase 2) -------------------------------------
 
     def fetch_null_subject_roots(self, limit: int) -> List[Dict[str, Any]]:

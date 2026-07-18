@@ -16,7 +16,7 @@
 // declarations here will get trimmed.
 export * from './api-types.generated'
 
-import { loginUrl } from './urls'
+import { apiUrl, loginUrl } from './urls'
 
 export interface Agent {
   agent_id: string
@@ -1128,6 +1128,38 @@ class ApiClient {
 
 // Create singleton instance
 export const apiClient = new ApiClient()
+
+// Feature 1 (message-threads-ui): fetch the WHOLE conversation a message
+// belongs to — the root plus every reply transitively descending from it,
+// ordered oldest-first (root first). Backs the conversation view in
+// <ViewMessageModal>. Hits GET /api/{project}/messages/{id}/thread through
+// the same cookie-auth + strict-v1-media-type wrapper the other message
+// calls use; returns data.thread. When ``projectName`` is empty (the
+// standalone single-tenant deploy) it falls back to the ApiClient's
+// configured API root so both deployment shapes resolve correctly.
+export async function getMessageThread(
+  projectName: string,
+  messageId: string,
+): Promise<Message[]> {
+  const rest = `messages/${encodeURIComponent(messageId)}/thread`
+  const url = projectName
+    ? apiUrl(projectName, rest)
+    : `${apiClient.getServerUrl()}/${rest}`
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: {
+      // PR-A: REST endpoints require the strict v1 media type.
+      Accept: 'application/vnd.agent-mcp.v1+json',
+    },
+    credentials: 'include',
+  })
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '')
+    throw new Error(txt || `HTTP ${res.status}`)
+  }
+  const data = await res.json()
+  return Array.isArray(data?.thread) ? (data.thread as Message[]) : []
+}
 
 // React Query keys
 export const queryKeys = {
