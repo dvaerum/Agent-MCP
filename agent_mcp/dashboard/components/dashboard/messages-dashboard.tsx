@@ -138,6 +138,26 @@ async function callMessages(
 
 // Stats card component — matches the Agents/Tasks/Memories StatsCard
 // (plain Tailwind sizing + rounded-lg + semantic tokens + tabular-nums).
+// A filter control with a small visible label stacked above it, so each
+// dropdown is self-describing before it's opened (the From/To agent
+// pickers otherwise both just read "— Any —").
+const FilterField = ({
+  label,
+  className,
+  children,
+}: {
+  label: string
+  className?: string
+  children: React.ReactNode
+}) => (
+  <div className={cn("flex flex-col gap-1", className)}>
+    <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+      {label}
+    </span>
+    {children}
+  </div>
+)
+
 const StatsCard = ({ icon: Icon, label, value, change, trend }: {
   icon: React.ComponentType<{ className?: string }>
   label: string
@@ -885,24 +905,29 @@ export function MessagesDashboard() {
       )}
 
       {/* Controls — un-boxed filter bar matching Memories/Tasks (no
-          Card wrapper). */}
-      <div className="flex flex-col sm:flex-row sm:flex-wrap items-stretch sm:items-center gap-2 sm:gap-3">
-        <div className="relative flex-1 sm:max-w-xs">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            aria-label="Search messages"
-            placeholder="Search messages..."
-            value={filters.q}
-            onChange={(e) => setFilter("q", e.target.value)}
-            className="pl-10"
-          />
-        </div>
+          Card wrapper). Each control carries a small visible label above
+          it so the filters are self-describing before you open them
+          (two are agent pickers that otherwise both just read "— Any —").
+          A `<FilterField>` wraps each in a label + control stack. */}
+      <div className="flex flex-col sm:flex-row sm:flex-wrap items-stretch sm:items-end gap-2 sm:gap-3">
+        <FilterField label="Search" className="flex-1 sm:max-w-xs">
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              aria-label="Search messages"
+              placeholder="subject, sender, recipient, content…"
+              value={filters.q}
+              onChange={(e) => setFilter("q", e.target.value)}
+              className="pl-10"
+            />
+          </div>
+        </FilterField>
         {/*
           From/To filter dropdowns share <AgentSelect> with every other
           agent-input site. noneLabel="— Any —" because an empty filter
           means "no filter".
         */}
-        <div className="w-full sm:w-40">
+        <FilterField label="From" className="w-full sm:w-40">
           <AgentSelect
             value={filters.from || null}
             onChange={(v) => setFilter("from", v ?? "")}
@@ -910,8 +935,8 @@ export function MessagesDashboard() {
             placeholder="from"
             ariaLabel="Filter by sender"
           />
-        </div>
-        <div className="w-full sm:w-40">
+        </FilterField>
+        <FilterField label="To" className="w-full sm:w-40">
           <AgentSelect
             value={filters.to || null}
             onChange={(v) => setFilter("to", v ?? "")}
@@ -919,38 +944,44 @@ export function MessagesDashboard() {
             placeholder="to"
             ariaLabel="Filter by recipient"
           />
-        </div>
-        <Select
-          value={filters.type || ALL}
-          onValueChange={(v) => setFilter("type", v === ALL ? "" : v)}
-        >
-          <SelectTrigger aria-label="Filter by type" className="w-full sm:w-40"><SelectValue placeholder="type" /></SelectTrigger>
-          <SelectContent>
-            <SelectItem value={ALL}>all types</SelectItem>
-            {MESSAGE_TYPES.map((t) => (<SelectItem key={t} value={t}>{t}</SelectItem>))}
-          </SelectContent>
-        </Select>
-        <Select
-          value={filters.priority || ALL}
-          onValueChange={(v) => setFilter("priority", v === ALL ? "" : v)}
-        >
-          <SelectTrigger aria-label="Filter by priority" className="w-full sm:w-36"><SelectValue placeholder="priority" /></SelectTrigger>
-          <SelectContent>
-            <SelectItem value={ALL}>any priority</SelectItem>
-            {PRIORITIES.map((p) => (<SelectItem key={p} value={p}>{p}</SelectItem>))}
-          </SelectContent>
-        </Select>
-        <Select
-          value={filters.read || ALL}
-          onValueChange={(v) => setFilter("read", v === ALL ? "" : (v as "true" | "false"))}
-        >
-          <SelectTrigger aria-label="Filter by read status" className="w-full sm:w-32"><SelectValue placeholder="read?" /></SelectTrigger>
-          <SelectContent>
-            <SelectItem value={ALL}>any</SelectItem>
-            <SelectItem value="false">unread</SelectItem>
-            <SelectItem value="true">read</SelectItem>
-          </SelectContent>
-        </Select>
+        </FilterField>
+        <FilterField label="Type" className="w-full sm:w-40">
+          <Select
+            value={filters.type || ALL}
+            onValueChange={(v) => setFilter("type", v === ALL ? "" : v)}
+          >
+            <SelectTrigger aria-label="Filter by type" className="w-full"><SelectValue placeholder="type" /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value={ALL}>all types</SelectItem>
+              {MESSAGE_TYPES.map((t) => (<SelectItem key={t} value={t}>{t}</SelectItem>))}
+            </SelectContent>
+          </Select>
+        </FilterField>
+        <FilterField label="Priority" className="w-full sm:w-36">
+          <Select
+            value={filters.priority || ALL}
+            onValueChange={(v) => setFilter("priority", v === ALL ? "" : v)}
+          >
+            <SelectTrigger aria-label="Filter by priority" className="w-full"><SelectValue placeholder="priority" /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value={ALL}>any priority</SelectItem>
+              {PRIORITIES.map((p) => (<SelectItem key={p} value={p}>{p}</SelectItem>))}
+            </SelectContent>
+          </Select>
+        </FilterField>
+        <FilterField label="Status" className="w-full sm:w-32">
+          <Select
+            value={filters.read || ALL}
+            onValueChange={(v) => setFilter("read", v === ALL ? "" : (v as "true" | "false"))}
+          >
+            <SelectTrigger aria-label="Filter by read status" className="w-full"><SelectValue placeholder="read?" /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value={ALL}>any</SelectItem>
+              <SelectItem value="false">unread</SelectItem>
+              <SelectItem value="true">read</SelectItem>
+            </SelectContent>
+          </Select>
+        </FilterField>
         <Button variant="ghost" size="sm" onClick={clearFilters}>
           <X className="h-4 w-4 mr-1" />
           Clear
