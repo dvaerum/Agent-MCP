@@ -109,14 +109,26 @@ async def test_max_context_tokens_env_override_wins(monkeypatch):
     assert await cw.resolve_max_context_tokens("http://llama/v1") == 6000
 
 
+def _expected_budget(window: int) -> int:
+    ctx = window - cw._ANSWER_RESERVE_TOKENS - cw._PROMPT_OVERHEAD_TOKENS
+    return max(cw._MIN_BUDGET, ctx // cw._MAX_TOKENS_PER_WORD)
+
+
 async def test_max_context_tokens_derived_from_window(monkeypatch):
     async def _probe(_):
         return 8192
 
     monkeypatch.setattr(cw, "_probe_props", _probe)
     got = await cw.resolve_max_context_tokens("http://llama/v1")
-    assert got == 8192 - cw._BUDGET_HEADROOM
+    assert got == _expected_budget(8192)
     assert got >= cw._MIN_BUDGET
+    # The derived WORD budget, at the worst-case tokens/word, plus the
+    # reserved answer+overhead tokens, must never exceed the window.
+    assert (
+        got * cw._MAX_TOKENS_PER_WORD
+        + cw._ANSWER_RESERVE_TOKENS
+        + cw._PROMPT_OVERHEAD_TOKENS
+    ) <= 8192
 
 
 async def test_derived_budget_shrinks_on_small_window(monkeypatch):
@@ -134,7 +146,7 @@ async def test_derived_budget_shrinks_on_small_window(monkeypatch):
     cw._WINDOW_CACHE.clear()
     large = await cw.resolve_max_context_tokens("http://large/v1")
 
-    assert small == 4096 - cw._BUDGET_HEADROOM
+    assert small == _expected_budget(4096)
     assert small >= cw._MIN_BUDGET          # never below the floor
     assert small < large                    # smaller window → smaller budget
 

@@ -45,10 +45,33 @@ _DEFAULT_WINDOW = 4096
 # and only when it positively identifies a real (small) window.
 _LEGACY_UNBOUNDED_BUDGET = 1_000_000
 
-# Retrieved-context budget = window − headroom (system prompt + query +
-# generated answer), floored so a tiny window still yields a usable budget.
-_BUDGET_HEADROOM = 2048
-_MIN_BUDGET = 1024
+# Deriving the retrieved-context budget from the window requires
+# reconciling a UNIT MISMATCH: the RAG assembler counts context in WORDS
+# (features/rag/query.py::_append_within_budget uses len(text.split())),
+# but the window is in TOKENS. Words inflate into tokens — ~1.3x for
+# prose, up to ~2x for code / punctuation-dense chunks. A naive
+# `window - headroom` word budget would therefore imply up to ~2x that
+# many tokens and overflow.
+#
+# So we derive a SAFE word budget by: (1) reserving tokens for the
+# generated answer + the fixed prompt overhead (system prompt + query +
+# section headers, which are added outside the budgeted loop), then
+# (2) dividing the remaining token space by the WORST-CASE tokens/word,
+# so even an all-code retrieval stays within the window. Worked example
+# on an 8192 window: (8192 − 1024 − 512) / 2 = 3328 words; at the 2x
+# worst case that's 6656 tokens of context + 512 overhead + 1024 answer
+# = 8192, exactly the window. Typical prose (~1.3x) leaves ample slack.
+#
+# An operator who knows their corpus is prose-heavy (or uses a
+# cloud-scale window) can always raise the ceiling with the explicit
+# AGENT_MCP_MAX_CONTEXT_TOKENS override.
+_ANSWER_RESERVE_TOKENS = 1024   # room for the model to generate its answer
+_PROMPT_OVERHEAD_TOKENS = 512   # system prompt + query + section headers
+_MAX_TOKENS_PER_WORD = 2        # worst-case word→token inflation (code)
+# Floor so a small window still yields *some* context. Best-effort only:
+# below ~1536 tokens the reserves alone exceed the window and no strictly
+# safe budget exists — a degenerate window on which RAG can't really work.
+_MIN_BUDGET = 256
 
 # Subject helper: a one-line subject only needs the OPENING of a message,
 # so its input cap is CEILING-capped (never grows past this even on a huge
@@ -125,7 +148,8 @@ async def resolve_max_context_tokens(base_url: Optional[str]) -> int:
     window = await resolve_context_window(base_url)
     if window is None:
         return _LEGACY_UNBOUNDED_BUDGET
-    return max(_MIN_BUDGET, window - _BUDGET_HEADROOM)
+    context_tokens = window - _ANSWER_RESERVE_TOKENS - _PROMPT_OVERHEAD_TOKENS
+    return max(_MIN_BUDGET, context_tokens // _MAX_TOKENS_PER_WORD)
 
 
 async def resolve_subject_input_chars(base_url: Optional[str]) -> int:
