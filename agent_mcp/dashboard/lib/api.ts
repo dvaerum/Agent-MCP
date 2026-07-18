@@ -223,7 +223,15 @@ export interface Message {
   timestamp: string
   delivered: number | boolean
   read: number | boolean
+  // Subject display value: a real (sender-chosen or model-generated)
+  // subject, OR — when `subject_is_placeholder` is true — a computed
+  // 50-char preview of the body standing in for a not-yet-set subject.
   subject: string | null
+  // True when `subject` is an auto-generated preview, not a real subject
+  // (the backend stores NULL until Phase 2's backfill titles it; the
+  // read path returns a preview + this flag). Absent/false = real subject
+  // or a reply (which carries no subject). See backend Phase 1/2.
+  subject_is_placeholder?: boolean
   parent_message_id: string | null
 }
 
