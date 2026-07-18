@@ -794,8 +794,20 @@ async def mcp_call_tool_handler(name: str, arguments: dict) -> mcp_types.CallToo
             content=[mcp_types.TextContent(type="text", text="Tool execution failed")],
             isError=True,
         )
+    # Ambient unread-message nudge (agent bearers only). Appends a single
+    # advisory line to the outgoing text when the calling agent has unread
+    # messages, so agents notice + read their inbox during normal work
+    # without polling. Agent-only, additive, fail-safe, and skipped on the
+    # ``get_agent_messages`` read tool itself — see ``core.unread_nudge``.
+    from ..core.unread_nudge import maybe_append_unread_nudge
+
+    content = maybe_append_unread_nudge(
+        render_as_text_content(result),
+        principal=principal,
+        tool_name=name,
+    )
     return mcp_types.CallToolResult(
-        content=render_as_text_content(result),
+        content=content,
         isError=is_error_result(result),
     )
 

@@ -489,6 +489,45 @@ def count_unread_for_recipient(recipient_id: str) -> int:
         return 0
 
 
+def distinct_unread_senders_for_recipient(
+    recipient_id: str, limit: int = 3
+) -> List[str]:
+    """Best-effort list of up to ``limit`` distinct senders of the unread
+    messages addressed to ``recipient_id`` (most-recent activity first).
+
+    Feeds the ambient unread-message nudge (``core.unread_nudge``): the
+    advisory line names a few senders so the agent knows *who* is waiting
+    without opening the inbox. One indexed query (the
+    ``idx_agent_messages_unread`` covering index on
+    ``recipient_id, read, timestamp``) — no per-message fan-out. Returns
+    ``[]`` on any error so the caller falls back to a count-only nudge
+    rather than dropping it; the count is the load-bearing part.
+    """
+    try:
+        with get_session() as session:
+            rows = session.execute(
+                select(AgentMessage.sender_id)
+                .where(AgentMessage.recipient_id == recipient_id)
+                .where(AgentMessage.read.is_(False))
+                .group_by(AgentMessage.sender_id)
+                .order_by(func.max(AgentMessage.timestamp).desc())
+                .limit(limit)
+            ).all()
+            return [r[0] for r in rows if r[0] is not None]
+    except SQLAlchemyError as e:
+        logger.error(
+            f"Database error listing unread senders for '{recipient_id}': {e}",
+            exc_info=True,
+        )
+        return []
+    except Exception as e:
+        logger.error(
+            f"Unexpected error listing unread senders for '{recipient_id}': {e}",
+            exc_info=True,
+        )
+        return []
+
+
 def delete_message(message_id: str) -> bool:
     """DELETE a message by id. Returns False if the row didn't exist
     or the DB call errored."""
