@@ -4,6 +4,10 @@ import * as React from "react"
 import { Trash2 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import {
+  priorityBadgeClass,
+  messageTypeBadgeClass,
+} from "@/components/dashboard/shared/message-badges"
 
 /**
  * Mobile card-list rendering of the messages table (CC-7 audit
@@ -126,12 +130,23 @@ export function MessagesMobileList({
               />
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
-                  <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
-                    {m.sender_id}
+                  {/* Cap long agent ids so a card can't overflow its
+                      width; the inner span truncates + a title reveals
+                      the full id on long-press/hover. */}
+                  <Badge
+                    variant="outline"
+                    className="px-1.5 py-0 text-[10px] max-w-[40%]"
+                    title={m.sender_id}
+                  >
+                    <span className="truncate">{m.sender_id}</span>
                   </Badge>
                   <span aria-hidden>→</span>
-                  <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
-                    {m.recipient_id}
+                  <Badge
+                    variant="outline"
+                    className="px-1.5 py-0 text-[10px] max-w-[40%]"
+                    title={m.recipient_id}
+                  >
+                    <span className="truncate">{m.recipient_id}</span>
                   </Badge>
                   {!isRead && (
                     <span
@@ -177,23 +192,30 @@ export function MessagesMobileList({
                 ) : null}
                 <p
                   className={
-                    "text-sm mt-1 line-clamp-2 " +
+                    "text-sm mt-1 line-clamp-2 break-words " +
                     (isRead ? "text-muted-foreground" : "text-foreground")
                   }
+                  title={m.message_content}
                 >
                   {m.message_content}
                 </p>
-                <div className="flex items-center gap-2 mt-2 text-[11px] text-muted-foreground">
+                <div className="flex flex-wrap items-center gap-1.5 mt-2 text-[11px] text-muted-foreground">
                   <span className="font-mono tabular-nums">
                     {m.timestamp.slice(0, 19)}
                   </span>
-                  <span aria-hidden>·</span>
-                  <span>{m.message_type}</span>
-                  {m.priority && m.priority !== "normal" && (
-                    <>
-                      <span aria-hidden>·</span>
-                      <span>{m.priority}</span>
-                    </>
+                  <Badge
+                    variant="outline"
+                    className={"px-1.5 py-0 text-[10px] " + messageTypeBadgeClass(m.message_type)}
+                  >
+                    {m.message_type}
+                  </Badge>
+                  {m.priority && (
+                    <Badge
+                      variant="outline"
+                      className={"px-1.5 py-0 text-[10px] " + priorityBadgeClass(m.priority)}
+                    >
+                      {m.priority}
+                    </Badge>
                   )}
                 </div>
               </div>

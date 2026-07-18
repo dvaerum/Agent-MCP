@@ -775,7 +775,9 @@ class MessageRepository:
         * ``read`` (bool)       — ``read == read``
         * ``since`` (str)       — ``timestamp >= since``
         * ``until`` (str)       — ``timestamp <= until``
-        * ``q`` (str)           — ``message_content LIKE %q%``
+        * ``q`` (str)           — substring (LIKE %q%) across
+                                  message_content, subject, sender_id,
+                                  and recipient_id
         * ``limit`` (int, default 50)  — page size (clamped 1..500)
         * ``offset`` (int, default 0) — page offset
 
@@ -949,11 +951,22 @@ class MessageRepository:
                 AgentMessage.timestamp <= filter_until
             )
         if filter_q:
+            from sqlalchemy import or_
+
+            # Broaden ``q`` beyond the body: match content + subject +
+            # sender_id + recipient_id so admins can find a message by who
+            # it's from/to or its subject line, not just the content.
+            # Parameterized LIKE (``.like`` binds ``pattern`` as a value —
+            # the term is never interpolated into the SQL text).
             pattern = f"%{filter_q}%"
-            stmt = stmt.where(AgentMessage.message_content.like(pattern))
-            count_stmt = count_stmt.where(
-                AgentMessage.message_content.like(pattern)
+            q_clause = or_(
+                AgentMessage.message_content.like(pattern),
+                AgentMessage.subject.like(pattern),
+                AgentMessage.sender_id.like(pattern),
+                AgentMessage.recipient_id.like(pattern),
             )
+            stmt = stmt.where(q_clause)
+            count_stmt = count_stmt.where(q_clause)
         return stmt, count_stmt
 
     # --- Write interface: send -------------------------------------------

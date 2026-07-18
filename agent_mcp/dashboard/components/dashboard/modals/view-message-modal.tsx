@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState, type Ref } from 'react'
 import {
   MessageSquare,
   Send,
@@ -22,6 +22,10 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
+import {
+  priorityBadgeClass,
+  messageTypeBadgeClass,
+} from '@/components/dashboard/shared/message-badges'
 import { getMessageThread, type Message } from '@/lib/api'
 import { projectContext } from '@/lib/project-context'
 
@@ -74,6 +78,7 @@ function ConversationRow({
   msg,
   opened,
   onToggleRead,
+  innerRef,
 }: {
   msg: Message
   opened: boolean
@@ -81,6 +86,10 @@ function ConversationRow({
   // thread, it's unambiguous which message is being marked (unlike a
   // single footer button that silently targets only the opened one).
   onToggleRead: (msg: Message) => void
+  // Attached only to the opened row so the modal can scroll it into the
+  // center of the (root-first) conversation scroll container — otherwise
+  // a deep reply is buried below the fold.
+  innerRef?: Ref<HTMLDivElement>
 }) {
   // Direction cue: messages FROM admin lean one way, TO admin the other.
   // Purely visual — a subtle left accent so a back-and-forth reads as a
@@ -89,6 +98,7 @@ function ConversationRow({
   const isRead = msg.read === 1 || msg.read === true
   return (
     <div
+      ref={innerRef}
       className={cn(
         "rounded-md border p-3 text-sm",
         fromAdmin
@@ -119,6 +129,8 @@ function ConversationRow({
           <button
             type="button"
             onClick={() => onToggleRead(msg)}
+            aria-pressed={isRead}
+            aria-label={isRead ? "Mark this message unread" : "Mark this message read"}
             title={isRead ? "Mark this message unread" : "Mark this message read"}
             className={cn(
               "inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium border transition-colors",
@@ -163,6 +175,12 @@ export function ViewMessageModal({
   const [thread, setThread] = useState<Message[]>([])
   const [loading, setLoading] = useState(false)
 
+  // Ref on the opened row so we can scroll it into view once the thread
+  // finishes loading. In a long, root-first conversation the clicked
+  // message is buried below the fold — the ring highlight alone doesn't
+  // help if the row is off-screen.
+  const openedRowRef = useRef<HTMLDivElement>(null)
+
   const openedId = message?.message_id ?? null
 
   useEffect(() => {
@@ -190,6 +208,19 @@ export function ViewMessageModal({
       cancelled = true
     }
   }, [open, openedId, message])
+
+  // Once the thread has loaded, scroll the opened message into the
+  // center of the conversation scroll container. Guarded on the ref
+  // (null for a single-message thread — the conversation branch, and
+  // thus the row ref, only renders when thread.length > 1, so this is a
+  // no-op there). Runs after loading flips false so the rows exist.
+  useEffect(() => {
+    if (loading) return
+    if (thread.length <= 1) return
+    const el = openedRowRef.current
+    if (!el) return
+    el.scrollIntoView({ block: "center" })
+  }, [loading, thread, openedId])
 
   if (!message) return null
 
@@ -252,14 +283,18 @@ export function ViewMessageModal({
           // each message below in time order. The clicked message is
           // ring-highlighted so the admin sees which one they opened.
           <div className="space-y-2 max-h-[55vh] overflow-auto pr-1">
-            {thread.map((msg) => (
-              <ConversationRow
-                key={msg.message_id}
-                msg={msg}
-                opened={msg.message_id === message.message_id}
-                onToggleRead={handleToggleRead}
-              />
-            ))}
+            {thread.map((msg) => {
+              const opened = msg.message_id === message.message_id
+              return (
+                <ConversationRow
+                  key={msg.message_id}
+                  msg={msg}
+                  opened={opened}
+                  onToggleRead={handleToggleRead}
+                  innerRef={opened ? openedRowRef : undefined}
+                />
+              )
+            })}
           </div>
         ) : (
           <>
@@ -275,13 +310,17 @@ export function ViewMessageModal({
               <div>
                 <div className="text-xs text-muted-foreground">Type</div>
                 <div>
-                  <Badge variant="outline">{message.message_type}</Badge>
+                  <Badge variant="outline" className={messageTypeBadgeClass(message.message_type)}>
+                    {message.message_type}
+                  </Badge>
                 </div>
               </div>
               <div>
                 <div className="text-xs text-muted-foreground">Priority</div>
                 <div>
-                  <Badge variant="outline">{message.priority}</Badge>
+                  <Badge variant="outline" className={priorityBadgeClass(message.priority)}>
+                    {message.priority}
+                  </Badge>
                 </div>
               </div>
               <div>
@@ -306,6 +345,8 @@ export function ViewMessageModal({
                   <button
                     type="button"
                     onClick={() => handleToggleRead(message)}
+                    aria-pressed={isRead}
+                    aria-label={isRead ? "Mark unread" : "Mark read"}
                     title={isRead ? "Mark unread" : "Mark read"}
                   >
                     {isRead ? (

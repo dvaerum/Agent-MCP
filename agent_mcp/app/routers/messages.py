@@ -96,7 +96,8 @@ async def list_messages_api_route(
       priority       priority filter
       read           bool — read flag filter
       since/until    ISO timestamp window
-      q              content substring (LIKE %q%)
+      q              substring (LIKE %q%) across content, subject,
+                     sender_id, and recipient_id
       limit/offset   pagination (default 50 / 0)
     """
     try:
