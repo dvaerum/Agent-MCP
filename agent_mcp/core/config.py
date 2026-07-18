@@ -313,10 +313,47 @@ def embedding_settings(advanced: Optional[bool] = None) -> "EmbeddingSettings":
 # constant was dead (the real batch controls are
 # PARALLEL_EMBEDDING_BATCH_SIZE / MAX_CONCURRENT_EMBEDDING_REQUESTS in
 # features/rag/indexing.py) and was removed.
-MAX_CONTEXT_TOKENS: int = 1000000  # GPT-4.1 has 1M token context window
-TASK_ANALYSIS_MAX_TOKENS: int = (
-    1000000  # Same 1M token context window for task analysis
-)
+def _positive_int_env(name: str, default: int) -> int:
+    """Parse a positive-integer env var, falling back GRACEFULLY.
+
+    A non-integer or non-positive value must never crash the server on a
+    typo — we log a warning and return ``default``.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not an integer; falling back to default %d.",
+            name,
+            raw,
+            default,
+        )
+        return default
+    if value <= 0:
+        logger.warning(
+            "%s=%r must be a positive integer; falling back to default %d.",
+            name,
+            raw,
+            default,
+        )
+        return default
+    return value
+
+
+# The model's usable context-token budget, env-overridable via
+# AGENT_MCP_MAX_CONTEXT_TOKENS. Defaults to 1,000,000 (GPT-4.1's window),
+# so cloud deployments are unchanged. The RAG assembler
+# (`features/rag/query.py:_append_within_budget`) truncates the retrieved
+# context to fit this budget — so a small-context local model (llama-cpp /
+# Ollama, ~8k window) should set this to its window minus headroom for the
+# system prompt + query + answer, otherwise the model 400s on oversized
+# RAG prompts (`exceed_context_size_error`).
+MAX_CONTEXT_TOKENS: int = _positive_int_env("AGENT_MCP_MAX_CONTEXT_TOKENS", 1000000)
+# Task analysis must also fit the model, so it shares the same budget.
+TASK_ANALYSIS_MAX_TOKENS: int = MAX_CONTEXT_TOKENS
 
 # --- Project Directory Helpers ---
 # These rely on an environment variable "MCP_PROJECT_DIR" being set,
