@@ -33,6 +33,9 @@ interface MessageRow {
   read: number | boolean
   // v5.0.22 message threads + subjects.
   subject: string | null
+  // True when `subject` is an auto-generated preview (Phase 1/2), not a
+  // real subject — rendered as a muted "auto" placeholder.
+  subject_is_placeholder?: boolean
   parent_message_id: string | null
 }
 
@@ -139,7 +142,20 @@ export function MessagesMobileList({
                 </div>
                 {/* v5.0.22: surface subject (root) or reply marker
                     (reply) on its own line above the body. */}
-                {m.subject ? (
+                {m.subject && m.subject_is_placeholder ? (
+                  // Placeholder: no subject set → auto-preview of the body
+                  // (Phase 1). Muted + italic with an "auto" tag so it reads
+                  // as a stub; the backfill sweep titles it later (Phase 2).
+                  <p
+                    className="text-sm mt-1 italic text-muted-foreground truncate"
+                    title="No subject set — auto-preview of the message. A generated subject will fill in shortly."
+                  >
+                    {m.subject}
+                    <span className="ml-1 not-italic text-[10px] font-medium uppercase tracking-wide text-muted-foreground/60">
+                      auto
+                    </span>
+                  </p>
+                ) : m.subject ? (
                   <p
                     className={
                       "text-sm mt-1 font-medium truncate " +

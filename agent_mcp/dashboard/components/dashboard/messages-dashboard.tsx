@@ -205,7 +205,21 @@ const MessageRow = ({
       <TableCell><Badge variant="outline">{m.sender_id}</Badge></TableCell>
       <TableCell><Badge variant="outline">{m.recipient_id}</Badge></TableCell>
       <TableCell className="text-xs max-w-[200px] truncate">
-        {m.subject ? (
+        {m.subject && m.subject_is_placeholder ? (
+          // Placeholder: the sender set no subject, so this is an
+          // auto-preview of the body (Phase 1). Shown muted + italic with
+          // an "auto" tag so it reads as a stub, not a real subject — a
+          // generated one fills in on the next backfill sweep (Phase 2).
+          <span
+            className="italic text-muted-foreground"
+            title="No subject set — auto-preview of the message. A generated subject will fill in shortly."
+          >
+            {m.subject}
+            <span className="ml-1 not-italic text-[10px] font-medium uppercase tracking-wide text-muted-foreground/60">
+              auto
+            </span>
+          </span>
+        ) : m.subject ? (
           m.subject
         ) : isReply ? (
           // v5.0.24 polish: human-readable parent label instead of the
