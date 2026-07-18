@@ -253,9 +253,12 @@ describe("MUX-8: recipient options include the selected value", () => {
 // ── MUX-9: broadened search placeholder ───────────────────────────
 
 describe("MUX-9: search placeholder broadened", () => {
-  it("placeholder reads 'Search messages…' not 'Search content'", () => {
-    expect(/placeholder="Search messages\.\.\."/.test(dash)).toBe(true)
-    expect(/Search content/.test(dash)).toBe(false)
+  it("placeholder names the broadened search scope, not just content", () => {
+    // The field now has a visible "Search" label above it, so the
+    // placeholder describes WHAT is searched (subject/sender/recipient/
+    // content) — reflecting the #559 broadened backend search.
+    expect(/placeholder="subject, sender, recipient, content/.test(dash)).toBe(true)
+    expect(/placeholder="Search content/.test(dash)).toBe(false)
   })
 })
 
@@ -346,6 +349,20 @@ describe("MUX-11: badge helper — every type + priority", () => {
     // helper only adds colour utilities, never a wrap/width override.
     for (const t of ALL_TYPES) {
       expect(/wrap|w-\[/.test(messageTypeBadgeClass(t))).toBe(false)
+    }
+  })
+})
+
+// ── MUX-12: filter controls carry a visible label ──────────────────
+describe("MUX-12: filter dropdowns have visible labels", () => {
+  const src = read("components/dashboard/messages-dashboard.tsx")
+  it("wraps each filter in a labeled FilterField (From/To/Type/Priority/Status)", () => {
+    expect(/const FilterField/.test(src)).toBe(true)
+    for (const label of ["Search", "From", "To", "Type", "Priority", "Status"]) {
+      expect(
+        new RegExp(`<FilterField label="${label}"`).test(src),
+        `missing visible label "${label}"`,
+      ).toBe(true)
     }
   })
 })
