@@ -31,6 +31,15 @@ and the alternatives weighed. Most recent decisions:
 - [ADR-0014](./adr/0014-rest-admin-api.md) — REST admin API; retire the `__` URL namespace.
 - [ADR-0015](./adr/0015-sso-oidc-and-proxy-header.md) — SSO via OIDC + proxy-header trust.
 
+### [`proposals/`](./proposals/) — parked future improvements
+
+Designs that are proposed but not accepted — captured so the idea
+outlives the session that raised it. Each states what it is, its
+current state in the tree, and the concrete need that would justify
+finishing it.
+
+- [`capability-based-authz.md`](./proposals/capability-based-authz.md) — replace coarse role tiers with fine-grained `resource.verb` capabilities sourced from SSO groups + bundles. Foundation partially shipped; feature parked pending a per-group-permissions need.
+
 ### [`audit/`](./audit/) — dated investigations
 
 Capture-what-we-learned reports from one-off investigations.
