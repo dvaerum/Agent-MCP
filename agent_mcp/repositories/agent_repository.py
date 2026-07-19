@@ -285,6 +285,13 @@ def _agent_to_dict(row: Agent) -> Dict[str, Any]:
         # Phase 2 Wave 2b: persisted by Wave 1a's migration with
         # ``DEFAULT 'worker'`` + CHECK in {'worker', 'manager'}.
         "agent_role": getattr(row, "agent_role", "worker"),
+        # Agent self-service profiles (migration 0018). All nullable;
+        # NULL ``profile`` = never set, NULL ``profile_reviewed_at`` =
+        # overdue for review.
+        "profile": getattr(row, "profile", None),
+        "profile_updated_at": getattr(row, "profile_updated_at", None),
+        "profile_reviewed_at": getattr(row, "profile_reviewed_at", None),
+        "profile_updated_by": getattr(row, "profile_updated_by", None),
     }
     raw_caps = data.get("capabilities")
     if isinstance(raw_caps, str):
@@ -1157,6 +1164,104 @@ class AgentRepository:
                 },
             )
         return True
+
+    def review_profile(
+        self,
+        agent_id: str,
+        *,
+        new_profile: Optional[str] = None,
+        editor_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Record a profile review; bump content bookkeeping iff it changed.
+
+        Two timestamps, one write (agent self-service profiles, plan §2):
+
+        * ``profile_reviewed_at`` is ALWAYS set to now — even a no-op
+          confirm counts as a review, and this is what drives the
+          staleness nudge. A forced weekly review that changes nothing
+          moves ONLY this, so peers are never spammed by a no-op.
+        * ``profile`` / ``profile_updated_at`` / ``profile_updated_by``
+          move ONLY when ``new_profile`` is provided AND its sha256
+          differs from the stored profile. ``profile_updated_at`` is what
+          the peer-broadcast keys on, so a real content change is the
+          only thing that reaches other agents.
+
+        ``new_profile=None`` (arg omitted by the caller) is the "confirm
+        still accurate" path: ``reviewed_at`` moves, nothing else.
+
+        Returns the post-review dict with an extra ``"changed": bool`` key,
+        or ``None`` when the agent row is unknown / a DB error occurred.
+        On a real content change refreshes the caches (so a cached auth
+        row carries the fresh profile) and publishes ``agent.updated``.
+        """
+        import hashlib
+
+        def _hash(value: Optional[str]) -> str:
+            return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
+
+        now = datetime.datetime.now().isoformat()
+        changed = False
+        try:
+            with get_session() as session:
+                row = (
+                    session.query(Agent)
+                    .filter(Agent.agent_id == agent_id)
+                    .one_or_none()
+                )
+                if row is None:
+                    return None
+                # Always record the review.
+                row.profile_reviewed_at = now
+                # Content change gate: only a real diff bumps updated_at
+                # + updated_by (and thus reaches the peer broadcast).
+                if (
+                    new_profile is not None
+                    and _hash(new_profile) != _hash(row.profile)
+                ):
+                    row.profile = new_profile
+                    row.profile_updated_at = now
+                    row.profile_updated_by = editor_id
+                    changed = True
+                # Keep the generic updated_at moving too (mirrors every
+                # other write path in this repo).
+                row.updated_at = now
+                session.commit()
+        except SQLAlchemyError as e:
+            logger.error(
+                f"Database error reviewing profile for agent "
+                f"'{agent_id}': {e}",
+                exc_info=True,
+            )
+            return None
+
+        fresh = _db_get_agent_by_id(agent_id)
+        if fresh is None:
+            return None
+        fresh["changed"] = changed
+
+        # Refresh the caches so a cached auth row carries the fresh
+        # profile. Gated on non-terminal status exactly like every other
+        # write path (terminate-revocation invariant).
+        if (
+            not self._cache_disabled
+            and fresh.get("status") not in TERMINAL_AGENT_STATUSES
+        ):
+            token = fresh.get("token")
+            if token:
+                state.active_agents[token] = fresh
+            wd = fresh.get("working_directory")
+            if wd:
+                state.agent_working_dirs[agent_id] = wd
+
+        # Only a real content change is worth waking sibling waiters /
+        # publishing — a no-op review moves reviewed_at only.
+        if changed:
+            _publish(
+                agent_id,
+                "agent.updated",
+                {"agent_id": agent_id, "field": "profile"},
+            )
+        return fresh
 
     def _update_field_with_cursor(
         self,

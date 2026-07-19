@@ -163,6 +163,7 @@ export const GROUP_ORDER: ReadonlyArray<{
 }> = [
   { group: "worker_permissions", title: "Worker permissions" },
   { group: "event_loop", title: "Agent event-loop" },
+  { group: "agent_profiles", title: "Agent profiles" },
   { group: "retention", title: "Message retention" },
   { group: "aoe", title: "AoE integration" },
 ]

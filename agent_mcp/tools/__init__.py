@@ -29,6 +29,7 @@ from . import project_context_tools
 from . import project_settings_tools  # noqa: E402,F401 — ADR-0016 settings store
 from . import file_metadata_tools
 from . import agent_tools
+from . import agent_profile_tools  # noqa: E402,F401 — self-service profile tool
 from . import rag_tools
 from . import utility_tools
 from . import agent_communication_tools

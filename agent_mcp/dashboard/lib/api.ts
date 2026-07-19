@@ -260,7 +260,7 @@ export interface SettingsSchemaEntry {
   type: 'bool' | 'int' | 'string' | 'secret'
   default: unknown
   tier: 'operator' | 'sysadmin'
-  group: 'worker_permissions' | 'event_loop' | 'retention' | 'aoe'
+  group: 'worker_permissions' | 'event_loop' | 'retention' | 'aoe' | 'agent_profiles'
   title: string
   description: string
   widget:

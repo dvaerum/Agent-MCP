@@ -25,6 +25,7 @@ from ..core.auth import generate_token  # For register_agent, terminate_agent
 # read by ``tools/access._derive_access_level`` once the decorator
 # is gone.
 from ..core.principal import Principal
+from ..core.agent_profile_defaults import MANAGER_DEFAULT_PROFILE
 from ..core.operator_tier import (
     is_confirmed_operator_tier as _shared_is_confirmed_operator_tier,
 )
@@ -375,7 +376,7 @@ async def register_agent_tool_impl(
             # sentinel rolls the uow back (zero effects) and surfaces the
             # caller-facing Invalid unchanged.
             try:
-                agent_repo.create(
+                created_row = agent_repo.create(
                     token=new_agent_token,
                     agent_id=agent_id,
                     capabilities=[],
@@ -389,6 +390,27 @@ async def register_agent_tool_impl(
             except ValueError as ve:
                 raise _UnitOfWorkAbort(
                     Invalid(field="name", message=str(ve))
+                )
+
+            # Agent self-service profiles (plan §2.6): seed managers with
+            # the hardcoded charter, stamping reviewed_at = updated_at =
+            # created_at so a fresh manager is not instantly "stale" (the
+            # first-connect greet still delivers the charter on its first
+            # event-loop call). ``profile_updated_by`` stays NULL (seed,
+            # not an editor) so the seed never fires a peer broadcast.
+            # Workers are left with a NULL profile — they build it up.
+            if role == "manager":
+                seed_ts = created_row.get("created_at") or created_at_iso
+                cursor.execute(
+                    "UPDATE agents SET profile = ?, "
+                    "profile_updated_at = ?, profile_reviewed_at = ?, "
+                    "profile_updated_by = NULL WHERE agent_id = ?",
+                    (
+                        MANAGER_DEFAULT_PROFILE,
+                        seed_ts,
+                        seed_ts,
+                        agent_id,
+                    ),
                 )
 
             actor_label = principal.actor_label() if principal else "operator"
@@ -422,6 +444,24 @@ async def register_agent_tool_impl(
                 "terminated_at": None,
                 "updated_at": created_at_iso,
                 "agent_role": role,
+                # Agent self-service profiles: mirror the seeded manager
+                # charter into the cache row so a cache-served read (e.g.
+                # the PR3 review greet) sees the profile without a DB
+                # round-trip. Workers seed NULL.
+                "profile": (
+                    MANAGER_DEFAULT_PROFILE if role == "manager" else None
+                ),
+                "profile_updated_at": (
+                    (created_row.get("created_at") or created_at_iso)
+                    if role == "manager"
+                    else None
+                ),
+                "profile_reviewed_at": (
+                    (created_row.get("created_at") or created_at_iso)
+                    if role == "manager"
+                    else None
+                ),
+                "profile_updated_by": None,
             }
             u.on_commit(lambda: agent_repo.upsert_cache(agent_cache_row))
             u.on_commit(

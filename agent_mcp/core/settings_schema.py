@@ -32,7 +32,9 @@ from typing import Literal, Optional
 
 SettingType = Literal["bool", "int", "string", "secret"]
 SettingTier = Literal["operator", "sysadmin"]
-SettingGroup = Literal["worker_permissions", "event_loop", "retention", "aoe"]
+SettingGroup = Literal[
+    "worker_permissions", "event_loop", "retention", "aoe", "agent_profiles",
+]
 SettingWidget = Literal[
     "switch",
     "int_days",
@@ -166,6 +168,69 @@ SETTINGS_SCHEMA: tuple[SettingSpec, ...] = (
             "rows from agent_messages where read=1 and timestamp is older "
             "than the configured window. Unread messages are never "
             "pruned. Set to 0 to disable (keep forever)."
+        ),
+        widget="int_days",
+    ),
+    SettingSpec(
+        key="config_allow_worker_update_own_profile",
+        type="bool",
+        default=True,
+        tier="operator",
+        group="agent_profiles",
+        title="Allow workers to edit their own profile",
+        description=(
+            "When on (default), a worker may call update_agent_profile to "
+            "edit or confirm its own self-authored profile. When off, a "
+            "worker can still review (confirm) but not change its profile. "
+            "Editing a profile is routing-neutral — this toggle is a "
+            "governance preference, not a safety gate."
+        ),
+        widget="switch",
+    ),
+    SettingSpec(
+        key="config_allow_manager_update_own_profile",
+        type="bool",
+        default=True,
+        tier="operator",
+        group="agent_profiles",
+        title="Allow managers to edit their own profile",
+        description=(
+            "When on (default), a manager may call update_agent_profile to "
+            "edit or confirm its own profile (the charter seeded at "
+            "registration). When off, a manager can still review but not "
+            "change its own profile."
+        ),
+        widget="switch",
+    ),
+    SettingSpec(
+        key="config_allow_manager_curate_profiles",
+        type="bool",
+        default=True,
+        tier="operator",
+        group="agent_profiles",
+        title="Allow managers to curate worker profiles",
+        description=(
+            "When on (default), a manager may edit any worker's profile in "
+            "the project (curation). Managers may never edit another "
+            "manager's profile regardless of this toggle. When off, "
+            "managers may only edit their own profile (subject to the "
+            "manager self-edit toggle)."
+        ),
+        widget="switch",
+    ),
+    SettingSpec(
+        key="config_profile_review_interval_days",
+        type="int",
+        default=7,
+        tier="operator",
+        group="agent_profiles",
+        title="Remind agents to review their profile every",
+        description=(
+            "How often an agent is nudged (on its event loop) to confirm or "
+            "refresh its profile. The nudge fires when the profile has not "
+            "been reviewed within this window, and always once on the first "
+            "event-loop call of a new session. Set to 0 to disable the "
+            "staleness nudge (the first-connect greet still fires once)."
         ),
         widget="int_days",
     ),
