@@ -97,6 +97,17 @@ export interface McpSessionMirror {
   alias_used?: string | null
 }
 
+/** Pydantic mirror of the `pending_directive` table. */
+export interface PendingDirectiveMirror {
+  poke_id: string
+  agent_id: string
+  prompt: string
+  priority?: string | null
+  created_at: string
+  created_by?: string | null
+  delivered_at?: string | null
+}
+
 /** Pydantic mirror of the `project_context` table. */
 export interface ProjectContextMirror {
   context_key: string
@@ -187,6 +198,7 @@ export const MIRROR_TABLE_NAMES = [
   "claude_code_sessions",
   "file_metadata",
   "mcp_sessions",
+  "pending_directive",
   "project_context",
   "project_settings",
   "rag_chunks",

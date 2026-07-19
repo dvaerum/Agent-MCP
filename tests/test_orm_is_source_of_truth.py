@@ -50,6 +50,7 @@ EXPECTED_TABLES = {
     "claude_code_sessions",
     "mcp_sessions",
     "scheduled_directive",
+    "pending_directive",
 }
 
 

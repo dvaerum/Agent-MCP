@@ -226,6 +226,18 @@ class TaskNoteMirror(BaseModel):
     text: str
 
 
+class PendingDirectiveMirror(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    poke_id: str
+    agent_id: str
+    prompt: str
+    priority: str = "urgent"
+    created_at: str
+    created_by: Optional[str] = None
+    delivered_at: Optional[str] = None
+
+
 class ScheduledDirectiveMirror(BaseModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
@@ -258,6 +270,7 @@ MIRRORS: dict[str, type[BaseModel]] = {
     "claude_code_sessions": ClaudeCodeSessionMirror,
     "file_metadata": FileMetadataMirror,
     "mcp_sessions": McpSessionMirror,
+    "pending_directive": PendingDirectiveMirror,
     "project_context": ProjectContextMirror,
     "project_settings": ProjectSettingsMirror,
     "rag_chunks": RagChunkMirror,
@@ -276,6 +289,7 @@ __all__ = [
     "FileMetadataMirror",
     "McpSessionMirror",
     "MIRRORS",
+    "PendingDirectiveMirror",
     "ProjectContextMirror",
     "ProjectSettingsMirror",
     "RagChunkMirror",

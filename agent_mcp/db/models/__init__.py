@@ -28,6 +28,7 @@ from .agent_message import AgentMessage
 from .claude_code_session import ClaudeCodeSession
 from .file_metadata import FileMetadata
 from .mcp_session import McpSession
+from .pending_directive import PendingDirective
 from .project_context import ProjectContext
 from .project_settings import ProjectSettings
 from .rag_chunk import RagChunk
@@ -43,6 +44,7 @@ __all__ = [
     "ClaudeCodeSession",
     "FileMetadata",
     "McpSession",
+    "PendingDirective",
     "ProjectContext",
     "ProjectSettings",
     "RagChunk",
