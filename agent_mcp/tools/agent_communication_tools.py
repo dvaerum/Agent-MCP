@@ -1189,7 +1189,9 @@ def _cap_events_to_boundary(
 # Kept as a small local frozenset (rather than importing the private bus
 # constant into the tool layer); the dedup tests pin the invariant that
 # the two sets track each other.
-_DEDUP_EVENT_TYPES = frozenset({"unassigned_task_appeared"})
+_DEDUP_EVENT_TYPES = frozenset(
+    {"unassigned_task_appeared", "agent_profile_updated"}
+)
 
 
 def _event_identity(event: Dict[str, Any]) -> Optional[tuple]:
@@ -1509,6 +1511,134 @@ def _collect_unassigned_task_events_for(
     return events
 
 
+def _collect_agent_profile_events_for(
+    agent_id: str, since: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Find peer profile changes newer than ``since`` (agent self-service
+    profiles, plan §8 PR2).
+
+    Derived from the ``agents`` table on catch-up — the table IS the log,
+    so this is disconnect-robust: an agent offline across a peer's edit
+    replays it on reconnect (``profile_updated_at > cursor``). Emits one
+    ``agent_profile_updated`` event per changed peer.
+
+    Exclusions (all in SQL so catch-up and the in-memory push agree). The
+    broadcast excludes the **editor**, not the subject (decision 3):
+
+    * ``profile_updated_by != :self`` — the recipient never sees a change
+      IT authored (its own self-edit, or a manager viewing its own
+      curation of a worker). This is the editor exclusion.
+    * ``NOT (agent_id = :self AND profile_updated_by IS NULL)`` — a
+      recipient does not get its OWN seed (the manager charter, which has
+      a NULL editor) echoed back to itself. A seed for SOMEONE ELSE (a
+      newly-registered manager's charter) still surfaces — a new manager
+      is a roster change worth learning about.
+    * tombstone / terminated / system rows are never a profile source.
+
+    Consequence (verifies the locked cases): a manager editing a worker
+    (``updated_by = manager``) DOES reach the worker subject
+    (``updated_by != worker``) but not the manager editor; a self-edit
+    reaches every peer but not the author.
+    """
+    since_iso = since if since else "0000-01-01T00:00:00"
+    events: List[Dict[str, Any]] = []
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT agent_id, agent_role, profile, profile_updated_at,
+                   profile_updated_by
+            FROM agents
+            WHERE profile_updated_at IS NOT NULL
+              AND profile_updated_at > ?
+              AND (profile_updated_by IS NULL OR profile_updated_by != ?)
+              AND NOT (agent_id = ? AND profile_updated_by IS NULL)
+              AND status NOT IN ('tombstone', 'terminated', 'system')
+            ORDER BY profile_updated_at ASC
+            """,
+            (since_iso, agent_id, agent_id),
+        )
+        for row in cursor.fetchall():
+            events.append({
+                "type": "agent_profile_updated",
+                "ref_id": row["agent_id"],
+                "timestamp": row["profile_updated_at"],
+                "data": {
+                    "agent_id": row["agent_id"],
+                    "agent_role": row["agent_role"],
+                    "profile": row["profile"],
+                    "updated_by": row["profile_updated_by"],
+                },
+            })
+    finally:
+        if conn:
+            conn.close()
+    return events
+
+
+def notify_agent_profile_updated(
+    subject_id: str, editor_id: Optional[str],
+) -> None:
+    """Push an ``agent_profile_updated`` event to every live agent except
+    the editor, for low latency (agent self-service profiles, plan §8 PR2).
+
+    Best-effort in-memory fan-out — the ``agents`` table is the source of
+    truth, so a dropped push is replayed on the recipient's next
+    ``fetch_events_since`` / ``wait_for_events`` catch-up via
+    :func:`_collect_agent_profile_events_for`. Wrapped in a broad
+    try/except so a notification side effect can never poison the source
+    write (the profile is already committed by the time we're called).
+
+    The event carries the subject's freshly-committed profile row and
+    rides ``profile_updated_at`` as its timestamp so the deduped copy
+    (DB re-query vs this push) anchors the cursor on the real DB
+    transition time (matches the ``unassigned_task_appeared`` contract).
+    """
+    try:
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT agent_id, agent_role, profile, profile_updated_at, "
+                "profile_updated_by FROM agents WHERE agent_id = ?",
+                (subject_id,),
+            )
+            subj = cur.fetchone()
+            if subj is None:
+                return
+            # arch: function-level import avoids the state<->comm module
+            # cycle; LIVE_AGENT_SQL excludes terminated + tombstone.
+            from ..repositories.agent_repository import LIVE_AGENT_SQL
+
+            cur.execute(f"SELECT agent_id FROM agents WHERE {LIVE_AGENT_SQL}")
+            recipients = [r["agent_id"] for r in cur.fetchall()]
+        finally:
+            conn.close()
+
+        event = {
+            "type": "agent_profile_updated",
+            "ref_id": subj["agent_id"],
+            "timestamp": subj["profile_updated_at"],
+            "data": {
+                "agent_id": subj["agent_id"],
+                "agent_role": subj["agent_role"],
+                "profile": subj["profile"],
+                "updated_by": subj["profile_updated_by"],
+            },
+        }
+        for rid in recipients:
+            # Exclude the EDITOR (not the subject): a self-edit's editor
+            # is the subject, so it's excluded; a manager's curation
+            # excludes the manager but reaches the worker subject.
+            if rid == editor_id:
+                continue
+            g.dispatch_synthetic_event(rid, event)
+    except Exception:  # pragma: no cover - defensive; catch-up is truth
+        pass
+
+
 def assemble_event_feed(
     agent_id: str,
     cursor: Optional[str],
@@ -1553,6 +1683,10 @@ def assemble_event_feed(
     """
     events, msg_cap_ts = _collect_events_with_cap(agent_id, cursor)
     events.extend(_collect_unassigned_task_events_for(agent_id, cursor))
+    # Peer profile changes (agent self-service profiles, PR2). Unbounded
+    # stream like unassigned tasks — invisible to the internal clamp
+    # inside stream 1, deduped against the in-memory push copy below.
+    events.extend(_collect_agent_profile_events_for(agent_id, cursor))
     if drain_queue:
         events.extend(drain_queue)
     # BL-R31-2: collapse the DB re-query + synthetic-queue copies of the
