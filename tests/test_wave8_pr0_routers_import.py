@@ -42,6 +42,7 @@ _PER_RESOURCE_MODULES: list[tuple[str, str]] = [
     ("tasks", "/api/tasks"),
     ("memories", "/api/memories"),
     ("messages", "/api/messages"),
+    ("schedules", "/api/schedules"),
     ("composition", "/api"),
     ("settings", "/api"),
 ]

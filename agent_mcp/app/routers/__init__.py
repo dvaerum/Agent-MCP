@@ -31,6 +31,7 @@ from .agents import router as agents_router
 from .composition import router as composition_router
 from .memories import router as memories_router
 from .messages import router as messages_router
+from .schedules import router as schedules_router
 from .settings import router as settings_router
 from .tasks import router as tasks_router
 
@@ -44,6 +45,7 @@ _ALL_ROUTERS: Tuple[APIRouter, ...] = (
     composition_router,
     memories_router,
     messages_router,
+    schedules_router,
     tasks_router,
     # settings registers LAST because it owns the catch-all OPTIONS
     # handler; see module docstring + register_routers docstring.

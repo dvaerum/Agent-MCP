@@ -65,6 +65,10 @@ const MessagesDashboard = dynamic(
   () => import("@/components/dashboard/messages-dashboard").then(m => m.MessagesDashboard),
   { ssr: false, loading: () => <SectionSkeleton /> },
 )
+const SchedulesDashboard = dynamic(
+  () => import("@/components/dashboard/schedules-dashboard").then(m => m.SchedulesDashboard),
+  { ssr: false, loading: () => <SectionSkeleton /> },
+)
 const SettingsDashboard = dynamic(
   () => import("@/components/dashboard/settings-dashboard").then(m => m.SettingsDashboard),
   { ssr: false, loading: () => <SectionSkeleton /> },
@@ -108,6 +112,8 @@ function DashboardPage() {
         return <MemoriesDashboard />
       case 'messages':
         return <MessagesDashboard />
+      case 'schedules':
+        return <SchedulesDashboard />
       case 'settings':
         return <SettingsDashboard />
       case 'system':

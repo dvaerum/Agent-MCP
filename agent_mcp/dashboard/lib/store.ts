@@ -55,8 +55,8 @@ export const useSidebar = create<SidebarState>()((set, get) => ({
 }))
 
 interface DashboardState {
-  currentView: 'overview' | 'agents' | 'tasks' | 'memories' | 'messages' | 'prompts' | 'settings' | 'system'
-  setCurrentView: (view: 'overview' | 'agents' | 'tasks' | 'memories' | 'messages' | 'prompts' | 'settings' | 'system') => void
+  currentView: 'overview' | 'agents' | 'tasks' | 'memories' | 'messages' | 'schedules' | 'prompts' | 'settings' | 'system'
+  setCurrentView: (view: 'overview' | 'agents' | 'tasks' | 'memories' | 'messages' | 'schedules' | 'prompts' | 'settings' | 'system') => void
   isLoading: boolean
   setLoading: (loading: boolean) => void
   lastUpdated: Date | null
