@@ -89,6 +89,47 @@ class SessionHandle:
 _runtime_queues: dict[str, asyncio.Queue[Any]] = {}
 
 
+# ---------------------------------------------------------------------------
+# Profile-review greet tracking (agent self-service profiles, plan §7 PR3).
+#
+# The event-loop ``profile_review`` section greets an agent ONCE per
+# connection (delivers a manager its charter, prompts a blank worker to
+# author one), then only re-surfaces when the profile goes overdue.
+#
+# In this deployment the /mcp transport runs STATELESS
+# (``StreamableHTTPSessionManager(stateless=True)`` in ``app.main_app``),
+# so the SDK issues NO ``Mcp-Session-Id`` and there is no per-request MCP
+# session object to hang the flag on (the plan's §4 "session object caches
+# principal" describes a shape this code never had). The real
+# per-connection lifecycle object IS the GET /mcp SSE stream registered
+# here. We therefore scope the greet to that connection, keyed by
+# ``agent_id``: opening a GET /mcp stream (``register_session``) RESETS the
+# greet so the agent's next event-loop call re-greets ("dies with the
+# connection → every reconnect re-greets", decision 7). A POST-only
+# long-poll agent that never opens a GET stream is simply greeted once on
+# its first loop call (it never appears here to be reset) — which is the
+# same once-per-working-session intent. In-memory only; a backend restart
+# clears it (agents reconnect and re-greet).
+_profile_greeted_agents: set[str] = set()
+
+
+def reset_profile_greet(agent_id: str) -> None:
+    """Forget that ``agent_id`` was greeted, so its next event-loop call
+    re-delivers the ``profile_review`` greet. Called on GET /mcp connect
+    (``register_session``) so a reconnect re-greets."""
+    _profile_greeted_agents.discard(agent_id)
+
+
+def mark_profile_greeted(agent_id: str) -> None:
+    """Record that ``agent_id`` has received its first-connect greet."""
+    _profile_greeted_agents.add(agent_id)
+
+
+def is_profile_greeted(agent_id: str) -> bool:
+    """True iff ``agent_id`` has already been greeted this connection."""
+    return agent_id in _profile_greeted_agents
+
+
 def _now_utc_iso() -> str:
     """Current UTC time as an ISO-8601 string with explicit timezone.
 
@@ -143,6 +184,10 @@ def register_session(
             )
         )
         session.commit()
+    # A (re)connect resets the profile-review greet so the agent's next
+    # event-loop call re-delivers it (decision 7). See the module-level
+    # ``_profile_greeted_agents`` note.
+    reset_profile_greet(agent_id)
     return session_id
 
 
@@ -156,6 +201,15 @@ def unregister_session(session_id: str) -> None:
     in-memory queue gets dropped by `detach_runtime_queue` regardless.
     """
     with get_session() as session:
+        # Capture the agent_id before the delete so we can clear its greet
+        # state once its last stream is gone (the greet "dies with the
+        # connection").
+        row = (
+            session.query(_McpSession)
+            .filter(_McpSession.session_id == session_id)
+            .one_or_none()
+        )
+        closing_agent_id = row.agent_id if row is not None else None
         session.execute(
             _sa_delete(_McpSession).where(_McpSession.session_id == session_id)
         )
@@ -163,6 +217,10 @@ def unregister_session(session_id: str) -> None:
     # Drop the runtime queue too — keeps the in-memory layer in
     # lockstep with the DB row.
     _runtime_queues.pop(session_id, None)
+    # If that was the agent's last GET /mcp stream, forget the greet so a
+    # fresh connection (or a POST-only reconnect) re-greets.
+    if closing_agent_id and not sessions_for_agent(closing_agent_id):
+        reset_profile_greet(closing_agent_id)
 
 
 def touch_session(session_id: str) -> None:

@@ -1261,7 +1261,8 @@ def _dedup_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _envelope(
-    events: List[Dict[str, Any]], since: Optional[str]
+    events: List[Dict[str, Any]], since: Optional[str],
+    *, profile_review: Optional[Dict[str, Any]] = None,
 ) -> Ok:
     """Wrap collected events into the standard response envelope.
 
@@ -1282,6 +1283,11 @@ def _envelope(
     else:
         next_cursor = since or ""
     payload = {"events": events, "next_cursor": next_cursor}
+    # Agent self-service profiles (PR3): attach the first-connect/overdue
+    # profile-review section when the builder produced one. Rides the loop
+    # response, never the system prompt.
+    if profile_review is not None:
+        payload["profile_review"] = profile_review
     return Ok(
         data=payload,
         message=json.dumps(payload, ensure_ascii=False),
@@ -1770,6 +1776,13 @@ async def wait_for_events_tool_impl(
     if timeout > WAIT_FOR_EVENTS_MAX_TIMEOUT:
         timeout = WAIT_FOR_EVENTS_MAX_TIMEOUT
 
+    # Agent self-service profiles (PR3): compute the profile-review section
+    # ONCE per call (marks the connection greeted as a side effect) and
+    # ride it on whichever envelope this call returns — greet on the first
+    # loop call of a connection, or when the profile is overdue.
+    from ..core.profile_review import build_profile_review_section
+    review_section = build_profile_review_section(principal)
+
     # PR-B fan-out: each call owns a private synthetic-event queue so
     # N concurrent waiters per agent each receive every notification.
     # Register on entry; unregister in the finally block on exit.
@@ -1782,7 +1795,7 @@ async def wait_for_events_tool_impl(
             # Drop anything that landed in our queue before the gate
             # check — agent is opted out, the events are stale.
             g.drain_waiter_queue(waiter_queue)
-            return _envelope([stop_evt], since)
+            return _envelope([stop_evt], since, profile_review=review_section)
 
         # Fast path — combine DB backlog with synthetic events that
         # arrived between register_waiter() and this point. The single
@@ -1793,7 +1806,7 @@ async def wait_for_events_tool_impl(
             agent_id, since, drain_queue=g.drain_waiter_queue(waiter_queue)
         )
         if events:
-            env = _envelope(events, since)
+            env = _envelope(events, since, profile_review=review_section)
             if cursor_value:
                 _write_last_event_seen_at(agent_id, cursor_value)
             return env
@@ -1814,7 +1827,7 @@ async def wait_for_events_tool_impl(
         while True:
             remaining = deadline - asyncio.get_event_loop().time()
             if remaining <= 0:
-                return _envelope([], since)
+                return _envelope([], since, profile_review=review_section)
             slice_timeout = min(_FLAG_RECHECK_INTERVAL_SECONDS, remaining)
             try:
                 # Block until either (a) the EventBus puts something on
@@ -1836,7 +1849,7 @@ async def wait_for_events_tool_impl(
                         reason or "auto_event_loop is OFF"
                     )
                     g.drain_waiter_queue(waiter_queue)
-                    return _envelope([stop_evt], since)
+                    return _envelope([stop_evt], since, profile_review=review_section)
                 # Drain everything that accumulated — our own private
                 # synthetic queue (plus the first_item we already
                 # popped to release ``queue.get()``) — and hand it to the
@@ -1850,7 +1863,7 @@ async def wait_for_events_tool_impl(
                     agent_id, since, drain_queue=drained
                 )
                 if events:
-                    env = _envelope(events, since)
+                    env = _envelope(events, since, profile_review=review_section)
                     if cursor_value:
                         _write_last_event_seen_at(agent_id, cursor_value)
                     return env
@@ -1867,7 +1880,7 @@ async def wait_for_events_tool_impl(
                         reason or "auto_event_loop is OFF"
                     )
                     g.drain_waiter_queue(waiter_queue)
-                    return _envelope([stop_evt], since)
+                    return _envelope([stop_evt], since, profile_review=review_section)
                 # Loop and wait another slice (or until deadline).
                 continue
     finally:
@@ -1923,6 +1936,15 @@ async def fetch_events_since_tool_impl(
         _write_last_event_seen_at(agent_id, new_cursor)
 
     body = {"events": events, "cursor": new_cursor}
+    # Agent self-service profiles (PR3): the catch-up path is often the
+    # first event-loop call of a session, so carry the profile-review
+    # greet/overdue section here too (rides the loop, not the system
+    # prompt). Shared greet flag with wait_for_events — whichever runs
+    # first greets.
+    from ..core.profile_review import build_profile_review_section
+    review_section = build_profile_review_section(principal)
+    if review_section is not None:
+        body["profile_review"] = review_section
     return Ok(
         data=body,
         message=json.dumps(body, ensure_ascii=False),
