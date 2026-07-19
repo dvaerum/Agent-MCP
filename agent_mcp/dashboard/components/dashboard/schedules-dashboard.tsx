@@ -32,6 +32,7 @@ import {
 } from "@/components/ui/tooltip"
 import { Skeleton } from "@/components/ui/skeleton"
 import { EmptyState } from "@/components/dashboard/shared/empty-state"
+import { SendDirectiveModal } from "@/components/dashboard/shared/send-directive-modal"
 import { toastError, toastSuccess } from "@/components/ui/toast"
 import { apiClient, type Agent, type Schedule } from "@/lib/api"
 import {
@@ -88,10 +89,17 @@ export function SchedulesDashboard() {
   // delete confirm
   const [deleteId, setDeleteId] = useState<string | null>(null)
 
-  // poke modal
-  const [pokeAgentId, setPokeAgentId] = useState<string | null>(null)
-  const [pokePrompt, setPokePrompt] = useState("")
-  const [poking, setPoking] = useState(false)
+  // Send-directive (poke) modal — shared with the Agents page.
+  // `directiveOpen` drives visibility; `directiveAgent` is the locked
+  // target for the per-row shortcut, or null for the standalone
+  // top-of-page control (which renders an agent picker).
+  const [directiveOpen, setDirectiveOpen] = useState(false)
+  const [directiveAgent, setDirectiveAgent] = useState<string | null>(null)
+
+  const openDirective = (agentId: string | null) => {
+    setDirectiveAgent(agentId)
+    setDirectiveOpen(true)
+  }
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -215,21 +223,6 @@ export function SchedulesDashboard() {
     }
   }
 
-  const submitPoke = async () => {
-    if (!pokeAgentId) return
-    setPoking(true)
-    try {
-      await apiClient.pokeAgent(pokeAgentId, { prompt: pokePrompt })
-      toastSuccess(`Directive sent to ${pokeAgentId}`)
-      setPokeAgentId(null)
-      setPokePrompt("")
-    } catch (e) {
-      toastError(e, "Failed to send directive")
-    } finally {
-      setPoking(false)
-    }
-  }
-
   return (
     <div className="space-y-4 p-1" data-testid="schedules-dashboard">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -242,6 +235,13 @@ export function SchedulesDashboard() {
           <Button variant="outline" size="sm" onClick={() => void load()}
                   aria-label="Refresh schedules">
             <RefreshCw className="h-4 w-4" />
+          </Button>
+          {/* Standalone send-directive control — NOT tied to a schedule
+              row, so any agent (schedule or not) can be poked from here.
+              Opens the shared modal with an agent picker. */}
+          <Button variant="outline" size="sm" onClick={() => openDirective(null)}
+                  data-testid="send-directive-btn">
+            <Zap className="mr-1 h-4 w-4" /> Send directive
           </Button>
           <Button size="sm" onClick={openCreate} data-testid="new-schedule-btn">
             <Plus className="mr-1 h-4 w-4" /> New schedule
@@ -360,7 +360,7 @@ export function SchedulesDashboard() {
                       <TableCell className="text-right">
                         <div className="flex justify-end gap-1">
                           <Button variant="ghost" size="sm"
-                                  onClick={() => setPokeAgentId(s.agent_id)}
+                                  onClick={() => openDirective(s.agent_id)}
                                   aria-label={`Poke ${s.agent_id}`}
                                   data-testid={`poke-${s.directive_id}`}>
                             <Zap className="h-4 w-4" />
@@ -485,36 +485,14 @@ export function SchedulesDashboard() {
         </DialogContent>
       </Dialog>
 
-      {/* Poke modal */}
-      <Dialog open={pokeAgentId != null}
-              onOpenChange={(o) => { if (!o) { setPokeAgentId(null); setPokePrompt("") } }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Send directive to {pokeAgentId}</DialogTitle>
-            <DialogDescription>
-              Delivered immediately if the agent is listening, otherwise
-              queued as its highest-priority next check-in.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-1">
-            <Label htmlFor="poke-prompt">Directive</Label>
-            <Textarea id="poke-prompt" value={pokePrompt}
-                      onChange={(e) => setPokePrompt(e.target.value)}
-                      placeholder="e.g. stop and report your current status" />
-          </div>
-          <DialogFooter>
-            <Button variant="outline"
-                    onClick={() => { setPokeAgentId(null); setPokePrompt("") }}>
-              Cancel
-            </Button>
-            <Button onClick={() => void submitPoke()}
-                    disabled={poking || !pokePrompt}
-                    data-testid="send-poke-btn">
-              {poking ? "Sending…" : "Send now"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {/* Send-directive (poke) modal — shared with the Agents page.
+          `directiveAgent` is a locked target (per-row shortcut) or null
+          for the standalone picker. */}
+      <SendDirectiveModal
+        open={directiveOpen}
+        onOpenChange={setDirectiveOpen}
+        lockedAgentId={directiveAgent}
+      />
     </div>
   )
 }

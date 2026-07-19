@@ -1099,7 +1099,17 @@ class ApiClient {
   async pokeAgent(agentId: string, data: {
     prompt: string
     priority?: string
-  }): Promise<{ success: boolean; poke_id: string }> {
+  }): Promise<{
+    success: boolean
+    poke_id: string
+    agent_id: string
+    // TRUE when the agent had a parked wait_for_events waiter and the
+    // poke was delivered immediately; FALSE when it was queued as its
+    // highest-priority next check-in. Drives the delivered-vs-queued
+    // toast copy (see SendDirectiveModal).
+    delivered: boolean
+    message: string
+  }> {
     return this.request(`/agents/${encodeURIComponent(agentId)}/directive`, {
       method: 'POST',
       body: JSON.stringify(data),

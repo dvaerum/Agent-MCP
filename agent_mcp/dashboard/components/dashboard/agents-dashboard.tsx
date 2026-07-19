@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useCallback } from "react"
 import {
   Users, Clock, AlertCircle, CheckCircle2, Shield, Cpu, Database, Network, Terminal,
-  Search, Plus, Eye, RefreshCw, Copy, RotateCcw, Trash2, Pencil
+  Search, Plus, Eye, RefreshCw, Copy, RotateCcw, Trash2, Pencil, Zap
 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -26,6 +26,7 @@ import { useFilters } from "@/hooks/use-filters"
 import { TaskDetailsDialog } from "./task-details-dialog"
 import { Skeleton } from "@/components/ui/skeleton"
 import { EmptyState } from "@/components/dashboard/shared/empty-state"
+import { SendDirectiveModal } from "@/components/dashboard/shared/send-directive-modal"
 import { AgentsMobileList } from "@/components/dashboard/agents-mobile-list"
 
 
@@ -74,14 +75,15 @@ const AgentTypeIcon = React.memo(({ agentId }: { agentId: string }) => {
   return <Icon className="h-4 w-4 text-muted-foreground" />
 })
 
-const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, openView, onEdit, onTaskClick }: {
+const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, openView, onEdit, onTaskClick, onSendDirective }: {
   agent: Agent,
   onTerminate: (id: string) => void,
   onRestore: (id: string) => void,
   onPurge: (id: string) => void,
   openView: (agent: Agent) => void,
   onEdit: (agent: Agent) => void,
-  onTaskClick: (task: Task) => void
+  onTaskClick: (task: Task) => void,
+  onSendDirective: (id: string) => void
 }) => {
   const { getAgentTasks } = useDataStore()
   const [copiedToken, setCopiedToken] = useState(false)
@@ -287,6 +289,23 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, op
           >
             <Eye className="h-3.5 w-3.5" />
           </Button>
+          {/* Send directive (ad-hoc poke). Agent-centric action — works
+              for ANY agent regardless of whether it has a schedule.
+              Live agents only (poking a terminated agent 404s); Admin
+              excluded (the operator pseudo-agent never calls
+              wait_for_events). */}
+          {agent.status !== 'terminated' && agent.agent_id !== 'Admin' && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={(e) => { e.stopPropagation(); onSendDirective(agent.agent_id) }}
+              title="Send directive (deliver now if listening, else queue)"
+              className="h-7 w-7 p-0 text-muted-foreground hover:text-foreground hover:bg-muted"
+              data-testid={`send-directive-${agent.agent_id}`}
+            >
+              <Zap className="h-3.5 w-3.5" />
+            </Button>
+          )}
           {agent.agent_id !== 'Admin' && (
             <Button
               variant="ghost"
@@ -1398,6 +1417,7 @@ const AgentDetailDialog = ({
   onEdit,
   onTerminate,
   onPurge,
+  onSendDirective,
 }: {
   agent: Agent | null
   open: boolean
@@ -1407,10 +1427,12 @@ const AgentDetailDialog = ({
   // close this detail dialog and open the sibling edit/terminate/purge
   // confirm dialog (close-then-open avoids stacked-dialog issues). The
   // render conditionals below mirror the row actions: Edit hidden for
-  // Admin; Terminate only for a live agent; Purge only once terminated.
+  // Admin; Terminate only for a live agent; Purge only once terminated;
+  // Send directive only for a live non-Admin agent.
   onEdit?: () => void
   onTerminate?: () => void
   onPurge?: () => void
+  onSendDirective?: () => void
 }) => {
   const [revealToken, setRevealToken] = useState(false)
   const [copied, setCopied] = useState(false)
@@ -1800,6 +1822,12 @@ const AgentDetailDialog = ({
         </div>
 
         <DialogFooter className="px-6 py-4 border-t border-border flex-shrink-0">
+          {onSendDirective && agent.status !== 'terminated' && agent.agent_id !== 'Admin' && (
+            <Button type="button" variant="outline" size="sm" onClick={onSendDirective}>
+              <Zap className="h-4 w-4 mr-1" />
+              Send directive
+            </Button>
+          )}
           {onEdit && agent.agent_id !== 'Admin' && (
             <Button type="button" variant="outline" size="sm" onClick={onEdit}>
               <Pencil className="h-4 w-4 mr-1" />
@@ -1997,6 +2025,16 @@ export function AgentsDashboard() {
 
   const handleSelectAgent = (agent: Agent) => {
     detailDialog.open(agent.agent_id)
+  }
+
+  // Send-directive (ad-hoc poke) modal state. Agent-centric action:
+  // reachable for ANY agent from its row / detail dialog, independent of
+  // whether it has a schedule. `directiveAgentId` is the locked target.
+  const [directiveAgentId, setDirectiveAgentId] = useState<string | null>(null)
+  const [directiveOpen, setDirectiveOpen] = useState(false)
+  const handleSendDirective = (agentId: string) => {
+    setDirectiveAgentId(agentId)
+    setDirectiveOpen(true)
   }
 
   if (!isConnected) {
@@ -2204,6 +2242,7 @@ export function AgentsDashboard() {
                       openView={handleSelectAgent}
                       onEdit={handleEditAgent}
                       onTaskClick={handleTaskClick}
+                      onSendDirective={handleSendDirective}
                     />
                   ))}
                 </TableBody>
@@ -2218,6 +2257,7 @@ export function AgentsDashboard() {
                 onTerminate={handleTerminateConfirm}
                 onRestore={handleRestoreAgent}
                 onPurge={handlePurgeAgent}
+                onSendDirective={handleSendDirective}
               />
             </div>
           </>
@@ -2253,6 +2293,12 @@ export function AgentsDashboard() {
           if (!agent) return
           detailDialog.close()
           handlePurgeAgent(agent.agent_id)
+        }}
+        onSendDirective={() => {
+          const agent = detailDialog.data
+          if (!agent) return
+          detailDialog.close()
+          handleSendDirective(agent.agent_id)
         }}
       />
 
@@ -2299,6 +2345,15 @@ export function AgentsDashboard() {
         onConfirmed={() => {
           void refreshData()
         }}
+      />
+
+      {/* Send-directive (ad-hoc poke) modal — shared with the Schedules
+          page. Locked to the row/detail agent so any agent is pokeable
+          straight from the Agents page, no schedule required. */}
+      <SendDirectiveModal
+        open={directiveOpen}
+        onOpenChange={setDirectiveOpen}
+        lockedAgentId={directiveAgentId}
       />
       </div>
     </React.Profiler>
