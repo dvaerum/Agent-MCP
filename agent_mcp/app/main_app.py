@@ -1157,6 +1157,13 @@ class _McpAsgiApp:
                 # are replayed unchanged via the synthetic `receive`.
                 await _send_simple_response(send, 400, _MCP_DEPTH_GUARD_BODY)
                 return
+            # Event-loop long-hold: capture the client's clientInfo from an
+            # `initialize` POST so the wait_for_events hold-strategy resolver
+            # can key on it later. Stateless mode means the SDK session has
+            # no client_params at tool-call time (initialize is a separate
+            # POST), so we record it here off the already-drained body.
+            if not disconnected:
+                _maybe_record_client_info(scope, body)
             receive = _replay_receive(raw_receive, body, disconnected)
         # POST/DELETE → SDK. Wrap ``send`` so a malformed-request
         # JSON-RPC error envelope (which the SDK fills with a raw
@@ -1380,6 +1387,39 @@ def _bearer_is_active(bearer: str) -> bool:
     from ..core import globals as _g
 
     return bool(bearer) and bearer in _g.active_agents
+
+
+def _maybe_record_client_info(scope, body: bytes) -> None:
+    """If ``body`` is an MCP ``initialize`` request, record its
+    ``clientInfo`` keyed by the bearer's agent_id.
+
+    Called for every POST /mcp off the already-drained body, so it adds no
+    extra read. Best-effort and fully defensive: a non-JSON body, a
+    non-initialize method, a missing clientInfo, or an unresolvable bearer
+    all silently no-op (the strategy resolver then feature-detects). See
+    :mod:`agent_mcp.core.client_info_registry` for why capture happens here
+    rather than on the SDK session.
+    """
+    try:
+        msg = json.loads(body)
+    except Exception:
+        return
+    if not isinstance(msg, dict) or msg.get("method") != "initialize":
+        return
+    params = msg.get("params")
+    client_info = (params or {}).get("clientInfo") if isinstance(params, dict) else None
+    if not isinstance(client_info, dict):
+        return
+    name = client_info.get("name")
+    if not name:
+        return
+    bearer = _bearer_from_scope(scope)
+    agent_id = get_agent_id(bearer) if bearer else None
+    if not agent_id:
+        return
+    from ..core.client_info_registry import record_client_info
+
+    record_client_info(agent_id, str(name), client_info.get("version"))
 
 
 def _bearer_from_scope(scope) -> str:
