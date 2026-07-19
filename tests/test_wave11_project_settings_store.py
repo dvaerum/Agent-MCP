@@ -52,7 +52,7 @@ from tests.harness import make_principal, mcp_session
 _REDACTED = "[redacted]"
 # The alembic head advances as migrations are added; keep this in lockstep
 # with the newest revision (0020 = agent last_activity_at for idle-stop).
-_MIGRATION_HEAD = "0021_scheduled_directive_table"
+_MIGRATION_HEAD = "0022_pending_directive_table"
 
 
 # ---------------------------------------------------------------------------

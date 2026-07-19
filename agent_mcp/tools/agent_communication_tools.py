@@ -1704,6 +1704,38 @@ def notify_agent_profile_updated(
         pass
 
 
+# Priority-aware feed ordering (plan §11). The feed historically sorted by
+# timestamp only; a poke's "highest priority" needs urgent events to sort
+# AHEAD of ordinary ones. Rank is a STABLE secondary key (priority, then
+# timestamp) so ordinary same-priority events keep their timestamp order.
+_PRIORITY_RANK: Dict[str, int] = {
+    "urgent": 0,
+    "high": 1,
+    "normal": 2,
+    "low": 3,
+}
+
+
+def _event_priority_rank(event: Dict[str, Any]) -> int:
+    """Rank an event by priority (lower sorts first). Reads the top-level
+    ``priority`` (directive events) then ``data.priority`` (messages),
+    defaulting to ``normal``."""
+    prio = event.get("priority")
+    if prio is None:
+        prio = (event.get("data") or {}).get("priority")
+    return _PRIORITY_RANK.get(prio or "normal", _PRIORITY_RANK["normal"])
+
+
+def _sort_events_priority_then_time(
+    events: List[Dict[str, Any]],
+) -> None:
+    """In-place stable sort: priority ASC-rank (urgent first), then
+    timestamp ASC."""
+    events.sort(
+        key=lambda e: (_event_priority_rank(e), e.get("timestamp") or "")
+    )
+
+
 # ---------------------------------------------------------------------------
 # Scheduled directives (event-loop scheduler, plan §4) — wait-loop-native
 # firing. The `scheduled_directive` row is pure state (`next_due_at`); this
@@ -1743,6 +1775,38 @@ def _collect_scheduled_directive_events_for(
     except Exception as e:  # pragma: no cover - defensive; fires next time
         logger.warning(
             "wait_for_events: scheduled-directive fire failed for %s: %s",
+            agent_id, e,
+        )
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def _collect_pending_pokes_for(agent_id: str) -> List[Dict[str, Any]]:
+    """Collect + mark-delivered every undelivered operator/admin poke for
+    ``agent_id`` and return the ``directive`` events (source="poke").
+
+    Mutates ``pending_directive.delivered_at`` (own connection + commit) so
+    each poke fires exactly once. Called only from the check-in paths via
+    ``assemble_event_feed(fire_scheduled=True)``. Best-effort: a DB failure
+    yields no events (the poke waits for the next check-in) rather than
+    failing the whole poll.
+    """
+    conn = None
+    try:
+        from ..repositories import pending_directive_repository as _poke
+        now_iso = datetime.datetime.now().isoformat()
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        events = _poke.collect_undelivered(
+            agent_id, connection=cursor, now_iso=now_iso
+        )
+        conn.commit()
+        return events
+    except Exception as e:  # pragma: no cover - defensive; retries next time
+        logger.warning(
+            "wait_for_events: pending-poke collection failed for %s: %s",
             agent_id, e,
         )
         return []
@@ -1847,9 +1911,18 @@ def assemble_event_feed(
     # directive event's timestamp is "now" (the latest), so it joins the
     # sort at the end and the cursor advances to it cleanly.
     if fire_scheduled and msg_cap_ts is None:
+        # Ad-hoc pokes first (highest-priority delivery), then scheduled
+        # fires. Both mutate delivery state (delivered_at / next_due), so
+        # they run only when the message backlog isn't truncated — a fired
+        # event must never be clamped away.
+        events.extend(_collect_pending_pokes_for(agent_id))
         events.extend(_collect_scheduled_directive_events_for(agent_id))
-    events.sort(key=lambda e: e.get("timestamp") or "")
+    # Priority-aware ordering (plan §11): urgent directives / pokes sort
+    # ahead of ordinary events; same-priority events keep timestamp order.
+    _sort_events_priority_then_time(events)
     if events:
+        # The cursor stays anchored to max TIMESTAMP (not sort position) so
+        # priority reordering never rewinds or over-advances progress.
         next_cursor = (
             max((e.get("timestamp") or "") for e in events) or (cursor or "")
         )

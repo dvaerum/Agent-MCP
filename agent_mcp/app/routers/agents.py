@@ -591,6 +591,101 @@ async def edit_agent_api_route(
     return _agent_tool_error(result, "Failed to edit agent")
 
 
+# --- Ad-hoc poke (event-loop scheduler PR2) -----------------------------
+# Operator/admin ONLY (decision 11): push a one-shot directive to an agent.
+# Delivered immediately if the agent is listening (waiter-wake) else queued
+# as highest priority for its next check-in. Not a message, not a task —
+# a `directive` event with source="poke".
+
+_POKE_PRIORITIES = ("low", "normal", "high", "urgent")
+
+
+@router.post("/{agent_id}/directive")
+async def poke_agent_directive_api_route(
+    agent_id: str,
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    """POST /api/agents/<id>/directive — operator/admin ad-hoc poke.
+
+    Body: ``{prompt, priority?}`` (priority default ``urgent``). Inserts a
+    ``pending_directive`` row and fires a waiter-wake so a listening agent
+    receives the ``directive`` event immediately; a busy agent picks it up,
+    priority-first, on its next ``wait_for_events`` / ``fetch_events_since``
+    check-in. 404 if the agent doesn't exist or is terminated.
+    """
+    import secrets as _secrets
+    import datetime as _dt
+
+    from ...core import globals as _g
+    from ...db.unit_of_work import unit_of_work
+    from ...db.actions.agent_actions_db import log_agent_action_to_db
+    from ...repositories import agent_repo
+    from ...repositories import pending_directive_repository as _poke
+
+    try:
+        data = await get_sanitized_json_body(request)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    prompt = data.get("prompt")
+    if prompt is not None and not isinstance(prompt, str):
+        return JSONResponse(
+            {"error": "prompt must be a string"}, status_code=400
+        )
+    if not prompt:
+        return JSONResponse({"error": "prompt is required"}, status_code=400)
+    if len(prompt) > 4000:
+        return JSONResponse(
+            {"error": "prompt too long (max 4000 characters)"},
+            status_code=400,
+        )
+    priority = data.get("priority", "urgent")
+    if priority not in _POKE_PRIORITIES:
+        return JSONResponse(
+            {"error": f"priority must be one of {_POKE_PRIORITIES}"},
+            status_code=400,
+        )
+
+    target = agent_repo.get_by_id(agent_id)
+    if target is None or target.get("status") in ("terminated", "tombstone"):
+        return JSONResponse({"error": "Agent not found"}, status_code=404)
+
+    poke_id = f"poke_{_secrets.token_hex(8)}"
+    operator_id = caller_identity(auth)
+    try:
+        with unit_of_work() as u:
+            _poke.create_poke(
+                poke_id=poke_id,
+                agent_id=agent_id,
+                prompt=prompt,
+                priority=priority,
+                created_by=operator_id,
+                connection=u.cursor,
+                now_iso=_dt.datetime.now().isoformat(),
+            )
+            log_agent_action_to_db(
+                u.cursor, operator_id, "poke_agent_directive",
+                details={"poke_id": poke_id, "agent_id": agent_id,
+                         "priority": priority},
+            )
+            # Immediate delivery: wake a listening wait_for_events waiter so
+            # it re-queries and collects this poke now (post-commit).
+            u.on_commit(lambda a=agent_id: _g.notify_agent_inbox(a))
+    except Exception as e:
+        logger.error("poke_agent_directive failed: %s", e, exc_info=True)
+        return JSONResponse(
+            {"error": "Failed to send directive"}, status_code=500
+        )
+
+    return JSONResponse({
+        "success": True,
+        "poke_id": poke_id,
+        "agent_id": agent_id,
+        "message": f"Directive queued for {agent_id}",
+    })
+
+
 # ``_gather_purge_preview`` + ``_purge_tombstone`` moved to
 # ``tools.admin_tools`` (E2) — the purge cascade logic now lives with the
 # ``purge_agent`` tool; this route + the preview route import them.
