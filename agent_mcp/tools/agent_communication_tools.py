@@ -949,6 +949,13 @@ WAIT_FOR_EVENTS_MAX_TIMEOUT = 300
 # the operator within a handful of seconds (test 6 requires < 5s).
 _FLAG_RECHECK_INTERVAL_SECONDS = 2.0
 
+# Event-loop long-hold ceiling for a heartbeat client whose strategy has
+# NO per-connection cap (OpenCode / unknown-with-progressToken). Without a
+# cap the connection would hold forever; PR2's idle-stop window becomes the
+# real terminator. Until then this generous 24h ceiling bounds the hold so
+# the loop always terminates cleanly (empty envelope → reconnect).
+_UNCAPPED_HOLD_CEILING_SECONDS = 24 * 60 * 60
+
 
 _BROADCAST_MESSAGE_TYPES = ("broadcast", "announcement", "system_alert")
 
@@ -1739,17 +1746,52 @@ async def wait_for_events_tool_impl(
             message="since must be an ISO-UTC timestamp string",
         )
 
-    raw_timeout = arguments.get(
-        "timeout_seconds", WAIT_FOR_EVENTS_DEFAULT_TIMEOUT
+    # Event-loop long-hold (plan: event-loop-longlived-connections).
+    # Resolve the per-connection hold strategy from the client's identity
+    # (recorded at its initialize handshake) with a progressToken
+    # feature-detect fallback, then derive how long THIS connection may
+    # hold and whether we emit heartbeats while it does.
+    from ..core.client_info_registry import get_client_name
+    from ..core.client_hold_strategy import (
+        resolve_hold_strategy,
+        HEARTBEAT_INTERVAL_SECONDS,
+        NO_HEARTBEAT_HOLD_SECONDS,
     )
-    try:
-        timeout = int(raw_timeout)
-    except (TypeError, ValueError):
-        timeout = WAIT_FOR_EVENTS_DEFAULT_TIMEOUT
-    if timeout <= 0:
-        timeout = WAIT_FOR_EVENTS_DEFAULT_TIMEOUT
-    if timeout > WAIT_FOR_EVENTS_MAX_TIMEOUT:
-        timeout = WAIT_FOR_EVENTS_MAX_TIMEOUT
+    from ..core.mcp_progress import current_progress_token
+
+    progress_token = current_progress_token()
+    strategy = resolve_hold_strategy(
+        get_client_name(agent_id),
+        has_progress_token=progress_token is not None,
+    )
+    strategy_cap = (
+        strategy.hold_cap
+        if strategy.hold_cap is not None
+        else _UNCAPPED_HOLD_CEILING_SECONDS
+    )
+    if strategy.heartbeat:
+        # Heartbeat clients hold long — up to their cap (Claude Code 24h)
+        # or the uncapped ceiling (OpenCode) — and we keep the client's
+        # idle timer alive with periodic progress frames.
+        base_hold = strategy_cap
+    else:
+        # No-heartbeat clients get a silent ~55s hold under the universal
+        # 60s SDK default, then reconnect.
+        base_hold = min(NO_HEARTBEAT_HOLD_SECONDS, strategy_cap)
+
+    # An explicit caller `timeout_seconds` still caps the hold (agents in
+    # the wake loop normally omit it and let the strategy decide). Absent /
+    # non-positive / non-numeric → strategy-driven only.
+    requested: Optional[int] = None
+    raw_timeout = arguments.get("timeout_seconds")
+    if raw_timeout is not None:
+        try:
+            parsed = int(raw_timeout)
+        except (TypeError, ValueError):
+            parsed = None
+        if parsed is not None and parsed > 0:
+            requested = parsed
+    timeout = base_hold if requested is None else min(base_hold, requested)
 
     # Agent self-service profiles (PR3): compute the profile-review section
     # ONCE per call (marks the connection greeted as a side effect) and
@@ -1799,6 +1841,16 @@ async def wait_for_events_tool_impl(
         # because the slice timeout is bounded — the flag re-check
         # happens at most ``_FLAG_RECHECK_INTERVAL_SECONDS`` late.
         deadline = asyncio.get_event_loop().time() + timeout
+        # Heartbeat bookkeeping (heartbeat clients only). We emit a
+        # `notifications/progress` frame every HEARTBEAT_INTERVAL_SECONDS
+        # of silence so the client resets its idle timeout; the flag
+        # re-check still runs at the tighter 2s slice cadence. `progress`
+        # must increase monotonically across the request (MCP spec).
+        heartbeat_enabled = strategy.heartbeat and progress_token is not None
+        next_heartbeat = (
+            asyncio.get_event_loop().time() + HEARTBEAT_INTERVAL_SECONDS
+        )
+        heartbeat_progress = 0.0
         while True:
             remaining = deadline - asyncio.get_event_loop().time()
             if remaining <= 0:
@@ -1856,6 +1908,23 @@ async def wait_for_events_tool_impl(
                     )
                     g.drain_waiter_queue(waiter_queue)
                     return _envelope([stop_evt], since, profile_review=review_section)
+                # Heartbeat: keep a heartbeat-capable client's idle timer
+                # alive across the long silent hold. Sent at most once per
+                # HEARTBEAT_INTERVAL_SECONDS regardless of the tighter flag
+                # slice; a failed send is a no-op (silent hold that tick).
+                if heartbeat_enabled and (
+                    asyncio.get_event_loop().time() >= next_heartbeat
+                ):
+                    from ..core.mcp_progress import send_progress_heartbeat
+
+                    heartbeat_progress += 1.0
+                    await send_progress_heartbeat(
+                        progress_token, heartbeat_progress
+                    )
+                    next_heartbeat = (
+                        asyncio.get_event_loop().time()
+                        + HEARTBEAT_INTERVAL_SECONDS
+                    )
                 # Loop and wait another slice (or until deadline).
                 continue
     finally:
@@ -2142,12 +2211,13 @@ def register_agent_communication_tools():
                 "timeout_seconds": {
                     "type": "integer",
                     "description": (
-                        "Max seconds to wait for new activity before "
-                        "returning an empty envelope. Default 60. "
-                        "Values above 900 are silently clamped "
-                        "server-side (no validation error)."
+                        "Optional cap (seconds) on how long this call may "
+                        "block before returning an empty envelope. Normally "
+                        "OMIT this — the server picks a client-appropriate "
+                        "hold (heartbeat long-hold for capable clients, a "
+                        "short silent hold otherwise). When provided it only "
+                        "SHORTENS the server's hold, never extends it."
                     ),
-                    "default": WAIT_FOR_EVENTS_DEFAULT_TIMEOUT,
                     "minimum": 1,
                 },
             },
