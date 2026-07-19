@@ -188,10 +188,11 @@ describe("int_duration — seconds ⇄ {amount, unit} conversion", () => {
 })
 
 describe("group ordering", () => {
-  it("GROUP_ORDER is the five groups in the specified order", () => {
+  it("GROUP_ORDER is the six groups in the specified order", () => {
     expect(GROUP_ORDER.map((g) => g.group)).toEqual([
       "worker_permissions",
       "event_loop",
+      "scheduling",
       "agent_profiles",
       "retention",
       "aoe",
@@ -199,6 +200,7 @@ describe("group ordering", () => {
     expect(GROUP_ORDER.map((g) => g.title)).toEqual([
       "Worker permissions",
       "Agent event-loop",
+      "Scheduled directives",
       "Agent profiles",
       "Message retention",
       "AoE integration",

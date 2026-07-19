@@ -34,6 +34,7 @@ SettingType = Literal["bool", "int", "string", "secret"]
 SettingTier = Literal["operator", "sysadmin"]
 SettingGroup = Literal[
     "worker_permissions", "event_loop", "retention", "aoe", "agent_profiles",
+    "scheduling",
 ]
 SettingWidget = Literal[
     "switch",
@@ -254,6 +255,71 @@ SETTINGS_SCHEMA: tuple[SettingSpec, ...] = (
             "staleness nudge (the first-connect greet still fires once)."
         ),
         widget="int_days",
+    ),
+    SettingSpec(
+        key="config_allow_worker_self_schedule",
+        type="bool",
+        default=True,
+        tier="operator",
+        group="scheduling",
+        title="Allow agents to self-register scheduled directives",
+        description=(
+            "When on (default), an agent may call "
+            "create_scheduled_directive to register its own recurring "
+            "directives (imperative 'do X' commands that fire when the "
+            "agent next checks in at-or-after the interval). When off, "
+            "only a manager (for its workers) or an operator/admin may "
+            "create schedules on an agent's behalf. Guardrails "
+            "(min-interval floor + max active loops per agent) always "
+            "apply."
+        ),
+        widget="switch",
+    ),
+    SettingSpec(
+        key="config_allow_manager_curate_schedules",
+        type="bool",
+        default=True,
+        tier="operator",
+        group="scheduling",
+        title="Allow managers to curate worker schedules",
+        description=(
+            "When on (default), a manager may create/update/delete "
+            "scheduled directives on any WORKER in the project. Managers "
+            "may never curate another manager's schedules regardless of "
+            "this toggle. When off, managers may only manage their own "
+            "schedules (subject to the self-schedule toggle)."
+        ),
+        widget="switch",
+    ),
+    SettingSpec(
+        key="config_min_schedule_interval_seconds",
+        type="int",
+        default=60,
+        tier="operator",
+        group="scheduling",
+        title="Minimum schedule interval",
+        description=(
+            "The floor (in seconds) on a scheduled directive's interval. "
+            "create/update reject any interval below this value with a "
+            "clear error. Since self-scheduling is on by default, this "
+            "keeps an agent from registering a hot loop. Default 60s."
+        ),
+        widget="int_duration",
+    ),
+    SettingSpec(
+        key="config_max_schedules_per_agent",
+        type="int",
+        default=10,
+        tier="operator",
+        group="scheduling",
+        title="Maximum active schedules per agent",
+        description=(
+            "The cap on how many active (enabled) scheduled directives a "
+            "single agent may hold at once. create/update reject a new "
+            "schedule that would exceed this count. Completed/paused "
+            "schedules do not count. Default 10."
+        ),
+        widget="int_duration",
     ),
     SettingSpec(
         key="config_aoe_notify_enabled",

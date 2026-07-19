@@ -32,6 +32,7 @@ from .project_context import ProjectContext
 from .project_settings import ProjectSettings
 from .rag_chunk import RagChunk
 from .rag_meta import RagMeta
+from .scheduled_directive import ScheduledDirective
 from .task import Task
 from .task_note import TaskNote
 
@@ -46,6 +47,7 @@ __all__ = [
     "ProjectSettings",
     "RagChunk",
     "RagMeta",
+    "ScheduledDirective",
     "Task",
     "TaskNote",
 ]

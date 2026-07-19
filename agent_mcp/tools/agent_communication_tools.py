@@ -1704,11 +1704,86 @@ def notify_agent_profile_updated(
         pass
 
 
+# ---------------------------------------------------------------------------
+# Scheduled directives (event-loop scheduler, plan §4) — wait-loop-native
+# firing. The `scheduled_directive` row is pure state (`next_due_at`); this
+# tool's slice loop is the sole driver (no background sweeper). When a
+# schedule is due AND the agent is checking in, the collector emits a
+# `directive` event, bumps run_count, and resets next_due = now + interval
+# (interval-reset-from-delivery). Reads back the soonest due time so the
+# idle hold can wake exactly at next_due.
+# ---------------------------------------------------------------------------
+
+
+def _collect_scheduled_directive_events_for(
+    agent_id: str,
+) -> List[Dict[str, Any]]:
+    """Fire every due scheduled directive for ``agent_id`` and return the
+    ``directive`` events.
+
+    Opens its own short-lived connection + transaction: the collector
+    MUTATES (bumps run_count, resets next_due, flips terminal schedules to
+    completed) so it must commit. Called only from the check-in paths
+    (``wait_for_events`` / ``fetch_events_since``) — NOT from the passive
+    inbox resource — via ``assemble_event_feed(fire_scheduled=True)``.
+    Best-effort: a DB failure yields no events (the schedule fires on the
+    next check-in) rather than failing the whole poll.
+    """
+    conn = None
+    try:
+        from ..repositories import scheduled_directive_repository as _sched
+        now_iso = datetime.datetime.now().isoformat()
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        events = _sched.collect_due_and_fire(
+            agent_id, now_iso, connection=cursor
+        )
+        conn.commit()
+        return events
+    except Exception as e:  # pragma: no cover - defensive; fires next time
+        logger.warning(
+            "wait_for_events: scheduled-directive fire failed for %s: %s",
+            agent_id, e,
+        )
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def _soonest_schedule_due_at(agent_id: str, now_iso: str) -> Optional[str]:
+    """Soonest ``next_due_at`` over the agent's fireable schedules, or
+    ``None``. Used to bound the idle hold's slice so it wakes at next_due.
+    """
+    conn = None
+    try:
+        from ..repositories import scheduled_directive_repository as _sched
+        conn = get_db_connection()
+        return _sched.soonest_due_at(
+            agent_id, now_iso, connection=conn.cursor()
+        )
+    except Exception:  # pragma: no cover - defensive
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def _agent_has_active_schedule(agent_id: str, now_iso: str) -> bool:
+    """True iff the agent has an enabled, in-window schedule.
+
+    Decision 9: an enabled schedule SUPPRESSES idle-stop — the agent must
+    stay present to receive fires (dormant-agent re-wake is out of scope).
+    """
+    return _soonest_schedule_due_at(agent_id, now_iso) is not None
+
+
 def assemble_event_feed(
     agent_id: str,
     cursor: Optional[str],
     *,
     drain_queue: Optional[List[Dict[str, Any]]] = None,
+    fire_scheduled: bool = False,
 ) -> tuple[List[Dict[str, Any]], str]:
     """Single owner of the event-feed stream-merge pipeline.
 
@@ -1763,6 +1838,16 @@ def assemble_event_feed(
     # so a newer unbounded task/synthetic event can't drag the persisted
     # cursor past the un-returned messages 501+.
     events = _cap_events_to_boundary(events, msg_cap_ts)
+    # Scheduled directives (event-loop scheduler). Fire due schedules ONLY
+    # when the message backlog is NOT truncated (``msg_cap_ts is None``):
+    # firing MUTATES state (resets next_due), so it must never emit an
+    # event that the clamp would then drop — that would advance next_due
+    # for a fire the agent never received. With 500+ pending messages the
+    # agent drains those first; the schedule fires on a later poll. The
+    # directive event's timestamp is "now" (the latest), so it joins the
+    # sort at the end and the cursor advances to it cleanly.
+    if fire_scheduled and msg_cap_ts is None:
+        events.extend(_collect_scheduled_directive_events_for(agent_id))
     events.sort(key=lambda e: e.get("timestamp") or "")
     if events:
         next_cursor = (
@@ -1897,7 +1982,8 @@ async def wait_for_events_tool_impl(
         # the waiter's private synthetic queue as stream 3.
         events: List[Dict[str, Any]]
         events, cursor_value = assemble_event_feed(
-            agent_id, since, drain_queue=g.drain_waiter_queue(waiter_queue)
+            agent_id, since, drain_queue=g.drain_waiter_queue(waiter_queue),
+            fire_scheduled=True,
         )
         if events:
             env = _envelope(events, since, profile_review=review_section)
@@ -1914,7 +2000,17 @@ async def wait_for_events_tool_impl(
         # (infinite / never stop). This is the ONLY thing that ends the
         # connection for a no-cap heartbeat client.
         idle_remaining = _idle_stop_seconds_remaining(agent_id)
-        if idle_remaining is not None and idle_remaining <= 0:
+        # Decision 9: an enabled schedule SUPPRESSES idle-stop — the agent
+        # must stay present to receive its fires (dormant re-wake is out of
+        # scope). Only stop when the window is exceeded AND no enabled
+        # schedule exists.
+        if (
+            idle_remaining is not None
+            and idle_remaining <= 0
+            and not _agent_has_active_schedule(
+                agent_id, datetime.datetime.now().isoformat()
+            )
+        ):
             stop_evt = _stop_listening_event(
                 "event-loop idle-stop window exceeded (no events)"
             )
@@ -1958,10 +2054,24 @@ async def wait_for_events_tool_impl(
         heartbeat_progress = 0.0
         while True:
             now_mono = asyncio.get_event_loop().time()
+            now_iso = datetime.datetime.now().isoformat()
+            # Soonest scheduled-directive fire for this agent (a new wake
+            # condition alongside flag-recheck / heartbeat / idle-stop). A
+            # schedule created or re-armed mid-hold is picked up here (the
+            # query is re-run each slice), so a create's waiter-wake and
+            # this poll both converge on firing it.
+            soonest_due = _soonest_schedule_due_at(agent_id, now_iso)
+            has_schedule = soonest_due is not None
             # Idle-stop wins over the hold deadline: a long-holding
             # (esp. no-cap heartbeat) connection winds the agent down when
-            # the idle window is crossed mid-hold.
-            if idle_deadline is not None and now_mono >= idle_deadline:
+            # the idle window is crossed mid-hold — UNLESS an enabled
+            # schedule keeps it alive (decision 9, re-checked each slice so
+            # the last schedule ending resumes normal idle-stop).
+            if (
+                idle_deadline is not None
+                and now_mono >= idle_deadline
+                and not has_schedule
+            ):
                 stop_evt = _stop_listening_event(
                     "event-loop idle-stop window exceeded (no events)"
                 )
@@ -1969,6 +2079,19 @@ async def wait_for_events_tool_impl(
                 return _envelope(
                     [stop_evt], since, profile_review=review_section
                 )
+            # A schedule is due now → fire it (wait-loop-native) and return.
+            if has_schedule and soonest_due <= now_iso:
+                events, cursor_value = assemble_event_feed(
+                    agent_id, since, fire_scheduled=True,
+                )
+                if events:
+                    env = _envelope(
+                        events, since, profile_review=review_section
+                    )
+                    if cursor_value:
+                        _write_last_event_seen_at(agent_id, cursor_value)
+                    _write_last_activity_at(agent_id, now_iso)
+                    return env
             remaining = deadline - now_mono
             if remaining <= 0:
                 return _envelope([], since, profile_review=review_section)
@@ -1976,6 +2099,19 @@ async def wait_for_events_tool_impl(
             if idle_deadline is not None:
                 # Don't overshoot the idle-stop by more than a slice.
                 slice_timeout = min(slice_timeout, idle_deadline - now_mono)
+            if has_schedule:
+                # Wake right at the soonest next_due so the fire is prompt
+                # (bounded below by 0; a due-in-the-past schedule was
+                # already handled above).
+                try:
+                    due_dt = datetime.datetime.fromisoformat(soonest_due)
+                    secs_until_due = (
+                        due_dt - datetime.datetime.now()
+                    ).total_seconds()
+                    if secs_until_due > 0:
+                        slice_timeout = min(slice_timeout, secs_until_due)
+                except (TypeError, ValueError):  # pragma: no cover
+                    pass
             try:
                 # Block until either (a) the EventBus puts something on
                 # our queue or (b) the slice expires. The item returned
@@ -2007,7 +2143,7 @@ async def wait_for_events_tool_impl(
                     drained.append(first_item)
                 drained.extend(g.drain_waiter_queue(waiter_queue))
                 events, cursor_value = assemble_event_feed(
-                    agent_id, since, drain_queue=drained
+                    agent_id, since, drain_queue=drained, fire_scheduled=True,
                 )
                 if events:
                     env = _envelope(events, since, profile_review=review_section)
@@ -2099,7 +2235,9 @@ async def fetch_events_since_tool_impl(
     # fetch_events_since is the "fresh catch-up" path and the queue
     # contents are only meaningful in the context of a wait_for_events
     # session that established expectations about ordering.
-    events, new_cursor = assemble_event_feed(agent_id, cursor)
+    events, new_cursor = assemble_event_feed(
+        agent_id, cursor, fire_scheduled=True,
+    )
     if events:
         _write_last_event_seen_at(agent_id, new_cursor)
 

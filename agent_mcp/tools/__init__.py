@@ -34,6 +34,7 @@ from . import agent_roster_tools  # noqa: E402,F401 — view_agents peer roster
 from . import rag_tools
 from . import utility_tools
 from . import agent_communication_tools
+from . import scheduled_directive_tools  # noqa: E402,F401 — event-loop scheduler
 
 # After all imports, the tool registry in tools.registry should be populated.
 # We can optionally add a log here to confirm, or check the registry's state.

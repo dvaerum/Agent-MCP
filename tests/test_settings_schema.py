@@ -50,6 +50,10 @@ GOLDEN_DEFAULTS: dict[str, object] = {
     "config_allow_manager_update_own_profile": True,
     "config_allow_manager_curate_profiles": True,
     "config_profile_review_interval_days": 7,
+    "config_allow_worker_self_schedule": True,
+    "config_allow_manager_curate_schedules": True,
+    "config_min_schedule_interval_seconds": 60,
+    "config_max_schedules_per_agent": 10,
     "config_aoe_notify_enabled": False,
     "config_aoe_base_url": "http://127.0.0.1:8181",
     "config_aoe_bearer_token": None,
@@ -80,10 +84,10 @@ def test_golden_table_and_schema_cover_the_same_keys() -> None:
     assert set(GOLDEN_DEFAULTS) == {s.key for s in SETTINGS_SCHEMA}
 
 
-def test_schema_has_seventeen_ordered_specs() -> None:
-    assert len(SETTINGS_SCHEMA) == 17
+def test_schema_has_twenty_one_ordered_specs() -> None:
+    assert len(SETTINGS_SCHEMA) == 21
     # Keys are unique.
-    assert len({s.key for s in SETTINGS_SCHEMA}) == 17
+    assert len({s.key for s in SETTINGS_SCHEMA}) == 21
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +113,7 @@ def test_tier_agrees_with_live_aoe_write_gate() -> None:
 
 def test_known_setting_keys_complete() -> None:
     """KNOWN_SETTING_KEYS == the config_* keys the backend actually
-    reads (the 17 in the golden table)."""
+    reads (the 21 in the golden table)."""
     assert KNOWN_SETTING_KEYS == frozenset(GOLDEN_DEFAULTS)
 
 
@@ -140,7 +144,7 @@ def _rows(payload: dict) -> list[dict]:
 async def test_settings_schema_endpoint_confirmed_operator(
     tmp_path: Path,
 ) -> None:
-    """A CONFIRMED operator-tier bearer gets 200 with all 12 schema rows
+    """A CONFIRMED operator-tier bearer gets 200 with all schema rows
     and a caller block reflecting their tier."""
     async with mcp_session(tmp_path) as admin:
         r = admin.client.get(
@@ -150,7 +154,7 @@ async def test_settings_schema_endpoint_confirmed_operator(
         assert r.status_code == 200, r.text
         body = r.json()
         rows = _rows(body)
-        assert len(rows) == 17
+        assert len(rows) == 21
         # Row shape carries every schema field the frontend renders.
         first = rows[0]
         assert set(first) == {
@@ -205,4 +209,4 @@ async def test_settings_schema_caller_sysadmin_true_for_sysadmin() -> None:
     body = json.loads(resp.body)
     assert body["caller"]["sysadmin"] is True
     assert body["caller"]["confirmed_operator"] is True
-    assert len(body["schema"]) == 17
+    assert len(body["schema"]) == 21
