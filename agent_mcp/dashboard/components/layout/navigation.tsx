@@ -8,6 +8,7 @@ import {
   Brain,
   BookOpen,
   MessageSquare,
+  CalendarClock,
   Settings,
   Network
 } from "lucide-react"
@@ -26,7 +27,7 @@ interface NavItem {
   // as a literal union here so a grep for the enum values lands on
   // this file too (the sidebar is where contributors reason about
   // "which menu items exist").
-  view: 'overview' | 'agents' | 'tasks' | 'memories' | 'messages' | 'settings' | 'system' | 'prompts'
+  view: 'overview' | 'agents' | 'tasks' | 'memories' | 'messages' | 'schedules' | 'settings' | 'system' | 'prompts'
   description?: string
   badge?: string
 }
@@ -61,6 +62,12 @@ const navigationItems: NavItem[] = [
     icon: MessageSquare,
     view: "messages",
     description: "Inter-agent messaging — compose, read, history"
+  },
+  {
+    title: "Schedules",
+    icon: CalendarClock,
+    view: "schedules",
+    description: "Recurring scheduled directives — list, toggle, poke"
   },
   {
     title: "Settings",

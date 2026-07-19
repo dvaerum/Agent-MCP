@@ -227,6 +227,27 @@ export interface Message {
   parent_message_id: string | null
 }
 
+// A scheduled_directive row (event-loop scheduler). A recurring
+// imperative that fires when the target agent next checks in at-or-after
+// the interval. `next_due_at` drives the "next fire" column; `enabled`
+// backs the inline toggle; `status` is active | paused | completed.
+export interface Schedule {
+  directive_id: string
+  agent_id: string
+  prompt: string
+  interval_seconds: number
+  next_due_at: string
+  enabled: boolean
+  status: string
+  until_at: string | null
+  max_runs: number | null
+  run_count: number
+  created_at: string
+  created_by: string | null
+  updated_at: string | null
+  updated_by: string | null
+}
+
 // A project_settings row (ADR-0016: config_* keys live in the dedicated
 // settings store, not project_context). `value` is the raw JSON-encoded
 // string the store carries; secret keys arrive as the literal string
@@ -1028,6 +1049,61 @@ class ApiClient {
   // Reads only — writes still go through create/update/deleteSetting.
   async getSettingsSchema(): Promise<SettingsSchemaResponse> {
     return this.request('/settings-schema')
+  }
+
+  // Scheduled directives (event-loop scheduler). Operator/admin surface
+  // behind the Schedules tab; all routes are require_operator_session-
+  // gated. The backend reuses the same guardrail-enforcing tool impls the
+  // agent surface uses, so the floor/max checks apply here too.
+  async getSchedules(): Promise<Schedule[]> {
+    const res = await this.request<{ schedules: Schedule[] }>('/schedules')
+    return res.schedules ?? []
+  }
+
+  async createSchedule(data: {
+    agent_id: string
+    prompt: string
+    interval_seconds: number
+    until?: string | null
+    count?: number | null
+    run_now?: boolean
+  }): Promise<{ success: boolean; directive: Schedule }> {
+    return this.request('/schedules', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    })
+  }
+
+  async updateSchedule(directiveId: string, data: {
+    prompt?: string
+    interval_seconds?: number
+    enabled?: boolean
+    until?: string | null
+    count?: number | null
+  }): Promise<{ success: boolean; directive: Schedule }> {
+    return this.request(`/schedules/${encodeURIComponent(directiveId)}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    })
+  }
+
+  async deleteSchedule(directiveId: string): Promise<{ success: boolean; deleted: string }> {
+    return this.request(`/schedules/${encodeURIComponent(directiveId)}`, {
+      method: 'DELETE',
+      body: JSON.stringify({}),
+    })
+  }
+
+  // Ad-hoc poke (operator/admin only) — push a one-shot directive to an
+  // agent. Delivered immediately if it's listening, else queued urgent.
+  async pokeAgent(agentId: string, data: {
+    prompt: string
+    priority?: string
+  }): Promise<{ success: boolean; poke_id: string }> {
+    return this.request(`/agents/${encodeURIComponent(agentId)}/directive`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    })
   }
 
   async createSetting(data: {

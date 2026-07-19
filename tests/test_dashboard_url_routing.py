@@ -53,6 +53,7 @@ EXPECTED_SECTIONS = {
     "tasks",
     "memories",
     "messages",
+    "schedules",
     "settings",
     "system",
     "prompts",
