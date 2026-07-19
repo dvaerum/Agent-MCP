@@ -190,6 +190,10 @@ _MUTABLE_FIELDS: set[str] = {
     # Event-coord PR-1 + PR-2.
     "auto_event_loop",
     "last_event_seen_at",
+    # Event-loop idle-stop (migration 0020): wall-clock marker of the
+    # agent's last REAL event, seeded on first listen. Written by
+    # ``wait_for_events``'s ``_write_last_activity_at``.
+    "last_activity_at",
     # PR 8 (Agent flip): added so the restore-agent path
     # (``app.routes.restore_agent``) can clear ``terminated_at`` via
     # the repo's transaction-aware ``update_field`` seam instead of

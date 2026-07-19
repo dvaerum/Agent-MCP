@@ -81,6 +81,9 @@ async def test_agent_model_columns_match_raw_schema(tmp_path) -> None:
             # toggle + cursor for fetch_events_since (PR-2).
             "auto_event_loop",
             "last_event_seen_at",
+            # Event-loop idle-stop (migration 0020): wall-clock marker of
+            # the agent's last real event, seeded on first listen.
+            "last_activity_at",
             # Phase 2 Wave 1a (migration 0013): per-agent privilege
             # tier. Read by @requires_role in Wave 2; column-only in
             # this PR.

@@ -1367,6 +1367,36 @@ def _check_auto_event_loop_flags(agent_id: str) -> tuple[bool, Optional[str]]:
     return True, None
 
 
+def _idle_stop_seconds_remaining(agent_id: str) -> Optional[float]:
+    """Seconds until this agent's event-loop idle-stop fires, or ``None``
+    when idle-stop is disabled (``config_event_idle_stop_seconds == 0``).
+
+    Reads the operator's idle-stop window and the agent's
+    ``last_activity_at`` marker. On first use (marker NULL) it SEEDS the
+    marker to "now" and grants a full window — so a brand-new agent starts
+    its idle clock when it begins listening rather than counting as
+    instantly idle. The marker is reset to "now" on every real event
+    (see the ``_write_last_activity_at`` call sites in
+    ``wait_for_events_tool_impl``), so this measures time-since-last-real-
+    event across reconnects. A return <= 0 means the window is already
+    exceeded.
+    """
+    window = _access._get_config_int("config_event_idle_stop_seconds")
+    if window <= 0:
+        return None  # 0 = infinite / never stop
+    now = datetime.datetime.now()
+    last = _read_last_activity_at(agent_id)
+    if not last:
+        _write_last_activity_at(agent_id, now.isoformat())
+        return float(window)
+    try:
+        last_dt = datetime.datetime.fromisoformat(last)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        _write_last_activity_at(agent_id, now.isoformat())
+        return float(window)
+    return float(window) - (now - last_dt).total_seconds()
+
+
 def _stop_listening_event(reason: str) -> Dict[str, Any]:
     """Build the canonical ``stop_listening`` event dict."""
     return {
@@ -1430,6 +1460,53 @@ def _read_last_event_seen_at(agent_id: str) -> Optional[str]:
     if row is None:
         return None
     return row["last_event_seen_at"]
+
+
+def _read_last_activity_at(agent_id: str) -> Optional[str]:
+    """Read the persisted idle-stop activity marker, or None if unset."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT last_activity_at FROM agents WHERE agent_id = ?",
+            (agent_id,),
+        )
+        row = cursor.fetchone()
+    except Exception:  # pragma: no cover - defensive
+        return None
+    finally:
+        if conn:
+            conn.close()
+    if row is None:
+        return None
+    return row["last_activity_at"]
+
+
+def _write_last_activity_at(agent_id: str, when_iso: str) -> None:
+    """Persist ``agents.last_activity_at`` (event-loop idle-stop marker).
+
+    Best-effort: a DB failure here must not fail the tool call. Unlike the
+    event cursor this is a wall-clock "now" that always advances forward on
+    a real event (or the first-listen seed), so a plain field write is
+    correct — no monotonic MAX needed.
+    """
+    if not when_iso:
+        return
+    try:
+        from ..repositories import agent_repo
+
+        if agent_repo.update_field(agent_id, "last_activity_at", when_iso) is None:
+            logger.warning(
+                "wait_for_events: failed to persist last_activity_at "
+                "for %s (unknown agent or DB error)",
+                agent_id,
+            )
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(
+            "wait_for_events: failed to persist last_activity_at for %s: %s",
+            agent_id, e,
+        )
 
 
 def _collect_unassigned_task_events_for(
@@ -1826,7 +1903,23 @@ async def wait_for_events_tool_impl(
             env = _envelope(events, since, profile_review=review_section)
             if cursor_value:
                 _write_last_event_seen_at(agent_id, cursor_value)
+            # Idle-stop: a real event resets the per-agent idle clock.
+            _write_last_activity_at(agent_id, datetime.datetime.now().isoformat())
             return env
+
+        # Idle-stop (event-loop wind-down): no events pending. Read how
+        # long until this agent's idle window expires (seeds the marker on
+        # first listen). If already exceeded, tell the agent to stop
+        # reconnecting instead of holding again. `None` ⇒ window is 0
+        # (infinite / never stop). This is the ONLY thing that ends the
+        # connection for a no-cap heartbeat client.
+        idle_remaining = _idle_stop_seconds_remaining(agent_id)
+        if idle_remaining is not None and idle_remaining <= 0:
+            stop_evt = _stop_listening_event(
+                "event-loop idle-stop window exceeded (no events)"
+            )
+            g.drain_waiter_queue(waiter_queue)
+            return _envelope([stop_evt], since, profile_review=review_section)
 
         # Slow path — block on the per-call queue. The EventBus pushes
         # either a real synthetic event (e.g. ``unassigned_task_appeared``)
@@ -1841,6 +1934,18 @@ async def wait_for_events_tool_impl(
         # because the slice timeout is bounded — the flag re-check
         # happens at most ``_FLAG_RECHECK_INTERVAL_SECONDS`` late.
         deadline = asyncio.get_event_loop().time() + timeout
+        # Idle-stop deadline (monotonic). `idle_remaining` was computed
+        # above from the persisted marker; within a single holding call no
+        # real event is delivered without returning, so the marker is
+        # constant here and we can convert it to a fixed monotonic deadline
+        # rather than re-reading the DB each slice. Crossing it returns
+        # stop_listening (vs the hold `deadline`, which returns empty →
+        # reconnect). `None` ⇒ idle-stop disabled (window 0).
+        idle_deadline: Optional[float] = (
+            asyncio.get_event_loop().time() + idle_remaining
+            if idle_remaining is not None
+            else None
+        )
         # Heartbeat bookkeeping (heartbeat clients only). We emit a
         # `notifications/progress` frame every HEARTBEAT_INTERVAL_SECONDS
         # of silence so the client resets its idle timeout; the flag
@@ -1852,10 +1957,25 @@ async def wait_for_events_tool_impl(
         )
         heartbeat_progress = 0.0
         while True:
-            remaining = deadline - asyncio.get_event_loop().time()
+            now_mono = asyncio.get_event_loop().time()
+            # Idle-stop wins over the hold deadline: a long-holding
+            # (esp. no-cap heartbeat) connection winds the agent down when
+            # the idle window is crossed mid-hold.
+            if idle_deadline is not None and now_mono >= idle_deadline:
+                stop_evt = _stop_listening_event(
+                    "event-loop idle-stop window exceeded (no events)"
+                )
+                g.drain_waiter_queue(waiter_queue)
+                return _envelope(
+                    [stop_evt], since, profile_review=review_section
+                )
+            remaining = deadline - now_mono
             if remaining <= 0:
                 return _envelope([], since, profile_review=review_section)
             slice_timeout = min(_FLAG_RECHECK_INTERVAL_SECONDS, remaining)
+            if idle_deadline is not None:
+                # Don't overshoot the idle-stop by more than a slice.
+                slice_timeout = min(slice_timeout, idle_deadline - now_mono)
             try:
                 # Block until either (a) the EventBus puts something on
                 # our queue or (b) the slice expires. The item returned
@@ -1893,6 +2013,10 @@ async def wait_for_events_tool_impl(
                     env = _envelope(events, since, profile_review=review_section)
                     if cursor_value:
                         _write_last_event_seen_at(agent_id, cursor_value)
+                    # Idle-stop: a real event resets the idle clock.
+                    _write_last_activity_at(
+                        agent_id, datetime.datetime.now().isoformat()
+                    )
                     return env
                 # Wake with no events for this caller's ``since`` cursor —
                 # treat as a spurious wake (e.g. flag toggle that flips

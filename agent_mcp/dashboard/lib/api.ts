@@ -259,6 +259,7 @@ export interface SettingsSchemaEntry {
     | 'switch'
     | 'int_days'
     | 'int_ms'
+    | 'int_duration'
     | 'url'
     | 'secret'
     | 'secret_path'

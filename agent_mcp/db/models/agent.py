@@ -65,6 +65,14 @@ class Agent(Base):
     last_event_seen_at: Mapped[Optional[str]] = mapped_column(
         Text, nullable=True,
     )
+    # Event-loop idle-stop (migration 0020): ISO-8601 wall-clock time the
+    # agent last received a REAL event (or first started listening, seeded
+    # on the first wait_for_events call). Distinct from last_event_seen_at
+    # (the fetch cursor). NULL ⇒ never seeded; the idle-stop window is
+    # measured as now − last_activity_at across reconnects.
+    last_activity_at: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+    )
     # Phase 2 Wave 1a: per-agent privilege tier. 'worker' (default) is
     # the existing behaviour; 'manager' is introduced in Wave 2 as a
     # supervisor tier that can edit subordinates + assign tasks but
