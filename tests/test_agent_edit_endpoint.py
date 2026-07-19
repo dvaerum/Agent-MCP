@@ -1,15 +1,14 @@
 """Backend tests for POST /api/agents/<id>/edit.
 
 The dashboard's Agents page Edit-icon needs a way to mutate the
-admin-editable agent fields: `capabilities`, `color`,
-`working_directory`. This PR adds a minimal admin-only REST endpoint
-that updates the row using the existing `update_agent_db_field`
-helper.
+admin-editable agent fields: `color`, `working_directory`. This PR
+adds a minimal admin-only REST endpoint that updates the row using
+the existing `update_agent_db_field` helper.
 
 Contract:
   - Method: POST
   - URL:    /api/agents/<id>/edit
-  - Body:   {"token": admin_token, "capabilities"?: [...], "color"?: str,
+  - Body:   {"token": admin_token, "color"?: str,
                                   "working_directory"?: str}
   - Auth:   admin token required (403 otherwise)
   - 404 when the agent_id doesn't exist
@@ -21,8 +20,6 @@ architecture review 2026-06-02).
 """
 
 from __future__ import annotations
-
-import json
 
 import pytest
 
@@ -46,22 +43,6 @@ def _row(table: str, where_sql: str, params: tuple) -> dict | None:
 
 
 # -------------------- happy path -------------------------------------
-
-
-async def test_edit_updates_capabilities(tmp_path) -> None:
-    async with mcp_session(tmp_path) as admin:
-        await admin.create_worker("alice")
-        resp = admin.post(
-            "/api/agents/alice/edit",
-            json={"capabilities": ["code_edit", "file_read"]},
-        )
-        assert resp.status_code == 200, resp.text
-        body = resp.json()
-        assert body.get("success") is True, body
-
-        row = _row("agents", "agent_id = ?", ("alice",))
-        assert row is not None
-        assert json.loads(row["capabilities"]) == ["code_edit", "file_read"]
 
 
 async def test_edit_updates_color(tmp_path) -> None:
@@ -98,7 +79,6 @@ async def test_edit_updates_multiple_fields_at_once(tmp_path) -> None:
         resp = admin.post(
             "/api/agents/alice/edit",
             json={
-                "capabilities": ["one", "two"],
                 "color": "#deadbe",
                 "working_directory": "/home/alice",
             },
@@ -107,7 +87,6 @@ async def test_edit_updates_multiple_fields_at_once(tmp_path) -> None:
 
         row = _row("agents", "agent_id = ?", ("alice",))
         assert row is not None
-        assert json.loads(row["capabilities"]) == ["one", "two"]
         assert row["color"] == "#deadbe"
         assert row["working_directory"] == "/home/alice"
 
@@ -150,7 +129,7 @@ async def test_edit_400_when_no_editable_fields(tmp_path) -> None:
 
 async def test_edit_rejects_non_whitelisted_fields(tmp_path) -> None:
     """Sending `status` or `agent_id` (not in the whitelist) must not
-    touch the row — only capabilities/color/working_directory are
+    touch the row — only color/working_directory are
     editable through this endpoint."""
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")

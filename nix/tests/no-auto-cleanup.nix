@@ -237,9 +237,9 @@ pkgs.testers.nixosTest {
         # recurring CI flake). 5s busy-timeout makes sqlite wait for the
         # lock instead of erroring instantly.
         f"sqlite3 -cmd '.timeout 5000' {db} \"INSERT INTO agents "
-        "(token, agent_id, capabilities, created_at, status, "
+        "(token, agent_id, created_at, status, "
         "working_directory, color, updated_at) VALUES "
-        "('__test_token_old', 'old-worker', '[]', "
+        "('__test_token_old', 'old-worker', "
         "'2024-01-01T00:00:00', 'created', '/tmp', '#888', "
         "'2024-01-01T00:00:00');\""
     )

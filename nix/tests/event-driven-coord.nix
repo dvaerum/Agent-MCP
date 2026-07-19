@@ -11,13 +11,12 @@
 #   1. serverInfo.instructions wake-loop bootstrap appears when both
 #      flags ON; disappears when per-agent flag OFF.
 #   2. wait_for_events blocks then returns on inbox message (fat).
-#   3. Capability subset routing for unassigned_task_appeared.
-#   4. Empty required_capabilities → broadcast.
-#   5. Empty agent capabilities → matches only empty-required tasks.
 #   6. fetch_events_since catch-up.
 #   7. Concurrent wait_for_events → conflict envelope.
 #   8. stop_listening on per-agent flag flip.
-#   9. Lowercase normalization of capability labels.
+#   9. assign_task creates a ROOT task (structured capability-tag routing
+#      retired in migration 0019 / ADR-0019 — unassigned tasks now notify
+#      every agent unconditionally, so cases 3/4/5 no longer apply).
 #   10. Global toggle OFF → stop_listening for all agents.
 #
 # Test runtime target: ~2-3 minutes total once the VM is booted.
@@ -207,26 +206,26 @@ pkgs.testers.nixosTest {
 
     # ── Provision two agents directly via SQL ────────────────────
     # The harness pattern from existing VM tests: skip the
-    # create_agent tool and INSERT directly so we control both the
-    # token and capabilities precisely.
+    # create_agent tool and INSERT directly so we control the token
+    # and agent_role precisely.
     def sql(stmt: str) -> str:
         # `sqlite3` defaults to no row separator for SELECT; the
         # test driver expects plain stdout, so we just shell out.
         return machine.succeed(f"sqlite3 {db_path} \"{stmt}\"")
 
     sql(
-        "INSERT INTO agents (token, agent_id, capabilities, "
+        "INSERT INTO agents (token, agent_id, "
         "created_at, status, working_directory, color, updated_at, "
         "auto_event_loop) VALUES "
-        "('tokbe', 'worker-backend', '[\\\"backend\\\"]', "
+        "('tokbe', 'worker-backend', "
         " '2026-01-01T00:00:00', 'active', '/tmp', '#888', "
         " '2026-01-01T00:00:00', 1)"
     )
     sql(
-        "INSERT INTO agents (token, agent_id, capabilities, "
+        "INSERT INTO agents (token, agent_id, "
         "created_at, status, working_directory, color, updated_at, "
         "auto_event_loop) VALUES "
-        "('tokfe', 'worker-frontend', '[\\\"frontend\\\"]', "
+        "('tokfe', 'worker-frontend', "
         " '2026-01-01T00:00:00', 'active', '/tmp', '#888', "
         " '2026-01-01T00:00:00', 1)"
     )
@@ -234,10 +233,10 @@ pkgs.testers.nixosTest {
     # which workers can't do (they must file under a parent_task_id).
     # agent_role is set here so it hydrates as manager at backend startup.
     sql(
-        "INSERT INTO agents (token, agent_id, capabilities, "
+        "INSERT INTO agents (token, agent_id, "
         "created_at, status, working_directory, color, updated_at, "
         "auto_event_loop, agent_role) VALUES "
-        "('tokmgr', 'mgr-norm', '[\\\"backend\\\"]', "
+        "('tokmgr', 'mgr-norm', "
         " '2026-01-01T00:00:00', 'active', '/tmp', '#888', "
         " '2026-01-01T00:00:00', 1, 'manager')"
     )
@@ -418,26 +417,24 @@ pkgs.testers.nixosTest {
         "WHERE context_key = 'config_auto_event_loop_global'"
     )
 
-    # ── Test 9: lowercase normalization (verify via SQL) ──────────
-    # PR-1 normalizes at write time; verify the column shape on
-    # task-create through the assign_task tool. Workers cannot create
-    # ROOT tasks (must specify parent_task_id), so use the seeded
-    # manager agent (mgr-norm / tokmgr) — agent_role is hydrated into
-    # the backend's active-agent set at startup, so the manager must be
-    # seeded before the backend restart above (a live SQL role flip is
-    # not picked up by the running backend).
+    # ── Test 9: assign_task creates a ROOT task (no capability tags) ──
+    # The structured capability-tag routing was retired (migration 0019,
+    # ADR-0019): there is no longer a `required_capabilities` column and
+    # unassigned tasks notify every agent unconditionally. This test just
+    # verifies a manager can still create a ROOT task via assign_task.
+    # Workers cannot create ROOT tasks (must specify parent_task_id), so
+    # use the seeded manager agent (mgr-norm / tokmgr) — agent_role is
+    # hydrated into the backend's active-agent set at startup, so the
+    # manager must be seeded before the backend restart above.
     tool_call("tokmgr", "assign_task", {
-        "task_title": "cap-norm task",
+        "task_title": "root task no-caps",
         "task_description": "x",
-        "required_capabilities": ["Backend", "DB"],
     })
-    rc = sql(
-        "SELECT required_capabilities FROM tasks "
-        "WHERE title = 'cap-norm task'"
+    cnt = sql(
+        "SELECT COUNT(*) FROM tasks WHERE title = 'root task no-caps'"
     ).strip()
-    # Stored as JSON list; should be lowercase + deduped.
-    assert "backend" in rc and "db" in rc and "Backend" not in rc, (
-        f"required_capabilities should normalize to lowercase; got {rc!r}"
+    assert cnt == "1", (
+        f"assign_task should create the root task; got count={cnt!r}"
     )
 
     # Smoke summary print so a failed assertion is easy to spot in

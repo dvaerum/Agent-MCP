@@ -48,9 +48,9 @@ def _insert_tombstone(agent_id: str) -> None:
         cursor = conn.cursor()
         cursor.execute(
             "INSERT OR IGNORE INTO agents "
-            "(token, agent_id, capabilities, created_at, status, "
+            "(token, agent_id, created_at, status, "
             " working_directory, color, updated_at) "
-            "VALUES (?, ?, '[]', ?, 'tombstone', '', '#000000', ?)",
+            "VALUES (?, ?, ?, 'tombstone', '', '#000000', ?)",
             (
                 f"__tombstone_{agent_id}",
                 f"[deleted-{agent_id}]",
@@ -136,7 +136,7 @@ async def test_notify_unassigned_task_skips_tombstone(tmp_path) -> None:
             # Empty required-caps => wake every active agent (subset of
             # any capability set), so the tombstone would be included
             # pre-fix.
-            _state.notify_unassigned_task_appeared("task-tomb-fanout", [])
+            _state.notify_unassigned_task_appeared("task-tomb-fanout")
         finally:
             _event_bus.notify = orig_notify
 

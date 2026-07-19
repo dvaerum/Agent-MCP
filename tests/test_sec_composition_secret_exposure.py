@@ -65,11 +65,11 @@ def _seed_agent_with_aoe(agent_id: str, aoe_session_id: str) -> None:
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO agents (token, agent_id, capabilities, created_at, "
+            "INSERT INTO agents (token, agent_id, created_at, "
             "status, working_directory, color, updated_at, agent_role, "
-            "aoe_session_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "aoe_session_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                secrets.token_hex(16), agent_id, "[]", now, "active",
+                secrets.token_hex(16), agent_id, now, "active",
                 "/tmp", "#abc", now, "worker", aoe_session_id,
             ),
         )

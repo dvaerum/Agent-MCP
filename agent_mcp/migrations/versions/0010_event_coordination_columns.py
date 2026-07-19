@@ -23,13 +23,13 @@ via the new `project_context["config_auto_event_loop_global"]` row.
 disconnect. NULL means "no events seen yet" — `fetch_events_since`
 treats it as "from the beginning".
 
-`tasks.required_capabilities` is the JSON-encoded list of capability
-labels a worker must satisfy (subset match) to receive an
-`unassigned_task_appeared` event for that task (PR-2 wiring). Stored
-as already-normalized lowercase strings; the normalization happens
-once at write time via
-`agent_mcp.utils.capability_normalization.normalize_capabilities`.
-Read paths must NOT re-normalize.
+`tasks.required_capabilities` was the JSON-encoded list of capability
+labels a worker had to satisfy (subset match) to receive an
+`unassigned_task_appeared` event for that task (PR-2 wiring). This
+structured capability-tag routing was RETIRED in migration 0019
+(behaviour-preserving — the subset filter was already a no-op); the
+column is physically dropped there. This migration is kept unchanged so
+the historical add→drop chain still applies cleanly on legacy DBs.
 
 ## SQLite ALTER TABLE constraints
 

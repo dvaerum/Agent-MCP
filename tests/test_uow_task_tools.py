@@ -269,8 +269,8 @@ def _capture_unassigned_wakes(monkeypatch) -> list:
     """Record every ``notify_unassigned_task_appeared`` fan-out."""
     seen: list = []
 
-    def _cap(task_id, caps):  # noqa: ANN001
-        seen.append((task_id, list(caps or [])))
+    def _cap(task_id):  # noqa: ANN001
+        seen.append(task_id)
 
     monkeypatch.setattr(
         "agent_mcp.core.globals.notify_unassigned_task_appeared", _cap
@@ -334,7 +334,7 @@ async def test_create_unassigned_commit_fires_audit_cache_notify(
         assert task_id in g.tasks, "unassigned task must be cached in g.tasks"
         assert g.tasks[task_id].get("status") == "unassigned"
         # Post-commit notify fanout fired for the new task.
-        assert any(t == task_id for t, _ in notified), (
+        assert any(t == task_id for t in notified), (
             f"unassigned create must wake the pool for {task_id}; "
             f"saw {notified}"
         )

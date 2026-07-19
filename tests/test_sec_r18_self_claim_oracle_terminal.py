@@ -53,11 +53,8 @@ def _seed_task(
     title: str = "seeded task",
     assigned_to: str | None = None,
     status: str = "pending",
-    required_capabilities: list[str] | None = None,
 ) -> str:
     """Insert a task row directly. Returns the task_id."""
-    import json
-
     from agent_mcp.db.connection import get_db_connection
 
     task_id = f"task_{secrets.token_hex(6)}"
@@ -67,9 +64,8 @@ def _seed_task(
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO tasks (task_id, title, description, status, priority, "
-        "assigned_to, required_capabilities, created_by, created_at, "
-        "updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "assigned_to, created_by, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             title,
@@ -77,9 +73,6 @@ def _seed_task(
             status,
             "medium",
             assigned_to,
-            json.dumps(required_capabilities)
-            if required_capabilities
-            else None,
             "admin",
             now,
             now,
@@ -113,23 +106,21 @@ def _task_state(task_id: str) -> tuple[str | None, str | None]:
 async def test_worker_self_claim_outcomes_are_indistinguishable(
     tmp_path,
 ) -> None:
-    """A worker self-claiming (a) a NONEXISTENT task, (b) a FOREIGN
-    ASSIGNED task, and (c) an existing task whose required_capabilities
-    the worker LACKS must all get the IDENTICAL response — same error
-    variant AND same rendered text after masking the supplied id — so
-    the differential response can't be used to enumerate task_ids or
-    read a foreign owner id."""
+    """A worker self-claiming (a) a NONEXISTENT task and (b) a FOREIGN
+    ASSIGNED task must get the IDENTICAL response — same error variant
+    AND same rendered text after masking the supplied id — so the
+    differential response can't be used to enumerate task_ids or read a
+    foreign owner id.
+
+    (PR5 retired the structured capability-tag gate, so the former
+    caps-mismatch arm of this oracle no longer exists — a task with no
+    assignee and no terminal status is simply claimable now.)"""
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
         bob = await admin.create_worker("bob")
 
         nonexistent = "task_deadbeefdeadbeef"
         foreign = _seed_task(title="bob's task", assigned_to=bob.agent_id)
-        caps_mismatch = _seed_task(
-            title="needs a skill alice lacks",
-            assigned_to=None,
-            required_capabilities=["backend.deploy"],
-        )
 
         async def self_claim(task_id: str) -> str:
             res = await alice.call(
@@ -140,7 +131,6 @@ async def test_worker_self_claim_outcomes_are_indistinguishable(
 
         nonexistent_text = await self_claim(nonexistent)
         foreign_text = await self_claim(foreign)
-        caps_text = await self_claim(caps_mismatch)
 
         # None may leak existence via Conflict/PermissionDenied, and the
         # foreign owner id must never appear.
@@ -151,7 +141,6 @@ async def test_worker_self_claim_outcomes_are_indistinguishable(
         for label, text in [
             ("nonexistent", nonexistent_text),
             ("foreign", foreign_text),
-            ("caps", caps_text),
         ]:
             assert "Unauthorized" not in text, (
                 f"{label} self-claim must not render PermissionDenied "
@@ -162,21 +151,19 @@ async def test_worker_self_claim_outcomes_are_indistinguishable(
                 f"got {text!r}"
             )
 
-        # Load-bearing: all three must be BYTE IDENTICAL after masking
-        # the (necessarily different) task_id each supplied.
+        # Load-bearing: both must be BYTE IDENTICAL after masking the
+        # (necessarily different) task_id each supplied.
         masked = [
             nonexistent_text.replace(nonexistent, "<TASK>"),
             foreign_text.replace(foreign, "<TASK>"),
-            caps_text.replace(caps_mismatch, "<TASK>"),
         ]
-        assert masked[0] == masked[1] == masked[2], (
-            "nonexistent / foreign-assigned / caps-mismatch self-claim "
-            f"responses must be identical after masking the id; got {masked!r}"
+        assert masked[0] == masked[1], (
+            "nonexistent / foreign-assigned self-claim responses must be "
+            f"identical after masking the id; got {masked!r}"
         )
 
-        # The foreign and caps tasks must be untouched.
+        # The foreign task must be untouched.
         assert _task_state(foreign) == (bob.agent_id, "pending")
-        assert _task_state(caps_mismatch) == (None, "pending")
 
 
 # ── BL-R18-1: terminal-sink on the assign axis ───────────────────
@@ -264,32 +251,9 @@ async def test_admin_gets_informative_conflict_for_foreign_task(
         )
 
 
-async def test_admin_gets_informative_permission_denied_for_caps(
-    tmp_path,
-) -> None:
-    """An admin assigning a task to a target agent that lacks the
-    required capabilities still gets the informative PermissionDenied,
-    not a phantom NotFound."""
-    async with mcp_session(tmp_path) as admin:
-        dave = await admin.create_worker("dave")  # empty caps
-        task_id = _seed_task(
-            title="needs a skill dave lacks",
-            assigned_to=None,
-            required_capabilities=["backend.deploy"],
-        )
-
-        res = await admin.call(
-            "assign_task",
-            {"agent_token": dave.token, "task_ids": [task_id]},
-        )
-        text = res[0].text
-        assert "not found" not in text.lower(), (
-            f"admin must get the informative PermissionDenied, not phantom "
-            f"NotFound; got {text!r}"
-        )
-        assert "capabilit" in text.lower(), (
-            f"admin should see the informative caps error; got {text!r}"
-        )
+# PR5 retired the structured capability-tag gate, so
+# ``test_admin_gets_informative_permission_denied_for_caps`` was removed —
+# there is no caps-mismatch PermissionDenied to assert any more.
 
 
 async def test_admin_blocked_from_assigning_terminal_task_informatively(

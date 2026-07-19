@@ -56,7 +56,7 @@ def _seed_agent(
     with get_session() as session:
         session.add(
             Agent(
-                token=f"tok-{agent_id}", agent_id=agent_id, capabilities="[]",
+                token=f"tok-{agent_id}", agent_id=agent_id,
                 created_at=now, status=status, current_task=None,
                 working_directory="/tmp/seed", color="#abc", terminated_at=None,
                 updated_at=now, aoe_session_id=None, agent_role=role,

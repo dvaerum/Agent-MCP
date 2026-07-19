@@ -49,10 +49,10 @@ def _seed_agent(agent_id: str, status: str = "active") -> str:
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO agents (token, agent_id, capabilities, created_at, "
+        "INSERT INTO agents (token, agent_id, created_at, "
         "status, working_directory, color, terminated_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (token, agent_id, "[]", now, status, "/tmp", "#888",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (token, agent_id, now, status, "/tmp", "#888",
          terminated_at, now),
     )
     conn.commit()
@@ -63,7 +63,6 @@ def _seed_agent(agent_id: str, status: str = "active") -> str:
             "agent_id": agent_id,
             "status": status,
             "created_at": now,
-            "capabilities": [],
         }
     return token
 

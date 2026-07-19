@@ -85,7 +85,7 @@ def _install_spies(monkeypatch):
     notified: list[str] = []
     monkeypatch.setattr(
         _g_mod, "notify_unassigned_task_appeared",
-        lambda task_id, caps: unassigned.append((task_id, caps)),
+        lambda task_id: unassigned.append(task_id),
     )
     monkeypatch.setattr(
         _g_mod, "notify_agent_inbox",
@@ -148,7 +148,7 @@ async def test_clear_assignment_terminal_does_not_fire_unassigned(
         r = _clear_assignment(admin, task_id, None)
         assert r.status_code == 200, r.text
 
-        fired_ids = [u[0] for u in unassigned]
+        fired_ids = list(unassigned)
         assert task_id not in fired_ids, (
             f"clearing a {terminal_status!r} task must NOT fire "
             f"notify_unassigned_task_appeared; fired={unassigned}"
@@ -181,7 +181,7 @@ async def test_clear_assignment_nonterminal_still_unassigns(
             f"non-terminal cleared task must become 'unassigned', got "
             f"{row['status']!r}"
         )
-        fired_ids = [u[0] for u in unassigned]
+        fired_ids = list(unassigned)
         assert task_id in fired_ids, (
             f"non-terminal clear must fire the unassigned fanout; "
             f"fired={unassigned}"

@@ -1428,17 +1428,20 @@ def _read_last_event_seen_at(agent_id: str) -> Optional[str]:
 def _collect_unassigned_task_events_for(
     agent_id: str, since: Optional[str],
 ) -> List[Dict[str, Any]]:
-    """Find unassigned tasks created after `since` that match this
-    agent's capabilities.
+    """Find unassigned tasks that transitioned after ``since``.
 
     Reused by both `wait_for_events_tool_impl` (on wake) and
     `fetch_events_since_tool_impl`. Produces the same skinny payload
     that `notify_unassigned_task_appeared` pushes to the in-memory
     queue, so a worker that misses the push event still picks up the
     same shape on its next catch-up.
-    """
-    from ..utils.capability_normalization import normalize_capabilities
 
+    Every unassigned task surfaces to every agent — the structured
+    capability-tag routing (``req ⊆ caps``) was retired in PR5 (it was
+    already a no-op: an empty required set matched everyone). The
+    ``agent_id`` gate below is kept only so a catch-up for an unknown /
+    tombstoned agent returns nothing.
+    """
     since_iso = since if since else "0000-01-01T00:00:00"
     events: List[Dict[str, Any]] = []
     conn = None
@@ -1446,23 +1449,11 @@ def _collect_unassigned_task_events_for(
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT capabilities FROM agents WHERE agent_id = ?",
+            "SELECT 1 FROM agents WHERE agent_id = ?",
             (agent_id,),
         )
-        row = cursor.fetchone()
-        if row is None:
+        if cursor.fetchone() is None:
             return []
-        try:
-            agent_caps_raw = row["capabilities"] or "[]"
-            agent_caps = set(
-                normalize_capabilities(
-                    json.loads(agent_caps_raw)
-                    if isinstance(agent_caps_raw, str)
-                    else list(agent_caps_raw)
-                )
-            )
-        except Exception:
-            agent_caps = set()
 
         # BL-R10-2: key on ``updated_at`` (the transition-to-unassigned
         # time), NOT ``created_at``. A task orphaned by terminate/purge
@@ -1476,8 +1467,7 @@ def _collect_unassigned_task_events_for(
         # unchanged.
         cursor.execute(
             """
-            SELECT task_id, title, priority, required_capabilities,
-                   updated_at
+            SELECT task_id, title, priority, updated_at
             FROM tasks
             WHERE assigned_to IS NULL
               AND updated_at > ?
@@ -1486,20 +1476,6 @@ def _collect_unassigned_task_events_for(
             (since_iso,),
         )
         for trow in cursor.fetchall():
-            try:
-                req_raw = trow["required_capabilities"] or "[]"
-                req = set(
-                    normalize_capabilities(
-                        json.loads(req_raw)
-                        if isinstance(req_raw, str)
-                        else list(req_raw)
-                    )
-                )
-            except Exception:
-                req = set()
-            # Subset match: req ⊆ agent_caps. Empty req → matches everyone.
-            if not req.issubset(agent_caps):
-                continue
             events.append({
                 "type": "unassigned_task_appeared",
                 "ref_id": trow["task_id"],
@@ -1508,7 +1484,6 @@ def _collect_unassigned_task_events_for(
                     "task_id": trow["task_id"],
                     "title": trow["title"],
                     "priority": trow["priority"],
-                    "required_capabilities": sorted(req),
                 },
             })
     finally:

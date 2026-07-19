@@ -74,7 +74,6 @@ def _seed_worker_agent_row_pre_lifespan(
             CREATE TABLE IF NOT EXISTS agents (
                 token TEXT PRIMARY KEY,
                 agent_id TEXT NOT NULL UNIQUE,
-                capabilities TEXT,
                 created_at TEXT NOT NULL,
                 status TEXT NOT NULL,
                 current_task TEXT,
@@ -88,14 +87,13 @@ def _seed_worker_agent_row_pre_lifespan(
         )
         now = _dt.datetime.now().isoformat()
         conn.execute(
-            "INSERT OR REPLACE INTO agents (token, agent_id, capabilities, "
+            "INSERT OR REPLACE INTO agents (token, agent_id, "
             "created_at, status, current_task, working_directory, color, "
             "terminated_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 token,
                 agent_id,
-                "[]",
                 now,
                 "created",
                 None,

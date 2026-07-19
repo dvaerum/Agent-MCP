@@ -369,51 +369,6 @@ def _agent_assignable(cursor, agent_id: str) -> bool:
     return is_live_agent(agent_id, cursor)
 
 
-def _missing_capabilities(
-    cursor,
-    task_required_capabilities: Any,
-    target_agent_id: str,
-) -> List[str]:
-    """Capabilities the target agent lacks for a task's required set.
-
-    Single source of truth for the Mode-3 routing control
-    ``required_capabilities ⊆ agent.capabilities`` (added round-1 in
-    ``_assign_to_existing_tasks``). EVERY assign/reassign write site must
-    call this before pinning a capability-tagged task onto an agent, so
-    the control cannot be bypassed on a reassign path (AZ-R26-1). Returns
-    the sorted list of missing capabilities (empty ⇒ satisfied).
-
-    ``task_required_capabilities`` may be the raw DB TEXT column (a JSON
-    string) or an already-decoded list. An empty/absent required set
-    always satisfies (empty ⇒ no missing). A terminated/absent agent has
-    no capabilities row, so the whole required set is reported missing.
-    Both sides are normalized (lowercased) at write time.
-    """
-    if isinstance(task_required_capabilities, str):
-        required = set(
-            json.loads(task_required_capabilities)
-            if task_required_capabilities
-            else []
-        )
-    else:
-        required = set(task_required_capabilities or [])
-    if not required:
-        return []
-    # A terminated/tombstone/absent agent has no live capabilities row,
-    # so the whole required set is reported missing (BL-R31-3b: a
-    # tombstone `[deleted-<id>]` is not a live agent).
-    from ..repositories.agent_repository import LIVE_AGENT_SQL
-
-    cursor.execute(
-        "SELECT capabilities FROM agents WHERE agent_id = ? "
-        f"AND {LIVE_AGENT_SQL}",
-        (target_agent_id,),
-    )
-    row = cursor.fetchone()
-    agent_caps = set(json.loads(row["capabilities"] or "[]")) if row else set()
-    return sorted(required - agent_caps)
-
-
 def _worker_ownership_deny(
     task_id: str, assignee: Optional[str], *, action: str = "update it"
 ) -> str:
@@ -568,26 +523,6 @@ async def _update_single_task(
                     f"Cannot reassign task '{task_id}' to "
                     f"'{new_assigned_to}': agent does not exist or is "
                     f"terminated."
-                ),
-            }
-        # Capability-routing parity (AZ-R26-1): the canonical assign path
-        # (``_assign_to_existing_tasks``) refuses to pin a
-        # capability-tagged task onto an under-capable agent; the single
-        # reassign path must enforce the SAME control or it becomes a
-        # bypass. ``required_capabilities`` is unchanged by this update,
-        # so check the task's stored tag against the new assignee.
-        missing_caps = _missing_capabilities(
-            cursor,
-            task_current_data.get("required_capabilities"),
-            new_assigned_to,
-        )
-        if missing_caps:
-            return {
-                "success": False,
-                "error": (
-                    f"Cannot reassign task '{task_id}' to "
-                    f"'{new_assigned_to}': agent lacks required "
-                    f"capabilities {missing_caps}."
                 ),
             }
 
@@ -875,14 +810,6 @@ async def _create_unassigned_tasks(
     tasks = arguments.get("tasks")
     priority = arguments.get("priority", "medium")
     parent_task_id_arg = arguments.get("parent_task_id")
-    # Event-coord PR-1: top-level required_capabilities applies to
-    # every task in the call (single + multi). For the multi path,
-    # individual task entries may override via their own
-    # `required_capabilities` key; otherwise they inherit the top-level
-    # value. Normalize once at write time.
-    from agent_mcp.utils.capability_normalization import normalize_capabilities
-
-    top_level_required_caps_raw = arguments.get("required_capabilities")
 
     # Provenance (non-repudiation). ``_worker_created_by`` is tagged by
     # ``_authorize_assign_task`` when a *worker* files an unassigned task
@@ -986,11 +913,6 @@ async def _create_unassigned_tasks(
                     description = task["description"]
                     task_priority = task.get("priority", "medium")
                     parent_task = task.get("parent_task_id")
-                    # Per-task override of top-level required_capabilities.
-                    per_task_caps_raw = task.get(
-                        "required_capabilities", top_level_required_caps_raw
-                    )
-                    normalized_caps = normalize_capabilities(per_task_caps_raw)
 
                     fresh = task_repo.create(
                         {
@@ -1001,9 +923,6 @@ async def _create_unassigned_tasks(
                             "status": "unassigned",
                             "priority": task_priority,
                             "parent_task": parent_task,
-                            "required_capabilities": (
-                                normalized_caps if normalized_caps else None
-                            ),
                         },
                         connection=cursor,
                     )
@@ -1032,8 +951,6 @@ async def _create_unassigned_tasks(
                 # ``task_{int(now().timestamp()*1000)}`` — two calls
                 # landing in the same millisecond collided on the PK.
                 # ``task_id`` omitted; ``task_repo.create`` mints one.
-                normalized_caps = normalize_capabilities(top_level_required_caps_raw)
-
                 fresh = task_repo.create(
                     {
                         "title": task_title,
@@ -1043,9 +960,6 @@ async def _create_unassigned_tasks(
                         "status": "unassigned",
                         "priority": priority,
                         "parent_task": parent_task_id_arg,
-                        "required_capabilities": (
-                            normalized_caps if normalized_caps else None
-                        ),
                     },
                     connection=cursor,
                 )
@@ -1086,32 +1000,14 @@ async def _create_unassigned_tasks(
         # The uow committed and flushed the cache hooks above; g.tasks is
         # now populated, so the notify fanout below reads fresh rows.
 
-        # PR-2 event-coord: fan out `unassigned_task_appeared` events
-        # to every active agent whose capabilities satisfy the task's
-        # required_capabilities. Per-task fanout (so a multi-task call
-        # with heterogeneous capability requirements still wakes the
-        # right subset per task). Wrapped in broad try/except so a
-        # notification failure can't poison a successful task write.
+        # PR-2 event-coord: fan out `unassigned_task_appeared` events to
+        # every active agent (capability-tag routing retired in PR5 — every
+        # unassigned task surfaces to everyone). Wrapped in broad
+        # try/except so a notification failure can't poison a successful
+        # task write.
         for task in created_tasks:
             try:
-                task_id = task["task_id"]
-                # Per-task required_capabilities (may have overridden
-                # the top-level value in the multi path); resolve from
-                # `g.tasks` (populated by `write_operation`) to keep
-                # this branch independent of which arg path produced
-                # the row.
-                cached = g.tasks.get(task_id, {})
-                raw_caps = cached.get("required_capabilities")
-                if isinstance(raw_caps, str):
-                    try:
-                        caps_list = json.loads(raw_caps)
-                    except Exception:
-                        caps_list = []
-                elif isinstance(raw_caps, list):
-                    caps_list = raw_caps
-                else:
-                    caps_list = []
-                g.notify_unassigned_task_appeared(task_id, caps_list)
+                g.notify_unassigned_task_appeared(task["task_id"])
             except Exception as e:  # pragma: no cover - defensive
                 logger.warning(
                     "notify_unassigned_task_appeared(%s) failed: %s",
@@ -1202,7 +1098,7 @@ async def _assign_to_existing_tasks(
             # terminal state (BL-R18-1).
             placeholders = ",".join(["?" for _ in task_ids])
             cursor.execute(
-                f"SELECT task_id, title, assigned_to, required_capabilities, status "
+                f"SELECT task_id, title, assigned_to, status "
                 f"FROM tasks WHERE task_id IN ({placeholders})",
                 task_ids,
             )
@@ -1311,38 +1207,12 @@ async def _assign_to_existing_tasks(
             from ..repositories.agent_repository import LIVE_AGENT_SQL
 
             cursor.execute(
-                "SELECT capabilities FROM agents WHERE agent_id = ? "
+                "SELECT 1 FROM agents WHERE agent_id = ? "
                 f"AND {LIVE_AGENT_SQL}",
                 (target_agent_id,),
             )
-            agent_caps_row = cursor.fetchone()
-            if not agent_caps_row:
+            if not cursor.fetchone():
                 return NotFound(resource="agent", identifier=target_agent_id)
-
-            # Capability-routing enforcement (Mode-3 self-claim). A caller
-            # that learns a task_id must not claim work it lacks the
-            # capabilities for: enforce required_capabilities ⊆ agent
-            # capabilities. Empty required_capabilities always passes. The
-            # subset check is factored into ``_missing_capabilities`` so
-            # every reassign path enforces the SAME control (AZ-R26-1).
-            for task in found_tasks:
-                missing = _missing_capabilities(
-                    cursor, task["required_capabilities"], target_agent_id
-                )
-                if missing:
-                    # SEC-R18: a non-admin self-claim caller must not learn
-                    # the task exists via a capability-mismatch signal —
-                    # collapse to the phantom NotFound. Admins keep the
-                    # informative PermissionDenied.
-                    if not is_admin_request:
-                        return phantom_not_found
-                    return PermissionDenied(
-                        reason=(
-                            f"agent '{target_agent_id}' lacks required "
-                            f"capabilities for task {task['task_id']}: "
-                            f"{missing}"
-                        )
-                    )
 
             # PR 6: task assignment UPDATEs go through task_repo with the
             # caller's cursor so they're atomic with the audit-log
@@ -2126,17 +1996,6 @@ async def assign_task_tool_impl(
                     }
                 )
 
-            # Event-coord PR-1: normalize required_capabilities at write
-            # time. None / missing key ⇒ store NULL ("anyone can claim",
-            # though this is the assigned path so the field is informational
-            # for routing on future reassignment / unassign).
-            from agent_mcp.utils.capability_normalization import normalize_capabilities
-
-            _norm_caps = normalize_capabilities(
-                arguments.get("required_capabilities")
-            )
-            _required_caps_json = json.dumps(_norm_caps) if _norm_caps else None
-
             # TOCTOU recheck (terminate-reconcile). ``validate_task_placement``
             # above yields on a RAG await; a concurrent ``terminate_agent``
             # can commit in that window, after the assignability gate passed
@@ -2149,24 +2008,6 @@ async def assign_task_tool_impl(
                         f"Cannot assign task to '{target_agent_id}': agent was "
                         f"terminated during task placement. Re-issue against a "
                         f"live agent."
-                    )
-                )
-
-            # SECURITY (AZ-R26-1): capability-routing parity at create time.
-            # This Mode-1 create+assign path tags the new task with
-            # ``required_capabilities`` AND pins it on ``target_agent_id`` in
-            # one call — so a caps-tagged task could land on an under-capable
-            # agent, the same routing-control bypass the reassign paths close.
-            # Enforce the SAME subset check the canonical assign path uses; an
-            # admin/operator caller gets the informative refusal.
-            missing_caps = _missing_capabilities(
-                cursor, _norm_caps, target_agent_id
-            )
-            if missing_caps:
-                return PermissionDenied(
-                    reason=(
-                        f"Cannot assign task to '{target_agent_id}': agent "
-                        f"lacks required capabilities {missing_caps}."
                     )
                 )
 
@@ -2186,9 +2027,6 @@ async def assign_task_tool_impl(
                     "parent_task": final_parent_task_id,
                     "depends_on_tasks": final_depends_on_tasks or [],
                     "notes": initial_notes,
-                    "required_capabilities": (
-                        _norm_caps if _norm_caps else None
-                    ),
                 },
                 connection=cursor,
             )
@@ -2641,18 +2479,6 @@ async def create_self_task_tool_impl(
                     "priority": priority,
                     "parent_task": final_parent_task_id,
                     "depends_on_tasks": final_depends_on_tasks or [],
-                    # arch-deepening R4 #7: explicit, locked decision — a
-                    # self-task is always immediately self-assigned (see
-                    # ``assigned_to`` above), so it never goes through the
-                    # capability-routing gate that ``required_capabilities``
-                    # exists to enforce on a separate assignment step. This
-                    # used to be an accidental omission (the dict simply
-                    # never had the key); it's now an explicit ``None`` so
-                    # the next reader doesn't mistake it for a bug. If a
-                    # future reassignment path needs self-tasks to carry a
-                    # capability tag, that's a deliberate follow-up, not a
-                    # silent behavior change here.
-                    "required_capabilities": None,
                 },
                 connection=cursor,
             )
@@ -3017,8 +2843,7 @@ async def update_task_status_tool_impl(
 # lines pre-refactor) onto the SAME invariant engine
 # ``update_task_status`` already uses: terminal-sink transition guard
 # (``_is_status_transition_allowed`` / ``_TERMINAL_TASK_STATUSES``),
-# assignability (``_agent_assignable``), capability-routing parity
-# (``_missing_capabilities``), and ``current_task`` reconcile
+# assignability (``_agent_assignable``), and ``current_task`` reconcile
 # (``reconcile_current_task_on_reassign``) — all via ``_update_single_task``.
 # Before this tool, ONLY ``status`` routed through ``_update_single_task``
 # (via ``update_task_status``); the REST route hand-reimplemented the
@@ -3173,10 +2998,7 @@ async def update_task_tool_impl(
                         return NotFound(resource="task", identifier=task_id)
                     if "invalid status transition" in lower:
                         return Conflict(reason=error)
-                    if (
-                        "lacks required capabilities" in lower
-                        or "does not exist or is terminated" in lower
-                    ):
+                    if "does not exist or is terminated" in lower:
                         return Invalid(field="assigned_to", message=error)
                     return Failed(message=error)
 
@@ -3200,7 +3022,6 @@ async def update_task_tool_impl(
                     changed_fields.append("assigned_to")
 
             clearing_fanout_needed = False
-            required_caps_for_fanout: Any = None
             if clearing:
                 from ..repositories import task_repo as _task_repo
                 from ..repositories import agent_repo as _agent_repo
@@ -3238,7 +3059,6 @@ async def update_task_tool_impl(
                 _agent_repo.reconcile_current_task_on_reassign(
                     task_id, prior_assignee, None, connection=cursor,
                 )
-                required_caps_for_fanout = prior_data.get("required_capabilities")
                 log_details["assigned_to_changed"] = None
                 changed_fields.append("assigned_to")
 
@@ -3299,20 +3119,9 @@ async def update_task_tool_impl(
             # BL-R16-1 / BL-R17-1: unassigned-fanout parity — only when
             # clearing landed a NON-terminal task back to 'unassigned'.
             if clearing_fanout_needed:
-                raw_caps = required_caps_for_fanout
-                if isinstance(raw_caps, str):
+                def _notify_unassigned(tid=task_id) -> None:
                     try:
-                        caps_list = json.loads(raw_caps or "[]")
-                    except json.JSONDecodeError:
-                        caps_list = []
-                elif isinstance(raw_caps, list):
-                    caps_list = raw_caps
-                else:
-                    caps_list = []
-
-                def _notify_unassigned(tid=task_id, caps=caps_list) -> None:
-                    try:
-                        g.notify_unassigned_task_appeared(tid, caps or [])
+                        g.notify_unassigned_task_appeared(tid)
                     except Exception as exc:  # pragma: no cover - defensive
                         logger.warning(
                             "notify_unassigned_task_appeared(%s) raised: %s",
@@ -4603,28 +4412,6 @@ async def bulk_task_operations_tool_impl(
                             )
                             continue
 
-                        # SECURITY (AZ-R26-1): capability-routing parity.
-                        # The canonical assign path
-                        # (``_assign_to_existing_tasks``) refuses to pin a
-                        # capability-tagged task onto an under-capable
-                        # agent; the bulk reassign op must enforce the SAME
-                        # control or it is a bypass. Deny this one op
-                        # (per-op error + continue), matching the
-                        # terminal-sink / assignability handling above.
-                        missing_caps = _missing_capabilities(
-                            cursor,
-                            task_data.get("required_capabilities"),
-                            new_assigned_to,
-                        )
-                        if missing_caps:
-                            results.append(
-                                f"Operation {i+1}: Cannot reassign task "
-                                f"'{task_id}' to '{new_assigned_to}': "
-                                f"agent lacks required capabilities "
-                                f"{missing_caps}"
-                            )
-                            continue
-
                         # PR 7 (Task flip): bulk reassign flows through
                         # task_repo.update_fields with the caller's cursor.
                         from ..repositories import task_repo as _task_repo
@@ -5118,23 +4905,6 @@ def register_task_tools():
                     "type": "string",
                     "description": "ID of the parent task (Mode 1 only)",
                 },
-                # Event-coord PR-1: capability routing for unassigned tasks.
-                # Subset match — an agent receives the
-                # `unassigned_task_appeared` event (PR-2) iff
-                # agent.capabilities ⊇ task.required_capabilities. Empty
-                # list / null ⇒ broadcast (everyone wakes). Server
-                # normalizes (strip + lowercase + dedupe) at write time.
-                "required_capabilities": {
-                    "type": "array",
-                    "description": (
-                        "Capability labels a worker must satisfy to be "
-                        "considered for this task (PR-1 event-coord). "
-                        "Subset match against agent.capabilities. Empty/"
-                        "missing = no capability gate. Free-text strings; "
-                        "lowercase-normalized at write time."
-                    ),
-                    "items": {"type": "string"},
-                },
                 # Mode 2: Multiple task creation
                 "tasks": {
                     "type": "array",
@@ -5156,15 +4926,6 @@ def register_task_tools():
                             "parent_task_id": {
                                 "type": "string",
                                 "description": "Parent task ID for this task",
-                            },
-                            "required_capabilities": {
-                                "type": "array",
-                                "description": (
-                                    "Per-task capability gate; overrides the "
-                                    "top-level required_capabilities for this "
-                                    "entry only (PR-1 event-coord)."
-                                ),
-                                "items": {"type": "string"},
                             },
                         },
                         "required": ["title", "description"],
@@ -5819,8 +5580,7 @@ def register_task_tools():
                     "type": "string",
                     "description": (
                         "Agent id to assign the task to. Must be a live "
-                        "agent that satisfies required_capabilities. Omit "
-                        "for an unassigned task."
+                        "agent. Omit for an unassigned task."
                     ),
                 },
                 "parent_task": {
@@ -5828,14 +5588,6 @@ def register_task_tools():
                     "description": (
                         "Existing task id to parent this task under. Must "
                         "exist. Omit for a top-level task."
-                    ),
-                },
-                "required_capabilities": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "Free-text capability labels an agent must hold to "
-                        "be assigned/claim this task."
                     ),
                 },
             },
@@ -6275,12 +6027,6 @@ async def create_task_tool_impl(
     if not title:
         return Invalid(field="task_title", message="task_title is required")
 
-    from ..utils.capability_normalization import normalize_capabilities
-
-    # Event-coord: normalize the optional capability gate at write time
-    # (lowercase + strip + dedupe). Empty/missing => stored as NULL.
-    _norm_caps = normalize_capabilities(arguments.get("required_capabilities"))
-
     # Provenance: the audit actor + ``created_by`` name whoever called
     # (operator username on the REST path, agent id on the MCP wire) —
     # the REST handler resolved this from ``caller_identity(auth)``, which
@@ -6310,9 +6056,8 @@ async def create_task_tool_impl(
                 if cursor.fetchone() is None:
                     return NotFound(resource="task", identifier=parent_task)
 
-            # BL-R13-1 / AZ-R26-1: a directly-assigned task must target a
-            # LIVE agent (exists + not terminated/tombstone) that satisfies
-            # the task's required capabilities — the same controls the
+            # BL-R13-1: a directly-assigned task must target a LIVE agent
+            # (exists + not terminated/tombstone) — the same control the
             # canonical MCP assign path enforces. Empty/absent assignment
             # falls through as unassigned.
             if assigned_to:
@@ -6321,16 +6066,6 @@ async def create_task_tool_impl(
                         message=(
                             f"Cannot assign task to '{assigned_to}': agent "
                             f"does not exist or is terminated."
-                        )
-                    )
-                missing_caps = _missing_capabilities(
-                    cursor, _norm_caps, assigned_to
-                )
-                if missing_caps:
-                    return Invalid(
-                        message=(
-                            f"Cannot assign task to '{assigned_to}': agent "
-                            f"lacks required capabilities {missing_caps}."
                         )
                     )
 
@@ -6345,7 +6080,6 @@ async def create_task_tool_impl(
                     "status": status,
                     "priority": priority,
                     "parent_task": parent_task,
-                    "required_capabilities": _norm_caps if _norm_caps else None,
                 },
                 connection=cursor,
             )
@@ -6409,8 +6143,7 @@ async def create_task_tool_impl(
                 )
             else:
                 u.on_commit(
-                    lambda t=task_id, c=list(_norm_caps or []):
-                    g.notify_unassigned_task_appeared(t, c)
+                    lambda t=task_id: g.notify_unassigned_task_appeared(t)
                 )
 
             return Ok(

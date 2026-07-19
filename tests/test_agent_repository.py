@@ -60,7 +60,6 @@ def _seed_agent(
     status: str = "active",
     working_directory: str = "/tmp/seed",
     color: str = "#abcdef",
-    capabilities_json: str = "[]",
 ):
     """Insert an agent via the ORM path, bypassing the repo.
 
@@ -77,7 +76,6 @@ def _seed_agent(
             Agent(
                 token=token or f"tok-{agent_id}",
                 agent_id=agent_id,
-                capabilities=capabilities_json,
                 created_at=now,
                 status=status,
                 current_task=None,
@@ -141,8 +139,6 @@ def test_get_by_id_returns_dict_when_present(project_dir, reset_globals):
         assert row is not None
         assert row["agent_id"] == "agent-getbyid"
         assert row["token"] == "tok-getbyid"
-        # Capabilities list is deserialised — preserves legacy projection.
-        assert row["capabilities"] == []
 
 
 def test_get_by_id_returns_none_when_missing(project_dir, reset_globals):
@@ -295,7 +291,6 @@ def test_create_returns_dict_and_updates_caches_and_publishes(
             entity = agent_repo.create(
                 token="tok-create",
                 agent_id="agent-create",
-                capabilities=["python"],
                 status="created",
                 working_directory="/tmp/agent-create",
                 color="#112233",
@@ -303,7 +298,6 @@ def test_create_returns_dict_and_updates_caches_and_publishes(
 
             assert entity["agent_id"] == "agent-create"
             assert entity["token"] == "tok-create"
-            assert entity["capabilities"] == ["python"]
 
             # Both caches reflect the new agent.
             assert "tok-create" in state.active_agents, (
@@ -459,7 +453,6 @@ def test_create_with_sqlite_cursor_lands_in_caller_transaction(
             agent_repo.create(
                 token="tok-seam-1",
                 agent_id="seam-1",
-                capabilities=["python"],
                 working_directory="/tmp/seam-1",
                 connection=cursor,
             )
@@ -586,7 +579,6 @@ def test_create_accepts_valid_agent_id(agent_id, project_dir, reset_globals):
         fresh = agent_repo.create(
             token=f"tok-valid-{agent_id}",
             agent_id=agent_id,
-            capabilities=[],
             status="created",
             working_directory=f"/tmp/{agent_id}",
         )
@@ -608,7 +600,6 @@ def test_create_rejects_invalid_agent_id(agent_id, project_dir, reset_globals):
             agent_repo.create(
                 token=f"tok-invalid-{abs(hash(agent_id))}",
                 agent_id=agent_id,
-                capabilities=[],
                 status="created",
                 working_directory="/tmp/invalid",
             )
@@ -649,10 +640,6 @@ _SANITISE_FIELD_CASES = [
     ("auto_event_loop", False, True, 0),
     ("auto_event_loop", 1, True, 1),
     ("auto_event_loop", 0, True, 0),
-    # capabilities: normalized (stripped, lowercased, deduped, order-preserved)
-    # then JSON-encoded.
-    ("capabilities", ["Foo", "foo", " Bar "], True, '["foo", "bar"]'),
-    ("capabilities", [], True, "[]"),
     # unknown / off-allowlist fields are rejected outright.
     ("token", "new-secret", False, None),
     ("agent_id", "renamed", False, None),
@@ -705,46 +692,6 @@ def test_sanitise_field_updated_at_explicit_value_passthrough():
     ok, value = _sanitise_field("updated_at", "2020-01-01T00:00:00")
     assert ok is True
     assert value == "2020-01-01T00:00:00"
-
-
-def test_update_field_via_cursor_and_standalone_agree(
-    project_dir, reset_globals,
-):
-    """The cursor writer and the standalone writer both route through
-    ``_sanitise_field`` — this pins that they produce the SAME
-    normalized value for the same input, which is the exact invariant
-    the (now-deleted) dead session writer put at risk of drifting.
-    """
-    with _make_client(project_dir):
-        from agent_mcp.db.connection import get_db_connection
-        from agent_mcp.repositories import agent_repo
-
-        _seed_agent("agent-cursor", token="tok-cursor", status="created")
-        _seed_agent("agent-standalone", token="tok-standalone", status="created")
-
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("BEGIN")
-            result = agent_repo.update_field(
-                "agent-cursor", "capabilities", ["Foo", "foo"],
-                connection=cursor,
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        assert result is not None
-
-        result2 = agent_repo.update_field(
-            "agent-standalone", "capabilities", ["Foo", "foo"],
-        )
-        assert result2 is not None
-
-        with agent_repo.disable_cache():
-            cursor_row = agent_repo.get_by_id("agent-cursor")
-            standalone_row = agent_repo.get_by_id("agent-standalone")
-        assert cursor_row["capabilities"] == standalone_row["capabilities"]
-        assert cursor_row["capabilities"] == ["foo"]
 
 
 # --- SEC-A: auth-cache re-warm gated on non-terminal status --------------

@@ -124,24 +124,42 @@ def _insert_admin_row(bind) -> None:
     # verbatim since we're using `sa.text`. Column set mirrors what
     # `init_database()` declares for `agents` (token PK, agent_id UNIQUE
     # NOT NULL, etc.).
-    bind.execute(
-        sa.text(
-            "INSERT OR IGNORE INTO agents "
-            "(token, agent_id, capabilities, created_at, status, "
-            " working_directory, color, updated_at) "
-            "VALUES (:token, :agent_id, :capabilities, :created_at, "
-            " :status, :working_directory, :color, :updated_at)"
-        ),
+    #
+    # `capabilities` was retired in migration 0019 (structured
+    # capability-tag routing removed). On a LEGACY DB this migration runs
+    # BEFORE 0019, so the column still exists and is seeded with "[]" (its
+    # historical behaviour). On a FRESH DB, `create_all()` lands the
+    # post-0019 ORM shape first — the column never exists — so this
+    # migration must NOT reference it or the INSERT fails with "no column
+    # named capabilities". Build the column list conditionally so both
+    # paths work.
+    inspector = sa.inspect(bind)
+    agent_cols = {c["name"] for c in inspector.get_columns("agents")}
+    has_caps = "capabilities" in agent_cols
+
+    cols = ["token", "agent_id"]
+    params = {
+        "token": _ADMIN_SYNTHETIC_TOKEN,
+        "agent_id": _ADMIN_AGENT_ID,
+    }
+    if has_caps:
+        cols.append("capabilities")
+        params["capabilities"] = "[]"
+    cols += ["created_at", "status", "working_directory", "color", "updated_at"]
+    params.update(
         {
-            "token": _ADMIN_SYNTHETIC_TOKEN,
-            "agent_id": _ADMIN_AGENT_ID,
-            "capabilities": "[]",
             "created_at": now,
             "status": "system",
             "working_directory": "",
             "color": "#000000",
             "updated_at": now,
-        },
+        }
+    )
+    col_sql = ", ".join(cols)
+    val_sql = ", ".join(f":{c}" for c in cols)
+    bind.execute(
+        sa.text(f"INSERT OR IGNORE INTO agents ({col_sql}) VALUES ({val_sql})"),
+        params,
     )
 
 

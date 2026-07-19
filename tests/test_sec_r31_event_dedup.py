@@ -49,13 +49,11 @@ def _seed_unassigned_task(
     task_id: str,
     *,
     updated_at: str = _DB_UPDATED_AT,
-    required_capabilities: str = "[]",
 ) -> None:
     """Insert one unassigned task whose ``updated_at`` is ``updated_at``.
 
-    ``_collect_unassigned_task_events_for`` surfaces it to any agent
-    whose capabilities are a superset of ``required_capabilities`` —
-    with the empty default it matches every agent."""
+    ``_collect_unassigned_task_events_for`` surfaces every unassigned
+    task to every agent (capability-tag routing retired in PR5)."""
     from agent_mcp.db.connection import get_db_connection
 
     conn = get_db_connection()
@@ -63,9 +61,8 @@ def _seed_unassigned_task(
         conn.execute(
             "INSERT INTO tasks (task_id, title, description, assigned_to, "
             "created_by, status, priority, created_at, updated_at, "
-            "parent_task, child_tasks, depends_on_tasks, notes, "
-            "required_capabilities) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "parent_task, child_tasks, depends_on_tasks, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 f"Unassigned {task_id}",
@@ -80,7 +77,6 @@ def _seed_unassigned_task(
                 "[]",
                 "[]",
                 "[]",
-                required_capabilities,
             ),
         )
         conn.commit()
@@ -140,7 +136,7 @@ async def test_unassigned_task_delivered_exactly_once(tmp_path: Path) -> None:
         # the transition time), then the notifier fans out a synthetic
         # wake-edge copy (wall-clock now()) and wakes the parked waiter.
         _seed_unassigned_task("dup-task", updated_at=_DB_UPDATED_AT)
-        g.notify_unassigned_task_appeared("dup-task", [])
+        g.notify_unassigned_task_appeared("dup-task")
 
         blocks = await task
         body = _envelope(blocks)
@@ -193,8 +189,8 @@ async def test_distinct_unassigned_tasks_not_collapsed(
 
         _seed_unassigned_task("task-a", updated_at="2026-01-01T00:00:00")
         _seed_unassigned_task("task-b", updated_at="2026-01-01T00:00:01")
-        g.notify_unassigned_task_appeared("task-a", [])
-        g.notify_unassigned_task_appeared("task-b", [])
+        g.notify_unassigned_task_appeared("task-a")
+        g.notify_unassigned_task_appeared("task-b")
 
         blocks = await task
         events = _envelope(blocks).get("events", [])

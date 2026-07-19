@@ -52,7 +52,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 # ---------------------------------------------------------------------------
 # Per-table mirrors. Each class:
@@ -69,7 +69,6 @@ class AgentMirror(BaseModel):
 
     token: str
     agent_id: str
-    capabilities: Optional[str] = None
     created_at: str
     status: str
     current_task: Optional[str] = None
@@ -214,7 +213,6 @@ class TaskMirror(BaseModel):
     child_tasks: Optional[str] = None
     depends_on_tasks: Optional[str] = None
     notes: Optional[str] = None
-    required_capabilities: Optional[str] = None
 
 
 class TaskNoteMirror(BaseModel):

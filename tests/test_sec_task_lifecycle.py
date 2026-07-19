@@ -21,14 +21,13 @@ hardening), all scoped to ``agent_mcp/tools/task_tools.py`` +
 
 4. Assignment must reject TERMINATED target agents (Modes 2/3, the
    admin ``agent_id`` alias path, bulk reassign, and the
-   ``update_task_status`` ``assigned_to`` field), and Mode-3 self-claim
-   must enforce ``task.required_capabilities ⊆ agent.capabilities``.
+   ``update_task_status`` ``assigned_to`` field). (The Mode-3 self-claim
+   capability-tag gate was retired in PR5.)
 """
 
 from __future__ import annotations
 
 import datetime as _dt
-import json
 import secrets
 
 import pytest
@@ -48,7 +47,6 @@ def _seed_task(
     status: str = "pending",
     assigned_to: str | None = None,
     parent_task: str | None = None,
-    required_capabilities: list[str] | None = None,
     created_by: str = "admin",
 ) -> str:
     from agent_mcp.db.connection import get_db_connection
@@ -61,8 +59,8 @@ def _seed_task(
         cursor.execute(
             "INSERT INTO tasks (task_id, title, description, status, "
             "priority, assigned_to, created_by, created_at, updated_at, "
-            "parent_task, required_capabilities) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "parent_task) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 title,
@@ -74,9 +72,6 @@ def _seed_task(
                 now,
                 now,
                 parent_task,
-                json.dumps(required_capabilities)
-                if required_capabilities
-                else None,
             ),
         )
         conn.commit()
@@ -109,28 +104,6 @@ def _terminate_agent(agent_id: str) -> None:
         conn.close()
     if row and row["token"]:
         g.active_agents.pop(row["token"], None)
-
-
-def _set_agent_capabilities(agent_id: str, caps: list[str]) -> None:
-    from agent_mcp.core import globals as g
-    from agent_mcp.db.connection import get_db_connection
-
-    conn = get_db_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE agents SET capabilities = ? WHERE agent_id = ?",
-            (json.dumps(caps), agent_id),
-        )
-        conn.commit()
-        cursor.execute(
-            "SELECT token FROM agents WHERE agent_id = ?", (agent_id,)
-        )
-        row = cursor.fetchone()
-    finally:
-        conn.close()
-    if row and row["token"] and row["token"] in g.active_agents:
-        g.active_agents[row["token"]]["capabilities"] = caps
 
 
 def _task_field(task_id: str, field: str):
@@ -459,42 +432,8 @@ async def test_update_status_reassign_to_terminated_agent_rejected(
 # --- Finding 4b: Mode-3 self-claim enforces capability subset ---
 
 
-async def test_self_claim_missing_capability_rejected(tmp_path) -> None:
-    async with mcp_session(tmp_path) as admin:
-        alice = await admin.create_worker("alice")  # caps == []
-        task_id = _seed_task(
-            title="needs python",
-            assigned_to=None,
-            required_capabilities=["python"],
-        )
-
-        result = await alice.call(
-            "assign_task",
-            {"agent_token": alice.token, "task_ids": [task_id]},
-        )
-        text = result[0].text
-        assert _task_field(task_id, "assigned_to") is None, (
-            f"self-claim of a task requiring caps the agent lacks must be "
-            f"rejected; got {text!r}"
-        )
-
-
-async def test_self_claim_with_matching_capability_allowed(tmp_path) -> None:
-    async with mcp_session(tmp_path) as admin:
-        alice = await admin.create_worker("alice")
-        _set_agent_capabilities("alice", ["python", "docs"])
-        task_id = _seed_task(
-            title="needs python",
-            assigned_to=None,
-            required_capabilities=["python"],
-        )
-
-        result = await alice.call(
-            "assign_task",
-            {"agent_token": alice.token, "task_ids": [task_id]},
-        )
-        text = result[0].text
-        assert "Unauthorized" not in text, text
-        assert _task_field(task_id, "assigned_to") == "alice", (
-            f"self-claim with sufficient caps must succeed; got {text!r}"
-        )
+# PR5 retired the structured capability-tag routing (the
+# ``task.required_capabilities ⊆ agent.capabilities`` self-claim gate),
+# so ``test_self_claim_missing_capability_rejected`` /
+# ``test_self_claim_with_matching_capability_allowed`` were removed — the
+# gate they exercised no longer exists (self-claim is caps-agnostic).

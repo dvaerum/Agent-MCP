@@ -189,17 +189,6 @@ def _task_to_dict(row: Task) -> Dict[str, Any]:
     the three JSON-typed columns are deserialised to Python lists.
     Parse failures fall back to an empty list with a warning (matches
     the legacy helper's behaviour exactly).
-
-    arch-deepening R4 #7: ``required_capabilities`` used to be missing
-    from this projection entirely — ``create()``'s ``connection=``
-    paths always included it in the ``fresh`` dict they build by hand,
-    but the standalone (no-``connection``) path re-fetches via
-    :func:`get_task_by_id`, which goes through here and silently
-    dropped the column. Every other reader of this projection
-    (``get_by_id``, ``list_all``, ``list_by_agent``) inherited the
-    same gap. Fixed here rather than left as a further landmine now
-    that ``create()``'s docstring makes the returned-shape contract
-    explicit.
     """
     data: Dict[str, Any] = {
         "task_id": row.task_id,
@@ -215,7 +204,6 @@ def _task_to_dict(row: Task) -> Dict[str, Any]:
         "child_tasks": row.child_tasks,
         "depends_on_tasks": row.depends_on_tasks,
         "notes": row.notes,
-        "required_capabilities": row.required_capabilities,
     }
     for field_key in _JSON_LIST_FIELDS:
         raw = data.get(field_key)
@@ -231,19 +219,6 @@ def _task_to_dict(row: Task) -> Dict[str, Any]:
         elif raw is None:
             data[field_key] = []
 
-    # required_capabilities is NOT in _JSON_LIST_FIELDS: NULL means "no
-    # requirement, anyone can claim" and must stay None, unlike the trio
-    # above whose NULL defaults to [].
-    raw_caps = data.get("required_capabilities")
-    if isinstance(raw_caps, str):
-        try:
-            data["required_capabilities"] = json.loads(raw_caps)
-        except json.JSONDecodeError:
-            logger.warning(
-                f"Failed to parse JSON for field 'required_capabilities' "
-                f"in task '{data.get('task_id', 'Unknown')}'. Raw: {raw_caps}"
-            )
-            data["required_capabilities"] = None
     return data
 
 
@@ -580,7 +555,7 @@ class TaskRepository:
         ``priority`` (defaults ``"medium"``), ``parent_task``,
         ``child_tasks``/``depends_on_tasks``/``notes`` (each defaults
         to ``[]`` — callers only need to pass these when the value is
-        non-empty), ``required_capabilities``.
+        non-empty).
 
         ``connection`` is the transaction-aware seam introduced in
         PR #151 and expanded here for the multi-table writes in
@@ -606,7 +581,6 @@ class TaskRepository:
         child_tasks = fields.get("child_tasks") or []
         depends_on_tasks = fields.get("depends_on_tasks") or []
         notes = fields.get("notes") or []
-        required_caps = fields.get("required_capabilities")
 
         task_id = fields.get("task_id") or _generate_task_id()
         assigned_to = fields.get("assigned_to")
@@ -621,9 +595,8 @@ class TaskRepository:
                 INSERT INTO tasks (
                     task_id, title, description, assigned_to, created_by,
                     status, priority, created_at, updated_at, parent_task,
-                    child_tasks, depends_on_tasks, notes,
-                    required_capabilities
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    child_tasks, depends_on_tasks, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -639,7 +612,6 @@ class TaskRepository:
                     json.dumps(child_tasks),
                     json.dumps(depends_on_tasks),
                     json.dumps(notes),
-                    json.dumps(required_caps) if required_caps else None,
                 ),
             )
             # Build the dict to return + cache without re-querying —
@@ -659,7 +631,6 @@ class TaskRepository:
                 "child_tasks": child_tasks,
                 "depends_on_tasks": depends_on_tasks,
                 "notes": notes,
-                "required_capabilities": required_caps,
             }
         elif connection is not None:
             # SQLAlchemy Session path: caller owns commit.
@@ -678,9 +649,6 @@ class TaskRepository:
                 child_tasks=json.dumps(child_tasks),
                 depends_on_tasks=json.dumps(depends_on_tasks),
                 notes=json.dumps(notes),
-                required_capabilities=(
-                    json.dumps(required_caps) if required_caps else None
-                ),
             )
             session.add(row)
             session.flush()
@@ -698,7 +666,6 @@ class TaskRepository:
                 "child_tasks": child_tasks,
                 "depends_on_tasks": depends_on_tasks,
                 "notes": notes,
-                "required_capabilities": required_caps,
             }
         else:
             # Standalone path — open session + commit.
@@ -717,9 +684,6 @@ class TaskRepository:
                     child_tasks=json.dumps(child_tasks),
                     depends_on_tasks=json.dumps(depends_on_tasks),
                     notes=json.dumps(notes),
-                    required_capabilities=(
-                        json.dumps(required_caps) if required_caps else None
-                    ),
                 )
                 session.add(row)
                 session.commit()

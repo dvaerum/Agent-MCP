@@ -40,7 +40,7 @@ async def test_body_token_is_rejected(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         r = admin.client.post(
             "/api/agents/admin/edit",
-            json={"token": admin.admin_token, "capabilities": []},
+            json={"token": admin.admin_token, "color": "#123456"},
         )
         assert r.status_code == 401, r.text
         assert admin.admin_token not in r.text
@@ -65,7 +65,7 @@ async def test_forwarding_header_still_admits(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         r = admin.post(
             "/api/agents/admin/edit",
-            json={"capabilities": []},
+            json={"color": "#123456"},
         )
         assert r.status_code == 200, r.text
 

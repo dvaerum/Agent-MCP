@@ -3,7 +3,7 @@
 
 The canonical MCP unassigned-create path
 (``task_tools.create_unassigned_tasks``) fires
-``g.notify_unassigned_task_appeared(task_id, caps)`` per created task so
+``g.notify_unassigned_task_appeared(task_id)`` per created task so
 an idle worker blocked in ``wait_for_events`` is edge-woken and a pure
 GET /mcp streaming subscriber receives the push (task_tools.py:757).
 
@@ -38,15 +38,13 @@ from tests.harness import mcp_session
 pytestmark = pytest.mark.asyncio
 
 
-def _create_task(admin, assigned_to=None, required_capabilities=None) -> str:
+def _create_task(admin, assigned_to=None) -> str:
     body = {
         "task_title": "r15-notify-target",
         "task_description": "a task created via REST",
     }
     if assigned_to is not None:
         body["assigned_to"] = assigned_to
-    if required_capabilities is not None:
-        body["required_capabilities"] = required_capabilities
     r = admin.post("/api/tasks", json=body)
     assert r.status_code == 200, r.text
     return r.json()["task_id"]
@@ -55,11 +53,11 @@ def _create_task(admin, assigned_to=None, required_capabilities=None) -> str:
 def _install_spies(monkeypatch):
     """Record unassigned-appeared fanouts + inbox wakes. Installed AFTER
     setup so create_worker's own side effects don't pollute recorders."""
-    unassigned: list[tuple] = []
+    unassigned: list[str] = []
     notified: list[str] = []
     monkeypatch.setattr(
         _g_mod, "notify_unassigned_task_appeared",
-        lambda task_id, caps: unassigned.append((task_id, caps)),
+        lambda task_id: unassigned.append(task_id),
     )
     monkeypatch.setattr(
         _g_mod, "notify_agent_inbox",
@@ -78,8 +76,7 @@ async def test_unassigned_create_fires_unassigned_task_appeared(
 
         task_id = _create_task(admin)  # no assigned_to
 
-        fired_ids = [u[0] for u in unassigned]
-        assert task_id in fired_ids, (
+        assert task_id in unassigned, (
             f"unassigned create must fire notify_unassigned_task_appeared "
             f"for the new task; fired={unassigned}"
         )
@@ -87,26 +84,6 @@ async def test_unassigned_create_fires_unassigned_task_appeared(
         # assigned).
         assert notified == [], (
             f"unassigned create should wake no assignee; notified={notified}"
-        )
-
-
-async def test_unassigned_create_forwards_required_capabilities(
-    tmp_path, monkeypatch,
-) -> None:
-    """The fanout must carry the task's normalized required
-    capabilities so the matcher wakes only the qualifying agents."""
-    async with mcp_session(tmp_path) as admin:
-        unassigned, _notified = _install_spies(monkeypatch)
-
-        task_id = _create_task(
-            admin, required_capabilities=["python", "docker"]
-        )
-
-        matched = [u for u in unassigned if u[0] == task_id]
-        assert matched, f"no fanout for the new task; fired={unassigned}"
-        caps = matched[0][1]
-        assert set(caps) == {"python", "docker"}, (
-            f"fanout must carry the task's required capabilities; got {caps}"
         )
 
 

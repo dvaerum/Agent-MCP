@@ -2,8 +2,8 @@
 
 Spec locked-decisions table:
   * `new_message` / `task_assigned` → **fat** payload (full row data).
-  * `unassigned_task_appeared` → **skinny** (title + priority +
-    required_capabilities; NO description).
+  * `unassigned_task_appeared` → **skinny** (title + priority;
+    NO description).
   * `stop_listening` → minimal `{type, ref_id: None, timestamp,
     payload: {reason}}`.
 
@@ -85,8 +85,8 @@ async def test_unassigned_task_event_is_skinny(tmp_path: Path) -> None:
 
     async with mcp_session(tmp_path) as admin:
         worker = await admin.create_worker("worker")
-        # Default empty capabilities — matches empty-required tasks
-        # (which broadcasts to everyone).
+        # Every unassigned task now broadcasts to every active agent
+        # (capability-tag routing retired in PR5).
 
         async def waiter():
             return await worker.call(
@@ -117,10 +117,14 @@ async def test_unassigned_task_event_is_skinny(tmp_path: Path) -> None:
             f"skinny payload must omit description; got {payload}"
         )
         # Required-positive invariants.
-        for k in ("task_id", "title", "priority", "required_capabilities"):
+        for k in ("task_id", "title", "priority"):
             assert k in payload, (
                 f"skinny payload missing key {k!r}; got {payload}"
             )
+        # Capability-tag routing was retired: no required_capabilities key.
+        assert "required_capabilities" not in payload, (
+            f"required_capabilities must be gone from payload; got {payload}"
+        )
         # Envelope-level shape: ref_id + timestamp + type.
         for k in ("type", "ref_id", "timestamp", "payload"):
             assert k in unassigned[0], (

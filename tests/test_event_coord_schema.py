@@ -29,7 +29,6 @@ poked directly.
 
 from __future__ import annotations
 
-import json as _json
 import os
 import sqlite3
 from pathlib import Path
@@ -191,8 +190,16 @@ def test_migration_applies_on_fresh_db_creates_columns(
     assert "last_event_seen_at" in agents_cols, (
         f"last_event_seen_at missing; have: {sorted(agents_cols)}"
     )
-    assert "required_capabilities" in tasks_cols, (
-        f"required_capabilities missing; have: {sorted(tasks_cols)}"
+    # PR5 retired structured capability-tag routing: migration 0019 drops
+    # tasks.required_capabilities (0010 added it, 0019 removes it), so the
+    # end-of-chain shape must NOT carry the column.
+    assert "required_capabilities" not in tasks_cols, (
+        f"required_capabilities should be dropped by 0019; "
+        f"have: {sorted(tasks_cols)}"
+    )
+    assert "capabilities" not in agents_cols, (
+        f"agents.capabilities should be dropped by 0019; "
+        f"have: {sorted(agents_cols)}"
     )
 
     # auto_event_loop is NOT NULL with default 1.
@@ -257,184 +264,6 @@ def test_migration_backfills_auto_event_loop_true_for_existing_agents(
         )
     finally:
         conn.close()
-
-
-# ---------------------------------------------------------------------------
-# (ii) — tasks.required_capabilities accepts NULL + JSON list
-# ---------------------------------------------------------------------------
-
-
-def test_required_capabilities_accepts_null_and_json_list(tmp_path: Path) -> None:
-    project_dir = str(tmp_path / "rc")
-    Path(project_dir).mkdir()
-    agent_dir = Path(project_dir) / ".agent"
-    agent_dir.mkdir()
-    db_path = str(agent_dir / "mcp_state.db")
-
-    _seed_legacy_db(db_path)
-    _run_alembic_upgrade(project_dir)
-
-    conn = sqlite3.connect(db_path)
-    try:
-        # NULL write.
-        conn.execute(
-            "INSERT INTO tasks (task_id, title, description, assigned_to, "
-            "created_by, status, priority, created_at, updated_at, "
-            "parent_task, child_tasks, depends_on_tasks, notes, "
-            "required_capabilities) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                "t-null",
-                "T",
-                "",
-                None,
-                "admin",
-                "unassigned",
-                "medium",
-                "2026-06-05T00:00:00",
-                "2026-06-05T00:00:00",
-                None,
-                "[]",
-                "[]",
-                "[]",
-                None,
-            ),
-        )
-        # JSON list write.
-        conn.execute(
-            "INSERT INTO tasks (task_id, title, description, assigned_to, "
-            "created_by, status, priority, created_at, updated_at, "
-            "parent_task, child_tasks, depends_on_tasks, notes, "
-            "required_capabilities) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                "t-list",
-                "T2",
-                "",
-                None,
-                "admin",
-                "unassigned",
-                "medium",
-                "2026-06-05T00:00:00",
-                "2026-06-05T00:00:00",
-                None,
-                "[]",
-                "[]",
-                "[]",
-                _json.dumps(["backend", "db"]),
-            ),
-        )
-        conn.commit()
-
-        a, b = conn.execute(
-            "SELECT required_capabilities FROM tasks "
-            "WHERE task_id IN (?, ?) ORDER BY task_id",
-            ("t-list", "t-null"),
-        ).fetchall()
-        assert _json.loads(a[0]) == ["backend", "db"]
-        assert b[0] is None
-    finally:
-        conn.close()
-
-
-# ---------------------------------------------------------------------------
-# (iii) — normalize_capabilities helper contract
-# ---------------------------------------------------------------------------
-
-
-def test_normalize_capabilities_strips_lowercases_and_dedupes() -> None:
-    from agent_mcp.utils.capability_normalization import normalize_capabilities
-
-    # Strip + lowercase + dedupe + preserve first-occurrence order.
-    assert normalize_capabilities(["Backend", "DB", "backend", " db ", "FrontEnd"]) == [
-        "backend",
-        "db",
-        "frontend",
-    ]
-    # None passes through to empty list.
-    assert normalize_capabilities(None) == []
-    # Empty / whitespace-only entries are dropped.
-    assert normalize_capabilities(["", "  ", "x"]) == ["x"]
-    # Non-string entries are coerced via str() then normalized.
-    assert normalize_capabilities(["A", 1, "a", "1"]) == ["a", "1"]
-
-
-# ---------------------------------------------------------------------------
-# (v) — assign_task_tool_impl stores normalized required_capabilities
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_assign_task_tool_normalizes_required_capabilities(
-    tmp_path: Path,
-) -> None:
-    """assign_task with required_capabilities=['Backend', 'DB'] stores
-    ['backend', 'db'] in the column. Uses the full TestClient harness
-    so the write queue is running (raw direct calls hit
-    "Database write queue is not running" otherwise)."""
-    from tests.harness import mcp_session
-
-    async with mcp_session(tmp_path) as admin:
-        result = await admin.assert_tool_succeeds(
-            "assign_task",
-            {
-                "task_title": "Build something",
-                "task_description": "...",
-                "priority": "medium",
-                # No agent_token → unassigned path (Mode 0).
-                "required_capabilities": ["Backend", "DB", "backend"],
-            },
-        )
-        text_blob = "\n".join(c.text for c in result)
-        assert "error" not in text_blob.lower() or "Error" not in text_blob, text_blob
-
-        # Read back the row via direct sqlite query — the dashboard
-        # /api/all-data + /api/tasks paths return dict(row) without
-        # parsing required_capabilities, so the asserted shape stays
-        # JSON-encoded text.
-        from agent_mcp.db.connection import get_db_connection
-
-        conn = get_db_connection()
-        try:
-            rows = conn.execute(
-                "SELECT task_id, required_capabilities FROM tasks "
-                "WHERE title = ?",
-                ("Build something",),
-            ).fetchall()
-            assert len(rows) == 1, rows
-            stored = rows[0]["required_capabilities"]
-            assert stored is not None, (
-                "required_capabilities must be stored as JSON, got NULL"
-            )
-            assert _json.loads(stored) == ["backend", "db"], stored
-        finally:
-            conn.close()
-
-
-# ---------------------------------------------------------------------------
-# (vi) — capability normalization helper
-# ---------------------------------------------------------------------------
-
-
-def test_normalize_capabilities_lowercases_and_dedupes() -> None:
-    """``normalize_capabilities(['BACKEND', 'db', 'Backend'])`` returns
-    ``['backend', 'db']``: lowercase + dedupe + stable order.
-
-    Wave 7 PR 1 (coordinator transition): pre-cutover this contract was
-    pinned end-to-end via ``admin.call("create_agent", ...)``, which
-    orphan-stormed claude processes through the legacy spawn impl. The
-    capability-normalization invariant lives in
-    ``agent_mcp.utils.capability_normalization.normalize_capabilities``
-    and is invoked by every call site that writes capabilities
-    (create_agent, agent_communication_tools.find_capable_agents, the
-    REST seam at routes.py). Testing the helper directly is the
-    strictly stronger coverage that doesn't require a spawning agent
-    surface in the loop.
-    """
-    from agent_mcp.utils.capability_normalization import normalize_capabilities
-
-    result = normalize_capabilities(["BACKEND", "db", "Backend"])
-    assert result == ["backend", "db"], result
 
 
 # ---------------------------------------------------------------------------

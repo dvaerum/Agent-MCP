@@ -31,7 +31,6 @@ from starlette.requests import Request
 from .._dispatch_helpers import _build_route_principal
 from ._read_limits import _clamp_section_limit
 from ._wire_validation import require_str as _require_str
-from ._wire_validation import require_str_list as _require_str_list
 from ..deps import (
     caller_identity,
     forwarding_route_role,
@@ -66,17 +65,11 @@ router = APIRouter(
 # SEC round-9 (type-confusion 400-not-500): the edit-agent handler writes
 # the DB directly, bypassing the schema-validating MCP tool dispatch.
 # ``color`` / ``working_directory`` bind straight into TEXT columns and
-# 500 on a dict/list; ``capabilities`` feeds ``normalize_capabilities``
-# which iterates a dict's KEYS (or a str's CHARS) and silently stores bad
-# data — and that data lands in ``g.active_agents`` which the task-claim
-# authz gate consumes. Guard every editable field up front.
+# 500 on a dict/list. Guard every editable field up front.
 #
-# arch-r4 #10: ``_require_str`` / ``_require_str_list`` now live once in
+# arch-r4 #10: ``_require_str`` now lives once in
 # ``._wire_validation`` (imported above) — the round-9 "kept local, do
-# NOT consolidate" scope boundary is settled. ``capabilities`` here has
-# always rejected an explicit ``None`` (unlike ``create_task``'s
-# ``required_capabilities``, which treats ``None`` as "not supplied"),
-# so the call site below passes ``allow_none=False``.
+# NOT consolidate" scope boundary is settled.
 
 
 def _mcp_presence_for(agent_id: str) -> Dict[str, Any]:
@@ -483,8 +476,8 @@ async def edit_agent_api_route(
 
     Accepts any combination of the editable fields
     (:data:`agent_mcp.tools.admin_tools.EDITABLE_AGENT_FIELDS`):
-    ``capabilities`` (list[str]), ``color`` (str), ``working_directory``
-    (str), ``aoe_session_id`` (str), ``auto_event_loop`` (bool),
+    ``color`` (str), ``working_directory`` (str), ``aoe_session_id``
+    (str), ``auto_event_loop`` (bool),
     ``agent_role`` ('worker'|'manager'). Returns 400 if none are supplied,
     404 if the agent does not exist. Non-whitelisted fields are ignored —
     status / agent_id / token have their own flows.
@@ -540,20 +533,11 @@ async def edit_agent_api_route(
         )
 
     # SEC round-9: type-guard each editable field BEFORE it reaches a SQL
-    # bind / normalize_capabilities / the g.active_agents cache. Wire-level
-    # hygiene kept local per the round-9 scope — the MCP path validates the
-    # same via the tool's inputSchema. ``capabilities`` must be a genuine
-    # list[str] — a dict would have normalize_capabilities iterate its keys
-    # and store them (the task-claim authz gate reads this cache), behind a
-    # misleading 200. ``color`` / ``working_directory`` 500 on a dict/list
+    # bind / the g.active_agents cache. Wire-level hygiene kept local per
+    # the round-9 scope — the MCP path validates the same via the tool's
+    # inputSchema. ``color`` / ``working_directory`` 500 on a dict/list
     # bind. ``auto_event_loop`` is a bool toggle — a dict/list/str is
     # truthy-coerced to a silent 1/0, so reject those.
-    if 'capabilities' in updates:
-        _err = _require_str_list(
-            updates['capabilities'], "capabilities", allow_none=False,
-        )
-        if _err is not None:
-            return _err
     for _field in ('color', 'working_directory'):
         if _field in updates:
             _err = _require_str(updates[_field], _field)

@@ -10,10 +10,9 @@
 //
 // The hand-maintained `Agent` / `Task` / `Memory` etc interfaces
 // declared below are kept for back-compat. They add richer literal
-// unions (status: 'pending' | 'running' | ...) and structured array
-// types (capabilities: string[]) the bare DB column types can't
-// express. As callers migrate to the generated types, the manual
-// declarations here will get trimmed.
+// unions (status: 'pending' | 'running' | ...) the bare DB column
+// types can't express. As callers migrate to the generated types,
+// the manual declarations here will get trimmed.
 export * from './api-types.generated'
 
 import { apiUrl, loginUrl } from './urls'
@@ -24,7 +23,6 @@ export interface Agent {
   current_task?: string
   working_directory?: string
   color?: string
-  capabilities?: string[]
   created_at: string
   updated_at: string
   terminated_at?: string | null
@@ -106,12 +104,6 @@ export interface Task {
   }>
   created_at: string
   updated_at: string
-  // Event-coord PR-1: JSON-encoded list of lowercase capability
-  // labels (the server stores it as TEXT and the /api endpoints
-  // currently return the raw column). The dashboard parses it lazily
-  // for the task-detail view; for routing decisions it's always
-  // already-normalized lowercase strings.
-  required_capabilities?: string | string[] | null
 }
 
 /**
@@ -709,7 +701,7 @@ class ApiClient {
     })
   }
 
-  // editAgent updates the editable agent fields (capabilities, color,
+  // editAgent updates the editable agent fields (color,
   // working_directory, aoe_session_id). PR D: cookie auth; backed by
   // POST /api/agents/<id>/edit. aoe_session_id is a 16-char lowercase
   // hex string (or empty to clear) used by the AoE notification side-
@@ -717,7 +709,6 @@ class ApiClient {
   async editAgent(
     agentId: string,
     updates: {
-      capabilities?: string[]
       color?: string
       working_directory?: string
       aoe_session_id?: string
@@ -861,10 +852,6 @@ class ApiClient {
     priority?: 'low' | 'medium' | 'high'
     assigned_to?: string
     parent_task?: string
-    // Event-coord PR-1: free-text capability labels for the
-    // routing-on-unassigned-task path shipped in PR-2. Server
-    // normalizes (lowercase + strip + dedupe) at write time.
-    required_capabilities?: string[]
   }): Promise<{ success: boolean; message: string; task_id?: string }> {
     // PR D (prancy-napping-pie): cookie auth, no body-token field.
     return this.request('/tasks', {
@@ -875,7 +862,6 @@ class ApiClient {
         priority: data.priority,
         assigned_to: data.assigned_to,
         parent_task: data.parent_task,
-        required_capabilities: data.required_capabilities,
       }),
     })
   }

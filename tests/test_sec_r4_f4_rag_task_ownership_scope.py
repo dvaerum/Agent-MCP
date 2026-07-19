@@ -94,9 +94,8 @@ def _seed_task(
         conn.execute(
             "INSERT INTO tasks (task_id, title, description, assigned_to, "
             "created_by, status, priority, created_at, updated_at, "
-            "parent_task, child_tasks, depends_on_tasks, notes, "
-            "required_capabilities) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "parent_task, child_tasks, depends_on_tasks, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 title,
@@ -108,7 +107,6 @@ def _seed_task(
                 now,
                 now,
                 None,
-                "[]",
                 "[]",
                 "[]",
                 "[]",
@@ -183,9 +181,8 @@ async def test_live_task_stage_excludes_unassigned_for_worker(
             conn.execute(
                 "INSERT INTO tasks (task_id, title, description, assigned_to, "
                 "created_by, status, priority, created_at, updated_at, "
-                "parent_task, child_tasks, depends_on_tasks, notes, "
-                "required_capabilities) VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "parent_task, child_tasks, depends_on_tasks, notes) VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     "task-unassigned",
                     "deploy pipeline delta",
@@ -197,7 +194,6 @@ async def test_live_task_stage_excludes_unassigned_for_worker(
                     now,
                     now,
                     None,
-                    "[]",
                     "[]",
                     "[]",
                     "[]",

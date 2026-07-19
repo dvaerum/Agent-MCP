@@ -11,7 +11,6 @@ Mirrors the shape of `tests/test_sqlalchemy_project_context.py`.
 from __future__ import annotations
 
 import datetime as _dt
-import json
 import sqlite3
 
 import pytest
@@ -33,7 +32,6 @@ async def test_agent_model_round_trip(tmp_path) -> None:
             row = Agent(
                 token="tok-round-trip",
                 agent_id="orm_round_trip",
-                capabilities=json.dumps(["cap1", "cap2"]),
                 created_at=now,
                 status="active",
                 current_task=None,
@@ -52,7 +50,6 @@ async def test_agent_model_round_trip(tmp_path) -> None:
             )
             assert fetched is not None
             assert fetched.token == "tok-round-trip"
-            assert json.loads(fetched.capabilities) == ["cap1", "cap2"]
             assert fetched.status == "active"
             assert fetched.working_directory == "/tmp"
             assert fetched.color == "#abc123"
@@ -72,7 +69,6 @@ async def test_agent_model_columns_match_raw_schema(tmp_path) -> None:
         assert model_cols == {
             "token",
             "agent_id",
-            "capabilities",
             "created_at",
             "status",
             "current_task",
@@ -163,9 +159,6 @@ async def test_agent_db_get_agent_by_id_uses_orm(tmp_path) -> None:
         assert agent is not None
         assert agent["agent_id"] == "alice"
         assert agent["status"] == "active"
-        # capabilities must be deserialised to a Python list (the raw
-        # column stores JSON-as-text).
-        assert isinstance(agent["capabilities"], list)
 
 
 async def test_agent_db_get_agent_by_token_uses_orm(tmp_path) -> None:
@@ -177,7 +170,6 @@ async def test_agent_db_get_agent_by_token_uses_orm(tmp_path) -> None:
         agent = get_agent_by_token(alice.token)
         assert agent is not None
         assert agent["agent_id"] == "alice"
-        assert isinstance(agent["capabilities"], list)
 
 
 async def test_agent_db_get_agent_by_id_missing_returns_none(tmp_path) -> None:
@@ -200,9 +192,6 @@ async def test_agent_db_get_all_active_agents_uses_orm(tmp_path) -> None:
         ids = {r["agent_id"] for r in rows}
         # admin pseudo-agent (PR-G1) + alice + bob — all non-terminated.
         assert {"alice", "bob"}.issubset(ids)
-        # Capabilities must be a list (JSON-decoded).
-        for r in rows:
-            assert isinstance(r["capabilities"], list)
 
 
 async def test_agent_db_update_agent_field_uses_orm(tmp_path) -> None:
@@ -227,26 +216,6 @@ async def test_agent_db_update_agent_field_uses_orm(tmp_path) -> None:
         assert after["status"] == "terminated"
         # updated_at should have advanced (or at least be set).
         assert after["updated_at"] is not None
-
-
-async def test_agent_db_update_agent_field_capabilities_serialises(
-    tmp_path,
-) -> None:
-    """Updating `capabilities` must JSON-serialise the list."""
-    from agent_mcp.repositories.agent_repository import (
-        get_agent_by_id,
-        update_agent_db_field,
-    )
-
-    async with mcp_session(tmp_path) as admin:
-        await admin.create_worker("alice")
-
-        ok = update_agent_db_field("alice", "capabilities", ["a", "b"])
-        assert ok is True
-
-        after = get_agent_by_id("alice")
-        assert after is not None
-        assert after["capabilities"] == ["a", "b"]
 
 
 async def test_agent_db_update_agent_field_rejects_unknown_field(

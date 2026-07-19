@@ -23,7 +23,6 @@ import { cn, formatRelative } from "@/lib/utils"
 import { Skeleton } from "@/components/ui/skeleton"
 import { EmptyState } from "@/components/dashboard/shared/empty-state"
 import { AgentSelect } from "@/components/dashboard/shared/agent-select"
-import { CapabilityTagInput } from "@/components/dashboard/shared/capability-tag-input"
 import { TasksMobileList } from "@/components/dashboard/tasks-mobile-list"
 
 // Status / priority colour helpers shared by the row + the View / Edit
@@ -411,28 +410,16 @@ const CreateTaskModal = React.memo(({ onCreateTask }: { onCreateTask: (data: any
     // <AgentSelect> dropdown, which surfaces the live agent roster
     // instead of asking the admin to type an agent_id.
     assigned_to: string | null
-    required_capabilities: string[]
   }>({
     title: '',
     description: '',
     priority: 'medium',
     assigned_to: null,
-    // Event-coord PR-1: free-text capability labels (routing skill
-    // tags). The <CapabilityTagInput> normalizes each tag on add
-    // (lowercase + strip + dedupe), mirroring the server's
-    // normalize_capabilities; the server re-normalizes at write time.
-    required_capabilities: [],
   })
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     if (!formData.title.trim()) return
-
-    // required_capabilities is already a normalized string[] (the tag
-    // input lowercases + strips + dedupes on add). Send the array
-    // straight through — the create-task POST shape is an array of
-    // strings, matching the assign_task tool. Server re-normalizes.
-    const capsDeduped = formData.required_capabilities
 
     onCreateTask({
       title: formData.title.trim(),
@@ -442,7 +429,6 @@ const CreateTaskModal = React.memo(({ onCreateTask }: { onCreateTask: (data: any
       // to "no assignment", which the create-task endpoint already
       // accepts as undefined / missing.
       assigned_to: formData.assigned_to ?? undefined,
-      required_capabilities: capsDeduped.length > 0 ? capsDeduped : undefined,
     })
 
     setFormData({
@@ -450,7 +436,6 @@ const CreateTaskModal = React.memo(({ onCreateTask }: { onCreateTask: (data: any
       description: '',
       priority: 'medium',
       assigned_to: null,
-      required_capabilities: [],
     })
     setOpen(false)
   }
@@ -532,41 +517,6 @@ const CreateTaskModal = React.memo(({ onCreateTask }: { onCreateTask: (data: any
                 noneLabel="— Unassigned —"
               />
             </div>
-          </div>
-          {/*
-            Event-coord PR-1: required capability tags. Comma-separated;
-            lowercase-normalized server-side (and locally on submit).
-            When the unassigned-task routing ships in PR-2, an agent
-            must satisfy `agent.capabilities ⊇ task.required_capabilities`
-            to receive the `unassigned_task_appeared` wake event.
-            Empty / blank ⇒ no capability gate (broadcasts to all idle
-            agents).
-          */}
-          <div>
-            <label
-              htmlFor="create-task-required-capabilities"
-              className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2"
-            >
-              Required capabilities
-            </label>
-            {/*
-              Free-text routing skill tags (NOT the Wave 9 permission
-              enum). The chips input suggests tags already in use across
-              live agents/tasks but always allows a new tag — see
-              <CapabilityTagInput>. An agent must satisfy
-              `agent.capabilities ⊇ task.required_capabilities` to
-              receive this task's wake event.
-            */}
-            <CapabilityTagInput
-              id="create-task-required-capabilities"
-              value={formData.required_capabilities}
-              onChange={(tags) => setFormData(prev => ({ ...prev, required_capabilities: tags }))}
-              placeholder="Add a capability, press Enter"
-            />
-            <p className="text-[10px] text-muted-foreground mt-1">
-              Leave blank to broadcast to every idle agent (PR-2
-              wake-loop routing).
-            </p>
           </div>
           <DialogFooter className="gap-2">
             <Button type="button" variant="outline" onClick={() => setOpen(false)} size="sm">
@@ -729,34 +679,6 @@ const ViewTaskDialog = React.memo(({ task, onOpenChange, onEdit, onDelete }: Vie
                   <p className="text-sm text-muted-foreground italic">(no description)</p>
                 )}
               </div>
-
-              {/*
-                Required capabilities (event-coord PR-1). Renders only
-                when the task carries any — JSON-encoded in the column
-                so parseJsonField handles both shapes. Lowercase chips
-                so an admin can verify normalization landed.
-              */}
-              {(() => {
-                const caps = task ? parseJsonField(task.required_capabilities) : []
-                return caps.length > 0 && (
-                  <div className="border-t border-border pt-4 space-y-2">
-                    <Label className="text-xs text-muted-foreground uppercase tracking-wider">
-                      Required capabilities
-                    </Label>
-                    <div className="flex flex-wrap gap-2">
-                      {caps.map((cap: any, idx) => (
-                        <Badge
-                          key={`${cap}-${idx}`}
-                          variant="outline"
-                          className="text-xs font-mono lowercase"
-                        >
-                          {String(cap).toLowerCase()}
-                        </Badge>
-                      ))}
-                    </div>
-                  </div>
-                )
-              })()}
 
               {/* Group 3: relations (only renders if present) */}
               {(dependencies.length > 0 || childTasks.length > 0) && (

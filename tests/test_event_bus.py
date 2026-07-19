@@ -262,15 +262,14 @@ def test_notify_unassigned_task_appeared_routes_through_bus(
                         task_id="task-1",
                         title="Do thing",
                         priority="low",
-                        required_capabilities="[]",
                         created_at="2026-06-05T00:00:00",
                     )
                 ]
             else:
                 # agents row
                 self._next = [
-                    FakeRow(agent_id="alice", capabilities="[]"),
-                    FakeRow(agent_id="admin", capabilities="[]"),
+                    FakeRow(agent_id="alice"),
+                    FakeRow(agent_id="admin"),
                 ]
             return self
 
@@ -292,7 +291,7 @@ def test_notify_unassigned_task_appeared_routes_through_bus(
     event_bus.register("capture", CaptureAdapter())
     try:
         with patch.object(_connection, "get_db_connection", lambda: FakeConn()):
-            state.notify_unassigned_task_appeared("task-1", [])
+            state.notify_unassigned_task_appeared("task-1")
     finally:
         event_bus.unregister("capture")
 

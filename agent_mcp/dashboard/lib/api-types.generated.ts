@@ -46,7 +46,6 @@ export interface AgentMessageMirror {
 export interface AgentMirror {
   token: string
   agent_id: string
-  capabilities?: string | null
   created_at: string
   status: string
   current_task?: string | null
@@ -159,7 +158,6 @@ export interface TaskMirror {
   child_tasks?: string | null
   depends_on_tasks?: string | null
   notes?: string | null
-  required_capabilities?: string | null
 }
 
 /** Table-name to interface map. */

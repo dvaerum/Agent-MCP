@@ -76,7 +76,6 @@ def _seed_agent(agent_id: str, *, token: str | None = None) -> None:
             Agent(
                 token=token or f"tok-{agent_id}",
                 agent_id=agent_id,
-                capabilities="[]",
                 created_at=now,
                 status="active",
                 current_task=None,

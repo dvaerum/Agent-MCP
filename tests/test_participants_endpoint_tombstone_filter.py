@@ -49,9 +49,9 @@ def _insert_tombstone(agent_id: str) -> None:
         cursor = conn.cursor()
         cursor.execute(
             "INSERT OR IGNORE INTO agents "
-            "(token, agent_id, capabilities, created_at, status, "
+            "(token, agent_id, created_at, status, "
             " working_directory, color, updated_at) "
-            "VALUES (?, ?, '[]', ?, 'tombstone', '', '#000000', ?)",
+            "VALUES (?, ?, ?, 'tombstone', '', '#000000', ?)",
             (
                 f"__tombstone_{agent_id}",
                 f"[deleted-{agent_id}]",
@@ -75,10 +75,10 @@ async def _seed_terminated_worker(agent_id: str) -> None:
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO agents (token, agent_id, capabilities, created_at, "
+        "INSERT INTO agents (token, agent_id, created_at, "
         "status, working_directory, color, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (token, agent_id, "[]", now, "terminated", "/tmp", "#888", now),
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (token, agent_id, now, "terminated", "/tmp", "#888", now),
     )
     conn.commit()
     conn.close()

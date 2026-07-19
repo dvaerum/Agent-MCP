@@ -32,7 +32,6 @@ from .._dispatch_helpers import (
 )
 from ._read_limits import _clamp_section_limit
 from ._wire_validation import require_str as _require_str
-from ._wire_validation import require_str_list as _require_str_list
 from ..deps import caller_identity, require_operator_session
 from ...core.config import logger
 from ...core.tool_result import (
@@ -56,7 +55,7 @@ router = APIRouter(
 # surfaces as an uncaught 500 — or is silently stored as bad data.
 # Guard every user-supplied field up front.
 #
-# arch-r4 #10: ``_require_str`` / ``_require_str_list`` now live once in
+# arch-r4 #10: ``_require_str`` now lives once in
 # ``._wire_validation`` (imported above) — the round-9 "kept local, do
 # NOT consolidate" scope boundary is settled.
 
@@ -183,7 +182,7 @@ async def create_task_api_route(
     shape. Auth stays operator-only via ``require_operator_session``.
 
     Body: {"task_title", "task_description", "priority"?,
-           "assigned_to"?, "parent_task"?, "required_capabilities"?}
+           "assigned_to"?, "parent_task"?}
     Returns: {"success": true, "task_id": "...", "message": "..."}
     """
     try:
@@ -210,11 +209,6 @@ async def create_task_api_route(
         _err = _require_str(_val, _name)
         if _err is not None:
             return _err
-    _caps_err = _require_str_list(
-        data.get('required_capabilities'), "required_capabilities"
-    )
-    if _caps_err is not None:
-        return _caps_err
 
     # F004 (verify-all-v6 MUTATING #3): distinguish an absent title from
     # one whose content was stripped to empty by the JSON-input sanitizer
@@ -246,7 +240,6 @@ async def create_task_api_route(
         "priority": priority,
         "assigned_to": assigned_to,
         "parent_task": parent_task,
-        "required_capabilities": data.get('required_capabilities'),
     }
 
     # Operator-session Principal (forwarding VIEWER gets a viewer-role
