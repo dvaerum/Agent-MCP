@@ -111,11 +111,11 @@ def test_migration_0013_default_backfills_existing_rows(tmp_path) -> None:
         # at the DDL/SQL layer rather than going through the ORM.)
         conn.execute(
             "INSERT INTO agents "
-            "(token, agent_id, capabilities, created_at, status, "
+            "(token, agent_id, created_at, status, "
             "current_task, working_directory, color, terminated_at, "
             "updated_at, aoe_session_id, auto_event_loop, "
             "last_event_seen_at) "
-            "VALUES ('tok-w1', 'worker-1', '[]', "
+            "VALUES ('tok-w1', 'worker-1', "
             "'2026-06-17T10:00:00', 'created', NULL, '/tmp/w1', "
             "NULL, NULL, NULL, NULL, 1, NULL)"
         )
@@ -138,11 +138,11 @@ def test_migration_0013_accepts_manager_value(tmp_path) -> None:
     try:
         conn.execute(
             "INSERT INTO agents "
-            "(token, agent_id, capabilities, created_at, status, "
+            "(token, agent_id, created_at, status, "
             "current_task, working_directory, color, terminated_at, "
             "updated_at, aoe_session_id, auto_event_loop, "
             "last_event_seen_at, agent_role) "
-            "VALUES ('tok-m1', 'manager-1', '[]', "
+            "VALUES ('tok-m1', 'manager-1', "
             "'2026-06-17T10:00:00', 'created', NULL, '/tmp/m1', "
             "NULL, NULL, NULL, NULL, 1, NULL, 'manager')"
         )
@@ -167,11 +167,11 @@ def test_migration_0013_rejects_invalid_role_value(tmp_path) -> None:
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
                 "INSERT INTO agents "
-                "(token, agent_id, capabilities, created_at, status, "
+                "(token, agent_id, created_at, status, "
                 "current_task, working_directory, color, terminated_at, "
                 "updated_at, aoe_session_id, auto_event_loop, "
                 "last_event_seen_at, agent_role) "
-                "VALUES ('tok-x1', 'bogus-1', '[]', "
+                "VALUES ('tok-x1', 'bogus-1', "
                 "'2026-06-17T10:00:00', 'created', NULL, '/tmp/x1', "
                 "NULL, NULL, NULL, NULL, 1, NULL, 'invalid')"
             )

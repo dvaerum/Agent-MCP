@@ -54,7 +54,6 @@ def _insert_task(
     created_by: str = "admin",
     created_at: str | None = None,
     updated_at: str | None = None,
-    required_capabilities: str | None = None,
 ) -> None:
     from agent_mcp.db.engine import get_session
     from agent_mcp.db.models import Task
@@ -72,7 +71,6 @@ def _insert_task(
                 priority="medium",
                 created_at=created_at or now,
                 updated_at=updated_at or now,
-                required_capabilities=required_capabilities,
             )
         )
         session.commit()
@@ -217,7 +215,7 @@ async def test_catchup_surfaces_task_unassigned_after_cursor(tmp_path):
             status="unassigned",
             created_at=created,
             updated_at=transitioned,
-            required_capabilities="[]",
+
         )
 
         events = _collect_unassigned_task_events_for(agent_id, cursor)
@@ -253,7 +251,7 @@ async def test_catchup_excludes_task_transitioned_before_cursor(tmp_path):
             status="unassigned",
             created_at=old,
             updated_at=old,
-            required_capabilities="[]",
+
         )
 
         events = _collect_unassigned_task_events_for(agent_id, cursor)
@@ -287,7 +285,7 @@ async def test_terminate_orphaned_task_surfaces_in_fetch_events(tmp_path):
             status="pending",
             created_at=old,
             updated_at=old,
-            required_capabilities="[]",
+
         )
         _warm_cache("fe-1")
 

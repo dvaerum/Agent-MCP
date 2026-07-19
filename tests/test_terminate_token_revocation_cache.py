@@ -53,7 +53,6 @@ def _insert_agent_via_db(
             Agent(
                 token=token,
                 agent_id=agent_id,
-                capabilities="[]",
                 created_at=now,
                 status=status,
                 current_task=None,
@@ -171,10 +170,10 @@ def _seed_terminated_agent(
         cur.execute(
             """
             INSERT INTO agents
-                (token, agent_id, capabilities, created_at, status,
+                (token, agent_id, created_at, status,
                  working_directory, color, updated_at, terminated_at,
                  agent_role)
-            VALUES (?, ?, '[]', ?, 'terminated', '/tmp/wd', '#ff0000',
+            VALUES (?, ?, ?, 'terminated', '/tmp/wd', '#ff0000',
                     ?, ?, ?)
             """,
             (token, agent_id, now, now, now, agent_role),

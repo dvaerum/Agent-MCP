@@ -379,7 +379,6 @@ async def register_agent_tool_impl(
                 created_row = agent_repo.create(
                     token=new_agent_token,
                     agent_id=agent_id,
-                    capabilities=[],
                     status="created",
                     current_task=None,
                     working_directory=agent_working_dir_abs,
@@ -435,7 +434,6 @@ async def register_agent_tool_impl(
             agent_cache_row = {
                 "token": new_agent_token,
                 "agent_id": agent_id,
-                "capabilities": [],
                 "created_at": created_at_iso,
                 "status": "created",
                 "current_task": None,
@@ -567,7 +565,6 @@ async def view_status_tool_impl(
             agent_status_dict[agent_id] = {
                 "status": agent_data.get("status", "unknown"),
                 "current_task": agent_data.get("current_task"),
-                "capabilities": agent_data.get("capabilities", []),
                 "working_directory": g.agent_working_dirs.get(agent_id, "N/A"),
                 "color": agent_data.get(
                     "color", "N/A"
@@ -627,9 +624,8 @@ def _reconcile_reassigned_tasks(
     """Post-commit reconciliation for tasks bulk-unassigned by the
     terminate (here) and purge (``app/routers/agents.py``) cascades.
 
-    ``reassigned_tasks`` is a list of ``(task_id,
-    required_capabilities_raw)`` tuples captured BEFORE the bulk
-    ``UPDATE tasks SET assigned_to=NULL`` ran.
+    ``reassigned_tasks`` is a list of ``task_id`` strings captured BEFORE
+    the bulk ``UPDATE tasks SET assigned_to=NULL`` ran.
 
     Two round-10 findings are addressed per task:
 
@@ -642,7 +638,7 @@ def _reconcile_reassigned_tasks(
       ``get_task_by_id`` (the DB free function) is used deliberately —
       ``task_repo.get_by_id`` is cache-first and would hand back the
       stale entry we are trying to replace.
-    * **BL-R10-2** — wake every capability-matched worker via
+    * **BL-R10-2** — wake every worker via
       ``notify_unassigned_task_appeared`` so a live ``wait_for_events``
       waiter picks the task up immediately. (Disconnected workers catch
       up via ``_collect_unassigned_task_events_for``, which keys on
@@ -656,7 +652,7 @@ def _reconcile_reassigned_tasks(
     from ..repositories.task_repository import get_task_by_id
     from ..repositories import task_repo
 
-    for task_id, req_caps_raw in reassigned_tasks:
+    for task_id in reassigned_tasks:
         try:
             fresh = get_task_by_id(task_id)
             if fresh is not None:
@@ -667,16 +663,7 @@ def _reconcile_reassigned_tasks(
                 task_id, e,
             )
         try:
-            if isinstance(req_caps_raw, str):
-                caps_list = json.loads(req_caps_raw or "[]")
-            elif req_caps_raw is None:
-                caps_list = []
-            else:
-                caps_list = list(req_caps_raw)
-        except Exception:
-            caps_list = []
-        try:
-            g.notify_unassigned_task_appeared(task_id, caps_list)
+            g.notify_unassigned_task_appeared(task_id)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning(
                 "notify_unassigned_task_appeared(%s) failed after "
@@ -777,22 +764,16 @@ async def terminate_agent_tool_impl(
 
             terminal_placeholders = ",".join("?" * len(_TERMINAL_TASK_STATUSES))
             # BL-R10-1/2: capture the rows we're about to reassign BEFORE the
-            # bulk UPDATE so we can reconcile them post-commit. We grab
-            # required_capabilities here too — the unassign UPDATE doesn't
-            # touch that column and the cache projection drops it, so this is
-            # the cheapest place to read it for the capability-matched wake.
+            # bulk UPDATE so we can reconcile them post-commit.
             cursor.execute(
-                "SELECT task_id, required_capabilities FROM tasks "
+                "SELECT task_id FROM tasks "
                 f"WHERE assigned_to = ? AND status NOT IN ({terminal_placeholders})",
                 (
                     agent_id_to_terminate,
                     *sorted(_TERMINAL_TASK_STATUSES),
                 ),
             )
-            reassigned_tasks = [
-                (r["task_id"], r["required_capabilities"])
-                for r in cursor.fetchall()
-            ]
+            reassigned_tasks = [r["task_id"] for r in cursor.fetchall()]
             cursor.execute(
                 "UPDATE tasks SET assigned_to = NULL, status = 'unassigned', "
                 "updated_at = ? "
@@ -958,7 +939,7 @@ async def terminate_agent_tool_impl(
 #: Anything outside this tuple is silently ignored (defence in depth —
 #: status / agent_id / token must never flow through the edit surface).
 EDITABLE_AGENT_FIELDS = (
-    "capabilities", "color", "working_directory", "aoe_session_id",
+    "color", "working_directory", "aoe_session_id",
     "auto_event_loop", "agent_role",
 )
 
@@ -1112,7 +1093,7 @@ async def restore_agent_tool_impl(
             # Read the (uncommitted, same-connection) restored row so the
             # post-commit cache rebuild uses the fresh values.
             cursor.execute(
-                "SELECT agent_id, capabilities, created_at, status, color, "
+                "SELECT agent_id, created_at, status, color, "
                 "working_directory, terminated_at, updated_at, current_task, "
                 "agent_role "
                 "FROM agents WHERE agent_id = ?",
@@ -1124,18 +1105,13 @@ async def restore_agent_tool_impl(
                 # Re-add to the in-memory active map so the dashboard sees
                 # the restored agent again.
                 if full is not None:
-                    try:
-                        caps = json.loads(full["capabilities"] or "[]")
-                    except (TypeError, json.JSONDecodeError):
-                        caps = []
                     # SECURITY (terminate-revocation, related): rebuild the
                     # FULL cache row including agent_role. Omitting it made a
                     # restored manager transiently resolve to worker
-                    # capabilities (a privilege downgrade) until reload.
+                    # authorization (a privilege downgrade) until reload.
                     g.active_agents[agent_token] = {
                         "token": agent_token,
                         "agent_id": full["agent_id"],
-                        "capabilities": caps,
                         "created_at": full["created_at"],
                         "status": full["status"],
                         "color": full["color"],
@@ -1382,9 +1358,9 @@ async def purge_agent_tool_impl(
             # tasks.assigned_to is an FK, so terminal tasks get a SEPARATE
             # UPDATE that NULLs the dangling ref while KEEPING terminal
             # status (no resurrection, no notify).
-            # BL-R10-1/2: capture affected rows (+ required_capabilities)
-            # BEFORE the UPDATE for the post-commit cache reconcile + wake;
-            # bump updated_at so the catch-up feed surfaces the transition.
+            # BL-R10-1/2: capture affected rows BEFORE the UPDATE for the
+            # post-commit cache reconcile + wake; bump updated_at so the
+            # catch-up feed surfaces the transition.
             from ..tools.task_tools import _TERMINAL_TASK_STATUSES
 
             terminal_placeholders = ",".join(
@@ -1392,15 +1368,12 @@ async def purge_agent_tool_impl(
             )
             terminal_params = sorted(_TERMINAL_TASK_STATUSES)
             cursor.execute(
-                "SELECT task_id, required_capabilities FROM tasks "
+                "SELECT task_id FROM tasks "
                 "WHERE assigned_to = ? "
                 f"AND status NOT IN ({terminal_placeholders})",
                 (agent_id, *terminal_params),
             )
-            reassigned_tasks = [
-                (r["task_id"], r["required_capabilities"])
-                for r in cursor.fetchall()
-            ]
+            reassigned_tasks = [r["task_id"] for r in cursor.fetchall()]
             now_iso = datetime.datetime.now().isoformat()
             cursor.execute(
                 "UPDATE tasks SET assigned_to = NULL, status = 'unassigned', "
@@ -1924,8 +1897,8 @@ def register_admin_tools():
     register_tool(
         name="edit_agent",
         description=(
-            "Update mutable fields of an existing agent (capabilities, "
-            "color, working_directory, aoe_session_id, auto_event_loop, "
+            "Update mutable fields of an existing agent (color, "
+            "working_directory, aoe_session_id, auto_event_loop, "
             "agent_role). Operator-only."
         ),
         input_schema={
@@ -1934,11 +1907,6 @@ def register_admin_tools():
                 "agent_id": {
                     "type": "string",
                     "description": "Unique identifier for the agent to edit.",
-                },
-                "capabilities": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Replacement capability labels for the agent.",
                 },
                 "color": {
                     "type": "string",

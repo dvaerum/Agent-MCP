@@ -45,10 +45,9 @@ def _seed_unassigned_task(
     task_id: str,
     *,
     updated_at: str,
-    required_capabilities: str = "[]",
 ) -> None:
-    """Insert one unassigned task (empty required caps → matches every
-    agent) whose ``updated_at`` is ``updated_at``."""
+    """Insert one unassigned task (every unassigned task now surfaces to
+    every agent) whose ``updated_at`` is ``updated_at``."""
     from agent_mcp.db.connection import get_db_connection
 
     conn = get_db_connection()
@@ -56,9 +55,8 @@ def _seed_unassigned_task(
         conn.execute(
             "INSERT INTO tasks (task_id, title, description, assigned_to, "
             "created_by, status, priority, created_at, updated_at, "
-            "parent_task, child_tasks, depends_on_tasks, notes, "
-            "required_capabilities) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "parent_task, child_tasks, depends_on_tasks, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 "unassigned work",
@@ -73,7 +71,6 @@ def _seed_unassigned_task(
                 "[]",
                 "[]",
                 "[]",
-                required_capabilities,
             ),
         )
         conn.commit()

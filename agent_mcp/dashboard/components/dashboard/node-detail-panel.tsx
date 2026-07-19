@@ -1,7 +1,7 @@
 "use client"
 
 import React, { useEffect, useState } from 'react'
-import { X, User, FileText, Activity, Clock, AlertCircle, CheckCircle, XCircle, Loader2, ChevronRight, Zap, Target, GitBranch, FileCode, Hash, Shield, Database, Copy } from 'lucide-react'
+import { X, User, FileText, Activity, Clock, AlertCircle, CheckCircle, XCircle, Loader2, ChevronRight, Target, GitBranch, FileCode, Hash, Shield, Database, Copy } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Progress } from '@/components/ui/progress'
@@ -92,7 +92,6 @@ export function NodeDetailPanel({ nodeId, nodeType, isOpen, onClose, nodeData }:
             agent_id: 'Admin',
             name: 'System Administrator',
             status: 'active',
-            capabilities: ['All permissions'],
             created_at: 'System'
           }
         }
@@ -201,37 +200,6 @@ export function NodeDetailPanel({ nodeId, nodeType, isOpen, onClose, nodeData }:
               </div>
             </div>
           )}
-
-          {/* Capabilities */}
-          {agent.capabilities && (() => {
-            // Parse capabilities if it's a string
-            let capabilities: string[] = []
-            try {
-              if (typeof agent.capabilities === 'string') {
-                capabilities = JSON.parse(agent.capabilities)
-              } else if (Array.isArray(agent.capabilities)) {
-                capabilities = agent.capabilities
-              }
-            } catch {
-              capabilities = []
-            }
-            
-            return capabilities.length > 0 && (
-              <div className="space-y-2">
-                <div className="flex items-center gap-2">
-                  <Zap className="h-4 w-4 text-muted-foreground" />
-                  <span className="text-sm font-medium">Capabilities</span>
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  {capabilities.map((cap, idx) => (
-                    <Badge key={idx} variant="secondary" className="text-xs">
-                      {cap}
-                    </Badge>
-                  ))}
-                </div>
-              </div>
-            )
-          })()}
 
           {/* Timestamps */}
           <div className="space-y-2 pt-2">

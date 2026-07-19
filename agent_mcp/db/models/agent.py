@@ -21,8 +21,6 @@ Column rationale:
 * `agent_id`: TEXT UNIQUE NOT NULL — the display id (e.g. "alice").
   Referenced by the four FK constraints landed in PR #96 and the
   three deferred FKs landed in PR-G1.
-* `capabilities`: JSON-as-TEXT, nullable in DDL (defaults to "[]" on
-  writes from the tool surface).
 * `created_at` / `updated_at`: ISO-8601 strings. `created_at` is set
   on INSERT only; `updated_at` refreshed by `update_agent_db_field`.
 * `status`: free-form string — common values are 'created', 'active',
@@ -48,7 +46,6 @@ class Agent(Base):
 
     token: Mapped[str] = mapped_column(Text, primary_key=True)
     agent_id: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
-    capabilities: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False)
     current_task: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

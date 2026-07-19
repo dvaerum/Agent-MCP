@@ -144,7 +144,7 @@ async def test_create_agent_via_admin_bearer_still_works(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         r = admin.client.post(
             "/api/agents/register",
-            json={"agent_id": "via-admin-bearer", "capabilities": []},
+            json={"agent_id": "via-admin-bearer"},
             headers={"Authorization": f"Bearer {admin.admin_token}"},
         )
         assert r.status_code == 200, r.text
@@ -162,7 +162,7 @@ async def test_create_agent_rejects_worker_bearer(tmp_path) -> None:
         worker = await admin.create_worker("worker-creator")
         r = admin.client.post(
             "/api/agents/register",
-            json={"agent_id": "should-not-create", "capabilities": []},
+            json={"agent_id": "should-not-create"},
             headers={"Authorization": f"Bearer {worker.token}"},
         )
         assert r.status_code == 401, r.text
@@ -173,7 +173,7 @@ async def test_create_agent_rejects_no_auth(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         r = admin.client.post(
             "/api/agents/register",
-            json={"agent_id": "no-auth-create", "capabilities": []},
+            json={"agent_id": "no-auth-create"},
         )
         assert r.status_code == 401, r.text
 
@@ -406,11 +406,11 @@ async def _seed_manager_agent(agent_id: str) -> str:
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO agents (token, agent_id, capabilities, "
+            "INSERT INTO agents (token, agent_id, "
             "created_at, status, working_directory, color, updated_at, "
-            "agent_role) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "agent_role) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                token, agent_id, "[]", now, "active", "/tmp", "#888",
+                token, agent_id, now, "active", "/tmp", "#888",
                 now, "manager",
             ),
         )
@@ -422,7 +422,6 @@ async def _seed_manager_agent(agent_id: str) -> str:
         "agent_id": agent_id,
         "status": "active",
         "created_at": now,
-        "capabilities": [],
         "agent_role": "manager",
     }
     return token

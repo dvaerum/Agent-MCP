@@ -44,10 +44,10 @@ async def _seed_terminated_worker(admin, name: str) -> None:
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO agents (token, agent_id, capabilities, created_at, "
+        "INSERT INTO agents (token, agent_id, created_at, "
         "status, working_directory, color, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (token, name, "[]", now, "terminated", "/tmp", "#888", now),
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (token, name, now, "terminated", "/tmp", "#888", now),
     )
     conn.commit()
     conn.close()

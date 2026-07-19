@@ -53,9 +53,9 @@ def _seed_terminated_agent(agent_id: str) -> str:
         cur.execute(
             """
             INSERT INTO agents
-                (token, agent_id, capabilities, created_at, status,
+                (token, agent_id, created_at, status,
                  working_directory, color, updated_at, terminated_at)
-            VALUES (?, ?, '[]', ?, 'terminated', '', '#ff0000', ?, ?)
+            VALUES (?, ?, ?, 'terminated', '', '#ff0000', ?, ?)
             """,
             (token, agent_id, now, now, now),
         )

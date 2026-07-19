@@ -63,13 +63,6 @@ class Task(Base):
         Text, nullable=True,
     )
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    # Event-coord PR-1: JSON list of lowercase capability labels. NULL
-    # ⇒ "anyone can claim" (matches the empty-set broadcast semantics
-    # locked in the plan). Normalized at write time via
-    # `agent_mcp.utils.capability_normalization.normalize_capabilities`.
-    required_capabilities: Mapped[Optional[str]] = mapped_column(
-        Text, nullable=True,
-    )
 
     # PR-W3 (ORM big-bang): the three hot-path indexes (composite
     # for wait_for_events, single-column for status/priority filters)

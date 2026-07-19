@@ -68,18 +68,6 @@ async def test_create_task_rejects_structured_field(tmp_path, field, bad) -> Non
         )
 
 
-async def test_create_task_rejects_structured_required_capabilities(tmp_path) -> None:
-    async with mcp_session(tmp_path) as admin:
-        r = admin.post(
-            "/api/tasks",
-            json={
-                "task_title": "caps probe",
-                "required_capabilities": {"code_edit": True},
-            },
-        )
-        assert r.status_code == 400, r.text
-
-
 async def test_create_task_description_dict_not_stored(tmp_path) -> None:
     """A dict description must be rejected, never persisted into the column."""
     async with mcp_session(tmp_path) as admin:
@@ -99,24 +87,6 @@ async def test_create_task_description_dict_not_stored(tmp_path) -> None:
 async def test_create_task_valid_still_works(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
-        # AZ-R26-1: create-with-assigned_to now enforces
-        # required_capabilities ⊆ agent.capabilities (parity with the
-        # reassign paths). Provision alice with the caps this task is
-        # tagged with so the valid-create path is exercised (the caps
-        # here are incidental to what this test asserts).
-        import json as _json
-
-        from agent_mcp.db.connection import get_db_connection
-
-        _conn = get_db_connection()
-        try:
-            _conn.execute(
-                "UPDATE agents SET capabilities = ? WHERE agent_id = ?",
-                (_json.dumps(["code_edit", "file_read"]), "alice"),
-            )
-            _conn.commit()
-        finally:
-            _conn.close()
         r = admin.post(
             "/api/tasks",
             json={
@@ -124,7 +94,6 @@ async def test_create_task_valid_still_works(tmp_path) -> None:
                 "task_description": "a description",
                 "priority": "high",
                 "assigned_to": "alice",
-                "required_capabilities": ["code_edit", "file_read"],
             },
         )
         assert r.status_code == 200, r.text
@@ -193,48 +162,6 @@ async def test_edit_agent_rejects_structured_string_field(tmp_path, field, bad) 
         assert r.status_code == 400, (
             f"{field}={bad!r} should be 400 not {r.status_code}: {r.text}"
         )
-
-
-async def test_edit_agent_rejects_dict_capabilities(tmp_path) -> None:
-    """capabilities feeds the task-claim authz cache; a dict must not land
-    there behind a misleading 200."""
-    async with mcp_session(tmp_path) as admin:
-        await admin.create_worker("alice")
-        r = admin.post(
-            "/api/agents/alice/edit",
-            json={"capabilities": {"admin": True}},
-        )
-        assert r.status_code == 400, r.text
-        # The cache / row must NOT have absorbed the dict's keys as caps.
-        row = _row("agents", "agent_id = ?", ("alice",))
-        assert row is not None
-        assert _json.loads(row["capabilities"] or "[]") != ["admin"]
-
-
-async def test_edit_agent_rejects_capabilities_with_nonstr_element(tmp_path) -> None:
-    async with mcp_session(tmp_path) as admin:
-        await admin.create_worker("alice")
-        r = admin.post(
-            "/api/agents/alice/edit",
-            json={
-                "capabilities": ["ok", {"nested": 1}],
-            },
-        )
-        assert r.status_code == 400, r.text
-
-
-async def test_edit_agent_capabilities_list_of_str_still_works(tmp_path) -> None:
-    async with mcp_session(tmp_path) as admin:
-        await admin.create_worker("alice")
-        r = admin.post(
-            "/api/agents/alice/edit",
-            json={
-                "capabilities": ["code_edit", "file_read"],
-            },
-        )
-        assert r.status_code == 200, r.text
-        row = _row("agents", "agent_id = ?", ("alice",))
-        assert _json.loads(row["capabilities"]) == ["code_edit", "file_read"]
 
 
 async def test_edit_agent_valid_color_still_works(tmp_path) -> None:

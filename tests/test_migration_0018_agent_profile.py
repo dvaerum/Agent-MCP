@@ -95,11 +95,11 @@ def test_migration_0018_existing_rows_get_null_profile(tmp_path) -> None:
     try:
         conn.execute(
             "INSERT INTO agents "
-            "(token, agent_id, capabilities, created_at, status, "
+            "(token, agent_id, created_at, status, "
             "current_task, working_directory, color, terminated_at, "
             "updated_at, aoe_session_id, auto_event_loop, "
             "last_event_seen_at, agent_role) "
-            "VALUES ('tok-w1', 'worker-1', '[]', "
+            "VALUES ('tok-w1', 'worker-1', "
             "'2026-07-19T10:00:00', 'created', NULL, '/tmp/w1', "
             "NULL, NULL, NULL, NULL, 1, NULL, 'worker')"
         )
@@ -122,12 +122,12 @@ def test_migration_0018_accepts_profile_values(tmp_path) -> None:
     try:
         conn.execute(
             "INSERT INTO agents "
-            "(token, agent_id, capabilities, created_at, status, "
+            "(token, agent_id, created_at, status, "
             "current_task, working_directory, color, terminated_at, "
             "updated_at, aoe_session_id, auto_event_loop, "
             "last_event_seen_at, agent_role, profile, profile_updated_at, "
             "profile_reviewed_at, profile_updated_by) "
-            "VALUES ('tok-m1', 'manager-1', '[]', "
+            "VALUES ('tok-m1', 'manager-1', "
             "'2026-07-19T10:00:00', 'created', NULL, '/tmp/m1', "
             "NULL, NULL, NULL, NULL, 1, NULL, 'manager', "
             "'I coordinate the team.', '2026-07-19T10:00:00', "

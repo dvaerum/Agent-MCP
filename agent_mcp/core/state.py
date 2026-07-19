@@ -453,31 +453,25 @@ def drain_waiter_queue(queue: asyncio.Queue) -> List[Dict[str, Any]]:
     return out
 
 
-def notify_unassigned_task_appeared(
-    task_id: str,
-    task_required_capabilities: List[str],
-) -> None:
-    """Fan out an ``unassigned_task_appeared`` event to every agent
-    whose capabilities satisfy the task's `required_capabilities`.
+def notify_unassigned_task_appeared(task_id: str) -> None:
+    """Fan out an ``unassigned_task_appeared`` event to every active agent.
 
-    Subset semantics (locked design decision):
-      * Empty ``task_required_capabilities`` -> wake every active agent.
-      * Empty ``agent.capabilities`` -> wake only when the task also has
-        empty required (no labels to satisfy).
-      * Non-empty both -> wake when ``agent.capabilities`` is a superset.
+    PR5 retired the structured capability-tag routing: the old
+    ``req ⊆ caps`` subset-match was already a no-op (an empty required
+    set matched everyone, and no project ever populated the tags), so
+    every unassigned task now surfaces to every active, non-admin agent
+    unconditionally. The retired capability-tag columns (on the agents
+    and tasks tables) are gone.
 
-    Implemented in-Python because we don't need SQL-indexed matching at
-    sub-100-agent scale. Each match pushes a skinny event to the
-    target agent's queue + sets their signal so any in-flight
-    ``wait_for_events`` wakes immediately.
+    Each agent gets a skinny event pushed to its queue + its signal set
+    so any in-flight ``wait_for_events`` wakes immediately.
 
     Since PR-W2b (v5.0.17) the per-agent wake is routed through the
-    EventBus: this function does the DB capability-matching and then
-    calls ``event_bus.notify(agent_id, "unassigned_task_appeared",
-    payload)`` for each matched agent. The default
-    ``LongPollSignalAdapter`` handles the legacy ``push_event`` + signal
-    set so ``wait_for_events`` keeps draining synthetic events; the
-    ``StreamingQueueAdapter`` additionally publishes the event to GET
+    EventBus: this function calls ``event_bus.notify(agent_id,
+    "unassigned_task_appeared", payload)`` for each active agent. The
+    default ``LongPollSignalAdapter`` handles the legacy ``push_event`` +
+    signal set so ``wait_for_events`` keeps draining synthetic events;
+    the ``StreamingQueueAdapter`` additionally publishes the event to GET
     /mcp subscribers.
 
     Wrapped in broad try/except so notification side-effects can never
@@ -487,23 +481,14 @@ def notify_unassigned_task_appeared(
     try:
         # Lazy import to avoid circular dependency.
         from ..db.connection import get_db_connection
-        from ..utils.capability_normalization import normalize_capabilities
         from . import event_bus
         import datetime as _dt
-        import json as _json
-
-        # Normalize the task's required caps once. PR-1 already
-        # normalizes at write time so this is idempotent; defensive
-        # against tests that bypass the normalizer.
-        required = normalize_capabilities(task_required_capabilities or [])
-        required_set = set(required)
 
         conn = get_db_connection()
         try:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT task_id, title, priority, required_capabilities, "
-                "       created_at "
+                "SELECT task_id, title, priority, created_at "
                 "FROM tasks WHERE task_id = ?",
                 (task_id,),
             )
@@ -521,7 +506,7 @@ def notify_unassigned_task_appeared(
             from ..repositories.agent_repository import LIVE_AGENT_SQL
 
             cursor.execute(
-                f"SELECT agent_id, capabilities FROM agents WHERE {LIVE_AGENT_SQL}",
+                f"SELECT agent_id FROM agents WHERE {LIVE_AGENT_SQL}",
             )
             agent_rows = cursor.fetchall()
         finally:
@@ -541,7 +526,6 @@ def notify_unassigned_task_appeared(
             "task_id": task_id,
             "title": task_row["title"],
             "priority": task_row["priority"],
-            "required_capabilities": list(required),
         }
 
         for row in agent_rows:
@@ -551,20 +535,6 @@ def notify_unassigned_task_appeared(
             # loops).
             if agent_id and agent_id.lower().startswith("admin"):
                 continue
-            try:
-                raw_caps = row["capabilities"] or "[]"
-                caps_list = (
-                    _json.loads(raw_caps) if isinstance(raw_caps, str) else list(raw_caps)
-                )
-            except Exception:
-                caps_list = []
-            agent_caps = set(normalize_capabilities(caps_list))
-
-            # Subset match: required is subset of agent_caps.
-            # Empty required -> matches everyone (set.issubset(empty) is True).
-            if not required_set.issubset(agent_caps):
-                continue
-
             event_bus.notify(agent_id, "unassigned_task_appeared", payload)
     except Exception:  # pragma: no cover - defensive
         # Source write is committed; notification is best-effort.

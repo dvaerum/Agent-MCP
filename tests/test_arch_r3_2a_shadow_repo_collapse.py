@@ -37,7 +37,6 @@ def test_file_tools_and_project_utils_resolve_via_top_agent_repo(
         get_agent_repo().create(
             token="tok-wd",
             agent_id="wd-agent",
-            capabilities=[],
             status="active",
             working_directory="/tmp/wd-canonical",
             color="#abcdef",

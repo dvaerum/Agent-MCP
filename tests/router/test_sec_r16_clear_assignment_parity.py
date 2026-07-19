@@ -50,31 +50,6 @@ def _row(table: str, where_sql: str, params: tuple) -> dict | None:
         conn.close()
 
 
-def _grant_caps(agent_id: str, caps: list[str]) -> None:
-    """Give an existing agent the capability set ``caps``.
-
-    AZ-R26-1 gates create-with-``assigned_to`` on
-    ``required_capabilities ⊆ agent.capabilities`` (parity with every
-    reassign path). This test assigns a caps-tagged task to ``alice`` at
-    create time, so ``alice`` must actually carry those caps — the caps
-    tag is what the test asserts is *forwarded*, not that under-capable
-    assignment is permitted.
-    """
-    import json as _json
-
-    from agent_mcp.db.connection import get_db_connection
-
-    conn = get_db_connection()
-    try:
-        conn.execute(
-            "UPDATE agents SET capabilities = ? WHERE agent_id = ?",
-            (_json.dumps(caps), agent_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
 async def _create_task(admin, **body_extra) -> str:
     body = {"task_title": "r16-clear-probe"}
     body.update(body_extra)
@@ -90,7 +65,7 @@ def _install_spies(monkeypatch):
     notified: list[str] = []
     monkeypatch.setattr(
         _g_mod, "notify_unassigned_task_appeared",
-        lambda task_id, caps: unassigned.append((task_id, caps)),
+        lambda task_id: unassigned.append(task_id),
     )
     monkeypatch.setattr(
         _g_mod, "notify_agent_inbox",
@@ -150,38 +125,9 @@ async def test_clear_assignment_fires_unassigned_task_appeared(
         r = _clear_assignment(admin, task_id, None)
         assert r.status_code == 200, r.text
 
-        fired_ids = [u[0] for u in unassigned]
-        assert task_id in fired_ids, (
+        assert task_id in unassigned, (
             f"clearing an assignment must fire "
             f"notify_unassigned_task_appeared for the task; fired={unassigned}"
-        )
-
-
-async def test_clear_assignment_forwards_required_capabilities(
-    tmp_path, monkeypatch,
-) -> None:
-    """The fanout must carry the task's required capabilities so only
-    the qualifying agents are woken."""
-    async with mcp_session(tmp_path) as admin:
-        await admin.create_worker("alice")
-        # AZ-R26-1: alice must carry the caps the task is tagged with to
-        # be a valid assignee at create time.
-        _grant_caps("alice", ["python", "docker"])
-        task_id = await _create_task(
-            admin, assigned_to="alice",
-            required_capabilities=["python", "docker"],
-        )
-
-        unassigned, _notified = _install_spies(monkeypatch)
-
-        r = _clear_assignment(admin, task_id, "unassigned")
-        assert r.status_code == 200, r.text
-
-        matched = [u for u in unassigned if u[0] == task_id]
-        assert matched, f"no fanout for the cleared task; fired={unassigned}"
-        caps = matched[0][1]
-        assert set(caps) == {"python", "docker"}, (
-            f"fanout must carry the task's required capabilities; got {caps}"
         )
 
 

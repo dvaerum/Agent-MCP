@@ -31,7 +31,6 @@ authoritative source, not a session-scoped cache.
 from __future__ import annotations
 
 import datetime as _dt
-import json
 import secrets
 
 import pytest
@@ -53,12 +52,12 @@ def _seed_agent(agent_id: str, *, current_task: str | None = None) -> None:
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO agents (token, agent_id, capabilities, created_at, "
+        "INSERT INTO agents (token, agent_id, created_at, "
         "status, working_directory, color, updated_at, agent_role, "
         "current_task) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
-            token, agent_id, json.dumps([]), now, "active",
+            token, agent_id, now, "active",
             "/tmp", "#888", now, "worker", current_task,
         ),
     )
@@ -68,7 +67,6 @@ def _seed_agent(agent_id: str, *, current_task: str | None = None) -> None:
         "agent_id": agent_id,
         "status": "active",
         "created_at": now,
-        "capabilities": [],
         "agent_role": "worker",
         "current_task": current_task,
     }

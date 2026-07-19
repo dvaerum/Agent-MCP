@@ -37,7 +37,6 @@ surface because the REST path carried its own duplicate implementation.
 
 from __future__ import annotations
 
-import json
 
 import pytest
 
@@ -77,62 +76,6 @@ def _force_status(task_id: str, status: str, assigned_to) -> None:
         cursor.execute(
             "UPDATE tasks SET status = ?, assigned_to = ? WHERE task_id = ?",
             (status, assigned_to, task_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def _seed_task_with_caps(required_capabilities: list[str], assigned_to: str) -> str:
-    """Insert a task row (+ cache) tagged with ``required_capabilities``."""
-    import datetime as _dt
-    import secrets
-
-    from agent_mcp.core import globals as g
-    from agent_mcp.db.connection import get_db_connection
-
-    task_id = f"task_{secrets.token_hex(6)}"
-    now = _dt.datetime.now().isoformat()
-    conn = get_db_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO tasks (task_id, title, description, status, priority, "
-            "assigned_to, created_by, created_at, updated_at, notes, "
-            "required_capabilities) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                task_id, "caps-tagged", "seed", "pending", "low",
-                assigned_to, "admin", now, now, "[]",
-                json.dumps(required_capabilities),
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    g.tasks[task_id] = {
-        "task_id": task_id,
-        "title": "caps-tagged",
-        "status": "pending",
-        "priority": "low",
-        "assigned_to": assigned_to,
-        "created_by": "admin",
-        "created_at": now,
-        "updated_at": now,
-        "notes": [],
-        "required_capabilities": required_capabilities,
-    }
-    return task_id
-
-
-def _grant_capabilities(agent_id: str, caps: list[str]) -> None:
-    from agent_mcp.db.connection import get_db_connection
-
-    conn = get_db_connection()
-    try:
-        conn.execute(
-            "UPDATE agents SET capabilities = ? WHERE agent_id = ?",
-            (json.dumps(caps), agent_id),
         )
         conn.commit()
     finally:
@@ -256,18 +199,20 @@ async def _update_via(surface: str, admin, task_id: str, **fields):
 
 @pytest.mark.parametrize("surface", ["mcp", "rest"])
 async def test_update_task_invariants_parity(tmp_path, surface) -> None:
-    """The terminal-sink / assignability / capability-routing /
-    current_task-reconcile invariants, exercised ONCE against the
-    canonical ``update_task`` tool, over BOTH call surfaces. Before
-    arch-r4 #1 this was untestable as a single invariant surface — the
-    REST path carried its own duplicate implementation that could (and
-    repeatedly did) drift from the MCP tool's.
+    """The terminal-sink / assignability / current_task-reconcile
+    invariants, exercised ONCE against the canonical ``update_task``
+    tool, over BOTH call surfaces. Before arch-r4 #1 this was
+    untestable as a single invariant surface — the REST path carried
+    its own duplicate implementation that could (and repeatedly did)
+    drift from the MCP tool's.
+
+    (The capability-routing invariant that used to be exercised here
+    was retired in PR5 — the structured capability-tag gate is gone.)
     """
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
-        await admin.create_worker("bob")  # no capabilities
+        await admin.create_worker("bob")
         await admin.create_worker("carol")
-        _grant_capabilities("carol", ["deploy"])
 
         # --- assignability (BL-R13-1): reassign to a nonexistent agent.
         task_assign = await _create_task(admin, assigned_to="alice")
@@ -276,23 +221,6 @@ async def test_update_task_invariants_parity(tmp_path, surface) -> None:
         )
         assert not ok, f"reassign to a nonexistent agent must be rejected: {detail}"
         assert _row("tasks", "task_id = ?", (task_assign,))["assigned_to"] == "alice"
-
-        # --- capability-routing (AZ-R26-1): reassign a capability-tagged
-        # task onto an agent that lacks the capability.
-        task_caps = _seed_task_with_caps(["deploy"], "alice")
-        ok, detail = await _update_via(
-            surface, admin, task_caps, assigned_to="bob",
-        )
-        assert not ok, f"reassign onto an under-capable agent must be rejected: {detail}"
-        assert _row("tasks", "task_id = ?", (task_caps,))["assigned_to"] == "alice"
-
-        # Regression: the SAME capability-tagged task CAN be reassigned
-        # to an agent that DOES carry the capability.
-        ok, detail = await _update_via(
-            surface, admin, task_caps, assigned_to="carol",
-        )
-        assert ok, f"reassign onto a capable agent must succeed: {detail}"
-        assert _row("tasks", "task_id = ?", (task_caps,))["assigned_to"] == "carol"
 
         # --- terminal-sink (BL-R12-1 / BL-R18-1): a completed task must
         # refuse a reassign to a live agent.

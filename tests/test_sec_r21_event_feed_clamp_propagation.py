@@ -85,13 +85,10 @@ def _seed_unassigned_task(
     task_id: str,
     *,
     updated_at: str,
-    required_capabilities: str = "[]",
 ) -> None:
     """Insert one unassigned task whose ``updated_at`` is ``updated_at``.
 
-    ``_collect_unassigned_task_events_for`` surfaces it to any agent
-    whose capabilities are a superset of ``required_capabilities`` —
-    with the empty default it matches every agent."""
+    ``_collect_unassigned_task_events_for`` surfaces it to every agent."""
     from agent_mcp.db.connection import get_db_connection
 
     conn = get_db_connection()
@@ -99,9 +96,8 @@ def _seed_unassigned_task(
         conn.execute(
             "INSERT INTO tasks (task_id, title, description, assigned_to, "
             "created_by, status, priority, created_at, updated_at, "
-            "parent_task, child_tasks, depends_on_tasks, notes, "
-            "required_capabilities) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "parent_task, child_tasks, depends_on_tasks, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 "Newer than msg 500",
@@ -116,7 +112,6 @@ def _seed_unassigned_task(
                 "[]",
                 "[]",
                 "[]",
-                required_capabilities,
             ),
         )
         conn.commit()

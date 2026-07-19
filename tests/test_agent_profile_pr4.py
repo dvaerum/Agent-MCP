@@ -41,7 +41,6 @@ def _seed_agent(agent_id, *, role="worker", status="active", profile=None):
             Agent(
                 token=f"tok-{agent_id}",
                 agent_id=agent_id,
-                capabilities="[]",
                 created_at=now,
                 status=status,
                 current_task=None,

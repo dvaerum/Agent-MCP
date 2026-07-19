@@ -267,7 +267,6 @@ _AGENT_NODE_SAFE_COLUMNS = (
     "agent_id",
     "status",
     "agent_role",
-    "capabilities",
     "created_at",
     "updated_at",
     "terminated_at",

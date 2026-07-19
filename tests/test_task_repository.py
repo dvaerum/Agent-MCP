@@ -182,7 +182,6 @@ def test_list_by_agent_without_status_filter(project_dir, reset_globals):
         agent_repo.create(
             token="tok-w1",
             agent_id="worker-1",
-            capabilities=[],
             status="active",
             working_directory="/tmp/w1",
             color="#111111",
@@ -204,7 +203,6 @@ def test_list_by_agent_with_status_filter(project_dir, reset_globals):
         agent_repo.create(
             token="tok-w2",
             agent_id="worker-2",
-            capabilities=[],
             status="active",
             working_directory="/tmp/w2",
             color="#222222",
@@ -310,9 +308,9 @@ def test_create_default_row_shape(project_dir, reset_globals):
     ``created_by``) gets the SAME defaults every ``create()`` call
     site used to hand-list explicitly (``child_tasks`` /
     ``depends_on_tasks`` / ``notes`` = ``[]``, ``status`` =
-    ``"pending"``, ``priority`` = ``"medium"``,
-    ``required_capabilities`` = ``None``) — one assertion here instead
-    of trusting ~7 near-identical call-site dict literals to agree.
+    ``"pending"``, ``priority`` = ``"medium"``) — one assertion here
+    instead of trusting ~7 near-identical call-site dict literals to
+    agree.
     """
     with _make_client(project_dir):
         from agent_mcp.repositories import task_repo
@@ -324,7 +322,6 @@ def test_create_default_row_shape(project_dir, reset_globals):
         assert entity["notes"] == []
         assert entity["status"] == "pending"
         assert entity["priority"] == "medium"
-        assert entity["required_capabilities"] is None
 
 
 def test_create_duplicate_id_raises(project_dir, reset_globals):

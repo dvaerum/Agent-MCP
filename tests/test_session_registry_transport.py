@@ -62,10 +62,10 @@ def _seed_worker(name: str) -> str:
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO agents (token, agent_id, capabilities, created_at, "
+        "INSERT INTO agents (token, agent_id, created_at, "
         "status, working_directory, color, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (worker_token, name, "[]", now, "active", "/tmp", "#888", now),
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (worker_token, name, now, "active", "/tmp", "#888", now),
     )
     conn.commit()
     conn.close()
@@ -74,7 +74,6 @@ def _seed_worker(name: str) -> str:
         "agent_id": name,
         "status": "active",
         "created_at": now,
-        "capabilities": [],
     }
     return worker_token
 
@@ -260,13 +259,12 @@ async def live_server(tmp_path: Path) -> AsyncIterator[tuple[str, str]]:
             cursor = conn.cursor()
             cursor.execute(
                 "INSERT OR IGNORE INTO agents (token, agent_id, "
-                "capabilities, created_at, status, working_directory, "
+                "created_at, status, working_directory, "
                 "color, updated_at, agent_role) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     admin_token,
                     "admin",
-                    "[]",
                     now,
                     "active",
                     "/tmp",
@@ -282,7 +280,6 @@ async def live_server(tmp_path: Path) -> AsyncIterator[tuple[str, str]]:
             "agent_id": "admin",
             "status": "active",
             "created_at": now,
-            "capabilities": [],
             "agent_role": "manager",
         }
         # retire-system-token Wave 3: ``g.admin_token`` is no longer

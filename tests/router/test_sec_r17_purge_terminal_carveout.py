@@ -64,7 +64,6 @@ def _insert_task(
     task_id: str,
     assigned_to,
     status: str,
-    required_capabilities: str | None = None,
 ) -> None:
     from agent_mcp.db.engine import get_session
     from agent_mcp.db.models import Task
@@ -82,7 +81,6 @@ def _insert_task(
                 priority="medium",
                 created_at=now,
                 updated_at=now,
-                required_capabilities=required_capabilities,
             )
         )
         session.commit()
@@ -94,7 +92,7 @@ def _install_notify_spy(monkeypatch) -> list[tuple]:
     unassigned: list[tuple] = []
     monkeypatch.setattr(
         _g_mod, "notify_unassigned_task_appeared",
-        lambda task_id, caps: unassigned.append((task_id, caps)),
+        lambda task_id: unassigned.append(task_id),
     )
     return unassigned
 
@@ -149,7 +147,6 @@ async def test_purge_does_not_notify_for_terminal_task(
 
         _insert_task(
             task_id="term-2", assigned_to=agent_id, status=terminal_status,
-            required_capabilities='["python"]',
         )
 
         unassigned = _install_notify_spy(monkeypatch)
@@ -157,7 +154,7 @@ async def test_purge_does_not_notify_for_terminal_task(
         resp = _purge(admin, agent_id)
         assert resp.status_code == 200, resp.text
 
-        fired = [u[0] for u in unassigned]
+        fired = list(unassigned)
         assert "term-2" not in fired, (
             f"a terminal task must NOT fire notify_unassigned_task_"
             f"appeared on purge; fired={unassigned}"
@@ -230,7 +227,6 @@ async def test_purge_still_notifies_for_active_task(
 
         _insert_task(
             task_id="active-2", assigned_to=agent_id, status="pending",
-            required_capabilities='["python", "docker"]',
         )
 
         unassigned = _install_notify_spy(monkeypatch)
@@ -238,13 +234,8 @@ async def test_purge_still_notifies_for_active_task(
         resp = _purge(admin, agent_id)
         assert resp.status_code == 200, resp.text
 
-        matched = [u for u in unassigned if u[0] == "active-2"]
-        assert matched, (
+        assert "active-2" in unassigned, (
             f"active task must fire notify on purge; fired={unassigned}"
-        )
-        caps = matched[0][1]
-        assert set(caps) == {"python", "docker"}, (
-            f"fanout must carry the task's required capabilities; got {caps}"
         )
 
 
@@ -277,6 +268,6 @@ async def test_purge_mixed_terminal_and_active(
         assert active["status"] == "unassigned"
         assert active["assigned_to"] is None
 
-        fired = [u[0] for u in unassigned]
+        fired = list(unassigned)
         assert "mix-active" in fired, "active task must be fanned out"
         assert "mix-term" not in fired, "terminal task must NOT be fanned out"

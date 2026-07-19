@@ -211,7 +211,6 @@ async def test_synthetic_event_fans_out_to_all_waiters(
                 "task_id": "synthetic-task-1",
                 "title": "synthetic test task",
                 "priority": "normal",
-                "required_capabilities": [],
             },
         )
 

@@ -61,7 +61,6 @@ _STRUCTURAL_FIELDS = (
     "priority",
     "assigned_to",
     "parent_task",
-    "required_capabilities",
     "child_tasks",
     "depends_on_tasks",
 )

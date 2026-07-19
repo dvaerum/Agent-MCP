@@ -43,11 +43,11 @@ def _seed_agent(agent_id: str, token: str, agent_role: str = "worker") -> None:
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO agents (token, agent_id, capabilities, "
+            "INSERT INTO agents (token, agent_id, "
             "created_at, status, working_directory, color, updated_at, "
-            "agent_role) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "agent_role) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                token, agent_id, "[]", now, "active", "/tmp", "#abc",
+                token, agent_id, now, "active", "/tmp", "#abc",
                 now, agent_role,
             ),
         )

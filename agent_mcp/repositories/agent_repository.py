@@ -66,7 +66,6 @@ from __future__ import annotations
 
 import contextlib
 import datetime
-import json
 import re
 import sqlite3
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -147,9 +146,8 @@ def _publish(addressee: str, event: str, payload: Dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 # Columns the caller is allowed to mutate via :func:`update_agent_db_field`
-# and :meth:`AgentRepository.update_field`. Used both as an allowlist
-# (anti-injection / anti-typo) and to centralise the JSON-serialisation
-# rule for ``capabilities``.
+# and :meth:`AgentRepository.update_field`. Used as an allowlist
+# (anti-injection / anti-typo) and to centralise per-field normalization.
 #
 # ``token`` is deliberately OFF this allowlist — it's the auth secret,
 # and the surface for rotating it lives in :meth:`AgentRepository.rotate_token`
@@ -187,7 +185,6 @@ _MUTABLE_FIELDS: set[str] = {
     "current_task",
     "working_directory",
     "color",
-    "capabilities",
     "updated_at",
     "aoe_session_id",
     # Event-coord PR-1 + PR-2.
@@ -212,9 +209,8 @@ def _sanitise_field(field_name: str, new_value: Any) -> Tuple[bool, Any]:
     """Allowlist-check ``field_name`` and normalize ``new_value``.
 
     The single source of truth for the ``_MUTABLE_FIELDS`` allowlist
-    plus the per-field normalization rules (``capabilities`` ->
-    normalized JSON, ``auto_event_loop`` -> 1/0, a ``None``
-    ``updated_at`` -> "now"). Before arch-r5 #3 this block was
+    plus the per-field normalization rules (``auto_event_loop`` -> 1/0,
+    a ``None`` ``updated_at`` -> "now"). Before arch-r5 #3 this block was
     duplicated 3x (the standalone own-session writer, the shared-cursor
     writer, and a dead shared-session writer that no caller ever
     exercised — see the module docstring / PR notes). Both surviving
@@ -227,16 +223,7 @@ def _sanitise_field(field_name: str, new_value: Any) -> Tuple[bool, Any]:
         return False, None
 
     value_to_set = new_value
-    if field_name == "capabilities":
-        # Event-coord PR-1: normalize at write time (strip + lowercase +
-        # dedupe, preserve order of first occurrence). One source of
-        # truth for both agents.capabilities and
-        # tasks.required_capabilities (task_tools applies the same
-        # helper). Read paths must NOT re-normalize.
-        from ..utils.capability_normalization import normalize_capabilities
-
-        value_to_set = json.dumps(normalize_capabilities(new_value))
-    elif field_name == "auto_event_loop":
+    if field_name == "auto_event_loop":
         # SQLite has no native bool; coerce any truthy value to 1, any
         # falsy to 0 so dashboard PATCH bodies (true/false/0/1) all
         # land as the integer the column expects.
@@ -261,13 +248,11 @@ def _agent_to_dict(row: Agent) -> Dict[str, Any]:
     """Project an ``Agent`` ORM row into the dict shape consumers expect.
 
     Mirrors the pre-cutover ``dict(sqlite_row)`` projection: every column
-    is exposed by name, and ``capabilities`` is JSON-decoded (the column
-    stores a JSON-encoded list).
+    is exposed by name.
     """
     data: Dict[str, Any] = {
         "token": row.token,
         "agent_id": row.agent_id,
-        "capabilities": row.capabilities,
         "created_at": row.created_at,
         "status": row.status,
         "current_task": row.current_task,
@@ -293,16 +278,6 @@ def _agent_to_dict(row: Agent) -> Dict[str, Any]:
         "profile_reviewed_at": getattr(row, "profile_reviewed_at", None),
         "profile_updated_by": getattr(row, "profile_updated_by", None),
     }
-    raw_caps = data.get("capabilities")
-    if isinstance(raw_caps, str):
-        try:
-            data["capabilities"] = json.loads(raw_caps or "[]")
-        except json.JSONDecodeError:
-            logger.warning(
-                f"Failed to parse capabilities JSON for agent "
-                f"{row.agent_id!r}. Raw: {raw_caps!r}"
-            )
-            data["capabilities"] = []
     return data
 
 
@@ -796,7 +771,6 @@ class AgentRepository:
         *,
         token: str,
         agent_id: str,
-        capabilities: Optional[List[str]] = None,
         status: str = "created",
         current_task: Optional[str] = None,
         working_directory: str,
@@ -807,8 +781,7 @@ class AgentRepository:
         """INSERT an agent row, update both caches, publish ``"agent.created"``.
 
         Required: ``token``, ``agent_id``, ``working_directory``.
-        Optional: ``capabilities``, ``status``, ``current_task``,
-        ``color``.
+        Optional: ``status``, ``current_task``, ``color``.
 
         ``connection`` is the transaction-aware seam. Tolerates a
         SQLAlchemy ``Session`` OR a raw ``sqlite3.Cursor`` so the
@@ -819,9 +792,8 @@ class AgentRepository:
         its own session.
 
         Returns the freshly-stored row in the same dict shape
-        consumers expect (capabilities deserialised). On DB conflict
-        (e.g. duplicate ``agent_id`` or duplicate ``token``), raises
-        the underlying ``SQLAlchemyError``.
+        consumers expect. On DB conflict (e.g. duplicate ``agent_id`` or
+        duplicate ``token``), raises the underlying ``SQLAlchemyError``.
 
         Raises ``ValueError`` if ``agent_id`` doesn't match the slug
         regex (see ``_AGENT_ID_RE``) — caught at the seam so every
@@ -851,7 +823,6 @@ class AgentRepository:
             )
 
         now = datetime.datetime.now().isoformat()
-        caps_json = json.dumps(capabilities or [])
 
         # Phase 2 Wave 2b: persist ``agent_role`` through every code
         # path (raw-cursor, caller-owned-session, repo-owned-session).
@@ -863,13 +834,13 @@ class AgentRepository:
             cur.execute(
                 """
                 INSERT INTO agents (
-                    token, agent_id, capabilities, created_at, status,
+                    token, agent_id, created_at, status,
                     current_task, working_directory, color,
                     terminated_at, updated_at, aoe_session_id, agent_role
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    token, agent_id, caps_json, now, status,
+                    token, agent_id, now, status,
                     current_task, working_directory, color,
                     None, now, None, agent_role,
                 ),
@@ -879,7 +850,6 @@ class AgentRepository:
             row = Agent(
                 token=token,
                 agent_id=agent_id,
-                capabilities=caps_json,
                 created_at=now,
                 status=status,
                 current_task=current_task,
@@ -897,7 +867,6 @@ class AgentRepository:
                 row = Agent(
                     token=token,
                     agent_id=agent_id,
-                    capabilities=caps_json,
                     created_at=now,
                     status=status,
                     current_task=current_task,
@@ -920,7 +889,6 @@ class AgentRepository:
                 fresh = {
                     "token": token,
                     "agent_id": agent_id,
-                    "capabilities": capabilities or [],
                     "created_at": now,
                     "status": status,
                     "current_task": current_task,
@@ -933,7 +901,6 @@ class AgentRepository:
             fresh = {
                 "token": token,
                 "agent_id": agent_id,
-                "capabilities": capabilities or [],
                 "created_at": now,
                 "status": status,
                 "current_task": current_task,
@@ -2102,9 +2069,9 @@ class AgentRepository:
             cur = connection
             cur.execute(
                 "INSERT OR IGNORE INTO agents "
-                "(token, agent_id, capabilities, created_at, status, "
+                "(token, agent_id, created_at, status, "
                 " working_directory, color, updated_at) "
-                "VALUES (?, ?, '[]', ?, 'tombstone', '', '#000000', ?)",
+                "VALUES (?, ?, ?, 'tombstone', '', '#000000', ?)",
                 (token, tombstone_agent_id, now, now),
             )
             return
@@ -2123,7 +2090,6 @@ class AgentRepository:
                 Agent(
                     token=token,
                     agent_id=tombstone_agent_id,
-                    capabilities="[]",
                     created_at=now,
                     status="tombstone",
                     working_directory="",
@@ -2148,7 +2114,6 @@ class AgentRepository:
                 Agent(
                     token=token,
                     agent_id=tombstone_agent_id,
-                    capabilities="[]",
                     created_at=now,
                     status="tombstone",
                     working_directory="",

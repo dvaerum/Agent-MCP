@@ -246,13 +246,12 @@ def seed_agent_row(
     cursor = conn.cursor()
     if role is not None:
         cursor.execute(
-            f"{verb} INTO agents (token, agent_id, capabilities, "
+            f"{verb} INTO agents (token, agent_id, "
             "created_at, status, working_directory, color, updated_at, "
-            "agent_role) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "agent_role) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 tok,
                 agent_id,
-                "[]",
                 now,
                 status,
                 working_directory,
@@ -263,10 +262,10 @@ def seed_agent_row(
         )
     else:
         cursor.execute(
-            f"{verb} INTO agents (token, agent_id, capabilities, "
+            f"{verb} INTO agents (token, agent_id, "
             "created_at, status, working_directory, color, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (tok, agent_id, "[]", now, status, working_directory, color, now),
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (tok, agent_id, now, status, working_directory, color, now),
         )
     conn.commit()
     return tok

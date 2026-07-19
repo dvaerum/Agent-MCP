@@ -611,7 +611,6 @@ def _seed_harness_admin_agent() -> str:
         "agent_id": _HARNESS_ADMIN_AGENT_ID,
         "status": "active",
         "created_at": now,
-        "capabilities": [],
         "agent_role": "manager",
     }
     return token
@@ -790,7 +789,6 @@ class AdminClient(WorkerSession):
             "agent_id": agent_id,
             "status": "active",
             "created_at": now,
-            "capabilities": [],
             "agent_role": "worker",
         }
         return WorkerSession(
@@ -809,7 +807,6 @@ class AdminClient(WorkerSession):
             "agent_id": agent_id,
             "status": "active",
             "created_at": _dt.datetime.now().isoformat(),
-            "capabilities": ["admin"],
         }
         return WorkerSession(
             token=self.admin_token,

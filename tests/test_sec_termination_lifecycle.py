@@ -109,7 +109,6 @@ def _insert_agent(
             Agent(
                 token=token,
                 agent_id=agent_id,
-                capabilities="[]",
                 created_at=now,
                 status=status,
                 current_task=None,

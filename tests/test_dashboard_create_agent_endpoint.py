@@ -79,7 +79,6 @@ async def test_post_api_agents_creates_agent_row(tmp_path) -> None:
             "/api/agents/register",
             json={
                 "agent_id": "e2e-add",
-                "capabilities": ["test"],
             },
         )
         assert resp.status_code == 200, (

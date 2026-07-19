@@ -27,7 +27,6 @@ import { TaskDetailsDialog } from "./task-details-dialog"
 import { Skeleton } from "@/components/ui/skeleton"
 import { EmptyState } from "@/components/dashboard/shared/empty-state"
 import { AgentsMobileList } from "@/components/dashboard/agents-mobile-list"
-import { CapabilityTagInput } from "@/components/dashboard/shared/capability-tag-input"
 
 
 // agent_id slug rule — mirrors the backend's `_AGENT_ID_RE`
@@ -777,27 +776,6 @@ const PurgeAgentDialog = ({
   )
 }
 
-// Defensive normalisation. The backend column is JSON-encoded text but
-// some endpoints (e.g. /api/all-data) return it parsed and others return
-// the raw string. Without this guard, calling .join() on a string blows
-// the whole agents page up with a TypeError.
-const normalizeCapabilities = (caps: unknown): string[] => {
-  if (Array.isArray(caps)) return caps.map((c) => String(c))
-  if (typeof caps === 'string') {
-    try {
-      const parsed = JSON.parse(caps)
-      if (Array.isArray(parsed)) return parsed.map((c) => String(c))
-    } catch {
-      // Fall through — treat as comma-separated.
-    }
-    return caps
-      .split(',')
-      .map((c) => c.trim())
-      .filter((c) => c.length > 0)
-  }
-  return []
-}
-
 // Event-coord PR-1: SQLite BOOLEAN columns arrive as JS number (0/1)
 // after the JSON round-trip; the JSON serializer never coerces them
 // back to true/false. Default to TRUE when missing — matches the
@@ -883,7 +861,7 @@ const TerminateAgentDialog = ({
 }
 
 // Edit dialog — admin-editable agent fields. Backed by
-// POST /api/agents/<id>/edit (capabilities / color / working_directory).
+// POST /api/agents/<id>/edit (color / working_directory).
 const EditAgentDialog = ({
   agent,
   open,
@@ -895,7 +873,6 @@ const EditAgentDialog = ({
   onOpenChange: (open: boolean) => void
   onSaved: () => void
 }) => {
-  const [capabilities, setCapabilities] = useState<string[]>([])
   const [color, setColor] = useState('')
   const [workingDirectory, setWorkingDirectory] = useState('')
   const [aoeSessionId, setAoeSessionId] = useState('')
@@ -939,7 +916,6 @@ const EditAgentDialog = ({
   const agentId = agent?.agent_id
   useEffect(() => {
     if (!open || !agent) return
-    setCapabilities(normalizeCapabilities(agent.capabilities))
     setColor(agent.color || '')
     setWorkingDirectory(agent.working_directory || '')
     setAoeSessionId(agent.aoe_session_id || '')
@@ -971,22 +947,12 @@ const EditAgentDialog = ({
     setBusy(true)
     setError(null)
     const updates: {
-      capabilities?: string[]
       color?: string
       working_directory?: string
       aoe_session_id?: string
       auto_event_loop?: boolean
       agent_role?: 'worker' | 'manager'
     } = {}
-    // capabilities is already a normalized string[] (the tag input
-    // lowercases + trims + dedupes on add, mirroring the server's
-    // normalize_capabilities). Send the list straight through — the
-    // edit-agent endpoint accepts `capabilities: string[]`.
-    const parsedCaps = capabilities
-    const currentCaps = normalizeCapabilities(agent.capabilities)
-    if (JSON.stringify(parsedCaps) !== JSON.stringify(currentCaps)) {
-      updates.capabilities = parsedCaps
-    }
     if (color !== (agent.color || '')) {
       updates.color = color
     }
@@ -1039,37 +1005,11 @@ const EditAgentDialog = ({
         <DialogHeader>
           <DialogTitle className="text-lg">Edit agent {agent?.agent_id}</DialogTitle>
           <DialogDescription className="text-muted-foreground">
-            Update the agent&apos;s capabilities, color, or working directory.
+            Update the agent&apos;s color or working directory.
             Status changes use Terminate / Restore / Purge.
           </DialogDescription>
         </DialogHeader>
         <form onSubmit={handleSave} className="space-y-4">
-          <div>
-            <label
-              htmlFor="edit-agent-capabilities"
-              className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2"
-            >
-              Capabilities
-            </label>
-            {/*
-              Free-text routing skill tags (NOT the Wave 9 permission
-              enum). The chips input suggests tags already in use across
-              live agents/tasks but always allows a brand-new tag — see
-              <CapabilityTagInput>. Normalized client-side to match the
-              server's normalize_capabilities.
-            */}
-            <CapabilityTagInput
-              id="edit-agent-capabilities"
-              value={capabilities}
-              onChange={setCapabilities}
-              disabled={busy}
-              placeholder="Add a capability, press Enter"
-            />
-            <p className="text-[10px] text-muted-foreground mt-1">
-              Routing skill tags. A task routes to this agent only when
-              its required capabilities are a subset of these.
-            </p>
-          </div>
           <div>
             <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
               Color
@@ -1667,21 +1607,8 @@ const AgentDetailDialog = ({
             </div>
           )}
 
-          {/* Group 2: capabilities / wd / color */}
+          {/* Group 2: wd / color */}
           <div className="border-t border-border pt-4 space-y-3">
-            <div className="space-y-1">
-              <Label className="text-xs text-muted-foreground uppercase tracking-wider">
-                Capabilities
-              </Label>
-              <div className="text-sm [overflow-wrap:anywhere]">
-                {(() => {
-                  const caps = normalizeCapabilities(agent.capabilities)
-                  return caps.length > 0
-                    ? caps.join(', ')
-                    : <span className="text-muted-foreground italic">none</span>
-                })()}
-              </div>
-            </div>
             <div className="space-y-1">
               <Label className="text-xs text-muted-foreground uppercase tracking-wider">
                 Working Directory

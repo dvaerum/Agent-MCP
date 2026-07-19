@@ -157,13 +157,12 @@ async def test_all_data_returns_old_idle_agent(tmp_path) -> None:
         try:
             cur = conn.cursor()
             cur.execute(
-                "INSERT INTO agents (token, agent_id, capabilities, "
+                "INSERT INTO agents (token, agent_id, "
                 "created_at, status, working_directory, color, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     "__test_old_worker_token",
                     "old-worker",
-                    "[]",
                     old_ts,
                     "created",
                     "/tmp",
@@ -216,13 +215,12 @@ async def test_no_server_side_idle_cleanup_endpoint(tmp_path) -> None:
         try:
             cur = conn.cursor()
             cur.execute(
-                "INSERT INTO agents (token, agent_id, capabilities, "
+                "INSERT INTO agents (token, agent_id, "
                 "created_at, status, working_directory, color, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     "__test_idle_worker_token",
                     "idle-worker",
-                    "[]",
                     old_ts,
                     "created",
                     "/tmp",
