@@ -678,11 +678,28 @@ async def poke_agent_directive_api_route(
             {"error": "Failed to send directive"}, status_code=500
         )
 
+    # Delivered vs queued: a poke is delivered *immediately* iff the agent
+    # currently has a parked ``wait_for_events`` waiter — the on_commit
+    # ``notify_agent_inbox`` above just woke it, and it will re-query and
+    # collect this poke (priority-first) before returning. With no parked
+    # waiter the poke sits in ``pending_directive`` until the agent's next
+    # check-in. We read the count *after* commit (same in-memory registry
+    # the UI's ``wait_for_events_in_flight`` chip is derived from) so the
+    # toast can tell the operator the real outcome rather than a generic
+    # "sent". The waiter isn't removed until its coroutine next runs, so
+    # this synchronous read still sees it.
+    delivered = _g.waiter_count(agent_id) > 0
+
     return JSONResponse({
         "success": True,
         "poke_id": poke_id,
         "agent_id": agent_id,
-        "message": f"Directive queued for {agent_id}",
+        "delivered": delivered,
+        "message": (
+            f"Directive delivered to {agent_id}"
+            if delivered
+            else f"Directive queued for {agent_id}"
+        ),
     })
 
 

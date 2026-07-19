@@ -2,7 +2,7 @@
 
 import * as React from "react"
 import {
-  Eye, Pencil, Trash2, RotateCcw, Copy,
+  Eye, Pencil, Trash2, RotateCcw, Copy, Zap,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -37,6 +37,7 @@ interface AgentsMobileListProps {
   onTerminate: (agentId: string) => void
   onRestore: (agentId: string) => void
   onPurge: (agentId: string) => void
+  onSendDirective: (agentId: string) => void
 }
 
 export function AgentsMobileList({
@@ -46,6 +47,7 @@ export function AgentsMobileList({
   onTerminate,
   onRestore,
   onPurge,
+  onSendDirective,
 }: AgentsMobileListProps): React.ReactElement {
   return (
     <ul role="list" className="divide-y divide-border">
@@ -113,6 +115,17 @@ export function AgentsMobileList({
               </Button>
               {!isAdmin && !isTerminated && (
                 <>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    title="Send directive (deliver now if listening, else queue)"
+                    aria-label="Send directive"
+                    className="h-9 w-9 p-0 text-muted-foreground hover:text-foreground hover:bg-muted"
+                    onClick={(e) => { e.stopPropagation(); onSendDirective(agent.agent_id) }}
+                    data-testid={`send-directive-mobile-${agent.agent_id}`}
+                  >
+                    <Zap className="h-4 w-4" />
+                  </Button>
                   <Button
                     variant="ghost"
                     size="sm"

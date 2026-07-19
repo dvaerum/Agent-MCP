@@ -195,6 +195,42 @@ async def test_rest_poke_operator_success(tmp_path):
             conn.close()
 
 
+async def test_rest_poke_queued_when_agent_not_listening(tmp_path):
+    """No parked wait_for_events waiter ⇒ the poke is *queued*: the REST
+    response reports delivered=False so the dashboard toast can say
+    "Queued for X — will arrive on its next check-in"."""
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        r = _post_poke(admin, "alice", {"prompt": "later"})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["delivered"] is False, body
+        assert "queued" in body["message"].lower(), body
+
+
+async def test_rest_poke_delivered_when_agent_listening(tmp_path):
+    """A parked wait_for_events waiter ⇒ the poke is *delivered
+    immediately*: the on_commit waiter-wake releases it, and the REST
+    response reports delivered=True so the toast says "Delivered to X".
+
+    We register a waiter directly (what an in-flight ``wait_for_events``
+    does on entry) so the branch is exercised deterministically without
+    racing a real long-poll coroutine."""
+    from agent_mcp.core import globals as g
+
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        queue = g.register_waiter("alice")
+        try:
+            r = _post_poke(admin, "alice", {"prompt": "go now"})
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["delivered"] is True, body
+            assert "delivered" in body["message"].lower(), body
+        finally:
+            g.unregister_waiter("alice", queue)
+
+
 async def test_rest_poke_unknown_agent_404(tmp_path):
     async with mcp_session(tmp_path) as admin:
         r = _post_poke(admin, "ghost", {"prompt": "x"})
