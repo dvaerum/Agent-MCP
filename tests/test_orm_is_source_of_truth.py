@@ -49,6 +49,7 @@ EXPECTED_TABLES = {
     "agent_messages",
     "claude_code_sessions",
     "mcp_sessions",
+    "scheduled_directive",
 }
 
 

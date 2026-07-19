@@ -56,6 +56,7 @@ export interface AgentMirror {
   aoe_session_id?: string | null
   auto_event_loop?: boolean | null
   last_event_seen_at?: string | null
+  last_activity_at?: string | null
   agent_role?: string | null
   profile?: string | null
   profile_updated_at?: string | null
@@ -134,6 +135,24 @@ export interface RagMetaMirror {
   meta_value?: string | null
 }
 
+/** Pydantic mirror of the `scheduled_directive` table. */
+export interface ScheduledDirectiveMirror {
+  directive_id: string
+  agent_id: string
+  prompt: string
+  interval_seconds: number
+  next_due_at: string
+  enabled?: number | null
+  status?: string | null
+  until_at?: string | null
+  max_runs?: number | null
+  run_count?: number | null
+  created_at: string
+  created_by?: string | null
+  updated_at?: string | null
+  updated_by?: string | null
+}
+
 /** Pydantic mirror of the `task_notes` table. */
 export interface TaskNoteMirror {
   note_id: number
@@ -172,6 +191,7 @@ export const MIRROR_TABLE_NAMES = [
   "project_settings",
   "rag_chunks",
   "rag_meta",
+  "scheduled_directive",
   "task_notes",
   "tasks",
 ] as const;

@@ -226,6 +226,25 @@ class TaskNoteMirror(BaseModel):
     text: str
 
 
+class ScheduledDirectiveMirror(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    directive_id: str
+    agent_id: str
+    prompt: str
+    interval_seconds: int
+    next_due_at: str
+    enabled: int = 1
+    status: str = "active"
+    until_at: Optional[str] = None
+    max_runs: Optional[int] = None
+    run_count: int = 0
+    created_at: str
+    created_by: Optional[str] = None
+    updated_at: Optional[str] = None
+    updated_by: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # Registry. Tests + the TS generator consult `MIRRORS[table_name]`.
 # Keep this map alphabetised by table_name to make diffs reviewable.
@@ -243,6 +262,7 @@ MIRRORS: dict[str, type[BaseModel]] = {
     "project_settings": ProjectSettingsMirror,
     "rag_chunks": RagChunkMirror,
     "rag_meta": RagMetaMirror,
+    "scheduled_directive": ScheduledDirectiveMirror,
     "task_notes": TaskNoteMirror,
     "tasks": TaskMirror,
 }
@@ -260,6 +280,7 @@ __all__ = [
     "ProjectSettingsMirror",
     "RagChunkMirror",
     "RagMetaMirror",
+    "ScheduledDirectiveMirror",
     "TaskMirror",
     "TaskNoteMirror",
 ]
