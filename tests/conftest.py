@@ -98,6 +98,12 @@ def reset_and_snapshot_globals() -> Callable[[], None]:
     # fresh, cleared Event so we can detect a regression where
     # application_startup forgets to set it.
     g.reset_startup_complete_event()
+    # Agent self-service profiles (PR3): the profile-review greet flag is
+    # a module-global set in session_registry. Clear it between tests so a
+    # greeted agent_id can't leak across tests and suppress a greet another
+    # test expects.
+    from agent_mcp.core import session_registry as _sr
+    _sr._profile_greeted_agents.clear()
 
     snapshot = {
         "connections": dict(g.connections),
