@@ -39,6 +39,7 @@ SettingWidget = Literal[
     "switch",
     "int_days",
     "int_ms",
+    "int_duration",
     "url",
     "secret",
     "secret_path",
@@ -155,6 +156,26 @@ SETTINGS_SCHEMA: tuple[SettingSpec, ...] = (
             "toggle)."
         ),
         widget="switch",
+    ),
+    SettingSpec(
+        key="config_event_idle_stop_seconds",
+        type="int",
+        default=604800,  # 7 days
+        tier="operator",
+        group="event_loop",
+        title="Stop the event-loop after idle",
+        description=(
+            "How long an agent may sit in the wake-loop with NO real "
+            "events (messages / task changes) before the server tells it "
+            "to stop listening and go dormant. Measured across reconnects "
+            "and reset by every real event (heartbeats and the "
+            "profile-review greet do NOT count). When the window is "
+            "exceeded, wait_for_events returns a stop_listening event and "
+            "the agent exits its loop. Default 7 days; set to 0 to never "
+            "stop (hold indefinitely). Re-waking a dormant agent is a "
+            "manual/operator action."
+        ),
+        widget="int_duration",
     ),
     SettingSpec(
         key="config_message_retention_days",

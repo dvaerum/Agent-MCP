@@ -110,6 +110,47 @@ function validateRetention(draft: string): string | null {
   return null
 }
 
+// ── duration widget (int_duration) ──────────────────────────────────
+//
+// A duration setting is STORED as a plain integer number of SECONDS
+// (e.g. config_event_idle_stop_seconds), but is edited as an amount +
+// a minutes/hours/days unit. 0 = the setting's "infinite" sentinel
+// ("never stop"). These pure helpers convert between the wire seconds
+// and the {amount, unit} the control renders, and are exported for the
+// vitest unit tests.
+export const DURATION_UNITS = [
+  { key: "minutes", label: "minutes", seconds: 60 },
+  { key: "hours", label: "hours", seconds: 3600 },
+  { key: "days", label: "days", seconds: 86400 },
+] as const
+export type DurationUnit = (typeof DURATION_UNITS)[number]["key"]
+
+// Pick the largest unit that divides the total evenly, so 604800s shows
+// as "7 days" (not "168 hours"). Falls back to minutes (rounded) for a
+// value that isn't a clean multiple of any unit. 0/negative → 0 days.
+export function secondsToParts(total: number): {
+  amount: number
+  unit: DurationUnit
+} {
+  if (!Number.isFinite(total) || total <= 0) return { amount: 0, unit: "days" }
+  for (const u of [...DURATION_UNITS].reverse()) {
+    if (total % u.seconds === 0) return { amount: total / u.seconds, unit: u.key }
+  }
+  return { amount: Math.max(1, Math.round(total / 60)), unit: "minutes" }
+}
+
+export function partsToSeconds(amount: number, unit: DurationUnit): number {
+  const u = DURATION_UNITS.find((x) => x.key === unit) ?? DURATION_UNITS[2]
+  if (!Number.isFinite(amount) || amount < 0) return 0
+  return Math.floor(amount) * u.seconds
+}
+
+export function formatDuration(total: number): string {
+  if (!Number.isFinite(total) || total <= 0) return "never stop"
+  const { amount, unit } = secondsToParts(total)
+  return `${amount} ${unit}`
+}
+
 // ── type→widget registry ────────────────────────────────────────────
 //
 // A schema entry's `widget` hint (falling back to `type`) selects the
@@ -119,7 +160,13 @@ function validateRetention(draft: string): string | null {
 //   int_ms   → number input + Save, plain non-negative int
 //   text     → text input + Save (url / template strings)
 //   secret   → write-only password input + Save (never prefilled)
-export type WidgetKind = "switch" | "int_days" | "int_ms" | "text" | "secret"
+export type WidgetKind =
+  | "switch"
+  | "int_days"
+  | "int_ms"
+  | "int_duration"
+  | "text"
+  | "secret"
 
 export function widgetKindFor(entry: SettingsSchemaEntry): WidgetKind {
   switch (entry.widget) {
@@ -129,6 +176,8 @@ export function widgetKindFor(entry: SettingsSchemaEntry): WidgetKind {
       return "int_days"
     case "int_ms":
       return "int_ms"
+    case "int_duration":
+      return "int_duration"
     case "url":
     case "template":
       return "text"
@@ -206,6 +255,7 @@ function formatDefault(entry: SettingsSchemaEntry): string {
       : `${Number(entry.default)} days`
   }
   if (kind === "int_ms") return `${Number(entry.default)} ms`
+  if (kind === "int_duration") return formatDuration(Number(entry.default))
   const d = entry.default
   return d === null || d === undefined || d === "" ? "(none)" : String(d)
 }
@@ -343,7 +393,9 @@ export function SettingsDashboard() {
     }
     const existed = rows.some((r) => r.context_key === entry.key)
     const value: unknown =
-      kind === "int_days" || kind === "int_ms" ? coerceNonNegInt(draft) : draft
+      kind === "int_days" || kind === "int_ms" || kind === "int_duration"
+        ? coerceNonNegInt(draft)
+        : draft
     setPendingKey(entry.key)
     try {
       if (existed) {
@@ -642,6 +694,22 @@ export function SettingControl({
     )
   }
 
+  if (kind === "int_duration") {
+    const savedInt = row ? coerceNonNegInt(row.value) : Number(entry.default) || 0
+    return (
+      <DurationControl
+        savedSeconds={savedInt}
+        draft={draft}
+        disabled={locked}
+        pending={pending}
+        exists={exists}
+        ariaLabel={entry.title}
+        onDraft={onDraft}
+        onSave={onSave}
+      />
+    )
+  }
+
   // int_ms / text / secret — an input + Save button.
   const isSecret = kind === "secret"
   const stored = isSecret ? "" : coerceDisplayString(row?.value)
@@ -674,6 +742,99 @@ export function SettingControl({
       >
         Save
       </Button>
+    </div>
+  )
+}
+
+// The int_duration control: an amount input + a minutes/hours/days unit
+// select + Save. The setting is stored as SECONDS; this widget converts
+// to/from a human unit and pushes the computed seconds up to the parent
+// draft so the shared save path (coerceNonNegInt → createSetting/
+// updateSetting) is unchanged. 0 = the "never stop" / infinite sentinel.
+function DurationControl({
+  savedSeconds,
+  draft,
+  disabled,
+  pending,
+  exists,
+  ariaLabel,
+  onDraft,
+  onSave,
+}: {
+  savedSeconds: number
+  draft?: string
+  disabled: boolean
+  pending: boolean
+  exists: boolean
+  ariaLabel: string
+  onDraft: (v: string) => void
+  onSave: () => void
+}) {
+  const initial = secondsToParts(
+    draft !== undefined ? coerceNonNegInt(draft) : savedSeconds,
+  )
+  const [amount, setAmount] = useState<string>(String(initial.amount))
+  const [unit, setUnit] = useState<DurationUnit>(initial.unit)
+
+  // Push the computed seconds up to the parent draft whenever amount/unit
+  // change, so onSave reads the seconds from drafts[key].
+  const pushDraft = (nextAmount: string, nextUnit: DurationUnit) => {
+    const n = Number(nextAmount)
+    onDraft(String(partsToSeconds(Number.isFinite(n) ? n : 0, nextUnit)))
+  }
+
+  const currentSeconds = partsToSeconds(Number(amount) || 0, unit)
+  const unchanged = exists && currentSeconds === savedSeconds
+  const isInfinite = currentSeconds === 0
+
+  return (
+    <div className="flex flex-col gap-1 items-end">
+      <div className="flex items-center gap-2">
+        <Input
+          type="number"
+          min={0}
+          step={1}
+          inputMode="numeric"
+          value={amount}
+          disabled={disabled || pending}
+          onChange={(e) => {
+            setAmount(e.target.value)
+            pushDraft(e.target.value, unit)
+          }}
+          className="w-20"
+          aria-label={`${ariaLabel} amount`}
+        />
+        <select
+          value={unit}
+          disabled={disabled || pending}
+          onChange={(e) => {
+            const u = e.target.value as DurationUnit
+            setUnit(u)
+            pushDraft(amount, u)
+          }}
+          aria-label={`${ariaLabel} unit`}
+          className="h-9 rounded-md border border-input bg-background px-2 text-sm"
+        >
+          {DURATION_UNITS.map((u) => (
+            <option key={u.key} value={u.key}>
+              {u.label}
+            </option>
+          ))}
+        </select>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={onSave}
+          disabled={disabled || pending || draft === undefined || unchanged}
+        >
+          Save
+        </Button>
+      </div>
+      <div className="text-xs text-muted-foreground">
+        {isInfinite
+          ? "0 = never stop (hold indefinitely)"
+          : `= ${currentSeconds} seconds`}
+      </div>
     </div>
   )
 }

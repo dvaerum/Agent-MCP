@@ -31,6 +31,9 @@ import {
   isTierLocked,
   widgetKindFor,
   SettingControl,
+  secondsToParts,
+  partsToSeconds,
+  formatDuration,
   type WidgetKind,
 } from "@/components/dashboard/settings-dashboard"
 
@@ -81,6 +84,7 @@ describe("widgetKindFor — type→widget mapping", () => {
     ["switch", "switch"],
     ["int_days", "int_days"],
     ["int_ms", "int_ms"],
+    ["int_duration", "int_duration"],
     ["url", "text"],
     ["template", "text"],
     ["secret", "secret"],
@@ -127,6 +131,19 @@ describe("SettingControl — each kind renders the right control", () => {
     expect(html).not.toContain("days")
   })
 
+  it("int_duration → a number input + a unit select (minutes/hours/days)", () => {
+    const html = renderControl(
+      entry({ type: "int", widget: "int_duration", default: 604800 }),
+    )
+    expect(html).toMatch(/<input[^>]*type="number"/)
+    expect(html).toMatch(/<select/)
+    expect(html).toContain("minutes")
+    expect(html).toContain("hours")
+    expect(html).toContain("days")
+    // 604800s = 7 days: the amount input seeds to 7 and unit to days.
+    expect(html).toMatch(/value="7"/)
+  })
+
   it("url → a text input", () => {
     const html = renderControl(entry({ type: "string", widget: "url" }))
     expect(html).toMatch(/<input[^>]*type="text"/)
@@ -140,6 +157,33 @@ describe("SettingControl — each kind renders the right control", () => {
   it("secret → a write-only password input (never a text field)", () => {
     const html = renderControl(entry({ type: "secret", widget: "secret" }))
     expect(html).toMatch(/<input[^>]*type="password"/)
+  })
+})
+
+describe("int_duration — seconds ⇄ {amount, unit} conversion", () => {
+  it("secondsToParts picks the largest whole unit", () => {
+    expect(secondsToParts(604800)).toEqual({ amount: 7, unit: "days" })
+    expect(secondsToParts(3600)).toEqual({ amount: 1, unit: "hours" })
+    expect(secondsToParts(120)).toEqual({ amount: 2, unit: "minutes" })
+    // 90 min = 5400s: not a whole hour/day → minutes.
+    expect(secondsToParts(5400)).toEqual({ amount: 90, unit: "minutes" })
+  })
+
+  it("secondsToParts treats 0/negative as 0 days", () => {
+    expect(secondsToParts(0)).toEqual({ amount: 0, unit: "days" })
+    expect(secondsToParts(-5)).toEqual({ amount: 0, unit: "days" })
+  })
+
+  it("partsToSeconds is the inverse", () => {
+    expect(partsToSeconds(7, "days")).toBe(604800)
+    expect(partsToSeconds(2, "hours")).toBe(7200)
+    expect(partsToSeconds(30, "minutes")).toBe(1800)
+    expect(partsToSeconds(-1, "days")).toBe(0)
+  })
+
+  it("formatDuration renders human copy, 0 = never stop", () => {
+    expect(formatDuration(604800)).toBe("7 days")
+    expect(formatDuration(0)).toBe("never stop")
   })
 })
 

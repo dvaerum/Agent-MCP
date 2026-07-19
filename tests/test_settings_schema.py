@@ -44,6 +44,7 @@ GOLDEN_DEFAULTS: dict[str, object] = {
     "config_allow_worker_create_unassigned": True,
     "config_allow_worker_update_own_status": True,
     "config_auto_event_loop_global": True,
+    "config_event_idle_stop_seconds": 604800,
     "config_message_retention_days": 0,
     "config_allow_worker_update_own_profile": True,
     "config_allow_manager_update_own_profile": True,
@@ -79,10 +80,10 @@ def test_golden_table_and_schema_cover_the_same_keys() -> None:
     assert set(GOLDEN_DEFAULTS) == {s.key for s in SETTINGS_SCHEMA}
 
 
-def test_schema_has_sixteen_ordered_specs() -> None:
-    assert len(SETTINGS_SCHEMA) == 16
+def test_schema_has_seventeen_ordered_specs() -> None:
+    assert len(SETTINGS_SCHEMA) == 17
     # Keys are unique.
-    assert len({s.key for s in SETTINGS_SCHEMA}) == 16
+    assert len({s.key for s in SETTINGS_SCHEMA}) == 17
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +109,7 @@ def test_tier_agrees_with_live_aoe_write_gate() -> None:
 
 def test_known_setting_keys_complete() -> None:
     """KNOWN_SETTING_KEYS == the config_* keys the backend actually
-    reads (the 16 in the golden table)."""
+    reads (the 17 in the golden table)."""
     assert KNOWN_SETTING_KEYS == frozenset(GOLDEN_DEFAULTS)
 
 
@@ -149,7 +150,7 @@ async def test_settings_schema_endpoint_confirmed_operator(
         assert r.status_code == 200, r.text
         body = r.json()
         rows = _rows(body)
-        assert len(rows) == 16
+        assert len(rows) == 17
         # Row shape carries every schema field the frontend renders.
         first = rows[0]
         assert set(first) == {
@@ -204,4 +205,4 @@ async def test_settings_schema_caller_sysadmin_true_for_sysadmin() -> None:
     body = json.loads(resp.body)
     assert body["caller"]["sysadmin"] is True
     assert body["caller"]["confirmed_operator"] is True
-    assert len(body["schema"]) == 16
+    assert len(body["schema"]) == 17
