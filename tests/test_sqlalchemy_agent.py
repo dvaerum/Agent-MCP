@@ -89,6 +89,12 @@ async def test_agent_model_columns_match_raw_schema(tmp_path) -> None:
             # tier. Read by @requires_role in Wave 2; column-only in
             # this PR.
             "agent_role",
+            # Agent self-service profiles (migration 0018): free-text
+            # profile + review/change bookkeeping.
+            "profile",
+            "profile_updated_at",
+            "profile_reviewed_at",
+            "profile_updated_by",
         }, f"ORM columns drifted from raw schema: {model_cols}"
 
         from agent_mcp.core.config import get_db_path

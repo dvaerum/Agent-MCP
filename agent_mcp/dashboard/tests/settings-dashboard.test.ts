@@ -9,9 +9,9 @@
  *   1. type→widget mapping — every `widget` (and the `type` fallback)
  *      resolves to the right control kind, and each kind renders the
  *      right DOM control.
- *   2. group ordering — the four groups render in the fixed order
- *      (worker_permissions → event_loop → retention → aoe), empty
- *      groups dropped, schema order preserved within a group.
+ *   2. group ordering — the five groups render in the fixed order
+ *      (worker_permissions → event_loop → agent_profiles → retention →
+ *      aoe), empty groups dropped, schema order preserved within a group.
  *   3. tier-gating — a sysadmin-tier entry renders DISABLED (with the
  *      inline note) when the caller is not a sysadmin, and enabled
  *      when they are (fixes the silent-403 mis-tier).
@@ -144,16 +144,18 @@ describe("SettingControl — each kind renders the right control", () => {
 })
 
 describe("group ordering", () => {
-  it("GROUP_ORDER is the four groups in the specified order", () => {
+  it("GROUP_ORDER is the five groups in the specified order", () => {
     expect(GROUP_ORDER.map((g) => g.group)).toEqual([
       "worker_permissions",
       "event_loop",
+      "agent_profiles",
       "retention",
       "aoe",
     ])
     expect(GROUP_ORDER.map((g) => g.title)).toEqual([
       "Worker permissions",
       "Agent event-loop",
+      "Agent profiles",
       "Message retention",
       "AoE integration",
     ])

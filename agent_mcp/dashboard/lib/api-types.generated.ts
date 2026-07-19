@@ -58,6 +58,10 @@ export interface AgentMirror {
   auto_event_loop?: boolean | null
   last_event_seen_at?: string | null
   agent_role?: string | null
+  profile?: string | null
+  profile_updated_at?: string | null
+  profile_reviewed_at?: string | null
+  profile_updated_by?: string | null
 }
 
 /** Pydantic mirror of the `claude_code_sessions` table. */

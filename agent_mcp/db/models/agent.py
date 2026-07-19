@@ -82,6 +82,29 @@ class Agent(Base):
         default="worker",
         server_default=text("'worker'"),
     )
+    # Agent self-service profiles (migration 0018). A single free-text
+    # ``profile`` (self-authored "what I do / how I work / what to ask
+    # me about") plus the review/change bookkeeping the governance story
+    # rides on. All four are nullable so every existing row is valid
+    # without a backfill:
+    #   * profile             — the prose; NULL/'' = never set.
+    #   * profile_updated_at  — bumped ONLY on content change (drives the
+    #                           peer-broadcast event).
+    #   * profile_reviewed_at — bumped on EVERY review, even a no-op
+    #                           confirm (drives the staleness nudge).
+    #   * profile_updated_by  — agent_id of whoever last changed the
+    #                           content (NULL = system/seed). The
+    #                           peer-broadcast excludes the EDITOR.
+    profile: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    profile_updated_at: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+    )
+    profile_reviewed_at: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+    )
+    profile_updated_by: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+    )
 
     __table_args__ = (
         CheckConstraint(
