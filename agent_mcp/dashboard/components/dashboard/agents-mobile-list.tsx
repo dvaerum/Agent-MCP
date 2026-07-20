@@ -2,7 +2,7 @@
 
 import * as React from "react"
 import {
-  Eye, Pencil, Trash2, RotateCcw, Copy, Zap,
+  Eye, Pencil, Trash2, RotateCcw, Copy, Send,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -124,7 +124,7 @@ export function AgentsMobileList({
                     onClick={(e) => { e.stopPropagation(); onSendDirective(agent.agent_id) }}
                     data-testid={`send-directive-mobile-${agent.agent_id}`}
                   >
-                    <Zap className="h-4 w-4" />
+                    <Send className="h-4 w-4" />
                   </Button>
                   <Button
                     variant="ghost"

@@ -8,7 +8,7 @@
 // /api/agents/{id}/directive poke route.
 
 import React, { useCallback, useEffect, useMemo, useState } from "react"
-import { CalendarClock, Pencil, Trash2, Zap, RefreshCw, Plus } from "lucide-react"
+import { CalendarClock, Pencil, Trash2, Send, RefreshCw, Plus } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -241,7 +241,7 @@ export function SchedulesDashboard() {
               Opens the shared modal with an agent picker. */}
           <Button variant="outline" size="sm" onClick={() => openDirective(null)}
                   data-testid="send-directive-btn">
-            <Zap className="mr-1 h-4 w-4" /> Send directive
+            <Send className="mr-1 h-4 w-4" /> Send directive
           </Button>
           <Button size="sm" onClick={openCreate} data-testid="new-schedule-btn">
             <Plus className="mr-1 h-4 w-4" /> New schedule
@@ -363,7 +363,7 @@ export function SchedulesDashboard() {
                                   onClick={() => openDirective(s.agent_id)}
                                   aria-label={`Poke ${s.agent_id}`}
                                   data-testid={`poke-${s.directive_id}`}>
-                            <Zap className="h-4 w-4" />
+                            <Send className="h-4 w-4" />
                           </Button>
                           <Button variant="ghost" size="sm"
                                   onClick={() => openEdit(s)}
