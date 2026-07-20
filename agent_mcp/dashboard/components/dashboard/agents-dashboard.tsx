@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useCallback } from "react"
 import {
   Users, Clock, AlertCircle, CheckCircle2, Shield, Cpu, Database, Network, Terminal,
-  Search, Plus, Eye, RefreshCw, Copy, RotateCcw, Trash2, Pencil, Zap
+  Search, Plus, Eye, RefreshCw, Copy, RotateCcw, Trash2, Pencil, Send
 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -303,7 +303,7 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, op
               className="h-7 w-7 p-0 text-muted-foreground hover:text-foreground hover:bg-muted"
               data-testid={`send-directive-${agent.agent_id}`}
             >
-              <Zap className="h-3.5 w-3.5" />
+              <Send className="h-3.5 w-3.5" />
             </Button>
           )}
           {agent.agent_id !== 'Admin' && (
@@ -1824,7 +1824,7 @@ const AgentDetailDialog = ({
         <DialogFooter className="px-6 py-4 border-t border-border flex-shrink-0">
           {onSendDirective && agent.status !== 'terminated' && agent.agent_id !== 'Admin' && (
             <Button type="button" variant="outline" size="sm" onClick={onSendDirective}>
-              <Zap className="h-4 w-4 mr-1" />
+              <Send className="h-4 w-4 mr-1" />
               Send directive
             </Button>
           )}
