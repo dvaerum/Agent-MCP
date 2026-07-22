@@ -87,14 +87,16 @@ SETTINGS_SCHEMA: tuple[SettingSpec, ...] = (
     SettingSpec(
         key="config_allow_worker_to_worker",
         type="bool",
-        default=False,
+        default=True,
         tier="operator",
         group="worker_permissions",
         title="Allow worker-to-worker messaging",
         description=(
-            "When off (default), workers can only send messages to the "
-            "admin. When on, workers may use send_agent_message with any "
-            "agent as recipient."
+            "When on (default), workers and managers may use "
+            "send_agent_message to message any agent. When off, direct "
+            "agent-to-agent messaging is disabled for them entirely — the "
+            "send_agent_message tool is hidden and they must use "
+            "request_assistance to escalate to an admin."
         ),
         widget="switch",
     ),
