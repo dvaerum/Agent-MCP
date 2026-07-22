@@ -59,7 +59,16 @@ async def test_get_system_prompt_derives_identity_from_principal(monkeypatch):
         {}, principal=principal
     )
 
-    text = result[0].text
+    # Post-Wave-6 the dispatcher requires a ``ToolResult`` — a bare
+    # ``list[TextContent]`` return is rejected as ``Failed`` (the
+    # auto-wrap bridge was deleted in Wave-6 PR-6). The system-prompt
+    # text now rides on ``Ok.message``.
+    from agent_mcp.core.tool_result import Ok
+
+    assert isinstance(result, Ok), (
+        f"get_system_prompt must return Ok, got {type(result).__name__}"
+    )
+    text = result.message or ""
     assert "worker-7" in text
     assert captured["agent_id"] == "worker-7", (
         "identity must come from principal.agent_id"
@@ -67,3 +76,20 @@ async def test_get_system_prompt_derives_identity_from_principal(monkeypatch):
     assert captured["token"] == "bearer-xyz", (
         "connection-snippet bearer must come from principal.source_token"
     )
+
+
+async def test_get_system_prompt_dispatches_without_error(tmp_path):
+    """End-to-end guard for the live bug: a worker calling
+    ``get_system_prompt`` over the wire must get a successful result —
+    NOT ``isError`` from a ``Failed("...returned unexpected type list;
+    expected ToolResult")``. Reproduces the production journal error (the
+    impl still returned a bare list after Wave-6 PR-6 deleted the
+    list→Ok auto-wrap bridge, so the dispatcher rejected it)."""
+    from tests.harness import mcp_session
+
+    async with mcp_session(tmp_path) as admin:
+        worker = await admin.create_worker("worker-gsp")
+        result = await worker.assert_tool_succeeds("get_system_prompt", {})
+
+    text = "".join(getattr(c, "text", "") or "" for c in result)
+    assert "worker-gsp" in text, f"missing agent id in prompt: {text!r}"

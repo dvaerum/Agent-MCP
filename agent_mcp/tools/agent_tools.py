@@ -1,12 +1,11 @@
 # Agent-MCP/mcp_template/mcp_server_src/tools/agent_tools.py
-from typing import List, Dict, Any, Optional
-
-import mcp.types as mcp_types # Assuming this is your mcp.types path
+from typing import Dict, Any, Optional
 
 from .registry import register_tool
 from ..core.config import logger
 from ..core.authorize import requires_capability
 from ..core.principal import Principal
+from ..core.tool_result import Ok, ToolResult
 from ..utils.audit_utils import log_audit
 from ..utils.project_utils import generate_system_prompt # The core logic
 
@@ -23,7 +22,7 @@ async def get_system_prompt_tool_impl(
     arguments: Dict[str, Any],
     *,
     principal: Optional[Principal] = None,
-) -> List[mcp_types.TextContent]:
+) -> ToolResult:
     # Identity + connection-snippet bearer come from the threaded
     # Principal: ``principal.agent_id`` is the caller's id and
     # ``principal.source_token`` is the caller's own bearer. The
@@ -45,10 +44,17 @@ async def get_system_prompt_tool_impl(
     log_audit(requesting_agent_id, "get_system_prompt", {}) # main.py:1375
     
     logger.info(f"Provided system prompt for agent '{requesting_agent_id}'.")
-    return [mcp_types.TextContent(
-        type="text",
-        text=f"System Prompt for Agent '{requesting_agent_id}':\n\n{system_prompt_str}"
-    )] # main.py:1377-1381
+    # Wave-6 typed result: every tool impl must return a ``ToolResult``.
+    # Post-PR-6 the ``list[TextContent]`` auto-wrap bridge in the
+    # dispatcher is gone — a bare list return is rejected as ``Failed``
+    # ("unexpected type list"). ``Ok(message=...)`` renders to the same
+    # single TextContent block on the MCP wire (render_as_text_content).
+    return Ok(
+        message=(
+            f"System Prompt for Agent '{requesting_agent_id}':"
+            f"\n\n{system_prompt_str}"
+        )
+    )
 
 
 # --- Register agent-specific tools ---
