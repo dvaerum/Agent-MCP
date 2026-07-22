@@ -246,7 +246,7 @@ def test_no_prompt_teaches_admin_agent_concept() -> None:
 
 
 def test_wake_loop_prompt_uses_real_tool_names() -> None:
-    """The `agent-mcp-enter-event-loop` prompt must reference tools
+    """The `event-loop` prompt must reference tools
     that actually exist in the registry.
 
     `view_messages` was never registered; the real tool is
@@ -262,7 +262,7 @@ def test_wake_loop_prompt_uses_real_tool_names() -> None:
     from agent_mcp.prompts import get_prompt
     from agent_mcp.app.event_loop_instructions import WAKE_LOOP_INSTRUCTIONS
 
-    entry = get_prompt("agent-mcp-enter-event-loop")
+    entry = get_prompt("event-loop")
     assert entry is not None, "wake-loop catalog entry vanished"
     template = entry["template"]
 

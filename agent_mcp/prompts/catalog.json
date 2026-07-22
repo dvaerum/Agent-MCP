@@ -320,9 +320,9 @@
       ]
     },
     {
-      "id": "agent-mcp-enter-event-loop",
-      "title": "Enter Agent Event Loop",
-      "description": "Instructs an agent to enter the wake-loop: fetch missed events, then long-poll for new ones (mirrors the serverInfo.instructions injection).",
+      "id": "event-loop",
+      "title": "Start the Event Loop",
+      "description": "Tell the agent to start monitoring the event loop: fetch missed events, then long-poll (wait_for_events) for new messages, tasks, and directives — its default idle behavior.",
       "category": "coordination",
       "template": "AGENT WAKE LOOP: On session start AND after recovery from any wait_for_events error: first call fetch_events_since(your_last_cursor) to drain anything missed since you were last connected. Handle each returned event (call get_agent_messages or view_tasks to fetch full content for skinny events). Then enter a loop where you call wait_for_events(); when it returns events, handle each, then call wait_for_events() again. If you receive a {type: \"stop_listening\"} event, exit the loop and wait for human input. This is your default idle behavior; do this whenever you have no other work in progress.",
       "variables": [],

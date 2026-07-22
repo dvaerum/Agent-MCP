@@ -4,7 +4,7 @@ On 2026-06-17 a Firefox-MCP click-through on the Prompt Book tab
 surfaced ``TypeError: s.tags is undefined`` inside
 ``fetchPromptsCatalog``'s consumer code. Root cause: one of the 12
 shipped prompts in ``agent_mcp/prompts/catalog.json``
-(``agent-mcp-enter-event-loop``) lacked the ``tags`` key entirely
+(``event-loop``) lacked the ``tags`` key entirely
 while the dashboard read-sites dereferenced ``prompt.tags`` directly.
 
 The fix is three layers of defense:

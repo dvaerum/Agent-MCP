@@ -149,7 +149,7 @@ def _build_registry_from_catalog() -> None:
     """Populate `prompt_registry` from the active catalog. Idempotent —
     safe to call after `_reload_catalog_for_tests` swaps the source.
 
-    Special case: the ``agent-mcp-enter-event-loop`` prompt's template
+    Special case: the ``event-loop`` prompt's template
     is sourced from the ``WAKE_LOOP_INSTRUCTIONS`` constant in
     ``agent_mcp.app.event_loop_instructions`` rather than the catalog's
     serialised copy. This keeps the prompt and the ``serverInfo.instructions``
@@ -174,7 +174,7 @@ def _build_registry_from_catalog() -> None:
             visibility = "admin"
         template = raw.get("template", "")
         if (
-            raw.get("id") == "agent-mcp-enter-event-loop"
+            raw.get("id") == "event-loop"
             and _wake_loop_text is not None
         ):
             template = _wake_loop_text

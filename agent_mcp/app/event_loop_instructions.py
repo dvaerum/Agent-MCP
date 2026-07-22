@@ -11,7 +11,7 @@ Two consumers read this constant verbatim:
    ``fetch_events_since`` to drain its backlog, then enters the
    long-poll loop.
 
-2. The MCP Prompt Book entry ``agent-mcp-enter-event-loop`` (registered
+2. The MCP Prompt Book entry ``event-loop`` (registered
    via ``agent_mcp/prompts/catalog.json``) returns the same text as a
    prompt template. Operators / clients who want the wake-loop behavior
    without enabling the global toggle can invoke the prompt manually.

@@ -159,7 +159,7 @@ def test_byte_identical_wake_loop_output() -> None:
     """Regression: the wake-loop contributor must return exactly
     ``WAKE_LOOP_INSTRUCTIONS`` (no leading/trailing modification)
     when the gate passes. The text is also surfaced via the
-    ``agent-mcp-enter-event-loop`` MCP prompt and through the
+    ``event-loop`` MCP prompt and through the
     initialize injection; both paths must serve the same bytes.
 
     We force the gate ON by monkeypatching the eligibility check; the
