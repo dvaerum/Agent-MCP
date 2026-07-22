@@ -36,11 +36,13 @@ def test_server_command_exists_and_keeps_legacy_options() -> None:
     # (and any user shell aliases) will silently lose flags.
     # retire-system-token Wave 3 dropped the --system-token-* family
     # (and the legacy --admin-token-* aliases) — they're no longer
-    # required surface.
+    # required surface. The dead `--git` worktree flag was likewise
+    # removed (coordinator-model cleanup): it fed the deleted spawn/
+    # worktree machinery and was never read.
     option_names = {opt.name for opt in server_cmd.params}
     for required in (
         "port", "uds", "transport", "project_dir",
-        "debug", "no_tui", "advanced", "git", "no_index",
+        "debug", "no_tui", "advanced", "no_index",
     ):
         assert required in option_names, f"server is missing --{required.replace('_', '-')}"
 

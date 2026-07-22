@@ -37,9 +37,9 @@ import { AgentsMobileList } from "@/components/dashboard/agents-mobile-list"
 // add-project-modal.tsx. Used for the RegisterAgentModal live hint so
 // the operator sees the format problem before submitting instead of
 // eating a 400 from the repo-seam validator.
-// '@' allowed in the interior (e.g. worker@host), not at start/end. Mirrors
-// the server-side `_AGENT_ID_RE` in agent_repository.py.
-const AGENT_ID_RE = /^[a-z](?:[a-z0-9@-]*[a-z0-9])?$/
+// '@' and '_' allowed in the interior (e.g. worker@host, pikvm_mcp_server@host),
+// not at start/end. Mirrors the server-side `_AGENT_ID_RE` in agent_repository.py.
+const AGENT_ID_RE = /^[a-z](?:[a-z0-9@_-]*[a-z0-9])?$/
 
 // AoE session id: 16 lowercase hex chars. Backend re-validates and
 // 400s bad input; this drives the live hint + submit-disable.

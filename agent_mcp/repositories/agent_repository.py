@@ -163,12 +163,13 @@ def _publish(addressee: str, event: str, payload: Dict[str, Any]) -> None:
 # (the first branch requires at least two chars: a leading lowercase
 # letter and a trailing lowercase letter/digit).
 #
-# `@` is permitted in the INTERIOR only (e.g. `worker@host`), never at the
-# start or end. It stays URL-safe: the dashboard `encodeURIComponent`s the id
-# into every REST path (`%40`) and Starlette decodes the `{agent_id}` param
-# back; the resource URIs are parsed by string-slice (not a URL parser), so
-# `@` is never read as userinfo.
-_AGENT_ID_RE = re.compile(r"^[a-z][a-z0-9@-]*[a-z0-9]$|^[a-z]$")
+# `@` and `_` are permitted in the INTERIOR only (e.g. `worker@host`,
+# `pikvm_mcp_server@host`), never at the start or end. Both stay URL-safe: `_`
+# is an unreserved URL char (needs no encoding); `@` is encodeURIComponent'd to
+# `%40` by the dashboard and decoded back by Starlette's `{agent_id}` param. The
+# resource URIs are parsed by string-slice (not a URL parser), so neither is
+# ever read as userinfo.
+_AGENT_ID_RE = re.compile(r"^[a-z][a-z0-9@_-]*[a-z0-9]$|^[a-z]$")
 
 # Reserved agent_id prefixes. Several authorization gates privilege an
 # agent purely by the agent_id STRING rather than by role — e.g.

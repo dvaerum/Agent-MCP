@@ -133,7 +133,7 @@ async def test_inbox_read_returns_event_envelope(tmp_path: Path) -> None:
 
 
 async def test_inbox_read_resolves_at_sign_agent_id(tmp_path: Path) -> None:
-    """An agent whose id contains '@' (e.g. ``worker@host``) resolves its own
+    """An agent whose id contains '@' (e.g. ``pikvm_mcp_server@host``) resolves its own
     inbox resource AND receives its messages through it. The '@' must survive
     ``Url()`` serialization AND the server's URI parse
     (``resolve_agent_id_for_uri``) as a literal — never mangled into ``%40`` —
@@ -146,17 +146,17 @@ async def test_inbox_read_resolves_at_sign_agent_id(tmp_path: Path) -> None:
     )
 
     async with mcp_session(tmp_path) as admin:
-        worker = await admin.create_worker("worker@host")
+        worker = await admin.create_worker("pikvm_mcp_server@host")
         with with_bearer(admin.admin_token):
             await send_agent_message_tool_impl(
                 {
                     "token": admin.admin_token,
-                    "recipient_id": "worker@host",
+                    "recipient_id": "pikvm_mcp_server@host",
                     "message": "in your inbox",
                     "deliver_method": "store",
                 }
             )
-        result = await _read_resource(worker, "agent-mcp://inbox/worker@host")
+        result = await _read_resource(worker, "agent-mcp://inbox/pikvm_mcp_server@host")
         payload = json.loads(_first_text(result.contents))
         assert "events" in payload and "next_cursor" in payload, (
             f"@-id inbox failed to resolve: {payload}"
