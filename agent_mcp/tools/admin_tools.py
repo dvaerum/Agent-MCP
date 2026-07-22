@@ -185,13 +185,11 @@ def _build_mcp_config_snippet(
     their user's claude config.
 
     Shape (matches the router's ``_mcp_json_for`` helper at
-    ``agent_mcp/router/app.py``, with the addition of a per-project
-    server key so multiple Agent-MCP deployments can coexist in one
-    ``.mcp.json``)::
+    ``agent_mcp/router/app.py``)::
 
         {
           "mcpServers": {
-            "agent-mcp-<project>": {
+            "agent-mcp": {
               "type": "http",
               "url": "<host>/agent-mcp/mcp/<project>",
               "headers": {"Authorization": "Bearer <token>"}
@@ -199,19 +197,26 @@ def _build_mcp_config_snippet(
           }
         }
 
-    Standalone (no router / single-tenant) deployments where the
-    backend is reached directly without a project segment fall back
-    to ``agent-mcp`` as the server key and an URL without the
-    project component.
+    The server key is the fixed string ``agent-mcp`` to match the
+    user's ``.claude.json`` convention, which makes the resulting
+    slash-command prefix ``agent-mcp:`` (not the ugly
+    ``agent-mcp-<project>:`` a namespaced key would produce). A
+    single fixed key is safe because ``.mcp.json`` entries are
+    scoped per cwd/project, so two Agent-MCP deployments used from
+    different project directories don't collide in practice — the
+    project scoping lives in the URL, not the key.
+
+    Standalone (no router / single-tenant) deployments reach the
+    backend directly without a project segment, so the URL drops the
+    ``/agent-mcp/.../<project>`` path; the key stays ``agent-mcp``.
 
     The result is pretty-printed JSON (indent=2) so the modal can
     drop it straight into a ``<pre>`` block.
     """
+    server_key = "agent-mcp"
     if project:
-        server_key = f"agent-mcp-{project}"
         url = f"{host}/agent-mcp/mcp/{project}"
     else:
-        server_key = "agent-mcp"
         url = f"{host}/mcp"
     snippet = {
         "mcpServers": {

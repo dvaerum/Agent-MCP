@@ -110,10 +110,13 @@ async def test_register_agent_returns_token_and_snippet(tmp_path) -> None:
     assert isinstance(snippet_text, str)
 
     # The snippet must parse as valid JSON and follow the documented
-    # shape: {"mcpServers": {"agent-mcp-<project>": {type, url, headers}}}.
+    # shape: {"mcpServers": {"agent-mcp": {type, url, headers}}}. The
+    # server key is the fixed string ``agent-mcp`` (matches the user's
+    # .claude.json convention → slash-command prefix ``agent-mcp:``);
+    # the project scoping lives in the URL, not the key.
     snippet = json.loads(snippet_text)
     assert "mcpServers" in snippet
-    server_key = "agent-mcp-demo-project"
+    server_key = "agent-mcp"
     assert server_key in snippet["mcpServers"]
     entry = snippet["mcpServers"][server_key]
     assert entry["type"] == "http"
@@ -140,9 +143,9 @@ async def test_register_agent_falls_back_to_principal_project_name(
 
     assert isinstance(result, Ok)
     snippet = json.loads(result.data["mcp_snippet"])
-    assert "agent-mcp-from-principal" in snippet["mcpServers"]
+    assert "agent-mcp" in snippet["mcpServers"]
     assert (
-        snippet["mcpServers"]["agent-mcp-from-principal"]["url"]
+        snippet["mcpServers"]["agent-mcp"]["url"]
         == "https://h.x/agent-mcp/mcp/from-principal"
     )
 
@@ -335,6 +338,6 @@ async def test_register_agent_strips_trailing_slash_from_host(tmp_path) -> None:
     assert isinstance(result, Ok)
     snippet = json.loads(result.data["mcp_snippet"])
     assert (
-        snippet["mcpServers"]["agent-mcp-p"]["url"]
+        snippet["mcpServers"]["agent-mcp"]["url"]
         == "https://h.x/agent-mcp/mcp/p"
     )

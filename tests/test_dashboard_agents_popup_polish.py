@@ -336,21 +336,24 @@ def test_view_dialog_persists_active_tab_in_localstorage() -> None:
     )
 
 
-def test_server_name_includes_agent_id() -> None:
-    """The snippet server name must be ``agent-mcp-<agent_id>`` (not
-    bare ``agent-mcp``) so multi-agent identity setups don't collide."""
+def test_server_name_is_fixed_agent_mcp() -> None:
+    """The snippet server name must be the fixed string ``agent-mcp``
+    (NOT namespaced ``agent-mcp-${agent.agent_id}``). This matches the
+    user's .claude.json convention so the slash-command prefix is
+    ``agent-mcp:``; a single fixed key is fine because .mcp.json entries
+    are scoped per cwd/project. The regex guards against a revert to the
+    ``agent-mcp-${...}`` interpolated form."""
     src = _read_agents()
-    body_block = re.search(
-        r"AgentDetailDialog[\s\S]*?</DialogFooter>",
-        src,
+    # buildSnippet owns the server-name literal; assert it binds `name`
+    # to the fixed 'agent-mcp' string.
+    assert re.search(r"const\s+name\s*=\s*'agent-mcp'", src), (
+        "buildSnippet must set `const name = 'agent-mcp'` (the fixed "
+        "server key), matching the user's .claude.json convention"
     )
-    assert body_block, "could not locate AgentDetailDialog body"
-    body = body_block.group(0)
-    # Either a template literal `agent-mcp-${agent.agent_id}` or string
-    # concat. Match the prefix + interpolation marker.
-    assert re.search(r"agent-mcp-\$\{[^}]*agent[^}]*\.agent_id", body), (
-        "snippets must use server name `agent-mcp-${agent.agent_id}` "
-        "(not bare `agent-mcp`) to support multi-agent identity setups"
+    # And guard against a revert to the interpolated per-agent_id form.
+    assert not re.search(r"agent-mcp-\$\{[^}]*agent[^}]*\.agent_id", src), (
+        "snippet server name must be the fixed `agent-mcp`, not the "
+        "namespaced `agent-mcp-${agent.agent_id}` form"
     )
 
 
@@ -397,4 +400,27 @@ def test_snippet_url_uses_mcp_endpoint() -> None:
     body = body_block.group(0)
     assert "/mcp" in body, (
         "snippet URL must point at the /mcp Streamable HTTP endpoint"
+    )
+
+
+def test_register_modal_snippet_container_has_min_w_0() -> None:
+    """RegisterAgentModal pane-2 wraps the .mcp.json snippet in a grid/
+    flex child. Without ``min-w-0`` that child inherits ``min-width:auto``
+    and refuses to shrink below the <pre>'s min-content (the long
+    unbreakable URL), so the dialog balloons past ``sm:!max-w-lg`` and
+    the snippet bleeds over the agents table. Lock ``min-w-0`` on the
+    snippet container so ``overflow-x-auto`` engages instead."""
+    src = _read_agents()
+    # The pane-2 block renders {result.mcp_snippet} inside a <pre>. Grab
+    # the enclosing snippet <div> (the one right before that <pre>) and
+    # assert it carries min-w-0.
+    block = re.search(
+        r"<div className=\"min-w-0\">\s*<div className=\"flex items-center"
+        r"[\s\S]*?\{result\.mcp_snippet\}",
+        src,
+    )
+    assert block, (
+        "RegisterAgentModal snippet container must be a <div "
+        'className="min-w-0"> wrapping the {result.mcp_snippet} <pre> '
+        "so the dialog stays at sm:!max-w-lg"
     )
