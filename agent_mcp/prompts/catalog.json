@@ -224,7 +224,7 @@
       "title": "Coordinate Multiple Agents",
       "description": "Coordinate work between multiple agents on related tasks",
       "category": "coordination",
-      "template": "Coordinate the following agents to work on {{PROJECT_PHASE}}:\n\nAgents involved:\n{{AGENT_LIST}}\n\nRequirements:\n- {{REQUIREMENT_1}}\n- {{REQUIREMENT_2}}\n- {{REQUIREMENT_3}}\n\nPlease ensure proper communication and dependency management between agents.",
+      "template": "Coordinate the following agents to work on {{PROJECT_PHASE}}:\n\nAgents involved:\n{{AGENT_LIST}}\n\nRequirements:\n- {{REQUIREMENT_1}}\n- {{REQUIREMENT_2}}\n- {{REQUIREMENT_3}}\n\nPlease ensure proper communication and dependency management between agents.\n\nTo message a teammate, use the agent-mcp send_agent_message tool with recipient_id set to the teammate's agent_id exactly as listed (e.g. pikvm-mcp-server@nixos-developer-system). Do NOT use Claude Code's native SendMessage tool — it only reaches native Task-spawned subagents in your own session, not the MCP teammates coordinated through this server. If an agent_id is shown with a leading @ (an @-mention prefix), drop the @ — it is not part of the agent_id.",
       "variables": [
         {
           "name": "PROJECT_PHASE",

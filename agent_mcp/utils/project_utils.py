@@ -188,6 +188,43 @@ Agent Type: {agent_type}
         "listing to discover the full set of tools available to you."
     )
 
+    # Manager-only coordination block.
+    #
+    # A manager is a Claude Code process connected via MCP that coordinates
+    # worker teammates (other MCP-connected Claude Code processes). Two
+    # things bit a live manager and belong in its system prompt:
+    #
+    # 1. Messaging teammates. Claude Code's NATIVE ``SendMessage`` tool only
+    #    reaches native Task-spawned subagents in the same session — it does
+    #    NOT reach MCP teammates. A manager that used it saw every send fail
+    #    silently. The correct tool is the agent-mcp ``send_agent_message``
+    #    MCP tool, addressed by ``recipient_id`` = the teammate's agent_id.
+    # 2. Working folder. The manager's own repo/checkout is its personal
+    #    space for the notes / progress / status it keeps while coordinating.
+    manager_note = ""
+    if agent_role == "manager":
+        manager_note = (
+            "\n\n"
+            "**Coordinating teammates (messaging):** To message another "
+            "agent, use the agent-mcp `send_agent_message` tool with "
+            "`recipient_id` set to the teammate's agent_id exactly as listed "
+            "(for example `pikvm-mcp-server@nixos-developer-system`). Do NOT "
+            "use Claude Code's native `SendMessage` tool to reach teammates "
+            "— that only reaches native Task-spawned subagents inside your "
+            "own session, not the MCP teammates coordinated through this "
+            "server, so those sends silently fail. If an agent_id is shown "
+            "with a leading `@` (an @-mention prefix in the UI), drop the "
+            "`@` — it is not part of the agent_id."
+            "\n\n"
+            "**Your working folder:** Your working directory (above) is your "
+            "own repo/checkout — your personal space for coordination. Keep "
+            "your own notes, progress reports, status logs, and scratch work "
+            "there as you track the work across your teammates. It is where "
+            "you record and follow your own progress."
+        )
+
     # Construct full prompt (Original main.py line 1238)
-    full_prompt = base_prompt + agent_details_str + "\n" + tool_access_note
+    full_prompt = (
+        base_prompt + agent_details_str + "\n" + tool_access_note + manager_note
+    )
     return full_prompt
