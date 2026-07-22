@@ -2049,12 +2049,41 @@ async def wait_for_events_tool_impl(
             requested = parsed
     timeout = base_hold if requested is None else min(base_hold, requested)
 
+    # Adaptive hold ladder — only for heartbeat-capable clients that sent a
+    # progressToken (the connections we can safely keep parked; without
+    # heartbeats a long silent hold would let the client's own idle watchdog
+    # kill it). When such an agent repeatedly caps itself with a short
+    # timeout_seconds and gets only empty returns, ADVISE it, escalate, then
+    # OVERRIDE (ignore the cap, park it). A one-off long monitor never trips
+    # this — only a run of short empty polls does. See core/hold_ladder.py.
+    from ..core import hold_ladder
+    _ladder_eligible = (
+        strategy.heartbeat
+        and progress_token is not None
+        and requested is not None
+        and requested < base_hold
+    )
+    _ladder_advisory: Optional[str] = None
+    _ladder_override = False
+    _ladder_phase = "n/a"
+    if _ladder_eligible:
+        _decision = hold_ladder.decide(hold_ladder.get_count(agent_id))
+        _ladder_phase = _decision.phase
+        _ladder_advisory = _decision.advisory
+        _ladder_override = _decision.override_hold
+        if _ladder_override:
+            timeout = base_hold  # ignore the agent's short cap; park it
+    else:
+        # Not self-capping (or the client can't be safely parked) — fine
+        # behaviour, so reset the ladder.
+        hold_ladder.reset(agent_id)
+
     _poll_start = asyncio.get_event_loop().time()
     _evlog(
         "poll START agent=%s client=%r heartbeat=%s hold_cap=%s "
-        "progress_token=%s requested=%s hold_budget=%ss",
+        "progress_token=%s requested=%s hold_budget=%ss ladder=%s",
         agent_id, _client_name, strategy.heartbeat, strategy.hold_cap,
-        progress_token is not None, requested, timeout,
+        progress_token is not None, requested, timeout, _ladder_phase,
     )
 
     # Agent self-service profiles (PR3): compute the profile-review section
@@ -2094,6 +2123,7 @@ async def wait_for_events_tool_impl(
                 agent_id, len(events),
                 [e.get("event_type") for e in events],
             )
+            hold_ladder.reset(agent_id)  # a real event resets the ladder
             env = _envelope(events, since, profile_review=review_section)
             if cursor_value:
                 _write_last_event_seen_at(agent_id, cursor_value)
@@ -2193,6 +2223,7 @@ async def wait_for_events_tool_impl(
                     agent_id, since, fire_scheduled=True,
                 )
                 if events:
+                    hold_ladder.reset(agent_id)  # real event resets the ladder
                     env = _envelope(
                         events, since, profile_review=review_section
                     )
@@ -2208,7 +2239,24 @@ async def wait_for_events_tool_impl(
                     "= NOT parking (no-heartbeat path); a long hold = parking.",
                     agent_id, now_mono - _poll_start, heartbeat_enabled,
                 )
-                return _envelope([], since, profile_review=review_section)
+                # Adaptive hold ladder: an eligible short empty poll climbs the
+                # run counter (skip when we already overrode — that empty is a
+                # long park, not a wasteful short poll) and rides the escalating
+                # advisory back to the agent.
+                extra_events: List[Dict[str, Any]] = []
+                if _ladder_eligible and not _ladder_override:
+                    _n = hold_ladder.note_empty_short_poll(agent_id)
+                    _evlog(
+                        "ladder agent=%s empty-short-poll run=%d phase=%s",
+                        agent_id, _n, _ladder_phase,
+                    )
+                    if _ladder_advisory:
+                        extra_events.append(
+                            hold_ladder.advisory_event(_ladder_advisory)
+                        )
+                return _envelope(
+                    extra_events, since, profile_review=review_section
+                )
             slice_timeout = min(_FLAG_RECHECK_INTERVAL_SECONDS, remaining)
             if idle_deadline is not None:
                 # Don't overshoot the idle-stop by more than a slice.
@@ -2267,6 +2315,7 @@ async def wait_for_events_tool_impl(
                         [e.get("event_type") for e in events],
                         asyncio.get_event_loop().time() - _poll_start,
                     )
+                    hold_ladder.reset(agent_id)  # a real event resets the ladder
                     env = _envelope(events, since, profile_review=review_section)
                     if cursor_value:
                         _write_last_event_seen_at(agent_id, cursor_value)
