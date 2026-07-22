@@ -156,13 +156,19 @@ def _publish(addressee: str, event: str, payload: Dict[str, Any]) -> None:
 # client-side pattern verbatim. VM e2e on 2026-06-16 surfaced that
 # `create_agent` accepted garbage IDs (`"InvalidName!@#"`) because the
 # server enforced nothing while the dashboard form pinned this regex.
-# Downstream consumers (URL routing, tmux session names, git worktree
-# paths) assume slug shape; non-slug IDs are a poisoning vector.
+# agent_id is a DB key + a URL segment (`/api/agents/<id>/…` and the
+# `agent-mcp://inbox/<id>` resource URIs); keeping it URL-safe is the point.
 #
 # The two-branch alternation `|^[a-z]$` handles single-character names
 # (the first branch requires at least two chars: a leading lowercase
 # letter and a trailing lowercase letter/digit).
-_AGENT_ID_RE = re.compile(r"^[a-z][a-z0-9-]*[a-z0-9]$|^[a-z]$")
+#
+# `@` is permitted in the INTERIOR only (e.g. `worker@host`), never at the
+# start or end. It stays URL-safe: the dashboard `encodeURIComponent`s the id
+# into every REST path (`%40`) and Starlette decodes the `{agent_id}` param
+# back; the resource URIs are parsed by string-slice (not a URL parser), so
+# `@` is never read as userinfo.
+_AGENT_ID_RE = re.compile(r"^[a-z][a-z0-9@-]*[a-z0-9]$|^[a-z]$")
 
 # Reserved agent_id prefixes. Several authorization gates privilege an
 # agent purely by the agent_id STRING rather than by role — e.g.

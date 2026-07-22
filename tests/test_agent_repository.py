@@ -549,6 +549,9 @@ _VALID_AGENT_IDS = [
     "a-b-c",
     "z9",
     "abc",
+    "worker@team",      # '@' allowed in the interior (e.g. worker@host)
+    "a@b",              # minimal '@' case
+    "backend-dev@pikvm",
 ]
 
 _INVALID_AGENT_IDS = [
@@ -562,6 +565,8 @@ _INVALID_AGENT_IDS = [
     "UPPERCASE",
     "agent_with_underscore",
     "agent.with.dots",
+    "@starts-with-at",  # '@' allowed only in the interior, not at the start
+    "ends-with-at@",    # ...nor at the end
 ]
 
 

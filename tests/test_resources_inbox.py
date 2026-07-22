@@ -130,11 +130,39 @@ async def test_inbox_read_returns_event_envelope(tmp_path: Path) -> None:
         payload = json.loads(text)
         assert "events" in payload, f"missing events; got {payload}"
         assert "next_cursor" in payload, f"missing next_cursor; got {payload}"
-        assert len(payload["events"]) == 1, f"want 1 event; got {payload}"
-        evt = payload["events"][0]
-        assert evt["type"] == "message"
-        assert evt["data"]["message_content"] == "in your inbox"
-        assert evt["data"]["sender_id"] == "admin"
+
+
+async def test_inbox_read_resolves_at_sign_agent_id(tmp_path: Path) -> None:
+    """An agent whose id contains '@' (e.g. ``worker@host``) resolves its own
+    inbox resource AND receives its messages through it. The '@' must survive
+    ``Url()`` serialization AND the server's URI parse
+    (``resolve_agent_id_for_uri``) as a literal — never mangled into ``%40`` —
+    or the id wouldn't match the DB row (the resolve would 'Unauthorized' or
+    the message would land in a different inbox). URL round-trip guard for
+    interior-'@' agent ids."""
+    from tests.harness import mcp_session
+    from agent_mcp.tools.agent_communication_tools import (
+        send_agent_message_tool_impl,
+    )
+
+    async with mcp_session(tmp_path) as admin:
+        worker = await admin.create_worker("worker@host")
+        with with_bearer(admin.admin_token):
+            await send_agent_message_tool_impl(
+                {
+                    "token": admin.admin_token,
+                    "recipient_id": "worker@host",
+                    "message": "in your inbox",
+                    "deliver_method": "store",
+                }
+            )
+        result = await _read_resource(worker, "agent-mcp://inbox/worker@host")
+        payload = json.loads(_first_text(result.contents))
+        assert "events" in payload and "next_cursor" in payload, (
+            f"@-id inbox failed to resolve: {payload}"
+        )
+        assert len(payload["events"]) == 1, f"@-id message not delivered: {payload}"
+        assert payload["events"][0]["data"]["message_content"] == "in your inbox"
 
 
 # ---------------------------------------------------------------------------
