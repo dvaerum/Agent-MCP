@@ -33,13 +33,20 @@ from tests.harness import mcp_session
 
 
 # ---------------------------------------------------------------------------
-# Golden defaults — a hardcoded, independent copy of every default the
-# backend resolved before the registry existed. This is the
-# no-behaviour-change proof: any drift fails here.
+# Golden defaults — a hardcoded, independent copy of the default the
+# backend resolves for every registered key. Originally a
+# no-behaviour-change proof (each value the pre-registry backend
+# resolved); it now also pins the DELIBERATE post-registry default
+# flips. Any UNINTENDED drift still fails here.
+#
+# `config_allow_worker_to_worker` was intentionally flipped False→True
+# (feat(settings): default-enable config_allow_worker_to_worker) so the
+# coordinator model messages out of the box; update this golden value in
+# lockstep with any future intentional flip.
 # ---------------------------------------------------------------------------
 
 GOLDEN_DEFAULTS: dict[str, object] = {
-    "config_allow_worker_to_worker": False,
+    "config_allow_worker_to_worker": True,
     "config_allow_worker_self_assign": True,
     "config_allow_worker_create_unassigned": True,
     "config_allow_worker_update_own_status": True,

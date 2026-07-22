@@ -46,14 +46,17 @@ async def test_admin_to_worker_still_works(tmp_path) -> None:
         assert "denied" not in text.lower(), text
 
 
-async def test_worker_to_worker_default_denied(tmp_path) -> None:
-    """With no toggle set, worker→worker denied (preserves upstream)."""
+async def test_worker_to_worker_denied_when_toggle_off(tmp_path) -> None:
+    """With the toggle EXPLICITLY off, worker→worker is denied (the
+    default is now True, so this pins the explicit-off path)."""
     async with mcp_session(tmp_path) as admin:
+        admin.set_toggle("config_allow_worker_to_worker", "false")
+
         await admin.create_worker("alice")
         bob = await admin.create_worker("bob")
 
-        # NB: with the default toggle (deny), the worker doesn't even
-        # see `send_agent_message` in tools/list (PR #55). The framework
+        # NB: with the toggle off, the worker doesn't even see
+        # `send_agent_message` in tools/list (PR #55). The framework
         # handler still dispatches the call — the policy check inside
         # the impl is what produces the denial text.
         result = await bob.call(
@@ -68,6 +71,28 @@ async def test_worker_to_worker_default_denied(tmp_path) -> None:
         assert "denied" in text.lower() or "not permitted" in text.lower(), (
             f"expected denial; got: {text}"
         )
+
+
+async def test_worker_to_worker_allowed_by_default(tmp_path) -> None:
+    """With NO toggle set, worker→worker is allowed — the default for
+    config_allow_worker_to_worker is now True."""
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        bob = await admin.create_worker("bob")
+
+        result = await bob.assert_tool_succeeds(
+            "send_agent_message",
+            {
+                "recipient_id": "alice",
+                "message": "hi alice",
+                "deliver_method": "store",
+            },
+        )
+        text = result[0].text
+        assert (
+            "denied" not in text.lower()
+            and "not permitted" not in text.lower()
+        ), f"expected allow by default; got: {text}"
 
 
 async def test_worker_to_worker_allowed_when_toggle_on(tmp_path) -> None:

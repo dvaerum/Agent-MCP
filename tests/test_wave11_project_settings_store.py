@@ -962,17 +962,23 @@ async def test_worker_to_worker_gate_reads_new_store_live(
     tmp_path: Path,
 ) -> None:
     """End-to-end: flipping the toggle in the NEW store changes the live
-    worker→worker send gate (no restart)."""
+    worker→worker send gate (no restart).
+
+    The default is now True, so the OFF leg is seeded explicitly — the
+    test still proves the gate re-reads the project_settings store live
+    across a real False→True flip."""
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("w2w-alice")
         bob = await admin.create_worker("w2w-bob")
+
+        _seed_setting("config_allow_worker_to_worker", False)
 
         denied = await alice.call(
             "send_agent_message",
             {"recipient_id": bob.agent_id, "message": "hi bob"},
         )
         assert alice._last_is_error or "worker" in _text(denied).lower(), (
-            f"default OFF: worker→worker send must be denied; got "
+            f"explicit OFF: worker→worker send must be denied; got "
             f"{_text(denied)}"
         )
 

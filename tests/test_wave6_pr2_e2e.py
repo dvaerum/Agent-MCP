@@ -134,18 +134,20 @@ async def test_send_agent_message_invalid_args_returns_invalid(tmp_path) -> None
     assert result.field == "message"
 
 
-async def test_send_agent_message_worker_denied_without_toggle(
+async def test_send_agent_message_worker_denied_when_toggle_off(
     tmp_path,
 ) -> None:
     """A worker bearer with the ``config_allow_worker_to_worker``
-    toggle off receives ``PermissionDenied`` from the inline gate
-    (formerly the ``@requires_policy`` decorator).
+    toggle EXPLICITLY off receives ``PermissionDenied`` from the inline
+    gate (formerly the ``@requires_policy`` decorator). The default is
+    now True, so the off state is set explicitly here.
     """
     from agent_mcp.tools.agent_communication_tools import (
         send_agent_message_tool_impl,
     )
 
     async with mcp_session(tmp_path) as admin:
+        admin.set_toggle("config_allow_worker_to_worker", "false")
         await admin.create_worker("alice")
         bob = await admin.create_worker("bob")
         result = await send_agent_message_tool_impl(

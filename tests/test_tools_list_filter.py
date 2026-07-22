@@ -41,6 +41,31 @@ def _names(tools) -> set[str]:
     return {t.name for t in tools}
 
 
+async def _promote_to_manager(admin, session):
+    """Promote a freshly-created worker session to manager role.
+
+    The harness has no `create_manager`; mirror the documented pattern
+    (see tests/test_scheduled_directive_tools.py) — flip the DB row AND
+    the in-memory cache the session's Principal reads. Returns `session`
+    so callers can chain.
+    """
+    from agent_mcp.core import globals as g
+    from agent_mcp.db.connection import get_db_connection
+
+    conn = get_db_connection()
+    try:
+        conn.cursor().execute(
+            "UPDATE agents SET agent_role='manager' WHERE agent_id=?",
+            (session.agent_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    if session.token in g.active_agents:
+        g.active_agents[session.token]["agent_role"] = "manager"
+    return session
+
+
 # --- Access classification: the registry must classify every tool ---
 
 
@@ -139,17 +164,50 @@ async def test_worker_bearer_sees_any_tools(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_worker_send_agent_message_hidden_by_default(tmp_path) -> None:
-    """`send_agent_message` is gated on `config_allow_worker_to_worker`
-    (default False per PR #16). Worker should NOT see it until the
-    toggle is on.
+async def test_worker_send_agent_message_hidden_when_toggle_off(
+    tmp_path,
+) -> None:
+    """`send_agent_message` is gated on `config_allow_worker_to_worker`.
+    With the toggle EXPLICITLY off, a worker should NOT see it (the
+    explicit-off path — the default is now True).
     """
     async with mcp_session(tmp_path) as admin:
+        admin.set_toggle("config_allow_worker_to_worker", "false")
         alice = await admin.create_worker("alice-w2w")
         tools = await alice.list_tools()
         assert "send_agent_message" not in _names(tools), (
             "worker should not see send_agent_message when "
-            "config_allow_worker_to_worker is unset (default False)"
+            "config_allow_worker_to_worker is explicitly false"
+        )
+
+
+@pytest.mark.asyncio
+async def test_worker_send_agent_message_visible_by_default(tmp_path) -> None:
+    """`config_allow_worker_to_worker` now defaults to True — a worker
+    with no toggle set DOES see `send_agent_message`.
+    """
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice-w2w-default")
+        tools = await alice.list_tools()
+        assert "send_agent_message" in _names(tools), (
+            "worker should see send_agent_message by default "
+            "(config_allow_worker_to_worker defaults to True)"
+        )
+
+
+@pytest.mark.asyncio
+async def test_manager_send_agent_message_visible_by_default(tmp_path) -> None:
+    """A manager-role agent also sees `send_agent_message` by default —
+    the gate treats managers like workers, and the default is now True.
+    """
+    async with mcp_session(tmp_path) as admin:
+        bossy = await _promote_to_manager(
+            admin, await admin.create_worker("bossy-mgr")
+        )
+        tools = await bossy.list_tools()
+        assert "send_agent_message" in _names(tools), (
+            "manager should see send_agent_message by default "
+            "(config_allow_worker_to_worker defaults to True)"
         )
 
 
