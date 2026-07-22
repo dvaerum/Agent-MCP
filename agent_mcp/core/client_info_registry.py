@@ -41,6 +41,21 @@ def record_client_info(
     if not agent_id or not name:
         return
     _CLIENT_INFO[agent_id] = {"name": name, "version": version or ""}
+    # Emit at WARNING when event-loop debug is on so journald's WARNING-level
+    # stderr handler actually captures it (the plain INFO below is invisible
+    # in the systemd journal) — this is how an operator confirms what a real
+    # client advertises and graduates an unknown name into the hold-strategy
+    # table.
+    import os
+
+    if os.environ.get("AGENT_MCP_EVENTLOOP_DEBUG", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    ):
+        logger.warning(
+            "EVENTLOOP client identity recorded: agent=%s clientInfo.name=%r "
+            "version=%r",
+            agent_id, name, version,
+        )
     logger.info(
         "MCP client identity recorded: agent=%s clientInfo.name=%r version=%r",
         agent_id,

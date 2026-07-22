@@ -957,6 +957,26 @@ _FLAG_RECHECK_INTERVAL_SECONDS = 2.0
 _UNCAPPED_HOLD_CEILING_SECONDS = 24 * 60 * 60
 
 
+def _evlog(msg: str, *args) -> None:
+    """Event-loop diagnostics. Emits at WARNING (so journald's WARNING-level
+    stderr handler captures it) ONLY when ``AGENT_MCP_EVENTLOOP_DEBUG`` is
+    set; otherwise DEBUG (invisible). Read per-call so an operator can flip
+    the env var + restart to trace the live event loop without a code change.
+
+    Traces the full picture the operator asked for: which hold strategy each
+    client gets, whether a connection PARKS-and-listens vs RE-REQUESTS every
+    slice, whether heartbeats go out, and the events in/out per poll.
+    """
+    import os
+
+    if os.environ.get("AGENT_MCP_EVENTLOOP_DEBUG", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    ):
+        logger.warning("EVENTLOOP " + msg, *args)
+    else:
+        logger.debug("EVENTLOOP " + msg, *args)
+
+
 _BROADCAST_MESSAGE_TYPES = ("broadcast", "announcement", "system_alert")
 
 # Per-poll cap on the message backlog the event feed drains at once.
@@ -1995,8 +2015,9 @@ async def wait_for_events_tool_impl(
     from ..core.mcp_progress import current_progress_token
 
     progress_token = current_progress_token()
+    _client_name = get_client_name(agent_id)
     strategy = resolve_hold_strategy(
-        get_client_name(agent_id),
+        _client_name,
         has_progress_token=progress_token is not None,
     )
     strategy_cap = (
@@ -2027,6 +2048,14 @@ async def wait_for_events_tool_impl(
         if parsed is not None and parsed > 0:
             requested = parsed
     timeout = base_hold if requested is None else min(base_hold, requested)
+
+    _poll_start = asyncio.get_event_loop().time()
+    _evlog(
+        "poll START agent=%s client=%r heartbeat=%s hold_cap=%s "
+        "progress_token=%s requested=%s hold_budget=%ss",
+        agent_id, _client_name, strategy.heartbeat, strategy.hold_cap,
+        progress_token is not None, requested, timeout,
+    )
 
     # Agent self-service profiles (PR3): compute the profile-review section
     # ONCE per call (marks the connection greeted as a side effect) and
@@ -2059,6 +2088,12 @@ async def wait_for_events_tool_impl(
             fire_scheduled=True,
         )
         if events:
+            _evlog(
+                "poll END agent=%s returned %d event(s) types=%s (fast path, "
+                "backlog present at entry)",
+                agent_id, len(events),
+                [e.get("event_type") for e in events],
+            )
             env = _envelope(events, since, profile_review=review_section)
             if cursor_value:
                 _write_last_event_seen_at(agent_id, cursor_value)
@@ -2167,6 +2202,12 @@ async def wait_for_events_tool_impl(
                     return env
             remaining = deadline - now_mono
             if remaining <= 0:
+                _evlog(
+                    "poll END agent=%s EMPTY after %.0fs -> client must "
+                    "RECONNECT (heartbeat=%s). Short (~55s) empties in a loop "
+                    "= NOT parking (no-heartbeat path); a long hold = parking.",
+                    agent_id, now_mono - _poll_start, heartbeat_enabled,
+                )
                 return _envelope([], since, profile_review=review_section)
             slice_timeout = min(_FLAG_RECHECK_INTERVAL_SECONDS, remaining)
             if idle_deadline is not None:
@@ -2219,6 +2260,13 @@ async def wait_for_events_tool_impl(
                     agent_id, since, drain_queue=drained, fire_scheduled=True,
                 )
                 if events:
+                    _evlog(
+                        "poll END agent=%s returned %d event(s) types=%s "
+                        "(WOKE after %.0fs of holding)",
+                        agent_id, len(events),
+                        [e.get("event_type") for e in events],
+                        asyncio.get_event_loop().time() - _poll_start,
+                    )
                     env = _envelope(events, since, profile_review=review_section)
                     if cursor_value:
                         _write_last_event_seen_at(agent_id, cursor_value)
@@ -2253,6 +2301,12 @@ async def wait_for_events_tool_impl(
                     heartbeat_progress += 1.0
                     await send_progress_heartbeat(
                         progress_token, heartbeat_progress
+                    )
+                    _evlog(
+                        "heartbeat SENT agent=%s n=%.0f (idle %.0fs, connection "
+                        "PARKED and listening)",
+                        agent_id, heartbeat_progress,
+                        asyncio.get_event_loop().time() - _poll_start,
                     )
                     next_heartbeat = (
                         asyncio.get_event_loop().time()
