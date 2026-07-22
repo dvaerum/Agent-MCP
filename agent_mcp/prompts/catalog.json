@@ -66,7 +66,7 @@
       ]
     },
     {
-      "id": "create-worker",
+      "id": "manager-create-worker",
       "title": "Create Worker Agent",
       "description": "Request the operator MCP session to create a new worker agent for specific tasks",
       "category": "task-management",
@@ -98,7 +98,7 @@
       ]
     },
     {
-      "id": "assign-task",
+      "id": "manager-assign-task",
       "title": "Assign Task to Agent",
       "description": "Assign a specific task to an existing agent",
       "category": "task-management",
@@ -220,7 +220,7 @@
       ]
     },
     {
-      "id": "coordinate-agents",
+      "id": "manager-coordinate-agents",
       "title": "Coordinate Multiple Agents",
       "description": "Coordinate work between multiple agents on related tasks",
       "category": "coordination",

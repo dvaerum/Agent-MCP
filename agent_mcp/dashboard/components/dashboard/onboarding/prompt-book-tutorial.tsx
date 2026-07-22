@@ -282,7 +282,7 @@ const tutorialSteps: TutorialStep[] = [
                 doesn't spawn claude anymore. The flow is: register
                 an agent → paste snippet → start claude yourself. */}
             <p className="text-xs text-muted-foreground">
-              Use the create-worker prompt to register your first worker agent — paste the snippet into claude’s .mcp.json to bring it online
+              Use the manager-create-worker prompt to register your first worker agent — paste the snippet into claude’s .mcp.json to bring it online
             </p>
           </div>
           <div className="p-3 border rounded-lg bg-primary/5 border-primary/20">
