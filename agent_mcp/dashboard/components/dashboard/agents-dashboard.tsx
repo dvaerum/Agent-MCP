@@ -586,14 +586,14 @@ const RegisterAgentModal = () => {
 
         {/* Pane 2 — output snippet */}
         {result && (
-          <div className="space-y-4">
+          <div className="space-y-4 min-w-0">
             <div className="text-sm">
               <div className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-1">
                 Agent ID
               </div>
               <code className="font-mono">{result.agent_id}</code>
             </div>
-            <div>
+            <div className="min-w-0">
               <div className="flex items-center justify-between mb-1">
                 <div className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
                   .mcp.json snippet
@@ -608,9 +608,7 @@ const RegisterAgentModal = () => {
                   {copyState === 'snippet' ? 'Copied' : 'Copy snippet'}
                 </Button>
               </div>
-              <pre className="bg-muted/40 border border-border rounded-md p-3 text-xs font-mono overflow-x-auto max-h-72">
-{result.mcp_snippet}
-              </pre>
+              <pre className="w-full max-w-full bg-muted/40 border border-border rounded-md p-3 text-xs font-mono overflow-x-auto max-h-72">{result.mcp_snippet}</pre>
             </div>
             <div className="text-xs text-muted-foreground">
               Paste this into the user&apos;s <code>.mcp.json</code>, then
@@ -1187,9 +1185,11 @@ const EditAgentDialog = ({
 //
 // The View dialog grows a tabbed "add me as an MCP server" section.
 // Each tab shows the copy-paste-ready config snippet for one MCP client
-// targeting THIS specific agent. The server name is namespaced per
-// agent_id (`agent-mcp-<agent_id>`) so multi-agent identity setups
-// don't collide. URL is derived from the path-prefix adapter
+// targeting THIS specific agent. The server name is the fixed string
+// `agent-mcp` to match the user's .claude.json convention (slash-command
+// prefix `agent-mcp:`); a single fixed key is fine because .mcp.json
+// entries are scoped per cwd/project, so the project scoping lives in
+// the URL, not the key. URL is derived from the path-prefix adapter
 // (lib/project-context.ts, PR #56). Transport is Streamable HTTP per
 // MCP spec rev 2025-03-26 (PR #61) — POST/GET/DELETE on /mcp with
 // Authorization: Bearer <agent_token>.
@@ -1250,8 +1250,8 @@ function deriveMcpUrl(): string {
   return `${origin}/mcp`
 }
 
-function buildSnippet(tab: ClientTab, agentId: string, token: string, url: string): string {
-  const name = `agent-mcp-${agentId}`
+function buildSnippet(tab: ClientTab, token: string, url: string): string {
+  const name = 'agent-mcp'
   const tokenForSnippet = token || '<AGENT_TOKEN>'
   switch (tab) {
     case 'claude-code':
@@ -1499,7 +1499,7 @@ const AgentDetailDialog = ({
   }
 
   const handleCopySnippet = (tab: ClientTab) => {
-    const snippet = buildSnippet(tab, agent.agent_id, snippetToken, mcpUrl)
+    const snippet = buildSnippet(tab, snippetToken, mcpUrl)
     navigator.clipboard.writeText(snippet)
     setCopiedSnippet(tab)
     setTimeout(() => setCopiedSnippet(null), 1500)
@@ -1741,7 +1741,8 @@ const AgentDetailDialog = ({
             </Label>
             <p className="text-xs text-muted-foreground">
               Streamable HTTP transport (MCP spec rev 2025-03-26). Server name is
-              namespaced per agent_id so multi-agent setups don&apos;t collide.
+              the fixed <code>agent-mcp</code> (slash-command prefix
+              <code>agent-mcp:</code>); .mcp.json entries are scoped per project.
             </p>
             {/*
               Tabs are expanded statically (one TabsTrigger / TabsContent
@@ -1751,9 +1752,10 @@ const AgentDetailDialog = ({
               schema knowledge; this block just wires it up.
 
               Snippet format details:
-              - Server name: `agent-mcp-${agent.agent_id}` so each
-                agent registers under a unique key in multi-agent
-                identity setups.
+              - Server name: the fixed string `agent-mcp` (matches the
+                user's .claude.json convention → slash-command prefix
+                `agent-mcp:`). A single fixed key is fine because
+                .mcp.json entries are scoped per cwd/project.
               - URL: derived from window.location.origin +
                 projectContext.apiPrefix + '/mcp' (path-prefix adapter,
                 PR #56). The /mcp endpoint is Streamable HTTP per
@@ -1772,49 +1774,49 @@ const AgentDetailDialog = ({
               </TabsList>
               <TabsContent value="claude-code" className="mt-2">
                 <SnippetBlock
-                  snippet={buildSnippet('claude-code', agent.agent_id, snippetToken, mcpUrl)}
+                  snippet={buildSnippet('claude-code', snippetToken, mcpUrl)}
                   copied={copiedSnippet === 'claude-code'}
                   onCopy={() => handleCopySnippet('claude-code')}
                 />
               </TabsContent>
               <TabsContent value="opencode" className="mt-2">
                 <SnippetBlock
-                  snippet={buildSnippet('opencode', agent.agent_id, snippetToken, mcpUrl)}
+                  snippet={buildSnippet('opencode', snippetToken, mcpUrl)}
                   copied={copiedSnippet === 'opencode'}
                   onCopy={() => handleCopySnippet('opencode')}
                 />
               </TabsContent>
               <TabsContent value="cursor" className="mt-2">
                 <SnippetBlock
-                  snippet={buildSnippet('cursor', agent.agent_id, snippetToken, mcpUrl)}
+                  snippet={buildSnippet('cursor', snippetToken, mcpUrl)}
                   copied={copiedSnippet === 'cursor'}
                   onCopy={() => handleCopySnippet('cursor')}
                 />
               </TabsContent>
               <TabsContent value="cline" className="mt-2">
                 <SnippetBlock
-                  snippet={buildSnippet('cline', agent.agent_id, snippetToken, mcpUrl)}
+                  snippet={buildSnippet('cline', snippetToken, mcpUrl)}
                   copied={copiedSnippet === 'cline'}
                   onCopy={() => handleCopySnippet('cline')}
                 />
               </TabsContent>
               <TabsContent value="zed" className="mt-2">
                 <SnippetBlock
-                  snippet={buildSnippet('zed', agent.agent_id, snippetToken, mcpUrl)}
+                  snippet={buildSnippet('zed', snippetToken, mcpUrl)}
                   copied={copiedSnippet === 'zed'}
                   onCopy={() => handleCopySnippet('zed')}
                 />
               </TabsContent>
               <TabsContent value="continue" className="mt-2">
                 <SnippetBlock
-                  snippet={buildSnippet('continue', agent.agent_id, snippetToken, mcpUrl)}
+                  snippet={buildSnippet('continue', snippetToken, mcpUrl)}
                   copied={copiedSnippet === 'continue'}
                   onCopy={() => handleCopySnippet('continue')}
                 />
               </TabsContent>
               <TabsContent value="generic" className="mt-2">
                 <SnippetBlock
-                  snippet={buildSnippet('generic', agent.agent_id, snippetToken, mcpUrl)}
+                  snippet={buildSnippet('generic', snippetToken, mcpUrl)}
                   copied={copiedSnippet === 'generic'}
                   onCopy={() => handleCopySnippet('generic')}
                 />
