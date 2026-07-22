@@ -531,9 +531,10 @@ def test_terminate_with_sqlite_cursor_uses_caller_transaction(
 #
 # VM e2e on 2026-06-16 surfaced that `create_agent` accepted garbage
 # agent IDs (literal `"InvalidName!@#"` was successfully created). The
-# dashboard form already pins `[a-z][a-z0-9-]*[a-z0-9]|[a-z]` but the
-# server enforced nothing — a poisoning vector for URL routing, tmux
-# session names, and git worktree paths that all assume slug shape.
+# dashboard form already pins the slug pattern but the server enforced
+# nothing — a poisoning vector for URL routing (agent_id is a DB key +
+# a URL segment). Interior `@` is now allowed (e.g. `worker@host`); see
+# `_AGENT_ID_RE` in agent_repository.py.
 #
 # Locked design (Dennis, 2026-06-16): the validation lives in the
 # Repository so every caller (MCP tool, REST, CLI) hits it. The repo

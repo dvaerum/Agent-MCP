@@ -66,7 +66,6 @@ def test_server_config_is_a_frozen_dataclass() -> None:
         "debug",
         "no_tui",
         "advanced",
-        "git",
         "no_index",
     ):
         assert required in field_names, f"ServerConfig missing field: {required}"
@@ -94,7 +93,6 @@ def test_server_config_from_cli_args_builds_from_click_decoded_kwargs(
         debug=False,
         no_tui=True,
         advanced=False,
-        git=False,
         no_index=False,
     )
     assert cfg.transport == "sse"
@@ -120,7 +118,6 @@ def test_server_config_validates_transport_value(tmp_path: Path) -> None:
             debug=False,
             no_tui=False,
             advanced=False,
-            git=False,
             no_index=False,
         )
 
@@ -142,7 +139,6 @@ def test_server_config_normalizes_project_dir_to_absolute(tmp_path: Path) -> Non
         debug=False,
         no_tui=True,
         advanced=False,
-        git=False,
         no_index=False,
     )
     assert Path(cfg.project_dir).is_absolute()
@@ -321,7 +317,6 @@ def _default_config(**overrides: Any):
         debug=overrides.pop("debug", False),
         no_tui=overrides.pop("no_tui", True),
         advanced=overrides.pop("advanced", False),
-        git=overrides.pop("git", False),
         no_index=overrides.pop("no_index", False),
         **overrides,
     )

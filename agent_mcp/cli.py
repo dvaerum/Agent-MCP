@@ -209,12 +209,6 @@ def cli(ctx: click.Context) -> None:
     help="Enable advanced embeddings mode with larger dimension (3072) and more sophisticated code analysis.",
 )
 @click.option(
-    "--git",
-    is_flag=True,
-    default=False,
-    help="Enable experimental Git worktree support for parallel agent development (advanced users only).",
-)
-@click.option(
     "--no-index",
     is_flag=True,
     default=False,
@@ -229,7 +223,6 @@ def server_cmd(
     debug: bool,
     no_tui: bool,
     advanced: bool,
-    git: bool,
     no_index: bool,
 ) -> None:
     """
@@ -258,7 +251,6 @@ def server_cmd(
         debug=debug,
         no_tui=no_tui,
         advanced=advanced,
-        git=git,
         no_index=no_index,
     )
     run_server(config)
@@ -594,7 +586,6 @@ _TOP_LEVEL_FLAGS_THAT_NOW_BELONG_TO_SERVER = {
     "--debug",
     "--no-tui",
     "--advanced",
-    "--git",
     "--no-index",
 }
 

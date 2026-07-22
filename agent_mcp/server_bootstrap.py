@@ -97,7 +97,6 @@ class ServerConfig:
     debug: bool = False
     no_tui: bool = False
     advanced: bool = False
-    git: bool = False
     no_index: bool = False
 
     def __post_init__(self) -> None:
@@ -118,7 +117,6 @@ class ServerConfig:
         debug: bool,
         no_tui: bool,
         advanced: bool,
-        git: bool,
         no_index: bool,
         forwarding_hmac_in_path: Optional[str] = None,
     ) -> "ServerConfig":
@@ -141,7 +139,6 @@ class ServerConfig:
             debug=bool(debug),
             no_tui=bool(no_tui),
             advanced=bool(advanced),
-            git=bool(git),
             no_index=bool(no_index),
         )
 
