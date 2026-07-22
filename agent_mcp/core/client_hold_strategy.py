@@ -103,14 +103,15 @@ def normalize_client_name(name: Optional[str]) -> Optional[str]:
     """Normalize a raw ``clientInfo.name`` for table lookup.
 
     Real handshakes vary in case/spacing (``"claude-code"`` vs a
-    hypothetical ``"Claude Code"``); we lower-case, strip, and collapse
-    internal whitespace to a single space so the table can key on one
-    canonical form. Returns ``None`` for an empty/absent name.
+    hypothetical ``"Claude Code"``); we lower-case, strip, collapse
+    internal whitespace, AND map spaces to hyphens so a space-separated
+    display name (``"Claude Code"``) matches the hyphenated table key
+    (``"claude-code"``). Returns ``None`` for an empty/absent name.
     """
     if not name:
         return None
     collapsed = " ".join(str(name).split())
-    return collapsed.strip().lower() or None
+    return collapsed.strip().lower().replace(" ", "-") or None
 
 
 def resolve_hold_strategy(

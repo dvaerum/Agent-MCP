@@ -1162,8 +1162,18 @@ class _McpAsgiApp:
             # can key on it later. Stateless mode means the SDK session has
             # no client_params at tool-call time (initialize is a separate
             # POST), so we record it here off the already-drained body.
-            if not disconnected:
-                _maybe_record_client_info(scope, body)
+            #
+            # Record REGARDLESS of `disconnected`: the body is already fully
+            # drained by this point, and a `httptools`-based uvicorn (the
+            # production build) can surface an `http.disconnect` immediately
+            # after the body on a short-lived, router-proxied request — which
+            # previously skipped recording, so `get_client_name()` stayed
+            # empty and EVERY agent (Claude Code included) fell to the 55s
+            # no-heartbeat re-poll instead of the parked heartbeat hold,
+            # burning a model turn every minute. `_maybe_record_client_info`
+            # is fully defensive (a non-initialize / empty body no-ops), so
+            # recording an already-drained body is always safe.
+            _maybe_record_client_info(scope, body)
             receive = _replay_receive(raw_receive, body, disconnected)
         # POST/DELETE → SDK. Wrap ``send`` so a malformed-request
         # JSON-RPC error envelope (which the SDK fills with a raw

@@ -74,7 +74,10 @@ def test_no_client_name_with_token_feature_detects():
         ("claude-code", "claude-code"),
         ("Claude-Code", "claude-code"),
         ("  claude-code  ", "claude-code"),
-        ("Claude   Code", "claude code"),
+        # Spaces collapse to hyphens so a space-separated display name
+        # matches the hyphenated table key (`claude-code`).
+        ("Claude   Code", "claude-code"),
+        ("Claude Code", "claude-code"),
         ("OpenCode", "opencode"),
         ("", None),
         (None, None),
@@ -87,5 +90,14 @@ def test_normalize_client_name(raw, expected):
 def test_normalization_applies_in_resolution():
     """A client that sends mixed-case identity still hits the table."""
     strat = resolve_hold_strategy("Claude-Code", has_progress_token=False)
+    assert strat.heartbeat is True
+    assert strat.hold_cap == CLAUDE_CODE_HOLD_CAP_SECONDS
+
+
+def test_space_separated_display_name_hits_table():
+    """A space-separated ``clientInfo.name`` (``"Claude Code"``) must
+    resolve to the heartbeat hold — spaces map to hyphens so it matches
+    the ``claude-code`` table key rather than falling to no-heartbeat."""
+    strat = resolve_hold_strategy("Claude Code", has_progress_token=False)
     assert strat.heartbeat is True
     assert strat.hold_cap == CLAUDE_CODE_HOLD_CAP_SECONDS
