@@ -152,7 +152,10 @@ async def test_fast_path_returns_pending_messages(tmp_path: Path) -> None:
         assert len(env["events"]) == 1, f"want 1 event; got: {env}"
         evt = env["events"][0]
         assert evt["type"] == "message"
-        assert evt["data"]["message_content"] == "hello alice"
+        # Skinny event: no body dump; subject (= preview for a short
+        # untitled body) + sender + message_id pointer.
+        assert "message_content" not in evt["data"]
+        assert evt["data"]["subject"] == "hello alice"
         assert evt["data"]["sender_id"] == "admin"
         # next_cursor advances past the message timestamp.
         assert env["next_cursor"] >= evt["timestamp"]
@@ -203,7 +206,7 @@ async def test_wake_on_message_within_one_second(tmp_path: Path) -> None:
         )
         assert len(env["events"]) == 1, f"want 1 event; got: {env}"
         assert env["events"][0]["type"] == "message"
-        assert env["events"][0]["data"]["message_content"] == "wake up"
+        assert env["events"][0]["data"]["subject"] == "wake up"
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +251,7 @@ async def test_wake_on_broadcast(tmp_path: Path) -> None:
         assert evt["type"] == "broadcast", (
             f"expected broadcast event; got {evt}"
         )
-        assert evt["data"]["message_content"] == "team announcement"
+        assert evt["data"]["subject"] == "team announcement"
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +295,10 @@ async def test_wake_on_task_assigned(tmp_path: Path) -> None:
         assert evt["type"] == "task_assigned", (
             f"expected task_assigned; got {evt}"
         )
-        assert evt["data"]["assigned_to"] == "alice"
+        # Skinny task event: title/status pointer, no description dump.
+        # (Reaching alice's waiter already proves the assignment.)
+        assert evt["data"]["title"] == "Write a sonnet"
+        assert "description" not in evt["data"]
 
 
 # ---------------------------------------------------------------------------
@@ -475,4 +481,6 @@ async def test_caller_agent_id_derived_from_token(tmp_path: Path) -> None:
             bob, since=since, timeout_seconds=1
         )
         assert len(env_bob["events"]) == 1
-        assert env_bob["events"][0]["data"]["recipient_id"] == "bob"
+        # Skinny event carries no recipient_id — reaching bob's own waiter
+        # (and NOT alice's, asserted above) is what proves recipiency.
+        assert env_bob["events"][0]["data"]["subject"] == "for bob only"

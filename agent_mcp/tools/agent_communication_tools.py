@@ -1003,6 +1003,27 @@ def _collect_events_for(
     return events
 
 
+# Max seconds a skinny message event is HELD waiting for the async AI
+# subject backfill to title it (only when subject-gen is ON). Past this,
+# the event fires with the 50-char preview so a stalled/failed backfill
+# can never strand a message out of its recipient's event stream.
+_TITLE_HOLD_MAX_SECONDS = 120
+
+
+def _within_title_hold(msg_ts: str, now_iso: str) -> bool:
+    """True while an untitled root message is still inside the title-hold
+    window (its skinny event is held for the AI subject backfill). Any
+    parse failure returns False → fire now rather than risk stranding."""
+    try:
+        age = (
+            datetime.datetime.fromisoformat(now_iso)
+            - datetime.datetime.fromisoformat(msg_ts)
+        ).total_seconds()
+    except (ValueError, TypeError):
+        return False
+    return 0 <= age < _TITLE_HOLD_MAX_SECONDS
+
+
 def _collect_events_with_cap(
     agent_id: str, since: Optional[str]
 ) -> tuple[List[Dict[str, Any]], Optional[str]]:
@@ -1081,23 +1102,49 @@ def _collect_events_with_cap(
     # task event would be skipped. `msg_cap_ts` is that boundary.
     messages_truncated = len(msg_rows) >= _MESSAGE_EVENT_QUERY_CAP
     msg_cap_ts = msg_rows[-1].get("timestamp") if msg_rows else None
+    # Skinny message events: a `message`/`broadcast` event is a POINTER,
+    # not a dump. It carries the subject/title + is_reply + sender so the
+    # agent can DECIDE, then call get_agent_messages to READ the body —
+    # which is what marks the message read. The full `message_content` is
+    # deliberately omitted (events signal "something changed", they don't
+    # flood the reader). `message_repo.query` already computes the display
+    # `subject` (real, or a 50-char body preview flagged
+    # `subject_is_placeholder`) and None-for-replies.
+    _gen_on = bool(os.environ.get("AGENT_MCP_SUBJECT_MODEL", "").strip())
+    _now_iso = datetime.datetime.now().isoformat()
+    _last_emitted_ts: Optional[str] = None
     for row in msg_rows:
         # repo `since` is inclusive (`>=`); the legacy SQL was strict
         # `>`. Re-apply the strict filter here to preserve the old
         # behaviour — a message exactly at `since_iso` shouldn't fire
         # again on the next long-poll wake.
-        if (row.get("timestamp") or "") <= since_iso:
+        ts = row.get("timestamp") or ""
+        if ts <= since_iso:
             continue
+        is_reply = row.get("parent_message_id") is not None
+        # Title gate (roots only; replies are threaded and fire at once).
+        # An untitled root fires immediately with the preview when AI
+        # subject-gen is OFF; when it is ON, HOLD the event so the pointer
+        # carries a real title once the async backfill sets it — reusing
+        # the truncation-cap boundary so the cursor can't advance past the
+        # held row (re-queried next poll). Bounded by _TITLE_HOLD_MAX so a
+        # stalled backfill can never strand the message.
+        if (
+            not is_reply
+            and bool(row.get("subject_is_placeholder"))
+            and _gen_on
+            and _within_title_hold(ts, _now_iso)
+        ):
+            messages_truncated = True
+            msg_cap_ts = _last_emitted_ts or since_iso
+            break
         data = {
             "message_id": row["message_id"],
             "sender_id": row["sender_id"],
-            "recipient_id": row["recipient_id"],
-            "message_content": row["message_content"],
-            "message_type": row["message_type"],
+            "subject": row.get("subject"),
+            "is_reply": is_reply,
             "priority": row["priority"],
-            "timestamp": row["timestamp"],
-            "delivered": bool(row["delivered"]),
-            "read": bool(row["read"]),
+            "timestamp": ts,
         }
         evt_type = (
             "broadcast"
@@ -1106,9 +1153,10 @@ def _collect_events_with_cap(
         )
         events.append({
             "type": evt_type,
-            "timestamp": row["timestamp"],
+            "timestamp": ts,
             "data": data,
         })
+        _last_emitted_ts = ts
 
     conn = None
     try:
@@ -1127,17 +1175,16 @@ def _collect_events_with_cap(
             (agent_id, since_iso),
         )
         for row in cursor.fetchall():
+            # Skinny task event: a pointer, not a dump. task_id + title +
+            # status (+ priority for triage) is enough to decide; the
+            # agent calls view_tasks to read the description and interact.
+            # The full description / relationships are deliberately omitted.
             data = {
                 "task_id": row["task_id"],
                 "title": row["title"],
-                "description": row["description"],
-                "assigned_to": row["assigned_to"],
-                "created_by": row["created_by"],
                 "status": row["status"],
                 "priority": row["priority"],
-                "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
-                "parent_task": row["parent_task"],
             }
             # v1 heuristic per the plan: rows created since the
             # cursor are treated as fresh assignments; older rows

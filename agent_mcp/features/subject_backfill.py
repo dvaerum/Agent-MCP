@@ -118,6 +118,13 @@ async def backfill_null_subjects(
         )
         if ok:
             titled += 1
+            # Release any held skinny message event: the message now has a
+            # real title, so wake the recipient's parked wait_for_events so
+            # the event fires promptly instead of on the next poll.
+            try:
+                g.notify_agent_inbox(root["recipient_id"])
+            except Exception:  # pragma: no cover — best-effort wake
+                pass
 
     if titled:
         logger.info(

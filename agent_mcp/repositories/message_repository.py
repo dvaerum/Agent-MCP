@@ -1703,7 +1703,9 @@ class MessageRepository:
         so one sweep loads the model once and titles a bounded batch.
 
         Each row carries ``message_id`` + ``message_content`` (the model
-        input). On DB error returns ``[]`` and logs at error.
+        input) + ``recipient_id`` (so the backfill can wake the recipient
+        once a title lands, releasing any held skinny message event). On
+        DB error returns ``[]`` and logs at error.
         """
         try:
             with get_session() as session:
@@ -1711,6 +1713,7 @@ class MessageRepository:
                     session.query(
                         AgentMessage.message_id,
                         AgentMessage.message_content,
+                        AgentMessage.recipient_id,
                     )
                     .filter(AgentMessage.parent_message_id.is_(None))
                     .filter(AgentMessage.subject.is_(None))
@@ -1720,7 +1723,8 @@ class MessageRepository:
                 )
                 return [
                     {"message_id": r.message_id,
-                     "message_content": r.message_content}
+                     "message_content": r.message_content,
+                     "recipient_id": r.recipient_id}
                     for r in rows
                 ]
         except SQLAlchemyError as e:
