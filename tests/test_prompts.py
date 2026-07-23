@@ -266,6 +266,16 @@ def test_wake_loop_prompt_uses_real_tool_names() -> None:
     assert entry is not None, "wake-loop catalog entry vanished"
     template = entry["template"]
 
+    # The two consumers MUST be byte-identical — the module docstring
+    # promises "the two consumers can't drift", but they HAD drifted (the
+    # catalog carried the NO-arguments paragraph while the constant carried
+    # the directive clause). Pin them so a future edit to one without the
+    # other fails here.
+    assert template == WAKE_LOOP_INSTRUCTIONS, (
+        "catalog.json event-loop template has drifted from "
+        "WAKE_LOOP_INSTRUCTIONS; update both copies together"
+    )
+
     # The two consumers (catalog + python constant) MUST stay in sync;
     # check both copies independently.
     for label, text in (
@@ -289,6 +299,42 @@ def test_wake_loop_prompt_uses_real_tool_names() -> None:
         assert not re.search(r"view_task(?![s_])", text), (
             f"{label} still references non-existent view_task "
             "(singular) tool"
+        )
+
+
+def test_wake_loop_prompt_mandates_reentry_after_finishing_work() -> None:
+    """The wake-loop text must EXPLICITLY tell the agent to re-enter the
+    loop the moment it finishes a unit of work.
+
+    Agents were finishing a task and then going silent — reading the old
+    passive "default idle behavior … whenever you have no other work in
+    progress" as "I'm done." The instruction must frame wait_for_events()
+    as the resting state the agent always returns to, so completing a task
+    ends with another wait_for_events() call rather than a stopped turn.
+    Both copies (catalog + constant) must carry it.
+    """
+    from agent_mcp.prompts import get_prompt
+    from agent_mcp.app.event_loop_instructions import WAKE_LOOP_INSTRUCTIONS
+
+    entry = get_prompt("event-loop")
+    assert entry is not None, "wake-loop catalog entry vanished"
+
+    for label, text in (
+        ("catalog.json template", entry["template"]),
+        ("WAKE_LOOP_INSTRUCTIONS constant", WAKE_LOOP_INSTRUCTIONS),
+    ):
+        low = text.lower()
+        # Frames the loop as the resting state, not a one-off check.
+        assert "resting state" in low, (
+            f"{label} must frame wait_for_events() as the resting state"
+        )
+        # Makes the finish-a-task → re-enter transition explicit.
+        assert "does not end your turn" in low, (
+            f"{label} must state that finishing a task does NOT end the turn"
+        )
+        # Names the failure mode so the agent understands the stakes.
+        assert "stop_listening" in text, (
+            f"{label} must name stop_listening as the only loop exit"
         )
 
 
