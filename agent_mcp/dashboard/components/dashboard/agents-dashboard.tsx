@@ -170,8 +170,8 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, op
           <StatusDot presence={presence} />
           <AgentTypeIcon agentId={agent.agent_id} />
           <div className="min-w-0 flex-1">
-            <div className="font-medium text-sm text-foreground truncate">{agent.agent_id}</div>
-            <div className="text-xs text-muted-foreground font-mono">#{agent.agent_id.slice(-6)}</div>
+            <div className="font-medium text-sm text-foreground truncate" title={agent.agent_id}>{agent.agent_id}</div>
+            <div className="text-xs text-muted-foreground font-mono truncate">#{agent.agent_id.slice(-6)}</div>
           </div>
         </div>
       </TableCell>
@@ -1049,8 +1049,9 @@ const EditAgentDialog = ({
         <DialogHeader>
           <DialogTitle className="text-lg">Edit agent {agent?.agent_id}</DialogTitle>
           <DialogDescription className="text-muted-foreground">
-            Update the agent&apos;s color or working directory.
-            Status changes use Terminate / Restore / Purge.
+            Update the agent&apos;s appearance, working directory,
+            self-description, role, and event-loop settings. Status
+            changes use Terminate / Restore / Purge.
           </DialogDescription>
         </DialogHeader>
         <form onSubmit={handleSave} className="space-y-4">
@@ -1709,6 +1710,25 @@ const AgentDetailDialog = ({
             </div>
           </div>
 
+          {/* Group: self-description (agent self-service profile,
+              migration 0018). Shown here so an operator viewing an agent
+              from the Agents page sees its profile, not only via the
+              System-page graph node panel. */}
+          <div className="border-t border-border pt-4 space-y-1">
+            <Label className="text-xs text-muted-foreground uppercase tracking-wider">
+              Self-description
+            </Label>
+            <div className="text-sm whitespace-pre-wrap [overflow-wrap:anywhere]">
+              {agent.profile ? (
+                agent.profile
+              ) : (
+                <span className="text-muted-foreground italic">
+                  unset — the agent hasn’t written a profile yet
+                </span>
+              )}
+            </div>
+          </div>
+
           {/* Group 3: current task */}
           <div className="border-t border-border pt-4 space-y-1">
             <Label className="text-xs text-muted-foreground uppercase tracking-wider">
@@ -2031,6 +2051,10 @@ export function AgentsDashboard() {
     online: agents.filter(a => presenceOf(a) === 'online').length,
     pending: agents.filter(a => presenceOf(a) === 'pending').length,
     offline: agents.filter(a => presenceOf(a) === 'offline').length,
+    // Terminated rows are counted in `total` but have no dedicated card;
+    // surfacing the count on the Total card keeps the four numbers
+    // reconcilable (total = online + pending + offline + terminated).
+    terminated: agents.filter(a => presenceOf(a) === 'terminated').length,
     totalInSystem: allAgents.length,
   }
 
@@ -2186,7 +2210,11 @@ export function AgentsDashboard() {
           icon={Users}
           label="Total"
           value={stats.total}
-          change={stats.total > 0 ? `${stats.online} online` : undefined}
+          change={
+            stats.terminated > 0
+              ? `${stats.terminated} terminated`
+              : stats.total > 0 ? `${stats.online} online` : undefined
+          }
           trend="neutral"
         />
         <StatsCard
@@ -2207,8 +2235,8 @@ export function AgentsDashboard() {
           icon={AlertCircle}
           label="Offline"
           value={stats.offline}
-          change={stats.offline > 0 ? "Idle/disconnected" : "All connected"}
-          trend={stats.offline > 0 ? "neutral" : "neutral"}
+          change={stats.offline > 0 ? "Idle/disconnected" : "None"}
+          trend="neutral"
         />
       </div>
 
@@ -2269,16 +2297,21 @@ export function AgentsDashboard() {
           />
         ) : (
           <>
-            {/* Desktop table */}
+            {/* Desktop table — `table-fixed` so a pathologically long
+                value in ANY cell (e.g. a 5000-char agent name) truncates
+                within its column instead of stretching the auto-layout
+                table thousands of px wide and pushing every other column
+                off-screen. Column widths below bound Status/Tasks/Token/
+                Actions; the Agent column takes the remainder. */}
             <div className="hidden sm:block overflow-x-auto">
-              <Table>
+              <Table className="table-fixed">
                 <TableHeader>
                   <TableRow className="border-border hover:bg-transparent">
                     <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Agent</TableHead>
-                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Status</TableHead>
-                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Tasks</TableHead>
-                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Token</TableHead>
-                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider w-24">Actions</TableHead>
+                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider w-32">Status</TableHead>
+                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider w-64">Tasks</TableHead>
+                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider w-36">Token</TableHead>
+                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider w-36">Actions</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
