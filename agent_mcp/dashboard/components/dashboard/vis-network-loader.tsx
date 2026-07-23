@@ -4,8 +4,8 @@ import React, { useEffect, useRef, useCallback, useState, Profiler } from 'react
 import { Network, DataSet } from 'vis-network/standalone'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { 
-  RefreshCw, GitBranch, Activity, Layers
+import {
+  RefreshCw, GitBranch, Activity, Layers, Info, ChevronDown
 } from 'lucide-react'
 import { apiClient } from '@/lib/api'
 import { useServerStore } from '@/lib/stores/server-store'
@@ -289,6 +289,10 @@ export default function VisNetworkLoader({
   const [nodeCount, setNodeCount] = useState(0)
   const [edgeCount, setEdgeCount] = useState(0)
   const [isMounted, setIsMounted] = useState(false)
+  // Legend (how to read the graph) — expanded by default so a first-time
+  // viewer can interpret the shapes/colours/edges; collapsible to reclaim
+  // space once they know the key.
+  const [showLegend, setShowLegend] = useState(true)
   
   // Track mounted state
   useEffect(() => {
@@ -831,6 +835,81 @@ export default function VisNetworkLoader({
                 <Button onClick={() => fetchGraphData(true)} variant="outline">
                   Retry
                 </Button>
+              </div>
+            </div>
+          )}
+
+          {/* Legend — how to read the graph. Nothing about the shapes,
+              colours, or edge styles is self-explanatory, so spell out the
+              key. Collapsible; hidden entirely while the empty/error state
+              is showing (nothing to interpret yet). */}
+          {nodeCount > 0 && (
+            <div className="absolute bottom-[var(--space-fluid-sm)] left-[var(--space-fluid-sm)] z-10 max-w-[220px]">
+              <div className="bg-background/95 backdrop-blur rounded-lg border p-2 text-xs">
+                <button
+                  type="button"
+                  onClick={() => setShowLegend((v) => !v)}
+                  className="flex items-center gap-1.5 font-medium w-full"
+                  aria-expanded={showLegend}
+                >
+                  <Info className="h-3.5 w-3.5 text-primary" />
+                  How to read this
+                  <ChevronDown
+                    className={cn(
+                      "h-3.5 w-3.5 ml-auto transition-transform",
+                      !showLegend && "-rotate-90",
+                    )}
+                  />
+                </button>
+                {showLegend && (
+                  <div className="mt-2 space-y-2.5">
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1">Nodes</div>
+                      <ul className="space-y-1">
+                        <li className="flex items-center gap-2">
+                          <span className="inline-block w-3 h-3 rounded-full bg-teal-300 border border-teal-400 shrink-0" />
+                          Agent
+                        </li>
+                        <li className="flex items-center gap-2">
+                          <span className="inline-block w-3 h-3 rounded-[2px] bg-sky-500 shrink-0" />
+                          Task <span className="text-muted-foreground">(colour = status)</span>
+                        </li>
+                        <li className="flex items-center gap-2">
+                          <span className="inline-block w-2.5 h-2.5 rotate-45 bg-purple-500 shrink-0 ml-[1px]" />
+                          Memory / context
+                        </li>
+                        <li className="flex items-center gap-2">
+                          <span className="inline-block w-0 h-0 border-l-[6px] border-r-[6px] border-b-[10px] border-l-transparent border-r-transparent border-b-teal-400 shrink-0" />
+                          File
+                        </li>
+                        <li className="flex items-center gap-2">
+                          <span className="text-purple-400 leading-none shrink-0">★</span>
+                          Admin (project root)
+                        </li>
+                      </ul>
+                    </div>
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1">Task status</div>
+                      <div className="flex flex-wrap gap-x-2.5 gap-y-1">
+                        <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-sky-500" />pending</span>
+                        <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-cyan-400" />in progress</span>
+                        <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-green-500" />done</span>
+                        <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-red-500" />failed</span>
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1">Edges</div>
+                      <ul className="space-y-1 text-muted-foreground">
+                        <li><span className="text-cyan-400 font-bold">──</span> agent working on task</li>
+                        <li><span className="text-teal-400 font-bold">──</span> task → subtask</li>
+                        <li><span className="text-orange-400 font-bold">- -</span> task depends on task</li>
+                      </ul>
+                    </div>
+                    <p className="text-[10px] text-muted-foreground pt-0.5 border-t border-border/50">
+                      Click a node for details · drag to rearrange · toggle Physics/Tree above.
+                    </p>
+                  </div>
+                )}
               </div>
             </div>
           )}
