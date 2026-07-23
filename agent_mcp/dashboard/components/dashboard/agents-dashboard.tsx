@@ -45,14 +45,15 @@ const AGENT_ID_RE = /^[a-z](?:[a-z0-9@_-]*[a-z0-9])?$/
 // 400s bad input; this drives the live hint + submit-disable.
 const AOE_SESSION_ID_RE = /^[0-9a-f]{16}$/
 
-// Display label per presence state. The `pending` KEY is kept in the
-// logic (agentPresence + all the css/tooltip branches), but "PENDING"
-// read like the dead spawn-lifecycle status; "NOT CONNECTED" says what
-// it actually is — the agent is registered but no Claude process has
-// ever connected to it yet (the yellow pulsing dot + tooltip explain).
+// Display label per presence state. `pending` (registered but never
+// connected) and `offline` (was connected, now down) both read as
+// "OFFLINE" — the distinction wasn't worth two look-alike badges, so it
+// collapses in the badge and dot; the never-connected case still gets its
+// own tooltip ("paste the snippet …") for the operator who hovers. The
+// `pending` KEY stays in the logic so that tooltip branch survives.
 const PRESENCE_LABEL: Record<AgentPresence, string> = {
   online: "ONLINE",
-  pending: "NOT CONNECTED",
+  pending: "OFFLINE",
   offline: "OFFLINE",
   terminated: "TERMINATED",
 }
@@ -64,7 +65,8 @@ const PRESENCE_LABEL: Record<AgentPresence, string> = {
 const StatusDot = React.memo(({ presence }: { presence: AgentPresence }) => {
   const config: Record<AgentPresence, string> = {
     online: "bg-primary shadow-primary/50 shadow-md",
-    pending: "bg-warning shadow-warning/50 shadow-md animate-pulse",
+    // pending collapses into offline's look (see PRESENCE_LABEL).
+    pending: "bg-muted-foreground shadow-muted-foreground/50 shadow-md",
     offline: "bg-muted-foreground shadow-muted-foreground/50 shadow-md",
     terminated: "bg-muted-foreground shadow-muted-foreground/50 shadow-md",
   }
@@ -198,7 +200,8 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, op
             className={cn(
               "text-xs font-semibold border-0 px-3 py-1.5 rounded-md",
               presence === 'online' && "bg-primary/15 text-primary ring-1 ring-primary/20",
-              presence === 'pending' && "bg-warning/15 text-warning ring-1 ring-warning/20",
+              // pending collapses into offline's look (see PRESENCE_LABEL).
+              presence === 'pending' && "bg-muted/50 text-muted-foreground ring-1 ring-border",
               presence === 'offline' && "bg-muted/50 text-muted-foreground ring-1 ring-border",
               presence === 'terminated' && "bg-muted/50 text-muted-foreground ring-1 ring-border",
             )}
