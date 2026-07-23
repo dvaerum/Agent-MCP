@@ -181,6 +181,25 @@ SETTINGS_SCHEMA: tuple[SettingSpec, ...] = (
         widget="int_duration",
     ),
     SettingSpec(
+        key="config_debug_eventloop",
+        type="bool",
+        default=False,
+        tier="operator",
+        group="event_loop",
+        title="Event-loop debug logging",
+        description=(
+            "When on, the backend logs a detailed trace of the "
+            "wait_for_events wake loop (which hold strategy each client "
+            "gets, whether a connection parks vs re-polls, heartbeats sent, "
+            "the adaptive hold-ladder phase, and events in/out) at a level "
+            "the systemd journal captures — grep for \"EVENTLOOP\". Off by "
+            "default; when unset it falls back to the "
+            "AGENT_MCP_EVENTLOOP_DEBUG environment variable (the deploy "
+            "default). Diagnostic only — leave off in normal operation."
+        ),
+        widget="switch",
+    ),
+    SettingSpec(
         key="config_message_retention_days",
         type="int",
         default=0,

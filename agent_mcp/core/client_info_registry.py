@@ -45,12 +45,11 @@ def record_client_info(
     # stderr handler actually captures it (the plain INFO below is invisible
     # in the systemd journal) — this is how an operator confirms what a real
     # client advertises and graduates an unknown name into the hold-strategy
-    # table.
-    import os
+    # table. Toggled by the ``config_debug_eventloop`` project setting (falls
+    # back to the AGENT_MCP_EVENTLOOP_DEBUG env var).
+    from .debug_flags import debug_enabled
 
-    if os.environ.get("AGENT_MCP_EVENTLOOP_DEBUG", "").strip().lower() in (
-        "1", "true", "yes", "on",
-    ):
+    if debug_enabled("config_debug_eventloop", "AGENT_MCP_EVENTLOOP_DEBUG"):
         logger.warning(
             "EVENTLOOP client identity recorded: agent=%s clientInfo.name=%r "
             "version=%r",

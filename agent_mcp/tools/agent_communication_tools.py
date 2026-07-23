@@ -959,19 +959,20 @@ _UNCAPPED_HOLD_CEILING_SECONDS = 24 * 60 * 60
 
 def _evlog(msg: str, *args) -> None:
     """Event-loop diagnostics. Emits at WARNING (so journald's WARNING-level
-    stderr handler captures it) ONLY when ``AGENT_MCP_EVENTLOOP_DEBUG`` is
-    set; otherwise DEBUG (invisible). Read per-call so an operator can flip
-    the env var + restart to trace the live event loop without a code change.
+    stderr handler captures it) when event-loop debug is enabled — the
+    ``config_debug_eventloop`` project setting (toggle in the Settings
+    dashboard), falling back to the ``AGENT_MCP_EVENTLOOP_DEBUG`` env var;
+    otherwise DEBUG (invisible). The check is TTL-cached so this hot path
+    doesn't hit the DB on every line, and a dashboard toggle takes effect
+    within a few seconds — no restart needed.
 
     Traces the full picture the operator asked for: which hold strategy each
     client gets, whether a connection PARKS-and-listens vs RE-REQUESTS every
     slice, whether heartbeats go out, and the events in/out per poll.
     """
-    import os
+    from ..core.debug_flags import debug_enabled
 
-    if os.environ.get("AGENT_MCP_EVENTLOOP_DEBUG", "").strip().lower() in (
-        "1", "true", "yes", "on",
-    ):
+    if debug_enabled("config_debug_eventloop", "AGENT_MCP_EVENTLOOP_DEBUG"):
         logger.warning("EVENTLOOP " + msg, *args)
     else:
         logger.debug("EVENTLOOP " + msg, *args)
