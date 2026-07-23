@@ -336,6 +336,13 @@ def test_wake_loop_prompt_mandates_reentry_after_finishing_work() -> None:
         assert "stop_listening" in text, (
             f"{label} must name stop_listening as the only loop exit"
         )
+        # Foreground-only: backgrounding the poll drops events out-of-turn.
+        assert "foreground only" in low, (
+            f"{label} must tell the agent to run the loop in the foreground"
+        )
+        assert "background task" in low, (
+            f"{label} must forbid backgrounding the wait_for_events loop"
+        )
 
 
 # ---------------------------------------------------------------------------
