@@ -64,6 +64,14 @@ export interface Agent {
   // (which is still surfaced, just not the source of the badge).
   online?: boolean
   last_mcp_connection?: string | null
+  // Agent self-service profile (migration 0018): the agent's own
+  // free-text "what I do / how I work / what to ask me" description,
+  // authored via the update_agent_profile MCP tool and curatable by the
+  // operator via POST /api/agents/<id>/edit. NULL/'' = never set.
+  profile?: string | null
+  profile_updated_at?: string | null
+  profile_updated_by?: string | null
+  profile_reviewed_at?: string | null
 }
 
 /** Wave 7 PR 2 — derived presence kind for the agents list / detail
@@ -741,6 +749,10 @@ class ApiClient {
       // demote). Whitelisted on the server side; the API-boundary
       // check 422s anything outside {'worker', 'manager'}.
       agent_role?: 'worker' | 'manager'
+      // Agent self-description curation. Routed server-side through
+      // review_profile so the updated_at/by/reviewed_at bookkeeping
+      // matches the agent's own MCP self-edit. Empty string clears it.
+      profile?: string
     },
   ): Promise<{ success: boolean; agent_id: string; updated: Record<string, unknown>; message: string }> {
     return this.request(

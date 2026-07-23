@@ -175,6 +175,19 @@ export function NodeDetailPanel({ nodeId, nodeType, isOpen, onClose, nodeData }:
             </div>
           )}
 
+          {/* Self-description (agent self-service profile, migration 0018) */}
+          {agent.profile && (
+            <div className="p-3 rounded-lg bg-muted/50 space-y-1">
+              <div className="flex items-center gap-2">
+                <FileCode className="h-4 w-4 text-muted-foreground" />
+                <span className="text-sm font-medium">Self-description</span>
+              </div>
+              <p className="text-sm text-muted-foreground whitespace-pre-wrap break-words">
+                {agent.profile}
+              </p>
+            </div>
+          )}
+
           {/* Auth Token (for admin or if available) */}
           {agent.auth_token && (
             <div className="p-3 rounded-lg bg-muted/50 space-y-2">

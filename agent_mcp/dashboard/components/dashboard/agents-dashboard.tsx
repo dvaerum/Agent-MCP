@@ -8,6 +8,7 @@ import {
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { Textarea } from "@/components/ui/textarea"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
@@ -916,6 +917,9 @@ const EditAgentDialog = ({
   // Phase 2 Wave 2b (plan §2e): role tier. Default 'worker' matches
   // the agents.agent_role column default (Wave 1a, v5.0.61, PR #182).
   const [agentRole, setAgentRole] = useState<'worker' | 'manager'>('worker')
+  // Agent self-description (migration 0018). Operator-curatable here;
+  // the agent also edits its own via the update_agent_profile MCP tool.
+  const [profile, setProfile] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -963,6 +967,7 @@ const EditAgentDialog = ({
     setAgentRole(
       agent.agent_role === 'manager' ? 'manager' : 'worker'
     )
+    setProfile(agent.profile || '')
     setError(null)
     // Intentionally key on agentId, not the agent object — see above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -986,6 +991,7 @@ const EditAgentDialog = ({
       aoe_session_id?: string
       auto_event_loop?: boolean
       agent_role?: 'worker' | 'manager'
+      profile?: string
     } = {}
     if (color !== (agent.color || '')) {
       updates.color = color
@@ -1016,6 +1022,10 @@ const EditAgentDialog = ({
       agent.agent_role === 'manager' ? 'manager' : 'worker'
     if (agentRole !== currentRole) {
       updates.agent_role = agentRole
+    }
+    // Self-description: only ship when changed (empty string clears it).
+    if (profile !== (agent.profile || '')) {
+      updates.profile = profile
     }
     if (Object.keys(updates).length === 0) {
       onOpenChange(false)
@@ -1073,6 +1083,27 @@ const EditAgentDialog = ({
               placeholder="/workspace/agent"
               className="bg-background border-border text-foreground font-mono text-sm"
             />
+          </div>
+          <div>
+            <label
+              htmlFor="edit-agent-profile"
+              className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2"
+            >
+              Self-description
+            </label>
+            <Textarea
+              id="edit-agent-profile"
+              value={profile}
+              onChange={(e) => setProfile(e.target.value)}
+              placeholder="What this agent does, how it works, what to ask it…"
+              rows={4}
+              className="bg-background border-border text-foreground text-sm"
+            />
+            <p className="text-[10px] text-muted-foreground mt-1">
+              The agent&apos;s own profile — normally authored by the agent
+              via update_agent_profile, editable here for curation. Empty
+              clears it.
+            </p>
           </div>
           <div>
             <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">

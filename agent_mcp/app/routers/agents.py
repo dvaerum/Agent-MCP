@@ -511,6 +511,23 @@ async def edit_agent_api_route(
 
     updates = {k: data[k] for k in EDITABLE_AGENT_FIELDS if k in data}
 
+    # profile: operator curation of the agent's self-authored description
+    # (agent self-service profiles, migration 0018). Handled OUT of the
+    # generic ``update_field`` path — it must go through
+    # ``review_profile`` so the profile_updated_at / profile_updated_by /
+    # profile_reviewed_at bookkeeping matches the agent's own MCP
+    # self-edit. A null/empty string clears it; a dict/list is a 400.
+    profile_supplied = 'profile' in data
+    profile_value = data.get('profile')
+    if (
+        profile_supplied
+        and profile_value is not None
+        and not isinstance(profile_value, str)
+    ):
+        return JSONResponse(
+            {"error": "profile must be a string"}, status_code=400,
+        )
+
     # agent_role validation is a wire-level 422 (Pydantic-equivalent) — the
     # CHECK constraint would otherwise surface as a 500. Kept here because
     # 422 is not a standard ToolResult status.
@@ -525,10 +542,10 @@ async def edit_agent_api_route(
             status_code=422,
         )
 
-    if not updates:
+    if not updates and not profile_supplied:
         return JSONResponse(
             {"error": "No editable fields supplied. Accepts any of: "
-                      + ", ".join(EDITABLE_AGENT_FIELDS)},
+                      + ", ".join(EDITABLE_AGENT_FIELDS) + ", profile"},
             status_code=400,
         )
 
@@ -573,22 +590,45 @@ async def edit_agent_api_route(
                 status_code=400,
             )
 
-    result = await _dispatch_agent_lifecycle_tool(
-        "edit_agent", {"agent_id": agent_id, **updates}, auth,
-    )
-    if isinstance(result, JSONResponse):
-        return result
-    if isinstance(result, _Ok):
-        return JSONResponse({
-            "success": True,
-            "agent_id": result.data["agent_id"],
-            "updated": result.data["updated"],
-            "message": result.message or (
-                f"Agent '{agent_id}' updated: "
-                + ", ".join(result.data["updated"].keys())
-            ),
-        })
-    return _agent_tool_error(result, "Failed to edit agent")
+    updated_fields: Dict[str, Any] = {}
+
+    # Generic editable fields → the edit_agent tool (update_field path).
+    if updates:
+        result = await _dispatch_agent_lifecycle_tool(
+            "edit_agent", {"agent_id": agent_id, **updates}, auth,
+        )
+        if isinstance(result, JSONResponse):
+            return result
+        if not isinstance(result, _Ok):
+            return _agent_tool_error(result, "Failed to edit agent")
+        updated_fields.update(result.data.get("updated", {}))
+
+    # Profile → review_profile (own bookkeeping). editor_id is the
+    # operator's identity so ``profile_updated_by`` records who curated it.
+    if profile_supplied:
+        from ...repositories import agent_repo
+
+        reviewed = agent_repo.review_profile(
+            agent_id,
+            new_profile=profile_value or "",
+            editor_id=caller_identity(auth),
+        )
+        if reviewed is None:
+            return JSONResponse(
+                {"error": f"Agent '{agent_id}' not found."},
+                status_code=404,
+            )
+        updated_fields["profile"] = reviewed.get("profile")
+
+    return JSONResponse({
+        "success": True,
+        "agent_id": agent_id,
+        "updated": updated_fields,
+        "message": (
+            f"Agent '{agent_id}' updated: "
+            + ", ".join(updated_fields.keys())
+        ),
+    })
 
 
 # --- Ad-hoc poke (event-loop scheduler PR2) -----------------------------
