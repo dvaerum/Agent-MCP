@@ -2191,6 +2191,24 @@ async def wait_for_events_tool_impl(
             asyncio.get_event_loop().time() + HEARTBEAT_INTERVAL_SECONDS
         )
         heartbeat_progress = 0.0
+
+        # Idle backlog reminder — periodically nudge an idle agent that still
+        # has unread messages / open tasks. Per-agent timer seeded on first
+        # sight (a fresh connection waits a full interval, not fires now).
+        from ..core import idle_reminder
+        from ..tools.access import _get_config_bool, _get_config_int
+
+        _reminder_enabled = _get_config_bool("config_idle_reminder_enabled", True)
+        _reminder_interval = _get_config_int(
+            "config_idle_reminder_interval_seconds", 3600
+        )
+        _reminder_deadline: Optional[float] = None
+        if _reminder_enabled and _reminder_interval > 0:
+            _rnow = asyncio.get_event_loop().time()
+            _reminder_deadline = _rnow + idle_reminder.seconds_until_due(
+                agent_id, float(_reminder_interval), _rnow
+            )
+
         while True:
             now_mono = asyncio.get_event_loop().time()
             now_iso = datetime.datetime.now().isoformat()
@@ -2218,6 +2236,26 @@ async def wait_for_events_tool_impl(
                 return _envelope(
                     [stop_evt], since, profile_review=review_section
                 )
+            # Idle backlog reminder due → if the agent still has unread
+            # messages / open tasks, wake it with a listed summary. No backlog
+            # → just advance the timer and keep holding for free.
+            if _reminder_deadline is not None and now_mono >= _reminder_deadline:
+                idle_reminder.mark_checked(agent_id, now_mono)
+                _reminder_deadline = now_mono + float(_reminder_interval)
+                _backlog = idle_reminder.collect_backlog(agent_id)
+                if _backlog is not None:
+                    _evlog(
+                        "reminder agent=%s unread=%d open_tasks=%d "
+                        "(idle backlog nudge)",
+                        agent_id, _backlog["unread_count"],
+                        _backlog["task_count"],
+                    )
+                    hold_ladder.reset(agent_id)
+                    g.drain_waiter_queue(waiter_queue)
+                    return _envelope(
+                        [idle_reminder.reminder_event(_backlog)], since,
+                        profile_review=review_section,
+                    )
             # A schedule is due now → fire it (wait-loop-native) and return.
             if has_schedule and soonest_due <= now_iso:
                 events, cursor_value = assemble_event_feed(
@@ -2262,6 +2300,11 @@ async def wait_for_events_tool_impl(
             if idle_deadline is not None:
                 # Don't overshoot the idle-stop by more than a slice.
                 slice_timeout = min(slice_timeout, idle_deadline - now_mono)
+            if _reminder_deadline is not None:
+                # Wake at the reminder boundary so the nudge is prompt.
+                slice_timeout = min(
+                    slice_timeout, max(0.0, _reminder_deadline - now_mono)
+                )
             if has_schedule:
                 # Wake right at the soonest next_due so the fire is prompt
                 # (bounded below by 0; a due-in-the-past schedule was

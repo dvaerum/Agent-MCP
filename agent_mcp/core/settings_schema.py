@@ -200,6 +200,36 @@ SETTINGS_SCHEMA: tuple[SettingSpec, ...] = (
         widget="switch",
     ),
     SettingSpec(
+        key="config_idle_reminder_enabled",
+        type="bool",
+        default=True,
+        tier="operator",
+        group="event_loop",
+        title="Idle backlog reminders",
+        description=(
+            "When on (default), an agent sitting idle in the event loop that "
+            "still has unaddressed work — unread messages and/or OPEN tasks "
+            "assigned to it (not completed/cancelled/failed) — is periodically "
+            "reminded with a listed summary and told to go handle it. An agent "
+            "with no backlog is never reminded (it stays parked for free)."
+        ),
+        widget="switch",
+    ),
+    SettingSpec(
+        key="config_idle_reminder_interval_seconds",
+        type="int",
+        default=3600,  # 1 hour
+        tier="operator",
+        group="event_loop",
+        title="Idle reminder interval",
+        description=(
+            "How often to re-remind an idle agent that still has an "
+            "unaddressed backlog. Default 1 hour. The reminder only fires "
+            "when a backlog is actually present at the interval boundary."
+        ),
+        widget="int_duration",
+    ),
+    SettingSpec(
         key="config_message_retention_days",
         type="int",
         default=0,
