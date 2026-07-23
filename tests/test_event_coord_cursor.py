@@ -171,3 +171,61 @@ async def test_fetch_events_since_null_cursor_uses_persisted(
         assert body.get("events") == [], (
             f"cursor=None should use persisted future ts; got {body}"
         )
+
+
+async def test_wait_for_events_no_since_uses_persisted_cursor(
+    tmp_path: Path,
+) -> None:
+    """`wait_for_events()` with NO `since` must resume from the agent's
+    persisted `last_event_seen_at`, NOT re-dump the whole backlog from
+    the epoch.
+
+    Regression: a no-arg reconnect (which the wake-loop recovery
+    guidance explicitly instructs the agent to do) resolved `since` to
+    the epoch and re-served every historical message on every call —
+    blowing the tool output cap and wedging the loop. Mirrors
+    `test_fetch_events_since_null_cursor_uses_persisted`: pin the cursor
+    far in the future so the just-stored message is "older", then assert
+    the no-arg poll returns no message events.
+    """
+    from tests.harness import mcp_session
+    from agent_mcp.tools.agent_communication_tools import (
+        send_agent_message_tool_impl,
+    )
+    from agent_mcp.db.connection import get_db_connection
+
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        with with_bearer(admin.admin_token):
+            await send_agent_message_tool_impl({
+                "token": admin.admin_token,
+                "recipient_id": "alice",
+                "message": "old backlog that must not be re-dumped",
+                "deliver_method": "store",
+            })
+
+        far_future = "9999-01-01T00:00:00"
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE agents SET last_event_seen_at = ? WHERE agent_id = ?",
+                (far_future, "alice"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # No `since` argument → must fall back to the persisted cursor.
+        blocks = await alice.call(
+            "wait_for_events", {"timeout_seconds": 2}
+        )
+        body = json.loads(_content_text(blocks))
+        msg_events = [
+            e for e in body.get("events", [])
+            if e.get("type") in ("message", "broadcast")
+        ]
+        assert msg_events == [], (
+            f"no-arg wait_for_events must use persisted future cursor, "
+            f"not re-dump the backlog; got {msg_events}"
+        )

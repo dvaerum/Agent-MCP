@@ -2001,6 +2001,14 @@ async def wait_for_events_tool_impl(
             field="since",
             message="since must be an ISO-UTC timestamp string",
         )
+    # No explicit cursor from the caller → resume from the agent's
+    # persisted high-water cursor (`agents.last_event_seen_at`), mirroring
+    # fetch_events_since. Without this, a no-arg reconnect — which the
+    # wake-loop recovery guidance explicitly tells agents to do — resolves
+    # `since` to the epoch and re-dumps the ENTIRE message backlog on every
+    # call, blowing the tool output cap and wedging the loop.
+    if not since:
+        since = _read_last_event_seen_at(agent_id)
 
     # Event-loop long-hold (plan: event-loop-longlived-connections).
     # Resolve the per-connection hold strategy from the client's identity
