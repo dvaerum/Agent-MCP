@@ -196,3 +196,73 @@ async def test_rest_thread_endpoint_rejects_bad_token(tmp_path) -> None:
             headers={"Authorization": f"Bearer {'x' * 32}"},
         )
         assert r.status_code == 401, r.text
+
+
+# ---------- reply implies read (mark parent read on reply) -------------
+
+
+async def test_reply_marks_parent_message_read(tmp_path) -> None:
+    """Replying to a message implies the sender has read it: the parent
+    row flips to read=True. Feature: "if you reply to someone you must
+    also have already read it." """
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        await admin.create_worker("bob")
+        # Parent: bob -> alice, unread.
+        _seed_message(
+            "parent1", "bob", "alice", "ping",
+            "2026-01-01T00:00:00", subject="Topic",
+        )
+        from agent_mcp.repositories import message_repo
+
+        assert message_repo.get_by_id("parent1")["read"] is False, (
+            "precondition: parent starts unread"
+        )
+
+        # alice replies to bob's message.
+        await alice.assert_tool_succeeds(
+            "send_agent_message",
+            {
+                "recipient_id": "bob",
+                "message": "pong",
+                "parent_message_id": "parent1",
+            },
+        )
+
+        assert message_repo.get_by_id("parent1")["read"] is True, (
+            "replying to a message must mark that parent message read"
+        )
+
+
+async def test_reply_from_non_recipient_does_not_mark_parent_read(
+    tmp_path,
+) -> None:
+    """Defense-in-depth: the mark-read is scoped to the replier being the
+    parent's recipient. A reply from anyone else must NOT clear the read
+    flag — otherwise a third party could hide a message from the agent it
+    was actually addressed to."""
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice")
+        await admin.create_worker("bob")
+        carol = await admin.create_worker("carol")
+        # Parent addressed to alice (NOT carol).
+        _seed_message(
+            "parent2", "bob", "alice", "ping",
+            "2026-01-01T00:00:00",
+        )
+
+        # carol (not the recipient) replies referencing the parent.
+        await carol.assert_tool_succeeds(
+            "send_agent_message",
+            {
+                "recipient_id": "bob",
+                "message": "butting in",
+                "parent_message_id": "parent2",
+            },
+        )
+
+        from agent_mcp.repositories import message_repo
+
+        assert message_repo.get_by_id("parent2")["read"] is False, (
+            "a reply from a non-recipient must not mark alice's message read"
+        )

@@ -778,6 +778,69 @@ class MessageRepository:
             )
             return False
 
+    @staticmethod
+    def _mark_read_on_reply(
+        parent_message_id: str,
+        replier_id: str,
+        connection: Any = None,
+    ) -> None:
+        """Flip the replied-to parent message to ``read=1`` (best-effort).
+
+        Invoked by :meth:`send` whenever a reply (``parent_message_id``
+        set) is stored: replying to a message implies its recipient has
+        read it, so the parent's unread flag clears automatically. Scoped
+        to ``recipient_id == replier_id`` (defense-in-depth) — a reply can
+        only clear the read flag on a message actually addressed to the
+        replier, so a reply referencing someone else's message is a no-op
+        (never hides a message from the agent it was sent to).
+
+        Same three connection shapes as :meth:`_parent_message_exists` so
+        the UPDATE participates in the caller's open transaction — atomic
+        with the reply INSERT on the ``send_agent_message_tool_impl`` /
+        ``create_message_api_route`` cursor paths. Never raises: a
+        mark-read failure must not roll back an otherwise-good send.
+        """
+        if not parent_message_id or not replier_id:
+            return
+
+        # sqlite3 cursor path — same transaction as the reply INSERT.
+        if connection is not None and not hasattr(connection, "query"):
+            try:
+                connection.execute(
+                    "UPDATE agent_messages SET read = 1 "
+                    "WHERE message_id = ? AND recipient_id = ? "
+                    "AND read = 0",
+                    (parent_message_id, replier_id),
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                logger.error(
+                    f"Database error marking parent {parent_message_id!r} "
+                    f"read on reply via shared cursor: {e}",
+                    exc_info=True,
+                )
+            return
+
+        # SQLAlchemy session path — caller's open session.
+        if connection is not None:
+            try:
+                connection.execute(
+                    sa_update(AgentMessage)
+                    .where(AgentMessage.message_id == parent_message_id)
+                    .where(AgentMessage.recipient_id == replier_id)
+                    .where(AgentMessage.read.is_(False))
+                    .values(read=True)
+                )
+            except SQLAlchemyError as e:  # pragma: no cover - defensive
+                logger.error(
+                    f"Database error marking parent {parent_message_id!r} "
+                    f"read on reply via shared session: {e}",
+                    exc_info=True,
+                )
+            return
+
+        # Standalone path — reuse the tested module helper (own session).
+        mark_read_by_ids([parent_message_id], recipient_id=replier_id)
+
     # --- Read interface --------------------------------------------------
 
     def get_by_id(self, message_id: str) -> Optional[Dict[str, Any]]:
@@ -1199,6 +1262,14 @@ class MessageRepository:
                         exc_info=True,
                     )
             fresh = _db_get_message_by_id(message_id)
+
+        # Reply implies read: a reply (parent_message_id set) means its
+        # recipient has read the parent, so clear the parent's unread flag
+        # on the SAME connection (atomic with the reply INSERT). Scoped to
+        # the replier as recipient — a reply to someone else's message is a
+        # no-op. Best-effort; never fails the send.
+        if parent_message_id is not None:
+            self._mark_read_on_reply(parent_message_id, sender_id, connection)
 
         # EventBus publish only on the standalone path. With a
         # ``connection=`` the caller's transaction is still open; a
