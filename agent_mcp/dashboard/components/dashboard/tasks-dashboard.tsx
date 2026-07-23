@@ -1223,17 +1223,19 @@ export function TasksDashboard() {
   }, [tasks, searchTerm, priorityFilter])
 
   // Memoize stats calculation
-  const stats = useMemo(() => ({
-    total: tasks.length,
-    in_progress: tasks.filter(t => t.status === 'in_progress').length,
-    pending: tasks.filter(t => t.status === 'pending').length,
-    completed: tasks.filter(t => t.status === 'completed').length,
-    failed: tasks.filter(t => t.status === 'failed').length,
-    // cancelled tasks are in `total` but have no dedicated card; surfacing
-    // the count on the Total card keeps the numbers reconcilable
-    // (total = in_progress + pending + completed + failed + cancelled).
-    cancelled: tasks.filter(t => t.status === 'cancelled').length,
-  }), [tasks])
+  const stats = useMemo(() => {
+    const total = tasks.length
+    const in_progress = tasks.filter(t => t.status === 'in_progress').length
+    const pending = tasks.filter(t => t.status === 'pending').length
+    const completed = tasks.filter(t => t.status === 'completed').length
+    const failed = tasks.filter(t => t.status === 'failed').length
+    // Any status without a dedicated card (unassigned, cancelled, …) is in
+    // `total` but not in the four cards; surface the remainder on the Total
+    // card so the numbers reconcile
+    // (total = in_progress + pending + completed + failed + other).
+    const other = Math.max(0, total - in_progress - pending - completed - failed)
+    return { total, in_progress, pending, completed, failed, other }
+  }, [tasks])
 
   const handleCreateTask = useCallback(async (data: any) => {
     try {
@@ -1345,8 +1347,8 @@ export function TasksDashboard() {
           label="Total"
           value={stats.total}
           change={
-            stats.cancelled > 0
-              ? `${stats.cancelled} cancelled`
+            stats.other > 0
+              ? `${stats.other} other`
               : stats.total > 0 ? `${stats.in_progress} active` : undefined
           }
           trend="neutral"
