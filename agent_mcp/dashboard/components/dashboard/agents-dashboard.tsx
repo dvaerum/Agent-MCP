@@ -45,6 +45,18 @@ const AGENT_ID_RE = /^[a-z](?:[a-z0-9@_-]*[a-z0-9])?$/
 // 400s bad input; this drives the live hint + submit-disable.
 const AOE_SESSION_ID_RE = /^[0-9a-f]{16}$/
 
+// Display label per presence state. The `pending` KEY is kept in the
+// logic (agentPresence + all the css/tooltip branches), but "PENDING"
+// read like the dead spawn-lifecycle status; "NOT CONNECTED" says what
+// it actually is — the agent is registered but no Claude process has
+// ever connected to it yet (the yellow pulsing dot + tooltip explain).
+const PRESENCE_LABEL: Record<AgentPresence, string> = {
+  online: "ONLINE",
+  pending: "NOT CONNECTED",
+  offline: "OFFLINE",
+  terminated: "TERMINATED",
+}
+
 // Wave 7 PR 2: presence-driven dot. The legacy `Agent['status']`
 // values (running / pending / terminated / failed) were spawn-
 // lifecycle artefacts. The coordinator model surfaces live MCP
@@ -191,7 +203,7 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, op
               presence === 'terminated' && "bg-muted/50 text-muted-foreground ring-1 ring-border",
             )}
           >
-            {presence.toUpperCase()}
+            {PRESENCE_LABEL[presence]}
           </Badge>
           {isNewAgent() && (
             <Badge variant="outline" className="text-xs bg-blue-500/15 text-blue-600 border-blue-500/30 font-medium">
