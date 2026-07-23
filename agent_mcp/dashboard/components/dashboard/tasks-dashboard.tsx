@@ -1229,6 +1229,10 @@ export function TasksDashboard() {
     pending: tasks.filter(t => t.status === 'pending').length,
     completed: tasks.filter(t => t.status === 'completed').length,
     failed: tasks.filter(t => t.status === 'failed').length,
+    // cancelled tasks are in `total` but have no dedicated card; surfacing
+    // the count on the Total card keeps the numbers reconcilable
+    // (total = in_progress + pending + completed + failed + cancelled).
+    cancelled: tasks.filter(t => t.status === 'cancelled').length,
   }), [tasks])
 
   const handleCreateTask = useCallback(async (data: any) => {
@@ -1338,9 +1342,13 @@ export function TasksDashboard() {
       <div className="grid gap-3 sm:gap-4 grid-cols-2 sm:grid-cols-3 lg:grid-cols-5">
         <StatsCard 
           icon={Target} 
-          label="Total" 
-          value={stats.total} 
-          change={stats.total > 0 ? `${stats.in_progress} active` : undefined}
+          label="Total"
+          value={stats.total}
+          change={
+            stats.cancelled > 0
+              ? `${stats.cancelled} cancelled`
+              : stats.total > 0 ? `${stats.in_progress} active` : undefined
+          }
           trend="neutral"
         />
         <StatsCard 

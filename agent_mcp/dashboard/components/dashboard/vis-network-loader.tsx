@@ -803,16 +803,28 @@ export default function VisNetworkLoader({
             </div>
           </div>
 
-          {/* Graph Container */}
-          {loading && nodeCount === 0 ? (
-            <div className="flex items-center justify-center h-full">
+          {/* Graph Container — ALWAYS rendered so the vis-network init
+              effect always finds `containerRef.current`. Previously the
+              container was swapped out for the loading/error state, so on
+              a slow backend (fetch > the 100ms init timer) the effect ran
+              while the spinner was mounted, found a null ref, bailed, and
+              never re-ran (its deps don't include `loading`) — the network
+              was never created and the graph stayed blank despite data
+              loading. Loading/error now render as overlays on top. */}
+          <div
+            ref={containerRef}
+            className="w-full h-full"
+          />
+          {loading && nodeCount === 0 && (
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
               <div className="text-center space-y-4">
                 <RefreshCw className="h-12 w-12 mx-auto animate-spin text-primary" />
                 <p className="text-muted-foreground">Loading graph data...</p>
               </div>
             </div>
-          ) : error && nodeCount === 0 ? (
-            <div className="flex items-center justify-center h-full">
+          )}
+          {error && nodeCount === 0 && (
+            <div className="absolute inset-0 flex items-center justify-center">
               <div className="text-center space-y-4">
                 <Activity className="h-12 w-12 mx-auto text-destructive" />
                 <p className="text-muted-foreground">{error}</p>
@@ -821,11 +833,6 @@ export default function VisNetworkLoader({
                 </Button>
               </div>
             </div>
-          ) : (
-            <div 
-              ref={containerRef} 
-              className="w-full h-full" 
-            />
           )}
         </div>
       </div>

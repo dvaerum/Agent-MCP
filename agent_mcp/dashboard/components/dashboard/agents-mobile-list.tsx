@@ -23,11 +23,24 @@ import { agentPresence, type Agent, type AgentPresence } from "@/lib/api"
 
 // Wave 7 PR 2 — presence-driven tone. Replaces the spawn-lifecycle
 // `status` keys ('running' / 'pending' / 'terminated' / 'failed').
+// `pending` collapses into offline's look + label to match the desktop
+// CompactAgentRow (a registered-but-never-connected agent reads as
+// "OFFLINE"; the never-connected nuance lives in the detail dialog's
+// tooltip, not a second look-alike badge).
 const PRESENCE_TONE: Record<AgentPresence, string> = {
   online: "bg-primary/15 text-primary ring-1 ring-primary/20",
-  pending: "bg-amber-500/15 text-amber-600 dark:text-amber-400 ring-1 ring-amber-500/20",
+  pending: "bg-muted text-muted-foreground ring-1 ring-border",
   offline: "bg-muted text-muted-foreground ring-1 ring-border",
   terminated: "bg-muted text-muted-foreground ring-1 ring-border",
+}
+
+// Display label per presence — kept in sync with the desktop
+// PRESENCE_LABEL so a given agent reads identically on both surfaces.
+const PRESENCE_LABEL: Record<AgentPresence, string> = {
+  online: "ONLINE",
+  pending: "OFFLINE",
+  offline: "OFFLINE",
+  terminated: "TERMINATED",
 }
 
 interface AgentsMobileListProps {
@@ -77,7 +90,7 @@ export function AgentsMobileList({
                   PRESENCE_TONE[presence],
                 )}
               >
-                {presence}
+                {PRESENCE_LABEL[presence]}
               </Badge>
             </div>
 
