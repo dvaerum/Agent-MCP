@@ -1475,6 +1475,32 @@ def _stop_listening_event(reason: str) -> Dict[str, Any]:
     }
 
 
+# Newest-wins: message returned to the OLDER wait_for_events call when a
+# NEWER one for the same agent supersedes it. Deliberately NOT a
+# stop_listening event — the agent must NOT exit the loop (its newer
+# connection is carrying it); this only closes the stale duplicate.
+_SUPERSEDED_MESSAGE = (
+    "This wait_for_events connection was superseded by a newer one for the "
+    "same agent, so this (duplicate) call is being closed — you should have "
+    "exactly ONE event-loop connection. Do NOT open a second wait_for_events "
+    "while one is already parked, and do NOT background it: it is meant to "
+    "stay in the foreground as your idle wait for new work. Your newer "
+    "connection is still live and carrying the loop; do nothing here."
+)
+
+
+def _superseded_event() -> Dict[str, Any]:
+    """Build the ``connection_superseded`` event (returned to a waiter that
+    a newer connection replaced). Distinct from stop_listening so the agent
+    keeps the loop running on its newer connection."""
+    return {
+        "type": "connection_superseded",
+        "ref_id": None,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "payload": {"reason": _SUPERSEDED_MESSAGE},
+    }
+
+
 def _write_last_event_seen_at(agent_id: str, cursor_value: str) -> None:
     """Persist the high-water cursor to `agents.last_event_seen_at`.
 
@@ -2153,6 +2179,17 @@ async def wait_for_events_tool_impl(
     # N concurrent waiters per agent each receive every notification.
     # Register on entry; unregister in the finally block on exit.
     waiter_queue = g.register_waiter(agent_id)
+    # Newest-wins: this new connection supersedes any prior parked
+    # wait_for_events for the same agent (a backgrounded/stale duplicate).
+    # The old waiter(s) wake on the supersede sentinel and return a
+    # connection_superseded event, so an agent keeps exactly ONE
+    # event-loop connection instead of accumulating parked ones.
+    _superseded_n = g.supersede_prior_waiters(agent_id, waiter_queue)
+    if _superseded_n:
+        _evlog(
+            "supersede agent=%s evicted %d prior wait_for_events connection(s)",
+            agent_id, _superseded_n,
+        )
     try:
         # Flag gate: if either toggle is OFF, return stop_listening now.
         enabled, reason = _check_auto_event_loop_flags(agent_id)
@@ -2384,6 +2421,20 @@ async def wait_for_events_tool_impl(
                 first_item = await asyncio.wait_for(
                     waiter_queue.get(), timeout=slice_timeout
                 )
+                # Newest-wins: a newer wait_for_events for this agent
+                # superseded us. Close this (stale/duplicate) call with a
+                # connection_superseded event — NOT stop_listening: the loop
+                # keeps running on the newer connection.
+                if first_item is g.WAITER_SUPERSEDE_SENTINEL:
+                    _evlog(
+                        "poll END agent=%s SUPERSEDED by a newer connection",
+                        agent_id,
+                    )
+                    g.drain_waiter_queue(waiter_queue)
+                    return _envelope(
+                        [_superseded_event()], since,
+                        profile_review=review_section,
+                    )
                 # Woken — recheck flags first; the wake may have come
                 # from `wake_for_flag_recheck` (toggle flip), in which
                 # case the new flag state requires stop_listening.

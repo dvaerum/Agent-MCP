@@ -1,24 +1,24 @@
-"""Fan-out semantics for `wait_for_events` (PR-B / v5.0.24).
+"""Newest-wins semantics for `wait_for_events`.
 
-Reverses PR #128's "one consumer per agent / HTTP 409" decision. The
-real-world dual-use case is a worker's Claude Code MCP session +
-a shell-based monitor curling the same bearer — both must be able to
-await events, and both must receive each event when it arrives.
+An agent must keep exactly ONE event-loop connection. When a new
+wait_for_events for an agent registers, it SUPERSEDES any prior parked
+waiter for the same agent (which returns a ``connection_superseded``
+event and exits) — so an agent can't accumulate stale parked connections
+(e.g. a backgrounded call left behind when it reconnects). This replaced
+the earlier fan-out (which let N concurrent waiters each receive every
+event) after that let backgrounded duplicates pile up.
+
+The waiter mechanism is unchanged; the change is that registering a new
+waiter pushes ``WAITER_SUPERSEDE_SENTINEL`` onto the prior ones.
 
 Tests cover:
-  * Two concurrent waiters with the same bearer both get the event.
-  * Neither call is rejected with ``another_wait_in_flight`` / 409.
-  * Synthetic events (``unassigned_task_appeared``) are delivered to
-    every waiter, not consumed destructively by the first.
+  * Newest-wins: a second waiter supersedes the first; only the survivor
+    receives a subsequently-sent message.
+  * No ``another_wait_in_flight`` / 409 on the concurrent call.
+  * Synthetic events reach the surviving waiter (not the superseded one).
   * Single-waiter regression — one waiter, one event still works.
-  * Timeout regression — both waiters time out cleanly when no event
-    arrives during the window.
-
-The wake path goes through ``g.notify_agent_inbox(agent_id)`` (PR-W2b
-EventBus), which all writers already call after commit. We exercise
-it via ``send_agent_message`` (DB-backed event) and
-``g.notify_unassigned_task_appeared`` (synthetic queue event) to
-cover both fan-out paths.
+  * Two near-simultaneous waiters: one superseded, one survives + times
+    out empty.
 """
 
 from __future__ import annotations
@@ -45,16 +45,19 @@ def _envelope(blocks) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Test 1: two concurrent waiters with the same bearer both receive a
-# DB-backed event (message). Neither gets the 409 envelope.
+# Test 1: newest-wins — a second wait_for_events for the same agent
+# supersedes the first. The older is closed with connection_superseded;
+# the newer carries the loop and receives the message.
 # ---------------------------------------------------------------------------
 
 
-async def test_two_concurrent_waiters_both_receive_message(
+async def test_newest_wins_supersedes_prior_waiter(
     tmp_path: Path,
 ) -> None:
-    """Worker session + observer session, same bearer. Admin sends one
-    message to the worker; both waiters return with the event."""
+    """An agent must keep exactly ONE event-loop connection: a second
+    wait_for_events supersedes the first. The older call returns a
+    connection_superseded event (NOT the message); the newer one is the
+    sole survivor and receives the subsequently-sent message."""
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
 
@@ -64,58 +67,40 @@ async def test_two_concurrent_waiters_both_receive_message(
             )
 
         first = asyncio.create_task(waiter())
+        await asyncio.sleep(0.3)   # first parks
         second = asyncio.create_task(waiter())
-        # Give both waiters a slice to enter the slow path before the
-        # send wakes them. Without this yield the test still works on
-        # fan-out but is flakier on slower CI.
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.3)   # second registers → supersedes first
 
-        # Send a message from admin -> alice via the proper tool path
-        # so the writer's notify_agent_inbox fires the EventBus.
+        # Only the surviving (newer) waiter should receive this.
         send_result = await admin.call(
             "send_agent_message",
             {
                 "recipient_id": "alice",
-                "message": "hello fanout",
+                "message": "hello newest wins",
                 "deliver_method": "store",
             },
         )
         assert send_result, "send_agent_message returned no content"
 
         first_blocks, second_blocks = await asyncio.gather(first, second)
-
         first_body = _envelope(first_blocks)
         second_body = _envelope(second_blocks)
 
-        # Neither waiter may be rejected with the legacy 409 envelope.
-        assert "error" not in first_body, (
-            f"first waiter got error envelope: {first_body}"
+        first_types = [e.get("type") for e in first_body.get("events", [])]
+        # Older waiter: superseded, and did NOT get the message.
+        assert "connection_superseded" in first_types, (
+            f"older waiter should be superseded; got {first_body}"
         )
-        assert "error" not in second_body, (
-            f"second waiter got error envelope: {second_body}"
-        )
+        assert not any(
+            "hello newest wins" in json.dumps(e)
+            for e in first_body.get("events", [])
+        ), f"superseded waiter must NOT get the message; got {first_body}"
 
-        # Both waiters must observe the new message in their events list.
-        first_events = first_body.get("events", [])
-        second_events = second_body.get("events", [])
-        assert first_events, (
-            f"first waiter returned no events; body={first_body}"
-        )
-        assert second_events, (
-            f"second waiter returned no events; body={second_body}"
-        )
-
-        def _has_message(events: list) -> bool:
-            return any(
-                "hello fanout" in json.dumps(e) for e in events
-            )
-
-        assert _has_message(first_events), (
-            f"first waiter missed the message: {first_events}"
-        )
-        assert _has_message(second_events), (
-            f"second waiter missed the message: {second_events}"
-        )
+        # Newer waiter: sole survivor, receives the message.
+        assert any(
+            "hello newest wins" in json.dumps(e)
+            for e in second_body.get("events", [])
+        ), f"surviving waiter should get the message; got {second_body}"
 
 
 # ---------------------------------------------------------------------------
@@ -175,17 +160,13 @@ async def test_concurrent_waiter_is_not_rejected_with_409(
 # ---------------------------------------------------------------------------
 
 
-async def test_synthetic_event_fans_out_to_all_waiters(
+async def test_synthetic_event_reaches_surviving_waiter(
     tmp_path: Path,
 ) -> None:
-    """Synthetic events (currently ``unassigned_task_appeared``) are
-    queued out-of-band rather than read from a DB row. The pre-fan-out
-    impl drained them destructively, so only one waiter saw them. With
-    fan-out, every waiter gets its own copy. We drive the notify
-    directly via the EventBus so the test is decoupled from the
-    capability-matching SQL inside
-    ``notify_unassigned_task_appeared`` — the fan-out contract is the
-    bus, not the matcher."""
+    """Under newest-wins a synthetic event (``unassigned_task_appeared``)
+    goes to the sole SURVIVING waiter; the superseded older one exits with
+    connection_superseded rather than a duplicate copy. Driven via the
+    EventBus directly to decouple from the matcher SQL."""
     from agent_mcp.core import event_bus
 
     async with mcp_session(tmp_path) as admin:
@@ -197,11 +178,10 @@ async def test_synthetic_event_fans_out_to_all_waiters(
             )
 
         first = asyncio.create_task(waiter())
+        await asyncio.sleep(0.3)   # first parks
         second = asyncio.create_task(waiter())
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.3)   # second supersedes first
 
-        # Synthetic event via the bus — same path the matcher uses
-        # after it picks alice out of the capability join.
         event_bus.notify(
             "alice",
             "unassigned_task_appeared",
@@ -215,7 +195,6 @@ async def test_synthetic_event_fans_out_to_all_waiters(
         )
 
         first_blocks, second_blocks = await asyncio.gather(first, second)
-
         first_events = _envelope(first_blocks).get("events", [])
         second_events = _envelope(second_blocks).get("events", [])
 
@@ -228,11 +207,13 @@ async def test_synthetic_event_fans_out_to_all_waiters(
                 for e in events
             )
 
-        assert _has_synthetic(first_events), (
-            f"first waiter missed the synthetic event; got {first_events}"
-        )
+        # Older waiter: superseded (no synthetic copy).
+        assert any(
+            e.get("type") == "connection_superseded" for e in first_events
+        ), f"older waiter should be superseded; got {first_events}"
+        # Surviving waiter: receives the synthetic event.
         assert _has_synthetic(second_events), (
-            f"second waiter missed the synthetic event; got {second_events}"
+            f"surviving waiter missed the synthetic event; got {second_events}"
         )
 
 
@@ -278,9 +259,14 @@ async def test_single_waiter_still_receives_event(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_two_waiters_both_time_out_cleanly(tmp_path: Path) -> None:
-    """No event during the window — both waiters return empty envelopes
-    around the timeout boundary, neither errors."""
+async def test_two_waiters_newest_survives_older_superseded(
+    tmp_path: Path,
+) -> None:
+    """Two near-simultaneous waiters, no event during the window: under
+    newest-wins exactly ONE is superseded (connection_superseded) and the
+    other (the survivor) times out with an empty envelope. Neither errors.
+    Order-agnostic — which of the two wins depends on registration
+    scheduling."""
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
 
@@ -292,19 +278,20 @@ async def test_two_waiters_both_time_out_cleanly(tmp_path: Path) -> None:
         first_blocks, second_blocks = await asyncio.gather(
             waiter(), waiter()
         )
+        bodies = [_envelope(first_blocks), _envelope(second_blocks)]
 
-        first_body = _envelope(first_blocks)
-        second_body = _envelope(second_blocks)
+        for b in bodies:
+            assert "error" not in b, f"waiter returned error: {b}"
 
-        assert "error" not in first_body, (
-            f"first timeout returned error: {first_body}"
+        superseded = [
+            b for b in bodies
+            if any(e.get("type") == "connection_superseded"
+                   for e in b.get("events", []))
+        ]
+        empty = [b for b in bodies if b.get("events", []) == []]
+        assert len(superseded) == 1, (
+            f"exactly one waiter should be superseded; got {bodies}"
         )
-        assert "error" not in second_body, (
-            f"second timeout returned error: {second_body}"
-        )
-        assert first_body.get("events", []) == [], (
-            f"first timeout returned non-empty events: {first_body}"
-        )
-        assert second_body.get("events", []) == [], (
-            f"second timeout returned non-empty events: {second_body}"
+        assert len(empty) == 1, (
+            f"the survivor should time out empty; got {bodies}"
         )

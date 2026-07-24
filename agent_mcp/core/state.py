@@ -384,6 +384,36 @@ def notify_waiters(agent_id: str) -> None:
             pass
 
 
+# Distinct sentinel pushed onto a PRIOR waiter's queue when a NEWER
+# wait_for_events call for the same agent supersedes it (newest-wins). A
+# unique object so the drain + slow-path tell it apart from a wake
+# sentinel (``None``) or a real synthetic event (a dict). The superseded
+# waiter returns a ``connection_superseded`` event and exits, so an agent
+# never accumulates stale parked event-loop connections (e.g. a
+# backgrounded call left behind when it reconnects).
+WAITER_SUPERSEDE_SENTINEL: Any = object()
+
+
+def supersede_prior_waiters(agent_id: str, keep: asyncio.Queue) -> int:
+    """Newest-wins: evict every parked ``wait_for_events`` waiter for this
+    agent EXCEPT ``keep`` (the just-registered newest connection) by
+    pushing the supersede sentinel onto their queues. Returns the number
+    of prior waiters superseded (0 when this is the agent's only one)."""
+    waiters = agent_event_waiters.get(agent_id)
+    if not waiters:
+        return 0
+    n = 0
+    for queue in list(waiters):
+        if queue is keep:
+            continue
+        try:
+            queue.put_nowait(WAITER_SUPERSEDE_SENTINEL)
+            n += 1
+        except Exception:  # pragma: no cover - defensive
+            pass
+    return n
+
+
 def dispatch_synthetic_event(
     agent_id: str, event: Dict[str, Any],
 ) -> None:
@@ -448,6 +478,12 @@ def drain_waiter_queue(queue: asyncio.Queue) -> List[Dict[str, Any]]:
         except asyncio.QueueEmpty:
             break
         if item is WAITER_WAKE_SENTINEL:
+            continue
+        # The supersede sentinel is handled by the slow-path queue.get()
+        # (which returns a connection_superseded event + exits); filter it
+        # here so it's never mistaken for a real synthetic event on a
+        # fast-path drain.
+        if item is WAITER_SUPERSEDE_SENTINEL:
             continue
         out.append(item)
     return out
