@@ -11,6 +11,7 @@ import { apiClient, Agent, Task } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { statusColorClasses, priorityColorClasses } from '@/lib/status'
 import { useDataStore } from '@/lib/stores/data-store'
+import { SafeMarkdown } from '@/components/dashboard/memory-value-view'
 
 interface ContextData {
   id: string;
@@ -182,9 +183,11 @@ export function NodeDetailPanel({ nodeId, nodeType, isOpen, onClose, nodeData }:
                 <FileCode className="h-4 w-4 text-muted-foreground" />
                 <span className="text-sm font-medium">Self-description</span>
               </div>
-              <p className="text-sm text-muted-foreground whitespace-pre-wrap break-words">
-                {agent.profile}
-              </p>
+              {/* Markdown-rendered in view (untrusted agent-authored →
+                  SafeMarkdown, the XSS-safe renderer). */}
+              <div className="break-words">
+                <SafeMarkdown source={agent.profile} />
+              </div>
             </div>
           )}
 

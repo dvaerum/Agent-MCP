@@ -29,6 +29,7 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { EmptyState } from "@/components/dashboard/shared/empty-state"
 import { SendDirectiveModal } from "@/components/dashboard/shared/send-directive-modal"
 import { AgentsMobileList } from "@/components/dashboard/agents-mobile-list"
+import { SafeMarkdown } from "@/components/dashboard/memory-value-view"
 
 
 // agent_id slug rule — mirrors the backend's `_AGENT_ID_RE`
@@ -1110,8 +1111,8 @@ const EditAgentDialog = ({
             />
             <p className="text-[10px] text-muted-foreground mt-1">
               The agent&apos;s own profile — normally authored by the agent
-              via update_agent_profile, editable here for curation. Empty
-              clears it.
+              via update_agent_profile, editable here for curation. Markdown
+              supported (rendered in the details view). Empty clears it.
             </p>
           </div>
           <div>
@@ -1727,15 +1728,22 @@ const AgentDetailDialog = ({
             <Label className="text-xs text-muted-foreground uppercase tracking-wider">
               Self-description
             </Label>
-            <div className="text-sm whitespace-pre-wrap [overflow-wrap:anywhere]">
-              {agent.profile ? (
-                agent.profile
-              ) : (
+            {/* Rendered as markdown in view mode (the Edit dialog keeps a
+                raw textarea for authoring). Profiles are agent-authored →
+                untrusted, so SafeMarkdown (no rehype-raw, allowlisted
+                links) is the XSS-safe renderer — same one the Memories
+                view uses. */}
+            {agent.profile ? (
+              <div className="[overflow-wrap:anywhere]">
+                <SafeMarkdown source={agent.profile} />
+              </div>
+            ) : (
+              <div className="text-sm">
                 <span className="text-muted-foreground italic">
                   unset — the agent hasn’t written a profile yet
                 </span>
-              )}
-            </div>
+              </div>
+            )}
           </div>
 
           {/* Group 3: current task */}
