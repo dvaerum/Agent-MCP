@@ -517,7 +517,7 @@ const RegisterAgentModal = () => {
           Register Agent
         </Button>
       </DialogTrigger>
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-lg bg-card border-border text-card-foreground">
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-lg bg-card border-border text-card-foreground max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle className="text-lg">
             {result ? 'Agent registered' : 'Register Agent'}
@@ -733,7 +733,7 @@ const PurgeAgentDialog = ({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground">
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle className="text-lg">
             Purge agent {agentId ?? ''}?
@@ -858,7 +858,7 @@ const TerminateAgentDialog = ({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground">
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle className="text-lg">
             Terminate agent {agentId ?? ''}?
@@ -1045,8 +1045,15 @@ const EditAgentDialog = ({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground">
-        <DialogHeader>
+      {/*
+        Height capped at 90vh + a flex column so the long form body
+        scrolls instead of overflowing the viewport (header + footer stay
+        pinned). Mirrors the AgentDetailDialog structure below; without
+        this the taller-than-viewport form clipped its own title and Save
+        button with no way to scroll to them.
+      */}
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground p-0 gap-0 max-h-[90vh] flex flex-col">
+        <DialogHeader className="px-6 pt-6 pb-4 border-b border-border flex-shrink-0">
           <DialogTitle className="text-lg">Edit agent {agent?.agent_id}</DialogTitle>
           <DialogDescription className="text-muted-foreground">
             Update the agent&apos;s appearance, working directory,
@@ -1054,7 +1061,8 @@ const EditAgentDialog = ({
             changes use Terminate / Restore / Purge.
           </DialogDescription>
         </DialogHeader>
-        <form onSubmit={handleSave} className="space-y-4">
+        <form onSubmit={handleSave} className="flex flex-col min-h-0 flex-1">
+          <div className="px-6 py-4 space-y-4 flex-1 min-h-0 overflow-y-auto">
           <div>
             <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider block mb-2">
               Color
@@ -1203,7 +1211,8 @@ const EditAgentDialog = ({
             )}
           </div>
           {error && <div className="text-sm text-destructive">{error}</div>}
-          <DialogFooter className="gap-2">
+          </div>
+          <DialogFooter className="gap-2 px-6 py-4 border-t border-border flex-shrink-0">
             <Button
               type="button"
               variant="outline"
