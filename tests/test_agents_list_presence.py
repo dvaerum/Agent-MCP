@@ -259,3 +259,54 @@ async def test_parked_wait_for_events_marks_agent_online(tmp_path) -> None:
         )
         assert row2 is not None
         assert row2["online"] is False, row2
+
+
+async def test_recent_activity_keeps_agent_online_within_grace(
+    tmp_path,
+) -> None:
+    """Task #360 follow-up (grace window). Agents' wait_for_events polls
+    wake every ~60-95s and there's a brief gap before the client
+    re-parks; without smoothing, the "Online" dot flickers to Offline in
+    that gap. Presence therefore also treats a fresh ``last_activity_at``
+    (bumped on every poll) as online for a short grace window, and flips
+    to offline once the agent genuinely stops re-parking (stale beyond
+    the window).
+    """
+    import datetime as _dt
+
+    from agent_mcp.repositories import agent_repo
+
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice-grace")
+
+        # Just polled (re-park gap): recent activity, no live waiter/stream.
+        agent_repo.update_field(
+            "alice-grace",
+            "last_activity_at",
+            _dt.datetime.now().isoformat(),
+        )
+        row = next(
+            (
+                a for a in admin.get("/api/agents").json()
+                if a["agent_id"] == "alice-grace"
+            ),
+            None,
+        )
+        assert row is not None
+        assert row["online"] is True, row  # RED before the grace window
+
+        # Genuinely stopped re-parking: stale beyond the grace window.
+        agent_repo.update_field(
+            "alice-grace",
+            "last_activity_at",
+            (_dt.datetime.now() - _dt.timedelta(minutes=30)).isoformat(),
+        )
+        row2 = next(
+            (
+                a for a in admin.get("/api/agents").json()
+                if a["agent_id"] == "alice-grace"
+            ),
+            None,
+        )
+        assert row2 is not None
+        assert row2["online"] is False, row2

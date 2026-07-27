@@ -22,6 +22,8 @@ mechanical URL-stable move.
 
 from __future__ import annotations
 
+import datetime as _dt
+import os
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends
@@ -73,7 +75,44 @@ router = APIRouter(
 # NOT consolidate" scope boundary is settled.
 
 
-def _mcp_presence_for(agent_id: str) -> Dict[str, Any]:
+# Presence grace window (seconds). A parked wait_for_events poll wakes
+# every ~60-95s and the client takes a moment to re-park; without a
+# window the "Online" dot would flicker to Offline in that gap. The
+# default (150s) comfortably covers one wake→re-park cycle while still
+# flipping an agent that has genuinely stopped re-parking to Offline
+# soon after. Override with AGENT_MCP_PRESENCE_GRACE_SECONDS.
+def _presence_grace_seconds() -> int:
+    try:
+        return max(0, int(os.environ.get(
+            "AGENT_MCP_PRESENCE_GRACE_SECONDS", "150",
+        )))
+    except (TypeError, ValueError):
+        return 150
+
+
+def _within_grace(last_activity_at: Optional[str]) -> bool:
+    """True iff ``last_activity_at`` (ISO, bumped on every poll) is within
+    the presence grace window. Handles both naive-local timestamps (how
+    the event loop writes them) and tz-aware ones defensively."""
+    if not last_activity_at:
+        return False
+    try:
+        parsed = _dt.datetime.fromisoformat(
+            last_activity_at.replace("Z", "+00:00"),
+        )
+    except (TypeError, ValueError):
+        return False
+    now = (
+        _dt.datetime.now(parsed.tzinfo)
+        if parsed.tzinfo is not None
+        else _dt.datetime.now()
+    )
+    return (now - parsed).total_seconds() <= _presence_grace_seconds()
+
+
+def _mcp_presence_for(
+    agent_id: str, last_activity_at: Optional[str] = None,
+) -> Dict[str, Any]:
     """Return ``{"online": bool, "last_mcp_connection": str | None}``
     for ``agent_id`` derived from :mod:`agent_mcp.core.session_registry`.
 
@@ -135,10 +174,15 @@ def _mcp_presence_for(agent_id: str) -> Dict[str, Any]:
         session_registry.get_runtime_queue(h.session_id) is not None
         for h in handles
     )
-    return {
-        "online": parked or stream_online,
-        "last_mcp_connection": last_seen,
-    }
+    # Grace smoothing: an agent that polled within the window is treated
+    # as online across the brief re-park gap (see _within_grace).
+    online = parked or stream_online or _within_grace(last_activity_at)
+    # When the agent is online purely via the long-poll/grace path (no
+    # SSE handle), surface last_activity_at as the "last connection" so
+    # the detail panel isn't misleadingly blank for a live agent.
+    if last_seen is None and online and last_activity_at:
+        last_seen = last_activity_at
+    return {"online": online, "last_mcp_connection": last_seen}
 
 
 @router.get("")
@@ -190,14 +234,16 @@ async def agents_list_api_route(request: Request) -> JSONResponse:
             # WHERE status != 'tombstone' filters the cascade-tombstone
             # rows out at the DB layer.
             cursor.execute(
-                "SELECT agent_id, status, color, created_at, current_task "
+                "SELECT agent_id, status, color, created_at, current_task, "
+                "last_activity_at "
                 "FROM agents WHERE status != 'tombstone' "
                 "ORDER BY created_at DESC LIMIT ?",
                 (limit,),
             )
         else:
             cursor.execute(
-                "SELECT agent_id, status, color, created_at, current_task "
+                "SELECT agent_id, status, color, created_at, current_task, "
+                "last_activity_at "
                 "FROM agents WHERE status = ? AND status != 'tombstone' "
                 "ORDER BY created_at DESC LIMIT ?",
                 (status_filter, limit),
@@ -206,7 +252,10 @@ async def agents_list_api_route(request: Request) -> JSONResponse:
             agent_dict = dict(row)
             # Wave 7 PR 2: presence signal sourced from the MCP
             # session registry (see _mcp_presence_for docstring).
-            agent_dict.update(_mcp_presence_for(agent_dict['agent_id']))
+            agent_dict.update(_mcp_presence_for(
+                agent_dict['agent_id'],
+                agent_dict.get('last_activity_at'),
+            ))
             agents_list_data.append(agent_dict)
     except Exception as e:
         logger.error(f"Error fetching agents list: {e}", exc_info=True)

@@ -486,7 +486,10 @@ async def all_data_api_route(
             # list so the badge can switch from spawn-lifecycle status
             # to live MCP-connection status. Same source as the
             # GET /api/agents endpoint.
-            agent_dict.update(_mcp_presence_for(agent_dict['agent_id']))
+            agent_dict.update(_mcp_presence_for(
+                agent_dict['agent_id'],
+                agent_dict.get('last_activity_at'),
+            ))
             agents_data.append(agent_dict)
 
         # Wave 3 (prancy-napping-pie): the synthesised 'Admin' agent
