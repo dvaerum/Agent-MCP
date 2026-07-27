@@ -204,3 +204,58 @@ async def test_row_without_runtime_queue_reads_offline(tmp_path) -> None:
             assert row["last_mcp_connection"] is not None, row
         finally:
             session_registry.unregister_session(sid)
+
+
+async def test_parked_wait_for_events_marks_agent_online(tmp_path) -> None:
+    """Task #360 regression. An agent parked in ``wait_for_events`` (a
+    live long-poll, the primary event-loop channel) must read
+    ``online=True`` — even with NO GET ``/mcp`` SSE runtime queue.
+
+    Before the fix, presence was derived ONLY from
+    ``session_registry`` (the SSE stream), which a parked long-poll
+    never touches, so an actively-listening agent showed a misleading
+    **Offline**. The in-memory waiter registry
+    (``state.register_waiter`` on poll START) is the authoritative,
+    zero-persistence signal for "currently holding an event-loop
+    connection", so presence ORs it in.
+    """
+    from agent_mcp.core import state
+
+    async with mcp_session(tmp_path) as admin:
+        await admin.create_worker("alice-parked")
+
+        # Simulate what the real wait_for_events does on entry.
+        q = state.register_waiter("alice-parked")
+        try:
+            row = next(
+                (
+                    a for a in admin.get("/api/agents").json()
+                    if a["agent_id"] == "alice-parked"
+                ),
+                None,
+            )
+            assert row is not None, "agent row missing"
+            assert row["online"] is True, row  # RED before the fix
+
+            all_row = next(
+                (
+                    a for a in admin.get("/api/all-data").json()["agents"]
+                    if a["agent_id"] == "alice-parked"
+                ),
+                None,
+            )
+            assert all_row is not None
+            assert all_row["online"] is True, all_row
+        finally:
+            state.unregister_waiter("alice-parked", q)
+
+        # Park ended → no live connection of either kind → not online.
+        row2 = next(
+            (
+                a for a in admin.get("/api/agents").json()
+                if a["agent_id"] == "alice-parked"
+            ),
+            None,
+        )
+        assert row2 is not None
+        assert row2["online"] is False, row2

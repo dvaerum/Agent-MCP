@@ -38,6 +38,7 @@ from ..deps import (
 )
 from ...core.config import logger
 from ...core import session_registry
+from ...core import state
 from ...core.principal_builder import build_operator_principal
 from ...core.tool_result import (
     Failed as _Failed,
@@ -95,31 +96,49 @@ def _mcp_presence_for(agent_id: str) -> Dict[str, Any]:
     because the agents-list endpoint is its primary caller; the
     ``/api/all-data`` composition route imports it from here too.
     """
+    # PRIMARY presence signal (task #360): a currently-parked
+    # ``wait_for_events`` long-poll. That POST — not the GET /mcp SSE
+    # stream — is the channel agents actually live in; the in-memory
+    # waiter registry (``state.register_waiter`` on poll START,
+    # ``unregister_waiter`` in the finally on exit) is the
+    # authoritative, zero-persistence record of "holding an event-loop
+    # connection right now". Deriving presence from ``session_registry``
+    # alone rendered actively-listening agents as "Offline" because a
+    # long-poll never opens/touches an SSE runtime queue.
+    try:
+        parked = state.waiter_count(agent_id) > 0
+    except Exception:
+        # Defensive: never let a presence lookup 500 the agents list.
+        logger.exception(
+            "waiter_count lookup failed for agent_id=%r", agent_id,
+        )
+        parked = False
+
+    # SECONDARY signal: a live GET /mcp SSE stream with an attached
+    # runtime queue (the server→client push channel). Also the source
+    # of ``last_mcp_connection``. ``last_seen_at`` is the ISO-UTC
+    # timestamp the transport bumps on every heartbeat; the max across
+    # handles is the most recent SSE liveness signal. A handle without
+    # a runtime queue is stale (backend restarted / client not
+    # reconnected).
     try:
         handles = session_registry.sessions_for_agent(agent_id)
     except Exception:
-        # Defensive: a DB hiccup here must not 500 the agents list;
-        # treat it as "no presence data" so the UI degrades to the
-        # legacy status pill instead of erroring out the page.
+        # A DB hiccup here must degrade gracefully, not 500 the page.
         logger.exception(
             "session_registry lookup failed for agent_id=%r", agent_id,
         )
-        return {"online": False, "last_mcp_connection": None}
-    if not handles:
-        return {"online": False, "last_mcp_connection": None}
-    # ``last_seen_at`` is the ISO-UTC timestamp the transport bumps
-    # on every heartbeat; the max across handles is the most recent
-    # liveness signal. "Online" means at least one runtime queue is
-    # currently attached for one of the agent's handles — i.e. the
-    # transport layer believes the SSE writer is still draining
-    # payloads. Without a runtime queue the row is stale (the backend
-    # restarted, the client hasn't reconnected yet).
-    last_seen = max(h.last_seen_at for h in handles)
-    online = any(
+        handles = []
+
+    last_seen = max((h.last_seen_at for h in handles), default=None)
+    stream_online = any(
         session_registry.get_runtime_queue(h.session_id) is not None
         for h in handles
     )
-    return {"online": online, "last_mcp_connection": last_seen}
+    return {
+        "online": parked or stream_online,
+        "last_mcp_connection": last_seen,
+    }
 
 
 @router.get("")
