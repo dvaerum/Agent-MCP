@@ -2214,7 +2214,7 @@ async def wait_for_events_tool_impl(
                 "poll END agent=%s returned %d event(s) types=%s (fast path, "
                 "backlog present at entry)",
                 agent_id, len(events),
-                [e.get("event_type") for e in events],
+                [e.get("type") for e in events],
             )
             hold_ladder.reset(agent_id)  # a real event resets the ladder
             env = _envelope(events, since, profile_review=review_section)
@@ -2462,7 +2462,7 @@ async def wait_for_events_tool_impl(
                         "poll END agent=%s returned %d event(s) types=%s "
                         "(WOKE after %.0fs of holding)",
                         agent_id, len(events),
-                        [e.get("event_type") for e in events],
+                        [e.get("type") for e in events],
                         asyncio.get_event_loop().time() - _poll_start,
                     )
                     hold_ladder.reset(agent_id)  # a real event resets the ladder
