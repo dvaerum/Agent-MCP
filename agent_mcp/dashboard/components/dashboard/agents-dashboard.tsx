@@ -1307,90 +1307,123 @@ function deriveMcpUrl(): string {
   return `${origin}/mcp`
 }
 
-function buildSnippet(tab: ClientTab, token: string, url: string): string {
+// A single independently-copyable config block. `content` is the ONLY
+// text the Copy button writes to the clipboard — clean, no leading
+// #/// comment markers, one thing per block. `note` is muted helper
+// prose (where/how to use it) that is rendered but NEVER copied.
+type SnippetPart = {
+  title: string // short label, e.g. "CLI command", "opencode.json"
+  note?: string // where/how to use it — rendered as muted helper text
+  content: string // the clean text Copy writes to the clipboard
+}
+
+function buildSnippetBlocks(tab: ClientTab, token: string, url: string): SnippetPart[] {
   const name = 'agent-mcp'
-  const tokenForSnippet = token || '<AGENT_TOKEN>'
+  const t = token || '<AGENT_TOKEN>'
   switch (tab) {
     case 'claude-code':
       return [
-        '# 1. CLI — one-shot add via the Claude Code CLI:',
-        `claude mcp add --transport http ${name} ${url} \\`,
-        `  --header "Authorization: Bearer ${tokenForSnippet}"`,
-        '',
-        '# 2. Equivalent JSON (paste into ~/.claude.json under',
-        '#    `mcpServers` for user-scope OR',
-        '#    `projects["<cwd>"].mcpServers` for project-scope):',
-        '"' + name + '": {',
-        '  "type": "http",',
-        `  "url": "${url}",`,
-        `  "headers": {"Authorization": "Bearer ${tokenForSnippet}"}`,
-        '}',
-      ].join('\n')
+        {
+          title: 'CLI command',
+          note: 'One-shot add via the Claude Code CLI.',
+          content: `claude mcp add --transport http ${name} ${url} --header "Authorization: Bearer ${t}"`,
+        },
+        {
+          title: 'JSON',
+          note: 'Paste into ~/.claude.json under `mcpServers` (user-scope) or `projects["<cwd>"].mcpServers` (project-scope).',
+          content: [
+            '"' + name + '": {',
+            '  "type": "http",',
+            `  "url": "${url}",`,
+            `  "headers": {"Authorization": "Bearer ${t}"}`,
+            '}',
+          ].join('\n'),
+        },
+      ]
     case 'opencode':
       // Verified against https://opencode.ai/docs/mcp-servers
       // Lives in opencode.json (project root) or
       // ~/.config/opencode/opencode.json (user-scope).
       return [
-        '// opencode.json (project) — or ~/.config/opencode/opencode.json',
-        '{',
-        '  "$schema": "https://opencode.ai/config.json",',
-        '  "mcp": {',
-        `    "${name}": {`,
-        '      "type": "remote",',
-        `      "url": "${url}",`,
-        '      "enabled": true,',
-        `      "headers": {"Authorization": "Bearer ${tokenForSnippet}"}`,
-        '    }',
-        '  }',
-        '}',
-      ].join('\n')
+        {
+          title: 'opencode.json',
+          note: 'Project-root opencode.json — or ~/.config/opencode/opencode.json (user-scope).',
+          content: [
+            '{',
+            '  "$schema": "https://opencode.ai/config.json",',
+            '  "mcp": {',
+            `    "${name}": {`,
+            '      "type": "remote",',
+            `      "url": "${url}",`,
+            '      "enabled": true,',
+            `      "headers": {"Authorization": "Bearer ${t}"}`,
+            '    }',
+            '  }',
+            '}',
+          ].join('\n'),
+        },
+      ]
     case 'cursor':
       // Verified against https://cursor.com/docs/context/mcp
       // Lives in .cursor/mcp.json (project) or ~/.cursor/mcp.json
       // (global).
       return [
-        '// .cursor/mcp.json (project) — or ~/.cursor/mcp.json (global)',
-        '{',
-        '  "mcpServers": {',
-        `    "${name}": {`,
-        `      "url": "${url}",`,
-        `      "headers": {"Authorization": "Bearer ${tokenForSnippet}"}`,
-        '    }',
-        '  }',
-        '}',
-      ].join('\n')
+        {
+          title: '.cursor/mcp.json',
+          note: 'Project .cursor/mcp.json — or ~/.cursor/mcp.json (global).',
+          content: [
+            '{',
+            '  "mcpServers": {',
+            `    "${name}": {`,
+            `      "url": "${url}",`,
+            `      "headers": {"Authorization": "Bearer ${t}"}`,
+            '    }',
+            '  }',
+            '}',
+          ].join('\n'),
+        },
+      ]
     case 'cline':
       // Verified against https://docs.cline.bot/mcp/configuring-mcp-servers
       // CLI: ~/.cline/mcp.json. IDE extensions: MCP Settings JSON
       // via the Configure tab.
       return [
-        '// ~/.cline/mcp.json (CLI) — or the MCP Settings JSON in the',
-        '// Configure tab for the VS Code / IDE extension',
-        '{',
-        '  "mcpServers": {',
-        `    "${name}": {`,
-        `      "url": "${url}",`,
-        `      "headers": {"Authorization": "Bearer ${tokenForSnippet}"},`,
-        '      "disabled": false,',
-        '      "autoApprove": []',
-        '    }',
-        '  }',
-        '}',
-      ].join('\n')
+        {
+          title: 'Cline MCP settings',
+          note: 'CLI ~/.cline/mcp.json — or the MCP Settings JSON in the Configure tab of the VS Code / IDE extension.',
+          content: [
+            '{',
+            '  "mcpServers": {',
+            `    "${name}": {`,
+            `      "url": "${url}",`,
+            `      "headers": {"Authorization": "Bearer ${t}"},`,
+            '      "disabled": false,',
+            '      "autoApprove": []',
+            '    }',
+            '  }',
+            '}',
+          ].join('\n'),
+        },
+      ]
     case 'zed':
       // Verified against https://zed.dev/docs/ai/mcp
       // Lives in ~/.config/zed/settings.json under `context_servers`.
       return [
-        '// ~/.config/zed/settings.json — under context_servers',
-        '{',
-        '  "context_servers": {',
-        `    "${name}": {`,
-        `      "url": "${url}",`,
-        `      "headers": {"Authorization": "Bearer ${tokenForSnippet}"}`,
-        '    }',
-        '  }',
-        '}',
-      ].join('\n')
+        {
+          title: 'Zed settings.json',
+          note: '~/.config/zed/settings.json — under context_servers.',
+          content: [
+            '{',
+            '  "context_servers": {',
+            `    "${name}": {`,
+            `      "url": "${url}",`,
+            `      "headers": {"Authorization": "Bearer ${t}"}`,
+            '    }',
+            '  }',
+            '}',
+          ].join('\n'),
+        },
+      ]
     case 'continue':
       // Verified against https://docs.continue.dev/customize/deep-dives/mcp
       // Continue uses per-server YAML files under
@@ -1400,58 +1433,62 @@ function buildSnippet(tab: ClientTab, token: string, url: string): string {
       // the broader Continue config convention; verify against your
       // installed Continue version.
       return [
-        '# .continue/mcpServers/' + name + '.yaml',
-        '# NOTE: Authorization-header syntax for HTTP MCP servers in',
-        '#       Continue is not explicitly documented in the public',
-        '#       docs — verify against your installed version.',
-        'mcpServers:',
-        `  - name: ${name}`,
-        '    type: streamable-http',
-        `    url: ${url}`,
-        '    requestOptions:',
-        '      headers:',
-        `        Authorization: "Bearer ${tokenForSnippet}"`,
-      ].join('\n')
+        {
+          title: `.continue/mcpServers/${name}.yaml`,
+          note: 'Authorization-header syntax for HTTP MCP servers in Continue is not explicitly documented — verify against your installed version.',
+          content: [
+            'mcpServers:',
+            `  - name: ${name}`,
+            '    type: streamable-http',
+            `    url: ${url}`,
+            '    requestOptions:',
+            '      headers:',
+            `        Authorization: "Bearer ${t}"`,
+          ].join('\n'),
+        },
+      ]
     case 'generic':
       return [
-        '// Generic / transport-agnostic — adapt to your client\'s schema.',
-        '{',
-        `  "name": "${name}",`,
-        `  "url": "${url}",`,
-        '  "transport": "http",',
-        `  "headers": {"Authorization": "Bearer ${tokenForSnippet}"}`,
-        '}',
-      ].join('\n')
+        {
+          title: 'Generic JSON',
+          note: "Transport-agnostic — adapt to your client's schema.",
+          content: [
+            '{',
+            `  "name": "${name}",`,
+            `  "url": "${url}",`,
+            '  "transport": "http",',
+            `  "headers": {"Authorization": "Bearer ${t}"}`,
+            '}',
+          ].join('\n'),
+        },
+      ]
   }
 }
 
-// SnippetBlock — a pre/code block with an inline Copy button. Pulled
-// out of the tab body so each TabsContent stays a one-liner; also lets
-// us count <Copy /> occurrences (one per tab + token copy + agent_id
-// copy) cleanly.
+// SnippetBlock — one titled config block with its own Copy button.
+// `block.content` is the only thing copied; `block.note` is muted
+// helper text and is never written to the clipboard. Pulled out of the
+// tab body so each TabsContent stays terse; also lets us count
+// <Copy /> occurrences cleanly.
 const SnippetBlock = ({
-  snippet,
+  block,
   copied,
   onCopy,
 }: {
-  snippet: string
+  block: SnippetPart
   copied: boolean
   onCopy: () => void
 }) => (
-  <div className="relative">
-    <Button
-      variant="ghost"
-      size="sm"
-      onClick={onCopy}
-      className="absolute top-2 right-2 h-7 px-2 text-xs z-10"
-      title="Copy snippet"
-    >
-      <Copy className="h-3 w-3 mr-1" />
-      {copied ? 'Copied' : 'Copy'}
-    </Button>
-    <pre className="text-xs leading-relaxed font-mono bg-muted/40 rounded p-3 pr-20 whitespace-pre-wrap break-words [overflow-wrap:anywhere] max-h-[40vh] overflow-y-auto">
-      {snippet}
-    </pre>
+  <div className="space-y-1">
+    <div className="flex items-center justify-between gap-2">
+      <span className="text-[11px] font-medium text-muted-foreground uppercase tracking-wider">{block.title}</span>
+      <Button variant="ghost" size="sm" onClick={onCopy} className="h-7 px-2 text-xs" title={`Copy ${block.title}`}>
+        <Copy className="h-3 w-3 mr-1" />
+        {copied ? 'Copied' : 'Copy'}
+      </Button>
+    </div>
+    {block.note && <p className="text-[10px] text-muted-foreground leading-snug">{block.note}</p>}
+    <pre className="text-xs leading-relaxed font-mono bg-muted/40 rounded p-3 whitespace-pre-wrap break-words [overflow-wrap:anywhere] max-h-[40vh] overflow-y-auto">{block.content}</pre>
   </div>
 )
 
@@ -1496,7 +1533,7 @@ const AgentDetailDialog = ({
   const [revealToken, setRevealToken] = useState(false)
   const [copied, setCopied] = useState(false)
   const [copiedToken, setCopiedToken] = useState(false)
-  const [copiedSnippet, setCopiedSnippet] = useState<ClientTab | null>(null)
+  const [copiedSnippet, setCopiedSnippet] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<ClientTab>('claude-code')
   const { getAgentTasks } = useDataStore()
 
@@ -1555,10 +1592,9 @@ const AgentDetailDialog = ({
     }
   }
 
-  const handleCopySnippet = (tab: ClientTab) => {
-    const snippet = buildSnippet(tab, snippetToken, mcpUrl)
-    navigator.clipboard.writeText(snippet)
-    setCopiedSnippet(tab)
+  const handleCopySnippet = (key: string, content: string) => {
+    navigator.clipboard.writeText(content)
+    setCopiedSnippet(key)
     setTimeout(() => setCopiedSnippet(null), 1500)
   }
 
@@ -1831,8 +1867,8 @@ const AgentDetailDialog = ({
               Tabs are expanded statically (one TabsTrigger / TabsContent
               per client) rather than .map()'d so the literal client
               values are greppable / regression-guard-friendly. The
-              buildSnippet helper still owns all the per-client config
-              schema knowledge; this block just wires it up.
+              buildSnippetBlocks helper still owns all the per-client
+              config schema knowledge; this block just wires it up.
 
               Snippet format details:
               - Server name: the fixed string `agent-mcp` (matches the
@@ -1855,54 +1891,75 @@ const AgentDetailDialog = ({
                 <TabsTrigger value="continue" className="text-xs">Continue.dev</TabsTrigger>
                 <TabsTrigger value="generic" className="text-xs">Generic JSON</TabsTrigger>
               </TabsList>
-              <TabsContent value="claude-code" className="mt-2">
-                <SnippetBlock
-                  snippet={buildSnippet('claude-code', snippetToken, mcpUrl)}
-                  copied={copiedSnippet === 'claude-code'}
-                  onCopy={() => handleCopySnippet('claude-code')}
-                />
+              <TabsContent value="claude-code" className="mt-2 space-y-3">
+                {buildSnippetBlocks('claude-code', snippetToken, mcpUrl).map((block, i) => (
+                  <SnippetBlock
+                    key={i}
+                    block={block}
+                    copied={copiedSnippet === `claude-code:${i}`}
+                    onCopy={() => handleCopySnippet(`claude-code:${i}`, block.content)}
+                  />
+                ))}
               </TabsContent>
-              <TabsContent value="opencode" className="mt-2">
-                <SnippetBlock
-                  snippet={buildSnippet('opencode', snippetToken, mcpUrl)}
-                  copied={copiedSnippet === 'opencode'}
-                  onCopy={() => handleCopySnippet('opencode')}
-                />
+              <TabsContent value="opencode" className="mt-2 space-y-3">
+                {buildSnippetBlocks('opencode', snippetToken, mcpUrl).map((block, i) => (
+                  <SnippetBlock
+                    key={i}
+                    block={block}
+                    copied={copiedSnippet === `opencode:${i}`}
+                    onCopy={() => handleCopySnippet(`opencode:${i}`, block.content)}
+                  />
+                ))}
               </TabsContent>
-              <TabsContent value="cursor" className="mt-2">
-                <SnippetBlock
-                  snippet={buildSnippet('cursor', snippetToken, mcpUrl)}
-                  copied={copiedSnippet === 'cursor'}
-                  onCopy={() => handleCopySnippet('cursor')}
-                />
+              <TabsContent value="cursor" className="mt-2 space-y-3">
+                {buildSnippetBlocks('cursor', snippetToken, mcpUrl).map((block, i) => (
+                  <SnippetBlock
+                    key={i}
+                    block={block}
+                    copied={copiedSnippet === `cursor:${i}`}
+                    onCopy={() => handleCopySnippet(`cursor:${i}`, block.content)}
+                  />
+                ))}
               </TabsContent>
-              <TabsContent value="cline" className="mt-2">
-                <SnippetBlock
-                  snippet={buildSnippet('cline', snippetToken, mcpUrl)}
-                  copied={copiedSnippet === 'cline'}
-                  onCopy={() => handleCopySnippet('cline')}
-                />
+              <TabsContent value="cline" className="mt-2 space-y-3">
+                {buildSnippetBlocks('cline', snippetToken, mcpUrl).map((block, i) => (
+                  <SnippetBlock
+                    key={i}
+                    block={block}
+                    copied={copiedSnippet === `cline:${i}`}
+                    onCopy={() => handleCopySnippet(`cline:${i}`, block.content)}
+                  />
+                ))}
               </TabsContent>
-              <TabsContent value="zed" className="mt-2">
-                <SnippetBlock
-                  snippet={buildSnippet('zed', snippetToken, mcpUrl)}
-                  copied={copiedSnippet === 'zed'}
-                  onCopy={() => handleCopySnippet('zed')}
-                />
+              <TabsContent value="zed" className="mt-2 space-y-3">
+                {buildSnippetBlocks('zed', snippetToken, mcpUrl).map((block, i) => (
+                  <SnippetBlock
+                    key={i}
+                    block={block}
+                    copied={copiedSnippet === `zed:${i}`}
+                    onCopy={() => handleCopySnippet(`zed:${i}`, block.content)}
+                  />
+                ))}
               </TabsContent>
-              <TabsContent value="continue" className="mt-2">
-                <SnippetBlock
-                  snippet={buildSnippet('continue', snippetToken, mcpUrl)}
-                  copied={copiedSnippet === 'continue'}
-                  onCopy={() => handleCopySnippet('continue')}
-                />
+              <TabsContent value="continue" className="mt-2 space-y-3">
+                {buildSnippetBlocks('continue', snippetToken, mcpUrl).map((block, i) => (
+                  <SnippetBlock
+                    key={i}
+                    block={block}
+                    copied={copiedSnippet === `continue:${i}`}
+                    onCopy={() => handleCopySnippet(`continue:${i}`, block.content)}
+                  />
+                ))}
               </TabsContent>
-              <TabsContent value="generic" className="mt-2">
-                <SnippetBlock
-                  snippet={buildSnippet('generic', snippetToken, mcpUrl)}
-                  copied={copiedSnippet === 'generic'}
-                  onCopy={() => handleCopySnippet('generic')}
-                />
+              <TabsContent value="generic" className="mt-2 space-y-3">
+                {buildSnippetBlocks('generic', snippetToken, mcpUrl).map((block, i) => (
+                  <SnippetBlock
+                    key={i}
+                    block={block}
+                    copied={copiedSnippet === `generic:${i}`}
+                    onCopy={() => handleCopySnippet(`generic:${i}`, block.content)}
+                  />
+                ))}
               </TabsContent>
             </Tabs>
           </div>
