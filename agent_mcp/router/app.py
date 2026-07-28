@@ -1349,11 +1349,18 @@ async def backend_api_handler(req: web.Request) -> web.StreamResponse:
     because the browser sends them automatically without an Accept
     header.
     """
-    if req.method != "OPTIONS":
+    rest = req.match_info.get("rest", "")
+    # The live-update SSE stream (`/api/<project>/events`) negotiates via
+    # `Accept: text/event-stream`, not the versioned JSON media type — the
+    # version gate governs JSON REST responses, not event streams. Exempt
+    # it so the dashboard's streaming fetch isn't 406'd by the gate.
+    _is_event_stream = rest == "events" or (
+        "text/event-stream" in req.headers.get("Accept", "").lower()
+    )
+    if req.method != "OPTIONS" and not _is_event_stream:
         if not _accept_includes_strict_api_media(req.headers.get("Accept", "")):
             return _api_version_required_response()
 
-    rest = req.match_info.get("rest", "")
     name = req.match_info["name"]
     redirect = _maybe_single_tenant_redirect(req, name)
     if redirect is not None:
