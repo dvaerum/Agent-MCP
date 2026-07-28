@@ -94,6 +94,15 @@ export function mcpUrl(projectName: string, origin: string = ""): string {
   return `${origin}${ROOT}/mcp/${encodeURIComponent(projectName)}`
 }
 
+/** Operator dashboard live-update SSE channel for a project. Distinct
+ *  from ``mcpUrl`` (the agent-scoped MCP transport): this is the
+ *  cookie-authenticated ``GET /agent-mcp/api/<name>/events`` endpoint the
+ *  dashboard's notification client subscribes to, proxied through the
+ *  REST ``/api`` root so the operator session cookie carries the auth. */
+export function eventsUrl(projectName: string, origin: string = ""): string {
+  return `${origin}${API}/${encodeURIComponent(projectName)}/events`
+}
+
 // ── Router admin surface (ADR 0014) ────────────────────────────────
 
 /** Public service descriptor / liveness probe. Reachable without an

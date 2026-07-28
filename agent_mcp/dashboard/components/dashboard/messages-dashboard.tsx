@@ -492,6 +492,24 @@ export function MessagesDashboard() {
     return () => clearInterval(interval)
   }, [refreshQuery, composeOpen])
 
+  // Live refetch on backend mutation. The operator SSE client
+  // (lib/mcp-notifications.ts) dispatches a debounced
+  // ``mcp:resources-updated`` window event on every
+  // ``notifications/resources/updated``. The messages list polls its
+  // OWN endpoint (POST /messages/query), so the data-store's
+  // scheduleDashboardRefresh doesn't cover it — hook the event to the
+  // in-place paged refetch (no local debounce: backend + client already
+  // debounce). Paused while composing, mirroring the background-refresh
+  // pause so a live tick can't disrupt an in-progress draft.
+  useEffect(() => {
+    if (typeof window === "undefined" || composeOpen) return
+    const handler = () => {
+      refreshQuery()
+    }
+    window.addEventListener("mcp:resources-updated", handler)
+    return () => window.removeEventListener("mcp:resources-updated", handler)
+  }, [refreshQuery, composeOpen])
+
   // Live-lookup selector shared by the detail + delete dialogs — reads
   // the current row from the hook-owned ``messages`` array on every
   // render, so a mark-read PATCH (or a delete elsewhere) re-renders the

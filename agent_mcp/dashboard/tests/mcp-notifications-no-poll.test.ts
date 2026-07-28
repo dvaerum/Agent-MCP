@@ -1,42 +1,29 @@
 /**
- * Regression guard for the GET /mcp 405-spam loop (verify-all-v8,
- * tailnet target, 2026-06-27).
+ * Contract guard for the operator live-update SSE subscription.
  *
- * Bug
- * ---
- * Wave 2 (cleanup-wave-2) stripped the router-side cookie→admin-bearer
- * translation from the GET /mcp path. PR #220 then closed the resulting
- * 500 (``session_registry_no_agent``) with a clean 405 at the router.
+ * History
+ * -------
+ * The GET /mcp 405-spam loop (verify-all-v8, 2026-06-27): the dashboard
+ * subscribed to the agent-scoped ``GET /agent-mcp/mcp/<project>`` with
+ * cookie-only auth, which the router rejects with 405 (that GET stream
+ * derives ``agent_id`` from a per-agent bearer the cookie can't carry).
+ * A user reproduction showed 60+ ``=> 405`` lines within seconds of a
+ * project page load. The interim fix turned ``subscribeMcpNotifications``
+ * into a no-op so no request fired at all.
  *
- * The dashboard's ``McpNotificationsProvider`` still subscribed to that
- * endpoint with cookie-only auth at every project page load, so every
- * subscription attempt got 405 and the reconnect loop (capped at 30s,
- * but running for every visibilitychange and after every drop)
- * generated continuous 405s in the user's browser network tab. A user
- * reproduction on https://nixos-developer-system.tailfdae0.ts.net/
- * agent-mcp/app/washing-brothers/?page=memories showed 60+ ``GET
- * /agent-mcp/mcp/washing-brothers => 405`` lines within seconds of
- * page load.
+ * The real fix is a dedicated cookie-authenticated operator events
+ * endpoint (``features/operator_events.py`` + ``GET /api/events``,
+ * proxied as ``/agent-mcp/api/<name>/events``). This test now pins the
+ * re-wired contract:
  *
- * PR #220's bg-agent report explicitly flagged the dashboard's
- * GET-SSE subscription as "silently failing"; this test pins the fix
- * so a future refactor can't re-enable the polling without an explicit
- * test update + a working cookie-authenticated SSE endpoint behind it.
- *
- * Contract
- * --------
- * ``subscribeMcpNotifications()`` must NOT fire any HTTP request at
- * mount time. There is no cookie-authenticated SSE notification
- * endpoint on the backend right now; subscribing to a POST-only route
- * is dead code that only generates 405-spam.
- *
- * When a notification endpoint that accepts cookie auth is
- * (re)introduced — e.g. a dedicated ``/agent-mcp/api/<name>/
- * notifications`` SSE route — this test must be updated to assert the
- * new endpoint shape and ``credentials: include`` semantics. The
- * dispatch logic (``dispatchNotification``) is intentionally kept
- * exported so that future wiring can plug back in without rewriting
- * the JSON-RPC→store invalidation glue.
+ *   1. ``subscribeMcpNotifications()`` opens exactly one stream at mount,
+ *      against the operator events endpoint — NOT the ``/mcp`` transport.
+ *   2. The fetch carries ``credentials: "include"`` (cookie auth), a GET
+ *      method, and an ``Accept: text/event-stream`` header.
+ *   3. It returns a callable cleanup that stops the stream cleanly.
+ *   4. ``McpNotificationsProvider`` never opens a stream directly — it
+ *      only calls ``subscribeMcpNotifications`` (which owns the endpoint
+ *      choice + reconnect/visibility lifecycle).
  */
 
 import { describe, expect, it, vi, beforeEach } from "vitest"
@@ -47,17 +34,17 @@ const DASHBOARD_ROOT = resolve(__dirname, "..")
 const read = (rel: string) =>
   readFileSync(resolve(DASHBOARD_ROOT, rel), "utf8")
 
-describe("mcp-notifications no-poll regression guard", () => {
+describe("operator events SSE subscription contract", () => {
   beforeEach(() => {
     vi.resetModules()
   })
 
-  it("subscribeMcpNotifications() does NOT fire fetch on mount", async () => {
-    // Stub fetch; if any request goes out, capture it for the
-    // assertion to display.
+  it("subscribeMcpNotifications() opens one stream against /api/events", async () => {
     const captured: { url: string; init?: RequestInit }[] = []
     const fetchStub = vi.fn(async (url: string, init?: RequestInit) => {
       captured.push({ url, init })
+      // Immediately-closing body so the run loop finishes its first pass
+      // (it will schedule a reconnect timer we cancel via unsubscribe()).
       return new Response(
         new ReadableStream({
           start(controller) {
@@ -73,11 +60,7 @@ describe("mcp-notifications no-poll regression guard", () => {
     const mod = await import("@/lib/mcp-notifications")
     const unsubscribe = mod.subscribeMcpNotifications()
 
-    // Yield a few microtask + macrotask ticks so any async fetch
-    // scheduled by the run loop has a chance to fire. The pre-fix
-    // implementation kicks off ``void run()`` synchronously inside
-    // ``openMcpNotificationStream``; one tick is enough to surface
-    // it, two is belt-and-braces.
+    // Yield a couple of ticks so the async ``void run()`` fires its fetch.
     await new Promise((r) => setTimeout(r, 0))
     await new Promise((r) => setTimeout(r, 0))
 
@@ -85,37 +68,61 @@ describe("mcp-notifications no-poll regression guard", () => {
 
     expect(
       captured.length,
-      `subscribeMcpNotifications fired ${captured.length} request(s); ` +
-        `none expected. Captured: ${JSON.stringify(captured.map((c) => c.url))}`,
-    ).toBe(0)
-    expect(fetchStub).not.toHaveBeenCalled()
+      `expected exactly one stream open; captured ` +
+        `${JSON.stringify(captured.map((c) => c.url))}`,
+    ).toBe(1)
+
+    const { url, init } = captured[0]
+    // Targets the operator events channel, not the MCP transport.
+    expect(url).toContain("/events")
+    expect(url).not.toContain("/mcp")
+    // Cookie auth + SSE framing.
+    expect(init?.credentials).toBe("include")
+    expect(init?.method).toBe("GET")
+    const headers = (init?.headers ?? {}) as Record<string, string>
+    expect(headers["Accept"]).toBe("text/event-stream")
   })
 
   it("subscribeMcpNotifications() returns a callable cleanup", async () => {
+    // Stub fetch so the opened stream doesn't hit undici with a relative
+    // URL; the body closes immediately.
+    const fetchStub = vi.fn(async () => new Response(
+      new ReadableStream({ start(c) { c.close() } }),
+      { status: 200 },
+    ))
+    globalThis.fetch = fetchStub as unknown as typeof fetch
+
     const mod = await import("@/lib/mcp-notifications")
     const unsubscribe = mod.subscribeMcpNotifications()
     expect(typeof unsubscribe).toBe("function")
-    // Calling the cleanup must not throw even when nothing was opened.
+    // Calling the cleanup must not throw.
     expect(() => unsubscribe()).not.toThrow()
   })
 
-  it("McpNotificationsProvider source does not pull in an active polling helper", () => {
-    // Defence in depth: if a future refactor re-introduces a polling
-    // import in the provider, this assertion flags it before the
-    // runtime test even runs. The provider may still call
-    // ``subscribeMcpNotifications`` (a no-op today) — what we forbid
-    // is the provider opening a stream directly, which would bypass
-    // the contract above.
+  it("openMcpNotificationStream default URL targets the events endpoint", () => {
+    // Source-level guard: the default stream URL builder must resolve to
+    // the events channel, never the retired /mcp transport.
+    const src = read("lib/mcp-notifications.ts")
+    expect(src).toContain("eventsUrlForProject")
+    expect(
+      /options\.url\s*\?\?\s*eventsUrlForProject\(\)/.test(src),
+      "openMcpNotificationStream must default to eventsUrlForProject()",
+    ).toBe(true)
+  })
+
+  it("McpNotificationsProvider does not open a stream directly", () => {
+    // The provider may call ``subscribeMcpNotifications`` — what we
+    // forbid is it opening a stream directly (bypassing the endpoint +
+    // lifecycle owned by mcp-notifications.ts).
     const src = read("components/providers/mcp-notifications-provider.tsx")
     expect(
       /openMcpNotificationStream\s*\(/.test(src),
       "McpNotificationsProvider must not call openMcpNotificationStream " +
-        "directly (it bypasses the no-poll contract).",
+        "directly.",
     ).toBe(false)
     expect(
       /new\s+EventSource\s*\(/.test(src),
-      "McpNotificationsProvider must not construct an EventSource " +
-        "(no cookie-authenticated SSE endpoint exists right now).",
+      "McpNotificationsProvider must not construct an EventSource.",
     ).toBe(false)
   })
 })

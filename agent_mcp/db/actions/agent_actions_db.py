@@ -47,23 +47,34 @@ def _dashboard_scope_for_action(action_type: Optional[str]) -> str:
 
 def _push_dashboard_data_changed(action_type: Optional[str]) -> None:
     """Best-effort: ping dashboard SSE subscribers that project data
-    changed so open pages refetch live. Never raises."""
+    changed so open pages refetch live. Never raises.
+
+    Two fan-out targets share the identical payload:
+
+      * ``session_registry.fanout_to_all`` — agent-scoped GET /mcp
+        streams (a manager parked on the transport gets the churn).
+      * ``operator_events.publish`` — the dedicated operator hub the
+        dashboard's ``GET /api/events`` SSE endpoint drains. Operators
+        aren't agents, so they can't live in ``session_registry`` (its
+        ``agent_id`` FK); the hub is their equivalent channel.
+    """
     try:
         # Late import: keep the db-layer import graph shallow and avoid
-        # any import-time coupling to the transport layer.
+        # any import-time coupling to the transport / features layers.
         from ...core import session_registry
+        from ...features import operator_events
 
         scope = _dashboard_scope_for_action(action_type)
-        session_registry.fanout_to_all(
-            {
-                "jsonrpc": "2.0",
-                "method": "notifications/resources/updated",
-                "params": {
-                    "uri": f"agent-mcp://{scope}",
-                    "action_type": action_type,
-                },
-            }
-        )
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "notifications/resources/updated",
+            "params": {
+                "uri": f"agent-mcp://{scope}",
+                "action_type": action_type,
+            },
+        }
+        session_registry.fanout_to_all(payload)
+        operator_events.publish(payload)
     except Exception:  # noqa: BLE001 — telemetry-grade, never disrupt the write
         pass
 

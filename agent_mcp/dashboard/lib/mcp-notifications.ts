@@ -1,34 +1,39 @@
 "use client"
 
 /**
- * Dashboard subscription to the MCP `notifications/...` SSE stream.
+ * Dashboard subscription to the operator live-update SSE stream.
  *
  * Background
  * ----------
  * PR #79 (Candidate A, 2026-06-02) wired session_registry into the
- * GET /mcp transport: opening a stream registers a row + queue, and
- * `fanout_to_agent()` now actually delivers `notifications/...`
- * JSON-RPC envelopes onto subscribed sessions. Before that, the
- * fan-out walked an empty `_runtime_queues` and every notification
- * dropped at the wire.
+ * GET /mcp transport so `fanout_to_agent()` delivers `notifications/...`
+ * JSON-RPC envelopes onto subscribed AGENT sessions. The dashboard,
+ * however, authenticates with an operator session cookie — not a
+ * per-agent bearer — and the MCP StreamableHTTP GET stream rejects a
+ * cookie-only open with 405 (it derives `agent_id` from a bearer the
+ * cookie can't carry, and needs an `Mcp-Session-Id` from an
+ * `initialize` handshake the dashboard never does). So this client
+ * never actually connected against `/mcp`.
  *
- * Candidate E (this module) wires the dashboard onto that stream.
- * When a notification arrives, the relevant zustand cache slice is
- * invalidated — admin-created prompts visible in other tabs within
- * seconds rather than waiting the full 60s of the data-store poll
- * tick.
+ * Fix: a dedicated cookie-authenticated operator SSE endpoint,
+ * `GET /agent-mcp/api/<name>/events`, backed by an in-process
+ * operator-events hub (`features/operator_events.py`). The same
+ * mutation choke point that fans `resources/updated` out to agent
+ * sessions also publishes onto that hub, so this client receives the
+ * identical payload — the JSON-RPC → store-invalidation glue below is
+ * unchanged. When a notification arrives, the relevant zustand cache
+ * slice is invalidated — admin-created prompts visible in other tabs
+ * within seconds rather than waiting the full 60s data-store poll tick.
  *
  * URL plumbing
  * ------------
- * The dashboard mounts at `/agent-mcp/app/<name>/...` and the REST
- * API at `/agent-mcp/api/<name>` (PR-B renamed both from /__dashboard/
- * and /__api/ respectively). The MCP Streamable HTTP endpoint for the
- * same project is at `/agent-mcp/<name>/mcp` — NOT the /api/ prefix;
- * that's the REST proxy. The dashboard's
- * `apiClient.createEventSource('/mcp')` would concatenate '/mcp'
- * onto baseUrl and hit the REST proxy prefix (a 404 — the router
- * doesn't expose /mcp under the REST root). We therefore build the
- * MCP URL separately, rooted at /agent-mcp/<name>/mcp directly.
+ * The dashboard mounts at `/agent-mcp/app/<name>/...` and the REST API
+ * at `/agent-mcp/api/<name>` (PR-B renamed both from /__dashboard/ and
+ * /__api/ respectively). The operator events channel lives UNDER the
+ * REST root at `/agent-mcp/api/<name>/events` — the router's `/api/...`
+ * proxy streams response bodies chunk-by-chunk, so the SSE frames flow
+ * through, and the operator session cookie carries the auth. See
+ * `eventsUrl` in lib/urls.ts.
  *
  * Auth
  * ----
@@ -74,44 +79,40 @@
 
 import { useDataStore, notifyPromptsListChanged } from "./stores/data-store"
 import { projectContext } from "./project-context"
-import { mcpUrl } from "./urls"
+import { eventsUrl } from "./urls"
 
 // -- URL construction -----------------------------------------------------
 
 /**
- * Build the MCP Streamable HTTP endpoint URL for the active project.
+ * Build the operator live-update SSE endpoint URL for the active
+ * project.
  *
- * Path-prefixed deployments: `/agent-mcp/<projectName>/mcp` (the
- * router-mounted wrapped backend; NOT the `__api` REST prefix).
+ * Path-prefixed deployments: `/agent-mcp/api/<projectName>/events`
+ * (the cookie-authenticated operator events channel under the REST
+ * proxy root — see `eventsUrl` in lib/urls.ts).
  *
- * Standalone (single-tenant) deployments: relative `/mcp` on the same
- * origin the dashboard is served from. The `setServer(host, port)`
- * path uses `http://host:port/api` as baseUrl — derive the MCP URL by
- * swapping `/api` → `/mcp` on the same origin.
+ * Standalone (single-tenant) deployments: relative `/api/events` on
+ * the same origin the dashboard is served from. The
+ * `setServer(host, port)` path uses `http://host:port/api` as baseUrl —
+ * derive the events URL from that origin.
  */
-export function mcpUrlForProject(): string {
+export function eventsUrlForProject(): string {
   if (projectContext.projectName) {
-    // PR-B: route through the shared URL helper. PR-D will move the
-    // MCP path to /agent-mcp/mcp/<name>; that change becomes a
-    // one-line edit in lib/urls.ts.
-    return mcpUrl(projectContext.projectName)
+    return eventsUrl(projectContext.projectName)
   }
   // Standalone: prefer the apiClient baseUrl's origin if it's an
   // absolute URL (the `setServer(host, port)` path). Otherwise fall
-  // back to a same-origin `/mcp`. We use `URL(...).origin` rather
-  // than interpolating baseUrl directly (which would carry the `/api`
-  // suffix and resolve to `/api/mcp`, a 404).
+  // back to a same-origin `/api/events`.
   const base = projectContext.baseUrl
   if (base.startsWith("http://") || base.startsWith("https://")) {
     try {
       const u = new URL(base)
-      const origin = u.origin
-      return origin + "/mcp"
+      return u.origin + "/api/events"
     } catch {
       /* fall through */
     }
   }
-  return "/mcp"
+  return "/api/events"
 }
 
 // -- SSE frame parser -----------------------------------------------------
@@ -236,10 +237,10 @@ const RECONNECT_BASE_DELAY_MS = 1000
 const RECONNECT_MAX_DELAY_MS = 30000
 
 /**
- * Start an MCP notification subscription against `/agent-mcp/mcp/<name>`
- * using the operator session cookie (Wave 2, cleanup-wave-2). Returns
- * a handle whose `stop()` aborts the in-flight stream and prevents
- * further reconnects.
+ * Start an operator notification subscription against
+ * `/agent-mcp/api/<name>/events` using the operator session cookie.
+ * Returns a handle whose `stop()` aborts the in-flight stream and
+ * prevents further reconnects.
  *
  * The loop schedules reconnects on disconnect (transport error or
  * stream end) with exponential backoff: `min(30000, 1000 * 2 **
@@ -249,7 +250,7 @@ const RECONNECT_MAX_DELAY_MS = 30000
 export function openMcpNotificationStream(
   options: { url?: string } = {}
 ): SubscriptionHandle {
-  const url = options.url ?? mcpUrlForProject()
+  const url = options.url ?? eventsUrlForProject()
   let stopped = false
   let attempt = 0
   let abortCtrl: AbortController | null = null
@@ -366,45 +367,59 @@ export function openMcpNotificationStream(
 /**
  * Higher-level wiring entry point used by ``McpNotificationsProvider``.
  *
- * No-op as of verify-all-v8 (2026-06-27). The router's
- * ``backend_mcp_handler`` rejects ``GET /agent-mcp/mcp/<project>`` from
- * cookie-only callers with 405 (PR #220, F015 fix) because the
- * backend's ``_handle_get`` derives ``agent_id`` from a per-agent
- * bearer that the cookie path can't carry. Wave 2 (cleanup-wave-2)
- * removed the router-side cookie→admin-bearer translation that
- * previously let this subscription proceed, so every reconnect
- * attempt now produces a 405 in the user's browser network tab.
+ * Opens the operator live-update SSE stream against
+ * ``/agent-mcp/api/<name>/events`` (cookie-authenticated) and manages
+ * its lifecycle. Returns a cleanup that stops the stream and detaches
+ * the visibility listener.
  *
- * Before this no-op was introduced, the dashboard generated 60+ ``GET
- * /agent-mcp/mcp/<project> => 405`` lines within seconds of any
- * project page load (user reproduction on
- * https://nixos-developer-system.tailfdae0.ts.net/agent-mcp/app/
- * washing-brothers/?page=memories surfaced this as "login errors").
- * PR #220's bg-agent report explicitly flagged the subscription as
- * "silently failing" — turning it into a no-op closes the spam loop.
+ * History: this was a no-op between verify-all-v8 (2026-06-27) and the
+ * introduction of the dedicated operator events endpoint. Before the
+ * no-op, the client subscribed to ``GET /agent-mcp/mcp/<project>`` with
+ * cookie-only auth, which the router rejects with 405 (that GET stream
+ * derives ``agent_id`` from a per-agent bearer the cookie can't carry),
+ * generating 60+ ``=> 405`` lines within seconds of any project page
+ * load. The fix was a purpose-built cookie-authenticated endpoint
+ * (``features/operator_events.py`` + ``GET /api/events``); this function
+ * now opens a stream against it — no more 405 spam, and live updates
+ * actually reach the browser.
  *
- * The dispatch glue (``dispatchNotification``) and the per-URL stream
- * opener (``openMcpNotificationStream``) remain exported so a future
- * cookie-authenticated SSE notification endpoint — e.g.
- * ``/agent-mcp/api/<name>/notifications`` accepting the operator
- * session cookie — can wire back in without rewriting the JSON-RPC →
- * store invalidation glue. When that endpoint exists, this function
- * should resume opening a stream against it (with the
- * visibility/reconnect lifecycle that lived here previously) and the
- * ``tests/mcp-notifications-no-poll.test.ts`` contract should be
- * updated to assert the new endpoint shape.
- *
- * Returns a no-op cleanup function so the calling React effect's
- * ``useEffect(() => subscribe(), [])`` shape stays identical and a
- * future re-wire is a one-function-body change.
+ * Lifecycle:
+ *   - Opens immediately via ``openMcpNotificationStream`` (which owns
+ *     the reconnect/backoff loop).
+ *   - On ``visibilitychange`` → hidden: stops the stream (the browser
+ *     throttles background timers anyway and a parked SSE socket is
+ *     wasteful). On visible again: reopens, restarting backoff from 1s.
  */
 export function subscribeMcpNotifications(): () => void {
-  // Intentionally empty — see the function comment above. No fetch
-  // fires; no visibility listener attaches; the returned cleanup is a
-  // no-op. The shape of the function (parameterless, returns a void
-  // thunk) is preserved so re-enabling the stream against a real
-  // cookie-authenticated endpoint is a body-only edit.
+  let handle: SubscriptionHandle | null = openMcpNotificationStream()
+
+  // Guard for SSR / non-DOM (vitest node) environments — there's no
+  // ``document`` to attach a visibility listener to. The stream itself
+  // is still opened above (harmless in tests; the fetch is stubbed).
+  const hasDocument = typeof document !== "undefined"
+
+  const onVisibility = (): void => {
+    if (document.visibilityState === "hidden") {
+      if (handle) {
+        handle.stop()
+        handle = null
+      }
+    } else if (handle === null) {
+      handle = openMcpNotificationStream()
+    }
+  }
+
+  if (hasDocument) {
+    document.addEventListener("visibilitychange", onVisibility)
+  }
+
   return () => {
-    /* no-op */
+    if (hasDocument) {
+      document.removeEventListener("visibilitychange", onVisibility)
+    }
+    if (handle) {
+      handle.stop()
+      handle = null
+    }
   }
 }

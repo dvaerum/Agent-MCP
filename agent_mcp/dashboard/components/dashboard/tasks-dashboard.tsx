@@ -160,6 +160,22 @@ const useTasksData = (serverFilters: TaskFilters) => {
     return () => clearInterval(interval)
   }, [refresh])
 
+  // Live refetch on backend mutation. The operator SSE client
+  // (lib/mcp-notifications.ts) dispatches a debounced
+  // ``mcp:resources-updated`` window event on every
+  // ``notifications/resources/updated``. The tasks list fetches its OWN
+  // GET /tasks endpoint (not the data-store all-data envelope), so
+  // scheduleDashboardRefresh doesn't cover it — hook the event to the
+  // force-fetch refresh (backend + client already debounce).
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    const handler = () => {
+      refresh()
+    }
+    window.addEventListener("mcp:resources-updated", handler)
+    return () => window.removeEventListener("mcp:resources-updated", handler)
+  }, [refresh])
+
   // ``lastFetch`` is ``number | null`` from the hook; the consumer
   // below assumes ``number`` (it checks ``> 0``). Coalesce.
   return useMemo(() => ({

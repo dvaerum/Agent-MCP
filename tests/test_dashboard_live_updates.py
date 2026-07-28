@@ -16,6 +16,7 @@ import sqlite3
 
 from agent_mcp.core import session_registry
 from agent_mcp.db.actions import agent_actions_db
+from agent_mcp.features import operator_events
 
 
 def _mk_cursor() -> sqlite3.Cursor:
@@ -66,6 +67,46 @@ def test_action_log_scopes_by_action_type(monkeypatch) -> None:
         )
         assert calls, action
         assert expected_scope in calls[0]["params"]["uri"], (action, calls[0])
+
+
+def test_action_log_also_publishes_to_operator_events(monkeypatch) -> None:
+    """The same scoped `resources/updated` payload is ALSO published to
+    the operator-events hub, so a dashboard operator (who can't register
+    in the agent-scoped session_registry) receives live updates on the
+    dedicated `GET /api/events` channel."""
+    # Silence the agent-scoped fan-out so this test isolates the operator
+    # channel.
+    monkeypatch.setattr(session_registry, "fanout_to_all", lambda payload: [])
+    published = []
+    monkeypatch.setattr(
+        operator_events, "publish", lambda payload: published.append(payload),
+    )
+    agent_actions_db.log_agent_action_to_db(
+        _mk_cursor(), agent_id="worker", action_type="send_message", task_id="t1",
+    )
+    assert published, "expected a publish to the operator-events hub"
+    p = published[0]
+    assert p["method"] == "notifications/resources/updated"
+    assert "messages" in p["params"]["uri"], p
+
+
+def test_action_log_never_raises_when_operator_publish_breaks(monkeypatch) -> None:
+    """A broken operator-events publish must never disrupt the mutation
+    that logged the action (best-effort telemetry, same contract as the
+    session_registry fan-out)."""
+    monkeypatch.setattr(session_registry, "fanout_to_all", lambda payload: [])
+
+    def boom(_payload):
+        raise RuntimeError("operator hub exploded")
+
+    monkeypatch.setattr(operator_events, "publish", boom)
+    cur = _mk_cursor()
+    # Must not raise.
+    agent_actions_db.log_agent_action_to_db(
+        cur, agent_id="worker", action_type="create_task", task_id="t9",
+    )
+    row = cur.execute("SELECT action_type FROM agent_actions").fetchone()
+    assert row and row[0] == "create_task"
 
 
 def test_action_log_never_raises_when_fanout_breaks(monkeypatch) -> None:
