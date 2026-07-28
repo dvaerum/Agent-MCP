@@ -73,6 +73,22 @@ CONSOLE_LOGGING_ENABLED = (
 )  # Enable console logging in debug mode
 
 
+def _resolve_stderr_log_level() -> int:
+    """journald floor for the always-on stderr handler.
+
+    Defaults to ``WARNING`` — INFO is too chatty for steady-state
+    operation (see the stderr-handler comment below). Override with
+    ``AGENT_MCP_STDERR_LOG_LEVEL=INFO`` (or ``DEBUG``) to surface INFO in
+    ``journalctl`` during a burn-in / while watching a new feature's
+    behaviour (e.g. the operator_events stream OPEN/CLOSE lines). An
+    unrecognised value falls back to WARNING rather than silencing the
+    handler.
+    """
+    name = os.environ.get("AGENT_MCP_STDERR_LOG_LEVEL", "WARNING").strip().upper()
+    level = logging.getLevelName(name)  # name→int, or "Level <name>" if unknown
+    return level if isinstance(level, int) else logging.WARNING
+
+
 def setup_logging():
     """Configures global logging for the application."""
 
@@ -119,7 +135,9 @@ def setup_logging():
     ):
         stderr_handler = logging.StreamHandler(sys.stderr)
         stderr_handler.setFormatter(logging.Formatter(LOG_FORMAT_FILE))
-        stderr_handler.setLevel(logging.WARNING)
+        # WARNING floor by default; AGENT_MCP_STDERR_LOG_LEVEL=INFO lifts
+        # it for burn-in visibility in journalctl.
+        stderr_handler.setLevel(_resolve_stderr_log_level())
         root_logger.addHandler(stderr_handler)
 
     # Suppress overly verbose logs from specific libraries for both file and console
