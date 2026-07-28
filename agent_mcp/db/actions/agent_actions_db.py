@@ -10,6 +10,64 @@ from ...core.config import logger
 # However, the calling code (e.g., tool functions) will use get_db_connection.
 
 
+# --- Live dashboard updates -------------------------------------------------
+# Every mutating tool logs an action here (this is the Recent-activity
+# source), which makes this the single choke point for "project data
+# changed". Pushing a `notifications/resources/updated` from here means
+# every current AND future mutation drives live dashboard refetches with
+# no per-site sprinkling. The fan-out reaches runtime-queue subscribers
+# — the dashboard's SSE stream — while agents parked in wait_for_events
+# POSTs have no runtime queue, so they aren't spammed. It is best-effort
+# telemetry: it must NEVER disrupt the mutation that logged the action.
+
+# (substring, dashboard-scope) — first match wins. Lets a future
+# fine-grained dashboard invalidate just the touched slice; today the
+# dashboard refetches the whole all-data envelope regardless.
+_ACTION_SCOPE_HINTS = (
+    ("task", "tasks"),
+    ("directive", "tasks"),
+    ("message", "messages"),
+    ("broadcast", "messages"),
+    ("agent", "agents"),
+    ("context", "memories"),
+    ("memory", "memories"),
+    ("config", "settings"),
+    ("setting", "settings"),
+    ("file", "agents"),
+)
+
+
+def _dashboard_scope_for_action(action_type: Optional[str]) -> str:
+    a = (action_type or "").lower()
+    for needle, scope in _ACTION_SCOPE_HINTS:
+        if needle in a:
+            return scope
+    return "activity"
+
+
+def _push_dashboard_data_changed(action_type: Optional[str]) -> None:
+    """Best-effort: ping dashboard SSE subscribers that project data
+    changed so open pages refetch live. Never raises."""
+    try:
+        # Late import: keep the db-layer import graph shallow and avoid
+        # any import-time coupling to the transport layer.
+        from ...core import session_registry
+
+        scope = _dashboard_scope_for_action(action_type)
+        session_registry.fanout_to_all(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/resources/updated",
+                "params": {
+                    "uri": f"agent-mcp://{scope}",
+                    "action_type": action_type,
+                },
+            }
+        )
+    except Exception:  # noqa: BLE001 — telemetry-grade, never disrupt the write
+        pass
+
+
 # Original location: main.py lines 256-263 (_log_agent_action function)
 def log_agent_action_to_db(
     cursor: sqlite3.Cursor,
@@ -103,6 +161,11 @@ def log_agent_action_to_db(
             VALUES (?, ?, ?, ?, ?)
         """, (agent_id, action_type, task_id, timestamp, details_json))
         # logger.debug(f"Logged action: {agent_id} - {action_type}") # Original main.py:263 (optional debug log)
+        # Live dashboard update (best-effort; see _push_dashboard_data_changed).
+        # The wire push is a "something changed, refetch soon" hint; the
+        # dashboard debounces it so the refetch lands after the caller's
+        # commit even though this fires pre-commit.
+        _push_dashboard_data_changed(action_type)
     except sqlite3.Error as e:
         # Log error but don't crash the primary operation that called this.
         # Original main.py line 266

@@ -156,6 +156,24 @@ interface JsonRpcNotification {
  * invalidation. Exported for unit-test reach (a future jsdom suite
  * would call this directly with synthetic frames).
  */
+// Coalesce bursts of resource-change notifications into a single
+// refetch. The backend now fires one `resources/updated` per mutation
+// (from the action-log choke point in agent_actions_db.py), so an active
+// project emits many in a tight window; debouncing collapses them into
+// one all-data refetch. The short delay also lets the caller's DB commit
+// land before the refetch reads — the backend notification fires
+// pre-commit as a "refetch soon" hint — avoiding a read-before-commit
+// race.
+const DASHBOARD_REFRESH_DEBOUNCE_MS = 300
+let _dashboardRefreshTimer: ReturnType<typeof setTimeout> | null = null
+function scheduleDashboardRefresh(): void {
+  if (_dashboardRefreshTimer !== null) clearTimeout(_dashboardRefreshTimer)
+  _dashboardRefreshTimer = setTimeout(() => {
+    _dashboardRefreshTimer = null
+    void useDataStore.getState().refreshData()
+  }, DASHBOARD_REFRESH_DEBOUNCE_MS)
+}
+
 export function dispatchNotification(payload: JsonRpcNotification): void {
   const method = payload?.method
   if (!method || typeof method !== "string") return
@@ -180,7 +198,7 @@ export function dispatchNotification(payload: JsonRpcNotification): void {
     if (!uri.startsWith("agent-mcp://")) {
       console.debug("[mcp-notifications] unknown resource uri:", uri)
     }
-    void useDataStore.getState().refreshData()
+    scheduleDashboardRefresh()
     // Phase 3.5a — also fan out a window event so the cross-project
     // overview store can refresh without importing the per-project
     // data store (the overview route doesn't load the data-store
@@ -199,7 +217,7 @@ export function dispatchNotification(payload: JsonRpcNotification): void {
     // carries everything the dashboard renders, so a refresh is the
     // catch-all. Documented here so a future tool-catalogue slice can
     // hook in by replacing this call.
-    void useDataStore.getState().refreshData()
+    scheduleDashboardRefresh()
     return
   }
 
