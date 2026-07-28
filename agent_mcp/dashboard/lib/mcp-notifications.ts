@@ -306,6 +306,21 @@ export function openMcpNotificationStream(
       // from 1s again.
       attempt = 0
 
+      // Catch-up on (re)connect. The operator-events hub is
+      // fire-and-forget: any mutation that happened while this stream
+      // was down (a transport drop, a router read-timeout, a
+      // tab-hidden→visible reopen, a backend restart) published to zero
+      // subscribers and is gone — there is no replay buffer. So on every
+      // successful connect we synthesize a resources/updated to force a
+      // full refetch, which reconciles whatever changed during the gap.
+      // The 300ms debounce coalesces this with the initial page-load
+      // fetch; the window event also nudges the per-page pollers
+      // (Messages/Tasks) the same way a real notification does.
+      dispatchNotification({
+        method: "notifications/resources/updated",
+        params: { uri: "agent-mcp://reconnect" },
+      })
+
       const reader = body.getReader()
       const decoder = new TextDecoder()
       let buffer = ""
