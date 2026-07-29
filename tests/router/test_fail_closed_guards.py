@@ -119,6 +119,73 @@ def test_resolve_bind_host_collapses_empty(router_module, monkeypatch) -> None:
     assert router_module._resolve_bind_host() == "127.0.0.1"
 
 
+# ── Multi-host bind (comma-separated AGENT_MCP_ROUTER_HOST) ─────────
+
+
+def test_resolve_bind_host_single_returns_bare_string(
+    router_module, monkeypatch,
+) -> None:
+    """A single value stays a bare string (back-compat; the empty→""
+    classification + existing single-host callers are unchanged)."""
+    monkeypatch.setenv("AGENT_MCP_ROUTER_HOST", "0.0.0.0")
+    assert router_module._resolve_bind_host() == "0.0.0.0"
+
+
+def test_resolve_bind_host_comma_returns_list(
+    router_module, monkeypatch,
+) -> None:
+    """A comma-separated value binds MULTIPLE explicit hosts — tighter
+    than 0.0.0.0. Whitespace + empty entries are trimmed/dropped."""
+    monkeypatch.setenv(
+        "AGENT_MCP_ROUTER_HOST", " 127.0.0.1 , 10.14.255.10 ,",
+    )
+    assert router_module._resolve_bind_host() == [
+        "127.0.0.1", "10.14.255.10",
+    ]
+
+
+def test_host_is_loopback_list_classification(router_module) -> None:
+    is_lb = router_module._host_is_loopback
+    # All-loopback list → loopback.
+    assert is_lb(["127.0.0.1", "::1"]) is True
+    # Any non-loopback entry → NOT loopback (fail-closed).
+    assert is_lb(["127.0.0.1", "10.14.255.10"]) is False
+    assert is_lb(["0.0.0.0", "127.0.0.1"]) is False
+    # Empty list → not loopback.
+    assert is_lb([]) is False
+
+
+def test_single_tenant_multihost_with_nonloopback_refuses(
+    router_module, monkeypatch,
+) -> None:
+    """Single-tenant + a multi-host bind that includes a non-loopback IP
+    must refuse exactly like a bare non-loopback bind."""
+    monkeypatch.setenv("AGENT_MCP_ROUTER_HOST", "127.0.0.1,10.14.255.10")
+    with pytest.raises(RuntimeError, match="single-tenant"):
+        router_module.make_app(single_tenant_name="only")
+
+
+def test_single_tenant_multihost_all_loopback_starts(
+    router_module, monkeypatch,
+) -> None:
+    """Single-tenant + a multi-host bind that is entirely loopback is
+    safe → starts."""
+    monkeypatch.setenv("AGENT_MCP_ROUTER_HOST", "127.0.0.1,::1")
+    app = router_module.make_app(single_tenant_name="only")
+    assert app is not None
+
+
+def test_multi_tenant_multihost_bind_starts(
+    router_module, monkeypatch,
+) -> None:
+    """Multi-tenant enforces auth, so the loopback+tunnel-IP bind (the
+    real use case: tailnet loopback + a wg-interface IP for an upstream
+    reverse proxy) starts fine."""
+    monkeypatch.setenv("AGENT_MCP_ROUTER_HOST", "127.0.0.1,10.14.255.10")
+    app = router_module.make_app()  # multi-tenant
+    assert app is not None
+
+
 # ── Secure-cookie fail-closed flag ─────────────────────────────────
 
 

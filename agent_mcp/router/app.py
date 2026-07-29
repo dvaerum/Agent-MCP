@@ -2284,10 +2284,27 @@ def _resolve_bind_host() -> str:
     bind all" idiom stays valid for multi-tenant, which HAS the auth
     gate.
     """
-    return os.environ.get("AGENT_MCP_ROUTER_HOST", "127.0.0.1").strip()
+    raw = os.environ.get("AGENT_MCP_ROUTER_HOST", "127.0.0.1")
+    # A comma-separated value binds MULTIPLE explicit hosts (e.g.
+    # ``127.0.0.1,10.14.255.10`` — loopback for tailscale-serve/nginx on
+    # this host PLUS a specific tunnel-interface IP an upstream reverse
+    # proxy forwards to), which is tighter than ``0.0.0.0``. aiohttp's
+    # ``web.run_app(host=…)`` accepts the returned list natively (its
+    # signature is ``str | Iterable[str]``). A single value still returns
+    # a bare string, so the empty→"" R6-F1 classification and existing
+    # single-host callers are byte-for-byte unchanged.
+    parts = [p.strip() for p in raw.split(",")]
+    parts = [p for p in parts if p]
+    if not parts:
+        # Present-but-empty / whitespace-only → bind all interfaces
+        # (0.0.0.0 + ::). Preserve the exact "" the R6-F1 guard classifies.
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    return parts
 
 
-def _host_is_loopback(host: str) -> bool:
+def _host_is_loopback(host: "str | list[str]") -> bool:
     """True iff ``host`` binds only the loopback interface (or a UDS).
 
     A unix-socket path (``unix:...`` or an absolute path) is treated as
@@ -2300,7 +2317,15 @@ def _host_is_loopback(host: str) -> bool:
     an explicit ``0.0.0.0``. Classifying it as loopback is the R6-F1
     hole — the guard would pass while the runtime published all
     interfaces. Fail closed instead.
+
+    A LIST of hosts (a multi-host bind from a comma-separated
+    ``AGENT_MCP_ROUTER_HOST``) is loopback-only iff EVERY entry is
+    loopback — fail-closed: any non-loopback entry (or an empty list)
+    makes the whole bind non-loopback, so the single-tenant guard trips
+    exactly as it would for a bare non-loopback host.
     """
+    if isinstance(host, (list, tuple)):
+        return bool(host) and all(_host_is_loopback(h) for h in host)
     host = host.strip()
     if not host:
         return False
