@@ -344,7 +344,17 @@ async def test_wait_for_events_returns_ok_envelope(tmp_path) -> None:
     assert "events" in result.data
     assert "next_cursor" in result.data
     assert len(result.data["events"]) == 1
-    assert result.data["events"][0]["data"]["message_content"] == "pending"
+    # Skinny message event: a POINTER carrying the subject preview +
+    # sender + message_id, NOT the body — the full message_content is
+    # deliberately omitted (the agent calls get_agent_messages to read
+    # it, which is what marks it read). An untitled root fires with a
+    # body-preview subject, so "pending" surfaces as the subject.
+    evt = result.data["events"][0]
+    assert evt["type"] == "message"
+    evt_data = evt["data"]
+    assert "message_content" not in evt_data
+    assert "pending" in (evt_data.get("subject") or "")
+    assert "message_id" in evt_data
 
     # Wire shape: the message field is the JSON-encoded envelope so
     # render_as_text_content produces the same bytes pre-Wave-6 callers

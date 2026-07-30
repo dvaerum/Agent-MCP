@@ -156,7 +156,7 @@ def test_view_dialog_has_max_w_3xl_override() -> None:
     ``sm:max-w-lg``, same as PR #54 did for the Tasks page."""
     src = _read_agents()
     assert re.search(
-        r"AgentDetailDialog[\s\S]*?DialogContent[^>]*sm:!max-w-3xl",
+        r"const AgentDetailDialog = [\s\S]*?DialogContent[^>]*sm:!max-w-3xl",
         src,
     ), (
         "AgentDetailDialog DialogContent must use sm:!max-w-3xl to "
@@ -169,7 +169,7 @@ def test_view_dialog_caps_height_at_90vh() -> None:
     push the modal past the viewport."""
     src = _read_agents()
     assert re.search(
-        r"AgentDetailDialog[\s\S]*?DialogContent[^>]*max-h-\[90vh\]",
+        r"const AgentDetailDialog = [\s\S]*?DialogContent[^>]*max-h-\[90vh\]",
         src,
     ), (
         "AgentDetailDialog DialogContent must declare max-h-[90vh]"
@@ -183,7 +183,7 @@ def test_view_dialog_body_is_single_flex_scroll_region() -> None:
     pinned via flex-shrink-0). Same idiom as PR #54."""
     src = _read_agents()
     body_block = re.search(
-        r"AgentDetailDialog[\s\S]*?</DialogFooter>",
+        r"const AgentDetailDialog = [\s\S]*?</DialogFooter>",
         src,
     )
     assert body_block, "could not locate AgentDetailDialog body"
@@ -204,7 +204,7 @@ def test_view_dialog_long_values_wrap_anywhere() -> None:
     box instead of stretching the dialog horizontally."""
     src = _read_agents()
     body_block = re.search(
-        r"AgentDetailDialog[\s\S]*?</DialogFooter>",
+        r"const AgentDetailDialog = [\s\S]*?</DialogFooter>",
         src,
     )
     assert body_block, "could not locate AgentDetailDialog body"
@@ -220,7 +220,7 @@ def test_view_dialog_title_uses_line_clamp_not_truncate() -> None:
     truncated with ``truncate``."""
     src = _read_agents()
     body_block = re.search(
-        r"AgentDetailDialog[\s\S]*?</DialogFooter>",
+        r"const AgentDetailDialog = [\s\S]*?</DialogFooter>",
         src,
     )
     assert body_block, "could not locate AgentDetailDialog body"
@@ -239,7 +239,7 @@ def test_view_dialog_renders_label_primitive() -> None:
     field labels above values."""
     src = _read_agents()
     body_block = re.search(
-        r"AgentDetailDialog[\s\S]*?</DialogFooter>",
+        r"const AgentDetailDialog = [\s\S]*?</DialogFooter>",
         src,
     )
     assert body_block, "could not locate AgentDetailDialog body"
@@ -258,7 +258,7 @@ def test_view_dialog_contains_tabs_jsx() -> None:
     primitive (Radix-backed)."""
     src = _read_agents()
     body_block = re.search(
-        r"AgentDetailDialog[\s\S]*?</DialogFooter>",
+        r"const AgentDetailDialog = [\s\S]*?</DialogFooter>",
         src,
     )
     assert body_block, "could not locate AgentDetailDialog body"
@@ -273,7 +273,7 @@ def test_view_dialog_has_all_seven_client_tabs() -> None:
     """One TabsTrigger per supported client."""
     src = _read_agents()
     body_block = re.search(
-        r"AgentDetailDialog[\s\S]*?</DialogFooter>",
+        r"const AgentDetailDialog = [\s\S]*?</DialogFooter>",
         src,
     )
     assert body_block, "could not locate AgentDetailDialog body"
@@ -308,7 +308,7 @@ def test_view_dialog_has_copy_button() -> None:
     rendered inside the MCP-onboarding section."""
     src = _read_agents()
     body_block = re.search(
-        r"AgentDetailDialog[\s\S]*?</DialogFooter>",
+        r"const AgentDetailDialog = [\s\S]*?</DialogFooter>",
         src,
     )
     assert body_block, "could not locate AgentDetailDialog body"
@@ -376,7 +376,7 @@ def test_snippet_uses_bearer_authorization() -> None:
     ``Authorization: Bearer <token>``."""
     src = _read_agents()
     body_block = re.search(
-        r"AgentDetailDialog[\s\S]*?</DialogFooter>",
+        r"const AgentDetailDialog = [\s\S]*?</DialogFooter>",
         src,
     )
     assert body_block, "could not locate AgentDetailDialog body"
@@ -393,7 +393,7 @@ def test_snippet_url_uses_mcp_endpoint() -> None:
     endpoint (not the legacy ``/sse``)."""
     src = _read_agents()
     body_block = re.search(
-        r"AgentDetailDialog[\s\S]*?</DialogFooter>",
+        r"const AgentDetailDialog = [\s\S]*?</DialogFooter>",
         src,
     )
     assert body_block, "could not locate AgentDetailDialog body"

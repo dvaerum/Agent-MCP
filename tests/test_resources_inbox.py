@@ -162,7 +162,11 @@ async def test_inbox_read_resolves_at_sign_agent_id(tmp_path: Path) -> None:
             f"@-id inbox failed to resolve: {payload}"
         )
         assert len(payload["events"]) == 1, f"@-id message not delivered: {payload}"
-        assert payload["events"][0]["data"]["message_content"] == "in your inbox"
+        # Skinny message event: body isn't dumped; an untitled root
+        # surfaces via its subject preview (see wait_for_events).
+        assert "in your inbox" in (
+            payload["events"][0]["data"].get("subject") or ""
+        )
 
 
 # ---------------------------------------------------------------------------

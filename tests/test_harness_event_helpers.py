@@ -59,7 +59,9 @@ async def test_wait_for_event_helper_returns_envelope(
         env = await alice.wait_for_event(since=since, timeout=2)
         assert "events" in env, f"helper must return envelope; got {env!r}"
         assert len(env["events"]) == 1
-        assert env["events"][0]["data"]["message_content"] == "via helper"
+        # Skinny message event: the body isn't dumped — an untitled root
+        # surfaces via its subject preview (see wait_for_events).
+        assert "via helper" in (env["events"][0]["data"].get("subject") or "")
 
 
 async def test_wait_for_event_helper_wakes_within_one_second(
@@ -96,7 +98,7 @@ async def test_wait_for_event_helper_wakes_within_one_second(
         env = await asyncio.wait_for(task, timeout=5.0)
         elapsed = asyncio.get_event_loop().time() - start
         assert elapsed < 2.0
-        assert env["events"][0]["data"]["message_content"] == "wake-helper"
+        assert "wake-helper" in (env["events"][0]["data"].get("subject") or "")
 
 
 async def test_read_inbox_helper(tmp_path: Path) -> None:
@@ -120,7 +122,7 @@ async def test_read_inbox_helper(tmp_path: Path) -> None:
             )
         env = await alice.read_inbox()
         assert env.get("events"), f"missing events; got {env!r}"
-        assert env["events"][0]["data"]["message_content"] == "for inbox"
+        assert "for inbox" in (env["events"][0]["data"].get("subject") or "")
 
 
 async def test_read_status_helper(tmp_path: Path) -> None:

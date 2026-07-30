@@ -228,27 +228,19 @@ def test_subscribes_with_reconnect_and_backoff() -> None:
     )
 
 
-def test_subscribe_entry_point_is_a_noop_until_cookie_sse_endpoint() -> None:
-    """The Wave-2 cookie-auth subscription was disabled in
-    verify-all-v8 (2026-06-27) after PR #220 (F015) made
-    ``GET /agent-mcp/mcp/<project>`` return 405 for cookie-only
-    callers. The dashboard's reconnect loop turned that 405 into a
-    60+-line spam in the browser network tab on every project page
-    load (real user reproduction on
-    nixos-developer-system.tailfdae0.ts.net surfaced it as "login
-    errors").
+def test_subscribe_opens_stream_against_cookie_sse_endpoint() -> None:
+    """Re-enabled after the operator SSE endpoint shipped
+    (``GET /api/events``, cookie-authenticated — the operator
+    live-update channel). The verify-all-v8 no-op guard held only
+    *until* a cookie-auth SSE endpoint existed; now that it does,
+    ``subscribeMcpNotifications`` opens the notification stream on mount
+    AND attaches a visibilitychange listener (battery-saver: pause the
+    stream when the tab is hidden, resume when visible).
 
-    Until a cookie-authenticated SSE notification endpoint exists,
-    ``subscribeMcpNotifications`` must NOT open a stream and must
-    NOT attach a visibilitychange listener (the listener only made
-    sense as a battery saver for an active stream).
-
-    The lower-level ``openMcpNotificationStream`` is intentionally
-    kept exported with its cookie+fetch+backoff shape — that's the
-    test_subscribes_with_reconnect_and_backoff /
-    test_uses_fetch_not_eventsource_for_cookie_auth contract — so a
-    re-enable against a future cookie-auth endpoint is a body-only
-    edit inside ``subscribeMcpNotifications``.
+    The lower-level ``openMcpNotificationStream`` stays exported with its
+    cookie+fetch+backoff shape (the reconnect/backoff + fetch-not-
+    EventSource regression tests pin it); ``subscribeMcpNotifications``
+    is the run-loop wrapper this test guards.
     """
     src = _read("lib/mcp-notifications.ts")
 
@@ -268,16 +260,16 @@ def test_subscribe_entry_point_is_a_noop_until_cookie_sse_endpoint() -> None:
         " { ... }` declaration in lib/mcp-notifications.ts"
     )
     body = fn_match.group(1)
-    assert "openMcpNotificationStream(" not in body, (
-        "subscribeMcpNotifications must not open a stream — there is no "
-        "cookie-authenticated SSE notification endpoint right now and "
-        "every GET /mcp attempt returns 405 (see PR #220). Body:\n"
+    assert "openMcpNotificationStream(" in body, (
+        "subscribeMcpNotifications must open the notification stream now "
+        "that the cookie-auth GET /api/events endpoint exists (operator "
+        "SSE live-update channel). Body:\n"
         + body
     )
-    assert "visibilitychange" not in body, (
-        "subscribeMcpNotifications must not attach a visibilitychange "
-        "listener — without an active stream there is nothing to pause "
-        "or resume. Body:\n" + body
+    assert "visibilitychange" in body, (
+        "subscribeMcpNotifications must attach a visibilitychange listener "
+        "to pause the live stream when the tab is hidden and resume it "
+        "when visible. Body:\n" + body
     )
 
     # Belt-and-braces: the per-URL opener IS still exported (its
