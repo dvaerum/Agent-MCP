@@ -100,7 +100,10 @@ async def test_per_agent_off_returns_stop_listening(tmp_path: Path) -> None:
         assert len(body["events"]) == 1
         evt = body["events"][0]
         assert evt["type"] == "stop_listening"
-        assert "auto_event_loop" in evt["payload"]["reason"].lower()
+        # Per-agent flag OFF is the operator "Disconnect" — the reason is
+        # operator-facing (why + when) so the agent relays it to the human.
+        reason = evt["payload"]["reason"].lower()
+        assert "paused" in reason or "disconnect" in reason, reason
 
 
 async def test_global_off_returns_stop_listening(tmp_path: Path) -> None:

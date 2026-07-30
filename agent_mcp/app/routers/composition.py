@@ -425,6 +425,12 @@ async def all_data_api_route(
             "SELECT * FROM agents ORDER BY created_at DESC LIMIT ?",
             (section_limit,),
         )
+        # Global loop toggle, read ONCE for the whole list — a paused
+        # fleet reports every agent offline (authoritative Disconnect).
+        from ...tools import access as _access
+        all_data_global_loop_on = _access._get_config_bool(
+            "config_auto_event_loop_global",
+        )
         agents_data = []
         for row in cursor.fetchall():
             agent_dict = dict(row)
@@ -481,14 +487,25 @@ async def all_data_api_route(
             agent_dict['wait_for_events_in_flight'] = bool(
                 g.waiter_count(agent_dict['agent_id']) > 0
             )
+            # SQLite stores the toggle as 0/1; coerce to a real bool for
+            # the typed frontend contract + the presence check below
+            # (default ON — column DEFAULT TRUE). The dashboard reads this
+            # for the Disconnect/Reconnect affordance + the PAUSED badge.
+            agent_dict['auto_event_loop'] = bool(
+                1 if agent_dict.get('auto_event_loop') is None
+                else agent_dict['auto_event_loop']
+            )
             # Wave 7 PR 2 — coordinator transition. Surface presence
             # (online + last_mcp_connection) for the dashboard agents
             # list so the badge can switch from spawn-lifecycle status
             # to live MCP-connection status. Same source as the
-            # GET /api/agents endpoint.
+            # GET /api/agents endpoint. Authoritative Disconnect: a paused
+            # agent (per-agent OFF or global OFF) reads offline.
             agent_dict.update(_mcp_presence_for(
                 agent_dict['agent_id'],
                 agent_dict.get('last_activity_at'),
+                auto_event_loop=agent_dict['auto_event_loop'],
+                global_loop_on=all_data_global_loop_on,
             ))
             agents_data.append(agent_dict)
 

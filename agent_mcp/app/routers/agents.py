@@ -111,10 +111,23 @@ def _within_grace(last_activity_at: Optional[str]) -> bool:
 
 
 def _mcp_presence_for(
-    agent_id: str, last_activity_at: Optional[str] = None,
+    agent_id: str,
+    last_activity_at: Optional[str] = None,
+    auto_event_loop: bool = True,
+    global_loop_on: bool = True,
 ) -> Dict[str, Any]:
     """Return ``{"online": bool, "last_mcp_connection": str | None}``
     for ``agent_id`` derived from :mod:`agent_mcp.core.session_registry`.
+
+    Authoritative-Disconnect (Option A): ``online`` tracks real
+    connectivity (a parked long-poll OR a live SSE stream OR a poll
+    within the grace window) — EXCEPT a *paused* agent is reported
+    OFFLINE regardless. "Paused" = the per-agent ``auto_event_loop`` is
+    OFF (operator Disconnect) OR the fleet is globally paused
+    (``global_loop_on`` False). This is what makes Disconnect flip the
+    dot offline the instant the stream closes (no 150s grace tail), while
+    a normally-working agent — including an SSE-less daemon that only
+    long-polls — still reads online.
 
     Wave 7 PR 2 — coordinator transition. The dashboard's agents list
     no longer surfaces spawn metadata ("tmux session active") — the
@@ -175,8 +188,15 @@ def _mcp_presence_for(
         for h in handles
     )
     # Grace smoothing: an agent that polled within the window is treated
-    # as online across the brief re-park gap (see _within_grace).
-    online = parked or stream_online or _within_grace(last_activity_at)
+    # as connected across the brief re-park gap (see _within_grace).
+    connected = parked or stream_online or _within_grace(last_activity_at)
+    # Authoritative Disconnect (Option A): a PAUSED agent reports OFFLINE
+    # even if a stream/poll signal lingers — so the operator "Disconnect"
+    # (which closes the stream + stops the loop) flips the dot offline
+    # immediately, with no 150s grace tail. A normally-working agent still
+    # shows online via any live signal.
+    loop_enabled = bool(auto_event_loop) and bool(global_loop_on)
+    online = connected and loop_enabled
     # When the agent is online purely via the long-poll/grace path (no
     # SSE handle), surface last_activity_at as the "last connection" so
     # the detail panel isn't misleadingly blank for a live agent.
@@ -235,7 +255,7 @@ async def agents_list_api_route(request: Request) -> JSONResponse:
             # rows out at the DB layer.
             cursor.execute(
                 "SELECT agent_id, status, color, created_at, current_task, "
-                "last_activity_at "
+                "last_activity_at, auto_event_loop "
                 "FROM agents WHERE status != 'tombstone' "
                 "ORDER BY created_at DESC LIMIT ?",
                 (limit,),
@@ -243,18 +263,36 @@ async def agents_list_api_route(request: Request) -> JSONResponse:
         else:
             cursor.execute(
                 "SELECT agent_id, status, color, created_at, current_task, "
-                "last_activity_at "
+                "last_activity_at, auto_event_loop "
                 "FROM agents WHERE status = ? AND status != 'tombstone' "
                 "ORDER BY created_at DESC LIMIT ?",
                 (status_filter, limit),
             )
+        # Read the global loop toggle ONCE for the whole list — a paused
+        # fleet reports every agent offline (authoritative Disconnect).
+        from ...tools import access as _access
+        global_loop_on = _access._get_config_bool(
+            "config_auto_event_loop_global",
+        )
         for row in cursor.fetchall():
             agent_dict = dict(row)
+            # SQLite stores the toggle as 0/1; coerce to a real bool for
+            # the typed frontend contract (default ON — column DEFAULT
+            # TRUE — so a NULL reads as "monitoring", not "paused"). The
+            # dashboard reads this to show the Disconnect vs Reconnect
+            # affordance and a "paused" badge.
+            agent_dict['auto_event_loop'] = bool(
+                1 if agent_dict.get('auto_event_loop') is None
+                else agent_dict['auto_event_loop']
+            )
             # Wave 7 PR 2: presence signal sourced from the MCP
-            # session registry (see _mcp_presence_for docstring).
+            # session registry (see _mcp_presence_for docstring). A paused
+            # agent (per-agent OFF or global OFF) reads offline.
             agent_dict.update(_mcp_presence_for(
                 agent_dict['agent_id'],
                 agent_dict.get('last_activity_at'),
+                auto_event_loop=agent_dict['auto_event_loop'],
+                global_loop_on=global_loop_on,
             ))
             agents_list_data.append(agent_dict)
     except Exception as e:
@@ -485,6 +523,163 @@ def _agent_tool_error(result: ToolResult, failed_message: str) -> JSONResponse:
         },
         status_code=status,
     )
+
+
+# ── Disconnect / Reconnect (operator "pause monitoring") ─────────────
+#
+# Disconnect stays operator/REST-only (dashboard action) — deliberately
+# NOT registered on the agent MCP tool surface, so it doesn't clutter
+# tools/list and a worker can't self-disconnect a peer. So instead of
+# ``_dispatch_agent_lifecycle_tool`` (which dispatches by REGISTERED tool
+# name) we call the impl directly with the same operator Principal
+# ``_build_route_principal`` mints for the lifecycle routes.
+
+
+async def _dispatch_presence_impl(
+    impl, arguments: Dict[str, Any], auth: dict,
+) -> "ToolResult | JSONResponse":
+    principal = _build_route_principal(
+        bearer_token=None,
+        operator_session=True,
+        operator_user_id=caller_identity(auth),
+    )
+    try:
+        return await impl(arguments, principal=principal)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.error(
+            "Error in presence impl %s: %s",
+            getattr(impl, "__name__", impl), e, exc_info=True,
+        )
+        return JSONResponse(
+            {"error": "Failed to update agent connection"}, status_code=500,
+        )
+
+
+@router.post("/disconnect-all")
+async def disconnect_all_agents_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    """POST /api/agents/disconnect-all — pause the whole fleet.
+
+    Flips the global ``config_auto_event_loop_global`` OFF (every agent's
+    ``wait_for_events`` starts returning ``stop_listening``), wakes every
+    parked waiter, and closes every live push stream. Reconnect-all lifts
+    it. "We're done for now."
+    """
+    try:
+        _ = await get_sanitized_json_body(request)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    from ...tools.admin_tools import disconnect_all_agents_tool_impl
+
+    result = await _dispatch_presence_impl(
+        disconnect_all_agents_tool_impl, {}, auth,
+    )
+    if isinstance(result, JSONResponse):
+        return result
+    if isinstance(result, _Ok):
+        return JSONResponse({
+            "success": True,
+            "closed_streams": result.data.get("closed_streams", 0),
+            "message": result.message or "All agents disconnected",
+        })
+    return _agent_tool_error(result, "Failed to disconnect all agents")
+
+
+@router.post("/reconnect-all")
+async def reconnect_all_agents_api_route(
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    """POST /api/agents/reconnect-all — re-enable the global loop."""
+    try:
+        _ = await get_sanitized_json_body(request)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    from ...tools.admin_tools import reconnect_all_agents_tool_impl
+
+    result = await _dispatch_presence_impl(
+        reconnect_all_agents_tool_impl, {}, auth,
+    )
+    if isinstance(result, JSONResponse):
+        return result
+    if isinstance(result, _Ok):
+        return JSONResponse({
+            "success": True,
+            "message": result.message or "All agents reconnected",
+        })
+    return _agent_tool_error(result, "Failed to reconnect all agents")
+
+
+@router.post("/{agent_id}/disconnect")
+async def disconnect_agent_api_route(
+    agent_id: str,
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    """POST /api/agents/<id>/disconnect — pause one agent's monitoring.
+
+    Sets ``auto_event_loop`` OFF (so its ``wait_for_events`` returns
+    ``stop_listening`` with an operator-facing reason), wakes the parked
+    long-poll to deliver that now, and closes the live push stream so the
+    agent flips OFFLINE. Reversible via reconnect. Does NOT terminate the
+    agent or revoke its token.
+    """
+    if not agent_id:
+        return JSONResponse({"error": "agent_id required"}, status_code=400)
+    try:
+        _ = await get_sanitized_json_body(request)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    from ...tools.admin_tools import disconnect_agent_tool_impl
+
+    result = await _dispatch_presence_impl(
+        disconnect_agent_tool_impl, {"agent_id": agent_id}, auth,
+    )
+    if isinstance(result, JSONResponse):
+        return result
+    if isinstance(result, _Ok):
+        return JSONResponse({
+            "success": True,
+            "agent_id": result.data["agent_id"],
+            "closed_streams": result.data.get("closed_streams", 0),
+            "message": result.message or f"Agent '{agent_id}' disconnected",
+        })
+    return _agent_tool_error(result, "Failed to disconnect agent")
+
+
+@router.post("/{agent_id}/reconnect")
+async def reconnect_agent_api_route(
+    agent_id: str,
+    request: Request,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    """POST /api/agents/<id>/reconnect — re-enable one agent's loop."""
+    if not agent_id:
+        return JSONResponse({"error": "agent_id required"}, status_code=400)
+    try:
+        _ = await get_sanitized_json_body(request)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    from ...tools.admin_tools import reconnect_agent_tool_impl
+
+    result = await _dispatch_presence_impl(
+        reconnect_agent_tool_impl, {"agent_id": agent_id}, auth,
+    )
+    if isinstance(result, JSONResponse):
+        return result
+    if isinstance(result, _Ok):
+        return JSONResponse({
+            "success": True,
+            "agent_id": result.data["agent_id"],
+            "message": result.message or f"Agent '{agent_id}' reconnected",
+        })
+    return _agent_tool_error(result, "Failed to reconnect agent")
 
 
 @router.post("/{agent_id}/restore")

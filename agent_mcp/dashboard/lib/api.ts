@@ -731,6 +731,45 @@ class ApiClient {
     })
   }
 
+  // Disconnect / Reconnect — pause or resume an agent's monitoring loop
+  // WITHOUT terminating it or revoking its token. Disconnect sets
+  // auto_event_loop OFF (its wait_for_events starts returning
+  // stop_listening with an operator-facing reason), wakes the parked
+  // long-poll to deliver that now, and closes the live push stream so the
+  // agent flips offline. Reconnect flips it back ON. The fleet variants
+  // toggle the GLOBAL loop — "we're done for now" / "we're back".
+  async disconnectAgent(
+    agentId: string,
+  ): Promise<{ success: boolean; agent_id: string; closed_streams: number; message: string }> {
+    return this.request(`/agents/${encodeURIComponent(agentId)}/disconnect`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    })
+  }
+
+  async reconnectAgent(
+    agentId: string,
+  ): Promise<{ success: boolean; agent_id: string; message: string }> {
+    return this.request(`/agents/${encodeURIComponent(agentId)}/reconnect`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    })
+  }
+
+  async disconnectAllAgents(): Promise<{ success: boolean; closed_streams: number; message: string }> {
+    return this.request('/agents/disconnect-all', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    })
+  }
+
+  async reconnectAllAgents(): Promise<{ success: boolean; message: string }> {
+    return this.request('/agents/reconnect-all', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    })
+  }
+
   // editAgent updates the editable agent fields (color,
   // working_directory, aoe_session_id). PR D: cookie auth; backed by
   // POST /api/agents/<id>/edit. aoe_session_id is a 16-char lowercase

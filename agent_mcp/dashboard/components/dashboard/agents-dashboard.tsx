@@ -3,7 +3,8 @@
 import React, { useState, useEffect, useCallback } from "react"
 import {
   Users, Clock, AlertCircle, CheckCircle2, Shield, Cpu, Database, Network, Terminal,
-  Search, Plus, Eye, RefreshCw, Copy, RotateCcw, Trash2, Pencil, Send
+  Search, Plus, Eye, RefreshCw, Copy, RotateCcw, Trash2, Pencil, Send,
+  Pause, Play, PowerOff, Power
 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -93,7 +94,7 @@ const AgentTypeIcon = React.memo(({ agentId }: { agentId: string }) => {
   return <Icon className="h-4 w-4 text-muted-foreground" />
 })
 
-const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, openView, onEdit, onTaskClick, onSendDirective }: {
+const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, openView, onEdit, onTaskClick, onSendDirective, onDisconnect, onReconnect }: {
   agent: Agent,
   onTerminate: (id: string) => void,
   onRestore: (id: string) => void,
@@ -101,7 +102,9 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, op
   openView: (agent: Agent) => void,
   onEdit: (agent: Agent) => void,
   onTaskClick: (task: Task) => void,
-  onSendDirective: (id: string) => void
+  onSendDirective: (id: string) => void,
+  onDisconnect: (id: string) => void,
+  onReconnect: (id: string) => void
 }) => {
   const { getAgentTasks } = useDataStore()
   const [copiedToken, setCopiedToken] = useState(false)
@@ -232,6 +235,19 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, op
               WAITING
             </Badge>
           )}
+          {/* Operator-paused: auto_event_loop is OFF (Disconnect). The
+              agent has been told to stop its monitoring loop; resume with
+              Reconnect. Authoritative + immediate — shown even if the
+              online dot lingers briefly on the presence grace window. */}
+          {agent.status !== 'terminated' && agent.auto_event_loop === false && (
+            <Badge
+              variant="outline"
+              className="text-xs bg-amber-500/15 text-amber-600 border-amber-500/30 font-medium"
+              title="Disconnected by operator — monitoring paused. Reconnect to resume."
+            >
+              PAUSED
+            </Badge>
+          )}
         </div>
       </TableCell>
       
@@ -335,6 +351,35 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, op
             >
               <Pencil className="h-3.5 w-3.5" />
             </Button>
+          )}
+          {/* Disconnect (pause monitoring) / Reconnect (resume). Reversible;
+              does NOT terminate or revoke the token. Shows Reconnect when the
+              agent is already paused (auto_event_loop === false), else the
+              Disconnect (pause) affordance. */}
+          {agent.status !== 'terminated' && agent.agent_id !== 'Admin' && (
+            agent.auto_event_loop === false ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={(e) => { e.stopPropagation(); onReconnect(agent.agent_id) }}
+                title="Reconnect (resume monitoring — re-enable the event loop)"
+                className="h-7 w-7 p-0 text-primary hover:text-primary/80 hover:bg-primary/10"
+                data-testid={`reconnect-${agent.agent_id}`}
+              >
+                <Play className="h-3.5 w-3.5" />
+              </Button>
+            ) : (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={(e) => { e.stopPropagation(); onDisconnect(agent.agent_id) }}
+                title="Disconnect (pause monitoring now; tells the agent to stop listening — resume anytime)"
+                className="h-7 w-7 p-0 text-muted-foreground hover:text-amber-500 hover:bg-amber-500/10"
+                data-testid={`disconnect-${agent.agent_id}`}
+              >
+                <Pause className="h-3.5 w-3.5" />
+              </Button>
+            )
           )}
           {agent.status !== 'terminated' && agent.agent_id !== 'Admin' && (
             <Button
@@ -2160,6 +2205,50 @@ export function AgentsDashboard() {
     purgeDialog.open(agentId)
   }
 
+  // Disconnect / Reconnect — pause or resume monitoring without
+  // terminating. The live-update SSE channel refetches on its own, but we
+  // refreshData() here too so the row flips immediately on click.
+  const handleDisconnectAgent = async (agentId: string) => {
+    try {
+      const res = await apiClient.disconnectAgent(agentId)
+      await refreshData()
+      toastSuccess(`Agent "${agentId}" disconnected — monitoring paused.`)
+      return res
+    } catch (error) {
+      toastError(error, `Failed to disconnect ${agentId}`)
+    }
+  }
+
+  const handleReconnectAgent = async (agentId: string) => {
+    try {
+      await apiClient.reconnectAgent(agentId)
+      await refreshData()
+      toastSuccess(`Agent "${agentId}" reconnected — monitoring resumed.`)
+    } catch (error) {
+      toastError(error, `Failed to reconnect ${agentId}`)
+    }
+  }
+
+  const handleDisconnectAll = async () => {
+    try {
+      await apiClient.disconnectAllAgents()
+      await refreshData()
+      toastSuccess('All agents disconnected — global monitoring paused.')
+    } catch (error) {
+      toastError(error, 'Failed to disconnect all agents')
+    }
+  }
+
+  const handleReconnectAll = async () => {
+    try {
+      await apiClient.reconnectAllAgents()
+      await refreshData()
+      toastSuccess('All agents reconnected — global monitoring resumed.')
+    } catch (error) {
+      toastError(error, 'Failed to reconnect all agents')
+    }
+  }
+
   // Row-click handler. Opens a confirmation dialog before firing the
   // actual terminate; the in-effect idle-cleanup path uses
   // handleTerminateAgent directly so it stays bypass-confirm.
@@ -2266,6 +2355,33 @@ export function AgentsDashboard() {
           >
             <RefreshCw className={cn("h-3.5 w-3.5 mr-1.5", loading && "animate-spin")} />
             Refresh
+          </Button>
+          {/* Fleet master switch — "we're done for now" / "we're back".
+              Disconnect all flips the GLOBAL event-loop toggle OFF (every
+              agent's wait_for_events returns stop_listening) + closes every
+              live stream; Reconnect all flips it back ON. Both reversible;
+              per-agent disconnects persist through a global reconnect. */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleDisconnectAll}
+            className="text-xs text-muted-foreground hover:text-amber-600"
+            title="Disconnect ALL agents — pause fleet-wide monitoring now (reversible)"
+            data-testid="disconnect-all"
+          >
+            <PowerOff className="h-3.5 w-3.5 mr-1.5" />
+            Disconnect all
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleReconnectAll}
+            className="text-xs text-muted-foreground hover:text-primary"
+            title="Reconnect ALL agents — resume fleet-wide monitoring"
+            data-testid="reconnect-all"
+          >
+            <Power className="h-3.5 w-3.5 mr-1.5" />
+            Reconnect all
           </Button>
           {/* Wave 7 coordinator transition: register-only modal is
               the sole agent-creation surface. The legacy
@@ -2400,6 +2516,8 @@ export function AgentsDashboard() {
                       onEdit={handleEditAgent}
                       onTaskClick={handleTaskClick}
                       onSendDirective={handleSendDirective}
+                      onDisconnect={handleDisconnectAgent}
+                      onReconnect={handleReconnectAgent}
                     />
                   ))}
                 </TableBody>
@@ -2415,6 +2533,8 @@ export function AgentsDashboard() {
                 onRestore={handleRestoreAgent}
                 onPurge={handlePurgeAgent}
                 onSendDirective={handleSendDirective}
+                onDisconnect={handleDisconnectAgent}
+                onReconnect={handleReconnectAgent}
               />
             </div>
           </>

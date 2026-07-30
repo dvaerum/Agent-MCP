@@ -1290,6 +1290,332 @@ async def edit_agent_tool_impl(
         return Failed(message=f"Unexpected error editing agent: {e}")
 
 
+# ── Disconnect / Reconnect (operator "pause monitoring") ─────────────
+#
+# "Disconnect" tells a monitoring agent to STOP its wait_for_events loop
+# and drops its live MCP push stream — WITHOUT terminating it or revoking
+# its token. It reuses the event-coordination primitives:
+#   1. `auto_event_loop` OFF — the load-bearing part: every subsequent
+#      wait_for_events POST returns `stop_listening` (with an operator-
+#      facing reason) so the loop exits and STAYS exited even if the
+#      client reconnects its transport. Tool calls are separate POSTs and
+#      are NOT blocked — we can't/shouldn't kill the operator-owned client
+#      (coordinator model); we only stop the monitoring loop.
+#   2. `wake_for_flag_recheck` — deliver that `stop_listening` reason NOW
+#      (not on the next ~5s tick).
+#   3. `close_streams_for_agent` — drop the live GET /mcp SSE push stream
+#      so the agent flips OFFLINE in the dashboard immediately.
+# Restartable weeks later: Reconnect flips `auto_event_loop` back ON.
+# Operator-tier (`agents.terminate`, the same gate `edit_agent` uses —
+# Disconnect is a scoped edit of `auto_event_loop`).
+
+
+async def disconnect_agent_tool_impl(
+    arguments: Dict[str, Any],
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    """Pause one agent's monitoring loop + drop its live stream."""
+    denied = _require_capability(principal, "agents.terminate")
+    if denied is not None:
+        return denied
+
+    agent_id = arguments.get("agent_id")
+    if not agent_id or not isinstance(agent_id, str):
+        return Invalid(field="agent_id", message="`agent_id` is required.")
+
+    actor_label = principal.actor_label() if principal else "operator"
+
+    try:
+        with unit_of_work() as u:
+            cursor = u.cursor
+            cursor.execute(
+                "SELECT token, status FROM agents WHERE agent_id = ?",
+                (agent_id,),
+            )
+            row = cursor.fetchone()
+            if row is None or str(row["status"]) == "terminated":
+                return NotFound(resource="agent", identifier=agent_id)
+            agent_token = row["token"]
+
+            from ..repositories import agent_repo
+
+            if agent_repo.update_field(
+                agent_id, "auto_event_loop", False, connection=cursor,
+            ) is None:
+                raise _UnitOfWorkAbort(
+                    Failed(message="Failed to set auto_event_loop")
+                )
+
+            log_agent_action_to_db(
+                cursor, actor_label, "disconnected_agent",
+                details={"agent_id": agent_id},
+            )
+
+            def _post_disconnect() -> None:
+                # Cache parity so the dashboard shows "paused" without a
+                # backend restart.
+                if agent_token in g.active_agents:
+                    g.active_agents[agent_token]["auto_event_loop"] = False
+                # Deliver the stop_listening reason to the parked long-poll
+                # immediately (emit-iff-commit).
+                try:
+                    g.wake_for_flag_recheck(agent_id)
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.warning(
+                        "wake_for_flag_recheck(%s) failed after disconnect: "
+                        "%s", agent_id, e,
+                    )
+
+            u.on_commit(_post_disconnect)
+    except _UnitOfWorkAbort as ab:
+        return ab.result
+    except sqlite3.Error as e_sql:
+        logger.error(
+            "Database error disconnecting agent %s: %s", agent_id, e_sql,
+            exc_info=True,
+        )
+        return Failed(message=f"Database error disconnecting agent: {e_sql}")
+    except Exception as e:
+        logger.error(
+            "Unexpected error disconnecting agent %s: %s", agent_id, e,
+            exc_info=True,
+        )
+        return Failed(message=f"Unexpected error disconnecting agent: {e}")
+
+    # Post-commit: drop the live push stream(s) so presence flips OFFLINE
+    # now rather than at the pump's next self-validation tick.
+    from ..core import session_registry
+
+    closed = session_registry.close_streams_for_agent(agent_id)
+    if closed:
+        logger.info(
+            "Disconnect: signalled %d open MCP stream(s) closed for %s.",
+            len(closed), agent_id,
+        )
+    return Ok(
+        data={
+            "agent_id": agent_id,
+            "auto_event_loop": False,
+            "closed_streams": len(closed),
+        },
+        message=(
+            f"Agent '{agent_id}' disconnected — monitoring paused; "
+            f"{len(closed)} live stream(s) closed. Reconnect to resume."
+        ),
+    )
+
+
+async def reconnect_agent_tool_impl(
+    arguments: Dict[str, Any],
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    """Re-enable one agent's monitoring loop (`auto_event_loop` ON)."""
+    denied = _require_capability(principal, "agents.terminate")
+    if denied is not None:
+        return denied
+
+    agent_id = arguments.get("agent_id")
+    if not agent_id or not isinstance(agent_id, str):
+        return Invalid(field="agent_id", message="`agent_id` is required.")
+
+    actor_label = principal.actor_label() if principal else "operator"
+
+    try:
+        with unit_of_work() as u:
+            cursor = u.cursor
+            cursor.execute(
+                "SELECT token, status FROM agents WHERE agent_id = ?",
+                (agent_id,),
+            )
+            row = cursor.fetchone()
+            if row is None or str(row["status"]) == "terminated":
+                return NotFound(resource="agent", identifier=agent_id)
+            agent_token = row["token"]
+
+            from ..repositories import agent_repo
+
+            if agent_repo.update_field(
+                agent_id, "auto_event_loop", True, connection=cursor,
+            ) is None:
+                raise _UnitOfWorkAbort(
+                    Failed(message="Failed to set auto_event_loop")
+                )
+
+            log_agent_action_to_db(
+                cursor, actor_label, "reconnected_agent",
+                details={"agent_id": agent_id},
+            )
+
+            def _post_reconnect() -> None:
+                if agent_token in g.active_agents:
+                    g.active_agents[agent_token]["auto_event_loop"] = True
+                # Wake so a still-parked idle waiter re-checks and resumes
+                # monitoring (harmless if none is parked).
+                try:
+                    g.wake_for_flag_recheck(agent_id)
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.warning(
+                        "wake_for_flag_recheck(%s) failed after reconnect: "
+                        "%s", agent_id, e,
+                    )
+
+            u.on_commit(_post_reconnect)
+    except _UnitOfWorkAbort as ab:
+        return ab.result
+    except sqlite3.Error as e_sql:
+        logger.error(
+            "Database error reconnecting agent %s: %s", agent_id, e_sql,
+            exc_info=True,
+        )
+        return Failed(message=f"Database error reconnecting agent: {e_sql}")
+    except Exception as e:
+        logger.error(
+            "Unexpected error reconnecting agent %s: %s", agent_id, e,
+            exc_info=True,
+        )
+        return Failed(message=f"Unexpected error reconnecting agent: {e}")
+
+    return Ok(
+        data={"agent_id": agent_id, "auto_event_loop": True},
+        message=f"Agent '{agent_id}' reconnected — monitoring re-enabled.",
+    )
+
+
+async def disconnect_all_agents_tool_impl(
+    arguments: Dict[str, Any],
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    """Fleet master switch: pause ALL monitoring ("we're done for now").
+
+    Flips the GLOBAL `config_auto_event_loop_global` toggle OFF — one
+    switch that makes every agent's wait_for_events return stop_listening
+    — wakes every parked waiter, and closes every live push stream.
+    Reconnect-all flips it back ON weeks later. Per-agent disconnects
+    persist through a global reconnect (their own flag stays OFF).
+    """
+    denied = _require_capability(principal, "agents.terminate")
+    if denied is not None:
+        return denied
+
+    actor_label = principal.actor_label() if principal else "operator"
+
+    try:
+        with unit_of_work() as u:
+            cursor = u.cursor
+            from ..repositories import (
+                project_settings_repository as settings_repo,
+            )
+
+            settings_repo.upsert(
+                "config_auto_event_loop_global", "false", None,
+                description_provided=False, actor=actor_label,
+                connection=cursor,
+            )
+            log_agent_action_to_db(
+                cursor, actor_label, "disconnected_all_agents", details={},
+            )
+
+            def _post_disconnect_all() -> None:
+                try:
+                    g.wake_all_for_flag_recheck()
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.warning(
+                        "wake_all_for_flag_recheck failed after "
+                        "disconnect-all: %s", e,
+                    )
+
+            u.on_commit(_post_disconnect_all)
+    except _UnitOfWorkAbort as ab:
+        return ab.result
+    except sqlite3.Error as e_sql:
+        logger.error(
+            "Database error on disconnect-all: %s", e_sql, exc_info=True,
+        )
+        return Failed(message=f"Database error on disconnect-all: {e_sql}")
+    except Exception as e:
+        logger.error("Unexpected error on disconnect-all: %s", e, exc_info=True)
+        return Failed(message=f"Unexpected error on disconnect-all: {e}")
+
+    # Post-commit: close every live push stream across the fleet.
+    from ..core import session_registry
+
+    sids = [h.session_id for h in session_registry.all_sessions()]
+    closed = session_registry.close_streams(sids)
+    logger.info(
+        "Disconnect-all: global loop OFF; signalled %d open stream(s) closed.",
+        len(closed),
+    )
+    return Ok(
+        data={"closed_streams": len(closed)},
+        message=(
+            "All agents disconnected — global monitoring paused; "
+            f"{len(closed)} live stream(s) closed. Reconnect-all to resume."
+        ),
+    )
+
+
+async def reconnect_all_agents_tool_impl(
+    arguments: Dict[str, Any],
+    *,
+    principal: Optional[Principal] = None,
+) -> ToolResult:
+    """Fleet master switch back ON: re-enable global monitoring.
+
+    Agents whose per-agent `auto_event_loop` is still OFF (individually
+    disconnected) stay paused — this only lifts the global gate.
+    """
+    denied = _require_capability(principal, "agents.terminate")
+    if denied is not None:
+        return denied
+
+    actor_label = principal.actor_label() if principal else "operator"
+
+    try:
+        with unit_of_work() as u:
+            cursor = u.cursor
+            from ..repositories import (
+                project_settings_repository as settings_repo,
+            )
+
+            settings_repo.upsert(
+                "config_auto_event_loop_global", "true", None,
+                description_provided=False, actor=actor_label,
+                connection=cursor,
+            )
+            log_agent_action_to_db(
+                cursor, actor_label, "reconnected_all_agents", details={},
+            )
+
+            def _post_reconnect_all() -> None:
+                try:
+                    g.wake_all_for_flag_recheck()
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.warning(
+                        "wake_all_for_flag_recheck failed after "
+                        "reconnect-all: %s", e,
+                    )
+
+            u.on_commit(_post_reconnect_all)
+    except _UnitOfWorkAbort as ab:
+        return ab.result
+    except sqlite3.Error as e_sql:
+        logger.error(
+            "Database error on reconnect-all: %s", e_sql, exc_info=True,
+        )
+        return Failed(message=f"Database error on reconnect-all: {e_sql}")
+    except Exception as e:
+        logger.error("Unexpected error on reconnect-all: %s", e, exc_info=True)
+        return Failed(message=f"Unexpected error on reconnect-all: {e}")
+
+    return Ok(
+        data={},
+        message="All agents reconnected — global monitoring re-enabled.",
+    )
+
+
 async def purge_agent_tool_impl(
     arguments: Dict[str, Any],
     *,

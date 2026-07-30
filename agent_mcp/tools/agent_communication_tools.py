@@ -1431,7 +1431,15 @@ def _check_auto_event_loop_flags(agent_id: str) -> tuple[bool, Optional[str]]:
     # SQLite stores BOOLEAN as INTEGER; both 0/1 and True/False arrive.
     per_agent_on = bool(row["auto_event_loop"])
     if not per_agent_on:
-        return False, f"auto_event_loop is OFF for agent '{agent_id}'"
+        # The per-agent flag only goes OFF via an operator "Disconnect"
+        # (or the equivalent edit) — so the reason names WHY (operator
+        # paused you) and WHEN (may resume later), which the agent relays
+        # to the human before exiting the loop.
+        return False, (
+            f"Monitoring paused by operator for agent '{agent_id}'. "
+            "You have been disconnected for now; you may be told to "
+            "resume later. Exit the event loop and wait for human input."
+        )
     return True, None
 
 

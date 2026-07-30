@@ -2,7 +2,7 @@
 
 import * as React from "react"
 import {
-  Eye, Pencil, Trash2, RotateCcw, Copy, Send,
+  Eye, Pencil, Trash2, RotateCcw, Copy, Send, Pause, Play,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -51,6 +51,8 @@ interface AgentsMobileListProps {
   onRestore: (agentId: string) => void
   onPurge: (agentId: string) => void
   onSendDirective: (agentId: string) => void
+  onDisconnect: (agentId: string) => void
+  onReconnect: (agentId: string) => void
 }
 
 export function AgentsMobileList({
@@ -61,6 +63,8 @@ export function AgentsMobileList({
   onRestore,
   onPurge,
   onSendDirective,
+  onDisconnect,
+  onReconnect,
 }: AgentsMobileListProps): React.ReactElement {
   return (
     <ul role="list" className="divide-y divide-border">
@@ -92,6 +96,15 @@ export function AgentsMobileList({
               >
                 {PRESENCE_LABEL[presence]}
               </Badge>
+              {!isTerminated && agent.auto_event_loop === false && (
+                <Badge
+                  variant="outline"
+                  className="shrink-0 text-[10px] font-semibold border-0 px-2 py-0.5 rounded-md uppercase tracking-wider bg-amber-500/15 text-amber-600 ring-1 ring-amber-500/30"
+                  title="Disconnected by operator — monitoring paused. Reconnect to resume."
+                >
+                  PAUSED
+                </Badge>
+              )}
             </div>
 
             {agent.auth_token && (
@@ -149,6 +162,31 @@ export function AgentsMobileList({
                   >
                     <Pencil className="h-4 w-4" />
                   </Button>
+                  {agent.auto_event_loop === false ? (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      title="Reconnect (resume monitoring)"
+                      aria-label="Reconnect agent"
+                      className="h-9 w-9 p-0 text-primary hover:text-primary hover:bg-primary/10"
+                      onClick={(e) => { e.stopPropagation(); onReconnect(agent.agent_id) }}
+                      data-testid={`reconnect-mobile-${agent.agent_id}`}
+                    >
+                      <Play className="h-4 w-4" />
+                    </Button>
+                  ) : (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      title="Disconnect (pause monitoring; resume anytime)"
+                      aria-label="Disconnect agent"
+                      className="h-9 w-9 p-0 text-muted-foreground hover:text-amber-600 hover:bg-amber-500/10"
+                      onClick={(e) => { e.stopPropagation(); onDisconnect(agent.agent_id) }}
+                      data-testid={`disconnect-mobile-${agent.agent_id}`}
+                    >
+                      <Pause className="h-4 w-4" />
+                    </Button>
+                  )}
                   <Button
                     variant="ghost"
                     size="sm"
