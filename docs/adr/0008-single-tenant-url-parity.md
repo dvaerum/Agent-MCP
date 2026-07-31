@@ -4,6 +4,13 @@
 
 Accepted (2026-06-03).
 
+Amended by ADR-0020 (2026-07-31): the `/agent-mcp` mount prefix in the
+URL examples below moves out of the application and into the reverse
+proxy (`X-Forwarded-Prefix`). This ADR's goal that a build artefact
+"works at any prefix" (below) is *completed* there — the prefix becomes
+per-request rather than a router-owned constant. The single-tenant ↔
+multi-tenant URL-parity decision itself is unchanged.
+
 ## Context
 
 Forks of agent-mcp can run in two modes:

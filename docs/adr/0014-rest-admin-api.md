@@ -4,6 +4,13 @@
 **Date**: 2026-06-18
 **Supersedes**: the implicit "PR-C will finish this" migration plan
   documented in `agent_mcp/dashboard/lib/urls.ts:1-40`.
+**Superseded in part by**: ADR-0020 (2026-07-31) — the leading
+  `/agent-mcp` mount prefix in the URL table below is no longer owned by
+  the app; it becomes a reverse-proxy concern (`X-Forwarded-Prefix`).
+  Read the routes below as relative to the proxy's mount (e.g.
+  `…/api/router/health`). Everything else in this ADR — retiring `__`,
+  the REST resources, the reserved `api`/`app`/`assets`/`mcp`/`router`
+  segments, Accept-header versioning — stands unchanged.
 
 ## Context
 
