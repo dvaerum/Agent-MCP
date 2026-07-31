@@ -284,8 +284,13 @@ describe("MUX-10: long-content robustness", () => {
   it("conversation scroll container is height-capped", () => {
     // Tall (wrapped) rows must stay inside the scroll container so the
     // scroll-to-opened (MUX-1) lands correctly rather than growing the
-    // modal unbounded.
-    expect(/max-h-\[55vh\] overflow-auto/.test(modal)).toBe(true)
+    // modal unbounded. The cap now comes from the dialog being bounded to
+    // the viewport height (max-h-[calc(100dvh-2rem)] flex-col) with the
+    // conversation as the flexible scroll region (flex-1 min-h-0), instead
+    // of a fixed 55vh that ignored the header+footer height and let the
+    // whole popup overflow above/below the screen on mobile.
+    expect(/max-h-\[calc\(100dvh-2rem\)\]/.test(modal)).toBe(true)
+    expect(/flex-1 min-h-0 space-y-2 overflow-auto/.test(modal)).toBe(true)
   })
 
   it("mobile content wraps long tokens (break-words)", () => {

@@ -254,12 +254,17 @@ export function ViewMessageModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      {/* [&>*]:min-w-0 lets the grid children shrink below their
-          min-content — without it a long, unbreakable recipient_id in the
-          nowrap "Reply as …" footer button forces the whole grid wider
-          than the dialog and the popup clips on the right (mobile/WebKit).
-          overflow-hidden clips any residual. */}
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-2xl overflow-hidden [&>*]:min-w-0">
+      {/* Layout guards for the popup:
+          - [&>*]:min-w-0 lets children shrink below their min-content — a
+            long, unbreakable recipient_id in the nowrap "Reply as …"
+            footer button would otherwise force the dialog wider than the
+            viewport and clip on the right (mobile/WebKit).
+          - flex-col + max-h-[100dvh-2rem] caps the dialog to the viewport
+            HEIGHT so a tall conversation can't overflow above/below the
+            screen (the vertically-centered dialog used to push its title
+            off the top). The message area (flex-1 min-h-0, below) scrolls;
+            header + footer stay pinned. */}
+      <DialogContent className="flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden w-[calc(100vw-2rem)] sm:!max-w-2xl [&>*]:min-w-0">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <MessageSquare className="h-5 w-5 text-primary" />
@@ -291,7 +296,7 @@ export function ViewMessageModal({
           // Flat chronological conversation: root pinned at the top, then
           // each message below in time order. The clicked message is
           // ring-highlighted so the admin sees which one they opened.
-          <div className="space-y-2 max-h-[55vh] overflow-auto pr-1">
+          <div className="flex-1 min-h-0 space-y-2 overflow-auto pr-1">
             {thread.map((msg) => {
               const opened = msg.message_id === message.message_id
               return (
@@ -372,9 +377,9 @@ export function ViewMessageModal({
               </div>
             </div>
 
-            <div className="space-y-1">
+            <div className="flex flex-1 min-h-0 flex-col space-y-1">
               <div className="text-xs text-muted-foreground">Content</div>
-              <pre className="whitespace-pre-wrap break-words rounded-md border bg-muted/50 p-3 font-mono text-xs max-h-[40vh] overflow-auto">
+              <pre className="flex-1 min-h-0 whitespace-pre-wrap break-words rounded-md border bg-muted/50 p-3 font-mono text-xs overflow-auto">
                 {message.message_content}
               </pre>
             </div>

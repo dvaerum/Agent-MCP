@@ -74,10 +74,40 @@ describe("ViewMessageModal does not overflow on a long recipient_id", () => {
       return el as HTMLElement
     })
     const cls = content.className
-    // Grid children must be allowed to shrink below their min-content,
-    // otherwise the nowrap reply button forces the whole grid wider.
+    // Children must be allowed to shrink below their min-content,
+    // otherwise the nowrap reply button forces the whole dialog wider.
     expect(cls).toContain("[&>*]:min-w-0")
     expect(cls).toContain("overflow-hidden")
+    // …and the dialog must be height-capped to the viewport with a
+    // flex column so a tall conversation scrolls internally instead of
+    // overflowing above/below the screen.
+    expect(cls).toContain("flex-col")
+    expect(cls).toContain("max-h-[calc(100dvh-2rem)]")
+  })
+
+  it("the message area flexes and scrolls instead of growing the dialog", async () => {
+    mockThread.mockResolvedValue([longRecipientMessage])
+    render(
+      <ViewMessageModal
+        message={longRecipientMessage}
+        open
+        onOpenChange={() => {}}
+        onReply={() => {}}
+        onToggleRead={() => {}}
+        onDelete={() => {}}
+      />,
+    )
+    // Single-message detail: the content <pre> is the scroll region — it
+    // must flex (flex-1 min-h-0) + overflow-auto, not a fixed max-height
+    // that (with header+footer) can still exceed the viewport.
+    const pre = await waitFor(() => {
+      const el = document.querySelector('[data-slot="dialog-content"] pre')
+      if (!el) throw new Error("content pre not found")
+      return el as HTMLElement
+    })
+    expect(pre.className).toContain("flex-1")
+    expect(pre.className).toContain("min-h-0")
+    expect(pre.className).toContain("overflow-auto")
   })
 
   it("the reply button truncates its label instead of forcing width", async () => {
