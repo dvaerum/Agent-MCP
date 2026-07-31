@@ -171,6 +171,20 @@ async def security_headers_middleware(
     except web.HTTPException as exc:
         _apply_headers(exc, request)
         raise
+    except ConnectionResetError as exc:
+        # The client vanished mid-response — an SSE stream whose browser
+        # tab closed, or an aborted fetch. aiohttp's
+        # ClientConnectionResetError ("Cannot write to closing transport")
+        # subclasses ConnectionResetError. It is NOT a server fault and
+        # there is nothing left to deliver, so log at DEBUG and let it
+        # unwind to aiohttp's transport cleanup — never a 500 (which we
+        # couldn't send anyway, and which spammed the journal on every
+        # dashboard tab-close of the live-update SSE).
+        logger.debug(
+            "client disconnected during %s %s: %s",
+            request.method, request.rel_url, exc,
+        )
+        raise
     except Exception:
         # Log the real cause server-side (with traceback) but NEVER put
         # it in the response body — a generic message keeps internals

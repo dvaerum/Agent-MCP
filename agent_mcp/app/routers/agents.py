@@ -350,6 +350,10 @@ async def register_agent_dashboard_api_route(
     role = data.get("role") or data.get("agent_role") or "worker"
     project_name = data.get("project_name")
     host = data.get("host")
+    # ADR-0020: the dashboard sends its derived external mount prefix
+    # ("" at the Traefik root, "/agent-mcp" on the tailnet) so the
+    # .mcp.json snippet URL matches the front door the operator used.
+    mount_prefix = data.get("mount_prefix")
 
     if not name:
         return JSONResponse(
@@ -401,6 +405,9 @@ async def register_agent_dashboard_api_route(
         tool_args["project_name"] = project_name
     if isinstance(host, str) and host:
         tool_args["host"] = host
+    # Forward "" verbatim (root mount) — only skip a truly-absent value.
+    if isinstance(mount_prefix, str):
+        tool_args["mount_prefix"] = mount_prefix
 
     try:
         result = await register_agent_tool_impl(

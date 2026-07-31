@@ -1428,7 +1428,7 @@ def _safe_dashboard_path(rest: str) -> Path | None:
 
 
 def _serve_dashboard_file(
-    candidate: Path, *, cache_control: str,
+    candidate: Path, *, cache_control: str, prefix: "str | None" = None,
 ) -> web.Response:
     """Serve a file from the dashboard tree, running it through the
     Phase 4 sentinel substitution if the Content-Type is one of the
@@ -1443,9 +1443,16 @@ def _serve_dashboard_file(
     monkey-patching ``ASSET_PREFIX`` after import see their override
     reflected immediately.
     """
+    # ADR-0020: the asset prefix is per-request (the caller passes the
+    # mount-derived value) so HTML/JS served over the root front door
+    # references `/assets/…` and the tailnet references
+    # `/agent-mcp/assets/…`. Falls back to the static module-level
+    # ASSET_PREFIX when the caller doesn't supply one (tests that
+    # monkeypatch it; non-request callers).
+    use_prefix = prefix if prefix is not None else ASSET_PREFIX
     ctype = _MIME.get(candidate.suffix.lower(), "application/octet-stream")
     if _asset_prefix.content_type_needs_substitution(ctype):
-        body = _asset_prefix.substitute_file_bytes(candidate, ASSET_PREFIX)
+        body = _asset_prefix.substitute_file_bytes(candidate, use_prefix)
         return web.Response(
             body=body,
             headers={
@@ -1482,7 +1489,10 @@ async def overview_dashboard_handler(req: web.Request) -> web.StreamResponse:
     candidate = _safe_dashboard_path("index.html")
     if candidate is None or not candidate.is_file():
         raise web.HTTPNotFound()
-    return _serve_dashboard_file(candidate, cache_control="no-store")
+    return _serve_dashboard_file(
+        candidate, cache_control="no-store",
+        prefix=mount.external_prefix(req) + "/assets",
+    )
 
 
 async def _warm_backend(name: str) -> None:
@@ -1604,7 +1614,10 @@ async def dashboard_handler(req: web.Request) -> web.StreamResponse:
     # HTML may change between rebuilds (different chunk hashes embedded
     # in <script> tags). Force fresh fetches so a redeploy doesn't get
     # masked by the browser disk cache.
-    return _serve_dashboard_file(candidate, cache_control="no-store")
+    return _serve_dashboard_file(
+        candidate, cache_control="no-store",
+        prefix=mount.external_prefix(req) + "/assets",
+    )
 
 
 async def dashboard_assets_handler(req: web.Request) -> web.StreamResponse:
@@ -1637,6 +1650,7 @@ async def dashboard_assets_handler(req: web.Request) -> web.StreamResponse:
     return _serve_dashboard_file(
         candidate,
         cache_control="public, max-age=31536000, immutable",
+        prefix=mount.external_prefix(req) + "/assets",
     )
 
 

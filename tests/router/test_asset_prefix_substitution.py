@@ -253,9 +253,11 @@ async def test_binary_png_response_is_passed_through_unchanged(
 async def test_alternate_configured_prefix_propagates_to_served_html(
     aiohttp_client, router_module, write_dashboard_file, monkeypatch,
 ) -> None:
-    """Setting the configured prefix to ``/tools`` produces
-    ``/tools/_next/...`` URLs in served HTML — the load-bearing
-    operator-facing guarantee."""
+    """ADR-0020: the served HTML's asset prefix follows the REQUEST
+    MOUNT (per-request), not the static ASSET_PREFIX env. A request under
+    /agent-mcp/ yields /agent-mcp/assets/… — even with ASSET_PREFIX
+    monkeypatched to /tools, proving the per-request derivation wins (the
+    env is now only a fallback for non-request callers)."""
     monkeypatch.setattr(router_module, "ASSET_PREFIX", "/tools")
     # Clear the rewrite cache (filled by previous tests using the default).
     from agent_mcp.router import asset_prefix as ap_module
@@ -271,5 +273,7 @@ async def test_alternate_configured_prefix_propagates_to_served_html(
     resp = await client.get("/agent-mcp/app/")
     assert resp.status == 200
     body = await resp.text()
-    assert "/tools/_next/x.js" in body
+    # Request mount wins over the env override.
+    assert "/agent-mcp/assets/_next/x.js" in body, body
+    assert "/tools/" not in body, body
     assert "__AGENT_MCP_ASSET_PREFIX__" not in body

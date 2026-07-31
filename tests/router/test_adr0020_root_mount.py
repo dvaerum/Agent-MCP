@@ -103,6 +103,26 @@ async def test_html_landing_redirect_honours_mount(
         tail.headers["Location"]
 
 
+def test_serve_dashboard_file_prefix_per_request(router_module, tmp_path) -> None:
+    """_serve_dashboard_file substitutes the asset-prefix sentinel with
+    the caller's PER-REQUEST prefix — /assets at the root front door,
+    /agent-mcp/assets on the tailnet (ADR-0020 cleanup)."""
+    from agent_mcp.router.app import _serve_dashboard_file
+    from agent_mcp.router.asset_prefix import SENTINEL
+
+    f = tmp_path / "chunk.js"
+    f.write_text(f'import"{SENTINEL}/_next/x.js"')
+
+    root = _serve_dashboard_file(f, cache_control="no-store", prefix="/assets")
+    tail = _serve_dashboard_file(
+        f, cache_control="no-store", prefix="/agent-mcp/assets",
+    )
+    rb = root.body.decode() if isinstance(root.body, bytes) else root.body
+    tb = tail.body.decode() if isinstance(tail.body, bytes) else tail.body
+    assert '"/assets/_next/x.js"' in rb and SENTINEL not in rb, rb
+    assert '"/agent-mcp/assets/_next/x.js"' in tb, tb
+
+
 @pytest.mark.no_auth_seed_session
 async def test_login_form_action_honours_mount(
     aiohttp_client, router_app,

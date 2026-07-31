@@ -706,6 +706,10 @@ class ApiClient {
     // per-project backend gets after the router proxy strips Host).
     project_name?: string | null
     host?: string
+    // ADR-0020: the client's external mount prefix (deriveMount()) —
+    // "" at a root front door, "/agent-mcp" on the tailnet — so the
+    // returned .mcp.json snippet URL matches the front door in use.
+    mount_prefix?: string
   }): Promise<{
     success?: boolean
     message: string

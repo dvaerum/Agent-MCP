@@ -180,6 +180,7 @@ def _build_mcp_config_snippet(
     project: Optional[str],
     token: str,
     host: str,
+    mount_prefix: str = "/agent-mcp",
 ) -> str:
     """Return the JSON ``.mcp.json`` snippet operators paste into
     their user's claude config.
@@ -215,7 +216,11 @@ def _build_mcp_config_snippet(
     """
     server_key = "agent-mcp"
     if project:
-        url = f"{host}/agent-mcp/mcp/{project}"
+        # ADR-0020: the mount prefix is the client's external mount
+        # (/agent-mcp on the tailnet, "" at a Traefik root front door),
+        # passed by the dashboard; defaults to /agent-mcp for callers
+        # (CLI / env-fallback) that don't know the mount.
+        url = f"{host}{mount_prefix}/mcp/{project}"
     else:
         url = f"{host}/mcp"
     snippet = {
@@ -480,10 +485,15 @@ async def register_agent_tool_impl(
 
             project_for_snippet = _resolve_snippet_project(arguments, principal)
             host_for_snippet = _resolve_snippet_host(arguments)
+            # ADR-0020: the dashboard passes the client's external mount
+            # prefix ("" at the Traefik root, "/agent-mcp" on the tailnet).
+            # Absent (CLI / non-dashboard callers) → default /agent-mcp.
+            _mp = arguments.get("mount_prefix")
             snippet = _build_mcp_config_snippet(
                 project=project_for_snippet,
                 token=new_agent_token,
                 host=host_for_snippet,
+                mount_prefix="/agent-mcp" if _mp is None else _mp,
             )
 
             logger.info(

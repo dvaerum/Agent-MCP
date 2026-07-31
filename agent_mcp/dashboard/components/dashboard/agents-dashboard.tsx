@@ -19,7 +19,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { apiClient, Agent, Task, agentPresence, type AgentPresence } from "@/lib/api"
 import { toastError, toastSuccess } from "@/components/ui/toast"
 import { projectContext } from "@/lib/project-context"
-import { mcpUrl } from "@/lib/urls"
+import { mcpUrl, deriveMount } from "@/lib/urls"
 import { useServerStore } from "@/lib/stores/server-store"
 import { useDataStore } from "@/lib/stores/data-store"
 import { cn, formatRelative } from "@/lib/utils"
@@ -511,6 +511,9 @@ const RegisterAgentModal = () => {
         role: formData.role,
         project_name: projectName,
         host: host || undefined,
+        // ADR-0020: send the current mount prefix so the snippet URL
+        // matches this front door ("" at root, "/agent-mcp" on tailnet).
+        mount_prefix: deriveMount(),
       })
       if (!res.agent_id || !res.agent_token || !res.mcp_snippet) {
         throw new Error('Backend response missing required fields')
