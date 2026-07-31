@@ -304,14 +304,21 @@ describe("MUX-10: long-content robustness", () => {
     expect(/max-w-\[200px\] truncate/.test(dash)).toBe(true)
   })
 
-  it("long sender/recipient ids truncate instead of growing the column", () => {
-    // Desktop From/To cells are width-capped and the badge truncates.
+  it("desktop From/To cells cap width; mobile shows full ids", () => {
+    // Desktop From/To cells stay width-capped + truncate (the wide table
+    // has limited column room; hover reveals the full id).
     expect(
       (dash.match(/<TableCell className="max-w-\[160px\]">/g) ?? []).length,
     ).toBeGreaterThanOrEqual(2)
-    // Mobile caps the id badges too.
+    // Mobile cards, by contrast, show the FULL sender/recipient: the id
+    // badges are no longer capped to 40% + truncated — they break-all and
+    // the header wraps (flex-wrap) so who↔who is readable without a
+    // hover/long-press. Guard against a regression back to truncation.
+    expect(/max-w-\[40%\]/.test(mobile)).toBe(false)
+    expect(/flex flex-wrap items-center gap-x-2 gap-y-1/.test(mobile)).toBe(true)
     expect(
-      (mobile.match(/max-w-\[40%\]/g) ?? []).length,
+      (mobile.match(/<span className="break-all">\{m\.(sender|recipient)_id\}/g) ?? [])
+        .length,
     ).toBeGreaterThanOrEqual(2)
   })
 })

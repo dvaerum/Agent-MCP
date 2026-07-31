@@ -129,29 +129,32 @@ export function MessagesMobileList({
                 className="mt-1 h-4 w-4 accent-primary"
               />
               <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
-                  {/* Cap long agent ids so a card can't overflow its
-                      width; the inner span truncates + a title reveals
-                      the full id on long-press/hover. */}
+                {/* Show the FULL sender/recipient ids: the header wraps
+                    (flex-wrap) so a long pair drops the recipient onto its
+                    own line, and each id badge grows to the row width and
+                    breaks within it (break-all) rather than truncating to
+                    "pikvm-nixos…". Reading who↔who no longer needs a
+                    hover/long-press. */}
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
                   <Badge
                     variant="outline"
-                    className="px-1.5 py-0 text-[10px] max-w-[40%]"
+                    className="px-1.5 py-0 text-[10px] max-w-full"
                     title={m.sender_id}
                   >
-                    <span className="truncate">{m.sender_id}</span>
+                    <span className="break-all">{m.sender_id}</span>
                   </Badge>
-                  <span aria-hidden>→</span>
+                  <span aria-hidden className="shrink-0">→</span>
                   <Badge
                     variant="outline"
-                    className="px-1.5 py-0 text-[10px] max-w-[40%]"
+                    className="px-1.5 py-0 text-[10px] max-w-full"
                     title={m.recipient_id}
                   >
-                    <span className="truncate">{m.recipient_id}</span>
+                    <span className="break-all">{m.recipient_id}</span>
                   </Badge>
                   {!isRead && (
                     <span
                       aria-label="unread"
-                      className="ml-auto h-2 w-2 rounded-full bg-primary"
+                      className="ml-auto h-2 w-2 shrink-0 rounded-full bg-primary"
                     />
                   )}
                 </div>
