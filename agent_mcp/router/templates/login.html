@@ -14,12 +14,12 @@
        /agent-mcp/setup before any user exists. #}
     <p>Sign in via your organisation's identity provider.</p>
     <p>
-      <a class="sso-button" href="/agent-mcp/sso/login">
+      <a class="sso-button" href="{{ sso_login_url }}">
         Sign in with {{ sso_provider_name }}
       </a>
     </p>
   {% else %}
-    <form method="post" action="/agent-mcp/login{% if next %}?next={{ next }}{% endif %}">
+    <form method="post" action="{{ login_action }}{% if next %}?next={{ next }}{% endif %}">
       <label for="username">Username</label>
       <input id="username" name="username" type="text" autocomplete="username"
              autofocus required value="{{ username or '' }}">

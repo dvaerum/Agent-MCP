@@ -104,6 +104,21 @@ async def test_html_landing_redirect_honours_mount(
 
 
 @pytest.mark.no_auth_seed_session
+async def test_login_form_action_honours_mount(
+    aiohttp_client, router_app,
+) -> None:
+    """The rendered login form POSTs to the login page at the caller's
+    mount — root → action="/login", tailnet → action="/agent-mcp/login".
+    A hardcoded /agent-mcp action would set a /agent-mcp cookie on a root
+    login, which the root redirect never sends → login loop."""
+    client = await aiohttp_client(router_app)
+    root = await (await client.get("/login")).text()
+    tail = await (await client.get("/agent-mcp/login")).text()
+    assert 'action="/login' in root, root[:600]
+    assert 'action="/agent-mcp/login' in tail, tail[:600]
+
+
+@pytest.mark.no_auth_seed_session
 async def test_unauth_login_redirect_honours_mount(
     aiohttp_client, router_app,
 ) -> None:

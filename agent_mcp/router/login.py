@@ -105,6 +105,19 @@ def _render(template: str, **ctx: Any) -> str:
     return _jinja_env.get_template(template).render(**ctx)
 
 
+def _form_urls(request: web.Request) -> dict[str, str]:
+    """ADR-0020: mount-relative URLs for the login template's form action
+    + SSO link, so the form submitted from the root front door POSTs to
+    /login (setting a Path=/ cookie), not /agent-mcp/login (which would
+    set a /agent-mcp cookie the root redirect never sends → login loop)."""
+    from . import mount
+
+    return {
+        "login_action": mount.external_path(request, "/login"),
+        "sso_login_url": mount.external_path(request, "/sso/login"),
+    }
+
+
 def _form_str(form: Any, key: str) -> str:
     """Read a ``request.post()`` field as ``str``, or "" if not a string.
 
@@ -429,6 +442,7 @@ async def login_get_handler(request: web.Request) -> web.Response:
         username="",
         next=next_url,
         sso_provider_name=sso_provider_name,
+        **_form_urls(request),
     )
     return web.Response(
         text=html, content_type="text/html", charset="utf-8",
@@ -481,6 +495,7 @@ async def login_post_handler(request: web.Request) -> web.StreamResponse:
                 error="Invalid username or password.",
                 username="",
                 next=next_url,
+                **_form_urls(request),
             ),
             status=401,
             content_type="text/html", charset="utf-8",
@@ -493,6 +508,7 @@ async def login_post_handler(request: web.Request) -> web.StreamResponse:
         error="Invalid username or password.",
         username=username,
         next=next_url,
+        **_form_urls(request),
     )
 
     if not username or not password:
