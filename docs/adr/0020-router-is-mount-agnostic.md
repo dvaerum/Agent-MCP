@@ -6,11 +6,17 @@ serves every route at the host **root** as well as under `/agent-mcp`
 (`agent_mcp/router/mount.py`), gates root-aliased routes on the
 canonicalised path (no auth bypass), and scopes the session cookie to
 the client's mount. The tailnet path is byte-identical.
-**Deferred (work as-needed, not blocking):** the dashboard `assetPrefix`
-+ `.mcp.json` snippet still emit `/agent-mcp` literals — they resolve at
-the root front door via the reverse proxy passing `/agent-mcp/assets`
-through, so they are cosmetic, not functional, gaps. Make them
-per-request when a root-front-door agent needs a clean snippet URL.
+**Frontend (v5.67.0):** the dashboard derives its mount from
+`window.location` at runtime (`lib/urls.ts deriveMount()`), so nav, API
+calls, login, and the path regexes are all mount-relative — clean at the
+root, `/agent-mcp` on the tailnet.
+**Cleanup (v5.68.0):** the dashboard `assetPrefix` is now per-request
+(`_serve_dashboard_file` takes the mount-derived prefix; cache keyed by
+prefix), the `.mcp.json` snippet honours the mount (`_build_mcp_config_snippet`
+`mount_prefix`, sent by the dashboard's `deriveMount()`), and the
+operator-SSE 500-on-disconnect is silenced (`security_headers` catches
+`ConnectionResetError`). Verified live at `mm.best.aau.dk`: zero
+`/agent-mcp` URLs in the served page, connected, no console errors.
 **Date**: 2026-07-31
 **Amends / supersedes-in-part**:
   - **ADR-0008** (single-tenant URL parity) — its `/agent-mcp/...` URL
