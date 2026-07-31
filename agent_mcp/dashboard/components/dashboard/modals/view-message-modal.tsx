@@ -110,18 +110,22 @@ function ConversationRow({
         opened && "ring-2 ring-primary ring-offset-1 ring-offset-background",
       )}
     >
-      <div className="flex items-center justify-between gap-2 mb-1">
-        <div className="flex items-center gap-1.5 text-xs font-mono">
+      {/* Stack on mobile so the sender→recipient line gets the full row
+          width — otherwise the read/unread + timestamp controls squeeze it
+          to ~1 char and `break-all` stacks the ids vertically (one letter
+          per line). Side-by-side again from sm up. */}
+      <div className="flex flex-col gap-1 mb-1 sm:flex-row sm:items-center sm:justify-between sm:gap-2">
+        <div className="flex min-w-0 items-center gap-1.5 text-xs font-mono">
           <span className="font-medium break-all">{msg.sender_id}</span>
-          <span className="text-muted-foreground">→</span>
+          <span className="shrink-0 text-muted-foreground">→</span>
           <span className="break-all">{msg.recipient_id}</span>
           {opened && (
-            <Badge variant="secondary" className="ml-1 text-[10px]">
+            <Badge variant="secondary" className="ml-1 shrink-0 text-[10px]">
               opened
             </Badge>
           )}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex shrink-0 items-center gap-2">
           {/* Per-message read status + toggle. The button's label IS the
               current state, and clicking it flips this specific message —
               so both "which are read" and "what will this toggle" are

@@ -13,22 +13,24 @@
 //   2. The reply label truncates (min-w-0 + a `truncate` span) instead of
 //      forcing width.
 // RED before the fix, GREEN after.
-import { describe, it, expect, vi, afterEach } from "vitest"
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
 import { render, cleanup, waitFor } from "@testing-library/react"
 
-// The modal fetches its thread on open; return just the opened message so
-// it renders the single-message detail (footer + Reply button) without
-// network.
+// The modal fetches its thread on open. Default: just the opened message
+// (single-message detail — footer + Reply button). The conversation test
+// overrides this with a multi-message thread so ConversationRow renders.
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>()
   return {
     ...actual,
-    getMessageThread: vi.fn(() => Promise.resolve([longRecipientMessage])),
+    getMessageThread: vi.fn(),
   }
 })
 
 import { ViewMessageModal } from "@/components/dashboard/modals/view-message-modal"
-import type { Message } from "@/lib/api"
+import { getMessageThread, type Message } from "@/lib/api"
+
+const mockThread = vi.mocked(getMessageThread)
 
 const longRecipientMessage: Message = {
   message_id: "m-overflow",
@@ -45,6 +47,13 @@ const longRecipientMessage: Message = {
   parent_message_id: null,
 }
 
+beforeEach(() => {
+  // jsdom has no layout engine; the modal scrolls the opened row into view
+  // once a conversation loads. Stub it so the effect doesn't throw.
+  Element.prototype.scrollIntoView = vi.fn()
+  // Default single-message thread; the conversation test overrides.
+  mockThread.mockResolvedValue([longRecipientMessage])
+})
 afterEach(() => cleanup())
 
 describe("ViewMessageModal does not overflow on a long recipient_id", () => {
@@ -94,5 +103,44 @@ describe("ViewMessageModal does not overflow on a long recipient_id", () => {
     // …but the button must be shrinkable and the label must truncate.
     expect(replyBtn.className).toContain("min-w-0")
     expect(replyBtn.querySelector(".truncate")).not.toBeNull()
+  })
+})
+
+describe("ViewMessageModal conversation-row from→to header", () => {
+  const second: Message = {
+    ...longRecipientMessage,
+    message_id: "m-2",
+    sender_id: "pikvm-mcp-server@georgs-mac-mini",
+    recipient_id: "manager",
+    parent_message_id: "m-overflow",
+  }
+
+  it("stacks the sender→recipient line on mobile so ids don't char-stack", async () => {
+    mockThread.mockResolvedValue([longRecipientMessage, second])
+    render(
+      <ViewMessageModal
+        message={longRecipientMessage}
+        open
+        onOpenChange={() => {}}
+        onReply={() => {}}
+        onToggleRead={() => {}}
+        onDelete={() => {}}
+      />,
+    )
+    // The sender id text node must be intact (not split char-by-char) and
+    // live inside a min-w-0 group within a header that stacks on mobile
+    // (flex-col) and only goes side-by-side from sm up (sm:flex-row).
+    const senderSpan = await waitFor(() => {
+      const el = [...document.querySelectorAll("span.font-medium")].find(
+        (s) => s.textContent === "manager",
+      )
+      if (!el) throw new Error("sender id span not found")
+      return el as HTMLElement
+    })
+    const idGroup = senderSpan.parentElement as HTMLElement
+    expect(idGroup.className).toContain("min-w-0")
+    const header = idGroup.parentElement as HTMLElement
+    expect(header.className).toContain("flex-col")
+    expect(header.className).toContain("sm:flex-row")
   })
 })
