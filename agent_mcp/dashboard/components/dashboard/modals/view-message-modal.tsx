@@ -250,7 +250,12 @@ export function ViewMessageModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-2xl">
+      {/* [&>*]:min-w-0 lets the grid children shrink below their
+          min-content — without it a long, unbreakable recipient_id in the
+          nowrap "Reply as …" footer button forces the whole grid wider
+          than the dialog and the popup clips on the right (mobile/WebKit).
+          overflow-hidden clips any residual. */}
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-2xl overflow-hidden [&>*]:min-w-0">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <MessageSquare className="h-5 w-5 text-primary" />
@@ -385,11 +390,16 @@ export function ViewMessageModal({
               use — "Reply as {message.recipient_id}". Derived from the
               opened message directly; a degenerate broadcast recipient
               ("*"/empty) falls back to a bare "Reply". */}
-          <Button variant="outline" size="sm" onClick={onReply}>
-            <Send className="h-4 w-4 mr-1" />
-            {message.recipient_id && message.recipient_id !== "*"
-              ? `Reply as ${message.recipient_id}`
-              : "Reply"}
+          {/* min-w-0 + a truncating label so a long recipient_id
+              ellipsizes instead of forcing the button (and the grid) past
+              the viewport. */}
+          <Button variant="outline" size="sm" onClick={onReply} className="min-w-0 max-w-full">
+            <Send className="h-4 w-4 mr-1 shrink-0" />
+            <span className="truncate min-w-0">
+              {message.recipient_id && message.recipient_id !== "*"
+                ? `Reply as ${message.recipient_id}`
+                : "Reply"}
+            </span>
           </Button>
           {/* Read-toggle moved onto each message row (the envelope icon:
               open = read, closed = unread) so it's unambiguous which
