@@ -15,6 +15,27 @@ pytestmark = pytest.mark.asyncio
 VER = {"Accept": "application/vnd.agent-mcp.v1+json"}
 
 
+async def test_multi_segment_api_path_resolves_at_root(router_app) -> None:
+    """The backend proxy is a tail-match route (/api/<name>/{rest:.*}).
+    Its root alias must keep the tail regex so MULTI-segment paths
+    resolve — regression for the messages 404 (single-segment all-data
+    worked but /api/<proj>/messages/query 404'd at the root front door)."""
+    from aiohttp.test_utils import make_mocked_request
+
+    for p in (
+        "/api/proj/messages/query",
+        "/api/proj/messages/participants",
+        "/api/proj/agents/some-id/disconnect",
+    ):
+        match = await router_app.router.resolve(make_mocked_request("POST", p))
+        assert match.http_exception is None, f"{p} did not resolve at root"
+        assert match.handler.__name__ == "backend_api_handler", p
+    # Single-segment (already worked) + the tailnet twin still resolve.
+    for p in ("/api/proj/all-data", "/agent-mcp/api/proj/messages/query"):
+        match = await router_app.router.resolve(make_mocked_request("GET", p))
+        assert match.http_exception is None, p
+
+
 @pytest.mark.no_auth_seed_session
 async def test_health_serves_at_both_mounts(aiohttp_client, router_app) -> None:
     """The public health probe answers at both the tailnet and root

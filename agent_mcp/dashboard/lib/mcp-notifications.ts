@@ -406,6 +406,17 @@ export function openMcpNotificationStream(
  *     wasteful). On visible again: reopens, restarting backoff from 1s.
  */
 export function subscribeMcpNotifications(): () => void {
+  // The cross-project overview (router-served, no project selected) has
+  // no per-project `/api/<project>/events` stream to subscribe to — the
+  // events feed is per-project. Subscribing there resolves to a bare
+  // `/api/events`, which 404s in a reconnect loop. Skip it; the overview
+  // refreshes via `/api/router/overview`. Per-project pages subscribe
+  // normally. (Standalone single-tenant is NOT isOverview, so it still
+  // subscribes to its `/api/events`.)
+  if (projectContext.isOverview) {
+    return () => {}
+  }
+
   let handle: SubscriptionHandle | null = openMcpNotificationStream()
 
   // Guard for SSR / non-DOM (vitest node) environments — there's no

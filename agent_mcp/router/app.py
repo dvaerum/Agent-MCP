@@ -2664,20 +2664,26 @@ def make_app(
 def _add_root_aliases(app: web.Application) -> None:
     """Register a root-mounted alias for every ``/agent-mcp`` route.
 
-    ADR-0020. The two tail-match (``{rest:.*}``) routes are aliased
+    ADR-0020. The THREE tail-match (``{rest:.*}``) routes are aliased
     EXPLICITLY first — ``resource.canonical`` drops the ``.*`` (rendering
     ``{rest}`` as a single segment), so a programmatic re-add would break
-    nested asset / SPA paths. The remaining routes (static + single-
-    segment ``{name}``) round-trip cleanly through ``canonical``.
+    ANY multi-segment path under them (nested assets, SPA deep links, and
+    — the bug this fixes — multi-segment backend API paths like
+    ``/api/<project>/messages/query``, which 404'd at the root while
+    single-segment ``/api/<project>/all-data`` worked). The remaining
+    routes (static + single-segment ``{name}``) round-trip cleanly.
     """
     # 1. Explicit aliases for the tail-match routes (regex preserved).
     app.router.add_get("/assets/{rest:.*}", dashboard_assets_handler)
     app.router.add_get("/app/{name}/{rest:.*}", dashboard_handler)
-    # Pre-seed so the programmatic pass skips these (canonical form).
+    app.router.add_route("*", "/api/{name}/{rest:.*}", backend_api_handler)
+    # Their canonical (regex-stripped) root paths — the programmatic pass
+    # must SKIP these so it doesn't re-register a single-segment variant
+    # that shadows the correct tail alias above.
+    handled_root_paths = {
+        "/assets/{rest}", "/app/{name}/{rest}", "/api/{name}/{rest}",
+    }
     seen: set[tuple[str, str]] = set()
-    for m in ("GET", "HEAD"):
-        seen.add((m, "/assets/{rest}"))
-        seen.add((m, "/app/{name}/{rest}"))
 
     # 2. Programmatic aliases for every other /agent-mcp route.
     for route in list(app.router.routes()):
@@ -2691,6 +2697,8 @@ def _add_root_aliases(app: web.Application) -> None:
             root_path = canonical[len(mount.INTERNAL_MOUNT):]
         else:
             continue  # already root (an alias) or foreign — skip.
+        if root_path in handled_root_paths:
+            continue  # explicitly aliased above with the tail regex.
         key = (route.method, root_path)
         if key in seen:
             continue
