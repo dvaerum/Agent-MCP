@@ -225,18 +225,27 @@ def _try_proxy_header_identity(
         return None
 
 
-def _unauth_response(message: str = "login_required") -> web.Response:
+def _unauth_response(
+    message: str = "login_required", request: web.Request | None = None,
+) -> web.Response:
     """Render the JSON envelope dashboards expect on a 401.
 
     The dashboard's ``ApiClient`` (PR D in api.ts) keys off the
-    ``error: "login_required"`` discriminator to redirect to
-    ``/agent-mcp/login``; we keep the body small and machine-readable.
+    ``error: "login_required"`` discriminator to redirect to the login
+    page. ADR-0020: ``login_url`` is emitted at the caller's mount prefix
+    (root for Traefik, /agent-mcp for the tailnet) when the request is
+    available, so the root dashboard redirects to /login not
+    /agent-mcp/login.
     """
+    login_url = (
+        mount.external_path(request, "/login")
+        if request is not None else "/agent-mcp/login"
+    )
     return web.json_response(
         {
             "error": "login_required",
             "message": message,
-            "login_url": "/agent-mcp/login",
+            "login_url": login_url,
         },
         status=401,
     )
@@ -301,7 +310,10 @@ def _login_redirect_response(request: web.Request) -> web.Response:
     # sent; ``quote`` with default ``safe="/"`` percent-encodes the
     # ``?`` and ``=`` so the login form sees one opaque next-value.
     next_target = quote(request.path_qs)
-    location = f"/agent-mcp/login?next={next_target}"
+    # ADR-0020: send the operator to the login page at THEIR mount prefix
+    # (root for Traefik, /agent-mcp for the tailnet) so a bare-root visit
+    # stays at the root rather than bouncing into /agent-mcp/login.
+    location = f"{mount.external_path(request, '/login')}?next={next_target}"
     return web.Response(status=303, headers={"Location": location})
 
 
@@ -380,7 +392,9 @@ async def require_operator_session_middleware(
             # ``error: "login_required"`` discriminator).
             if _wants_html(request):
                 return _login_redirect_response(request)
-            return _unauth_response("session cookie missing or invalid")
+            return _unauth_response(
+                "session cookie missing or invalid", request,
+            )
 
     # Phase 3 Wave 2: sysadmin bypasses the project-membership check
     # entirely. The bit travels via either ``users.is_sysadmin = 1``

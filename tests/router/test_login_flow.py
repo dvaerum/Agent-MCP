@@ -683,10 +683,16 @@ async def test_login_honours_safe_next_param(
 async def test_login_rejects_open_redirect(
     aiohttp_client, router_app,
 ) -> None:
-    """A protocol-relative or off-host next= falls back to /agent-mcp/."""
+    """A protocol-relative or off-host next= falls back to the mount root.
+
+    ADR-0020: `next` is now validated as any SAME-ORIGIN absolute path
+    (root paths like `/app/…` are legitimate mounts), not pinned to
+    `/agent-mcp/`. Genuine open-redirect vectors (protocol-relative,
+    off-host) are still rejected."""
     _seed_user(username="kyle", password="x")
     client = await aiohttp_client(router_app)
-    for nxt in ("//evil.example.com/", "https://evil.example.com/", "/no-prefix"):
+    # Open-redirect vectors → rejected to the (tailnet) mount root.
+    for nxt in ("//evil.example.com/", "https://evil.example.com/"):
         resp = await client.post(
             f"/agent-mcp/login?next={nxt}",
             data={"username": "kyle", "password": "x"},
@@ -696,4 +702,15 @@ async def test_login_rejects_open_redirect(
         assert resp.headers.get("Location") == "/agent-mcp/", (
             f"next={nxt!r} should be rejected, got Location={resp.headers.get('Location')!r}"
         )
-        # New session each iteration is fine for the assertion shape.
+    # A same-origin path OUTSIDE /agent-mcp/ (e.g. a root-mount deep link)
+    # is now honoured — it can't leave the origin, so it's not an
+    # open-redirect.
+    resp = await client.post(
+        "/agent-mcp/login?next=/app/foo",
+        data={"username": "kyle", "password": "x"},
+        allow_redirects=False,
+    )
+    assert resp.status == 303
+    assert resp.headers.get("Location") == "/app/foo", (
+        f"same-origin next should be honoured, got {resp.headers.get('Location')!r}"
+    )

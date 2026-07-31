@@ -275,31 +275,40 @@ def resolve_current_user(request: web.Request) -> dict[str, Any] | None:
 # ── next= validation ───────────────────────────────────────────────
 
 
-def _safe_next(raw: str | None) -> str:
-    """Return ``raw`` if safely path-relative under /agent-mcp/, else /.
+def _safe_next(raw: str | None, request: web.Request) -> str:
+    """Return ``raw`` if a safe same-origin path, else the mount default.
 
-    Rejects:
-      * empty / missing values (fall through to default)
+    ADR-0020: the router is served at different external mounts (root for
+    Traefik, /agent-mcp for the tailnet), so ``next`` is validated as any
+    absolute-path-relative, SAME-ORIGIN target (``/…``) rather than being
+    pinned to ``/agent-mcp/``. This keeps a root login returning to the
+    root (``/``, ``/app/…``) while a tailnet login returns under
+    ``/agent-mcp/``. Open-redirect protection is unchanged — we still
+    reject anything that could leave the origin.
+
+    Rejects (→ the client's mount root):
+      * empty / missing values
       * protocol-relative URLs (``//host/...``)
-      * absolute URLs (anything with ``://``)
-      * paths outside ``/agent-mcp/`` — keeps the redirect inside the
-        router's URL surface so a compromised query string can't bounce
-        the operator to an unrelated mount.
+      * absolute URLs (anything with ``://``, or a scheme/netloc)
+      * non-absolute paths (must start with a single ``/``)
     """
+    from . import mount
+
+    default = mount.external_path(request, "/")
     if not raw:
-        return "/agent-mcp/"
+        return default
     if raw.startswith("//"):
-        return "/agent-mcp/"
+        return default
     if "://" in raw:
-        return "/agent-mcp/"
+        return default
     try:
         parsed = urlsplit(raw)
     except ValueError:
-        return "/agent-mcp/"
+        return default
     if parsed.scheme or parsed.netloc:
-        return "/agent-mcp/"
-    if not raw.startswith("/agent-mcp/"):
-        return "/agent-mcp/"
+        return default
+    if not raw.startswith("/"):
+        return default
     return raw
 
 
@@ -410,7 +419,7 @@ async def login_get_handler(request: web.Request) -> web.Response:
     setup-wizard bootstrap (first user, no SSO accounts yet).
     """
     if resolve_current_user(request) is not None:
-        target = _safe_next(request.rel_url.query.get("next"))
+        target = _safe_next(request.rel_url.query.get("next"), request)
         raise web.HTTPSeeOther(location=target)
     next_url = request.rel_url.query.get("next", "")
     sso_provider_name = _resolve_sso_provider_name()
@@ -524,7 +533,7 @@ async def login_post_handler(request: web.Request) -> web.StreamResponse:
     # Auth ok: create a session, set the cookie, redirect.
     session_id = identity.create_session(user["user_id"])
     identity.touch_last_login(user["user_id"])
-    target = _safe_next(next_url)
+    target = _safe_next(next_url, request)
     response = web.HTTPSeeOther(location=target)
     _set_session_cookie(response, request, session_id)
     raise response

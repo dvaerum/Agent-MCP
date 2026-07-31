@@ -104,6 +104,27 @@ async def test_html_landing_redirect_honours_mount(
 
 
 @pytest.mark.no_auth_seed_session
+async def test_unauth_login_redirect_honours_mount(
+    aiohttp_client, router_app,
+) -> None:
+    """An UNAUTHENTICATED html visit is bounced to the login page at the
+    caller's mount: root → /login (stays at root, no /agent-mcp bounce);
+    tailnet → /agent-mcp/login."""
+    client = await aiohttp_client(router_app)
+    root = await client.get(
+        "/", headers={"Accept": "text/html"}, allow_redirects=False,
+    )
+    tail = await client.get(
+        "/agent-mcp/", headers={"Accept": "text/html"}, allow_redirects=False,
+    )
+    assert root.status == 303, await root.text()
+    assert root.headers["Location"].startswith("/login?next="), \
+        root.headers["Location"]
+    assert tail.headers["Location"].startswith("/agent-mcp/login?next="), \
+        tail.headers["Location"]
+
+
+@pytest.mark.no_auth_seed_session
 async def test_root_landing_redirect_honours_root_mount(
     aiohttp_client, router_app,
 ) -> None:
