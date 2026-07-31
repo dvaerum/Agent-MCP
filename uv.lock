@@ -10,7 +10,7 @@ resolution-markers = [
 
 [[package]]
 name = "agent-mcp"
-version = "5.63.0"
+version = "5.64.0"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },

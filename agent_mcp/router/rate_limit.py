@@ -316,7 +316,12 @@ def _is_auth_path(request: web.Request) -> bool:
     is cheap, but the login POST runs argon2; the SSO callback mints
     a session; the SSO login start kicks off the IdP round-trip.
     """
-    path = request.path
+    # ADR-0020: canonicalise so a root-aliased /login|/setup|/sso POST
+    # (Traefik at host root) is rate-limited identically to its tailnet
+    # /agent-mcp twin — else the argon2 login POST is un-throttled at the
+    # root front door (brute-force vector).
+    from . import mount
+    path = mount.canonical_path(request)
     method = request.method.upper()
     if path == "/agent-mcp/login" and method == "POST":
         return True

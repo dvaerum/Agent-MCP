@@ -108,6 +108,7 @@ from urllib.parse import quote
 from aiohttp import ClientSession, ClientTimeout, UnixConnector, web
 
 from . import project_registry  # sibling module — see ./project_registry.py
+from . import mount  # ADR-0020: per-request external prefix/origin
 from . import asset_prefix as _asset_prefix  # Phase 4: runtime sentinel sub
 from . import project_orchestrator as _po  # PR-C: lifecycle state machine
 from .single_tenant import bypasses_operator_gate  # arch-r4 #8
@@ -2216,11 +2217,14 @@ async def index_handler(req: web.Request) -> web.Response:
     to parse.
     """
     if _accept_prefers_html(req.headers.get("Accept", "")):
+        # ADR-0020: redirect to the dashboard at the CLIENT's mount prefix
+        # (root for Traefik, /agent-mcp for the tailnet) so the bare
+        # landing works under either front door.
         if SINGLE_TENANT_NAME is not None:
-            target = f"/agent-mcp/app/{quote(SINGLE_TENANT_NAME)}/"
+            suffix = f"/app/{quote(SINGLE_TENANT_NAME)}/"
         else:
-            target = "/agent-mcp/app/"
-        raise web.HTTPFound(location=target)
+            suffix = "/app/"
+        raise web.HTTPFound(location=mount.external_path(req, suffix))
     return web.json_response(_service_descriptor(), headers={"Cache-Control": "no-store"})
 
 
@@ -2630,7 +2634,60 @@ def make_app(
     # __bridge routes removed: dashboard now uses upstream REST
     # endpoints directly (dvaerum/Agent-MCP#12 + #22).
 
+    # ADR-0020: mirror every /agent-mcp route at the host ROOT so a
+    # reverse proxy can mount the router at the root (Traefik at
+    # mm.best.aau.dk) as well as under /agent-mcp (tailnet). The
+    # canonical /agent-mcp routes are untouched — the tailnet path stays
+    # byte-identical; these are purely additive aliases to the SAME
+    # handlers, gated identically because the operator-session middleware
+    # keys off mount.canonical_path (which normalises a root request back
+    # to /agent-mcp — no auth bypass).
+    _add_root_aliases(app)
+
     return app
+
+
+def _add_root_aliases(app: web.Application) -> None:
+    """Register a root-mounted alias for every ``/agent-mcp`` route.
+
+    ADR-0020. The two tail-match (``{rest:.*}``) routes are aliased
+    EXPLICITLY first — ``resource.canonical`` drops the ``.*`` (rendering
+    ``{rest}`` as a single segment), so a programmatic re-add would break
+    nested asset / SPA paths. The remaining routes (static + single-
+    segment ``{name}``) round-trip cleanly through ``canonical``.
+    """
+    # 1. Explicit aliases for the tail-match routes (regex preserved).
+    app.router.add_get("/assets/{rest:.*}", dashboard_assets_handler)
+    app.router.add_get("/app/{name}/{rest:.*}", dashboard_handler)
+    # Pre-seed so the programmatic pass skips these (canonical form).
+    seen: set[tuple[str, str]] = set()
+    for m in ("GET", "HEAD"):
+        seen.add((m, "/assets/{rest}"))
+        seen.add((m, "/app/{name}/{rest}"))
+
+    # 2. Programmatic aliases for every other /agent-mcp route.
+    for route in list(app.router.routes()):
+        resource = route.resource
+        if resource is None:
+            continue
+        canonical = resource.canonical
+        if canonical == mount.INTERNAL_MOUNT:
+            root_path = "/"
+        elif canonical.startswith(mount.INTERNAL_MOUNT + "/"):
+            root_path = canonical[len(mount.INTERNAL_MOUNT):]
+        else:
+            continue  # already root (an alias) or foreign — skip.
+        key = (route.method, root_path)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            app.router.add_route(route.method, root_path, route.handler)
+        except (ValueError, RuntimeError) as e:  # pragma: no cover
+            log.warning(
+                "ADR-0020 root-alias skipped %s %s: %s",
+                route.method, root_path, e,
+            )
 
 
 def main() -> None:

@@ -177,10 +177,16 @@ def _set_session_cookie(
     session_id: str,
 ) -> None:
     """Attach a fresh agent_mcp_session cookie to ``response``."""
+    # ADR-0020: scope the cookie to the CLIENT's mount prefix so a session
+    # minted at the root front door (Traefik) is sent back on root paths,
+    # while the tailnet keeps Path=/agent-mcp (so it doesn't leak to other
+    # services sharing that host at other paths). Falls back to COOKIE_PATH
+    # when there's no external prefix signal.
+    from . import mount
     response.set_cookie(
         SESSION_COOKIE_NAME,
         session_id,
-        path=COOKIE_PATH,
+        path=mount.external_prefix(request) + "/",
         httponly=True,
         secure=cookie_secure_flag(request),
         samesite="Lax",
@@ -197,10 +203,11 @@ def _clear_session_cookie(
     ``Expires`` in the past; we want a minimal, predictable header
     so the test's Set-Cookie parser stays trivial.
     """
+    from . import mount
     response.set_cookie(
         SESSION_COOKIE_NAME,
         "",
-        path=COOKIE_PATH,
+        path=mount.external_prefix(request) + "/",
         httponly=True,
         secure=cookie_secure_flag(request),
         samesite="Lax",

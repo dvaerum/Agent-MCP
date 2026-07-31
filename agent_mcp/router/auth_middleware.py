@@ -35,6 +35,7 @@ from urllib.parse import quote
 
 from aiohttp import web
 
+from . import mount
 from .login import resolve_current_user
 from .single_tenant import bypasses_operator_gate
 
@@ -331,7 +332,14 @@ async def require_operator_session_middleware(
     a successful cookie resolution, keeping active sessions alive
     indefinitely as long as the operator is using the dashboard.
     """
-    path = request.path
+    # ADR-0020: gate on the CANONICAL (/agent-mcp-form) path, not
+    # request.path. A root-aliased request (Traefik mounted at the host
+    # root) arrives as /api/... — canonicalising it back to
+    # /agent-mcp/api/... makes it hit the SAME gate + unauth allow-list
+    # as its tailnet twin. SECURITY: keying off request.path here would
+    # let every root-aliased route skip the gate (path wouldn't start
+    # with /agent-mcp) and serve unauthenticated.
+    path = mount.canonical_path(request)
     if not path.startswith("/agent-mcp"):
         return await handler(request)
     if _path_is_unauth(path):

@@ -89,13 +89,17 @@ async def empty_users_redirect_middleware(
     handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
 ) -> web.StreamResponse:
     """Bounce any /agent-mcp/* HTML request to /setup when no users exist."""
-    path = request.path
+    # ADR-0020: canonicalise so a root-aliased request (Traefik at host
+    # root) hits the same exempt-prefix allow-list as its tailnet twin,
+    # and redirect to the SETUP page at the client's actual mount prefix.
+    from . import mount
+    path = mount.canonical_path(request)
     if not path.startswith("/agent-mcp"):
         return await handler(request)
     if any(path.startswith(p) for p in _REDIRECT_EXEMPT_PREFIXES):
         return await handler(request)
     if users_table_is_empty():
-        raise web.HTTPSeeOther(location="/agent-mcp/setup")
+        raise web.HTTPSeeOther(location=mount.external_path(request, "/setup"))
     return await handler(request)
 
 

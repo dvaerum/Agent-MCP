@@ -1,8 +1,16 @@
 # ADR 0020: Router is mount-agnostic; the URL prefix is a reverse-proxy concern
 
-**Status**: Accepted (decision locked 2026-07-31) — implementation is a
-tracked follow-up (see *Migration*). Until it ships, the router still
-hardcodes `/agent-mcp` and the deploy notes below describe the target.
+**Status**: Accepted + implemented (v5.64.0, 2026-07-31). The router now
+serves every route at the host **root** as well as under `/agent-mcp`
+(additive aliases), derives the external prefix/origin per request
+(`agent_mcp/router/mount.py`), gates root-aliased routes on the
+canonicalised path (no auth bypass), and scopes the session cookie to
+the client's mount. The tailnet path is byte-identical.
+**Deferred (work as-needed, not blocking):** the dashboard `assetPrefix`
++ `.mcp.json` snippet still emit `/agent-mcp` literals — they resolve at
+the root front door via the reverse proxy passing `/agent-mcp/assets`
+through, so they are cosmetic, not functional, gaps. Make them
+per-request when a root-front-door agent needs a clean snippet URL.
 **Date**: 2026-07-31
 **Amends / supersedes-in-part**:
   - **ADR-0008** (single-tenant URL parity) — its `/agent-mcp/...` URL
