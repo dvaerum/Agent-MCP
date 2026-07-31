@@ -35,8 +35,35 @@
  *   /agent-mcp/mcp/<name>                    MCP transport
  */
 
+// ── Mount prefix (ADR-0020) ─────────────────────────────────────────
+// The router serves the dashboard at different external mounts: under
+// `/agent-mcp/…` on the tailnet, and at the host ROOT behind a Traefik
+// reverse proxy (mm.best.aau.dk). The prefix is owned by the proxy, so
+// the dashboard DERIVES it at runtime from window.location — everything
+// below (API base, nav links, login, SSE, path regexes) cascades from it.
+//
+// Derivation: the prefix is whatever precedes the first reserved segment
+// (app | api | assets | mcp | login — ADR-0014's reserved segments). The
+// dashboard SPA only ever runs under `…/app/…`, so this always resolves:
+//   /agent-mcp/app/foo/  → "/agent-mcp"   (tailnet — byte-identical)
+//   /app/foo/            → ""             (Traefik root)
+// SSR/prerender (next build, no window) defaults to "/agent-mcp"; the
+// static export re-runs this in the browser at import, so the client
+// value is always correct per-origin.
+export function deriveMount(pathname?: string): string {
+  const p =
+    pathname ??
+    (typeof window === "undefined" ? null : window.location.pathname)
+  // No window (SSR/prerender) → the historical default; the static
+  // export re-evaluates this in the browser at import, so the client
+  // value is always correct per-origin.
+  if (p === null || p === undefined) return "/agent-mcp"
+  const m = p.match(/^(.*?)\/(?:app|api|assets|mcp|login)(?:\/|$)/)
+  return m ? m[1] : ""
+}
+
 // ── Top-level path segments ─────────────────────────────────────────
-const ROOT = "/agent-mcp"
+const ROOT = deriveMount()
 const APP = `${ROOT}/app`
 const API = `${ROOT}/api`
 const ASSETS = `${ROOT}/assets`
@@ -243,14 +270,16 @@ export function routerSsoConfigUrl(): string {
 
 // ── URL pattern matchers (used by project-context.ts) ───────────────
 
-/** Regex matching /agent-mcp/app/<name>/<rest?> — extracts the project
- *  name as match[1]. The trailing slash is optional in the URL but the
- *  client-router code normalises it. */
-export const APP_PROJECT_PATH_RE = /\/agent-mcp\/app\/([^/]+)/
+/** Regex matching <mount>/app/<name>/<rest?> — extracts the project name
+ *  as match[1]. ADR-0020: built from the derived mount so it matches at
+ *  both /agent-mcp/app/<name> (tailnet) and /app/<name> (Traefik root).
+ *  This is what makes project-context.ts identify the project (and take
+ *  the router-served render path) under either front door. */
+export const APP_PROJECT_PATH_RE = new RegExp(`${ROOT}/app/([^/]+)`)
 
-/** Regex matching the bare /agent-mcp/app/ overview path (no project
+/** Regex matching the bare <mount>/app/ overview path (no project
  *  segment). The cross-project React overview lives here. */
-export const APP_OVERVIEW_PATH_RE = /\/agent-mcp\/app\/?$/
+export const APP_OVERVIEW_PATH_RE = new RegExp(`${ROOT}/app/?$`)
 
 // v5.0.0: ``LEGACY_DASHBOARD_PATH_RE`` (the regex for the old
 // /agent-mcp/__dashboard/<name> path shape) was removed alongside the

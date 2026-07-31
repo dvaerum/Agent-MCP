@@ -558,7 +558,10 @@ class ApiClient {
         if (
           r.status === 401 &&
           typeof window !== 'undefined' &&
-          !window.location.pathname.endsWith('/agent-mcp/login')
+          // ADR-0020: compare against the mount-derived login path
+          // (loginUrl() = `${ROOT}/login`) so the loop-guard holds at
+          // both the tailnet (/agent-mcp/login) and root (/login) mounts.
+          !window.location.pathname.endsWith(loginUrl())
         ) {
           const next = window.location.pathname + window.location.search
           window.location.assign(loginUrl(next))
