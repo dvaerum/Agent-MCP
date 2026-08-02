@@ -956,6 +956,16 @@ _FLAG_RECHECK_INTERVAL_SECONDS = 2.0
 # the loop always terminates cleanly (empty envelope → reconnect).
 _UNCAPPED_HOLD_CEILING_SECONDS = 24 * 60 * 60
 
+# Reap a parked hold after this many CONSECUTIVE failed heartbeats. A
+# failed progress send means the heartbeat-capable client's transport is
+# gone (dropped socket / proxy restart / tailnet blip); nothing on this
+# connection can reach it again. The supersede path only reaps on a
+# *reconnect*, so a client that simply vanished would otherwise park until
+# the deadline — holding the slot and lingering "online" in presence. A
+# small threshold (not 1) tolerates a one-off transient send failure
+# without ending a still-live hold.
+_MAX_HEARTBEAT_MISSES = 2
+
 
 def _evlog(msg: str, *args) -> None:
     """Event-loop diagnostics. Emits at WARNING (so journald's WARNING-level
@@ -2291,6 +2301,7 @@ async def wait_for_events_tool_impl(
             asyncio.get_event_loop().time() + HEARTBEAT_INTERVAL_SECONDS
         )
         heartbeat_progress = 0.0
+        heartbeat_misses = 0
 
         # Idle backlog reminder — periodically nudge an idle agent that still
         # has unread messages / open tasks. Per-agent timer seeded on first
@@ -2499,22 +2510,50 @@ async def wait_for_events_tool_impl(
                 # Heartbeat: keep a heartbeat-capable client's idle timer
                 # alive across the long silent hold. Sent at most once per
                 # HEARTBEAT_INTERVAL_SECONDS regardless of the tighter flag
-                # slice; a failed send is a no-op (silent hold that tick).
+                # slice.
                 if heartbeat_enabled and (
                     asyncio.get_event_loop().time() >= next_heartbeat
                 ):
                     from ..core.mcp_progress import send_progress_heartbeat
 
                     heartbeat_progress += 1.0
-                    await send_progress_heartbeat(
+                    sent = await send_progress_heartbeat(
                         progress_token, heartbeat_progress
                     )
-                    _evlog(
-                        "heartbeat SENT agent=%s n=%.0f (idle %.0fs, connection "
-                        "PARKED and listening)",
-                        agent_id, heartbeat_progress,
-                        asyncio.get_event_loop().time() - _poll_start,
-                    )
+                    if sent:
+                        heartbeat_misses = 0
+                        _evlog(
+                            "heartbeat SENT agent=%s n=%.0f (idle %.0fs, "
+                            "connection PARKED and listening)",
+                            agent_id, heartbeat_progress,
+                            asyncio.get_event_loop().time() - _poll_start,
+                        )
+                    else:
+                        # The progress frame could not be delivered ⇒ the
+                        # client's transport is gone. Reap after a few
+                        # consecutive misses so a vanished client (which
+                        # never reconnects to trigger supersede) doesn't
+                        # park until the deadline, holding the slot and
+                        # lingering "online" in presence.
+                        heartbeat_misses += 1
+                        _evlog(
+                            "heartbeat MISS agent=%s (%d/%d) — client "
+                            "transport unreachable (idle %.0fs)",
+                            agent_id, heartbeat_misses,
+                            _MAX_HEARTBEAT_MISSES,
+                            asyncio.get_event_loop().time() - _poll_start,
+                        )
+                        if heartbeat_misses >= _MAX_HEARTBEAT_MISSES:
+                            _evlog(
+                                "poll END agent=%s REAPED half-open "
+                                "connection after %d consecutive heartbeat "
+                                "misses",
+                                agent_id, heartbeat_misses,
+                            )
+                            g.drain_waiter_queue(waiter_queue)
+                            return _envelope(
+                                [], since, profile_review=review_section
+                            )
                     next_heartbeat = (
                         asyncio.get_event_loop().time()
                         + HEARTBEAT_INTERVAL_SECONDS

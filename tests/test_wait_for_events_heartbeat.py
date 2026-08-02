@@ -49,6 +49,34 @@ class _RecordingSession:
         )
 
 
+class _BrokenSession:
+    """A session whose transport is gone: every progress send raises,
+    exactly as aiohttp does when the client TCP connection has closed
+    (``ClientConnectionResetError``). ``send_progress_heartbeat`` swallows
+    the raise and returns False — the signal the hold loop must act on."""
+
+    def __init__(self):
+        self.attempts = 0
+
+    async def send_progress_notification(self, **_kwargs):
+        self.attempts += 1
+        raise ConnectionResetError("Cannot write to closing transport")
+
+
+class _FlakySession:
+    """Fails its first progress send, then succeeds — a one-off transient
+    blip on an otherwise-live transport. Must NOT trip the reaper."""
+
+    def __init__(self):
+        self.attempts = 0
+
+    async def send_progress_notification(self, **_kwargs):
+        self.attempts += 1
+        if self.attempts == 1:
+            raise ConnectionResetError("transient")
+        # otherwise succeed
+
+
 class _Meta:
     def __init__(self, token):
         self.progressToken = token
@@ -187,6 +215,95 @@ async def test_in_table_no_heartbeat_client_never_heartbeats_despite_token(
         assert session.progress_calls == [], (
             f"cursor must never receive heartbeats; got {session.progress_calls}"
         )
+
+
+async def test_dead_client_transport_is_reaped_not_held(tmp_path, monkeypatch):
+    """A heartbeat client whose transport has died (every progress send
+    raises → send_progress_heartbeat returns False) must be REAPED after a
+    few consecutive misses, not parked until the timeout/deadline.
+
+    Regression: the hold loop discarded the heartbeat return value, so a
+    dropped client (tailnet blip / proxy restart / crash) left the server
+    parked-and-listening — wasting the slot and lingering "online" in
+    presence — because the supersede path only reaps on a *reconnect*, and
+    a vanished client never reconnects. RED before the fix (held to the
+    2s timeout, dozens of send attempts), GREEN after (reaped in ~2 misses).
+    """
+    from tests.harness import mcp_session
+
+    monkeypatch.setattr(chs, "HEARTBEAT_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setattr(acm, "_FLAG_RECHECK_INTERVAL_SECONDS", 0.05)
+
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        client_info_registry.record_client_info(
+            alice.agent_id, "claude-code", "2.1.207"
+        )
+
+        session = _BrokenSession()
+        tok = request_ctx.set(_Ctx("tok-dead", session))
+        loop_start = _dt.datetime.now()
+        try:
+            result = await acm.wait_for_events_tool_impl(
+                # Long timeout: only prompt reaping (not the timeout) can
+                # end this hold quickly.
+                {"since": _future_since(), "timeout_seconds": 2},
+                principal=alice._principal(),
+            )
+        finally:
+            request_ctx.reset(tok)
+        elapsed = (_dt.datetime.now() - loop_start).total_seconds()
+
+        env = _parse(result)
+        assert env["events"] == []
+        assert elapsed < 1.5, (
+            f"a dead client must be reaped promptly, not held to the 2s "
+            f"timeout; took {elapsed:.2f}s"
+        )
+        # Stopped after a few misses rather than hammering a dead socket
+        # for the whole hold.
+        assert 2 <= session.attempts < 6, (
+            f"expected reaping after a few missed heartbeats; "
+            f"got {session.attempts} attempts"
+        )
+
+
+async def test_transient_heartbeat_blip_does_not_reap(tmp_path, monkeypatch):
+    """A single failed heartbeat on an otherwise-live transport must NOT
+    reap the hold — the miss counter resets on the next success, so the
+    connection keeps parking until its normal timeout. Guards against the
+    reaper being too trigger-happy on a one-off blip."""
+    from tests.harness import mcp_session
+
+    monkeypatch.setattr(chs, "HEARTBEAT_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setattr(acm, "_FLAG_RECHECK_INTERVAL_SECONDS", 0.05)
+
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        client_info_registry.record_client_info(
+            alice.agent_id, "claude-code", "2.1.207"
+        )
+
+        session = _FlakySession()
+        tok = request_ctx.set(_Ctx("tok-flaky", session))
+        loop_start = _dt.datetime.now()
+        try:
+            result = await acm.wait_for_events_tool_impl(
+                {"since": _future_since(), "timeout_seconds": 1},
+                principal=alice._principal(),
+            )
+        finally:
+            request_ctx.reset(tok)
+        elapsed = (_dt.datetime.now() - loop_start).total_seconds()
+
+        env = _parse(result)
+        assert env["events"] == []
+        # Held to the ~1s timeout rather than reaping on the single blip.
+        assert elapsed >= 0.8, (
+            f"a transient blip must not reap the hold; ended in {elapsed:.2f}s"
+        )
+        # Kept heart-beating well past the miss threshold (blip recovered).
+        assert session.attempts > acm._MAX_HEARTBEAT_MISSES
 
 
 async def test_hold_cap_recycles_returns_empty(tmp_path, monkeypatch):
