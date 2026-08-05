@@ -41,6 +41,7 @@ from ..deps import (
 from ...core.config import logger
 from ...core import session_registry
 from ...core import state
+from ...features import delivery_transport
 from ...core.principal_builder import build_operator_principal
 from ...core.tool_result import (
     Failed as _Failed,
@@ -202,7 +203,16 @@ def _mcp_presence_for(
     # the detail panel isn't misleadingly blank for a live agent.
     if last_seen is None and online and last_activity_at:
         last_seen = last_activity_at
-    return {"online": online, "last_mcp_connection": last_seen}
+    # ADR-0021: expose the runtime-reported delivery transport-status as a
+    # SEPARATE field. It's the accurate "is the session alive/working"
+    # signal for a worker that doesn't poll (agent-mcp's own `online` can't
+    # know that) — but it never overrides `online`; readers choose. None
+    # when no delivery transport has reported for this worker.
+    return {
+        "online": online,
+        "last_mcp_connection": last_seen,
+        "transport_status": delivery_transport.get_status(agent_id),
+    }
 
 
 @router.get("")

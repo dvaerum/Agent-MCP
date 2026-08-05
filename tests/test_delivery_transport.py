@@ -122,3 +122,27 @@ async def test_status_post_rejects_invalid_status(tmp_path: Path):
         )
         assert r.status_code == 422
         assert dt.get_status(alice.agent_id) is None
+
+
+@pytest.mark.asyncio
+async def test_agents_list_exposes_transport_status_separately(tmp_path: Path):
+    """ADR-0021: the agents list surfaces the runtime-reported
+    transport-status as a SEPARATE field alongside agent-mcp's own
+    `online` presence (which stays independent)."""
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        hdr = {"Authorization": f"Bearer {admin.admin_token}"}
+
+        # Before any report: field present but None.
+        rows = admin.client.get("/api/agents", headers=hdr).json()
+        alice_row = next(r for r in rows if r["agent_id"] == alice.agent_id)
+        assert alice_row["transport_status"] is None
+        assert "online" in alice_row  # own presence, independent
+
+        # The runtime reports a status → it surfaces separately.
+        dt.set_status(alice.agent_id, "working")
+        rows2 = admin.client.get("/api/agents", headers=hdr).json()
+        alice_row2 = next(r for r in rows2 if r["agent_id"] == alice.agent_id)
+        assert alice_row2["transport_status"] == "working"
+        # `online` is NOT overridden by the transport status.
+        assert isinstance(alice_row2["online"], bool)
