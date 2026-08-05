@@ -93,6 +93,11 @@ def is_connected(agent_id: str) -> bool:
     return bool(_subs.get(agent_id))
 
 
+def connected_agent_ids() -> List[str]:
+    """Every worker with a live delivery stream (the scheduler's work-set)."""
+    return [aid for aid, subs in _subs.items() if subs]
+
+
 def set_status(agent_id: str, status: str) -> None:
     _status[agent_id] = status
 

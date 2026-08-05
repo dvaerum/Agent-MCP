@@ -365,6 +365,25 @@ async def start_background_tasks(task_group: anyio.abc.TaskGroup):
         f"Message retention pruner started with interval {retention_interval}s."
     )
 
+    # Start the delivery-transport scheduler (ADR-0021). The loop always
+    # runs but each tick no-ops cheaply while config_delivery_enabled is
+    # false (a single toggle read), so it's safe to start unconditionally.
+    # Override the tick via MCP_DELIVERY_TICK_INTERVAL_SECONDS.
+    from ..features.delivery_scheduler import (
+        TICK_INTERVAL_SECONDS as _DELIVERY_TICK_DEFAULT,
+        run_loop as run_delivery_scheduler,
+    )
+
+    delivery_interval = int(
+        os.environ.get(
+            "MCP_DELIVERY_TICK_INTERVAL_SECONDS", str(_DELIVERY_TICK_DEFAULT)
+        )
+    )
+    task_group.start_soon(run_delivery_scheduler, delivery_interval)
+    logger.info(
+        f"Delivery scheduler started with interval {delivery_interval}s."
+    )
+
     # Start null-subject backfill sweep (Phase 2). Deferred, batched
     # titling of the NULL-subject root-message backlog so the (RAM-hungry,
     # socket-activated) subject model is loaded once per sweep and amortised
