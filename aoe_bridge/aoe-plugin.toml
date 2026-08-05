@@ -1,0 +1,38 @@
+# aoe-plugin.toml — agent-mcp delivery bridge (ADR-0021)
+#
+# DRAFT manifest. The exact field/section schema is owned by AoE's
+# `aoe-plugin-api` crate (manifest.rs, API_VERSION) — reconcile these keys
+# against the target AoE version's schema before loading (the `[runtime]`
+# kind and the `capabilities` shape especially). Documented in README.md.
+#
+# The worker is a long-lived daemon (plugin-cron shape): it reaches OUT to
+# agent-mcp per covered session (SSE /delivery/stream + status POST) and
+# injects delivered frames into the session via AoE's REST /send (tmux) and
+# /acp/prompt (structured).
+
+id = "dvaerum.agent-mcp-bridge"
+name = "agent-mcp delivery bridge"
+version = "0.1.0"
+description = """
+Fallback delivery for agents that don't poll: subscribe to agent-mcp's
+per-worker /delivery stream and inject skinny notifications (message/task
+id, title, status — never bodies) into the session, in both terminal and
+structured mode.
+"""
+
+# A separate executable the host supervises, speaking JSON-RPC 2.0 over
+# newline-delimited JSON on stdio (host = server, worker = client).
+[runtime]
+kind = "command"
+# Resolve python + this package on the host; the deploy wires PYTHONPATH /
+# a venv so `aoe_bridge` is importable.
+command = ["python3", "-m", "aoe_bridge.worker"]
+
+# Install-time capability grants (see README for why each is needed).
+[capabilities]
+required = [
+  "net",           # outbound to agent-mcp + localhost AoE REST
+  "session.read",  # list sessions -> id/title/mode mapping
+  "config.get",    # read the per-session (agent-mcp endpoint, token) config
+  "notifications", # surface bridge status to the operator
+]
