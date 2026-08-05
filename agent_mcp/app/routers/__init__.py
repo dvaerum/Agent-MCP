@@ -29,6 +29,7 @@ from fastapi import APIRouter, FastAPI
 
 from .agents import router as agents_router
 from .composition import router as composition_router
+from .delivery import router as delivery_router
 from .events import router as events_router
 from .memories import router as memories_router
 from .messages import router as messages_router
@@ -44,6 +45,7 @@ from .tasks import router as tasks_router
 _ALL_ROUTERS: Tuple[APIRouter, ...] = (
     agents_router,
     composition_router,
+    delivery_router,
     events_router,
     memories_router,
     messages_router,
