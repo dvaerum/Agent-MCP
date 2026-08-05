@@ -1,0 +1,255 @@
+//! The orchestrator: reconcile covered sessions, hold one SSE delivery stream
+//! per session, report transport-status up, and inject rendered frames down.
+//!
+//! Each reconcile pass (every `status_interval_secs`, or immediately on a
+//! `plugin.settings.changed` nudge):
+//! 1. load settings via `config.get`;
+//! 2. list live sessions via `sessions.list`;
+//! 3. resolve the per-session routes;
+//! 4. for each live route: POST its transport-status, and ensure exactly one
+//!    SSE task is running (respawning it if its endpoint/token/mode/AoE creds
+//!    changed);
+//! 5. for a configured-but-not-live session: POST `dead` and drop its task;
+//! 6. drop tasks whose session left the mapping.
+//!
+//! A per-session SSE task reconnects with backoff on drop — a transient stream
+//! drop is not a session end (ADR-0021); the policy re-fires on reconnect.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use futures_util::StreamExt;
+use reqwest::header::{ACCEPT, AUTHORIZATION};
+use serde_json::json;
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
+
+use crate::config::{self, Route, SessionRecord};
+use crate::inject::{build_injection, delivery_url, extract_sse_data};
+use crate::mode::map_transport_status;
+use crate::plugin::PluginConn;
+use crate::render::{parse_frame, render_skinny};
+
+/// Shared per-task context: the HTTP client plus the AoE injection creds.
+struct BridgeCtx {
+    http: reqwest::Client,
+    aoe_base: String,
+    aoe_token: String,
+}
+
+/// A running per-session SSE task and the route fingerprint it was spawned for.
+struct SessionTask {
+    fingerprint: String,
+    handle: JoinHandle<()>,
+}
+
+/// The reconcile loop. Runs until the process exits (stdin EOF aborts it).
+pub async fn run_bridge(conn: Arc<PluginConn>, reconcile: Arc<Notify>) {
+    let http = reqwest::Client::new();
+    let mut tasks: HashMap<String, SessionTask> = HashMap::new();
+
+    loop {
+        let settings = config::load_settings(&conn).await;
+        let interval = Duration::from_secs(settings.status_interval_secs.max(5));
+
+        if !settings.enabled {
+            for (_, t) in tasks.drain() {
+                t.handle.abort();
+            }
+        } else {
+            let live = fetch_live_sessions(&conn).await;
+            let ctx = Arc::new(BridgeCtx {
+                http: http.clone(),
+                aoe_base: settings.aoe_base.clone(),
+                aoe_token: settings.aoe_token.clone(),
+            });
+            let routes = config::resolve_routes(&settings, &live);
+            let mut wanted: HashSet<String> = HashSet::new();
+
+            for route in routes {
+                let fingerprint = route.fingerprint(&settings.aoe_base, &settings.aoe_token);
+                if route.live {
+                    wanted.insert(route.session_id.clone());
+
+                    // Report transport-status from the live record.
+                    let status = live
+                        .get(&route.session_id)
+                        .map(|r| map_transport_status(&format!("{} {}", r.tool, r.status)))
+                        .unwrap_or("idle");
+                    report_status(&ctx, &route.endpoint, &route.token, status).await;
+
+                    // Ensure a fresh SSE task with the current fingerprint.
+                    let needs_spawn = match tasks.get(&route.session_id) {
+                        Some(t) => t.fingerprint != fingerprint,
+                        None => true,
+                    };
+                    if needs_spawn {
+                        if let Some(old) = tasks.remove(&route.session_id) {
+                            old.handle.abort();
+                        }
+                        let ctx = ctx.clone();
+                        let r = route.clone();
+                        let sid = route.session_id.clone();
+                        let handle = tokio::spawn(async move { run_session_stream(ctx, r).await });
+                        tasks.insert(sid, SessionTask { fingerprint, handle });
+                    }
+                } else {
+                    // Configured but not currently live: report dead and stop.
+                    report_status(&ctx, &route.endpoint, &route.token, "dead").await;
+                    if let Some(old) = tasks.remove(&route.session_id) {
+                        old.handle.abort();
+                    }
+                }
+            }
+
+            // Tear down tasks for sessions no longer in the mapping.
+            let stale: Vec<String> = tasks
+                .keys()
+                .filter(|k| !wanted.contains(*k))
+                .cloned()
+                .collect();
+            for k in stale {
+                if let Some(t) = tasks.remove(&k) {
+                    t.handle.abort();
+                }
+            }
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = reconcile.notified() => {}
+        }
+    }
+}
+
+/// `sessions.list` → id→record map. Empty on any failure (a failed list just
+/// means no live sessions this tick; next tick retries).
+async fn fetch_live_sessions(conn: &PluginConn) -> HashMap<String, SessionRecord> {
+    let value = match conn.sessions_list().await {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log(&format!("sessions.list failed: {e}"));
+            return HashMap::new();
+        }
+    };
+    let mut map = HashMap::new();
+    if let Some(arr) = value.get("sessions").and_then(|s| s.as_array()) {
+        for item in arr {
+            if let Ok(rec) = serde_json::from_value::<SessionRecord>(item.clone()) {
+                if !rec.id.is_empty() {
+                    map.insert(rec.id.clone(), rec);
+                }
+            }
+        }
+    }
+    map
+}
+
+/// POST the session's transport-status up the delivery channel. Best-effort.
+async fn report_status(ctx: &BridgeCtx, endpoint: &str, token: &str, status: &str) {
+    let url = delivery_url(endpoint, "delivery/status");
+    let res = ctx
+        .http
+        .post(url.as_str())
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .json(&json!({ "status": status }))
+        .send()
+        .await;
+    if let Err(e) = res {
+        crate::log(&format!("status POST to {url} failed: {e}"));
+    }
+}
+
+/// Hold one SSE stream for a session, reconnecting with capped backoff. A
+/// transient drop is not a session end, so we always reconnect.
+async fn run_session_stream(ctx: Arc<BridgeCtx>, route: Route) {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        match stream_once(&ctx, &route).await {
+            Ok(()) => {
+                crate::log(&format!(
+                    "delivery stream for {} ended; reconnecting",
+                    route.session_id
+                ));
+                backoff = Duration::from_secs(1);
+            }
+            Err(e) => {
+                crate::log(&format!(
+                    "delivery stream for {} error: {e:#}; reconnecting",
+                    route.session_id
+                ));
+            }
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(30));
+    }
+}
+
+/// One SSE connection: subscribe, parse events, inject each frame. Returns
+/// `Ok(())` when the stream cleanly ends (server closed), `Err` on transport
+/// failure.
+async fn stream_once(ctx: &BridgeCtx, route: &Route) -> Result<()> {
+    let url = delivery_url(&route.endpoint, "delivery/stream");
+    let resp = ctx
+        .http
+        .get(url.as_str())
+        .header(AUTHORIZATION, format!("Bearer {}", route.token))
+        .header(ACCEPT, "text/event-stream")
+        .send()
+        .await
+        .context("connect delivery stream")?
+        .error_for_status()
+        .context("delivery stream status")?;
+
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("read delivery chunk")?;
+        // Normalise CRLF to LF so the "\n\n" event boundary search is simple;
+        // dropping bare '\r' is safe for SSE (CR is not significant in a field).
+        buf.push_str(&String::from_utf8_lossy(&chunk).replace('\r', ""));
+
+        while let Some(idx) = buf.find("\n\n") {
+            let block: String = buf.drain(..idx + 2).collect();
+            if let Some(data) = extract_sse_data(&block) {
+                handle_frame(ctx, route, &data).await;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Render one delivery frame skinny and inject it into the session.
+async fn handle_frame(ctx: &BridgeCtx, route: &Route, data: &str) {
+    let frame = match parse_frame(data) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::log(&format!("bad delivery frame for {}: {e}", route.session_id));
+            return;
+        }
+    };
+    if frame.kind != "delivery" {
+        return; // ignore any non-delivery event (keepalives, future types).
+    }
+
+    let text = render_skinny(&frame);
+    let (url, body) = build_injection(route.mode, &ctx.aoe_base, &route.session_id, &text);
+    let res = ctx
+        .http
+        .post(url.as_str())
+        .header(AUTHORIZATION, format!("Bearer {}", ctx.aoe_token))
+        .json(&body)
+        .send()
+        .await;
+    match res {
+        Ok(r) if r.status().is_success() => {}
+        Ok(r) => crate::log(&format!(
+            "inject to {} returned HTTP {}",
+            route.session_id,
+            r.status()
+        )),
+        Err(e) => crate::log(&format!("inject to {} failed: {e}", route.session_id)),
+    }
+}

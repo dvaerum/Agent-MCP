@@ -1,0 +1,119 @@
+# agent-mcp delivery bridge — Agent of Empires plugin manifest.
+#
+# Schema reference: aoe-plugin-api (PluginManifest), docs/plugin-api.md.
+# api_version 9 is required for the `object_list` settings widget used by the
+# per-session mapping (`sessions`). The current host schema is 11, so 9 loads.
+
+id = "dev.dvaerum.agent-mcp-delivery"
+name = "agent-mcp Delivery Bridge"
+version = "0.1.0"
+api_version = 9
+description = "Injects agent-mcp delivery notifications into AoE-run sessions that don't poll wait_for_events (ADR-0021): subscribes to each covered session's delivery SSE stream, reports transport-status up, and injects skinny (id/subject/status only) nudges via AoE's /send and /acp/prompt routes."
+
+# runtime.worker: run the worker at all (and the config.get host RPC).
+# session.read:   sessions.list, to enumerate live sessions + their status.
+# net:            outbound HTTP/SSE to agent-mcp and AoE's localhost REST.
+# notifications:  ui.notify, to surface bridge errors to the operator.
+capabilities = ["runtime.worker", "session.read", "net", "notifications"]
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+[[commands]]
+id = "status"
+title = "agent-mcp Delivery: status"
+description = "Report that the delivery bridge worker is running."
+
+# ---------------------------------------------------------------------------
+# Settings — read by the worker over the config.get host RPC.
+# ---------------------------------------------------------------------------
+
+[[settings]]
+key = "enabled"
+label = "Enable delivery bridge"
+description = "Master switch. When off, the worker holds no streams and reports no status."
+type = "boolean"
+default = true
+
+[[settings]]
+key = "aoe_base"
+label = "AoE serve base URL"
+description = "Base URL of this AoE serve instance's REST API, used to inject notifications into sessions."
+type = "string"
+default = "http://127.0.0.1:8080"
+
+[[settings]]
+key = "aoe_token"
+label = "AoE serve token"
+description = "Bearer token for this AoE serve instance (from ~/.agent-of-empires/serve.url). Used to authenticate injection POSTs."
+type = "string"
+default = ""
+advanced = true
+
+[[settings]]
+key = "default_endpoint"
+label = "Default agent-mcp delivery endpoint"
+description = "Project mount base of the agent-mcp server, e.g. https://host/api/<project>. Used for any session row that leaves 'endpoint' blank. /delivery/stream and /delivery/status are appended."
+type = "string"
+default = ""
+
+[[settings]]
+key = "status_interval_secs"
+label = "Status/reconcile interval (seconds)"
+description = "How often the bridge re-resolves routes and re-posts each session's transport-status."
+type = "integer"
+default = 30
+min = 5
+max = 3600
+advanced = true
+
+# Per-session mapping: one row per covered session. `token` is the SAME
+# per-session agent-mcp bearer wired into that session's per-session MCP config.
+[[settings]]
+key = "sessions"
+label = "Covered sessions"
+description = "Sessions the bridge covers. Each row maps an AoE session id to its agent-mcp delivery endpoint, per-session token, and injection mode."
+type = "object_list"
+max_items = 200
+
+[[settings.fields]]
+key = "session_id"
+label = "AoE session id"
+description = "Matches sessions.list[].id."
+type = "string"
+required = true
+
+[[settings.fields]]
+key = "token"
+label = "agent-mcp session token"
+description = "The session's agent-mcp bearer (the same token wired into its per-session MCP config)."
+type = "string"
+required = true
+
+[[settings.fields]]
+key = "endpoint"
+label = "agent-mcp delivery endpoint"
+description = "Project mount base, e.g. https://host/api/<project>. Blank falls back to the default endpoint."
+type = "string"
+
+[[settings.fields]]
+key = "mode"
+label = "Injection mode"
+description = "auto infers terminal vs structured from the live session; set explicitly for ACP/CityHall/composer sessions."
+type = "select"
+options = ["auto", "terminal", "structured"]
+default = "auto"
+
+# ---------------------------------------------------------------------------
+# Runtime worker — built from source into .aoe-build/ (excluded from the plugin
+# integrity hash) and launched as a plugin-relative binary.
+# ---------------------------------------------------------------------------
+
+[runtime]
+kind = "command"
+command = [".aoe-build/target/release/aoe-bridge-worker"]
+
+[[runtime.build]]
+command = ["cargo", "build", "--release", "--target-dir", ".aoe-build/target"]
+platforms = ["linux", "macos"]

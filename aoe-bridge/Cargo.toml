@@ -1,0 +1,41 @@
+[package]
+name = "aoe-bridge"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Agent-MCP delivery bridge — an Agent of Empires plugin worker that injects agent-mcp delivery notifications into AoE-run Claude sessions (ADR-0021)."
+license = "MIT"
+publish = false
+
+# The plugin host launches a single worker binary over stdio. Keeping a fixed
+# binary name lets `aoe-plugin.toml`'s [runtime] point at a stable path.
+[[bin]]
+name = "aoe-bridge-worker"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime. io-std gives tokio::io::{stdin,stdout}; io-util the
+# AsyncBufReadExt/AsyncWriteExt traits the stdio loop uses.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-std",
+    "io-util",
+    "sync",
+    "time",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# HTTP client for the AoE REST injector, the delivery status POST, and the SSE
+# GET. `stream` exposes Response::bytes_stream for reading the event stream;
+# rustls-tls avoids an OpenSSL system dependency (AoE deliberately avoids
+# OpenSSL too). Swap to the "native-tls" feature if the host toolchain prefers it.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls",
+    "charset",
+] }
+# StreamExt::next() over the reqwest byte stream.
+futures-util = "0.3"
+anyhow = "1"
