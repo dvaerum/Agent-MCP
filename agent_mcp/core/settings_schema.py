@@ -34,7 +34,7 @@ SettingType = Literal["bool", "int", "string", "secret"]
 SettingTier = Literal["operator", "sysadmin"]
 SettingGroup = Literal[
     "worker_permissions", "event_loop", "retention", "aoe", "agent_profiles",
-    "scheduling",
+    "scheduling", "delivery",
 ]
 SettingWidget = Literal[
     "switch",
@@ -440,6 +440,122 @@ SETTINGS_SCHEMA: tuple[SettingSpec, ...] = (
         title="Timeout (ms)",
         description="",
         widget="int_ms",
+    ),
+    # -- Delivery transport / fallback push (ADR-0021) -----------------
+    # The tunable per-project policy for when agent-mcp pushes a skinny
+    # notification down a worker's registered delivery transport (the
+    # fallback for sessions that don't poll wait_for_events). All
+    # operator-tier (none match the sysadmin _CONFIG_AOE_KEY_RE gate).
+    SettingSpec(
+        key="config_delivery_enabled",
+        type="bool",
+        default=False,
+        tier="operator",
+        group="delivery",
+        title="Fallback delivery channel",
+        description=(
+            "When on, agent-mcp pushes skinny notifications (message/task "
+            "id, title, status — never the body) to a worker's registered "
+            "delivery transport when the agent falls behind (see the "
+            "triggers below), so a session that isn't polling still gets "
+            "poked. Off by default; a runtime (e.g. the AoE bridge) must "
+            "also register the transport for a worker. Supersedes the "
+            "legacy config_aoe_* notify push."
+        ),
+        widget="switch",
+    ),
+    SettingSpec(
+        key="config_delivery_on_unread_messages",
+        type="bool",
+        default=True,
+        tier="operator",
+        group="delivery",
+        title="Deliver on unread messages",
+        description=(
+            "Arm the fallback while the agent has unread inbox messages."
+        ),
+        widget="switch",
+    ),
+    SettingSpec(
+        key="config_delivery_on_unfinished_tasks",
+        type="bool",
+        default=True,
+        tier="operator",
+        group="delivery",
+        title="Deliver on unfinished tasks",
+        description=(
+            "Arm the fallback while the agent has OPEN tasks assigned to it "
+            "(not completed/cancelled/failed)."
+        ),
+        widget="switch",
+    ),
+    SettingSpec(
+        key="config_delivery_on_unassigned_tasks",
+        type="bool",
+        default=False,
+        tier="operator",
+        group="delivery",
+        title="Deliver on unassigned tasks",
+        description=(
+            "Arm the fallback while there are unassigned tasks in the pool "
+            "the agent could claim. Off by default — this can be noisy."
+        ),
+        widget="switch",
+    ),
+    SettingSpec(
+        key="config_delivery_backoff_initial_seconds",
+        type="int",
+        default=30,
+        tier="operator",
+        group="delivery",
+        title="Initial re-ping delay",
+        description=(
+            "First delay before re-pinging while a condition stays unmet. "
+            "The delay widens on each re-ping (escalating backoff) up to "
+            "the max, and resets the moment the condition clears."
+        ),
+        widget="int_duration",
+    ),
+    SettingSpec(
+        key="config_delivery_backoff_max_seconds",
+        type="int",
+        default=3600,  # 1 hour
+        tier="operator",
+        group="delivery",
+        title="Max re-ping delay",
+        description=(
+            "The ceiling the escalating re-ping delay backs off to. "
+            "Default 1 hour."
+        ),
+        widget="int_duration",
+    ),
+    SettingSpec(
+        key="config_delivery_cooldown_seconds",
+        type="int",
+        default=60,
+        tier="operator",
+        group="delivery",
+        title="Post-ping cooldown",
+        description=(
+            "Minimum quiet window after a ping before another may fire for "
+            "the same worker (also the window a just-active session is left "
+            "alone)."
+        ),
+        widget="int_duration",
+    ),
+    SettingSpec(
+        key="config_delivery_wake_dormant",
+        type="bool",
+        default=False,
+        tier="operator",
+        group="delivery",
+        title="Wake dormant sessions",
+        description=(
+            "When on, a fallback ping may wake a dormant "
+            "(stopped-but-revivable) session. When off (default), dormant "
+            "sessions are left asleep — only idle sessions are pinged."
+        ),
+        widget="switch",
     ),
 )
 

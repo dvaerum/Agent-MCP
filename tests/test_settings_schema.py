@@ -73,6 +73,15 @@ GOLDEN_DEFAULTS: dict[str, object] = {
         "Call get_agent_messages to read."
     ),
     "config_aoe_timeout_ms": 2000,
+    # Delivery transport / fallback push (ADR-0021).
+    "config_delivery_enabled": False,
+    "config_delivery_on_unread_messages": True,
+    "config_delivery_on_unfinished_tasks": True,
+    "config_delivery_on_unassigned_tasks": False,
+    "config_delivery_backoff_initial_seconds": 30,
+    "config_delivery_backoff_max_seconds": 3600,
+    "config_delivery_cooldown_seconds": 60,
+    "config_delivery_wake_dormant": False,
 }
 
 
@@ -94,10 +103,10 @@ def test_golden_table_and_schema_cover_the_same_keys() -> None:
     assert set(GOLDEN_DEFAULTS) == {s.key for s in SETTINGS_SCHEMA}
 
 
-def test_schema_has_twenty_four_ordered_specs() -> None:
-    assert len(SETTINGS_SCHEMA) == 24
+def test_schema_has_thirty_two_ordered_specs() -> None:
+    assert len(SETTINGS_SCHEMA) == 32
     # Keys are unique.
-    assert len({s.key for s in SETTINGS_SCHEMA}) == 24
+    assert len({s.key for s in SETTINGS_SCHEMA}) == 32
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +173,7 @@ async def test_settings_schema_endpoint_confirmed_operator(
         assert r.status_code == 200, r.text
         body = r.json()
         rows = _rows(body)
-        assert len(rows) == 24
+        assert len(rows) == 32
         # Row shape carries every schema field the frontend renders.
         first = rows[0]
         assert set(first) == {
@@ -219,4 +228,4 @@ async def test_settings_schema_caller_sysadmin_true_for_sysadmin() -> None:
     body = json.loads(resp.body)
     assert body["caller"]["sysadmin"] is True
     assert body["caller"]["confirmed_operator"] is True
-    assert len(body["schema"]) == 24
+    assert len(body["schema"]) == 32
