@@ -47,7 +47,11 @@ pub struct Incoming {
     pub id: Option<Value>,
     #[serde(default)]
     pub method: Option<String>,
+    // Part of the JSON-RPC wire shape (host requests carry params); handlers
+    // don't consume it yet — they re-fetch via config.get. Kept for
+    // completeness, like `jsonrpc` above.
     #[serde(default)]
+    #[allow(dead_code)]
     pub params: Value,
     #[serde(default)]
     pub result: Option<Value>,
