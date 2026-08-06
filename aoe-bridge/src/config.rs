@@ -1,32 +1,35 @@
 //! Settings + the `session → route` mapping resolver.
 //!
-//! ## Where the mapping comes from
+//! ## The model: one base, everything derived
 //!
-//! The bridge needs, per covered session, an agent-mcp **delivery endpoint** and
-//! a per-session **bearer token**; optionally it also injects agent-mcp's
-//! **tools** into the session as a per-session MCP server. The one token drives
-//! both surfaces: an agent-mcp agent token authenticates the delivery stream
-//! (`/delivery/stream`) AND the MCP transport (`/mcp/<project>`). The operator
-//! supplies that token per session (minted via agent-mcp's `register_agent`);
-//! the bridge then wires delivery (always) and MCP (when `expose_mcp` is on,
-//! over `session.mcp.set`) — no separate provisioning step.
+//! There is exactly ONE agent-mcp URL to configure — `agent_mcp_base`, the
+//! router mount root (e.g. `https://host/agent-mcp`). Every per-session URL is
+//! derived from it plus the row's `project`:
 //!
-//! The bridge sources the mapping from **its own plugin settings**, read over
+//! ```text
+//!   delivery = <agent_mcp_base>/api/<project>   (SSE /delivery/stream + status POST)
+//!   mcp      = <agent_mcp_base>/mcp/<project>   (injected per-session MCP server)
+//! ```
+//!
+//! So a covered-session row carries only identity — `session_id`, `token`,
+//! `project` (+ optional `expose_mcp`, `mode`) — never a URL. The one token
+//! drives both surfaces: an agent-mcp agent token authenticates the delivery
+//! stream AND the MCP transport. The operator supplies it per session (minted
+//! via agent-mcp's `register_agent`); the bridge wires delivery (always) and MCP
+//! (when `expose_mcp`, over `session.mcp.set`) — no separate provisioning step.
+//!
+//! `aoe_base` is a SEPARATE concern: the AoE-side REST the bridge injects INTO
+//! (`/api/sessions/<id>/send|acp/prompt`), not an agent-mcp url.
+//!
+//! The bridge sources all of this from **its own plugin settings**, read over
 //! the `config.get` host RPC (which only ever returns this plugin's own table).
-//! Concretely: a `sessions` object-list, one row per covered session
-//! `{ session_id, token, endpoint?, project?, expose_mcp?, mode? }`, plus globals
-//! `default_endpoint` (delivery base fallback) and `mcp_base` (shared MCP mount).
 //!
 //! ## Assumptions (see README)
 //! - `session_id` matches `sessions.list[].id` (stable across respawn).
-//! - `endpoint` is the agent-mcp project mount base, e.g.
-//!   `https://host/api/<project>`; `/delivery/stream` and `/delivery/status`
-//!   are appended.
+//! - `agent_mcp_base` is the router mount root; the bridge appends
+//!   `/api/<project>` (+ `/delivery/stream|status`) and `/mcp/<project>`.
 //! - `token` == the session's agent-mcp bearer; it authenticates BOTH the
-//!   delivery stream and the injected `/mcp/<project>` server. Empty token means
-//!   the target runs without auth (no `Authorization` header is sent).
-//! - the injected MCP url is `<mcp_base>/<project>`; `project` falls back to the
-//!   trailing path segment of the resolved delivery endpoint.
+//!   delivery stream and the injected MCP server.
 //! - `sessions.list` exposes no definitive terminal/structured flag, so `auto`
 //!   is best-effort (it inspects `tool` + `status`); set `mode` explicitly to
 //!   `structured` for ACP / CityHall / composer sessions.
@@ -49,43 +52,49 @@ fn default_true() -> bool {
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub enabled: bool,
-    /// AoE serve REST base for injection, e.g. `http://127.0.0.1:8080`.
+    /// AoE serve REST base — where the bridge POSTs to INJECT nudges into a
+    /// session (AoE's own `/api/sessions/<id>/send|acp/prompt`). Distinct from
+    /// `agent_mcp_base`: this is the AoE side. E.g. `http://127.0.0.1:8080`.
     pub aoe_base: String,
-    /// AoE serve bearer token (injection auth).
+    /// AoE serve bearer token, only if this AoE instance runs with auth. Empty
+    /// for a `--auth=none` instance.
     pub aoe_token: String,
-    /// Fallback agent-mcp delivery base when a row omits `endpoint`.
-    pub default_endpoint: String,
-    /// agent-mcp MCP-transport mount base shared by all covered sessions, e.g.
-    /// `https://host/agent-mcp/mcp`. The per-row `project` is appended to form
-    /// the session's injected MCP url (`<mcp_base>/<project>`). Blank disables
-    /// MCP injection for every row (delivery-only).
-    pub mcp_base: String,
+    /// The agent-mcp router mount root shared by all covered sessions, e.g.
+    /// `https://host/agent-mcp`. The bridge derives BOTH per-session URLs from
+    /// it + the row's `project`:
+    ///   delivery = `<agent_mcp_base>/api/<project>`   (SSE + status POST)
+    ///   mcp      = `<agent_mcp_base>/mcp/<project>`   (injected MCP server)
+    /// Blank ⇒ no routes resolve (nothing to point at).
+    pub agent_mcp_base: String,
     /// How often to re-resolve routes and re-post transport-status.
     pub status_interval_secs: u64,
     /// Per-session mapping rows.
     pub sessions: Vec<SessionEntry>,
 }
 
-/// One row of the `sessions` object-list setting.
+/// One row of the `sessions` object-list setting. A row is just the identity of
+/// a covered session — everything URL-shaped is derived from `agent_mcp_base` +
+/// `project`, so there is no per-row endpoint to keep in sync.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionEntry {
+    /// AoE session id (matches `sessions.list[].id`). Required.
     #[serde(default)]
     pub session_id: String,
+    /// The session's agent-mcp bearer token. Authenticates BOTH the delivery
+    /// stream and the injected MCP server. Required. Empty ⇒ the row is skipped.
     #[serde(default)]
     pub token: String,
-    #[serde(default)]
-    pub endpoint: String,
-    /// agent-mcp project this session belongs to; appended to the global
-    /// `mcp_base` for the injected MCP url. Blank falls back to the trailing
-    /// path segment of the (resolved) delivery endpoint.
+    /// agent-mcp project this session acts as. Appended to `agent_mcp_base` for
+    /// both the delivery (`/api/<project>`) and MCP (`/mcp/<project>`) urls.
+    /// Required. Empty ⇒ the row is skipped.
     #[serde(default)]
     pub project: String,
     /// Whether to also inject agent-mcp's tools into this session as a
-    /// per-session MCP server (over `session.mcp.set`). Delivery still fires
-    /// regardless; this only controls the MCP-tools half.
+    /// per-session MCP server (over `session.mcp.set`). Delivery fires
+    /// regardless; this only gates the MCP-tools half. Defaults to true.
     #[serde(default = "default_true")]
     pub expose_mcp: bool,
-    /// `auto` | `terminal` | `structured`.
+    /// `auto` | `terminal` | `structured`. How a nudge is injected.
     #[serde(default)]
     pub mode: String,
 }
@@ -95,7 +104,6 @@ impl Default for SessionEntry {
         Self {
             session_id: String::new(),
             token: String::new(),
-            endpoint: String::new(),
             project: String::new(),
             expose_mcp: true,
             mode: String::new(),
@@ -121,9 +129,9 @@ pub struct Route {
     pub endpoint: String,
     pub token: String,
     pub mode: Mode,
-    /// The agent-mcp MCP url to inject into this session (`<mcp_base>/<project>`),
-    /// or `None` when MCP injection is off for this row (`expose_mcp` false, or
-    /// `mcp_base`/`project` unresolved). Delivery is independent of this.
+    /// The agent-mcp MCP url to inject (`<agent_mcp_base>/mcp/<project>`), or
+    /// `None` when MCP injection is off for this row (`expose_mcp` false).
+    /// Delivery is independent of this.
     pub mcp_url: Option<String>,
     /// Whether the session is currently present in `sessions.list`.
     pub live: bool,
@@ -144,44 +152,33 @@ impl Route {
     }
 }
 
-/// Trailing non-empty path segment of a URL-ish string, used to recover the
-/// agent-mcp project from a delivery endpoint like `.../api/<project>` when a
-/// row leaves `project` blank.
-fn project_from_endpoint(endpoint: &str) -> &str {
-    endpoint
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or("")
-        .trim()
+/// Join the agent-mcp base with a sub-path (`api/<project>` or `mcp/<project>`),
+/// tolerant of a trailing slash on the base.
+fn join_base(agent_mcp_base: &str, kind: &str, project: &str) -> String {
+    format!(
+        "{}/{}/{}",
+        agent_mcp_base.trim().trim_end_matches('/'),
+        kind,
+        project.trim().trim_matches('/')
+    )
 }
 
-/// Build the injected MCP url from the global base and a project, or `None`
-/// when either is missing.
-fn resolve_mcp_url(mcp_base: &str, project: &str) -> Option<String> {
-    let base = mcp_base.trim().trim_end_matches('/');
-    let project = project.trim().trim_matches('/');
-    if base.is_empty() || project.is_empty() {
-        return None;
-    }
-    Some(format!("{base}/{project}"))
-}
-
-/// Resolve every configured session entry into a [`Route`], enriching mode and
-/// liveness from the live `sessions.list` map. Rows without a usable
-/// `(token, endpoint)` are dropped.
+/// Resolve every configured session entry into a [`Route`]. Both the delivery
+/// endpoint and the MCP url are DERIVED from `agent_mcp_base` + the row's
+/// `project`, so a row is self-contained given the one global base. A row is
+/// dropped unless it has a `session_id`, a `token`, a `project`, and the global
+/// `agent_mcp_base` is set. Mode + liveness come from the live `sessions.list`.
 pub fn resolve_routes(settings: &Settings, live: &HashMap<String, SessionRecord>) -> Vec<Route> {
+    let base = settings.agent_mcp_base.trim();
+    if base.is_empty() {
+        return Vec::new(); // nothing to point at.
+    }
     let mut out = Vec::new();
     for entry in &settings.sessions {
-        if entry.session_id.trim().is_empty() || entry.token.trim().is_empty() {
-            continue;
-        }
-        let endpoint = if entry.endpoint.trim().is_empty() {
-            settings.default_endpoint.trim().to_string()
-        } else {
-            entry.endpoint.trim().to_string()
-        };
-        if endpoint.is_empty() {
+        if entry.session_id.trim().is_empty()
+            || entry.token.trim().is_empty()
+            || entry.project.trim().is_empty()
+        {
             continue;
         }
         let record = live.get(&entry.session_id);
@@ -195,24 +192,16 @@ pub fn resolve_routes(settings: &Settings, live: &HashMap<String, SessionRecord>
                 None => Mode::Terminal,
             },
         };
-        // MCP injection is opt-in per row and only when we can build a url. The
-        // project falls back to the trailing segment of the delivery endpoint.
-        let mcp_url = if entry.expose_mcp {
-            let project = if entry.project.trim().is_empty() {
-                project_from_endpoint(&endpoint)
-            } else {
-                entry.project.trim()
-            };
-            resolve_mcp_url(&settings.mcp_base, project)
-        } else {
-            None
-        };
         out.push(Route {
             session_id: entry.session_id.clone(),
-            endpoint,
+            endpoint: join_base(base, "api", &entry.project),
             token: entry.token.clone(),
             mode,
-            mcp_url,
+            mcp_url: if entry.expose_mcp {
+                Some(join_base(base, "mcp", &entry.project))
+            } else {
+                None
+            },
             live: record.is_some(),
         });
     }
@@ -260,12 +249,7 @@ pub async fn load_settings(conn: &PluginConn) -> Settings {
         .as_str()
         .map(str::to_string)
         .unwrap_or_default();
-    let default_endpoint = get_value(conn, "default_endpoint")
-        .await
-        .as_str()
-        .map(str::to_string)
-        .unwrap_or_default();
-    let mcp_base = get_value(conn, "mcp_base")
+    let agent_mcp_base = get_value(conn, "agent_mcp_base")
         .await
         .as_str()
         .map(str::to_string)
@@ -280,8 +264,7 @@ pub async fn load_settings(conn: &PluginConn) -> Settings {
         enabled,
         aoe_base,
         aoe_token,
-        default_endpoint,
-        mcp_base,
+        agent_mcp_base,
         status_interval_secs,
         sessions,
     }
@@ -308,23 +291,24 @@ mod tests {
             .collect()
     }
 
-    fn settings(sessions: Vec<SessionEntry>, default_endpoint: &str) -> Settings {
-        settings_with_mcp(sessions, default_endpoint, "")
-    }
-
-    fn settings_with_mcp(
-        sessions: Vec<SessionEntry>,
-        default_endpoint: &str,
-        mcp_base: &str,
-    ) -> Settings {
+    fn settings(sessions: Vec<SessionEntry>, agent_mcp_base: &str) -> Settings {
         Settings {
             enabled: true,
             aoe_base: "http://127.0.0.1:8080".to_string(),
             aoe_token: "aoe-tok".to_string(),
-            default_endpoint: default_endpoint.to_string(),
-            mcp_base: mcp_base.to_string(),
+            agent_mcp_base: agent_mcp_base.to_string(),
             status_interval_secs: 30,
             sessions,
+        }
+    }
+
+    fn entry(session_id: &str, token: &str, project: &str, mode: &str) -> SessionEntry {
+        SessionEntry {
+            session_id: session_id.into(),
+            token: token.into(),
+            project: project.into(),
+            mode: mode.into(),
+            ..Default::default()
         }
     }
 
@@ -332,8 +316,8 @@ mod tests {
     fn parse_entries_drops_non_array_and_bad_rows() {
         assert!(parse_session_entries(&Value::Null).is_empty());
         let v = json!([
-            { "session_id": "s1", "token": "t1", "endpoint": "https://e/api/p", "mode": "terminal" },
-            { "session_id": "s2", "token": "t2" },
+            { "session_id": "s1", "token": "t1", "project": "p", "mode": "terminal" },
+            { "session_id": "s2", "token": "t2", "project": "p" },
             42
         ]);
         let entries = parse_session_entries(&v);
@@ -343,83 +327,61 @@ mod tests {
     }
 
     #[test]
-    fn resolve_uses_default_endpoint_and_infers_auto_mode() {
-        let entries = vec![
-            SessionEntry {
-                session_id: "s1".into(),
-                token: "t1".into(),
-                endpoint: "".into(),
-                mode: "auto".into(),
-                ..Default::default()
-            },
-            SessionEntry {
-                session_id: "s2".into(),
-                token: "t2".into(),
-                endpoint: "https://override/api/p".into(),
-                mode: "".into(),
-                ..Default::default()
-            },
-        ];
-        let live = live_map(&[("s1", "claude", "acp running"), ("s2", "claude", "Running")]);
-        let routes = resolve_routes(&settings(entries, "https://default/api/p"), &live);
-        assert_eq!(routes.len(), 2);
-        // s1: no per-row endpoint -> default; status mentions acp -> structured.
-        assert_eq!(routes[0].endpoint, "https://default/api/p");
-        assert_eq!(routes[0].mode, Mode::Structured);
+    fn derives_both_urls_from_base_and_project() {
+        // A trailing slash on the base is tolerated.
+        let entries = vec![entry("s1", "t1", "washing", "auto")];
+        let live = live_map(&[("s1", "claude", "Running")]);
+        let routes = resolve_routes(&settings(entries, "https://host/agent-mcp/"), &live);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].endpoint, "https://host/agent-mcp/api/washing");
+        assert_eq!(
+            routes[0].mcp_url.as_deref(),
+            Some("https://host/agent-mcp/mcp/washing")
+        );
         assert!(routes[0].live);
-        // s2: explicit endpoint; terminal-ish status -> terminal.
-        assert_eq!(routes[1].endpoint, "https://override/api/p");
+    }
+
+    #[test]
+    fn auto_mode_inferred_from_live_record() {
+        let entries = vec![entry("s1", "t1", "p", "auto"), entry("s2", "t2", "p", "")];
+        let live = live_map(&[("s1", "claude", "acp running"), ("s2", "claude", "Running")]);
+        let routes = resolve_routes(&settings(entries, "https://h/agent-mcp"), &live);
+        // s1: status mentions acp -> structured; s2: terminal-ish -> terminal.
+        assert_eq!(routes[0].mode, Mode::Structured);
         assert_eq!(routes[1].mode, Mode::Terminal);
     }
 
     #[test]
     fn explicit_mode_overrides_inference() {
-        let entries = vec![SessionEntry {
-            session_id: "s1".into(),
-            token: "t1".into(),
-            endpoint: "https://e/api/p".into(),
-            mode: "structured".into(),
-            ..Default::default()
-        }];
+        let entries = vec![entry("s1", "t1", "p", "structured")];
         // Live status looks terminal, but explicit "structured" wins.
         let live = live_map(&[("s1", "claude", "Running")]);
-        let routes = resolve_routes(&settings(entries, ""), &live);
+        let routes = resolve_routes(&settings(entries, "https://h/agent-mcp"), &live);
         assert_eq!(routes[0].mode, Mode::Structured);
     }
 
     #[test]
-    fn rows_without_token_or_endpoint_are_dropped() {
+    fn rows_missing_id_token_or_project_are_dropped() {
         let entries = vec![
-            SessionEntry {
-                session_id: "s1".into(),
-                token: "".into(),
-                endpoint: "https://e/api/p".into(),
-                mode: "".into(),
-                ..Default::default()
-            },
-            SessionEntry {
-                session_id: "s2".into(),
-                token: "t2".into(),
-                endpoint: "".into(),
-                mode: "".into(),
-                ..Default::default()
-            },
+            entry("", "t", "p", ""),  // no id
+            entry("s2", "", "p", ""), // no token
+            entry("s3", "t", "", ""), // no project
         ];
-        // default_endpoint empty -> s2 also unusable.
+        let routes = resolve_routes(&settings(entries, "https://h/agent-mcp"), &HashMap::new());
+        assert!(routes.is_empty());
+    }
+
+    #[test]
+    fn blank_base_resolves_nothing() {
+        let entries = vec![entry("s1", "t1", "p", "auto")];
         let routes = resolve_routes(&settings(entries, ""), &HashMap::new());
         assert!(routes.is_empty());
     }
 
     #[test]
     fn configured_but_not_live_is_marked_not_live() {
-        let entries = vec![SessionEntry {
-            session_id: "ghost".into(),
-            token: "t".into(),
-            endpoint: "https://e/api/p".into(),
-            mode: "auto".into(),
-            ..Default::default()
-        }];
-        let routes = resolve_routes(&settings(entries, ""), &HashMap::new());
+        let entries = vec![entry("ghost", "t", "p", "auto")];
+        let routes = resolve_routes(&settings(entries, "https://h/agent-mcp"), &HashMap::new());
         assert_eq!(routes.len(), 1);
         assert!(!routes[0].live);
         // No live signal -> auto defaults to terminal.
@@ -427,80 +389,18 @@ mod tests {
     }
 
     #[test]
-    fn mcp_url_from_global_base_and_per_row_project() {
-        let entries = vec![SessionEntry {
-            session_id: "s1".into(),
-            token: "t1".into(),
-            endpoint: "https://host/agent-mcp/api/washing".into(),
-            project: "washing".into(),
-            expose_mcp: true,
-            mode: "auto".into(),
-        }];
+    fn expose_mcp_off_yields_no_mcp_url_but_keeps_delivery() {
+        let mut e = entry("s1", "t1", "p", "auto");
+        e.expose_mcp = false;
         let live = live_map(&[("s1", "claude", "Running")]);
-        let s = settings_with_mcp(entries, "", "https://host/agent-mcp/mcp/");
-        let routes = resolve_routes(&s, &live);
-        assert_eq!(
-            routes[0].mcp_url.as_deref(),
-            Some("https://host/agent-mcp/mcp/washing")
-        );
-    }
-
-    #[test]
-    fn mcp_url_falls_back_to_endpoint_trailing_segment_for_project() {
-        // project blank -> recovered from the delivery endpoint's last segment.
-        let entries = vec![SessionEntry {
-            session_id: "s1".into(),
-            token: "t1".into(),
-            endpoint: "".into(),
-            project: "".into(),
-            expose_mcp: true,
-            mode: "auto".into(),
-        }];
-        let live = live_map(&[("s1", "claude", "Running")]);
-        // default_endpoint carries the project; mcp_base is the shared mount.
-        let s = settings_with_mcp(
-            entries,
-            "https://host/agent-mcp/api/proj",
-            "https://host/agent-mcp/mcp",
-        );
-        let routes = resolve_routes(&s, &live);
-        assert_eq!(
-            routes[0].mcp_url.as_deref(),
-            Some("https://host/agent-mcp/mcp/proj")
-        );
-    }
-
-    #[test]
-    fn mcp_url_none_when_expose_off_or_base_blank() {
-        // expose_mcp off -> no url even with a base + project.
-        let off = vec![SessionEntry {
-            session_id: "s1".into(),
-            token: "t1".into(),
-            endpoint: "https://host/api/p".into(),
-            project: "p".into(),
-            expose_mcp: false,
-            mode: "auto".into(),
-        }];
-        let live = live_map(&[("s1", "claude", "Running")]);
-        let routes = resolve_routes(&settings_with_mcp(off, "", "https://host/mcp"), &live);
+        let routes = resolve_routes(&settings(vec![e], "https://h/agent-mcp"), &live);
         assert!(routes[0].mcp_url.is_none());
-
-        // expose on but mcp_base blank -> still none (delivery-only).
-        let no_base = vec![SessionEntry {
-            session_id: "s1".into(),
-            token: "t1".into(),
-            endpoint: "https://host/api/p".into(),
-            project: "p".into(),
-            expose_mcp: true,
-            mode: "auto".into(),
-        }];
-        let routes = resolve_routes(&settings_with_mcp(no_base, "", ""), &live);
-        assert!(routes[0].mcp_url.is_none());
+        // Delivery endpoint is still derived (delivery is independent of MCP).
+        assert_eq!(routes[0].endpoint, "https://h/agent-mcp/api/p");
     }
 
     #[test]
     fn expose_mcp_defaults_true_when_row_omits_it() {
-        // A row parsed from JSON without expose_mcp defaults to true.
         let v = json!([{ "session_id": "s1", "token": "t1", "project": "p" }]);
         let entries = parse_session_entries(&v);
         assert_eq!(entries.len(), 1);

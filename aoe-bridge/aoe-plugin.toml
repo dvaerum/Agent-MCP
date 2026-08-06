@@ -38,34 +38,32 @@ description = "Master switch. When off, the worker holds no streams and reports 
 type = "boolean"
 default = true
 
+# ── agent-mcp side ──────────────────────────────────────────────────────────
+# The ONE agent-mcp URL to configure. Every per-session URL is derived from it:
+#   delivery = <agent_mcp_base>/api/<project>   (SSE stream + status POST)
+#   mcp      = <agent_mcp_base>/mcp/<project>   (injected per-session MCP server)
+[[settings]]
+key = "agent_mcp_base"
+label = "agent-mcp base URL"
+description = "The agent-mcp router mount root, e.g. https://host/agent-mcp. The bridge derives every covered session's delivery URL (<base>/api/<project>) and MCP URL (<base>/mcp/<project>) from this plus the row's project — you never enter a per-session URL. Blank ⇒ the bridge covers nothing."
+type = "string"
+default = ""
+
+# ── AoE side (the injection target — a DIFFERENT service from agent-mcp) ─────
 [[settings]]
 key = "aoe_base"
-label = "AoE serve base URL"
-description = "Base URL of this AoE serve instance's REST API, used to inject notifications into sessions."
+label = "AoE serve base URL (injection target)"
+description = "Base URL of THIS AoE serve instance's REST API — where the bridge POSTs a nudge to inject it into a session (/api/sessions/<id>/send or /acp/prompt). This is the AoE side, not agent-mcp."
 type = "string"
 default = "http://127.0.0.1:8080"
 
 [[settings]]
 key = "aoe_token"
 label = "AoE serve token"
-description = "Bearer token for this AoE serve instance (from ~/.agent-of-empires/serve.url). Used to authenticate injection POSTs."
+description = "Bearer token for THIS AoE serve instance (from ~/.agent-of-empires/serve.url), if it runs with auth. Leave blank for a --auth=none instance."
 type = "string"
 default = ""
 advanced = true
-
-[[settings]]
-key = "default_endpoint"
-label = "Default agent-mcp delivery endpoint"
-description = "Project mount base of the agent-mcp server, e.g. https://host/api/<project>. Used for any session row that leaves 'endpoint' blank. /delivery/stream and /delivery/status are appended."
-type = "string"
-default = ""
-
-[[settings]]
-key = "mcp_base"
-label = "agent-mcp MCP mount base"
-description = "Shared base of the agent-mcp MCP transport, e.g. https://host/agent-mcp/mcp. When set, each covered session with 'expose MCP' on gets agent-mcp's tools injected at <mcp_base>/<project> (using the row's token). Blank disables MCP injection everywhere (delivery-only)."
-type = "string"
-default = ""
 
 [[settings]]
 key = "status_interval_secs"
@@ -77,52 +75,48 @@ min = 5
 max = 3600
 advanced = true
 
-# Per-session mapping: one row per covered session. `token` is the SAME
-# per-session agent-mcp bearer wired into that session's per-session MCP config.
+# ── Covered sessions ────────────────────────────────────────────────────────
+# One row per session the bridge covers. A row is just identity — session_id,
+# token, project — no URL (those derive from agent_mcp_base above).
 [[settings]]
 key = "sessions"
 label = "Covered sessions"
-description = "Sessions the bridge covers. Each row maps an AoE session id to its agent-mcp delivery endpoint, per-session token, and injection mode."
+description = "Sessions the bridge covers. Each row is an AoE session id + the agent-mcp token and project it acts as. The delivery and MCP URLs are derived from 'agent-mcp base URL' + project, so there's no URL to enter here."
 type = "object_list"
 max_items = 200
 
 [[settings.fields]]
 key = "session_id"
 label = "AoE session id"
-description = "Matches sessions.list[].id."
+description = "The session to cover. Matches sessions.list[].id (stable across respawn)."
 type = "string"
 required = true
 
 [[settings.fields]]
 key = "token"
-label = "agent-mcp session token"
-description = "The session's agent-mcp bearer (the same token wired into its per-session MCP config)."
+label = "agent-mcp token"
+description = "The session's agent-mcp bearer (mint one via agent-mcp's Register Agent). Authenticates BOTH the delivery stream and the injected MCP tools."
 type = "string"
 required = true
 
 [[settings.fields]]
-key = "endpoint"
-label = "agent-mcp delivery endpoint"
-description = "Project mount base, e.g. https://host/api/<project>. Blank falls back to the default endpoint."
-type = "string"
-
-[[settings.fields]]
 key = "project"
 label = "agent-mcp project"
-description = "Project this session belongs to; appended to the global MCP mount base for the injected MCP url (<mcp_base>/<project>). Blank falls back to the trailing path segment of the delivery endpoint."
+description = "The agent-mcp project this session acts as. Appended to the global agent-mcp base for both its delivery (/api/<project>) and MCP (/mcp/<project>) URLs."
 type = "string"
+required = true
 
 [[settings.fields]]
 key = "expose_mcp"
-label = "Expose agent-mcp tools (MCP)"
-description = "Also wire agent-mcp's tools into this session as a per-session MCP server (using this row's token). Delivery still fires regardless. First enable respawns the session once to load the MCP set."
+label = "Also inject agent-mcp tools (MCP)"
+description = "On: also wire agent-mcp's tools into this session as a per-session MCP server. Off: delivery-push only. First enable respawns the session once (transcript-preserving) to load the tools."
 type = "boolean"
 default = true
 
 [[settings.fields]]
 key = "mode"
 label = "Injection mode"
-description = "auto infers terminal vs structured from the live session; set explicitly for ACP/CityHall/composer sessions."
+description = "How a nudge is delivered. auto infers terminal vs structured from the live session; set explicitly for ACP/CityHall/composer sessions."
 type = "select"
 options = ["auto", "terminal", "structured"]
 default = "auto"

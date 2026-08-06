@@ -45,32 +45,38 @@ knowledge of AoE; the dependency points from the runtime into agent-mcp.
 
 ## The session → route mapping
 
-Per covered session the bridge needs an agent-mcp **delivery endpoint** and a
-per-session **bearer token**; optionally it also injects agent-mcp's **tools**
-into the session as a per-session MCP server. The **one token drives both
-surfaces** — an agent-mcp agent token authenticates the delivery stream
-(`/delivery/stream`) AND the MCP transport (`/mcp/<project>`) — so the operator
-supplies it once (minted via agent-mcp's `register_agent`), and the bridge wires
-delivery (always) and MCP (when `expose_mcp`, over `session.mcp.set`).
+**One base, everything derived.** There is exactly one agent-mcp URL to
+configure — `agent_mcp_base`, the router mount root (e.g. `https://host/agent-mcp`).
+Every per-session URL is derived from it plus the row's `project`:
+
+```text
+delivery = <agent_mcp_base>/api/<project>   (SSE /delivery/stream + status POST)
+mcp      = <agent_mcp_base>/mcp/<project>   (injected per-session MCP server)
+```
+
+So a covered-session row carries **only identity** — never a URL. The **one
+token drives both surfaces**: an agent-mcp agent token (minted via
+`register_agent`) authenticates the delivery stream AND the MCP transport. The
+bridge wires delivery (always) and MCP (when `expose_mcp`, over
+`session.mcp.set`) — no separate provisioning step.
 
 The AoE plugin host gives a worker **no** way to read another component's
 per-session MCP config, so the mapping is sourced from **this plugin's own
 settings**, read over the `config.get` host RPC (which only ever returns this
-plugin's own table). The `sessions` object-list setting holds one row per
-covered session:
+plugin's own table). The `sessions` object-list holds one row per covered
+session:
 
 | Field | Meaning |
 |---|---|
-| `session_id` | AoE session id (matches `sessions.list[].id`; stable across respawn). |
-| `token` | The session's agent-mcp bearer. Authenticates the delivery stream AND the injected MCP server. Empty ⇒ target runs without auth (no `Authorization` header sent). |
-| `endpoint` | agent-mcp delivery mount base, e.g. `https://host/api/<project>`. Blank ⇒ `default_endpoint`. `/delivery/stream|status` appended. |
-| `project` | agent-mcp project; appended to the global `mcp_base` → `<mcp_base>/<project>` for the injected MCP url. Blank ⇒ trailing path segment of the resolved `endpoint`. |
+| `session_id` | **(required)** AoE session id (matches `sessions.list[].id`; stable across respawn). |
+| `token` | **(required)** The session's agent-mcp bearer. Authenticates both the delivery stream and the injected MCP server. |
+| `project` | **(required)** The agent-mcp project this session acts as. Appended to `agent_mcp_base` for both its `/api/<project>` (delivery) and `/mcp/<project>` (MCP) URLs. |
 | `expose_mcp` | Also inject agent-mcp's tools into this session (default `true`). Delivery fires regardless; this gates only the MCP-tools half. First enable respawns the session once (transcript-preserving) to load the set. |
 | `mode` | `auto` \| `terminal` \| `structured`. |
 
-Global settings: `enabled`, `aoe_base`, `aoe_token`, `default_endpoint`,
-`mcp_base` (shared MCP-transport mount, e.g. `https://host/agent-mcp/mcp`),
-`status_interval_secs`. See `aoe-plugin.toml`.
+Global settings: `agent_mcp_base` (the one above), `aoe_base` (the **AoE-side**
+REST the bridge injects into — a *different* service), `aoe_token` (only if AoE
+runs with auth), `status_interval_secs`, `enabled`. See `aoe-plugin.toml`.
 
 The bridge re-asserts each covered session's MCP layer every reconcile; the AoE
 host makes an unchanged set a no-op (no respawn), so re-assertion — and a bridge
@@ -82,8 +88,8 @@ provisioned.
 - **`session_id` == `sessions.list[].id`.** The bridge only opens a stream for a
   configured session while it is present in `sessions.list`; a configured
   session that has left the list is reported `dead` and its stream dropped.
-- **`endpoint` is the project mount base.** `/delivery/stream` and
-  `/delivery/status` are appended.
+- **`agent_mcp_base` is the router mount root.** The bridge appends
+  `/api/<project>` (+ `/delivery/stream|status`) and `/mcp/<project>`.
 - **`token`** authenticates both the SSE subscribe and the status POST; it is
   the session's agent-mcp worker bearer.
 - **Mode `auto` is best-effort.** `sessions.list` exposes no definitive
