@@ -1,20 +1,22 @@
 # agent-mcp delivery bridge — Agent of Empires plugin manifest.
 #
 # Schema reference: aoe-plugin-api (PluginManifest), docs/plugin-api.md.
-# api_version 9 is required for the `object_list` settings widget used by the
-# per-session mapping (`sessions`). The current host schema is 11, so 9 loads.
+# api_version 13 is required for the `session.mcp` capability / `session.mcp.set`
+# RPC (the per-session-MCP host patch). The `object_list` settings widget used
+# by the per-session mapping (`sessions`) needs ≥9; 13 covers both.
 
 id = "dev.dvaerum.agent-mcp-delivery"
 name = "agent-mcp Delivery Bridge"
 version = "0.1.0"
-api_version = 9
-description = "Injects agent-mcp delivery notifications into AoE-run sessions that don't poll wait_for_events (ADR-0021): subscribes to each covered session's delivery SSE stream, reports transport-status up, and injects skinny (id/subject/status only) nudges via AoE's /send and /acp/prompt routes."
+api_version = 13
+description = "Injects agent-mcp delivery notifications into AoE-run sessions that don't poll wait_for_events (ADR-0021): subscribes to each covered session's delivery SSE stream, reports transport-status up, injects skinny (id/subject/status only) nudges via AoE's /send and /acp/prompt routes, and (optionally) wires agent-mcp's tools into each covered session as a per-session MCP server."
 
 # runtime.worker: run the worker at all (and the config.get host RPC).
 # session.read:   sessions.list, to enumerate live sessions + their status.
+# session.mcp:    session.mcp.set, to inject agent-mcp's tools per session.
 # net:            outbound HTTP/SSE to agent-mcp and AoE's localhost REST.
 # notifications:  ui.notify, to surface bridge errors to the operator.
-capabilities = ["runtime.worker", "session.read", "net", "notifications"]
+capabilities = ["runtime.worker", "session.read", "session.mcp", "net", "notifications"]
 
 # ---------------------------------------------------------------------------
 # Commands
@@ -59,6 +61,13 @@ type = "string"
 default = ""
 
 [[settings]]
+key = "mcp_base"
+label = "agent-mcp MCP mount base"
+description = "Shared base of the agent-mcp MCP transport, e.g. https://host/agent-mcp/mcp. When set, each covered session with 'expose MCP' on gets agent-mcp's tools injected at <mcp_base>/<project> (using the row's token). Blank disables MCP injection everywhere (delivery-only)."
+type = "string"
+default = ""
+
+[[settings]]
 key = "status_interval_secs"
 label = "Status/reconcile interval (seconds)"
 description = "How often the bridge re-resolves routes and re-posts each session's transport-status."
@@ -96,6 +105,19 @@ key = "endpoint"
 label = "agent-mcp delivery endpoint"
 description = "Project mount base, e.g. https://host/api/<project>. Blank falls back to the default endpoint."
 type = "string"
+
+[[settings.fields]]
+key = "project"
+label = "agent-mcp project"
+description = "Project this session belongs to; appended to the global MCP mount base for the injected MCP url (<mcp_base>/<project>). Blank falls back to the trailing path segment of the delivery endpoint."
+type = "string"
+
+[[settings.fields]]
+key = "expose_mcp"
+label = "Expose agent-mcp tools (MCP)"
+description = "Also wire agent-mcp's tools into this session as a per-session MCP server (using this row's token). Delivery still fires regardless. First enable respawns the session once to load the MCP set."
+type = "boolean"
+default = true
 
 [[settings.fields]]
 key = "mode"

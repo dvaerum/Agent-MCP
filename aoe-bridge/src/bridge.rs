@@ -27,7 +27,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::config::{self, Route, SessionRecord};
-use crate::inject::{build_injection, delivery_url, extract_sse_data};
+use crate::inject::{build_injection, build_mcp_set_params, delivery_url, extract_sse_data};
 use crate::mode::map_transport_status;
 use crate::plugin::PluginConn;
 use crate::render::{parse_frame, render_skinny};
@@ -49,6 +49,11 @@ struct SessionTask {
 pub async fn run_bridge(conn: Arc<PluginConn>, reconcile: Arc<Notify>) {
     let http = reqwest::Client::new();
     let mut tasks: HashMap<String, SessionTask> = HashMap::new();
+    // Per-session fingerprint of the last MCP set we asserted (`url|token`), so
+    // we skip the RPC when nothing changed. Correctness never depends on this
+    // (the host makes an unchanged set a no-op respawn); it only avoids RPC
+    // spam and, on a real change, forces a re-assert.
+    let mut mcp_set: HashMap<String, String> = HashMap::new();
 
     loop {
         let settings = config::load_settings(&conn).await;
@@ -58,6 +63,7 @@ pub async fn run_bridge(conn: Arc<PluginConn>, reconcile: Arc<Notify>) {
             for (_, t) in tasks.drain() {
                 t.handle.abort();
             }
+            mcp_set.clear();
         } else {
             let live = fetch_live_sessions(&conn).await;
             let ctx = Arc::new(BridgeCtx {
@@ -80,6 +86,11 @@ pub async fn run_bridge(conn: Arc<PluginConn>, reconcile: Arc<Notify>) {
                         .unwrap_or("idle");
                     report_status(&ctx, &route.endpoint, &route.token, status).await;
 
+                    // Ensure this session's per-session MCP layer matches config:
+                    // set agent-mcp's tools when `expose_mcp` yields a url, or
+                    // clear our entry when it was on and is now off.
+                    ensure_session_mcp(&conn, &mut mcp_set, &route).await;
+
                     // Ensure a fresh SSE task with the current fingerprint.
                     let needs_spawn = match tasks.get(&route.session_id) {
                         Some(t) => t.fingerprint != fingerprint,
@@ -93,7 +104,13 @@ pub async fn run_bridge(conn: Arc<PluginConn>, reconcile: Arc<Notify>) {
                         let r = route.clone();
                         let sid = route.session_id.clone();
                         let handle = tokio::spawn(async move { run_session_stream(ctx, r).await });
-                        tasks.insert(sid, SessionTask { fingerprint, handle });
+                        tasks.insert(
+                            sid,
+                            SessionTask {
+                                fingerprint,
+                                handle,
+                            },
+                        );
                     }
                 } else {
                     // Configured but not currently live: report dead and stop.
@@ -114,6 +131,10 @@ pub async fn run_bridge(conn: Arc<PluginConn>, reconcile: Arc<Notify>) {
                 if let Some(t) = tasks.remove(&k) {
                     t.handle.abort();
                 }
+                // Drop the MCP guard so a re-added row re-asserts. We do NOT
+                // actively clear the session's injected tools here: a removed
+                // row stops delivery but leaves the session usable via MCP.
+                mcp_set.remove(&k);
             }
         }
 
@@ -145,6 +166,49 @@ async fn fetch_live_sessions(conn: &PluginConn) -> HashMap<String, SessionRecord
         }
     }
     map
+}
+
+/// Reconcile one live session's per-session MCP layer with its resolved route.
+/// - `mcp_url = Some`: assert agent-mcp's tools are set (skipping the RPC when
+///   unchanged since we last set them; the host makes an unchanged set a no-op
+///   anyway, so a bridge restart re-asserts harmlessly).
+/// - `mcp_url = None` but we had set it: clear our entry (the row's `expose_mcp`
+///   was turned off) so the session's MCP layer tracks config.
+async fn ensure_session_mcp(
+    conn: &Arc<PluginConn>,
+    guard: &mut HashMap<String, String>,
+    route: &Route,
+) {
+    match route.mcp_url.as_deref() {
+        Some(url) => {
+            let fingerprint = format!("{url}|{}", route.token);
+            if guard.get(&route.session_id).map(String::as_str) == Some(fingerprint.as_str()) {
+                return; // already asserted with this url+token.
+            }
+            let params = build_mcp_set_params(&route.session_id, url, &route.token);
+            match conn.session_mcp_set(params).await {
+                Ok(_) => {
+                    guard.insert(route.session_id.clone(), fingerprint);
+                }
+                Err(e) => crate::log(&format!(
+                    "session.mcp.set for {} failed: {e:#}",
+                    route.session_id
+                )),
+            }
+        }
+        None => {
+            if guard.remove(&route.session_id).is_some() {
+                // Clear our layer: empty `servers` replaces it with nothing.
+                let params = json!({ "session_id": route.session_id, "servers": [] });
+                if let Err(e) = conn.session_mcp_set(params).await {
+                    crate::log(&format!(
+                        "session.mcp clear for {} failed: {e:#}",
+                        route.session_id
+                    ));
+                }
+            }
+        }
+    }
 }
 
 /// POST the session's transport-status up the delivery channel. Best-effort.

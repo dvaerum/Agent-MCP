@@ -46,6 +46,31 @@ pub fn delivery_url(endpoint: &str, path: &str) -> String {
     format!("{}/{}", trim_end(endpoint), path.trim_start_matches('/'))
 }
 
+/// The fixed server name for the injected agent-mcp entry in a session's
+/// per-session MCP layer. The bridge owns this one entry (a full-replace set),
+/// so the name is stable.
+pub const MCP_SERVER_NAME: &str = "agent-mcp";
+
+/// Build the `session.mcp.set` params that inject agent-mcp's tools into a
+/// session as a single http MCP server. `servers` is the COMPLETE per-session
+/// layer, so we send exactly our one entry (the bridge owns this layer).
+///
+/// An empty `token` omits the `Authorization` header entirely — for an
+/// agent-mcp reachable without auth (e.g. a `--auth=none` deploy). The AoE
+/// host DTO uses `deny_unknown_fields`, so we emit only the four recognised
+/// keys (`name`/`transport`/`url`/`headers`) and drop `headers` when empty.
+pub fn build_mcp_set_params(session_id: &str, mcp_url: &str, token: &str) -> Value {
+    let mut server = json!({
+        "name": MCP_SERVER_NAME,
+        "transport": "http",
+        "url": mcp_url,
+    });
+    if !token.trim().is_empty() {
+        server["headers"] = json!({ "Authorization": format!("Bearer {token}") });
+    }
+    json!({ "session_id": session_id, "servers": [server] })
+}
+
 /// Extract the concatenated `data:` payload from one SSE event block (the text
 /// between blank-line separators). Returns `None` for a block with no data
 /// lines (e.g. a bare `: ping` comment keepalive).
@@ -78,7 +103,8 @@ mod tests {
 
     #[test]
     fn structured_injection_targets_acp_prompt_with_text() {
-        let (url, body) = build_injection(Mode::Structured, "http://127.0.0.1:8080/", "sid-2", "yo");
+        let (url, body) =
+            build_injection(Mode::Structured, "http://127.0.0.1:8080/", "sid-2", "yo");
         // Trailing slash on the base is tolerated.
         assert_eq!(url, "http://127.0.0.1:8080/api/sessions/sid-2/acp/prompt");
         assert_eq!(body, json!({ "text": "yo" }));
@@ -94,6 +120,29 @@ mod tests {
             delivery_url("https://mcp.example/api/proj/", "/delivery/status"),
             "https://mcp.example/api/proj/delivery/status"
         );
+    }
+
+    #[test]
+    fn mcp_set_params_with_token_carry_bearer_header() {
+        let p = build_mcp_set_params("sid-1", "https://host/agent-mcp/mcp/proj", "tok123");
+        assert_eq!(p["session_id"], json!("sid-1"));
+        let server = &p["servers"][0];
+        assert_eq!(server["name"], json!("agent-mcp"));
+        assert_eq!(server["transport"], json!("http"));
+        assert_eq!(server["url"], json!("https://host/agent-mcp/mcp/proj"));
+        assert_eq!(server["headers"]["Authorization"], json!("Bearer tok123"));
+        // Only the four recognised keys (deny_unknown_fields on the host).
+        let keys: Vec<&String> = server.as_object().unwrap().keys().collect();
+        assert_eq!(keys.len(), 4);
+    }
+
+    #[test]
+    fn mcp_set_params_without_token_omit_headers() {
+        let p = build_mcp_set_params("sid-2", "http://127.0.0.1:8001/mcp/p", "  ");
+        let server = &p["servers"][0];
+        assert!(server.get("headers").is_none());
+        // name/transport/url only.
+        assert_eq!(server.as_object().unwrap().len(), 3);
     }
 
     #[test]

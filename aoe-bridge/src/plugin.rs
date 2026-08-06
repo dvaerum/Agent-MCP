@@ -99,6 +99,14 @@ impl PluginConn {
         self.call("config.get", json!({ "key": key })).await
     }
 
+    /// `session.mcp.set` (needs `session.mcp`) — replace one session's
+    /// per-session MCP layer with `params.servers`. Idempotent on the host
+    /// side: an unchanged set is a no-op (no respawn), so the bridge may
+    /// re-assert it every reconcile. Returns `{ "status": ... }`.
+    pub async fn session_mcp_set(&self, params: Value) -> Result<Value> {
+        self.call("session.mcp.set", params).await
+    }
+
     /// `ui.notify` (needs `notifications`) — surface a message to the operator.
     /// Best-effort; callers ignore the result.
     #[allow(dead_code)]
