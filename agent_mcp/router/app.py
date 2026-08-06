@@ -770,7 +770,14 @@ async def _proxy_to_backend(
     # Detect streaming up front (the SSE verb/path) and cap concurrency
     # BEFORE opening the upstream; the response Content-Type is a
     # belt-and-suspenders second signal below for any streaming POST.
-    is_stream_request = req.method == "GET" and backend_path == "/mcp"
+    # /mcp and the ADR-0021 delivery stream are both long-lived agent SSE. Both
+    # get the concurrency cap + the structural streaming anchor here, so delivery
+    # keep-alive doesn't depend solely on sniffing the response Content-Type (a
+    # backend content-type regression would otherwise buffer it → idle-reap it).
+    is_stream_request = req.method == "GET" and backend_path in (
+        "/mcp",
+        "/api/delivery/stream",
+    )
     stream_cap = (
         _po._track_streaming_proxy(_sse_agent_key(headers))
         if is_stream_request
@@ -1358,7 +1365,13 @@ async def backend_api_handler(req: web.Request) -> web.StreamResponse:
     _is_event_stream = rest == "events" or (
         "text/event-stream" in req.headers.get("Accept", "").lower()
     )
-    if req.method != "OPTIONS" and not _is_event_stream:
+    # ADR-0021 delivery transport (agent-bearer, machine-to-machine): its own
+    # stable contract, versioned by the delivery frame shape, not the JSON REST
+    # media type. Exempt both routes like the events stream — otherwise the
+    # bridge's `POST .../delivery/status` (no versioned Accept header) is 406'd
+    # and ALL transport-status reporting silently fails.
+    _is_delivery = rest in ("delivery/stream", "delivery/status")
+    if req.method != "OPTIONS" and not _is_event_stream and not _is_delivery:
         if not _accept_includes_strict_api_media(req.headers.get("Accept", "")):
             return _api_version_required_response()
 

@@ -118,6 +118,18 @@ _PROJECT_SCOPED_PATTERNS = (
 _NON_PROJECT_API_SEGMENTS = frozenset({"router"})
 
 
+# ADR-0021 delivery transport: the per-agent fallback channel. These two
+# project-scoped routes are authenticated by the AGENT BEARER at the backend
+# (``require_agent_bearer``), exactly like the ``/agent-mcp/mcp/`` transport —
+# NOT by an operator session. So they must skip the operator-session gate (the
+# backend does the real auth), while every OTHER ``/api/<project>/...`` route
+# stays operator-gated. The match is deliberately tight (only ``stream`` and
+# ``status``) so it can't be used to reach any other project route unauthed.
+_DELIVERY_RE = re.compile(
+    r"^/agent-mcp/api/[^/]+/delivery/(?:stream|status)/?$"
+)
+
+
 # ── Helpers ────────────────────────────────────────────────────────
 
 
@@ -126,6 +138,13 @@ def _path_is_unauth(path: str) -> bool:
     if path in _UNAUTH_EXACT:
         return True
     return any(path.startswith(p) for p in _UNAUTH_PREFIXES)
+
+
+def _path_is_delivery(path: str) -> bool:
+    """Return True iff ``path`` is an ADR-0021 delivery route
+    (``/agent-mcp/api/<project>/delivery/{stream,status}``), which the backend
+    authenticates by agent bearer, so it skips the operator-session gate."""
+    return _DELIVERY_RE.match(path) is not None
 
 
 def _project_exists(project_name: str) -> bool:
@@ -355,6 +374,12 @@ async def require_operator_session_middleware(
     if not path.startswith("/agent-mcp"):
         return await handler(request)
     if _path_is_unauth(path):
+        return await handler(request)
+    # ADR-0021 delivery routes are agent-bearer-authed at the backend (like
+    # /mcp/), so they skip the operator-session gate here — otherwise an agent's
+    # delivery stream/status is rejected with login_required and delivery can
+    # never work. The backend's require_agent_bearer is the real gate.
+    if _path_is_delivery(path):
         return await handler(request)
     # Single-tenant mode: the deploy is pinned to one operator-owned
     # box (per ADR-0008); there is no multi-operator audience to gate
