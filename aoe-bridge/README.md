@@ -43,13 +43,15 @@ knowledge of AoE; the dependency points from the runtime into agent-mcp.
    > `src/acp/protocol.rs::PromptRequest`), not `prompt`. This bridge sends
    > `text`.
 
-## The `session → (endpoint, token, mode)` mapping
+## The session → route mapping
 
-Per covered session the bridge needs an agent-mcp **delivery endpoint**, a
-per-session **bearer token**, and an injection **mode**. The token is the *same*
-per-session agent-mcp token wired into that session's per-session MCP config by
-the separate AoE per-session-MCP patch (ADR-0021 — "one token links tools,
-fallback, and identity").
+Per covered session the bridge needs an agent-mcp **delivery endpoint** and a
+per-session **bearer token**; optionally it also injects agent-mcp's **tools**
+into the session as a per-session MCP server. The **one token drives both
+surfaces** — an agent-mcp agent token authenticates the delivery stream
+(`/delivery/stream`) AND the MCP transport (`/mcp/<project>`) — so the operator
+supplies it once (minted via agent-mcp's `register_agent`), and the bridge wires
+delivery (always) and MCP (when `expose_mcp`, over `session.mcp.set`).
 
 The AoE plugin host gives a worker **no** way to read another component's
 per-session MCP config, so the mapping is sourced from **this plugin's own
@@ -59,13 +61,21 @@ covered session:
 
 | Field | Meaning |
 |---|---|
-| `session_id` | AoE session id (matches `sessions.list[].id`). |
-| `token` | The session's agent-mcp bearer (identical to its MCP-tools token). |
-| `endpoint` | agent-mcp project mount base, e.g. `https://host/api/<project>`. Blank ⇒ `default_endpoint`. |
+| `session_id` | AoE session id (matches `sessions.list[].id`; stable across respawn). |
+| `token` | The session's agent-mcp bearer. Authenticates the delivery stream AND the injected MCP server. Empty ⇒ target runs without auth (no `Authorization` header sent). |
+| `endpoint` | agent-mcp delivery mount base, e.g. `https://host/api/<project>`. Blank ⇒ `default_endpoint`. `/delivery/stream|status` appended. |
+| `project` | agent-mcp project; appended to the global `mcp_base` → `<mcp_base>/<project>` for the injected MCP url. Blank ⇒ trailing path segment of the resolved `endpoint`. |
+| `expose_mcp` | Also inject agent-mcp's tools into this session (default `true`). Delivery fires regardless; this gates only the MCP-tools half. First enable respawns the session once (transcript-preserving) to load the set. |
 | `mode` | `auto` \| `terminal` \| `structured`. |
 
 Global settings: `enabled`, `aoe_base`, `aoe_token`, `default_endpoint`,
+`mcp_base` (shared MCP-transport mount, e.g. `https://host/agent-mcp/mcp`),
 `status_interval_secs`. See `aoe-plugin.toml`.
+
+The bridge re-asserts each covered session's MCP layer every reconcile; the AoE
+host makes an unchanged set a no-op (no respawn), so re-assertion — and a bridge
+restart — is free. A session is interrupted at most once, the first time it is
+provisioned.
 
 ### Assumptions
 
@@ -86,9 +96,11 @@ Global settings: `enabled`, `aoe_base`, `aoe_token`, `default_endpoint`,
 - **`transport-status` mapping** from AoE's session status is likewise a
   keyword match (`map_transport_status`); it only *gates nudge timing*, never
   authorizes anything, so an occasional misclassification is low-blast-radius.
-- **The companion tooling (or an operator) populates `sessions`.** Until the
-  per-session-MCP automation writes rows here with the matching token, an
-  operator fills the object-list in by hand.
+- **The operator populates `sessions`.** Each row's `token` is minted via
+  agent-mcp's `register_agent`; the bridge then wires both delivery and (if
+  `expose_mcp`) the per-session MCP itself — no separate provisioning step. On a
+  nix deploy where config.toml is writable (e.g. via `nix-it-in`), rows are added
+  at runtime so tokens stay out of git.
 
 ## Protocol model
 
