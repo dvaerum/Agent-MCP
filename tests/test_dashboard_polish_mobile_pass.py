@@ -30,6 +30,35 @@ silently re-introduce any of them. Tests parse the .tsx files for
 required-class / forbidden-class patterns; no dashboard runtime
 needed (we keep this lightweight per the test_dashboard_*polish*
 pattern set by PR #54).
+
+Contract update — delegation to the shared scaffold
+---------------------------------------------------
+
+The audit was originally written against an architecture where every
+list page re-implemented its own header, skeleton, empty state and
+mobile card-list. The shared foundation (`<DataTablePage>` +
+`<ResponsiveDataTable>`) now owns those concerns, so several of these
+guarantees are **satisfied directly OR by delegation**:
+
+  * CC-3 (Skeleton), CC-6/CC-20 (EmptyState) and CC-7 (mobile
+    card-list) pass if the page carries the marker itself *or* renders
+    through `<DataTablePage>`.
+  * The scaffold is then audited DIRECTLY for each guarantee it
+    absorbs (`test_data_table_page_provides_skeleton_loading`,
+    `test_data_table_page_provides_empty_state`,
+    `test_responsive_data_table_renders_mobile_twin_guard`,
+    `test_data_table_page_renders_responsive_table`), so delegation is
+    an equivalence rather than an exemption.
+  * `test_delegation_detection_is_not_an_escape_hatch` pins the
+    negative cases, so a page that neither carries the marker nor
+    genuinely delegates still fails.
+
+Two file manifests that used to be hardcoded (the `<DialogContent>`
+set and the CC-7 table-dashboard set) are now derived from the tree.
+A hardcoded list breaks when a file is legitimately deleted — that is
+what happened when `delete-memory-modal.tsx` was subsumed by the
+unified `<DeleteConfirmModal>` — and silently skips files nobody
+remembers to add.
 """
 
 from __future__ import annotations
@@ -48,6 +77,48 @@ HOOKS = ROOT / "hooks"
 
 def _read(p: Path) -> str:
     return p.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Shared list-page scaffold — the delegation target
+# ---------------------------------------------------------------------------
+#
+# The CC-3 / CC-6 / CC-7 guarantees below were originally written when
+# EVERY list page re-implemented its own skeleton, empty state and
+# mobile card-list. The shared foundation (`<DataTablePage>` +
+# `<ResponsiveDataTable>`) now owns those concerns for any page that
+# delegates to it, so a per-page grep alone no longer describes the
+# architecture — a migrated page provably still HAS the behaviour, it
+# just doesn't spell it out inline.
+#
+# The contract these tests enforce is therefore:
+#
+#     a page satisfies CC-3 / CC-6 / CC-7 if it contains the marker
+#     ITSELF **or** it renders through <DataTablePage>
+#
+# and — so this is a real equivalence rather than an escape hatch — the
+# scaffold itself is audited directly for each guarantee it absorbs
+# (see the `test_data_table_page_*` / `test_responsive_data_table_*`
+# tests). Net coverage is therefore stronger than the pre-delegation
+# audit: the shared components are now pinned too, and a page that
+# neither carries the marker nor delegates still FAILS (pinned by
+# `test_delegation_detection_is_not_an_escape_hatch`).
+
+DATA_TABLE_PAGE = DASHBOARDS / "shared" / "data-table-page.tsx"
+RESPONSIVE_DATA_TABLE = DASHBOARDS / "shared" / "responsive-data-table.tsx"
+
+_SCAFFOLD_IMPORT_RE = re.compile(
+    r"from\s+[\"']@/components/dashboard/shared/data-table-page[\"']"
+)
+
+
+def _delegates_to_scaffold(src: str) -> bool:
+    """True if this page renders its list through `<DataTablePage>`.
+
+    Requires BOTH the import and an actual `<DataTablePage` render, so
+    a stray type-only import can't be used to opt out of the audit.
+    """
+    return bool(_SCAFFOLD_IMPORT_RE.search(src)) and "<DataTablePage" in src
 
 
 # ---------------------------------------------------------------------------
@@ -104,21 +175,35 @@ def test_tasks_dashboard_uses_theme_tokens_not_raw_palette() -> None:
 # CC-14 — every <DialogContent> needs the mobile-width fallback
 # ---------------------------------------------------------------------------
 
-DIALOG_CONTENT_FILES = [
-    DASHBOARDS / "tasks-dashboard.tsx",
-    DASHBOARDS / "agents-dashboard.tsx",
-    DASHBOARDS / "memories-dashboard.tsx",
-    DASHBOARDS / "messages-dashboard.tsx",
-    DASHBOARDS / "prompt-book-dashboard.tsx",
-    DASHBOARDS / "task-details-dialog.tsx",
-    MODALS / "view-memory-modal.tsx",
-    MODALS / "create-memory-modal.tsx",
-    MODALS / "edit-memory-modal.tsx",
-    MODALS / "delete-memory-modal.tsx",
-    MODALS / "create-prompt-modal.tsx",
-    DASHBOARDS / "onboarding" / "prompt-book-tutorial.tsx",
-    SERVER / "server-management-modal.tsx",
-]
+# Audit surface for CC-14, enumerated DYNAMICALLY.
+#
+# This used to be a hardcoded list of 13 paths. That list was a drift
+# source in both directions: it silently skipped app dialogs nobody
+# remembered to add (it was missing 9 files carrying `<DialogContent>`,
+# one of which had a real un-audited violation), and it hard-FAILED the
+# whole suite when a listed file was legitimately deleted — which is
+# exactly what happened when `delete-memory-modal.tsx` was subsumed by
+# the unified `<DeleteConfirmModal>`. A file list that breaks on a
+# legitimate deletion is testing the manifest, not the code.
+#
+# Globbing the component tree instead means "every dialog we ship" is
+# the audit surface, automatically, forever.
+#
+# `components/ui/` is excluded: those are vendored shadcn primitives
+# (e.g. `command.tsx`'s CommandDialog), not app-authored dialogs — the
+# app-level wrappers around them ARE covered.
+DIALOG_CONTENT_ROOTS = [DASHBOARDS, SERVER]
+
+
+def _dialog_content_files() -> list[Path]:
+    found: list[Path] = []
+    for root in DIALOG_CONTENT_ROOTS:
+        for f in sorted(root.rglob("*.tsx")):
+            if f.name.endswith(".test.tsx"):
+                continue
+            if "<DialogContent" in _read(f):
+                found.append(f)
+    return found
 
 # Match `<DialogContent ... className="..."` with the className value
 # captured. Multi-line tolerant.
@@ -141,10 +226,19 @@ def test_every_dialog_content_has_mobile_width_fallback() -> None:
 
     Sweep applies the same fix to the remaining 18 DialogContent
     usages found by the audit.
+
+    The file set is globbed (see `_dialog_content_files`), so a dialog
+    added tomorrow is audited automatically and a dialog legitimately
+    deleted doesn't red the suite.
     """
+    files = _dialog_content_files()
+    assert files, (
+        "no <DialogContent> sites found under "
+        f"{[str(r) for r in DIALOG_CONTENT_ROOTS]} — the glob is broken, "
+        "which would silently disable this audit"
+    )
     failures: list[str] = []
-    for f in DIALOG_CONTENT_FILES:
-        assert f.is_file(), f"DialogContent audit target missing: {f}"
+    for f in files:
         src = _read(f)
         for m in DIALOG_CONTENT_RE.finditer(src):
             classes = m.group(1)
@@ -166,33 +260,57 @@ def test_every_dialog_content_has_mobile_width_fallback() -> None:
 # CC-7 — mobile card-list sibling for every data-table dashboard
 # ---------------------------------------------------------------------------
 
-TABLE_DASHBOARDS = {
-    "tasks": DASHBOARDS / "tasks-dashboard.tsx",
-    "agents": DASHBOARDS / "agents-dashboard.tsx",
-    "messages": DASHBOARDS / "messages-dashboard.tsx",
-    "memories": DASHBOARDS / "memories-dashboard.tsx",
-}
+def _table_dashboards() -> dict[str, Path]:
+    """Derive the CC-7 audit set instead of hardcoding paths.
+
+    A page is in scope if it either ships a `*-mobile-list.tsx` sibling
+    (the pre-scaffold idiom) or renders through `<DataTablePage>` (the
+    scaffold idiom). Both halves are computed from the tree, so a new
+    list page or a new migration joins the audit with no edit here, and
+    deleting a file can't break the manifest.
+    """
+    targets: dict[str, Path] = {}
+    for mobile in sorted(DASHBOARDS.glob("*-mobile-list.tsx")):
+        slug = mobile.name[: -len("-mobile-list.tsx")]
+        page = DASHBOARDS / f"{slug}-dashboard.tsx"
+        if page.is_file():
+            targets[slug] = page
+    for page in sorted(DASHBOARDS.glob("*-dashboard.tsx")):
+        if _delegates_to_scaffold(_read(page)):
+            targets[page.name[: -len("-dashboard.tsx")]] = page
+    return targets
 
 
 def test_data_tables_have_mobile_card_list_sibling() -> None:
     """At < sm: viewports the desktop <Table> renders are unusable
     (5-7 columns × 10+ rows horizontally overflow on 375 px). Each
-    list dashboard must import a sibling `*-mobile-list` component
-    AND render the `hidden sm:block` (table) / `block sm:hidden`
-    (mobile) twin guard.
+    list dashboard must therefore offer a mobile card alternative —
+    satisfied EITHER directly (import a `*-mobile-list` sibling and
+    render the `hidden sm:block` / `block sm:hidden` twin guard) OR by
+    delegating to `<DataTablePage>`, which renders the twin guard
+    inside `<ResponsiveDataTable>` from one column spec.
+
+    The scaffold's own guarantee is pinned by
+    `test_responsive_data_table_renders_mobile_twin_guard`, so the
+    delegation branch is an equivalence, not an exemption.
     """
+    targets = _table_dashboards()
+    assert targets, "CC-7 audit set derived empty — the derivation is broken"
     failures: list[str] = []
-    for slug, path in TABLE_DASHBOARDS.items():
+    for slug, path in targets.items():
         src = _read(path)
-        # Look for `*-mobile-list` import (camelCase or kebab-case form).
+        # Branch 1 — the page delegates the whole table shell.
+        if _delegates_to_scaffold(src):
+            continue
+        # Branch 2 — the page renders its own table + mobile twin.
         mobile_import = re.search(
             rf"from\s+[\"']@/components/dashboard/{slug}-mobile-list[\"']",
             src,
         )
         if not mobile_import:
             failures.append(
-                f"{path}: no `import … from '@/components/dashboard/"
-                f"{slug}-mobile-list'` found"
+                f"{path}: neither renders via <DataTablePage> nor imports "
+                f"'@/components/dashboard/{slug}-mobile-list'"
             )
             continue
         # Look for the twin-guard idiom: hidden sm:block AND sm:hidden.
@@ -210,6 +328,39 @@ def test_data_tables_have_mobile_card_list_sibling() -> None:
     )
 
 
+def test_responsive_data_table_renders_mobile_twin_guard() -> None:
+    """The scaffold half of CC-7: `<ResponsiveDataTable>` must itself
+    render the desktop/mobile twin guard, because every page that
+    delegates inherits its mobile behaviour from exactly this file.
+    """
+    assert RESPONSIVE_DATA_TABLE.is_file(), (
+        f"expected the shared responsive table at {RESPONSIVE_DATA_TABLE}"
+    )
+    src = _read(RESPONSIVE_DATA_TABLE)
+    missing = [c for c in ("hidden sm:block", "sm:hidden") if c not in src]
+    assert not missing, (
+        f"{RESPONSIVE_DATA_TABLE}: missing twin-guard class(es) "
+        f"{missing}. Every <DataTablePage> page inherits its mobile "
+        "card-list from this component (CC-7)."
+    )
+
+
+def test_data_table_page_renders_responsive_table() -> None:
+    """`<DataTablePage>` must actually route its rows through
+    `<ResponsiveDataTable>` — otherwise the CC-7 delegation branch
+    above would be vacuous.
+    """
+    assert DATA_TABLE_PAGE.is_file(), (
+        f"expected the shared list-page scaffold at {DATA_TABLE_PAGE}"
+    )
+    src = _read(DATA_TABLE_PAGE)
+    assert "<ResponsiveDataTable" in src, (
+        f"{DATA_TABLE_PAGE}: does not render <ResponsiveDataTable>. "
+        "Pages delegating to the scaffold would then have no mobile "
+        "card-list at all (CC-7)."
+    )
+
+
 # ---------------------------------------------------------------------------
 # CC-3 — Skeleton loading
 # ---------------------------------------------------------------------------
@@ -217,11 +368,16 @@ def test_data_tables_have_mobile_card_list_sibling() -> None:
 
 def test_list_dashboards_use_skeleton_loading() -> None:
     """Each list dashboard (tasks, agents, messages, memories,
-    prompt-book) must import `Skeleton` from `@/components/ui/skeleton`
-    — either directly or transitively via a per-page loading
-    sub-component. Today every page falls back to "Loading…" text or
-    blank, which is sloppy. The shadcn primitive ships in the repo
-    but is unused.
+    prompt-book) must render a `Skeleton` loading state — satisfied by
+    a direct `@/components/ui/skeleton` import, a per-page
+    `*-loading` sub-component that imports it, OR delegation to
+    `<DataTablePage>` (which owns the stats+rows skeleton for every
+    page that renders through it — pinned by
+    `test_data_table_page_provides_skeleton_loading`).
+
+    Before any of these existed every page fell back to "Loading…"
+    text or a blank pane, which is sloppy; the shadcn primitive
+    shipped in the repo but was unused.
     """
     targets = {
         "tasks": DASHBOARDS / "tasks-dashboard.tsx",
@@ -250,13 +406,30 @@ def test_list_dashboards_use_skeleton_loading() -> None:
                     r"from\s+[\"']@/components/ui/skeleton[\"']",
                     loading_src,
                 ))
-        if not (direct or loading_sub_uses_skeleton):
+        if not (direct or loading_sub_uses_skeleton or _delegates_to_scaffold(src)):
             failures.append(
-                f"{path}: neither direct Skeleton import nor a "
-                f"{slug}-loading sub-component using Skeleton"
+                f"{path}: no direct Skeleton import, no {slug}-loading "
+                "sub-component using Skeleton, and no <DataTablePage> "
+                "delegation"
             )
     assert not failures, (
         "Skeleton loading missing (CC-3):\n  " + "\n  ".join(failures)
+    )
+
+
+def test_data_table_page_provides_skeleton_loading() -> None:
+    """The scaffold half of CC-3: every page delegating to
+    `<DataTablePage>` inherits its loading state from this file, so
+    the file must actually import and render the Skeleton primitive.
+    """
+    src = _read(DATA_TABLE_PAGE)
+    assert re.search(r"from\s+[\"']@/components/ui/skeleton[\"']", src), (
+        f"{DATA_TABLE_PAGE}: does not import the Skeleton primitive. "
+        "Pages delegating to the scaffold would then have no skeleton "
+        "loading state (CC-3)."
+    )
+    assert "<Skeleton" in src, (
+        f"{DATA_TABLE_PAGE}: imports Skeleton but never renders it (CC-3)."
     )
 
 
@@ -276,9 +449,18 @@ def test_empty_state_primitive_exists() -> None:
     )
 
 
+EMPTY_STATE_IMPORT_RE = re.compile(
+    r"from\s+[\"']@/components/dashboard/shared/empty-state[\"']"
+)
+
+
 def test_list_dashboards_import_empty_state() -> None:
-    """Each list dashboard + messages dashboard imports the shared
-    EmptyState primitive (CC-6, CC-20)."""
+    """Each list dashboard + messages dashboard renders the shared
+    EmptyState primitive (CC-6, CC-20) — satisfied either by importing
+    it directly or by delegating to `<DataTablePage>`, which renders
+    `<EmptyState>` for its `empty` prop (pinned by
+    `test_data_table_page_provides_empty_state`).
+    """
     targets = [
         DASHBOARDS / "tasks-dashboard.tsx",
         DASHBOARDS / "agents-dashboard.tsx",
@@ -289,14 +471,84 @@ def test_list_dashboards_import_empty_state() -> None:
     failures: list[str] = []
     for path in targets:
         src = _read(path)
-        if not re.search(
-            r"from\s+[\"']@/components/dashboard/shared/empty-state[\"']",
-            src,
+        if not (
+            EMPTY_STATE_IMPORT_RE.search(src) or _delegates_to_scaffold(src)
         ):
             failures.append(str(path))
     assert not failures, (
         "EmptyState primitive not imported (CC-6/CC-20):\n  "
         + "\n  ".join(failures)
+    )
+
+
+def test_delegation_detection_is_not_an_escape_hatch() -> None:
+    """Guard the guard.
+
+    The CC-3 / CC-6 / CC-7 tests accept "renders via <DataTablePage>"
+    in place of an inline marker. That is only sound while
+    `_delegates_to_scaffold` stays strict, so pin its negative cases:
+    a page with no scaffold reference, and a page that imports the
+    scaffold type but never renders it, must BOTH be treated as
+    non-delegating and therefore still be required to carry their own
+    markers.
+    """
+    assert not _delegates_to_scaffold(
+        "export function X(){ return <div>plain page</div> }"
+    ), "a page with no scaffold reference must not count as delegating"
+
+    import_only = (
+        "import type { DataTablePageProps } from "
+        "'@/components/dashboard/shared/data-table-page'\n"
+        "export function X(){ return <div>hand-rolled</div> }"
+    )
+    assert not _delegates_to_scaffold(import_only), (
+        "importing the scaffold without rendering <DataTablePage> must "
+        "not satisfy the audit — otherwise a page could opt out of "
+        "CC-3/CC-6/CC-7 with a single unused import"
+    )
+
+    render_only = "export function X(){ return <DataTablePage /> }"
+    assert not _delegates_to_scaffold(render_only), (
+        "a <DataTablePage> render with no matching import must not "
+        "count as delegating"
+    )
+
+    real = (
+        "import { DataTablePage } from "
+        "'@/components/dashboard/shared/data-table-page'\n"
+        "export function X(){ return <DataTablePage rows={[]} /> }"
+    )
+    assert _delegates_to_scaffold(real), (
+        "a genuine import + render must be recognised as delegating"
+    )
+
+    # And the audit must still be watching at least one page that does
+    # NOT delegate — otherwise every assertion above is vacuous and the
+    # per-page markers would go unchecked repo-wide.
+    non_delegating = [
+        p
+        for p in sorted(DASHBOARDS.glob("*-dashboard.tsx"))
+        if not _delegates_to_scaffold(_read(p))
+    ]
+    assert non_delegating, (
+        "every dashboard now delegates — re-point these audits at the "
+        "shared components directly instead of leaving them vacuous"
+    )
+
+
+def test_data_table_page_provides_empty_state() -> None:
+    """The scaffold half of CC-6/CC-20: pages delegating to
+    `<DataTablePage>` inherit their empty state from this file.
+    """
+    src = _read(DATA_TABLE_PAGE)
+    assert EMPTY_STATE_IMPORT_RE.search(src), (
+        f"{DATA_TABLE_PAGE}: does not import the shared EmptyState "
+        "primitive. Pages delegating to the scaffold would then have no "
+        "empty state (CC-6/CC-20)."
+    )
+    assert "<EmptyState" in src, (
+        f"{DATA_TABLE_PAGE}: imports EmptyState but never renders it "
+        "(CC-6/CC-20)."
     )
 
 
