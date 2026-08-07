@@ -1,5 +1,6 @@
 # Agent-MCP/mcp_template/mcp_server_src/app/main_app.py
 import asyncio
+import contextlib
 import contextvars
 import json
 import os
@@ -1267,20 +1268,34 @@ class _McpAsgiApp:
                 for t in pending:
                     t.cancel()
                 # Surface pump errors (disconnect is expected to
-                # finish first under normal usage).
+                # finish first under normal usage) — EXCEPT a write that
+                # failed because the peer left. That is this stream
+                # ending normally, so re-raising it would make the ASGI
+                # server log an application-error traceback for a closed
+                # tab. uvicorn happens to drop sends after it has seen
+                # the disconnect, so today that write usually never
+                # raises; this keeps the behaviour correct rather than
+                # incidental (and under any other ASGI server).
                 for t in done:
                     if t is pump_task and not t.cancelled():
                         exc = t.exception()
-                        if exc is not None:
+                        if isinstance(exc, ConnectionError):
+                            logger.debug(
+                                "session_registry: GET /mcp peer gone "
+                                "mid-stream session=%s: %s", session_id, exc,
+                            )
+                        elif exc is not None:
                             raise exc
             finally:
                 disconnect_task.cancel()
                 pump_task.cancel()
 
-            try:
+            # Final empty body frame closes the response cleanly. The
+            # peer is often already gone by here (that is what ended the
+            # stream), so a connection error is the expected outcome,
+            # not a fault.
+            with contextlib.suppress(ConnectionError):
                 await send({"type": "http.response.body", "body": b"", "more_body": False})
-            except Exception:  # pragma: no cover - peer already gone
-                pass
         finally:
             session_registry.detach_runtime_queue(session_id)
             session_registry.unregister_session(session_id)
