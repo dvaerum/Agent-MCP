@@ -25,28 +25,44 @@ const read = (rel: string) =>
 
 // ── UX-08: group delete type-to-confirm guard ─────────────────────
 
+// The guard used to live in a bespoke `DeleteGroupModal` inside
+// groups-dashboard.tsx (`confirmText.trim() === group.name`). The
+// shared-scaffold migration retired that copy in favour of the unified
+// <DeleteConfirmModal> with `requiredWord` + `matchCase`. UX-08 is
+// therefore pinned in two halves: the page must still demand the
+// group's exact NAME, and the shared modal must still gate on it.
 describe("UX-08: group deletion type-to-confirm", () => {
   const src = read("components/dashboard/groups-dashboard.tsx")
+  const modal = read("components/dashboard/modals/delete-confirm-modal.tsx")
 
-  it("compares a typed confirmation against the group name", () => {
-    // The guard is `confirmText.trim() === group.name`; if that check
-    // disappears the Delete button would no longer require the name.
+  it("requires the group's own name as the confirmation word", () => {
     expect(
-      /confirmText\s*\.trim\(\)\s*===\s*group\.name/.test(src),
-      "DeleteGroupModal must compare confirmText to group.name",
+      /requiredWord=\{deleteTarget\?\.name/.test(src),
+      "groups-dashboard must pass the group name as requiredWord",
+    ).toBe(true)
+  })
+
+  it("confirms the name case-sensitively (no 'devs' for 'Devs')", () => {
+    expect(
+      /matchCase/.test(src),
+      "groups-dashboard must pass matchCase so the name is exact",
+    ).toBe(true)
+    expect(
+      /matchCase\s*\n?\s*\?\s*confirmationText === requiredWord/.test(modal),
+      "DeleteConfirmModal must compare exactly when matchCase is set",
     ).toBe(true)
   })
 
   it("disables the Delete button until the name is confirmed", () => {
     expect(
-      /disabled=\{submitting \|\| !confirmed\}/.test(src),
-      "Delete button must be disabled while !confirmed",
+      /disabled=\{loading \|\| !isConfirmed\}/.test(modal),
+      "Delete button must be disabled while !isConfirmed",
     ).toBe(true)
   })
 
   it("guards the delete request behind the confirmation", () => {
     expect(
-      /if \(!confirmed\) return/.test(src),
+      /if \(!isConfirmed\) return/.test(modal),
       "handleDelete must bail when not confirmed",
     ).toBe(true)
   })

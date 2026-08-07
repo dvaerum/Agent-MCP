@@ -56,6 +56,17 @@ export interface ResponsiveDataTableProps<T> {
   renderMobileCard?: (row: T) => React.ReactNode
   /** Extra classes on each desktop body <tr>. */
   rowClassName?: string
+  /**
+   * Optional expandable detail for a row (accordion pages such as
+   * Groups, whose row expands to show its members + capabilities).
+   * Return a falsy value for a collapsed row.
+   *
+   * Desktop: a full-width `colSpan` sibling `<tr>` is emitted directly
+   * beneath the row. Mobile auto-stack: the content is appended inside
+   * the row's `<li>`. A page supplying `renderMobileCard` owns its
+   * mobile rendering entirely and therefore its own mobile expansion.
+   */
+  renderExpanded?: (row: T) => React.ReactNode
 }
 
 const HIDE_BELOW_CLASS: Record<NonNullable<Column<unknown>["hideBelow"]>, string> = {
@@ -71,6 +82,7 @@ export function ResponsiveDataTable<T>({
   onRowClick,
   renderMobileCard,
   rowClassName,
+  renderExpanded,
 }: ResponsiveDataTableProps<T>): React.ReactElement {
   return (
     <>
@@ -97,29 +109,43 @@ export function ResponsiveDataTable<T>({
             </TableRow>
           </TableHeader>
           <TableBody>
-            {rows.map((row) => (
-              <TableRow
-                key={getRowId(row)}
-                className={cn(
-                  "border-border/50 hover:bg-muted/30 group transition-all duration-200",
-                  onRowClick && "cursor-pointer",
-                  rowClassName,
-                )}
-                onClick={onRowClick ? () => onRowClick(row) : undefined}
-              >
-                {columns.map((col) => (
-                  <TableCell
-                    key={col.id}
+            {rows.map((row) => {
+              const expanded = renderExpanded?.(row)
+              return (
+                <React.Fragment key={getRowId(row)}>
+                  <TableRow
                     className={cn(
-                      col.hideBelow && HIDE_BELOW_CLASS[col.hideBelow],
-                      col.cellClassName,
+                      "border-border/50 hover:bg-muted/30 group transition-all duration-200",
+                      onRowClick && "cursor-pointer",
+                      rowClassName,
                     )}
+                    onClick={onRowClick ? () => onRowClick(row) : undefined}
                   >
-                    {col.cell(row)}
-                  </TableCell>
-                ))}
-              </TableRow>
-            ))}
+                    {columns.map((col) => (
+                      <TableCell
+                        key={col.id}
+                        className={cn(
+                          col.hideBelow && HIDE_BELOW_CLASS[col.hideBelow],
+                          col.cellClassName,
+                        )}
+                      >
+                        {col.cell(row)}
+                      </TableCell>
+                    ))}
+                  </TableRow>
+                  {expanded ? (
+                    <TableRow
+                      data-slot="data-table-expanded"
+                      className="border-border/50 hover:bg-transparent"
+                    >
+                      <TableCell colSpan={columns.length} className="p-0">
+                        {expanded}
+                      </TableCell>
+                    </TableRow>
+                  ) : null}
+                </React.Fragment>
+              )
+            })}
           </TableBody>
         </Table>
       </div>
@@ -157,6 +183,7 @@ export function ResponsiveDataTable<T>({
                       <span className="min-w-0">{col.cell(row)}</span>
                     </div>
                   ))}
+                {renderExpanded?.(row)}
               </li>
             ),
           )}
