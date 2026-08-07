@@ -32,10 +32,18 @@
 # "interactive dev sandbox" framing Dennis confirmed in the
 # prancy-napping-pie plan's VM E2E section.
 #
+# This VM runs in EXTERNAL LLM MODE (nix/vm-dev.nix passes
+# llm = "external" to nix/vm.nix): no ollama inside the guest, no
+# model weights preloaded, 2 GB of guest RAM instead of 4 GB. The
+# price is that the chat + embedding endpoints must already be
+# running on the HOST — the guest reaches them via qemu user-mode's
+# 10.0.2.2 host alias. A boot-time probe unit hard-fails, naming the
+# URLs, rather than letting a backend run with dead embeddings.
+#
 # The flake hard-substitutes @VM_DEV@ at build time with the absolute
 # store path of the dev VM derivation (which differs from vm-multi
-# in forwardPorts, the env-var operator seed on the router unit, and
-# the dev-mode SSH stack).
+# in forwardPorts, the env-var operator seed on the router unit, the
+# external LLM wiring, and the dev-mode SSH stack).
 set -euo pipefail
 
 VM_DEV="@VM_DEV@"
@@ -136,6 +144,10 @@ else
 fi
 
 export NIX_DISK_IMAGE="$state_dir/disk.qcow2"
+# Unused while nix/vm-dev.nix runs with llm = "external" (no in-guest
+# ollama ⇒ no 9p model share referencing this var). Kept — and the dir
+# still created — so flipping vm-dev.nix back to llm = "internal"
+# doesn't fail the launch on an unbound var under `set -u`.
 export AGENT_MCP_OLLAMA_DIR="$state_dir/ollama"
 mkdir -p -- "$AGENT_MCP_OLLAMA_DIR"
 export TMPDIR="$state_dir"
@@ -191,6 +203,12 @@ agent-mcp-vm-dev: booting Path B interactive sandbox
 agent-mcp-vm-dev: dashboard      http://localhost:${host_port}/agent-mcp/
 agent-mcp-vm-dev: ssh access     ssh root@localhost -p ${ssh_port}  (no password — DEV-MODE)
 agent-mcp-vm-dev: operator       dev / dev  (seeded via env-var bootstrap)
+agent-mcp-vm-dev: llm mode       external — 2 GB guest, endpoints on the HOST:
+agent-mcp-vm-dev:                  chat       127.0.0.1:11435  (guest: 10.0.2.2)
+agent-mcp-vm-dev:                  embeddings 127.0.0.1:11434  (guest: 10.0.2.2)
+agent-mcp-vm-dev:                start them before booting — the guest's
+agent-mcp-vm-dev:                agent-mcp-llm-endpoint-check.service refuses
+agent-mcp-vm-dev:                to let the backend run against dead endpoints.
 agent-mcp-vm-dev: state dir      ${state_dir}
 agent-mcp-vm-dev: host port      ${host_port}$( [[ "$host_port" != "$DEFAULT_HOST_PORT" ]] && echo " (override via AGENT_MCP_VM_DEV_HOST_PORT)" )
 agent-mcp-vm-dev: ssh port       ${ssh_port}$( [[ "$ssh_port" != "$DEFAULT_SSH_PORT" ]] && echo " (override via AGENT_MCP_VM_DEV_SSH_PORT)" )
