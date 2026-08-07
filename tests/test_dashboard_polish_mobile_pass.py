@@ -106,6 +106,7 @@ def _read(p: Path) -> str:
 
 DATA_TABLE_PAGE = DASHBOARDS / "shared" / "data-table-page.tsx"
 RESPONSIVE_DATA_TABLE = DASHBOARDS / "shared" / "responsive-data-table.tsx"
+DASHBOARD_HEADER = DASHBOARDS / "shared" / "dashboard-header.tsx"
 
 _SCAFFOLD_IMPORT_RE = re.compile(
     r"from\s+[\"']@/components/dashboard/shared/data-table-page[\"']"
@@ -769,27 +770,69 @@ def test_prompt_book_header_actions_reflow_on_mobile() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _h1_uses_text_foreground(src: str, title: str) -> tuple[bool, str]:
+    """Locate the `<h1>` wrapping `title` and report whether it carries
+    `text-foreground`. Returns (ok, detail) — detail is the offending
+    tag (or a not-found note) for the failure message.
+    """
+    title_idx = src.find(title)
+    if title_idx < 0:
+        return False, f"H1 text {title!r} not found"
+    region_start = src.rfind("<h1", 0, title_idx)
+    if region_start < 0:
+        return False, f"no <h1> tag precedes {title!r}"
+    region_end = src.find(">", region_start) + 1
+    if region_end <= region_start:
+        return False, f"unterminated <h1> tag before {title!r}"
+    h1_tag = src[region_start:region_end]
+    return "text-foreground" in h1_tag, h1_tag[:200]
+
+
 def test_tasks_h1_uses_text_foreground() -> None:
-    """The Tasks page H1 today reads `text-fluid-2xl font-bold
+    """The Tasks page H1 once read `text-fluid-2xl font-bold
     text-white dark:text-white text-slate-900` — Tailwind v4 emits
     `text-white` AFTER `text-slate-900` in the generated stylesheet
     (utilities are ordered, not source-order), so the always-on
     `text-white` wins over the always-on `text-slate-900` and the
-    H1 disappears on light-mode white backgrounds. Switch to
+    H1 disappears on light-mode white backgrounds. It must use
     `text-foreground` (semantic token).
+
+    Delegation-aware, same equivalence as CC-3/CC-6/CC-7: the page
+    satisfies this either by rendering its own `<h1>` or by handing the
+    title to `<DataTablePage header={{title: ...}}>`, whose
+    `<DashboardHeader>` renders the `<h1>`. The delegating branch is
+    NOT an exemption — it additionally requires that the page really
+    passes "Task Operations" as the header title, and the scaffold half
+    is pinned directly by
+    `test_dashboard_header_h1_uses_text_foreground`.
     """
     src = _read(TASKS)
-    title_idx = src.find("Task Operations")
-    assert title_idx >= 0, "Tasks H1 'Task Operations' text not found"
-    region_start = src.rfind("<h1", 0, title_idx)
-    region_end = src.find(">", region_start) + 1
-    assert region_start >= 0 and region_end > region_start, (
-        "couldn't locate the H1 JSX tag wrapping 'Task Operations'"
-    )
-    h1_tag = src[region_start:region_end]
-    assert "text-foreground" in h1_tag, (
+    if _delegates_to_scaffold(src):
+        assert re.search(r"title:\s*['\"]Task Operations['\"]", src), (
+            f"{TASKS}: delegates to <DataTablePage> but does not pass "
+            "`title: 'Task Operations'` in its `header` prop — the page "
+            "would then have no H1 at all (CC-21)."
+        )
+        return
+    ok, detail = _h1_uses_text_foreground(src, "Task Operations")
+    assert ok, (
         f"{TASKS}: Tasks H1 must use `text-foreground` (semantic "
         "token), not the broken `text-white dark:text-white "
         "text-slate-900` triplet that resolves to invisible white "
-        "text in light mode. Current H1 tag:\n  " + h1_tag[:200]
+        "text in light mode. Current H1 tag:\n  " + detail
+    )
+
+
+def test_dashboard_header_h1_uses_text_foreground() -> None:
+    """The scaffold half of CC-21: every page that hands its title to
+    `<DashboardHeader>` (directly or via `<DataTablePage>`) inherits
+    its H1 styling from exactly this file, so the shared header must
+    itself use the semantic token.
+    """
+    src = _read(DASHBOARD_HEADER)
+    ok, detail = _h1_uses_text_foreground(src, "{title}")
+    assert ok, (
+        f"{DASHBOARD_HEADER}: the shared header's H1 must use "
+        "`text-foreground`; every delegating page's title is rendered "
+        "here. Current H1 tag:\n  " + detail
     )

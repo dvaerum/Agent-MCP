@@ -61,15 +61,30 @@ def test_row_body_click_opens_view_dialog() -> None:
     handler takes the row's identity field (``task.task_id``) rather
     than the row itself so the dialog can read the row live from the
     source.
+
+    Two accepted shapes, because the row markup moved into the shared
+    scaffold (PR #581): the pre-scaffold ``<TableRow onClick={() =>
+    openView(task.task_id)}>``, or the scaffold's row-click slot
+    ``<DataTablePage onRowClick={(task) => openView(task.task_id)}>``.
+    The GUARANTEE is unchanged — a row-body click routes to the same
+    ``openView`` the eye icon uses — only the prop that carries it
+    differs. Neither shape accepts the legacy handleTaskClick /
+    setSelectedTask sidebar path.
     """
     src = _read_tasks()
-    # The TableRow onClick should call openView(task.task_id) — not the
-    # legacy handleTaskClick / setSelectedTask path.
-    assert re.search(r"onClick=\{\(\)\s*=>\s*openView\(task\.task_id\)\}", src), (
-        "TableRow onClick must call openView(task.task_id) so the row "
-        "body opens the View dialog (same as the eye icon) and the "
-        "live-lookup useDialog reads the row from the store on every "
-        "render"
+    table_row_click = re.search(
+        r"onClick=\{\(\)\s*=>\s*openView\(task\.task_id\)\}", src
+    )
+    scaffold_row_click = re.search(
+        r"onRowClick=\{\(task\)\s*=>\s*openView\(task\.task_id\)\}", src
+    )
+    assert table_row_click or scaffold_row_click, (
+        "the row body must call openView(task.task_id) — either as the "
+        "TableRow `onClick={() => openView(task.task_id)}` or as the "
+        "<DataTablePage> `onRowClick={(task) => openView(task.task_id)}` "
+        "— so the row body opens the View dialog (same as the eye icon) "
+        "and the live-lookup useDialog reads the row from the store on "
+        "every render"
     )
 
 
