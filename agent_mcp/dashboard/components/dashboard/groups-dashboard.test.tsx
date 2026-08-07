@@ -21,8 +21,6 @@ import { setupUser } from "@/tests/support/user-event"
 
 import { ApiError } from "@/lib/api"
 
-// Radix Dialog locks pointer-events on <body>; disable the guard.
-
 const requestMock = vi.fn()
 vi.mock("@/lib/router-api", () => ({
   routerApi: { request: (...args: unknown[]) => requestMock(...args) },

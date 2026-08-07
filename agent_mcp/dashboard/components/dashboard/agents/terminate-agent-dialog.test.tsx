@@ -11,8 +11,6 @@ import { setupUser } from "@/tests/support/user-event"
 
 import { TerminateAgentDialog } from "@/components/dashboard/agents/terminate-agent-dialog"
 
-// Radix Dialog locks `pointer-events: none` on <body> while open.
-
 afterEach(() => cleanup())
 
 describe("<TerminateAgentDialog>", () => {

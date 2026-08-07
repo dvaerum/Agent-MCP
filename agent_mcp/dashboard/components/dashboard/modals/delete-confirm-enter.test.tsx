@@ -9,10 +9,6 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
 import { render, cleanup, waitFor } from "@testing-library/react"
 import { setupUser } from "@/tests/support/user-event"
 
-// Radix Dialog locks `pointer-events: none` on <body> while open; that
-// makes user-event's default pointer-events guard throw. Disable the
-// guard — we drive the input via keyboard, not real pointer hit-testing.
-
 import { DeleteConfirmModal } from "@/components/dashboard/modals/delete-confirm-modal"
 
 // The groups delete modal calls the router API directly; stub it so the
