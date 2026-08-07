@@ -4,7 +4,8 @@
 //! Each reconcile pass (every `status_interval_secs`, or immediately on a
 //! `plugin.settings.changed` nudge):
 //! 1. load settings via `config.get`;
-//! 2. list live sessions via `sessions.list`;
+//! 2. fetch per-session liveness via AoE's web REST `GET /api/sessions`
+//!    (worker state, not just status — so a stopped session reads `dormant`);
 //! 3. resolve the per-session routes;
 //! 4. for each live route: POST its transport-status, and ensure exactly one
 //!    SSE task is running (respawning it if its endpoint/token/mode/AoE creds
@@ -26,9 +27,9 @@ use serde_json::json;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use crate::config::{self, Route, SessionRecord};
+use crate::config::{self, Liveness, Route};
 use crate::inject::{build_injection, build_mcp_set_params, delivery_url, extract_sse_data};
-use crate::mode::map_transport_status;
+use crate::mode::classify_transport_status;
 use crate::plugin::PluginConn;
 use crate::render::{parse_frame, render_skinny};
 
@@ -65,7 +66,7 @@ pub async fn run_bridge(conn: Arc<PluginConn>, reconcile: Arc<Notify>) {
             }
             mcp_set.clear();
         } else {
-            let live = fetch_live_sessions(&conn).await;
+            let live = fetch_liveness(&http, &settings.aoe_base, &settings.aoe_token).await;
             let ctx = Arc::new(BridgeCtx {
                 http: http.clone(),
                 aoe_base: settings.aoe_base.clone(),
@@ -79,10 +80,21 @@ pub async fn run_bridge(conn: Arc<PluginConn>, reconcile: Arc<Notify>) {
                 if route.live {
                     wanted.insert(route.session_id.clone());
 
-                    // Report transport-status from the live record.
+                    // Report transport-status from the live record's worker
+                    // liveness. A present record with no running worker maps to
+                    // `dormant` (not the old, misleading `idle`). `route.live`
+                    // is true here, so the record is present; the fallback is
+                    // unreachable.
                     let status = live
                         .get(&route.session_id)
-                        .map(|r| map_transport_status(&format!("{} {}", r.tool, r.status)))
+                        .map(|r| {
+                            classify_transport_status(
+                                &r.status,
+                                &r.acp_worker_state,
+                                r.has_terminal,
+                                r.dormant,
+                            )
+                        })
                         .unwrap_or("idle");
                     report_status(&ctx, &route.endpoint, &route.token, status).await;
 
@@ -145,27 +157,38 @@ pub async fn run_bridge(conn: Arc<PluginConn>, reconcile: Arc<Notify>) {
     }
 }
 
-/// `sessions.list` → id→record map. Empty on any failure (a failed list just
-/// means no live sessions this tick; next tick retries).
-async fn fetch_live_sessions(conn: &PluginConn) -> HashMap<String, SessionRecord> {
-    let value = match conn.sessions_list().await {
-        Ok(v) => v,
+/// AoE web REST `GET {aoe_base}/api/sessions` → id→liveness map. This is the
+/// source of both session existence and worker liveness (replacing the plugin
+/// `sessions.list`, which cannot tell a stopped session from an idle one).
+///
+/// Empty on ANY failure (transport, non-2xx, or decode): a failed fetch means
+/// no liveness this tick, so no session is treated as live and the next tick
+/// retries. The `Authorization` header is sent only when `aoe_token` is
+/// non-empty (an `--auth=none` AoE instance needs no bearer).
+async fn fetch_liveness(
+    http: &reqwest::Client,
+    aoe_base: &str,
+    aoe_token: &str,
+) -> HashMap<String, Liveness> {
+    let url = format!("{}/api/sessions", aoe_base.trim_end_matches('/'));
+    let mut req = http.get(&url).header(ACCEPT, "application/json");
+    if !aoe_token.trim().is_empty() {
+        req = req.header(AUTHORIZATION, format!("Bearer {aoe_token}"));
+    }
+    let value = match req.send().await.and_then(|r| r.error_for_status()) {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(v) => v,
+            Err(e) => {
+                crate::log(&format!("GET {url} decode failed: {e}"));
+                return HashMap::new();
+            }
+        },
         Err(e) => {
-            crate::log(&format!("sessions.list failed: {e}"));
+            crate::log(&format!("GET {url} failed: {e}"));
             return HashMap::new();
         }
     };
-    let mut map = HashMap::new();
-    if let Some(arr) = value.get("sessions").and_then(|s| s.as_array()) {
-        for item in arr {
-            if let Ok(rec) = serde_json::from_value::<SessionRecord>(item.clone()) {
-                if !rec.id.is_empty() {
-                    map.insert(rec.id.clone(), rec);
-                }
-            }
-        }
-    }
-    map
+    config::parse_liveness(&value)
 }
 
 /// Reconcile one live session's per-session MCP layer with its resolved route.
