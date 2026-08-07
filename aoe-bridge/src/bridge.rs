@@ -157,6 +157,12 @@ pub async fn run_bridge(
                 live.len()
             ));
 
+            // Every session the settings still cover, live or not. The page is
+            // retained on THIS (not `wanted`): "configured but the session is
+            // gone" is precisely the state an operator needs to see, so a dead
+            // session must stay listed rather than vanish from the page.
+            let covered: HashSet<String> = routes.iter().map(|r| r.session_id.clone()).collect();
+
             for route in routes {
                 let fingerprint = route.fingerprint(&settings.aoe_base, &settings.aoe_token);
                 if route.live {
@@ -276,12 +282,12 @@ pub async fn run_bridge(
                 acp_enabled.remove(&k);
             }
 
-            // Sessions that vanished from the settings also vanish from the page.
+            // Only sessions REMOVED from the settings vanish from the page.
             state
                 .lock()
                 .unwrap()
                 .sessions
-                .retain(|k, _| wanted.contains(k) || tasks.contains_key(k));
+                .retain(|k, _| covered.contains(k));
         }
 
         let _ = publish.send(PublishReason::Tick);

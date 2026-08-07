@@ -378,7 +378,10 @@ pub fn classify_health(snap: &Snapshot) -> Health {
     if snap.failing_count() > 0 {
         return Health::Degraded;
     }
-    if snap.sessions.is_empty() {
+    // No LIVE session is idle, not healthy — "Delivering to 0 sessions" must
+    // never read green. Covers both "nothing configured" and "every covered
+    // session has stopped".
+    if snap.live_count() == 0 {
         return Health::Idle;
     }
     Health::Healthy
@@ -724,6 +727,32 @@ mod tests {
         let mut ok = live_session("a");
         ok.note_inject(succeeded(10));
         assert_eq!(classify_health(&snap_with(vec![ok])), Health::Healthy);
+    }
+
+    #[test]
+    fn covered_sessions_that_all_stopped_are_idle_not_healthy() {
+        // "Delivering to 0 session(s)" must never render green: a covered
+        // session that died is a state the operator has to notice.
+        let mut stopped = live_session("a");
+        stopped.live = false;
+        let s = snap_with(vec![stopped]);
+        assert_eq!(classify_health(&s), Health::Idle);
+        let rendered = render_page(&s, 2_000, None, Level::Info).to_string();
+        assert!(!rendered.contains("\"tone\":\"success\""), "{rendered}");
+        assert!(
+            rendered.contains("none resolved to a live session"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_stopped_session_still_appears_on_the_page() {
+        let mut stopped = live_session("ghost");
+        stopped.live = false;
+        stopped.transport_status = "dead".to_string();
+        let rendered = render_page(&snap_with(vec![stopped]), 2_000, None, Level::Info).to_string();
+        assert!(rendered.contains("ghost"), "{rendered}");
+        assert!(rendered.contains("not live"), "{rendered}");
     }
 
     // ---- notify gating ----------------------------------------------------
