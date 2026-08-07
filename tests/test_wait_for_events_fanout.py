@@ -261,11 +261,18 @@ async def test_single_waiter_still_receives_event(tmp_path: Path) -> None:
 async def test_two_waiters_newest_survives_older_superseded(
     tmp_path: Path,
 ) -> None:
-    """Two near-simultaneous waiters, no event during the window: under
+    """Two overlapping waiters, no event during the window: under
     newest-wins exactly ONE is superseded (connection_superseded) and the
     other (the survivor) times out with an empty envelope. Neither errors.
-    Order-agnostic — which of the two wins depends on registration
-    scheduling."""
+
+    The two waiters must genuinely OVERLAP for the supersede to happen —
+    the second has to register while the first is still parked. A plain
+    ``asyncio.gather(waiter(), waiter())`` does not guarantee that: the
+    two calls are free to run end-to-end one after the other, in which
+    case nothing is ever superseded and both just time out empty. That
+    is exactly what happened on Python 3.11 (deterministically; 3.12+
+    happened to interleave), so the overlap is now established
+    explicitly — same stagger as test 1 above."""
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
 
@@ -274,9 +281,11 @@ async def test_two_waiters_newest_survives_older_superseded(
                 "wait_for_events", {"timeout_seconds": 1}
             )
 
-        first_blocks, second_blocks = await asyncio.gather(
-            waiter(), waiter()
-        )
+        first = asyncio.create_task(waiter())
+        await asyncio.sleep(0.3)   # first parks
+        second = asyncio.create_task(waiter())
+
+        first_blocks, second_blocks = await asyncio.gather(first, second)
         bodies = [_envelope(first_blocks), _envelope(second_blocks)]
 
         for b in bodies:
