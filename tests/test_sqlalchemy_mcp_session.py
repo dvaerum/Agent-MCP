@@ -25,12 +25,11 @@ import pytest
 
 from tests.harness import mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 
 def _now_utc_iso() -> str:
-    return _dt.datetime.now(_dt.timezone.utc).isoformat()
+    return _dt.datetime.now(_dt.UTC).isoformat()
 
 
 def _hash(token: str) -> str:
@@ -307,7 +306,7 @@ async def test_expire_stale_deletes_old_rows(tmp_path) -> None:
 
         # Backdate the "old" session's last_seen_at by an hour.
         backdated = (
-            _dt.datetime.now(_dt.timezone.utc)
+            _dt.datetime.now(_dt.UTC)
             - _dt.timedelta(hours=1)
         ).isoformat()
         conn = get_db_connection()

@@ -14,10 +14,9 @@ a different value, this table catches it.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
-
-import json
 
 import pytest
 
@@ -30,7 +29,6 @@ from agent_mcp.core.settings_schema import (
 )
 from agent_mcp.tools.project_settings_tools import _CONFIG_AOE_KEY_RE
 from tests.harness import mcp_session
-
 
 # ---------------------------------------------------------------------------
 # Golden defaults — a hardcoded, independent copy of the default the

@@ -35,7 +35,6 @@ import asyncio
 import mcp.types as mcp_types
 import pytest
 
-
 # --- Invariant: no tool's inputSchema may list "token" in `required` ---
 
 def test_no_tool_lists_token_in_required() -> None:

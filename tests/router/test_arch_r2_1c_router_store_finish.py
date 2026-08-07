@@ -41,7 +41,6 @@ from types import SimpleNamespace
 
 import pytest
 
-
 # ── Fixtures (mirror tests/router/test_arch_r2_1b_membership.py) ─────
 
 

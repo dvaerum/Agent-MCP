@@ -34,13 +34,14 @@ and ``sys.path`` shim are gone.
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import subprocess
 import sys
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
 import pytest
 
@@ -247,7 +248,7 @@ def router_module(
     # registers it on .on_startup, which the aiohttp TestServer DOES
     # invoke. Patch the start hook to a no-op so we don't have a
     # rogue reaper task running across tests.
-    async def _noop(app):  # noqa: D401 - tiny stub
+    async def _noop(app):
         return None
 
     monkeypatch.setattr(router, "_start_reaper_task", _noop)
@@ -275,7 +276,7 @@ _SENTINEL_USERNAME = "test_sentinel_op"
 _SENTINEL_PASSWORD = "test_sentinel_pw"
 
 
-import pytest_asyncio  # noqa: E402 — kept local to the fixture
+import pytest_asyncio
 
 
 @pytest_asyncio.fixture
@@ -401,26 +402,21 @@ def register_project(
             # haven't built the app yet, run them eagerly so the
             # users table exists.
             from agent_mcp.router import identity as _identity
-            try:
+            with contextlib.suppress(Exception):  # pragma: no cover - defensive
                 _identity.run_router_migrations_upgrade()
-            except Exception:  # pragma: no cover - defensive
-                pass
-            try:
+            row = None
+            with contextlib.suppress(Exception):
                 row = _identity.get_user_by_username(_SENTINEL_USERNAME)
-            except Exception:
-                row = None
             if row is None:
                 # The on_startup bootstrap hasn't fired yet (e.g.,
                 # single-tenant test variants build the app
                 # differently); create the sentinel here.
-                try:
+                with contextlib.suppress(Exception):  # pragma: no cover - defensive
                     _identity.create_user(
                         username=_SENTINEL_USERNAME,
                         password=_SENTINEL_PASSWORD,
                     )
                     row = _identity.get_user_by_username(_SENTINEL_USERNAME)
-                except Exception:  # pragma: no cover - defensive
-                    row = None
             if row is not None:
                 _identity.add_project_membership(row["user_id"], name)
         return ws

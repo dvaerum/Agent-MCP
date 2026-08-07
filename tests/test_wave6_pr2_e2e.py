@@ -35,8 +35,7 @@ from agent_mcp.core.tool_result import (
     Ok,
     PermissionDenied,
 )
-from tests.harness import make_principal, mcp_session, with_principal
-from tests.harness import with_bearer
+from tests.harness import make_principal, mcp_session, with_bearer, with_principal
 
 pytestmark = pytest.mark.asyncio
 

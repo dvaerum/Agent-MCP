@@ -21,13 +21,12 @@ legacy ``@requires`` / ``@requires_role`` decorators tested here.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
-
-import pytest
+from typing import Any
 
 import mcp.types as mcp_types
-from tests.harness import with_bearer
+import pytest
 
+from tests.harness import with_bearer
 
 # --- AuthRejected propagation -----------------------------------------------
 
@@ -57,7 +56,7 @@ async def test_requires_policy_admin_always_allowed(reset_globals) -> None:
     from tests.harness import make_principal
 
     @requires_policy("config_some_toggle", default=False)
-    async def my_tool(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
+    async def my_tool(arguments: dict[str, Any]) -> list[mcp_types.TextContent]:
         return [mcp_types.TextContent(type="text", text="admin in")]
 
     p = make_principal(
@@ -86,24 +85,24 @@ async def test_requires_policy_worker_rejected_when_toggle_off(
     monkeypatch.setenv("MCP_PROJECT_DIR", str(project_dir))
     # Build an app to get the DB schema initialised, then exercise the
     # decorator directly.
-    from agent_mcp.app.main_app import create_app
     from starlette.testclient import TestClient
+
+    from agent_mcp.app.main_app import create_app
 
     app = create_app(project_dir=str(project_dir))
     with TestClient(app):
         g.active_agents["worker-token"] = {"agent_id": "worker_a"}
 
-        from agent_mcp.core.authorize import requires_policy, AuthRejected
+        from agent_mcp.core.authorize import AuthRejected, requires_policy
 
         @requires_policy("config_allow_worker_to_worker", default=False)
         async def my_tool(
-            arguments: Dict[str, Any],
-        ) -> List[mcp_types.TextContent]:  # pragma: no cover
+            arguments: dict[str, Any],
+        ) -> list[mcp_types.TextContent]:  # pragma: no cover
             return [mcp_types.TextContent(type="text", text="ran")]
 
-        with pytest.raises(AuthRejected):
-            with with_bearer("worker-token"):
-                await my_tool({"token": "worker-token"})
+        with pytest.raises(AuthRejected), with_bearer("worker-token"):
+            await my_tool({"token": "worker-token"})
 
 
 @pytest.mark.asyncio
@@ -114,8 +113,9 @@ async def test_requires_policy_worker_allowed_when_any_toggle_on(
     from agent_mcp.core import globals as g
 
     monkeypatch.setenv("MCP_PROJECT_DIR", str(project_dir))
-    from agent_mcp.app.main_app import create_app
     from starlette.testclient import TestClient
+
+    from agent_mcp.app.main_app import create_app
 
     app = create_app(project_dir=str(project_dir))
     with TestClient(app):
@@ -129,7 +129,7 @@ async def test_requires_policy_worker_allowed_when_any_toggle_on(
         @requires_policy(
             "config_allow_worker_self_assign", default=True
         )
-        async def my_tool(arguments: Dict[str, Any]) -> List[mcp_types.TextContent]:
+        async def my_tool(arguments: dict[str, Any]) -> list[mcp_types.TextContent]:
             return [mcp_types.TextContent(type="text", text="worker in")]
 
         with with_bearer("worker-token"):
@@ -201,12 +201,12 @@ async def test_requires_policy_rejects_viewer_forwarding_header(
 ) -> None:
     """A viewer forwarding-header caller must be rejected at the policy
     gate (it is neither operator-tier nor an agent bearer)."""
-    from agent_mcp.core.authorize import requires_policy, AuthRejected
+    from agent_mcp.core.authorize import AuthRejected, requires_policy
 
     @requires_policy("config_some_toggle", default=False)
     async def my_tool(
-        arguments: Dict[str, Any],
-    ) -> List[mcp_types.TextContent]:  # pragma: no cover - must not run
+        arguments: dict[str, Any],
+    ) -> list[mcp_types.TextContent]:  # pragma: no cover - must not run
         return [mcp_types.TextContent(type="text", text="viewer in")]
 
     viewer = _forwarding_principal("viewer")
@@ -236,8 +236,9 @@ async def test_dispatcher_translates_authrejected_to_iserror(
     typed-result migration.
     """
     monkeypatch.setenv("MCP_PROJECT_DIR", str(project_dir))
-    from agent_mcp.app.main_app import create_app
     from starlette.testclient import TestClient
+
+    from agent_mcp.app.main_app import create_app
     from agent_mcp.core.tool_result import PermissionDenied
     from agent_mcp.tools.registry import dispatch_tool_call
 

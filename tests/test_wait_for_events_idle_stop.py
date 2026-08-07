@@ -130,10 +130,10 @@ async def test_real_event_resets_idle_marker(tmp_path):
     """A real event takes priority over idle-stop AND resets the marker:
     even with an ancient marker and a tiny window, a pending message is
     delivered (not stop_listening) and the marker advances to ~now."""
-    from tests.harness import mcp_session, with_bearer
     from agent_mcp.tools.agent_communication_tools import (
         send_agent_message_tool_impl,
     )
+    from tests.harness import mcp_session, with_bearer
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")

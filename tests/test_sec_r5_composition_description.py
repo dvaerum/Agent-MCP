@@ -49,7 +49,7 @@ def _assert_desc_present(text: str) -> None:
     assert _SECRET_IN_DESC in text, "description must be returned in full"
 
 
-from tests.harness import mcp_session  # noqa: E402
+from tests.harness import mcp_session
 
 
 @pytest.mark.asyncio

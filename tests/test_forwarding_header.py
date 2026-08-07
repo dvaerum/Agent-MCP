@@ -193,7 +193,7 @@ def test_tampered_operator_id_rejected(key: bytes) -> None:
     """An attacker who swaps the operator_id field while preserving
     role/expiry/mac MUST be rejected (the HMAC covers operator_id)."""
     header = fh.sign("dennis", "operator", key, ttl_sec=30, _now=1000)
-    operator_id, role, expiry, mac = header.split(".")
+    _operator_id, role, expiry, mac = header.split(".")
     forged = f"attacker.{role}.{expiry}.{mac}"
     assert fh.verify(forged, key, _now=1001) is None
 

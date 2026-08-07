@@ -48,7 +48,7 @@ def _assert_value_present(text: str) -> None:
     assert _EMBEDDED_SK in text, "value must be returned in full"
 
 
-from tests.harness import mcp_session  # noqa: E402
+from tests.harness import mcp_session
 
 
 @pytest.mark.asyncio

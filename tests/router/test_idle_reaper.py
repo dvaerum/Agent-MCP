@@ -24,7 +24,6 @@ import pytest
 
 from tests.harness import assert_ran_off_event_loop
 
-
 pytestmark = pytest.mark.asyncio
 
 

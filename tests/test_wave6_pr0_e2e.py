@@ -280,9 +280,8 @@ async def test_with_principal_helper_stamps_request_principal(tmp_path) -> None:
     the request context, but the dispatcher itself never reads from
     a ContextVar fallback.
     """
-    from agent_mcp.tools.registry import dispatch_tool_call, request_principal
-
     from agent_mcp.db.actions import task_notes_db
+    from agent_mcp.tools.registry import dispatch_tool_call, request_principal
 
     async with mcp_session(tmp_path):
         _insert_task("wave6-demo-helper-1")

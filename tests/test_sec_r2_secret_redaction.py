@@ -24,7 +24,6 @@ from agent_mcp.features.rag import query as query_mod
 from agent_mcp.features.rag.query import query_rag_system
 from tests.harness import make_principal, mcp_session
 
-
 _SECRET_VALUE = "SENTINEL-R2-SECRET-4c8e"
 _PUBLIC_VALUE = "public-r2-info"
 

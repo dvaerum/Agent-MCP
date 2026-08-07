@@ -35,7 +35,6 @@ from agent_mcp.core.tool_result import (
     render_as_text_content,
 )
 
-
 # ── Ok variant — the F015 regression surface ─────────────────────
 
 

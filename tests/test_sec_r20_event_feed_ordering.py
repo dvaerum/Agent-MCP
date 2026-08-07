@@ -92,10 +92,10 @@ async def test_backlog_over_500_drains_in_order_no_loss(
     GREEN after: first poll returns the oldest 500, cursor sits at the
     500th, second poll returns the remaining 100.
     """
-    from tests.harness import mcp_session
     from agent_mcp.tools.agent_communication_tools import (
         _collect_events_for,
     )
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
@@ -144,10 +144,10 @@ async def test_critical_message_survives_flood_censorship(
     RED on main: the critical message is the oldest, so it lands in the
     dropped-oldest tail and is never delivered.
     """
-    from tests.harness import mcp_session
     from agent_mcp.tools.agent_communication_tools import (
         _collect_events_for,
     )
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("bob")
@@ -178,10 +178,10 @@ async def test_small_backlog_delivers_promptly_in_order(
 ) -> None:
     """Regression: a normal small backlog still delivers in a single
     poll, in timestamp order."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.agent_communication_tools import (
         _collect_events_for,
     )
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("carol")
@@ -200,8 +200,8 @@ async def test_message_repo_query_default_is_newest_first(
     """Regression for other callers (message-list REST endpoint,
     agent-detail sample): ``query`` still defaults to timestamp-DESC
     (newest first); only the opt-in ``oldest_first=True`` flips it."""
-    from tests.harness import mcp_session
     from agent_mcp.repositories import message_repo
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("dave")

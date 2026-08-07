@@ -25,7 +25,6 @@ from pathlib import Path
 
 import pytest
 
-
 # ── Fixtures (mirror tests/test_group_resolver.py) ──────────────────
 
 

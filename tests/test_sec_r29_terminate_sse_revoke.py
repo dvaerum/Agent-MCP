@@ -209,10 +209,10 @@ async def test_wait_for_events_stops_when_agent_terminated_midflight(
     liveness re-check flips to disabled once the agent is terminated, so
     an in-flight long-poll returns ``stop_listening`` instead of
     continuing to deliver event content for the rest of its window."""
+    from agent_mcp.tools.admin_tools import terminate_agent_tool_impl
     from agent_mcp.tools.agent_communication_tools import (
         _check_auto_event_loop_flags,
     )
-    from agent_mcp.tools.admin_tools import terminate_agent_tool_impl
 
     async with mcp_session(tmp_path) as admin:
         worker = await admin.create_worker("w-longpoll")

@@ -27,8 +27,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ROUTERS_DIR = REPO_ROOT / "agent_mcp" / "app" / "routers"
 ROUTER_APP_FILE = REPO_ROOT / "agent_mcp" / "router" / "app.py"

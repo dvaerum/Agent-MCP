@@ -19,11 +19,15 @@ scope for this PR.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import mcp.types as mcp_types
 import pytest
+
 from tests.harness import with_bearer
+
+logger = logging.getLogger(__name__)
 
 pytestmark = pytest.mark.asyncio
 
@@ -47,8 +51,9 @@ async def _list_resources(session) -> list[mcp_types.Resource]:
 
 
 async def _read_resource(session, uri: str) -> mcp_types.ReadResourceResult:
-    from agent_mcp.tools.registry import request_auth_token
     from pydantic_core import Url
+
+    from agent_mcp.tools.registry import request_auth_token
 
     handler = session._admin._mcp_app_instance().request_handlers[
         mcp_types.ReadResourceRequest
@@ -107,10 +112,10 @@ async def test_inbox_read_returns_event_envelope(tmp_path: Path) -> None:
     """Reading the inbox returns JSON
     `{"events": [...], "next_cursor": "..."}` containing pending
     messages — same shape `wait_for_events` returns."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.agent_communication_tools import (
         send_agent_message_tool_impl,
     )
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -140,10 +145,10 @@ async def test_inbox_read_resolves_at_sign_agent_id(tmp_path: Path) -> None:
     or the id wouldn't match the DB row (the resolve would 'Unauthorized' or
     the message would land in a different inbox). URL round-trip guard for
     interior-'@' agent ids."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.agent_communication_tools import (
         send_agent_message_tool_impl,
     )
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         worker = await admin.create_worker("pikvm_mcp_server@host")
@@ -178,10 +183,10 @@ async def test_worker_cannot_read_anothers_inbox(tmp_path: Path) -> None:
     """A worker calling `resources/read` on another agent's inbox
     URI is rejected (or returns an empty/error result) — the
     per-caller URI must enforce the bearer→agent_id binding."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.agent_communication_tools import (
         send_agent_message_tool_impl,
     )
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -205,6 +210,11 @@ async def test_worker_cannot_read_anothers_inbox(tmp_path: Path) -> None:
         try:
             result = await _read_resource(alice, "agent-mcp://inbox/bob")
         except Exception:
+            # Deliberately broad: the contract is "alice must not see
+            # bob's message", and ANY rejection satisfies it — pinning a
+            # concrete type here would over-constrain the impl. Logged so
+            # the rejection shape is still visible when debugging.
+            logger.debug("alice's read of bob's inbox was rejected", exc_info=True)
             return  # rejection is also fine
 
         text = _first_text(result.contents)

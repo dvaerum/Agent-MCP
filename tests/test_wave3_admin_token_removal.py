@@ -45,7 +45,6 @@ import pytest
 
 from tests.harness import mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -333,6 +332,7 @@ async def _seed_task(
     so the worker owns the task it annotates.
     """
     import datetime
+
     from agent_mcp.db.connection import get_db_connection
 
     now = datetime.datetime.now().isoformat()
@@ -397,8 +397,9 @@ async def _seed_manager_agent(agent_id: str) -> str:
     """INSERT an agents row with agent_role='manager' and return its
     token. Mirrors AdminClient.create_worker but flips the role."""
     import datetime
-    from agent_mcp.db.connection import get_db_connection
+
     from agent_mcp.core import globals as g
+    from agent_mcp.db.connection import get_db_connection
 
     token = secrets.token_hex(16)
     now = datetime.datetime.now().isoformat()
@@ -436,10 +437,11 @@ async def _add_note(token: str, task_id: str, text: str) -> int:
     ``Ok(data={"note_id": ..., "task_id": ...}, ...)``. Pull the
     note_id from ``Ok.data`` rather than re-parsing the message.
     """
-    from agent_mcp.tools.registry import (
-        dispatch_tool_call, request_auth_token,
-    )
     from agent_mcp.core.tool_result import Ok
+    from agent_mcp.tools.registry import (
+        dispatch_tool_call,
+        request_auth_token,
+    )
 
     cv = request_auth_token.set(token)
     try:
@@ -462,10 +464,11 @@ async def _edit_note(token: str, note_id: int, new_text: str) -> str:
     the existing assertion sites (``"updated"`` substring match,
     etc.) valid while admitting the new typed paths.
     """
-    from agent_mcp.tools.registry import (
-        dispatch_tool_call, request_auth_token,
-    )
     from agent_mcp.core.tool_result import render_as_text_content
+    from agent_mcp.tools.registry import (
+        dispatch_tool_call,
+        request_auth_token,
+    )
 
     cv = request_auth_token.set(token)
     try:

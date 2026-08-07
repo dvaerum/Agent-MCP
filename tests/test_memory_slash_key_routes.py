@@ -12,11 +12,9 @@ GREEN after ``/{context_key:path}``.
 
 from __future__ import annotations
 
-
 import pytest
 
 from tests.harness import mcp_session
-
 
 pytestmark = pytest.mark.asyncio
 

@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
+from joserfc.errors import JoseError
 
 pytestmark = pytest.mark.asyncio
 
@@ -67,8 +67,9 @@ def _group_names_for(group_ids: set[str]) -> set[str]:
     identifier, so the test assertions live in name-space, not id-
     space.
     """
-    from agent_mcp.router import identity
     import sqlite3
+
+    from agent_mcp.router import identity
 
     if not group_ids:
         return set()
@@ -336,11 +337,11 @@ async def test_sso_group_mapping_explicit(
         "AGENT_MCP_SSO_OIDC_GROUP_MAPPING",
         json.dumps({"eng-backend": "backend-team"}),
     )
-    from agent_mcp.router import identity, group_resolver
+    from agent_mcp.router import group_resolver, identity
     identity.run_router_migrations_upgrade()
     # Pre-create the agent-mcp side group so the mapping has a target.
-    import sqlite3
     import secrets
+    import sqlite3
     with sqlite3.connect(str(identity.get_router_db_path())) as conn:
         conn.execute(
             "INSERT INTO groups (group_id, name, is_sysadmin, created_at) "
@@ -408,7 +409,7 @@ async def test_sso_group_mapping_wildcard_jit(
     )
     assert cb.status in (302, 303), await cb.text()
 
-    from agent_mcp.router import identity, group_resolver
+    from agent_mcp.router import group_resolver, identity
     user = identity.get_user_by_username("dave")
     assert user is not None
     group_ids = group_resolver.resolve_user_groups(user["user_id"])
@@ -509,7 +510,8 @@ async def test_decode_id_token_rejects_nonce_mismatch(monkeypatch):
     """
     import sys
     import time
-    from authlib.jose import jwt, JsonWebKey
+
+    from authlib.jose import JsonWebKey, jwt
     sso = sys.modules.get("agent_mcp.router.sso")
     if sso is None:
         import importlib
@@ -546,7 +548,7 @@ async def test_decode_id_token_rejects_nonce_mismatch(monkeypatch):
     assert out["sub"] == "u"
 
     # Mismatched nonce is rejected.
-    with pytest.raises(Exception):
+    with pytest.raises(JoseError):
         sso._decode_id_token(
             token, metadata, _FAKE_CLIENT_ID, nonce="attacker-nonce",
         )
@@ -596,8 +598,9 @@ def _passwordless_users():
     is password-backed) so the assertions below count only the rows
     the SSO flow itself created.
     """
-    from agent_mcp.router import identity
     import sqlite3
+
+    from agent_mcp.router import identity
 
     with sqlite3.connect(str(identity.get_router_db_path())) as conn:
         conn.row_factory = sqlite3.Row
@@ -680,7 +683,7 @@ async def test_sso_emailless_login_reconciles_to_single_user(
     (absent) email — otherwise every login mints a new user and any
     grants attached to the previous row are orphaned.
     """
-    from agent_mcp.router import identity, group_resolver
+    from agent_mcp.router import group_resolver, identity
 
     _patch_idp(monkeypatch, id_token_claims={
         "sub": "stable-subject-42",
@@ -698,8 +701,8 @@ async def test_sso_emailless_login_reconciles_to_single_user(
 
     # Attach a grant to the freshly-minted user; it MUST survive the
     # next login (i.e. the next login returns the SAME row).
-    import sqlite3
     import secrets
+    import sqlite3
     with sqlite3.connect(str(identity.get_router_db_path())) as conn:
         gid = secrets.token_hex(8)
         conn.execute(
@@ -738,9 +741,10 @@ async def test_sso_wildcard_group_does_not_bind_existing_privileged_group(
     collision is impossible: the user joins a fresh ``oidc:admins``
     group, never the locally-managed ``admins`` sysadmin group.
     """
-    from agent_mcp.router import identity, group_resolver
-    import sqlite3
     import secrets
+    import sqlite3
+
+    from agent_mcp.router import group_resolver, identity
 
     identity.run_router_migrations_upgrade()
     # Locally-managed, sysadmin-flagged group named "admins".

@@ -34,7 +34,6 @@ from typing import Any
 
 import pytest
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -140,8 +139,9 @@ def _direct_group_names(user_id: str) -> set[str]:
 
 
 def _insert_group(name: str, *, is_sysadmin: int = 0) -> str:
-    from agent_mcp.router import identity
     import secrets
+
+    from agent_mcp.router import identity
     gid = secrets.token_hex(8)
     with sqlite3.connect(str(identity.get_router_db_path())) as conn:
         conn.execute(

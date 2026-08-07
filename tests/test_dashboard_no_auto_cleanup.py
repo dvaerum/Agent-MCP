@@ -56,7 +56,6 @@ import pytest
 
 from tests.harness import mcp_session
 
-
 DASHBOARD = Path("agent_mcp/dashboard")
 
 

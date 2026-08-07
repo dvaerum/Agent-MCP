@@ -29,7 +29,6 @@ import pytest
 
 from tests.harness import mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -94,7 +93,7 @@ def _capture_inbox_wakes(monkeypatch) -> list:
     """Record every ``notify_agent_inbox`` fan-out (the assignee wake)."""
     woken: list = []
 
-    def _capture(agent_id):  # noqa: ANN001
+    def _capture(agent_id):
         woken.append(agent_id)
 
     monkeypatch.setattr(
@@ -225,7 +224,7 @@ async def test_assign_task_rollback_fires_zero_side_effects(
         class _Boom(Exception):
             pass
 
-        def _boom(*args, **kwargs):  # noqa: ANN002, ANN003
+        def _boom(*args, **kwargs):
             raise _Boom("induced mid-scope failure")
 
         monkeypatch.setattr(task_tools, "_link_child_to_parent", _boom)
@@ -269,7 +268,7 @@ def _capture_unassigned_wakes(monkeypatch) -> list:
     """Record every ``notify_unassigned_task_appeared`` fan-out."""
     seen: list = []
 
-    def _cap(task_id):  # noqa: ANN001
+    def _cap(task_id):
         seen.append(task_id)
 
     monkeypatch.setattr(
@@ -361,7 +360,7 @@ async def test_create_unassigned_rollback_fires_zero_side_effects(
         class _Boom(Exception):
             pass
 
-        def _boom(*args, **kwargs):  # noqa: ANN002, ANN003
+        def _boom(*args, **kwargs):
             raise _Boom("induced mid-scope failure")
 
         monkeypatch.setattr(task_tools, "_link_child_to_parent", _boom)
@@ -446,7 +445,7 @@ async def test_request_assistance_rollback_fires_zero_side_effects(
 
         # Blow up on the LAST write inside the scope (the DB audit insert),
         # after the child INSERT + parent UPDATE but before commit.
-        def _boom(*args, **kwargs):  # noqa: ANN002, ANN003
+        def _boom(*args, **kwargs):
             raise RuntimeError("induced mid-scope failure")
 
         monkeypatch.setattr(task_tools, "log_agent_action_to_db", _boom)

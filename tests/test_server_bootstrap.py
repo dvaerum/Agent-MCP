@@ -39,7 +39,6 @@ from typing import Any
 
 import pytest
 
-
 # --- ServerConfig contract --------------------------------------------
 
 
@@ -48,6 +47,7 @@ def test_server_config_is_a_frozen_dataclass() -> None:
     after the bootstrap runs gets caught at write time, not deep in a
     background task that captured the value at boot."""
     from dataclasses import fields, is_dataclass
+
     from agent_mcp.server_bootstrap import ServerConfig
 
     assert is_dataclass(ServerConfig)
@@ -228,6 +228,7 @@ def test_bootstrap_server_returns_starlette_app_and_teardown(
     plus a teardown callable (idempotent — the SystemExit/KeyboardInterrupt
     paths in the CLI runner may invoke it more than once)."""
     from starlette.applications import Starlette
+
     from agent_mcp import server_bootstrap
 
     project_dir = tmp_path / "p"
@@ -338,8 +339,8 @@ def test_load_forwarding_hmac_key_preserves_leading_whitespace_byte(tmp_path):
     not 31. Stripping any byte would have shortened the key and broken
     HMAC verify against the unchanged router-side bytes.
     """
-    from agent_mcp.server_bootstrap import _load_forwarding_hmac_key
     from agent_mcp.core import globals as g
+    from agent_mcp.server_bootstrap import _load_forwarding_hmac_key
 
     key = b"\n" + bytes(range(31))  # 32 bytes, first is \n (0x0a)
     keyfile = tmp_path / "forwarding_hmac"
@@ -357,8 +358,8 @@ def test_load_forwarding_hmac_key_preserves_leading_whitespace_byte(tmp_path):
 
 def test_load_forwarding_hmac_key_preserves_trailing_whitespace_byte(tmp_path):
     """Same defence for trailing \\n / \\r etc."""
-    from agent_mcp.server_bootstrap import _load_forwarding_hmac_key
     from agent_mcp.core import globals as g
+    from agent_mcp.server_bootstrap import _load_forwarding_hmac_key
 
     key = bytes(range(31)) + b"\n"  # 32 bytes, last is \n
     keyfile = tmp_path / "forwarding_hmac"
@@ -374,8 +375,8 @@ def test_load_forwarding_hmac_key_preserves_trailing_whitespace_byte(tmp_path):
 def test_load_forwarding_hmac_key_empty_file_is_dormant(tmp_path):
     """Empty file still leaves the key None (forwarding-header auth
     dormant). The strip() removal must not regress this safety net."""
-    from agent_mcp.server_bootstrap import _load_forwarding_hmac_key
     from agent_mcp.core import globals as g
+    from agent_mcp.server_bootstrap import _load_forwarding_hmac_key
 
     keyfile = tmp_path / "forwarding_hmac"
     keyfile.write_bytes(b"")

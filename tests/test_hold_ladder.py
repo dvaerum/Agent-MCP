@@ -93,19 +93,18 @@ async def _call_wait(worker, *, timeout_seconds, progress_token, client="claude-
     """
     from unittest.mock import patch
 
-    from agent_mcp.tools import agent_communication_tools as act
     from agent_mcp.core import client_info_registry, mcp_progress
+    from agent_mcp.tools import agent_communication_tools as act
     from tests.harness import with_bearer
 
     client_info_registry.record_client_info(worker.agent_id, client, "1.0")
     with patch.object(
         mcp_progress, "current_progress_token", lambda: progress_token
-    ):
-        with with_bearer(worker.token):
-            return await act.wait_for_events_tool_impl(
-                {"timeout_seconds": timeout_seconds},
-                principal=worker._principal(),
-            )
+    ), with_bearer(worker.token):
+        return await act.wait_for_events_tool_impl(
+            {"timeout_seconds": timeout_seconds},
+            principal=worker._principal(),
+        )
 
 
 @pytest.mark.asyncio
@@ -113,6 +112,7 @@ async def test_advise_attaches_hold_advisory(tmp_path):
     """At the ADVISE threshold, an eligible empty short-poll comes back with a
     hold_advisory event nudging the agent to drop the timeout."""
     import json
+
     from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
@@ -134,6 +134,7 @@ async def test_override_ignores_short_timeout_and_parks(tmp_path):
     """At the OVERRIDE threshold, a 1s timeout is ignored — the server parks
     the connection (does NOT return at ~1s)."""
     import asyncio
+
     from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
@@ -154,6 +155,7 @@ async def test_no_progress_token_is_not_eligible_no_park(tmp_path):
     idle watchdog would kill a silent hold) — even seeded past override, the
     short 1s timeout is honoured."""
     import asyncio
+
     from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:

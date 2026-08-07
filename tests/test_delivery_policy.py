@@ -19,27 +19,27 @@ from agent_mcp.features.delivery_policy import (
 
 
 def _cfg(**over) -> DeliveryPolicyConfig:
-    base = dict(
-        enabled=True,
-        on_unread_messages=True,
-        on_unfinished_tasks=True,
-        on_unassigned_tasks=False,
-        backoff_initial_seconds=30,
-        backoff_max_seconds=3600,
-        cooldown_seconds=60,
-        wake_dormant=False,
-    )
+    base = {
+        "enabled": True,
+        "on_unread_messages": True,
+        "on_unfinished_tasks": True,
+        "on_unassigned_tasks": False,
+        "backoff_initial_seconds": 30,
+        "backoff_max_seconds": 3600,
+        "cooldown_seconds": 60,
+        "wake_dormant": False,
+    }
     base.update(over)
     return DeliveryPolicyConfig(**base)
 
 
 def _sig(**over) -> WorkerSignals:
-    base = dict(
-        unread_messages=0,
-        open_tasks=0,
-        unassigned_tasks=0,
-        transport_status="idle",
-    )
+    base = {
+        "unread_messages": 0,
+        "open_tasks": 0,
+        "unassigned_tasks": 0,
+        "transport_status": "idle",
+    }
     base.update(over)
     return WorkerSignals(**base)
 

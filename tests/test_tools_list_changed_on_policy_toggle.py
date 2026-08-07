@@ -46,8 +46,8 @@ async def test_toggle_write_invokes_emitter(tmp_path: Path) -> None:
     trigger must fire so the deferred push lands without source
     changes.
     """
-    from tests.harness import mcp_session
     import agent_mcp.tools.project_context_tools as pct
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         with patch.object(
@@ -65,7 +65,7 @@ async def test_toggle_write_invokes_emitter(tmp_path: Path) -> None:
                 "config_allow_worker_* write must invoke "
                 "_emit_tools_list_changed; emit was never called"
             )
-            args, kwargs = emit.call_args
+            args, _kwargs = emit.call_args
             # First positional is the context_key.
             if args:
                 assert args[0] == "config_allow_worker_self_assign", (
@@ -79,8 +79,8 @@ async def test_non_toggle_write_does_not_invoke_emitter(
     """Writing a non-toggle key (e.g. a plain notes value) MUST NOT
     fire the notification — otherwise every project_context write
     would cost a wakeup."""
-    from tests.harness import mcp_session
     import agent_mcp.tools.project_context_tools as pct
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         with patch.object(

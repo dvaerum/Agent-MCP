@@ -27,7 +27,6 @@ from pathlib import Path
 
 import pytest
 
-
 # Path resolution mirrors what nix sees at flake-eval time: the module
 # lives at <repo-root>/nix/home-manager-module.nix.
 _REPO_ROOT = Path(__file__).resolve().parent.parent

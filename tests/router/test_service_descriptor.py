@@ -20,13 +20,12 @@ header — the request now fails at the Accept gate first.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Awaitable, Callable
 
 import pytest
 import pytest_asyncio
 from aiohttp import web
-
 
 pytestmark = pytest.mark.asyncio
 

@@ -25,7 +25,6 @@ import pytest
 
 from tests.harness import mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -35,7 +34,7 @@ pytestmark = pytest.mark.asyncio
 def _capture_publishes(monkeypatch) -> list:
     published: list = []
 
-    def _capture(agent_id, event_type, payload=None):  # noqa: ANN001
+    def _capture(agent_id, event_type, payload=None):
         published.append((agent_id, event_type, payload))
 
     monkeypatch.setattr(
@@ -138,22 +137,21 @@ async def test_uow_rollback_fires_zero_side_effects(tmp_path, monkeypatch):
         class _Boom(Exception):
             pass
 
-        with pytest.raises(_Boom):
-            with unit_of_work() as u:
-                u.cursor.execute(
-                    "DELETE FROM tasks WHERE task_id = ?", (task_id,)
-                )
-                u.emit("alice", "task.deleted", {"task_id": task_id})
-                u.audit(
-                    "admin",
-                    "deleted_task",
-                    task_id=task_id,
-                    details={"title": "rollback-target"},
-                )
-                u.on_commit(lambda: hook_fired.append("nope"))
-                # Something blows up AFTER we registered effects but
-                # BEFORE __exit__ commits.
-                raise _Boom()
+        with pytest.raises(_Boom), unit_of_work() as u:
+            u.cursor.execute(
+                "DELETE FROM tasks WHERE task_id = ?", (task_id,)
+            )
+            u.emit("alice", "task.deleted", {"task_id": task_id})
+            u.audit(
+                "admin",
+                "deleted_task",
+                task_id=task_id,
+                details={"title": "rollback-target"},
+            )
+            u.on_commit(lambda: hook_fired.append("nope"))
+            # Something blows up AFTER we registered effects but
+            # BEFORE __exit__ commits.
+            raise _Boom()
 
         # DB write rolled back — the row is still there.
         assert _task_exists(task_id), (

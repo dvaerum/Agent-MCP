@@ -23,7 +23,6 @@ from pathlib import Path
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # 1. Generic Registry[T] — register / list_visible / get on arbitrary T.
 # ---------------------------------------------------------------------------
@@ -128,7 +127,7 @@ def test_tool_registry_reflects_legacy_register_tool() -> None:
     `tool_schemas` after import is also present in the shared
     `tool_registry`'s entries."""
     import agent_mcp.tools  # noqa: F401 — triggers registration
-    from agent_mcp.tools.registry import tool_schemas, tool_registry
+    from agent_mcp.tools.registry import tool_registry, tool_schemas
 
     registered = {e["name"] for e in tool_schemas}
     shared = {e.name for e in tool_registry.list_visible("admin")}
@@ -287,9 +286,9 @@ async def test_mcp_prompts_list_filters_admin_only_for_worker(
     `"visibility": "admin"` in catalog.json."""
     import mcp.types as mcp_types
 
-    from tests.harness import mcp_session
     import agent_mcp.prompts as prompts_mod
     from agent_mcp.tools.registry import request_auth_token
+    from tests.harness import mcp_session
 
     fake_catalog = {
         "categories": [{"id": "t", "name": "T", "description": "", "icon": "X"}],
@@ -356,9 +355,9 @@ async def test_mcp_prompts_get_rejects_admin_only_for_worker(
     guesses the name)."""
     import mcp.types as mcp_types
 
-    from tests.harness import mcp_session
     import agent_mcp.prompts as prompts_mod
     from agent_mcp.tools.registry import request_auth_token
+    from tests.harness import mcp_session
 
     fake_catalog = {
         "categories": [{"id": "t", "name": "T", "description": "", "icon": "X"}],
@@ -406,7 +405,7 @@ async def test_mcp_prompts_get_rejects_admin_only_for_worker(
             assert inner.messages, "admin should successfully render"
 
             # Worker rejected.
-            with pytest.raises(Exception):
+            with pytest.raises(PermissionError):
                 await get_for(alice, "admin-secret")
     finally:
         prompts_mod._reload_catalog_for_tests(None)

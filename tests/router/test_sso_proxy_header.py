@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import pytest
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -178,9 +177,10 @@ async def test_repeated_proxy_header_reconciles_to_single_user(
     r1 = await _probe()
     assert r1.status == 200, await r1.text()
 
-    from agent_mcp.router import identity
-    import sqlite3
     import secrets
+    import sqlite3
+
+    from agent_mcp.router import identity
 
     def _proxy_users():
         with sqlite3.connect(str(identity.get_router_db_path())) as conn:
@@ -225,8 +225,9 @@ async def test_repeated_proxy_header_reconciles_to_single_user(
 
 def _users_by_subject_prefix(prefix: str) -> list[dict]:
     """All users whose ``sso_subject`` begins with ``prefix``."""
-    from agent_mcp.router import identity
     import sqlite3
+
+    from agent_mcp.router import identity
 
     with sqlite3.connect(str(identity.get_router_db_path())) as conn:
         conn.row_factory = sqlite3.Row

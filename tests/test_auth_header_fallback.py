@@ -23,7 +23,6 @@ import pytest
 
 from tests.harness import make_principal, mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -54,7 +53,7 @@ async def test_dispatch_resolves_bearer_from_contextvar(
             raise AssertionError(
                 f"dispatch_tool_call should resolve bearer from contextvar; "
                 f"got: {e}"
-            )
+            ) from e
 
         from agent_mcp.core.tool_result import Ok
         assert isinstance(result, Ok), f"expected Ok, got {result!r}"
@@ -74,11 +73,11 @@ async def test_dispatch_without_contextvar_and_without_token_returns_auth_failur
     receives ``principal=None`` and surfaces
     :class:`PermissionDenied`.
     """
+    from agent_mcp.core.tool_result import PermissionDenied
     from agent_mcp.tools.registry import (
         dispatch_tool_call,
         request_auth_token,
     )
-    from agent_mcp.core.tool_result import PermissionDenied
 
     async with mcp_session(tmp_path):
         # Make sure the contextvar is empty for this test.
@@ -97,11 +96,11 @@ async def test_dispatch_admits_view_status_with_operator_session_contextvar(
     Wave 6 PR 6 regression guard: this is the production REST seam's
     code path — ``_dispatch_through_tool`` builds the Principal and
     the migrated tool admits via the typed Principal."""
+    from agent_mcp.core.tool_result import Ok
     from agent_mcp.tools.registry import (
         dispatch_tool_call,
         request_auth_token,
     )
-    from agent_mcp.core.tool_result import Ok
 
     async with mcp_session(tmp_path):
         request_auth_token.set(None)

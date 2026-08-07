@@ -43,7 +43,6 @@ import pytest
 
 from tests.harness import mcp_session
 
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 API_FILE = REPO_ROOT / "agent_mcp" / "dashboard" / "lib" / "api.ts"
 

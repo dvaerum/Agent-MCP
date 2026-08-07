@@ -35,7 +35,6 @@ import pytest
 from agent_mcp.core.principal import Principal
 from tests.harness import make_principal, with_capabilities
 
-
 # ── Principal builders shared across tests ────────────────────────
 
 

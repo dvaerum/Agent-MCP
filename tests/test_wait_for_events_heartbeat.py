@@ -15,11 +15,11 @@ import datetime as _dt
 import json
 
 import pytest
-
-import agent_mcp.tools.agent_communication_tools as acm
-import agent_mcp.core.client_hold_strategy as chs
-from agent_mcp.core import client_info_registry
 from mcp.server.lowlevel.server import request_ctx
+
+import agent_mcp.core.client_hold_strategy as chs
+import agent_mcp.tools.agent_communication_tools as acm
+from agent_mcp.core import client_info_registry
 
 pytestmark = pytest.mark.asyncio
 
@@ -156,10 +156,10 @@ async def test_known_heartbeat_client_emits_progress_during_hold(
 async def test_heartbeat_client_returns_event_immediately(tmp_path):
     """Even for a heartbeat client, a pending event returns via the fast
     path without holding or emitting heartbeats."""
-    from tests.harness import mcp_session, with_bearer
     from agent_mcp.tools.agent_communication_tools import (
         send_agent_message_tool_impl,
     )
+    from tests.harness import mcp_session, with_bearer
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")

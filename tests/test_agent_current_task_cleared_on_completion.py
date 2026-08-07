@@ -33,7 +33,6 @@ from agent_mcp.core import globals as g
 from agent_mcp.db.connection import get_db_connection
 from tests.harness import mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -68,7 +67,7 @@ def _force_current_task(agent_id: str, task_id: str) -> None:
         conn.close()
     # Mirror into the in-memory active-agents cache used by some
     # code paths.
-    for token, entry in g.active_agents.items():
+    for entry in g.active_agents.values():
         if entry.get("agent_id") == agent_id:
             entry["current_task"] = task_id
             break

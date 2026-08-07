@@ -28,9 +28,9 @@ async def test_per_agent_toggle_off_wakes_in_flight(tmp_path: Path) -> None:
     """A `wait_for_events` already in flight returns within 5s with
     `stop_listening` when the per-agent flag is flipped OFF (test
     case 8 of the VM E2E plan)."""
-    from tests.harness import mcp_session
     from agent_mcp.core import globals as g
     from agent_mcp.db.connection import get_db_connection
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -74,10 +74,11 @@ async def test_per_agent_toggle_off_wakes_in_flight(tmp_path: Path) -> None:
 async def test_global_toggle_off_wakes_all_in_flight(tmp_path: Path) -> None:
     """A global toggle flip wakes EVERY in-flight wait — verified
     with two agents simultaneously waiting."""
-    from tests.harness import mcp_session
+    import datetime as _dt
+
     from agent_mcp.core import globals as g
     from agent_mcp.db.connection import get_db_connection
-    import datetime as _dt
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")

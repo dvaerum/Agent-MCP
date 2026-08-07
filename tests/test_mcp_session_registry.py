@@ -47,7 +47,6 @@ import pytest
 
 from tests.harness import mcp_session, seed_agent_rows
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -206,7 +205,7 @@ async def test_expire_stale_removes_old_sessions(tmp_path) -> None:
         # Backdate `stale` to a long time ago. ISO-UTC string with an
         # explicit timezone so the comparison in expire_stale is unambiguous.
         long_ago = (
-            _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=3600)
+            _dt.datetime.now(_dt.UTC) - _dt.timedelta(seconds=3600)
         ).isoformat()
         conn = get_db_connection()
         try:

@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import pytest
 
-from tests.harness import mcp_session
 from agent_mcp.utils.string_utils import (
     is_valid_memory_key,
     sanitize_memory_key,
 )
+from tests.harness import mcp_session
 
 
 # ---- unit: predicate ----

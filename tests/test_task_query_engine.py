@@ -25,7 +25,7 @@ chasing the response-text adapter.
 from __future__ import annotations
 
 import datetime as _dt
-from typing import Any, Dict
+from typing import Any
 
 import pytest
 
@@ -34,7 +34,6 @@ from agent_mcp.features.task_queries import (
     TaskQueryEngine,
     TaskSortSpec,
 )
-
 
 # --- Fixtures ---------------------------------------------------------
 
@@ -50,7 +49,7 @@ def _task(
     created_at: str | None = None,
     updated_at: str | None = None,
     title: str | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Build a synthetic task row matching ``g.tasks`` shape."""
     base = _dt.datetime(2025, 1, 1)
     return {
@@ -71,7 +70,7 @@ def _task(
 
 
 @pytest.fixture
-def snapshot() -> Dict[str, Dict[str, Any]]:
+def snapshot() -> dict[str, dict[str, Any]]:
     """A 10-task fixture covering the rule matrix."""
     base = _dt.datetime(2025, 1, 1)
     tasks = {
@@ -159,7 +158,7 @@ def snapshot() -> Dict[str, Dict[str, Any]]:
 
 
 @pytest.fixture
-def engine(snapshot: Dict[str, Dict[str, Any]]) -> TaskQueryEngine:
+def engine(snapshot: dict[str, dict[str, Any]]) -> TaskQueryEngine:
     """Engine bound to the fixture snapshot.
 
     The engine accepts a callable ``task_source`` that returns the
@@ -307,7 +306,7 @@ def test_paginate_total_count_reflects_filter_not_window(
 
 
 def test_health_of_blocked_task_reports_blocking_deps(
-    engine: TaskQueryEngine, snapshot: Dict[str, Dict[str, Any]]
+    engine: TaskQueryEngine, snapshot: dict[str, dict[str, Any]]
 ) -> None:
     health = engine.health_of(snapshot["t6"], snapshot)
     assert health.is_blocked is True
@@ -318,7 +317,7 @@ def test_health_of_blocked_task_reports_blocking_deps(
 
 
 def test_health_of_unblocked_task(
-    engine: TaskQueryEngine, snapshot: Dict[str, Dict[str, Any]]
+    engine: TaskQueryEngine, snapshot: dict[str, dict[str, Any]]
 ) -> None:
     health = engine.health_of(snapshot["t1"], snapshot)
     assert health.is_blocked is False
@@ -350,14 +349,14 @@ def test_metrics_includes_blocked_and_stale_counts(
 
 
 def test_empty_repo_returns_empty_result() -> None:
-    engine = TaskQueryEngine(task_source=lambda: {})
+    engine = TaskQueryEngine(task_source=dict)
     result = engine.query()
     assert result.tasks == []
     assert result.total_count == 0
 
 
 def test_snapshot_consistency_during_concurrent_write(
-    snapshot: Dict[str, Dict[str, Any]],
+    snapshot: dict[str, dict[str, Any]],
 ) -> None:
     """A query takes a snapshot of the source at .query() entry.  Mid-
     iteration mutations to the underlying dict must not affect the

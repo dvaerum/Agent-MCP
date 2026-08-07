@@ -24,7 +24,6 @@ import subprocess
 import pytest
 from aiohttp import web
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -136,9 +135,11 @@ async def test_spawn_failure_response_is_generic(
 
     monkeypatch.setattr(_po, "_systemctl", _failing_systemctl)
 
-    with caplog.at_level("ERROR"):
-        with pytest.raises(web.HTTPInternalServerError) as excinfo:
-            await _po._ensure("spawnfail", "backend")
+    with (
+        caplog.at_level("ERROR"),
+        pytest.raises(web.HTTPInternalServerError) as excinfo,
+    ):
+        await _po._ensure("spawnfail", "backend")
 
     exc = excinfo.value
     # HTTP status preserved.

@@ -26,7 +26,6 @@ import pytest
 
 from tests.harness import mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -57,7 +56,7 @@ def _insert_mcp_session(agent_id: str) -> str:
     from agent_mcp.db.connection import get_db_connection
 
     session_id = secrets.token_hex(8)
-    now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    now = _dt.datetime.now(_dt.UTC).isoformat()
     conn = get_db_connection()
     try:
         cur = conn.cursor()
@@ -77,7 +76,7 @@ def _insert_claude_code_session(agent_id: str) -> str:
     from agent_mcp.db.connection import get_db_connection
 
     session_id = secrets.token_hex(8)
-    now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    now = _dt.datetime.now(_dt.UTC).isoformat()
     conn = get_db_connection()
     try:
         cur = conn.cursor()

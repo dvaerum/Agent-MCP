@@ -24,10 +24,11 @@ import pytest
 
 from tests.harness import (
     _HARNESS_OPERATOR_ID as OPERATOR_ID,
+)
+from tests.harness import (
     mcp_session,
     seed_agent_rows,
 )
-
 
 pytestmark = pytest.mark.asyncio
 

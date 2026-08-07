@@ -13,10 +13,9 @@ import json
 
 import pytest
 
-from tests.harness import mcp_session
 import agent_mcp.tools.agent_communication_tools as acm
 from agent_mcp.repositories import scheduled_directive_repository as repo
-
+from tests.harness import mcp_session
 
 pytestmark = pytest.mark.asyncio
 
@@ -104,7 +103,7 @@ async def test_due_schedule_fires_on_check_in(tmp_path):
         )
         env = _parse(res)
         assert "directive" in _types(env), env
-        directive = [e for e in env["events"] if e["type"] == "directive"][0]
+        directive = next(e for e in env["events"] if e["type"] == "directive")
         assert directive["data"]["source"] == "schedule"
         assert directive["data"]["prompt"] == "do the thing"
         # next_due reset from delivery (future now).

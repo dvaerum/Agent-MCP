@@ -18,7 +18,6 @@ import pytest
 
 from tests.harness import _first_text, mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -209,7 +208,7 @@ async def test_edit_note_admin_can_edit_anyone(tmp_path) -> None:
     async with mcp_session(tmp_path):
         _insert_task("ad-task")
         nid = task_notes_db.add_note("ad-task", "alice", "original")
-        ok, err = task_notes_db.edit_note(
+        ok, _err = task_notes_db.edit_note(
             note_id=nid, requester="admin", new_text="moderated",
             is_admin=True,
         )

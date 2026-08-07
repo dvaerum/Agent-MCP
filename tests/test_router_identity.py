@@ -27,7 +27,6 @@ from pathlib import Path
 
 import pytest
 
-
 # ── Fixtures ────────────────────────────────────────────────────────
 
 
@@ -385,6 +384,7 @@ def test_cli_create_operator(
         text=True,
         env=env,
         timeout=30,
+        check=False,
     )
     assert result.returncode == 0, (
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
@@ -432,11 +432,11 @@ def test_cli_create_operator_duplicate_username(
         "--password-stdin",
     ]
     first = subprocess.run(
-        cmd, input="x\n", capture_output=True, text=True, env=env, timeout=30
+        cmd, input="x\n", capture_output=True, text=True, env=env, timeout=30, check=False
     )
     assert first.returncode == 0
     second = subprocess.run(
-        cmd, input="y\n", capture_output=True, text=True, env=env, timeout=30
+        cmd, input="y\n", capture_output=True, text=True, env=env, timeout=30, check=False
     )
     assert second.returncode != 0
     combined = (second.stdout + second.stderr).lower()

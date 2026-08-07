@@ -99,9 +99,10 @@ async def test_resources_surface_uses_catalog_role_for_admin_agent(tmp_path) -> 
     another agent's resource; a worker may not. This replaces the bare
     ``bearer_agent_id == "admin"`` string test with ``catalog_role``.
     """
-    from tests.harness import mcp_session
     import mcp.types as mcp_types
     from pydantic_core import Url
+
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -133,7 +134,7 @@ async def test_resources_surface_uses_catalog_role_for_admin_agent(tmp_path) -> 
         )
         tok2 = request_auth_token.set(alice.token)
         try:
-            with pytest.raises(Exception):
+            with pytest.raises(ValueError):
                 await handler(req2)
         finally:
             request_auth_token.reset(tok2)

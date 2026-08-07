@@ -39,18 +39,18 @@ These tests pin that contract:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 
 import pytest
+from starlette.requests import Request
 
 from agent_mcp.app import forwarding_header as _fh
 from agent_mcp.app.deps import require_operator_session
 from agent_mcp.app.main_app import AuthHeaderMiddleware
 from agent_mcp.core import globals as g
 from agent_mcp.core.principal import Principal
-from starlette.requests import Request
 from tests.harness import make_principal
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -110,10 +110,8 @@ def hmac_key():
         g.forwarding_hmac_key = prev
         # Leave the diagnostic global as we found it so no state bleeds
         # into a co-located test in the same xdist worker.
-        try:
+        with contextlib.suppress(Exception):
             g.current_operator = prev_op
-        except Exception:
-            pass
 
 
 # ---------- deterministic: dep must read the principal ---------------
@@ -132,10 +130,8 @@ async def test_dep_reads_principal_not_process_global():
     req.state.principal = _forwarding_principal("realop")
 
     # Simulate a concurrent request having clobbered the process-global.
-    try:
+    with contextlib.suppress(Exception):
         g.current_operator = "intruder"
-    except Exception:
-        pass
 
     auth = await require_operator_session(req)
 
@@ -209,10 +205,8 @@ async def test_missing_principal_falls_through_forwarding_branch():
 
     req = _make_request()  # no principal, no forwarding header
     # A poisoned global must NOT make this resolve as forwarding.
-    try:
+    with contextlib.suppress(Exception):
         g.current_operator = "ghost"
-    except Exception:
-        pass
 
     with pytest.raises(HTTPException) as excinfo:
         await require_operator_session(req)

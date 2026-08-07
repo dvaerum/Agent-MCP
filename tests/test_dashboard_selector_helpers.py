@@ -114,7 +114,7 @@ def test_data_store_no_longer_duplicates_admin_normalize() -> None:
     assert not matches, (
         "data-store.ts still contains the inline Admin/admin assigned_to "
         "predicate -- it should compose normalizeAgentId + selectTasks "
-        "from the helpers instead. Found {n} match(es).".format(n=len(matches))
+        f"from the helpers instead. Found {len(matches)} match(es)."
     )
 
 

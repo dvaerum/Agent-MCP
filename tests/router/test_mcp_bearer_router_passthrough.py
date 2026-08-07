@@ -38,7 +38,6 @@ import pytest
 import pytest_asyncio
 from aiohttp import web
 
-
 pytestmark = pytest.mark.asyncio
 
 

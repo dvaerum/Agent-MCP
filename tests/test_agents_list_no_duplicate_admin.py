@@ -43,7 +43,6 @@ import pytest
 
 from tests.harness import mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -109,9 +108,10 @@ async def test_state_load_skips_admin_pseudo_agent(tmp_path) -> None:
     which lifespan-replay would then load into active_agents. So this
     test runs lifespan BARE (without the harness's seeding) to
     exercise just the lifespan's own behaviour."""
-    from agent_mcp.core import globals as g
-    from agent_mcp.app.main_app import create_app
     from starlette.testclient import TestClient
+
+    from agent_mcp.app.main_app import create_app
+    from agent_mcp.core import globals as g
 
     project_dir = tmp_path / "project"
     project_dir.mkdir()

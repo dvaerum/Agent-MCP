@@ -22,11 +22,10 @@ continues to wake long-poll waiters and streaming subscribers.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 from unittest.mock import patch
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Test A: an adapter registered with the bus receives notify() calls.
@@ -37,14 +36,14 @@ def test_register_adapter_receives_notify_call() -> None:
     """A registered adapter's ``deliver`` is invoked with the right args."""
     from agent_mcp.core import event_bus
 
-    received: List[Tuple[str, str, Optional[Dict[str, Any]]]] = []
+    received: list[tuple[str, str, dict[str, Any] | None]] = []
 
     class FakeAdapter:
         def deliver(
             self,
             agent_id: str,
             event_type: str,
-            payload: Optional[Dict[str, Any]],
+            payload: dict[str, Any] | None,
         ) -> None:
             received.append((agent_id, event_type, payload))
 
@@ -67,7 +66,7 @@ def test_register_adapter_receives_notify_call() -> None:
 def test_multiple_adapters_each_receive_call_in_order() -> None:
     from agent_mcp.core import event_bus
 
-    order: List[str] = []
+    order: list[str] = []
 
     class TaggingAdapter:
         def __init__(self, name: str) -> None:
@@ -77,7 +76,7 @@ def test_multiple_adapters_each_receive_call_in_order() -> None:
             self,
             agent_id: str,
             event_type: str,
-            payload: Optional[Dict[str, Any]],
+            payload: dict[str, Any] | None,
         ) -> None:
             order.append(self.name)
 
@@ -102,14 +101,14 @@ def test_multiple_adapters_each_receive_call_in_order() -> None:
 def test_crashing_adapter_does_not_break_bus_or_other_adapters() -> None:
     from agent_mcp.core import event_bus
 
-    survivor_called: List[bool] = []
+    survivor_called: list[bool] = []
 
     class CrashingAdapter:
         def deliver(
             self,
             agent_id: str,
             event_type: str,
-            payload: Optional[Dict[str, Any]],
+            payload: dict[str, Any] | None,
         ) -> None:
             raise RuntimeError("kaboom — adapter is unhappy")
 
@@ -118,7 +117,7 @@ def test_crashing_adapter_does_not_break_bus_or_other_adapters() -> None:
             self,
             agent_id: str,
             event_type: str,
-            payload: Optional[Dict[str, Any]],
+            payload: dict[str, Any] | None,
         ) -> None:
             survivor_called.append(True)
 
@@ -162,7 +161,7 @@ async def test_notify_agent_inbox_still_wakes_signal_for_waiters() -> None:
     # Should resolve quickly.
     try:
         await asyncio.wait_for(waiter_task, timeout=1.0)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         pytest.fail(
             "notify_agent_inbox failed to wake a waiter blocked on "
             "signal_for(agent-y) — the LongPollSignalAdapter path is broken."
@@ -180,7 +179,7 @@ async def test_notify_agent_inbox_still_wakes_signal_for_waiters() -> None:
 def test_notify_agent_inbox_still_pushes_to_session_registry_fanout() -> None:
     from agent_mcp.core import session_registry, state
 
-    calls: List[Tuple[str, Any]] = []
+    calls: list[tuple[str, Any]] = []
 
     def _spy(agent_id: str, payload: Any):  # mirrors fanout_to_agent sig
         calls.append((agent_id, payload))
@@ -212,7 +211,7 @@ def test_audit_log_adapter_registered_by_default() -> None:
     exercised, even when its DEBUG log is gated off."""
     from agent_mcp.core import event_bus
 
-    names = {name for name, _ in event_bus._adapters}  # noqa: SLF001
+    names = {name for name, _ in event_bus._adapters}
     assert "AuditLogAdapter" in names, (
         f"AuditLogAdapter not registered; got adapters: {names}"
     )
@@ -235,14 +234,14 @@ def test_notify_unassigned_task_appeared_routes_through_bus(
     """The capability-matched fanout still uses the bus per-agent."""
     from agent_mcp.core import event_bus, state
 
-    received: List[Tuple[str, str, Optional[Dict[str, Any]]]] = []
+    received: list[tuple[str, str, dict[str, Any] | None]] = []
 
     class CaptureAdapter:
         def deliver(
             self,
             agent_id: str,
             event_type: str,
-            payload: Optional[Dict[str, Any]],
+            payload: dict[str, Any] | None,
         ) -> None:
             received.append((agent_id, event_type, payload))
 
@@ -253,7 +252,7 @@ def test_notify_unassigned_task_appeared_routes_through_bus(
 
     class FakeCursor:
         def __init__(self) -> None:
-            self._next: List[Any] = []
+            self._next: list[Any] = []
 
         def execute(self, sql: str, params=()):
             if "FROM tasks" in sql:

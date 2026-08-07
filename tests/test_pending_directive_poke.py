@@ -9,10 +9,9 @@ import json
 
 import pytest
 
-from tests.harness import mcp_session
 import agent_mcp.tools.agent_communication_tools as acm
 from agent_mcp.repositories import pending_directive_repository as poke_repo
-
+from tests.harness import mcp_session
 
 pytestmark = pytest.mark.asyncio
 
@@ -139,6 +138,7 @@ async def test_poke_wakes_a_blocked_waiter_immediately(tmp_path):
     releases an agent already blocked in wait_for_events — immediate
     delivery, not next-reconnect."""
     import asyncio
+
     from agent_mcp.core import globals as g
 
     async with mcp_session(tmp_path) as admin:

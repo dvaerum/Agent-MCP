@@ -24,10 +24,9 @@ contract and guard the real-password regression paths.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -57,7 +56,7 @@ def _seed_sso_user(username: str = "sso-alice") -> str:
 
     identity = _identity_module()
     user_id = secrets.token_hex(8)
-    created_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    created_at = datetime.now(UTC).isoformat(timespec="milliseconds")
     with identity._connect() as conn:
         conn.execute(
             """

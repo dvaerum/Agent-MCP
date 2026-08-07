@@ -22,7 +22,6 @@ from pathlib import Path
 import mcp.types as mcp_types
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Static-shape tests — no harness needed.
 # ---------------------------------------------------------------------------
@@ -109,8 +108,8 @@ async def test_prompts_list_returns_catalog_entries(tmp_path: Path) -> None:
     """`prompts/list` returns every catalogue entry as an
     `mcp_types.Prompt`. Names are stable (prompt id from the
     catalog)."""
-    from tests.harness import mcp_session
     from agent_mcp.prompts import load_catalog
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         prompts = await _list_prompts(admin)
@@ -259,8 +258,8 @@ def test_wake_loop_prompt_uses_real_tool_names() -> None:
     """
     import re
 
-    from agent_mcp.prompts import get_prompt
     from agent_mcp.app.event_loop_instructions import WAKE_LOOP_INSTRUCTIONS
+    from agent_mcp.prompts import get_prompt
 
     entry = get_prompt("event-loop")
     assert entry is not None, "wake-loop catalog entry vanished"
@@ -313,8 +312,8 @@ def test_wake_loop_prompt_mandates_reentry_after_finishing_work() -> None:
     ends with another wait_for_events() call rather than a stopped turn.
     Both copies (catalog + constant) must carry it.
     """
-    from agent_mcp.prompts import get_prompt
     from agent_mcp.app.event_loop_instructions import WAKE_LOOP_INSTRUCTIONS
+    from agent_mcp.prompts import get_prompt
 
     entry = get_prompt("event-loop")
     assert entry is not None, "wake-loop catalog entry vanished"
@@ -354,8 +353,8 @@ def test_wake_loop_prompt_mandates_reentry_after_finishing_work() -> None:
 async def test_rest_catalog_endpoint_returns_json(tmp_path: Path) -> None:
     """`GET /api/prompts/catalog` returns the same JSON
     `load_catalog()` returns."""
-    from tests.harness import mcp_session
     from agent_mcp.prompts import load_catalog
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         resp = admin.client.get("/api/prompts/catalog")

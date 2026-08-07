@@ -49,7 +49,6 @@ from pathlib import Path
 import pytest
 from aiohttp import web
 
-
 pytestmark = pytest.mark.asyncio
 
 _GENERIC = "backend not ready"
@@ -90,9 +89,8 @@ async def test_socket_timeout_reason_is_generic(
 
     with caplog.at_level(
         logging.ERROR, logger="agent_mcp.router.project_orchestrator",
-    ):
-        with pytest.raises(web.HTTPGatewayTimeout) as excinfo:
-            await router_module._ensure(name, "backend")
+    ), pytest.raises(web.HTTPGatewayTimeout) as excinfo:
+        await router_module._ensure(name, "backend")
 
     _assert_generic(excinfo.value.reason, where="raised 504 reason")
 

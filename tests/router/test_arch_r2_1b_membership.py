@@ -34,7 +34,6 @@ from pathlib import Path
 
 import pytest
 
-
 # ── Fixtures (mirror tests/router/test_arch_r2_1_router_store.py) ────
 
 

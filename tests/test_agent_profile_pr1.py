@@ -19,10 +19,11 @@ from __future__ import annotations
 
 import datetime
 
+from starlette.testclient import TestClient
+
 from agent_mcp.app.main_app import create_app
 from agent_mcp.core.capabilities import resolve_capabilities
 from agent_mcp.core.principal import Principal
-from starlette.testclient import TestClient
 
 
 def _make_client(project_dir):
@@ -168,7 +169,7 @@ def test_review_profile_unknown_agent_returns_none(project_dir, reset_globals):
 # --- update_agent_profile tool: gating matrix ---------------------------
 
 
-import asyncio  # noqa: E402
+import asyncio
 
 
 def _run(coro):

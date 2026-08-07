@@ -103,9 +103,16 @@ manually as part of release verification — **not** part of CI here.
 
 - `pytest` (everything under `tests/`)
 - `ruff check tests/` (scope is `tests/` only for now — legacy
-  `agent_mcp/` has 216 existing ruff errors that we don't gate CI on;
+  `agent_mcp/` has ~2300 existing ruff errors that we don't gate CI on;
   PRs that touch `agent_mcp/` files should manually `ruff check <file>`
   and clean them up incrementally)
+
+  ruff is pinned exactly in `[project.optional-dependencies] dev`. The
+  lint job installs dev deps by re-resolving `pyproject.toml`, not from
+  `uv.lock`, so an unpinned ruff lets an upstream release red `main`
+  with no repo change — ruff 0.16.0 did exactly that when it grew the
+  default rule set from 59 rules to 413. Bump the pin in its own PR
+  that also clears whatever the new version flags.
 - `( cd agent_mcp/dashboard && npm ci && npm run build )`
 
 Red CI blocks merge.

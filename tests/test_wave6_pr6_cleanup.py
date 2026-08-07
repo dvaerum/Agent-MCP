@@ -134,6 +134,7 @@ def test_dispatch_tool_call_requires_principal_kwarg_signature() -> None:
     direct-call fallback synthesizes from ``arguments["token"]``).
     """
     import inspect
+
     from agent_mcp.tools.registry import dispatch_tool_call
 
     sig = inspect.signature(dispatch_tool_call)
@@ -150,19 +151,21 @@ async def test_tool_result_wrap_helper_no_longer_called_for_lists() -> None:
     The bridge that wrapped them as ``Ok(message=...)`` is gone; a
     tool that returns the legacy shape surfaces as :class:`Failed`.
     """
-    from typing import Any, Dict, List
+    from typing import Any
+
     import mcp.types as mcp_types
+
+    from agent_mcp.core.tool_result import Failed
     from agent_mcp.tools.registry import (
         dispatch_tool_call,
         register_tool,
         tool_implementations,
         tool_schemas,
     )
-    from agent_mcp.core.tool_result import Failed
 
     async def _legacy_returner(
-        arguments: Dict[str, Any],
-    ) -> List[mcp_types.TextContent]:
+        arguments: dict[str, Any],
+    ) -> list[mcp_types.TextContent]:
         return [mcp_types.TextContent(type="text", text="legacy")]
 
     register_tool(

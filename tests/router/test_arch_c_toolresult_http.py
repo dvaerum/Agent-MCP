@@ -31,7 +31,6 @@ from agent_mcp.core.tool_result import (
     tool_result_to_http,
 )
 
-
 # ── Table test: each variant → its status exactly once ───────────
 
 
