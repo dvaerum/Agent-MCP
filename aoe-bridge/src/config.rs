@@ -72,6 +72,13 @@ pub struct Settings {
     pub agent_mcp_base: String,
     /// How often to re-resolve routes and re-post transport-status.
     pub status_interval_secs: u64,
+    /// When true (default), each covered session that gets MCP injected is also
+    /// switched to ACP mode (a one-time terminal→ACP view swap) so AoE's
+    /// per-session MCP (`session_mcp_servers`) actually reaches the agent —
+    /// terminal `claude`/`opencode` sessions never load per-session MCP, ACP
+    /// delivers it agent-agnostically. Only sessions with `expose_mcp` on are
+    /// switched; delivery-only rows are left untouched.
+    pub ensure_acp: bool,
     /// Per-session mapping rows.
     pub sessions: Vec<SessionEntry>,
 }
@@ -142,6 +149,14 @@ pub struct Route {
 }
 
 impl Route {
+    /// Whether this route should be switched to ACP mode. Only covered sessions
+    /// that actually get MCP injected (`mcp_url` set, i.e. `expose_mcp` on) are
+    /// candidates, and only when the global `ensure_acp` setting is on —
+    /// delivery-only rows are never switched.
+    pub fn wants_acp(&self, ensure_acp: bool) -> bool {
+        ensure_acp && self.mcp_url.is_some()
+    }
+
     /// A change in any of these means the running per-session task must be torn
     /// down and respawned (it captured the old values).
     pub fn fingerprint(&self, aoe_base: &str, aoe_token: &str) -> String {
@@ -262,6 +277,10 @@ pub async fn load_settings(conn: &PluginConn) -> Settings {
         .await
         .as_u64()
         .unwrap_or(30);
+    let ensure_acp = get_value(conn, "ensure_acp")
+        .await
+        .as_bool()
+        .unwrap_or(true);
     let sessions = parse_session_entries(&get_value(conn, "sessions").await);
 
     Settings {
@@ -270,6 +289,7 @@ pub async fn load_settings(conn: &PluginConn) -> Settings {
         aoe_token,
         agent_mcp_base,
         status_interval_secs,
+        ensure_acp,
         sessions,
     }
 }
@@ -302,6 +322,7 @@ mod tests {
             aoe_token: "aoe-tok".to_string(),
             agent_mcp_base: agent_mcp_base.to_string(),
             status_interval_secs: 30,
+            ensure_acp: true,
             sessions,
         }
     }
@@ -401,6 +422,36 @@ mod tests {
         assert!(routes[0].mcp_url.is_none());
         // Delivery endpoint is still derived (delivery is independent of MCP).
         assert_eq!(routes[0].endpoint, "https://h/agent-mcp/api/p");
+    }
+
+    #[test]
+    fn ensure_acp_defaults_true_when_key_absent() {
+        // Mirrors how load_settings resolves the setting: a missing key comes
+        // back from config.get as Null, which must fall back to true (the
+        // "switch covered sessions to ACP so per-session MCP applies" default).
+        assert!(Value::Null.as_bool().unwrap_or(true));
+        // An explicit false is honoured.
+        assert!(!json!(false).as_bool().unwrap_or(true));
+    }
+
+    #[test]
+    fn wants_acp_gates_on_expose_mcp_and_setting() {
+        let live = live_map(&[("s1", "claude", "Running")]);
+        // expose_mcp on -> mcp_url set -> candidate when ensure_acp on.
+        let covered = resolve_routes(
+            &settings(vec![entry("s1", "t", "p", "auto")], "https://h"),
+            &live,
+        );
+        assert!(covered[0].wants_acp(true));
+        // ...but never when the global setting is off.
+        assert!(!covered[0].wants_acp(false));
+
+        // expose_mcp off -> no mcp_url -> never a candidate, even with ensure_acp on.
+        let mut e = entry("s1", "t", "p", "auto");
+        e.expose_mcp = false;
+        let delivery_only = resolve_routes(&settings(vec![e], "https://h"), &live);
+        assert!(delivery_only[0].mcp_url.is_none());
+        assert!(!delivery_only[0].wants_acp(true));
     }
 
     #[test]
