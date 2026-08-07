@@ -32,6 +32,7 @@
 
 import { useEffect } from "react"
 import { subscribeMcpNotifications } from "@/lib/mcp-notifications"
+import { startDataStoreAutoRefresh } from "@/lib/stores/data-store"
 
 export function McpNotificationsProvider({
   children,
@@ -40,8 +41,15 @@ export function McpNotificationsProvider({
 }) {
   useEffect(() => {
     const unsubscribe = subscribeMcpNotifications()
+    // The data-store's 60s freshness poll is the safety net BEHIND this
+    // stream, so its lifecycle belongs next to the stream's rather than
+    // firing as an import-time side effect of `lib/stores/data-store`
+    // (where it was unstoppable and re-armed on every module
+    // re-evaluation). See `startDataStoreAutoRefresh`.
+    const stopAutoRefresh = startDataStoreAutoRefresh()
     return () => {
       unsubscribe()
+      stopAutoRefresh()
     }
   }, [])
 

@@ -9,7 +9,7 @@
 // by rendering the whole Agents page.
 import { describe, it, expect, vi, afterEach } from "vitest"
 import { render, cleanup, screen, waitFor } from "@testing-library/react"
-import userEvent from "@testing-library/user-event"
+import { setupUser } from "@/tests/support/user-event"
 
 // jsdom ships no ResizeObserver; Radix's Select measures its trigger.
 class ResizeObserverStub {
@@ -31,8 +31,6 @@ import {
   RegisterAgentModal,
 } from "@/components/dashboard/agents/register-agent-modal"
 
-const ue = () => userEvent.setup({ pointerEventsCheck: 0 })
-
 afterEach(() => {
   cleanup()
   registerAgent.mockReset()
@@ -53,14 +51,14 @@ describe("AGENT_ID_RE", () => {
 
 async function openModal() {
   render(<RegisterAgentModal />)
-  await ue().click(screen.getByRole("button", { name: /Register Agent/ }))
+  await setupUser().click(screen.getByRole("button", { name: /Register Agent/ }))
   return screen.getByPlaceholderText("worker-analytics-01")
 }
 
 describe("<RegisterAgentModal>", () => {
   it("disarms Register and explains the slug rule for an invalid id", async () => {
     const input = await openModal()
-    await ue().type(input, "Bad Name!")
+    await setupUser().type(input, "Bad Name!")
     expect(screen.getByRole("button", { name: "Register" })).toHaveProperty(
       "disabled",
       true,
@@ -76,8 +74,8 @@ describe("<RegisterAgentModal>", () => {
       message: "ok",
     })
     const input = await openModal()
-    await ue().type(input, "worker-1")
-    await ue().click(screen.getByRole("button", { name: "Register" }))
+    await setupUser().type(input, "worker-1")
+    await setupUser().click(screen.getByRole("button", { name: "Register" }))
 
     await waitFor(() => expect(screen.getByText("Agent registered")).toBeTruthy())
     expect(screen.getByText('{"mcpServers": {"agent-mcp": {}}}')).toBeTruthy()
@@ -87,8 +85,8 @@ describe("<RegisterAgentModal>", () => {
   it("keeps the dialog open with the typed id when the server rejects", async () => {
     registerAgent.mockRejectedValue(new Error("invalid agent_id"))
     const input = await openModal()
-    await ue().type(input, "worker-1")
-    await ue().click(screen.getByRole("button", { name: "Register" }))
+    await setupUser().type(input, "worker-1")
+    await setupUser().click(screen.getByRole("button", { name: "Register" }))
 
     await waitFor(() => expect(registerAgent).toHaveBeenCalled())
     // Still on pane 1, input preserved — the 2026-06-17 regression.
@@ -99,8 +97,8 @@ describe("<RegisterAgentModal>", () => {
   it("treats a response missing the token/snippet as a failure", async () => {
     registerAgent.mockResolvedValue({ agent_id: "worker-1" })
     const input = await openModal()
-    await ue().type(input, "worker-1")
-    await ue().click(screen.getByRole("button", { name: "Register" }))
+    await setupUser().type(input, "worker-1")
+    await setupUser().click(screen.getByRole("button", { name: "Register" }))
 
     await waitFor(() => expect(registerAgent).toHaveBeenCalled())
     expect(screen.queryByText("Agent registered")).toBeNull()
@@ -114,8 +112,8 @@ describe("<RegisterAgentModal>", () => {
       message: "ok",
     })
     const input = await openModal()
-    await ue().type(input, "worker-1")
-    await ue().click(screen.getByRole("button", { name: "Register" }))
+    await setupUser().type(input, "worker-1")
+    await setupUser().click(screen.getByRole("button", { name: "Register" }))
     await waitFor(() => expect(registerAgent).toHaveBeenCalled())
     expect(registerAgent.mock.calls[0][0]).toMatchObject({
       name: "worker-1",

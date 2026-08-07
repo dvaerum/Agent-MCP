@@ -5,7 +5,7 @@
 // the in-modal action rules inside the god-file.
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest"
 import { render, cleanup, screen, waitFor } from "@testing-library/react"
-import userEvent from "@testing-library/user-event"
+import { setupUser } from "@/tests/support/user-event"
 
 class ResizeObserverStub {
   observe() {}
@@ -25,8 +25,6 @@ vi.mock("@/lib/stores/data-store", () => ({
 import { AgentDetailDialog } from "@/components/dashboard/agents/agent-detail-dialog"
 import { ACTIVE_TAB_STORAGE_KEY } from "@/lib/mcp-snippets"
 import type { Agent } from "@/lib/api"
-
-const ue = () => userEvent.setup({ pointerEventsCheck: 0 })
 
 const agent = {
   agent_id: "worker-1",
@@ -61,7 +59,7 @@ describe("<AgentDetailDialog>", () => {
       />,
     )
     expect(screen.getByText("...cdef")).toBeTruthy()
-    await ue().click(screen.getByRole("button", { name: "Reveal" }))
+    await setupUser().click(screen.getByRole("button", { name: "Reveal" }))
     expect(screen.getByText(agent.auth_token!)).toBeTruthy()
   })
 
@@ -95,7 +93,7 @@ describe("<AgentDetailDialog>", () => {
         onTaskClick={() => {}}
       />,
     )
-    await ue().click(screen.getByRole("tab", { name: "Zed" }))
+    await setupUser().click(screen.getByRole("tab", { name: "Zed" }))
     await waitFor(() =>
       expect(window.localStorage.getItem(ACTIVE_TAB_STORAGE_KEY)).toBe("zed"),
     )

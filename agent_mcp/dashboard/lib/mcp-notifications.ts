@@ -175,6 +175,24 @@ function scheduleDashboardRefresh(): void {
   }, DASHBOARD_REFRESH_DEBOUNCE_MS)
 }
 
+/**
+ * Drop a debounced refetch that hasn't fired yet.
+ *
+ * Called from a subscription's `stop()`: the debounce exists to
+ * coalesce stream traffic, so once the stream is gone the pending tick
+ * has nothing left to reconcile. Without this it survived teardown and
+ * drove a `refreshData()` 300ms after unmount / navigate-away / tab-
+ * hide — a stray request against a store nobody is rendering, and a
+ * live timer in a finished vitest worker. A later reconnect re-arms it
+ * via the catch-up dispatch, so nothing is lost.
+ */
+function cancelScheduledDashboardRefresh(): void {
+  if (_dashboardRefreshTimer !== null) {
+    clearTimeout(_dashboardRefreshTimer)
+    _dashboardRefreshTimer = null
+  }
+}
+
 export function dispatchNotification(payload: JsonRpcNotification): void {
   const method = payload?.method
   if (!method || typeof method !== "string") return
@@ -374,6 +392,7 @@ export function openMcpNotificationStream(
         clearTimeout(reconnectTimer)
         reconnectTimer = null
       }
+      cancelScheduledDashboardRefresh()
       if (abortCtrl) abortCtrl.abort()
     },
   }

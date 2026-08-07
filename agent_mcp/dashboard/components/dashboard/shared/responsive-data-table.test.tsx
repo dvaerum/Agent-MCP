@@ -6,7 +6,7 @@
 // double-renderer pattern (architecture review Class 4).
 import { describe, it, expect, afterEach, vi } from "vitest"
 import { render, cleanup, within } from "@testing-library/react"
-import userEvent from "@testing-library/user-event"
+import { setupUserPlain } from "@/tests/support/user-event"
 
 import {
   ResponsiveDataTable,
@@ -49,7 +49,7 @@ describe("<ResponsiveDataTable>", () => {
   })
 
   it("fires onRowClick with the row when a desktop row is clicked", async () => {
-    const u = userEvent.setup()
+    const u = setupUserPlain()
     const onRowClick = vi.fn()
     const { container } = render(
       <ResponsiveDataTable
@@ -227,7 +227,7 @@ describe("<ResponsiveDataTable>", () => {
   })
 
   it("auto-stacks columns on mobile when no renderMobileCard is given", async () => {
-    const u = userEvent.setup()
+    const u = setupUserPlain()
     const onRowClick = vi.fn()
     const { container } = render(
       <ResponsiveDataTable

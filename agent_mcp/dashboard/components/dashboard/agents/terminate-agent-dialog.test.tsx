@@ -7,12 +7,9 @@
 // possible.
 import { describe, it, expect, vi, afterEach } from "vitest"
 import { render, cleanup, screen, waitFor } from "@testing-library/react"
-import userEvent from "@testing-library/user-event"
+import { setupUser } from "@/tests/support/user-event"
 
 import { TerminateAgentDialog } from "@/components/dashboard/agents/terminate-agent-dialog"
-
-// Radix Dialog locks `pointer-events: none` on <body> while open.
-const ue = () => userEvent.setup({ pointerEventsCheck: 0 })
 
 afterEach(() => cleanup())
 
@@ -41,7 +38,7 @@ describe("<TerminateAgentDialog>", () => {
         onConfirmed={onConfirmed}
       />,
     )
-    await ue().click(screen.getByRole("button", { name: "Terminate" }))
+    await setupUser().click(screen.getByRole("button", { name: "Terminate" }))
     await waitFor(() => expect(onConfirmed).toHaveBeenCalledWith("worker-1"))
     expect(onOpenChange).toHaveBeenCalledWith(false)
   })
@@ -57,7 +54,7 @@ describe("<TerminateAgentDialog>", () => {
         onConfirmed={onConfirmed}
       />,
     )
-    await ue().click(screen.getByRole("button", { name: "Terminate" }))
+    await setupUser().click(screen.getByRole("button", { name: "Terminate" }))
     await waitFor(() => expect(onConfirmed).toHaveBeenCalled())
     expect(onOpenChange).not.toHaveBeenCalledWith(false)
   })
@@ -72,7 +69,7 @@ describe("<TerminateAgentDialog>", () => {
         onConfirmed={onConfirmed}
       />,
     )
-    await ue().click(screen.getByRole("button", { name: "Terminate" }))
+    await setupUser().click(screen.getByRole("button", { name: "Terminate" }))
     expect(onConfirmed).not.toHaveBeenCalled()
   })
 })

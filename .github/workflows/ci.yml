@@ -110,6 +110,10 @@ jobs:
         run: cargo test --locked
 
   dashboard:
+    # Job display name is load-bearing: branch protection matches
+    # required status checks by name, so renaming it would silently stop
+    # satisfying an existing requirement. The added vitest step is a
+    # step-level change on purpose.
     name: Dashboard build
     runs-on: ubuntu-latest
     defaults:
@@ -127,6 +131,18 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      # The Vitest suite was ungated until fix/vitest-notifications-flake,
+      # which is exactly why a testTimeout bump papering over two real
+      # timer/import defects went unnoticed for a release: nothing outside
+      # a developer's own terminal ever ran it. `npm run build` only
+      # typechecks — it cannot catch a leaked timer, a lost SSE contract,
+      # or a source-grep guard going stale.
+      #
+      # Cost is ~20s on top of a job that already pays for `npm ci`, so it
+      # runs BEFORE the (much slower) build for fast feedback.
+      - name: Unit tests (vitest)
+        run: npm test
 
       - name: Build static export
         run: npm run build
