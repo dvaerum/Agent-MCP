@@ -391,14 +391,11 @@ export function MessagesDashboard() {
   })
 
   // Surface the hook's query error via the shared toast (matches
-  // Agents/Tasks/Memories — no more in-page red banner).
-  //
-  // NOTE: this is deliberately NOT wired into <DataTablePage>'s
-  // scaffold-owned `error` panel. That panel REPLACES the page, and a
-  // messages list refreshes itself every 60 s / on every SSE tick — one
-  // transient failure would blank a page the operator is reading. The
-  // toast is the pre-existing (and still correct) surface here;
-  // switching to the panel would be a UX change, not a refactor.
+  // Agents/Tasks/Memories — no more in-page red banner). `queryError` is
+  // ALSO handed to <DataTablePage>, which now degrades to an inline
+  // stale notice whenever rows are in hand and only takes over the page
+  // on an empty first load — so the toast announces the blip and the
+  // rows the operator is reading stay put.
   useEffect(() => {
     if (queryError) toastError(queryError, "Failed to load messages")
   }, [queryError])
@@ -1207,6 +1204,7 @@ export function MessagesDashboard() {
   return (
     <DataTablePage<Message>
       loading={loading}
+      error={queryError?.message ?? null}
       header={{
         title: "Messages",
         subtitle: "Inspect and route inter-agent messages",
