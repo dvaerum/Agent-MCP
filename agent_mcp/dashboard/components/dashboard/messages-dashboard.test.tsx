@@ -1,0 +1,129 @@
+// @vitest-environment jsdom
+//
+// Render pin for the Messages page after its migration onto the shared
+// <DataTablePage> scaffold. The page's other guards are source-text
+// greps (tests/test_dashboard_messages_*.py, tests/messages-ux.test.ts)
+// — they can't tell whether the column spec actually produces the same
+// rendered surface the hand-rolled <Table> + <MessagesMobileList> did.
+// This mounts the real component (data source stubbed) and asserts the
+// surface: header, stats, every column header, one desktop row AND one
+// mobile card per message, the reply indent on replies only, both
+// pagination footers, and the selection checkboxes.
+import { describe, it, expect, vi, afterEach } from "vitest"
+import { render, cleanup, screen, within } from "@testing-library/react"
+
+const message = {
+  message_id: "m1",
+  sender_id: "backend-dev",
+  recipient_id: "manager",
+  message_content: "hello world",
+  message_type: "text",
+  priority: "high",
+  timestamp: "2026-01-01T00:00:00Z",
+  delivered: 1,
+  read: 0,
+  subject: "a subject",
+  parent_message_id: null,
+}
+// A reply: no subject, parent set — drives the "↳ reply to" branch and
+// the left-border row indent.
+const reply = {
+  ...message,
+  message_id: "m2",
+  subject: null,
+  parent_message_id: "m1",
+  read: 1,
+}
+
+vi.mock("@/hooks/use-paged-query", () => ({
+  usePagedQuery: () => ({
+    data: [message, reply],
+    total: 2,
+    loading: false,
+    error: null,
+    refresh: () => {},
+    lastFetch: Date.now(),
+  }),
+}))
+vi.mock("@/lib/stores/server-store", () => ({
+  useServerStore: () => ({
+    servers: [{ id: "s1", name: "proj", status: "connected" }],
+    activeServerId: "s1",
+  }),
+}))
+vi.mock("@/lib/api", () => ({
+  apiClient: { getServerUrl: () => "http://localhost:1/api" },
+}))
+// The compose recipient dropdown pulls /messages/participants on mount.
+vi.stubGlobal(
+  "fetch",
+  vi.fn(() =>
+    Promise.resolve({ ok: true, json: () => Promise.resolve({ live: [] }) }),
+  ),
+)
+
+import { MessagesDashboard } from "@/components/dashboard/messages-dashboard"
+
+afterEach(() => cleanup())
+
+describe("<MessagesDashboard> (scaffold migration)", () => {
+  it("renders the scaffold header + stats strip", () => {
+    render(<MessagesDashboard />)
+    expect(screen.getByRole("heading", { name: "Messages" })).toBeTruthy()
+    expect(
+      screen.getByText("Inspect and route inter-agent messages"),
+    ).toBeTruthy()
+    for (const label of ["Total", "Unread", "Read", "Selected"]) {
+      expect(screen.getAllByText(label).length, label).toBeGreaterThan(0)
+    }
+  })
+
+  it("renders every desktop column header from the column spec", () => {
+    const { container } = render(<MessagesDashboard />)
+    const table = container.querySelector("table")!
+    for (const header of [
+      "Time",
+      "From",
+      "To",
+      "Subject",
+      "Type",
+      "Priority",
+      "Read?",
+      "Content",
+    ]) {
+      expect(within(table).getByText(header), header).toBeTruthy()
+    }
+    expect(screen.getByLabelText("select all visible")).toBeTruthy()
+  })
+
+  it("renders a desktop row AND a mobile card per message", () => {
+    const { container } = render(<MessagesDashboard />)
+    expect(container.querySelectorAll("tbody tr")).toHaveLength(2)
+    const mobile = container.querySelector('[data-slot="data-table-mobile"]')!
+    expect(mobile.querySelectorAll("li")).toHaveLength(2)
+    // Per-row checkbox exists on both halves.
+    expect(screen.getAllByLabelText("select message m1")).toHaveLength(2)
+  })
+
+  it("indents reply rows only (rowClassName callback)", () => {
+    const { container } = render(<MessagesDashboard />)
+    const rows = container.querySelectorAll("tbody tr")
+    expect(rows[0].className).not.toContain("border-l-2")
+    expect(rows[1].className).toContain("border-l-2")
+  })
+
+  it("renders both pagination footers with the range label", () => {
+    render(<MessagesDashboard />)
+    expect(screen.getAllByText(/Showing 1–2 of 2/)).toHaveLength(2)
+    expect(screen.getAllByLabelText("jump to newest page")).toHaveLength(2)
+    expect(screen.getAllByLabelText("jump to oldest page")).toHaveLength(2)
+  })
+
+  it("keeps the filter bar controls", () => {
+    render(<MessagesDashboard />)
+    expect(screen.getByLabelText("Search messages")).toBeTruthy()
+    expect(screen.getByLabelText("Filter by type")).toBeTruthy()
+    expect(screen.getByLabelText("Filter by priority")).toBeTruthy()
+    expect(screen.getByLabelText("Filter by read status")).toBeTruthy()
+  })
+})
