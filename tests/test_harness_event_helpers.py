@@ -25,6 +25,7 @@ import datetime as _dt
 from pathlib import Path
 
 import pytest
+
 from tests.harness import with_bearer
 
 pytestmark = pytest.mark.asyncio
@@ -35,10 +36,10 @@ async def test_wait_for_event_helper_returns_envelope(
 ) -> None:
     """`wait_for_event` returns a parsed envelope dict
     (`{events: [...], next_cursor: "..."}`), not raw TextContent."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.agent_communication_tools import (
         send_agent_message_tool_impl,
     )
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -70,10 +71,10 @@ async def test_wait_for_event_helper_wakes_within_one_second(
     """The helper exposes the same wake-on-event semantics as the
     raw tool call — assert a concurrent waiter wakes when a message
     fires."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.agent_communication_tools import (
         send_agent_message_tool_impl,
     )
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -104,10 +105,10 @@ async def test_wait_for_event_helper_wakes_within_one_second(
 async def test_read_inbox_helper(tmp_path: Path) -> None:
     """`read_inbox()` reads the calling agent's inbox resource and
     returns the parsed envelope dict."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.agent_communication_tools import (
         send_agent_message_tool_impl,
     )
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -128,8 +129,8 @@ async def test_read_inbox_helper(tmp_path: Path) -> None:
 async def test_read_status_helper(tmp_path: Path) -> None:
     """`read_status()` reads the status resource and returns the
     counter dict."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.task_tools import assign_task_tool_impl
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")

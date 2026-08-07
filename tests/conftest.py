@@ -24,8 +24,9 @@ instead of re-implementing them.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional
+from typing import Any
 
 import pytest
 
@@ -198,13 +199,13 @@ def seed_agent_row(
     conn: Any,
     agent_id: str,
     *,
-    token: Optional[str] = None,
-    role: Optional[str] = "worker",
+    token: str | None = None,
+    role: str | None = "worker",
     status: str = "active",
     working_directory: str = "/tmp",
     color: str = "#888",
     or_ignore: bool = False,
-    created_at: Optional[str] = None,
+    created_at: str | None = None,
 ) -> str:
     """INSERT a minimal `agents` row directly via raw SQL. Returns the token.
 

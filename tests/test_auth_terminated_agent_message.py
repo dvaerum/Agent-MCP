@@ -35,7 +35,6 @@ import pytest
 
 from tests.harness import mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 

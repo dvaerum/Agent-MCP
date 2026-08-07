@@ -17,10 +17,9 @@ expired sessions).
 
 from __future__ import annotations
 
-import time
+import asyncio
 
 import pytest
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -592,7 +591,7 @@ async def test_session_last_used_at_slides(aiohttp_client, router_app) -> None:
     identity = _identity_module()
     first = identity.get_session(sid)
     assert first is not None
-    time.sleep(0.02)
+    await asyncio.sleep(0.02)
 
     # touch_session is the helper PR C exposes for the session-resolver
     # path; should slide the timestamp the same way get_session does.
@@ -619,6 +618,7 @@ async def test_resolve_current_user_returns_none_for_expired(
     sid = identity.create_session(uid, lifetime_days=-1)
 
     from aiohttp.test_utils import make_mocked_request
+
     from agent_mcp.router import login as login_views
 
     req = make_mocked_request(
@@ -638,6 +638,7 @@ async def test_resolve_current_user_returns_user_for_valid_session(
     sid = identity.create_session(uid)
 
     from aiohttp.test_utils import make_mocked_request
+
     from agent_mcp.router import login as login_views
 
     req = make_mocked_request(
@@ -656,6 +657,7 @@ async def test_resolve_current_user_no_cookie_returns_none(
 ) -> None:
     """No cookie → None."""
     from aiohttp.test_utils import make_mocked_request
+
     from agent_mcp.router import login as login_views
 
     req = make_mocked_request("GET", "/agent-mcp/")

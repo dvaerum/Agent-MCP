@@ -33,7 +33,6 @@ import pytest
 
 from tests.harness import mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -116,7 +115,7 @@ async def test_parent_fk_declared_with_set_null(tmp_path) -> None:
                 f"parent_message_id FK missing from agent_messages; have {fks}"
             )
             # ON DELETE behaviour should be SET NULL (index 4 in our tuple).
-            from_col, ref_table, ref_col, _on_update, on_delete = parent_fk[0]
+            _from_col, _ref_table, ref_col, _on_update, on_delete = parent_fk[0]
             assert ref_col == "message_id", parent_fk
             assert on_delete.upper() == "SET NULL", (
                 f"parent_message_id FK should be ON DELETE SET NULL; "

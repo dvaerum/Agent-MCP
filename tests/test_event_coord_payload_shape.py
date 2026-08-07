@@ -22,6 +22,7 @@ import json
 from pathlib import Path
 
 import pytest
+
 from tests.harness import with_bearer
 
 pytestmark = pytest.mark.asyncio
@@ -38,10 +39,10 @@ async def test_message_event_is_skinny(tmp_path: Path) -> None:
     The agent calls get_agent_messages to READ the body — which is what
     marks the message read. (Subject-gen is OFF in tests, so an untitled
     message fires immediately with the 50-char preview as its subject.)"""
-    from tests.harness import mcp_session
     from agent_mcp.tools.agent_communication_tools import (
         send_agent_message_tool_impl,
     )
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -83,8 +84,8 @@ async def test_task_assigned_event_is_skinny(tmp_path: Path) -> None:
     """`task_assigned` / `task_changed` events are pointers too: task_id
     + title + status, NOT the full description. The agent calls
     view_tasks to read + interact."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.task_tools import assign_task_tool_impl
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         worker = await admin.create_worker("worker")
@@ -127,8 +128,8 @@ async def test_unassigned_task_event_is_skinny(tmp_path: Path) -> None:
     """`unassigned_task_appeared` payload must NOT include
     `description` (the spec's reason: workers call `view_tasks` if
     they're interested, keeping the wake event small)."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.task_tools import assign_task_tool_impl
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         worker = await admin.create_worker("worker")
@@ -182,8 +183,8 @@ async def test_unassigned_task_event_is_skinny(tmp_path: Path) -> None:
 async def test_stop_listening_payload_shape(tmp_path: Path) -> None:
     """`stop_listening` event has `ref_id: None` and a `payload.reason`
     string."""
-    from tests.harness import mcp_session
     from agent_mcp.db.connection import get_db_connection
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -222,12 +223,12 @@ async def test_untitled_message_held_until_titled_when_gen_on(
     is HELD (not delivered) until it gets a real subject — so the pointer
     always carries a proper title. Titling it releases the event."""
     monkeypatch.setenv("AGENT_MCP_SUBJECT_MODEL", "test-model")
-    from tests.harness import mcp_session
+    from agent_mcp.db.connection import get_db_connection
+    from agent_mcp.repositories import message_repo
     from agent_mcp.tools.agent_communication_tools import (
         send_agent_message_tool_impl,
     )
-    from agent_mcp.db.connection import get_db_connection
-    from agent_mcp.repositories import message_repo
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")

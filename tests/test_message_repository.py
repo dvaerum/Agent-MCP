@@ -43,9 +43,9 @@ from __future__ import annotations
 import datetime
 import sys
 
-from agent_mcp.app.main_app import create_app
 from starlette.testclient import TestClient
 
+from agent_mcp.app.main_app import create_app
 
 # --- Helpers -------------------------------------------------------------
 
@@ -142,7 +142,7 @@ class _CapturingBus:
     def __init__(self):
         self.events: list[tuple[str, str, dict]] = []
 
-    def notify(self, agent_id, event_type, payload):  # noqa: D401, ANN001
+    def notify(self, agent_id, event_type, payload):
         self.events.append((agent_id, event_type, payload or {}))
 
 
@@ -1069,6 +1069,7 @@ def test_send_with_cursor_to_unknown_recipient_raises(
     before the INSERT fires is what protects the wider transaction.
     """
     import pytest
+
     from agent_mcp.db.connection import get_db_connection
 
     with _make_client(project_dir):

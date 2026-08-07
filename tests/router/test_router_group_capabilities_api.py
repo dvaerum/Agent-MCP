@@ -35,7 +35,6 @@ import json
 
 import pytest
 
-
 # Each test seeds its own user and logs in explicitly. The auto-login
 # sentinel-session fixture is fine for the legacy CRUD tests because
 # the sentinel IS the bootstrap sysadmin, but the auth gate test below

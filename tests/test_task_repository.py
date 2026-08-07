@@ -39,10 +39,10 @@ import datetime
 import sys
 
 import pytest
-
-from agent_mcp.app.main_app import create_app
+from sqlalchemy.exc import IntegrityError
 from starlette.testclient import TestClient
 
+from agent_mcp.app.main_app import create_app
 
 # --- Helpers -------------------------------------------------------------
 
@@ -110,7 +110,7 @@ class _CapturingBus:
     def __init__(self):
         self.events: list[tuple[str, str, dict]] = []
 
-    def notify(self, agent_id, event_type, payload):  # noqa: D401, ANN001
+    def notify(self, agent_id, event_type, payload):
         self.events.append((agent_id, event_type, payload or {}))
 
 
@@ -174,8 +174,7 @@ def test_list_all_returns_every_task(project_dir, reset_globals):
 
 def test_list_by_agent_without_status_filter(project_dir, reset_globals):
     with _make_client(project_dir):
-        from agent_mcp.repositories import agent_repo
-        from agent_mcp.repositories import task_repo
+        from agent_mcp.repositories import agent_repo, task_repo
 
         # FK from tasks.assigned_to -> agents.agent_id requires the
         # agent row first (PR #96 declared the constraint).
@@ -197,8 +196,7 @@ def test_list_by_agent_without_status_filter(project_dir, reset_globals):
 
 def test_list_by_agent_with_status_filter(project_dir, reset_globals):
     with _make_client(project_dir):
-        from agent_mcp.repositories import agent_repo
-        from agent_mcp.repositories import task_repo
+        from agent_mcp.repositories import agent_repo, task_repo
 
         agent_repo.create(
             token="tok-w2",
@@ -344,7 +342,7 @@ def test_create_duplicate_id_raises(project_dir, reset_globals):
         }
         task_repo.create(fields)
 
-        with pytest.raises(Exception):
+        with pytest.raises(IntegrityError):
             task_repo.create(fields)
 
 

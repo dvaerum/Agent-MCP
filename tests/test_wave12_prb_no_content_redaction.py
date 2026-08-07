@@ -34,7 +34,6 @@ from agent_mcp.tools.project_context_tools import (
 )
 from tests.harness import make_principal, mcp_session
 
-
 # A secret-NAMED key AND a credential-SHAPED value — the two shapes the
 # old detector (key-name vocab + embedded-value scanner) redacted. The
 # value is a synthetic high-entropy sentinel (NOT a real provider format,

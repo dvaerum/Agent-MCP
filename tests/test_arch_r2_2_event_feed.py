@@ -29,6 +29,7 @@ import json
 from pathlib import Path
 
 import pytest
+
 from tests.harness import with_bearer
 
 pytestmark = pytest.mark.asyncio
@@ -90,12 +91,12 @@ async def test_inbox_and_wait_for_events_identical_for_same_cursor(
     ``wait_for_events`` (fast path) surfaces both; the inbox resource
     must surface the SAME two events. RED on main (inbox omits the
     unassigned-task stream)."""
-    from tests.harness import mcp_session
+    from agent_mcp.resources.inbox import render_inbox
     from agent_mcp.tools.agent_communication_tools import (
         send_agent_message_tool_impl,
         wait_for_events_tool_impl,
     )
-    from agent_mcp.resources.inbox import render_inbox
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -148,9 +149,9 @@ async def test_noop_cursor_advance_does_not_publish_agent_updated(
     (equal or lower value) must not publish ``agent.updated`` — that
     event wakes every sibling ``wait_for_events`` waiter for nothing.
     RED on main (publishes unconditionally)."""
-    from tests.harness import mcp_session
-    from agent_mcp.repositories import agent_repo
     import agent_mcp.repositories.agent_repository as agent_repository
+    from agent_mcp.repositories import agent_repo
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")
@@ -158,7 +159,7 @@ async def test_noop_cursor_advance_does_not_publish_agent_updated(
         published: list[tuple[str, str]] = []
         orig_publish = agent_repository._publish
 
-        def _spy(addressee, event, payload):  # noqa: ANN001
+        def _spy(addressee, event, payload):
             published.append((event, (payload or {}).get("field")))
             return orig_publish(addressee, event, payload)
 
@@ -192,11 +193,11 @@ async def test_real_cursor_advance_still_persists_monotonically(
 ) -> None:
     """The self-wake fix must not weaken the MAX-based monotonic advance:
     a higher cursor moves the watermark, a lower one never rewinds it."""
-    from tests.harness import mcp_session
     from agent_mcp.repositories import agent_repo
     from agent_mcp.tools.agent_communication_tools import (
         _read_last_event_seen_at,
     )
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("alice")

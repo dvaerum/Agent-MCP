@@ -33,13 +33,13 @@ for ~60 s (the aiohttp default ``shutdown_timeout``), failing the
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 
 import aiohttp
 import pytest
 import pytest_asyncio
 from aiohttp import web
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -140,20 +140,16 @@ async def test_runner_cleanup_completes_promptly_with_inflight_proxy(
     client_session = aiohttp.ClientSession()
 
     async def _open_stream() -> None:
-        try:
+        with contextlib.suppress(Exception):
             async with client_session.post(
                 f"http://127.0.0.1:{unused_tcp_port}/agent-mcp/mcp/proj",
                 data=b"{}",
                 headers={"Authorization": "Bearer tok-1234"},
             ) as resp:
                 # Read until the proxy or the cleanup tears it down.
-                try:
+                with contextlib.suppress(Exception):
                     async for _ in resp.content.iter_chunked(1):
                         pass
-                except Exception:
-                    pass
-        except Exception:
-            pass
 
     client_task = asyncio.create_task(_open_stream())
     try:
@@ -167,8 +163,6 @@ async def test_runner_cleanup_completes_promptly_with_inflight_proxy(
         await asyncio.wait_for(runner.cleanup(), timeout=5.0)
     finally:
         client_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await client_task
-        except (asyncio.CancelledError, Exception):
-            pass
         await client_session.close()

@@ -21,7 +21,6 @@ from agent_mcp.core.capabilities import AGENT_ROLE_BUNDLES
 from agent_mcp.tools.access import TOOL_ACCESS, is_visible_to_role
 from agent_mcp.tools.registry import tool_registry
 
-
 # Restrictiveness rank of a derived visibility level. Lower = fewer roles
 # admitted. A cap-gated tool's derived level may be EQUAL to or MORE
 # restrictive than its cap tier (an explicit tighten override), never
@@ -114,9 +113,12 @@ def test_cap_gated_tool_without_explicit_kwarg_is_not_any() -> None:
     """
     offenders = []
     for name, cap, entry in _cap_gated_tools():
-        if entry.meta.declared_visibility == "any":  # default / no override
-            if TOOL_ACCESS.get(name) == "any":
-                offenders.append((name, cap))
+        # declared_visibility "any" means default / no override.
+        if (
+            entry.meta.declared_visibility == "any"
+            and TOOL_ACCESS.get(name) == "any"
+        ):
+            offenders.append((name, cap))
     assert not offenders, (
         "cap-gated tools defaulting to visibility='any' still derive "
         f"'any' (cap ignored): {offenders}"

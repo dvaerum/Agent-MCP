@@ -40,7 +40,6 @@ import pytest
 
 from tests.harness import mcp_session
 
-
 # ---------------------------------------------------------------------------
 # Migration 0005 — schema check
 # ---------------------------------------------------------------------------
@@ -181,7 +180,9 @@ async def test_alias_header_middleware_parses_scope(tmp_path: Path) -> None:
     own scope-handling code.
     """
     async with mcp_session(tmp_path) as admin:
-        from agent_mcp.app.main_app import _parse_alias_header  # type: ignore[attr-defined]
+        from agent_mcp.app.main_app import (
+            _parse_alias_header,  # type: ignore[attr-defined]
+        )
 
         # Parse helper roundtrip — middleware ultimately calls this.
         parsed = _parse_alias_header("old-name,2026-07-15T00:00:00Z")

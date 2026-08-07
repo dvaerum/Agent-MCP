@@ -93,6 +93,7 @@ def _emb(values):
     """Pad/truncate a short fixture vector to whatever dimension the
     on-disk vec0 ``rag_embeddings`` table declares."""
     import re
+
     from agent_mcp.db.connection import get_db_connection
 
     conn = get_db_connection()
@@ -154,8 +155,8 @@ def test_bulk_index_chunks_inserts_chunks_and_embeddings(
     with _make_client(project_dir):
         if not _vss_available():
             pytest.skip("sqlite-vec not loadable on this host")
-        from agent_mcp.repositories import rag_repo
         from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import rag_repo
 
         chunks = [
             {
@@ -204,8 +205,8 @@ def test_delete_chunks_for_removes_chunks_and_embeddings(
     with _make_client(project_dir):
         if not _vss_available():
             pytest.skip("sqlite-vec not loadable on this host")
-        from agent_mcp.repositories import rag_repo
         from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import rag_repo
 
         # Seed one chunk first.
         rag_repo.bulk_index_chunks(
@@ -271,8 +272,8 @@ def test_set_meta_writes_source_hashes(project_dir, reset_globals):
     straight call swap.
     """
     with _make_client(project_dir):
-        from agent_mcp.repositories import rag_repo
         from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import rag_repo
 
         rag_repo.set_meta(
             source_type="markdown",
@@ -444,8 +445,8 @@ def test_search_similar_returns_empty_when_table_absent(
     consults today.
     """
     with _make_client(project_dir):
-        from agent_mcp.repositories import rag_repo
         from agent_mcp.core import globals as g
+        from agent_mcp.repositories import rag_repo
 
         monkeypatch.setattr(g, "global_vss_load_successful", False)
         results = rag_repo.search_similar(
@@ -491,8 +492,8 @@ def test_get_chunk_by_id_returns_hydrated_chunk(
     with _make_client(project_dir):
         if not _vss_available():
             pytest.skip("sqlite-vec not loadable on this host")
-        from agent_mcp.repositories import rag_repo
         from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import rag_repo
 
         rag_repo.bulk_index_chunks(
             source_type="markdown",
@@ -535,8 +536,8 @@ def test_fetch_recent_context_time_windowed(project_dir, reset_globals):
     falling back to vector search.
     """
     with _make_client(project_dir):
-        from agent_mcp.repositories import rag_repo
         from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import rag_repo
 
         # Seed two project_context rows with distinct timestamps far
         # in the future so the admin-token row (inserted at lifespan
@@ -589,8 +590,8 @@ def test_bulk_index_chunks_joins_parent_transaction(
     with _make_client(project_dir):
         if not _vss_available():
             pytest.skip("sqlite-vec not loadable on this host")
-        from agent_mcp.repositories import rag_repo
         from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import rag_repo
 
         owner = get_db_connection()
         try:
@@ -646,8 +647,8 @@ def test_bulk_index_replaces_after_delete(project_dir, reset_globals):
     with _make_client(project_dir):
         if not _vss_available():
             pytest.skip("sqlite-vec not loadable on this host")
-        from agent_mcp.repositories import rag_repo
         from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import rag_repo
 
         rag_repo.bulk_index_chunks(
             source_type="markdown",

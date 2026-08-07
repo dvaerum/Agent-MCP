@@ -39,7 +39,6 @@ from pathlib import Path
 
 import pytest
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -47,8 +46,8 @@ async def test_mcp_session_yields_working_admin_client(tmp_path: Path) -> None:
     """The harness builds the app, runs lifespan, and yields an admin
     client whose `tools/list` returns the full registered catalogue
     (admin sees everything per PR #55)."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.registry import tool_schemas
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         assert admin.admin_token, "admin_token should be populated"

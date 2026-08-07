@@ -29,7 +29,6 @@ import pytest
 
 from tests.harness import mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -43,7 +42,7 @@ _DISALLOWED_KEYS = [
     ("control_soh",       "a\x01b"),
     ("del",               "a\x7fb"),
     ("rtl_override",      "config‮drowssap"),   # the spoofing case
-    ("zero_width_space",  "a​b"),
+    ("zero_width_space",  "a\u200bb"),
     ("bom",               "a﻿b"),
     ("lri_isolate",       "a⁦b"),
     ("line_separator",    "a b"),

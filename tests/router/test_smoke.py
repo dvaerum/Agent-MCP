@@ -25,6 +25,6 @@ def test_make_app_returns_app_with_routes(router_app) -> None:
 
 
 def test_project_registry_importable() -> None:
-    from agent_mcp.router import project_registry  # noqa: F401
+    from agent_mcp.router import project_registry
 
     assert hasattr(project_registry, "ProjectRegistry")

@@ -17,6 +17,7 @@ import json
 from pathlib import Path
 
 import pytest
+
 from tests.harness import with_bearer
 
 pytestmark = pytest.mark.asyncio
@@ -57,10 +58,10 @@ async def test_fetch_events_since_is_registered(tmp_path: Path) -> None:
 async def test_fetch_events_since_returns_messages(tmp_path: Path) -> None:
     """`fetch_events_since(None)` returns messages persisted while
     the agent was offline."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.agent_communication_tools import (
         send_agent_message_tool_impl,
     )
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -94,10 +95,10 @@ async def test_wait_for_events_persists_last_seen_at(
     """After `wait_for_events` returns events,
     `agents.last_event_seen_at` is updated to the high-water
     timestamp."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.agent_communication_tools import (
         send_agent_message_tool_impl,
     )
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -137,11 +138,11 @@ async def test_fetch_events_since_null_cursor_uses_persisted(
     persisted `last_event_seen_at`. Verified by pre-seeding the
     column with a far-future timestamp — the call should return no
     events even though we just persisted one."""
-    from tests.harness import mcp_session
+    from agent_mcp.db.connection import get_db_connection
     from agent_mcp.tools.agent_communication_tools import (
         send_agent_message_tool_impl,
     )
-    from agent_mcp.db.connection import get_db_connection
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -188,11 +189,11 @@ async def test_wait_for_events_no_since_uses_persisted_cursor(
     far in the future so the just-stored message is "older", then assert
     the no-arg poll returns no message events.
     """
-    from tests.harness import mcp_session
+    from agent_mcp.db.connection import get_db_connection
     from agent_mcp.tools.agent_communication_tools import (
         send_agent_message_tool_impl,
     )
-    from agent_mcp.db.connection import get_db_connection
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")

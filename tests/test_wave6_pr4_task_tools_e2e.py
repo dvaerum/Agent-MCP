@@ -32,7 +32,6 @@ from agent_mcp.core.tool_result import (
 )
 from tests.harness import make_principal, mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -76,8 +75,8 @@ def _seed_unassigned_task(title: str = "needs an owner") -> str:
 def _seed_assigned_task(
     title: str, assigned_to: str, parent: str | None = None,
 ) -> str:
-    from agent_mcp.db.connection import get_db_connection
     from agent_mcp.core import globals as g
+    from agent_mcp.db.connection import get_db_connection
 
     task_id = f"task_{secrets.token_hex(6)}"
     now = _dt.datetime.now().isoformat()
@@ -472,8 +471,9 @@ async def test_delete_task_with_children_no_force_returns_conflict(
         parent_id = _seed_assigned_task("parent", "admin")
         # Direct DB-level append to parent.child_tasks so the
         # cascade-check loads a non-empty list.
-        from agent_mcp.db.connection import get_db_connection
         import json as _json
+
+        from agent_mcp.db.connection import get_db_connection
 
         child_id = _seed_assigned_task("child", "admin", parent=parent_id)
 

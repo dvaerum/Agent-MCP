@@ -34,7 +34,13 @@ dependencies = [
     "sqlite-vec",
     "httpx",
     "requests",
-    "mcp>=1.8.1",
+    # Capped below 2.0: the CI test jobs resolve this range fresh from
+    # pyproject (not from uv.lock), and mcp 2.0.0 (2026-07-28) is a
+    # breaking major — `mcp.server.lowlevel.server.request_ctx` and the
+    # session/transport surfaces this codebase builds on all moved.
+    # Lifting the cap is a deliberate migration PR, not a resolver
+    # accident. uv.lock pins the in-range version we actually ship.
+    "mcp>=1.8.1,<2",
     "sqlalchemy>=2.0",
     "alembic",
     # Router-side identity store (Phase 1 PR B of prancy-napping-pie).
@@ -69,7 +75,14 @@ dev = [
     # time on multi-core machines. See [tool.pytest.ini_options]
     # below for the default `-n auto` config and override notes.
     "pytest-xdist>=3.0",
-    "ruff",
+    # Pinned exactly: the CI lint gate installs dev deps by
+    # re-resolving pyproject (not from uv.lock), so an unpinned ruff
+    # reds `main` the moment upstream ships a release that changes the
+    # rule set — which is exactly what 0.16.0 did (2026-07-23: default
+    # rules went 59 -> 413, taking tests/ from clean to 1021 errors
+    # with zero repo changes). Bump this deliberately, in a PR that
+    # also clears whatever the new version flags.
+    "ruff==0.16.1",
     "black",
     "isort",
 ]
@@ -109,7 +122,9 @@ include = ["agent_mcp*"]
 managed = true
 dev-dependencies = [
     "pytest>=8.3.2",
-    "ruff>=0.5.5",
+    # Keep in lockstep with the [project.optional-dependencies] dev pin
+    # above — see the rationale there.
+    "ruff==0.16.1",
 ]
 
 [tool.rye.scripts]
@@ -155,3 +170,40 @@ extend-exclude = ["tests/router/_fixtures"]
 [tool.ruff.lint.isort]
 known-first-party = ["agent-mcp"]
 # ... existing code ...
+
+# Two rules out of ruff 0.16's expanded default set are wrong for this
+# test suite specifically. Everything else in the default set is
+# enforced on tests/ (see the CI "Lint (tests/ only)" step).
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    # PLR0402 (manual-from-import) rewrites `import pkg.mod as mod`
+    # into `from pkg import mod`. Those are NOT equivalent here: a big
+    # part of this suite gets a clean module by doing
+    # `sys.modules.pop(...)` + `importlib.reload(mod)`, and the
+    # `from pkg import mod` form rebinds the stale attribute off the
+    # already-imported parent package without repopulating
+    # sys.modules — so reload() then raises "module ... not in
+    # sys.modules". Applying this rule's fix broke 91 tests across 7
+    # files. The `import x.y as y` spelling is load-bearing, not style.
+    "PLR0402",
+    # DTZ001/DTZ003/DTZ005 (naive datetime constructors). The tests
+    # write timestamps that must byte-match what production writes,
+    # and agent_mcp/ persists naive local `datetime.now().isoformat()`
+    # in ~82 places (task/agent/note rows, retention cutoffs, the
+    # scheduler's string-ordered ISO comparisons). Making the tests
+    # tz-aware would append "+00:00" and stop them from exercising the
+    # real format. Moving production to aware datetimes is a separate,
+    # deliberate change; when that lands, drop these three and fix the
+    # tests in the same PR.
+    "DTZ001",
+    "DTZ003",
+    "DTZ005",
+]
+# PLE2502 (bidirectional-unicode) fires on the RTL-override / BOM /
+# zero-width characters this file embeds — they ARE the subject under
+# test (it pins that /api/memories rejects spoofable context keys), so
+# the file cannot exist without them. Scoped to this one file rather
+# than tests/** so the rule keeps guarding every other test. A `noqa`
+# is not an option: two of the five hits are inside the module
+# docstring, where a trailing comment is just more string content.
+"tests/test_memories_unsafe_unicode_key.py" = ["PLE2502"]

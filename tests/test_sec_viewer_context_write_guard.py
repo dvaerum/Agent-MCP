@@ -43,7 +43,6 @@ from agent_mcp.tools.project_context_tools import (
 )
 from tests.harness import make_principal, mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 

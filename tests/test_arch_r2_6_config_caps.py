@@ -28,7 +28,6 @@ import pytest
 
 from tests.harness import mcp_session
 
-
 # --------------------------------------------------------------------------
 # Part A — bundle-subset smoke test (still passes post-review)
 # --------------------------------------------------------------------------

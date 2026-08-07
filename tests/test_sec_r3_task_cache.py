@@ -35,7 +35,6 @@ import pytest
 
 from tests.harness import mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -51,7 +50,7 @@ def _capture_publishes(monkeypatch) -> list:
     """
     published: list = []
 
-    def _capture(agent_id, event_type, payload=None):  # noqa: ANN001
+    def _capture(agent_id, event_type, payload=None):
         published.append((agent_id, event_type, payload))
 
     monkeypatch.setattr(

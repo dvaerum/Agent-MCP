@@ -121,15 +121,14 @@ async def test_notify_unassigned_task_skips_tombstone(tmp_path) -> None:
         finally:
             conn.close()
 
-        from agent_mcp.core import state as _state
         from agent_mcp.core import event_bus as _event_bus
+        from agent_mcp.core import state as _state
 
         notified: list[str] = []
         orig_notify = _event_bus.notify
 
-        def _spy(agent_id, event_type, payload):  # noqa: ANN001
+        def _spy(agent_id, event_type, payload):
             notified.append(agent_id)
-            return None
 
         _event_bus.notify = _spy
         try:
@@ -231,8 +230,8 @@ async def test_tombstone_is_not_an_assignable_target(tmp_path) -> None:
         await admin.create_worker("alice")
         _insert_tombstone("ghost")
 
-        from agent_mcp.tools.task_tools import _agent_assignable
         from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.tools.task_tools import _agent_assignable
 
         conn = get_db_connection()
         try:
@@ -261,8 +260,8 @@ async def test_tombstone_is_not_a_terminate_target(tmp_path) -> None:
         await admin.create_worker("alice")
         _insert_tombstone("ghost")
 
-        from agent_mcp.repositories import agent_repo
         from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import agent_repo
 
         # A tombstone is not a terminate target.
         assert agent_repo.terminate("[deleted-ghost]") is False, (

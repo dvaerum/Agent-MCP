@@ -26,7 +26,7 @@ report ``None``) keep the historical operator-tier bundle.
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+from typing import Any
 
 import pytest
 
@@ -37,7 +37,6 @@ from agent_mcp.core.principal import Principal
 from agent_mcp.core.tool_result import Ok
 from tests.harness import make_principal
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -45,7 +44,7 @@ pytestmark = pytest.mark.asyncio
 
 
 class _State:
-    def __init__(self, principal: Optional[Principal]) -> None:
+    def __init__(self, principal: Principal | None) -> None:
         self.principal = principal
 
 
@@ -53,7 +52,7 @@ class _FakeAuthRequest:
     """Stand-in the ``require_operator_session`` dep reads to admit the
     forwarding caller (mirrors ``test_sec_r5_rest_role_fidelity``)."""
 
-    def __init__(self, principal: Optional[Principal]) -> None:
+    def __init__(self, principal: Principal | None) -> None:
         self.state = _State(principal)
         self.cookies: dict[str, str] = {}
         self.method = "POST"
@@ -76,7 +75,7 @@ class _FakeRouteRequest:
         return json.dumps(self._payload).encode()
 
 
-def _forwarding_principal(role: Optional[str], *, user_id: str = "op-1") -> Principal:
+def _forwarding_principal(role: str | None, *, user_id: str = "op-1") -> Principal:
     """A ``forwarding_header`` Principal as the auth middleware would build
     it — carrying the operator's REAL signed ``project_role``."""
     return make_principal(

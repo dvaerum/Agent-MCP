@@ -34,7 +34,7 @@
     "cmdk": "^1.1.1",
     "framer-motion": "^12.19.1",
     "lucide-react": "^0.523.0",
-    "next": "15.5.20",
+    "next": "15.5.23",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-markdown": "^10.1.0",
@@ -63,5 +63,23 @@
     "tailwindcss": "^4",
     "typescript": "^5",
     "vitest": "^4.1.9"
+  },
+  "//overrides": [
+    "next 15.5.x still resolves postcss <=8.5.22 (4 HIGH advisories:",
+    "GHSA-qx2v-qp2m-jg93 XSS, GHSA-6g55-p6wh-862q / GHSA-r28c-9q8g-f849 /",
+    "GHSA-fxqj-rqcc-2cmp sourceMappingURL path traversal) and sharp",
+    "<0.35.0 (GHSA-f88m-g3jw-g9cj, inherited libvips CVEs). npm's own",
+    "remediation for both is `next@16`, a framework major that does not",
+    "belong on a CI-repair PR. These overrides lift the two transitives",
+    "to their patched releases instead — the standard npm mechanism for",
+    "a fix the parent package has not picked up yet. Both bumps are",
+    "low-risk here: postcss is a patch bump, and sharp is never",
+    "exercised at all because next.config.ts sets output:'export' with",
+    "images.unoptimized. Drop these once next ships a 15.5.x that",
+    "resolves the patched versions, or when the next@16 migration lands."
+  ],
+  "overrides": {
+    "postcss": "^8.5.26",
+    "sharp": "^0.35.3"
   }
 }

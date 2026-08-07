@@ -12,7 +12,6 @@ import pytest
 
 from tests.harness import make_principal, mcp_session
 
-
 # ── .mcp.json snippet honours the mount prefix ──────────────────────
 
 
@@ -36,8 +35,8 @@ def test_snippet_url_mount_prefix_direct() -> None:
 @pytest.mark.asyncio
 async def test_register_snippet_root_mount(tmp_path) -> None:
     """register_agent with mount_prefix="" mints a root-mount snippet."""
-    from agent_mcp.tools.admin_tools import register_agent_tool_impl
     from agent_mcp.core.tool_result import Ok
+    from agent_mcp.tools.admin_tools import register_agent_tool_impl
 
     async with mcp_session(tmp_path):
         res = await register_agent_tool_impl(

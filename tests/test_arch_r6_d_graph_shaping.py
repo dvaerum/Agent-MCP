@@ -23,7 +23,7 @@ not inside `_task_node` itself.
 from __future__ import annotations
 
 import sqlite3
-from typing import Any, Dict
+from typing import Any
 
 import pytest
 
@@ -40,7 +40,7 @@ def _task_row(**overrides: Any) -> sqlite3.Row:
     helpers under test see exactly what production code sees (attribute
     access by column name, not a plain dict).
     """
-    defaults: Dict[str, Any] = {
+    defaults: dict[str, Any] = {
         "task_id": "task-1",
         "title": "Some Task",
         "status": "pending",

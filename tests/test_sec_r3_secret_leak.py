@@ -23,7 +23,6 @@ from agent_mcp.features.rag.query import (
 )
 from tests.harness import mcp_session
 
-
 # ── shared helpers ───────────────────────────────────────────────────
 
 _SECRET_VALUE = "SENTINEL-R3-SECRET-7d2b"

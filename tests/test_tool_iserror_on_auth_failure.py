@@ -34,8 +34,8 @@ async def test_dispatch_tool_call_returns_permission_denied_on_bad_token() -> No
     set, so the derived principal is None and the inline
     operator check returns :class:`PermissionDenied`.
     """
-    from agent_mcp.tools.registry import dispatch_tool_call
     from agent_mcp.core.tool_result import PermissionDenied
+    from agent_mcp.tools.registry import dispatch_tool_call
 
     result = await dispatch_tool_call(
         "view_status",
@@ -57,8 +57,8 @@ async def test_dispatch_tool_call_passes_through_normal_success() -> None:
     ``Ok(message=...)``. The successful-tool path therefore
     surfaces as ``Ok``, not a list.
     """
-    from agent_mcp.tools.registry import dispatch_tool_call
     from agent_mcp.core.tool_result import Ok
+    from agent_mcp.tools.registry import dispatch_tool_call
 
     # The simplest "always works" tool: `test` (no auth required per upstream).
     # If it doesn't exist on this build, fall back to no-op.

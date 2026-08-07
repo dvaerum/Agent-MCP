@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import pytest
 
-
 # Async tests below get explicit @pytest.mark.asyncio decorators rather
 # than a module-level pytestmark, because the first batch of tests is
 # synchronous (pure function under test) and the asyncio mark on a

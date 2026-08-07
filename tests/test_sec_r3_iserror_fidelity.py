@@ -23,9 +23,8 @@ decision from any particular tool's policy.
 
 from __future__ import annotations
 
-import pytest
-
 import mcp.types as mcp_types
+import pytest
 
 import agent_mcp.app.main_app as main_app
 from agent_mcp.core.authorize import AuthRejected

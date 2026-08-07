@@ -37,11 +37,9 @@ surface because the REST path carried its own duplicate implementation.
 
 from __future__ import annotations
 
-
 import pytest
 
 from tests.harness import mcp_session
-
 
 pytestmark = pytest.mark.asyncio
 

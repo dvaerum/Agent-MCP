@@ -19,8 +19,9 @@ from __future__ import annotations
 
 import inspect
 
-from agent_mcp.app.main_app import create_app
 from starlette.testclient import TestClient
+
+from agent_mcp.app.main_app import create_app
 
 
 def _make_client(project_dir):

@@ -16,9 +16,8 @@ import datetime as _dt
 
 import pytest
 
-from tests.harness import mcp_session
 from agent_mcp.repositories import scheduled_directive_repository as repo
-
+from tests.harness import mcp_session
 
 pytestmark = pytest.mark.asyncio
 

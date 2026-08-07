@@ -20,7 +20,6 @@ import pytest
 
 from tests.harness import mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -81,8 +80,9 @@ async def test_real_reply_gets_no_hint(tmp_path) -> None:
                 "deliver_method": "store",
             },
         )
-        from agent_mcp.core.config import get_db_path
         import sqlite3
+
+        from agent_mcp.core.config import get_db_path
 
         conn = sqlite3.connect(str(get_db_path()))
         try:

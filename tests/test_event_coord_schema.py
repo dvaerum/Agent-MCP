@@ -32,10 +32,8 @@ from __future__ import annotations
 import os
 import sqlite3
 from pathlib import Path
-from typing import Dict
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -144,11 +142,11 @@ def _run_alembic_upgrade(project_dir: str) -> None:
     command.upgrade(cfg, "head")
 
 
-def _table_columns(db_path: str, table: str) -> Dict[str, sqlite3.Row]:
+def _table_columns(db_path: str, table: str) -> dict[str, sqlite3.Row]:
     conn = sqlite3.connect(db_path)
     try:
         cur = conn.execute(f"PRAGMA table_info({table})")
-        out: Dict[str, sqlite3.Row] = {}
+        out: dict[str, sqlite3.Row] = {}
         for row in cur.fetchall():
             # cid, name, type, notnull, dflt_value, pk
             out[row[1]] = row
@@ -174,8 +172,8 @@ def test_migration_applies_on_fresh_db_creates_columns(
     project_dir.mkdir()
     monkeypatch.setenv("MCP_PROJECT_DIR", str(project_dir))
 
-    from agent_mcp.db.schema import init_database
     from agent_mcp.db.migrations_runner import run_migrations_upgrade
+    from agent_mcp.db.schema import init_database
 
     init_database()
     run_migrations_upgrade()

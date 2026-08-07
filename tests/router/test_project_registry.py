@@ -27,7 +27,7 @@ import json
 import os
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -35,7 +35,7 @@ import pytest
 
 def _iso(dt: datetime) -> str:
     """ISO-8601 UTC with a trailing Z — the storage format aliases use."""
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @pytest.fixture
@@ -309,7 +309,7 @@ def test_nested_shape_reads_with_populated_aliases(
     reg, registry_path: Path,
 ) -> None:
     registry_path.parent.mkdir(parents=True, exist_ok=True)
-    future = _iso(datetime.now(timezone.utc) + timedelta(days=10))
+    future = _iso(datetime.now(UTC) + timedelta(days=10))
     registry_path.write_text(
         json.dumps(
             {
@@ -355,14 +355,12 @@ def test_write_upgrades_legacy_file_to_nested_shape(
 
 def test_add_alias_default_expiry_is_30_days(reg) -> None:
     reg.register("alpha", "/tmp/alpha")
-    before = datetime.now(timezone.utc)
+    before = datetime.now(UTC)
     reg.add_alias("alpha", "ancient")
-    after = datetime.now(timezone.utc)
+    after = datetime.now(UTC)
     row = reg.get("alpha")
     assert len(row["aliases"]) == 1
-    expires = datetime.fromisoformat(
-        row["aliases"][0]["expires_at"].replace("Z", "+00:00")
-    )
+    expires = datetime.fromisoformat(row["aliases"][0]["expires_at"])
     assert before + timedelta(days=30) - timedelta(minutes=1) <= expires
     assert expires <= after + timedelta(days=30) + timedelta(minutes=1)
 
@@ -397,7 +395,7 @@ def test_resolve_alias_returns_name_for_matching_alias(reg) -> None:
 
 def test_resolve_alias_skips_expired(reg) -> None:
     reg.register("real", "/tmp/real")
-    past = _iso(datetime.now(timezone.utc) - timedelta(seconds=1))
+    past = _iso(datetime.now(UTC) - timedelta(seconds=1))
     reg.add_alias("real", "stale", expires_at=past)
     assert reg.resolve_alias("stale") is None
 

@@ -39,7 +39,6 @@ from pathlib import Path
 
 import pytest
 
-
 # Async tests opt in individually with ``@pytest.mark.asyncio``; the
 # AST/structural tests at the bottom of the file are plain sync
 # functions and must NOT inherit an asyncio mark.

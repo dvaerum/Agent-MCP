@@ -10,10 +10,10 @@ exactly. Legitimate worker→admin messaging is preserved.
 
 from __future__ import annotations
 
+from agent_mcp.tools import agent_communication_tools as _mod
 from agent_mcp.tools.agent_communication_tools import (
     _can_agents_communicate,
 )
-from agent_mcp.tools import agent_communication_tools as _mod
 
 
 def test_worker_to_admin_lookalike_denied(monkeypatch) -> None:

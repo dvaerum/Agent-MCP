@@ -37,7 +37,6 @@ import pytest
 from agent_mcp.core.tool_result import Ok
 from tests.harness import mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -50,7 +49,7 @@ class _FrozenDateTime(_dt.datetime):
     """
 
     @classmethod
-    def now(cls, tz=None):  # noqa: D102 - stdlib signature
+    def now(cls, tz=None):
         return cls(2026, 1, 1, 12, 0, 0, 0, tzinfo=tz)
 
 

@@ -32,7 +32,6 @@ import json
 
 import pytest
 
-
 # Bypass the conftest auto-login: each test seeds its own user(s)
 # and logs in explicitly so the assertion targets the real
 # sysadmin-vs-cap-delegation distinction rather than a side-effect

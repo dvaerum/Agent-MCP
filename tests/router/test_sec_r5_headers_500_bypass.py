@@ -22,7 +22,6 @@ from __future__ import annotations
 import pytest
 from aiohttp import web
 
-
 pytestmark = pytest.mark.asyncio
 
 

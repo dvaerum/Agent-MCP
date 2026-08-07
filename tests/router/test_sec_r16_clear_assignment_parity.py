@@ -33,7 +33,6 @@ import pytest
 import agent_mcp.core.globals as _g_mod
 from tests.harness import mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 

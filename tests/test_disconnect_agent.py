@@ -74,7 +74,7 @@ def _read_auto_event_loop(agent_id: str) -> int:
     return int(row["auto_event_loop"])
 
 
-def _attach_live_stream(agent_id: str) -> "asyncio.Queue":
+def _attach_live_stream(agent_id: str) -> asyncio.Queue:
     """Register an mcp_sessions row + attach a runtime queue, simulating
     a live GET /mcp SSE stream so ``close_streams_for_agent`` has
     something to signal. Returns the queue so the test can assert the
@@ -89,7 +89,7 @@ def _attach_live_stream(agent_id: str) -> "asyncio.Queue":
     return q
 
 
-def _queue_got_close(q: "asyncio.Queue") -> bool:
+def _queue_got_close(q: asyncio.Queue) -> bool:
     """Drain the runtime queue and report whether the ``CLOSE_STREAM``
     sentinel is among what was enqueued. The operator live-update fanout
     (a ``notifications/resources/updated`` push triggered by the

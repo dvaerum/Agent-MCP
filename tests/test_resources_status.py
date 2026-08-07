@@ -16,14 +16,16 @@ from pathlib import Path
 
 import mcp.types as mcp_types
 import pytest
+
 from tests.harness import with_bearer
 
 pytestmark = pytest.mark.asyncio
 
 
 async def _read_resource(session, uri: str) -> mcp_types.ReadResourceResult:
-    from agent_mcp.tools.registry import request_auth_token
     from pydantic_core import Url
+
+    from agent_mcp.tools.registry import request_auth_token
 
     handler = session._admin._mcp_app_instance().request_handlers[
         mcp_types.ReadResourceRequest
@@ -74,10 +76,10 @@ async def test_status_unread_counter_increments_after_message(
 ) -> None:
     """After admin sends a message to alice, alice's
     `unread_messages` counter goes from 0 → 1."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.agent_communication_tools import (
         send_agent_message_tool_impl,
     )
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -110,8 +112,8 @@ async def test_status_unfinished_tasks_counter_reflects_assignments(
 ) -> None:
     """After admin assigns a task to alice, her
     `unfinished_tasks` counter goes 0 → 1."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.task_tools import assign_task_tool_impl
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")

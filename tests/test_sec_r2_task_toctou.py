@@ -35,12 +35,11 @@ admin/manager branch.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List
+from typing import Any
 
 import pytest
 
 from tests.harness import make_principal, mcp_session
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -88,7 +87,7 @@ def _make_terminating_validator(victim_agent_id: str) -> Any:
         depends_on_tasks: list[str] | None,
         created_by: str,
         auth_token: str,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         # The concurrent terminate lands here, in the RAG yield window.
         _terminate_in_db(victim_agent_id)
         return {
@@ -115,7 +114,7 @@ def _make_approving_validator() -> Any:
         depends_on_tasks: list[str] | None,
         created_by: str,
         auth_token: str,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         return {
             "status": "approved",
             "suggestions": {
@@ -144,7 +143,7 @@ async def _seed_root(admin, holder_token: str) -> str:
     return re.search(r"task_[a-f0-9]+", result[0].text).group(0)
 
 
-def _first_text(result: List[Any]) -> str:
+def _first_text(result: list[Any]) -> str:
     if not result:
         return ""
     return getattr(result[0], "text", "") or ""

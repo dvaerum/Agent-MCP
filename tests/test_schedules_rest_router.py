@@ -6,7 +6,6 @@ import pytest
 
 from tests.harness import mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -31,7 +30,7 @@ async def test_create_list_update_delete_flow(tmp_path):
         assert rl.status_code == 200, rl.text
         rows = rl.json()["schedules"]
         assert any(s["directive_id"] == did for s in rows)
-        row = [s for s in rows if s["directive_id"] == did][0]
+        row = next(s for s in rows if s["directive_id"] == did)
         assert row["agent_id"] == "alice"
         assert row["enabled"] is True
 

@@ -35,7 +35,6 @@ from agent_mcp.core.principal import Principal
 from agent_mcp.core.tool_result import Failed, Ok
 from tests.harness import make_principal, mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -152,7 +151,7 @@ async def test_register_agent_rollback_fires_zero_side_effects(
 
         audit_before = len(g.audit_log)
 
-        def _boom(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        def _boom(*args, **kwargs):
             raise RuntimeError("audit sink exploded mid-transaction")
 
         # log_agent_action_to_db runs AFTER the agent INSERT and BEFORE
@@ -266,7 +265,7 @@ async def test_update_file_metadata_rollback_fires_zero_db_effects(
         filepath = "/tmp/d3-uow-meta-rollback.txt"
         audit_before = len(g.audit_log)
 
-        def _boom(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        def _boom(*args, **kwargs):
             raise RuntimeError("audit sink exploded mid-transaction")
 
         monkeypatch.setattr(

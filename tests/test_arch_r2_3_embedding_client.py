@@ -26,7 +26,6 @@ import inspect
 
 import pytest
 
-
 # ── provider selection (mirror of test_completion_service) ───────────
 
 

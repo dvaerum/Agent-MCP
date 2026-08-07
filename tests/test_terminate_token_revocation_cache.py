@@ -27,9 +27,9 @@ import datetime
 import secrets
 
 import pytest
-from agent_mcp.app.main_app import create_app
 from starlette.testclient import TestClient
 
+from agent_mcp.app.main_app import create_app
 from tests.harness import mcp_session
 
 
@@ -119,8 +119,8 @@ def test_get_agent_id_does_not_reactivate_terminated_bearer(
     re-insert it into the auth cache. Otherwise ``/mcp`` (cache-only)
     would admit the terminated bearer again."""
     with _make_client(project_dir):
-        from agent_mcp.core import state
         from agent_mcp.core import auth as core_auth
+        from agent_mcp.core import state
 
         _insert_agent_via_db(
             agent_id="ghost3", token="tok-terminated-3", status="terminated",

@@ -45,7 +45,6 @@ import pytest
 
 from tests.harness import mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -145,10 +144,10 @@ async def test_disconnect_clears_online_status(tmp_path) -> None:
         session_registry.attach_runtime_queue(sid, asyncio.Queue())
 
         assert next(
-            (
+            
                 a for a in admin.get("/api/agents").json()
                 if a["agent_id"] == "alice-flapping"
-            )
+            
         )["online"] is True
 
         # Graceful close — same teardown the GET /mcp transport

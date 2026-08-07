@@ -34,15 +34,13 @@ from __future__ import annotations
 import json as _json
 import sqlite3
 
+import mcp.types as mcp_types
 import pytest
 
-import mcp.types as mcp_types
-
-import agent_mcp.app.main_app as main_app
 import agent_mcp.app._dispatch_helpers as dispatch_helpers
+import agent_mcp.app.main_app as main_app
 from agent_mcp.core.authorize import AuthRejected
 from agent_mcp.core.tool_result import Ok
-
 
 pytestmark = pytest.mark.asyncio
 

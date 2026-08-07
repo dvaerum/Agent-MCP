@@ -28,7 +28,6 @@ from agent_mcp.features.rag.query import (
 )
 from tests.harness import mcp_session, seed_config_setting_as_sysadmin
 
-
 pytestmark = pytest.mark.asyncio
 
 

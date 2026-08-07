@@ -80,7 +80,6 @@ async def test_failure_is_also_cached(monkeypatch):
 
     async def _probe(_):
         calls["n"] += 1
-        return None
 
     monkeypatch.setattr(cw, "_probe_props", _probe)
     await cw.resolve_context_window("http://cloud/v1")

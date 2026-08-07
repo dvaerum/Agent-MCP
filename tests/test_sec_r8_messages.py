@@ -34,7 +34,6 @@ import agent_mcp.core.globals as _g_mod
 from agent_mcp.core import event_bus_shim as _shim
 from tests.harness import mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 

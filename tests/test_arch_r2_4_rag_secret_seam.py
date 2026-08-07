@@ -20,7 +20,6 @@ from starlette.testclient import TestClient
 
 from agent_mcp.app.main_app import create_app
 
-
 _SECRET_VALUE = "SENTINEL-SECRET-VALUE-9f3a"
 _PUBLIC_VALUE = "public-readme-info"
 
@@ -38,6 +37,7 @@ def _vss_available() -> bool:
 def _emb(values):
     """Pad/truncate a fixture vector to the on-disk vec0 dimension."""
     import re
+
     from agent_mcp.db.connection import get_db_connection
 
     conn = get_db_connection()
@@ -69,8 +69,8 @@ def test_fetch_recent_context_returns_secret_keyed_row(
     """A direct ``fetch_recent_context`` call returns a secret-named
     project_context row AS-IS (ADR-0017)."""
     with _make_client(project_dir):
-        from agent_mcp.repositories import rag_repo
         from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import rag_repo
 
         conn = get_db_connection()
         try:
@@ -109,8 +109,8 @@ def test_fetch_recent_context_returns_embedded_secret_value(
     """A non-secret KEY whose VALUE embeds a credential is returned AS-IS
     by the seam (ADR-0017 — no content scan)."""
     with _make_client(project_dir):
-        from agent_mcp.repositories import rag_repo
         from agent_mcp.db.connection import get_db_connection
+        from agent_mcp.repositories import rag_repo
 
         embedded = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
         conn = get_db_connection()

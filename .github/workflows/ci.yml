@@ -55,7 +55,7 @@ jobs:
           uv pip install -e ".[dev]"
 
       - name: Lint (tests/ only)
-        # Scope is tests/ for now; agent_mcp/ has 216 pre-existing ruff
+        # Scope is tests/ for now; agent_mcp/ has ~2300 pre-existing ruff
         # errors documented in CONTRIBUTING.md. PRs that touch agent_mcp/
         # files clean them up incrementally.
         run: uv run ruff check tests/

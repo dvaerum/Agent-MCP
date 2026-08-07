@@ -30,7 +30,7 @@ existing test suites cover the deeper edge cases.
 from __future__ import annotations
 
 import datetime as _dt
-from typing import Any, Dict
+from typing import Any
 
 import pytest
 
@@ -121,9 +121,10 @@ def _insert_task(task_id: str) -> None:
         conn.close()
 
 
-def _set_file_metadata(filepath: str, metadata: Dict[str, Any]) -> None:
+def _set_file_metadata(filepath: str, metadata: dict[str, Any]) -> None:
     """Insert a file_metadata row for view tests."""
     import json
+
     from agent_mcp.db.connection import get_db_connection
 
     now = _dt.datetime.now().isoformat()
@@ -146,8 +147,8 @@ def _set_file_metadata(filepath: str, metadata: Dict[str, Any]) -> None:
 
 async def test_edit_task_note_returns_ok_for_author(tmp_path) -> None:
     """A worker editing their own note returns ``Ok(data={"note_id": N})``."""
-    from agent_mcp.tools.registry import dispatch_tool_call
     from agent_mcp.db.actions import task_notes_db
+    from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path) as admin:
         _insert_task("pr1-task-edit-ok")
@@ -178,8 +179,8 @@ async def test_edit_task_note_permission_denied_for_non_author(
     note-existence oracle — and must never leak the authoring agent's
     id (the DB layer's ``"owned by 'alice'"`` string). (Previously this
     surfaced as PermissionDenied naming the author.)"""
-    from agent_mcp.tools.registry import dispatch_tool_call
     from agent_mcp.db.actions import task_notes_db
+    from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path) as admin:
         _insert_task("pr1-task-edit-denied")
@@ -257,8 +258,8 @@ async def test_delete_task_note_operator_can_delete_worker_note(
     """An operator-session principal (manager-tier) can delete a
     worker-authored note via the same is_admin=True path that
     manager-role agents use."""
-    from agent_mcp.tools.registry import dispatch_tool_call
     from agent_mcp.db.actions import task_notes_db
+    from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path) as admin:
         _insert_task("pr1-task-delete-op")
@@ -432,8 +433,8 @@ async def test_update_file_status_conflict_when_claimed_by_other(
     :class:`Conflict` (state invariant, REST → 409). Distinct from
     PermissionDenied — the principal is valid; the file map is the
     blocker."""
-    from agent_mcp.tools.registry import dispatch_tool_call
     from agent_mcp.core.tool_result import Conflict
+    from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -563,8 +564,8 @@ async def test_update_file_metadata_requires_operator(tmp_path) -> None:
 async def test_update_file_metadata_operator_writes_row(tmp_path) -> None:
     """Happy path: operator writes a metadata row; the row reads
     back with the operator's user_id as updated_by."""
-    from agent_mcp.tools.registry import dispatch_tool_call
     from agent_mcp.db.connection import get_db_connection
+    from agent_mcp.tools.registry import dispatch_tool_call
 
     async with mcp_session(tmp_path):
         p = _operator_principal("op-claire")
@@ -647,7 +648,7 @@ async def test_update_file_metadata_invalid_non_serializable(tmp_path) -> None:
 async def test_migrated_tools_reject_anonymous_principal(
     tmp_path,
     tool_name: str,
-    arguments: Dict[str, Any],
+    arguments: dict[str, Any],
 ) -> None:
     """Every migrated tool rejects an anonymous caller.
 

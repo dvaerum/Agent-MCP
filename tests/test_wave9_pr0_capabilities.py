@@ -33,7 +33,6 @@ from agent_mcp.core.capabilities import (
 )
 from tests.harness import make_principal, with_capabilities
 
-
 # ── Vocabulary shape ───────────────────────────────────────────────
 
 
@@ -308,8 +307,8 @@ def _patch_group_caps(monkeypatch, group_caps):
     Patches the source symbols (imported lazily inside the function)
     so a single group ``"g1"`` resolves to the given cap frozenset.
     """
-    import agent_mcp.router.group_resolver as gr
     import agent_mcp.repositories.group_capability_repository as gcr
+    import agent_mcp.router.group_resolver as gr
 
     monkeypatch.setattr(gr, "resolve_user_groups", lambda user_id: {"g1"})
     monkeypatch.setattr(gcr, "fetch", lambda gid: frozenset(group_caps))

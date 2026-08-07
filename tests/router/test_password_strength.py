@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import pytest
 
-
 # no_seed_operator applies module-wide (the async setup tests need an
 # empty users table); the async tests carry @pytest.mark.asyncio
 # individually so the sync helper-unit tests don't get a spurious mark.
