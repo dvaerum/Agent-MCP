@@ -54,8 +54,20 @@ export interface ResponsiveDataTableProps<T> {
    * omitted, the mobile section auto-stacks the columns.
    */
   renderMobileCard?: (row: T) => React.ReactNode
-  /** Extra classes on each desktop body <tr>. */
-  rowClassName?: string
+  /**
+   * Extra classes on the DATA row — the desktop body `<tr>` and the
+   * mobile auto-stack `<li>`. Pass a callback for a per-row treatment a
+   * single static string cannot express (messages' reply rows carry a
+   * left-border indent keyed on `parent_message_id`).
+   *
+   * Deliberately NOT applied to the `renderExpanded` sibling row: that
+   * row is chrome for the data row, owns its own styling (it opts out
+   * of the hover tint), and a per-row class such as a left-border
+   * indent or an opacity dim is meant for the data row alone. A page
+   * that wants its expansion styled per-row can do it inside its own
+   * `renderExpanded` markup, where it has the row in hand.
+   */
+  rowClassName?: string | ((row: T) => string | undefined)
   /**
    * Optional expandable detail for a row (accordion pages such as
    * Groups, whose row expands to show its members + capabilities).
@@ -67,6 +79,14 @@ export interface ResponsiveDataTableProps<T> {
    * mobile rendering entirely and therefore its own mobile expansion.
    */
   renderExpanded?: (row: T) => React.ReactNode
+}
+
+/** Resolve the static-or-callback `rowClassName` for one row. */
+function resolveRowClassName<T>(
+  rowClassName: ResponsiveDataTableProps<T>["rowClassName"],
+  row: T,
+): string | undefined {
+  return typeof rowClassName === "function" ? rowClassName(row) : rowClassName
 }
 
 const HIDE_BELOW_CLASS: Record<NonNullable<Column<unknown>["hideBelow"]>, string> = {
@@ -117,7 +137,7 @@ export function ResponsiveDataTable<T>({
                     className={cn(
                       "border-border/50 hover:bg-muted/30 group transition-all duration-200",
                       onRowClick && "cursor-pointer",
-                      rowClassName,
+                      resolveRowClassName(rowClassName, row),
                     )}
                     onClick={onRowClick ? () => onRowClick(row) : undefined}
                   >
@@ -166,6 +186,11 @@ export function ResponsiveDataTable<T>({
                   "px-4 py-3 space-y-1",
                   onRowClick &&
                     "hover:bg-muted/30 active:bg-muted/50 transition-colors duration-150 cursor-pointer",
+                  // The auto-stack <li> IS the mobile data row, so it
+                  // takes the same per-row treatment as the desktop
+                  // <tr>. (A page with its own renderMobileCard owns
+                  // that markup — and its per-row styling — itself.)
+                  resolveRowClassName(rowClassName, row),
                 )}
               >
                 {columns

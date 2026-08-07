@@ -64,9 +64,20 @@ def test_row_has_click_handler_opening_detail() -> None:
     assert "detailDialog" in src, (
         "expected detailDialog (useDialog<Message>()) to back the modal"
     )
-    # The TableRow itself must carry an onClick that opens the modal
-    # — that's how clicking on the row content area opens it.
-    assert "<TableRow" in src
+    # The row body must carry a click handler that opens the modal.
+    #
+    # Pre-scaffold the page hand-rolled `<TableRow onClick=…>`. After
+    # the <DataTablePage> migration the row element is owned by the
+    # shared <ResponsiveDataTable>, which attaches the handler the page
+    # passes as `onRowClick` (and does so for BOTH the desktop row and
+    # the mobile card — strictly more coverage than the old inline
+    # TableRow). Accept either spelling; the invariant is that the
+    # row-body click opens the detail dialog.
+    assert "<TableRow" in src or "onRowClick" in src, (
+        "expected a row-body click handler — either an inline "
+        "<TableRow onClick> or an onRowClick passed to the shared "
+        "<DataTablePage> / <ResponsiveDataTable>"
+    )
     # The handler must reference the hook's .open(...) method (the
     # post-migration replacement for setDetailMessage).
     assert "detailDialog.open" in src, (
@@ -133,9 +144,14 @@ def test_detail_popup_has_mark_read_toggle() -> None:
 
 def test_detail_popup_delete_routes_through_confirm() -> None:
     # Messages-page-parity PR: the modal Delete no longer fires an
-    # unconfirmed DELETE. It routes through the shared confirm dialog
-    # (<DeleteMessageModal>, type-DELETE-to-confirm) — closing the
-    # real no-confirm gap the audit flagged.
+    # unconfirmed DELETE. It routes through a type-DELETE-to-confirm
+    # dialog — closing the real no-confirm gap the audit flagged.
+    #
+    # Scaffold migration: that dialog is now the unified
+    # <DeleteConfirmModal> (delete-message-modal.tsx was subsumed, the
+    # same way delete-memory-modal.tsx was by PR #581) — single-row
+    # delete passes the message preview as `details`, bulk delete
+    # overrides title/description/warning with the count-aware copy.
     import re
 
     modal = _read_modal()
@@ -147,9 +163,11 @@ def test_detail_popup_delete_routes_through_confirm() -> None:
         "an onDelete prop (parent opens the confirm dialog)"
     )
     dash = _read("components/dashboard/messages-dashboard.tsx")
-    assert "DeleteMessageModal" in dash and "deleteDialog.open" in dash, (
-        "expected the dashboard to route deletes through the "
-        "DeleteMessageModal confirm dialog (no unconfirmed delete)"
+    assert (
+        "DeleteConfirmModal" in dash or "DeleteMessageModal" in dash
+    ) and "deleteDialog.open" in dash, (
+        "expected the dashboard to route deletes through the shared "
+        "type-DELETE-to-confirm dialog (no unconfirmed delete)"
     )
 
 

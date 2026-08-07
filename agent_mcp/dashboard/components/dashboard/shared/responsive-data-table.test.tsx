@@ -153,6 +153,79 @@ describe("<ResponsiveDataTable>", () => {
     ).toBe("beta-detail")
   })
 
+  it("applies a per-row rowClassName function to the matching row only", () => {
+    // Messages' reply rows carry a left-border indent that depends on
+    // the row (`parent_message_id`), which a single static className
+    // cannot express — the callback form is the seam for that.
+    const { container } = render(
+      <ResponsiveDataTable
+        columns={columns}
+        rows={rows}
+        getRowId={(r) => r.id}
+        rowClassName={(r) => (r.size > 1 ? "border-l-2" : undefined)}
+      />,
+    )
+    const bodyRows = container.querySelectorAll("tbody tr")
+    expect(bodyRows[0].className).not.toContain("border-l-2")
+    expect(bodyRows[1].className).toContain("border-l-2")
+  })
+
+  it("still accepts a static rowClassName string for every row", () => {
+    const { container } = render(
+      <ResponsiveDataTable
+        columns={columns}
+        rows={rows}
+        getRowId={(r) => r.id}
+        rowClassName="ring-1"
+      />,
+    )
+    for (const tr of container.querySelectorAll("tbody tr")) {
+      expect(tr.className).toContain("ring-1")
+    }
+  })
+
+  it("applies rowClassName to the mobile auto-stack item too", () => {
+    const { container } = render(
+      <ResponsiveDataTable
+        columns={columns}
+        rows={rows}
+        getRowId={(r) => r.id}
+        rowClassName={(r) => (r.size > 1 ? "border-l-2" : undefined)}
+      />,
+    )
+    const mobile = container.querySelector(
+      '[data-slot="data-table-mobile"]',
+    ) as HTMLElement
+    const items = mobile.querySelectorAll("li")
+    expect(items[0].className).not.toContain("border-l-2")
+    expect(items[1].className).toContain("border-l-2")
+  })
+
+  it("does NOT leak rowClassName onto the renderExpanded sibling row", () => {
+    // The expansion is chrome for the data row and owns its own styling
+    // (it opts out of the hover tint); a per-row indent/dim meant for
+    // the data row must not silently apply to it.
+    const { container } = render(
+      <ResponsiveDataTable
+        columns={columns}
+        rows={rows}
+        getRowId={(r) => r.id}
+        rowClassName="border-l-2"
+        renderExpanded={(r) =>
+          r.id === "a" ? <div data-testid="detail">detail</div> : null
+        }
+      />,
+    )
+    const expandedRow = container.querySelector(
+      '[data-slot="data-table-expanded"]',
+    )!
+    expect(expandedRow.className).not.toContain("border-l-2")
+    // The data row it belongs to still carries the class.
+    expect(container.querySelector("tbody tr")!.className).toContain(
+      "border-l-2",
+    )
+  })
+
   it("auto-stacks columns on mobile when no renderMobileCard is given", async () => {
     const u = userEvent.setup()
     const onRowClick = vi.fn()

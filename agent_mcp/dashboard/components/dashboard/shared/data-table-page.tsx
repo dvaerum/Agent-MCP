@@ -79,8 +79,11 @@ export interface DataTablePageProps<T> {
   onRowClick?: (row: T) => void
   /** Custom mobile card; omit to auto-stack columns. */
   renderMobileCard?: (row: T) => React.ReactNode
-  /** Extra classes on desktop body rows. */
-  rowClassName?: string
+  /**
+   * Extra classes on data rows (static or per-row callback). See
+   * `ResponsiveDataTableProps.rowClassName`.
+   */
+  rowClassName?: string | ((row: T) => string | undefined)
   /**
    * Expandable per-row detail (accordion pages, e.g. Groups). See
    * `ResponsiveDataTableProps.renderExpanded`.

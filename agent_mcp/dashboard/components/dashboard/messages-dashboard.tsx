@@ -4,7 +4,6 @@ import React, { useCallback, useEffect, useMemo, useState } from "react"
 import {
   MessageSquare,
   Send,
-  RefreshCw,
   X,
   Trash2,
   MailOpen,
@@ -24,14 +23,6 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table"
-import {
   Select,
   SelectContent,
   SelectItem,
@@ -44,17 +35,19 @@ import { useDialog } from "@/hooks/use-dialog"
 import { useFilters } from "@/hooks/use-filters"
 import { usePagedQuery } from "@/hooks/use-paged-query"
 import { useServerStore } from "@/lib/stores/server-store"
-import { Skeleton } from "@/components/ui/skeleton"
-import { EmptyState } from "@/components/dashboard/shared/empty-state"
 import { AgentSelect } from "@/components/dashboard/shared/agent-select"
-import { MessagesMobileList } from "@/components/dashboard/messages-mobile-list"
+import { MessageMobileCard } from "@/components/dashboard/messages-mobile-list"
 import {
   priorityBadgeClass,
   messageTypeBadgeClass,
 } from "@/components/dashboard/shared/message-badges"
 import { ViewMessageModal } from "@/components/dashboard/modals/view-message-modal"
-import { DeleteMessageModal } from "@/components/dashboard/modals/delete-message-modal"
+import { DeleteConfirmModal } from "@/components/dashboard/modals/delete-confirm-modal"
 import { toastError, toastSuccess } from "@/components/ui/toast"
+import { DataTablePage } from "@/components/dashboard/shared/data-table-page"
+import type { EmptyStateProps } from "@/components/dashboard/shared/empty-state"
+import type { StatsCardProps } from "@/components/dashboard/shared/stats-card"
+import type { Column } from "@/components/dashboard/shared/responsive-data-table"
 
 interface Filters {
   from: string
@@ -136,8 +129,6 @@ async function callMessages(
   return res.json()
 }
 
-// Stats card component — matches the Agents/Tasks/Memories StatsCard
-// (plain Tailwind sizing + rounded-lg + semantic tokens + tabular-nums).
 // A filter control with a small visible label stacked above it, so each
 // dropdown is self-describing before it's opened (the From/To agent
 // pickers otherwise both just read "— Any —").
@@ -158,188 +149,122 @@ const FilterField = ({
   </div>
 )
 
-const StatsCard = ({ icon: Icon, label, value, change, trend }: {
-  icon: React.ComponentType<{ className?: string }>
-  label: string
-  value: number
-  change?: string
-  trend?: 'up' | 'down' | 'neutral'
-}) => (
-  <div className="bg-card border border-border rounded-lg p-3 sm:p-5 hover:bg-muted/30 transition-colors duration-150 group">
-    <div className="flex items-center justify-between">
-      <div>
-        <div className="flex items-center gap-2 mb-2">
-          <Icon className="h-4 w-4 text-muted-foreground transition-colors" />
-          <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">{label}</span>
+// Preview block shown inside the DeleteConfirmModal `details` slot for
+// the SINGLE-message variant — reproduces the pre-foundation
+// DeleteMessageModal body (participants / SUBJECT / CONTENT PREVIEW /
+// metadata). The bulk variant has no preview (there is no single row to
+// show); it overrides `title` / `description` / `warningText` instead.
+function MessageDeletePreview({ message }: { message: Message }) {
+  const formatContent = (value: string) =>
+    value.length > 120 ? value.substring(0, 120) + "…" : value
+  return (
+    <div className="space-y-3">
+      <div className="text-sm font-medium text-foreground">Message to be deleted:</div>
+      <div className="bg-muted/30 border border-border rounded-lg p-3 space-y-3">
+        {/* Participants */}
+        <div className="flex items-center gap-2 text-sm">
+          <Badge variant="outline">{message.sender_id}</Badge>
+          <span aria-hidden className="text-muted-foreground">→</span>
+          <Badge variant="outline">{message.recipient_id}</Badge>
         </div>
-        <div className="text-2xl sm:text-3xl font-semibold text-foreground tabular-nums mb-1">{value}</div>
-        {change && (
-          <div className={cn(
-            "text-xs font-medium tabular-nums",
-            trend === 'up' && "text-emerald-500",
-            trend === 'down' && "text-destructive",
-            trend === 'neutral' && "text-muted-foreground"
-          )}>
-            {change}
+        {message.subject && (
+          <div>
+            <div className="text-xs font-medium text-muted-foreground mb-1">SUBJECT</div>
+            <div className="text-sm text-foreground">{message.subject}</div>
           </div>
         )}
+        <div>
+          <div className="text-xs font-medium text-muted-foreground mb-1">CONTENT PREVIEW</div>
+          <div className="text-sm text-muted-foreground bg-background border border-border rounded px-2 py-1 font-mono max-h-16 overflow-hidden">
+            {formatContent(message.message_content)}
+          </div>
+        </div>
+        <div className="flex items-center gap-4 text-xs text-muted-foreground pt-2 border-t border-border">
+          <span>{message.timestamp.slice(0, 19)}</span>
+          <span>Type: {message.message_type}</span>
+          <span>Priority: {message.priority}</span>
+        </div>
       </div>
     </div>
-  </div>
-)
+  )
+}
 
-// Message table row — extracted for parity with memories' <MemoryRow>.
-// Row-body click opens the detail modal; the checkbox + delete cells
-// stopPropagation so they don't also fire the row-open.
-const MessageRow = ({
-  message: m,
-  selected,
-  onToggle,
-  onOpenDetail,
-  onDelete,
-  labelForParent,
+/**
+ * v5.0.26 pagination footer — « Newest / Newer / Older / Oldest » plus
+ * a "Showing N–M of T" range label.
+ *
+ * One button spec drives both layouts: a single justified row on sm+,
+ * and (below sm) the range label stacked above a 4-column grid so the
+ * labels stay readable at 375 px. Pre-scaffold these were two separate
+ * hand-written copies — one here, one inside messages-mobile-list.tsx —
+ * which is the same double-renderer drift the shared table retires.
+ */
+function MessagesPagination({
+  rangeStart,
+  rangeEnd,
+  total,
+  onFirstPage,
+  onLastPage,
+  onNewest,
+  onNewer,
+  onOlder,
+  onOldest,
 }: {
-  message: Message
-  selected: boolean
-  onToggle: (id: string) => void
-  onOpenDetail: (m: Message) => void
-  onDelete: (m: Message) => void
-  labelForParent: (parentId: string | null) => string
-}) => {
-  // v5.0.22: rows whose parent_message_id is non-null are replies.
-  // Visual cue = subtle left border + "↳ reply to: <parent>" prefix in
-  // the Subject column.
-  const isReply = !!m.parent_message_id
-  const isRead = m.read === 1 || m.read === true
-  return (
-    <TableRow
-      className={
-        "cursor-pointer" +
-        (isReply ? " border-l-2 border-l-muted-foreground/30" : "")
-      }
-      onClick={() => onOpenDetail(m)}
+  rangeStart: number
+  rangeEnd: number
+  total: number
+  onFirstPage: boolean
+  onLastPage: boolean
+  onNewest: () => void
+  onNewer: () => void
+  onOlder: () => void
+  onOldest: () => void
+}) {
+  const nav = [
+    {
+      key: "newest",
+      label: "« Newest",
+      onClick: onNewest,
+      disabled: onFirstPage,
+      ariaLabel: "jump to newest page",
+    },
+    { key: "newer", label: "Newer", onClick: onNewer, disabled: onFirstPage },
+    { key: "older", label: "Older", onClick: onOlder, disabled: onLastPage },
+    {
+      key: "oldest",
+      label: "Oldest »",
+      onClick: onOldest,
+      disabled: onLastPage,
+      ariaLabel: "jump to oldest page",
+    },
+  ]
+  const button = (b: (typeof nav)[number]) => (
+    <Button
+      key={b.key}
+      variant="outline"
+      size="sm"
+      onClick={b.onClick}
+      disabled={b.disabled}
+      aria-label={b.ariaLabel}
     >
-      <TableCell onClick={(e) => e.stopPropagation()}>
-        <input
-          type="checkbox"
-          aria-label={`select message ${m.message_id}`}
-          checked={selected}
-          onChange={() => onToggle(m.message_id)}
-        />
-      </TableCell>
-      <TableCell className="text-xs font-mono tabular-nums">
-        {/* Per-row entity glyph (matches memories' <Brain> convention). */}
-        <div className="flex items-center gap-2">
-          <MessageSquare className="h-3 w-3 text-primary flex-shrink-0" />
-          <span>{m.timestamp.slice(0, 19)}</span>
+      {b.label}
+    </Button>
+  )
+  const range = `Showing ${rangeStart}–${rangeEnd} of ${total}`
+  return (
+    <>
+      <div className="hidden sm:flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2">{nav.slice(0, 2).map(button)}</div>
+        <div className="text-xs text-muted-foreground tabular-nums">{range}</div>
+        <div className="flex items-center gap-2">{nav.slice(2).map(button)}</div>
+      </div>
+      <div className="block sm:hidden">
+        <div className="text-[11px] text-muted-foreground tabular-nums text-center mb-2">
+          {range}
         </div>
-      </TableCell>
-      <TableCell className="max-w-[160px]">
-        <div className="flex items-center gap-1.5">
-          {/* Leading unread dot — mirrors the mobile treatment so an
-              unread row is scannable at a glance, not just a ✓ column. */}
-          {!isRead && (
-            <span
-              aria-hidden
-              className="h-2 w-2 flex-shrink-0 rounded-full bg-primary"
-            />
-          )}
-          {/* Long agent ids truncate (with a title tooltip) instead of
-              growing the column and forcing table-wide horizontal
-              overflow. */}
-          <Badge
-            variant="outline"
-            className={cn("min-w-0 max-w-full", !isRead && "font-semibold")}
-            title={m.sender_id}
-          >
-            <span className="truncate">{m.sender_id}</span>
-          </Badge>
-        </div>
-      </TableCell>
-      <TableCell className="max-w-[160px]">
-        <Badge
-          variant="outline"
-          className="min-w-0 max-w-full"
-          title={m.recipient_id}
-        >
-          <span className="truncate">{m.recipient_id}</span>
-        </Badge>
-      </TableCell>
-      <TableCell
-        className={cn(
-          "text-xs max-w-[200px] truncate",
-          !isRead && "font-semibold text-foreground",
-        )}
-      >
-        {m.subject && m.subject_is_placeholder ? (
-          // Placeholder: the sender set no subject, so this is an
-          // auto-preview of the body (Phase 1). Shown muted + italic with
-          // an "auto" tag so it reads as a stub, not a real subject — a
-          // generated one fills in on the next backfill sweep (Phase 2).
-          <span
-            className="italic text-muted-foreground"
-            title="No subject set — auto-preview of the message. A generated subject will fill in shortly."
-          >
-            {m.subject}
-            <span className="ml-1 not-italic text-[10px] font-medium uppercase tracking-wide text-muted-foreground/60">
-              auto
-            </span>
-          </span>
-        ) : m.subject ? (
-          // Real subject: title reveals the full text on hover when the
-          // cell truncates. (The placeholder branch keeps its own
-          // explanatory title, so we don't clobber it here.)
-          <span title={m.subject}>{m.subject}</span>
-        ) : isReply ? (
-          // v5.0.24 polish: human-readable parent label instead of the
-          // opaque message_id.
-          <span className="text-muted-foreground">
-            ↳ reply to:{" "}
-            <span className="text-foreground">
-              {labelForParent(m.parent_message_id)}
-            </span>
-          </span>
-        ) : (
-          <span className="text-muted-foreground/50">—</span>
-        )}
-      </TableCell>
-      <TableCell className="text-xs">
-        <Badge variant="outline" className={messageTypeBadgeClass(m.message_type)}>
-          {m.message_type}
-        </Badge>
-      </TableCell>
-      <TableCell className="text-xs">
-        <Badge variant="outline" className={priorityBadgeClass(m.priority)}>
-          {m.priority}
-        </Badge>
-      </TableCell>
-      <TableCell>
-        {/* Glyph is silent to screen readers; the sr-only text names the
-            state so it's announced. */}
-        <span aria-hidden>{isRead ? "✓" : ""}</span>
-        <span className="sr-only">{isRead ? "read" : "unread"}</span>
-      </TableCell>
-      <TableCell
-        className={cn(
-          "max-w-[400px] truncate text-xs",
-          !isRead && "text-foreground",
-        )}
-        title={m.message_content}
-      >
-        {m.message_content}
-      </TableCell>
-      <TableCell onClick={(e) => e.stopPropagation()}>
-        <Button
-          variant="ghost"
-          size="sm"
-          aria-label="delete message"
-          className="text-destructive hover:text-destructive hover:bg-destructive/10"
-          onClick={() => onDelete(m)}
-        >
-          <Trash2 className="h-4 w-4" />
-        </Button>
-      </TableCell>
-    </TableRow>
+        <div className="grid grid-cols-4 gap-2">{nav.map(button)}</div>
+      </div>
+    </>
   )
 }
 
@@ -467,6 +392,13 @@ export function MessagesDashboard() {
 
   // Surface the hook's query error via the shared toast (matches
   // Agents/Tasks/Memories — no more in-page red banner).
+  //
+  // NOTE: this is deliberately NOT wired into <DataTablePage>'s
+  // scaffold-owned `error` panel. That panel REPLACES the page, and a
+  // messages list refreshes itself every 60 s / on every SSE tick — one
+  // transient failure would blank a page the operator is reading. The
+  // toast is the pre-existing (and still correct) surface here;
+  // switching to the panel would be a UX change, not a refactor.
   useEffect(() => {
     if (queryError) toastError(queryError, "Failed to load messages")
   }, [queryError])
@@ -706,7 +638,7 @@ export function MessagesDashboard() {
   }
 
   // Confirmed single delete — the onConfirm handler for the
-  // DeleteMessageModal opened from a row / mobile row / the detail
+  // DeleteConfirmModal opened from a row / mobile card / the detail
   // modal's Delete button. Re-throws on failure so the confirm dialog
   // stays open (mirrors memories' handleDeleteMemory).
   const handleConfirmDelete = async () => {
@@ -722,7 +654,7 @@ export function MessagesDashboard() {
     }
   }
 
-  // Confirmed bulk delete — onConfirm for the bulk DeleteMessageModal.
+  // Confirmed bulk delete — onConfirm for the bulk DeleteConfirmModal.
   const handleConfirmBulkDelete = async () => {
     const ids = Array.from(selectedIds)
     if (ids.length === 0) return
@@ -764,84 +696,268 @@ export function MessagesDashboard() {
   ).length
   const readOnPage = messages.length - unreadOnPage
 
-  return (
-    <div className="w-full p-4 sm:p-6 space-y-4 sm:space-y-6">
-      {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-        <div>
-          <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight text-foreground">Messages</h1>
-          <p className="text-muted-foreground text-sm sm:text-base mt-1">Inspect and route inter-agent messages</p>
+  // Stats strip — rendered by the scaffold's shared <StatsCard> row
+  // (the page's own copy of that component is retired).
+  const statsCards: StatsCardProps[] = [
+    {
+      icon: MessageSquare,
+      label: "Total",
+      value: total,
+      change: total > 0 ? `${messages.length} on this page` : undefined,
+      trend: "neutral",
+    },
+    {
+      icon: Mail,
+      label: "Unread",
+      value: unreadOnPage,
+      change: "on this page",
+      trend: unreadOnPage > 0 ? "down" : "neutral",
+    },
+    {
+      icon: MailOpen,
+      label: "Read",
+      value: readOnPage,
+      change: "on this page",
+      trend: "up",
+    },
+    {
+      icon: CheckSquare,
+      label: "Selected",
+      value: selectedIds.size,
+      change: selectedIds.size > 0 ? "ready to act" : "none",
+      trend: "neutral",
+    },
+  ]
+
+  // Empty-state copy branches on whether a filter is actually set: a
+  // filtered-to-nothing list gets a Clear-filters CTA, an untouched
+  // empty inbox just says so. Rendered by the scaffold's shared
+  // <EmptyState> (CC-20).
+  const emptyState: EmptyStateProps = hasActiveFilters ? ({
+    icon: MessageSquare,
+    title: "No messages",
+    description: "No messages match the current filters.",
+    action: (
+      <Button variant="outline" size="sm" onClick={clearFilters}>
+        <X className="h-4 w-4 mr-1" />
+        Clear filters
+      </Button>
+    ),
+  }) : ({
+    // No filters active → nothing to clear; just an empty inbox.
+    icon: MessageSquare,
+    title: "No messages yet",
+    description: "No messages have been sent yet.",
+  })
+
+  // Column spec — ONE source for the desktop table (via
+  // <ResponsiveDataTable>) and, through `renderMobileCard`, the mobile
+  // card. Cells reproduce the pre-foundation <MessageRow> exactly; the
+  // checkbox + delete cells stopPropagation so they don't also fire the
+  // row-body onClick (open detail).
+  const columns: Column<Message>[] = [
+    {
+      id: "select",
+      headClassName: "w-8",
+      header: (
+        <input
+          type="checkbox"
+          aria-label="select all visible"
+          checked={allVisibleSelected}
+          onChange={toggleAllVisible}
+        />
+      ),
+      cell: (m) => (
+        <input
+          type="checkbox"
+          aria-label={`select message ${m.message_id}`}
+          checked={selectedIds.has(m.message_id)}
+          onChange={() => toggleOne(m.message_id)}
+          onClick={(e) => e.stopPropagation()}
+        />
+      ),
+    },
+    {
+      id: "time",
+      header: "Time",
+      cellClassName: "text-xs font-mono tabular-nums",
+      // Per-row entity glyph (matches memories' <Brain> convention).
+      cell: (m) => (
+        <div className="flex items-center gap-2">
+          <MessageSquare className="h-3 w-3 text-primary flex-shrink-0" />
+          <span>{m.timestamp.slice(0, 19)}</span>
         </div>
-        <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-          {activeServer && (
-            <Badge variant="outline" className="text-xs bg-primary/15 text-primary border-primary/30 font-medium">
-              <span aria-hidden className="w-2 h-2 bg-primary rounded-full mr-2" />
-              {activeServer.name}
-            </Badge>
-          )}
-          {lastFetch && (
-            <span className="text-xs text-muted-foreground">
-              Last updated: {new Date(lastFetch).toLocaleTimeString()}
-            </span>
-          )}
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={refresh}
-            disabled={loading}
-            className="text-xs"
-          >
-            <RefreshCw className={cn("h-3.5 w-3.5 mr-1.5", loading && "animate-spin")} />
-            Refresh
-          </Button>
-          <Button size="sm" onClick={() => setComposeOpen((v) => !v)}>
-            {composeOpen ? (
-              <>
-                <X className="h-4 w-4 mr-1" />
-                Close
-              </>
-            ) : (
-              <>
-                <Plus className="h-4 w-4 mr-1" />
-                New Message
-              </>
+      ),
+    },
+    {
+      id: "from",
+      header: "From",
+      cellClassName: "max-w-[160px]",
+      cell: (m) => {
+        const isRead = m.read === 1 || m.read === true
+        return (
+          <div className="flex items-center gap-1.5">
+            {/* Leading unread dot — mirrors the mobile treatment so an
+                unread row is scannable at a glance, not just a ✓ column. */}
+            {!isRead && (
+              <span
+                aria-hidden
+                className="h-2 w-2 flex-shrink-0 rounded-full bg-primary"
+              />
             )}
-          </Button>
-        </div>
-      </div>
+            {/* Long agent ids truncate (with a title tooltip) instead of
+                growing the column and forcing table-wide horizontal
+                overflow. */}
+            <Badge
+              variant="outline"
+              className={cn("min-w-0 max-w-full", !isRead && "font-semibold")}
+              title={m.sender_id}
+            >
+              <span className="truncate">{m.sender_id}</span>
+            </Badge>
+          </div>
+        )
+      },
+    },
+    {
+      id: "to",
+      header: "To",
+      cellClassName: "max-w-[160px]",
+      cell: (m) => (
+        <Badge
+          variant="outline"
+          className="min-w-0 max-w-full"
+          title={m.recipient_id}
+        >
+          <span className="truncate">{m.recipient_id}</span>
+        </Badge>
+      ),
+    },
+    {
+      id: "subject",
+      header: "Subject",
+      cellClassName: "text-xs max-w-[200px] truncate",
+      cell: (m) => {
+        const isRead = m.read === 1 || m.read === true
+        const isReply = !!m.parent_message_id
+        return (
+          <span className={cn(!isRead && "font-semibold text-foreground")}>
+            {m.subject && m.subject_is_placeholder ? (
+              // Placeholder: the sender set no subject, so this is an
+              // auto-preview of the body (Phase 1). Shown muted + italic
+              // with an "auto" tag so it reads as a stub, not a real
+              // subject — a generated one fills in on the next backfill
+              // sweep (Phase 2).
+              <span
+                className="italic text-muted-foreground"
+                title="No subject set — auto-preview of the message. A generated subject will fill in shortly."
+              >
+                {m.subject}
+                <span className="ml-1 not-italic text-[10px] font-medium uppercase tracking-wide text-muted-foreground/60">
+                  auto
+                </span>
+              </span>
+            ) : m.subject ? (
+              // Real subject: title reveals the full text on hover when the
+              // cell truncates. (The placeholder branch keeps its own
+              // explanatory title, so we don't clobber it here.)
+              <span title={m.subject}>{m.subject}</span>
+            ) : isReply ? (
+              // v5.0.24 polish: human-readable parent label instead of the
+              // opaque message_id.
+              <span className="text-muted-foreground">
+                ↳ reply to:{" "}
+                <span className="text-foreground">
+                  {labelForParent(m.parent_message_id)}
+                </span>
+              </span>
+            ) : (
+              <span className="text-muted-foreground/50">—</span>
+            )}
+          </span>
+        )
+      },
+    },
+    {
+      id: "type",
+      header: "Type",
+      cellClassName: "text-xs",
+      cell: (m) => (
+        <Badge variant="outline" className={messageTypeBadgeClass(m.message_type)}>
+          {m.message_type}
+        </Badge>
+      ),
+    },
+    {
+      id: "priority",
+      header: "Priority",
+      cellClassName: "text-xs",
+      cell: (m) => (
+        <Badge variant="outline" className={priorityBadgeClass(m.priority)}>
+          {m.priority}
+        </Badge>
+      ),
+    },
+    {
+      id: "read",
+      header: "Read?",
+      // Glyph is silent to screen readers; the sr-only text names the
+      // state so it's announced.
+      cell: (m) => {
+        const isRead = m.read === 1 || m.read === true
+        return (
+          <>
+            <span aria-hidden>{isRead ? "✓" : ""}</span>
+            <span className="sr-only">{isRead ? "read" : "unread"}</span>
+          </>
+        )
+      },
+    },
+    {
+      id: "content",
+      header: "Content",
+      cellClassName: "max-w-[400px] truncate text-xs",
+      cell: (m) => {
+        const isRead = m.read === 1 || m.read === true
+        return (
+          <span
+            className={cn(!isRead && "text-foreground")}
+            title={m.message_content}
+          >
+            {m.message_content}
+          </span>
+        )
+      },
+    },
+    {
+      id: "actions",
+      header: "",
+      headClassName: "w-8",
+      cell: (m) => (
+        <Button
+          variant="ghost"
+          size="sm"
+          aria-label="delete message"
+          className="text-destructive hover:text-destructive hover:bg-destructive/10"
+          onClick={(e) => { e.stopPropagation(); deleteDialog.open(m.message_id) }}
+        >
+          <Trash2 className="h-4 w-4" />
+        </Button>
+      ),
+    },
+  ]
 
-      {/* Stats */}
-      <div className="grid gap-3 sm:gap-4 grid-cols-2 xl:grid-cols-4">
-        <StatsCard
-          icon={MessageSquare}
-          label="Total"
-          value={total}
-          change={total > 0 ? `${messages.length} on this page` : undefined}
-          trend="neutral"
-        />
-        <StatsCard
-          icon={Mail}
-          label="Unread"
-          value={unreadOnPage}
-          change="on this page"
-          trend={unreadOnPage > 0 ? "down" : "neutral"}
-        />
-        <StatsCard
-          icon={MailOpen}
-          label="Read"
-          value={readOnPage}
-          change="on this page"
-          trend="up"
-        />
-        <StatsCard
-          icon={CheckSquare}
-          label="Selected"
-          value={selectedIds.size}
-          change={selectedIds.size > 0 ? "ready to act" : "none"}
-          trend="neutral"
-        />
-      </div>
-
+  // Everything between the stats strip and the table card. The scaffold
+  // exposes ONE slot there (`filterBar`), and the compose panel + the
+  // selection toolbar both belong in that band:
+  //   * Compose must stay ABOVE the list — pushing it into `children`
+  //     (below the table) would hide a freshly-opened draft under 100
+  //     rows.
+  //   * The selection toolbar ("N messages / N selected" + bulk
+  //     actions) was the table Card's CardHeader; the scaffold owns the
+  //     card and has no header slot, so it sits directly above it.
+  const filterBar = (
+    <div className="w-full space-y-4 sm:space-y-6">
       {composeOpen && (
         <Card>
           <CardHeader>
@@ -1058,170 +1174,101 @@ export function MessagesDashboard() {
         </Button>
       </div>
 
-      <Card>
-        <CardHeader className="flex flex-row items-center justify-between space-y-0">
-          <CardTitle className="text-base">
-            {messages.length} {messages.length === 1 ? "message" : "messages"}
-            {selectedIds.size > 0 && (
-              <span className="ml-2 text-sm text-muted-foreground">
-                ({selectedIds.size} selected)
-              </span>
-            )}
-          </CardTitle>
+      {/* Row count + bulk-action toolbar (was the table Card's header). */}
+      <div className="flex flex-row items-center justify-between gap-2">
+        <div className="text-base font-semibold text-foreground">
+          {messages.length} {messages.length === 1 ? "message" : "messages"}
           {selectedIds.size > 0 && (
-            <div className="flex gap-2">
-              <Button variant="outline" size="sm" onClick={() => bulkMark(true)}>
-                <MailOpen className="h-4 w-4 mr-1" />
-                Mark read
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => bulkMark(false)}>
-                <Mail className="h-4 w-4 mr-1" />
-                Mark unread
-              </Button>
-              <Button variant="destructive" size="sm" onClick={() => setBulkDeleteOpen(true)}>
-                <Trash2 className="h-4 w-4 mr-1" />
-                Delete
-              </Button>
-            </div>
+            <span className="ml-2 text-sm font-normal text-muted-foreground">
+              ({selectedIds.size} selected)
+            </span>
           )}
-        </CardHeader>
-        <CardContent>
-          {loading && messages.length === 0 ? (
-            <div className="space-y-2">
-              {Array.from({ length: 6 }).map((_, i) => (
-                <Skeleton key={i} className="h-12 w-full" />
-              ))}
-            </div>
-          ) : messages.length === 0 ? (
-            hasActiveFilters ? (
-              <EmptyState
-                icon={MessageSquare}
-                title="No messages"
-                description="No messages match the current filters."
-                action={
-                  <Button variant="outline" size="sm" onClick={clearFilters}>
-                    <X className="h-4 w-4 mr-1" />
-                    Clear filters
-                  </Button>
-                }
-              />
+        </div>
+        {selectedIds.size > 0 && (
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" size="sm" onClick={() => bulkMark(true)}>
+              <MailOpen className="h-4 w-4 mr-1" />
+              Mark read
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => bulkMark(false)}>
+              <Mail className="h-4 w-4 mr-1" />
+              Mark unread
+            </Button>
+            <Button variant="destructive" size="sm" onClick={() => setBulkDeleteOpen(true)}>
+              <Trash2 className="h-4 w-4 mr-1" />
+              Delete
+            </Button>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+
+  return (
+    <DataTablePage<Message>
+      loading={loading}
+      header={{
+        title: "Messages",
+        subtitle: "Inspect and route inter-agent messages",
+        serverName: activeServer?.name,
+        lastUpdated: lastFetch ?? undefined,
+        onRefresh: refresh,
+        refreshing: loading,
+        actions: (
+          <Button size="sm" onClick={() => setComposeOpen((v) => !v)}>
+            {composeOpen ? (
+              <>
+                <X className="h-4 w-4 mr-1" />
+                Close
+              </>
             ) : (
-              // No filters active → nothing to clear; just an empty inbox.
-              <EmptyState
-                icon={MessageSquare}
-                title="No messages yet"
-                description="No messages have been sent yet."
-              />
-            )
-          ) : (
-            <>
-              {/* Desktop table */}
-              <div className="hidden sm:block overflow-x-auto">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead className="w-8">
-                        <input
-                          type="checkbox"
-                          aria-label="select all visible"
-                          checked={allVisibleSelected}
-                          onChange={toggleAllVisible}
-                        />
-                      </TableHead>
-                      <TableHead>Time</TableHead>
-                      <TableHead>From</TableHead>
-                      <TableHead>To</TableHead>
-                      <TableHead>Subject</TableHead>
-                      <TableHead>Type</TableHead>
-                      <TableHead>Priority</TableHead>
-                      <TableHead>Read?</TableHead>
-                      <TableHead>Content</TableHead>
-                      <TableHead className="w-8"></TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {messages.map((m) => (
-                      <MessageRow
-                        key={m.message_id}
-                        message={m}
-                        selected={selectedIds.has(m.message_id)}
-                        onToggle={toggleOne}
-                        onOpenDetail={(msg) => detailDialog.open(msg.message_id)}
-                        onDelete={(msg) => deleteDialog.open(msg.message_id)}
-                        labelForParent={labelForParent}
-                      />
-                    ))}
-                  </TableBody>
-                </Table>
-              </div>
-              {/* Mobile card-list (CC-7) */}
-              <div className="block sm:hidden -m-6">
-                <MessagesMobileList
-                  messages={messages}
-                  selectedIds={selectedIds}
-                  toggleOne={toggleOne}
-                  openDetail={(m) => detailDialog.open(m.message_id)}
-                  deleteOne={(m) => deleteDialog.open(m.message_id)}
-                  labelForParent={labelForParent}
-                  currentOffset={currentOffset}
-                  total={total}
-                  pageSize={PAGE_SIZE}
-                  onNewest={goNewest}
-                  onNewer={goNewer}
-                  onOlder={goOlder}
-                  onOldest={goOldest}
-                />
-              </div>
-            </>
-          )}
-          {/* v5.0.26: pagination footer — desktop only. */}
-          {total > 0 && (
-            <div className="hidden sm:flex items-center justify-between gap-2 mt-4 pt-3 border-t">
-              <div className="flex items-center gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={goNewest}
-                  disabled={onFirstPage}
-                  aria-label="jump to newest page"
-                >
-                  « Newest
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={goNewer}
-                  disabled={onFirstPage}
-                >
-                  Newer
-                </Button>
-              </div>
-              <div className="text-xs text-muted-foreground tabular-nums">
-                Showing {rangeStart}–{rangeEnd} of {total}
-              </div>
-              <div className="flex items-center gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={goOlder}
-                  disabled={onLastPage}
-                >
-                  Older
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={goOldest}
-                  disabled={onLastPage}
-                  aria-label="jump to oldest page"
-                >
-                  Oldest »
-                </Button>
-              </div>
-            </div>
-          )}
-        </CardContent>
-      </Card>
+              <>
+                <Plus className="h-4 w-4 mr-1" />
+                New Message
+              </>
+            )}
+          </Button>
+        ),
+      }}
+      stats={statsCards}
+      filterBar={filterBar}
+      columns={columns}
+      rows={messages}
+      getRowId={(m) => m.message_id}
+      onRowClick={(m) => detailDialog.open(m.message_id)}
+      // v5.0.22: rows whose parent_message_id is non-null are replies.
+      // Visual cue = subtle left border (the "↳ reply to: <parent>"
+      // prefix in the Subject column is the other half).
+      rowClassName={(m) =>
+        m.parent_message_id ? "border-l-2 border-l-muted-foreground/30" : undefined
+      }
+      skeletonRows={6}
+      renderMobileCard={(m) => (
+        <MessageMobileCard
+          message={m}
+          selected={selectedIds.has(m.message_id)}
+          toggleOne={toggleOne}
+          openDetail={(msg) => detailDialog.open(msg.message_id)}
+          deleteOne={(msg) => deleteDialog.open(msg.message_id)}
+          labelForParent={labelForParent}
+        />
+      )}
+      empty={emptyState}
+    >
+      {/* v5.0.26: pagination footer (desktop row + mobile grid). */}
+      {total > 0 && (
+        <MessagesPagination
+          rangeStart={rangeStart}
+          rangeEnd={rangeEnd}
+          total={total}
+          onFirstPage={onFirstPage}
+          onLastPage={onLastPage}
+          onNewest={goNewest}
+          onNewer={goNewer}
+          onOlder={goOlder}
+          onOldest={goOldest}
+        />
+      )}
 
       {/* Detail modal (extracted <ViewMessageModal>). Mark-read stays
           inline (modal stays open); Delete routes through the confirm
@@ -1245,21 +1292,32 @@ export function MessagesDashboard() {
         }}
       />
 
-      {/* Single-message delete confirmation (type-DELETE-to-confirm). */}
-      <DeleteMessageModal
-        message={deleteDialog.data}
+      {/* Single-message delete confirmation (type-DELETE-to-confirm,
+          shared modal). The default entityLabel copy reproduces the
+          retired DeleteMessageModal's single-message wording verbatim. */}
+      <DeleteConfirmModal
         open={deleteDialog.isOpen}
         onOpenChange={(open) => { if (!open) deleteDialog.close() }}
+        entityLabel="Message"
+        details={deleteDialog.data && <MessageDeletePreview message={deleteDialog.data} />}
         onConfirm={handleConfirmDelete}
       />
 
-      {/* Bulk delete confirmation. */}
-      <DeleteMessageModal
-        count={selectedIds.size}
+      {/* Bulk delete confirmation — same shared modal, no per-row
+          `details` preview (there is no single row to preview); the
+          count-aware copy comes from the title/description/warning
+          overrides. */}
+      <DeleteConfirmModal
         open={bulkDeleteOpen}
         onOpenChange={setBulkDeleteOpen}
+        entityLabel="Message"
+        inputId="bulk-confirmation"
+        title={`Delete ${selectedIds.size} Messages`}
+        description={`This action cannot be undone. The ${selectedIds.size} selected messages will be permanently deleted.`}
+        warningText={`All ${selectedIds.size} selected messages will be permanently removed. This action cannot be reversed.`}
+        confirmLabel={`Delete ${selectedIds.size} Messages`}
         onConfirm={handleConfirmBulkDelete}
       />
-    </div>
+    </DataTablePage>
   )
 }
