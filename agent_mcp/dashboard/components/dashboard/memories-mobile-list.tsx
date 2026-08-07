@@ -7,8 +7,7 @@ import { Badge } from "@/components/ui/badge"
 import type { Memory } from "@/lib/api"
 
 /**
- * Mobile card-list rendering of the memories table (CC-7 audit
- * 2026-06-02).
+ * Mobile card rendering of a single memory row (CC-7 audit 2026-06-02).
  *
  * Desktop has 5 columns (Key / Value / Status / Updated / Actions).
  * Mobile collapses to a stacked card: key + brain icon on top,
@@ -17,6 +16,11 @@ import type { Memory } from "@/lib/api"
  * Value is intentionally OMITTED on mobile — values can be long
  * stringified JSON and don't fit; the user taps "View" to see them
  * in the dialog (which has its own scrollable region).
+ *
+ * This is a *single card* (`<li>`); the `<ul>` wrapper is provided by
+ * <ResponsiveDataTable>'s `renderMobileCard` slot. Pre-foundation this
+ * file exported a whole-list `<MemoriesMobileList>` — that role now
+ * belongs to the shared scaffold, leaving only the per-row markup here.
  */
 
 const SECRET_KEY_RE = /(token|secret|password|api[_-]?key|priv(?:ate)?[_-]?key)/i
@@ -24,29 +28,25 @@ const NON_SECRET_RE = /(token[_-]?(count|limit|usage|stats|description|name|kind
 const isSecretKey = (key: string): boolean =>
   SECRET_KEY_RE.test(key) && !NON_SECRET_RE.test(key)
 
-interface MemoriesMobileListProps {
-  memories: Memory[]
+interface MemoryMobileCardProps {
+  memory: Memory
   onView: (memory: Memory) => void
   onEdit: (memory: Memory) => void
   onDelete: (memory: Memory) => void
 }
 
-export function MemoriesMobileList({
-  memories,
+export function MemoryMobileCard({
+  memory,
   onView,
   onEdit,
   onDelete,
-}: MemoriesMobileListProps): React.ReactElement {
+}: MemoryMobileCardProps): React.ReactElement {
+  const meta = memory._metadata
   return (
-    <ul role="list" className="divide-y divide-border">
-      {memories.map((memory) => {
-        const meta = memory._metadata
-        return (
-          <li
-            key={memory.context_key}
-            onClick={() => onView(memory)}
-            className="px-4 py-3 hover:bg-muted/30 active:bg-muted/50 transition-colors duration-150 cursor-pointer"
-          >
+    <li
+      onClick={() => onView(memory)}
+      className="px-4 py-3 hover:bg-muted/30 active:bg-muted/50 transition-colors duration-150 cursor-pointer"
+    >
             <div className="flex items-start gap-3">
               <Brain className="h-4 w-4 text-primary mt-0.5 shrink-0" />
               <div className="min-w-0 flex-1">
@@ -136,9 +136,6 @@ export function MemoriesMobileList({
                 </div>
               </div>
             </div>
-          </li>
-        )
-      })}
-    </ul>
+    </li>
   )
 }

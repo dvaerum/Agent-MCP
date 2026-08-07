@@ -14,7 +14,7 @@ import userEvent from "@testing-library/user-event"
 // guard — we drive the input via keyboard, not real pointer hit-testing.
 const ue = () => userEvent.setup({ pointerEventsCheck: 0 })
 
-import { DeleteMemoryModal } from "@/components/dashboard/modals/delete-memory-modal"
+import { DeleteConfirmModal } from "@/components/dashboard/modals/delete-confirm-modal"
 import { DeleteMessageModal } from "@/components/dashboard/modals/delete-message-modal"
 
 // Users/groups delete modals call the router API directly; stub it so the
@@ -27,15 +27,7 @@ vi.mock("@/lib/router-api", () => ({
 import { DeleteUserModal } from "@/components/dashboard/users-dashboard"
 import { DeleteGroupModal } from "@/components/dashboard/groups-dashboard"
 
-import type { Memory, Message } from "@/lib/api"
-
-const memory: Memory = {
-  context_key: "some.key",
-  value: "hello",
-  description: "a memory",
-  updated_at: "2026-01-01T00:00:00Z",
-  updated_by: "admin",
-}
+import type { Message } from "@/lib/api"
 
 const message: Message = {
   message_id: "m1",
@@ -74,38 +66,61 @@ beforeEach(() => {
 afterEach(() => cleanup())
 
 describe("Enter submits type-to-confirm delete dialogs", () => {
-  it("DeleteMemoryModal: Enter fires delete after correct confirmation", async () => {
+  it("DeleteConfirmModal: Enter fires confirm after correct confirmation", async () => {
     const u = ue()
-    const onDeleteMemory = vi.fn(() => Promise.resolve())
+    const onConfirm = vi.fn(() => Promise.resolve())
     render(
-      <DeleteMemoryModal
-        memory={memory}
+      <DeleteConfirmModal
         open
         onOpenChange={() => {}}
-        onDeleteMemory={onDeleteMemory}
+        onConfirm={onConfirm}
+        entityLabel="Memory"
       />,
     )
     const input = document.getElementById("confirmation") as HTMLElement
     await u.type(input, "DELETE")
     await u.keyboard("{Enter}")
-    await waitFor(() => expect(onDeleteMemory).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1))
   })
 
-  it("DeleteMemoryModal: Enter with wrong text does NOT fire delete", async () => {
+  it("DeleteConfirmModal: Enter with wrong text does NOT fire confirm", async () => {
     const u = ue()
-    const onDeleteMemory = vi.fn(() => Promise.resolve())
+    const onConfirm = vi.fn(() => Promise.resolve())
     render(
-      <DeleteMemoryModal
-        memory={memory}
+      <DeleteConfirmModal
         open
         onOpenChange={() => {}}
-        onDeleteMemory={onDeleteMemory}
+        onConfirm={onConfirm}
+        entityLabel="Memory"
       />,
     )
     const input = document.getElementById("confirmation") as HTMLElement
     await u.type(input, "WRONG")
     await u.keyboard("{Enter}")
-    expect(onDeleteMemory).not.toHaveBeenCalled()
+    expect(onConfirm).not.toHaveBeenCalled()
+  })
+
+  it("DeleteConfirmModal: matchCase requires exact-case name (users/groups contract)", async () => {
+    const u = ue()
+    const onConfirm = vi.fn(() => Promise.resolve())
+    render(
+      <DeleteConfirmModal
+        open
+        onOpenChange={() => {}}
+        onConfirm={onConfirm}
+        entityLabel="User"
+        requiredWord="alice"
+        matchCase
+      />,
+    )
+    const input = document.getElementById("confirmation") as HTMLElement
+    await u.type(input, "ALICE")
+    await u.keyboard("{Enter}")
+    expect(onConfirm).not.toHaveBeenCalled()
+    await u.clear(input)
+    await u.type(input, "alice")
+    await u.keyboard("{Enter}")
+    await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1))
   })
 
   it("DeleteMessageModal: Enter fires confirm after correct confirmation", async () => {
