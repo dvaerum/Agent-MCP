@@ -66,6 +66,14 @@ TOAST_TSX = DASHBOARD / "components" / "ui" / "toast.tsx"
 
 
 def _read(p: Path) -> str:
+    # The Agents page is a page module + a directory of satellites since
+    # the <DataTablePage> migration (RegisterAgentModal now lives in
+    # components/dashboard/agents/register-agent-modal.tsx); guards
+    # about "the Agents page" read all of it.
+    if p == AGENTS_TSX:
+        from tests.dashboard_sources import agents_page_source
+
+        return agents_page_source()
     return p.read_text(encoding="utf-8")
 
 

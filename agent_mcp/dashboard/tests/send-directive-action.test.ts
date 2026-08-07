@@ -34,6 +34,12 @@ const read = (rel: string) => readFileSync(resolve(DASHBOARD_ROOT, rel), "utf8")
 
 describe("send-directive reachable from the Agents page (no schedule required)", () => {
   const agents = read("components/dashboard/agents-dashboard.tsx")
+  // Post-<DataTablePage> migration the desktop row markup lives in the
+  // Agents column spec, and the mobile card in its own module. Both are
+  // satellites of the same page, so the wiring assertions below name the
+  // file that actually owns each half.
+  const columns = read("components/dashboard/agents/agent-columns.tsx")
+  const mobileCard = read("components/dashboard/agents-mobile-list.tsx")
 
   it("Agents page imports and renders the shared SendDirectiveModal", () => {
     expect(agents).toContain(
@@ -44,12 +50,14 @@ describe("send-directive reachable from the Agents page (no schedule required)",
   })
 
   it("Agents page wires a per-agent send-directive row action", () => {
-    // The action handler is threaded down to the row + mobile list + the
-    // detail dialog.
+    // The action handler is threaded down to the column spec (desktop
+    // row), the mobile card, and the detail dialog.
+    expect(agents).toContain("const handleSendDirective = useCallback((agentId: string)")
+    expect(agents).toContain("onSendDirective: handleSendDirective,")
     expect(agents).toContain("onSendDirective={handleSendDirective}")
-    expect(agents).toContain("const handleSendDirective = (agentId: string)")
-    // The row renders a data-testid-tagged trigger for the poke.
-    expect(agents).toContain("send-directive-${agent.agent_id}")
+    // Both row surfaces render a data-testid-tagged trigger for the poke.
+    expect(columns).toContain("send-directive-${agent.agent_id}")
+    expect(mobileCard).toContain("send-directive-mobile-${agent.agent_id}")
   })
 })
 

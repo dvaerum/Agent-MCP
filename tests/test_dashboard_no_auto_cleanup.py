@@ -60,6 +60,15 @@ DASHBOARD = Path("agent_mcp/dashboard")
 
 
 def _read(rel: str) -> str:
+    # The Agents page is a page module + a directory of satellites since
+    # the <DataTablePage> migration. The negative assertions below only
+    # mean something if they cover every file the auto-cleanup loop
+    # could have been re-hidden in, so read all of them
+    # (tests/dashboard_sources.py).
+    if rel == "components/dashboard/agents-dashboard.tsx":
+        from tests.dashboard_sources import agents_page_source
+
+        return agents_page_source()
     return (DASHBOARD / rel).read_text()
 
 

@@ -24,13 +24,16 @@ project ships no jsdom / vitest setup).
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
-AGENTS_TSX = Path("agent_mcp/dashboard/components/dashboard/agents-dashboard.tsx")
+from tests.dashboard_sources import agents_page_source
 
 
 def _src() -> str:
-    return AGENTS_TSX.read_text()
+    # The row markup moved out of agents-dashboard.tsx into the Agents
+    # column spec when the page adopted <DataTablePage>; these guards
+    # are about the page's behaviour, so they read the whole page +
+    # satellites (tests/dashboard_sources.py).
+    return agents_page_source()
 
 
 # All three terminal statuses must appear as exclusions in the
