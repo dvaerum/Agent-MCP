@@ -55,6 +55,10 @@ pub async fn run_bridge(conn: Arc<PluginConn>, reconcile: Arc<Notify>) {
     // (the host makes an unchanged set a no-op respawn); it only avoids RPC
     // spam and, on a real change, forces a re-assert.
     let mut mcp_set: HashMap<String, String> = HashMap::new();
+    // Per-session guard: sessions we've already POSTed acp/enable for this run.
+    // The host call is idempotent, so this only avoids repeat view-swaps / log
+    // spam; a stale/removed row is dropped from it so a re-add re-enables.
+    let mut acp_enabled: HashSet<String> = HashSet::new();
 
     loop {
         let settings = config::load_settings(&conn).await;
@@ -65,6 +69,7 @@ pub async fn run_bridge(conn: Arc<PluginConn>, reconcile: Arc<Notify>) {
                 t.handle.abort();
             }
             mcp_set.clear();
+            acp_enabled.clear();
         } else {
             let live = fetch_liveness(&http, &settings.aoe_base, &settings.aoe_token).await;
             let ctx = Arc::new(BridgeCtx {
@@ -102,6 +107,14 @@ pub async fn run_bridge(conn: Arc<PluginConn>, reconcile: Arc<Notify>) {
                     // set agent-mcp's tools when `expose_mcp` yields a url, or
                     // clear our entry when it was on and is now off.
                     ensure_session_mcp(&conn, &mut mcp_set, &route).await;
+
+                    // Set the MCP first (above), then flip the session to ACP so
+                    // the ACP spawn picks up `session_mcp_servers`. Only covered
+                    // sessions (expose_mcp on ⇒ mcp_url set) are switched, and
+                    // only when the global ensure_acp setting is on.
+                    if route.wants_acp(settings.ensure_acp) {
+                        ensure_acp_mode(&ctx, &route.session_id, &mut acp_enabled).await;
+                    }
 
                     // Ensure a fresh SSE task with the current fingerprint.
                     let needs_spawn = match tasks.get(&route.session_id) {
@@ -147,6 +160,10 @@ pub async fn run_bridge(conn: Arc<PluginConn>, reconcile: Arc<Notify>) {
                 // actively clear the session's injected tools here: a removed
                 // row stops delivery but leaves the session usable via MCP.
                 mcp_set.remove(&k);
+                // Drop the ACP guard too so a re-added row re-enables. We do NOT
+                // revert the session to terminal: the ACP switch is one-way and
+                // leaves the session usable.
+                acp_enabled.remove(&k);
             }
         }
 
@@ -231,6 +248,33 @@ async fn ensure_session_mcp(
                 }
             }
         }
+    }
+}
+
+/// Switch a covered session to ACP mode so AoE's per-session MCP
+/// (`session_mcp_servers`) actually reaches the agent. Terminal
+/// `claude`/`opencode` sessions never load per-session MCP; ACP delivers it
+/// agent-agnostically. POSTs `{aoe_base}/api/sessions/{id}/acp/enable`, which is
+/// idempotent host-side (a session already structured/ACP is a no-op) — the
+/// `guard` set only avoids repeated view-swaps / log spam by calling it at most
+/// once per session. Best-effort: a non-ACP-capable agent (or any transport
+/// error) is logged and skipped; it never fails the reconcile.
+async fn ensure_acp_mode(ctx: &BridgeCtx, session_id: &str, guard: &mut HashSet<String>) {
+    if !guard.insert(session_id.to_string()) {
+        return; // already attempted this session.
+    }
+    let url = format!("{}/api/sessions/{}/acp/enable", ctx.aoe_base, session_id);
+    let mut req = ctx.http.post(&url).json(&json!({}));
+    if !ctx.aoe_token.is_empty() {
+        req = req.header(AUTHORIZATION, format!("Bearer {}", ctx.aoe_token));
+    }
+    match req.send().await {
+        Ok(r) if r.status().is_success() => {}
+        Ok(r) => crate::log(&format!(
+            "acp/enable for {session_id} returned HTTP {}",
+            r.status()
+        )),
+        Err(e) => crate::log(&format!("acp/enable for {session_id} failed: {e}")),
     }
 }
 

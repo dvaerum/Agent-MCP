@@ -75,6 +75,13 @@ min = 5
 max = 3600
 advanced = true
 
+[[settings]]
+key = "ensure_acp"
+label = "Switch covered sessions to ACP mode"
+description = "On (default): every covered session that gets agent-mcp's tools injected (expose_mcp on) is also switched to ACP mode, so AoE's per-session MCP actually reaches the agent. Terminal claude/opencode sessions never load per-session MCP; ACP delivers it agent-agnostically. This is a one-time terminal→ACP view swap per session (transcript-preserving), applied only to sessions whose agent is ACP-capable. Off: sessions are left in their current mode and per-session MCP may not apply to terminal agents."
+type = "boolean"
+default = true
+
 # ── Covered sessions ────────────────────────────────────────────────────────
 # One row per session the bridge covers. A row is just identity — session_id,
 # token, project — no URL (those derive from agent_mcp_base above).
