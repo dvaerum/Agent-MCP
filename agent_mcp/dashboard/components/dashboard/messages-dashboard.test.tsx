@@ -35,15 +35,18 @@ const reply = {
   read: 1,
 }
 
+// Mutable so individual tests can drive the hook into an error state.
+const query = {
+  data: [message, reply] as unknown[],
+  total: 2,
+  loading: false,
+  error: null as Error | null,
+  refresh: () => {},
+  lastFetch: Date.now(),
+}
+
 vi.mock("@/hooks/use-paged-query", () => ({
-  usePagedQuery: () => ({
-    data: [message, reply],
-    total: 2,
-    loading: false,
-    error: null,
-    refresh: () => {},
-    lastFetch: Date.now(),
-  }),
+  usePagedQuery: () => query,
 }))
 vi.mock("@/lib/stores/server-store", () => ({
   useServerStore: () => ({
@@ -51,8 +54,11 @@ vi.mock("@/lib/stores/server-store", () => ({
     activeServerId: "s1",
   }),
 }))
+// `ApiError` is needed too: the error path runs through `toastError`,
+// which instanceof-checks against it.
 vi.mock("@/lib/api", () => ({
   apiClient: { getServerUrl: () => "http://localhost:1/api" },
+  ApiError: class ApiError extends Error {},
 }))
 // The compose recipient dropdown pulls /messages/participants on mount.
 vi.stubGlobal(
@@ -64,7 +70,12 @@ vi.stubGlobal(
 
 import { MessagesDashboard } from "@/components/dashboard/messages-dashboard"
 
-afterEach(() => cleanup())
+afterEach(() => {
+  cleanup()
+  query.data = [message, reply]
+  query.total = 2
+  query.error = null
+})
 
 describe("<MessagesDashboard> (scaffold migration)", () => {
   it("renders the scaffold header + stats strip", () => {
@@ -117,6 +128,27 @@ describe("<MessagesDashboard> (scaffold migration)", () => {
     expect(screen.getAllByText(/Showing 1–2 of 2/)).toHaveLength(2)
     expect(screen.getAllByLabelText("jump to newest page")).toHaveLength(2)
     expect(screen.getAllByLabelText("jump to oldest page")).toHaveLength(2)
+  })
+
+  // Messages is now wired straight into the scaffold's `error` prop —
+  // safe only because the scaffold keeps content when rows are in hand.
+  it("keeps the message rows when a background refresh fails", () => {
+    query.error = new Error("network down")
+    const { container } = render(<MessagesDashboard />)
+    expect(container.querySelectorAll("tbody tr")).toHaveLength(2)
+    expect(screen.queryByText(/Connection Error/i)).toBeNull()
+    expect(
+      container.querySelector('[data-slot="stale-notice"]'),
+    ).toBeTruthy()
+  })
+
+  it("shows the full error panel when the first load fails empty", () => {
+    query.error = new Error("network down")
+    query.data = []
+    query.total = 0
+    render(<MessagesDashboard />)
+    expect(screen.getByText(/Connection Error/i)).toBeTruthy()
+    expect(screen.queryByRole("heading", { name: "Messages" })).toBeNull()
   })
 
   it("keeps the filter bar controls", () => {

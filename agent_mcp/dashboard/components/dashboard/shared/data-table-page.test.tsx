@@ -81,17 +81,53 @@ describe("<DataTablePage>", () => {
     expect(document.querySelector('[data-slot="table-skeleton"]')).toBeNull()
   })
 
-  it("renders the error panel (not the header) when error is set", () => {
-    render(<DataTablePage {...base({ error: "boom" })} />)
+  it("renders the error panel (not the header) when error is set with no rows", () => {
+    render(<DataTablePage {...base({ error: "boom", rows: [] })} />)
     expect(screen.queryByRole("heading", { name: "Memory Bank" })).toBeNull()
     expect(screen.getByText("boom")).toBeTruthy()
     expect(screen.getByText(/Connection Error/i)).toBeTruthy()
+  })
+
+  // The regression this scaffold fix exists for: a polling page
+  // (Messages every 60 s + every SSE tick, Tasks every 60 s) hitting one
+  // transient failure must NOT blank the page the operator is reading.
+  // Error precedence mirrors the loading precedence — the panel owns the
+  // page only when there is genuinely nothing else to show.
+  it("keeps rendering rows when a refresh fails with content already on screen", () => {
+    render(<DataTablePage {...base({ error: "boom", rows })} />)
+    expect(screen.getByRole("heading", { name: "Memory Bank" })).toBeTruthy()
+    expect(screen.queryByText(/Connection Error/i)).toBeNull()
+    const table = document.querySelector("table")!
+    expect(within(table).getByText("alpha")).toBeTruthy()
+    expect(within(table).getByText("beta")).toBeTruthy()
+  })
+
+  it("flags the kept content as stale via a non-blocking notice", () => {
+    render(<DataTablePage {...base({ error: "boom", rows })} />)
+    const notice = document.querySelector('[data-slot="stale-notice"]')!
+    expect(notice).toBeTruthy()
+    expect(notice.getAttribute("role")).toBe("status")
+    expect(notice.textContent).toContain("boom")
+  })
+
+  it("renders no stale notice while healthy", () => {
+    render(<DataTablePage {...base()} />)
+    expect(document.querySelector('[data-slot="stale-notice"]')).toBeNull()
   })
 
   it("renders the forbidden panel when forbidden is set", () => {
     render(<DataTablePage {...base({ forbidden: true })} />)
     expect(screen.queryByRole("heading", { name: "Memory Bank" })).toBeNull()
     expect(screen.getByText(/Sysadmin only/i)).toBeTruthy()
+  })
+
+  // A 403 is a standing authorization verdict, not a transient blip —
+  // it must still replace the page even when stale rows are in hand.
+  it("prefers the forbidden panel over the error state, rows or not", () => {
+    render(<DataTablePage {...base({ forbidden: true, error: "boom", rows })} />)
+    expect(screen.getByText(/Sysadmin only/i)).toBeTruthy()
+    expect(document.querySelector("table")).toBeNull()
+    expect(screen.queryByText(/Connection Error/i)).toBeNull()
   })
 
   it("renders the guard panel (short-circuit) when guard is set", () => {

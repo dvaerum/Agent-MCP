@@ -41,13 +41,25 @@ import {
  *   2. `loading` & no rows — the stats+table skeleton.
  *   3. `forbidden` — the centralized "Sysadmin only" panel (was
  *                    copy-pasted across 3 router views).
- *   4. `error`     — the "Connection Error" panel.
+ *   4. `error` & no rows — the "Connection Error" panel.
  *   5. loaded      — header + stats + filter bar + card
  *                    (EmptyState when `rows` is empty, else the
- *                    responsive table) + `children` (modals).
+ *                    responsive table) + `children` (modals), plus the
+ *                    stale-data notice when `error` arrived with rows.
  *
- * A background refresh (`loading` true WITH rows already present) keeps
- * showing content rather than flashing the skeleton.
+ * Content in hand beats a transient failure, for BOTH the in-flight and
+ * the failed case: a refresh (`loading`) with rows already present keeps
+ * showing them rather than flashing the skeleton, and a *failed* refresh
+ * (`error`) with rows already present keeps showing them rather than
+ * blanking the page behind a full-page panel. These pages poll —
+ * Messages every 60 s and on every SSE tick, Tasks every 60 s — so a
+ * single dropped request would otherwise wipe a page the operator is
+ * actively reading. The full panel is reserved for the first load, where
+ * there is genuinely nothing else to render.
+ *
+ * `forbidden` deliberately still outranks `error` in both cases: a 403
+ * is a standing authorization verdict, not a blip, and stale rows must
+ * not survive it.
  */
 export interface DataTablePageProps<T> {
   /** Header config (title/subtitle/chip/last-updated/refresh/actions). */
@@ -59,7 +71,12 @@ export interface DataTablePageProps<T> {
 
   /** True while the data source is fetching. */
   loading: boolean
-  /** List-load error message, or null/undefined when healthy. */
+  /**
+   * List-load error message, or null/undefined when healthy. Renders the
+   * full-page "Connection Error" panel only when there are no rows to
+   * fall back on; with rows present it degrades to the inline
+   * stale-data notice (see the precedence note above).
+   */
   error?: string | null
   /** 403 — renders the "Sysadmin only" panel. */
   forbidden?: boolean
@@ -207,8 +224,10 @@ export function DataTablePage<T>({
     )
   }
 
-  // 4. List-load error.
-  if (error) {
+  // 4. First-load error — nothing in hand, so the panel owns the page.
+  //    With rows present we fall through to the loaded branch and show
+  //    the inline stale notice instead (mirrors the loading precedence).
+  if (error && rows.length === 0) {
     return (
       <CenteredPanel
         icon={AlertCircle}
@@ -236,6 +255,28 @@ export function DataTablePage<T>({
       {filterBar && (
         <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 sm:gap-3">
           {filterBar}
+        </div>
+      )}
+
+      {/*
+        The demoted error surface. Without it a failed background refresh
+        would be silent on every page that has no toast of its own
+        (Agents/Tasks/Memories/Users/Groups all pass `error` straight to
+        this scaffold and surface it nowhere else), leaving the operator
+        reading stale rows with no way to tell. One line, in flow, no
+        focus steal, no layout jump for the healthy case.
+      */}
+      {error && (
+        <div
+          data-slot="stale-notice"
+          role="status"
+          aria-live="polite"
+          className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        >
+          <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
+          <span>
+            Showing the last loaded data — refresh failed: {error}
+          </span>
         </div>
       )}
 
