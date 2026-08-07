@@ -111,6 +111,7 @@ from . import project_registry  # sibling module — see ./project_registry.py
 from . import mount  # ADR-0020: per-request external prefix/origin
 from . import asset_prefix as _asset_prefix  # Phase 4: runtime sentinel sub
 from . import project_orchestrator as _po  # PR-C: lifecycle state machine
+from .client_disconnect import client_gone_response as _client_gone_response
 from .single_tenant import bypasses_operator_gate  # arch-r4 #8
 
 
@@ -759,7 +760,20 @@ async def _proxy_to_backend(
     # a streamed `data=req.content` could finish with an empty body
     # upstream. Reading first guarantees the full body reaches the
     # backend before we wait on its response.
-    req_body = await req.read()
+    try:
+        req_body = await req.read()
+    except ConnectionError as exc:
+        # Same class as the response-side disconnect below, from the
+        # other direction: the peer abandoned its upload mid-body, so
+        # aiohttp fails this read with ``ConnectionResetError("Connection
+        # lost")``. There is nobody left to serve and nothing was
+        # proxied, so answer with the client-gone status instead of
+        # letting it render as a server error.
+        logger.debug(
+            "client disconnected while uploading its request body to %s: %s",
+            name, exc,
+        )
+        return _client_gone_response()
     # R8-F2: `GET /mcp` is the SSE verb/path — the backend answers it
     # with an INFINITE `text/event-stream` (a `: ping` heartbeat every
     # 15 s, forever). Buffering that with `await up.read()` never
@@ -904,7 +918,30 @@ async def _stream_upstream_to_client(
     write-side disconnect signal alongside the watcher.
     """
     resp = web.StreamResponse(status=up.status, headers=out_headers)
-    await resp.prepare(req)
+    try:
+        await resp.prepare(req)
+    except ConnectionError as exc:
+        # The peer left in the window between us opening the upstream
+        # and writing the FIRST downstream byte — aiohttp's
+        # ``ClientConnectionResetError("Cannot write to closing
+        # transport")``. That is the stream terminating normally from
+        # the far end, NOT a router fault, so it must not surface as an
+        # ``aiohttp.server`` ERROR traceback (which is indistinguishable
+        # at a glance from a real failure and costs a triage every
+        # time). Returning the already-``prepare``d response instead of
+        # propagating keeps the exception out of aiohttp's 500 renderer;
+        # aiohttp's own ``finish_response`` re-``prepare``s it as a
+        # no-op (the payload writer is already bound) and absorbs the
+        # ``ConnectionError`` from the trailing ``write_eof``. Returning
+        # here also unwinds the caller's ``async with sess.request(...)``
+        # scope, so the upstream connection + its slot in
+        # ``_track_connection`` / the streaming cap are released rather
+        # than leaked.
+        logger.debug(
+            "SSE client for %s disconnected before response headers: %s",
+            name, exc,
+        )
+        return resp
 
     async def _pump() -> None:
         async for chunk in up.content.iter_any():
@@ -912,7 +949,7 @@ async def _stream_upstream_to_client(
             await resp.write(chunk)
         # Upstream ended naturally (rare for /mcp). Flush a clean EOF;
         # the client may already be gone, so a reset here is non-fatal.
-        with contextlib.suppress(ConnectionResetError):
+        with contextlib.suppress(ConnectionError):
             await resp.write_eof()
 
     async def _watch_disconnect() -> None:
@@ -932,18 +969,32 @@ async def _stream_upstream_to_client(
             {pump, watcher}, return_when=asyncio.FIRST_COMPLETED,
         )
     finally:
-        # Cancel the loser (and, on the caller unwinding, both). Then
-        # re-await the pump so a benign client-gone error is swallowed
-        # here while any genuine pump failure still propagates.
+        # Cancel the loser (and, on the caller unwinding, both), then
+        # collect both outcomes. ``return_exceptions=True`` hands back
+        # each task's error instead of raising it here, so:
+        #   * a client-gone write failure is logged at DEBUG as the
+        #     normal end of the stream (it is the write-side twin of the
+        #     pre-headers disconnect handled above);
+        #   * a CancelledError from a task WE cancelled is expected and
+        #     ignored — while a cancellation aimed at this handler still
+        #     unwinds, because ``gather`` re-raises that one (a bare
+        #     ``suppress(CancelledError)`` would silently eat it);
+        #   * any other pump failure is a genuine fault and re-raised.
         watcher.cancel()
         if not pump.done():
             pump.cancel()
-        with contextlib.suppress(
-            asyncio.CancelledError, ConnectionResetError,
+        for outcome in await asyncio.gather(
+            pump, watcher, return_exceptions=True,
         ):
-            await pump
-        with contextlib.suppress(asyncio.CancelledError):
-            await watcher
+            if isinstance(outcome, ConnectionError):
+                logger.debug(
+                    "SSE client for %s disconnected mid-stream: %s",
+                    name, outcome,
+                )
+            elif isinstance(outcome, BaseException) and not isinstance(
+                outcome, asyncio.CancelledError,
+            ):
+                raise outcome
     return resp
 
 
