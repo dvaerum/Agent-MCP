@@ -22,14 +22,17 @@ behaviour is verified by ``npm run build`` plus Firefox MCP e2e.
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
-DASHBOARD = Path("agent_mcp/dashboard")
-AGENTS_TSX = DASHBOARD / "components/dashboard/agents-dashboard.tsx"
+from tests.dashboard_sources import agents_page_source, read_dashboard
 
 
 def _read_agents() -> str:
-    return AGENTS_TSX.read_text()
+    # Post-<DataTablePage> migration the Agents page is a page module
+    # plus a directory of satellites (register / detail / edit /
+    # terminate / purge dialogs, the column spec, the snippet builder).
+    # These guards are about the PAGE, so they read all of it — see
+    # tests/dashboard_sources.py.
+    return agents_page_source()
 
 
 # ---------- Imports ------------------------------------------------
@@ -98,26 +101,48 @@ def test_agents_dashboard_imports_project_context() -> None:
 
 
 def test_table_row_click_opens_view_dialog() -> None:
-    """The ``TableRow`` body click must call ``openView(agent)`` so
-    clicking anywhere on the row body opens the View dialog — mirrors
-    the Tasks page row-click pattern."""
-    src = _read_agents()
+    """Clicking anywhere on a row body must open the View dialog —
+    mirrors the Tasks page row-click pattern.
+
+    Post-migration the desktop row shell belongs to
+    ``<ResponsiveDataTable>``, so the page expresses this by handing
+    ``<DataTablePage>`` an ``onRowClick``; the mobile card keeps its own
+    ``onClick``. Both must point at the detail-dialog opener.
+    """
+    page = read_dashboard("components/dashboard/agents-dashboard.tsx")
+    assert re.search(
+        r"onRowClick=\{handleSelectAgent\}",
+        page,
+    ), (
+        "agents-dashboard.tsx must pass onRowClick={handleSelectAgent} to "
+        "<DataTablePage> so the desktop row body opens the View dialog "
+        "(same as the eye icon)"
+    )
+    mobile = read_dashboard("components/dashboard/agents-mobile-list.tsx")
     assert re.search(
         r"onClick=\{\(\)\s*=>\s*openView\(agent\)\}",
-        src,
+        mobile,
     ), (
-        "TableRow onClick must call openView(agent) so the row body "
-        "opens the View dialog (same as the eye icon)"
+        "the mobile agent card must call openView(agent) on tap"
     )
 
 
 def test_table_row_has_cursor_pointer() -> None:
-    """A clickable row must visually advertise its clickability."""
-    src = _read_agents()
-    # We accept either the literal Tailwind class or a cn() include.
-    assert "cursor-pointer" in src, (
-        "TableRow must declare cursor-pointer so the click affordance "
-        "is visible"
+    """A clickable row must visually advertise its clickability.
+
+    The desktop row's affordance is owned by ``<ResponsiveDataTable>``
+    (which adds ``cursor-pointer`` whenever ``onRowClick`` is set); the
+    mobile card declares its own.
+    """
+    shared = read_dashboard(
+        "components/dashboard/shared/responsive-data-table.tsx"
+    )
+    assert "cursor-pointer" in shared, (
+        "ResponsiveDataTable must declare cursor-pointer on clickable "
+        "rows so the affordance is visible"
+    )
+    assert "cursor-pointer" in _read_agents(), (
+        "the mobile agent card must declare cursor-pointer"
     )
 
 

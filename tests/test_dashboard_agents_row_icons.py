@@ -18,13 +18,16 @@ test_dashboard_agent_restore_purge.py).
 
 from __future__ import annotations
 
-from pathlib import Path
-
-DASHBOARD = Path("agent_mcp/dashboard")
+from tests.dashboard_sources import agents_page_source, read_dashboard
 
 
 def _read(rel: str) -> str:
-    return (DASHBOARD / rel).read_text()
+    # The Agents page is a page module + a directory of satellites since
+    # the <DataTablePage> migration; guards about "the Agents page" read
+    # all of it (tests/dashboard_sources.py).
+    if rel == "components/dashboard/agents-dashboard.tsx":
+        return agents_page_source()
+    return read_dashboard(rel)
 
 
 # ---------- Kebab removed -----------------------------------------

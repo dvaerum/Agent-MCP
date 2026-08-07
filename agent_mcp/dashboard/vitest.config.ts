@@ -33,6 +33,13 @@ export default defineConfig({
       "components/**/*.test.tsx",
     ],
     environment: "node",
+    // The jsdom UI tests (Radix dialogs + user-event) are an order of
+    // magnitude slower than the pure-Node ones, and vitest fans the
+    // whole suite across one worker per core. On a loaded machine a
+    // single `it` can exceed the 5 s default purely from scheduling
+    // pressure — a false red that says nothing about the code. 20 s is
+    // still far below any real hang.
+    testTimeout: 20_000,
   },
   resolve: {
     alias: {

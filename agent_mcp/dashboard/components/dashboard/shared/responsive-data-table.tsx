@@ -67,6 +67,17 @@ export interface ResponsiveDataTableProps<T> {
    * mobile rendering entirely and therefore its own mobile expansion.
    */
   renderExpanded?: (row: T) => React.ReactNode
+  /**
+   * Extra classes on the desktop `<table>` itself.
+   *
+   * Exists for `table-fixed`: a page whose cells can hold unbounded
+   * user-supplied text (e.g. the Agents table's `agent_id`) needs fixed
+   * layout so one pathological value truncates within its column
+   * instead of stretching the auto-layout table thousands of px wide
+   * and pushing every other column off-screen. Column widths then come
+   * from each column's `headClassName`.
+   */
+  tableClassName?: string
 }
 
 const HIDE_BELOW_CLASS: Record<NonNullable<Column<unknown>["hideBelow"]>, string> = {
@@ -83,6 +94,7 @@ export function ResponsiveDataTable<T>({
   renderMobileCard,
   rowClassName,
   renderExpanded,
+  tableClassName,
 }: ResponsiveDataTableProps<T>): React.ReactElement {
   return (
     <>
@@ -91,7 +103,7 @@ export function ResponsiveDataTable<T>({
         data-slot="data-table-desktop"
         className="hidden sm:block overflow-x-auto"
       >
-        <Table>
+        <Table className={tableClassName}>
           <TableHeader>
             <TableRow className="border-border hover:bg-transparent">
               {columns.map((col) => (

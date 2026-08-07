@@ -86,6 +86,8 @@ export interface DataTablePageProps<T> {
    * `ResponsiveDataTableProps.renderExpanded`.
    */
   renderExpanded?: (row: T) => React.ReactNode
+  /** Extra classes on the desktop `<table>` (e.g. `table-fixed`). */
+  tableClassName?: string
 
   /** Empty-state content when `rows` is empty. */
   empty: EmptyStateProps
@@ -149,6 +151,7 @@ export function DataTablePage<T>({
   renderMobileCard,
   rowClassName,
   renderExpanded,
+  tableClassName,
   empty,
   skeletonRows = 5,
   skeletonStats,
@@ -245,6 +248,7 @@ export function DataTablePage<T>({
             renderMobileCard={renderMobileCard}
             rowClassName={rowClassName}
             renderExpanded={renderExpanded}
+            tableClassName={tableClassName}
           />
         )}
       </div>
