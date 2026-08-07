@@ -6,9 +6,15 @@
 // edit / delete modals, and a per-agent "poke" (ad-hoc directive) button.
 // Backed by the operator-gated /api/schedules REST routes + the
 // /api/agents/{id}/directive poke route.
+//
+// Presentation is delegated to the shared <DataTablePage> scaffold
+// (components/dashboard/shared/data-table-page.tsx; memories-dashboard
+// is the reference migration): header, skeleton, empty state and the
+// desktop/mobile responsive table live there. This file owns the data
+// source, the column spec, and the create/edit/delete/poke modals.
 
 import React, { useCallback, useEffect, useMemo, useState } from "react"
-import { CalendarClock, Pencil, Trash2, Send, RefreshCw, Plus } from "lucide-react"
+import { CalendarClock, Pencil, Trash2, Send, Plus } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -16,10 +22,6 @@ import { Label } from "@/components/ui/label"
 import { Badge } from "@/components/ui/badge"
 import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import {
-  Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
-} from "@/components/ui/table"
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select"
@@ -30,9 +32,9 @@ import {
 import {
   Tooltip, TooltipContent, TooltipProvider, TooltipTrigger,
 } from "@/components/ui/tooltip"
-import { Skeleton } from "@/components/ui/skeleton"
-import { EmptyState } from "@/components/dashboard/shared/empty-state"
 import { SendDirectiveModal } from "@/components/dashboard/shared/send-directive-modal"
+import { DataTablePage } from "@/components/dashboard/shared/data-table-page"
+import type { Column } from "@/components/dashboard/shared/responsive-data-table"
 import { toastError, toastSuccess } from "@/components/ui/toast"
 import { apiClient, type Agent, type Schedule } from "@/lib/api"
 import {
@@ -96,10 +98,10 @@ export function SchedulesDashboard() {
   const [directiveOpen, setDirectiveOpen] = useState(false)
   const [directiveAgent, setDirectiveAgent] = useState<string | null>(null)
 
-  const openDirective = (agentId: string | null) => {
+  const openDirective = useCallback((agentId: string | null) => {
     setDirectiveAgent(agentId)
     setDirectiveOpen(true)
-  }
+  }, [])
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -152,7 +154,7 @@ export function SchedulesDashboard() {
     setFormOpen(true)
   }
 
-  const openEdit = (s: Schedule) => {
+  const openEdit = useCallback((s: Schedule) => {
     setEditId(s.directive_id)
     setForm({
       agent_id: s.agent_id,
@@ -163,7 +165,7 @@ export function SchedulesDashboard() {
       run_now: false,
     })
     setFormOpen(true)
-  }
+  }, [])
 
   const submitForm = async () => {
     setSaving(true)
@@ -197,7 +199,7 @@ export function SchedulesDashboard() {
     }
   }
 
-  const toggleEnabled = async (s: Schedule, next: boolean) => {
+  const toggleEnabled = useCallback(async (s: Schedule, next: boolean) => {
     // Optimistic flip; revert on error.
     setSchedules((prev) => prev.map((x) =>
       x.directive_id === s.directive_id ? { ...x, enabled: next } : x))
@@ -209,7 +211,7 @@ export function SchedulesDashboard() {
       setSchedules((prev) => prev.map((x) =>
         x.directive_id === s.directive_id ? { ...x, enabled: s.enabled } : x))
     }
-  }
+  }, [load])
 
   const confirmDelete = async () => {
     if (!deleteId) return
@@ -223,276 +225,296 @@ export function SchedulesDashboard() {
     }
   }
 
+  // One column spec drives the desktop table and the mobile card stack
+  // (this page had no mobile list at all before the migration).
+  const columns: Column<Schedule>[] = useMemo(() => [
+    {
+      id: "enabled",
+      header: "Enabled",
+      mobileLabel: "Enabled",
+      cell: (s) => (
+        <Switch
+          checked={s.enabled}
+          disabled={s.status === "completed"}
+          onCheckedChange={(v) => void toggleEnabled(s, v)}
+          aria-label={`Toggle schedule ${s.directive_id}`}
+          data-testid={`toggle-${s.directive_id}`}
+        />
+      ),
+    },
+    {
+      id: "agent",
+      header: "Agent",
+      mobileLabel: "Agent",
+      cellClassName: "font-medium",
+      cell: (s) => s.agent_id,
+    },
+    {
+      id: "prompt",
+      header: "Directive",
+      mobileLabel: "Directive",
+      cellClassName: "max-w-[260px]",
+      cell: (s) => (
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="block truncate">{s.prompt}</span>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-sm">
+              {s.prompt}
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      ),
+    },
+    {
+      id: "interval",
+      header: "Interval",
+      mobileLabel: "Interval",
+      cell: (s) => formatInterval(s.interval_seconds),
+    },
+    {
+      id: "next_fire",
+      header: "Next fire",
+      mobileLabel: "Next fire",
+      cell: (s) => (
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span>{formatNextFire(s.next_due_at)}</span>
+            </TooltipTrigger>
+            <TooltipContent>
+              {formatAbsolute(s.next_due_at)}
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      ),
+    },
+    {
+      id: "status",
+      header: "Status",
+      mobileLabel: "Status",
+      cell: (s) => (
+        <Badge variant="outline" className={STATUS_BADGE[s.status] ?? ""}>
+          {s.status}
+        </Badge>
+      ),
+    },
+    {
+      id: "runs",
+      header: "Runs",
+      mobileLabel: "Runs",
+      cell: (s) => s.run_count,
+    },
+    {
+      id: "end",
+      header: "End",
+      mobileLabel: "End",
+      cellClassName: "text-xs text-muted-foreground",
+      cell: (s) => formatEndCondition(s),
+    },
+    {
+      id: "actions",
+      header: "Actions",
+      headClassName: "text-right",
+      cellClassName: "text-right",
+      cell: (s) => (
+        <div className="flex justify-end gap-1">
+          <Button variant="ghost" size="sm"
+                  onClick={() => openDirective(s.agent_id)}
+                  aria-label={`Poke ${s.agent_id}`}
+                  data-testid={`poke-${s.directive_id}`}>
+            <Send className="h-4 w-4" />
+          </Button>
+          <Button variant="ghost" size="sm"
+                  onClick={() => openEdit(s)}
+                  aria-label={`Edit ${s.directive_id}`}
+                  data-testid={`edit-${s.directive_id}`}>
+            <Pencil className="h-4 w-4" />
+          </Button>
+          <Button variant="ghost" size="sm"
+                  onClick={() => setDeleteId(s.directive_id)}
+                  aria-label={`Delete ${s.directive_id}`}
+                  data-testid={`delete-${s.directive_id}`}>
+            <Trash2 className="h-4 w-4" />
+          </Button>
+        </div>
+      ),
+    },
+  ], [toggleEnabled, openEdit, openDirective])
+
+  const filterBar = (
+    <>
+      <Select value={agentFilter} onValueChange={setAgentFilter}>
+        <SelectTrigger className="w-full sm:w-[180px]" aria-label="Filter by agent">
+          <SelectValue placeholder="All agents" />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="all">All agents</SelectItem>
+          {agentOptions.map((a) => (
+            <SelectItem key={a} value={a}>{a}</SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      <Select value={statusFilter}
+              onValueChange={(v) => setStatusFilter(v as StatusFilter)}>
+        <SelectTrigger className="w-full sm:w-[160px]" aria-label="Filter by status">
+          <SelectValue placeholder="All statuses" />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="all">All statuses</SelectItem>
+          <SelectItem value="active">Active</SelectItem>
+          <SelectItem value="paused">Paused</SelectItem>
+          <SelectItem value="completed">Completed</SelectItem>
+        </SelectContent>
+      </Select>
+    </>
+  )
+
   return (
-    <div className="space-y-4 p-1" data-testid="schedules-dashboard">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-2">
-          <CalendarClock className="h-5 w-5 text-muted-foreground" />
-          <h1 className="text-xl font-semibold">Schedules</h1>
-          <Badge variant="outline">{schedules.length}</Badge>
-        </div>
-        <div className="flex items-center gap-2">
-          <Button variant="outline" size="sm" onClick={() => void load()}
-                  aria-label="Refresh schedules">
-            <RefreshCw className="h-4 w-4" />
-          </Button>
-          {/* Standalone send-directive control — NOT tied to a schedule
-              row, so any agent (schedule or not) can be poked from here.
-              Opens the shared modal with an agent picker. */}
-          <Button variant="outline" size="sm" onClick={() => openDirective(null)}
-                  data-testid="send-directive-btn">
-            <Send className="mr-1 h-4 w-4" /> Send directive
-          </Button>
-          <Button size="sm" onClick={openCreate} data-testid="new-schedule-btn">
-            <Plus className="mr-1 h-4 w-4" /> New schedule
-          </Button>
-        </div>
-      </div>
-
-      <div className="flex flex-wrap items-center gap-2">
-        <Select value={agentFilter} onValueChange={setAgentFilter}>
-          <SelectTrigger className="w-[180px]" aria-label="Filter by agent">
-            <SelectValue placeholder="All agents" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All agents</SelectItem>
-            {agentOptions.map((a) => (
-              <SelectItem key={a} value={a}>{a}</SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <Select value={statusFilter}
-                onValueChange={(v) => setStatusFilter(v as StatusFilter)}>
-          <SelectTrigger className="w-[160px]" aria-label="Filter by status">
-            <SelectValue placeholder="All statuses" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All statuses</SelectItem>
-            <SelectItem value="active">Active</SelectItem>
-            <SelectItem value="paused">Paused</SelectItem>
-            <SelectItem value="completed">Completed</SelectItem>
-          </SelectContent>
-        </Select>
-      </div>
-
-      <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="text-sm text-muted-foreground">
-            All scheduled directives
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          {loading ? (
-            <div className="space-y-2">
-              {[0, 1, 2].map((i) => <Skeleton key={i} className="h-10 w-full" />)}
-            </div>
-          ) : visible.length === 0 ? (
-            <EmptyState
-              icon={CalendarClock}
-              title="No schedules"
-              description="Create a recurring directive for an agent to get started."
-            />
-          ) : (
-            <div className="overflow-x-auto">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Enabled</TableHead>
-                    <TableHead>Agent</TableHead>
-                    <TableHead>Directive</TableHead>
-                    <TableHead>Interval</TableHead>
-                    <TableHead>Next fire</TableHead>
-                    <TableHead>Status</TableHead>
-                    <TableHead>Runs</TableHead>
-                    <TableHead>End</TableHead>
-                    <TableHead className="text-right">Actions</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {visible.map((s) => (
-                    <TableRow key={s.directive_id}
-                              data-testid={`schedule-row-${s.directive_id}`}>
-                      <TableCell>
-                        <Switch
-                          checked={s.enabled}
-                          disabled={s.status === "completed"}
-                          onCheckedChange={(v) => void toggleEnabled(s, v)}
-                          aria-label={`Toggle schedule ${s.directive_id}`}
-                          data-testid={`toggle-${s.directive_id}`}
-                        />
-                      </TableCell>
-                      <TableCell className="font-medium">{s.agent_id}</TableCell>
-                      <TableCell className="max-w-[260px]">
-                        <TooltipProvider>
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <span className="block truncate">{s.prompt}</span>
-                            </TooltipTrigger>
-                            <TooltipContent className="max-w-sm">
-                              {s.prompt}
-                            </TooltipContent>
-                          </Tooltip>
-                        </TooltipProvider>
-                      </TableCell>
-                      <TableCell>{formatInterval(s.interval_seconds)}</TableCell>
-                      <TableCell>
-                        <TooltipProvider>
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <span>{formatNextFire(s.next_due_at)}</span>
-                            </TooltipTrigger>
-                            <TooltipContent>
-                              {formatAbsolute(s.next_due_at)}
-                            </TooltipContent>
-                          </Tooltip>
-                        </TooltipProvider>
-                      </TableCell>
-                      <TableCell>
-                        <Badge variant="outline"
-                               className={STATUS_BADGE[s.status] ?? ""}>
-                          {s.status}
-                        </Badge>
-                      </TableCell>
-                      <TableCell>{s.run_count}</TableCell>
-                      <TableCell className="text-xs text-muted-foreground">
-                        {formatEndCondition(s)}
-                      </TableCell>
-                      <TableCell className="text-right">
-                        <div className="flex justify-end gap-1">
-                          <Button variant="ghost" size="sm"
-                                  onClick={() => openDirective(s.agent_id)}
-                                  aria-label={`Poke ${s.agent_id}`}
-                                  data-testid={`poke-${s.directive_id}`}>
-                            <Send className="h-4 w-4" />
-                          </Button>
-                          <Button variant="ghost" size="sm"
-                                  onClick={() => openEdit(s)}
-                                  aria-label={`Edit ${s.directive_id}`}
-                                  data-testid={`edit-${s.directive_id}`}>
-                            <Pencil className="h-4 w-4" />
-                          </Button>
-                          <Button variant="ghost" size="sm"
-                                  onClick={() => setDeleteId(s.directive_id)}
-                                  aria-label={`Delete ${s.directive_id}`}
-                                  data-testid={`delete-${s.directive_id}`}>
-                            <Trash2 className="h-4 w-4" />
-                          </Button>
-                        </div>
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
-          )}
-        </CardContent>
-      </Card>
-
-      {/* Create / edit modal */}
-      <Dialog open={formOpen} onOpenChange={setFormOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>{editId ? "Edit schedule" : "New schedule"}</DialogTitle>
-            <DialogDescription>
-              Interval floor is {floor}s; max {maxPerAgent} active schedules
-              per agent.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-3">
-            {!editId && (
+    <div data-testid="schedules-dashboard">
+      <DataTablePage<Schedule>
+        header={{
+          title: "Schedules",
+          subtitle: "Recurring directives delivered to this project's agents",
+          onRefresh: () => void load(),
+          refreshing: loading,
+          actions: (
+            <>
+              <Badge variant="outline">{schedules.length}</Badge>
+              {/* Standalone send-directive control — NOT tied to a schedule
+                  row, so any agent (schedule or not) can be poked from here.
+                  Opens the shared modal with an agent picker. */}
+              <Button variant="outline" size="sm" onClick={() => openDirective(null)}
+                      data-testid="send-directive-btn">
+                <Send className="mr-1 h-4 w-4" /> Send directive
+              </Button>
+              <Button size="sm" onClick={openCreate} data-testid="new-schedule-btn">
+                <Plus className="mr-1 h-4 w-4" /> New schedule
+              </Button>
+            </>
+          ),
+        }}
+        loading={loading}
+        filterBar={filterBar}
+        columns={columns}
+        rows={visible}
+        getRowId={(s) => s.directive_id}
+        empty={{
+          icon: CalendarClock,
+          title: "No schedules",
+          description: "Create a recurring directive for an agent to get started.",
+        }}
+        skeletonRows={3}
+      >
+        {/* Create / edit modal */}
+        <Dialog open={formOpen} onOpenChange={setFormOpen}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>{editId ? "Edit schedule" : "New schedule"}</DialogTitle>
+              <DialogDescription>
+                Interval floor is {floor}s; max {maxPerAgent} active schedules
+                per agent.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-3">
+              {!editId && (
+                <div className="space-y-1">
+                  <Label htmlFor="sched-agent">Agent</Label>
+                  <Select value={form.agent_id}
+                          onValueChange={(v) => setForm((f) => ({ ...f, agent_id: v }))}>
+                    <SelectTrigger id="sched-agent" aria-label="Agent">
+                      <SelectValue placeholder="Select an agent" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {agentOptions.map((a) => (
+                        <SelectItem key={a} value={a}>{a}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
               <div className="space-y-1">
-                <Label htmlFor="sched-agent">Agent</Label>
-                <Select value={form.agent_id}
-                        onValueChange={(v) => setForm((f) => ({ ...f, agent_id: v }))}>
-                  <SelectTrigger id="sched-agent" aria-label="Agent">
-                    <SelectValue placeholder="Select an agent" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {agentOptions.map((a) => (
-                      <SelectItem key={a} value={a}>{a}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                <Label htmlFor="sched-prompt">Directive</Label>
+                <Textarea id="sched-prompt" value={form.prompt}
+                          onChange={(e) => setForm((f) => ({ ...f, prompt: e.target.value }))}
+                          placeholder="e.g. check the CI status and report" />
               </div>
-            )}
-            <div className="space-y-1">
-              <Label htmlFor="sched-prompt">Directive</Label>
-              <Textarea id="sched-prompt" value={form.prompt}
-                        onChange={(e) => setForm((f) => ({ ...f, prompt: e.target.value }))}
-                        placeholder="e.g. check the CI status and report" />
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              <div className="space-y-1">
-                <Label htmlFor="sched-interval">Interval (seconds)</Label>
-                <Input id="sched-interval" type="number" min={floor}
-                       value={form.interval_seconds}
-                       onChange={(e) => setForm((f) => ({ ...f, interval_seconds: e.target.value }))} />
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <Label htmlFor="sched-interval">Interval (seconds)</Label>
+                  <Input id="sched-interval" type="number" min={floor}
+                         value={form.interval_seconds}
+                         onChange={(e) => setForm((f) => ({ ...f, interval_seconds: e.target.value }))} />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="sched-count">Max runs (optional)</Label>
+                  <Input id="sched-count" type="number" min={1}
+                         value={form.count}
+                         onChange={(e) => setForm((f) => ({ ...f, count: e.target.value }))} />
+                </div>
               </div>
               <div className="space-y-1">
-                <Label htmlFor="sched-count">Max runs (optional)</Label>
-                <Input id="sched-count" type="number" min={1}
-                       value={form.count}
-                       onChange={(e) => setForm((f) => ({ ...f, count: e.target.value }))} />
+                <Label htmlFor="sched-until">Until (optional)</Label>
+                <Input id="sched-until" type="datetime-local"
+                       value={form.until}
+                       onChange={(e) => setForm((f) => ({ ...f, until: e.target.value }))} />
               </div>
+              {!editId && (
+                <label className="flex items-center gap-2 text-sm">
+                  <Switch checked={form.run_now}
+                          onCheckedChange={(v) => setForm((f) => ({ ...f, run_now: v }))}
+                          aria-label="Run now" />
+                  Fire once immediately (run now)
+                </label>
+              )}
             </div>
-            <div className="space-y-1">
-              <Label htmlFor="sched-until">Until (optional)</Label>
-              <Input id="sched-until" type="datetime-local"
-                     value={form.until}
-                     onChange={(e) => setForm((f) => ({ ...f, until: e.target.value }))} />
-            </div>
-            {!editId && (
-              <label className="flex items-center gap-2 text-sm">
-                <Switch checked={form.run_now}
-                        onCheckedChange={(v) => setForm((f) => ({ ...f, run_now: v }))}
-                        aria-label="Run now" />
-                Fire once immediately (run now)
-              </label>
-            )}
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setFormOpen(false)}>
-              Cancel
-            </Button>
-            <Button onClick={() => void submitForm()}
-                    disabled={saving || !form.prompt || (!editId && !form.agent_id)}
-                    data-testid="save-schedule-btn">
-              {saving ? "Saving…" : editId ? "Save" : "Create"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setFormOpen(false)}>
+                Cancel
+              </Button>
+              <Button onClick={() => void submitForm()}
+                      disabled={saving || !form.prompt || (!editId && !form.agent_id)}
+                      data-testid="save-schedule-btn">
+                {saving ? "Saving…" : editId ? "Save" : "Create"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
 
-      {/* Delete confirm */}
-      <Dialog open={deleteId != null} onOpenChange={(o) => !o && setDeleteId(null)}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Delete schedule</DialogTitle>
-            <DialogDescription>
-              This permanently removes the scheduled directive. This cannot
-              be undone.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setDeleteId(null)}>
-              Cancel
-            </Button>
-            <Button variant="destructive" onClick={() => void confirmDelete()}
-                    data-testid="confirm-delete-btn">
-              Delete
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        {/* Delete confirm — deliberately a plain one-click confirm, not the
+            type-to-confirm <DeleteConfirmModal>: a schedule is cheap to
+            re-create, so this migration does not tighten the gate. */}
+        <Dialog open={deleteId != null} onOpenChange={(o) => !o && setDeleteId(null)}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Delete schedule</DialogTitle>
+              <DialogDescription>
+                This permanently removes the scheduled directive. This cannot
+                be undone.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setDeleteId(null)}>
+                Cancel
+              </Button>
+              <Button variant="destructive" onClick={() => void confirmDelete()}
+                      data-testid="confirm-delete-btn">
+                Delete
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
 
-      {/* Send-directive (poke) modal — shared with the Agents page.
-          `directiveAgent` is a locked target (per-row shortcut) or null
-          for the standalone picker. */}
-      <SendDirectiveModal
-        open={directiveOpen}
-        onOpenChange={setDirectiveOpen}
-        lockedAgentId={directiveAgent}
-      />
+        {/* Send-directive (poke) modal — shared with the Agents page.
+            `directiveAgent` is a locked target (per-row shortcut) or null
+            for the standalone picker. */}
+        <SendDirectiveModal
+          open={directiveOpen}
+          onOpenChange={setDirectiveOpen}
+          lockedAgentId={directiveAgent}
+        />
+      </DataTablePage>
     </div>
   )
 }
