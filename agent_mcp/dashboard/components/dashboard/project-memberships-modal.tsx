@@ -144,7 +144,10 @@ export function ProjectMembershipsModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-3xl">
+      {/* CC-14: `w-[calc(100vw-2rem)]` keeps a 1rem gutter each side at
+          375px; without it the sm:max-w-3xl width applies below sm too
+          and the dialog clips horizontally. */}
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-3xl">
         <DialogHeader>
           <DialogTitle>Memberships for {projectName}</DialogTitle>
           <DialogDescription>
