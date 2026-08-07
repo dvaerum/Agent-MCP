@@ -218,6 +218,22 @@ fn join_base(agent_mcp_base: &str, kind: &str, project: &str) -> String {
     )
 }
 
+/// Infer the injection [`Mode`] for a `mode = "auto"` row from its live
+/// liveness record. A session with an active ACP worker must be injected via
+/// `/acp/prompt`; its terminal `/send` returns 400 `acp_mode_unsupported`. So a
+/// live ACP worker forces [`Mode::Structured`] regardless of the tool/status
+/// text (a `claude` session switched to ACP by `ensure_acp` still reports
+/// `tool="claude" status="Idle"`). Without an ACP worker we fall back to the
+/// tool/status keyword heuristic ([`normalize_mode`]).
+fn infer_auto_mode(r: &Liveness) -> Mode {
+    let acp_active = !matches!(r.acp_worker_state.as_str(), "" | "absent");
+    if acp_active {
+        Mode::Structured
+    } else {
+        normalize_mode(&format!("{} {}", r.tool, r.status))
+    }
+}
+
 /// Resolve every configured session entry into a [`Route`]. Both the delivery
 /// endpoint and the MCP url are DERIVED from `agent_mcp_base` + the row's
 /// `project`, so a row is self-contained given the one global base. A row is
@@ -241,10 +257,15 @@ pub fn resolve_routes(settings: &Settings, live: &HashMap<String, Liveness>) -> 
         let mode = match entry.mode.trim().to_lowercase().as_str() {
             "terminal" => Mode::Terminal,
             "structured" => Mode::Structured,
-            // "auto" (or unset/unknown): infer from the live record's
-            // tool+status; default terminal when the session is not live.
+            // "auto" (or unset/unknown): infer from the live record. A session
+            // AoE runs as an ACP worker MUST be injected via /acp/prompt — its
+            // terminal /send returns 400 acp_mode_unsupported — so a live ACP
+            // worker forces Structured even when tool/status read terminal-like
+            // ("claude Idle"), which is exactly what ensure_acp produces. Only a
+            // non-ACP live record falls back to the tool/status keyword
+            // heuristic; a not-live session defaults terminal.
             _ => match record {
-                Some(r) => normalize_mode(&format!("{} {}", r.tool, r.status)),
+                Some(r) => infer_auto_mode(r),
                 None => Mode::Terminal,
             },
         };
@@ -412,6 +433,31 @@ mod tests {
         // s1: status mentions acp -> structured; s2: terminal-ish -> terminal.
         assert_eq!(routes[0].mode, Mode::Structured);
         assert_eq!(routes[1].mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn auto_mode_infers_structured_for_acp_worker_despite_terminal_toolstatus() {
+        // Regression (ensure_acp interaction): a covered session switched to ACP
+        // reports tool="claude" status="Idle" (terminal-looking) but
+        // acp_worker_state="running" + has_terminal=false. AoE's terminal /send
+        // returns 400 acp_mode_unsupported for such a session, so auto-mode MUST
+        // resolve Structured (/acp/prompt), not Terminal — otherwise every
+        // delivery nudge is dropped.
+        let mut live = HashMap::new();
+        live.insert(
+            "s1".to_string(),
+            Liveness {
+                id: "s1".into(),
+                tool: "claude".into(),
+                status: "Idle".into(),
+                acp_worker_state: "running".into(),
+                has_terminal: false,
+                dormant: false,
+            },
+        );
+        let routes =
+            resolve_routes(&settings(vec![entry("s1", "t", "p", "auto")], "https://h"), &live);
+        assert_eq!(routes[0].mode, Mode::Structured);
     }
 
     #[test]
