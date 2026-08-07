@@ -72,7 +72,20 @@ export interface Agent {
   profile_updated_at?: string | null
   profile_updated_by?: string | null
   profile_reviewed_at?: string | null
+  // ADR-0021 delivery transport liveness, reported per-agent by the
+  // delivery transport worker (`_mcp_presence_for` in
+  // app/routers/agents.py). Distinct from `agentPresence()` (which
+  // reflects the live /mcp stream): this is the delivery side-channel's
+  // own view of whether the agent is actively working / idle / dormant /
+  // dead. NULL or absent when no delivery transport has reported for
+  // this agent yet — the UI renders nothing in that case.
+  transport_status?: TransportStatus | null
 }
+
+/** ADR-0021 delivery transport per-agent liveness. Reported by the
+ *  delivery transport worker; separate axis from MCP-stream presence
+ *  (`AgentPresence`). */
+export type TransportStatus = 'working' | 'idle' | 'dormant' | 'dead'
 
 /** Wave 7 PR 2 — derived presence kind for the agents list / detail
  *  panel. Sourced from the new `online` + `last_mcp_connection`

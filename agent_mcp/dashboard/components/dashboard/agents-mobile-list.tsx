@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { cn } from "@/lib/utils"
 import { agentPresence, type Agent, type AgentPresence } from "@/lib/api"
+import { transportStatusBadge } from "@/lib/status"
 
 /**
  * Mobile card-list rendering of the agents table (CC-7 audit 2026-06-02).
@@ -72,6 +73,9 @@ export function AgentsMobileList({
         const isAdmin = agent.agent_id === "Admin"
         const isTerminated = agent.status === "terminated"
         const presence = agentPresence(agent)
+        // ADR-0021 — delivery transport liveness (distinct from presence);
+        // null when no delivery transport has reported for this agent.
+        const transport = transportStatusBadge(agent.transport_status)
         return (
           <li
             key={agent.agent_id}
@@ -96,6 +100,20 @@ export function AgentsMobileList({
               >
                 {PRESENCE_LABEL[presence]}
               </Badge>
+              {/* ADR-0021: delivery transport_status — distinct axis from
+                  the presence badge; rendered only when reported. */}
+              {transport && (
+                <Badge
+                  variant="outline"
+                  title={`Delivery transport: ${transport.label.toLowerCase()}`}
+                  className={cn(
+                    "shrink-0 text-[10px] font-semibold px-2 py-0.5 rounded-md uppercase tracking-wider",
+                    transport.className,
+                  )}
+                >
+                  {transport.label}
+                </Badge>
+              )}
               {!isTerminated && agent.auto_event_loop === false && (
                 <Badge
                   variant="outline"

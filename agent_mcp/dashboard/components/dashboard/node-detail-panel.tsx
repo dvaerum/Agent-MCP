@@ -9,7 +9,7 @@ import { Separator } from '@/components/ui/separator'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { apiClient, Agent, Task } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import { statusColorClasses, priorityColorClasses } from '@/lib/status'
+import { statusColorClasses, priorityColorClasses, transportStatusBadge } from '@/lib/status'
 import { useDataStore } from '@/lib/stores/data-store'
 import { SafeMarkdown } from '@/components/dashboard/memory-value-view'
 
@@ -130,6 +130,9 @@ export function NodeDetailPanel({ nodeId, nodeType, isOpen, onClose, nodeData }:
   const renderAgentDetails = (agent: Agent) => {
     const StatusIcon = statusIcons[agent.status] || Activity
     const isActive = agent.status === 'running'
+    // ADR-0021 — delivery transport liveness (distinct from the legacy
+    // status badge); null when no delivery transport has reported.
+    const transport = transportStatusBadge(agent.transport_status)
 
     return (
       <>
@@ -144,10 +147,21 @@ export function NodeDetailPanel({ nodeId, nodeType, isOpen, onClose, nodeData }:
               <p className="text-sm text-muted-foreground">Agent ID</p>
             </div>
           </div>
-          <Badge variant="outline" className={cn(statusColorClasses(agent.status))}>
-            <StatusIcon className={cn("h-3 w-3 mr-1", isActive && "animate-spin")} />
-            {agent.status}
-          </Badge>
+          <div className="flex items-center gap-2">
+            <Badge variant="outline" className={cn(statusColorClasses(agent.status))}>
+              <StatusIcon className={cn("h-3 w-3 mr-1", isActive && "animate-spin")} />
+              {agent.status}
+            </Badge>
+            {transport && (
+              <Badge
+                variant="outline"
+                title={`Delivery transport: ${transport.label.toLowerCase()}`}
+                className={cn(transport.className)}
+              >
+                {transport.label}
+              </Badge>
+            )}
+          </div>
         </div>
 
         <Separator className="mb-4" />
