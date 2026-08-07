@@ -8,15 +8,14 @@ import { cn, formatRelative } from "@/lib/utils"
 import type { Task } from "@/lib/api"
 
 /**
- * Mobile card-list rendering of the tasks table (CC-7 audit 2026-06-02).
+ * Mobile card rendering of a single task row (CC-7 audit 2026-06-02).
  *
  * The desktop <Table> has 7 columns (Task / Status / Details / Priority
  * / Relations / Updated / Actions) and overflows horizontally at 375 px
- * (verified in the audit screenshots). This component renders the same
- * rows as a stack of compact <Card>s with the primary fields
- * (title + status + priority) on top and the secondary fields
- * (assignee, relations, updated, actions) tucked into a compact
- * meta-row underneath.
+ * (verified in the audit screenshots). This renders the same row as a
+ * compact card with the primary fields (title + status + priority) on
+ * top and the secondary fields (assignee, relations, updated, actions)
+ * tucked into a compact meta-row underneath.
  *
  * Tap-anywhere opens the View dialog, same as the desktop row. The
  * three icon buttons stop propagation so they trigger Edit / Delete /
@@ -24,6 +23,11 @@ import type { Task } from "@/lib/api"
  * desktop h-7 w-7 (28 px) per CC-12 (44 px is the strict iOS HIG floor;
  * 36 px is the shadcn-conventional mobile-icon-button size and lives
  * inside a generous full-card touch zone that opens View anyway).
+ *
+ * This is a *single card* (`<li>`); the `<ul>` wrapper is provided by
+ * <ResponsiveDataTable>'s `renderMobileCard` slot. Pre-scaffold this
+ * file exported a whole-list `<TasksMobileList>` — that role now
+ * belongs to the shared scaffold, leaving only the per-row markup here.
  */
 
 const STATUS_TONE: Record<string, string> = {
@@ -40,8 +44,8 @@ const PRIORITY_TONE: Record<string, string> = {
   low: "bg-muted text-muted-foreground border-border",
 }
 
-interface TasksMobileListProps {
-  tasks: Task[]
+interface TaskMobileCardProps {
+  task: Task
   // Live-lookup useDialog (Candidate D, 2026-06-02): handlers take
   // the task_id; the dialog reads the row live from the source.
   openView: (taskId: string) => void
@@ -49,17 +53,14 @@ interface TasksMobileListProps {
   openDelete: (taskId: string) => void
 }
 
-export function TasksMobileList({
-  tasks,
+export function TaskMobileCard({
+  task,
   openView,
   openEdit,
   openDelete,
-}: TasksMobileListProps): React.ReactElement {
+}: TaskMobileCardProps): React.ReactElement {
   return (
-    <ul role="list" className="divide-y divide-border">
-      {tasks.map((task) => (
         <li
-          key={task.task_id}
           onClick={() => openView(task.task_id)}
           className="p-4 hover:bg-muted/30 active:bg-muted/50 transition-colors duration-150 cursor-pointer"
         >
@@ -160,7 +161,5 @@ export function TasksMobileList({
             </Button>
           </div>
         </li>
-      ))}
-    </ul>
   )
 }

@@ -4,7 +4,7 @@ import React, { useState, useEffect, useCallback, useMemo } from "react"
 import {
   CheckSquare, Clock, AlertCircle, Users,
   Search, Plus, Eye, Pencil, Trash2, X,
-  ArrowUp, ArrowDown, Minus, CheckCircle2, Target, Zap, GitBranch, RefreshCw
+  ArrowUp, ArrowDown, Minus, CheckCircle2, Target, Zap, GitBranch
 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -13,17 +13,18 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Textarea } from "@/components/ui/textarea"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
 import { Label } from "@/components/ui/label"
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { apiClient, Task, type TaskFilters } from "@/lib/api"
 import { useServerStore } from "@/lib/stores/server-store"
 import { useDialog } from "@/hooks/use-dialog"
 import { useFilters } from "@/hooks/use-filters"
 import { usePagedQuery } from "@/hooks/use-paged-query"
 import { cn, formatRelative } from "@/lib/utils"
-import { Skeleton } from "@/components/ui/skeleton"
-import { EmptyState } from "@/components/dashboard/shared/empty-state"
+import { toastError } from "@/components/ui/toast"
 import { AgentSelect } from "@/components/dashboard/shared/agent-select"
-import { TasksMobileList } from "@/components/dashboard/tasks-mobile-list"
+import { TaskMobileCard } from "@/components/dashboard/tasks-mobile-list"
+import { DataTablePage } from "@/components/dashboard/shared/data-table-page"
+import type { StatsCardProps } from "@/components/dashboard/shared/stats-card"
+import type { Column } from "@/components/dashboard/shared/responsive-data-table"
 
 // Status / priority colour helpers shared by the row + the View / Edit
 // modals. Keep these here so the styles match the rest of the page.
@@ -224,196 +225,31 @@ const PriorityIcon = React.memo(({ priority }: { priority: Task['priority'] }) =
 })
 PriorityIcon.displayName = 'PriorityIcon'
 
-interface CompactTaskRowProps {
-  task: Task
-  // Three distinct row-action handlers. Each opens its own Dialog
-  // modal (View / Edit / Delete). The icon buttons stopPropagation so
-  // the row-level click handler (which now opens the same View
-  // dialog) doesn't fire twice when the icons are pressed.
-  // Live-lookup useDialog (Candidate D, 2026-06-02) takes the key
-  // (task_id) rather than the row — the dialog reads the row live
-  // from the source on every render.
-  openView: (taskId: string) => void
-  openEdit: (taskId: string) => void
-  openDelete: (taskId: string) => void
-}
-
-const CompactTaskRow = React.memo(({ task, openView, openEdit, openDelete }: CompactTaskRowProps) => {
+// The "Updated" cell keeps the hydration guard the pre-scaffold
+// <CompactTaskRow> carried: a locale-formatted date differs between the
+// pre-hydration and post-hydration pass, so render a placeholder until
+// mount. It survives as a standalone cell because the row markup itself
+// is now owned by <ResponsiveDataTable>'s column spec.
+const TaskUpdatedCell = React.memo(({ value }: { value: string }) => {
   const [mounted, setMounted] = useState(false)
 
   useEffect(() => {
     setMounted(true)
   }, [])
 
-  const formatDate = useCallback((dateString: string) => {
-    if (!mounted) return "..."
-    return new Date(dateString).toLocaleDateString('en-US', {
-      month: 'short',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit'
-    })
-  }, [mounted])
-
+  if (!mounted) return <>...</>
   return (
-    <TableRow className="border-border hover:bg-muted/50 group transition-colors duration-150 cursor-pointer" onClick={() => openView(task.task_id)}>
-      <TableCell className="py-3">
-        <div className="flex items-center gap-3">
-          <StatusDot status={task.status} />
-          <PriorityIcon priority={task.priority} />
-          <div className="min-w-0 flex-1">
-            <div className="font-medium text-sm text-foreground truncate">{task.title}</div>
-            <div className="text-xs text-muted-foreground font-mono">#{task.task_id.slice(-6)}</div>
-          </div>
-        </div>
-      </TableCell>
-      
-      <TableCell className="py-3">
-        <Badge 
-          variant="outline" 
-          className={cn(
-            "text-xs font-semibold border-0 px-3 py-1.5 rounded-md",
-            task.status === 'in_progress' && "bg-primary/15 text-primary ring-1 ring-primary/20",
-            task.status === 'pending' && "bg-amber-500/15 text-amber-500 dark:text-amber-300 ring-1 ring-amber-500/20",
-            task.status === 'completed' && "bg-emerald-500/15 text-emerald-500 dark:text-emerald-300 ring-1 ring-emerald-500/20",
-            task.status === 'cancelled' && "bg-muted text-muted-foreground ring-1 ring-border",
-            task.status === 'failed' && "bg-orange-500/15 text-orange-500 dark:text-orange-300 ring-1 ring-orange-500/20"
-          )}
-        >
-          {task.status.replace('_', ' ').toUpperCase()}
-        </Badge>
-      </TableCell>
-      
-      <TableCell className="py-3 max-w-xs">
-        <div className="text-sm text-foreground truncate">
-          {task.description || "No description"}
-        </div>
-        {task.assigned_to && (
-          <div className="text-xs text-muted-foreground mt-1 flex items-center gap-1">
-            <Users className="h-3 w-3" />
-            {task.assigned_to}
-          </div>
-        )}
-      </TableCell>
-      
-      <TableCell className="py-3">
-        <Badge 
-          variant="outline" 
-          className={cn(
-            "text-xs font-medium px-2 py-0.5",
-            task.priority === 'high' && "bg-orange-500/10 text-orange-500 dark:text-orange-300 border-orange-500/20",
-            task.priority === 'medium' && "bg-amber-500/10 text-amber-500 dark:text-amber-300 border-amber-500/20",
-            task.priority === 'low' && "bg-muted text-muted-foreground border-border"
-          )}
-        >
-          {task.priority.toUpperCase()}
-        </Badge>
-      </TableCell>
-      
-      <TableCell className="py-3">
-        <div className="flex flex-wrap gap-1">
-          {task.parent_task && (
-            <Badge variant="outline" className="text-xs px-2 py-0.5 bg-purple-500/10 text-purple-500 dark:text-purple-300 border-purple-500/20">
-              <GitBranch className="h-3 w-3 mr-1" />
-              Subtask
-            </Badge>
-          )}
-          {task.child_tasks && task.child_tasks.length > 0 && (
-            <Badge variant="outline" className="text-xs px-2 py-0.5 bg-blue-500/10 text-blue-500 dark:text-blue-300 border-blue-500/20">
-              {task.child_tasks.length} children
-            </Badge>
-          )}
-        </div>
-      </TableCell>
-      
-      <TableCell className="py-3 text-xs text-muted-foreground font-mono">
-        {formatDate(task.updated_at)}
-      </TableCell>
-      
-      <TableCell className="py-3">
-        {/*
-          Three distinct row icons. Each opens its own Dialog modal
-          (View / Edit / Delete). stopPropagation prevents the row-
-          level onClick (which opens the same View dialog) from
-          firing twice when the eye icon is pressed and from opening
-          the View dialog when Edit/Delete are pressed.
-        */}
-        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-          <Button
-            variant="ghost"
-            size="sm"
-            title="View task"
-            aria-label="View task"
-            className="h-7 w-7 p-0 text-muted-foreground hover:text-foreground hover:bg-muted"
-            onClick={(e) => { e.stopPropagation(); openView(task.task_id) }}
-          >
-            <Eye className="h-3.5 w-3.5" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            title="Edit task"
-            aria-label="Edit task"
-            className="h-9 w-9 sm:h-7 sm:w-7 p-0 text-primary hover:text-primary hover:bg-primary/10"
-            onClick={(e) => { e.stopPropagation(); openEdit(task.task_id) }}
-          >
-            <Pencil className="h-3.5 w-3.5" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            title="Delete task"
-            aria-label="Delete task"
-            className="h-7 w-7 p-0 text-destructive hover:text-destructive hover:bg-destructive/10"
-            onClick={(e) => { e.stopPropagation(); openDelete(task.task_id) }}
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-          </Button>
-        </div>
-      </TableCell>
-    </TableRow>
+    <>
+      {new Date(value).toLocaleDateString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+      })}
+    </>
   )
-}, (prevProps, nextProps) => {
-  // Only re-render if the task actually changed
-  return JSON.stringify(prevProps.task) === JSON.stringify(nextProps.task)
 })
-CompactTaskRow.displayName = 'CompactTaskRow'
-
-const StatsCard = React.memo(({ icon: Icon, label, value, change, trend }: {
-  icon: any
-  label: string
-  value: number
-  change?: string
-  trend?: 'up' | 'down' | 'neutral'
-}) => (
-  // CC-1/CC-2/CC-4/CC-5/CC-8 audit 2026-06-02: migrated to semantic
-  // tokens (bg-card / border-border / text-foreground /
-  // text-muted-foreground / text-primary). Drop the inconsistent
-  // rounded-xl + backdrop-blur + slate/teal palette. Added
-  // tabular-nums on the value so digits don't shift width.
-  <div className="bg-card border border-border rounded-lg p-3 sm:p-5 hover:bg-muted/30 transition-colors duration-150 group">
-    <div className="flex items-center justify-between">
-      <div>
-        <div className="flex items-center gap-2 mb-2">
-          <Icon className="h-4 w-4 text-muted-foreground transition-colors" />
-          <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">{label}</span>
-        </div>
-        <div className="text-2xl sm:text-3xl font-semibold text-foreground tabular-nums mb-1">{value}</div>
-        {change && (
-          <div className={cn(
-            "text-xs font-medium tabular-nums",
-            trend === 'up' && "text-emerald-500",
-            trend === 'down' && "text-orange-500",
-            trend === 'neutral' && "text-muted-foreground"
-          )}>
-            {change}
-          </div>
-        )}
-      </div>
-    </div>
-  </div>
-))
-StatsCard.displayName = 'StatsCard'
+TaskUpdatedCell.displayName = 'TaskUpdatedCell'
 
 const CreateTaskModal = React.memo(({ onCreateTask }: { onCreateTask: (data: any) => void }) => {
   const [open, setOpen] = useState(false)
@@ -834,7 +670,6 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
   // entry per request. Empty string = no note added. Cleared on save.
   const [editNote, setEditNote] = useState<string>('')
   const [saving, setSaving] = useState(false)
-  const [saveError, setSaveError] = useState<string | null>(null)
 
   // Existing notes for the "Existing notes" preview block at the
   // bottom of the Edit dialog. Read-only here — to edit historical
@@ -846,8 +681,10 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
   // `task` prop reference can change on every background refresh
   // even when the underlying fields are unchanged — keying the effect
   // on task identity prevents the refresh from blowing away the
-  // admin's in-progress edits. Only the New-note textarea + save
-  // error are reset between opens; existing field edits survive.
+  // admin's in-progress edits. Only the New-note textarea is reset
+  // between opens; existing field edits survive. (The save error used
+  // to be reset here too — it is now a shared toast, which owns its
+  // own lifetime.)
   const taskId = task?.task_id
   useEffect(() => {
     if (!task) return
@@ -857,7 +694,6 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
     setEditPriority(task.priority || 'medium')
     setEditAssignedTo(task.assigned_to || null)
     setEditNote('')
-    setSaveError(null)
     // We deliberately depend on taskId, not the whole task object —
     // see the comment above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -874,7 +710,6 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
     e.preventDefault()
     if (!task) return
     setSaving(true)
-    setSaveError(null)
     try {
       // Build the patch: include every editable field so the admin
       // can blanket-overwrite, but normalise assigned_to so the
@@ -897,7 +732,12 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
       onSaved()
       onOpenChange(false)
     } catch (err) {
-      setSaveError(err instanceof Error ? err.message : String(err))
+      // Was a bespoke inline `saveError` banner (architecture review
+      // Class 1: three error idioms for one failure mode). The shared
+      // toast owns mutation errors now — the dialog stays open with
+      // the operator's edits intact because we never reach the
+      // onSaved()/close pair above.
+      toastError(err, 'Failed to save task')
     } finally {
       setSaving(false)
     }
@@ -1034,11 +874,6 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
                     </details>
                   )}
                 </div>
-                {saveError && (
-                  <div className="text-xs text-destructive bg-destructive/10 border border-destructive/30 rounded p-2">
-                    {saveError}
-                  </div>
-                )}
                 {/* Monospace task_id footer — matches the View dialog idiom. */}
                 <div className="border-t border-border pt-3 flex justify-between gap-2 text-xs text-muted-foreground">
                   <span>Task ID</span>
@@ -1063,6 +898,16 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
 EditTaskDialog.displayName = 'EditTaskDialog'
 
 // ---------- Delete confirm dialog ---------------------------------
+//
+// Deliberately NOT migrated to the shared <DeleteConfirmModal> in the
+// scaffold PR: that modal gates the confirm button behind typing
+// "DELETE", which is a real behaviour change for this page (task delete
+// is a single-click confirm today), and three guarantees in
+// tests/test_dashboard_tasks_popup_polish.py are pinned to this
+// dialog's markup (max-w-md, footer order, destructive variant). Both
+// belong in a follow-up that moves those guarantees onto
+// modals/delete-confirm-modal.tsx and accepts the stricter confirm —
+// see architecture review Class 5.
 
 interface DeleteTaskDialogProps extends RowDialogProps {
   onDeleted: () => void
@@ -1258,298 +1103,348 @@ export function TasksDashboard() {
       await apiClient.createTask(data)
       // Refresh tasks after creating a new one
       refresh()
-    } catch (error) {
-      console.error('Failed to create task:', error)
+    } catch (err) {
+      // Was a silent `console.error` (architecture review Class 1: the
+      // operator saw the modal close and nothing appear). Mutation
+      // errors go through the shared toast now.
+      toastError(err, 'Failed to create task')
     }
   }, [refresh])
 
   // Row-action handlers. Each opens the matching Dialog. openView
   // is used by BOTH the eye icon and the row-body click — the
   // sidebar (TaskDetailsPanel) is retired. We forward the stable
-  // hook .open methods directly; CompactTaskRow is memoised so the
-  // referential identity matters.
+  // hook .open methods directly.
   const openView = viewDialog.open
   const openEdit = editDialog.open
   const openDelete = deleteDialog.open
   const handleEditSaved = useCallback(() => { refresh() }, [refresh])
   const handleDeleted = useCallback(() => { refresh() }, [refresh])
 
-  if (!isConnected) {
-    return (
-      <div className="h-full flex items-center justify-center">
-        <div className="text-center space-y-4">
-          <CheckSquare className="h-12 w-12 text-muted-foreground mx-auto" />
-          <div>
-            <h3 className="text-lg font-medium text-foreground mb-2">No Server Connection</h3>
-            <p className="text-muted-foreground text-sm">Connect to an MCP server to manage tasks</p>
+  // Stats strip — rendered by the scaffold's <StatsCard> row. Note the
+  // down-trend tint is the shared `text-destructive`; this page's
+  // private copy used `text-orange-500`, the outlier of the four
+  // drifted StatsCard copies (architecture review Class 6).
+  const statsCards: StatsCardProps[] = [
+    {
+      icon: Target,
+      label: 'Total',
+      value: stats.total,
+      change:
+        stats.other > 0
+          ? `${stats.other} other`
+          : stats.total > 0 ? `${stats.in_progress} active` : undefined,
+      trend: 'neutral',
+    },
+    {
+      icon: Zap,
+      label: 'Active',
+      value: stats.in_progress,
+      change: stats.total > 0 ? `${Math.round((stats.in_progress / stats.total) * 100)}%` : '0%',
+      trend: 'up',
+    },
+    {
+      icon: Clock,
+      label: 'Pending',
+      value: stats.pending,
+      change: stats.pending > 0 ? 'Queued' : 'None',
+      trend: 'neutral',
+    },
+    {
+      icon: CheckCircle2,
+      label: 'Completed',
+      value: stats.completed,
+      change: stats.total > 0 ? `${Math.round((stats.completed / stats.total) * 100)}% done` : '0%',
+      trend: 'up',
+    },
+    {
+      icon: AlertCircle,
+      label: 'Failed',
+      value: stats.failed,
+      change: stats.failed > 0 ? 'Need review' : 'All good',
+      trend: stats.failed > 0 ? 'down' : 'neutral',
+    },
+  ]
+
+  // Column spec — one source for the desktop table (via
+  // <ResponsiveDataTable>) and the mobile twin. Cells reproduce the
+  // pre-scaffold <CompactTaskRow> exactly.
+  const columns: Column<Task>[] = useMemo(() => [
+    {
+      id: 'task',
+      header: 'Task',
+      cellClassName: 'py-3',
+      cell: (task) => (
+        <div className="flex items-center gap-3">
+          <StatusDot status={task.status} />
+          <PriorityIcon priority={task.priority} />
+          <div className="min-w-0 flex-1">
+            <div className="font-medium text-sm text-foreground truncate">{task.title}</div>
+            <div className="text-xs text-muted-foreground font-mono">#{task.task_id.slice(-6)}</div>
           </div>
         </div>
-      </div>
-    )
-  }
-
-  if (loading) {
-    return (
-      <div className="h-full flex items-center justify-center">
-        <div className="text-center space-y-4">
-          <div className="animate-spin h-8 w-8 border-2 border-primary border-t-transparent rounded-full mx-auto" />
-          <p className="text-muted-foreground text-sm">Loading tasks...</p>
-        </div>
-      </div>
-    )
-  }
-
-  if (error) {
-    return (
-      <div className="h-full flex items-center justify-center">
-        <div className="text-center space-y-4">
-          <AlertCircle className="h-12 w-12 text-destructive mx-auto" />
-          <div>
-            <h3 className="text-lg font-medium text-foreground mb-2">Connection Error</h3>
-            <p className="text-destructive text-sm">{error}</p>
+      ),
+    },
+    {
+      id: 'status',
+      header: 'Status',
+      cellClassName: 'py-3',
+      cell: (task) => (
+        <Badge
+          variant="outline"
+          className={cn(
+            "text-xs font-semibold border-0 px-3 py-1.5 rounded-md",
+            statusBadgeClass(task.status),
+          )}
+        >
+          {task.status.replace('_', ' ').toUpperCase()}
+        </Badge>
+      ),
+    },
+    {
+      id: 'details',
+      header: 'Details',
+      cellClassName: 'py-3 max-w-xs',
+      cell: (task) => (
+        <>
+          <div className="text-sm text-foreground truncate">
+            {task.description || "No description"}
           </div>
+          {task.assigned_to && (
+            <div className="text-xs text-muted-foreground mt-1 flex items-center gap-1">
+              <Users className="h-3 w-3" />
+              {task.assigned_to}
+            </div>
+          )}
+        </>
+      ),
+    },
+    {
+      id: 'priority',
+      header: 'Priority',
+      cellClassName: 'py-3',
+      cell: (task) => (
+        <Badge
+          variant="outline"
+          className={cn("text-xs font-medium px-2 py-0.5", priorityBadgeClass(task.priority))}
+        >
+          {task.priority.toUpperCase()}
+        </Badge>
+      ),
+    },
+    {
+      id: 'relations',
+      header: 'Relations',
+      cellClassName: 'py-3',
+      cell: (task) => (
+        <div className="flex flex-wrap gap-1">
+          {task.parent_task && (
+            <Badge variant="outline" className="text-xs px-2 py-0.5 bg-purple-500/10 text-purple-500 dark:text-purple-300 border-purple-500/20">
+              <GitBranch className="h-3 w-3 mr-1" />
+              Subtask
+            </Badge>
+          )}
+          {task.child_tasks && task.child_tasks.length > 0 && (
+            <Badge variant="outline" className="text-xs px-2 py-0.5 bg-blue-500/10 text-blue-500 dark:text-blue-300 border-blue-500/20">
+              {task.child_tasks.length} children
+            </Badge>
+          )}
         </div>
+      ),
+    },
+    {
+      id: 'updated',
+      header: 'Updated',
+      cellClassName: 'py-3 text-xs text-muted-foreground font-mono',
+      cell: (task) => <TaskUpdatedCell value={task.updated_at} />,
+    },
+    {
+      id: 'actions',
+      header: 'Actions',
+      headClassName: 'w-24',
+      cellClassName: 'py-3',
+      /*
+        Three distinct row icons. Each opens its own Dialog modal
+        (View / Edit / Delete). stopPropagation prevents the row-
+        level onClick (which opens the same View dialog) from
+        firing twice when the eye icon is pressed and from opening
+        the View dialog when Edit/Delete are pressed. Hover-reveal
+        rides on the row's `group` class, owned by the scaffold.
+      */
+      cell: (task) => (
+        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+          <Button
+            variant="ghost"
+            size="sm"
+            title="View task"
+            aria-label="View task"
+            className="h-7 w-7 p-0 text-muted-foreground hover:text-foreground hover:bg-muted"
+            onClick={(e) => { e.stopPropagation(); openView(task.task_id) }}
+          >
+            <Eye className="h-3.5 w-3.5" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            title="Edit task"
+            aria-label="Edit task"
+            className="h-9 w-9 sm:h-7 sm:w-7 p-0 text-primary hover:text-primary hover:bg-primary/10"
+            onClick={(e) => { e.stopPropagation(); openEdit(task.task_id) }}
+          >
+            <Pencil className="h-3.5 w-3.5" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            title="Delete task"
+            aria-label="Delete task"
+            className="h-7 w-7 p-0 text-destructive hover:text-destructive hover:bg-destructive/10"
+            onClick={(e) => { e.stopPropagation(); openDelete(task.task_id) }}
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </Button>
+        </div>
+      ),
+    },
+  ], [openView, openEdit, openDelete])
+
+  /*
+    Controls — un-boxed filter row matching Messages/Memories (no Card
+    wrapper). Search + Priority narrow the in-memory rows client-side;
+    Status + Assignment + Created-by drive the server-side GET /tasks
+    query (single source of truth).
+
+    The inner flex wrapper keeps this page's `sm:flex-wrap` — six
+    controls don't fit one desktop row, and the scaffold's filter-bar
+    slot is a plain non-wrapping row (right for the 1-2 control pages).
+  */
+  const filterBar = (
+    <div className="flex flex-col sm:flex-row sm:flex-wrap items-stretch sm:items-center gap-2 sm:gap-3 w-full">
+      <div className="relative flex-1 sm:max-w-xs">
+        {/* CC-1/CC-13 audit 2026-06-02: Search + Select migrated to
+            shadcn semantic tokens. Dropped hand-rolled focus:ring-
+            teal-* (different color + uses :focus not :focus-visible).
+            Now relies on the Input/Select primitives' built-in
+            focus-visible:ring-ring/50 styles. */}
+        <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          placeholder="Search tasks..."
+          value={searchTerm}
+          onChange={(e) => setFilter("searchTerm", e.target.value)}
+          className="pl-10"
+        />
       </div>
-    )
-  }
+      {/* Status (server-side). "Incomplete (open)" sends
+          status=incomplete — the backend alias for every non-terminal
+          task (pending + in_progress). */}
+      <Select value={statusFilter} onValueChange={(v) => setFilter("statusFilter", v)}>
+        <SelectTrigger className="w-full sm:w-44">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="all">Any status</SelectItem>
+          <SelectItem value="incomplete">Incomplete (open)</SelectItem>
+          <SelectItem value="pending">Pending</SelectItem>
+          <SelectItem value="in_progress">In Progress</SelectItem>
+          <SelectItem value="completed">Completed</SelectItem>
+          <SelectItem value="cancelled">Cancelled</SelectItem>
+          <SelectItem value="failed">Failed</SelectItem>
+        </SelectContent>
+      </Select>
+      {/* Assignment (server-side). Maps to the dedicated
+          assigned=true / unassigned=true booleans — never a magic
+          assigned_to="unassigned" value. */}
+      <Select value={assignment} onValueChange={(v) => setFilter("assignment", v)}>
+        <SelectTrigger className="w-full sm:w-40">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="all">Any assignment</SelectItem>
+          <SelectItem value="assigned">Assigned</SelectItem>
+          <SelectItem value="unassigned">Unassigned</SelectItem>
+        </SelectContent>
+      </Select>
+      {/* Created by (server-side) → created_by. Live-agents picker
+          (shared <AgentSelect>); noneLabel="— Any —" means no filter. */}
+      <div className="w-full sm:w-44">
+        <AgentSelect
+          value={createdBy || null}
+          onChange={(v) => setFilter("createdBy", v ?? "")}
+          noneLabel="— Any —"
+          placeholder="created by"
+        />
+      </div>
+      {/* Priority (client-side — not part of the GET /tasks contract). */}
+      <Select value={priorityFilter} onValueChange={(v) => setFilter("priorityFilter", v)}>
+        <SelectTrigger className="w-full sm:w-32">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="all">Any priority</SelectItem>
+          <SelectItem value="high">High</SelectItem>
+          <SelectItem value="medium">Medium</SelectItem>
+          <SelectItem value="low">Low</SelectItem>
+        </SelectContent>
+      </Select>
+      {isActive && (
+        <Button variant="ghost" size="sm" onClick={clearAll}>
+          <X className="h-4 w-4 mr-1" />
+          Clear
+        </Button>
+      )}
+    </div>
+  )
 
   return (
-    <div className="relative w-full p-4 sm:p-6 space-y-4 sm:space-y-6">
-      {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-        <div>
-          {/* CC-1/CC-8/CC-21 audit 2026-06-02: H1 was hard-coded with
-              a three-way light/dark palette triplet that Tailwind v4
-              ordered alphabetically — the always-on white utility won
-              over the always-on slate-900 on light-mode white
-              backgrounds, so the title vanished. Switched to
-              text-foreground semantic token. Same fix for the
-              subtitle paragraph below. */}
-          <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight text-foreground">Task Operations</h1>
-          <p className="text-muted-foreground text-sm sm:text-base mt-1">Orchestrate and monitor autonomous tasks</p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-          {/* CC-19: dropped the animate-pulse on the server-online dot —
-              constant motion in the chrome reads as busy. Switched the
-              palette to bg-emerald-500 for "alive" semantics. */}
-          <Badge variant="outline" className="text-xs bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30 font-medium">
-            <span aria-hidden className="w-2 h-2 bg-emerald-500 rounded-full mr-2" />
-            {activeServer?.name}
-          </Badge>
-          {lastFetch > 0 && (
-            <span className="text-xs text-muted-foreground">
-              Last updated: {new Date(lastFetch).toLocaleTimeString()}
-            </span>
-          )}
-          <Button 
-            variant="outline" 
-            size="sm" 
-            onClick={refresh}
-            disabled={loading}
-            className="text-xs"
-          >
-            <RefreshCw className={cn("h-3.5 w-3.5 mr-1.5", loading && "animate-spin")} />
-            Refresh
-          </Button>
-          <CreateTaskModal onCreateTask={handleCreateTask} />
-        </div>
-      </div>
-
-      {/* Stats — CC-16: plain Tailwind spacing replaces the
-          --space-fluid-md var for predictable scaling. */}
-      <div className="grid gap-3 sm:gap-4 grid-cols-2 sm:grid-cols-3 lg:grid-cols-5">
-        <StatsCard 
-          icon={Target} 
-          label="Total"
-          value={stats.total}
-          change={
-            stats.other > 0
-              ? `${stats.other} other`
-              : stats.total > 0 ? `${stats.in_progress} active` : undefined
-          }
-          trend="neutral"
-        />
-        <StatsCard 
-          icon={Zap} 
-          label="Active" 
-          value={stats.in_progress} 
-          change={stats.total > 0 ? `${Math.round((stats.in_progress/stats.total)*100)}%` : "0%"}
-          trend="up"
-        />
-        <StatsCard 
-          icon={Clock} 
-          label="Pending" 
-          value={stats.pending} 
-          change={stats.pending > 0 ? "Queued" : "None"}
-          trend="neutral"
-        />
-        <StatsCard 
-          icon={CheckCircle2} 
-          label="Completed" 
-          value={stats.completed} 
-          change={stats.total > 0 ? `${Math.round((stats.completed/stats.total)*100)}% done` : "0%"}
-          trend="up"
-        />
-        <StatsCard 
-          icon={AlertCircle} 
-          label="Failed" 
-          value={stats.failed} 
-          change={stats.failed > 0 ? "Need review" : "All good"}
-          trend={stats.failed > 0 ? "down" : "neutral"}
-        />
-      </div>
-
-      {/* Controls — un-boxed filter row matching Messages/Memories
-          (no Card wrapper). Search + Priority narrow the in-memory
-          rows client-side; Status + Assignment + Created-by drive the
-          server-side GET /tasks query (single source of truth). */}
-      <div className="flex flex-col sm:flex-row sm:flex-wrap items-stretch sm:items-center gap-2 sm:gap-3">
-        <div className="relative flex-1 sm:max-w-xs">
-          {/* CC-1/CC-13 audit 2026-06-02: Search + Select migrated to
-              shadcn semantic tokens. Dropped hand-rolled focus:ring-
-              teal-* (different color + uses :focus not :focus-visible).
-              Now relies on the Input/Select primitives' built-in
-              focus-visible:ring-ring/50 styles. */}
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            placeholder="Search tasks..."
-            value={searchTerm}
-            onChange={(e) => setFilter("searchTerm", e.target.value)}
-            className="pl-10"
-          />
-        </div>
-        {/* Status (server-side). "Incomplete (open)" sends
-            status=incomplete — the backend alias for every non-terminal
-            task (pending + in_progress). */}
-        <Select value={statusFilter} onValueChange={(v) => setFilter("statusFilter", v)}>
-          <SelectTrigger className="w-full sm:w-44">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">Any status</SelectItem>
-            <SelectItem value="incomplete">Incomplete (open)</SelectItem>
-            <SelectItem value="pending">Pending</SelectItem>
-            <SelectItem value="in_progress">In Progress</SelectItem>
-            <SelectItem value="completed">Completed</SelectItem>
-            <SelectItem value="cancelled">Cancelled</SelectItem>
-            <SelectItem value="failed">Failed</SelectItem>
-          </SelectContent>
-        </Select>
-        {/* Assignment (server-side). Maps to the dedicated
-            assigned=true / unassigned=true booleans — never a magic
-            assigned_to="unassigned" value. */}
-        <Select value={assignment} onValueChange={(v) => setFilter("assignment", v)}>
-          <SelectTrigger className="w-full sm:w-40">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">Any assignment</SelectItem>
-            <SelectItem value="assigned">Assigned</SelectItem>
-            <SelectItem value="unassigned">Unassigned</SelectItem>
-          </SelectContent>
-        </Select>
-        {/* Created by (server-side) → created_by. Live-agents picker
-            (shared <AgentSelect>); noneLabel="— Any —" means no filter. */}
-        <div className="w-full sm:w-44">
-          <AgentSelect
-            value={createdBy || null}
-            onChange={(v) => setFilter("createdBy", v ?? "")}
-            noneLabel="— Any —"
-            placeholder="created by"
-          />
-        </div>
-        {/* Priority (client-side — not part of the GET /tasks contract). */}
-        <Select value={priorityFilter} onValueChange={(v) => setFilter("priorityFilter", v)}>
-          <SelectTrigger className="w-full sm:w-32">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">Any priority</SelectItem>
-            <SelectItem value="high">High</SelectItem>
-            <SelectItem value="medium">Medium</SelectItem>
-            <SelectItem value="low">Low</SelectItem>
-          </SelectContent>
-        </Select>
-        {isActive && (
-          <Button variant="ghost" size="sm" onClick={clearAll}>
-            <X className="h-4 w-4 mr-1" />
-            Clear
-          </Button>
-        )}
-      </div>
-
-      {/* Tasks Table — token-clean shadcn card. CC-1/CC-2/CC-4/CC-5
-          audit 2026-06-02: dropped slate/teal palette + rounded-xl +
-          shadow-teal in favour of bg-card / border-border / rounded-lg
-          (no shadow — cards don't need elevation, the border carries
-          the surface). Desktop renders <Table>, mobile renders
-          <TasksMobileList> (CC-7). Loading shows <Skeleton> rows
-          instead of the previous blank pane (CC-3). Empty state uses
-          the shared <EmptyState> primitive (CC-6). */}
-      <div className="bg-card border border-border rounded-lg overflow-hidden">
-        {loading && tasks.length === 0 ? (
-          <div className="p-4 space-y-3">
-            {Array.from({ length: 6 }).map((_, i) => (
-              <Skeleton key={i} className="h-14 w-full" />
-            ))}
-          </div>
-        ) : filteredTasks.length === 0 ? (
-          <EmptyState
-            icon={CheckSquare}
-            title="No tasks found"
-            description={
-              tasks.length === 0
-                ? "Create your first task to get started."
-                : "No tasks match your current filters."
+    <DataTablePage<Task>
+      guard={
+        !isConnected
+          ? {
+              icon: CheckSquare,
+              title: 'No Server Connection',
+              description: 'Connect to an MCP server to manage tasks',
             }
-            action={
-              tasks.length === 0
-                ? <CreateTaskModal onCreateTask={handleCreateTask} />
-                : undefined
-            }
-          />
-        ) : (
-          <>
-            {/* Desktop table */}
-            <div className="hidden sm:block overflow-x-auto">
-              <Table>
-                <TableHeader>
-                  <TableRow className="border-border hover:bg-transparent">
-                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Task</TableHead>
-                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Status</TableHead>
-                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Details</TableHead>
-                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Priority</TableHead>
-                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Relations</TableHead>
-                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider">Updated</TableHead>
-                    <TableHead className="text-muted-foreground font-medium text-xs uppercase tracking-wider w-24">Actions</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {filteredTasks.map((task) => (
-                    <CompactTaskRow
-                      key={task.task_id}
-                      task={task}
-                      openView={openView}
-                      openEdit={openEdit}
-                      openDelete={openDelete}
-                    />
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
-            {/* Mobile card-list (CC-7) */}
-            <div className="block sm:hidden">
-              <TasksMobileList
-                tasks={filteredTasks}
-                openView={openView}
-                openEdit={openEdit}
-                openDelete={openDelete}
-              />
-            </div>
-          </>
-        )}
-      </div>
-
+          : null
+      }
+      loading={loading}
+      error={error}
+      header={{
+        title: 'Task Operations',
+        subtitle: 'Orchestrate and monitor autonomous tasks',
+        serverName: activeServer?.name,
+        lastUpdated: lastFetch > 0 ? lastFetch : undefined,
+        onRefresh: refresh,
+        refreshing: loading,
+        actions: <CreateTaskModal onCreateTask={handleCreateTask} />,
+      }}
+      stats={statsCards}
+      filterBar={filterBar}
+      columns={columns}
+      rows={filteredTasks}
+      getRowId={(task) => task.task_id}
+      onRowClick={(task) => openView(task.task_id)}
+      renderMobileCard={(task) => (
+        <TaskMobileCard
+          task={task}
+          openView={openView}
+          openEdit={openEdit}
+          openDelete={openDelete}
+        />
+      )}
+      skeletonRows={6}
+      empty={{
+        icon: CheckSquare,
+        title: 'No tasks found',
+        description:
+          tasks.length === 0
+            ? "Create your first task to get started."
+            : "No tasks match your current filters.",
+        action:
+          tasks.length === 0
+            ? <CreateTaskModal onCreateTask={handleCreateTask} />
+            : undefined,
+      }}
+    >
       {/* Row-action dialogs (View / Edit / Delete) — Dialog modals,
           NOT the sidebar Sheet. Mirrors the messages-tab popup
           pattern from PR #36. */}
@@ -1579,6 +1474,6 @@ export function TasksDashboard() {
         onOpenChange={(open) => { if (!open) deleteDialog.close() }}
         onDeleted={handleDeleted}
       />
-    </div>
+    </DataTablePage>
   )
 }
