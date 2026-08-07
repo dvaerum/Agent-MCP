@@ -17,12 +17,11 @@
 // anything here), so every query is scoped to the desktop <table>.
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
 import { render, cleanup, screen, waitFor, within } from "@testing-library/react"
-import userEvent from "@testing-library/user-event"
+import { setupUser } from "@/tests/support/user-event"
 
 import { ApiError } from "@/lib/api"
 
 // Radix Dialog locks pointer-events on <body>; disable the guard.
-const ue = () => userEvent.setup({ pointerEventsCheck: 0 })
 
 const requestMock = vi.fn()
 vi.mock("@/lib/router-api", () => ({
@@ -125,7 +124,7 @@ describe("<GroupsDashboard> on the shared scaffold", () => {
   })
 
   it("expands a row and reports member-load failure through the SHARED toast", async () => {
-    const u = ue()
+    const u = setupUser()
     // Capabilities 403s (non-sysadmin) so only the member failure
     // reaches the toast surface.
     routeBy({
@@ -153,7 +152,7 @@ describe("<GroupsDashboard> on the shared scaffold", () => {
   })
 
   it("routes a capabilities save through the SHARED toast (retiring the shadow toast)", async () => {
-    const u = ue()
+    const u = setupUser()
     routeBy({
       "/capabilities": { capabilities: [] },
       "/members": { members: [] },

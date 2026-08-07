@@ -11,11 +11,18 @@
  * that behaviour so a future refactor can't silently drop it and leave
  * post-gap changes stale until the slow poll.
  */
-import { describe, expect, it, vi, beforeEach } from "vitest"
+import { describe, expect, it, vi, afterEach } from "vitest"
+// Static import, not an in-test `await import()` — the module graph's
+// transform+evaluation cost would otherwise be billed to `testTimeout`
+// instead of the collection phase. See the note in
+// `mcp-notifications-no-poll.test.ts` for the measurements.
+import { subscribeMcpNotifications } from "@/lib/mcp-notifications"
+
+const realFetch = globalThis.fetch
 
 describe("operator events SSE reconnect catch-up", () => {
-  beforeEach(() => {
-    vi.resetModules()
+  afterEach(() => {
+    globalThis.fetch = realFetch
   })
 
   it("dispatches a resources/updated catch-up on (re)connect", async () => {
@@ -35,8 +42,7 @@ describe("operator events SSE reconnect catch-up", () => {
       seen.push((e as CustomEvent).detail?.uri)
     window.addEventListener("mcp:resources-updated", handler)
 
-    const mod = await import("@/lib/mcp-notifications")
-    const unsubscribe = mod.subscribeMcpNotifications()
+    const unsubscribe = subscribeMcpNotifications()
     await new Promise((r) => setTimeout(r, 0))
     await new Promise((r) => setTimeout(r, 0))
     unsubscribe()

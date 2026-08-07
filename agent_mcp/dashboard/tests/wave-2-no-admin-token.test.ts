@@ -25,9 +25,14 @@
  * passing — the field is simply gone, not surfaced.
  */
 
-import { describe, expect, it, vi, beforeEach } from "vitest"
+import { describe, expect, it, vi, afterEach } from "vitest"
 import { readFileSync } from "node:fs"
 import { resolve } from "node:path"
+// Static import, not an in-test `await import()` — the module graph's
+// transform+evaluation cost would otherwise be billed to `testTimeout`
+// instead of the collection phase. See the note in
+// `mcp-notifications-no-poll.test.ts` for the measurements.
+import { openMcpNotificationStream } from "@/lib/mcp-notifications"
 
 // Resolve relative to this test file rather than the cwd Vitest happens
 // to launch from — the test runs identically from the repo root, from
@@ -126,8 +131,9 @@ describe("Wave 2: dashboard mutation call sites", () => {
 // ── 3. MCP notifications client uses cookie auth, no Authorization ─
 
 describe("Wave 2: MCP notifications client", () => {
-  beforeEach(() => {
-    vi.resetModules()
+  const realFetch = globalThis.fetch
+  afterEach(() => {
+    globalThis.fetch = realFetch
   })
 
   it("opens the SSE stream with credentials:include and no Authorization", async () => {
@@ -150,14 +156,11 @@ describe("Wave 2: MCP notifications client", () => {
     // @ts-expect-error global stub for the duration of this test
     globalThis.fetch = fetchStub
 
-    // Import after the stub is in place. The module is "use client"
-    // so it touches `window`/`document` lazily; we don't drive the
-    // visibility handler here.
-    const mod = await import("@/lib/mcp-notifications")
-
     // Drive the lowest-level entry point so we don't depend on the
-    // visibility-listener wiring in subscribeMcpNotifications.
-    const handle = mod.openMcpNotificationStream({ url: "/mcp/test" })
+    // visibility-listener wiring in subscribeMcpNotifications. The
+    // module reads `globalThis.fetch` at call time, so stubbing it
+    // above (rather than before the import) is sufficient.
+    const handle = openMcpNotificationStream({ url: "/mcp/test" })
 
     // Yield twice so the async fetch in the run loop kicks off.
     await new Promise((r) => setTimeout(r, 0))

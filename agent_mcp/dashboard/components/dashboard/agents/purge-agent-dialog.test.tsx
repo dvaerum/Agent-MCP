@@ -10,7 +10,7 @@
 // itself became that modal's `details` slot.
 import { describe, it, expect, vi, afterEach } from "vitest"
 import { render, cleanup, screen, waitFor } from "@testing-library/react"
-import userEvent from "@testing-library/user-event"
+import { setupUser } from "@/tests/support/user-event"
 
 const getPurgePreview = vi.fn()
 const purgeAgent = vi.fn()
@@ -23,8 +23,6 @@ vi.mock("@/lib/api", () => ({
 }))
 
 import { PurgeAgentDialog } from "@/components/dashboard/agents/purge-agent-dialog"
-
-const ue = () => userEvent.setup({ pointerEventsCheck: 0 })
 
 const preview = {
   agent_id: "worker-1",
@@ -81,7 +79,7 @@ describe("<PurgeAgentDialog>", () => {
     const confirm = screen.getByRole("button", { name: /Confirm purge/ })
     expect(confirm).toHaveProperty("disabled", true)
 
-    await ue().type(screen.getByLabelText(/to confirm deletion/i), "DELETE")
+    await setupUser().type(screen.getByLabelText(/to confirm deletion/i), "DELETE")
     await waitFor(() => expect(confirm).toHaveProperty("disabled", false))
   })
 
@@ -89,8 +87,8 @@ describe("<PurgeAgentDialog>", () => {
     getPurgePreview.mockResolvedValue(preview)
     purgeAgent.mockResolvedValue({})
     const { onConfirmed } = renderDialog()
-    await ue().type(screen.getByLabelText(/to confirm deletion/i), "DELETE")
-    await ue().click(screen.getByRole("button", { name: /Confirm purge/ }))
+    await setupUser().type(screen.getByLabelText(/to confirm deletion/i), "DELETE")
+    await setupUser().click(screen.getByRole("button", { name: /Confirm purge/ }))
     await waitFor(() => expect(purgeAgent).toHaveBeenCalledWith("worker-1"))
     expect(onConfirmed).toHaveBeenCalled()
   })
@@ -99,8 +97,8 @@ describe("<PurgeAgentDialog>", () => {
     getPurgePreview.mockResolvedValue(preview)
     purgeAgent.mockRejectedValue(new Error("cascade failed"))
     const { onConfirmed, onOpenChange } = renderDialog()
-    await ue().type(screen.getByLabelText(/to confirm deletion/i), "DELETE")
-    await ue().click(screen.getByRole("button", { name: /Confirm purge/ }))
+    await setupUser().type(screen.getByLabelText(/to confirm deletion/i), "DELETE")
+    await setupUser().click(screen.getByRole("button", { name: /Confirm purge/ }))
     await waitFor(() => expect(screen.getByText("cascade failed")).toBeTruthy())
     expect(onConfirmed).not.toHaveBeenCalled()
     expect(onOpenChange).not.toHaveBeenCalledWith(false)

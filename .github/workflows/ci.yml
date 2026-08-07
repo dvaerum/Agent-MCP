@@ -68,7 +68,7 @@ jobs:
         run: uv run pytest -v
 
   dashboard:
-    name: Dashboard build
+    name: Dashboard build + tests
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -85,6 +85,18 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      # The Vitest suite was ungated until fix/vitest-notifications-flake,
+      # which is exactly why a testTimeout bump papering over two real
+      # timer/import defects went unnoticed for a release: nothing outside
+      # a developer's own terminal ever ran it. `npm run build` only
+      # typechecks — it cannot catch a leaked timer, a lost SSE contract,
+      # or a source-grep guard going stale.
+      #
+      # Cost is ~20s on top of a job that already pays for `npm ci`, so it
+      # runs BEFORE the (much slower) build for fast feedback.
+      - name: Unit tests (vitest)
+        run: npm test
 
       - name: Build static export
         run: npm run build

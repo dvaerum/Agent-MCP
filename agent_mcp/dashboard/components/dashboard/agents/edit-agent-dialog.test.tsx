@@ -9,7 +9,7 @@
 // `setError` banner, so neither half could be tested in isolation.
 import { describe, it, expect, vi, afterEach } from "vitest"
 import { render, cleanup, screen, waitFor } from "@testing-library/react"
-import userEvent from "@testing-library/user-event"
+import { setupUser } from "@/tests/support/user-event"
 
 // jsdom ships no ResizeObserver; Radix's Switch/Select measure their
 // trigger on mount. Minimal stub so the form can render.
@@ -35,8 +35,6 @@ import {
   coerceAutoEventLoop,
 } from "@/components/dashboard/agents/edit-agent-dialog"
 import type { Agent } from "@/lib/api"
-
-const ue = () => userEvent.setup({ pointerEventsCheck: 0 })
 
 afterEach(() => cleanup())
 
@@ -82,9 +80,9 @@ describe("<EditAgentDialog>", () => {
       />,
     )
     const profile = screen.getByLabelText(/Self-description/i)
-    await ue().clear(profile)
-    await ue().type(profile, "new profile")
-    await ue().click(screen.getByRole("button", { name: "Save changes" }))
+    await setupUser().clear(profile)
+    await setupUser().type(profile, "new profile")
+    await setupUser().click(screen.getByRole("button", { name: "Save changes" }))
 
     await waitFor(() => expect(onSave).toHaveBeenCalled())
     expect(onSave).toHaveBeenCalledWith("worker-1", { profile: "new profile" })
@@ -101,7 +99,7 @@ describe("<EditAgentDialog>", () => {
         onSave={onSave}
       />,
     )
-    await ue().click(screen.getByRole("button", { name: "Save changes" }))
+    await setupUser().click(screen.getByRole("button", { name: "Save changes" }))
     expect(onSave).not.toHaveBeenCalled()
     expect(onOpenChange).toHaveBeenCalledWith(false)
   })
@@ -118,9 +116,9 @@ describe("<EditAgentDialog>", () => {
       />,
     )
     const profile = screen.getByLabelText(/Self-description/i)
-    await ue().clear(profile)
-    await ue().type(profile, "x")
-    await ue().click(screen.getByRole("button", { name: "Save changes" }))
+    await setupUser().clear(profile)
+    await setupUser().type(profile, "x")
+    await setupUser().click(screen.getByRole("button", { name: "Save changes" }))
 
     await waitFor(() => expect(onSave).toHaveBeenCalled())
     expect(onOpenChange).not.toHaveBeenCalledWith(false)
@@ -138,7 +136,7 @@ describe("<EditAgentDialog>", () => {
       />,
     )
     const aoe = screen.getByPlaceholderText(/16-char lowercase hex/i)
-    await ue().type(aoe, "nothex")
+    await setupUser().type(aoe, "nothex")
     expect(
       screen.getByRole("button", { name: "Save changes" }),
     ).toHaveProperty("disabled", true)
@@ -155,11 +153,11 @@ describe("<EditAgentDialog>", () => {
         onSave={onSave}
       />,
     )
-    await ue().type(
+    await setupUser().type(
       screen.getByPlaceholderText(/16-char lowercase hex/i),
       "551e7a79d11f435b",
     )
-    await ue().click(screen.getByRole("button", { name: "Save changes" }))
+    await setupUser().click(screen.getByRole("button", { name: "Save changes" }))
     await waitFor(() => expect(onSave).toHaveBeenCalled())
     expect(onSave).toHaveBeenCalledWith("worker-1", {
       aoe_session_id: "551e7a79d11f435b",

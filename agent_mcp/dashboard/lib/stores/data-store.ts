@@ -439,14 +439,56 @@ export const useDataStore = create<DataStore>((set, get) => ({
   }
 }))
 
-// Auto-refresh every 60 seconds (reduced from 30s for better performance)
-if (typeof window !== 'undefined') {
-  setInterval(() => {
-    const store = useDataStore.getState()
-    if (store.data) {
-      store.refreshData()
+// -- background freshness poll -------------------------------------------
+
+/**
+ * Slow safety-net poll behind the live-update SSE stream
+ * (`lib/mcp-notifications.ts`). The stream is what makes the dashboard
+ * feel live; this tick only covers the case where the stream is down
+ * and the operator hasn't noticed. 60s (was 30s) — the stream carries
+ * the latency-sensitive updates.
+ *
+ * Ownership: this used to be a bare `setInterval` fired at module
+ * import time with its handle discarded — unstoppable by construction,
+ * and re-armed on every module re-evaluation (Next Fast Refresh, a
+ * test's `vi.resetModules()`), so instances accumulated. It is now
+ * started explicitly by `<McpNotificationsProvider>`, which already
+ * owns the live-update lifecycle, and the caller holds the stop.
+ * `tests/live-update-timer-leaks.test.ts` pins that.
+ */
+const AUTO_REFRESH_INTERVAL_MS = 60000
+let _autoRefreshTimer: ReturnType<typeof setInterval> | null = null
+let _autoRefreshOwners = 0
+
+/**
+ * Start the background freshness poll. Idempotent — concurrent callers
+ * share one interval, refcounted so the last stop() is the one that
+ * clears it. Returns a stop function that is safe to call more than
+ * once.
+ */
+export function startDataStoreAutoRefresh(): () => void {
+  _autoRefreshOwners += 1
+  if (_autoRefreshTimer === null) {
+    _autoRefreshTimer = setInterval(() => {
+      const store = useDataStore.getState()
+      // A freshness top-up, not the initial load: nothing to refresh
+      // until some page has populated the envelope.
+      if (store.data) {
+        void store.refreshData()
+      }
+    }, AUTO_REFRESH_INTERVAL_MS)
+  }
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    _autoRefreshOwners -= 1
+    if (_autoRefreshOwners <= 0 && _autoRefreshTimer !== null) {
+      clearInterval(_autoRefreshTimer)
+      _autoRefreshTimer = null
+      _autoRefreshOwners = 0
     }
-  }, 60000)
+  }
 }
 
 /**

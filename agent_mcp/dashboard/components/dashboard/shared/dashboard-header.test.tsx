@@ -7,7 +7,7 @@
 // These tests pin the single reusable contract.
 import { describe, it, expect, afterEach, vi } from "vitest"
 import { render, cleanup, screen } from "@testing-library/react"
-import userEvent from "@testing-library/user-event"
+import { setupUserPlain } from "@/tests/support/user-event"
 
 import { DashboardHeader } from "@/components/dashboard/shared/dashboard-header"
 
@@ -35,7 +35,7 @@ describe("<DashboardHeader>", () => {
   })
 
   it("renders a Refresh button that calls onRefresh", async () => {
-    const u = userEvent.setup()
+    const u = setupUserPlain()
     const onRefresh = vi.fn()
     render(<DashboardHeader title="T" onRefresh={onRefresh} />)
     await u.click(screen.getByRole("button", { name: /refresh/i }))

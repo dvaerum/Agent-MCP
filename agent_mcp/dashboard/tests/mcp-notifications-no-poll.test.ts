@@ -26,17 +26,33 @@
  *      choice + reconnect/visibility lifecycle).
  */
 
-import { describe, expect, it, vi, beforeEach } from "vitest"
+import { describe, expect, it, vi, afterEach } from "vitest"
 import { readFileSync } from "node:fs"
 import { resolve } from "node:path"
+// Imported statically, NOT with an in-test `await import()`.
+//
+// Why it matters: this module pulls in the data-store, the api client
+// and zustand, and Vitest charges module transform + evaluation to
+// whichever phase asks for it. Behind an in-test dynamic import the
+// whole graph was billed to `testTimeout` — measured at 175ms idle but
+// 1.3–3.1s when the box is oversubscribed, i.e. 85%+ of this test's
+// wall time was module loading, not the assertion. That is what pushed
+// the file over the old 5s budget under parallel load and prompted a
+// 5s→20s bump. A static import moves the cost into the collection
+// phase where it belongs. `vi.resetModules()` was ceremony — nothing
+// here depends on fresh module state (the stream's state is per-call,
+// held in `openMcpNotificationStream`'s closure).
+import * as mcpNotifications from "@/lib/mcp-notifications"
 
 const DASHBOARD_ROOT = resolve(__dirname, "..")
 const read = (rel: string) =>
   readFileSync(resolve(DASHBOARD_ROOT, rel), "utf8")
 
+const realFetch = globalThis.fetch
+
 describe("operator events SSE subscription contract", () => {
-  beforeEach(() => {
-    vi.resetModules()
+  afterEach(() => {
+    globalThis.fetch = realFetch
   })
 
   it("subscribeMcpNotifications() opens one stream against /api/events", async () => {
@@ -57,8 +73,7 @@ describe("operator events SSE subscription contract", () => {
     // @ts-expect-error global stub for the duration of this test
     globalThis.fetch = fetchStub
 
-    const mod = await import("@/lib/mcp-notifications")
-    const unsubscribe = mod.subscribeMcpNotifications()
+    const unsubscribe = mcpNotifications.subscribeMcpNotifications()
 
     // Yield a couple of ticks so the async ``void run()`` fires its fetch.
     await new Promise((r) => setTimeout(r, 0))
@@ -83,7 +98,7 @@ describe("operator events SSE subscription contract", () => {
     expect(headers["Accept"]).toBe("text/event-stream")
   })
 
-  it("subscribeMcpNotifications() returns a callable cleanup", async () => {
+  it("subscribeMcpNotifications() returns a callable cleanup", () => {
     // Stub fetch so the opened stream doesn't hit undici with a relative
     // URL; the body closes immediately.
     const fetchStub = vi.fn(async () => new Response(
@@ -92,8 +107,7 @@ describe("operator events SSE subscription contract", () => {
     ))
     globalThis.fetch = fetchStub as unknown as typeof fetch
 
-    const mod = await import("@/lib/mcp-notifications")
-    const unsubscribe = mod.subscribeMcpNotifications()
+    const unsubscribe = mcpNotifications.subscribeMcpNotifications()
     expect(typeof unsubscribe).toBe("function")
     // Calling the cleanup must not throw.
     expect(() => unsubscribe()).not.toThrow()

@@ -7,12 +7,11 @@
 // GREEN after.
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
 import { render, cleanup, waitFor } from "@testing-library/react"
-import userEvent from "@testing-library/user-event"
+import { setupUser } from "@/tests/support/user-event"
 
 // Radix Dialog locks `pointer-events: none` on <body> while open; that
 // makes user-event's default pointer-events guard throw. Disable the
 // guard — we drive the input via keyboard, not real pointer hit-testing.
-const ue = () => userEvent.setup({ pointerEventsCheck: 0 })
 
 import { DeleteConfirmModal } from "@/components/dashboard/modals/delete-confirm-modal"
 
@@ -69,7 +68,7 @@ afterEach(() => cleanup())
 
 describe("Enter submits type-to-confirm delete dialogs", () => {
   it("DeleteConfirmModal: Enter fires confirm after correct confirmation", async () => {
-    const u = ue()
+    const u = setupUser()
     const onConfirm = vi.fn(() => Promise.resolve())
     render(
       <DeleteConfirmModal
@@ -86,7 +85,7 @@ describe("Enter submits type-to-confirm delete dialogs", () => {
   })
 
   it("DeleteConfirmModal: Enter with wrong text does NOT fire confirm", async () => {
-    const u = ue()
+    const u = setupUser()
     const onConfirm = vi.fn(() => Promise.resolve())
     render(
       <DeleteConfirmModal
@@ -103,7 +102,7 @@ describe("Enter submits type-to-confirm delete dialogs", () => {
   })
 
   it("DeleteConfirmModal: matchCase requires exact-case name (users/groups contract)", async () => {
-    const u = ue()
+    const u = setupUser()
     const onConfirm = vi.fn(() => Promise.resolve())
     render(
       <DeleteConfirmModal
@@ -132,7 +131,7 @@ describe("Enter submits type-to-confirm delete dialogs", () => {
   // message variants — details preview for the single row, a
   // count-titled variant with no details for the bulk delete.
   it("DeleteConfirmModal (message): Enter fires confirm after correct confirmation", async () => {
-    const u = ue()
+    const u = setupUser()
     const onConfirm = vi.fn(() => Promise.resolve())
     render(
       <DeleteConfirmModal
@@ -150,7 +149,7 @@ describe("Enter submits type-to-confirm delete dialogs", () => {
   })
 
   it("DeleteConfirmModal (message): Enter with wrong text does NOT fire confirm", async () => {
-    const u = ue()
+    const u = setupUser()
     const onConfirm = vi.fn(() => Promise.resolve())
     render(
       <DeleteConfirmModal
@@ -168,7 +167,7 @@ describe("Enter submits type-to-confirm delete dialogs", () => {
   })
 
   it("DeleteConfirmModal (bulk messages): count-titled variant still Enter-submits", async () => {
-    const u = ue()
+    const u = setupUser()
     const onConfirm = vi.fn(() => Promise.resolve())
     render(
       <DeleteConfirmModal
@@ -194,7 +193,7 @@ describe("Enter submits type-to-confirm delete dialogs", () => {
   // (requiredWord={username} + matchCase + inputId) is pinned by
   // tests/user-form-hardening.test.ts (UX-08).
   it("users page delegates its delete to the shared modal with the username as the confirm word", async () => {
-    const u = ue()
+    const u = setupUser()
     const onConfirm = vi.fn(() => Promise.resolve())
     render(
       <DeleteConfirmModal
@@ -239,7 +238,7 @@ describe("Enter submits type-to-confirm delete dialogs", () => {
   )
 
   it("groups delete: Enter fires delete after typing the group name", async () => {
-    const u = ue()
+    const u = setupUser()
     render(groupsDeleteModal())
     const input = document.getElementById("delete-group-confirm") as HTMLElement
     await u.type(input, group.name)
@@ -248,7 +247,7 @@ describe("Enter submits type-to-confirm delete dialogs", () => {
   })
 
   it("groups delete: Enter with wrong text does NOT fire delete", async () => {
-    const u = ue()
+    const u = setupUser()
     render(groupsDeleteModal())
     const input = document.getElementById("delete-group-confirm") as HTMLElement
     await u.type(input, "wrong-name")
