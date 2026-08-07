@@ -1,14 +1,17 @@
 # agent-mcp delivery bridge — Agent of Empires plugin manifest.
 #
 # Schema reference: aoe-plugin-api (PluginManifest), docs/plugin-api.md.
-# api_version 13 is required for the `session.mcp` capability / `session.mcp.set`
-# RPC (the per-session-MCP host patch). The `object_list` settings widget used
-# by the per-session mapping (`sessions`) needs ≥9; 13 covers both.
+# api_version 14 is required for the `sessions` dynamic_select option source (the
+# session_id dropdown) and the `password` (masked) field type (the token field).
+# 13 already covers the `session.mcp` capability / `session.mcp.set` RPC (the
+# per-session-MCP host patch) and the `object_list` widget (≥9); 14 adds both
+# field-type niceties. A pre-14 host emits an "upgrade aoe" message rather than
+# an "unknown variant" error.
 
 id = "dev.dvaerum.agent-mcp-delivery"
 name = "agent-mcp Delivery Bridge"
 version = "0.1.0"
-api_version = 13
+api_version = 14
 description = "Injects agent-mcp delivery notifications into AoE-run sessions that don't poll wait_for_events (ADR-0021): subscribes to each covered session's delivery SSE stream, reports transport-status up, injects skinny (id/subject/status only) nudges via AoE's /send and /acp/prompt routes, and (optionally) wires agent-mcp's tools into each covered session as a per-session MCP server."
 
 # runtime.worker: run the worker at all (and the config.get host RPC).
@@ -95,15 +98,16 @@ max_items = 200
 [[settings.fields]]
 key = "session_id"
 label = "AoE session id"
-description = "The session to cover. Matches sessions.list[].id (stable across respawn)."
-type = "string"
+description = "The session to cover. Pick from the live AoE sessions (label is '<title> (<id>)'); the stored value is the session id (stable across respawn), matching sessions.list[].id."
+type = "dynamic_select"
+option_source = "sessions"
 required = true
 
 [[settings.fields]]
 key = "token"
 label = "agent-mcp token"
-description = "The session's agent-mcp bearer (mint one via agent-mcp's Register Agent). Authenticates BOTH the delivery stream and the injected MCP tools."
-type = "string"
+description = "The session's agent-mcp bearer (mint one via agent-mcp's Register Agent). Authenticates BOTH the delivery stream and the injected MCP tools. Masked in the UI."
+type = "password"
 required = true
 
 [[settings.fields]]
