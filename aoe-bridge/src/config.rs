@@ -3,8 +3,10 @@
 //! ## The model: one base, everything derived
 //!
 //! There is exactly ONE agent-mcp URL to configure — `agent_mcp_base`, the
-//! router mount root (e.g. `https://host/agent-mcp`). Every per-session URL is
-//! derived from it plus the row's `project`:
+//! BARE router address you reach it at (on the same host `http://127.0.0.1:1337`,
+//! no `/agent-mcp`). The `/agent-mcp` prefix is a reverse-proxy concern (a front
+//! door may serve the router under it externally), not part of this base. Every
+//! per-session URL is derived from it plus the row's `project`:
 //!
 //! ```text
 //!   delivery = <agent_mcp_base>/api/<project>   (SSE /delivery/stream + status POST)
@@ -26,8 +28,9 @@
 //!
 //! ## Assumptions (see README)
 //! - `session_id` matches `sessions.list[].id` (stable across respawn).
-//! - `agent_mcp_base` is the router mount root; the bridge appends
-//!   `/api/<project>` (+ `/delivery/stream|status`) and `/mcp/<project>`.
+//! - `agent_mcp_base` is the bare router address (no reverse-proxy prefix); the
+//!   bridge appends `/api/<project>` (+ `/delivery/stream|status`) and
+//!   `/mcp/<project>`.
 //! - `token` == the session's agent-mcp bearer; it authenticates BOTH the
 //!   delivery stream and the injected MCP server.
 //! - `sessions.list` exposes no definitive terminal/structured flag, so `auto`
@@ -59,9 +62,10 @@ pub struct Settings {
     /// AoE serve bearer token, only if this AoE instance runs with auth. Empty
     /// for a `--auth=none` instance.
     pub aoe_token: String,
-    /// The agent-mcp router mount root shared by all covered sessions, e.g.
-    /// `https://host/agent-mcp`. The bridge derives BOTH per-session URLs from
-    /// it + the row's `project`:
+    /// The BARE agent-mcp router address shared by all covered sessions (e.g.
+    /// `http://127.0.0.1:1337`, no `/agent-mcp` — that prefix is a reverse-proxy
+    /// concern, not part of this base). The bridge derives BOTH per-session URLs
+    /// from it + the row's `project`:
     ///   delivery = `<agent_mcp_base>/api/<project>`   (SSE + status POST)
     ///   mcp      = `<agent_mcp_base>/mcp/<project>`   (injected MCP server)
     /// Blank ⇒ no routes resolve (nothing to point at).

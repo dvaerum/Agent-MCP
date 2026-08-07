@@ -45,7 +45,7 @@ default = true
 [[settings]]
 key = "agent_mcp_base"
 label = "agent-mcp base URL"
-description = "The agent-mcp router mount root, e.g. https://host/agent-mcp. The bridge derives every covered session's delivery URL (<base>/api/<project>) and MCP URL (<base>/mcp/<project>) from this plus the row's project — you never enter a per-session URL. Blank ⇒ the bridge covers nothing."
+description = "The agent-mcp router's base URL. Use the BARE address you reach it at — on the same host that's http://127.0.0.1:1337, with NO /agent-mcp. The /agent-mcp prefix is a reverse-proxy concern (a front door may serve the router under it externally); it does not belong in this base. The bridge derives each covered session's delivery URL (<base>/api/<project>) and MCP URL (<base>/mcp/<project>) from this plus the row's project. Blank ⇒ the bridge covers nothing."
 type = "string"
 default = ""
 

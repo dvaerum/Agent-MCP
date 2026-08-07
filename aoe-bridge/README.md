@@ -46,8 +46,10 @@ knowledge of AoE; the dependency points from the runtime into agent-mcp.
 ## The session → route mapping
 
 **One base, everything derived.** There is exactly one agent-mcp URL to
-configure — `agent_mcp_base`, the router mount root (e.g. `https://host/agent-mcp`).
-Every per-session URL is derived from it plus the row's `project`:
+configure — `agent_mcp_base`, the **bare** router address you reach it at (on the
+same host `http://127.0.0.1:1337`, no `/agent-mcp` — that prefix is a
+reverse-proxy concern, per ADR-0020, not part of this base). Every per-session
+URL is derived from it plus the row's `project`:
 
 ```text
 delivery = <agent_mcp_base>/api/<project>   (SSE /delivery/stream + status POST)
@@ -88,8 +90,9 @@ provisioned.
 - **`session_id` == `sessions.list[].id`.** The bridge only opens a stream for a
   configured session while it is present in `sessions.list`; a configured
   session that has left the list is reported `dead` and its stream dropped.
-- **`agent_mcp_base` is the router mount root.** The bridge appends
-  `/api/<project>` (+ `/delivery/stream|status`) and `/mcp/<project>`.
+- **`agent_mcp_base` is the bare router address** (no reverse-proxy prefix). The
+  bridge appends `/api/<project>` (+ `/delivery/stream|status`) and
+  `/mcp/<project>`.
 - **`token`** authenticates both the SSE subscribe and the status POST; it is
   the session's agent-mcp worker bearer.
 - **Mode `auto` is best-effort.** `sessions.list` exposes no definitive
