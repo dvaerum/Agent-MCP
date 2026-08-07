@@ -15,7 +15,6 @@ import userEvent from "@testing-library/user-event"
 const ue = () => userEvent.setup({ pointerEventsCheck: 0 })
 
 import { DeleteConfirmModal } from "@/components/dashboard/modals/delete-confirm-modal"
-import { DeleteMessageModal } from "@/components/dashboard/modals/delete-message-modal"
 
 // The groups delete modal calls the router API directly; stub it so the
 // handler runs without network and we can assert it fired. (The users
@@ -126,15 +125,22 @@ describe("Enter submits type-to-confirm delete dialogs", () => {
     await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1))
   })
 
-  it("DeleteMessageModal: Enter fires confirm after correct confirmation", async () => {
+  // The messages page's single/bulk delete dialogs are the shared
+  // <DeleteConfirmModal> too (delete-message-modal.tsx was subsumed by
+  // the Messages migration, exactly as delete-memory-modal.tsx was by
+  // the Memories one). Keep the Enter-submit contract pinned for the
+  // message variants — details preview for the single row, a
+  // count-titled variant with no details for the bulk delete.
+  it("DeleteConfirmModal (message): Enter fires confirm after correct confirmation", async () => {
     const u = ue()
     const onConfirm = vi.fn(() => Promise.resolve())
     render(
-      <DeleteMessageModal
-        message={message}
+      <DeleteConfirmModal
         open
         onOpenChange={() => {}}
         onConfirm={onConfirm}
+        entityLabel="Message"
+        details={<div>{message.message_content}</div>}
       />,
     )
     const input = document.getElementById("confirmation") as HTMLElement
@@ -143,21 +149,43 @@ describe("Enter submits type-to-confirm delete dialogs", () => {
     await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1))
   })
 
-  it("DeleteMessageModal: Enter with wrong text does NOT fire confirm", async () => {
+  it("DeleteConfirmModal (message): Enter with wrong text does NOT fire confirm", async () => {
     const u = ue()
     const onConfirm = vi.fn(() => Promise.resolve())
     render(
-      <DeleteMessageModal
-        message={message}
+      <DeleteConfirmModal
         open
         onOpenChange={() => {}}
         onConfirm={onConfirm}
+        entityLabel="Message"
+        details={<div>{message.message_content}</div>}
       />,
     )
     const input = document.getElementById("confirmation") as HTMLElement
     await u.type(input, "nope")
     await u.keyboard("{Enter}")
     expect(onConfirm).not.toHaveBeenCalled()
+  })
+
+  it("DeleteConfirmModal (bulk messages): count-titled variant still Enter-submits", async () => {
+    const u = ue()
+    const onConfirm = vi.fn(() => Promise.resolve())
+    render(
+      <DeleteConfirmModal
+        open
+        onOpenChange={() => {}}
+        onConfirm={onConfirm}
+        entityLabel="Message"
+        inputId="bulk-confirmation"
+        title="Delete 3 Messages"
+        description="This action cannot be undone. The 3 selected messages will be permanently deleted."
+        confirmLabel="Delete 3 Messages"
+      />,
+    )
+    const input = document.getElementById("bulk-confirmation") as HTMLElement
+    await u.type(input, "DELETE")
+    await u.keyboard("{Enter}")
+    await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1))
   })
 
   // Users delete: the page-level modal was retired in favour of the

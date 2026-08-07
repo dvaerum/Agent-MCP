@@ -306,9 +306,14 @@ describe("MUX-10: long-content robustness", () => {
 
   it("desktop From/To cells cap width; mobile shows full ids", () => {
     // Desktop From/To cells stay width-capped + truncate (the wide table
-    // has limited column room; hover reveals the full id).
+    // has limited column room; hover reveals the full id). Post-scaffold
+    // the cell element is emitted by <ResponsiveDataTable>, so the cap
+    // is declared on the column spec (`cellClassName`) instead of an
+    // inline <TableCell className>. Accept either spelling — the pinned
+    // property is that BOTH id columns stay capped at 160px.
     expect(
-      (dash.match(/<TableCell className="max-w-\[160px\]">/g) ?? []).length,
+      (dash.match(/(<TableCell className|cellClassName:) "max-w-\[160px\]"/g) ?? [])
+        .length,
     ).toBeGreaterThanOrEqual(2)
     // Mobile cards, by contrast, show the FULL sender/recipient: the id
     // badges are no longer capped to 40% + truncated — they break-all and
