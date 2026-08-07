@@ -17,14 +17,16 @@ const ue = () => userEvent.setup({ pointerEventsCheck: 0 })
 import { DeleteConfirmModal } from "@/components/dashboard/modals/delete-confirm-modal"
 import { DeleteMessageModal } from "@/components/dashboard/modals/delete-message-modal"
 
-// Users/groups delete modals call the router API directly; stub it so the
-// handler runs without network and we can assert it fired.
+// The groups delete modal calls the router API directly; stub it so the
+// handler runs without network and we can assert it fired. (The users
+// page no longer ships its own delete modal — it delegates to the
+// shared <DeleteConfirmModal> with `requiredWord={username}` +
+// `matchCase`, pinned by the matchCase case below.)
 const requestMock = vi.fn((..._args: unknown[]) => Promise.resolve({}))
 vi.mock("@/lib/router-api", () => ({
   routerApi: { request: (...args: unknown[]) => requestMock(...args) },
 }))
 
-import { DeleteUserModal } from "@/components/dashboard/users-dashboard"
 import { DeleteGroupModal } from "@/components/dashboard/groups-dashboard"
 
 import type { Message } from "@/lib/api"
@@ -157,38 +159,33 @@ describe("Enter submits type-to-confirm delete dialogs", () => {
     expect(onConfirm).not.toHaveBeenCalled()
   })
 
-  it("DeleteUserModal: Enter fires delete after typing the username", async () => {
+  // Users delete: the page-level modal was retired in favour of the
+  // shared <DeleteConfirmModal>. Its Enter + exact-case-username
+  // contract is covered by the `matchCase` case above; the wiring
+  // (requiredWord={username} + matchCase + inputId) is pinned by
+  // tests/user-form-hardening.test.ts (UX-08).
+  it("users page delegates its delete to the shared modal with the username as the confirm word", async () => {
     const u = ue()
-    const onDeleted = vi.fn(() => Promise.resolve())
+    const onConfirm = vi.fn(() => Promise.resolve())
     render(
-      <DeleteUserModal
-        user={user}
+      <DeleteConfirmModal
         open
         onOpenChange={() => {}}
-        onDeleted={onDeleted}
-      />,
-    )
-    const input = document.getElementById("delete-user-confirm") as HTMLElement
-    await u.type(input, user.username)
-    await u.keyboard("{Enter}")
-    await waitFor(() => expect(requestMock).toHaveBeenCalledTimes(1))
-  })
-
-  it("DeleteUserModal: Enter with wrong text does NOT fire delete", async () => {
-    const u = ue()
-    const onDeleted = vi.fn(() => Promise.resolve())
-    render(
-      <DeleteUserModal
-        user={user}
-        open
-        onOpenChange={() => {}}
-        onDeleted={onDeleted}
+        onConfirm={onConfirm}
+        entityLabel="User"
+        requiredWord={user.username}
+        matchCase
+        inputId="delete-user-confirm"
       />,
     )
     const input = document.getElementById("delete-user-confirm") as HTMLElement
     await u.type(input, "bob")
     await u.keyboard("{Enter}")
-    expect(requestMock).not.toHaveBeenCalled()
+    expect(onConfirm).not.toHaveBeenCalled()
+    await u.clear(input)
+    await u.type(input, user.username)
+    await u.keyboard("{Enter}")
+    await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1))
   })
 
   it("DeleteGroupModal: Enter fires delete after typing the group name", async () => {
