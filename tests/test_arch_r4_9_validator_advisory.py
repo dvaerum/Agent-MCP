@@ -41,6 +41,13 @@ import inspect
 
 import pytest
 
+import agent_mcp.tools.task_tools  # noqa: F401  (see NB above)
+from agent_mcp.features.task_placement import validator as validator_mod
+from agent_mcp.features.task_placement.suggestions import (
+    format_suggestions_for_agent,
+)
+from agent_mcp.features.task_placement.validator import validate_task_placement
+
 # NB: import order matters here (pre-existing, unrelated to this PR's
 # change). ``agent_mcp.tools.task_tools`` imports
 # ``agent_mcp.features.task_placement.validator``, and validator.py in
@@ -52,14 +59,6 @@ import pytest
 # "cannot import name ... from partially initialized module". Import
 # ``tests.harness`` first (it pulls in the full app) to sidestep it.
 from tests.harness import mcp_session
-
-import agent_mcp.tools.task_tools  # noqa: F401  (see NB above)
-from agent_mcp.features.task_placement import validator as validator_mod
-from agent_mcp.features.task_placement.suggestions import (
-    format_suggestions_for_agent,
-)
-from agent_mcp.features.task_placement.validator import validate_task_placement
-
 
 # NB: no module-level ``pytestmark = pytest.mark.asyncio`` — this file
 # mixes sync structural tests with async ones, and applying the mark

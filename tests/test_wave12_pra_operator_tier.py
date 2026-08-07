@@ -38,7 +38,6 @@ import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
 
-
 pytestmark = pytest.mark.asyncio
 
 

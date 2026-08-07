@@ -20,6 +20,7 @@ import json
 from pathlib import Path
 
 import pytest
+
 from tests.harness import with_bearer
 
 pytestmark = pytest.mark.asyncio
@@ -33,8 +34,8 @@ def _content_text(blocks) -> str:
 async def test_unassigned_task_wakes_every_active_agent(tmp_path: Path) -> None:
     """A created unassigned task wakes every active agent, regardless of
     any (now-removed) capability tags."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.task_tools import assign_task_tool_impl
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         worker_a = await admin.create_worker("worker-a")
@@ -86,8 +87,8 @@ async def test_second_unassigned_task_also_wakes_everyone(
     """There is no per-agent capability gate: a second unassigned task
     (which previously might have been filtered by tags) still reaches
     every agent."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.task_tools import assign_task_tool_impl
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         generalist = await admin.create_worker("generalist")

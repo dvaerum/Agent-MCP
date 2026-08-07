@@ -28,7 +28,6 @@ import json
 import re
 from pathlib import Path
 
-
 _REPO = Path(__file__).resolve().parents[1]
 _DASHBOARD = _REPO / "agent_mcp" / "dashboard"
 _CATALOG = _REPO / "agent_mcp" / "prompts" / "catalog.json"

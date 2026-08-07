@@ -51,11 +51,10 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 import pytest
-
 
 # A value chosen to be unmistakable in any stdout output. The prefix
 # (first 20 chars) is what the legacy code used to log, so we assert
@@ -77,7 +76,7 @@ _SENTINEL_VAR_VALUE = "do-not-log-this-name-either"
 def _project_root() -> Path:
     """The directory where ``agent_mcp/__main__.py``'s discovery walk
     will look for ``.env`` (= parent.parent of __main__.py)."""
-    import agent_mcp  # noqa: PLC0415
+    import agent_mcp
 
     return Path(agent_mcp.__file__).resolve().parent.parent
 
@@ -132,6 +131,7 @@ def test_startup_does_not_leak_openai_key_prefix(_tmp_env_file: Path) -> None:
         text=True,
         timeout=30,
         env=env,
+        check=False,
     )
 
     # Diagnostic dump on any assertion failure.

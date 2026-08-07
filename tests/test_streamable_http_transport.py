@@ -36,7 +36,6 @@ import pytest
 
 from tests.harness import mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -78,8 +77,11 @@ def _nested_array_body(depth: int, *, request_id: int = 1) -> bytes:
     array nested `depth` levels deep, as raw bytes (see `_post_mcp_raw`)."""
     nested = ("[" * depth) + "1" + ("]" * depth)
     return (
-        '{"jsonrpc":"2.0","id":%d,"method":"tools/call",'
-        '"params":{"name":"x","arguments":%s}}' % (request_id, nested)
+        '{"jsonrpc":"2.0","id":'
+        + str(request_id)
+        + ',"method":"tools/call","params":{"name":"x","arguments":'
+        + nested
+        + "}}"
     ).encode("utf-8")
 
 
@@ -236,8 +238,9 @@ async def test_get_mcp_is_routed_to_streamable_http_manager(tmp_path) -> None:
     our `_McpAsgiApp` wrapper, and the wrapper holds a real
     `StreamableHTTPSessionManager` instance (not `None`).
     """
-    from starlette.routing import Mount
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+    from starlette.routing import Mount
+
     from agent_mcp.app.main_app import _McpAsgiApp
 
     async with mcp_session(tmp_path) as admin:

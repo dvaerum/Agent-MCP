@@ -32,10 +32,8 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-from typing import Dict, Optional
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # INFO-002 — direct tests for the handle_options Origin allowlist
@@ -51,7 +49,7 @@ class _StubRequest:
     ``Request`` keeps the test focused on the allowlist check.
     """
 
-    def __init__(self, headers: Optional[Dict[str, str]] = None) -> None:
+    def __init__(self, headers: dict[str, str] | None = None) -> None:
         self.headers = headers or {}
 
 

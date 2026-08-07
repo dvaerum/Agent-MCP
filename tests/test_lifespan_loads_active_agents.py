@@ -46,7 +46,6 @@ import pytest
 
 from agent_mcp.core import globals as g
 
-
 pytestmark = pytest.mark.asyncio
 
 

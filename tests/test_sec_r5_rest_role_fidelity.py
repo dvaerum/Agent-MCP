@@ -27,7 +27,7 @@ paths) are unaffected.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 import pytest
 
@@ -41,7 +41,6 @@ from agent_mcp.app.deps import (
 from agent_mcp.core.principal import Principal
 from tests.harness import make_principal
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -49,7 +48,7 @@ pytestmark = pytest.mark.asyncio
 
 
 class _State:
-    def __init__(self, principal: Optional[Principal]) -> None:
+    def __init__(self, principal: Principal | None) -> None:
         self.principal = principal
 
 
@@ -64,9 +63,9 @@ class _FakeRequest:
 
     def __init__(
         self,
-        principal: Optional[Principal],
+        principal: Principal | None,
         *,
-        cookies: Optional[dict[str, str]] = None,
+        cookies: dict[str, str] | None = None,
         method: str = "DELETE",
     ) -> None:
         self.state = _State(principal)
@@ -79,7 +78,7 @@ class _FakeRequest:
         return b""
 
 
-def _forwarding_principal(role: Optional[str], *, user_id: str = "op-1") -> Principal:
+def _forwarding_principal(role: str | None, *, user_id: str = "op-1") -> Principal:
     """A ``forwarding_header`` Principal as the auth middleware would build
     it — carrying the operator's REAL signed ``project_role``."""
     return make_principal(

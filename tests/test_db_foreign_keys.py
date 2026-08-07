@@ -50,7 +50,6 @@ import pytest
 
 from tests.harness import mcp_session
 
-
 # Default to asyncio for the async tests; the two synchronous
 # orphan-cleanup tests at the bottom override via their own decorators.
 pytestmark = pytest.mark.asyncio
@@ -351,6 +350,7 @@ def _run_migration_to_head(db_path: Path, env: dict[str, str]) -> tuple[int, str
         env=full_env,
         capture_output=True,
         text=True,
+        check=False,
     )
     return proc.returncode, proc.stdout, proc.stderr
 

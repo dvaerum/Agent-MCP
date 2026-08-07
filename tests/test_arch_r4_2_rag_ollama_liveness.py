@@ -38,14 +38,11 @@ finds nothing. Post-fix, the doc is embedded and the query returns it.
 
 from __future__ import annotations
 
-from typing import List
-
 import anyio
 import pytest
 
 from agent_mcp.features.rag import indexing as indexing_mod
 from tests.harness import mcp_session
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -63,10 +60,10 @@ class _FakeEmbeddingClient:
     def __init__(self, dimension: int) -> None:
         self.dimension = dimension
 
-    def embed(self, texts: List[str]) -> List[List[float]]:
+    def embed(self, texts: list[str]) -> list[list[float]]:
         return [[0.0] * self.dimension for _ in texts]
 
-    async def aembed(self, texts: List[str]) -> List[List[float]]:
+    async def aembed(self, texts: list[str]) -> list[list[float]]:
         return [[0.0] * self.dimension for _ in texts]
 
 
@@ -112,7 +109,6 @@ async def test_ollama_only_deploy_indexes_and_queries_markdown(
         async def fake_sleep(duration):
             if duration >= 30:
                 g.server_running = False
-            return
 
         monkeypatch.setattr(anyio, "sleep", fake_sleep)
         g.server_running = True

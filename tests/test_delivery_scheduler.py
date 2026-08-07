@@ -33,16 +33,16 @@ def _clean():
 
 
 def _cfg(**over) -> dp.DeliveryPolicyConfig:
-    base = dict(
-        enabled=True,
-        on_unread_messages=True,
-        on_unfinished_tasks=True,
-        on_unassigned_tasks=False,
-        backoff_initial_seconds=30,
-        backoff_max_seconds=3600,
-        cooldown_seconds=60,
-        wake_dormant=False,
-    )
+    base = {
+        "enabled": True,
+        "on_unread_messages": True,
+        "on_unfinished_tasks": True,
+        "on_unassigned_tasks": False,
+        "backoff_initial_seconds": 30,
+        "backoff_max_seconds": 3600,
+        "cooldown_seconds": 60,
+        "wake_dormant": False,
+    }
     base.update(over)
     return dp.DeliveryPolicyConfig(**base)
 

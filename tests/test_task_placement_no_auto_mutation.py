@@ -33,13 +33,11 @@ The tests below pin both halves of the new contract for both tools:
 from __future__ import annotations
 
 import re
-from typing import Any, Dict
+from typing import Any
 
 import pytest
 
-from tests.harness import mcp_session
-from tests.harness import with_bearer
-
+from tests.harness import mcp_session, with_bearer
 
 pytestmark = pytest.mark.asyncio
 
@@ -85,7 +83,7 @@ def _make_validator_mock(
         # stand-in keeps the same signature as the patched target.
         requesting_agent_id: str | None = None,
         can_view_all_tasks: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         return {
             "status": status,
             "suggestions": {

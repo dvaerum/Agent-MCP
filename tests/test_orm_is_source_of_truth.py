@@ -31,7 +31,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 # Tables expected to live under `agent_mcp.db.models` after PR-W3.
 # `rag_embeddings` is a sqlite-vec `vec0` virtual table — not modelled
 # in the ORM; `init_database()` keeps owning its creation behind the
@@ -59,8 +58,8 @@ def _collect_orm_table_map():
 
     Imports `agent_mcp.db.models` and walks `Base.metadata.tables`.
     """
-    from agent_mcp.db.engine import Base
     from agent_mcp.db import models  # noqa: F401  (force registration)
+    from agent_mcp.db.engine import Base
 
     table_map = {}
     for table_name, table in Base.metadata.tables.items():
@@ -142,6 +141,7 @@ def test_ts_type_generator_is_deterministic(tmp_path) -> None:
             cwd=repo_root,
             capture_output=True,
             text=True,
+            check=False,
         )
         assert result.returncode == 0, (
             f"generator failed: stdout={result.stdout!r} "
@@ -172,6 +172,7 @@ def test_every_orm_column_appears_in_generated_ts(tmp_path) -> None:
         cwd=repo_root,
         capture_output=True,
         text=True,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
 
@@ -204,8 +205,9 @@ def test_orm_create_all_matches_init_database_table_set(tmp_path) -> None:
     doesn't model)."""
     # Drive the ORM-only create_all into a tmp DB.
     import sqlalchemy as sa
-    from agent_mcp.db.engine import Base
+
     from agent_mcp.db import models  # noqa: F401  (force registration)
+    from agent_mcp.db.engine import Base
 
     db_path = tmp_path / "orm_only.db"
     engine = sa.create_engine(f"sqlite:///{db_path}", future=True)
@@ -283,8 +285,8 @@ def test_migration_chain_matches_create_all_schema(tmp_path, monkeypatch) -> Non
     """
     import sqlalchemy as sa
 
-    from agent_mcp.db.engine import Base
     from agent_mcp.db import models  # noqa: F401  (force registration)
+    from agent_mcp.db.engine import Base
 
     # DB A: ORM-only, no migrations involved.
     db_a = tmp_path / "create_all_only.db"
@@ -303,8 +305,8 @@ def test_migration_chain_matches_create_all_schema(tmp_path, monkeypatch) -> Non
 
     _engine_mod.reset_engine_cache()
 
-    from agent_mcp.db.schema import init_database
     from agent_mcp.db.migrations_runner import run_migrations_upgrade
+    from agent_mcp.db.schema import init_database
 
     init_database()
     run_migrations_upgrade()
@@ -349,10 +351,9 @@ def test_round_trip_orm_to_pydantic_to_orm() -> None:
         # Build a sample dict with sentinel values per column type.
         sample = {}
         for col in orm_cls.__table__.columns:
-            pytype = col.type.python_type if hasattr(col.type, "python_type") else str
             try:
-                pytype_val = pytype
-            except Exception:
+                pytype_val = col.type.python_type
+            except (AttributeError, NotImplementedError):
                 pytype_val = str
             if pytype_val is bool:
                 sample[col.name] = False

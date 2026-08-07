@@ -23,7 +23,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 # Synchronous tests (no harness): the CLI subcommand runs against a
 # pre-built sqlite file; the helper runs against any connection.
 # No pytest-asyncio markers needed.
@@ -73,6 +72,7 @@ def _run_cli(*args: str) -> subprocess.CompletedProcess:
         [sys.executable, "-m", "agent_mcp.cli", *args],
         capture_output=True,
         text=True,
+        check=False,
     )
 
 

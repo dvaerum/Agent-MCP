@@ -29,7 +29,6 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from tests.harness import mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 

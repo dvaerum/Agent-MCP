@@ -16,6 +16,7 @@ Starlette's routing layer, before the recording ASGI wrapper runs).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 import time
@@ -49,8 +50,8 @@ async def test_initialize_through_router_records_client_info(
     caller's ``clientInfo.name`` in the backend's registry — so the
     hold-strategy resolver can hand Claude Code the heartbeat hold."""
     from agent_mcp.core import client_info_registry as reg
-    from agent_mcp.repositories import agent_repo
     from agent_mcp.core.auth import generate_token
+    from agent_mcp.repositories import agent_repo
 
     name = "recproj"
     projdir = str(tmp_path / "proj")
@@ -93,4 +94,4 @@ async def test_initialize_through_router_records_client_info(
         )
     finally:
         server.should_exit = True
-        time.sleep(0.3)
+        await asyncio.sleep(0.3)

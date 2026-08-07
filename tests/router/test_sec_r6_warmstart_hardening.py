@@ -42,7 +42,6 @@ from aiohttp import web
 
 from tests.harness import assert_ran_off_event_loop
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -181,7 +180,6 @@ async def test_ensure_aborts_when_project_deleted_while_lock_held(
         # Stand-in for a concurrent delete_project_handler landing while
         # we hold the lock: drop the registry row mid-critical-section.
         router_module._REGISTRY.unregister(name)
-        return None
 
     monkeypatch.setattr(
         _po, "ensure_forwarding_hmac_key", _delete_during_lock,
@@ -284,7 +282,6 @@ async def test_two_rapid_app_gets_schedule_at_most_one_warm(
     async def _slow_ensure(name: str, role: str):
         calls.append(name)
         await gate.wait()  # keep the first task pending across both GETs
-        return None
 
     monkeypatch.setattr(router_module, "_ensure", _slow_ensure)
     client = await aiohttp_client(router_app)

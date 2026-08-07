@@ -26,7 +26,9 @@ from __future__ import annotations
 import pytest
 
 from agent_mcp.app.main_app import _build_principal_from_request
-from agent_mcp.tools import admin_tools as _admin_tools  # noqa: F401 — registers register_agent
+from agent_mcp.tools import (
+    admin_tools as _admin_tools,  # noqa: F401 — registers register_agent
+)
 from agent_mcp.tools.registry import list_available_tools
 
 

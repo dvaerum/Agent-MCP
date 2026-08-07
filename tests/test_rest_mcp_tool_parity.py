@@ -34,7 +34,6 @@ import pytest
 
 from tests.harness import mcp_session
 
-
 # --- /api/terminate-agent  <->  terminate_agent ---
 
 

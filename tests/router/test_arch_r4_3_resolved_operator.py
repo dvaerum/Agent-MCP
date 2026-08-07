@@ -52,7 +52,6 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
-
 pytestmark = [pytest.mark.asyncio, pytest.mark.no_auth_seed_session]
 
 

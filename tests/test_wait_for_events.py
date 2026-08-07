@@ -24,11 +24,13 @@ implementation lands.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as _dt
 import json
 from pathlib import Path
 
 import pytest
+
 from tests.harness import with_bearer
 
 pytestmark = pytest.mark.asyncio
@@ -117,10 +119,10 @@ async def test_empty_timeout_returns_empty_envelope(tmp_path: Path) -> None:
 async def test_fast_path_returns_pending_messages(tmp_path: Path) -> None:
     """Pre-existing messages newer than `since` are returned without
     waiting on the signal."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.agent_communication_tools import (
         send_agent_message_tool_impl,
     )
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -169,10 +171,10 @@ async def test_fast_path_returns_pending_messages(tmp_path: Path) -> None:
 async def test_wake_on_message_within_one_second(tmp_path: Path) -> None:
     """A `wait_for_events` call already in flight must wake within
     ~1s of `send_agent_message` to the same recipient."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.agent_communication_tools import (
         send_agent_message_tool_impl,
     )
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -218,10 +220,10 @@ async def test_wake_on_broadcast(tmp_path: Path) -> None:
     """`broadcast_admin_message` writes one message row per active
     recipient; each recipient's waiter wakes with a `broadcast`
     event."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.agent_communication_tools import (
         broadcast_admin_message_tool_impl,
     )
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -263,8 +265,8 @@ async def test_wake_on_task_assigned(tmp_path: Path) -> None:
     """`assign_task` to a worker wakes that worker's waiter with a
     `task_assigned` event (assigned_to transitioned INTO the agent
     since the cursor)."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.task_tools import assign_task_tool_impl
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -310,10 +312,10 @@ async def test_wake_on_task_assigned(tmp_path: Path) -> None:
 async def test_cursor_advances_between_calls(tmp_path: Path) -> None:
     """Two-call sequence: call 1 returns N events + `next_cursor`;
     call 2 with that cursor returns 0 events (until something new)."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.agent_communication_tools import (
         send_agent_message_tool_impl,
     )
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -377,8 +379,8 @@ async def test_timeout_clamp_to_max(tmp_path: Path) -> None:
     short captures and assert the slice timeout matches the clamped
     ceiling.
     """
-    from tests.harness import mcp_session
     import agent_mcp.tools.agent_communication_tools as acm
+    from tests.harness import mcp_session
 
     captured_timeouts: list[float] = []
 
@@ -396,10 +398,8 @@ async def test_timeout_clamp_to_max(tmp_path: Path) -> None:
         # SINGLE iteration. Raising TimeoutError here instead made the
         # impl loop until its wall-clock deadline (the post-clamp 300s
         # ceiling) — a ~300s busy-spin that dominated the whole suite.
-        try:
+        with contextlib.suppress(Exception):
             awaitable.close()
-        except Exception:
-            pass
         return {"type": "test-wake", "timestamp": "z"}
 
     async with mcp_session(tmp_path) as admin:
@@ -444,10 +444,10 @@ async def test_caller_agent_id_derived_from_token(tmp_path: Path) -> None:
     they cannot pass a different recipient_id to peek at someone
     else's inbox. The tool derives the agent_id from the bearer
     token via `get_agent_id`."""
-    from tests.harness import mcp_session
     from agent_mcp.tools.agent_communication_tools import (
         send_agent_message_tool_impl,
     )
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")

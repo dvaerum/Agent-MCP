@@ -26,7 +26,6 @@ from agent_mcp.core import globals as g
 from agent_mcp.repositories import agent_repo
 from tests.harness import mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 

@@ -62,6 +62,7 @@ def _resolve_config(overrides: dict[str, str]) -> dict:
         cwd=str(_REPO_ROOT),
         capture_output=True,
         text=True,
+        check=False,
     )
     assert proc.returncode == 0, (
         f"probe subprocess failed ({proc.returncode}):\n{proc.stderr}"

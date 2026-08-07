@@ -29,8 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.harness import mcp_session, seed_agent_rows
-from tests.harness import with_bearer
+from tests.harness import mcp_session, seed_agent_rows, with_bearer
 
 pytestmark = pytest.mark.asyncio
 

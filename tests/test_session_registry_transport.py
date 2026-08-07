@@ -40,13 +40,12 @@ import secrets
 import socket
 import threading
 import time
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import AsyncIterator
 
 import httpx
 import pytest
 import pytest_asyncio
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -154,6 +153,7 @@ async def live_server(tmp_path: Path) -> AsyncIterator[tuple[str, str]]:
     slate).
     """
     import os
+
     from agent_mcp.core import globals as g
     from agent_mcp.db import engine as _engine
 
@@ -336,7 +336,7 @@ async def _read_sse_event(response: httpx.Response, timeout: float = 3.0) -> dic
 
     try:
         return await asyncio.wait_for(_consume(), timeout=timeout)
-    except asyncio.TimeoutError as exc:
+    except TimeoutError as exc:
         raise AssertionError(
             f"timed out after {timeout}s waiting for an SSE `data:` frame"
         ) from exc
@@ -360,27 +360,31 @@ async def test_get_mcp_registers_session_and_runtime_queue(live_server) -> None:
     baseline_queues = _runtime_queues_size()
     assert _mcp_sessions_count_for("alice") == 0
 
-    async with httpx.AsyncClient(base_url=base_url, timeout=10.0, follow_redirects=True) as client:
-        async with client.stream(
+    async with (
+        httpx.AsyncClient(
+            base_url=base_url, timeout=10.0, follow_redirects=True
+        ) as client,
+        client.stream(
             "GET",
             "/mcp",
             headers={
                 "Authorization": f"Bearer {alice_token}",
                 "Accept": "text/event-stream",
             },
-        ) as response:
-            assert response.status_code == 200, await response.aread()
+        ) as response,
+    ):
+        assert response.status_code == 200, await response.aread()
 
-            for _ in range(40):
-                if _mcp_sessions_count_for("alice") >= 1:
-                    break
-                await asyncio.sleep(0.05)
-            assert _mcp_sessions_count_for("alice") == 1, (
-                "GET /mcp must register a session row for the bearer's agent_id"
-            )
-            assert _runtime_queues_size() >= baseline_queues + 1, (
-                "GET /mcp must attach an asyncio queue for runtime fan-out"
-            )
+        for _ in range(40):
+            if _mcp_sessions_count_for("alice") >= 1:
+                break
+            await asyncio.sleep(0.05)
+        assert _mcp_sessions_count_for("alice") == 1, (
+            "GET /mcp must register a session row for the bearer's agent_id"
+        )
+        assert _runtime_queues_size() >= baseline_queues + 1, (
+            "GET /mcp must attach an asyncio queue for runtime fan-out"
+        )
 
     # After the stream closes, the row + queue must be cleaned up.
     for _ in range(60):

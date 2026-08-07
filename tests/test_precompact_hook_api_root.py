@@ -36,7 +36,6 @@ from pathlib import Path
 
 import pytest
 
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOOK_TEMPLATE = (
     REPO_ROOT / "nix" / "agent-mcp-daemon-agent-precompact-hook.sh.in"

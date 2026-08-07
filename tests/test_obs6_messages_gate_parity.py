@@ -34,7 +34,6 @@ from agent_mcp.tools.agent_communication_tools import (
 )
 from tests.harness import make_principal, mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 

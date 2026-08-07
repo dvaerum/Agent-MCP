@@ -39,7 +39,6 @@ import pytest
 
 from tests.harness import mcp_session, seed_config_setting_as_sysadmin
 
-
 _REDACTED = "[redacted]"
 _BEARER_SECRET = "SENTINEL-AOE-BEARER-9f04"
 

@@ -48,7 +48,6 @@ import pytest
 
 from tests.harness import make_principal, mcp_session
 
-
 _REDACTED = "[redacted]"
 # The alembic head advances as migrations are added; keep this in lockstep
 # with the newest revision (0020 = agent last_activity_at for idle-stop).
@@ -702,8 +701,8 @@ async def test_view_project_settings_redaction(tmp_path: Path) -> None:
         assert "SENTINEL-VIEW-BEARER" in text
 
         # A non-confirmed operator-session principal gets the mask.
-        from agent_mcp.tools.registry import dispatch_tool_call
         from agent_mcp.core.tool_result import Ok
+        from agent_mcp.tools.registry import dispatch_tool_call
 
         # kind=forwarding_header + no project_role visible would lack the
         # cap; use an operator whose tier is nonetheless confirmed only

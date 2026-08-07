@@ -41,7 +41,6 @@ from pathlib import Path
 
 import pytest
 
-
 pytestmark = pytest.mark.no_auth_seed_session
 
 _ACCEPT = {"Accept": "application/vnd.agent-mcp.v1+json"}
@@ -151,8 +150,10 @@ _INFORMATIONAL_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
         # service descriptor's "mode" string (index_handler's sibling).
         (
             "app.py",
-            '"mode": "single-tenant" if SINGLE_TENANT_NAME is not None '
-            'else "multi-tenant",',
+            (
+                '"mode": "single-tenant" if SINGLE_TENANT_NAME is not None '
+                'else "multi-tenant",'
+            ),
         ),
     }
 )

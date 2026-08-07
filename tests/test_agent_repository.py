@@ -36,9 +36,9 @@ import datetime
 import sys
 
 import pytest
-from agent_mcp.app.main_app import create_app
 from starlette.testclient import TestClient
 
+from agent_mcp.app.main_app import create_app
 
 # --- Helpers -------------------------------------------------------------
 
@@ -99,7 +99,7 @@ class _CapturingBus:
     def __init__(self):
         self.events: list[tuple[str, str, dict]] = []
 
-    def notify(self, agent_id, event_type, payload):  # noqa: D401, ANN001
+    def notify(self, agent_id, event_type, payload):
         self.events.append((agent_id, event_type, payload or {}))
 
 

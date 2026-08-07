@@ -16,11 +16,10 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-
 
 # Every async test in this file uses the asyncio loop fixture from
 # pytest-asyncio. Apply once at module scope so individual tests stay
@@ -35,7 +34,7 @@ _STRICT_ACCEPT = {
 
 
 def _iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ── PATCH /api/router/projects/<name> ──────────────────────────────
@@ -238,8 +237,8 @@ async def test_alias_reaper_removes_expired_entries(
     )
     reg = project_registry.ProjectRegistry()
     reg.register("alpha", "/tmp/alpha")
-    past = _iso(datetime.now(timezone.utc) - timedelta(seconds=1))
-    future = _iso(datetime.now(timezone.utc) + timedelta(days=10))
+    past = _iso(datetime.now(UTC) - timedelta(seconds=1))
+    future = _iso(datetime.now(UTC) + timedelta(days=10))
     reg.add_alias("alpha", "expired-one", expires_at=past)
     reg.add_alias("alpha", "alive-one", expires_at=future)
 

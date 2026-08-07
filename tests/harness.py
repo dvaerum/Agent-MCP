@@ -78,10 +78,11 @@ import datetime as _dt
 import os
 import secrets
 import time
+from collections.abc import AsyncIterator
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, AsyncIterator, List, Optional
+from typing import TYPE_CHECKING, Any
 
 import mcp.types as mcp_types
 import pytest
@@ -97,8 +98,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 
 async def assert_ran_off_event_loop(
-    started_at: "List[float]",
-    loop_free_at: "List[float]",
+    started_at: list[float],
+    loop_free_at: list[float],
     *,
     block_sec: float,
     what: str,
@@ -150,7 +151,7 @@ async def assert_ran_off_event_loop(
 # --- Session classes ---
 
 
-def _result_text(result: List[mcp_types.TextContent]) -> str:
+def _result_text(result: list[mcp_types.TextContent]) -> str:
     """Concatenate text blocks from a tool-call result."""
     if not result:
         return ""
@@ -162,7 +163,7 @@ def _result_text(result: List[mcp_types.TextContent]) -> str:
     return "\n".join(parts)
 
 
-def _first_text(result: List[mcp_types.TextContent]) -> str:
+def _first_text(result: list[mcp_types.TextContent]) -> str:
     if not result:
         return ""
     return getattr(result[0], "text", "") or ""
@@ -276,14 +277,14 @@ class WorkerSession:
 
     token: str
     agent_id: str
-    _admin: "AdminClient"
+    _admin: AdminClient
     is_admin_caller: bool = False
 
     # --- Low-level call surface ---
 
     async def call(
         self, tool_name: str, arguments: dict[str, Any]
-    ) -> List[mcp_types.TextContent]:
+    ) -> list[mcp_types.TextContent]:
         """Invoke a tool through the registered CallToolRequest handler.
 
         Same path real SSE/JSON-RPC clients take. Bearer is bound via
@@ -386,7 +387,7 @@ class WorkerSession:
             source_token=self.token,
         )
 
-    async def list_tools(self) -> List[mcp_types.Tool]:
+    async def list_tools(self) -> list[mcp_types.Tool]:
         """`tools/list` as this bearer sees it (admin or worker filter
         per PR #55).
 
@@ -417,7 +418,7 @@ class WorkerSession:
 
     async def assert_tool_succeeds(
         self, tool_name: str, arguments: dict[str, Any]
-    ) -> List[mcp_types.TextContent]:
+    ) -> list[mcp_types.TextContent]:
         """Call `tool_name`; pytest.fail if isError or the response
         text matches the Unauthorized shape. Returns the content blocks
         on success so callers can assert on the result text.
@@ -438,7 +439,7 @@ class WorkerSession:
 
     async def wait_for_event(
         self,
-        since: Optional[str] = None,
+        since: str | None = None,
         timeout: int = 5,
     ) -> dict[str, Any]:
         """Call the `wait_for_events` MCP tool for this session and
@@ -472,8 +473,9 @@ class WorkerSession:
         """Hit `resources/read` for `uri` through the registered MCP
         handler with this session's bearer; return the first text
         block, empty string if none."""
-        from agent_mcp.tools.registry import request_auth_token
         from pydantic_core import Url
+
+        from agent_mcp.tools.registry import request_auth_token
 
         handler = self._admin._mcp_app_instance().request_handlers[
             mcp_types.ReadResourceRequest
@@ -849,18 +851,18 @@ class AdminClient(WorkerSession):
 
 def make_principal(
     *,
-    kind: "PrincipalKind",
-    user_id: Optional[str] = None,
-    agent_id: Optional[str] = None,
+    kind: PrincipalKind,
+    user_id: str | None = None,
+    agent_id: str | None = None,
     sysadmin: bool = False,
-    project_name: Optional[str] = None,
-    project_role: Optional[str] = None,
-    agent_role: "Optional[AgentRole]" = None,
+    project_name: str | None = None,
+    project_role: str | None = None,
+    agent_role: AgentRole | None = None,
     can_wake_loop: bool = False,
-    source_token: Optional[str] = None,
-    groups: Optional[frozenset] = frozenset(),
-    capabilities: Optional[frozenset] = None,
-) -> "Principal":
+    source_token: str | None = None,
+    groups: frozenset | None = frozenset(),
+    capabilities: frozenset | None = None,
+) -> Principal:
     """Construct a test :class:`Principal` with HONEST capabilities.
 
     arch-r5 #1: replaces the ~30 test-local ``_worker_principal`` /
@@ -1025,8 +1027,8 @@ def with_principal(principal):
     use returns a fresh handle that resets its own scope.
     """
     from agent_mcp.tools.registry import (
-        request_principal,
         request_auth_token,
+        request_principal,
     )
 
     cv_principal = request_principal.set(principal)
@@ -1086,8 +1088,9 @@ async def mcp_session(tmp_path: Path) -> AsyncIterator[AdminClient]:
         project_dir = tmp_path / "project"
         project_dir.mkdir(exist_ok=True)
 
-        from agent_mcp.app.main_app import create_app
         from starlette.testclient import TestClient
+
+        from agent_mcp.app.main_app import create_app
 
         app = create_app(project_dir=str(project_dir))
 

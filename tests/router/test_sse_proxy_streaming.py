@@ -40,7 +40,6 @@ import pytest
 import pytest_asyncio
 from aiohttp import web
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -318,7 +317,7 @@ async def _serve_router_on_tcp(router_app):
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
     await site.start()
-    port = site._server.sockets[0].getsockname()[1]  # noqa: SLF001
+    port = site._server.sockets[0].getsockname()[1]
     return runner, port
 
 
@@ -364,7 +363,7 @@ async def test_client_disconnect_frees_slot_without_a_subsequent_write(
     backend = quiet_streaming_backend
     runner, port = await _serve_router_on_tcp(router_app)
     try:
-        reader, writer = await _raw_sse_open(port)
+        _reader, writer = await _raw_sse_open(port)
         assert _po.active_conns["proj"] == 1, "stream should count as one conn"
         assert backend.heartbeats_written == 0, "backend must be quiet"
 

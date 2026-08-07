@@ -43,8 +43,9 @@ def _set_per_agent_flag(agent_id: str, value: bool) -> None:
 def _set_global_flag(value: bool) -> None:
     """Insert/update the project_settings row directly to avoid the
     REST roundtrip (which has its own coverage in test_routes_*)."""
-    from agent_mcp.db.connection import get_db_connection
     import datetime as _dt
+
+    from agent_mcp.db.connection import get_db_connection
 
     now = _dt.datetime.now().isoformat()
     raw = "true" if value else "false"
@@ -140,8 +141,8 @@ async def test_server_info_instructions_gated_by_flags(
     :attr:`Principal.can_wake_loop` at middleware build time; the
     contributor reads that bit directly.
     """
-    from tests.harness import mcp_session
     from agent_mcp.app.main_app import _build_principal_from_request
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
@@ -174,8 +175,8 @@ async def test_admin_bearer_does_not_get_wake_loop(tmp_path: Path) -> None:
     """Admin bearers coordinate; they don't run the worker wake loop.
     The eligibility check returns False for the admin token even with
     both flags ON."""
-    from tests.harness import mcp_session
     from agent_mcp.app.main_app import _build_principal_from_request
+    from tests.harness import mcp_session
 
     async with mcp_session(tmp_path) as admin:
         p = _build_principal_from_request(

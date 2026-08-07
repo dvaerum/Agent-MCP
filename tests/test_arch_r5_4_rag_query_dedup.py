@@ -46,7 +46,6 @@ from agent_mcp.features.rag.query import (
 )
 from tests.harness import mcp_session
 
-
 # ── _append_within_budget boundary (sync, no harness needed) ─────────
 
 

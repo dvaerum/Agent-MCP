@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import pytest
 
-
 # These tests exercise the auth gate directly, so we MUST start
 # without the sentinel-operator cookie the router/conftest.py
 # auto-attaches via the overridden ``aiohttp_client`` fixture —

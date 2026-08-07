@@ -213,9 +213,10 @@ def test_migration_0015_is_in_alembic_chain(tmp_path) -> None:
     # assert 0015 is on it (robust to future head bumps).
     import os as _os
 
-    import agent_mcp
     from alembic.config import Config
     from alembic.script import ScriptDirectory
+
+    import agent_mcp
 
     cfg = Config()
     cfg.set_main_option(

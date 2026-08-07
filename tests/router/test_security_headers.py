@@ -9,8 +9,9 @@ request, absent on plain HTTP).
 
 from __future__ import annotations
 
-import pytest
+from typing import ClassVar
 
+import pytest
 
 pytestmark = pytest.mark.asyncio
 
@@ -185,7 +186,7 @@ class _FakeHttpRequest:
     class _URL:
         scheme = "http"
 
-    headers: dict = {}
+    headers: ClassVar[dict] = {}
     url = _URL()
 
 

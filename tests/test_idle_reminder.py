@@ -123,8 +123,8 @@ def test_reminder_event_has_count_and_itemized_list():
 @pytest.mark.asyncio
 async def test_reminder_fires_in_loop_when_backlog(tmp_path, monkeypatch):
     """An idle agent with a backlog gets a reminder event with the list."""
-    from tests.harness import mcp_session, with_bearer
     from agent_mcp.tools import agent_communication_tools as act
+    from tests.harness import mcp_session, with_bearer
 
     fake = {
         "unread_count": 1,
@@ -157,8 +157,9 @@ async def test_reminder_fires_in_loop_when_backlog(tmp_path, monkeypatch):
 async def test_no_reminder_when_no_backlog(tmp_path, monkeypatch):
     """Idle + empty backlog → no reminder; the poll just returns empty."""
     import asyncio
-    from tests.harness import mcp_session, with_bearer
+
     from agent_mcp.tools import agent_communication_tools as act
+    from tests.harness import mcp_session, with_bearer
 
     monkeypatch.setattr(ir, "collect_backlog", lambda a: None)  # no backlog
 

@@ -35,7 +35,8 @@ gating cap is rejected.
 """
 from __future__ import annotations
 
-from typing import Any, Dict
+import logging
+from typing import Any
 
 import pytest
 
@@ -43,6 +44,7 @@ from agent_mcp.core.authorize import AuthRejected
 from agent_mcp.core.principal import Principal
 from tests.harness import make_principal
 
+logger = logging.getLogger(__name__)
 
 pytestmark = pytest.mark.asyncio
 
@@ -139,7 +141,7 @@ def _impl_for(tool_name: str):
     "tool_name,gating_cap,arguments", _MIGRATED_TOOLS,
 )
 async def test_principal_without_cap_is_rejected(
-    tool_name: str, gating_cap: str, arguments: Dict[str, Any],
+    tool_name: str, gating_cap: str, arguments: dict[str, Any],
 ) -> None:
     """A principal whose cap set does NOT contain the gating cap
     raises :class:`AuthRejected` mentioning the missing cap.
@@ -169,7 +171,7 @@ async def test_principal_without_cap_is_rejected(
     "tool_name,gating_cap,arguments", _MIGRATED_TOOLS,
 )
 async def test_principal_with_cap_admits_decorator(
-    tool_name: str, gating_cap: str, arguments: Dict[str, Any],
+    tool_name: str, gating_cap: str, arguments: dict[str, Any],
     tmp_path,
 ) -> None:
     """A principal carrying ``gating_cap`` clears the decorator —
@@ -197,7 +199,12 @@ async def test_principal_with_cap_admits_decorator(
                 f"{tool_name} rejected a principal carrying {gating_cap!r}: "
                 f"{e.reason}"
             )
-        # Any other exception is fine here — we're not asserting on
-        # the body's success, only that the decorator handed off.
         except Exception:
-            pass
+            # Any other exception is fine here — we're not asserting on
+            # the body's success, only that the decorator handed off.
+            # Logged rather than swallowed so a surprising failure is
+            # still visible under `pytest --log-cli-level=DEBUG`.
+            logger.debug(
+                "%s body raised after the decorator handed off", tool_name,
+                exc_info=True,
+            )

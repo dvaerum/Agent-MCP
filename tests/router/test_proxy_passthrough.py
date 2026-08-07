@@ -22,13 +22,12 @@ real agent-mcp@<name>.service runs) and prove:
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Awaitable, Callable
 
 import pytest
 import pytest_asyncio
 from aiohttp import web
-
 
 pytestmark = pytest.mark.asyncio
 

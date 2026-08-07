@@ -20,7 +20,6 @@ from pathlib import Path
 import pytest
 from aiohttp import web
 
-
 pytestmark = pytest.mark.asyncio
 
 

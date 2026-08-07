@@ -115,8 +115,12 @@ def test_canonical_repository_modules_expose_the_relocated_functions():
     """The functions the deleted shims used to re-export are reachable
     directly from the canonical repository modules importers were
     repointed at."""
-    from agent_mcp.repositories import agent_repository, task_repository
-    from agent_mcp.repositories import message_repository, rag_repository
+    from agent_mcp.repositories import (
+        agent_repository,
+        message_repository,
+        rag_repository,
+        task_repository,
+    )
 
     assert callable(task_repository.get_task_by_id)
     assert callable(agent_repository.get_agent_by_token)

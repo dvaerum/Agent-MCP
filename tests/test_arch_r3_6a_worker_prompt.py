@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from agent_mcp.utils.project_utils import generate_system_prompt
 
-
 # Substrings that only appear in the fictional hand-rolled protocol.
 _FICTIONAL_SUBSTRINGS = [
     '"type": "tool_call"',

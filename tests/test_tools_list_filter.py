@@ -29,7 +29,6 @@ import pytest
 
 from tests.harness import mcp_session
 
-
 # Note: tests in this module mix one sync structural test
 # (`test_every_registered_tool_has_access_classification`) with async
 # harness-driven tests. We mark the async ones individually rather

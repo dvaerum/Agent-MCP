@@ -35,7 +35,6 @@ import importlib
 import pytest
 from fastapi import APIRouter
 
-
 _PER_RESOURCE_MODULES: list[tuple[str, str]] = [
     # (module suffix under agent_mcp.app.routers, expected APIRouter prefix)
     ("agents", "/api/agents"),

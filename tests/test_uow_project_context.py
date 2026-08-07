@@ -45,7 +45,6 @@ from agent_mcp.core.principal import Principal
 from agent_mcp.core.tool_result import Conflict, Failed, NotFound, Ok, PermissionDenied
 from tests.harness import make_principal, mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 

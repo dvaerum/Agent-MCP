@@ -24,7 +24,6 @@ from __future__ import annotations
 import os
 import sqlite3
 
-
 _PROFILE_COLUMNS = (
     "profile",
     "profile_updated_at",

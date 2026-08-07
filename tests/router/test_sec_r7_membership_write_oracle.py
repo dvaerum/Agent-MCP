@@ -40,7 +40,6 @@ import json
 
 import pytest
 
-
 pytestmark = [
     pytest.mark.asyncio,
     pytest.mark.no_auth_seed_session,

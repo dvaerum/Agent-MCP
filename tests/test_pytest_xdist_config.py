@@ -16,14 +16,8 @@ same commit and justify it in the PR.
 
 from __future__ import annotations
 
-import sys
+import tomllib
 from pathlib import Path
-
-if sys.version_info >= (3, 11):
-    import tomllib
-else:  # pragma: no cover - 3.10 fallback
-    import tomli as tomllib
-
 
 PYPROJECT = Path(__file__).resolve().parent.parent / "pyproject.toml"
 
@@ -54,7 +48,7 @@ def test_pytest_addopts_enables_parallel_workers() -> None:
         tokens = list(addopts)
     # Accept either `-n auto`, `-n 4`, `-nauto`, or `--numprocesses=...`
     has_n_flag = any(
-        tok == "-n" or tok.startswith("-n") or tok.startswith("--numprocesses")
+        tok == "-n" or tok.startswith(("-n", "--numprocesses"))
         for tok in tokens
     )
     assert has_n_flag, (

@@ -22,7 +22,6 @@ import io
 import aiohttp
 import pytest
 
-
 pytestmark = pytest.mark.asyncio
 
 

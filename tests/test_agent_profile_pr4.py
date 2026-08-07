@@ -13,10 +13,11 @@ from __future__ import annotations
 import asyncio
 import datetime
 
+from starlette.testclient import TestClient
+
 from agent_mcp.app.main_app import create_app
 from agent_mcp.core.capabilities import resolve_capabilities
 from agent_mcp.core.principal import Principal
-from starlette.testclient import TestClient
 
 
 def _make_client(project_dir):

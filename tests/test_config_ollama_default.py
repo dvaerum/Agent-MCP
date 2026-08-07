@@ -16,7 +16,6 @@ import os
 
 import pytest
 
-
 _OLLAMA_KEYS = (
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
@@ -54,7 +53,7 @@ def test_openai_api_key_env_module_attr_is_ollama_when_unset(
     cfg = _reload_config()
     # The module-level OPENAI_API_KEY_ENV must reflect the seeded
     # default, not stay None.
-    assert getattr(cfg, "OPENAI_API_KEY_ENV") == "ollama"
+    assert cfg.OPENAI_API_KEY_ENV == "ollama"
 
 
 def test_explicit_openai_api_key_is_not_overridden(

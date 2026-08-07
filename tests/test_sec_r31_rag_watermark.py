@@ -35,7 +35,6 @@ import pytest
 from agent_mcp.features.rag import indexing as indexing_mod
 from tests.harness import mcp_session
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -109,7 +108,6 @@ def _install_indexer_harness(
             state["cycle"] += 1
             if state["cycle"] >= state["max_cycles"]:
                 g.server_running = False
-        return
 
     def fake_delete(source_type, source_ref, connection=None):
         return 0
