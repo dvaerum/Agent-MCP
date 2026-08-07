@@ -115,15 +115,51 @@ impl Default for SessionEntry {
     }
 }
 
-/// A live session as seen by `sessions.list` (only the fields we use).
+/// A live session's liveness as seen by AoE's web REST `GET /api/sessions`
+/// (only the fields we use). This is richer than the plugin `sessions.list`
+/// (which exposes just id/title/tool/status): `acp_worker_state`,
+/// `has_terminal`, and `dormant` let the bridge tell a STOPPED session (no
+/// running worker) apart from a merely idle one — the plugin RPC reports both
+/// as `status="Idle"`, so it cannot make that distinction.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct SessionRecord {
+pub struct Liveness {
     #[serde(default)]
     pub id: String,
     #[serde(default)]
     pub tool: String,
     #[serde(default)]
     pub status: String,
+    /// ACP worker liveness, e.g. `"absent"` when no ACP worker is running.
+    #[serde(default)]
+    pub acp_worker_state: String,
+    /// Whether a terminal (tmux) worker is attached to the session.
+    #[serde(default)]
+    pub has_terminal: bool,
+    /// AoE's own dormant flag (session parked / no running worker).
+    #[serde(default)]
+    pub dormant: bool,
+}
+
+/// Parse the `GET /api/sessions` body into an id→liveness map. Accepts either
+/// the wrapped `{"sessions":[...]}` shape or a bare `[...]` array. Rows without
+/// an `id` or that fail to deserialize are dropped (defensive: a bad row must
+/// not sink the whole tick).
+pub fn parse_liveness(value: &Value) -> HashMap<String, Liveness> {
+    let arr = value
+        .get("sessions")
+        .and_then(Value::as_array)
+        .or_else(|| value.as_array());
+    let mut map = HashMap::new();
+    if let Some(arr) = arr {
+        for item in arr {
+            if let Ok(rec) = serde_json::from_value::<Liveness>(item.clone()) {
+                if !rec.id.is_empty() {
+                    map.insert(rec.id.clone(), rec);
+                }
+            }
+        }
+    }
+    map
 }
 
 /// A fully-resolved delivery route for one session.
@@ -171,8 +207,9 @@ fn join_base(agent_mcp_base: &str, kind: &str, project: &str) -> String {
 /// endpoint and the MCP url are DERIVED from `agent_mcp_base` + the row's
 /// `project`, so a row is self-contained given the one global base. A row is
 /// dropped unless it has a `session_id`, a `token`, a `project`, and the global
-/// `agent_mcp_base` is set. Mode + liveness come from the live `sessions.list`.
-pub fn resolve_routes(settings: &Settings, live: &HashMap<String, SessionRecord>) -> Vec<Route> {
+/// `agent_mcp_base` is set. Mode + liveness come from AoE's web REST liveness
+/// map (`GET /api/sessions`).
+pub fn resolve_routes(settings: &Settings, live: &HashMap<String, Liveness>) -> Vec<Route> {
     let base = settings.agent_mcp_base.trim();
     if base.is_empty() {
         return Vec::new(); // nothing to point at.
@@ -279,16 +316,17 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn live_map(records: &[(&str, &str, &str)]) -> HashMap<String, SessionRecord> {
+    fn live_map(records: &[(&str, &str, &str)]) -> HashMap<String, Liveness> {
         records
             .iter()
             .map(|(id, tool, status)| {
                 (
                     id.to_string(),
-                    SessionRecord {
+                    Liveness {
                         id: id.to_string(),
                         tool: tool.to_string(),
                         status: status.to_string(),
+                        ..Default::default()
                     },
                 )
             })
@@ -401,6 +439,37 @@ mod tests {
         assert!(routes[0].mcp_url.is_none());
         // Delivery endpoint is still derived (delivery is independent of MCP).
         assert_eq!(routes[0].endpoint, "https://h/agent-mcp/api/p");
+    }
+
+    #[test]
+    fn parse_liveness_handles_wrapped_and_bare_shapes() {
+        // Wrapped {"sessions":[...]} shape.
+        let wrapped = json!({
+            "sessions": [
+                {
+                    "id": "s1", "title": "t", "status": "Running", "tool": "claude",
+                    "acp_worker_state": "running", "has_terminal": true, "dormant": false
+                },
+                { "id": "s2", "status": "Idle", "acp_worker_state": "absent",
+                  "has_terminal": false, "dormant": false },
+                { "status": "no id" }
+            ]
+        });
+        let m = parse_liveness(&wrapped);
+        assert_eq!(m.len(), 2); // the id-less row is dropped.
+        assert!(m["s1"].has_terminal);
+        assert_eq!(m["s1"].acp_worker_state, "running");
+        assert_eq!(m["s2"].acp_worker_state, "absent");
+        assert!(!m["s2"].has_terminal);
+
+        // Bare [...] array shape.
+        let bare = json!([{ "id": "b1", "status": "Running", "dormant": true }]);
+        let m = parse_liveness(&bare);
+        assert_eq!(m.len(), 1);
+        assert!(m["b1"].dormant);
+
+        // Non-array / unexpected shape yields empty.
+        assert!(parse_liveness(&Value::Null).is_empty());
     }
 
     #[test]

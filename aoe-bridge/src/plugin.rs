@@ -88,7 +88,11 @@ impl PluginConn {
     // ---- Host RPC conveniences ------------------------------------------
 
     /// `sessions.list` (needs `session.read`) — live sessions with
-    /// id/title/tool/status/project_path.
+    /// id/title/tool/status/project_path. Retained as a capability, but the
+    /// bridge now sources liveness from AoE's richer web REST `GET
+    /// /api/sessions` (which also exposes worker state), so this is currently
+    /// unused for reconcile.
+    #[allow(dead_code)]
     pub async fn sessions_list(&self) -> Result<Value> {
         self.call("sessions.list", json!({})).await
     }
