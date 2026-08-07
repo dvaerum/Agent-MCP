@@ -15,6 +15,9 @@ get a working `.mcp.json` back.
 - KVM-capable kernel (the VM falls back to TCG, ~5x slower boot,
   but works).
 - ~3 GB free disk for the closure + first-boot Ollama download.
+- ~4 GB free RAM for the guest — or ~2 GB with `llm = "external"`,
+  which moves the LLM/embedding endpoints onto the host (see
+  [LLM endpoints](#llm-endpoints-in-guest-internal-vs-on-host-external)).
 
 QEMU itself is brought in by the flake.
 
@@ -35,6 +38,18 @@ xdg-open http://localhost:5454/agent-mcp/
 State persists to `./vm-persistent-data/` in the directory you ran
 the command from; nothing leaks into `~`. Ctrl-C cleanly shuts the
 VM down.
+
+There is also an interactive dashboard-E2E sandbox:
+
+```sh
+nix run .#vm-dev        # dashboard on http://localhost:18080/agent-mcp/
+                        # operator dev/dev, root SSH on :18222 — DEV ONLY
+```
+
+It differs from the above in three ways documented in
+`nix/vm-dev.nix`, one of which is that it runs with
+`llm = "external"` and therefore needs LLM endpoints on the host —
+see [LLM endpoints](#llm-endpoints-in-guest-internal-vs-on-host-external).
 
 ## Flags
 
@@ -90,7 +105,8 @@ API itself.
 ## State layout
 
 Two independent persistence substrates side-by-side in the persist
-directory:
+directory (the `ollama/` half exists in `llm = "internal"` mode only —
+`external` mode has no in-guest ollama and no 9p share):
 
 ```
 ./vm-persistent-data/
@@ -116,6 +132,85 @@ independent: nuke either without disturbing the other.
 
 With `--ephemeral` the wrapper mktemp's a fresh dir containing both
 substrates and `rm -rf`s it on exit.
+
+## LLM endpoints: in-guest (`internal`) vs on-host (`external`)
+
+`nix/vm.nix` takes an `llm` parameter that decides where the chat and
+embedding endpoints live. Pass it (plus any of the overrides below)
+where `vm.nix` is imported; `nix/vm-dev.nix` is the worked example.
+
+| | `llm = "internal"` (default) | `llm = "external"` |
+|---|---|---|
+| Ollama | `services.ollama` inside the guest, `loadModels` preloads `qwen3-embedding:0.6b` + `qwen3:1.7b` | not installed at all |
+| Guest RAM (`memorySize`) | **4096 MB** | **2048 MB** |
+| Guest disk (`diskSize`) | **8192 MB** | **4096 MB** |
+| 9p `ollama-models` share | yes (`$AGENT_MCP_OLLAMA_DIR`) | no |
+| Needs anything on the host | no — self-contained | yes — a live chat + embedding endpoint |
+
+`internal` is what `nix run .#` (and every VM the CI workflow builds)
+uses; it is unchanged. `external` exists because ~1.6 GB of preloaded
+model weights is pure overhead for dashboard/E2E work that never
+exercises RAG — and on a busy workstation the difference between a
+4 GB and a 2 GB guest is often the difference between the VM starting
+and not. 2048 MB is 512 MB above the 1536 MB the `nix/tests/`
+nixosTests boot the same router+backend shape at in CI, leaving room
+for real 1024-dimension embedding batches and a second concurrent
+project backend.
+
+### Reaching the host from the guest
+
+`external` mode points the backend at **`10.0.2.2`**. QEMU's
+user-mode ("slirp") networking puts the guest on a synthetic
+`10.0.2.0/24` in which `10.0.2.2` is an alias for the host's own
+loopback — so a host service bound to `127.0.0.1` is reachable from
+inside the guest at `10.0.2.2`, with no bridge, no firewall hole and
+no host port published to the network.
+
+Defaults (all overridable at the import site):
+
+| Parameter | Default | Purpose |
+|---|---|---|
+| `llm` | `"internal"` | mode switch |
+| `llmHost` | `"10.0.2.2"` | qemu user-mode host alias |
+| `llmChatPort` | `11435` | host llama-cpp |
+| `llmChatModel` | `"qwen2.5:3b-instruct"` | |
+| `llmEmbeddingPort` | `11434` | host ollama |
+| `llmEmbeddingModel` | `"qwen3-embedding:0.6b"` | |
+| `llmEmbeddingDimension` | `1024` | must match the model |
+
+Chat and embeddings resolve from *different* env vars, so they can
+live on different ports (a fast iGPU llama-cpp for completion, a CPU
+ollama for embeddings). `external` mode sets, on the backend units
+only:
+
+```
+AGENT_MCP_LLM_BASE_URL=http://10.0.2.2:11435/v1   # chat/completion
+OPENAI_BASE_URL=http://10.0.2.2:11434/v1          # embeddings
+OPENAI_API_KEY=external                           # non-empty sentinel
+OPENAI_MODEL=qwen2.5:3b-instruct
+AGENT_MCP_EMBEDDING_MODEL=qwen3-embedding:0.6b
+AGENT_MCP_EMBEDDING_DIMENSION=1024
+```
+
+No Python change is involved — see the module docstrings in
+`agent_mcp/external/completion_service.py` and
+`embedding_service.py` for the resolution rules those vars feed.
+
+### Fail-loud endpoint probe
+
+`10.0.2.2` answers whether or not anything is listening behind it, so
+a host that forgot to start llama-cpp/ollama would otherwise give you
+a VM that boots green and fails deep inside RAG indexing — a passing
+E2E run against a backend with no embeddings. `external` mode
+therefore adds `agent-mcp-llm-endpoint-check.service`: a boot-time
+oneshot that curls both `/v1/models` endpoints (10 attempts, 2 s
+apart) and hard-fails, naming the exact URLs on the serial console, if
+either is unreachable. Every unit that embeds or completes
+(`agent-mcp@` in multi mode, `agent-mcp-backend` in single) `Requires`
+it, so a dead endpoint stops the backend instead of degrading it.
+`agent-mcp-router.service` is deliberately *not* gated — it never
+talks to an LLM, and a dashboard that loads plus an explicit "backend
+failed to start" is more diagnostic than a refused connection.
 
 ## Running the e2e tests against the VM
 
@@ -183,7 +278,9 @@ The module covers the systemd shape only — TLS termination
 - A polkit rule (in `nix/module.nix`) grants the unprivileged
   `agent-mcp` user permission to start/stop `agent-mcp@*.service`
   units via systemd, so the router doesn't need root.
-- Ollama runs in-VM with `qwen3-embedding:0.6b` (1024-dim). The
+- In `llm = "internal"` mode (the default — see
+  [LLM endpoints](#llm-endpoints-in-guest-internal-vs-on-host-external)),
+  Ollama runs in-VM with `qwen3-embedding:0.6b` (1024-dim). The
   model (~610 MB) is downloaded on first boot to
   `./vm-persistent-data/ollama/` on the host (9p bind-mounted
   into the VM at `/var/lib/ollama`). Subsequent runs — including

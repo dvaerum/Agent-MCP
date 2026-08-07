@@ -38,15 +38,35 @@
 #      A boot-time systemd banner and a motd shout this restriction
 #      so the next maintainer cargo-culting from this file notices.
 #
-# Everything else (Ollama, systemd shape, agent-mcp services) is
-# inherited from the regular multi-tenant module. We import vm.nix
-# directly and patch the divergent attrs via lib.mkForce.
+#   4. **EXTERNAL LLM MODE.** `llm = "external"` is passed to vm.nix
+#      below, so this VM runs NO in-guest ollama and preloads no
+#      model weights; the backend is pointed at endpoints already
+#      running on the developer's HOST via qemu user-mode's
+#      10.0.2.2 host alias (chat on :11435, embeddings on :11434 by
+#      default). That drops guest RAM from 4096 MB to 2048 MB —
+#      which is the difference between "can boot the sandbox" and
+#      "cannot" on a busy workstation, and this VM exists precisely
+#      for interactive dashboard E2E where the RAG models are never
+#      exercised. nix/vm.nix keeps `internal` as its default so the
+#      production/CI VMs stay self-contained; see that file's header
+#      for the full option contract, the env-var mapping, and the
+#      boot-time endpoint probe that hard-fails rather than letting
+#      a backend run with dead embeddings.
+#
+# Everything else (systemd shape, agent-mcp services) is inherited
+# from the regular multi-tenant module. We import vm.nix directly and
+# patch the divergent attrs via lib.mkForce.
 
 {
   imports = [
     (import ./vm.nix {
       inherit config lib pkgs modulesPath src;
       mode = "multi";
+      # See header note 4. Retarget host/ports/models here (llmHost,
+      # llmChatPort, llmEmbeddingPort, llmChatModel,
+      # llmEmbeddingModel, llmEmbeddingDimension) if your host serves
+      # them somewhere other than the defaults.
+      llm = "external";
     })
   ];
 
