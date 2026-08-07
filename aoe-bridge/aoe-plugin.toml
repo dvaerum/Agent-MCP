@@ -14,21 +14,46 @@ version = "0.1.0"
 api_version = 14
 description = "Injects agent-mcp delivery notifications into AoE-run sessions that don't poll wait_for_events (ADR-0021): subscribes to each covered session's delivery SSE stream, reports transport-status up, injects skinny (id/subject/status only) nudges via AoE's /send and /acp/prompt routes, and (optionally) wires agent-mcp's tools into each covered session as a per-session MCP server."
 
-# runtime.worker: run the worker at all (and the config.get host RPC).
+# runtime.worker: run the worker at all, plus the config.get and ui.state.*
+#                 host RPCs (ui.state.set is gated on runtime.worker + the
+#                 `[[ui]]` declaration below, NOT on a capability of its own).
 # session.read:   sessions.list, to enumerate live sessions + their status.
 # session.mcp:    session.mcp.set, to inject agent-mcp's tools per session.
 # net:            outbound HTTP/SSE to agent-mcp and AoE's localhost REST.
 # notifications:  ui.notify, to surface bridge errors to the operator.
+#
+# UNCHANGED by the observability surface: the settings page needs only
+# runtime.worker (already held), so the nix deploy's `grant.capabilities` needs
+# no edit. The grant hash is derived from this file's bytes and updates itself.
 capabilities = ["runtime.worker", "session.read", "session.mcp", "net", "notifications"]
+
+# ---------------------------------------------------------------------------
+# UI contributions
+# ---------------------------------------------------------------------------
+# The host gates `ui.state.set` on the (slot, id) pair being declared here
+# (host_api.rs::require_declared_slot). `settings-page` is a GLOBAL slot, so one
+# entry covers every session the bridge holds; the dashboard mounts it as its own
+# entry in the Settings nav, labelled with this plugin's name.
+#
+# This is the bridge's only durable operator-facing surface. A worker's stderr
+# goes to an unnamed per-spawn file nothing reads, and a `[[commands]]` invoke is
+# fire-and-forget (202, no result channel) — so pushed UI state is the only way
+# an operator can ask "is this session covered, and is delivery working?".
+[[ui]]
+slot = "settings-page"
+id = "main"
 
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
+# Invoked as a reply-less notification (`plugin.command.invoke`), so it cannot
+# return anything: it forces an immediate repaint of the settings page above and
+# toasts a one-line summary.
 [[commands]]
 id = "status"
 title = "agent-mcp Delivery: status"
-description = "Report that the delivery bridge worker is running."
+description = "Refresh the delivery bridge's status page and toast a one-line summary."
 
 # ---------------------------------------------------------------------------
 # Settings — read by the worker over the config.get host RPC.

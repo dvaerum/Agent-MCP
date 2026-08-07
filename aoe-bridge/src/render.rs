@@ -85,10 +85,16 @@ pub fn render_skinny(f: &Frame) -> String {
     if !f.unread_messages.is_empty() {
         lines.push("Unread messages (call get_agent_messages to read the body):".to_string());
         for m in f.unread_messages.iter().take(MAX_ITEMS) {
-            lines.push(format!("  - #{} from {}: {}", m.message_id, m.sender_id, m.subject));
+            lines.push(format!(
+                "  - #{} from {}: {}",
+                m.message_id, m.sender_id, m.subject
+            ));
         }
         if f.unread_messages.len() > MAX_ITEMS {
-            lines.push(format!("  … and {} more", f.unread_messages.len() - MAX_ITEMS));
+            lines.push(format!(
+                "  … and {} more",
+                f.unread_messages.len() - MAX_ITEMS
+            ));
         }
     }
 

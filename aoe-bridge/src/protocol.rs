@@ -47,11 +47,10 @@ pub struct Incoming {
     pub id: Option<Value>,
     #[serde(default)]
     pub method: Option<String>,
-    // Part of the JSON-RPC wire shape (host requests carry params); handlers
-    // don't consume it yet — they re-fetch via config.get. Kept for
-    // completeness, like `jsonrpc` above.
+    /// Host-supplied params. Load-bearing for `plugin.command.invoke`, which
+    /// carries the invoked command's fqid in `params.command` (the method name
+    /// is the same for every command). Absent ⇒ `Value::Null`.
     #[serde(default)]
-    #[allow(dead_code)]
     pub params: Value,
     #[serde(default)]
     pub result: Option<Value>,
@@ -103,9 +102,10 @@ mod tests {
 
     #[test]
     fn classifies_request_by_method() {
-        let m = parse_incoming(r#"{"jsonrpc":"2.0","id":1,"method":"plugin.x.status","params":{}}"#)
-            .unwrap()
-            .unwrap();
+        let m =
+            parse_incoming(r#"{"jsonrpc":"2.0","id":1,"method":"plugin.x.status","params":{}}"#)
+                .unwrap()
+                .unwrap();
         assert_eq!(m.method.as_deref(), Some("plugin.x.status"));
         assert!(m.error.is_none());
         assert!(m.result.is_none());
@@ -123,9 +123,10 @@ mod tests {
 
     #[test]
     fn classifies_error_response() {
-        let m = parse_incoming(r#"{"jsonrpc":"2.0","id":9,"error":{"code":-32601,"message":"no"}}"#)
-            .unwrap()
-            .unwrap();
+        let m =
+            parse_incoming(r#"{"jsonrpc":"2.0","id":9,"error":{"code":-32601,"message":"no"}}"#)
+                .unwrap()
+                .unwrap();
         assert!(m.method.is_none());
         let e = m.error.unwrap();
         assert_eq!(e.code, -32601);

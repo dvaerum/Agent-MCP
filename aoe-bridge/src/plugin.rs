@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, Notify};
 
+use crate::observe;
 use crate::protocol::{self, codes, Incoming, RpcError};
 
 /// How long a host RPC may take before we give up on it. The host answers
@@ -111,16 +112,48 @@ impl PluginConn {
         self.call("session.mcp.set", params).await
     }
 
-    /// `ui.notify` (needs `notifications`) — surface a message to the operator.
+    /// `ui.notify` (needs `notifications`) — surface a toast to the operator.
     /// Best-effort; callers ignore the result.
-    #[allow(dead_code)]
+    ///
+    /// The host caps `title` at 256 bytes and `body` at 4096
+    /// (`src/plugin/ui_state.rs`) and rejects the whole call if either is over,
+    /// so both are clipped here rather than losing the notification. `tone` is a
+    /// closed host-side set: `neutral|info|success|warn|danger`.
     pub async fn ui_notify(&self, tone: &str, title: &str, body: Option<&str>) -> Result<Value> {
         self.call(
             "ui.notify",
-            json!({ "tone": tone, "title": title, "body": body }),
+            json!({
+                "tone": tone,
+                "title": clip_bytes(title, 256),
+                "body": body.map(|b| clip_bytes(b, 4096)),
+            }),
         )
         .await
     }
+
+    /// `ui.state.set` (needs `runtime.worker` AND the `(slot, id)` pair declared
+    /// in the manifest's `[[ui]]`) — replace this plugin's entry in a
+    /// host-rendered slot. The bridge uses the global `settings-page` slot, which
+    /// the AoE dashboard mounts as its own Settings nav entry.
+    pub async fn ui_state_set(&self, slot: &str, id: &str, payload: Value) -> Result<Value> {
+        self.call(
+            "ui.state.set",
+            json!({ "slot": slot, "id": id, "payload": payload }),
+        )
+        .await
+    }
+}
+
+/// Clip a string to at most `max` BYTES without splitting a UTF-8 character.
+fn clip_bytes(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 /// Drain the outbound channel to stdout, one flushed line at a time.
@@ -136,29 +169,51 @@ pub async fn run_stdout_writer(mut rx: mpsc::UnboundedReceiver<String>) {
     }
 }
 
-/// Read host lines until EOF, demuxing responses from requests. `reconcile`
-/// is pinged whenever the host reports a settings change so the bridge can
-/// re-resolve its routes immediately instead of waiting for the next tick.
-pub async fn run_stdin_reader(conn: Arc<PluginConn>, reconcile: Arc<Notify>) {
+/// Read host lines until EOF, demuxing responses from requests.
+///
+/// - `reconcile` is pinged whenever the host reports a settings change so the
+///   bridge can re-resolve its routes immediately instead of waiting for a tick.
+/// - `publish` carries UI-repaint requests raised by host-invoked commands.
+pub async fn run_stdin_reader(
+    conn: Arc<PluginConn>,
+    reconcile: Arc<Notify>,
+    publish: mpsc::UnboundedSender<PublishReason>,
+) {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     loop {
         match lines.next_line().await {
-            Ok(Some(line)) => handle_line(&conn, &reconcile, &line),
+            Ok(Some(line)) => handle_line(&conn, &reconcile, &publish, &line),
             Ok(None) => break, // EOF: host closed stdin -> worker exits.
             Err(e) => {
-                crate::log(&format!("stdin read error: {e}"));
+                observe::error(&format!("stdin read error: {e}"));
                 break;
             }
         }
     }
 }
 
-fn handle_line(conn: &Arc<PluginConn>, reconcile: &Arc<Notify>, line: &str) {
+/// Why the UI state is being republished. `StatusCommand` additionally toasts a
+/// one-line summary, because a command invocation is fire-and-forget: the
+/// operator gets no HTTP response body to read, so the toast IS the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishReason {
+    /// Routine repaint (reconcile finished, frame handled, periodic refresh).
+    Tick,
+    /// The operator ran the plugin's `status` command.
+    StatusCommand,
+}
+
+fn handle_line(
+    conn: &Arc<PluginConn>,
+    reconcile: &Arc<Notify>,
+    publish: &mpsc::UnboundedSender<PublishReason>,
+    line: &str,
+) {
     let incoming: Incoming = match protocol::parse_incoming(line) {
         Ok(Some(i)) => i,
         Ok(None) => return,
         Err(e) => {
-            crate::log(&format!("ignoring unparseable host line: {e}"));
+            observe::warn(&format!("ignoring unparseable host line: {e}"));
             return;
         }
     };
@@ -174,12 +229,7 @@ fn handle_line(conn: &Arc<PluginConn>, reconcile: &Arc<Notify>, line: &str) {
                 };
                 conn.send_raw(response);
             }
-            None => {
-                if method == "plugin.settings.changed" {
-                    reconcile.notify_one();
-                }
-                // Any other host notification is not one we handle: ignore it.
-            }
+            None => handle_notification(reconcile, publish, method, &incoming.params),
         }
         return;
     }
@@ -193,10 +243,56 @@ fn handle_line(conn: &Arc<PluginConn>, reconcile: &Arc<Notify>, line: &str) {
     }
 }
 
-/// Handle a host-initiated command, dispatching on the trailing segment of the
-/// namespaced method (`plugin.<id>.<command>`), per the plugin protocol.
+/// Handle a host notification (a `method` with no `id`, so no reply is possible).
+///
+/// `plugin.command.invoke` is how the host delivers a `[[commands]]` entry:
+/// `POST /api/plugins/commands/{fqid}/invoke` answers `202 {"ok": true}` and
+/// forwards `{ command: <fqid>, session_id }` as a **notification**
+/// (`src/server/api/plugins.rs` → `PluginHost::notify_worker`). The command id
+/// is therefore in `params.command`, NOT in the method name — a worker that
+/// dispatches on the method's trailing segment never sees its own commands at
+/// all, which is why the bridge's `status` command had never once run.
+fn handle_notification(
+    reconcile: &Arc<Notify>,
+    publish: &mpsc::UnboundedSender<PublishReason>,
+    method: &str,
+    params: &Value,
+) {
+    match method {
+        "plugin.settings.changed" => reconcile.notify_one(),
+        "plugin.command.invoke" => {
+            let fqid = params
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match command_id(fqid) {
+                "status" => {
+                    observe::info("status command invoked; republishing bridge state");
+                    let _ = publish.send(PublishReason::StatusCommand);
+                }
+                other => observe::warn(&format!("ignoring unknown command {other:?}")),
+            }
+        }
+        // Any other host notification is not one we handle: ignore it.
+        _ => {}
+    }
+}
+
+/// The bare command id from a fully-qualified `plugin.<plugin-id>.<command>`.
+/// Plugin ids contain dots (`dev.dvaerum.agent-mcp-delivery`), so only the
+/// trailing segment is the command.
+fn command_id(fqid: &str) -> &str {
+    fqid.rsplit('.').next().unwrap_or(fqid)
+}
+
+/// Handle a host-initiated *request* (a `method` carrying an `id`).
+///
+/// The current host has no request-shaped command path — commands arrive as
+/// notifications (see [`handle_notification`]) — but the protocol allows a host
+/// request, so an unknown one must answer `METHOD_NOT_FOUND` rather than hang
+/// the host's parked call.
 fn dispatch_command(method: &str) -> std::result::Result<Value, (i64, String)> {
-    match method.rsplit('.').next().unwrap_or(method) {
+    match command_id(method) {
         "status" => Ok(json!({
             "ok": true,
             "message": "agent-mcp delivery bridge running",
@@ -212,6 +308,24 @@ fn dispatch_command(method: &str) -> std::result::Result<Value, (i64, String)> {
 mod tests {
     use super::*;
 
+    fn reader_bits() -> (
+        Arc<Notify>,
+        mpsc::UnboundedSender<PublishReason>,
+        mpsc::UnboundedReceiver<PublishReason>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Arc::new(Notify::new()), tx, rx)
+    }
+
+    #[test]
+    fn command_id_takes_the_trailing_segment_of_a_dotted_plugin_id() {
+        assert_eq!(
+            command_id("plugin.dev.dvaerum.agent-mcp-delivery.status"),
+            "status"
+        );
+        assert_eq!(command_id("status"), "status");
+    }
+
     #[test]
     fn status_command_dispatches_on_trailing_segment() {
         let r = dispatch_command("plugin.dev.dvaerum.agent-mcp-delivery.status").unwrap();
@@ -222,5 +336,63 @@ mod tests {
     fn unknown_command_is_method_not_found() {
         let (code, _msg) = dispatch_command("plugin.x.frobnicate").unwrap_err();
         assert_eq!(code, codes::METHOD_NOT_FOUND);
+    }
+
+    #[test]
+    fn command_invoke_notification_requests_a_status_publish() {
+        // The regression this closes: the host names EVERY command with the same
+        // method (`plugin.command.invoke`) and puts the fqid in params, so
+        // dispatching on the method's trailing segment never fired the command.
+        let (reconcile, tx, mut rx) = reader_bits();
+        handle_notification(
+            &reconcile,
+            &tx,
+            "plugin.command.invoke",
+            &json!({
+                "command": "plugin.dev.dvaerum.agent-mcp-delivery.status",
+                "session_id": "sid-1",
+            }),
+        );
+        assert_eq!(rx.try_recv().unwrap(), PublishReason::StatusCommand);
+    }
+
+    #[test]
+    fn unknown_command_invoke_publishes_nothing() {
+        let (reconcile, tx, mut rx) = reader_bits();
+        handle_notification(
+            &reconcile,
+            &tx,
+            "plugin.command.invoke",
+            &json!({ "command": "plugin.x.frobnicate" }),
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn settings_changed_notification_pings_reconcile_without_publishing() {
+        let (reconcile, tx, mut rx) = reader_bits();
+        handle_notification(
+            &reconcile,
+            &tx,
+            "plugin.settings.changed",
+            &json!({ "revision": 4, "changed_keys": ["sessions"] }),
+        );
+        // A settings change re-resolves routes; it is not a repaint request (the
+        // reconcile it triggers publishes one when it finishes).
+        assert!(rx.try_recv().is_err());
+        // `notify_one` before any waiter parks stores a permit, so this resolves.
+        tokio::time::timeout(Duration::from_secs(1), reconcile.notified())
+            .await
+            .expect("reconcile should have been notified");
+    }
+
+    #[test]
+    fn ui_notify_clips_oversized_title_and_body_to_the_host_caps() {
+        // The host rejects the whole call past 256/4096 bytes, so clipping is
+        // what keeps a long AoE error from silently dropping the toast.
+        assert_eq!(clip_bytes("abc", 256), "abc");
+        assert_eq!(clip_bytes(&"x".repeat(300), 256).len(), 256);
+        // Never split a multi-byte char: 'é' is 2 bytes, so a 3-byte cap keeps 1.
+        assert_eq!(clip_bytes("ééé", 3), "é");
     }
 }

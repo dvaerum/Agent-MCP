@@ -173,6 +173,10 @@ pub fn parse_liveness(value: &Value) -> HashMap<String, Liveness> {
 #[derive(Debug, Clone)]
 pub struct Route {
     pub session_id: String,
+    /// The agent-mcp project this session acts as. Not used to build URLs (the
+    /// endpoints below already embed it) — carried so the observability surface
+    /// can name the project without re-deriving it from a URL.
+    pub project: String,
     pub endpoint: String,
     pub token: String,
     pub mode: Mode,
@@ -271,6 +275,7 @@ pub fn resolve_routes(settings: &Settings, live: &HashMap<String, Liveness>) -> 
         };
         out.push(Route {
             session_id: entry.session_id.clone(),
+            project: entry.project.trim().trim_matches('/').to_string(),
             endpoint: join_base(base, "api", &entry.project),
             token: entry.token.clone(),
             mode,
@@ -306,7 +311,7 @@ async fn get_value(conn: &PluginConn, key: &str) -> Value {
     match conn.config_get(key).await {
         Ok(resp) => resp.get("value").cloned().unwrap_or(Value::Null),
         Err(e) => {
-            crate::log(&format!("config.get {key} failed: {e}"));
+            crate::observe::warn(&format!("config.get {key} failed: {e}"));
             Value::Null
         }
     }
@@ -455,8 +460,10 @@ mod tests {
                 dormant: false,
             },
         );
-        let routes =
-            resolve_routes(&settings(vec![entry("s1", "t", "p", "auto")], "https://h"), &live);
+        let routes = resolve_routes(
+            &settings(vec![entry("s1", "t", "p", "auto")], "https://h"),
+            &live,
+        );
         assert_eq!(routes[0].mode, Mode::Structured);
     }
 

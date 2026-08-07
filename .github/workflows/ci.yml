@@ -67,6 +67,48 @@ jobs:
         # ~4 cores, which is the sweet spot for this suite.
         run: uv run pytest -v
 
+  aoe-bridge:
+    # The AoE delivery-bridge plugin worker (ADR-0021). It is a standalone
+    # crate consumed by the nix deploy as a flake-input source path, so nothing
+    # else in this workflow compiles it — without this job a Rust change ships
+    # unverified and only breaks at `nixos-rebuild` time (the deploy's crane
+    # build runs `doCheck`, i.e. these same tests, but hours later).
+    name: aoe-bridge (Rust)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: aoe-bridge
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Install Rust toolchain
+        # `stable` satisfies the crate's declared rust-version floor (1.85).
+        # `rustup default` pins what bare `cargo` resolves to, so fmt/clippy
+        # cannot silently run under a different toolchain than the tests.
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --component rustfmt --component clippy
+          rustup default stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            aoe-bridge/target
+          key: aoe-bridge-${{ runner.os }}-${{ hashFiles('aoe-bridge/Cargo.lock') }}
+          restore-keys: aoe-bridge-${{ runner.os }}-
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
   dashboard:
     name: Dashboard build
     runs-on: ubuntu-latest
