@@ -116,10 +116,15 @@ provisioned.
 The worker is a JSON-RPC 2.0 **peer** over newline-delimited JSON on stdio.
 Over the one pipe it both:
 
-- initiates host RPCs (`sessions.list`, `config.get`, `ui.notify`) and reads
-  their responses, and
-- answers host-initiated requests (a `status` command) and notifications
-  (`plugin.settings.changed`, which triggers an immediate re-reconcile).
+- initiates host RPCs (`config.get`, `session.mcp.set`, `ui.state.set`,
+  `ui.notify`) and reads their responses, and
+- answers host-initiated notifications: `plugin.settings.changed` (triggers an
+  immediate re-reconcile) and `plugin.command.invoke` (a `[[commands]]` entry).
+
+**`plugin.command.invoke` carries the command in `params.command`, not in the
+method name.** The host names every command with the same method and answers the
+operator `202 {"ok": true}` before forwarding a reply-less notification, so a
+command can never return a value — it acts, then re-pushes UI state.
 
 A single stdout writer task serialises all outgoing lines. The reader demuxes on
 the presence of a `method` field: `method` present ⇒ host request/notification;
@@ -136,7 +141,9 @@ stdin EOF (host closed the pipe).
 | `mode.rs` | `normalize_mode`, `map_transport_status` | ✅ |
 | `render.rs` | skinny frame renderer (`render_skinny`) | ✅ |
 | `inject.rs` | REST request building, SSE data extraction | ✅ |
-| `bridge.rs` | async orchestrator: reconcile, SSE client, status reporter, injector | — |
+| `observe.rs` | leveled + redacted diagnostics, durable log file, rotation | ✅ |
+| `status.rs` | observable state, notify gating, settings-page renderer | ✅ |
+| `bridge.rs` | async orchestrator: reconcile, SSE client, status reporter, injector, publisher | — |
 | `main.rs` | wiring | — |
 
 ## Build & install
@@ -153,24 +160,77 @@ The build step compiles into `.aoe-build/target/` (excluded from the plugin
 integrity hash) and the host launches the plugin-relative binary
 `.aoe-build/target/release/aoe-bridge-worker`.
 
-Drive the worker by hand to smoke-test the protocol:
-
-```sh
-echo '{"jsonrpc":"2.0","id":1,"method":"plugin.dev.dvaerum.agent-mcp-delivery.status","params":{}}' \
-  | .aoe-build/target/release/aoe-bridge-worker
-# => {"jsonrpc":"2.0","id":1,"result":{"ok":true,"message":"agent-mcp delivery bridge running"}}
-```
-
 Run the unit tests:
 
 ```sh
 cargo test
 ```
 
+## Observability
+
+Two surfaces, because the host gives a runtime worker exactly two channels.
+
+### The status page (live state)
+
+The manifest declares the global `settings-page` UI slot, so the AoE dashboard
+mounts **Settings → agent-mcp Delivery Bridge**. The worker re-pushes it after
+every reconcile, on every stream/inject state change, and at least every 30s.
+It answers, per covered session:
+
+| Question | Where |
+|---|---|
+| is this session covered, and live? | the session's `live` / `transport-status` rows |
+| is the delivery stream up? | `stream`: connected / reconnecting (attempt N) / stopped |
+| did a frame arrive? | `frames received`: count, age, and the frame's `reason` |
+| did the inject work? | `injects`: ok/failed counts, and `last inject` with the HTTP status |
+| **why did it fail?** | `last inject` carries AoE's error body, e.g. `HTTP 400: acp_mode_unsupported` |
+| is agent-mcp's MCP wired in? | `agent-mcp tools`: injected / pending |
+
+Failing sessions sort first and render expanded. The overall verdict
+distinguishes *disabled*, *not configured*, *no live sessions*, *healthy* and
+*degraded* — an empty page always says which.
+
+The `agent-mcp Delivery: status` command forces an immediate repaint and toasts
+a one-line summary. It cannot return anything (see *Protocol model*), so the
+toast is the answer.
+
+Injection failures also raise a **danger toast**, rate-limited to one per session
+per 15 minutes while it keeps failing, plus one success toast on recovery.
+
+### The log file (history)
+
+The page shows *state*; the log holds *history*. The host redirects worker stderr
+into `<app_dir>/plugin-workers/<random-uuid>.log`, a file with a per-spawn
+unguessable name that nothing reads and that never reaches the journal — so
+`journalctl --user -u aoe-web.service | grep aoe-bridge` returns nothing, and
+never could. The bridge therefore writes its own log at a fixed path:
+
+```sh
+tail -f ~/.local/state/aoe-bridge/worker.log     # or $XDG_STATE_HOME/aoe-bridge/
+```
+
+The exact path in force is shown under *Diagnostics* on the status page.
+
+| Env | Default | Meaning |
+|---|---|---|
+| `AOE_BRIDGE_LOG_LEVEL` | `info` | `error` / `warn` / `info` / `debug` |
+| `AOE_BRIDGE_LOG_FILE` | `$XDG_STATE_HOME/aoe-bridge/worker.log` | explicit path; set **empty** to disable file logging |
+
+Rotates at 2 MiB keeping one `.1` generation. Levels are chosen for volume:
+per-frame and per-inject traffic is `debug`, state transitions (coverage gained
+or lost, stream connected, MCP injected) are `info`, retrying failures are
+`warn`, and a refused injection is `error`.
+
+**Nothing logged or displayed carries a token or a message body.** Every line
+passes through a redactor that scrubs `Bearer …` and `token=…`-shaped values,
+and the observable state model has no field a message subject, sender or task
+title could occupy — only ids, counts, timestamps, HTTP codes and the frame's
+`reason` enum.
+
 ## Notes
 
-- **stdout is the protocol channel** — all diagnostics go to stderr (the host
-  drains a worker's stderr to its worker log).
+- **stdout is the protocol channel** — a non-JSON line there makes the host stop
+  reading the worker. All diagnostics go through `observe.rs`.
 - TLS uses `rustls` (no OpenSSL system dependency). Swap the reqwest feature to
   `native-tls` in `Cargo.toml` if the host toolchain prefers it.
 - A transient SSE drop is treated as *temporarily gone*, not a session end: the
