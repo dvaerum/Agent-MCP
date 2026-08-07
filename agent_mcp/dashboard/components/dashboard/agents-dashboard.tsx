@@ -17,6 +17,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { apiClient, Agent, Task, agentPresence, type AgentPresence } from "@/lib/api"
+import { transportStatusBadge } from "@/lib/status"
 import { toastError, toastSuccess } from "@/components/ui/toast"
 import { projectContext } from "@/lib/project-context"
 import { mcpUrl, deriveMount } from "@/lib/urls"
@@ -111,6 +112,9 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, op
 
   // Wave 7 PR 2 — presence drives the row badge.
   const presence = agentPresence(agent)
+  // ADR-0021 — delivery transport liveness. Separate axis from presence;
+  // null when no delivery transport has reported for this agent.
+  const transport = transportStatusBadge(agent.transport_status)
 
   // Check if agent is new (less than 10 minutes old)
   const isNewAgent = () => {
@@ -213,6 +217,23 @@ const CompactAgentRow = React.memo(({ agent, onTerminate, onRestore, onPurge, op
           >
             {PRESENCE_LABEL[presence]}
           </Badge>
+          {/* ADR-0021: delivery transport_status — a DISTINCT axis from
+              the presence badge above (which is MCP-stream presence).
+              Rendered only when the delivery transport has reported for
+              this agent; null/absent renders nothing so the row stays
+              uncluttered for agents with no delivery transport. */}
+          {transport && (
+            <Badge
+              variant="outline"
+              title={`Delivery transport: ${transport.label.toLowerCase()}`}
+              className={cn(
+                "text-xs font-semibold px-3 py-1.5 rounded-md",
+                transport.className,
+              )}
+            >
+              {transport.label}
+            </Badge>
+          )}
           {isNewAgent() && (
             <Badge variant="outline" className="text-xs bg-blue-500/15 text-blue-600 border-blue-500/30 font-medium">
               NEW

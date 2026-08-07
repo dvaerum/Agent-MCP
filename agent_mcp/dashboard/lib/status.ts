@@ -1,4 +1,4 @@
-import type { Agent, Task } from "@/lib/api"
+import type { Agent, Task, TransportStatus } from "@/lib/api"
 
 /**
  * arch-r5 #8 — one status/priority color map. Replaces 4 divergent,
@@ -38,4 +38,36 @@ const PRIORITY_COLOR_CLASSES: Record<Task["priority"], string> = {
 
 export function priorityColorClasses(priority: Task["priority"]): string {
   return PRIORITY_COLOR_CLASSES[priority]
+}
+
+/**
+ * ADR-0021 delivery `transport_status` → badge label + classes.
+ *
+ * Distinct axis from `agentPresence()` (live /mcp stream) — this is the
+ * delivery transport's own liveness view. Rendered as a small labeled
+ * pill next to (not instead of) the presence badge. Reuses the same
+ * semantic tokens as `STATUS_COLOR_CLASSES` (primary / warning / muted /
+ * destructive) so it themes correctly in both light and dark and stays
+ * consistent with the rest of the dashboard's status vocabulary:
+ *   working → primary (active), idle → warning (attention),
+ *   dormant → muted (quiet), dead → destructive (fault).
+ *
+ * Returns `null` for null / undefined / any unrecognised value so the
+ * caller renders nothing (or a muted "—") rather than an empty badge.
+ */
+const TRANSPORT_STATUS_CONFIG: Record<
+  TransportStatus,
+  { label: string; className: string }
+> = {
+  working: { label: "WORKING", className: "bg-primary/15 text-primary border-primary/30" },
+  idle: { label: "IDLE", className: "bg-warning/15 text-warning border-warning/30" },
+  dormant: { label: "DORMANT", className: "bg-muted/50 text-muted-foreground border-border" },
+  dead: { label: "DEAD", className: "bg-destructive/15 text-destructive border-destructive/30" },
+}
+
+export function transportStatusBadge(
+  status: TransportStatus | null | undefined,
+): { label: string; className: string } | null {
+  if (!status) return null
+  return TRANSPORT_STATUS_CONFIG[status] ?? null
 }
