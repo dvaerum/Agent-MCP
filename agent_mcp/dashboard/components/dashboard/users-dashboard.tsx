@@ -9,12 +9,19 @@
 //
 // Backend: /agent-mcp/api/router/users[/<user_id>] (Wave 1b REST).
 // Cookie session carries auth; no body-token field.
+//
+// Presentation is delegated to the shared <DataTablePage> scaffold
+// (see components/dashboard/shared/data-table-page.tsx and the
+// memories-dashboard reference migration): header, loading skeleton,
+// the "Sysadmin only" 403 panel, the list-load error panel, the empty
+// state and the desktop/mobile table all live there now. This file
+// owns only the data source (useRouterQuery), the column spec and the
+// create/edit/delete modals.
 
-import React, { useCallback, useState } from "react"
-import { Loader2, Plus, Pencil, Trash2, Shield, ShieldAlert } from "lucide-react"
+import React, { useCallback, useMemo, useState } from "react"
+import { Loader2, Plus, Pencil, Trash2, Shield, Users } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import {
   Dialog,
   DialogContent,
@@ -25,18 +32,13 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table"
 import { routerUsersUrl, routerUserUrl } from "@/lib/urls"
 import { routerApi } from "@/lib/router-api"
-import { onEnterSubmit } from "@/lib/keyboard"
+import { toastError, toastSuccess } from "@/components/ui/toast"
 import { useRouterQuery } from "@/hooks/use-router-query"
+import { DataTablePage } from "@/components/dashboard/shared/data-table-page"
+import type { Column } from "@/components/dashboard/shared/responsive-data-table"
+import { DeleteConfirmModal } from "./modals/delete-confirm-modal"
 
 // Client-side hint that MUST be kept in sync with the server's canonical
 // policy: `identity.PASSWORD_MIN_LENGTH` / `validate_password_strength`
@@ -79,111 +81,118 @@ export function UsersDashboard(): React.ReactElement {
   const [editTarget, setEditTarget] = useState<UserRow | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<UserRow | null>(null)
 
+  // Delete is owned here (was the inline DeleteUserModal): the shared
+  // <DeleteConfirmModal> renders the type-to-confirm gate and keeps
+  // itself open on failure when we re-throw.
+  const deleteUser = useCallback(
+    async (user: UserRow) => {
+      try {
+        await routerApi.request(routerUserUrl(user.user_id), {
+          method: "DELETE",
+        })
+        refresh()
+        toastSuccess(`User "${user.username}" deleted.`)
+      } catch (e) {
+        toastError(e, "Failed to delete user")
+        throw e
+      }
+    },
+    [refresh],
+  )
+
+  const columns: Column<UserRow>[] = useMemo(
+    () => [
+      {
+        id: "username",
+        header: "Username",
+        mobileLabel: "Username",
+        cellClassName: "font-medium",
+        cell: (u) => u.username,
+      },
+      {
+        id: "email",
+        header: "Email",
+        mobileLabel: "Email",
+        cellClassName: "text-muted-foreground",
+        cell: (u) => u.email ?? "—",
+      },
+      {
+        id: "sysadmin",
+        header: "Sysadmin",
+        mobileLabel: "Sysadmin",
+        cell: (u) =>
+          u.is_sysadmin ? (
+            <Badge variant="default" className="flex items-center gap-1 w-fit">
+              <Shield className="h-3 w-3" /> sysadmin
+            </Badge>
+          ) : (
+            <span className="text-muted-foreground">—</span>
+          ),
+      },
+      {
+        id: "last_login",
+        header: "Last login",
+        mobileLabel: "Last login",
+        cellClassName: "text-muted-foreground text-xs",
+        cell: (u) => (u.last_login_at ? u.last_login_at.slice(0, 19) : "never"),
+      },
+      {
+        id: "actions",
+        header: "Actions",
+        headClassName: "text-right",
+        cellClassName: "text-right",
+        cell: (u) => (
+          <>
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label={`Edit ${u.username}`}
+              onClick={() => setEditTarget(u)}
+            >
+              <Pencil className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label={`Delete ${u.username}`}
+              className="text-destructive"
+              onClick={() => setDeleteTarget(u)}
+            >
+              <Trash2 className="h-4 w-4" />
+            </Button>
+          </>
+        ),
+      },
+    ],
+    [],
+  )
+
   return (
-    <div className="flex flex-col h-full w-full">
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between px-[var(--space-fluid-lg)] py-[var(--space-fluid-md)] gap-[var(--space-fluid-sm)] border-b bg-background/95">
-        <div>
-          <h1 className="text-fluid-2xl font-bold tracking-tight">Users</h1>
-          <p className="text-fluid-base text-muted-foreground mt-1">
-            Operator accounts and sysadmin status
-          </p>
-        </div>
-        <Button onClick={() => setAddOpen(true)} size="sm">
-          <Plus className="h-4 w-4 mr-1" /> Add user
-        </Button>
-      </div>
-
-      <div className="flex-1 overflow-auto p-[var(--space-fluid-lg)]">
-        {loading && (
-          <div className="flex items-center gap-2 text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" /> Loading users…
-          </div>
-        )}
-        {!loading && forbidden && (
-          <Card className="m-4">
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <ShieldAlert className="h-4 w-4 text-destructive" />
-                Sysadmin only
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="text-sm text-muted-foreground">
-              You don&apos;t have sysadmin privileges. Ask a sysadmin to view
-              or manage users on your behalf.
-            </CardContent>
-          </Card>
-        )}
-        {!loading && !forbidden && error && (
-          <div className="text-destructive text-sm">Error: {error}</div>
-        )}
-        {!loading && !forbidden && !error && (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Username</TableHead>
-                <TableHead>Email</TableHead>
-                <TableHead>Sysadmin</TableHead>
-                <TableHead>Last login</TableHead>
-                <TableHead className="text-right">Actions</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {users.length === 0 && (
-                <TableRow>
-                  <TableCell colSpan={5} className="text-center text-muted-foreground">
-                    No users yet.
-                  </TableCell>
-                </TableRow>
-              )}
-              {users.map((u) => (
-                <TableRow key={u.user_id}>
-                  <TableCell className="font-medium">{u.username}</TableCell>
-                  <TableCell className="text-muted-foreground">
-                    {u.email ?? "—"}
-                  </TableCell>
-                  <TableCell>
-                    {u.is_sysadmin ? (
-                      <Badge variant="default" className="flex items-center gap-1 w-fit">
-                        <Shield className="h-3 w-3" /> sysadmin
-                      </Badge>
-                    ) : (
-                      <span className="text-muted-foreground">—</span>
-                    )}
-                  </TableCell>
-                  <TableCell className="text-muted-foreground text-xs">
-                    {u.last_login_at ? u.last_login_at.slice(0, 19) : "never"}
-                  </TableCell>
-                  <TableCell className="text-right">
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      aria-label={`Edit ${u.username}`}
-                      onClick={() => setEditTarget(u)}
-                    >
-                      <Pencil className="h-4 w-4" />
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      aria-label={`Delete ${u.username}`}
-                      className="text-destructive"
-                      onClick={() => setDeleteTarget(u)}
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </Button>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        )}
-      </div>
-
-      <AddUserModal
-        open={addOpen}
-        onOpenChange={setAddOpen}
-        onCreated={refresh}
-      />
+    <DataTablePage<UserRow>
+      header={{
+        title: "Users",
+        subtitle: "Operator accounts and sysadmin status",
+        onRefresh: refresh,
+        refreshing: loading,
+        actions: (
+          <Button onClick={() => setAddOpen(true)} size="sm">
+            <Plus className="h-4 w-4 mr-1" /> Add user
+          </Button>
+        ),
+      }}
+      loading={loading}
+      error={error}
+      forbidden={forbidden}
+      columns={columns}
+      rows={users}
+      getRowId={(u) => u.user_id}
+      empty={{
+        icon: Users,
+        title: "No users yet",
+        description: "Add an operator account to get started.",
+      }}
+    >
+      <AddUserModal open={addOpen} onOpenChange={setAddOpen} onCreated={refresh} />
       {editTarget && (
         <EditUserModal
           user={editTarget}
@@ -192,15 +201,26 @@ export function UsersDashboard(): React.ReactElement {
           onSaved={refresh}
         />
       )}
+      {/* Type-the-username-to-confirm delete (shared modal, matchCase —
+          the confirmation word is a case-sensitive account name, not the
+          generic "DELETE"). Mounted only while a target is selected so
+          the modal's confirm-input state resets between selections. */}
       {deleteTarget && (
-        <DeleteUserModal
-          user={deleteTarget}
+        <DeleteConfirmModal
           open={true}
           onOpenChange={(o) => !o && setDeleteTarget(null)}
-          onDeleted={refresh}
+          entityLabel="User"
+          requiredWord={deleteTarget.username}
+          matchCase
+          inputId="delete-user-confirm"
+          title={`Delete ${deleteTarget.username}?`}
+          description="This permanently removes the account, all its sessions, and all its project memberships. This action cannot be undone."
+          warningText="The account, all its sessions and all its project memberships will be permanently removed. This action cannot be reversed."
+          confirmLabel="Delete user"
+          onConfirm={() => deleteUser(deleteTarget)}
         />
       )}
-    </div>
+    </DataTablePage>
   )
 }
 
@@ -221,7 +241,6 @@ function AddUserModal({
   const [email, setEmail] = useState("")
   const [isSysadmin, setIsSysadmin] = useState(false)
   const [submitting, setSubmitting] = useState(false)
-  const [error, setError] = useState<string | null>(null)
 
   const passwordTooShort =
     password.length > 0 && password.length < PASSWORD_MIN_LENGTH
@@ -232,13 +251,13 @@ function AddUserModal({
     setEmail("")
     setIsSysadmin(false)
     setSubmitting(false)
-    setError(null)
   }
 
+  // Mutation errors go through the shared toast (architecture review
+  // Class 1) — no per-modal error state / inline banner.
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setSubmitting(true)
-    setError(null)
     try {
       await routerApi.request(routerUsersUrl(), {
         method: "POST",
@@ -250,10 +269,11 @@ function AddUserModal({
         }),
       })
       await onCreated()
+      toastSuccess(`User "${username}" created.`)
       reset()
       onOpenChange(false)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      toastError(e, "Failed to create user")
       setSubmitting(false)
     }
   }
@@ -319,7 +339,6 @@ function AddUserModal({
               />
               Grant sysadmin
             </label>
-            {error && <div className="text-sm text-destructive">{error}</div>}
           </div>
           <DialogFooter>
             <Button
@@ -362,12 +381,10 @@ function EditUserModal({
   const [isSysadmin, setIsSysadmin] = useState(user.is_sysadmin)
   const [email, setEmail] = useState(user.email ?? "")
   const [submitting, setSubmitting] = useState(false)
-  const [error, setError] = useState<string | null>(null)
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setSubmitting(true)
-    setError(null)
     try {
       await routerApi.request(routerUserUrl(user.user_id), {
         method: "PATCH",
@@ -377,9 +394,10 @@ function EditUserModal({
         }),
       })
       await onSaved()
+      toastSuccess(`User "${user.username}" updated.`)
       onOpenChange(false)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      toastError(e, "Failed to update user")
       setSubmitting(false)
     }
   }
@@ -409,7 +427,6 @@ function EditUserModal({
               />
               Grant sysadmin
             </label>
-            {error && <div className="text-sm text-destructive">{error}</div>}
           </div>
           <DialogFooter>
             <Button
@@ -426,93 +443,6 @@ function EditUserModal({
             </Button>
           </DialogFooter>
         </form>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-
-export function DeleteUserModal({
-  user,
-  open,
-  onOpenChange,
-  onDeleted,
-}: {
-  user: UserRow
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  onDeleted: () => void | Promise<void>
-}): React.ReactElement {
-  const [submitting, setSubmitting] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  // Type-to-confirm guard: the operator must type the exact username
-  // before the destructive delete unlocks. The parent unmounts this
-  // modal when `deleteTarget` clears between selections, so this state
-  // resets naturally on the next open.
-  const [confirmText, setConfirmText] = useState("")
-  const confirmed = confirmText === user.username
-
-  const handleDelete = async () => {
-    if (!confirmed) return
-    setSubmitting(true)
-    setError(null)
-    try {
-      await routerApi.request(routerUserUrl(user.user_id), {
-        method: "DELETE",
-      })
-      await onDeleted()
-      onOpenChange(false)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-      setSubmitting(false)
-    }
-  }
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Delete {user.username}?</DialogTitle>
-          <DialogDescription>
-            This permanently removes the account, all its sessions, and
-            all its project memberships. This action cannot be undone.
-          </DialogDescription>
-        </DialogHeader>
-        <div className="space-y-2 py-2">
-          <Label htmlFor="delete-user-confirm">
-            Type <span className="font-mono font-semibold">{user.username}</span>{" "}
-            to confirm
-          </Label>
-          <Input
-            id="delete-user-confirm"
-            value={confirmText}
-            onChange={(e) => setConfirmText(e.target.value)}
-            onKeyDown={onEnterSubmit(confirmed && !submitting, handleDelete)}
-            placeholder={user.username}
-            autoComplete="off"
-            autoFocus
-          />
-        </div>
-        {error && (
-          <div className="text-sm text-destructive py-2">{error}</div>
-        )}
-        <DialogFooter>
-          <Button
-            variant="ghost"
-            onClick={() => onOpenChange(false)}
-            disabled={submitting}
-          >
-            Cancel
-          </Button>
-          <Button
-            variant="destructive"
-            onClick={handleDelete}
-            disabled={submitting || !confirmed}
-          >
-            {submitting && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}
-            Delete
-          </Button>
-        </DialogFooter>
       </DialogContent>
     </Dialog>
   )
