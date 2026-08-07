@@ -27,7 +27,8 @@ vi.mock("@/lib/router-api", () => ({
   routerApi: { request: (...args: unknown[]) => requestMock(...args) },
 }))
 
-import { DeleteGroupModal } from "@/components/dashboard/groups-dashboard"
+import { routerApi } from "@/lib/router-api"
+import { routerGroupUrl } from "@/lib/urls"
 
 import type { Message } from "@/lib/api"
 
@@ -188,34 +189,39 @@ describe("Enter submits type-to-confirm delete dialogs", () => {
     await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1))
   })
 
-  it("DeleteGroupModal: Enter fires delete after typing the group name", async () => {
+  // Groups migrated onto the shared scaffold: the bespoke
+  // `DeleteGroupModal` is gone and groups-dashboard now renders
+  // <DeleteConfirmModal requiredWord={group.name} matchCase
+  // inputId="delete-group-confirm">. These two cases render that exact
+  // configuration so the Enter-to-submit contract stays pinned.
+  const groupsDeleteModal = (onOpenChange = () => {}) => (
+    <DeleteConfirmModal
+      open
+      onOpenChange={onOpenChange}
+      entityLabel="Group"
+      requiredWord={group.name}
+      matchCase
+      inputId="delete-group-confirm"
+      onConfirm={async () => {
+        await routerApi.request(routerGroupUrl(group.group_id), {
+          method: "DELETE",
+        })
+      }}
+    />
+  )
+
+  it("groups delete: Enter fires delete after typing the group name", async () => {
     const u = ue()
-    const onDeleted = vi.fn(() => Promise.resolve())
-    render(
-      <DeleteGroupModal
-        group={group}
-        open
-        onOpenChange={() => {}}
-        onDeleted={onDeleted}
-      />,
-    )
+    render(groupsDeleteModal())
     const input = document.getElementById("delete-group-confirm") as HTMLElement
     await u.type(input, group.name)
     await u.keyboard("{Enter}")
     await waitFor(() => expect(requestMock).toHaveBeenCalledTimes(1))
   })
 
-  it("DeleteGroupModal: Enter with wrong text does NOT fire delete", async () => {
+  it("groups delete: Enter with wrong text does NOT fire delete", async () => {
     const u = ue()
-    const onDeleted = vi.fn(() => Promise.resolve())
-    render(
-      <DeleteGroupModal
-        group={group}
-        open
-        onOpenChange={() => {}}
-        onDeleted={onDeleted}
-      />,
-    )
+    render(groupsDeleteModal())
     const input = document.getElementById("delete-group-confirm") as HTMLElement
     await u.type(input, "wrong-name")
     await u.keyboard("{Enter}")

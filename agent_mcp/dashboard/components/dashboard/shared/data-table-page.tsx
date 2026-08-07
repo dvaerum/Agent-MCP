@@ -81,6 +81,11 @@ export interface DataTablePageProps<T> {
   renderMobileCard?: (row: T) => React.ReactNode
   /** Extra classes on desktop body rows. */
   rowClassName?: string
+  /**
+   * Expandable per-row detail (accordion pages, e.g. Groups). See
+   * `ResponsiveDataTableProps.renderExpanded`.
+   */
+  renderExpanded?: (row: T) => React.ReactNode
 
   /** Empty-state content when `rows` is empty. */
   empty: EmptyStateProps
@@ -143,6 +148,7 @@ export function DataTablePage<T>({
   onRowClick,
   renderMobileCard,
   rowClassName,
+  renderExpanded,
   empty,
   skeletonRows = 5,
   skeletonStats,
@@ -238,6 +244,7 @@ export function DataTablePage<T>({
             onRowClick={onRowClick}
             renderMobileCard={renderMobileCard}
             rowClassName={rowClassName}
+            renderExpanded={renderExpanded}
           />
         )}
       </div>
