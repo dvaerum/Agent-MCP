@@ -9,27 +9,26 @@
     let
       system = "x86_64-linux";
 
-      # nixpkgs' python3.12-tenacity carries a timing-sensitive
-      # self-test (test_sleeps asserts a ~1s backoff sleep completes in
-      # <1.1s) that flakes under CI load and reddens the Nix VM build,
-      # even though tenacity's runtime behaviour is fine. tenacity is a
-      # transitive build input of our closure only
-      # (agent-mcp-router → sse-starlette → tenacity); we consume the
-      # package, we don't maintain it, so skip just that one flaky test
-      # and keep the rest of its suite running.
-      tenacityTestFix = _final: prev: {
-        python312 = prev.python312.override {
-          packageOverrides = _pyfinal: pyprev: {
-            tenacity = pyprev.tenacity.overridePythonAttrs (old: {
-              disabledTests = (old.disabledTests or [ ]) ++ [ "test_sleeps" ];
-            });
-          };
-        };
-      };
-
+      # No overlays, deliberately.
+      #
+      # This used to carry a `tenacityTestFix` overlay
+      # (`python312.override { packageOverrides = … }`) that disabled
+      # tenacity's timing-sensitive `test_sleeps`, because that test
+      # flaked under CI load and reddened the Nix VM builds. Removed
+      # 2026-08-08 together with the python312 pin (see
+      # nix/packages.nix): a package-set override rehashes the package
+      # it touches, so the resulting store path no longer matches what
+      # Hydra published and tenacity had to build — and therefore
+      # self-test — locally. The overlay was creating the very
+      # condition it was added to fix.
+      #
+      # On the channel's DEFAULT python (pkgs.python3) tenacity
+      # substitutes pre-built from cache.nixos.org, so its suite never
+      # runs here at all. Don't re-add an overlay for a flaky test in
+      # a package we merely consume; check first whether the package
+      # is being needlessly rebuilt.
       pkgs = import nixpkgs {
         inherit system;
-        overlays = [ tenacityTestFix ];
       };
       lib = nixpkgs.lib;
 

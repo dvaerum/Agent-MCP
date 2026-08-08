@@ -29,7 +29,7 @@
 #
 # Nix substitutions:
 #   @bash@    — pkgs.bash
-#   @python@  — pkgs.python312
+#   @python@  — the interpreter nix/packages.nix picked (pkgs.python3)
 #   @runner@  — absolute path to the runner script (Python source
 #               file installed by the same Nix derivation that
 #               substituted this wrapper)

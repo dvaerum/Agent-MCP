@@ -65,40 +65,48 @@ let
   # UPPER bound, already satisfied. No dependency cascade.
   #
   # Version-GATED so it retires itself: the moment a consumer's channel ships
-  # >= 1.27.0 this evaluates to {} and the pin disappears. Follows the
-  # `tenacityTestFix` precedent in flake.nix.
+  # >= 1.27.0 `mcpPinned` is just `python.pkgs.mcp` and the pin disappears.
   mcpFloor = "1.27.0";
   mcpPinVersion = "1.27.1";
 
-  # Gate read from the UNTOUCHED package set, deliberately. Testing
-  # `pyprev.mcp.version` inside `packageOverrides` is the obvious spelling and
-  # it hits infinite recursion: the condition that decides the overlay would
-  # have to be evaluated through the fixpoint the overlay is defining. Reading
-  # `pkgs.python312Packages.mcp.version` here sidesteps the fixpoint entirely.
-  mcpNeedsPin = lib.versionOlder pkgs.python312Packages.mcp.version mcpFloor;
+  # The channel's DEFAULT interpreter, deliberately not a pinned
+  # `pkgs.python312`. Hydra builds the default set exhaustively; the
+  # non-default sets get patchy coverage, so pinning an off-default
+  # python means a large slice of the closure has no binary-cache hit
+  # and builds — and self-tests — from source in CI. (Measured
+  # 2026-08-08: `python3.12-tenacity` was absent from cache.nixos.org
+  # while `python3.13-tenacity` was present.)
+  python = pkgs.python3;
 
-  python =
-    if !mcpNeedsPin then
-      pkgs.python312
+  # Single-derivation override, spliced straight into `dependencies`
+  # below — NOT `python.override { packageOverrides = … }`.
+  #
+  # A package-set override rebuilds `mcp` *and* re-instantiates
+  # everything downstream of it inside a fresh fixpoint, so those store
+  # paths stop matching what Hydra published and nothing substitutes.
+  # Overriding the single derivation rehashes only `mcp` and the one
+  # package that consumes it (ours), leaving the rest of the set
+  # cacheable. It also sidesteps the infinite recursion that reading
+  # `pyprev.mcp.version` inside `packageOverrides` would cause: the
+  # gate below reads the untouched set.
+  mcpPinned =
+    if !lib.versionOlder python.pkgs.mcp.version mcpFloor then
+      python.pkgs.mcp
     else
-      pkgs.python312.override {
-        packageOverrides = _pyfinal: pyprev: {
-          mcp = pyprev.mcp.overridePythonAttrs (_old: {
-            version = mcpPinVersion;
-            src = pkgs.fetchFromGitHub {
-              owner = "modelcontextprotocol";
-              repo = "python-sdk";
-              tag = "v${mcpPinVersion}";
-              hash = "sha256-LhoLcFC5+7xOCfud23sbHyTMxKYmdeZh0c+UtGdvzCs=";
-            };
-            # 1.27.1's suite wants pytest/inline-snapshot newer than 26.05
-            # ships (upstream nixpkgs needed a -W filter and an extra exclusion
-            # for it). We pin for a runtime fix, not to vendor their test
-            # matrix — our own suite exercises this path in CI.
-            doCheck = false;
-          });
+      python.pkgs.mcp.overridePythonAttrs (_old: {
+        version = mcpPinVersion;
+        src = pkgs.fetchFromGitHub {
+          owner = "modelcontextprotocol";
+          repo = "python-sdk";
+          tag = "v${mcpPinVersion}";
+          hash = "sha256-LhoLcFC5+7xOCfud23sbHyTMxKYmdeZh0c+UtGdvzCs=";
         };
-      };
+        # 1.27.1's suite wants pytest/inline-snapshot newer than 26.05
+        # ships (upstream nixpkgs needed a -W filter and an extra exclusion
+        # for it). We pin for a runtime fix, not to vendor their test
+        # matrix — our own suite exercises this path in CI.
+        doCheck = false;
+      });
 
   agentMcpPy = python.pkgs.buildPythonApplication {
     pname = "agent-mcp";
@@ -116,7 +124,9 @@ let
     build-system = [ python.pkgs.setuptools ];
     dependencies = with python.pkgs; [
       anyio click openai fastapi starlette uvicorn jinja2
-      python-dotenv sqlite-vec httpx mcp
+      python-dotenv sqlite-vec httpx
+      # Version-gated single-package override; see `mcpPinned` above.
+      mcpPinned
       # Declared in pyproject.toml; was reaching the closure only as a
       # transitive dep of `mcp`. List it explicitly so the build doesn't
       # silently depend on someone else's dependency graph.
@@ -291,7 +301,7 @@ let
   #                                 template.
   #
   # The Nix-substituted `.sh.in` files use `@var@` markers so the
-  # store-path locations of pkgs.bash / pkgs.python312 / the runner
+  # store-path locations of pkgs.bash / the interpreter / the runner
   # script / pkgs.curl / pkgs.jq are baked in at build time.
 
   agentMcpDaemonAgentRunner = pkgs.runCommand "agent-mcp-daemon-agent-runner.py" {} ''
