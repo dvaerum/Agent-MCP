@@ -32,6 +32,25 @@ import { APP_PROJECT_PATH_RE, appUrl, overviewAppUrl } from "@/lib/urls"
 //     configured project name with a small "single-tenant" badge.
 //     There's nowhere else for the operator to go.
 
+/**
+ * Chip trigger geometry, shared by both tenancy branches.
+ *
+ * The chip lives in the app-shell header's `flex-1 min-w-0` slot, which
+ * is only ~173px wide on a 390px phone. `<Button>` is an `inline-flex`
+ * with `whitespace-nowrap`, so without a cap it sizes to its content:
+ * the 31-char live project name measured 301px — 128px past the slot,
+ * 64px past the viewport, and painted over the theme toggle.
+ *
+ *   max-w-full          cap the chip at its slot (the actual fix)
+ *   sm:min-w-[200px]    keep the desktop floor, but only from `sm` up:
+ *                       unqualified, min-width BEATS max-width and the
+ *                       chip overflows a phone header anyway
+ *
+ * The inner label wrapper needs its own `min-w-0` for the `truncate`
+ * span to engage — see the call sites.
+ */
+const CHIP_CLASS = "justify-between max-w-full sm:min-w-[200px]"
+
 function readActiveProjectName(): string | null {
   if (typeof window === "undefined") return null
   const m = window.location.pathname.match(APP_PROJECT_PATH_RE)
@@ -77,12 +96,13 @@ export function ProjectPicker() {
     return (
       <Button
         variant="outline"
-        className="justify-between min-w-[200px] cursor-not-allowed opacity-80"
+        className={CHIP_CLASS + " cursor-not-allowed opacity-80"}
         disabled
+        title={displayName}
         aria-label="Project picker disabled in single-tenant mode"
       >
-        <div className="flex items-center space-x-2">
-          <Lock className="h-3 w-3 text-muted-foreground" />
+        <div className="flex items-center space-x-2 min-w-0">
+          <Lock className="h-3 w-3 text-muted-foreground shrink-0" />
           <span className="truncate">{displayName}</span>
         </div>
         <Badge variant="outline" className="text-[10px] ml-2">
@@ -95,12 +115,12 @@ export function ProjectPicker() {
   return (
     <DropdownMenu open={isOpen} onOpenChange={setIsOpen}>
       <DropdownMenuTrigger asChild>
-        <Button variant="outline" className="justify-between min-w-[200px]">
-          <div className="flex items-center space-x-2">
-            <div className="w-2 h-2 rounded-full bg-primary" />
+        <Button variant="outline" className={CHIP_CLASS} title={displayName}>
+          <div className="flex items-center space-x-2 min-w-0">
+            <div className="w-2 h-2 rounded-full bg-primary shrink-0" />
             <span className="truncate">{displayName}</span>
           </div>
-          <Settings className="h-4 w-4 ml-2 opacity-50" />
+          <Settings className="h-4 w-4 ml-2 opacity-50 shrink-0" />
         </Button>
       </DropdownMenuTrigger>
 

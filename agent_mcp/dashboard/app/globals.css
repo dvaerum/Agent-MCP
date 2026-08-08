@@ -422,11 +422,19 @@
     }
   }
   
-  /* Ensure full width layouts don't have unwanted margins */
-  .w-full {
-    width: 100% !important;
-  }
-  
+  /* NOTE: there used to be a `.w-full { width: 100% !important }` here
+     ("ensure full width layouts don't have unwanted margins"). It was
+     redundant with Tailwind's own `.w-full` — which lives in the later
+     `@layer utilities` and therefore already wins — but its
+     `!important` also outranked every responsive override, and an
+     `!important` inside a cascade layer beats both unlayered rules and
+     later layers. So `w-full sm:w-40` resolved to 100% at ALL
+     breakpoints, and every filter bar built on that idiom (Messages,
+     Tasks, Memories, Agents, Schedules, Prompt Book) stacked one
+     control per row on desktop. Do not reintroduce it: sizing belongs
+     in the utility classes, never in an !important components-layer
+     override. Guarded by tests/responsive-width-utilities.test.ts. */
+
   /* Better handling of flex containers on large screens */
   @media (min-width: 1920px) {
     .flex {
