@@ -269,12 +269,13 @@ The module covers the systemd shape only — TLS termination
 
 ## Architecture notes
 
-- The vendored `nix/router.py` is `nixos-developer-system`'s
-  router with one knob added: `AGENT_MCP_SYSTEMCTL_MODE`
-  switches between `systemctl --user` (production, home-manager)
-  and plain `systemctl` (VM, where there's no per-user
-  systemd instance). Plus `AGENT_MCP_ROUTER_HOST` so the VM can
-  bind `0.0.0.0` for qemu hostfwd.
+- The router is the packaged one (`agent_mcp/router/`, invoked via
+  `python -m agent_mcp.cli router`), not a vendored script — the
+  pre-upstream `nix/router.py` copy was deleted 2026-08-09. Two env
+  knobs matter in the VM: `AGENT_MCP_SYSTEMCTL_MODE` switches between
+  `systemctl --user` (production, home-manager) and plain `systemctl`
+  (VM, where there's no per-user systemd instance), and
+  `AGENT_MCP_ROUTER_HOST` lets the VM bind `0.0.0.0` for qemu hostfwd.
 - A polkit rule (in `nix/module.nix`) grants the unprivileged
   `agent-mcp` user permission to start/stop `agent-mcp@*.service`
   units via systemd, so the router doesn't need root.
