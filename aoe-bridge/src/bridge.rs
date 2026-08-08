@@ -7,9 +7,11 @@
 //! 2. fetch per-session liveness via AoE's web REST `GET /api/sessions`
 //!    (worker state, not just status — so a stopped session reads `dormant`);
 //! 3. resolve the per-session routes;
-//! 4. for each live route: POST its transport-status, and ensure exactly one
-//!    SSE task is running (respawning it if its endpoint/token/mode/AoE creds
-//!    changed);
+//! 4. for each live route: POST its transport-status, assert its per-session
+//!    MCP, switch it to ACP if asked — correcting an `auto` route to
+//!    `structured` the moment that switch succeeds, since step 3 resolved it
+//!    from a pre-switch snapshot — and ensure exactly one SSE task is running
+//!    (respawning it if its endpoint/token/mode/AoE creds changed);
 //! 5. for a configured-but-not-live session: POST `dead` and drop its task;
 //! 6. drop tasks whose session left the mapping;
 //! 7. publish the observable state to the plugin's AoE settings page.
@@ -48,8 +50,8 @@ use crate::observe::{self, now_secs};
 use crate::plugin::{PluginConn, PublishReason};
 use crate::render::{parse_frame, render_skinny};
 use crate::status::{
-    clip_detail, render_page, summary_line, InjectOutcome, Notice, Snapshot, StreamState, PAGE_ID,
-    PAGE_SLOT,
+    clip_detail, compact_error, render_page, summary_line, InjectOutcome, Notice, Snapshot,
+    StreamState, PAGE_ID, PAGE_SLOT,
 };
 
 /// How often the settings page repaints even with nothing happening. The page
@@ -110,10 +112,14 @@ pub async fn run_bridge(
     // (the host makes an unchanged set a no-op respawn); it only avoids RPC
     // spam and, on a real change, forces a re-assert.
     let mut mcp_set: HashMap<String, String> = HashMap::new();
-    // Per-session guard: sessions we've already POSTed acp/enable for this run.
-    // The host call is idempotent, so this only avoids repeat view-swaps / log
-    // spam; a stale/removed row is dropped from it so a re-add re-enables.
-    let mut acp_enabled: HashSet<String> = HashSet::new();
+    // Per-session ACP memory: session_id -> "is this session known to be in ACP
+    // mode?", recorded once per run when we POST acp/enable. The host call is
+    // idempotent, so the entry only avoids repeat view-swaps / log spam — but it
+    // also carries the OUTCOME forward, which routing needs: a session we
+    // switched stays structured on later passes even while AoE's liveness still
+    // reports `acp_worker_state = "absent"` (the worker can spawn lazily). A
+    // stale/removed row is dropped so a re-add re-enables and re-learns.
+    let mut acp_mode: HashMap<String, bool> = HashMap::new();
 
     loop {
         let settings = config::load_settings(&conn).await;
@@ -135,7 +141,7 @@ pub async fn run_bridge(
                 t.handle.abort();
             }
             mcp_set.clear();
-            acp_enabled.clear();
+            acp_mode.clear();
             state.lock().unwrap().sessions.clear();
         } else {
             let live = fetch_liveness(&http, &settings.aoe_base, &settings.aoe_token).await;
@@ -163,8 +169,7 @@ pub async fn run_bridge(
             // session must stay listed rather than vanish from the page.
             let covered: HashSet<String> = routes.iter().map(|r| r.session_id.clone()).collect();
 
-            for route in routes {
-                let fingerprint = route.fingerprint(&settings.aoe_base, &settings.aoe_token);
+            for mut route in routes {
                 if route.live {
                     wanted.insert(route.session_id.clone());
 
@@ -212,11 +217,35 @@ pub async fn run_bridge(
                     // the ACP spawn picks up `session_mcp_servers`. Only covered
                     // sessions (expose_mcp on ⇒ mcp_url set) are switched, and
                     // only when the global ensure_acp setting is on.
-                    if route.wants_acp(settings.ensure_acp) {
-                        ensure_acp_mode(&ctx, &route, &mut acp_enabled).await;
+                    //
+                    // A session that IS in ACP mode only accepts `/acp/prompt`;
+                    // its terminal `/send` answers 400 acp_mode_unsupported. The
+                    // route above was resolved from a liveness snapshot taken
+                    // BEFORE this flip, so on the pass that first switches a
+                    // session an `auto` row still reads Terminal. Correct it here
+                    // — before the fingerprint is taken and before the SSE task
+                    // is spawned with the route — so frames arriving seconds
+                    // later go to the right endpoint instead of being dropped
+                    // until the next reconcile.
+                    if route.wants_acp(settings.ensure_acp)
+                        && ensure_acp_mode(&ctx, &route, &mut acp_mode).await
+                        && route.promote_structured_after_acp()
+                    {
+                        observe::info(&format!(
+                            "session {} is in ACP mode; route corrected to structured",
+                            route.session_id
+                        ));
+                        ctx.observe(&route.session_id, &route.project, |o| {
+                            o.mode = route.mode.as_str().to_string()
+                        });
                     }
 
-                    // Ensure a fresh SSE task with the current fingerprint.
+                    // Ensure a fresh SSE task with the current fingerprint. The
+                    // fingerprint is taken AFTER the ACP correction above so the
+                    // task is keyed on the mode it actually runs with — a later
+                    // pass that infers Structured from a now-live ACP worker then
+                    // matches, instead of respawning the stream we just opened.
+                    let fingerprint = route.fingerprint(&settings.aoe_base, &settings.aoe_token);
                     let needs_spawn = match tasks.get(&route.session_id) {
                         Some(t) => t.fingerprint != fingerprint,
                         None => true,
@@ -276,10 +305,10 @@ pub async fn run_bridge(
                 // actively clear the session's injected tools here: a removed
                 // row stops delivery but leaves the session usable via MCP.
                 mcp_set.remove(&k);
-                // Drop the ACP guard too so a re-added row re-enables. We do NOT
+                // Drop the ACP memory too so a re-added row re-enables. We do NOT
                 // revert the session to terminal: the ACP switch is one-way and
                 // leaves the session usable.
-                acp_enabled.remove(&k);
+                acp_mode.remove(&k);
             }
 
             // Only sessions REMOVED from the settings vanish from the page.
@@ -452,13 +481,23 @@ async fn ensure_session_mcp(ctx: &BridgeCtx, guard: &mut HashMap<String, String>
 /// `claude`/`opencode` sessions never load per-session MCP; ACP delivers it
 /// agent-agnostically. POSTs `{aoe_base}/api/sessions/{id}/acp/enable`, which is
 /// idempotent host-side (a session already structured/ACP is a no-op) — the
-/// `guard` set only avoids repeated view-swaps / log spam by calling it at most
+/// `guard` map only avoids repeated view-swaps / log spam by calling it at most
 /// once per session. Best-effort: a non-ACP-capable agent (or any transport
 /// error) is recorded and skipped; it never fails the reconcile.
-async fn ensure_acp_mode(ctx: &BridgeCtx, route: &Route, guard: &mut HashSet<String>) {
+///
+/// Returns whether the session is now KNOWN to be in ACP mode — the caller
+/// routes on that (an ACP session's terminal `/send` is refused), so the
+/// outcome, not just the fact of the attempt, is remembered in `guard` for the
+/// rest of the run. A refused/failed flip returns false: that session was never
+/// switched, so its route must stay as resolved.
+async fn ensure_acp_mode(
+    ctx: &BridgeCtx,
+    route: &Route,
+    guard: &mut HashMap<String, bool>,
+) -> bool {
     let session_id = &route.session_id;
-    if !guard.insert(session_id.to_string()) {
-        return; // already attempted this session.
+    if let Some(&known_acp) = guard.get(session_id) {
+        return known_acp; // already attempted this session; reuse the outcome.
     }
     let url = format!("{}/api/sessions/{}/acp/enable", ctx.aoe_base, session_id);
     let mut req = ctx.http.post(&url).json(&json!({}));
@@ -468,7 +507,8 @@ async fn ensure_acp_mode(ctx: &BridgeCtx, route: &Route, guard: &mut HashSet<Str
     let msg = match req.send().await {
         Ok(r) if r.status().is_success() => {
             observe::info(&format!("session {session_id} switched to ACP mode"));
-            return;
+            guard.insert(session_id.to_string(), true);
+            return true;
         }
         Ok(r) => {
             let code = r.status().as_u16();
@@ -479,10 +519,12 @@ async fn ensure_acp_mode(ctx: &BridgeCtx, route: &Route, guard: &mut HashSet<Str
         }
         Err(e) => format!("acp/enable for {session_id} failed: {e}"),
     };
+    guard.insert(session_id.to_string(), false);
     observe::warn(&msg);
     ctx.observe(session_id, &route.project, |o| {
         o.note_error(&msg, now_secs())
     });
+    false
 }
 
 /// POST the session's transport-status up the delivery channel. Best-effort.
@@ -656,26 +698,32 @@ async fn handle_frame(ctx: &BridgeCtx, route: &Route, data: &str) {
             // "message": …}`, and it is that code (e.g. acp_mode_unsupported)
             // that says whether the route or the session is wrong.
             let code = r.status().as_u16();
-            let detail = error_body(r).await;
+            let body = error_body(r).await;
+            // Full body to the log; the page gets the compacted form. The page
+            // row is one non-wrapping line and the raw JSON envelope overflowed
+            // its card on a phone, clipping off the error code — the one part
+            // worth reading. Nothing is lost: the log keeps the whole body.
             observe::error(&format!(
-                "inject to {} via {} returned HTTP {code}: {detail}",
+                "inject to {} via {} returned HTTP {code}: {body}",
                 route.session_id,
                 route.mode.as_str()
             ));
             InjectOutcome {
                 ok: false,
                 http: Some(code),
-                detail,
+                detail: compact_error(&body),
                 at: now_secs(),
             }
         }
         Err(e) => {
-            let detail = clip_detail(&e.to_string());
-            observe::error(&format!("inject to {} failed: {detail}", route.session_id));
+            // Same split as above: the whole transport error to the log, a
+            // row-width summary to the page.
+            let full = clip_detail(&e.to_string());
+            observe::error(&format!("inject to {} failed: {full}", route.session_id));
             InjectOutcome {
                 ok: false,
                 http: None,
-                detail,
+                detail: compact_error(&full),
                 at: now_secs(),
             }
         }

@@ -101,7 +101,13 @@ provisioned.
   structured/acp/composer/cityhall ⇒ structured, else terminal*. **Set `mode`
   explicitly to `structured`** for ACP / CityHall / composer sessions to be
   safe. If `sessions.list` later exposes a real mode field, wire it into
-  `resolve_routes` and the inference tightens automatically.
+  `resolve_routes` and the inference tightens automatically. Two things already
+  tighten it: a live `acp_worker_state` forces `structured` regardless of the
+  tool/status text, and a session this bridge itself switches to ACP
+  (`ensure_acp`) has its `auto` route corrected to `structured` in the same
+  reconcile pass — otherwise every nudge until the next pass would hit the
+  terminal `/send` and come back `400 acp_mode_unsupported`. An explicit
+  `mode = "terminal"` is never overridden by either.
 - **`transport-status` mapping** from AoE's session status is likewise a
   keyword match (`map_transport_status`); it only *gates nudge timing*, never
   authorizes anything, so an occasional misclassification is low-blast-radius.
@@ -183,7 +189,7 @@ It answers, per covered session:
 | is the delivery stream up? | `stream`: connected / reconnecting (attempt N) / stopped |
 | did a frame arrive? | `frames received`: count, age, and the frame's `reason` |
 | did the inject work? | `injects`: ok/failed counts, and `last inject` with the HTTP status |
-| **why did it fail?** | `last inject` carries AoE's error body, e.g. `HTTP 400: acp_mode_unsupported` |
+| **why did it fail?** | `last inject` carries AoE's error code, e.g. `HTTP 400: acp_mode_unsupported` — compacted from the JSON body so it still reads on a phone; the untruncated body is in the log |
 | is agent-mcp's MCP wired in? | `agent-mcp tools`: injected / pending |
 
 Failing sessions sort first and render expanded. The overall verdict

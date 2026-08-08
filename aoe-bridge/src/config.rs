@@ -186,6 +186,11 @@ pub struct Route {
     pub mcp_url: Option<String>,
     /// Whether the session is currently present in `sessions.list`.
     pub live: bool,
+    /// Whether the row left the mode to `auto` (i.e. did NOT pin `terminal` or
+    /// `structured`). Only an `auto` route may have its mode corrected mid-pass
+    /// by [`Route::promote_structured_after_acp`]; an operator's explicit pin is
+    /// never silently overridden.
+    pub auto_mode: bool,
 }
 
 impl Route {
@@ -195,6 +200,25 @@ impl Route {
     /// delivery-only rows are never switched.
     pub fn wants_acp(&self, ensure_acp: bool) -> bool {
         ensure_acp && self.mcp_url.is_some()
+    }
+
+    /// Correct an `auto` route to [`Mode::Structured`] after the bridge has just
+    /// switched this session to ACP. Returns whether the mode changed.
+    ///
+    /// The reconcile pass resolves modes from a liveness snapshot taken BEFORE
+    /// `acp/enable` runs, so on the pass that first switches a session the
+    /// snapshot still reads `acp_worker_state = "absent"` and `auto` infers
+    /// [`Mode::Terminal`]. Every frame arriving before the NEXT pass would then
+    /// be POSTed to the terminal `/send`, which answers `400
+    /// acp_mode_unsupported` — the nudge is dropped for up to
+    /// `status_interval_secs`. Applying this the moment the flip succeeds closes
+    /// that window, including for the SSE task spawned with the route.
+    pub fn promote_structured_after_acp(&mut self) -> bool {
+        if !self.auto_mode || self.mode == Mode::Structured {
+            return false;
+        }
+        self.mode = Mode::Structured;
+        true
     }
 
     /// A change in any of these means the running per-session task must be torn
@@ -258,7 +282,8 @@ pub fn resolve_routes(settings: &Settings, live: &HashMap<String, Liveness>) -> 
             continue;
         }
         let record = live.get(&entry.session_id);
-        let mode = match entry.mode.trim().to_lowercase().as_str() {
+        let raw_mode = entry.mode.trim().to_lowercase();
+        let mode = match raw_mode.as_str() {
             "terminal" => Mode::Terminal,
             "structured" => Mode::Structured,
             // "auto" (or unset/unknown): infer from the live record. A session
@@ -285,6 +310,7 @@ pub fn resolve_routes(settings: &Settings, live: &HashMap<String, Liveness>) -> 
                 None
             },
             live: record.is_some(),
+            auto_mode: !matches!(raw_mode.as_str(), "terminal" | "structured"),
         });
     }
     out
@@ -465,6 +491,111 @@ mod tests {
             &live,
         );
         assert_eq!(routes[0].mode, Mode::Structured);
+    }
+
+    /// One live record with full control over the liveness fields.
+    fn liveness(id: &str, tool: &str, status: &str, acp: &str, term: bool) -> Liveness {
+        Liveness {
+            id: id.into(),
+            tool: tool.into(),
+            status: status.into(),
+            acp_worker_state: acp.into(),
+            has_terminal: term,
+            dormant: false,
+        }
+    }
+
+    #[test]
+    fn acp_switch_promotes_auto_route_to_structured_same_pass() {
+        // Regression for the live 400 acp_mode_unsupported window: the pass that
+        // FIRST switches a session to ACP resolved its route from a liveness
+        // snapshot taken before the switch (acp_worker_state="absent"), so an
+        // `auto` row infers Terminal. Every frame arriving before the next
+        // reconcile (up to status_interval_secs) would be POSTed to the terminal
+        // /send, which answers 400 acp_mode_unsupported and drops the nudge. The
+        // successful ACP flip must correct the route immediately.
+        let mut live = HashMap::new();
+        live.insert(
+            "s1".to_string(),
+            liveness("s1", "claude", "Idle", "absent", true),
+        );
+        let mut routes = resolve_routes(
+            &settings(vec![entry("s1", "t", "p", "auto")], "https://h"),
+            &live,
+        );
+        let route = &mut routes[0];
+        // Pre-flip: the stale snapshot infers Terminal, and this row is an
+        // ensure_acp candidate (expose_mcp defaults on).
+        assert_eq!(route.mode, Mode::Terminal);
+        assert!(route.wants_acp(true));
+
+        // The flip succeeds -> the route is corrected for the rest of the pass.
+        assert!(route.promote_structured_after_acp());
+        assert_eq!(route.mode, Mode::Structured);
+
+        // ...which is what the SSE task spawned with this route injects through.
+        let (url, _) = crate::inject::build_injection(route.mode, "http://a:8080", "s1", "hi");
+        assert_eq!(url, "http://a:8080/api/sessions/s1/acp/prompt");
+
+        // Idempotent: a later pass re-asserting the known-ACP state is a no-op.
+        assert!(!route.promote_structured_after_acp());
+        assert_eq!(route.mode, Mode::Structured);
+    }
+
+    #[test]
+    fn explicit_terminal_row_is_never_promoted_after_acp_switch() {
+        // An operator who pinned mode="terminal" keeps it, even if the bridge
+        // switched the session to ACP: an explicit choice is never silently
+        // overridden (same principle as `explicit_mode_overrides_inference`).
+        let mut live = HashMap::new();
+        live.insert(
+            "s1".to_string(),
+            liveness("s1", "claude", "Idle", "absent", true),
+        );
+        let mut routes = resolve_routes(
+            &settings(vec![entry("s1", "t", "p", "terminal")], "https://h"),
+            &live,
+        );
+        assert!(!routes[0].promote_structured_after_acp());
+        assert_eq!(routes[0].mode, Mode::Terminal);
+
+        // An explicitly-structured row is likewise left alone (already correct).
+        let mut routes = resolve_routes(
+            &settings(vec![entry("s1", "t", "p", "structured")], "https://h"),
+            &live,
+        );
+        assert!(!routes[0].promote_structured_after_acp());
+        assert_eq!(routes[0].mode, Mode::Structured);
+    }
+
+    #[test]
+    fn promoted_route_fingerprint_matches_the_next_pass_so_no_respawn() {
+        // `mode` is part of the task fingerprint, so the corrected route must be
+        // fingerprinted AFTER the promotion — otherwise the next pass (whose
+        // liveness now reports the ACP worker) resolves Structured, sees a
+        // different fingerprint, and pointlessly tears down and respawns the
+        // stream it just opened.
+        let cfg = settings(vec![entry("s1", "t", "p", "auto")], "https://h");
+
+        let mut pre = HashMap::new();
+        pre.insert(
+            "s1".to_string(),
+            liveness("s1", "claude", "Idle", "absent", true),
+        );
+        let mut this_pass = resolve_routes(&cfg, &pre);
+        assert!(this_pass[0].promote_structured_after_acp());
+
+        let mut post = HashMap::new();
+        post.insert(
+            "s1".to_string(),
+            liveness("s1", "claude", "Idle", "running", false),
+        );
+        let next_pass = resolve_routes(&cfg, &post);
+        assert_eq!(next_pass[0].mode, Mode::Structured);
+        assert_eq!(
+            this_pass[0].fingerprint(&cfg.aoe_base, &cfg.aoe_token),
+            next_pass[0].fingerprint(&cfg.aoe_base, &cfg.aoe_token)
+        );
     }
 
     #[test]
