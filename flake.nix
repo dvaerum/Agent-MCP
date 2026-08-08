@@ -41,16 +41,20 @@
         src = self;
       };
 
-      # ── VM package set (older NixOS-module flake, kept for tests) ──
-      # Re-usable builders for the Python package, the dashboard, the
-      # router wrapper, etc. The two modes differ only in
-      # assetPrefix; the dashboard derivation hard-bakes that prefix.
-      mkVmPkgs = assetPrefix: import ./nix/package.nix {
-        inherit pkgs lib assetPrefix;
-        src = self;
-      };
-      vmPkgsMulti = mkVmPkgs "/agent-mcp/__dashboard";
-      vmPkgsSingle = mkVmPkgs "";
+      # There is deliberately no second package set here.
+      #
+      # Until 2026-08-09 this file also imported `nix/package.nix`, a
+      # near-copy of nix/packages.nix that built its own `agentMcpPy`
+      # from a SEPARATELY MAINTAINED dependency list — and the two
+      # drifted (see docs/learnings/duplication-drift.md). Nothing
+      # imported that copy's Python app, backend wrapper, launcher or
+      # readme: it reached the outside world only as two flake outputs
+      # that were themselves dead — `agent-mcp-dashboard-single`
+      # (byte-identical to `agent-mcp-dashboard` since Phase 4 made
+      # `assetPrefix` a serve-time substitution) and `agent-mcp-router`
+      # (a wrapper around the pre-upstream vendored `nix/router.py`,
+      # superseded by `agent_mcp/router/`). Both were deleted with it.
+      # `tests/test_nix_single_source_of_truth.py` keeps it that way.
 
       # NixOS VM builder. `mode` selects the systemd shape via
       # services.agent-mcp.mode in nix/vm.nix.
@@ -116,7 +120,7 @@
       # ── packages ────────────────────────────────────────────────
       # The three top-level packages the home-manager module consumes
       # (agent-mcp, agent-mcp-dashboard, agent-mcp-router-wrapper) plus
-      # the legacy VM-flavoured packages and the qemu run script.
+      # the VM derivations and the qemu run scripts.
       packages.${system} = {
         # Phase 2 production set (consumed by the home-manager module).
         agent-mcp = productionPkgs.agentMcpPy;
@@ -124,11 +128,6 @@
         agent-mcp-router-wrapper = productionPkgs.agentMcpRouterWrapper;
         default = productionPkgs.agentMcpPy;
 
-        # Legacy VM/test packages. The dashboard variant with empty
-        # assetPrefix supports the WIP single-tenant URL surface
-        # (Phase 3 owns the toggle that selects between the two).
-        agent-mcp-dashboard-single = vmPkgsSingle.agentMcpDashboard;
-        agent-mcp-router = vmPkgsMulti.agentMcpRouter;
         vm = vmMulti;
         vm-multi = vmMulti;
         vm-single = vmSingle;
