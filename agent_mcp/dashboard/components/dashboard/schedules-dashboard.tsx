@@ -32,6 +32,7 @@ import {
 import {
   Tooltip, TooltipContent, TooltipProvider, TooltipTrigger,
 } from "@/components/ui/tooltip"
+import { ConfirmActionModal } from "@/components/dashboard/modals/confirm-action-modal"
 import { SendDirectiveModal } from "@/components/dashboard/shared/send-directive-modal"
 import { DataTablePage } from "@/components/dashboard/shared/data-table-page"
 import type { Column } from "@/components/dashboard/shared/responsive-data-table"
@@ -90,6 +91,8 @@ export function SchedulesDashboard() {
 
   // delete confirm
   const [deleteId, setDeleteId] = useState<string | null>(null)
+  // Tier 1 names its target, so the confirm dialog needs the row.
+  const deletingSchedule = schedules.find((s) => s.directive_id === deleteId)
 
   // Send-directive (poke) modal — shared with the Agents page.
   // `directiveOpen` drives visibility; `directiveAgent` is the locked
@@ -218,10 +221,12 @@ export function SchedulesDashboard() {
     try {
       await apiClient.deleteSchedule(deleteId)
       toastSuccess("Schedule deleted")
-      setDeleteId(null)
       await load()
     } catch (e) {
       toastError(e, "Failed to delete schedule")
+      // Re-throw so <ConfirmActionModal> keeps itself open and shows
+      // the reason inline next to the button that failed.
+      throw e
     }
   }
 
@@ -409,7 +414,7 @@ export function SchedulesDashboard() {
       >
         {/* Create / edit modal */}
         <Dialog open={formOpen} onOpenChange={setFormOpen}>
-          <DialogContent>
+          <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-lg">
             <DialogHeader>
               <DialogTitle>{editId ? "Edit schedule" : "New schedule"}</DialogTitle>
               <DialogDescription>
@@ -482,29 +487,23 @@ export function SchedulesDashboard() {
           </DialogContent>
         </Dialog>
 
-        {/* Delete confirm — deliberately a plain one-click confirm, not the
-            type-to-confirm <DeleteConfirmModal>: a schedule is cheap to
-            re-create, so this migration does not tighten the gate. */}
-        <Dialog open={deleteId != null} onOpenChange={(o) => !o && setDeleteId(null)}>
-          <DialogContent alertDialog>
-            <DialogHeader>
-              <DialogTitle>Delete schedule</DialogTitle>
-              <DialogDescription>
-                This permanently removes the scheduled directive. This cannot
-                be undone.
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setDeleteId(null)}>
-                Cancel
-              </Button>
-              <Button variant="destructive" onClick={() => void confirmDelete()}
-                      data-testid="confirm-delete-btn">
-                Delete
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+        {/* Delete confirm — TIER 1 (shared <ConfirmActionModal>).
+            A schedule is cheap to re-create and the cascade is bounded
+            to the one directive row, so the gate stays a single click;
+            what the tier DOES require is naming the target, which the
+            hand-rolled copy never did. */}
+        <ConfirmActionModal
+          open={deleteId != null}
+          onOpenChange={(o) => !o && setDeleteId(null)}
+          title="Delete schedule"
+          description={
+            deletingSchedule
+              ? `Delete the schedule for ${deletingSchedule.agent_id} (“${deletingSchedule.prompt}”)? This permanently removes the scheduled directive and cannot be undone.`
+              : "This permanently removes the scheduled directive. This cannot be undone."
+          }
+          confirmTestId="confirm-delete-btn"
+          onConfirm={confirmDelete}
+        />
 
         {/* Send-directive (poke) modal — shared with the Agents page.
             `directiveAgent` is a locked target (per-row shortcut) or null

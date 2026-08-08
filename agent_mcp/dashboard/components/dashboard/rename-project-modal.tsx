@@ -113,7 +113,7 @@ export function RenameProjectModal({
 
   return (
     <Dialog open={open} onOpenChange={(o) => (o ? onOpenChange(true) : close())}>
-      <DialogContent>
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-lg">
         <form onSubmit={handleSubmit}>
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">

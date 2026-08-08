@@ -39,6 +39,7 @@ vi.mock("@/lib/stores/projects-store", () => ({
 }))
 
 import { DeleteConfirmModal } from "@/components/dashboard/modals/delete-confirm-modal"
+import { ConfirmActionModal } from "@/components/dashboard/modals/confirm-action-modal"
 import { TerminateAgentDialog } from "@/components/dashboard/agents/terminate-agent-dialog"
 import { RemoveProjectModal } from "@/components/dashboard/remove-project-modal"
 
@@ -154,5 +155,42 @@ describe("<RemoveProjectModal>", () => {
     renderModal()
     const remove = screen.getByRole("button", { name: "Remove" })
     await waitFor(() => expect(document.activeElement).not.toBe(remove))
+  })
+})
+
+// The tier-1 confirm (tasks-leaf, schedules, memories, terminate all
+// render this). Same two APG requirements as its type-to-confirm
+// sibling — a simple confirm is still a confirmation prompt.
+describe("<ConfirmActionModal> (tasks-leaf, schedules, memories, terminate)", () => {
+  const renderModal = () =>
+    render(
+      <ConfirmActionModal
+        open
+        onOpenChange={() => {}}
+        onConfirm={async () => {}}
+        title="Delete task"
+        description="Delete task \u201cShip the thing\u201d? This cannot be undone."
+      />,
+    )
+
+  it("announces as an alertdialog", () => {
+    renderModal()
+    expect(screen.getByRole("alertdialog")).toBeTruthy()
+  })
+
+  it("describes the CONSEQUENCE, not just the title", () => {
+    renderModal()
+    expect(describedText(screen.getByRole("alertdialog"))).toMatch(
+      /cannot be undone/i,
+    )
+  })
+
+  it("focuses Cancel, the least destructive control", async () => {
+    renderModal()
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", { name: "Cancel" }),
+      ),
+    )
   })
 })

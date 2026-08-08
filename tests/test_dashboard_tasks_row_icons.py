@@ -170,18 +170,57 @@ def test_edit_dialog_assigned_to_dropdown_uses_agents() -> None:
 # ---------- Delete confirm + DELETE endpoint -------------------
 
 
+# The delete confirm was extracted to
+# `components/dashboard/tasks/delete-task-dialog.tsx` when its
+# confirmation tier became conditional on the delete's blast radius (leaf
+# = one-click, sub-tree = type DELETE). The two guarantees below follow
+# the markup to its new home; `test_delete_dialog_wired_into_the_page`
+# keeps the page on the hook for actually rendering it.
+
+DELETE_DIALOG = "components/dashboard/tasks/delete-task-dialog.tsx"
+
+
 def test_delete_confirm_dialog_present() -> None:
-    src = _read("components/dashboard/tasks-dashboard.tsx")
+    src = _read(DELETE_DIALOG)
     # Confirm copy matches the spec ("cannot be undone").
     assert "cannot be undone" in src or "Cannot be undone" in src, (
         "expected the delete confirm dialog to warn 'cannot be undone'"
     )
 
 
-def test_delete_button_calls_delete_endpoint() -> None:
+def test_delete_dialog_wired_into_the_page() -> None:
     src = _read("components/dashboard/tasks-dashboard.tsx")
+    assert "<DeleteTaskDialog" in src, (
+        "the Trash2 row action must still open <DeleteTaskDialog>"
+    )
+
+
+def test_delete_button_calls_delete_endpoint() -> None:
+    src = _read(DELETE_DIALOG)
     assert "apiClient.deleteTask" in src, (
         "delete confirm must call apiClient.deleteTask (DELETE /api/tasks/<id>)"
+    )
+
+
+def test_cascade_delete_requires_explicit_force() -> None:
+    """The dashboard may only ask for the destructive cascade from the
+    branch that showed the blast radius AND made the operator type
+    DELETE. `force: true` anywhere else would re-disarm the backend
+    guard this dialog exists to keep armed."""
+    src = _read(DELETE_DIALOG)
+    assert "runDelete(true)" in src and "runDelete(false)" in src, (
+        "delete dialog must have both a forced and an unforced path"
+    )
+    assert src.count("runDelete(true)") == 1, (
+        "only ONE call site may request the cascade"
+    )
+    # ...and it must be the DeleteConfirmModal (type-to-confirm) branch.
+    forced = src.index("runDelete(true)")
+    assert "DeleteConfirmModal" in src[:forced], (
+        "the forced delete must sit inside the type-to-confirm branch"
+    )
+    assert "ConfirmActionModal" in src[forced:], (
+        "the unforced (tier-1) branch must come after the forced one"
     )
 
 

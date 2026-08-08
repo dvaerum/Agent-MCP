@@ -18,10 +18,28 @@ from pathlib import Path
 
 DASHBOARD = Path("agent_mcp/dashboard")
 TASKS_TSX = DASHBOARD / "components/dashboard/tasks-dashboard.tsx"
+# The Delete dialog was EXTRACTED out of the page god-file (it needed a
+# test seam once its confirmation tier became conditional on the blast
+# radius). The three delete guarantees below therefore audit the
+# component where the markup now lives — plus the page, which must still
+# render it. Following a file that moved is not the same as weakening
+# what is asserted: every original assertion is still made, and
+# `test_delete_dialog_is_rendered_by_the_page` is a NEW assertion that
+# stops the redirection from becoming an escape hatch.
+DELETE_DIALOG_TSX = (
+    DASHBOARD / "components/dashboard/tasks/delete-task-dialog.tsx"
+)
+CONFIRM_ACTION_MODAL_TSX = (
+    DASHBOARD / "components/dashboard/modals/confirm-action-modal.tsx"
+)
 
 
 def _read_tasks() -> str:
     return TASKS_TSX.read_text()
+
+
+def _read_delete_dialog() -> str:
+    return DELETE_DIALOG_TSX.read_text()
 
 
 # ---------- Legacy sidebar gone -----------------------------------
@@ -131,12 +149,28 @@ def test_edit_dialog_has_max_w_xl() -> None:
 
 
 def test_delete_dialog_has_max_w_md() -> None:
-    src = _read_tasks()
+    # Satisfied by delegation: <DeleteTaskDialog> renders the shared
+    # <ConfirmActionModal> (tier 1) / <DeleteConfirmModal> (tier 2), and
+    # the sizing now lives on those. Assert it there.
+    src = CONFIRM_ACTION_MODAL_TSX.read_text()
     assert re.search(
-        r"DeleteTaskDialog.*?DialogContent[^>]*max-w-md",
+        r"<DialogContent[^>]*max-w-md",
         src,
         re.DOTALL,
     ), "Delete dialog DialogContent must use max-w-md"
+
+
+def test_delete_dialog_is_rendered_by_the_page() -> None:
+    """Guard the redirection above: the Tasks page must actually render
+    the extracted dialog, or the three delete guarantees would be
+    auditing a component nobody uses."""
+    src = _read_tasks()
+    assert "<DeleteTaskDialog" in src, (
+        "tasks-dashboard.tsx must render <DeleteTaskDialog>"
+    )
+    assert "tasks/delete-task-dialog" in src, (
+        "tasks-dashboard.tsx must import the extracted delete dialog"
+    )
 
 
 # ---------- Scrollable body, not the whole modal ------------------
@@ -204,12 +238,17 @@ def test_edit_dialog_footer_cancel_before_save() -> None:
 
 
 def test_delete_dialog_footer_cancel_before_destructive() -> None:
-    src = _read_tasks()
-    footer = _footer_block(src, "DeleteTaskDialog")
+    # Delegated to the shared tier-1 modal (see the module note above).
+    src = CONFIRM_ACTION_MODAL_TSX.read_text()
+    footer = _footer_block(src, r"ConfirmActionModal\(")
     cancel_idx = footer.find("Cancel")
-    delete_idx = footer.find("Delete")
+    # The confirm label is a prop (it reads "Delete" / "Delete N tasks" /
+    # "Terminate" per call site), so the destructive button is located by
+    # its variant rather than by literal text — a tighter anchor than the
+    # word "Delete", not a looser one.
+    delete_idx = footer.find('variant="destructive"')
     assert cancel_idx != -1, "Delete dialog footer missing Cancel button"
-    assert delete_idx != -1, "Delete dialog footer missing Delete button"
+    assert delete_idx != -1, "Delete dialog footer missing destructive button"
     assert cancel_idx < delete_idx, (
         "Delete dialog footer must place Cancel before the destructive "
         "Delete confirm (Cancel-left, destructive-right)"
@@ -217,10 +256,10 @@ def test_delete_dialog_footer_cancel_before_destructive() -> None:
 
 
 def test_delete_dialog_confirm_uses_destructive_variant() -> None:
-    src = _read_tasks()
-    # The destructive confirm button must use variant="destructive".
+    # Delegated to the shared tier-1 modal (see the module note above).
+    src = CONFIRM_ACTION_MODAL_TSX.read_text()
     assert re.search(
-        r'DeleteTaskDialog[\s\S]*?variant="destructive"',
+        r'ConfirmActionModal\([\s\S]*?variant="destructive"',
         src,
     ), "Delete dialog confirm button must use variant=\"destructive\""
 
