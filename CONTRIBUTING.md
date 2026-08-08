@@ -113,6 +113,14 @@ manually as part of release verification — **not** part of CI here.
   with no repo change — ruff 0.16.0 did exactly that when it grew the
   default rule set from 59 rules to 413. Bump the pin in its own PR
   that also clears whatever the new version flags.
+- `ruff check --select F821 agent_mcp/` (undefined names ONLY, over the
+  otherwise-ungated package). Not a style gate: F821 is a guaranteed
+  `NameError` at runtime, and it hides best in the branches tests
+  exercise least — 5.74.0 shipped three `logger.debug(...)` calls in a
+  module whose logger is `log`, inside peer-disconnect `except` blocks,
+  so every benign client disconnect logged an ERROR traceback in
+  production. The package is at zero F821, so the pre-existing style
+  debt above can never trip this.
 - `( cd agent_mcp/dashboard && npm ci && npm run build )`
 
 Red CI blocks merge.

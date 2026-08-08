@@ -60,6 +60,20 @@ jobs:
         # files clean them up incrementally.
         run: uv run ruff check tests/
 
+      - name: Lint agent_mcp/ for undefined names (F821)
+        # Narrow gate over the OTHERWISE-UNGATED package. F821 is not a
+        # style rule: an undefined name is a guaranteed NameError the
+        # moment its line executes, and the lines most likely to be
+        # undefined-name-buggy are the ones tests exercise least — error
+        # and disconnect branches. agent-mcp 5.74.0 shipped exactly that:
+        # three `logger.debug(...)` calls in a module whose logger is
+        # `log`, sitting inside peer-disconnect `except` blocks, which
+        # turned every benign client disconnect into an "Unhandled
+        # exception" ERROR + traceback in production. F821 is already at
+        # zero here, so this gate costs nothing and cannot be tripped by
+        # the pre-existing style debt above.
+        run: uv run ruff check --select F821 agent_mcp/
+
       - name: Run pytest
         # `-n auto` (one worker per CPU) is configured in pyproject.toml
         # under [tool.pytest.ini_options] addopts; pytest-xdist comes

@@ -20,10 +20,21 @@ tests pin the whole class at the seams a real peer disconnect can hit:
   2. Peer gone MID-BODY, between frames of a live stream.
   3. Peer gone while the router is still reading the peer's REQUEST body
      (the same ``ConnectionResetError`` from the other direction).
+  4. The downstream write fails while the transport has NOT yet been
+     flagged closing — the disconnect-handling code itself must survive
+     that, see ``test_write_site_absorbs_reset_with_transport_not_closing``.
 
-Each asserts two things: nothing was logged at ERROR by ``aiohttp.server``
-(the noise), and the upstream was released so ``active_conns`` returns to
-0 (no leaked backend connection pinning it against the idle reaper).
+Each asserts two things: nothing was logged at ERROR by any logger an
+operator watches — ``aiohttp.server`` OR the router's own outermost
+middleware (the noise) — and the upstream was released so
+``active_conns`` returns to 0 (no leaked backend connection pinning it
+against the idle reaper).
+
+The counter-property — a ``ConnectionError`` that is NOT a downstream
+client-write failure must STAY loud — is pinned by
+``test_backend_leg_connection_error_is_still_a_loud_error``. Without it
+this file's quiet assertions could be satisfied by simply swallowing
+every ``ConnectionError``, which would hide real backend faults.
 
 Like the R9-F3 tests in ``test_sse_proxy_streaming.py``, these drive the
 router over a REAL loopback TCP socket with a raw client: aiohttp's
@@ -37,10 +48,12 @@ import asyncio
 import contextlib
 import logging
 from pathlib import Path
+from unittest import mock
 
 import pytest
 import pytest_asyncio
-from aiohttp import web
+from aiohttp import ClientConnectionResetError, web
+from aiohttp.test_utils import make_mocked_coro, make_mocked_request
 
 pytestmark = pytest.mark.asyncio
 
@@ -151,35 +164,42 @@ async def _poll_until(pred, timeout: float = 5.0, interval: float = 0.02) -> boo
     return pred()
 
 
-def _server_errors(caplog: pytest.LogCaptureFixture) -> list[str]:
-    """Every ERROR-or-worse record aiohttp's server logger emitted.
+# Every logger that renders a request failure as an operator-visible
+# ERROR + traceback. ``aiohttp.server`` is what
+# ``RequestHandler.handle_error`` uses when an exception escapes a web
+# handler; ``agent_mcp.router.security_headers`` is our OUTERMOST
+# middleware, which catches what would otherwise reach aiohttp and logs
+# it itself. Watching only the former is how the live 5.74.0 regression
+# hid in a green suite: the exception no longer escaped to aiohttp, it
+# just produced the identical ERROR traceback one frame earlier. For the
+# operator the two are the same noise, so both are asserted quiet.
+_ERROR_LOGGERS = ("aiohttp.server", "agent_mcp.router.security_headers")
 
-    ``aiohttp.server`` is the logger ``RequestHandler.handle_error`` uses
-    when an exception escapes a web handler — the exact "Error handling
-    request from ..." + traceback seen in production.
-    """
+
+def _server_errors(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Every ERROR-or-worse record from any logger in ``_ERROR_LOGGERS``."""
     return [
-        r.getMessage()
+        f"{r.name}: {r.getMessage()}"
         for r in caplog.records
-        if r.name == "aiohttp.server" and r.levelno >= logging.ERROR
+        if r.name in _ERROR_LOGGERS and r.levelno >= logging.ERROR
     ]
 
 
 _NO_ERROR = (
-    "a peer disconnect was logged as an aiohttp.server ERROR with a "
-    "traceback; client disconnects are normal stream termination and "
-    "must not look like application failures: {}"
+    "a peer disconnect was logged as an ERROR with a traceback; client "
+    "disconnects are normal stream termination and must not look like "
+    "application failures: {}"
 )
 
 
 async def _assert_server_stayed_quiet(caplog: pytest.LogCaptureFixture) -> None:
-    """Assert ``aiohttp.server`` logged nothing at ERROR — after settling.
+    """Assert nothing was logged at ERROR — after settling.
 
     The request task releases ``active_conns`` while UNWINDING, so the
-    ERROR (logged once the exception reaches aiohttp) lands strictly
-    after any observable counter change. Poll for an error to appear —
-    returning the instant one does — so the check neither races the log
-    nor pays a fixed sleep on the passing path.
+    ERROR (logged once the exception reaches the middleware/aiohttp)
+    lands strictly after any observable counter change. Poll for an error
+    to appear — returning the instant one does — so the check neither
+    races the log nor pays a fixed sleep on the passing path.
     """
     await _poll_until(lambda: bool(_server_errors(caplog)), timeout=2.0)
     errors = _server_errors(caplog)
@@ -188,8 +208,10 @@ async def _assert_server_stayed_quiet(caplog: pytest.LogCaptureFixture) -> None:
 
 @pytest.fixture
 def capture_aiohttp_server_log(caplog: pytest.LogCaptureFixture):
-    """Capture ``aiohttp.server`` records at DEBUG for the test body."""
-    with caplog.at_level(logging.DEBUG, logger="aiohttp.server"):
+    """Capture records at DEBUG from every logger in ``_ERROR_LOGGERS``."""
+    with contextlib.ExitStack() as stack:
+        for name in _ERROR_LOGGERS:
+            stack.enter_context(caplog.at_level(logging.DEBUG, logger=name))
         yield caplog
 
 
@@ -278,6 +300,111 @@ async def test_disconnect_mid_stream_is_not_an_error(
         await _assert_server_stayed_quiet(capture_aiohttp_server_log)
     finally:
         await runner.cleanup()
+
+
+async def test_write_site_absorbs_reset_with_transport_not_closing(
+    router_module, capture_aiohttp_server_log,
+) -> None:
+    """The downstream write fails, but ``request.transport`` does NOT yet
+    report closing — the "is the peer gone?" question answered two ways.
+
+    ``http_writer._write`` raises ``ClientConnectionResetError`` off the
+    same ``protocol.transport`` that ``client_is_gone`` reads, so in the
+    real server the two agree. This test forces them APART (a transport
+    whose ``is_closing()`` is False, whose header write still raises) to
+    pin the design decision: the disconnect is handled AT THE WRITE SITE,
+    where a failed write to the client is itself proof the client is
+    gone, and never depends on a second, separately-sampled signal.
+
+    It is also the tightest reproduction of the live 5.74.0 regression:
+    the write-site handler DID catch the reset, then raised ``NameError:
+    name 'logger' is not defined`` out of its own logging call (the
+    module's logger is ``log``), which the outermost middleware reported
+    as an "Unhandled exception" ERROR + traceback. The peer-disconnect
+    noise had moved one frame, not gone.
+    """
+    transport = mock.Mock()
+    # The race, made explicit: the peer is going away, but nothing has
+    # flagged the transport yet.
+    transport.is_closing.return_value = False
+    writer = mock.Mock()
+    writer.write_headers = make_mocked_coro(None)
+    writer.write = make_mocked_coro(None)
+    writer.write_eof = make_mocked_coro(None)
+    writer.drain = make_mocked_coro(None)
+    writer.transport = transport
+    writer.send_headers = mock.Mock(
+        side_effect=ClientConnectionResetError(
+            "Cannot write to closing transport",
+        ),
+    )
+    req = make_mocked_request(
+        "GET", "/agent-mcp/mcp/proj", transport=transport, writer=writer,
+    )
+    from agent_mcp.router.client_disconnect import client_is_gone
+
+    assert client_is_gone(req) is False, (
+        "the fixture must simulate the write failing while the transport "
+        "still reports itself live — otherwise it does not test the seam"
+    )
+
+    resp = await router_module._stream_upstream_to_client(
+        req, mock.Mock(status=200), "proj", {"Content-Type": "text/event-stream"},
+    )
+
+    assert isinstance(resp, web.StreamResponse)
+    assert writer.send_headers.called, "the downstream header write never ran"
+    await _assert_server_stayed_quiet(capture_aiohttp_server_log)
+
+
+async def test_backend_leg_connection_error_is_still_a_loud_error(
+    aiohttp_client_cls, capture_aiohttp_server_log,
+) -> None:
+    """The counter-property. A ``ConnectionError`` raised while the CLIENT
+    is still connected is somebody else's reset — the backend leg, an
+    upstream socket — and must keep its ERROR + traceback.
+
+    This is what stops the quiet-disconnect handling from degrading into
+    a blanket ``except ConnectionError``: the quiet path lives at the
+    downstream WRITE site, where "the write to this client failed" is
+    unambiguous. Anything that reaches the outermost middleware with a
+    live client transport is a real fault and stays loud (and answers a
+    generic 500, not the client-gone status).
+    """
+    from aiohttp.test_utils import TestServer
+
+    from agent_mcp.router.security_headers import security_headers_middleware
+
+    async def backend_leg_reset(request: web.Request) -> web.Response:
+        # Shape of a router→backend UDS reset: raised while the
+        # downstream peer is alive and waiting for its answer.
+        raise ConnectionResetError("Connection lost")
+
+    app = web.Application(middlewares=[security_headers_middleware])
+    app.router.add_get("/backend-reset", backend_leg_reset)
+
+    server = TestServer(app, host="127.0.0.1")
+    await server.start_server()
+    try:
+        client = aiohttp_client_cls(server)
+        await client.start_server()
+        try:
+            resp = await client.get("/backend-reset")
+            assert resp.status == 500, (
+                "an upstream fault must not be answered with the "
+                "client-gone status — the client is still there"
+            )
+        finally:
+            await client.close()
+    finally:
+        await server.close()
+
+    errors = _server_errors(capture_aiohttp_server_log)
+    assert errors, (
+        "a ConnectionError raised while the client was still connected was "
+        "logged quietly — that silently hides genuine backend faults, the "
+        "exact regression the quiet-disconnect handling must not cause"
+    )
 
 
 async def test_disconnect_while_reading_request_body_is_not_an_error(

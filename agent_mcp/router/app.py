@@ -769,7 +769,7 @@ async def _proxy_to_backend(
         # lost")``. There is nobody left to serve and nothing was
         # proxied, so answer with the client-gone status instead of
         # letting it render as a server error.
-        logger.debug(
+        log.debug(
             "client disconnected while uploading its request body to %s: %s",
             name, exc,
         )
@@ -937,7 +937,7 @@ async def _stream_upstream_to_client(
         # scope, so the upstream connection + its slot in
         # ``_track_connection`` / the streaming cap are released rather
         # than leaked.
-        logger.debug(
+        log.debug(
             "SSE client for %s disconnected before response headers: %s",
             name, exc,
         )
@@ -987,7 +987,7 @@ async def _stream_upstream_to_client(
             pump, watcher, return_exceptions=True,
         ):
             if isinstance(outcome, ConnectionError):
-                logger.debug(
+                log.debug(
                     "SSE client for %s disconnected mid-stream: %s",
                     name, outcome,
                 )

@@ -20,6 +20,15 @@ Deliberately NOT a blanket handler: :func:`client_is_gone` checks the
 DOWNSTREAM transport, so a ``ConnectionError`` raised while the peer is
 still connected — an upstream/backend reset, say — stays a real error and
 keeps its traceback.
+
+Layering, which is what keeps that property true: the quiet path belongs
+at the DOWNSTREAM WRITE SITE (``app._stream_upstream_to_client``,
+``app._proxy_to_backend``'s request-body read), where "this write to this
+client failed" is unambiguous evidence the client is gone and no second
+signal is needed. The middleware's use of :func:`client_is_gone` is the
+last-resort net for whatever reaches it anyway — never the place to
+widen, because a generic handler cannot tell a failed write to the client
+from a failed read off the backend.
 """
 
 from __future__ import annotations
