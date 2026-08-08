@@ -227,17 +227,25 @@ pub async fn run_bridge(
                     // is spawned with the route — so frames arriving seconds
                     // later go to the right endpoint instead of being dropped
                     // until the next reconcile.
-                    if route.wants_acp(settings.ensure_acp)
-                        && ensure_acp_mode(&ctx, &route, &mut acp_mode).await
-                        && route.promote_structured_after_acp()
-                    {
-                        observe::info(&format!(
-                            "session {} is in ACP mode; route corrected to structured",
-                            route.session_id
-                        ));
-                        ctx.observe(&route.session_id, &route.project, |o| {
-                            o.mode = route.mode.as_str().to_string()
-                        });
+                    if route.wants_acp(settings.ensure_acp) {
+                        // Whether this pass is the one that actually calls
+                        // acp/enable — the correction below then repeats on every
+                        // later pass (whenever AoE still reports the worker
+                        // absent), so only the first one is worth a log line.
+                        let first_attempt = !acp_mode.contains_key(&route.session_id);
+                        if ensure_acp_mode(&ctx, &route, &mut acp_mode).await
+                            && route.promote_structured_after_acp()
+                        {
+                            if first_attempt {
+                                observe::info(&format!(
+                                    "session {} is in ACP mode; route corrected to structured",
+                                    route.session_id
+                                ));
+                            }
+                            ctx.observe(&route.session_id, &route.project, |o| {
+                                o.mode = route.mode.as_str().to_string()
+                            });
+                        }
                     }
 
                     // Ensure a fresh SSE task with the current fingerprint. The
