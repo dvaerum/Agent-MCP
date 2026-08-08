@@ -17,12 +17,15 @@ on:
   workflow_dispatch:
 
 # Least-privilege: the action only needs to push the lock update to a branch
-# (contents: write) and open the PR (pull-requests: write). It runs on the
-# trusted `schedule`/`workflow_dispatch` events with no untrusted PR head, so
-# `pull_request_target` (and its checkout-of-fork-code risk) is not involved.
+# (contents: write), open the PR (pull-requests: write), and release that PR's
+# own parked CI run (actions: write — see the "Release CI" step). It runs on
+# the trusted `schedule`/`workflow_dispatch` events with no untrusted PR head,
+# so `pull_request_target` (and its checkout-of-fork-code risk) is not
+# involved.
 permissions:
   contents: write
   pull-requests: write
+  actions: write
 
 jobs:
   update-flake-lock:
@@ -34,14 +37,96 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
       - name: Update flake.lock
+        id: update
         uses: DeterminateSystems/update-flake-lock@834c491b2ece4de0bbd00d85214bb5e83b4da5c6 # v28
         with:
           pr-title: "chore(deps): bump flake.lock (nixpkgs)"
           pr-labels: |
             dependencies
             nix
-          # Uses the default GITHUB_TOKEN. Note: PRs opened by GITHUB_TOKEN
-          # don't themselves trigger further workflow runs, so CI is
-          # re-triggered by closing/reopening or an empty commit. Kept on the
-          # default token to avoid a stored PAT secret; revisit if the PR
-          # needs CI to auto-run on open.
+          # Uses the default GITHUB_TOKEN — no stored PAT, no GitHub App key.
+          # The cost is that this PR's own CI is parked pending approval; the
+          # next step pays it back.
+
+      - name: Release CI on the bump PR
+        # GitHub will not let events raised by GITHUB_TOKEN start workflows.
+        # Since 2026-06-11 a bot-opened PR is a partial exception: the
+        # `pull_request` run *is* created, then parked with conclusion
+        # `action_required` until someone with write access clicks "Approve
+        # workflows to run". Parked means zero check runs, so `gh pr checks`
+        # reports none at all and the merge box is empty — which is how PR #599
+        # arrived carrying a 2.5-month nixpkgs jump with nothing having run.
+        #
+        # Approving that run from here is what puts the checks back. It gives
+        # the PR the *native* `pull_request` suite, so all eleven jobs land in
+        # the PR's status rollup and merge box exactly as they do for a human
+        # PR. Two nearby alternatives do not:
+        #   - dispatching ci.yml at the bump branch produces a real run whose
+        #     check runs attach to the head commit, but GitHub omits
+        #     workflow_dispatch suites from the PR rollup, so the PR still
+        #     shows nothing (measured, not assumed);
+        #   - `workflow_run` runs in default-branch context, so its checks
+        #     attach to main's SHA rather than the PR head.
+        #
+        # Auto-approving is a considered narrowing of that gate, not a blanket
+        # disable: the gate exists so generated code cannot reach workflow
+        # secrets, and ci.yml runs under `contents: read` with no secrets at
+        # all. The only content being released is a lockfile hash bump produced
+        # by a SHA-pinned action, and it is released for one specific run on
+        # one specific head SHA of this workflow's own PR.
+        #
+        # If GitHub ever withdraws GITHUB_TOKEN's ability to approve, this step
+        # fails loudly rather than silently shipping an unchecked PR. The
+        # documented fix at that point is to open the PR under a trusted
+        # identity instead — mint an installation token with
+        # `actions/create-github-app-token` from a GitHub App holding
+        # `contents: write` + `pull-requests: write`, and pass it to the action
+        # above as `token:`. A PR opened that way is never parked, so this step
+        # becomes a no-op and can be deleted.
+        #
+        # Why this cannot loop: the only thing it starts is ci.yml, which runs
+        # under `contents: read` and creates no commits, PRs, or approvals, so
+        # nothing it does can re-enter this workflow — which is reachable only
+        # from `schedule` and a human `workflow_dispatch`.
+        if: >-
+          steps.update.outputs.pull-request-operation == 'created'
+          || steps.update.outputs.pull-request-operation == 'updated'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.update.outputs.pull-request-number }}
+        run: |
+          set -euo pipefail
+
+          head_sha=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')
+          echo "PR #${PR_NUMBER} head is ${head_sha}"
+
+          # The run is registered a beat after the PR, so poll rather than
+          # assume it is already there.
+          for attempt in $(seq 1 12); do
+            runs=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/runs?event=pull_request&head_sha=${head_sha}")
+
+            parked=$(jq -r '.workflow_runs[] | select(.conclusion == "action_required") | .id' <<<"${runs}")
+            if [ -n "${parked}" ]; then
+              for run in ${parked}; do
+                gh api --method POST \
+                  "repos/${GITHUB_REPOSITORY}/actions/runs/${run}/approve"
+                echo "Released run ${run} for PR #${PR_NUMBER}"
+              done
+              exit 0
+            fi
+
+            # Not parked at all — either GitHub stopped gating bot PRs or the
+            # PR is being opened under a trusted identity. Either way CI is
+            # already running and there is nothing to release.
+            if [ "$(jq -r '.workflow_runs | length' <<<"${runs}")" -gt 0 ]; then
+              echo "CI is already running unparked for ${head_sha}; nothing to release."
+              exit 0
+            fi
+
+            echo "No CI run registered yet for ${head_sha} (attempt ${attempt}); waiting."
+            sleep 10
+          done
+
+          echo "::error::No CI run ever appeared for PR #${PR_NUMBER} (${head_sha}); the bump PR would sit mergeable with no checks."
+          exit 1
