@@ -34,6 +34,37 @@ import {
  * reads the data store, `AgentTokenCell` owns per-row "copied" state.
  */
 
+/**
+ * Class list for the Agents `<table>` itself.
+ *
+ * Lives here, next to the column widths it depends on, because the two
+ * are one decision: `min-w` must be at least the sum of the fixed
+ * columns plus a usable floor for the elastic one, so a change to
+ * either belongs in the same edit.
+ *
+ * `table-fixed` — a pathologically long value in ANY cell (a 5000-char
+ * agent name was the live case, PR #588's predecessor) stretches an
+ * auto-layout table thousands of px wide and pushes every other column
+ * off-screen; measured 40,660px → 923px when this was added. Fixed
+ * layout also makes the widths data-INdependent, so the columns don't
+ * shuffle as rows come and go.
+ *
+ * `min-w-[56rem]` (896px) — the missing half of that decision. Under
+ * fixed layout the elastic column absorbs the leftover, and when the
+ * container is narrower than the fixed columns' sum that leftover goes
+ * NEGATIVE: the browser clamps the column to 0px and its content paints
+ * over the next one. Measured on a 1024×800 viewport (677px container,
+ * over which the old columns' 720px sum forced the table wider and left
+ * the elastic one nothing): AGENT 0px wide, 36 elements painting
+ * outside their own `<td>` — the very defect #595 fixed, one
+ * breakpoint down, because the wrapper had nothing to scroll.
+ * The floor keeps every column at its minimum and lets the wrapper's
+ * `overflow-x-auto` scroll instead — 688px of fixed columns + a 208px
+ * AGENT floor. It sits below the 923px container a 1280 viewport gives,
+ * so it costs nothing at the widths that already fit.
+ */
+export const AGENTS_TABLE_CLASS = "table-fixed min-w-[56rem]"
+
 export interface AgentRowHandlers {
   onTerminate: (id: string) => void
   onRestore: (id: string) => void
@@ -180,14 +211,50 @@ export function useAgentColumns(handlers: AgentRowHandlers): Column<Agent>[] {
     {
       id: 'agent',
       header: 'Agent',
-      cellClassName: 'py-3',
+      // NO width class, deliberately: AGENT is the table's single
+      // elastic column. Every other column reserves its measured
+      // content minimum and this one takes whatever is left, which is
+      // the right way round — it carries the row's primary key, and
+      // it's also the only cell whose content degrades gracefully
+      // (text clips) rather than painting outside its box (badges and
+      // icon buttons are fixed-size and `shrink-0`).
+      //
+      // `whitespace-normal` undoes the `whitespace-nowrap` that shadcn's
+      // <TableCell> puts on every <td>. It's the reason this cell could
+      // only ever truncate: under `white-space: nowrap` the id's
+      // `break-words` is inert and the text stays on one line no matter
+      // how much room the box has. Scoped to this column — the other
+      // four WANT nowrap (badges and buttons must not break up).
+      cellClassName: 'py-3 whitespace-normal',
       cell: (agent) => (
         <div className="flex items-center gap-3">
           <StatusDot presence={agentPresence(agent)} />
           <AgentTypeIcon agentId={agent.agent_id} />
           <div className="min-w-0 flex-1">
-            <div className="font-medium text-sm text-foreground truncate" title={agent.agent_id}>{agent.agent_id}</div>
-            <div className="text-xs text-muted-foreground font-mono truncate">#{agent.agent_id.slice(-6)}</div>
+            {/* Two lines, both spent on the id.
+                The line under this one used to render
+                `#{agent_id.slice(-6)}` — the last six characters of the
+                string directly above it. That is no information at all,
+                and on the live fleet it's actively ambiguous: both
+                `pikvm-nixos@nixos-developer-system` and
+                `pikvm-mcp-server@nixos-developer-system` rendered
+                `#system`. Meanwhile the id itself was clipped at 17 of
+                39 characters, losing the `@host` suffix that's the only
+                thing telling those two agents apart.
+
+                So the id gets the line back. `break-words` because an
+                agent id has no spaces — without it the second line
+                would never be reached. `line-clamp-2` caps the height
+                (a 5000-char id must not grow the row) and brings
+                `overflow:hidden`, so this stays inside the cell no
+                matter how long the id is; `title` keeps the full value
+                reachable in the cases that still clip. */}
+            <div
+              className="font-medium text-sm text-foreground break-words line-clamp-2"
+              title={agent.agent_id}
+            >
+              {agent.agent_id}
+            </div>
           </div>
         </div>
       ),
@@ -195,14 +262,19 @@ export function useAgentColumns(handlers: AgentRowHandlers): Column<Agent>[] {
     {
       id: 'status',
       header: 'Status',
-      // The table is `table-fixed` (see agents-dashboard.tsx), so this
+      // The table is `table-fixed` (see AGENTS_TABLE_CLASS), so this
       // width is the cell's HARD box — content that can't shrink or
       // wrap paints straight over the next column. w-32 (112px content
       // box) could not hold even one badge PAIR: measured live, an
       // ONLINE + WAITING row overflowed 29px into TASKS and an
-      // ONLINE + WORKING + WAITING row overflowed 121px. w-44 (160px)
-      // holds the common pair on one line; three badges wrap, which is
-      // what `flex-wrap` below is for.
+      // ONLINE + WORKING + WAITING row overflowed 121px.
+      //
+      // w-44 is the EXACT minimum, not a round number: re-measured per
+      // badge in Firefox, ONLINE is 70.2px and WORKING 84.9px, so the
+      // common presence+transport pair is 70.2 + 4 (gap-1) + 84.9 =
+      // 159.1px against w-44's 160px content box — 0.9px to spare.
+      // w-40 (144px) would break the pair; nothing here can be given
+      // back to AGENT.
       headClassName: 'w-44',
       cellClassName: 'py-3',
       cell: (agent) => {
@@ -301,19 +373,56 @@ export function useAgentColumns(handlers: AgentRowHandlers): Column<Agent>[] {
     {
       id: 'tasks',
       header: 'Tasks',
-      // Trimmed w-64 → w-56 to pay for the STATUS and ACTIONS widening
-      // above. Under `table-fixed` the AGENT column is the only elastic
-      // one, and it holds the row's identity (a full agent_id); 32px
-      // back here keeps it ~200px instead of ~170px. Task titles
-      // truncate either way.
-      headClassName: 'w-56',
+      // w-52 (208px, content box 192px). The widest thing that MUST fit
+      // is the summary sub-line — "18 assigned, 3 contributed" measures
+      // ~132px; titles clip at any width, so the floor is set by the
+      // sub-line, not by them. That's 16px back from w-56, and it goes
+      // to AGENT.
+      //
+      // This column was the one candidate for proportional `minmax`
+      // sizing — a flat reserve is arguably wrong at the wide end,
+      // where the table is 1483px at 1920 and TASKS sits at 208px
+      // while AGENT balloons to ~750px for an id needing 293px.
+      // `w-[max(13rem,18%)]` expresses exactly that. It does not work:
+      // probed in Firefox on the live table (table width 922.8px),
+      // setting this column's width to
+      //     13rem            → 208.0px  ✓
+      //     18%              → 166.1px  ✓ (resolved against the table)
+      //     calc(18%)        → 166.1px  ✓
+      //     max(13rem,18%)   → 221.4px  ✗ — the even auto split
+      // i.e. the fixed-table-layout column algorithm DROPS a `max()`
+      // mixing a length and a percentage and falls back to auto, which
+      // hands the column a share of the slack instead of a floor —
+      // the opposite of the intent, and silently. A plain percentage
+      // works but has no floor, so it starves this column at 1280 (the
+      // width that actually hurts) to pad it at 1920 (where nothing is
+      // starving). Fixed px is the honest answer until table columns
+      // can express minmax.
+      headClassName: 'w-52',
       cellClassName: 'py-3 max-w-xs',
       cell: (agent) => <AgentTasksCell agent={agent} onTaskClick={onTaskClick} />,
     },
     {
       id: 'token',
       header: 'Token',
-      headClassName: 'w-36',
+      // Trimmed w-36 → w-32. Measured live, the cell's intrinsic width
+      // is 97px: the 8-char elision is ≤65px, plus gap-2 (8px) and the
+      // 24px copy button. w-36's 128px content box was reserving 31px
+      // that nothing ever used, at the direct expense of AGENT. w-32
+      // (112px) still clears it by 15px, and the transient "copied"
+      // flash is absorbed by the `min-w-0` on the <code> as before.
+      // w-28 (96px) would be 1px short.
+      //
+      // Considered and rejected: dropping this column entirely at
+      // narrow widths via `hideBelow`. It's the least valuable column
+      // (an opaque 8-char elision behind a copy button, with the full
+      // token in the detail dialog) — but the breakpoints are VIEWPORT
+      // -keyed while the constraint is the table's CONTAINER (923px
+      // inside a 1280 viewport, because of the sidebar), so no
+      // breakpoint lines up with the width that actually hurts. And
+      // once the id gets its second line back it no longer needs the
+      // 128px, so the cost would buy nothing.
+      headClassName: 'w-32',
       cellClassName: 'py-3',
       cell: (agent) => <AgentTokenCell agent={agent} />,
     },
@@ -322,9 +431,11 @@ export function useAgentColumns(handlers: AgentRowHandlers): Column<Agent>[] {
       header: 'Actions',
       // w-36's 128px content box could not hold the five-button live
       // toolbar (5 × 28px + 4 × 4px = 156px) — measured 20px past the
-      // cell edge on every live row. w-44 fits it; the terminated
-      // variant (text Restore / Purge buttons) still exceeds it and
-      // falls back to the cell's `flex-wrap`.
+      // cell edge on every live row. w-44's 160px box fits it with 4px
+      // to spare, so like STATUS this is a measured minimum with
+      // nothing to give back; the terminated variant (text Restore /
+      // Purge buttons) still exceeds it and falls back to the cell's
+      // `flex-wrap`.
       headClassName: 'w-44',
       cellClassName: 'py-3',
       // Row-action buttons. Every onClick must stopPropagation —

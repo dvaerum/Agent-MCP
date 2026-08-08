@@ -19,7 +19,10 @@ import { SendDirectiveModal } from "@/components/dashboard/shared/send-directive
 import { AgentMobileCard } from "@/components/dashboard/agents-mobile-list"
 import { DataTablePage } from "@/components/dashboard/shared/data-table-page"
 import type { StatsCardProps } from "@/components/dashboard/shared/stats-card"
-import { useAgentColumns } from "@/components/dashboard/agents/agent-columns"
+import {
+  AGENTS_TABLE_CLASS,
+  useAgentColumns,
+} from "@/components/dashboard/agents/agent-columns"
 import { RegisterAgentModal } from "@/components/dashboard/agents/register-agent-modal"
 import { AgentDetailDialog } from "@/components/dashboard/agents/agent-detail-dialog"
 import {
@@ -433,12 +436,10 @@ export function AgentsDashboard() {
         rows={filteredAgents}
         getRowId={(a) => a.agent_id}
         onRowClick={handleSelectAgent}
-        // `table-fixed` so a pathologically long value in ANY cell
-        // (e.g. a 5000-char agent name) truncates within its column
-        // instead of stretching the auto-layout table thousands of px
-        // wide and pushing every other column off-screen. Column widths
-        // live on the column specs' headClassName.
-        tableClassName="table-fixed"
+        // `table-fixed` + the min-width floor that goes with it; both
+        // are derived from the column widths, so they live next to
+        // them in agent-columns.tsx rather than being restated here.
+        tableClassName={AGENTS_TABLE_CLASS}
         renderMobileCard={(agent) => (
           <AgentMobileCard
             agent={agent}

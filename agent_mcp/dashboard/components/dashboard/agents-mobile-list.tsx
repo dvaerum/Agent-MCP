@@ -70,11 +70,19 @@ export function AgentMobileCard({
     >
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0 flex-1">
-          <div className="font-medium text-sm text-foreground truncate">
+          {/* Same treatment as the desktop AGENT cell (see
+              `agent-columns.tsx`): the `#{slice(-6)}` line under this
+              one repeated the tail of the id above it while the id
+              itself was clipped mid-`@host`, which is the part that
+              tells two agents apart. The id gets both lines;
+              `line-clamp-2` caps the card height and `title` keeps the
+              full value reachable — it had none before, so a clipped
+              id was simply unrecoverable here. */}
+          <div
+            className="font-medium text-sm text-foreground break-words line-clamp-2"
+            title={agent.agent_id}
+          >
             {agent.agent_id}
-          </div>
-          <div className="text-[11px] text-muted-foreground font-mono tabular-nums mt-0.5">
-            #{agent.agent_id.slice(-6)}
           </div>
         </div>
         <Badge

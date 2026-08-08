@@ -17,7 +17,10 @@ vi.mock("@/lib/stores/data-store", () => ({
   },
 }))
 
-import { useAgentColumns } from "@/components/dashboard/agents/agent-columns"
+import {
+  AGENTS_TABLE_CLASS,
+  useAgentColumns,
+} from "@/components/dashboard/agents/agent-columns"
 import { ResponsiveDataTable } from "@/components/dashboard/shared/responsive-data-table"
 import type { Agent } from "@/lib/api"
 
@@ -43,6 +46,7 @@ function Harness({ agents }: { agents: Agent[] }) {
       columns={columns}
       rows={agents}
       getRowId={(a) => a.agent_id}
+      tableClassName={AGENTS_TABLE_CLASS}
     />
   )
 }
@@ -235,5 +239,136 @@ describe("useAgentColumns cell containment", () => {
     // monospace token refuses to shrink and the transient "copied"
     // span pushes the row past the cell edge.
     expect(code.className).toContain("min-w-0")
+  })
+})
+
+/**
+ * Column sizing model (refactor/agents-table-column-sizing).
+ *
+ * PR #595 bought STATUS/ACTIONS containment by trimming TASKS, which
+ * squeezed the elastic AGENT column from 277px to 203px at 1280 — and
+ * AGENT is the column holding the row's primary key. Rather than keep
+ * trading pixels, the widths were re-derived from a live measurement
+ * (Firefox, 6-agent project, `getBoundingClientRect()` per cell):
+ *
+ *   STATUS   content 160px; ONLINE 70.2 + gap 4 + WORKING 84.9 = 159.1
+ *            → `w-44` is the exact minimum for the common pair.
+ *   ACTIONS  5 × 28px buttons + 4 × 4px gaps = 156px → `w-44` likewise.
+ *   TOKEN    8-char elision (≤65px) + gap 8 + 24px button = 97px, so
+ *            `w-36` (128px box) reserved 31px nobody used → `w-32`.
+ *   TASKS    the "{n} assigned, {m} contributed" sub-line is ~132px, so
+ *            the 224px reserve was ~90px of slack at the narrow end
+ *            while never growing at the wide end → `max(13rem, 18%)`:
+ *            a floor for 1280 and a proportional share above ~1156px.
+ *
+ * Three things this file can pin and one it cannot:
+ *   * the per-column width classes (below) — the measured contract;
+ *   * that AGENT stays the elastic column (no width class at all), so
+ *     it absorbs the slack the trims freed;
+ *   * that the table carries a `min-w-*` floor, without which
+ *     `table-fixed` squeezes the elastic column to ZERO instead of
+ *     letting the wrapper scroll (measured on `main` at 1024×800:
+ *     AGENT = 0px wide and 36 elements painting outside their own
+ *     `<td>` — the very defect #595 fixed, one breakpoint down);
+ *   * NOT the resulting pixels. jsdom has no layout engine. The
+ *     geometry was verified in Firefox at 1280 / 1440 / 1920 against
+ *     the live project (numbers in the PR body).
+ */
+describe("useAgentColumns column sizing", () => {
+  const head = (label: string): HTMLElement =>
+    within(document.querySelector("table")!).getByText(label)
+
+  it("keeps AGENT elastic so it absorbs every column's leftover", () => {
+    render(<Harness agents={[mk({})]} />)
+    // A width class here would hand AGENT a fixed reserve like all the
+    // others and leave NO column to take up the slack.
+    expect(head("Agent").className).not.toMatch(/(^|\s)w-/)
+  })
+
+  it("pins the measured content minimum of every fixed column", () => {
+    render(<Harness agents={[mk({})]} />)
+    expect(head("Status").className).toContain("w-44")
+    expect(head("Actions").className).toContain("w-44")
+    // Trimmed from w-36: the cell's intrinsic content is 97px, so the
+    // 128px content box was 31px of reserve that only starved AGENT.
+    expect(head("Token").className).toContain("w-32")
+  })
+
+  it("sizes TASKS by its sub-line, in px rather than a proportion", () => {
+    render(<Harness agents={[mk({})]} />)
+    // Proportional sizing was tried here and measured to be broken:
+    // fixed table layout drops `max(13rem,18%)` and falls back to the
+    // auto split (221.4px instead of 208px on a 922.8px table), and a
+    // bare percentage has no floor. See the note on the column.
+    expect(head("Tasks").className).toContain("w-52")
+    expect(head("Tasks").className).not.toMatch(/w-\[max\(/)
+  })
+
+  it("lets the AGENT cell wrap, which shadcn's nowrap <td> otherwise forbids", () => {
+    render(<Harness agents={[mk({})]} />)
+    const cell = within(document.querySelector("table")!)
+      .getByText("worker-1")
+      .closest("td")!
+    // Without this the id's `break-words` is inert: <TableCell> ships
+    // `whitespace-nowrap`, so the id stays on one line however much
+    // room the column has, and truncation is the only option.
+    expect(cell.className).toContain("whitespace-normal")
+  })
+
+  it("floors the table so table-fixed cannot squeeze a column to zero", () => {
+    render(<Harness agents={[mk({})]} />)
+    const table = document.querySelector("table")!
+    expect(table.className).toContain("table-fixed")
+    // Without this, a container narrower than the sum of the fixed
+    // columns leaves the elastic column 0px and its content paints
+    // over its neighbour. With it, the `overflow-x-auto` wrapper
+    // scrolls instead — every column keeps its minimum at any width.
+    expect(table.className).toContain("min-w-[56rem]")
+  })
+})
+
+/**
+ * Agent-id legibility.
+ *
+ * The id is the primary key an operator scans by, and for this fleet
+ * the DISTINGUISHING part is the host suffix — `…@georgs-mac-mini` vs
+ * `…@nixos-developer-system` — which is exactly what a single truncated
+ * line cuts off. At 1280 the id line is a 137px box against a 293px
+ * id: 17 of 39 characters.
+ *
+ * The cell was already two lines tall; the second one spent itself on
+ * `#{agent_id.slice(-6)}` — the last six characters of the string on
+ * the line above. Pure redundancy, and ambiguous on the live fleet
+ * (`#system` for two different agents). Reusing that line for the rest
+ * of the id doubles the visible characters at zero layout cost.
+ */
+describe("useAgentColumns agent id", () => {
+  const LONG = "pikvm-mcp-server@nixos-developer-system"
+
+  const idEl = (): HTMLElement => {
+    render(<Harness agents={[mk({ agent_id: LONG })]} />)
+    return within(document.querySelector("table")!).getByText(LONG)
+  }
+
+  it("drops the short-id line that only repeated the id's own tail", () => {
+    const el = idEl()
+    expect(
+      within(el.closest("td")!).queryByText(`#${LONG.slice(-6)}`),
+    ).toBeNull()
+  })
+
+  it("lets the id use both lines and break inside an unspaced id", () => {
+    const el = idEl()
+    // `line-clamp-2` caps the height (a pathological id must not grow
+    // the row) AND brings `overflow:hidden`, so nothing escapes the
+    // cell. Agent ids have no spaces, so without `break-words` the
+    // second line would never be reached.
+    expect(el.className).toContain("line-clamp-2")
+    expect(el.className).toContain("break-words")
+    expect(el.className).not.toContain("truncate")
+  })
+
+  it("keeps the full id reachable where it still clips", () => {
+    expect(idEl().getAttribute("title")).toBe(LONG)
   })
 })
