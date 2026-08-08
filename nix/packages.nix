@@ -45,7 +45,60 @@
 # the `agent-mcp` flake input.
 
 let
-  python = pkgs.python312;
+  # `mcp` floor, enforced here because this file is the ONE expression both
+  # consumers evaluate: the flake (nix/../flake.nix) for CI/VM tests, and the
+  # home-manager module (nix/home-manager-module.nix) with the CONSUMER's
+  # `pkgs` for production. Pinning in either place alone leaves the other on
+  # whatever its channel happens to ship.
+  #
+  # WHY (2026-08-08): mcp < 1.27.0 raises an unhandled ClosedResourceError out
+  # of its own task group when a client disconnects mid-request — upstream
+  # python-sdk#2306, fixed in 1.27.0 by cancelling the task group and treating
+  # a closed write stream as normal termination. It surfaced on the live
+  # deployment ~0.7×/day as an ERROR traceback that costs a triage every time.
+  #
+  # The deploy tracks nixos-26.05, whose last `mcp` change was 1.25→1.26 in
+  # January; neither 1.27 bump was backported, so waiting for the channel is
+  # not a plan. Verified before pinning: 1.26.0 → 1.27.1 changes only version,
+  # hash and two test-side attrs in nixpkgs' expression — the propagated input
+  # list is byte-identical and upstream's only constraint change is an httpx
+  # UPPER bound, already satisfied. No dependency cascade.
+  #
+  # Version-GATED so it retires itself: the moment a consumer's channel ships
+  # >= 1.27.0 this evaluates to {} and the pin disappears. Follows the
+  # `tenacityTestFix` precedent in flake.nix.
+  mcpFloor = "1.27.0";
+  mcpPinVersion = "1.27.1";
+
+  # Gate read from the UNTOUCHED package set, deliberately. Testing
+  # `pyprev.mcp.version` inside `packageOverrides` is the obvious spelling and
+  # it hits infinite recursion: the condition that decides the overlay would
+  # have to be evaluated through the fixpoint the overlay is defining. Reading
+  # `pkgs.python312Packages.mcp.version` here sidesteps the fixpoint entirely.
+  mcpNeedsPin = lib.versionOlder pkgs.python312Packages.mcp.version mcpFloor;
+
+  python =
+    if !mcpNeedsPin then
+      pkgs.python312
+    else
+      pkgs.python312.override {
+        packageOverrides = _pyfinal: pyprev: {
+          mcp = pyprev.mcp.overridePythonAttrs (_old: {
+            version = mcpPinVersion;
+            src = pkgs.fetchFromGitHub {
+              owner = "modelcontextprotocol";
+              repo = "python-sdk";
+              tag = "v${mcpPinVersion}";
+              hash = "sha256-LhoLcFC5+7xOCfud23sbHyTMxKYmdeZh0c+UtGdvzCs=";
+            };
+            # 1.27.1's suite wants pytest/inline-snapshot newer than 26.05
+            # ships (upstream nixpkgs needed a -W filter and an extra exclusion
+            # for it). We pin for a runtime fix, not to vendor their test
+            # matrix — our own suite exercises this path in CI.
+            doCheck = false;
+          });
+        };
+      };
 
   agentMcpPy = python.pkgs.buildPythonApplication {
     pname = "agent-mcp";
@@ -64,6 +117,10 @@ let
     dependencies = with python.pkgs; [
       anyio click openai fastapi starlette uvicorn jinja2
       python-dotenv sqlite-vec httpx mcp
+      # Declared in pyproject.toml; was reaching the closure only as a
+      # transitive dep of `mcp`. List it explicitly so the build doesn't
+      # silently depend on someone else's dependency graph.
+      sse-starlette
       sqlalchemy alembic aiohttp requests
       # Router identity store (Phase 1 PR B, prancy-napping-pie).
       argon2-cffi

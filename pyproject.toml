@@ -40,7 +40,13 @@ dependencies = [
     # session/transport surfaces this codebase builds on all moved.
     # Lifting the cap is a deliberate migration PR, not a resolver
     # accident. uv.lock pins the in-range version we actually ship.
-    "mcp>=1.8.1,<2",
+    # Floor is 1.27.0, not 1.8.1: earlier versions raise an unhandled
+    # ClosedResourceError out of the SDK's own task group when a client
+    # disconnects mid-request (python-sdk#2306, fixed in 1.27.0). Seen live.
+    # nix/packages.nix carries a version-gated override so this floor is
+    # satisfiable on channels that still ship 1.26 — the two MUST move
+    # together or nixpkgs' pythonRuntimeDepsCheckHook fails the build.
+    "mcp>=1.27.0,<2",
     "sqlalchemy>=2.0",
     "alembic",
     # Router-side identity store (Phase 1 PR B of prancy-napping-pie).
