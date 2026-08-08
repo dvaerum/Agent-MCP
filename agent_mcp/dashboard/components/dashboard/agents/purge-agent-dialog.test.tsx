@@ -8,6 +8,10 @@
 // hand-rolled confirm it carried inside the god-file, so it now inherits
 // the type-to-confirm gate; the blast-radius preview it used to render
 // itself became that modal's `details` slot.
+//
+// Tier 3: the confirmation word is the AGENT ID (case-sensitive), not
+// `DELETE`. Purge has no un-purge endpoint and agent ids are visually
+// near-identical, so the gate has to prove TARGET, not just intent.
 import { describe, it, expect, vi, afterEach } from "vitest"
 import { render, cleanup, screen, waitFor } from "@testing-library/react"
 import { setupUser } from "@/tests/support/user-event"
@@ -73,21 +77,37 @@ describe("<PurgeAgentDialog>", () => {
     expect(screen.getByText("[deleted-worker-1]")).toBeTruthy()
   })
 
-  it("keeps the confirm button disarmed until DELETE is typed", async () => {
+  it("keeps the confirm button disarmed until the agent id is typed", async () => {
     getPurgePreview.mockResolvedValue(preview)
     renderDialog()
     const confirm = screen.getByRole("button", { name: /Confirm purge/ })
     expect(confirm).toHaveProperty("disabled", true)
 
-    await setupUser().type(screen.getByLabelText(/to confirm deletion/i), "DELETE")
+    await setupUser().type(screen.getByLabelText(/to confirm deletion/i), "worker-1")
     await waitFor(() => expect(confirm).toHaveProperty("disabled", false))
+  })
+
+  it("does NOT accept the generic word DELETE (tier-3 polymorphism)", async () => {
+    getPurgePreview.mockResolvedValue(preview)
+    renderDialog()
+    const confirm = screen.getByRole("button", { name: /Confirm purge/ })
+    await setupUser().type(screen.getByLabelText(/to confirm deletion/i), "DELETE")
+    expect(confirm).toHaveProperty("disabled", true)
+  })
+
+  it("matches the agent id case-sensitively", async () => {
+    getPurgePreview.mockResolvedValue(preview)
+    renderDialog()
+    const confirm = screen.getByRole("button", { name: /Confirm purge/ })
+    await setupUser().type(screen.getByLabelText(/to confirm deletion/i), "WORKER-1")
+    expect(confirm).toHaveProperty("disabled", true)
   })
 
   it("purges and notifies the page once confirmed", async () => {
     getPurgePreview.mockResolvedValue(preview)
     purgeAgent.mockResolvedValue({})
     const { onConfirmed } = renderDialog()
-    await setupUser().type(screen.getByLabelText(/to confirm deletion/i), "DELETE")
+    await setupUser().type(screen.getByLabelText(/to confirm deletion/i), "worker-1")
     await setupUser().click(screen.getByRole("button", { name: /Confirm purge/ }))
     await waitFor(() => expect(purgeAgent).toHaveBeenCalledWith("worker-1"))
     expect(onConfirmed).toHaveBeenCalled()
@@ -97,7 +117,7 @@ describe("<PurgeAgentDialog>", () => {
     getPurgePreview.mockResolvedValue(preview)
     purgeAgent.mockRejectedValue(new Error("cascade failed"))
     const { onConfirmed, onOpenChange } = renderDialog()
-    await setupUser().type(screen.getByLabelText(/to confirm deletion/i), "DELETE")
+    await setupUser().type(screen.getByLabelText(/to confirm deletion/i), "worker-1")
     await setupUser().click(screen.getByRole("button", { name: /Confirm purge/ }))
     await waitFor(() => expect(screen.getByText("cascade failed")).toBeTruthy())
     expect(onConfirmed).not.toHaveBeenCalled()

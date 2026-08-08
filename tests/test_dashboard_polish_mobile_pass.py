@@ -213,6 +213,33 @@ DIALOG_CONTENT_RE = re.compile(
     flags=re.DOTALL,
 )
 
+# Every `<DialogContent` opening tag, className or not.
+#
+# The className-anchored pattern above cannot see a dialog written as a
+# bare `<DialogContent>` — it simply does not match, so the site is
+# skipped SILENTLY. That is not a theoretical hole: the schedules page
+# shipped two of them, and its delete confirm sat outside this audit
+# (while clipping on a phone, which is exactly what the audit exists to
+# catch) for as long as it existed. A classless DialogContent has no
+# mobile-width fallback BY CONSTRUCTION, so it is always a violation —
+# counting it as one is what makes the audit's surface equal to its
+# glob.
+DIALOG_CONTENT_ANY_RE = re.compile(r"<DialogContent\b")
+
+# Comments legitimately WRITE `<DialogContent>` when explaining this
+# very audit, so both passes read comment-stripped source. Otherwise a
+# doc-comment counts as a dialog and the classless check reports files
+# that are actually fine.
+_JSX_COMMENT_RE = re.compile(r"\{/\*[\s\S]*?\*/\}")
+_BLOCK_COMMENT_RE = re.compile(r"/\*[\s\S]*?\*/")
+_LINE_COMMENT_RE = re.compile(r"^\s*//.*$", flags=re.MULTILINE)
+
+
+def _code_only(src: str) -> str:
+    src = _JSX_COMMENT_RE.sub("", src)
+    src = _BLOCK_COMMENT_RE.sub("", src)
+    return _LINE_COMMENT_RE.sub("", src)
+
 
 def test_every_dialog_content_has_mobile_width_fallback() -> None:
     """Every <DialogContent> must include `w-[calc(100vw-2rem)]` so it
@@ -240,7 +267,7 @@ def test_every_dialog_content_has_mobile_width_fallback() -> None:
     )
     failures: list[str] = []
     for f in files:
-        src = _read(f)
+        src = _code_only(_read(f))
         for m in DIALOG_CONTENT_RE.finditer(src):
             classes = m.group(1)
             if "w-[calc(100vw-2rem)]" not in classes:
@@ -248,6 +275,17 @@ def test_every_dialog_content_has_mobile_width_fallback() -> None:
                 line = src[: m.start()].count("\n") + 1
                 snippet = classes[:80] + ("…" if len(classes) > 80 else "")
                 failures.append(f"{f}:{line}  className={snippet!r}")
+        # Classless tags: every `<DialogContent` must have been reached
+        # by the className-anchored pass above. Any surplus is a dialog
+        # this audit could not see.
+        seen = len(DIALOG_CONTENT_RE.findall(src))
+        total = len(DIALOG_CONTENT_ANY_RE.findall(src))
+        if total > seen:
+            failures.append(
+                f"{f}  {total - seen} <DialogContent> with NO className "
+                "(invisible to this audit, and with no mobile-width "
+                "fallback by construction)"
+            )
     assert not failures, (
         "DialogContent missing mobile-width fallback "
         "`w-[calc(100vw-2rem)]` at "

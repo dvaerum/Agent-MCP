@@ -82,7 +82,7 @@ function PurgePreviewBlock({
 }
 
 /**
- * Purge confirmation — hard delete + cascade tombstone.
+ * Purge confirmation — hard delete + cascade tombstone. **Tier 3**.
  *
  * Routed through the shared `<DeleteConfirmModal>` (architecture review
  * Class 5: the pre-extraction dialog was the third hand-rolled variant
@@ -91,6 +91,21 @@ function PurgePreviewBlock({
  * one genuinely irreversible action, which is exactly what that modal's
  * "Permanent Data Loss Warning" contract is for; the blast-radius
  * preview it used to render itself becomes the modal's `details` slot.
+ *
+ * The confirmation word is the AGENT ID, case-sensitive — not `DELETE`.
+ * There is no un-purge endpoint (Restore only reverses a *terminate*),
+ * and agent ids are visually near-identical (`agent-a959a84c…` vs
+ * `agent-a92d2d9ef…`) while terminated rows render interleaved with
+ * active ones. Typing `DELETE` proves INTENT but not TARGET; typing the
+ * id proves both, and is the only gate that catches "I purged the wrong
+ * one" — the failure mode this dialog actually has.
+ *
+ * DO NOT collapse this back to a uniform `DELETE`. Users type the
+ * username, groups the group name, projects the project name, purge the
+ * agent id: each page demands a DIFFERENT string, so the gesture cannot
+ * become a reflex (Anderson et al.'s polymorphic-warning effect). A
+ * uniform word is one muscle-memory sequence that opens every tier-3
+ * gate in the product.
  */
 export function PurgeAgentDialog({
   agentId,
@@ -139,6 +154,8 @@ export function PurgeAgentDialog({
       open={open}
       onOpenChange={onOpenChange}
       entityLabel="Agent"
+      requiredWord={agentId ?? ''}
+      matchCase
       title={`Purge agent ${agentId ?? ''}?`}
       description="This deletes the agent row and tombstones every reference to it. Task notes are preserved as an audit trail."
       warningText="The agent row is deleted outright and every message, task and action that referenced it is rewritten to a tombstone. This action cannot be reversed."

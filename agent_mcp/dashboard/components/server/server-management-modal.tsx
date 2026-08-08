@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/badge"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
 import { useServerStore } from "@/lib/stores/server-store"
 import { ManualServerInput } from "./manual-server-input"
+import { useServerConfirms } from "./use-server-confirms"
 import { config } from "@/lib/config"
 
 export function ServerManagementModal() {
@@ -54,11 +55,14 @@ export function ServerManagementModal() {
     }
   }
 
-  const handleClearData = () => {
-    if (confirm('This will clear all saved server configurations. Continue?')) {
-      clearPersistedData()
-    }
-  }
+  // Both destructive actions on this screen are tier-1 confirms in the
+  // shared <ConfirmActionModal>, not native window.confirm() — see
+  // ./use-server-confirms.tsx for why.
+  const { requestRemove, requestClear, confirmModals } = useServerConfirms({
+    removeServer,
+    clearPersistedData,
+    serverCount: servers.length,
+  })
 
   return (
     <Dialog open={isOpen} onOpenChange={setIsOpen}>
@@ -103,7 +107,7 @@ export function ServerManagementModal() {
               {isRefreshing ? 'Refreshing...' : 'Refresh All'}
             </Button>
             <Button
-              onClick={handleClearData}
+              onClick={requestClear}
               variant="outline"
               size="sm"
               className="gap-2 text-destructive hover:text-destructive"
@@ -155,9 +159,7 @@ export function ServerManagementModal() {
                             className="h-6 w-6 p-0 opacity-50 hover:opacity-100 text-destructive hover:text-destructive"
                             onClick={(e) => {
                               e.stopPropagation()
-                              if (confirm(`Delete server "${server.name}"?`)) {
-                                removeServer(server.id)
-                              }
+                              requestRemove(server)
                             }}
                           >
                             <Trash2 className="w-3 h-3" />
@@ -206,9 +208,7 @@ export function ServerManagementModal() {
                             className="h-6 w-6 p-0 opacity-50 hover:opacity-100 text-destructive hover:text-destructive"
                             onClick={(e) => {
                               e.stopPropagation()
-                              if (confirm(`Delete server "${server.name}"?`)) {
-                                removeServer(server.id)
-                              }
+                              requestRemove(server)
                             }}
                           >
                             <Trash2 className="w-3 h-3" />
@@ -246,6 +246,7 @@ export function ServerManagementModal() {
           )}
         </div>
       </DialogContent>
+      {confirmModals}
     </Dialog>
   )
 }

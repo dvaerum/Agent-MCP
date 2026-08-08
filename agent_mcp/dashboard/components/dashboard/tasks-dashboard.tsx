@@ -21,6 +21,7 @@ import { usePagedQuery } from "@/hooks/use-paged-query"
 import { cn, formatRelative } from "@/lib/utils"
 import { toastError } from "@/components/ui/toast"
 import { AgentSelect } from "@/components/dashboard/shared/agent-select"
+import { DeleteTaskDialog } from "@/components/dashboard/tasks/delete-task-dialog"
 import { TaskMobileCard } from "@/components/dashboard/tasks-mobile-list"
 import { DataTablePage } from "@/components/dashboard/shared/data-table-page"
 import type { StatsCardProps } from "@/components/dashboard/shared/stats-card"
@@ -899,89 +900,15 @@ EditTaskDialog.displayName = 'EditTaskDialog'
 
 // ---------- Delete confirm dialog ---------------------------------
 //
-// Deliberately NOT migrated to the shared <DeleteConfirmModal> in the
-// scaffold PR: that modal gates the confirm button behind typing
-// "DELETE", which is a real behaviour change for this page (task delete
-// is a single-click confirm today), and three guarantees in
-// tests/test_dashboard_tasks_popup_polish.py are pinned to this
-// dialog's markup (max-w-md, footer order, destructive variant). Both
-// belong in a follow-up that moves those guarantees onto
-// modals/delete-confirm-modal.tsx and accepts the stricter confirm —
-// see architecture review Class 5.
+// EXTRACTED to `tasks/delete-task-dialog.tsx`. The hand-rolled copy that
+// lived here was the third instance of the same {busy, error} +
+// Cancel/destructive-confirm state machine (Schedules and Terminate were
+// the others) — that duplication is now the shared tier-1
+// <ConfirmActionModal>. The extraction also gives the dialog a test seam,
+// which it needs because its confirmation tier is now CONDITIONAL: a leaf
+// task keeps the one-click confirm, a task with descendants escalates to
+// type-DELETE and shows what the cascade will take.
 
-interface DeleteTaskDialogProps extends RowDialogProps {
-  onDeleted: () => void
-}
-
-const DeleteTaskDialog = React.memo(({ task, onOpenChange, onDeleted }: DeleteTaskDialogProps) => {
-  const open = task !== null
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    if (open) setError(null)
-  }, [open])
-
-  const handleConfirm = async () => {
-    if (!task) return
-    setBusy(true)
-    setError(null)
-    try {
-      await apiClient.deleteTask(task.task_id)
-      onDeleted()
-      onOpenChange(false)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent alertDialog className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground p-0 gap-0">
-        {task && (
-          <>
-            <DialogHeader className="px-6 pt-6 pb-4">
-              <DialogTitle className="text-lg">Delete task</DialogTitle>
-              <DialogDescription className="text-muted-foreground">
-                Delete task &ldquo;{task.title}&rdquo;? This cannot be undone.
-              </DialogDescription>
-            </DialogHeader>
-            <div className="px-6 pb-4 max-h-[80vh] overflow-y-auto space-y-3">
-              <div className="space-y-2">
-                <Label className="text-sm text-muted-foreground">Task ID</Label>
-                <div className="text-xs text-muted-foreground font-mono break-all border border-border rounded p-2 bg-muted/30">
-                  {task.task_id}
-                </div>
-              </div>
-              {error && (
-                <div className="text-xs text-destructive bg-destructive/10 border border-destructive/30 rounded p-2">
-                  {error}
-                </div>
-              )}
-            </div>
-            <DialogFooter className="px-6 py-4 border-t border-border gap-2">
-              <Button variant="outline" size="sm" onClick={() => onOpenChange(false)} disabled={busy}>
-                Cancel
-              </Button>
-              <Button
-                variant="destructive"
-                size="sm"
-                onClick={handleConfirm}
-                disabled={busy}
-              >
-                <Trash2 className="h-3.5 w-3.5 mr-1.5" />
-                {busy ? 'Deleting…' : 'Delete'}
-              </Button>
-            </DialogFooter>
-          </>
-        )}
-      </DialogContent>
-    </Dialog>
-  )
-})
-DeleteTaskDialog.displayName = 'DeleteTaskDialog'
 
 export function TasksDashboard() {
   const { servers, activeServerId } = useServerStore()

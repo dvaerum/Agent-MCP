@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/badge"
 import { useServerStore } from "@/lib/stores/server-store"
 import { ProjectPicker } from "./project-picker"
 import { ManualServerInput } from "./manual-server-input"
+import { useServerConfirms } from "./use-server-confirms"
 import { config } from "@/lib/config"
 import { projectContext } from "@/lib/project-context"
 
@@ -48,11 +49,19 @@ export function ServerConnection() {
     }
   }
 
-  const handleClearData = () => {
-    if (confirm('This will clear all saved server configurations and reset to defaults. Continue?')) {
-      clearPersistedData()
-    }
-  }
+  // Tier-1 confirms via the shared <ConfirmActionModal> rather than
+  // native window.confirm() — see ./use-server-confirms.tsx.
+  //
+  // This page has no "clear all" control (the pre-migration
+  // `handleClearData` here was dead code — defined, never rendered), so
+  // only the per-row remove confirm is wired. `clearPersistedData` is
+  // still threaded through because the hook owns both modals; the clear
+  // one simply never opens on this surface.
+  const { requestRemove, confirmModals } = useServerConfirms({
+    removeServer,
+    clearPersistedData,
+    serverCount: servers.length,
+  })
 
   return (
     <div className="min-h-[60vh] flex items-center justify-center p-[var(--space-fluid-xl)]">
@@ -113,9 +122,7 @@ export function ServerConnection() {
                           className="opacity-50 hover:opacity-100 text-destructive hover:text-destructive"
                           onClick={(e) => {
                             e.stopPropagation()
-                            if (confirm(`Delete server "${server.name}"?`)) {
-                              removeServer(server.id)
-                            }
+                            requestRemove(server)
                           }}
                         >
                           <Trash2 className="w-4 h-4" />
@@ -165,9 +172,7 @@ export function ServerConnection() {
                           className="opacity-50 hover:opacity-100 text-destructive hover:text-destructive"
                           onClick={(e) => {
                             e.stopPropagation()
-                            if (confirm(`Delete server "${server.name}"?`)) {
-                              removeServer(server.id)
-                            }
+                            requestRemove(server)
                           }}
                         >
                           <Trash2 className="w-4 h-4" />
@@ -224,6 +229,7 @@ export function ServerConnection() {
           </div>
         )}
       </div>
+      {confirmModals}
     </div>
   )
 }

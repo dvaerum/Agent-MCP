@@ -139,7 +139,10 @@ export function SendDirectiveModal({
         if (!o) reset()
       }}
     >
-      <DialogContent data-testid="send-directive-modal">
+      <DialogContent
+        data-testid="send-directive-modal"
+        className="w-[calc(100vw-2rem)] sm:!max-w-lg"
+      >
         <DialogHeader>
           <DialogTitle>
             {locked ? `Send directive to ${lockedAgentId}` : "Send directive"}

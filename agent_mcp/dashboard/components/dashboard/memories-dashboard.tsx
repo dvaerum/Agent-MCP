@@ -34,7 +34,7 @@ import { decodeMemoryValue, memoryValuePreview } from '@/lib/memory-value'
 import { CreateMemoryModal } from './modals/create-memory-modal'
 import { ViewMemoryModal } from './modals/view-memory-modal'
 import { EditMemoryModal } from './modals/edit-memory-modal'
-import { DeleteConfirmModal } from './modals/delete-confirm-modal'
+import { ConfirmActionModal } from './modals/confirm-action-modal'
 import { MemoryMobileCard } from '@/components/dashboard/memories-mobile-list'
 import {
   DataTablePage,
@@ -60,9 +60,11 @@ const formatDeleteValue = (value: unknown) => {
   return jsonStr.length > 50 ? jsonStr.substring(0, 50) + '...' : jsonStr
 }
 
-// Preview block shown inside the DeleteConfirmModal `details` slot —
+// Preview block shown inside the confirm modal's `details` slot —
 // reproduces the pre-foundation DeleteMemoryModal body (KEY /
-// DESCRIPTION / VALUE PREVIEW / metadata).
+// DESCRIPTION / VALUE PREVIEW / metadata). It is also what makes a
+// memory delete tier-1 material: the value is on screen at the moment
+// of confirmation, so the row is recreatable by copy/paste.
 function MemoryDeletePreview({ memory }: { memory: Memory }) {
   return (
     <div className="space-y-3">
@@ -226,9 +228,9 @@ export function MemoriesDashboard() {
   // threaded through the call site anymore.
   //
   // Success/error are surfaced via the shared toast (matches Agents/
-  // Tasks). The delete confirmation is the shared DeleteConfirmModal
-  // (type-DELETE-to-confirm); it shows an inline error on failure —
-  // we re-throw so it stays open, and also toast for consistency.
+  // Tasks). The delete confirmation is the shared tier-1
+  // <ConfirmActionModal>; it shows an inline error on failure — we
+  // re-throw so it stays open, and also toast for consistency.
   const handleDeleteMemory = async (memory: Memory) => {
     try {
       await apiClient.deleteMemory(memory.context_key)
@@ -559,13 +561,34 @@ export function MemoriesDashboard() {
         />
       )}
 
-      {/* Delete confirmation (type-DELETE-to-confirm, shared modal) */}
-      <DeleteConfirmModal
+      {/* Delete confirmation — TIER 1 (a deliberate downgrade from the
+          type-DELETE `<DeleteConfirmModal>` this used to render).
+
+          A memory delete is a single row with a bounded cascade (one RAG
+          source), its full value is on screen in the `details` slot
+          below — so it is recreatable by copy/paste — and the keys where
+          that is NOT true (`server_*`, `database_version`,
+          `system_config`, `mcp_server_url`) are already gated
+          server-side behind `force_delete` in
+          `project_context_tools.py`. It is also the highest-frequency
+          delete in the product.
+
+          Charging type-to-confirm for routine housekeeping is what
+          trains an operator to type DELETE without reading, and that
+          reflex is spent on the Users / Groups dialogs, which cascade
+          across every project membership and capability grant. Making
+          THIS cheap is what keeps those expensive. See
+          `confirm-action-modal.tsx` for the tier table + citations. */}
+      <ConfirmActionModal
         open={deleteDialog.isOpen}
         onOpenChange={(open) => { if (!open) deleteDialog.close() }}
-        entityLabel="Memory"
-        description="This action cannot be undone. The memory entry will be permanently deleted."
-        warningText="This memory entry and all its associated data will be permanently removed. This action cannot be reversed."
+        title="Delete memory"
+        description={
+          deleteDialog.data
+            ? `Delete “${deleteDialog.data.context_key}”? This cannot be undone.`
+            : undefined
+        }
+        confirmLabel="Delete Memory"
         details={deleteDialog.data && <MemoryDeletePreview memory={deleteDialog.data} />}
         onConfirm={async () => {
           const memory = deleteDialog.data

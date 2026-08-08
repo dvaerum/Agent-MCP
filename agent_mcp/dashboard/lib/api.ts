@@ -959,12 +959,46 @@ class ApiClient {
     })
   }
 
+  // Blast radius of a task delete — the descendant subtree plus the two
+  // other conditions the backend refuses on (dependents / an agent's
+  // current_task). Mirrors `getPurgePreview`. The delete dialog reads
+  // `requires_force` to choose its confirmation tier.
+  async getTaskDeletePreview(taskId: string): Promise<{
+    task_id: string
+    title: string
+    descendant_count: number
+    descendants: Array<{
+      task_id: string
+      title: string
+      status: string
+      assigned_to: string | null
+    }>
+    dependent_count: number
+    dependents: Array<{ task_id: string; title: string }>
+    blocking_agents: string[]
+    requires_force: boolean
+  }> {
+    return this.request(
+      `/tasks/${encodeURIComponent(taskId)}/delete-preview`,
+    )
+  }
+
   // Delete a task via DELETE /api/tasks/<id> (added upstream in dvaerum#12).
   // PR D: cookie auth.
-  async deleteTask(taskId: string): Promise<{ success: boolean; message: string }> {
+  //
+  // `force` is the operator's EXPLICIT cascade confirmation and defaults
+  // to false. The route used to hardcode `force_delete=true` server-side,
+  // which made the backend's cascade guard dead code on this surface: one
+  // click deleted a whole descendant subtree. Only the tier-2 branch of
+  // the delete dialog — the one that showed the count and made the
+  // operator type DELETE — may pass true.
+  async deleteTask(
+    taskId: string,
+    opts?: { force?: boolean },
+  ): Promise<{ success: boolean; message: string }> {
     return this.request(`/tasks/${taskId}`, {
       method: 'DELETE',
-      body: JSON.stringify({}),
+      body: JSON.stringify({ force_delete: opts?.force === true }),
     })
   }
 

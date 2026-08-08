@@ -300,6 +300,101 @@ async def create_task_api_route(
     )
 
 
+@router.get("/{task_id}/delete-preview")
+async def delete_task_preview_api_route(
+    task_id: str,
+    auth: dict = Depends(require_operator_session),
+) -> JSONResponse:
+    """GET /api/tasks/<id>/delete-preview — blast radius of a delete.
+
+    Mirrors ``/api/agents/<id>/purge-preview``: a READ that lets the
+    confirmation dialog NAME what dies instead of saying only "this
+    cannot be undone". The dashboard picks its confirmation tier from
+    ``requires_force`` — a leaf keeps the plain one-click confirm, a
+    task with a cascade escalates to type-DELETE.
+
+    The subtree walk is NOT reimplemented here: it reuses
+    :func:`agent_mcp.tools.task_tools._collect_task_descendants`, the
+    same authoritative ``parent_task``-FK BFS the cascade itself uses,
+    so the preview can never disagree with what the delete will do.
+
+    ``requires_force`` covers all THREE conditions the tool refuses on
+    (children / dependents / an agent's ``current_task``), not just
+    children — otherwise a childless-but-depended-on task would get the
+    tier-1 dialog and then surprise the operator with a 409.
+    """
+    from ...db.connection import get_db_connection
+    from ...tools.task_tools import _collect_task_descendants
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT title FROM tasks WHERE task_id = ?", (task_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return JSONResponse(
+                {"error": f"Task '{task_id}' not found"}, status_code=404,
+            )
+
+        descendants = _collect_task_descendants(cursor, task_id)
+        descendant_rows = []
+        for descendant_id, assigned_to in descendants:
+            cursor.execute(
+                "SELECT title, status FROM tasks WHERE task_id = ?",
+                (descendant_id,),
+            )
+            d_row = cursor.fetchone()
+            descendant_rows.append({
+                "task_id": descendant_id,
+                "title": d_row["title"] if d_row else "",
+                "status": d_row["status"] if d_row else "",
+                "assigned_to": assigned_to,
+            })
+
+        # The other two refusal conditions (task_tools.py ~:5674 / ~:5697).
+        cursor.execute(
+            "SELECT task_id, title FROM tasks "
+            "WHERE json_extract(depends_on_tasks, '$') LIKE ?",
+            (f'%"{task_id}"%',),
+        )
+        dependents = [
+            {"task_id": r["task_id"], "title": r["title"]}
+            for r in cursor.fetchall()
+        ]
+        cursor.execute(
+            "SELECT agent_id FROM agents WHERE current_task = ?", (task_id,),
+        )
+        blocking_agents = [r["agent_id"] for r in cursor.fetchall()]
+
+        return JSONResponse({
+            "task_id": task_id,
+            "title": row["title"],
+            "descendant_count": len(descendant_rows),
+            "descendants": descendant_rows,
+            "dependent_count": len(dependents),
+            "dependents": dependents,
+            "blocking_agents": blocking_agents,
+            "requires_force": bool(
+                descendant_rows or dependents or blocking_agents
+            ),
+        })
+    except Exception as e:
+        logger.error(
+            f"Error computing delete preview for {task_id}: {e}",
+            exc_info=True,
+        )
+        # BL-R5-2 / SD-R6-1: generic message, real detail server-side only.
+        return JSONResponse(
+            {"error": "Failed to compute delete preview"}, status_code=500,
+        )
+    finally:
+        if conn:
+            conn.close()
+
+
 @router.delete("/{task_id}")
 async def delete_task_api_route(
     task_id: str,
@@ -325,18 +420,28 @@ async def delete_task_api_route(
     400/404/405 for exactly this reason — still green.
     """
     try:
-        _ = await get_sanitized_json_body(request)
+        data = await get_sanitized_json_body(request)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-    # ``force_delete=True`` matches the legacy REST behavior (the
-    # direct-DB handler had no cascade safety check). The MCP tool's
-    # default is False; passing True here preserves wire compatibility
-    # — the dashboard never sent force_delete, and silently failing on
-    # tasks with children would break existing flows.
+    # ``force_delete`` is CLIENT-SUPPLIED and defaults to False — the
+    # same body-field contract the memories DELETE route already uses.
+    #
+    # It used to be hardcoded ``True`` here "for wire compatibility",
+    # which made the tool's cascade guard (task_tools.py ~:5659) dead
+    # code on this surface: one click on a parent row silently deleted
+    # the entire descendant subtree, NULLed ``agents.current_task`` for
+    # every affected agent, pruned ``depends_on_tasks`` across unrelated
+    # tasks (auto-advancing blocked ones), and purged the RAG index for
+    # all of them — behind a dialog that never named a count. Now the
+    # server-side ``Conflict`` is re-armed as a BACKSTOP: force is only
+    # granted when the operator explicitly confirmed the blast radius
+    # the dashboard showed them (see the delete-preview route above).
+    force_delete = bool(data.get("force_delete", False))
+
     return await _dispatch_through_tool(
         "delete_task",
-        {"task_id": task_id, "force_delete": True},
+        {"task_id": task_id, "force_delete": force_delete},
         bearer_token=None,
         operator_session=True,
         operator_user_id=caller_identity(auth),

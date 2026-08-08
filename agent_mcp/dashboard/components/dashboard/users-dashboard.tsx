@@ -286,7 +286,7 @@ function AddUserModal({
         onOpenChange(o)
       }}
     >
-      <DialogContent>
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-lg">
         <form onSubmit={handleSubmit}>
           <DialogHeader>
             <DialogTitle>Add user</DialogTitle>
@@ -404,7 +404,7 @@ function EditUserModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
+      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-lg">
         <form onSubmit={handleSubmit}>
           <DialogHeader>
             <DialogTitle>Edit {user.username}</DialogTitle>
