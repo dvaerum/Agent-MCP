@@ -331,7 +331,7 @@ export function useAgentColumns(handlers: AgentRowHandlers): Column<Agent>[] {
       // otherwise the row-body onClick (which opens View) fires on
       // top of the destructive Terminate / Purge confirm.
       cell: (agent) => (
-        <div className="flex flex-wrap items-center justify-end gap-1 min-w-0 opacity-0 group-hover:opacity-100 transition-opacity">
+        <div className="flex flex-wrap items-center gap-1 min-w-0 opacity-0 group-hover:opacity-100 transition-opacity">
           <Button
             variant="ghost"
             size="sm"
