@@ -262,18 +262,14 @@ jobs:
         run: uv export --locked --no-emit-project --format requirements-txt --output-file requirements-audit.txt
 
       - name: pip-audit (Python deps)
-        # Fails the build on any advisory in the locked tree EXCEPT the
-        # allowlist below. Keep the list short and time-bound — every
-        # entry needs a reason and the follow-up that removes it.
-        #
-        # GHSA-4xgf-cpjx-pc3j — pydantic-settings 2.14.1 (transitive),
-        #   Moderate (CVSS 5.3): symlink escape in
-        #   NestedSecretsSettingsSource. Only reachable with
-        #   secrets_nested_subdir=True, which this codebase does not use,
-        #   so it is not exploitable here. Fixed in 2.14.2, which lands
-        #   via the Dependabot uv bump PR — drop this ignore once uv.lock
-        #   picks up the new version.
-        run: uvx pip-audit -r requirements-audit.txt --ignore-vuln GHSA-4xgf-cpjx-pc3j
+        # Fails the build on ANY advisory in the locked tree. The
+        # allowlist is deliberately empty: the GHSA-4xgf-cpjx-pc3j
+        # (pydantic-settings symlink escape) ignore that used to live
+        # here is gone because uv.lock now carries a version past its
+        # 2.14.2 fix, which is what that entry said should retire it.
+        # Keep it empty — an ignore needs a reason AND the follow-up
+        # that removes it.
+        run: uvx pip-audit -r requirements-audit.txt
 
       # --- Dashboard: npm audit ---
       - name: Set up Node.js

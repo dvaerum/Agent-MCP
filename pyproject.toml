@@ -28,6 +28,15 @@ dependencies = [
     # (GET /api/events). Already present transitively via `mcp`; pinned
     # here as an explicit direct dependency since we import it directly.
     "sse-starlette",
+    # The router's entire HTTP server: agent_mcp/router/*.py does
+    # `from aiohttp import web` in a dozen modules. Until now this was
+    # NOT declared here and reached the resolved tree only via the
+    # `pytest-aiohttp` *dev* extra — so a non-dev `pip install agent-mcp`
+    # produced a package whose `router` subcommand cannot import. Same
+    # class as the `sse-starlette` omission above. nix/packages.nix has
+    # always listed it explicitly, which is why the deployed closure
+    # worked and the gap stayed invisible.
+    "aiohttp",
     "uvicorn[standard]",
     "jinja2",
     "python-dotenv",
