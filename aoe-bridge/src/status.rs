@@ -78,6 +78,14 @@ const MAX_DETAIL_SESSIONS: usize = 40;
 /// on sight), short enough to keep the page inside its byte budget.
 const MAX_DETAIL_CHARS: usize = 200;
 
+/// Cap on the error detail shown in a page ROW. A row renders on one
+/// non-wrapping line (`HTTP 400: <detail> · 3h ago`), and at a 390 px phone
+/// viewport the card gives it ~341 px — about 43 characters. AoE's raw JSON
+/// body blew past that and the part clipped off screen was the error code
+/// itself, so the value is compacted to fit rather than truncated by the
+/// browser. See [`compact_error`].
+const MAX_ROW_DETAIL_CHARS: usize = 24;
+
 /// How long a session must keep failing before a *second* toast is allowed.
 /// A flapping endpoint would otherwise fire one per frame.
 pub const NOTIFY_COOLDOWN_SECS: u64 = 900;
@@ -629,9 +637,34 @@ pub fn truncate(s: &str, max: usize) -> String {
     format!("{kept}…")
 }
 
-/// Clip an AoE error body for capture into [`InjectOutcome::detail`].
+/// Clip an AoE error body for the LOG (and any full-width capture).
 pub fn clip_detail(s: &str) -> String {
     truncate(s, MAX_DETAIL_CHARS)
+}
+
+/// Compact an AoE error body down to what a page ROW can show:
+/// - AoE's `{"error": <code>, "message": …}` envelope collapses to the `code`
+///   (falling back to `message` when `error` is not a string) — the code is the
+///   whole diagnostic, the envelope is what pushed it off a phone screen;
+/// - anything else (HTML from a proxy, plain text) is kept as-is;
+/// - either way the result is capped at [`MAX_ROW_DETAIL_CHARS`], so an
+///   unexpectedly long body cannot reintroduce the overflow.
+///
+/// This shapes the glanceable page value ONLY. The untruncated body still goes
+/// to `worker.log` at `error` level, which is where the full detail belongs.
+/// Redaction happens upstream (`observe::redact`, before capture), so this never
+/// sees a raw token to pass through.
+pub fn compact_error(body: &str) -> String {
+    let lifted = serde_json::from_str::<Value>(body).ok().and_then(|v| {
+        v.get("error")
+            .and_then(Value::as_str)
+            .or_else(|| v.get("message").and_then(Value::as_str))
+            .map(str::to_string)
+    });
+    match lifted {
+        Some(code) => truncate(&code, MAX_ROW_DETAIL_CHARS),
+        None => truncate(body, MAX_ROW_DETAIL_CHARS),
+    }
 }
 
 /// The one-line summary the `status` command toasts, and the body of the
@@ -887,6 +920,111 @@ mod tests {
             rendered.contains("1 session(s) failing to inject"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn json_error_body_compacts_to_its_error_code() {
+        // AoE answers a refused inject with `{"error": <code>, "message": …}`.
+        // The code is the whole diagnostic; the envelope is noise that pushed the
+        // code off-screen on a phone.
+        assert_eq!(
+            compact_error(
+                r#"{"error":"acp_mode_unsupported","message":"session runs in ACP mode"}"#
+            ),
+            "acp_mode_unsupported"
+        );
+        // Pretty-printed / whitespaced bodies compact the same way.
+        assert_eq!(
+            compact_error("{ \"error\": \"session_not_found\" }"),
+            "session_not_found"
+        );
+        // A body whose `error` is not a string falls back to `message`.
+        assert_eq!(
+            compact_error(r#"{"error":{"kind":"x"},"message":"upstream is unreachable"}"#),
+            "upstream is unreachable"
+        );
+    }
+
+    #[test]
+    fn compacting_an_error_body_never_carries_the_message_through() {
+        // The envelope's `message` can quote request detail; when a code is
+        // present only the code survives, so nothing else can ride along.
+        let compact = compact_error(r#"{"error":"unauthorized","message":"bad Bearer token"}"#);
+        assert_eq!(compact, "unauthorized");
+        for forbidden in ["Bearer", "token"] {
+            assert!(!compact.contains(forbidden), "leaked {forbidden:?}");
+        }
+    }
+
+    #[test]
+    fn non_json_error_body_is_capped_but_stays_informative() {
+        // AoE (or a proxy in front of it) can answer HTML or plain text. There is
+        // no code to lift out, so the body is kept — capped, and marked as cut.
+        let compact = compact_error("upstream connect error or disconnect/reset before headers");
+        assert!(compact.starts_with("upstream connect"), "{compact}");
+        assert!(compact.ends_with('…'), "{compact}");
+        assert_eq!(compact.chars().count(), MAX_ROW_DETAIL_CHARS + 1);
+        // A short body is passed through untouched.
+        assert_eq!(compact_error("<no body>"), "<no body>");
+        assert_eq!(compact_error(""), "");
+    }
+
+    #[test]
+    fn the_log_keeps_the_full_body_while_the_page_compacts_it() {
+        // The two surfaces bridge.rs composes from one AoE error body: the log
+        // line takes the whole (redacted) body, the page value takes the code.
+        // Detail is relocated, never lost.
+        let body = r#"{"error":"acp_mode_unsupported","message":"session runs in ACP mode; use /acp/prompt"}"#;
+        assert_eq!(clip_detail(&crate::observe::redact(body)), body);
+        assert_eq!(compact_error(body), "acp_mode_unsupported");
+    }
+
+    #[test]
+    fn failed_inject_row_value_fits_a_phone_line() {
+        // Live defect at a 390px viewport: the row rendered
+        //   HTTP 400: {"error":"acp_mode_unsupported"} · 3h ago
+        // which measured 394px inside a 341px card — the error code, the one
+        // useful part, was the part clipped off screen. The card fits ~43
+        // characters at that width, so the composed value must stay inside that.
+        let mut broken = live_session("sid-1");
+        broken.note_inject(InjectOutcome {
+            ok: false,
+            http: Some(400),
+            detail: compact_error(r#"{"error":"acp_mode_unsupported","message":"nope"}"#),
+            at: 1_000,
+        });
+        let value = row_value(&snap_with(vec![broken]), "sid-1", "last inject");
+        assert!(value.contains("HTTP 400"), "{value}");
+        assert!(value.contains("acp_mode_unsupported"), "{value}");
+        assert!(!value.contains('{'), "raw JSON envelope survived: {value}");
+        assert!(
+            value.chars().count() <= 44,
+            "value is {} chars, too wide for a phone: {value}",
+            value.chars().count()
+        );
+    }
+
+    /// The rendered value of one labelled row inside a session's section.
+    fn row_value(snap: &Snapshot, session_id: &str, label: &str) -> String {
+        let page = render_page(snap, 2_000, None, Level::Info);
+        let blocks = page["blocks"].as_array().unwrap().clone();
+        for block in blocks {
+            let children = match block["children"].as_array() {
+                Some(c) => c.clone(),
+                None => continue,
+            };
+            for child in children {
+                if child["title"] != session_id {
+                    continue;
+                }
+                for r in child["children"].as_array().unwrap() {
+                    if r["label"] == label {
+                        return r["value"].as_str().unwrap().to_string();
+                    }
+                }
+            }
+        }
+        panic!("no {label:?} row for {session_id}");
     }
 
     #[test]

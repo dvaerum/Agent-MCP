@@ -42,7 +42,7 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::mode::{normalize_mode, Mode};
+use crate::mode::{normalize_mode, view_mode, Mode};
 use crate::plugin::PluginConn;
 
 /// `expose_mcp` defaults to true: covering a session normally means you also
@@ -145,6 +145,12 @@ pub struct Liveness {
     /// AoE's own dormant flag (session parked / no running worker).
     #[serde(default)]
     pub dormant: bool,
+    /// How AoE renders this session: `"structured"`, or ABSENT for a terminal
+    /// one (AoE skips the field on its default value). This is the authoritative
+    /// routing signal — see [`crate::mode::view_mode`]. Empty when the payload
+    /// omits it.
+    #[serde(default)]
+    pub view: String,
 }
 
 /// Parse the `GET /api/sessions` body into an id→liveness map. Accepts either
@@ -186,6 +192,11 @@ pub struct Route {
     pub mcp_url: Option<String>,
     /// Whether the session is currently present in `sessions.list`.
     pub live: bool,
+    /// Whether the row left the mode to `auto` (i.e. did NOT pin `terminal` or
+    /// `structured`). Only an `auto` route may have its mode corrected mid-pass
+    /// by [`Route::promote_structured_after_acp`]; an operator's explicit pin is
+    /// never silently overridden.
+    pub auto_mode: bool,
 }
 
 impl Route {
@@ -197,16 +208,37 @@ impl Route {
         ensure_acp && self.mcp_url.is_some()
     }
 
+    /// Correct an `auto` route to [`Mode::Structured`] after the bridge has just
+    /// switched this session to ACP. Returns whether the mode changed.
+    ///
+    /// The reconcile pass resolves modes from a liveness snapshot taken BEFORE
+    /// `acp/enable` runs, so on the pass that first switches a session the
+    /// snapshot still reads `acp_worker_state = "absent"` and `auto` infers
+    /// [`Mode::Terminal`]. Every frame arriving before the NEXT pass would then
+    /// be POSTed to the terminal `/send`, which answers `400
+    /// acp_mode_unsupported` — the nudge is dropped for up to
+    /// `status_interval_secs`. Applying this the moment the flip succeeds closes
+    /// that window, including for the SSE task spawned with the route.
+    pub fn promote_structured_after_acp(&mut self) -> bool {
+        if !self.auto_mode || self.mode == Mode::Structured {
+            return false;
+        }
+        self.mode = Mode::Structured;
+        true
+    }
+
     /// A change in any of these means the running per-session task must be torn
     /// down and respawned (it captured the old values).
+    ///
+    /// `mode` is deliberately NOT part of it. The task re-resolves the mode per
+    /// inject ([`effective_mode`]), so it does not care which mode it was
+    /// spawned with — and if mode were included, a session flapping between
+    /// views would tear down and reopen its delivery stream on every reconcile,
+    /// losing frames to reconnects in the name of fixing routing.
     pub fn fingerprint(&self, aoe_base: &str, aoe_token: &str) -> String {
         format!(
-            "{}|{}|{}|{}|{}",
-            self.endpoint,
-            self.token,
-            self.mode.as_str(),
-            aoe_base,
-            aoe_token
+            "{}|{}|{}|{}",
+            self.endpoint, self.token, aoe_base, aoe_token
         )
     }
 }
@@ -222,19 +254,61 @@ fn join_base(agent_mcp_base: &str, kind: &str, project: &str) -> String {
     )
 }
 
-/// Infer the injection [`Mode`] for a `mode = "auto"` row from its live
-/// liveness record. A session with an active ACP worker must be injected via
-/// `/acp/prompt`; its terminal `/send` returns 400 `acp_mode_unsupported`. So a
-/// live ACP worker forces [`Mode::Structured`] regardless of the tool/status
-/// text (a `claude` session switched to ACP by `ensure_acp` still reports
-/// `tool="claude" status="Idle"`). Without an ACP worker we fall back to the
-/// tool/status keyword heuristic ([`normalize_mode`]).
+/// Infer the injection [`Mode`] for a `mode = "auto"` row from a liveness
+/// record, best signal first:
+///
+/// 1. **`view`** — AoE's own render mode, and the exact value its terminal
+///    `/send` guard reads. Decisive when present ([`view_mode`]).
+/// 2. **`acp_worker_state`** — a running structured worker implies a structured
+///    view, so it forces [`Mode::Structured`] regardless of the tool/status text
+///    (a `claude` session switched to ACP still reports `tool="claude"
+///    status="Idle"`). Only a proxy: it reads `absent` for a structured session
+///    whose worker has not spawned yet, which is why `view` comes first.
+/// 3. **the tool/status keyword heuristic** ([`normalize_mode`]) — last resort.
 fn infer_auto_mode(r: &Liveness) -> Mode {
+    if let Some(m) = view_mode(&r.view) {
+        return m;
+    }
     let acp_active = !matches!(r.acp_worker_state.as_str(), "" | "absent");
     if acp_active {
         Mode::Structured
     } else {
         normalize_mode(&format!("{} {}", r.tool, r.status))
+    }
+}
+
+/// The mode to inject with RIGHT NOW, for one frame.
+///
+/// A [`Route`] is resolved once per reconcile pass but used for the whole
+/// interval by a long-lived SSE task, and a session's view can change in
+/// between — `ensure_acp` switching it, an operator flipping it in the AoE UI, a
+/// respawn coming back in the other view, a structured worker dying. Deciding
+/// the mode at INJECT time instead of at resolution time removes that staleness
+/// by construction rather than patching one instance of it.
+///
+/// Precedence:
+/// 1. **A pinned row** (`mode = "terminal"` / `"structured"`) always wins.
+///    Operator intent is not drift; a pin that turns out to be wrong is
+///    reported, never silently corrected (see [`crate::mode::on_refusal`]).
+/// 2. **Current `view`** from a fresh liveness read — AoE's own answer.
+/// 3. **`learned`** — what AoE told us by REFUSING an inject, or a successful
+///    `acp/enable`. Beats the proxies below because it is a direct statement.
+/// 4. **The proxies** on the fresh record (worker state, tool/status keywords).
+/// 5. **The route's resolved mode** when there is no fresh liveness at all — a
+///    failed liveness read must never drop a nudge.
+pub fn effective_mode(route: &Route, fresh: Option<&Liveness>, learned: Option<Mode>) -> Mode {
+    if !route.auto_mode {
+        return route.mode;
+    }
+    if let Some(m) = fresh.and_then(|r| view_mode(&r.view)) {
+        return m;
+    }
+    if let Some(m) = learned {
+        return m;
+    }
+    match fresh {
+        Some(r) => infer_auto_mode(r),
+        None => route.mode,
     }
 }
 
@@ -258,7 +332,8 @@ pub fn resolve_routes(settings: &Settings, live: &HashMap<String, Liveness>) -> 
             continue;
         }
         let record = live.get(&entry.session_id);
-        let mode = match entry.mode.trim().to_lowercase().as_str() {
+        let raw_mode = entry.mode.trim().to_lowercase();
+        let mode = match raw_mode.as_str() {
             "terminal" => Mode::Terminal,
             "structured" => Mode::Structured,
             // "auto" (or unset/unknown): infer from the live record. A session
@@ -285,6 +360,7 @@ pub fn resolve_routes(settings: &Settings, live: &HashMap<String, Liveness>) -> 
                 None
             },
             live: record.is_some(),
+            auto_mode: !matches!(raw_mode.as_str(), "terminal" | "structured"),
         });
     }
     out
@@ -451,19 +527,211 @@ mod tests {
         let mut live = HashMap::new();
         live.insert(
             "s1".to_string(),
-            Liveness {
-                id: "s1".into(),
-                tool: "claude".into(),
-                status: "Idle".into(),
-                acp_worker_state: "running".into(),
-                has_terminal: false,
-                dormant: false,
-            },
+            liveness("s1", "claude", "Idle", "running", false),
         );
         let routes = resolve_routes(
             &settings(vec![entry("s1", "t", "p", "auto")], "https://h"),
             &live,
         );
+        assert_eq!(routes[0].mode, Mode::Structured);
+    }
+
+    /// One live record with full control over the worker-liveness proxies, and
+    /// no `view` field (an AoE that predates it, or a terminal session).
+    fn liveness(id: &str, tool: &str, status: &str, acp: &str, term: bool) -> Liveness {
+        Liveness {
+            id: id.into(),
+            tool: tool.into(),
+            status: status.into(),
+            acp_worker_state: acp.into(),
+            has_terminal: term,
+            dormant: false,
+            view: String::new(),
+        }
+    }
+
+    /// A live record carrying AoE's authoritative `view`, with the worker
+    /// proxies deliberately pointing the OTHER way (no ACP worker, a terminal
+    /// attached) so a test that passes can only have used `view`.
+    fn view_liveness(id: &str, view: &str) -> Liveness {
+        Liveness {
+            view: view.into(),
+            ..liveness(id, "claude", "Idle", "absent", true)
+        }
+    }
+
+    #[test]
+    fn acp_switch_promotes_auto_route_to_structured_same_pass() {
+        // Regression for the live 400 acp_mode_unsupported window: the pass that
+        // FIRST switches a session to ACP resolved its route from a liveness
+        // snapshot taken before the switch (acp_worker_state="absent"), so an
+        // `auto` row infers Terminal. Every frame arriving before the next
+        // reconcile (up to status_interval_secs) would be POSTed to the terminal
+        // /send, which answers 400 acp_mode_unsupported and drops the nudge. The
+        // successful ACP flip must correct the route immediately.
+        let mut live = HashMap::new();
+        live.insert(
+            "s1".to_string(),
+            liveness("s1", "claude", "Idle", "absent", true),
+        );
+        let mut routes = resolve_routes(
+            &settings(vec![entry("s1", "t", "p", "auto")], "https://h"),
+            &live,
+        );
+        let route = &mut routes[0];
+        // Pre-flip: the stale snapshot infers Terminal, and this row is an
+        // ensure_acp candidate (expose_mcp defaults on).
+        assert_eq!(route.mode, Mode::Terminal);
+        assert!(route.wants_acp(true));
+
+        // The flip succeeds -> the route is corrected for the rest of the pass.
+        assert!(route.promote_structured_after_acp());
+        assert_eq!(route.mode, Mode::Structured);
+
+        // ...which is what the SSE task spawned with this route injects through.
+        let (url, _) = crate::inject::build_injection(route.mode, "http://a:8080", "s1", "hi");
+        assert_eq!(url, "http://a:8080/api/sessions/s1/acp/prompt");
+
+        // Idempotent: a later pass re-asserting the known-ACP state is a no-op.
+        assert!(!route.promote_structured_after_acp());
+        assert_eq!(route.mode, Mode::Structured);
+    }
+
+    #[test]
+    fn inject_mode_follows_liveness_that_changed_after_the_route_resolved() {
+        // The staleness CLASS: a route is resolved once per reconcile pass but
+        // used later — by a long-lived SSE task — and the session's view can
+        // change in between for any reason (ensure_acp, an operator flipping the
+        // view in the AoE UI, a respawn coming back in the other view). The mode
+        // an inject actually uses must come from CURRENT liveness, not from the
+        // snapshot the route was resolved against.
+        let mut routes = resolve_routes(
+            &settings(vec![entry("s1", "t", "p", "auto")], "https://h"),
+            &HashMap::new(),
+        );
+        let route = &mut routes[0];
+        assert_eq!(route.mode, Mode::Terminal); // resolved with no live record
+
+        // The session is structured NOW.
+        let now_structured = view_liveness("s1", "structured");
+        assert_eq!(
+            effective_mode(route, Some(&now_structured), None),
+            Mode::Structured
+        );
+
+        // ...and the mirror: a route resolved Structured whose session has since
+        // gone back to a terminal view injects terminal again.
+        route.mode = Mode::Structured;
+        let now_terminal = view_liveness("s1", "");
+        assert_eq!(
+            effective_mode(route, Some(&now_terminal), None),
+            Mode::Terminal
+        );
+    }
+
+    #[test]
+    fn pinned_mode_wins_over_current_liveness_and_over_learning() {
+        // Operator intent is not drift. A pinned row is never auto-corrected,
+        // whatever AoE currently reports or what a refusal taught us.
+        let live = HashMap::from([("s1".to_string(), view_liveness("s1", "structured"))]);
+        let pinned = resolve_routes(
+            &settings(vec![entry("s1", "t", "p", "terminal")], "https://h"),
+            &live,
+        );
+        assert_eq!(
+            effective_mode(&pinned[0], live.get("s1"), Some(Mode::Structured)),
+            Mode::Terminal
+        );
+    }
+
+    #[test]
+    fn a_refusal_teaches_the_mode_for_later_frames() {
+        // What AoE told us by refusing an inject beats the liveness proxies, and
+        // survives for the next frame — so one refusal is corrected once, not
+        // re-learned per frame.
+        let routes = resolve_routes(
+            &settings(vec![entry("s1", "t", "p", "auto")], "https://h"),
+            &HashMap::new(),
+        );
+        // No `view` in the payload (an older AoE) and no ACP worker: the proxies
+        // would say Terminal, but AoE already refused a terminal inject.
+        let old_aoe = liveness("s1", "claude", "Idle", "absent", true);
+        assert_eq!(
+            effective_mode(&routes[0], Some(&old_aoe), None),
+            Mode::Terminal
+        );
+        assert_eq!(
+            effective_mode(&routes[0], Some(&old_aoe), Some(Mode::Structured)),
+            Mode::Structured
+        );
+    }
+
+    #[test]
+    fn effective_mode_falls_back_to_the_resolved_route_without_liveness() {
+        // A failed liveness read must never drop a nudge: fall back to what the
+        // pass resolved (which already carries the post-acp/enable correction).
+        let mut routes = resolve_routes(
+            &settings(vec![entry("s1", "t", "p", "auto")], "https://h"),
+            &HashMap::new(),
+        );
+        assert!(routes[0].promote_structured_after_acp());
+        assert_eq!(effective_mode(&routes[0], None, None), Mode::Structured);
+    }
+
+    #[test]
+    fn view_beats_the_worker_state_proxy_when_resolving_routes() {
+        // A structured session whose worker has not spawned yet reports
+        // acp_worker_state="absent"; only `view` gets it right.
+        let mut live = HashMap::new();
+        live.insert("s1".to_string(), view_liveness("s1", "structured"));
+        let routes = resolve_routes(
+            &settings(vec![entry("s1", "t", "p", "auto")], "https://h"),
+            &live,
+        );
+        assert_eq!(routes[0].mode, Mode::Structured);
+    }
+
+    #[test]
+    fn mode_is_not_part_of_the_fingerprint_so_a_view_flip_never_respawns() {
+        // Mode is resolved per-inject now, so the running SSE task does not care
+        // which mode the route was spawned with — and a session flapping between
+        // views must never tear down its delivery stream.
+        let cfg = settings(vec![entry("s1", "t", "p", "auto")], "https://h");
+        let terminal = resolve_routes(&cfg, &HashMap::new());
+        let mut live = HashMap::new();
+        live.insert("s1".to_string(), view_liveness("s1", "structured"));
+        let structured = resolve_routes(&cfg, &live);
+        assert_eq!(terminal[0].mode, Mode::Terminal);
+        assert_eq!(structured[0].mode, Mode::Structured);
+        assert_eq!(
+            terminal[0].fingerprint(&cfg.aoe_base, &cfg.aoe_token),
+            structured[0].fingerprint(&cfg.aoe_base, &cfg.aoe_token)
+        );
+    }
+
+    #[test]
+    fn explicit_terminal_row_is_never_promoted_after_acp_switch() {
+        // An operator who pinned mode="terminal" keeps it, even if the bridge
+        // switched the session to ACP: an explicit choice is never silently
+        // overridden (same principle as `explicit_mode_overrides_inference`).
+        let mut live = HashMap::new();
+        live.insert(
+            "s1".to_string(),
+            liveness("s1", "claude", "Idle", "absent", true),
+        );
+        let mut routes = resolve_routes(
+            &settings(vec![entry("s1", "t", "p", "terminal")], "https://h"),
+            &live,
+        );
+        assert!(!routes[0].promote_structured_after_acp());
+        assert_eq!(routes[0].mode, Mode::Terminal);
+
+        // An explicitly-structured row is likewise left alone (already correct).
+        let mut routes = resolve_routes(
+            &settings(vec![entry("s1", "t", "p", "structured")], "https://h"),
+            &live,
+        );
+        assert!(!routes[0].promote_structured_after_acp());
         assert_eq!(routes[0].mode, Mode::Structured);
     }
 

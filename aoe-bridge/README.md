@@ -95,13 +95,30 @@ provisioned.
   `/mcp/<project>`.
 - **`token`** authenticates both the SSE subscribe and the status POST; it is
   the session's agent-mcp worker bearer.
-- **Mode `auto` is best-effort.** `sessions.list` exposes no definitive
-  terminal-vs-structured flag today (only `tool` + a debug-formatted `status`),
-  so `auto` infers from those strings via the rule *contains
-  structured/acp/composer/cityhall ⇒ structured, else terminal*. **Set `mode`
-  explicitly to `structured`** for ACP / CityHall / composer sessions to be
-  safe. If `sessions.list` later exposes a real mode field, wire it into
-  `resolve_routes` and the inference tightens automatically.
+- **Mode `auto` is resolved per inject, not per reconcile.** Injecting on the
+  wrong transport is refused outright (`400 acp_mode_unsupported`), and a
+  session's view can change at any point in an interval — this bridge's own
+  `ensure_acp`, an operator flipping the view in the AoE UI, a respawn coming
+  back the other way, a structured worker dying. A mode decided once per pass
+  and used for 30s is therefore a standing source of dropped nudges, so `auto`
+  is resolved at the moment a frame is injected, best signal first:
+  1. AoE's **`view`** field on `GET /api/sessions` (`structured`, omitted when
+     terminal) — the very value AoE's `/send` guard checks, read through a 5s
+     cache that each reconcile pass seeds for free;
+  2. what AoE **told us by refusing** an inject, or by accepting an
+     `acp/enable` (see self-healing below);
+  3. the old proxies — a live `acp_worker_state`, then the tool/status keyword
+     heuristic — for an AoE too old to send `view`.
+- **A refused inject corrects itself.** The two responses that name a mismatch
+  (`400 acp_mode_unsupported` on `/send`, `404 session has no running structured
+  view` on `/acp/prompt`) trigger exactly one retry on the other transport,
+  logged at `warn`, and the corrected route is remembered for the session's
+  later frames. Nothing else — `503 worker_not_ready`, `404 session not found`,
+  any 5xx — is ever treated as a routing signal.
+- **An explicit `mode` always wins.** `mode = "terminal"` / `"structured"` is
+  operator intent, never auto-corrected. If AoE refuses a pinned route the
+  bridge says so loudly (log + the session's `last error` row) and lets the
+  nudge fail, because silently overriding a pin would hide the misconfiguration.
 - **`transport-status` mapping** from AoE's session status is likewise a
   keyword match (`map_transport_status`); it only *gates nudge timing*, never
   authorizes anything, so an occasional misclassification is low-blast-radius.
@@ -183,7 +200,7 @@ It answers, per covered session:
 | is the delivery stream up? | `stream`: connected / reconnecting (attempt N) / stopped |
 | did a frame arrive? | `frames received`: count, age, and the frame's `reason` |
 | did the inject work? | `injects`: ok/failed counts, and `last inject` with the HTTP status |
-| **why did it fail?** | `last inject` carries AoE's error body, e.g. `HTTP 400: acp_mode_unsupported` |
+| **why did it fail?** | `last inject` carries AoE's error code, e.g. `HTTP 400: acp_mode_unsupported` — compacted from the JSON body so it still reads on a phone; the untruncated body is in the log |
 | is agent-mcp's MCP wired in? | `agent-mcp tools`: injected / pending |
 
 Failing sessions sort first and render expanded. The overall verdict
