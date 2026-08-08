@@ -63,6 +63,18 @@ describe("<DataTablePage>", () => {
     expect(within(table).getByText("alpha")).toBeTruthy()
   })
 
+  // The slot was a NON-wrapping `sm:flex-row`. Every migrated page that
+  // passes more than a couple of controls (Messages: 7) had to bring its
+  // own `sm:flex-wrap` wrapper, and a page that forgot would push its
+  // controls off the right edge. Wrapping belongs to the slot: it is a
+  // no-op for the 1–3-control pages (they already fit on one line).
+  it("wraps the filter-bar slot instead of overflowing it", () => {
+    render(<DataTablePage {...base({ filterBar: <input aria-label="search" /> })} />)
+    const slot = screen.getByLabelText("search").parentElement!
+    expect(slot.className).toContain("sm:flex-row")
+    expect(slot.className).toContain("sm:flex-wrap")
+  })
+
   it("renders the empty state (not a table) when rows is empty", () => {
     render(<DataTablePage {...base({ rows: [] })} />)
     expect(screen.getByText("No memories found")).toBeTruthy()

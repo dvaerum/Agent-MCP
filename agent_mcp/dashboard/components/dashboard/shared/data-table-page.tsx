@@ -252,8 +252,16 @@ export function DataTablePage<T>({
         </div>
       )}
 
+      {/*
+        `sm:flex-wrap` belongs to the slot, not to each page. A filter
+        bar grows one control at a time (Messages is at 7) and a
+        non-wrapping row silently pushes the extras off the right edge.
+        Wrapping is a no-op for the 1–3-control pages (Agents /
+        Memories / Users / Groups / Schedules) — they already fit on
+        one line — so the slot can own it.
+      */}
       {filterBar && (
-        <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 sm:gap-3">
+        <div className="flex flex-col sm:flex-row sm:flex-wrap items-stretch sm:items-center gap-2 sm:gap-3">
           {filterBar}
         </div>
       )}
