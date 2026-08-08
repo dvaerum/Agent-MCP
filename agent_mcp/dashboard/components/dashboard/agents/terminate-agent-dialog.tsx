@@ -54,7 +54,7 @@ export function TerminateAgentDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground max-h-[90vh] overflow-y-auto">
+      <DialogContent alertDialog className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle className="text-lg">
             Terminate agent {agentId ?? ''}?

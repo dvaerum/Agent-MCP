@@ -46,7 +46,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { toastError, toastSuccess } from "@/components/ui/toast"
+import { toastError, toastSuccess, toastUndo } from "@/components/ui/toast"
 import {
   routerGroupsUrl, routerGroupUrl,
   routerGroupMembersUrl, routerGroupMemberUrl,
@@ -412,7 +412,16 @@ function GroupDetailPanel({
     void refreshMembers()
   }, [refreshMembers])
 
-  const handleRemoveMember = async (memberId: string) => {
+  // Removing a member deletes exactly ONE `group_membership` row and
+  // the inverse is the very POST the Add-member modal already makes —
+  // so this stays a no-dialog action and pays for that by OFFERING the
+  // reversal instead (Material: "confirmation isn't necessary when the
+  // consequences of an action are reversible"). Pre-PR it succeeded in
+  // total silence.
+  const handleRemoveMember = async (m: MemberRow) => {
+    const memberId = m.user_id ?? m.group_id!
+    const label = m.username || m.name || memberId
+    const body = m.user_id ? { user_id: m.user_id } : { group_id: m.group_id }
     try {
       await routerApi.request(
         routerGroupMemberUrl(group.group_id, memberId),
@@ -420,6 +429,18 @@ function GroupDetailPanel({
       )
       await refreshMembers()
       await onMembersChange()
+      toastUndo(
+        `Removed ${label} from ${group.name}.`,
+        async () => {
+          await routerApi.request(routerGroupMembersUrl(group.group_id), {
+            method: "POST",
+            body: JSON.stringify(body),
+          })
+          await refreshMembers()
+          await onMembersChange()
+        },
+        { undoneMessage: `${label} restored to ${group.name}.` },
+      )
     } catch (e) {
       toastError(e, "Failed to remove member")
     }
@@ -475,7 +496,7 @@ function GroupDetailPanel({
               size="icon"
               className="h-6 w-6"
               aria-label={`Remove ${m.username || m.name}`}
-              onClick={() => handleRemoveMember(id)}
+              onClick={() => handleRemoveMember(m)}
             >
               <X className="h-3 w-3" />
             </Button>

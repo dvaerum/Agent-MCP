@@ -45,6 +45,7 @@ import {
 } from "@/lib/urls"
 import { routerApi } from "@/lib/router-api"
 import { useRouterQuery } from "@/hooks/use-router-query"
+import { toastUndo } from "@/components/ui/toast"
 
 type Role = "operator" | "viewer"
 
@@ -117,13 +118,37 @@ export function ProjectMembershipsModal({
     if (loading) setMutationError(null)
   }, [loading])
 
-  const handleRemove = async (id: string) => {
+  // One `project_membership` row, re-grantable by the POST the
+  // Add-membership modal already makes — so no confirm dialog, but the
+  // reversal is offered instead of the silent success this used to be.
+  // The row's ROLE is carried through: an Undo that re-added the member
+  // as `operator` when they had been `viewer` would be a privilege
+  // escalation dressed up as a restore.
+  const handleRemove = async (row: MembershipRow) => {
+    const label = row.username || row.group_name || row.membership_id
+    const body = row.user_id
+      ? { user_id: row.user_id, role: row.role }
+      : { group_id: row.group_id, role: row.role }
     try {
-      await routerApi.request(projectMembershipUrl(projectName, id), {
-        method: "DELETE",
-      })
+      await routerApi.request(
+        projectMembershipUrl(projectName, row.membership_id),
+        { method: "DELETE" },
+      )
       setMutationError(null)
       refresh()
+      toastUndo(
+        `Removed ${label} from ${projectName}.`,
+        async () => {
+          await routerApi.request(projectMembershipsUrl(projectName), {
+            method: "POST",
+            body: JSON.stringify(body),
+          })
+          refresh()
+        },
+        {
+          undoneMessage: `${label} restored to ${projectName} as ${row.role}.`,
+        },
+      )
     } catch (e) {
       setMutationError(e instanceof Error ? e.message : String(e))
     }
@@ -238,7 +263,7 @@ export function ProjectMembershipsModal({
                           size="icon"
                           aria-label={`Remove ${r.username || r.group_name}`}
                           className="text-destructive"
-                          onClick={() => handleRemove(r.membership_id)}
+                          onClick={() => handleRemove(r)}
                         >
                           <Trash2 className="h-4 w-4" />
                         </Button>

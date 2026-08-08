@@ -37,7 +37,7 @@
  * fade/slide uses Tailwind's transition utilities.
  */
 
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { create } from 'zustand'
 import { AlertCircle, CheckCircle2, Info, X } from 'lucide-react'
 
@@ -50,28 +50,59 @@ import { cn } from '@/lib/utils'
 
 export type ToastVariant = 'error' | 'success' | 'info'
 
+/**
+ * A single follow-up control rendered inside the toast — in practice
+ * "Undo".
+ *
+ * M3's snackbar guidance is explicit that this is what the slot is
+ * for: *"To allow users to amend choices, display an 'Undo' action."*
+ * It is also the enabling half of the older Material confirmation
+ * rule — *"confirmation isn't necessary when the consequences of an
+ * action are reversible"* — which a dashboard can only lean on once a
+ * reversible action can actually OFFER the reversal.
+ *
+ * ``onAction`` may be async. The toast awaits it, dismisses itself on
+ * success, and — critically — surfaces an ERROR toast if it rejects.
+ * A silent failure here would be the worst possible outcome: the user
+ * clicked Undo, saw the toast vanish, and believes the state was
+ * restored when it wasn't.
+ */
+export interface ToastAction {
+  label: string
+  onAction: () => void | Promise<void>
+}
+
 export interface ToastOptions {
   title?: string
   description: string
   variant?: ToastVariant
   durationMs?: number
+  action?: ToastAction
 }
 
-interface ToastItem extends Required<Omit<ToastOptions, 'title'>> {
+interface ToastItem
+  extends Required<Omit<ToastOptions, 'title' | 'action'>> {
   id: number
   title?: string
+  action?: ToastAction
 }
 
 interface ToastStore {
   toasts: ToastItem[]
   push: (opts: ToastOptions) => number
   dismiss: (id: number) => void
+  reset: () => void
 }
 
-const DEFAULT_DURATION_MS = 4500
+export const DEFAULT_TOAST_DURATION_MS = 4500
 // Errors stay up longer — the user is more likely to need to read
 // (and possibly act on) a server message than a "saved" confirmation.
-const DEFAULT_ERROR_DURATION_MS = 8000
+export const DEFAULT_ERROR_TOAST_DURATION_MS = 8000
+// An action toast is a DEADLINE, not just a notification: once it
+// auto-dismisses the undo is gone. M3 puts the ceiling for an
+// actionable snackbar at ~10s, which is also long enough to notice,
+// read and reach the button on a phone.
+export const ACTION_TOAST_DURATION_MS = 10000
 
 let nextId = 1
 
@@ -85,18 +116,27 @@ const useToastStore = create<ToastStore>((set) => ({
       title: opts.title,
       description: opts.description,
       variant,
+      action: opts.action,
       durationMs:
         opts.durationMs ??
-        (variant === 'error'
-          ? DEFAULT_ERROR_DURATION_MS
-          : DEFAULT_DURATION_MS),
+        (opts.action
+          ? ACTION_TOAST_DURATION_MS
+          : variant === 'error'
+            ? DEFAULT_ERROR_TOAST_DURATION_MS
+            : DEFAULT_TOAST_DURATION_MS),
     }
     set((s) => ({ toasts: [...s.toasts, item] }))
     return id
   },
   dismiss: (id) =>
     set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
+  reset: () => set({ toasts: [] }),
 }))
+
+/** Test-only: drop every pending toast between cases. */
+export function __resetToastsForTests(): void {
+  useToastStore.getState().reset()
+}
 
 // ---------------------------------------------------------------------
 // Imperative API (callable from anywhere, including non-React code)
@@ -140,6 +180,38 @@ export function toastError(err: unknown, fallback?: string): number {
   })
 }
 
+/**
+ * Success toast for a reversible mutation, carrying an honest Undo.
+ *
+ * ``undo`` should issue the exact inverse call and refresh whatever
+ * the caller refreshed after the original mutation. Only wire this up
+ * where the inverse genuinely restores the prior state — an "Undo"
+ * that quietly produces something *different* is worse than no undo
+ * at all, because the user stops checking.
+ *
+ * On success the restore is confirmed with its own toast
+ * (``undoneMessage``); on failure ``<ToastView>`` surfaces the error,
+ * so the user is never left believing a failed undo worked.
+ */
+export function toastUndo(
+  description: string,
+  undo: () => Promise<void>,
+  opts?: { title?: string; undoneMessage?: string; label?: string },
+): number {
+  return toast({
+    variant: 'success',
+    title: opts?.title,
+    description,
+    action: {
+      label: opts?.label ?? 'Undo',
+      onAction: async () => {
+        await undo()
+        toastSuccess(opts?.undoneMessage ?? 'Restored.')
+      },
+    },
+  })
+}
+
 // ---------------------------------------------------------------------
 // Toaster portal
 // ---------------------------------------------------------------------
@@ -158,11 +230,32 @@ const VARIANT_ICONS: Record<ToastVariant, React.ReactNode> = {
 
 function ToastView({ item }: { item: ToastItem }) {
   const dismiss = useToastStore((s) => s.dismiss)
+  const [running, setRunning] = useState(false)
 
   useEffect(() => {
+    // Don't yank the toast out from under an in-flight action.
+    if (running) return
     const t = setTimeout(() => dismiss(item.id), item.durationMs)
     return () => clearTimeout(t)
-  }, [item.id, item.durationMs, dismiss])
+  }, [item.id, item.durationMs, dismiss, running])
+
+  const action = item.action
+  const handleAction = async () => {
+    if (!action || running) return
+    setRunning(true)
+    try {
+      await action.onAction()
+      dismiss(item.id)
+    } catch (e) {
+      // Honesty rule: a failed Undo must never look like a successful
+      // one. Replace the toast with the error rather than silently
+      // dropping it.
+      dismiss(item.id)
+      toastError(e, `${action.label} failed`)
+    } finally {
+      setRunning(false)
+    }
+  }
 
   return (
     <div
@@ -178,7 +271,13 @@ function ToastView({ item }: { item: ToastItem }) {
       )}
     >
       <div className="mt-0.5 flex-shrink-0">{VARIANT_ICONS[item.variant]}</div>
-      <div className="min-w-0 flex-1">
+      {/* The action lives INSIDE this min-w-0 column, on its own row —
+          not as a fourth inline cell next to icon/text/close. At 390px
+          the toast is only ~358px wide; an inline action would compete
+          with the description for that width and push the close button
+          off-canvas the moment either string got long. Stacking costs
+          one row of height and cannot overflow. */}
+      <div className="min-w-0 flex-1" data-testid="toast-body">
         {item.title ? (
           <div className="text-sm font-semibold leading-tight">
             {item.title}
@@ -192,6 +291,25 @@ function ToastView({ item }: { item: ToastItem }) {
         >
           {item.description}
         </div>
+        {action ? (
+          <div className="mt-2 flex justify-end">
+            <button
+              type="button"
+              data-testid="toast-action"
+              onClick={() => void handleAction()}
+              disabled={running}
+              className={cn(
+                'rounded-md border border-border px-2.5 py-1',
+                'text-xs font-semibold uppercase tracking-wide',
+                'text-primary hover:bg-muted/60 transition-colors',
+                'focus-visible:outline-none focus-visible:ring-2',
+                'focus-visible:ring-ring disabled:opacity-60',
+              )}
+            >
+              {running ? 'Working…' : action.label}
+            </button>
+          </div>
+        ) : null}
       </div>
       <button
         type="button"
@@ -208,14 +326,30 @@ function ToastView({ item }: { item: ToastItem }) {
 export function Toaster() {
   const toasts = useToastStore((s) => s.toasts)
 
-  if (toasts.length === 0) {
-    return null
-  }
-
+  // The live region is ALWAYS mounted, even with nothing to show.
+  //
+  // Two reasons, both load-bearing:
+  //
+  //   1. Radix's modal Dialog runs `hideOthers(content)` on mount,
+  //      stamping `aria-hidden="true"` on every body child that exists
+  //      at that moment. The `aria-hidden` package deliberately spares
+  //      `[aria-live]` nodes — but only ones it can see when it runs.
+  //      Returning `null` while idle made that a coin flip: a toast
+  //      raised from inside an open dialog (project memberships, for
+  //      one) could land inside an aria-hidden subtree and never be
+  //      announced. An Undo a screen reader can't reach isn't an undo.
+  //
+  //   2. It is the correct live-region idiom regardless: assistive
+  //      tech observes a region that already exists, rather than
+  //      discovering one that materialises with its first message.
+  //
+  // The idle region is an empty `pointer-events-none` box — it renders
+  // nothing and intercepts nothing.
   return (
     <div
       aria-live="polite"
       aria-label="Notifications"
+      data-testid="toaster"
       className={cn(
         'pointer-events-none fixed top-4 right-4 z-[100]',
         'flex w-[calc(100vw-2rem)] max-w-sm flex-col gap-2',
