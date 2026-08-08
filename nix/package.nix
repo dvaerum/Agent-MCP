@@ -16,7 +16,9 @@
 # move into nix/module.nix as NixOS services).
 
 let
-  python = pkgs.python312;
+  # The channel's default interpreter — see nix/packages.nix for why an
+  # off-default pin (python312) costs the binary cache.
+  python = pkgs.python3;
 
   # Product version for the dashboard sidebar, read from pyproject.toml
   # (single source of truth). Distinct from agentMcpPy's deliberate
