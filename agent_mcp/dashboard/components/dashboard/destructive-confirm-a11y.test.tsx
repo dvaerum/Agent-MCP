@@ -1,0 +1,158 @@
+// @vitest-environment jsdom
+//
+// Accessibility contract for every destructive confirmation dialog.
+//
+// Two W3C ARIA APG requirements, pinned per dialog:
+//
+//   1. role="alertdialog" — the APG names confirmation prompts as the
+//      canonical case; the role "enables assistive technologies and
+//      browsers to distinguish alert dialogs from other dialogs".
+//
+//   2. Initial focus must NOT land on the destructive control. The APG
+//      dialog-modal pattern: "If a dialog contains the final step in a
+//      process that is not easily reversible… it may be advisable to
+//      set focus on the least destructive action."
+//
+//      Radix's FocusScope already autofocuses the FIRST TABBABLE
+//      element in DOM order (`focusFirst(removeLinks(
+//      getTabbableCandidates(container)))` in
+//      @radix-ui/react-focus-scope). Every dialog below happens to put
+//      a non-destructive control first — Cancel, a checkbox, or a
+//      type-to-confirm input whose destructive button is disabled
+//      until it is satisfied — so no extra focus code is warranted.
+//      These tests pin that so a future footer reorder (or a migration
+//      that moves the destructive button up) can't silently regress it.
+//
+//   3. The accessible DESCRIPTION must carry the consequence, not just
+//      the title.
+import { describe, it, expect, vi, afterEach } from "vitest"
+import { render, cleanup, screen, waitFor } from "@testing-library/react"
+
+const routerRequest = vi.fn().mockResolvedValue({})
+vi.mock("@/lib/router-api", () => ({
+  routerApi: { request: (...a: unknown[]) => routerRequest(...a) },
+}))
+const fetchOverview = vi.fn().mockResolvedValue(undefined)
+vi.mock("@/lib/stores/projects-store", () => ({
+  useProjectsStore: (sel: (s: unknown) => unknown) =>
+    sel({ fetchOverview }),
+}))
+
+import { DeleteConfirmModal } from "@/components/dashboard/modals/delete-confirm-modal"
+import { TerminateAgentDialog } from "@/components/dashboard/agents/terminate-agent-dialog"
+import { RemoveProjectModal } from "@/components/dashboard/remove-project-modal"
+
+afterEach(() => {
+  cleanup()
+  routerRequest.mockClear()
+})
+
+/** Resolve an element's accessible description from aria-describedby. */
+function describedText(node: HTMLElement): string {
+  const ids = (node.getAttribute("aria-describedby") ?? "").split(/\s+/)
+  return ids
+    .map((id) => document.getElementById(id)?.textContent ?? "")
+    .join(" ")
+}
+
+describe("<DeleteConfirmModal> (users, groups, memories, messages, purge)", () => {
+  const renderModal = () =>
+    render(
+      <DeleteConfirmModal
+        open
+        onOpenChange={() => {}}
+        onConfirm={async () => {}}
+        entityLabel="Memory"
+      />,
+    )
+
+  it("announces as an alertdialog", () => {
+    renderModal()
+    expect(screen.getByRole("alertdialog")).toBeTruthy()
+  })
+
+  it("describes the CONSEQUENCE, not just the title", () => {
+    renderModal()
+    expect(describedText(screen.getByRole("alertdialog"))).toMatch(
+      /permanently removed|cannot be reversed/i,
+    )
+  })
+
+  it("does not focus the destructive button on open", async () => {
+    renderModal()
+    const destructive = screen.getByRole("button", { name: /Delete Memory/i })
+    await waitFor(() =>
+      expect(document.activeElement).not.toBe(destructive),
+    )
+    // The confirm button is also disabled until the word is typed, so
+    // even a stray Enter cannot fire it.
+    expect((destructive as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it("puts initial focus on the type-to-confirm input", async () => {
+    renderModal()
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByPlaceholderText('Type "DELETE" to confirm'),
+      ),
+    )
+  })
+})
+
+describe("<TerminateAgentDialog>", () => {
+  const renderDialog = () =>
+    render(
+      <TerminateAgentDialog
+        agentId="worker-1"
+        open
+        onOpenChange={() => {}}
+        onConfirmed={() => {}}
+      />,
+    )
+
+  it("announces as an alertdialog", () => {
+    renderDialog()
+    expect(screen.getByRole("alertdialog")).toBeTruthy()
+  })
+
+  it("describes the consequence", () => {
+    renderDialog()
+    expect(describedText(screen.getByRole("alertdialog"))).toMatch(
+      /soft-delete/i,
+    )
+  })
+
+  it("focuses Cancel, the least destructive control", async () => {
+    renderDialog()
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", { name: "Cancel" }),
+      ),
+    )
+  })
+})
+
+describe("<RemoveProjectModal>", () => {
+  const renderModal = () =>
+    render(
+      <RemoveProjectModal projectName="acme" open onOpenChange={() => {}} />,
+    )
+
+  it("announces as an alertdialog", () => {
+    renderModal()
+    expect(screen.getByRole("alertdialog")).toBeTruthy()
+  })
+
+  it("describes the consequence", () => {
+    renderModal()
+    expect(describedText(screen.getByRole("alertdialog"))).toMatch(
+      /Stops the systemd backend/i,
+    )
+  })
+
+  it("does not focus the destructive button on open", async () => {
+    renderModal()
+    const remove = screen.getByRole("button", { name: "Remove" })
+    await waitFor(() => expect(document.activeElement).not.toBe(remove))
+  })
+})

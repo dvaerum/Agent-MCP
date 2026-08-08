@@ -486,7 +486,7 @@ export function SchedulesDashboard() {
             type-to-confirm <DeleteConfirmModal>: a schedule is cheap to
             re-create, so this migration does not tighten the gate. */}
         <Dialog open={deleteId != null} onOpenChange={(o) => !o && setDeleteId(null)}>
-          <DialogContent>
+          <DialogContent alertDialog>
             <DialogHeader>
               <DialogTitle>Delete schedule</DialogTitle>
               <DialogDescription>

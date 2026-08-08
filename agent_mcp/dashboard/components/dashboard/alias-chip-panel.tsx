@@ -23,6 +23,7 @@ import { Button } from "@/components/ui/button"
 import { useProjectsStore, type ProjectAlias } from "@/lib/stores/projects-store"
 import { projectAliasUrl, projectAliasesUrl } from "@/lib/urls"
 import { routerApi } from "@/lib/router-api"
+import { toastSuccess } from "@/components/ui/toast"
 
 interface AliasUsage {
   alias: string
@@ -75,6 +76,17 @@ export function AliasChipPanel({
     }
   }, [open, alias.name])
 
+  // Success toast, deliberately NO Undo.
+  //
+  // The router registers only GET + DELETE on
+  // `/agent-mcp/api/router/projects/{name}/aliases` (see
+  // `register_admin_routes` in agent_mcp/router/admin_api.py) — there is
+  // no create-alias endpoint to invert this with. The one path that
+  // DOES mint an alias is rename (`ProjectOrchestrator.add_alias`,
+  // grace_days from now), which would resurrect the name with a FRESH
+  // `expires_at` rather than the one the operator just expired. That is
+  // a different alias wearing the same name, so offering "Undo" here
+  // would be a lie. If a real inverse lands, this becomes `toastUndo`.
   const handleRemove = async () => {
     setRemoving(true)
     setError(null)
@@ -83,6 +95,10 @@ export function AliasChipPanel({
         method: "DELETE",
       })
       await fetchOverview()
+      toastSuccess(
+        `Removed alias ${alias.name} from ${projectName}. ` +
+          `Re-issue it with Rename if you still need the old name.`,
+      )
       onClose()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))

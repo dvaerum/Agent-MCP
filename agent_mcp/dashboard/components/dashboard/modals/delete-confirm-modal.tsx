@@ -83,6 +83,10 @@ export function DeleteConfirmModal({
   const [loading, setLoading] = useState(false)
   const [confirmationText, setConfirmationText] = useState("")
   const [error, setError] = useState<string | null>(null)
+  // The consequence lives in the warning banner, not in
+  // <DialogDescription> — see the aria-describedby note on
+  // <DialogContent> below.
+  const warningId = React.useId()
 
   const isConfirmed = matchCase
     ? confirmationText === requiredWord
@@ -125,7 +129,22 @@ export function DeleteConfirmModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-lg bg-card border-border text-card-foreground">
+      {/* aria-describedby is aimed at the WARNING BANNER, overriding
+          Radix's default wiring to <DialogDescription>.
+          The APG's point in giving a confirmation `role="alertdialog"`
+          is that the accessible description carries the CONSEQUENCE.
+          Here the description is the one-line summary while the banner
+          is the specific blast radius the caller supplies (`warningText`
+          — e.g. purge's "every message, task and action that referenced
+          it is rewritten to a tombstone"). The banner is the sentence a
+          screen-reader user needs before the confirm input, so it is the
+          one aria-describedby names. The visible <DialogDescription> is
+          still read in document order. */}
+      <DialogContent
+        alertDialog
+        aria-describedby={warningId}
+        className="w-[calc(100vw-2rem)] sm:!max-w-lg bg-card border-border text-card-foreground"
+      >
         <DialogHeader>
           <div className="flex items-center gap-2">
             <div className="flex h-8 w-8 items-center justify-center rounded-full bg-destructive/15">
@@ -144,7 +163,7 @@ export function DeleteConfirmModal({
           {/* Warning Banner */}
           <div className="flex items-start gap-3 p-3 bg-destructive/10 border border-destructive/20 rounded-lg">
             <AlertTriangle className="h-5 w-5 text-destructive mt-0.5 flex-shrink-0" />
-            <div className="space-y-1">
+            <div className="space-y-1" id={warningId}>
               <div className="text-sm font-medium text-destructive">
                 {warningTitle}
               </div>

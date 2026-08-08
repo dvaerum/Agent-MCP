@@ -939,7 +939,7 @@ const DeleteTaskDialog = React.memo(({ task, onOpenChange, onDeleted }: DeleteTa
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground p-0 gap-0">
+      <DialogContent alertDialog className="w-[calc(100vw-2rem)] sm:!max-w-md bg-card border-border text-card-foreground p-0 gap-0">
         {task && (
           <>
             <DialogHeader className="px-6 pt-6 pb-4">

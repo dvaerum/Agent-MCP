@@ -46,19 +46,50 @@ function DialogOverlay({
   )
 }
 
+/**
+ * `alertDialog` — opt in to `role="alertdialog"`.
+ *
+ * W3C ARIA APG names a confirmation prompt as the canonical alertdialog
+ * case; the role "enables assistive technologies and browsers to
+ * distinguish alert dialogs from other dialogs", which is what lets a
+ * screen reader treat "Delete task?" differently from "Edit task".
+ * Every destructive confirmation in the dashboard sets it.
+ *
+ * Why a PROP and not a sibling `<AlertDialogContent>` component:
+ * `tests/test_dashboard_polish_mobile_pass.py` globs the component tree
+ * for `<DialogContent … className="…">` to audit the
+ * `w-[calc(100vw-2rem)]` mobile-width fallback. A parallel component
+ * name would silently drop every migrated confirm out of that audit —
+ * exactly the "hardcoded list drifts" failure that test was rewritten
+ * to avoid.
+ *
+ * Initial focus needs no code here. Radix's FocusScope autofocuses the
+ * first tabbable element in DOM order, and every confirm in this app
+ * puts a non-destructive control first (Cancel, a checkbox, or a
+ * type-to-confirm input that keeps the destructive button disabled), so
+ * the APG's "set focus on the least destructive action" already holds.
+ * `components/dashboard/destructive-confirm-a11y.test.tsx` pins it.
+ */
 function DialogContent({
   className,
   children,
   showCloseButton = true,
+  alertDialog = false,
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   showCloseButton?: boolean
+  alertDialog?: boolean
 }) {
   return (
     <DialogPortal data-slot="dialog-portal">
       <DialogOverlay />
       <DialogPrimitive.Content
         data-slot="dialog-content"
+        // Radix sets role="dialog" BEFORE spreading caller props, so an
+        // explicit role here wins. It must be spread CONDITIONALLY —
+        // `role={undefined}` still lands in the props object and blanks
+        // Radix's default, leaving the node with no role at all.
+        {...(alertDialog ? ({ role: "alertdialog" } as const) : {})}
         className={cn(
           "bg-background data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 fixed top-[50%] left-[50%] z-50 grid w-full max-w-[calc(100%-2rem)] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-lg border p-6 shadow-lg duration-200 sm:max-w-lg",
           className
