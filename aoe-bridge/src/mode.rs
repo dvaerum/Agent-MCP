@@ -21,6 +21,74 @@ impl Mode {
     }
 }
 
+/// Parse AoE's authoritative `view` field (`GET /api/sessions[].view`) into a
+/// [`Mode`], or `None` when the payload does not state one.
+///
+/// This is THE routing signal: AoE's terminal `/api/sessions/{id}/send` refuses
+/// a session whose view is structured (`EnsureReadyError::StructuredView` →
+/// `400 acp_mode_unsupported`), and that check reads exactly this value. Every
+/// other signal the bridge has (`acp_worker_state`, `has_terminal`, the
+/// tool/status text) is a proxy that can disagree — a structured session whose
+/// worker has not spawned yet reports `acp_worker_state = "absent"`.
+///
+/// AoE serialises the field only when it is `structured`
+/// (`#[serde(skip_serializing_if = "View::is_terminal")]`), so an absent field
+/// on a current AoE means terminal. It is still mapped to `None` rather than
+/// `Terminal` here, because an AoE too old to have the field would be
+/// indistinguishable — the caller falls back to the proxies, which is right in
+/// both cases.
+pub fn view_mode(view: &str) -> Option<Mode> {
+    match view.trim().to_ascii_lowercase().as_str() {
+        "structured" => Some(Mode::Structured),
+        "terminal" => Some(Mode::Terminal),
+        _ => None,
+    }
+}
+
+/// What to do about an inject AoE refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MismatchAction {
+    /// AoE named a mode mismatch on an `auto` row: retry once on `Mode`, and
+    /// remember it for this session's later frames.
+    Retry(Mode),
+    /// The same mismatch on a row whose mode the operator PINNED. Their pin is
+    /// wrong, but silently overriding it would hide the misconfiguration — say
+    /// so loudly instead and let the nudge fail.
+    TellOperator(Mode),
+    /// Not a mode mismatch (a real outage, a transient, a vanished session).
+    Nothing,
+}
+
+/// Classify a refused inject: did AoE tell us we used the wrong route?
+///
+/// Only these two responses are a mode statement, and both are exact (verified
+/// against AoE's handlers):
+/// - terminal `/send` on a structured session → `400 {"error":
+///   "acp_mode_unsupported"}` (`SendKeysError::StructuredView`);
+/// - `/acp/prompt` on a session with no structured view → `404 "session has no
+///   running structured view"` (`SupervisorError::UnknownSession`).
+///
+/// Everything else — `503 worker_not_ready` (a structured worker still
+/// starting), `404 session not found` (the session is gone), `409
+/// session_transient`, any 5xx — is NOT a mismatch and must never flip the
+/// route: retrying those on the other transport would inject into the wrong
+/// surface or mask a real outage. Status AND body must both match, so a stray
+/// substring cannot promote an unrelated failure into a route change.
+pub fn on_refusal(attempted: Mode, auto_mode: bool, http: u16, body: &str) -> MismatchAction {
+    let correct = match attempted {
+        Mode::Terminal if http == 400 && body.contains("acp_mode_unsupported") => Mode::Structured,
+        Mode::Structured if http == 404 && body.contains("no running structured view") => {
+            Mode::Terminal
+        }
+        _ => return MismatchAction::Nothing,
+    };
+    if auto_mode {
+        MismatchAction::Retry(correct)
+    } else {
+        MismatchAction::TellOperator(correct)
+    }
+}
+
 /// Normalise a free-form mode signal to a [`Mode`]. Anything mentioning a
 /// structured surface (`structured`, `acp`, `composer`, `cityhall`) is
 /// structured; everything else defaults to terminal. Case-insensitive.
@@ -110,6 +178,101 @@ pub fn classify_transport_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_field_is_authoritative_and_absence_means_terminal() {
+        // AoE serialises `view` only when it is `structured`
+        // (`skip_serializing_if = "View::is_terminal"`), so an absent field is a
+        // positive statement that the session renders as a terminal — not a
+        // missing signal.
+        assert_eq!(view_mode("structured"), Some(Mode::Structured));
+        assert_eq!(view_mode("terminal"), Some(Mode::Terminal));
+        assert_eq!(view_mode(""), None);
+        assert_eq!(view_mode("Structured"), Some(Mode::Structured));
+        // An unknown future value is not guessed at; the caller falls back.
+        assert_eq!(view_mode("holodeck"), None);
+    }
+
+    #[test]
+    fn refused_terminal_inject_retries_once_as_structured() {
+        // AoE's terminal /send answers a structured-view session with exactly
+        // this, which is AoE stating the session's view — stronger than any
+        // proxy we infer.
+        assert_eq!(
+            on_refusal(
+                Mode::Terminal,
+                true,
+                400,
+                r#"{"error":"acp_mode_unsupported"}"#
+            ),
+            MismatchAction::Retry(Mode::Structured)
+        );
+    }
+
+    #[test]
+    fn refused_structured_inject_retries_once_as_terminal() {
+        // The mirror case: /acp/prompt on a session with no structured view
+        // answers 404 "session has no running structured view"
+        // (SupervisorError::UnknownSession).
+        assert_eq!(
+            on_refusal(
+                Mode::Structured,
+                true,
+                404,
+                "session has no running structured view"
+            ),
+            MismatchAction::Retry(Mode::Terminal)
+        );
+    }
+
+    #[test]
+    fn a_pinned_row_is_told_about_the_mismatch_never_silently_corrected() {
+        // An explicit `mode = "terminal"` that AoE refuses is an operator
+        // misconfiguration. Correcting it silently would hide the mistake; the
+        // caller is told to say so loudly instead.
+        assert_eq!(
+            on_refusal(
+                Mode::Terminal,
+                false,
+                400,
+                r#"{"error":"acp_mode_unsupported"}"#
+            ),
+            MismatchAction::TellOperator(Mode::Structured)
+        );
+        assert_eq!(
+            on_refusal(
+                Mode::Structured,
+                false,
+                404,
+                "session has no running structured view"
+            ),
+            MismatchAction::TellOperator(Mode::Terminal)
+        );
+    }
+
+    #[test]
+    fn unrelated_failures_never_trigger_a_mode_retry() {
+        for (mode, http, body) in [
+            // A genuinely-structured session whose worker is still starting.
+            (Mode::Structured, 503, "worker_not_ready"),
+            (Mode::Structured, 503, "worker_capacity_full (4/4)"),
+            // The session is gone, not mis-routed.
+            (Mode::Structured, 404, "session not found"),
+            (Mode::Terminal, 404, "session not found"),
+            // A different 400, and a 409 mid-lifecycle retry.
+            (Mode::Terminal, 400, r#"{"error":"empty_message"}"#),
+            (Mode::Terminal, 409, r#"{"error":"session_transient"}"#),
+            (Mode::Terminal, 500, "tmux exploded"),
+            // Right code, wrong status: do not guess.
+            (Mode::Terminal, 500, r#"{"error":"acp_mode_unsupported"}"#),
+        ] {
+            assert_eq!(
+                on_refusal(mode, true, http, body),
+                MismatchAction::Nothing,
+                "{mode:?} {http} {body}"
+            );
+        }
+    }
 
     #[test]
     fn structured_signals_map_to_structured() {

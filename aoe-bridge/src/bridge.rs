@@ -8,16 +8,41 @@
 //!    (worker state, not just status — so a stopped session reads `dormant`);
 //! 3. resolve the per-session routes;
 //! 4. for each live route: POST its transport-status, assert its per-session
-//!    MCP, switch it to ACP if asked — correcting an `auto` route to
-//!    `structured` the moment that switch succeeds, since step 3 resolved it
-//!    from a pre-switch snapshot — and ensure exactly one SSE task is running
-//!    (respawning it if its endpoint/token/mode/AoE creds changed);
+//!    MCP, switch it to ACP if asked, and ensure exactly one SSE task is running
+//!    (respawning it if its endpoint/token/AoE creds changed);
 //! 5. for a configured-but-not-live session: POST `dead` and drop its task;
 //! 6. drop tasks whose session left the mapping;
 //! 7. publish the observable state to the plugin's AoE settings page.
 //!
 //! A per-session SSE task reconnects with backoff on drop — a transient stream
 //! drop is not a session end (ADR-0021); the policy re-fires on reconnect.
+//!
+//! ## Routing: decided per inject, not per pass
+//!
+//! AoE runs a session either as a terminal (`/send`) or a structured/ACP view
+//! (`/acp/prompt`), and injecting on the wrong one is REFUSED — the nudge is
+//! dropped, not queued. A route resolved once per pass but used for the whole
+//! interval is therefore a standing hazard: the session's view can change under
+//! it at any moment (this bridge's own `ensure_acp`, an operator flipping the
+//! view, a respawn coming back the other way, a structured worker dying).
+//!
+//! So the mode is NOT a property of the running stream. Three layers, in order:
+//!
+//! 1. **Resolution** ([`effective_mode`]) runs per frame, off AoE's
+//!    authoritative `view` field read through a short-TTL cache
+//!    ([`RuntimeModes`]) — so there is no window in which a stale mode can be
+//!    used, only a ≤[`LIVENESS_TTL`] window in which a stale *snapshot* can be.
+//! 2. **Self-healing** ([`on_refusal`]) treats AoE's own refusal as the last
+//!    word: the two responses that name a mode mismatch trigger exactly one
+//!    retry on the other transport, and the correction is remembered for the
+//!    session's later frames. This holds even if layer 1 is wrong for a reason
+//!    nobody anticipated.
+//! 3. **An explicit `mode` in the row always wins over both.** Operator intent
+//!    is not drift; a pin AoE refuses is reported loudly, never overridden.
+//!
+//! Consequently `mode` is deliberately absent from the task fingerprint
+//! ([`Route::fingerprint`]): a session flipping views must correct its routing
+//! WITHOUT tearing down and reopening its delivery stream.
 //!
 //! ## Observability
 //!
@@ -33,7 +58,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -43,9 +68,9 @@ use serde_json::json;
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
-use crate::config::{self, Liveness, Route};
+use crate::config::{self, effective_mode, Liveness, Route};
 use crate::inject::{build_injection, build_mcp_set_params, delivery_url, extract_sse_data};
-use crate::mode::classify_transport_status;
+use crate::mode::{classify_transport_status, on_refusal, MismatchAction, Mode};
 use crate::observe::{self, now_secs};
 use crate::plugin::{PluginConn, PublishReason};
 use crate::render::{parse_frame, render_skinny};
@@ -62,8 +87,101 @@ const PUBLISH_REFRESH: Duration = Duration::from_secs(30);
 /// task, read by the publisher.
 pub type SharedState = Arc<Mutex<Snapshot>>;
 
+/// How long a liveness read is reused before the inject path refetches it.
+///
+/// Injects are RARE (only when a nudge fires) and AoE is a loopback REST call,
+/// so refetching per frame would be affordable; the TTL exists so that a burst
+/// of frames across many sessions collapses into one `GET /api/sessions`
+/// instead of N. Short enough that a view flip is picked up essentially
+/// immediately, which is the whole point of resolving the mode here.
+const LIVENESS_TTL: Duration = Duration::from_secs(5);
+
+/// Session→mode knowledge shared by the reconcile loop and every SSE task, and
+/// the reason a delivery cannot be dropped by a stale route.
+///
+/// The reconcile loop resolves routes once per pass; a session's view can change
+/// at any point after that. Rather than trying to enumerate every way reality
+/// drifts, the inject path re-derives the mode from these two sources:
+/// - `liveness` — the last `GET /api/sessions`, refetched on demand once older
+///   than [`LIVENESS_TTL`]. Seeded free of charge by each reconcile pass.
+/// - `learned` — what AoE itself told us: a successful `acp/enable`, or a
+///   refused inject naming the mismatch ([`on_refusal`]). Stronger than the
+///   liveness proxies and, unlike them, never lags a lazily-spawned worker.
+struct RuntimeModes {
+    liveness: Mutex<(Option<Instant>, HashMap<String, Liveness>)>,
+    learned: Mutex<HashMap<String, Mode>>,
+}
+
+impl RuntimeModes {
+    fn new() -> Self {
+        Self {
+            liveness: Mutex::new((None, HashMap::new())),
+            learned: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Publish a reconcile pass's liveness so the inject path gets it for free.
+    /// An EMPTY map never replaces a populated one: `fetch_liveness` returns
+    /// empty on any failure, and throwing away good routing data because one
+    /// GET timed out is exactly how a nudge ends up on the wrong transport.
+    fn seed(&self, live: &HashMap<String, Liveness>) {
+        if live.is_empty() {
+            return;
+        }
+        let mut g = self.liveness.lock().unwrap();
+        *g = (Some(Instant::now()), live.clone());
+    }
+
+    /// This session's liveness, refetched if the cached copy is older than
+    /// [`LIVENESS_TTL`]. `None` when AoE is unreachable and nothing is cached —
+    /// the caller then falls back to the route's resolved mode.
+    async fn liveness_for(
+        &self,
+        http: &reqwest::Client,
+        aoe_base: &str,
+        aoe_token: &str,
+        session_id: &str,
+    ) -> Option<Liveness> {
+        {
+            // Scoped so the lock is never held across the await below.
+            let g = self.liveness.lock().unwrap();
+            if g.0.is_some_and(|at| at.elapsed() < LIVENESS_TTL) {
+                return g.1.get(session_id).cloned();
+            }
+        }
+        let fresh = fetch_liveness(http, aoe_base, aoe_token).await;
+        self.seed(&fresh);
+        if fresh.is_empty() {
+            // Failed (or genuinely empty) fetch: fall back to whatever we last
+            // saw rather than pretending we know nothing.
+            return self.liveness.lock().unwrap().1.get(session_id).cloned();
+        }
+        fresh.get(session_id).cloned()
+    }
+
+    fn learned(&self, session_id: &str) -> Option<Mode> {
+        self.learned.lock().unwrap().get(session_id).copied()
+    }
+
+    fn learn(&self, session_id: &str, mode: Mode) {
+        self.learned
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), mode);
+    }
+
+    fn forget(&self, session_id: &str) {
+        self.learned.lock().unwrap().remove(session_id);
+    }
+
+    fn forget_all(&self) {
+        self.learned.lock().unwrap().clear();
+    }
+}
+
 /// Shared per-task context: the HTTP client, the AoE injection creds, the host
-/// connection (for failure toasts) and the observable state.
+/// connection (for failure toasts), the observable state and the runtime mode
+/// knowledge.
 struct BridgeCtx {
     http: reqwest::Client,
     aoe_base: String,
@@ -71,6 +189,7 @@ struct BridgeCtx {
     conn: Arc<PluginConn>,
     state: SharedState,
     publish: mpsc::UnboundedSender<PublishReason>,
+    modes: Arc<RuntimeModes>,
 }
 
 impl BridgeCtx {
@@ -89,6 +208,25 @@ impl BridgeCtx {
 
     fn request_publish(&self) {
         let _ = self.publish.send(PublishReason::Tick);
+    }
+
+    /// The mode to inject this frame with — see [`effective_mode`] for the
+    /// precedence. A PINNED row short-circuits before any liveness read: the
+    /// answer cannot depend on it, so there is no reason to pay for it.
+    async fn inject_mode(&self, route: &Route) -> Mode {
+        if !route.auto_mode {
+            return route.mode;
+        }
+        let fresh = self
+            .modes
+            .liveness_for(
+                &self.http,
+                &self.aoe_base,
+                &self.aoe_token,
+                &route.session_id,
+            )
+            .await;
+        effective_mode(route, fresh.as_ref(), self.modes.learned(&route.session_id))
     }
 }
 
@@ -120,6 +258,10 @@ pub async fn run_bridge(
     // reports `acp_worker_state = "absent"` (the worker can spawn lazily). A
     // stale/removed row is dropped so a re-add re-enables and re-learns.
     let mut acp_mode: HashMap<String, bool> = HashMap::new();
+    // Lives across passes and is shared with every spawned SSE task, which is
+    // what lets a task resolve its mode from CURRENT state rather than from the
+    // route it was spawned with.
+    let modes = Arc::new(RuntimeModes::new());
 
     loop {
         let settings = config::load_settings(&conn).await;
@@ -142,9 +284,13 @@ pub async fn run_bridge(
             }
             mcp_set.clear();
             acp_mode.clear();
+            modes.forget_all();
             state.lock().unwrap().sessions.clear();
         } else {
             let live = fetch_liveness(&http, &settings.aoe_base, &settings.aoe_token).await;
+            // The inject path reuses this read while it is fresh, so a nudge
+            // arriving just after a reconcile costs no extra HTTP call.
+            modes.seed(&live);
             let ctx = Arc::new(BridgeCtx {
                 http: http.clone(),
                 aoe_base: settings.aoe_base.clone(),
@@ -152,6 +298,7 @@ pub async fn run_bridge(
                 conn: conn.clone(),
                 state: state.clone(),
                 publish: publish.clone(),
+                modes: modes.clone(),
             });
             let routes = config::resolve_routes(&settings, &live);
             let mut wanted: HashSet<String> = HashSet::new();
@@ -317,6 +464,9 @@ pub async fn run_bridge(
                 // revert the session to terminal: the ACP switch is one-way and
                 // leaves the session usable.
                 acp_mode.remove(&k);
+                // And the learned route, so a re-added row re-derives it from
+                // whatever the session actually is by then.
+                modes.forget(&k);
             }
 
             // Only sessions REMOVED from the settings vanish from the page.
@@ -516,6 +666,11 @@ async fn ensure_acp_mode(
         Ok(r) if r.status().is_success() => {
             observe::info(&format!("session {session_id} switched to ACP mode"));
             guard.insert(session_id.to_string(), true);
+            // AoE just told us this session's view: record it so the very first
+            // frame routes structured, without waiting for a liveness read to
+            // catch up (the ACP worker can spawn lazily, leaving the proxies
+            // reading "absent" long after the view changed).
+            ctx.modes.learn(session_id, Mode::Structured);
             return true;
         }
         Ok(r) => {
@@ -667,39 +822,119 @@ async fn handle_frame(ctx: &BridgeCtx, route: &Route, data: &str) {
     ctx.observe(&route.session_id, &route.project, |o| {
         o.note_frame(&frame.reason, now)
     });
+    // The mode is resolved HERE, per frame, not when the route was resolved: a
+    // session's view can change at any point in the interval this task has been
+    // running (ensure_acp, an operator flipping the view, a respawn, a dead
+    // structured worker), and injecting on a stale mode is refused outright.
+    let mode = ctx.inject_mode(route).await;
     observe::debug(&format!(
         "delivery frame for {} ({}, {} unread / {} tasks); injecting via {}",
         route.session_id,
         frame.reason,
         frame.unread_count,
         frame.task_count,
-        route.mode.as_str()
+        mode.as_str()
     ));
 
     let text = render_skinny(&frame);
-    let (url, body) = build_injection(route.mode, &ctx.aoe_base, &route.session_id, &text);
+    let mut attempt = inject_once(ctx, route, mode, &text).await;
+
+    // Self-healing: whatever the resolution above concluded, AoE has the last
+    // word — and when the route is wrong it says so in an exact, unambiguous
+    // way. Correct it, remember it for this session's later frames, and retry
+    // EXACTLY once (`on_refusal` answers `Retry` only for the two mismatch
+    // responses, so this cannot loop or fire on a real outage).
+    if let (false, Some(code)) = (attempt.outcome.ok, attempt.outcome.http) {
+        match on_refusal(mode, route.auto_mode, code, &attempt.body) {
+            MismatchAction::Retry(correct) => {
+                // warn, not debug: a mismatch that keeps happening is a real
+                // resolution bug, and papering over it silently is how the
+                // original outage stayed invisible.
+                observe::warn(&format!(
+                    "AoE refused the {} route for {}; it renders as {} — retrying and \
+                     routing this session as {} from now on",
+                    mode.as_str(),
+                    route.session_id,
+                    correct.as_str(),
+                    correct.as_str()
+                ));
+                ctx.modes.learn(&route.session_id, correct);
+                attempt = inject_once(ctx, route, correct, &text).await;
+            }
+            MismatchAction::TellOperator(correct) => {
+                // A pinned row is operator intent: correcting it silently would
+                // hide the misconfiguration, so the nudge is allowed to fail and
+                // the operator is told, loudly, on both surfaces.
+                let msg = format!(
+                    "session {} is pinned mode=\"{}\" but AoE renders it as {}; \
+                     the row is wrong — set mode=\"{}\" or \"auto\"",
+                    route.session_id,
+                    mode.as_str(),
+                    correct.as_str(),
+                    correct.as_str()
+                );
+                observe::error(&msg);
+                ctx.observe(&route.session_id, &route.project, |o| {
+                    o.note_error(&msg, now_secs())
+                });
+            }
+            MismatchAction::Nothing => {}
+        }
+    }
+
+    // Only the FINAL attempt is recorded: a frame that self-healed on the retry
+    // was delivered, and counting the refused first try as a failure would fire
+    // a failure toast for a nudge that arrived.
+    let outcome = attempt.outcome;
+    ctx.observe(&route.session_id, &route.project, |o| {
+        o.mode = attempt.mode.as_str().to_string()
+    });
+    let notice = ctx.observe(&route.session_id, &route.project, |o| {
+        o.note_inject(outcome.clone())
+    });
+    ctx.request_publish();
+    announce(ctx, route, notice, &outcome).await;
+}
+
+/// One injection attempt on one mode.
+struct Attempt {
+    outcome: InjectOutcome,
+    /// The mode this attempt used.
+    mode: Mode,
+    /// The RAW (redacted) AoE error body. [`InjectOutcome::detail`] carries the
+    /// page-width compaction of it, which is too short to classify against —
+    /// mismatch detection must read the whole thing.
+    body: String,
+}
+
+/// POST one rendered nudge into a session on the given mode.
+async fn inject_once(ctx: &BridgeCtx, route: &Route, mode: Mode, text: &str) -> Attempt {
+    let (url, payload) = build_injection(mode, &ctx.aoe_base, &route.session_id, text);
     let res = ctx
         .http
         .post(url.as_str())
         .header(AUTHORIZATION, format!("Bearer {}", ctx.aoe_token))
-        .json(&body)
+        .json(&payload)
         .send()
         .await;
 
-    let outcome = match res {
+    let (outcome, body) = match res {
         Ok(r) if r.status().is_success() => {
             let code = r.status().as_u16();
             observe::debug(&format!(
                 "injected into {} via {} (HTTP {code})",
                 route.session_id,
-                route.mode.as_str()
+                mode.as_str()
             ));
-            InjectOutcome {
-                ok: true,
-                http: Some(code),
-                detail: String::new(),
-                at: now_secs(),
-            }
+            (
+                InjectOutcome {
+                    ok: true,
+                    http: Some(code),
+                    detail: String::new(),
+                    at: now_secs(),
+                },
+                String::new(),
+            )
         }
         Ok(r) => {
             // The BODY is the whole point: AoE answers `{"error": <code>,
@@ -714,34 +949,39 @@ async fn handle_frame(ctx: &BridgeCtx, route: &Route, data: &str) {
             observe::error(&format!(
                 "inject to {} via {} returned HTTP {code}: {body}",
                 route.session_id,
-                route.mode.as_str()
+                mode.as_str()
             ));
-            InjectOutcome {
-                ok: false,
-                http: Some(code),
-                detail: compact_error(&body),
-                at: now_secs(),
-            }
+            (
+                InjectOutcome {
+                    ok: false,
+                    http: Some(code),
+                    detail: compact_error(&body),
+                    at: now_secs(),
+                },
+                body,
+            )
         }
         Err(e) => {
             // Same split as above: the whole transport error to the log, a
             // row-width summary to the page.
             let full = clip_detail(&e.to_string());
             observe::error(&format!("inject to {} failed: {full}", route.session_id));
-            InjectOutcome {
-                ok: false,
-                http: None,
-                detail: compact_error(&full),
-                at: now_secs(),
-            }
+            (
+                InjectOutcome {
+                    ok: false,
+                    http: None,
+                    detail: compact_error(&full),
+                    at: now_secs(),
+                },
+                full,
+            )
         }
     };
-
-    let notice = ctx.observe(&route.session_id, &route.project, |o| {
-        o.note_inject(outcome.clone())
-    });
-    ctx.request_publish();
-    announce(ctx, route, notice, &outcome).await;
+    Attempt {
+        outcome,
+        mode,
+        body,
+    }
 }
 
 /// Surface an inject failure (or its recovery) to the operator as a toast.
@@ -789,5 +1029,76 @@ async fn error_body(resp: Response) -> String {
         Ok(t) if t.trim().is_empty() => "<no body>".to_string(),
         Ok(t) => clip_detail(&observe::redact(&t)),
         Err(e) => format!("<unreadable body: {e}>"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(id: &str, view: &str) -> Liveness {
+        Liveness {
+            id: id.to_string(),
+            view: view.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn seeded(id: &str, view: &str) -> RuntimeModes {
+        let modes = RuntimeModes::new();
+        modes.seed(&HashMap::from([(id.to_string(), record(id, view))]));
+        modes
+    }
+
+    #[test]
+    fn a_failed_liveness_fetch_never_clobbers_what_we_last_saw() {
+        // `fetch_liveness` answers an empty map on ANY failure. Letting that
+        // overwrite the cache would drop every session back to the proxy
+        // heuristics — routing worse after a transient GET failure than before
+        // it.
+        let modes = seeded("s1", "structured");
+        modes.seed(&HashMap::new());
+        let cached = modes.liveness.lock().unwrap();
+        assert_eq!(cached.1["s1"].view, "structured");
+    }
+
+    #[tokio::test]
+    async fn a_fresh_cache_answers_the_inject_path_without_touching_aoe() {
+        // The TTL is what keeps inject-time resolution cheap: a burst of frames
+        // right after a reconcile must not each fire a GET. The base here is a
+        // dead port, so a fetch would fail and lose the `view` — passing proves
+        // no fetch happened.
+        let modes = seeded("s1", "structured");
+        let got = modes
+            .liveness_for(&reqwest::Client::new(), "http://127.0.0.1:1", "", "s1")
+            .await;
+        assert_eq!(got.map(|r| r.view), Some("structured".to_string()));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_aoe_falls_back_to_the_last_known_view() {
+        // Once the TTL lapses the fetch is attempted and fails; the last known
+        // record still answers, so a nudge is never routed on nothing.
+        let modes = seeded("s1", "structured");
+        modes.liveness.lock().unwrap().0 = Some(Instant::now() - LIVENESS_TTL * 2);
+        let got = modes
+            .liveness_for(&reqwest::Client::new(), "http://127.0.0.1:1", "", "s1")
+            .await;
+        assert_eq!(got.map(|r| r.view), Some("structured".to_string()));
+    }
+
+    #[test]
+    fn a_learned_route_is_forgotten_when_its_row_leaves_the_mapping() {
+        // Otherwise a re-added row would inherit a route learned about whatever
+        // that session used to be.
+        let modes = RuntimeModes::new();
+        modes.learn("s1", Mode::Structured);
+        modes.learn("s2", Mode::Terminal);
+        assert_eq!(modes.learned("s1"), Some(Mode::Structured));
+        modes.forget("s1");
+        assert_eq!(modes.learned("s1"), None);
+        assert_eq!(modes.learned("s2"), Some(Mode::Terminal));
+        modes.forget_all();
+        assert_eq!(modes.learned("s2"), None);
     }
 }
