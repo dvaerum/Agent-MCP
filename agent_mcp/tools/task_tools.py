@@ -35,6 +35,7 @@ from ..features.task_placement.suggestions import (
 )
 from ..features.rag.indexing import index_task_data
 from ..features.task_queries import (
+    TERMINAL_TASK_STATUSES as _TERMINAL_TASK_STATUSES,
     TaskFilterSpec,
     TaskQueryEngine,
     TaskSortSpec,
@@ -365,7 +366,29 @@ def _generate_notification_id() -> str:
 # resurrect a cancelled/failed task. Enforced in both
 # ``_update_single_task`` (the update_task_status path) and
 # ``bulk_task_operations``.
-_TERMINAL_TASK_STATUSES: set = {"completed", "cancelled", "failed"}
+#
+# R16-F2: the terminal set is now imported from ``features.task_queries``
+# (single source of truth) so the read-side claimable-pool predicate can
+# never drift from this write-side sink — see that module's
+# ``TERMINAL_TASK_STATUSES`` / ``is_claimable_task``.
+
+
+def _normalize_parent(value: Any) -> Optional[str]:
+    """Collapse an empty / whitespace-only ``parent_task`` to ``None`` (R16-F1).
+
+    A blank parent is semantically "no parent". Left un-normalized, an
+    empty string is falsy (so the parent-existence pre-check is skipped)
+    yet not ``None`` (so the single-root guard is skipped too), and it
+    then reaches the ``tasks.parent_task`` self-FK INSERT and raises an
+    IntegrityError that surfaces as a generic 500. Normalizing at the top
+    of every create path routes a blank parent through the single-root
+    guard (clean 409) and a nonexistent one through the existence check
+    (clean 404) instead. Non-string values pass through untouched so a
+    later type guard can reject them.
+    """
+    if isinstance(value, str):
+        value = value.strip()
+    return value or None
 
 
 def _is_status_transition_allowed(old_status: Optional[str], new_status: str) -> bool:
@@ -1531,7 +1554,13 @@ async def assign_task_tool_impl(
     task_description = arguments.get("task_description")
     priority = arguments.get("priority", "medium")  # Default from schema
     depends_on_tasks_list = arguments.get("depends_on_tasks")  # List[str] or None
-    parent_task_id_arg = arguments.get("parent_task_id")  # Optional str
+    # R16-F1: normalize an empty / whitespace parent to None here so the
+    # single-root guards (``parent_task_id_arg is None`` at both the
+    # pre-check and the uow re-check) and the self-FK INSERT never see a
+    # blank string — a blank parent means "no parent", not a 500.
+    parent_task_id_arg = _normalize_parent(
+        arguments.get("parent_task_id")
+    )  # Optional str
 
     # Mode 2: Multiple task creation (new)
     tasks = arguments.get("tasks")  # List[Dict] with task details
@@ -2249,7 +2278,12 @@ async def create_self_task_tool_impl(
     task_description = arguments.get("task_description")
     priority = arguments.get("priority", "medium")
     depends_on_tasks_list = arguments.get("depends_on_tasks")
-    parent_task_id_arg = arguments.get("parent_task_id")
+    # R16-F1: collapse an empty / whitespace parent to None so the
+    # PRIVILEGED (tasks.assign) branch — which skips the AZ-R19-1 ownership
+    # gate that already protects the worker path — cannot carry a blank
+    # parent to the self-FK INSERT (a generic 500). A blank parent then
+    # falls through to the ``current_task`` default / single-root guard.
+    parent_task_id_arg = _normalize_parent(arguments.get("parent_task_id"))
     # VULN-004: explicit opt-in to apply validator-suggested
     # parent_task / dependencies. See note in assign_task_tool_impl —
     # same prompt-injection vector applies here (in fact more directly,
@@ -3089,22 +3123,19 @@ async def update_task_tool_impl(
                 from ..repositories import agent_repo as _agent_repo
 
                 clear_fields: Dict[str, Any] = {"assigned_to": None}
-                # NOTE (pre-existing, preserved verbatim from the
-                # pre-refactor route): this terminal check reads
-                # ``prior_status`` — the status BEFORE this call, not
-                # the status the ``admin_fields_requested`` branch above
-                # may have JUST written in the SAME transaction. A
-                # combined ``{status: "completed", assigned_to: null}``
-                # request therefore still sets ``clearing_fanout_needed``
-                # from the OLD (non-terminal) status and fires the
-                # unassigned-fanout on a task that is now terminal — the
-                # pre-refactor route had the exact same gap (its
-                # ``prior_status`` was captured once, up front, before
-                # either branch ran). Left as-is: fixing the ORDER
-                # dependency is a genuine behavior change outside this
-                # PR's collapse-onto-the-canonical-tool scope; flagged
-                # in the PR description as a good follow-up.
-                if prior_status not in _TERMINAL_TASK_STATUSES:
+                # R16-F2 (ordering gap, now closed): gate the
+                # unassigned-fanout on the EFFECTIVE final status — the
+                # ``explicit_status`` this same call writes if present,
+                # else ``prior_status`` — not on ``prior_status`` alone.
+                # A combined ``{status: "completed", assigned_to: null}``
+                # request drives the task terminal in one call; keying the
+                # fanout off the OLD (non-terminal) status fired a spurious
+                # ``unassigned_task_appeared`` for work that is now a
+                # terminal sink nobody can claim. Only a task whose
+                # effective status is non-terminal re-enters the claimable
+                # pool (and only then does it get restamped 'unassigned').
+                effective_status = explicit_status or prior_status
+                if effective_status not in _TERMINAL_TASK_STATUSES:
                     clearing_fanout_needed = True
                     if not explicit_status:
                         clear_fields["status"] = "unassigned"
@@ -6083,7 +6114,11 @@ async def create_task_tool_impl(
     description = arguments.get("task_description", "")
     priority = arguments.get("priority", "medium")
     assigned_to = arguments.get("assigned_to")  # nullable
-    parent_task = arguments.get("parent_task")  # nullable
+    # R16-F1: collapse an empty / whitespace parent to None at the earliest
+    # point so a blank parent runs the single-root guard (clean 409) / the
+    # existence pre-check (clean 404) instead of tripping the self-FK at
+    # INSERT and surfacing as a generic 500.
+    parent_task = _normalize_parent(arguments.get("parent_task"))  # nullable
 
     title = raw_title.strip() if isinstance(raw_title, str) else ""
     if not title:

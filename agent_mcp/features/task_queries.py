@@ -155,6 +155,33 @@ _ACTIVE_STATUSES = {"in_progress", "pending"}
 #: one of these as its status.
 INCOMPLETE_STATUS_ALIASES = frozenset({"incomplete", "active", "open"})
 
+#: Terminal task statuses — finished work that is a SINK on both axes:
+#: the write side (``_assign_to_existing_tasks`` / the status-transition
+#: guard in ``task_tools.py``) refuses to (re)claim these, so the
+#: read/discovery "claimable/unassigned pool" MUST exclude them too or it
+#: advertises work nobody can claim (R16-F2). This is the single source
+#: of truth for that predicate: ``task_tools.py`` imports it (it used to
+#: keep a private copy) and the wake seam
+#: (``agent_communication_tools._collect_unassigned_task_events_for``)
+#: filters its SQL on it. Kept HERE (a leaf feature module) rather than in
+#: ``task_tools`` because ``task_tools`` already imports this module — the
+#: reverse import would be circular.
+TERMINAL_TASK_STATUSES = frozenset({"completed", "cancelled", "failed"})
+
+
+def is_claimable_task(task: Dict[str, Any]) -> bool:
+    """The ONE canonical "claimable/unassigned pool" predicate (R16-F2).
+
+    A task is claimable iff it is unassigned (``assigned_to`` is NULL or
+    the empty string) AND not in a terminal state. Applied at every read
+    surface (REST ``?unassigned=true``, the query engine's ``unassigned``
+    / worker ``include_unassigned`` pool, and the wake seam) so the
+    read side can never drift from the write-side terminal sink.
+    """
+    if task.get("assigned_to") not in (None, ""):
+        return False
+    return (task.get("status") or "") not in TERMINAL_TASK_STATUSES
+
 
 def status_filter_matches(want: str, actual: Optional[str]) -> bool:
     """Whether a task whose status is ``actual`` satisfies a ``want``
@@ -287,19 +314,25 @@ class TaskQueryEngine:
             and task.get("created_by") != filters.created_by
         ):
             return False
-        if filters.unassigned and task.get("assigned_to") not in (None, ""):
+        if filters.unassigned and not is_claimable_task(task):
+            # R16-F2: the "unassigned pool" is the CLAIMABLE pool — a
+            # terminal (completed/cancelled/failed) task the write side
+            # won't let anyone (re)claim is not part of it.
             return False
         if filters.assigned and task.get("assigned_to") in (None, ""):
             return False
         if filters.agent_id:
             assignee = task.get("assigned_to")
             if filters.include_unassigned:
-                # Worker pool visibility: own tasks OR the unassigned
-                # (claimable) pool. Foreign-owned rows still fail the
-                # match — cross-worker isolation (AZ-R17-1 / PF-1) holds.
-                if (
-                    assignee != filters.agent_id
-                    and assignee not in (None, "")
+                # Worker pool visibility: own tasks OR the CLAIMABLE
+                # (unassigned + non-terminal) pool. Own tasks stay
+                # visible regardless of status (a worker sees its own
+                # finished work); the widened pool applies the R16-F2
+                # terminal sink so it never advertises dead-end work.
+                # Foreign-owned rows still fail the match — cross-worker
+                # isolation (AZ-R17-1 / PF-1) holds.
+                if assignee != filters.agent_id and not is_claimable_task(
+                    task
                 ):
                     return False
             elif assignee != filters.agent_id:
