@@ -138,6 +138,42 @@ def _refresh_parent_cache(parent_task_id) -> None:
         _task_repo.upsert_cache(fresh_parent)
 
 
+def _single_root_conflict(cursor) -> Optional[ToolResult]:
+    """Return a :class:`Conflict` if a root task already exists, else None.
+
+    The single-root-task invariant (at most one ``parent_task IS NULL``
+    per project DB) is enforced on every create path. This is the shared
+    check every parentless-create call site runs INSIDE its
+    ``unit_of_work`` cursor so it sees uncommitted siblings and stays
+    atomic with the INSERT. Mirrors the message/shape of the historical
+    inline checks in ``assign_task_tool_impl`` / ``create_self_task_tool_impl``.
+
+    R15-BL-1: ``create_task_tool_impl`` had no such guard at all.
+    R15 Sibling 1b (TOCTOU): the enforcing paths checked BEFORE the
+    suspending ``await validate_task_placement`` but never re-checked
+    before the INSERT — so this must be re-run in-transaction right
+    before the write, exactly like the assignability re-check.
+    """
+    cursor.execute(
+        "SELECT COUNT(*) as count, MIN(task_id) as root_id "
+        "FROM tasks WHERE parent_task IS NULL"
+    )
+    result = cursor.fetchone()
+    if result["count"] > 0:
+        existing_root_id = result["root_id"]
+        logger.error(
+            f"Attempt to create second root task. Existing root: "
+            f"{existing_root_id}"
+        )
+        return Conflict(
+            reason=(
+                f"Cannot create root task. A root task already exists "
+                f"({existing_root_id}). All new tasks must have a parent."
+            )
+        )
+    return None
+
+
 def _collect_task_descendants(cursor, root_task_id) -> list[tuple[str, Any]]:
     """Return ``[(task_id, assigned_to), ...]`` for every descendant of
     ``root_task_id``, ordered so front-to-back deletion never violates the
@@ -2011,6 +2047,18 @@ async def assign_task_tool_impl(
                     )
                 )
 
+            # R15 Sibling 1b (single-root TOCTOU): the single-root guard
+            # above ran BEFORE the ``validate_task_placement`` await; a
+            # concurrent root-create can commit in that window. Re-check
+            # in-transaction immediately before the INSERT — same window,
+            # same treatment as the assignability recheck above. Keyed on
+            # ``final_parent_task_id`` so an accepted RAG re-parent
+            # suggestion (which makes this a child, not a root) is exempt.
+            if final_parent_task_id is None:
+                conflict = _single_root_conflict(cursor)
+                if conflict is not None:
+                    return conflict
+
             # PR 6: task INSERT goes through task_repo with the caller's
             # cursor so it's atomic with the agent UPDATE and audit log.
             from ..repositories import agent_repo, task_repo
@@ -2401,6 +2449,20 @@ async def create_self_task_tool_impl(
                         f"was terminated during task placement."
                     )
                 )
+
+            # R15 Sibling 1b (single-root TOCTOU): the single-root guard
+            # above ran BEFORE the ``validate_task_placement`` await; a
+            # concurrent root-create can commit in that window. Re-check
+            # in-transaction immediately before the INSERT — same window,
+            # same treatment as the assignability recheck above. Keyed on
+            # ``final_parent_task_id`` so an accepted RAG re-parent
+            # suggestion (which makes this a child, not a root) is exempt.
+            # Only admin reaches here parentless (workers were blocked from
+            # any root creation far above).
+            if final_parent_task_id is None:
+                conflict = _single_root_conflict(cursor)
+                if conflict is not None:
+                    return conflict
 
             # AZ-R19-1 (class-sweep sibling of the Mode-0 fix): a worker may
             # only parent its self-task under a task it OWNS (assigned_to ==
@@ -6068,6 +6130,18 @@ async def create_task_tool_impl(
                             f"does not exist or is terminated."
                         )
                     )
+
+            # R15-BL-1: enforce the single-root-task invariant here too —
+            # this canonical impl (behind ``create_task`` + ``POST /api/tasks``)
+            # was the one create path missing the guard its siblings run,
+            # so a second (LIVE-confirmed: serial third) root slipped
+            # through as ``success:true``. Runs inside the uow cursor; this
+            # impl is awaitless, so the check→INSERT is atomic (no TOCTOU
+            # re-check needed, unlike the RAG-awaiting assign paths).
+            if parent_task is None:
+                conflict = _single_root_conflict(cursor)
+                if conflict is not None:
+                    return conflict
 
             from ..repositories import task_repo as _task_repo
 

@@ -113,6 +113,13 @@ def _insert_task(
         notes_json = json.dumps([
             {"timestamp": now, "author": notes_author, "content": "first note"}
         ])
+    from tests.conftest import existing_root_task_id
+
+    # R15-BL-1: chain under the single root (first seed = root, rest are
+    # children). Restore/purge acts on assigned_to/created_by, not
+    # parentage, and no extra row is added.
+    parent = existing_root_task_id()
+
     conn = get_db_connection()
     try:
         cur = conn.cursor()
@@ -120,10 +127,10 @@ def _insert_task(
             "INSERT INTO tasks (task_id, title, description, assigned_to, "
             "created_by, status, priority, created_at, updated_at, "
             "parent_task, child_tasks, depends_on_tasks, notes) "
-            "VALUES (?, ?, '', ?, ?, ?, 'medium', ?, ?, NULL, '[]', '[]', ?)",
+            "VALUES (?, ?, '', ?, ?, ?, 'medium', ?, ?, ?, '[]', '[]', ?)",
             (task_id, title, assigned_to, created_by,
              "pending" if assigned_to else "unassigned",
-             now, now, notes_json),
+             now, now, parent, notes_json),
         )
         conn.commit()
     finally:

@@ -45,14 +45,16 @@ async def test_all_data_applies_default_limit_per_section(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         # Seed DEFAULT_LIMIT + OVERSHOOT tasks. They all show up in the
         # tasks table; we only care that the API trims at the cap.
+        # R15-BL-1: the first POST is the sole root; the rest chain under
+        # it (a parentless second POST is now rejected by the invariant).
+        root_id = None
         for i in range(DEFAULT_LIMIT + OVERSHOOT):
-            admin.post(
-                "/api/tasks",
-                json={
-                    "task_title": f"seed-{i}",
-                    "task_description": "limit test",
-                },
-            )
+            payload = {"task_title": f"seed-{i}", "task_description": "limit test"}
+            if root_id is not None:
+                payload["parent_task"] = root_id
+            r = admin.post("/api/tasks", json=payload)
+            if root_id is None:
+                root_id = r.json()["task_id"]
 
         resp = admin.get("/api/all-data")
         assert resp.status_code == 200
@@ -67,15 +69,16 @@ async def test_all_data_applies_default_limit_per_section(tmp_path) -> None:
 async def test_all_data_accepts_limit_query_param(tmp_path) -> None:
     """`?limit=N` overrides the default per-section cap."""
     async with mcp_session(tmp_path) as admin:
+        # R15-BL-1: first POST is the root; the rest chain under it.
+        root_id = None
         for i in range(10):
-            r = admin.post(
-                "/api/tasks",
-                json={
-                    "task_title": f"limit-override-{i}",
-                    "task_description": "x",
-                },
-            )
+            payload = {"task_title": f"limit-override-{i}", "task_description": "x"}
+            if root_id is not None:
+                payload["parent_task"] = root_id
+            r = admin.post("/api/tasks", json=payload)
             assert r.status_code == 200, r.text
+            if root_id is None:
+                root_id = r.json()["task_id"]
 
         resp = admin.get("/api/all-data?limit=3")
         assert resp.status_code == 200

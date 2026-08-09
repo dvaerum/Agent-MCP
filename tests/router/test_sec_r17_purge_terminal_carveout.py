@@ -67,6 +67,12 @@ def _insert_task(
     from agent_mcp.db.engine import get_session
     from agent_mcp.db.models import Task
 
+    from tests.conftest import existing_root_task_id
+
+    # R15-BL-1: chain under the single root (first seed = root, rest are
+    # children). Purge keys on assigned_to/status, not parentage.
+    parent = existing_root_task_id()
+
     now = datetime.datetime.now().isoformat()
     with get_session() as session:
         session.add(
@@ -80,6 +86,7 @@ def _insert_task(
                 priority="medium",
                 created_at=now,
                 updated_at=now,
+                parent_task=parent,
             )
         )
         session.commit()

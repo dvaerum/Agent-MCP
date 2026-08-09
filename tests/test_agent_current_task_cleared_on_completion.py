@@ -152,6 +152,9 @@ async def test_other_agents_current_task_untouched_when_unrelated_task_completes
                 "task_title": "bob task",
                 "task_description": "...",
                 "assigned_to": bob.agent_id,
+                # R15-BL-1: chain under task_a (single-root invariant); the
+                # current_task-clear logic scopes by assignee, not parent.
+                "parent_task": task_a,
             },
         )
         task_b = r_b.json()["task_id"]

@@ -81,7 +81,13 @@ def _force_status(task_id: str, status: str, assigned_to) -> None:
 
 
 async def _create_task(admin, **body_extra) -> str:
-    body = {"task_title": "arch-r4-1-probe"}
+    from tests.conftest import ensure_seed_root
+
+    # R15-BL-1: chain each probe under one dedicated root unless the
+    # caller set a parent — parentless roots collide under the
+    # single-root invariant, and these tests create several independent
+    # tasks.
+    body = {"task_title": "arch-r4-1-probe", "parent_task": ensure_seed_root()}
     body.update(body_extra)
     r = admin.post("/api/tasks", json=body)
     assert r.status_code == 200, r.text

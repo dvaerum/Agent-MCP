@@ -272,6 +272,81 @@ def seed_agent_row(
     return tok
 
 
+def existing_root_task_id() -> str | None:
+    """Return the current root task_id (``parent_task IS NULL``), or None.
+
+    R15-BL-1: the single-root-task invariant is now enforced by a partial
+    UNIQUE index (``idx_tasks_single_root``), so a test that seeds several
+    tasks can no longer make every row a root. Fixtures chain seeded tasks
+    under ONE root: the first parentless seed becomes the sole root, and
+    every subsequent seed passes this value as its ``parent_task`` (a
+    child, which the index permits). Opens its own short-lived connection,
+    so it only sees roots that were already COMMITTED — fine for the
+    commit-per-seed helpers; batch-insert loops must track the root
+    locally instead.
+
+    Use this in COUNT/bound-sensitive fixtures (no extra row is added).
+    Where a test asserts on parent-context display or hierarchy, prefer
+    :func:`ensure_seed_root` so the asserted ids are never a parent.
+    """
+    from agent_mcp.db.connection import get_db_connection
+
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT task_id FROM tasks WHERE parent_task IS NULL LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        # sqlite3.Row supports index access; plain tuples do too.
+        return row[0]
+    finally:
+        conn.close()
+
+
+_SEED_ROOT_ID = "task_seed_root_0000"
+
+
+def ensure_seed_root() -> str:
+    """Ensure a DEDICATED hidden root task exists; return its task_id.
+
+    R15-BL-1: for fixtures where the seeded tasks are themselves under
+    assertion (presence/absence, or parent-context display), chaining
+    under the FIRST seed would leak that seed's id into hierarchy output.
+    Instead every seeded task parents under this dedicated root, whose id
+    (:data:`_SEED_ROOT_ID`) no test asserts on. Idempotent: created once
+    per DB, reused thereafter. ``assigned_to`` is NULL (no agents FK) and
+    the status is terminal (``completed``) so it stays out of most
+    active-task filters. Adds ONE row — do NOT use in count/bound tests;
+    use :func:`existing_root_task_id` there.
+    """
+    import datetime as _dt
+
+    from agent_mcp.db.connection import get_db_connection
+
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT task_id FROM tasks WHERE task_id = ?",
+            (_SEED_ROOT_ID,),
+        ).fetchone()
+        if row is not None:
+            return _SEED_ROOT_ID
+        now = _dt.datetime.now().isoformat()
+        conn.execute(
+            "INSERT INTO tasks (task_id, title, description, assigned_to, "
+            "created_by, status, priority, created_at, updated_at, "
+            "parent_task, child_tasks, depends_on_tasks, notes) "
+            "VALUES (?, 'seed root', 'hidden root for seeded tasks', NULL, "
+            "'admin', 'completed', 'medium', ?, ?, NULL, '[]', '[]', '[]')",
+            (_SEED_ROOT_ID, now, now),
+        )
+        conn.commit()
+        return _SEED_ROOT_ID
+    finally:
+        conn.close()
+
+
 @pytest.fixture
 def client(app):
     """An httpx TestClient against the in-process app.

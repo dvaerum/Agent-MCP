@@ -49,6 +49,12 @@ def _seed_assigned_task(
     from agent_mcp.core import globals as g
     from agent_mcp.db.connection import get_db_connection
 
+    from tests.conftest import existing_root_task_id
+
+    # R15-BL-1: chain under the single root (first seed = root, rest are
+    # children). Bulk reassign keys on assigned_to, not parentage.
+    parent = existing_root_task_id()
+
     task_id = f"task_{secrets.token_hex(6)}"
     now = _dt.datetime.now().isoformat()
 
@@ -56,11 +62,11 @@ def _seed_assigned_task(
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO tasks (task_id, title, description, status, priority, "
-        "assigned_to, created_by, created_at, updated_at, notes) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "assigned_to, created_by, created_at, updated_at, notes, parent_task) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id, title, "seed description", status, priority,
-            assigned_to, "admin", now, now, "[]",
+            assigned_to, "admin", now, now, "[]", parent,
         ),
     )
     conn.commit()

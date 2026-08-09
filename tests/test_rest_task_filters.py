@@ -42,15 +42,22 @@ def _seed_task(
     """Insert a task row directly with varied assignment/creator/status."""
     from agent_mcp.db.connection import get_db_connection
 
+    from tests.conftest import existing_root_task_id
+
+    # R15-BL-1: chain under the single root (first seed = root, rest are
+    # children). No extra row is added, so the exact-id-set assertions
+    # below stay valid; parentage doesn't affect status/assignee filters.
+    parent = existing_root_task_id()
+
     now = _dt.datetime.now().isoformat()
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO tasks (task_id, title, description, assigned_to, "
-        "created_by, status, priority, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "created_by, status, priority, created_at, updated_at, parent_task) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (task_id, task_id, "seeded by test", assigned_to, created_by,
-         status, "medium", now, now),
+         status, "medium", now, now, parent),
     )
     conn.commit()
     conn.close()

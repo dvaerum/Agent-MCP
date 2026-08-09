@@ -41,6 +41,13 @@ def _seed_task(
     from agent_mcp.core import globals as g
     from agent_mcp.db.connection import get_db_connection
 
+    from tests.conftest import ensure_seed_root
+
+    # R15-BL-1: chain every seed under a dedicated hidden root so the
+    # single-root invariant holds without making any asserted task id a
+    # parent (view_tasks echoes parent ids in its output).
+    parent = ensure_seed_root()
+
     now = _dt.datetime.now().isoformat()
     conn = get_db_connection()
     try:
@@ -49,9 +56,10 @@ def _seed_task(
             "(task_id, title, description, status, priority, assigned_to, "
             " created_by, created_at, updated_at, parent_task, child_tasks, "
             " depends_on_tasks, notes) "
-            "VALUES (?, ?, 'desc', ?, 'medium', ?, ?, ?, ?, NULL, "
+            "VALUES (?, ?, 'desc', ?, 'medium', ?, ?, ?, ?, ?, "
             "        '[]', '[]', '[]')",
-            (task_id, title, status, assigned_to, created_by, now, now),
+            (task_id, title, status, assigned_to, created_by, now, now,
+             parent),
         )
         conn.commit()
     finally:
@@ -67,7 +75,7 @@ def _seed_task(
         "created_by": created_by,
         "created_at": now,
         "updated_at": now,
-        "parent_task": None,
+        "parent_task": parent,
         "child_tasks": [],
         "depends_on_tasks": [],
         "notes": [],

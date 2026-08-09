@@ -413,7 +413,17 @@ async def test_migration_cleans_up_orphans_by_default(tmp_path) -> None:
             "SELECT parent_task FROM tasks WHERE task_id='task-orph-parent'"
         ).fetchone()
         assert orph_parent is not None, "orphan-parent task row should be kept"
-        assert orph_parent[0] is None, "tasks.parent_task orphan should be NULLed"
+        # 0007 NULLs the dangling 'nonexistent-parent' pointer; the R15
+        # single-root repair (0023) then re-parents this now-extra root
+        # under the surviving root. Either way the pointer must no longer
+        # dangle — it is NULL or references a REAL task, so the FK holds.
+        assert orph_parent[0] != "nonexistent-parent", (
+            "tasks.parent_task dangling orphan was not cleaned"
+        )
+        if orph_parent[0] is not None:
+            assert conn.execute(
+                "SELECT 1 FROM tasks WHERE task_id=?", (orph_parent[0],)
+            ).fetchone(), "re-parented pointer must reference a real task"
 
         # Orphans on the dropped agents-targeting FKs: 0007's
         # ``tasks.assigned_to`` orphan gets NULLed by 0007's own

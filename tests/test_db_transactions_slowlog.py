@@ -50,19 +50,21 @@ async def test_assign_existing_tasks_commits_once(tmp_path) -> None:
     async with mcp_session(tmp_path) as admin:
         await admin.create_worker("worker-bulk")
 
-        # Seed 5 unassigned tasks via /api/tasks (the same endpoint
-        # the dashboard uses).
+        # Seed 5 tasks via /api/tasks (the same endpoint the dashboard
+        # uses). R15-BL-1: the first is the sole root; the rest chain
+        # under it (a parentless second POST is now rejected).
         task_ids = []
+        root_id = None
         for i in range(5):
-            r = admin.post(
-                "/api/tasks",
-                json={
-                    "task_title": f"bulk-task-{i}",
-                    "task_description": "x",
-                },
-            )
+            body = {"task_title": f"bulk-task-{i}", "task_description": "x"}
+            if root_id is not None:
+                body["parent_task"] = root_id
+            r = admin.post("/api/tasks", json=body)
             assert r.status_code == 200
-            task_ids.append(r.json()["task_id"])
+            tid = r.json()["task_id"]
+            task_ids.append(tid)
+            if root_id is None:
+                root_id = tid
 
         # Spy on Connection.commit so we can count the calls during
         # the assign tool invocation. Post-D1 the Mode-3 assign path

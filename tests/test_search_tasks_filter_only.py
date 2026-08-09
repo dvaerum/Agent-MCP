@@ -44,6 +44,12 @@ def _seed_task(
     from agent_mcp.core import globals as g
     from agent_mcp.db.connection import get_db_connection
 
+    from tests.conftest import existing_root_task_id
+
+    # R15-BL-1: chain under the single root (first seed = root, rest are
+    # children); status-only search is unaffected by parentage.
+    parent = existing_root_task_id()
+
     now = _dt.datetime.now().isoformat()
     conn = get_db_connection()
     try:
@@ -53,8 +59,9 @@ def _seed_task(
             " status, priority, created_at, updated_at, "
             " parent_task, child_tasks, depends_on_tasks, notes) "
             "VALUES (?, ?, ?, ?, 'admin', ?, 'medium', ?, ?, "
-            "        NULL, '[]', '[]', '[]')",
-            (task_id, title, description, assigned_to, status, now, now),
+            "        ?, '[]', '[]', '[]')",
+            (task_id, title, description, assigned_to, status, now, now,
+             parent),
         )
         conn.commit()
     finally:

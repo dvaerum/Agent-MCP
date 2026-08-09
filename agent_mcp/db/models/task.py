@@ -39,7 +39,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import Index, Text
+from sqlalchemy import Index, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ..engine import Base
@@ -67,6 +67,21 @@ class Task(Base):
     # PR-W3 (ORM big-bang): the three hot-path indexes (composite
     # for wait_for_events, single-column for status/priority filters)
     # were previously only in init_database()'s raw SQL.
+    # R15-BL-1: structural backstop for the single-root-task invariant
+    # (at most one ``parent_task IS NULL`` per project DB). SQLite treats
+    # each NULL as distinct in a unique index, so a plain
+    # ``UNIQUE(parent_task)`` would NOT enforce it — index the CONSTANT
+    # expression ``(parent_task IS NULL)`` (always 1 for a root row) under
+    # a ``WHERE parent_task IS NULL`` predicate, so all roots collide on
+    # one key while children are excluded entirely.
+    #
+    # Fresh DBs pick this up here via ``create_all()``. Legacy DBs get it
+    # from migration ``0023_single_root_task_index`` — which FIRST repairs
+    # any pre-existing multi-root violation, because ``create_all()`` runs
+    # before the Alembic chain at startup and only creates indexes when it
+    # creates the table (it never adds this index to an already-existing
+    # ``tasks`` table), so a legacy multi-root DB reaches the repairing
+    # migration without ``create_all`` hard-failing on the bad data.
     __table_args__ = (
         Index(
             "idx_tasks_assigned_to_updated_at",
@@ -75,6 +90,12 @@ class Task(Base):
         ),
         Index("idx_tasks_status", "status"),
         Index("idx_tasks_priority", "priority"),
+        Index(
+            "idx_tasks_single_root",
+            text("(parent_task IS NULL)"),
+            unique=True,
+            sqlite_where=text("parent_task IS NULL"),
+        ),
     )
 
     def __repr__(self) -> str:  # pragma: no cover — debug aid

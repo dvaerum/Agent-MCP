@@ -88,6 +88,13 @@ def _seed_task(
 ) -> None:
     from agent_mcp.db.connection import get_db_connection
 
+    from tests.conftest import existing_root_task_id
+
+    # R15-BL-1: chain under the single root (first seed = root, rest are
+    # children). RAG-scope assertions key on markers/ownership, not
+    # parentage, and no extra row is added.
+    parent = existing_root_task_id()
+
     now = datetime.datetime.now().isoformat()
     conn = get_db_connection()
     try:
@@ -106,7 +113,7 @@ def _seed_task(
                 "medium",
                 now,
                 now,
-                None,
+                parent,
                 "[]",
                 "[]",
                 "[]",
@@ -175,6 +182,13 @@ async def test_live_task_stage_excludes_unassigned_for_worker(
         # drops it for a worker; the RAG scope must match.
         from agent_mcp.db.connection import get_db_connection
 
+        from tests.conftest import existing_root_task_id
+
+        # R15-BL-1: a worker-owned task was already seeded above as the
+        # root; this unassigned task chains under it (assigned_to stays
+        # NULL, so it's still the unassigned-pool case under test).
+        parent = existing_root_task_id()
+
         now = datetime.datetime.now().isoformat()
         conn = get_db_connection()
         try:
@@ -193,7 +207,7 @@ async def test_live_task_stage_excludes_unassigned_for_worker(
                     "medium",
                     now,
                     now,
-                    None,
+                    parent,
                     "[]",
                     "[]",
                     "[]",

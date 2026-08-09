@@ -82,9 +82,19 @@ async def test_rest_and_mcp_create_task_are_one_path(
 
         monkeypatch.setattr(_shim, "publish", _spy)
 
+        # R15-BL-1: the single-root-task invariant is now enforced on
+        # this canonical impl too, so both surfaces create CHILDREN of a
+        # single pre-created root rather than two roots. Parenting both
+        # under the same root keeps the structural-parity comparison
+        # meaningful (identical ``parent_task``).
+        root_resp = admin.post("/api/tasks", json={"task_title": "the root"})
+        assert root_resp.status_code == 200, root_resp.text
+        root_id = root_resp.json()["task_id"]
+
         body = {
             "task_title": "one path",
             "task_description": "same effects on both surfaces",
+            "parent_task": root_id,
         }
 
         # --- REST: POST /api/tasks ---
