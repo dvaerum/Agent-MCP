@@ -24,6 +24,15 @@
 # To retire an entry: bump this repo's flake.lock nixpkgs so the closure ships
 # `fixed_in` or later, rebuild, and delete the entry (the gate will then
 # demand its removal anyway).
+#
+# Scope of the gate (what it CAN and CANNOT catch). The audit fails loud on any
+# python store path it cannot turn into an OSV coordinate (R14-F3), so a
+# suffixed / unparseable version can no longer pass silently. One residual
+# remains, documented and not fully closed: OSV is queried by the nix pname, so
+# a package whose nix pname differs from its OSV/PyPI name returns empty and
+# passes silently. Nixpkgs keeps python pnames aligned with PyPI as policy, so
+# this is rare; `_PYPI_NAME_OVERRIDES` in closure_advisory_audit.py is the place
+# to record any divergence that surfaces. See that file's module docstring.
 
 [[accepted]]
 id = "GHSA-4xgf-cpjx-pc3j"
