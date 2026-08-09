@@ -29,6 +29,7 @@
 id = "GHSA-4xgf-cpjx-pc3j"
 package = "pydantic-settings"
 fixed_in = "2.14.2"
+aliases = ["CVE-2026-58203"]
 # uv.lock already pins 2.15.0 (past the fix); the nixpkgs closure still ships
 # 2.12.0. Unreachable here: the codebase uses no pydantic BaseSettings and no
 # `secrets_dir` (grep: zero hits), which is the only surface the symlink-escape

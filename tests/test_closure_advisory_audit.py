@@ -16,11 +16,11 @@ PYSEC-2026-3552) while ``uv.lock`` pins versions past both fixes — so the
 uv.lock audit is green while the deploy is not.
 
 ``nix/audit/closure_advisory_audit.py`` closes that gap: it resolves the
-ACTUAL nix-closure python package versions and runs ``pip-audit`` against
-THAT set, reconciled against a checked-in advisory allowlist so the gate is
-actionable (red == a NEW unaccepted advisory in the shipping closure, not
-"nixpkgs has CVEs"). These tests exercise the pure parse / reconcile logic —
-no nix build, no network.
+ACTUAL nix-closure python package versions and queries OSV for advisories
+affecting those exact coordinates, reconciled against a checked-in advisory
+allowlist so the gate is actionable (red == a NEW unaccepted advisory in the
+shipping closure, not "nixpkgs has CVEs"). These tests exercise the pure
+parse / reconcile logic — no nix build, no network.
 """
 
 from __future__ import annotations
@@ -70,70 +70,74 @@ def test_parse_python_packages_excludes_interpreter_and_non_python() -> None:
     assert not any("glibc" in k for k in pkgs)
 
 
-def test_requirements_text_is_pinned_and_deduped() -> None:
-    text = audit.requirements_text({"cryptography": "49.0.0", "anyio": "4.14.2"})
-    lines = sorted(text.strip().splitlines())
-    assert lines == ["anyio==4.14.2", "cryptography==49.0.0"]
+# ── OSV response parsing ──────────────────────────────────────────────
 
-
-# ── pip-audit JSON parsing ────────────────────────────────────────────
-
-# Shape emitted by `pip-audit --format json`: cryptography reported with a
-# GHSA primary id and PYSEC/CVE aliases; pydantic-settings with a bare GHSA.
-PIP_AUDIT_JSON = {
-    "dependencies": [
-        {"name": "anyio", "version": "4.14.2", "vulns": []},
-        {
-            "name": "cryptography",
-            "version": "49.0.0",
-            "vulns": [
-                {
-                    "id": "GHSA-g6cj-pr64-35w5",
-                    "fix_versions": ["50.0.0"],
-                    "aliases": ["CVE-2026-69247", "PYSEC-2026-3552"],
-                    "description": "Bleichenbacher oracle in PKCS#7 decrypt.",
-                }
-            ],
-        },
-        {
-            "name": "pydantic-settings",
-            "version": "2.12.0",
-            "vulns": [
-                {
-                    "id": "GHSA-4xgf-cpjx-pc3j",
-                    "fix_versions": ["2.14.2"],
-                    "aliases": [],
-                    "description": "secrets_dir symlink escape.",
-                }
-            ],
-        },
-    ]
+# Shape returned by OSV `POST /v1/querybatch` (ids only, query-order) plus the
+# per-id detail from `GET /v1/vulns/{id}` (where aliases live). cryptography is
+# reported by OSV as TWO aliased records (GHSA + PYSEC of the same CVE); the
+# audit must handle that without choking. pydantic-settings has no CVE/PYSEC.
+OSV_COORDS = [
+    ("anyio", "4.14.2"),
+    ("cryptography", "49.0.0"),
+    ("pydantic-settings", "2.12.0"),
+]
+OSV_BATCH = [
+    {"vulns": []},
+    {"vulns": [{"id": "GHSA-g6cj-pr64-35w5"}, {"id": "PYSEC-2026-3552"}]},
+    {"vulns": [{"id": "GHSA-4xgf-cpjx-pc3j"}]},
+]
+OSV_DETAILS = {
+    "GHSA-g6cj-pr64-35w5": {
+        "id": "GHSA-g6cj-pr64-35w5",
+        "aliases": ["CVE-2026-69247", "PYSEC-2026-3552"],
+        "affected": [
+            {
+                "package": {"ecosystem": "PyPI", "name": "cryptography"},
+                "ranges": [
+                    {"type": "ECOSYSTEM", "events": [{"introduced": "44.0.0"}, {"fixed": "50.0.0"}]}
+                ],
+            }
+        ],
+    },
+    "PYSEC-2026-3552": {
+        "id": "PYSEC-2026-3552",
+        "aliases": ["CVE-2026-69247", "GHSA-g6cj-pr64-35w5"],
+    },
+    "GHSA-4xgf-cpjx-pc3j": {"id": "GHSA-4xgf-cpjx-pc3j", "aliases": []},
 }
 
 
-def test_parse_pip_audit_json_collects_ids_and_aliases() -> None:
-    advisories = audit.parse_pip_audit_json(PIP_AUDIT_JSON)
-    by_pkg = {a.package: a for a in advisories}
-    assert set(by_pkg) == {"cryptography", "pydantic-settings"}
-    crypto = by_pkg["cryptography"]
+def _sample_found() -> list:
+    return audit.advisories_from_osv(OSV_COORDS, OSV_BATCH, OSV_DETAILS)
+
+
+def test_advisories_from_osv_enriches_ids_with_aliases() -> None:
+    found = _sample_found()
+    packages = {a.package for a in found}
+    assert packages == {"cryptography", "pydantic-settings"}
+    crypto_ids = {i for a in found if a.package == "cryptography" for i in a.ids}
     # Primary id and every alias are queryable for matching.
-    assert "GHSA-g6cj-pr64-35w5" in crypto.ids
-    assert "PYSEC-2026-3552" in crypto.ids
-    assert "CVE-2026-69247" in crypto.ids
+    assert "GHSA-g6cj-pr64-35w5" in crypto_ids
+    assert "PYSEC-2026-3552" in crypto_ids
+    assert "CVE-2026-69247" in crypto_ids
+
+
+def test_advisories_from_osv_extracts_fixed_version() -> None:
+    found = _sample_found()
+    crypto = next(a for a in found if a.package == "cryptography" and a.fix_versions)
+    assert "50.0.0" in crypto.fix_versions
 
 
 # ── reconciliation ────────────────────────────────────────────────────
 
 
 def test_empty_allowlist_flags_every_advisory() -> None:
-    found = audit.parse_pip_audit_json(PIP_AUDIT_JSON)
-    unaccepted, stale = audit.reconcile(found, [])
+    unaccepted, stale = audit.reconcile(_sample_found(), [])
     assert {a.package for a in unaccepted} == {"cryptography", "pydantic-settings"}
     assert stale == []
 
 
 def test_allowlist_by_primary_id_accepts() -> None:
-    found = audit.parse_pip_audit_json(PIP_AUDIT_JSON)
     allow = [
         audit.AllowEntry(
             id="GHSA-4xgf-cpjx-pc3j",
@@ -142,30 +146,28 @@ def test_allowlist_by_primary_id_accepts() -> None:
             rationale="unreachable",
         )
     ]
-    unaccepted, stale = audit.reconcile(found, allow)
+    unaccepted, stale = audit.reconcile(_sample_found(), allow)
     # cryptography still unaccepted; pydantic-settings cleared.
     assert {a.package for a in unaccepted} == {"cryptography"}
     assert stale == []
 
 
 def test_allowlist_matches_by_alias() -> None:
-    """An entry keyed on PYSEC clears an advisory pip-audit keyed on GHSA."""
-    found = audit.parse_pip_audit_json(PIP_AUDIT_JSON)
+    """An entry keyed on one alias clears an advisory OSV keyed on another."""
     allow = [
         audit.AllowEntry(
-            id="PYSEC-2026-3552",  # pip-audit reported GHSA as primary
+            id="CVE-2026-69247",  # neither the GHSA nor PYSEC primary id
             package="cryptography",
             aliases=(),
             rationale="unreachable",
         )
     ]
-    unaccepted, _ = audit.reconcile(found, allow)
+    unaccepted, _ = audit.reconcile(_sample_found(), allow)
     assert {a.package for a in unaccepted} == {"pydantic-settings"}
 
 
 def test_allowlist_does_not_cross_packages() -> None:
     """A matching id under the wrong package name does not silence anything."""
-    found = audit.parse_pip_audit_json(PIP_AUDIT_JSON)
     allow = [
         audit.AllowEntry(
             id="GHSA-4xgf-cpjx-pc3j",
@@ -174,7 +176,7 @@ def test_allowlist_does_not_cross_packages() -> None:
             rationale="typo",
         )
     ]
-    unaccepted, stale = audit.reconcile(found, allow)
+    unaccepted, stale = audit.reconcile(_sample_found(), allow)
     assert {a.package for a in unaccepted} == {"cryptography", "pydantic-settings"}
     # The entry matched nothing -> stale.
     assert len(stale) == 1
@@ -182,7 +184,6 @@ def test_allowlist_does_not_cross_packages() -> None:
 
 def test_stale_allowlist_entry_is_flagged() -> None:
     """An accepted advisory no longer present in the closure must be removed."""
-    found = audit.parse_pip_audit_json(PIP_AUDIT_JSON)
     allow = [
         audit.AllowEntry(
             id="GHSA-4xgf-cpjx-pc3j",
@@ -197,7 +198,7 @@ def test_stale_allowlist_entry_is_flagged() -> None:
             rationale="retired advisory nobody removed",
         ),
     ]
-    unaccepted, stale = audit.reconcile(found, allow)
+    unaccepted, stale = audit.reconcile(_sample_found(), allow)
     assert {a.package for a in unaccepted} == {"cryptography"}
     assert [e.package for e in stale] == ["left-pad"]
 
@@ -218,10 +219,10 @@ def test_committed_allowlist_parses() -> None:
 def test_committed_allowlist_makes_the_known_divergence_green_and_honest() -> None:
     """The seeded allowlist accepts today's real closure advisories and nothing
     stale — proving the gate CATCHES the divergence (they are found) while
-    staying green (they are accepted with rationale)."""
+    staying green (they are accepted with rationale). This uses the real OSV
+    two-record shape for cryptography to prove aliased duplicates reconcile."""
     entries = audit.load_allowlist(ALLOWLIST.read_text())
-    found = audit.parse_pip_audit_json(PIP_AUDIT_JSON)
-    unaccepted, stale = audit.reconcile(found, entries)
+    unaccepted, stale = audit.reconcile(_sample_found(), entries)
     assert unaccepted == [], (
         "the seeded allowlist should accept the known pydantic-settings + "
         f"cryptography closure advisories; unaccepted={unaccepted}"

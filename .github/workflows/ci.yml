@@ -299,15 +299,19 @@ jobs:
     # both behind the fixes uv.lock already pins).
     #
     # This job closes that gap: it builds the production closure, resolves
-    # the exact python versions it ships, and runs the SAME pip-audit tool
-    # against THAT set — reconciled against a checked-in advisory allowlist
+    # the exact python versions it ships, and queries OSV (the vulnerability
+    # DB pip-audit itself consumes) for advisories affecting those exact
+    # coordinates — reconciled against a checked-in advisory allowlist
     # (nix/audit/closure-advisory-allowlist.toml) so the gate is actionable:
     # red means "a NEW, unaccepted advisory is in what deploys", not
     # "nixpkgs has CVEs". It is ADDITIVE — the uv.lock audit above stays and
     # still guards the pip-install path. See nix/audit/closure_advisory_audit.py
     # for why an advisory-scoped audit was chosen over vulnix (firehose of
     # unfixable transitive nixpkgs CVEs) or a raw version-drift detector
-    # (flags benign nixpkgs-lag with no advisory).
+    # (flags benign nixpkgs-lag with no advisory) — and why OSV's coordinate
+    # query is used instead of `pip-audit -r` (a nix closure carries versions
+    # PyPI never published, e.g. joserfc 1.6.9, which an install-based auditor
+    # cannot resolve).
     name: Closure advisory audit
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -331,20 +335,12 @@ jobs:
           purge-created: 0
           purge-primary-key: never
 
-      - name: Install uv
-        # Provides `uvx`, which the audit script uses to run the pinned
-        # pip-audit (astral's uv builds a proper venv with pip — the same
-        # path the dependency-audit job above relies on).
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
-        with:
-          enable-cache: true
-          cache-suffix: closure-audit
-
       - name: Audit the deploy closure
         # Builds .#agent-mcp + the router wrapper, walks their runtime
-        # closure, and pip-audits the exact python versions that ship,
-        # reconciled against nix/audit/closure-advisory-allowlist.toml.
-        # --fallback keeps the build resilient to a flaky binary cache.
+        # closure, and audits the exact python versions that ship against OSV,
+        # reconciled against nix/audit/closure-advisory-allowlist.toml. Needs
+        # only python3 (stdlib urllib) + nix — no extra tooling. --fallback
+        # (set in the script) keeps the build resilient to a flaky cache.
         env:
           NIX_CONFIG: "experimental-features = nix-command flakes\nfallback = true"
         run: python3 nix/audit/closure_advisory_audit.py
