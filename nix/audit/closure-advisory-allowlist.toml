@@ -1,0 +1,49 @@
+# Closure advisory allowlist — R13-F1 hardening.
+#
+# Consumed by nix/audit/closure_advisory_audit.py, which runs `pip-audit`
+# against the ACTUAL nix deploy closure (see that file's module docstring for
+# the full rationale). This file is the triage ledger that keeps the gate
+# ACTIONABLE: a red build means "a NEW, unaccepted advisory is in the shipping
+# closure", not "nixpkgs has CVEs".
+#
+# Each entry accepts ONE advisory that the closure currently ships. Every entry
+# MUST carry a one-line `rationale` explaining why it is safe to ship for now
+# (mirrors the pentest accepted_ledger). Entries are self-retiring: when the
+# closure no longer ships the advisory (e.g. after a nixpkgs pin refresh moves
+# the package past its fix), the audit flags the entry as STALE and fails until
+# it is removed — an ignore cannot outlive the advisory it excused.
+#
+# Fields:
+#   id        — the advisory id (GHSA / PYSEC / CVE). Any one that pip-audit
+#               reports for the advisory works; matching is alias-aware.
+#   package   — the affected package (PEP 503 name).
+#   fixed_in  — the first fixed version (informational; what a pin bump needs).
+#   aliases   — optional extra ids for robust matching across GHSA/PYSEC/CVE.
+#   rationale — REQUIRED. Why shipping this for now is acceptable.
+#
+# To retire an entry: bump this repo's flake.lock nixpkgs so the closure ships
+# `fixed_in` or later, rebuild, and delete the entry (the gate will then
+# demand its removal anyway).
+
+[[accepted]]
+id = "GHSA-4xgf-cpjx-pc3j"
+package = "pydantic-settings"
+fixed_in = "2.14.2"
+aliases = ["CVE-2026-58203"]
+# uv.lock already pins 2.15.0 (past the fix); the nixpkgs closure still ships
+# 2.12.0. Unreachable here: the codebase uses no pydantic BaseSettings and no
+# `secrets_dir` (grep: zero hits), which is the only surface the symlink-escape
+# advisory affects. Retire on the next nixpkgs pin refresh.
+rationale = "unreachable — no BaseSettings/secrets_dir usage; pending next nixpkgs refresh"
+
+[[accepted]]
+id = "GHSA-g6cj-pr64-35w5"
+package = "cryptography"
+fixed_in = "50.0.0"
+aliases = ["PYSEC-2026-3552", "CVE-2026-69247"]
+# uv.lock pins 50.0.0 (past the fix); the nixpkgs closure still ships 49.0.0.
+# The advisory is a Bleichenbacher timing/error oracle in the PKCS#7 decrypt
+# functions (pkcs7_decrypt_der/pem/smime) reachable only by a service that
+# auto-decrypts untrusted S/MIME EnvelopedData. agent-mcp does none of that
+# (grep: zero pkcs7/smime hits). Retire on the next nixpkgs pin refresh.
+rationale = "unreachable — no PKCS#7/S-MIME decrypt of untrusted data; pending next nixpkgs refresh"
