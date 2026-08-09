@@ -116,6 +116,26 @@
         wrapProgram $out/bin/agent-mcp-vm-dev \
           --prefix PATH : ${lib.makeBinPath [ pkgs.qemu pkgs.coreutils pkgs.bash ]}
       '';
+
+      # `nix run .#capture-vm-dev-fixture -- <name>` — reproducible
+      # generator for the vm-dev preload fixtures. Boots the ephemeral
+      # vm-dev runner (substituted below), seeds a demo dataset via the
+      # REST API, quiesces the SQLite DBs over the dev-mode SSH, and
+      # writes nix/vm-dev/fixtures/<name>.tar.zst. See
+      # nix/vm-dev/fixtures/README.md.
+      captureFixture = pkgs.runCommand "agent-mcp-capture-vm-dev-fixture" {
+        nativeBuildInputs = [ pkgs.makeWrapper ];
+      } ''
+        mkdir -p $out/bin
+        substitute ${./nix/capture-vm-dev-fixture.sh} $out/bin/capture-vm-dev-fixture \
+          --replace-fail "@VM_DEV_RUN@" "${runScriptDev}/bin/agent-mcp-vm-dev"
+        chmod +x $out/bin/capture-vm-dev-fixture
+        wrapProgram $out/bin/capture-vm-dev-fixture \
+          --prefix PATH : ${lib.makeBinPath [
+            pkgs.bash pkgs.coreutils pkgs.curl pkgs.python3
+            pkgs.openssh pkgs.sshpass pkgs.zstd
+          ]}
+      '';
     in {
       # ── packages ────────────────────────────────────────────────
       # The three top-level packages the home-manager module consumes
@@ -134,6 +154,7 @@
         vm-dev = vmDev;
         vm-run = runScript;
         vm-dev-run = runScriptDev;
+        capture-vm-dev-fixture = captureFixture;
       };
 
       apps.${system} = {
@@ -148,6 +169,11 @@
         vm-dev = {
           type = "app";
           program = "${runScriptDev}/bin/agent-mcp-vm-dev";
+        };
+        # Reproducible generator for the vm-dev preload fixtures.
+        capture-vm-dev-fixture = {
+          type = "app";
+          program = "${captureFixture}/bin/capture-vm-dev-fixture";
         };
       };
 
