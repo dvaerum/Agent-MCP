@@ -128,6 +128,38 @@ def is_live_agent(agent_id: str, cursor: Any) -> bool:
     return cursor.fetchone() is not None
 
 
+def is_active_agent(agent_id: str) -> bool:
+    """Connection-owning liveness check — True iff a live (non-terminated,
+    non-tombstone) agent row exists for ``agent_id``.
+
+    The auth-gate companion to :func:`is_live_agent` for callers that
+    don't already hold a cursor (the delivery-transport bearer gate in
+    ``app/routers/delivery.py``). It reads the DB source of truth via
+    the canonical :data:`LIVE_AGENT_SQL` predicate rather than the
+    in-memory ``state.active_agents`` cache, so it holds even in a
+    context that never warmed that cache. **Fails closed** (returns
+    ``False``) on a missing id or any DB error — the safe default for an
+    auth predicate: a transient DB blip denies rather than admits.
+    """
+    if not agent_id:
+        return False
+    from ..db.connection import get_db_connection
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        return is_live_agent(agent_id, conn.cursor())
+    except Exception as e:  # pragma: no cover - defensive fail-closed
+        logger.error(
+            f"is_active_agent liveness check failed for {agent_id!r}: {e}",
+            exc_info=True,
+        )
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def _publish(addressee: str, event: str, payload: Dict[str, Any]) -> None:
     """Lazy-import shim around ``event_bus_shim.publish``.
 

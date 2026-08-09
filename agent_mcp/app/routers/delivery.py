@@ -18,6 +18,7 @@ so no router change is needed for the stream.
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -26,6 +27,8 @@ from sse_starlette.sse import EventSourceResponse
 
 from ...core.auth import get_agent_id
 from ...features import delivery_transport
+from ...repositories.agent_repository import is_active_agent
+from ...utils.json_utils import get_sanitized_json_body
 
 
 router = APIRouter(prefix="/api", tags=["delivery"])
@@ -34,16 +37,37 @@ router = APIRouter(prefix="/api", tags=["delivery"])
 # disconnect (see events.py). Same value as the operator stream.
 PING_SECONDS = 15
 
+# How often an OPEN delivery stream re-checks that its bearer is still
+# live (R13-F2). Mirrors the GET /mcp pump, which re-validates every
+# heartbeat so a stream opened BEFORE revocation is torn down rather than
+# surviving it (main_app.py:1336, AC-R29-1 class). Kept ≤ PING_SECONDS so
+# revocation latency never exceeds one keepalive interval.
+REVALIDATE_SECONDS = PING_SECONDS
+
 
 def require_agent_bearer(authorization: str = Header(None)) -> str:
     """Resolve the worker's ``agent_id`` from its ``Authorization: Bearer``
     token, or 401. This is the AGENT identity gate (the delivery channel is
-    keyed per worker), NOT the operator-session gate the dashboard uses."""
+    keyed per worker), NOT the operator-session gate the dashboard uses.
+
+    R13-F2: existence is not liveness. ``get_agent_id`` →
+    ``get_by_token`` resolves the row for ANY status (its docstring says
+    "NOT an auth gate"), so a terminated / tombstone bearer still
+    resolved and passed here even though it 401s on ``/mcp``. We gate on
+    the canonical DB-backed liveness predicate (``LIVE_AGENT_SQL`` —
+    excludes ``terminated`` AND ``tombstone``) so a revoked bearer 401s,
+    closing the SEC-A/B / AC-R29-1 liveness-vs-existence class on this
+    path too."""
     token = None
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
+    # A reserved ``__tombstone_*`` token is an FK artefact, never a real
+    # bearer — reject before identity resolution (belt-and-braces: the
+    # liveness check below also excludes tombstone rows).
+    if token and token.startswith("__tombstone_"):
+        raise HTTPException(status_code=401, detail="agent bearer required")
     agent_id = get_agent_id(token) if token else None
-    if not agent_id:
+    if not agent_id or not is_active_agent(agent_id):
         raise HTTPException(status_code=401, detail="agent bearer required")
     return agent_id
 
@@ -59,9 +83,29 @@ async def delivery_stream(
         sub = delivery_transport.subscribe(agent_id)
         try:
             while True:
-                # EventSourceResponse cancels this on client disconnect, so
-                # a blocked get() unblocks into the finally below.
-                frame = await sub.queue.get()
+                # R13-F2: re-validate liveness before every emit. A stream
+                # authenticates its bearer ONCE at open, then pumps
+                # indefinitely; on mid-stream revocation we must tear down
+                # rather than keep pushing to a terminated bearer (the same
+                # contract the GET /mcp pump enforces at main_app.py:1336).
+                if not is_active_agent(agent_id):
+                    return
+                try:
+                    # Bounded wait so revocation is noticed within
+                    # REVALIDATE_SECONDS even when no frame arrives; on
+                    # timeout we loop back to the liveness check above.
+                    # EventSourceResponse still cancels this on client
+                    # disconnect, unblocking into the finally below.
+                    frame = await asyncio.wait_for(
+                        sub.queue.get(), timeout=REVALIDATE_SECONDS
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                # Re-validate post-dequeue: a frame may have been queued
+                # before revocation and only reach the front of the FIFO
+                # afterwards — never wire it to a bearer that went away.
+                if not is_active_agent(agent_id):
+                    return
                 yield {"data": json.dumps(frame)}
         finally:
             delivery_transport.unsubscribe(sub)
@@ -75,11 +119,19 @@ async def delivery_status(
     agent_id: str = Depends(require_agent_bearer),
 ) -> JSONResponse:
     """Record the worker's runtime-reported ``transport-status``."""
+    # R13-F3: route the body through the canonical object-guarding
+    # sanitizer (like every other app/routers/ body route) rather than a
+    # raw ``request.json()``. A truthy non-dict JSON value ([1,2,3], 42,
+    # "idle", true) used to survive ``(body or {}).get`` → AttributeError
+    # → unhandled 500; the helper raises ValueError for a non-object body,
+    # which we map to a clean 400.
     try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    status = (body or {}).get("status")
+        body = await get_sanitized_json_body(request)
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail="request body must be a JSON object"
+        )
+    status = body.get("status")
     if status not in delivery_transport.VALID_STATUSES:
         raise HTTPException(
             status_code=422,
