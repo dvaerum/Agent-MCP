@@ -1873,7 +1873,9 @@ async def view_audit_log_tool_impl(
         limit = int(limit)
         if not (1 <= limit <= 200):  # Max 200 for safety
             limit = 50
-    except ValueError:
+    except (ValueError, TypeError, OverflowError):
+        # OverflowError (R16 sweep): ``int(float('inf'))`` from a JSON
+        # ``1e400`` token — sibling of the scheduler R16-F3/F4 fix.
         limit = 50
 
     # Filter the in-memory audit log (g.audit_log) (main.py:1394-1400)
@@ -1988,14 +1990,17 @@ async def get_agent_tokens_tool_impl(
         limit = int(limit)
         if not (1 <= limit <= 500):  # Max 500 for safety
             limit = 50
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
+        # OverflowError (R16 sweep): ``int(float('inf'))`` from a JSON
+        # ``1e400`` token — sibling of the scheduler R16-F3/F4 fix.
         limit = 50
 
     try:
         offset = int(offset)
         if offset < 0:
             offset = 0
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
+        # OverflowError (R16 sweep): see the limit guard above.
         offset = 0
 
     # Validate sort parameters

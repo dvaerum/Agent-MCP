@@ -104,9 +104,19 @@ async def create_schedule_api_route(
         data = await get_sanitized_json_body(request)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
-    result = await create_scheduled_directive_tool_impl(
-        data, principal=_operator_principal(auth),
-    )
+    try:
+        result = await create_scheduled_directive_tool_impl(
+            data, principal=_operator_principal(auth),
+        )
+    except Exception as e:
+        # Defense-in-depth (R16-F3): these handlers call the tool impl
+        # DIRECTLY (bypassing dispatch_tool_call's envelope), so an impl
+        # exception would otherwise leak as FastAPI's raw text/plain 500.
+        # Mirror the messages/tasks/memories routers' generic 500 shape.
+        logger.error("create_schedule failed: %s", e, exc_info=True)
+        return JSONResponse(
+            {"error": "Failed to create schedule"}, status_code=500
+        )
     return _tool_result_to_response(result)
 
 
@@ -126,9 +136,16 @@ async def update_schedule_api_route(
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     args = {**data, "directive_id": directive_id}
-    result = await update_scheduled_directive_tool_impl(
-        args, principal=_operator_principal(auth),
-    )
+    try:
+        result = await update_scheduled_directive_tool_impl(
+            args, principal=_operator_principal(auth),
+        )
+    except Exception as e:
+        # Defense-in-depth (R16-F3) — see create handler above.
+        logger.error("update_schedule failed: %s", e, exc_info=True)
+        return JSONResponse(
+            {"error": "Failed to update schedule"}, status_code=500
+        )
     return _tool_result_to_response(result)
 
 
@@ -139,7 +156,15 @@ async def delete_schedule_api_route(
     auth: dict = Depends(require_operator_session),
 ) -> JSONResponse:
     """DELETE /api/schedules/{id} — remove a schedule permanently."""
-    result = await delete_scheduled_directive_tool_impl(
-        {"directive_id": directive_id}, principal=_operator_principal(auth),
-    )
+    try:
+        result = await delete_scheduled_directive_tool_impl(
+            {"directive_id": directive_id},
+            principal=_operator_principal(auth),
+        )
+    except Exception as e:
+        # Defense-in-depth (R16-F3) — see create handler above.
+        logger.error("delete_schedule failed: %s", e, exc_info=True)
+        return JSONResponse(
+            {"error": "Failed to delete schedule"}, status_code=500
+        )
     return _tool_result_to_response(result)

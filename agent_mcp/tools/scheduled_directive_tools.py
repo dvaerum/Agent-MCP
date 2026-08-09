@@ -61,6 +61,15 @@ from ..repositories import scheduled_directive_repository as repo
 # Agent statuses that make a row a non-target (mirrors the profile tool).
 TERMINAL_AGENT_STATUSES = ("terminated", "tombstone")
 
+# R16-F3/F4 upper bounds (sibling of PF-R18-1). ``int(<client value>)``
+# must be bounded, not just floored: a huge finite interval passes the
+# floor check then overflows ``now + timedelta(seconds=interval)``
+# (timedelta caps near 2.7e6 days), and a huge finite count overflows
+# SQLite's signed-64-bit INTEGER bind (2**63). Cap both at a sane value
+# so the field-level ``Invalid`` fires before either overflow can.
+MAX_INTERVAL_SECONDS = 315_360_000  # 10 years — well within timedelta's range
+MAX_COUNT = 1_000_000  # a million fires — sane, and far under 2**63
+
 
 def _generate_directive_id() -> str:
     return f"sd_{secrets.token_hex(8)}"
@@ -136,10 +145,15 @@ def _authorize_target_write(
 
 
 def _validate_interval(raw: Any) -> tuple[Optional[int], Optional[ToolResult]]:
-    """Coerce + floor-check an interval (seconds)."""
+    """Coerce + floor/ceiling-check an interval (seconds)."""
     try:
         interval = int(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError (R16-F3): a JSON number token like ``1e400``
+        # parses to ``float('inf')`` via ``json.loads``, and
+        # ``int(float('inf'))`` raises OverflowError — a sibling the
+        # PF-R18-1 fix caught for messages/grace_days but scheduling
+        # never got. Reject it as a clean field error, not a raw 500.
         return None, Invalid(
             field="interval_seconds",
             message="interval_seconds must be an integer number of seconds",
@@ -152,6 +166,16 @@ def _validate_interval(raw: Any) -> tuple[Optional[int], Optional[ToolResult]]:
                 f"interval_seconds must be at least the configured floor "
                 f"of {floor}s (config_min_schedule_interval_seconds). "
                 f"Got {interval}."
+            ),
+        )
+    # Upper bound (R16-F3): a huge finite interval clears the floor then
+    # overflows ``now + timedelta(seconds=interval)`` downstream.
+    if interval > MAX_INTERVAL_SECONDS:
+        return None, Invalid(
+            field="interval_seconds",
+            message=(
+                f"interval_seconds must be at most {MAX_INTERVAL_SECONDS}s "
+                f"(10 years). Got {interval}."
             ),
         )
     return interval, None
@@ -190,13 +214,22 @@ def _validate_count(raw: Any) -> tuple[Optional[int], Optional[ToolResult]]:
         return None, None
     try:
         count = int(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError (R16-F4): ``int(float('inf'))`` from a JSON
+        # ``1e400`` token — same sibling as interval_seconds above.
         return None, Invalid(
             field="count", message="count must be a positive integer"
         )
     if count < 1:
         return None, Invalid(
             field="count", message="count must be a positive integer"
+        )
+    # Upper bound (R16-F4): a huge finite count overflows SQLite's
+    # signed-64-bit INTEGER bind (``max_runs`` column) → a generic 500.
+    if count > MAX_COUNT:
+        return None, Invalid(
+            field="count",
+            message=f"count must be at most {MAX_COUNT}. Got {count}.",
         )
     return count, None
 
