@@ -100,7 +100,7 @@ dashboard's overview.
 |--------|------|---------|-------------|
 | `services.agent-mcp.enable` | bool | `false` | Enable the router, template, and daemon-agent units. |
 | `services.agent-mcp.source` | path | `self` (the flake) | Source tree the module builds from. Override to pin a local checkout. |
-| `services.agent-mcp.package` | null \| package | `null` | Override the Python derivation. `null` uses the one built from `source`. |
+| `services.agent-mcp.pkgs` | package set | the consumer's `pkgs` | Package set every agent-mcp derivation is built from. See [Building from a different nixpkgs](#building-from-a-different-nixpkgs). |
 | `services.agent-mcp.router.port` | port | `1337` | Router's loopback port. |
 | `services.agent-mcp.router.idleSec` | int (positive) | `14400` | Seconds of inactivity before the router stops a per-project backend. |
 | `services.agent-mcp.router.externalUrl` | str | (required) | Base URL the host can be reached at; used in `.mcp.json` snippets. |
@@ -116,6 +116,43 @@ Each `daemonAgents` entry has:
 | `project` | str | Project slug (must exist via `/__create`). |
 | `agentId` | str | Agent slug (must exist on the project). |
 | `tokenPath` | str | Absolute path to the file holding the agent's bearer token. |
+
+## Building from a different nixpkgs
+
+The module builds agent-mcp from the **consumer's** package set — the
+`pkgs` your home-manager configuration was evaluated with. agent-mcp's
+own flake pin has no say in it, so adding or dropping
+`inputs.agent-mcp.inputs.nixpkgs.follows` in your flake changes only
+what `nix build` inside *this* repo produces, never your deployed
+closure.
+
+That matters when the host tracks a NixOS **stable** branch. Stable
+branches don't take routine Python security backports, so the router's
+aiohttp stays on whatever that branch froze on for the life of the
+release, advisories included, while unstable already ships the fix.
+`services.agent-mcp.pkgs` rebuilds agent-mcp — and only agent-mcp —
+from a set you choose, leaving the rest of the profile on stable:
+
+```nix
+{ agent-mcp, pkgs, ... }:
+
+{
+  imports = [ agent-mcp.homeManagerModules.default ];
+
+  services.agent-mcp.pkgs = import agent-mcp.inputs.nixpkgs {
+    inherit (pkgs.stdenv.hostPlatform) system;
+  };
+}
+```
+
+The Python tree, the interpreter the units exec, the wrappers and the
+dashboard all come from that one set — mixing them is not offered,
+because a wrapper that execs one channel's interpreter against another
+channel's site-packages does not run. That is also why there is no
+single-derivation override; `services.agent-mcp.package` was removed
+(setting it now fails evaluation with a pointer here). The full
+rationale is in the `pkgs` option's description in
+[`home-manager-module.nix`](./home-manager-module.nix).
 
 ## Daemon-agent tokens
 

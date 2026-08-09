@@ -40,27 +40,48 @@
 let
   cfg = config.services.agent-mcp;
 
+  # The package set the module was instantiated with. Named so the
+  # `services.agent-mcp.pkgs` option below can default to it without
+  # the attribute name shadowing the module argument.
+  #
+  # Scope boundary: `cfg.pkgs` governs agent-mcp's OWN derivations —
+  # the ones coupled to a single interpreter and to each other. The
+  # generic shell utilities this file reaches for directly (`pkgs.jq`,
+  # `pkgs.coreutils`, `pkgs.runtimeShell` in the unit ExecStartPre
+  # lines) stay on the consumer's set on purpose: nothing about them
+  # is Python-coupled, and reusing the copies already in the profile
+  # keeps an override from dragging a second coreutils/bash into the
+  # closure for no benefit.
+  consumerPkgs = pkgs;
+
+  # EVERY derivation this module installs comes out of this one
+  # import: the Python tree, the interpreter the wrappers exec, the
+  # PYTHONPATH they bake in, and the dashboard. That is deliberate —
+  # see the `pkgs` option below. Nothing may be spliced onto the
+  # result afterwards; an attribute added with `//` here would be
+  # read by nothing, because packages.nix has already closed over its
+  # own `agentMcpPy` and `python` by the time it returns. (That was
+  # the `services.agent-mcp.package` bug: a silently ineffective
+  # override. The option is gone — see the mkRemovedOptionModule in
+  # `imports` — and tests/test_nix_module_package_set.py keeps this
+  # single-import shape from regressing.)
   pkgs' = import ./packages.nix {
-    inherit pkgs lib;
+    pkgs = cfg.pkgs;
+    # nixpkgs' `lib` from the SAME set, matching flake.nix's call
+    # site. packages.nix needs it only for `lib.versionOlder`, and
+    # taking it from cfg.pkgs keeps the whole import single-sourced
+    # rather than half consumer-set, half home-manager's extended lib.
+    lib = cfg.pkgs.lib;
     # cfg.source defaults to the fork's repo root via the flake's
     # `homeManagerModules.default` wrapper. Operators can override
     # to pin a different source tree (e.g. for local development).
     src = cfg.source;
   };
 
-  # When the operator overrides services.agent-mcp.package, we use
-  # their derivation for the Python tree but still derive the
-  # ancillary wrappers from pkgs' (they depend on the Python tree's
-  # site-packages path). This branch is the override path; the
-  # default path uses pkgs'.agentMcpPy throughout.
-  resolvedPkgs =
-    if cfg.package == null then pkgs'
-    else pkgs' // { agentMcpPy = cfg.package; };
-
   daemonAgentInstanceName = a: "${a.project}--${a.agentId}";
 
   daemonAgentWrapper =
-    resolvedPkgs.agentMcpDaemonAgentWrapper cfg.router.port;
+    pkgs'.agentMcpDaemonAgentWrapper cfg.router.port;
 
   # ── Shared systemd hardening (defense-in-depth) ───────────────────
   # The SAFE sandboxing subset, factored into nix/hardening.nix so the
@@ -112,6 +133,52 @@ let
   );
 
 in {
+  imports = [
+    # `services.agent-mcp.package` was a single-derivation override of
+    # the Python tree. It never reached anything that runs.
+    #
+    # The module spliced it onto the *result* of nix/packages.nix
+    # (`pkgs' // { agentMcpPy = cfg.package; }`), but by then
+    # packages.nix had already built agentMcpRouterWrapper,
+    # agentMcpBackendWrapper, agentMcpLauncher and the daemon-agent
+    # wrapper around its OWN `agentMcpPy` and `python` — those
+    # wrappers bake in `''${python}/bin/python` plus a PYTHONPATH
+    # computed from the internal tree. Overriding the attribute
+    # replaced something nothing downstream reads, so every unit kept
+    # exec'ing the internally-built tree. A silent no-op.
+    #
+    # It also cannot be repaired in that shape. To make the wrappers
+    # honour an operator-supplied derivation they would need its
+    # interpreter and its site-packages layout, and a derivation
+    # produced by nixpkgs' Python *application* builder carries
+    # neither: `pythonModule` is absent on applications (verified
+    # against nixpkgs f13ff45), so there is no way to recover the
+    # python it was built with. Pairing a 3.14-built tree with the
+    # consumer's 3.13 interpreter would not merely mix closures, it
+    # would fail to import.
+    #
+    # The coherent knob is the whole package SET —
+    # `services.agent-mcp.pkgs` — which moves app, interpreter,
+    # wrappers and dashboard together.
+    (lib.mkRemovedOptionModule [ "services" "agent-mcp" "package" ] ''
+      services.agent-mcp.package has been removed: it was a silent
+      no-op. The override was applied AFTER nix/packages.nix had
+      already built the router / backend / launcher / daemon-agent
+      wrappers against its own internal derivation, so the systemd
+      units kept running the internally-built tree.
+
+      A single derivation also cannot carry the interpreter and
+      site-packages layout the wrappers need, so the option could not
+      be fixed in place.
+
+      Use `services.agent-mcp.pkgs` to build every agent-mcp
+      derivation from a different package set (the supported way to
+      escape a stable channel's Python security lag), and/or
+      `services.agent-mcp.source` to build from a different source
+      tree.
+    '')
+  ];
+
   options.services.agent-mcp = {
     enable = lib.mkEnableOption "agent-mcp (multi-tenant router + daemon agents)";
 
@@ -124,13 +191,56 @@ in {
       '';
     };
 
-    package = lib.mkOption {
-      type = lib.types.nullOr lib.types.package;
-      default = null;
+    pkgs = lib.mkOption {
+      type = lib.types.pkgs;
+      default = consumerPkgs;
+      defaultText = lib.literalMD
+        "the `pkgs` this home-manager configuration was evaluated with";
+      example = lib.literalExpression ''
+        import agent-mcp.inputs.nixpkgs {
+          inherit (pkgs.stdenv.hostPlatform) system;
+        }
+      '';
       description = ''
-        Override for the agent-mcp Python derivation. When null
-        (default) the module builds it from `source`. Override to
-        pin a pre-built derivation, e.g. from a flake input.
+        Package set EVERY agent-mcp derivation is built from: the
+        Python application, the interpreter its wrappers exec, the
+        PYTHONPATH they bake in, the shell wrappers themselves and the
+        dashboard. Defaults to the `pkgs` home-manager itself is
+        configured with, which is what you want unless you have a
+        specific reason otherwise.
+
+        **Why you would set it — the stable-channel security lag.**
+        agent-mcp's router is an aiohttp server exposed on whatever
+        interface `router.externalUrl` fronts. NixOS *stable* branches
+        do not take routine Python security backports, so a host
+        tracking e.g. nixos-26.05 keeps that branch's frozen aiohttp
+        (3.13.5, carrying advisories for pipelining DoS,
+        `max_line_size` / `client_max_size` bypass, CRLF injection and
+        WebSocket request smuggling) for the life of the release,
+        while nixos-unstable already ships the fixed 3.14.3. Pointing
+        this option at a fresher package set rebuilds agent-mcp — and
+        ONLY agent-mcp — against it; the rest of the home-manager
+        profile stays on the stable channel:
+
+        ```nix
+        services.agent-mcp.pkgs = import agent-mcp.inputs.nixpkgs {
+          inherit (pkgs.stdenv.hostPlatform) system;
+        };
+        ```
+
+        Note that agent-mcp's own flake pin does NOT do this for you.
+        The module builds from the *consumer's* package set by
+        construction, so dropping `inputs.agent-mcp.inputs.nixpkgs.follows`
+        in your flake changes only what `nix build` inside agent-mcp's
+        own flake produces — not your deployed closure. This option is
+        the switch that does.
+
+        It must be a whole package set, not a single derivation: the
+        wrappers bake in `''${python}/bin/python` and a PYTHONPATH
+        built from the same set's site-packages, so an application
+        from one channel with an interpreter from another does not
+        merely mix closures, it fails to import. (That is why
+        `services.agent-mcp.package` was removed.)
       '';
     };
 
@@ -192,8 +302,9 @@ in {
 
       package = lib.mkOption {
         type = lib.types.package;
-        default = resolvedPkgs.agentMcpDashboard;
-        defaultText = lib.literalExpression "pkgs.agent-mcp-dashboard";
+        default = pkgs'.agentMcpDashboard;
+        defaultText = lib.literalMD
+          "the dashboard built from `services.agent-mcp.source` using `services.agent-mcp.pkgs`";
         description = "Dashboard derivation (Next.js static export).";
       };
     };
@@ -475,11 +586,11 @@ in {
     ];
 
     home.packages = [
-      resolvedPkgs.agentMcpBackendWrapper        # invoked by the systemd template launcher
-      resolvedPkgs.agentMcpRouterWrapper         # invoked by agent-mcp-router.service
-      resolvedPkgs.agentMcpLauncher              # invoked by agent-mcp@.service via %i
-      daemonAgentWrapper                          # invoked by agent-mcp-daemon-agent@.service via %i
-      resolvedPkgs.agentMcpDaemonAgentPrecompactHook  # operator-installed PreCompact hook
+      pkgs'.agentMcpBackendWrapper             # invoked by the systemd template launcher
+      pkgs'.agentMcpRouterWrapper              # invoked by agent-mcp-router.service
+      pkgs'.agentMcpLauncher                   # invoked by agent-mcp@.service via %i
+      daemonAgentWrapper                       # invoked by agent-mcp-daemon-agent@.service via %i
+      pkgs'.agentMcpDaemonAgentPrecompactHook  # operator-installed PreCompact hook
     ];
 
     # ── Systemd services ───────────────────────────────────────────
@@ -582,7 +693,7 @@ in {
             "${pkgs.runtimeShell} -c 'test -f \"$RUNTIME_DIRECTORY/forwarding_hmac\" || { ${pkgs.coreutils}/bin/head -c 32 /dev/urandom > \"$RUNTIME_DIRECTORY/forwarding_hmac\" && ${pkgs.coreutils}/bin/chmod 600 \"$RUNTIME_DIRECTORY/forwarding_hmac\"; }'"
             "${pkgs.coreutils}/bin/rm -f %t/agent-mcp/%i/backend.sock"
           ];
-          ExecStart = "${resolvedPkgs.agentMcpLauncher}/bin/agent-mcp-launcher %i";
+          ExecStart = "${pkgs'.agentMcpLauncher}/bin/agent-mcp-launcher %i";
           Restart = "on-failure";
           RestartSec = 5;
           TimeoutStopSec = 10;
@@ -606,8 +717,8 @@ in {
             "AGENT_MCP_DEFAULT_WORKSPACE=${cfg.router.defaultWorkspaceParent}"
             "AGENT_MCP_ROUTER_PORT=${toString cfg.router.port}"
             "AGENT_MCP_IDLE_SEC=${toString cfg.router.idleSec}"
-            "AGENT_MCP_README_HTML=${resolvedPkgs.readmeHtml}"
-            "AGENT_MCP_INSTALLER_TEMPLATE=${resolvedPkgs.installerTemplate}"
+            "AGENT_MCP_README_HTML=${pkgs'.readmeHtml}"
+            "AGENT_MCP_INSTALLER_TEMPLATE=${pkgs'.installerTemplate}"
             # Router DB lives under XDG_DATA_HOME (default
             # ~/.local/share/agent-mcp/router.db). Without this, the
             # python default in agent_mcp.router.migrations_runner
@@ -669,12 +780,12 @@ in {
           ];
           ExecStart =
             if cfg.multiTenant then
-              "${resolvedPkgs.agentMcpRouterWrapper}/bin/agent-mcp-router"
+              "${pkgs'.agentMcpRouterWrapper}/bin/agent-mcp-router"
             else
               # The wrapper does `exec python -m agent_mcp.cli router "$@"`,
               # so passing flags through it lands them on the router
               # subcommand as expected.
-              "${resolvedPkgs.agentMcpRouterWrapper}/bin/agent-mcp-router "
+              "${pkgs'.agentMcpRouterWrapper}/bin/agent-mcp-router "
               + "--single-tenant ${lib.escapeShellArg cfg.singleProject.name} "
               + "--single-workspace ${lib.escapeShellArg cfg.singleProject.workspace}";
           Restart = "on-failure";
