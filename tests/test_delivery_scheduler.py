@@ -10,6 +10,7 @@ tick() test confirms it reads config + no-ops when disabled by default.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -72,13 +73,45 @@ async def test_pushes_skinny_frame_on_unread(tmp_path: Path):
         assert frame["reason"] == "unread_messages"
         assert frame["unread_count"] >= 1
         # SKINNY by SHAPE: each item carries only id/sender/subject — never a
-        # full-body field (message/content/body). A short message's text
-        # legitimately becomes its derived subject; that's the preview, not
-        # a body leak.
+        # full-body field (message/content/body). The `subject` is the stored
+        # subject or a fixed body-free placeholder — never a body snippet
+        # (R13-F4; see test_skinny_frame_never_leaks_body_for_subjectless_message).
         assert frame["unread_messages"], "should list the unread message"
         first = frame["unread_messages"][0]
         assert set(first.keys()) <= {"message_id", "sender_id", "subject"}
         assert not ({"message", "content", "body"} & set(first.keys()))
+
+
+@pytest.mark.asyncio
+async def test_skinny_frame_never_leaks_body_for_subjectless_message(
+    tmp_path: Path,
+):
+    """R13-F4: a NULL-subject message must NOT leak its body into the skinny
+    frame.
+
+    The frame is a contractually body-free channel (ADR-0021): it flows over
+    SSE to the Rust bridge, which types the `subject` verbatim into the
+    recipient's pane and from there into the agent's session logs. Message
+    bodies can carry secrets (admin tokens appear in message text — see
+    aoe_notify.py), so NO substring of the body may appear in the rendered
+    frame. Subject is optional and stored NULL by default, so this is the
+    common case, not an edge.
+    """
+    secret = "admin token is sk-live-DEADBEEF1234567890 please rotate it"
+    async with mcp_session(tmp_path) as admin:
+        alice = await admin.create_worker("alice")
+        await _send(admin, alice.agent_id, secret)  # no subject → stored NULL
+        sub = dt.subscribe(alice.agent_id)
+
+        assert sched.evaluate_and_push(alice.agent_id, _cfg(), now=100.0) is True
+        frame = sub.queue.get_nowait()
+
+        blob = json.dumps(frame)
+        for leak in ("sk-live-DEADBEEF1234567890", "admin token", "rotate"):
+            assert leak not in blob, f"body leaked into skinny frame: {leak!r}"
+
+        first = frame["unread_messages"][0]
+        assert first["subject"] == "(no subject)"
 
 
 @pytest.mark.asyncio

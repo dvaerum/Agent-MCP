@@ -54,11 +54,27 @@ def clear() -> None:
 
 
 def _subject_of(row: Dict[str, Any]) -> str:
+    """A real, sender-set subject — or a fixed body-free placeholder.
+
+    NEVER emits body content. A message row's ``subject`` is only a genuine
+    subject when ``subject_is_placeholder`` is false; when the DB subject was
+    NULL (the common case — subject is optional and stored NULL by default)
+    the read path (``message_subject_view``) fills ``subject`` with a
+    body PREVIEW and flags it ``subject_is_placeholder``. That preview is
+    body content and must not be surfaced here, because this string is copied
+    into ``unread_messages[].subject`` (``collect_backlog``) which feeds the
+    SKINNY delivery frame (``delivery_scheduler._render_frame`` → SSE → the
+    Rust bridge, which types the subject verbatim into the recipient's pane
+    and from there into the agent's logs). That path is contractually
+    body-free (ADR-0021), and message bodies routinely carry secrets — admin
+    tokens appear in message text (see ``aoe_notify`` for the same threat).
+    The reminder loses nothing: it already tells the agent to call
+    ``get_agent_messages`` to read the body. (R13-F4)
+    """
+    if row.get("subject_is_placeholder"):
+        return "(no subject)"
     subj = (row.get("subject") or "").strip()
-    if subj:
-        return subj
-    body = (row.get("message_content") or "").strip().replace("\n", " ")
-    return (body[:57] + "…") if len(body) > 58 else (body or "(no content)")
+    return subj if subj else "(no subject)"
 
 
 def collect_backlog(agent_id: str) -> Optional[Dict[str, Any]]:

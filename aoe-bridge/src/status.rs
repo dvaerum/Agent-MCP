@@ -249,7 +249,16 @@ impl SessionObs {
     }
 
     pub fn note_error(&mut self, what: &str, at: u64) {
-        self.last_error = Some((truncate(what, MAX_DETAIL_CHARS), at));
+        // `last_error` renders into the settings page (a durable operator
+        // surface), so it must pass through the same scrubber as every log
+        // line — the module docstrings claim "a single redactor on the one
+        // write path", and this sink would otherwise bypass it and echo a
+        // bearer token from a transport-error `Debug` into the page. Redact
+        // BEFORE truncating so the cap never severs a half-redacted token.
+        self.last_error = Some((
+            truncate(&crate::observe::redact(what), MAX_DETAIL_CHARS),
+            at,
+        ));
     }
 
     /// Whether this session currently counts as broken for the page's verdict.
@@ -717,6 +726,35 @@ mod tests {
             detail: "acp_mode_unsupported".to_string(),
             at,
         }
+    }
+
+    #[test]
+    fn note_error_redacts_before_it_reaches_the_page_sink() {
+        // `last_error` is a durable operator surface (the settings page). A
+        // transport error can carry a bearer token in its `Debug` rendering;
+        // the module docstrings promise a single redactor on the write path,
+        // so this sink must scrub too — not echo the credential onto the page.
+        let mut o = live_session("s1");
+        o.note_error(
+            "session.mcp.set failed: Authorization: Bearer sk-secret-DEADBEEF",
+            10,
+        );
+        let (stored, _) = o.last_error.as_ref().unwrap();
+        assert!(
+            !stored.contains("sk-secret-DEADBEEF"),
+            "token leaked into last_error: {stored:?}"
+        );
+        assert!(stored.contains("Bearer ***"), "not redacted: {stored:?}");
+
+        // And it must not surface when the page renders the row.
+        let s = snap_with(vec![o]);
+        let page = render_page(&s, 2_000, None, Level::Info);
+        assert!(
+            !serde_json::to_string(&page)
+                .unwrap()
+                .contains("sk-secret-DEADBEEF"),
+            "token leaked into rendered page"
+        );
     }
 
     fn succeeded(at: u64) -> InjectOutcome {
