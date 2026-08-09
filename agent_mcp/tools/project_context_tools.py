@@ -703,7 +703,9 @@ async def view_project_context_tool_impl(
     # table dump). Coerce + clamp so the LIMIT is always sane.
     try:
         max_results = max(1, min(int(arguments.get("max_results", 50)), 200))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError (R16 sweep): ``int(float('inf'))`` from a JSON
+        # ``1e400`` token — sibling of the scheduler R16-F3/F4 fix.
         max_results = 50
     # Sort by: key, updated_at, size. Accept `last_updated` as a
     # backward-compatible alias for `updated_at` so existing dashboard

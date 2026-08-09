@@ -232,7 +232,9 @@ async def edit_task_note_tool_impl(
         return Invalid(field="text", message="`text` is required.")
     try:
         note_id = int(note_id_raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError (R16 sweep): ``int(float('inf'))`` from a JSON
+        # ``1e400`` token — sibling of the scheduler R16-F3/F4 fix.
         return Invalid(
             field="note_id",
             message=f"`note_id` must be an integer, got {note_id_raw!r}.",
@@ -283,7 +285,9 @@ async def delete_task_note_tool_impl(
         return Invalid(field="note_id", message="`note_id` is required.")
     try:
         note_id = int(note_id_raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError (R16 sweep): ``int(float('inf'))`` from a JSON
+        # ``1e400`` token — sibling of the scheduler R16-F3/F4 fix.
         return Invalid(
             field="note_id",
             message=f"`note_id` must be an integer, got {note_id_raw!r}.",
