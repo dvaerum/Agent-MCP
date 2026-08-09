@@ -9,6 +9,7 @@ hub tests.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,46 @@ def test_push_delivers_to_subscriber():
 def test_push_with_no_subscriber_drops():
     # No live transport → frame dropped (policy re-fires next cycle).
     assert dt.push("nobody", {"id": "x"}) == 0
+
+
+# ── R14-F1: the subscriber queue is bounded + drops-on-full ─────────
+#
+# A slow/stalled SSE reader stops draining ``sub.queue`` (TCP
+# backpressure stalls the frame_gen ``await sub.queue.get()``). With an
+# UNBOUNDED queue, ``push`` accumulates frames without limit — an
+# in-process memory-exhaustion surface. The sibling durable-subscriber
+# queues (operator_events, session_registry) bound at 256 + drop-on-full
+# with a log line; delivery must too.
+
+
+def test_subscriber_queue_is_bounded():
+    sub = dt.subscribe("alice")
+    # RED pre-fix: asyncio.Queue() has maxsize 0 (unbounded).
+    assert sub.queue.maxsize == dt._QUEUE_MAXSIZE
+    assert dt._QUEUE_MAXSIZE == 256  # matches operator_events template
+
+
+def test_push_drops_when_subscriber_queue_full(caplog):
+    """A stalled (non-draining) subscriber must NOT grow past the cap:
+    frames beyond ``maxsize`` are dropped-with-log, not queued unbounded,
+    and the producer never blocks."""
+    sub = dt.subscribe("alice")
+    cap = dt._QUEUE_MAXSIZE
+
+    # Fill the queue exactly to the cap — every frame is enqueued.
+    for i in range(cap):
+        assert dt.push("alice", {"id": f"f{i}"}) == 1
+    assert sub.queue.qsize() == cap
+
+    # Now the reader is stalled: further pushes must drop (return 0),
+    # NOT block the producer nor grow the queue past the cap.
+    with caplog.at_level(logging.WARNING):
+        for i in range(10):
+            assert dt.push("alice", {"id": f"overflow-{i}"}) == 0
+    assert sub.queue.qsize() == cap, "queue grew past the cap — unbounded"
+    assert any(
+        "queue full" in rec.getMessage().lower() for rec in caplog.records
+    ), "a dropped frame must be logged (mirror operator_events)"
 
 
 def test_unsubscribe_disconnects():

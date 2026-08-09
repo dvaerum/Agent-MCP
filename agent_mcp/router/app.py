@@ -784,16 +784,21 @@ async def _proxy_to_backend(
     # Detect streaming up front (the SSE verb/path) and cap concurrency
     # BEFORE opening the upstream; the response Content-Type is a
     # belt-and-suspenders second signal below for any streaming POST.
-    # /mcp and the ADR-0021 delivery stream are both long-lived agent SSE. Both
-    # get the concurrency cap + the structural streaming anchor here, so delivery
-    # keep-alive doesn't depend solely on sniffing the response Content-Type (a
-    # backend content-type regression would otherwise buffer it → idle-reap it).
+    # /mcp, the ADR-0021 delivery stream, and the operator dashboard SSE
+    # (/api/<project>/events → backend /api/events) are all long-lived,
+    # infinite text/event-stream responses. Each gets the concurrency cap
+    # + the structural streaming anchor here, so keep-alive doesn't depend
+    # solely on sniffing the response Content-Type (a backend content-type
+    # regression would otherwise buffer it → pin active_conns against the
+    # idle reaper) AND each holds a slot so a client can't open unbounded
+    # concurrent streams (R8-F2 for the agent SSE, R14-F2 for operator SSE).
     is_stream_request = req.method == "GET" and backend_path in (
         "/mcp",
         "/api/delivery/stream",
+        "/api/events",
     )
     stream_cap = (
-        _po._track_streaming_proxy(_sse_agent_key(headers))
+        _po._track_streaming_proxy(_sse_agent_key(req, headers))
         if is_stream_request
         else contextlib.nullcontext(True)
     )
@@ -852,14 +857,31 @@ async def _proxy_to_backend(
                     )
 
 
-def _sse_agent_key(headers: dict[str, str]) -> str:
-    """Per-agent cap key for a streaming proxy: a short hash of the
-    forwarded bearer (never the raw token, for log/hygiene safety).
+def _sse_agent_key(req: web.Request, headers: dict[str, str]) -> str:
+    """Per-caller cap key for a streaming proxy.
 
-    `GET /mcp` always carries a bearer — the cookie-only GET path is
-    405'd upstream in `backend_mcp_handler` — so the ``"anon"`` fallback
-    is defensive only.
+    Two authentication shapes reach the streaming caps:
+
+    * Agent SSE (``GET /mcp``, ``/api/delivery/stream``) carries an
+      ``Authorization`` bearer — key on a short hash of it (never the
+      raw token, for log/hygiene safety). The cookie-only GET path is
+      405'd upstream in ``backend_mcp_handler`` so a bearer is always
+      present here; the ``"anon"`` fallback is defensive only.
+    * Operator SSE (``/api/<project>/events``) drops the bearer in
+      favour of the session cookie (Wave 2), so it has no Authorization
+      header. Key on the resolved operator identity that
+      ``require_operator_session_middleware`` stashed in ``req["user"]``
+      — giving each operator an independent slot budget rather than
+      collapsing every operator into the shared ``"anon"`` bucket. The
+      ``op:`` prefix keeps the namespace disjoint from the bearer hash.
+      When no identity was stashed (e.g. the single-tenant bypass, which
+      never sets ``req["user"]``), it falls through to ``"anon"``.
     """
+    user = req.get("user")
+    if isinstance(user, dict) and user.get("user_id") is not None:
+        return "op:" + hashlib.sha256(
+            str(user["user_id"]).encode("utf-8", "replace")
+        ).hexdigest()[:16]
     auth = headers.get("Authorization", "")
     if not auth:
         return "anon"

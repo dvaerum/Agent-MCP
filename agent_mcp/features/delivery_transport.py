@@ -22,8 +22,17 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from ..core.config import logger
+
 #: The statuses a runtime may report (ADR-0021).
 VALID_STATUSES: tuple[str, ...] = ("working", "idle", "dormant", "dead")
+
+# Bound each subscriber queue exactly like the operator_events /
+# session_registry runtime queues: a stalled SSE reader (TCP backpressure
+# stalls frame_gen's ``await sub.queue.get()``) must NOT accumulate frames
+# without limit. Beyond this depth ``push`` drops the incoming frame with a
+# log line rather than blocking the producer (R14-F1).
+_QUEUE_MAXSIZE = 256
 
 
 @dataclass(eq=False)
@@ -50,7 +59,9 @@ def _now_iso() -> str:
 def subscribe(agent_id: str) -> Subscription:
     """Register a live delivery stream for ``agent_id``."""
     sub = Subscription(
-        agent_id=agent_id, queue=asyncio.Queue(), connected_at=_now_iso()
+        agent_id=agent_id,
+        queue=asyncio.Queue(maxsize=_QUEUE_MAXSIZE),
+        connected_at=_now_iso(),
     )
     _subs.setdefault(agent_id, []).append(sub)
     return sub
@@ -73,8 +84,14 @@ def unsubscribe(sub: Subscription) -> None:
 
 def push(agent_id: str, frame: Dict[str, Any]) -> int:
     """Enqueue ``frame`` onto every live stream for ``agent_id``. Returns
-    the number of streams reached (0 = the worker has no live transport, so
-    the frame is dropped — the fallback policy re-fires next cycle)."""
+    the number of streams the frame was ENQUEUED onto (0 = the worker has
+    no live transport, or every live stream's bounded queue was full, so
+    the frame is dropped — the fallback policy re-fires next cycle).
+
+    A stream whose bounded queue is full gets the frame dropped + logged
+    (mirrors ``operator_events.publish`` / ``session_registry._enqueue_to``)
+    rather than blocking the scheduler that pushed it — telemetry-grade
+    delivery must never stall the producer on a slow reader (R14-F1)."""
     subs = _subs.get(agent_id)
     if not subs:
         return 0
@@ -83,6 +100,12 @@ def push(agent_id: str, frame: Dict[str, Any]) -> int:
         try:
             sub.queue.put_nowait(frame)
             n += 1
+        except asyncio.QueueFull:
+            logger.warning(
+                "delivery_transport: subscriber queue full for %s — "
+                "dropping frame",
+                agent_id,
+            )
         except Exception:  # pragma: no cover - defensive
             pass
     return n
