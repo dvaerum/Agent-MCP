@@ -63,6 +63,36 @@ API endpoint. The vulnerability DB is live — same as the existing uv.lock job
 — which is intended for a security gate: a newly disclosed advisory in the
 shipping closure SHOULD turn the build red.
 
+Fail loud, never silent (R14-F3)
+--------------------------------
+
+The gate's own failure mode is a silent skip: a python store path the parser
+cannot turn into a real ``name==version`` coordinate is queried as garbage (or
+not at all), OSV returns nothing, and the package passes without ever being
+audited — invisible. That is the exact silent-control class this whole gate
+exists to eliminate. So:
+
+* version parsing strips nixpkgs' build-provenance suffixes
+  (``-unstable-YYYY-MM-DD``, ``-git-<hash>``, ``-rcN``, ``-pre*``, date
+  snapshots, …) to recover the base version — the suffixed pin is precisely the
+  unreleased case most likely to lag a security fix, so it MUST be audited;
+* any ``python3.N-``-prefixed path that STILL does not yield a usable
+  coordinate (e.g. the ``0.0.0-unknown`` pyproject fallback) is reported as
+  ``unparseable`` and FAILS the gate — a package that cannot be audited is made
+  visible, not dropped. The app's own derivations (``APP_PACKAGES``) are the
+  one exclusion, by name — they are not OSV-tracked deps.
+
+Known residual — name divergence
+--------------------------------
+
+OSV is queried by the nix pname (PEP 503-canonicalized). If a nix pname differs
+from the package's OSV/PyPI name, the query returns empty and the coordinate
+passes silently — a real, harder-to-close silent-miss (there is no
+authoritative nix-pname -> PyPI-name table). Nixpkgs keeps python pnames
+aligned with PyPI as policy, so this is rare; ``_PYPI_NAME_OVERRIDES`` gives
+any divergence that surfaces a home. This residual is documented, not fully
+closed.
+
 Run locally:  ``python3 nix/audit/closure_advisory_audit.py``
 """
 
@@ -91,12 +121,65 @@ CLOSURE_TARGETS = [".#agent-mcp", ".#agent-mcp-router-wrapper"]
 _AUDIT_DIR = Path(__file__).resolve().parent
 DEFAULT_ALLOWLIST = _AUDIT_DIR / "closure-advisory-allowlist.toml"
 
-# `/nix/store/<hash>-python3.<minor>-<pname>-<version>`. The dotted
+# `/nix/store/<hash>-python3.<minor>-<pname>-<version>[<suffix>]`. The dotted
 # `python3.N-` prefix is what distinguishes a python package from the
-# interpreter derivation (`python3-3.14.6`) and from C libraries.
-_STORE_PY = re.compile(
-    r"-python3\.\d+-(?P<name>.+?)-(?P<version>\d[^-]*(?:\.[^-]*)*)$"
+# interpreter derivation (`python3-3.14.6`) and from C libraries. `rest` is
+# `<pname>-<version>[<suffix>]`; it is split further below. The prefix match is
+# deliberately NOT version-shaped: a python store path must be RECOGNISED as
+# python first, so an unparseable tail can be failed loud rather than skipped
+# silently (R14-F3 — the old regex forbade a hyphen inside the version group,
+# so an `-unstable-*` / `-rcN` / `0.0.0-unknown` tail simply did not match and
+# the package fell through unaudited AND unflagged: a silent pass).
+_STORE_PY = re.compile(r"-python3\.\d+-(?P<rest>.+)$")
+
+# Within `rest`, the version starts at the first hyphen-delimited component
+# beginning with a digit — nix's own `parseDrvName` rule. This lets a
+# hyphenated pname (`argon2-cffi-bindings`) split cleanly from its version.
+_NAME_VERSION = re.compile(r"^(?P<name>.+?)-(?P<version>\d.*)$")
+
+# nixpkgs decorates a base version with build-provenance suffixes for
+# unreleased pins: `-unstable-YYYY-MM-DD`, `-git-<hash>`, `-pre*`, `-rcN`,
+# `-alpha*`/`-beta*`/`-dev*`/`-post*`, a bare `-YYYY-MM-DD` date snapshot, etc.
+# Strip them to recover the base version the OSV query needs. The suffixed pin
+# is exactly the unreleased case most likely to LAG a security fix, so it must
+# be audited against its real version, never skipped.
+_VERSION_SUFFIX = re.compile(
+    r"-(?:unstable|git|pre|post|dev|rc|alpha|beta|snapshot|nightly"
+    r"|\d{4}-\d{2}-\d{2}).*$",
+    re.IGNORECASE,
 )
+
+# A usable OSV coordinate needs a real dotted-numeric base version. The
+# pyproject fallback `0.0.0-unknown` (buildPythonApplication when it cannot
+# read a version) leaves a non-numeric `-unknown` residue that no suffix rule
+# strips — so it does NOT fullmatch here and is surfaced as unparseable rather
+# than queried as garbage.
+_CLEAN_VERSION = re.compile(r"\d+(?:\.\d+)*")
+
+# The app's OWN derivations are not OSV-tracked dependencies. A `0.0.0-unknown`
+# fallback (or any odd version) on one of these must be excluded BY NAME — not
+# by silently dropping unparseables broadly, and not by failing the gate on the
+# app auditing itself.
+APP_PACKAGES = frozenset(
+    {"agent-mcp", "agent-mcp-router-wrapper", "agent-mcp-dashboard"}
+)
+
+# KNOWN RESIDUAL (documented, partially mitigated): OSV is queried by the nix
+# pname (PEP 503-canonicalized). When a nix pname differs from the package's
+# OSV/PyPI name, the query returns empty and the coordinate passes SILENTLY —
+# the same silent-miss class as the parse bug, but harder to close in general
+# (there is no authoritative nix-pname -> PyPI-name table). Nixpkgs keeps
+# python pnames aligned with PyPI names as a policy, so divergences are rare;
+# the mechanism below gives any that surface a home. Add `"<nix-pname>":
+# "<pypi-name>"` here (both canonicalized) when the audit or a CVE writeup
+# shows a package whose nix pname is not its PyPI/OSV name.
+_PYPI_NAME_OVERRIDES: dict[str, str] = {}
+
+
+def osv_query_name(name: str) -> str:
+    """Map a canonical nix pname to the name OSV/PyPI knows it by. Identity for
+    all but the (rare) documented divergences in ``_PYPI_NAME_OVERRIDES``."""
+    return _PYPI_NAME_OVERRIDES.get(name, name)
 
 
 def canonicalize(name: str) -> str:
@@ -107,25 +190,70 @@ def canonicalize(name: str) -> str:
 # ── closure -> python versions ────────────────────────────────────────
 
 
-def parse_python_packages(requisites: Iterable[str]) -> dict[str, str]:
-    """Map canonical package name -> version from ``nix-store -qR`` lines.
+@dataclass(frozen=True)
+class ClosureScan:
+    """Classification of ``nix-store -qR`` output for the audit.
 
-    Non-python store paths (the interpreter, glibc, …) do not carry the
-    dotted ``python3.N-`` prefix and are skipped. If two closure entries
-    disagree on a package version (should not happen for a single runtime
-    closure) the lower version wins — the conservative choice for an audit.
+    ``packages`` maps canonical pname -> base version for every python package
+    that yielded a usable OSV coordinate. ``unparseable`` lists python store
+    paths that carry the ``python3.N-`` prefix but did NOT yield a usable
+    coordinate and are not one of the app's own derivations. The gate FAILS
+    LOUD on ``unparseable`` (R14-F3): a package that cannot be audited must be
+    VISIBLE, never silently skipped — the exact silent-control class this gate
+    exists to eliminate.
     """
-    out: dict[str, str] = {}
+
+    packages: dict[str, str]
+    unparseable: list[str]
+
+
+def _base_version(version_full: str) -> str | None:
+    """Recover the dotted-numeric base version from a nixpkgs version string,
+    stripping build-provenance suffixes (``-unstable-*``, ``-git-*``, ``-rcN``,
+    ``-pre*``, date snapshots, …). Returns ``None`` when what remains is not a
+    real version (e.g. the ``0.0.0-unknown`` fallback, whose ``-unknown`` tail
+    is not a recognised suffix and leaves a non-numeric residue)."""
+    stripped = _VERSION_SUFFIX.sub("", version_full)
+    return stripped if _CLEAN_VERSION.fullmatch(stripped) else None
+
+
+def scan_closure(requisites: Iterable[str]) -> ClosureScan:
+    """Split ``nix-store -qR`` output into auditable coordinates and the
+    unparseable python paths the gate must fail loud on.
+
+    Non-python store paths (the interpreter, glibc, …) do not carry the dotted
+    ``python3.N-`` prefix and are ignored. The app's own derivations are
+    excluded by name (not OSV-tracked deps). If two closure entries disagree on
+    a package version (should not happen for a single runtime closure) the lower
+    version wins — the conservative choice for an audit.
+    """
+    packages: dict[str, str] = {}
+    unparseable: list[str] = []
     for line in requisites:
-        m = _STORE_PY.search(line.strip())
+        path = line.strip()
+        m = _STORE_PY.search(path)
         if not m:
+            continue  # not a python package
+        nv = _NAME_VERSION.match(m.group("rest"))
+        name = canonicalize(nv.group("name")) if nv else ""
+        if name in APP_PACKAGES:
+            continue  # the app's own derivation — not an OSV-tracked dep
+        base = _base_version(nv.group("version")) if nv else None
+        if not name or base is None:
+            # python-prefixed but no usable coordinate — fail loud, don't skip.
+            unparseable.append(path)
             continue
-        name = canonicalize(m.group("name"))
-        version = m.group("version")
-        prev = out.get(name)
-        if prev is None or _lower_version(version, prev):
-            out[name] = version
-    return out
+        prev = packages.get(name)
+        if prev is None or _lower_version(base, prev):
+            packages[name] = base
+    return ClosureScan(packages=packages, unparseable=unparseable)
+
+
+def parse_python_packages(requisites: Iterable[str]) -> dict[str, str]:
+    """Coordinate-only view of :func:`scan_closure`: canonical pname -> base
+    version for the auditable python packages. Callers that also need the
+    fail-loud data use :func:`scan_closure` directly."""
+    return scan_closure(requisites).packages
 
 
 def _lower_version(a: str, b: str) -> bool:
@@ -345,8 +473,14 @@ def _osv_get(path: str) -> dict:
 def query_osv(packages: dict[str, str]) -> list[Advisory]:
     """Audit every ``name==version`` coordinate against OSV."""
     coords = sorted(packages.items())
+    # Query OSV by the PyPI/OSV name (see `_PYPI_NAME_OVERRIDES`) but keep the
+    # canonical nix pname in `coords` so advisories and allowlist entries match
+    # on the same name the closure ships.
     queries = [
-        {"package": {"ecosystem": "PyPI", "name": name}, "version": version}
+        {
+            "package": {"ecosystem": "PyPI", "name": osv_query_name(name)},
+            "version": version,
+        }
         for name, version in coords
     ]
     batch = _osv_post("/v1/querybatch", {"queries": queries})
@@ -395,6 +529,11 @@ def main(argv: list[str] | None = None) -> int:
 
     allowlist = load_allowlist(args.allowlist.read_text())
 
+    # Python store paths the parser could not turn into an OSV coordinate.
+    # Only the real-closure path can produce these; they FAIL the gate loud
+    # (R14-F3) rather than being silently skipped.
+    unparseable: list[str] = []
+
     if args.osv_json:
         raw = json.loads(args.osv_json.read_text())
         found = [
@@ -418,7 +557,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print("Building deploy closure:", " ".join(CLOSURE_TARGETS))
             requisites = build_closure_requisites(CLOSURE_TARGETS)
-            packages = parse_python_packages(requisites)
+            scan = scan_closure(requisites)
+            packages = scan.packages
+            unparseable = scan.unparseable
         print(f"Closure ships {len(packages)} python packages.")
         print("Querying OSV for advisories affecting the shipped versions...")
         found = query_osv(packages)
@@ -432,6 +573,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  [{state}] {_format_advisory(adv)}")
 
     ok = True
+    if unparseable:
+        ok = False
+        print()
+        print("FAIL: python store paths that did NOT yield an auditable OSV")
+        print("  coordinate — they were NOT queried against OSV. A package that")
+        print("  cannot be audited must be VISIBLE, not silently skipped")
+        print("  (R14-F3). Teach the parser the version suffix in")
+        print("  nix/audit/closure_advisory_audit.py (_VERSION_SUFFIX), or — if")
+        print("  this is one of the app's own derivations — add it to")
+        print("  APP_PACKAGES:")
+        for p in unparseable:
+            print(f"    - {p}")
+
     if unaccepted:
         ok = False
         print()

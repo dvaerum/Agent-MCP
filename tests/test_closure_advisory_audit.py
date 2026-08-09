@@ -70,6 +70,87 @@ def test_parse_python_packages_excludes_interpreter_and_non_python() -> None:
     assert not any("glibc" in k for k in pkgs)
 
 
+# ── nixpkgs version-suffix parsing (R14-F3) ───────────────────────────
+
+# nixpkgs decorates a base version with build-provenance suffixes for
+# unreleased pins. The audit must recover the BASE version for the OSV query,
+# not skip/garble the coordinate — the suffixed pin is precisely the case most
+# likely to lag a security fix, so it MUST be audited.
+SUFFIXED_REQUISITES = [
+    "/nix/store/11111111111111111111111111111111-python3.14-bar-2.0.0-unstable-2024-05-01",
+    "/nix/store/22222222222222222222222222222222-python3.14-foo-1.6.9-rc1",
+    "/nix/store/33333333333333333333333333333333-python3.14-baz-3.1.0-git-abcdef0",
+    "/nix/store/44444444444444444444444444444444-python3.14-qux-0.9.0-pre20240101",
+]
+
+
+def test_parse_strips_nixpkgs_version_suffixes() -> None:
+    pkgs = audit.parse_python_packages(SUFFIXED_REQUISITES)
+    # `-unstable-<date>` / `-git-<hash>` / `-rcN` / `-pre*` are stripped so the
+    # real base version is audited against OSV.
+    assert pkgs["bar"] == "2.0.0"
+    assert pkgs["foo"] == "1.6.9"
+    assert pkgs["baz"] == "3.1.0"
+    assert pkgs["qux"] == "0.9.0"
+
+
+def test_unparseable_python_path_fails_loud_not_silent() -> None:
+    """A `python3.N-`-prefixed path that yields no usable coordinate (the
+    `0.0.0-unknown` pyproject fallback) must be SURFACED, not silently dropped
+    — that silent-skip is the whole R14-F3 finding."""
+    reqs = [
+        "/nix/store/55555555555555555555555555555555-python3.14-weird-0.0.0-unknown",
+    ]
+    scan = audit.scan_closure(reqs)
+    assert "weird" not in scan.packages
+    assert any("weird-0.0.0-unknown" in p for p in scan.unparseable), (
+        "an unparseable python coordinate must appear in scan.unparseable so "
+        f"the gate can fail loud; got {scan.unparseable}"
+    )
+
+
+def test_app_own_package_is_excluded_not_flagged() -> None:
+    """The app's own derivation is not an OSV-tracked dep; a `0.0.0-unknown`
+    fallback on it must be excluded BY NAME, not counted as unparseable (which
+    would red the gate) nor audited as a bogus coordinate."""
+    reqs = [
+        "/nix/store/66666666666666666666666666666666-python3.14-agent-mcp-0.0.0-unknown",
+    ]
+    scan = audit.scan_closure(reqs)
+    assert scan.unparseable == [], (
+        f"agent-mcp is the app itself; must not be flagged: {scan.unparseable}"
+    )
+    assert "agent-mcp" not in scan.packages
+
+
+def test_parse_strips_bare_date_snapshot_suffix() -> None:
+    """A bare `-YYYY-MM-DD` snapshot suffix (no `unstable`/`git` marker) still
+    reduces to the base version rather than garbling name+version."""
+    reqs = [
+        "/nix/store/77777777777777777777777777777777-python3.14-quux-1.4.0-2024-11-30",
+    ]
+    assert audit.parse_python_packages(reqs)["quux"] == "1.4.0"
+
+
+def test_versionless_python_path_is_flagged() -> None:
+    """A `python3.N-`-prefixed path with no version component at all is
+    unparseable — surfaced, never silently skipped."""
+    reqs = [
+        "/nix/store/88888888888888888888888888888888-python3.14-nameonly",
+    ]
+    scan = audit.scan_closure(reqs)
+    assert scan.packages == {}
+    assert any("nameonly" in p for p in scan.unparseable)
+
+
+def test_scan_closure_packages_match_parse_wrapper() -> None:
+    """`parse_python_packages` is the thin coordinate-only view of
+    `scan_closure`; they must agree on the auditable packages."""
+    scan = audit.scan_closure(SAMPLE_REQUISITES)
+    assert scan.packages == audit.parse_python_packages(SAMPLE_REQUISITES)
+    assert scan.unparseable == []
+
+
 # ── OSV response parsing ──────────────────────────────────────────────
 
 # Shape returned by OSV `POST /v1/querybatch` (ids only, query-order) plus the
