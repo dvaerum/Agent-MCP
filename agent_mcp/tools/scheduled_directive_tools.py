@@ -144,6 +144,33 @@ def _authorize_target_write(
     return None
 
 
+def _authorize_existing_or_notfound(
+    principal: Principal, existing: Dict[str, Any], directive_id: str
+) -> Optional[ToolResult]:
+    """Authorize a write against an EXISTING directive without leaking that
+    it exists. Returns a denial :class:`ToolResult`, or ``None`` to proceed.
+
+    R17-F2: update/delete looked the row up first and then returned the raw
+    authorization denial, so a non-owner worker could distinguish "exists
+    but forbidden" (``PermissionDenied``) from "missing" (``NotFound``) — an
+    existence oracle. Collapse the two: any caller who is neither the owner
+    nor operator-tier gets the SAME opaque ``NotFound`` a missing id yields
+    (mirrors the tasks/notes phantom-not-found pattern, and the pre-lookup
+    authz already used by ``list_scheduled_directives``). The owning worker
+    still gets the real reason (e.g. self-scheduling toggled off); a manager
+    curating its worker (or an operator) still gets real access.
+    """
+    auth_denial = _authorize_target_write(principal, existing["agent_id"])
+    if auth_denial is None:
+        return None
+    caller_id = principal.agent_id if principal.kind == "agent_bearer" else None
+    if existing["agent_id"] != caller_id:
+        return NotFound(
+            resource="scheduled directive", identifier=directive_id
+        )
+    return auth_denial
+
+
 def _validate_interval(raw: Any) -> tuple[Optional[int], Optional[ToolResult]]:
     """Coerce + floor/ceiling-check an interval (seconds)."""
     try:
@@ -201,6 +228,19 @@ def _validate_until(raw: Any) -> tuple[Optional[str], Optional[ToolResult]]:
             field="until",
             message="until must be a valid ISO-8601 datetime string",
         )
+    # R17-F1: a tz-aware ``until`` (offset or trailing 'Z') must not blow up
+    # the comparison below with ``TypeError: can't compare offset-naive and
+    # offset-aware datetimes`` (which escaped this ValueError-only guard and
+    # surfaced as a raw 500 / generic Failed — a direct sibling of the
+    # R16-F3/F4 interval/count hardening in this same file). Normalize a
+    # tz-aware value to the module's naive-LOCAL convention before both the
+    # future-check AND storage: everything downstream compares ``until_at``
+    # LEXICALLY against naive-local ISO strings (``next_due`` in create,
+    # ``now_iso`` in the repository's collect_due_and_fire / soonest_due), so
+    # a stored tz-aware string would silently mis-order those windows. This
+    # mirrors the tz-safe pattern in app/routers/agents.py:_within_grace.
+    if until_dt.tzinfo is not None:
+        until_dt = until_dt.astimezone().replace(tzinfo=None)
     if until_dt <= _now():
         return None, Invalid(
             field="until",
@@ -449,8 +489,8 @@ async def update_scheduled_directive_tool_impl(
                 return NotFound(
                     resource="scheduled directive", identifier=directive_id
                 )
-            auth_denial = _authorize_target_write(
-                principal, existing["agent_id"]
+            auth_denial = _authorize_existing_or_notfound(
+                principal, existing, directive_id
             )
             if auth_denial is not None:
                 return auth_denial
@@ -581,8 +621,8 @@ async def delete_scheduled_directive_tool_impl(
                 return NotFound(
                     resource="scheduled directive", identifier=directive_id
                 )
-            auth_denial = _authorize_target_write(
-                principal, existing["agent_id"]
+            auth_denial = _authorize_existing_or_notfound(
+                principal, existing, directive_id
             )
             if auth_denial is not None:
                 return auth_denial
