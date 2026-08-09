@@ -74,17 +74,34 @@ def test_backlog_excludes_terminal_tasks(monkeypatch):
     assert {t["task_id"] for t in bl["open_tasks"]} == {"t1", "t5"}
 
 
-def test_backlog_uses_content_preview_when_no_subject(monkeypatch):
+def test_backlog_never_leaks_body_when_no_subject(monkeypatch):
+    # R13-F4: a NULL-subject message must NOT surface a body snippet as its
+    # "subject" — that field flows into the body-free skinny delivery frame
+    # (ADR-0021). It gets a fixed placeholder instead; the body is read via
+    # get_agent_messages, never inlined here.
+    secret = "admin token is sk-live-DEADBEEF1234567890 please rotate it"
+    # Faithful to what message_repo.query returns for a NULL-subject row:
+    # the read path (message_subject_view) already put a body PREVIEW in
+    # `subject` and flagged it `subject_is_placeholder`. _subject_of must
+    # NOT surface that preview.
     _patch_repos(
         monkeypatch,
         unread_rows=[
-            {"message_id": "m", "sender_id": "x", "message_content": "hello there"}
+            {
+                "message_id": "m",
+                "sender_id": "x",
+                "message_content": secret,
+                "subject": secret[:50] + "...",
+                "subject_is_placeholder": True,
+            }
         ],
         unread_count=1,
         tasks=[],
     )
     bl = ir.collect_backlog("a")
-    assert bl["unread_messages"][0]["subject"] == "hello there"
+    assert bl["unread_messages"][0]["subject"] == "(no subject)"
+    # No fragment of the body escaped into the backlog item.
+    assert "sk-live-DEADBEEF1234567890" not in str(bl["unread_messages"])
 
 
 # ── formatting / event shape ─────────────────────────────────────────────
