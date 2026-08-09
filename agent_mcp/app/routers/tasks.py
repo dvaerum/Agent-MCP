@@ -127,7 +127,10 @@ async def all_tasks_api_route(request: Request) -> JSONResponse:
         # the incomplete/active/open pseudo-values identically to the MCP
         # view_tasks / search_tasks tools (single source of truth).
         from ...repositories import task_repo
-        from ...features.task_queries import status_filter_matches
+        from ...features.task_queries import (
+            is_claimable_task,
+            status_filter_matches,
+        )
 
         if assigned_to_filter is not None:
             candidates = task_repo.list_by_agent(assigned_to_filter, limit=limit)
@@ -136,7 +139,10 @@ async def all_tasks_api_route(request: Request) -> JSONResponse:
 
         def _keep(task: dict) -> bool:
             assignee = task.get("assigned_to")
-            if unassigned_filter and assignee not in (None, ""):
+            # R16-F2: ``?unassigned=true`` is the CLAIMABLE pool — exclude
+            # terminal (completed/cancelled/failed) tasks the write side
+            # won't let anyone claim, via the shared canonical predicate.
+            if unassigned_filter and not is_claimable_task(task):
                 return False
             if assigned_filter and assignee in (None, ""):
                 return False

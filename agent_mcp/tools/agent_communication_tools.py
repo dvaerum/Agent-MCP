@@ -647,7 +647,9 @@ async def get_agent_messages_tool_impl(
         limit = int(limit)
         if not (1 <= limit <= 100):
             limit = 20
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
+        # OverflowError: ``int(float('inf'))`` — a JSON body like
+        # ``{"limit": 1e400}`` parses to ``inf`` and would otherwise 500.
         limit = 20
     
     conn = None
@@ -938,7 +940,7 @@ def _read_default_timeout() -> int:
     try:
         v = int(raw)
         return v if v > 0 else 60
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 60
 
 
@@ -1661,15 +1663,26 @@ def _collect_unassigned_task_events_for(
         # re-surfaced on the next catch-up. Freshly-created unassigned
         # tasks have ``created_at == updated_at``, so the create case is
         # unchanged.
+        # R16-F2: the wake seam advertises the CLAIMABLE pool, so it must
+        # apply the SAME terminal-status sink the write side enforces —
+        # otherwise it pushes spurious ``unassigned_task_appeared`` events
+        # for finished (completed/cancelled/failed) work nobody can claim.
+        # Uses the shared canonical terminal set (single source of truth
+        # with the query engine + REST ``?unassigned=true``).
+        from ..features.task_queries import TERMINAL_TASK_STATUSES
+
+        terminal = tuple(sorted(TERMINAL_TASK_STATUSES))
+        placeholders = ", ".join("?" for _ in terminal)
         cursor.execute(
-            """
+            f"""
             SELECT task_id, title, priority, updated_at
             FROM tasks
             WHERE assigned_to IS NULL
+              AND status NOT IN ({placeholders})
               AND updated_at > ?
             ORDER BY updated_at ASC
             """,
-            (since_iso,),
+            (*terminal, since_iso),
         )
         for trow in cursor.fetchall():
             events.append({
@@ -2143,7 +2156,8 @@ async def wait_for_events_tool_impl(
     if raw_timeout is not None:
         try:
             parsed = int(raw_timeout)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError: ``int(float('inf'))`` from a ``1e400`` body.
             parsed = None
         if parsed is not None and parsed > 0:
             requested = parsed
