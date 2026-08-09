@@ -124,14 +124,19 @@ def _is_operator_tier_bearer(token: str) -> bool:
     if not token:
         return False
     from ..repositories import agent_repo
+    from ..repositories.agent_repository import is_live_status
     row = agent_repo.get_by_token(token)
     if not isinstance(row, dict):
         return False
-    # Termination-revocation (Wave-B; same class as #275/#280 on this
-    # REST dep path): ``get_agent_by_token`` still returns terminated
-    # rows (for audit/attribution), so a terminated manager's bearer
-    # must be denied operator-tier here explicitly.
-    if row.get("status") == "terminated":
+    # Liveness-revocation (Wave-B; same class as #275/#280 on this REST
+    # dep path): ``get_by_token`` still returns non-live rows (for
+    # audit/attribution), so a non-live operator bearer must be denied
+    # here explicitly. Reuse the canonical ``is_live_status`` companion
+    # to :data:`LIVE_AGENT_SQL` — excludes BOTH ``terminated`` AND
+    # ``tombstone`` — so this gate stays in lock-step with the sibling
+    # liveness gates (main_app cache-only, delivery router) and the weak
+    # ``!= 'terminated'`` variant cannot re-appear (R16-DiD-1).
+    if not is_live_status(row.get("status")):
         return False
     return row.get("agent_role") in _OPERATOR_TIER_AGENT_ROLES
 
