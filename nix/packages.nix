@@ -124,6 +124,11 @@ let
     build-system = [ python.pkgs.setuptools ];
     dependencies = with python.pkgs; [
       anyio click openai fastapi starlette uvicorn jinja2
+      # uvicorn's speed-ups. Config defaults to loop/http = "auto",
+      # so their mere presence switches the backend off asyncio/h11.
+      # They were absent from the deployed closure until 2026-08-09
+      # despite pyproject asking for uvicorn[standard].
+      uvloop httptools
       python-dotenv sqlite-vec httpx
       # Version-gated single-package override; see `mcpPinned` above.
       mcpPinned

@@ -37,7 +37,19 @@ dependencies = [
     # always listed it explicitly, which is why the deployed closure
     # worked and the gap stayed invisible.
     "aiohttp",
-    "uvicorn[standard]",
+    # NOT `uvicorn[standard]`: that extra also drags in watchfiles
+    # (--reload, dev only) and colorama (Windows console colours),
+    # neither of which belongs in a Linux server closure — and the
+    # blanket alias hides which parts are actually load-bearing.
+    # uvicorn's Config defaults to loop="auto"/http="auto", so these
+    # two are picked up automatically when present and silently
+    # fall back to asyncio/h11 when not. app/main_app.py reasons
+    # explicitly about "a httptools-based uvicorn (the production
+    # build)" — which was NOT true of the deployed closure until
+    # these were declared here (2026-08-09).
+    "uvicorn",
+    "uvloop",
+    "httptools",
     "jinja2",
     "python-dotenv",
     "sqlite-vec",
