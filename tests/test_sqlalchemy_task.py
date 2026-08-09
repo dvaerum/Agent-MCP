@@ -154,6 +154,11 @@ def _insert_task(
     import json as _json
 
     from agent_mcp.db.connection import get_db_connection
+    from tests.conftest import existing_root_task_id
+
+    # R15-BL-1: chain under the single root (first seed = root, rest are
+    # children) — no extra row; parentage doesn't affect these read tests.
+    parent = existing_root_task_id()
 
     now = datetime.datetime.now().isoformat()
     conn = get_db_connection()
@@ -162,7 +167,7 @@ def _insert_task(
             "INSERT INTO tasks (task_id, title, description, assigned_to, "
             "created_by, status, priority, created_at, updated_at, "
             "parent_task, child_tasks, depends_on_tasks, notes) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 title,
@@ -173,6 +178,7 @@ def _insert_task(
                 priority,
                 now,
                 now,
+                parent,
                 _json.dumps([]),
                 _json.dumps([]),
                 _json.dumps([]),

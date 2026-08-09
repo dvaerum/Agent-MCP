@@ -58,6 +58,9 @@ def _make_client(project_dir):
     return TestClient(app)
 
 
+_SEED_ROOT_ID = "__seed_root__"
+
+
 def _seed_task(
     task_id: str,
     *,
@@ -67,18 +70,60 @@ def _seed_task(
     created_by: str = "admin",
     status: str = "pending",
     priority: str = "medium",
+    parent_task: str | None = "__auto__",
 ):
     """Insert a task via the existing ORM path (bypassing the repo).
 
     The repo class under test must observe this row when callers ask
     for it — proves the read methods fall through to the DB rather
     than returning only what passed through ``create``.
+
+    R15-BL-1: the single-root-task invariant is now enforced by a
+    partial UNIQUE index, so seeding many parentless tasks would violate
+    it. ``parent_task`` defaults to ``"__auto__"``: the FIRST seeded task
+    lazily creates a shared root and every subsequent task is parented
+    under it — so callers get distinct rows without tripping the index.
+    Pass ``parent_task=None`` to deliberately seed a root, or an explicit
+    id to parent under a specific task.
     """
+    from sqlalchemy import text as _text
+
     from agent_mcp.db.engine import get_session
     from agent_mcp.db.models import Task
 
     now = datetime.datetime.now().isoformat()
     with get_session() as session:
+        if parent_task == "__auto__":
+            existing_root = session.execute(
+                _text(
+                    "SELECT task_id FROM tasks WHERE parent_task IS NULL "
+                    "LIMIT 1"
+                )
+            ).fetchone()
+            if existing_root is not None:
+                parent_task = existing_root[0]
+            elif task_id == _SEED_ROOT_ID:
+                parent_task = None
+            else:
+                session.add(
+                    Task(
+                        task_id=_SEED_ROOT_ID,
+                        title="seed root",
+                        description="shared root for seeded tasks",
+                        assigned_to=None,
+                        created_by="admin",
+                        status="pending",
+                        priority="medium",
+                        created_at=now,
+                        updated_at=now,
+                        parent_task=None,
+                        child_tasks="[]",
+                        depends_on_tasks="[]",
+                        notes="[]",
+                    )
+                )
+                session.flush()
+                parent_task = _SEED_ROOT_ID
         session.add(
             Task(
                 task_id=task_id,
@@ -90,7 +135,7 @@ def _seed_task(
                 priority=priority,
                 created_at=now,
                 updated_at=now,
-                parent_task=None,
+                parent_task=parent_task,
                 child_tasks="[]",
                 depends_on_tasks="[]",
                 notes="[]",
@@ -289,10 +334,20 @@ def test_create_minted_ids_unique_across_rapid_creates(project_dir, reset_global
     with _make_client(project_dir):
         from agent_mcp.repositories import task_repo
 
+        # A single root first (single-root-task invariant, R15-BL-1); the
+        # batch are children of it so the rapid creates don't trip the
+        # partial UNIQUE root index.
+        root_id = task_repo.create(
+            {"title": "batch root", "created_by": "admin"}
+        )["task_id"]
         ids = [
-            task_repo.create({"title": f"batch {i}", "created_by": "admin"})[
-                "task_id"
-            ]
+            task_repo.create(
+                {
+                    "title": f"batch {i}",
+                    "created_by": "admin",
+                    "parent_task": root_id,
+                }
+            )["task_id"]
             for i in range(50)
         ]
 

@@ -40,16 +40,21 @@ def _seed_task(
 ) -> str:
     """Insert a task row directly. Returns the task_id."""
     from agent_mcp.db.connection import get_db_connection
+    from tests.conftest import existing_root_task_id
 
     task_id = f"task_{secrets.token_hex(6)}"
     now = _dt.datetime.now().isoformat()
+
+    # R15-BL-1: chain under the single root (first seed = root, rest are
+    # children). Dependency-ownership keys on assigned_to, not parentage.
+    parent = existing_root_task_id()
 
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO tasks (task_id, title, description, status, priority, "
-        "assigned_to, created_by, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "assigned_to, created_by, created_at, updated_at, parent_task) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             title,
@@ -60,6 +65,7 @@ def _seed_task(
             "admin",
             now,
             now,
+            parent,
         ),
     )
     conn.commit()

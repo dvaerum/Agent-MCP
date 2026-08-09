@@ -35,6 +35,11 @@ def _seed_task(
 ) -> str:
     from agent_mcp.core import globals as g
     from agent_mcp.db.connection import get_db_connection
+    from tests.conftest import existing_root_task_id
+
+    # R15-BL-1: chain under the single root (first seed = root, rest are
+    # children). Dependency-advance keys on depends_on/status, not parent.
+    parent = existing_root_task_id()
 
     task_id = f"task_{secrets.token_hex(6)}"
     now = _dt.datetime.now().isoformat()
@@ -45,11 +50,11 @@ def _seed_task(
     cursor.execute(
         "INSERT INTO tasks (task_id, title, description, status, priority, "
         "assigned_to, created_by, created_at, updated_at, notes, "
-        "depends_on_tasks) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "depends_on_tasks, parent_task) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id, title, "seed", status, "low",
-            assigned_to, "admin", now, now, "[]", deps,
+            assigned_to, "admin", now, now, "[]", deps, parent,
         ),
     )
     conn.commit()

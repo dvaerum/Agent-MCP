@@ -33,11 +33,17 @@ def _seed_task(
     *,
     status: str = "pending",
     depends_on: list[str] | None = None,
-    parent_task: str | None = None,
+    parent_task: str | None = "__auto__",
     child_tasks: list[str] | None = None,
 ) -> str:
     from agent_mcp.core import globals as g
     from agent_mcp.db.connection import get_db_connection
+    from tests.conftest import existing_root_task_id
+
+    # R15-BL-1: default chains under the single root (first seed = root,
+    # rest are children). An explicit parent_task= (incl. None) is honored.
+    if parent_task == "__auto__":
+        parent_task = existing_root_task_id()
 
     task_id = f"task_{secrets.token_hex(6)}"
     now = _dt.datetime.now().isoformat()

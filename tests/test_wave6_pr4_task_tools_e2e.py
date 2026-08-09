@@ -45,6 +45,11 @@ def _seed_unassigned_task(title: str = "needs an owner") -> str:
     repeated here so this file is self-contained.
     """
     from agent_mcp.db.connection import get_db_connection
+    from tests.conftest import existing_root_task_id
+
+    # R15-BL-1: chain under the single root (first seed = root, rest are
+    # children); claim/assign flows key on assigned_to, not parentage.
+    parent = existing_root_task_id()
 
     task_id = f"task_{secrets.token_hex(6)}"
     now = _dt.datetime.now().isoformat()
@@ -53,8 +58,8 @@ def _seed_unassigned_task(title: str = "needs an owner") -> str:
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO tasks (task_id, title, description, status, priority, "
-        "assigned_to, created_by, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "assigned_to, created_by, created_at, updated_at, parent_task) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             title,
@@ -65,6 +70,7 @@ def _seed_unassigned_task(title: str = "needs an owner") -> str:
             "admin",
             now,
             now,
+            parent,
         ),
     )
     conn.commit()
@@ -73,10 +79,15 @@ def _seed_unassigned_task(title: str = "needs an owner") -> str:
 
 
 def _seed_assigned_task(
-    title: str, assigned_to: str, parent: str | None = None,
+    title: str, assigned_to: str, parent: str | None = "__auto__",
 ) -> str:
     from agent_mcp.core import globals as g
     from agent_mcp.db.connection import get_db_connection
+    from tests.conftest import existing_root_task_id
+
+    # R15-BL-1: default chains under the single root; explicit parent= wins.
+    if parent == "__auto__":
+        parent = existing_root_task_id()
 
     task_id = f"task_{secrets.token_hex(6)}"
     now = _dt.datetime.now().isoformat()

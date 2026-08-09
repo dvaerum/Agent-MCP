@@ -67,17 +67,26 @@ async def test_unassigned_task_ids_dont_collide_same_millisecond(
     distinct ids regardless of the caller's clock.
     """
     from agent_mcp.tools.task_tools import _create_unassigned_tasks
+    from tests.conftest import ensure_seed_root
 
     async with mcp_session(tmp_path):
+        # R15-BL-1: both creates are children of one dedicated root
+        # (parentless roots collide under the single-root invariant). The
+        # Ok message lists only the created task's own id, so the
+        # disjoint-id assertion below is unaffected.
+        root = ensure_seed_root()
+
         monkeypatch.setattr(
             "agent_mcp.tools.task_tools.datetime.datetime", _FrozenDateTime,
         )
 
         result_1 = await _create_unassigned_tasks(
-            {"task_title": "first frozen-instant task", "task_description": "d1"}
+            {"task_title": "first frozen-instant task", "task_description": "d1",
+             "parent_task_id": root}
         )
         result_2 = await _create_unassigned_tasks(
-            {"task_title": "second frozen-instant task", "task_description": "d2"}
+            {"task_title": "second frozen-instant task", "task_description": "d2",
+             "parent_task_id": root}
         )
 
         assert isinstance(result_1, Ok), result_1
@@ -101,9 +110,14 @@ async def test_multi_create_ids_dont_collide_same_millisecond(
     must not collide on the ``i=0`` (or any) row.
     """
     from agent_mcp.tools.task_tools import _create_and_assign_multiple_tasks
+    from tests.conftest import ensure_seed_root
 
     async with mcp_session(tmp_path) as admin:
         alice = await admin.create_worker("alice")
+
+        # R15-BL-1: both batch tasks parent under one dedicated root
+        # (parentless roots collide under the single-root invariant).
+        root = ensure_seed_root()
 
         monkeypatch.setattr(
             "agent_mcp.tools.task_tools.datetime.datetime", _FrozenDateTime,
@@ -112,7 +126,7 @@ async def test_multi_create_ids_dont_collide_same_millisecond(
         result_1 = await _create_and_assign_multiple_tasks(
             {},
             alice.agent_id,
-            [{"title": "batch A #1", "description": "d"}],
+            [{"title": "batch A #1", "description": "d", "parent_task_id": root}],
             False,
             False,
             "",
@@ -120,7 +134,7 @@ async def test_multi_create_ids_dont_collide_same_millisecond(
         result_2 = await _create_and_assign_multiple_tasks(
             {},
             alice.agent_id,
-            [{"title": "batch B #1", "description": "d"}],
+            [{"title": "batch B #1", "description": "d", "parent_task_id": root}],
             False,
             False,
             "",

@@ -91,6 +91,13 @@ def _insert_task(
         notes_json = json.dumps(
             [{"timestamp": now, "author": notes_author, "content": "n"}]
         )
+    from tests.conftest import existing_root_task_id
+
+    # R15-BL-1: chain under the single root (first seed = root, rest are
+    # children). Purge tombstones created_by / NULLs assigned_to — it does
+    # not cascade by hierarchy, so parentage is inert here.
+    parent = existing_root_task_id()
+
     resolved_status = status or ("pending" if assigned_to else "unassigned")
     conn = get_db_connection()
     try:
@@ -99,9 +106,9 @@ def _insert_task(
             "INSERT INTO tasks (task_id, title, description, assigned_to, "
             "created_by, status, priority, created_at, updated_at, "
             "parent_task, child_tasks, depends_on_tasks, notes) "
-            "VALUES (?, ?, '', ?, ?, ?, 'medium', ?, ?, NULL, '[]', '[]', ?)",
+            "VALUES (?, ?, '', ?, ?, ?, 'medium', ?, ?, ?, '[]', '[]', ?)",
             (task_id, title, assigned_to, created_by, resolved_status,
-             now, now, notes_json),
+             now, now, parent, notes_json),
         )
         conn.commit()
     finally:

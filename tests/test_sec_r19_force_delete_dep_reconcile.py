@@ -36,12 +36,21 @@ def _seed_task(
     title: str = "seeded task",
     status: str = "pending",
     assigned_to: str | None = None,
-    parent_task: str | None = None,
+    parent_task: str | None = "__auto__",
     child_tasks: list | None = None,
     depends_on_tasks: list | None = None,
 ) -> str:
     """Insert a task row directly. Returns the task_id."""
     from agent_mcp.db.connection import get_db_connection
+    from tests.conftest import ensure_seed_root
+
+    # R15-BL-1: this suite needs INDEPENDENT subtrees (an "outside" task
+    # must survive another subtree's cascade delete). Under the
+    # single-root invariant those become SIBLINGS under one dedicated
+    # hidden root — so the default parent is that root, never a
+    # to-be-deleted seed. An explicit parent_task= is honored.
+    if parent_task == "__auto__":
+        parent_task = ensure_seed_root()
 
     task_id = f"task_{secrets.token_hex(6)}"
     now = _dt.datetime.now().isoformat()

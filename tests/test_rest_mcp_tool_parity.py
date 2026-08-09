@@ -116,6 +116,13 @@ async def test_terminate_agent_rest_404_unknown(tmp_path) -> None:
 def _seed_task(conn_factory, task_id: str, title: str, created_by: str) -> None:
     """Insert a minimal valid task row directly so the test isn't
     coupled to any REST/MCP creation path."""
+    from tests.conftest import ensure_seed_root
+
+    # R15-BL-1: both seeds are independent SIBLINGS under one dedicated
+    # hidden root, so deleting one never cascades into the other and no
+    # parentless-root collision occurs.
+    parent = ensure_seed_root()
+
     now = _dt.datetime.now().isoformat()
     conn = conn_factory()
     try:
@@ -131,7 +138,7 @@ def _seed_task(conn_factory, task_id: str, title: str, created_by: str) -> None:
             (
                 task_id, title, "seed", None, created_by,
                 "pending", "medium", now, now,
-                None, "[]", "[]", "[]",
+                parent, "[]", "[]", "[]",
             ),
         )
         conn.commit()
