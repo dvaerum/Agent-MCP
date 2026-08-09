@@ -311,4 +311,7 @@ async def test_worker_cannot_update_another_agents_schedule(tmp_path):
             {"directive_id": did, "enabled": False},
             principal=alice._principal(),
         )
-        assert isinstance(r, PermissionDenied), r
+        # R17-F2: a non-owner worker must not be able to tell "exists but
+        # forbidden" apart from "missing" — collapsed to opaque NotFound.
+        assert isinstance(r, NotFound), r
+        assert not isinstance(r, PermissionDenied), r
