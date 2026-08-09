@@ -79,6 +79,18 @@ Environment:
                         SSH into the VM with:
                             ssh root@localhost -p \${SSH_PORT}
                         (DEV-MODE: root + empty password — loopback only.)
+  AGENT_MCP_VM_DEV_PRELOAD
+                        Name(s) of preload fixture bundle(s) to restore
+                        into /var/lib/agent-mcp before the router starts,
+                        so the VM comes up with projects/agents/tasks
+                        already present instead of an empty first-boot
+                        state. Comma-separate to stack several bundles.
+                        Bundles live in nix/vm-dev/fixtures/<name>.tar.zst
+                        (capture new ones with
+                        \`nix run .#capture-vm-dev-fixture\`). Passed to
+                        the guest via the kernel cmdline (no rebuild).
+                        Only applied on a FRESH disk — see the in-guest
+                        agent-mcp-vm-dev-preload.service. Default: none.
 
 Flags:
   --ephemeral           Use a tmpdir for VM state; nothing survives.
@@ -128,6 +140,26 @@ fi
 if (( ssh_port == host_port )); then
   echo "agent-mcp-vm-dev: AGENT_MCP_VM_DEV_SSH_PORT and AGENT_MCP_VM_DEV_HOST_PORT must differ (both = $ssh_port)" >&2
   exit 2
+fi
+
+# ── Preload fixture selection (runtime, no rebuild) ────────────────
+# AGENT_MCP_VM_DEV_PRELOAD names one or more fixture bundles baked into
+# the VM image (nix/vm-dev/fixtures/<name>.tar.zst → /etc/agent-mcp-vm-dev/
+# fixtures/ in the guest). We hand the selection to the guest on the
+# kernel command line: the NixOS qemu-vm run-script appends
+# $QEMU_KERNEL_PARAMS to -append, and the in-guest
+# agent-mcp-vm-dev-preload.service reads the token from /proc/cmdline.
+# This keeps bundle selection a pure runtime concern (same rationale as
+# the hostfwd port sentinels above) — no VM rebuild to switch datasets.
+preload="${AGENT_MCP_VM_DEV_PRELOAD:-}"
+if [[ -n "$preload" ]]; then
+  # Restrict to a safe token: bundle names are [A-Za-z0-9._-], comma-
+  # separated. Anything else could smuggle extra kernel params.
+  if ! [[ "$preload" =~ ^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$ ]]; then
+    echo "agent-mcp-vm-dev: AGENT_MCP_VM_DEV_PRELOAD must be comma-separated bundle names [A-Za-z0-9._-] (got '$preload')" >&2
+    exit 2
+  fi
+  export QEMU_KERNEL_PARAMS="${QEMU_KERNEL_PARAMS:+$QEMU_KERNEL_PARAMS }agent_mcp_preload=${preload}"
 fi
 
 cleanup=""
@@ -209,6 +241,7 @@ agent-mcp-vm-dev:                  embeddings 127.0.0.1:11434  (guest: 10.0.2.2)
 agent-mcp-vm-dev:                start them before booting — the guest's
 agent-mcp-vm-dev:                agent-mcp-llm-endpoint-check.service refuses
 agent-mcp-vm-dev:                to let the backend run against dead endpoints.
+agent-mcp-vm-dev: preload       ${preload:-none}$( [[ -n "$preload" ]] && echo "  (restored into /var/lib/agent-mcp on a fresh disk)" )
 agent-mcp-vm-dev: state dir      ${state_dir}
 agent-mcp-vm-dev: host port      ${host_port}$( [[ "$host_port" != "$DEFAULT_HOST_PORT" ]] && echo " (override via AGENT_MCP_VM_DEV_HOST_PORT)" )
 agent-mcp-vm-dev: ssh port       ${ssh_port}$( [[ "$ssh_port" != "$DEFAULT_SSH_PORT" ]] && echo " (override via AGENT_MCP_VM_DEV_SSH_PORT)" )

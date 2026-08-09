@@ -57,6 +57,37 @@
 # from the regular multi-tenant module. We import vm.nix directly and
 # patch the divergent attrs via lib.mkForce.
 
+let
+  # ── Preload fixtures (dev-only test-data seeding) ─────────────────
+  # Auto-discover every nix/vm-dev/fixtures/<name>.tar.zst and bake it
+  # into the image at /etc/agent-mcp-vm-dev/fixtures/. Each is a raw tar
+  # of the agent-mcp state-dir subtree captured from a seeded VM
+  # (`nix run .#capture-vm-dev-fixture`); the in-guest
+  # agent-mcp-vm-dev-preload.service restores the one(s) named by
+  # AGENT_MCP_VM_DEV_PRELOAD (via the kernel cmdline) on a fresh disk.
+  # readDir-based so an empty/absent fixtures dir is a clean no-op — the
+  # feature adds nothing to the image until a fixture is captured.
+  fixturesDir = ./vm-dev/fixtures;
+  fixtureEntries =
+    if builtins.pathExists fixturesDir
+    then lib.filterAttrs
+      (n: t: t == "regular" && lib.hasSuffix ".tar.zst" n)
+      (builtins.readDir fixturesDir)
+    else { };
+  etcFixtures = lib.mapAttrs'
+    (name: _: lib.nameValuePair
+      "agent-mcp-vm-dev/fixtures/${name}"
+      { source = fixturesDir + "/${name}"; })
+    fixtureEntries;
+
+  # writeShellApplication (shellcheck + PATH inputs) per repo idiom; the
+  # script body lives in a real file next to this module.
+  preloadScript = pkgs.writeShellApplication {
+    name = "agent-mcp-vm-dev-preload";
+    runtimeInputs = [ pkgs.gnutar pkgs.zstd pkgs.coreutils ];
+    text = builtins.readFile ./vm-dev-preload.sh;
+  };
+in
 {
   imports = [
     (import ./vm.nix {
@@ -214,4 +245,46 @@
   # above) creates projects + agents through the dashboard UI, which
   # is the same path a real user takes. verify-all drives that same
   # UI via Firefox-MCP, so we don't need a back-door seed.
+  #
+  # PRELOAD (opt-in, orthogonal to the above): a developer who WANTS a
+  # pre-populated sandbox can restore a captured DB fixture instead of
+  # re-walking the create-project/register-agent UI every run. That is
+  # the agent-mcp-vm-dev-preload.service below — a file-level restore of
+  # the SQLite state dir, which needs no session cookie (the reason the
+  # legacy HTTP seed couldn't work) and no LLM endpoint (unlike a
+  # boot-time API seeder). Off by default; enabled per-launch via
+  # AGENT_MCP_VM_DEV_PRELOAD.
+
+  # Bake every captured fixture into the image (no-op when none exist).
+  environment.etc = etcFixtures;
+
+  # ── Preload restore unit ──────────────────────────────────────────
+  # Runs ONLY when the kernel cmdline carries `agent_mcp_preload=…`
+  # (set by nix/run-vm-dev.sh from $AGENT_MCP_VM_DEV_PRELOAD), AFTER
+  # systemd-tmpfiles created ${stateDir}, and BEFORE the router (and
+  # therefore before any lazily-spawned agent-mcp@ backend reads a
+  # project DB). Not a `requires=` of the router: a missing-bundle
+  # failure should be loud (red unit + console) without bricking the
+  # VM — the dev still gets an empty-state sandbox to work in.
+  systemd.services.agent-mcp-vm-dev-preload = {
+    description = "Restore a preload DB fixture into the agent-mcp state dir (vm-dev, fresh disk only)";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "systemd-tmpfiles-setup.service" "local-fs.target" ];
+    before = [ "agent-mcp-router.service" ];
+    # Only fire when a preload was actually requested. Matches both the
+    # bare word and `word=value` forms of the cmdline option.
+    unitConfig.ConditionKernelCommandLine = "agent_mcp_preload";
+    environment = {
+      AGENT_MCP_STATE_DIR = config.services.agent-mcp.stateDir;
+      AGENT_MCP_FIXTURES_DIR = "/etc/agent-mcp-vm-dev/fixtures";
+    };
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+      # Root so tar --same-owner restores the archived agent-mcp uid.
+      ExecStart = "${preloadScript}/bin/agent-mcp-vm-dev-preload";
+      StandardOutput = "journal+console";
+      StandardError = "journal+console";
+    };
+  };
 }
