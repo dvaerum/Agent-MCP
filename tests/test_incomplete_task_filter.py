@@ -40,7 +40,6 @@ def _seed_task(
     listing sees it."""
     from agent_mcp.core import globals as g
     from agent_mcp.db.connection import get_db_connection
-
     from tests.conftest import ensure_seed_root
 
     # R15-BL-1: chain every seed under a dedicated hidden root so the

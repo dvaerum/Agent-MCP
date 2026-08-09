@@ -48,7 +48,6 @@ def _seed_assigned_task(
     the in-memory cache. Mirrors the R16 bulk-ops SEC tests."""
     from agent_mcp.core import globals as g
     from agent_mcp.db.connection import get_db_connection
-
     from tests.conftest import existing_root_task_id
 
     # R15-BL-1: chain under the single root (first seed = root, rest are

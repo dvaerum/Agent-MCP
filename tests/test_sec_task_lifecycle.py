@@ -49,7 +49,6 @@ def _seed_task(
     created_by: str = "admin",
 ) -> str:
     from agent_mcp.db.connection import get_db_connection
-
     from tests.conftest import existing_root_task_id
 
     # R15-BL-1: default chains under the single root (first seed = root,

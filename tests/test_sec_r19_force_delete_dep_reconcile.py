@@ -42,7 +42,6 @@ def _seed_task(
 ) -> str:
     """Insert a task row directly. Returns the task_id."""
     from agent_mcp.db.connection import get_db_connection
-
     from tests.conftest import ensure_seed_root
 
     # R15-BL-1: this suite needs INDEPENDENT subtrees (an "outside" task

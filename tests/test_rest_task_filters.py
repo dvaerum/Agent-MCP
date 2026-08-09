@@ -41,7 +41,6 @@ def _seed_task(
 ) -> None:
     """Insert a task row directly with varied assignment/creator/status."""
     from agent_mcp.db.connection import get_db_connection
-
     from tests.conftest import existing_root_task_id
 
     # R15-BL-1: chain under the single root (first seed = root, rest are

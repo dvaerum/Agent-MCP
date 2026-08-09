@@ -40,7 +40,6 @@ def _seed_task(
 ) -> str:
     """Insert a task row directly. Returns the task_id."""
     from agent_mcp.db.connection import get_db_connection
-
     from tests.conftest import existing_root_task_id
 
     task_id = f"task_{secrets.token_hex(6)}"

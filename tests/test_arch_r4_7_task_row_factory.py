@@ -67,7 +67,6 @@ async def test_unassigned_task_ids_dont_collide_same_millisecond(
     distinct ids regardless of the caller's clock.
     """
     from agent_mcp.tools.task_tools import _create_unassigned_tasks
-
     from tests.conftest import ensure_seed_root
 
     async with mcp_session(tmp_path):
@@ -111,7 +110,6 @@ async def test_multi_create_ids_dont_collide_same_millisecond(
     must not collide on the ``i=0`` (or any) row.
     """
     from agent_mcp.tools.task_tools import _create_and_assign_multiple_tasks
-
     from tests.conftest import ensure_seed_root
 
     async with mcp_session(tmp_path) as admin:

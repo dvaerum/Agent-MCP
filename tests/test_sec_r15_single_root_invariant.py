@@ -62,7 +62,7 @@ async def _create_task(admin, title: str, parent: str | None = None):
     if not is_error and result:
         try:
             task_id = _json.loads(result[-1].text)["task_id"]
-        except Exception:
+        except (KeyError, IndexError, ValueError, AttributeError):
             task_id = None
     return task_id, is_error
 
@@ -99,8 +99,8 @@ async def test_create_task_rejects_serial_third_root(tmp_path) -> None:
     """
     async with mcp_session(tmp_path) as admin:
         t1, e1 = await _create_task(admin, "root #1")
-        t2, e2 = await _create_task(admin, "root #2")
-        t3, e3 = await _create_task(admin, "root #3")
+        _t2, e2 = await _create_task(admin, "root #2")
+        _t3, e3 = await _create_task(admin, "root #3")
 
         assert not e1 and t1, "first root should succeed"
         assert e2, "SECOND serial root should be rejected"

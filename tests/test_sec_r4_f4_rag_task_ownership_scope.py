@@ -87,7 +87,6 @@ def _seed_task(
     *, task_id: str, title: str, description: str, assigned_to: str
 ) -> None:
     from agent_mcp.db.connection import get_db_connection
-
     from tests.conftest import existing_root_task_id
 
     # R15-BL-1: chain under the single root (first seed = root, rest are
@@ -181,7 +180,6 @@ async def test_live_task_stage_excludes_unassigned_for_worker(
         # Unassigned task — NULL owner. view_tasks' exact-match filter
         # drops it for a worker; the RAG scope must match.
         from agent_mcp.db.connection import get_db_connection
-
         from tests.conftest import existing_root_task_id
 
         # R15-BL-1: a worker-owned task was already seeded above as the

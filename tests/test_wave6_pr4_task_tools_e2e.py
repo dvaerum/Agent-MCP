@@ -45,7 +45,6 @@ def _seed_unassigned_task(title: str = "needs an owner") -> str:
     repeated here so this file is self-contained.
     """
     from agent_mcp.db.connection import get_db_connection
-
     from tests.conftest import existing_root_task_id
 
     # R15-BL-1: chain under the single root (first seed = root, rest are
@@ -84,7 +83,6 @@ def _seed_assigned_task(
 ) -> str:
     from agent_mcp.core import globals as g
     from agent_mcp.db.connection import get_db_connection
-
     from tests.conftest import existing_root_task_id
 
     # R15-BL-1: default chains under the single root; explicit parent= wins.

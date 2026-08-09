@@ -63,7 +63,6 @@ def _insert_task(
 ) -> None:
     from agent_mcp.db.engine import get_session
     from agent_mcp.db.models import Task
-
     from tests.conftest import existing_root_task_id
 
     # R15-BL-1: chain under the single root (first seed = root, rest are

@@ -54,7 +54,6 @@ def _seed_unassigned_task(
     ``_collect_unassigned_task_events_for`` surfaces every unassigned
     task to every agent (capability-tag routing retired in PR5)."""
     from agent_mcp.db.connection import get_db_connection
-
     from tests.conftest import existing_root_task_id
 
     # R15-BL-1: chain under the single root (first seed = root, rest are
