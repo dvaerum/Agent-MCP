@@ -297,6 +297,134 @@ async def test_concurrent_sse_capped_per_agent(
             r.close()
 
 
+# ── R14-F2: operator dashboard SSE (/api/<project>/events) cap ──────
+#
+# The streaming concurrency cap was gated ONLY on ``/mcp`` +
+# ``/api/delivery/stream``. The operator dashboard SSE
+# ``/api/<project>/events`` (→ backend ``/api/events``) was NOT in that
+# set, so it was ALWAYS admitted: it held no cap slot at all. Any
+# operator (viewer tier included) could open unbounded concurrent
+# event streams. These tests pin the fix — ``/api/events`` gets the same
+# admission control + slot accounting as ``/mcp`` — and guard the happy
+# path (a single stream still works and frees its slot on close).
+
+
+async def _register_active_streaming_backend(
+    name, router_module, router_env, systemctl_stub, register_project,
+    heartbeat_sec=None,
+):
+    """Register ``name`` via ``register_project`` (grants the sentinel
+    operator membership so the cookie-authed events path clears the
+    membership gate), start an infinite-SSE backend on its UDS, and mark
+    its unit active. Returns ``(backend, runner)``."""
+    register_project(name)
+    sock = router_env.sock_dir / name / "backend.sock"
+    backend = _StreamingBackend(heartbeat_sec=heartbeat_sec)
+    runner = await _start_backend_on_uds(backend, sock)
+    systemctl_stub.active_units.add(f"agent-mcp@{name}.service")
+    return backend, runner
+
+
+async def test_operator_events_sse_capped(
+    aiohttp_client, router_app, router_module, router_env,
+    systemctl_stub, register_project, monkeypatch,
+) -> None:
+    """More than the concurrency cap of concurrent ``/api/<project>/events``
+    operator streams → the over-limit one is rejected with a clean 429.
+
+    Pre-fix ``/api/events`` is NOT in the router's ``is_stream_request``
+    set, so it holds NO cap slot: every stream is admitted,
+    ``_streaming_proxies_global`` stays 0, and the over-limit request
+    returns 200 — this test fails (RED). The fix adds ``/api/events`` to
+    the stream set so it gets the same slot-accounted admission as
+    ``/mcp``.
+    """
+    _po = router_module._po
+    monkeypatch.setattr(_po, "MAX_STREAMS_PER_AGENT", 2)
+    _backend, runner = await _register_active_streaming_backend(
+        "proj", router_module, router_env, systemctl_stub, register_project,
+    )
+    # Auto-logged-in sentinel operator (cookie), member of proj.
+    client = await aiohttp_client(router_app)
+    held = []
+
+    async def _open_events():
+        r = await asyncio.wait_for(
+            client.get(
+                "/agent-mcp/api/proj/events",
+                headers={"Accept": "text/event-stream"},
+            ),
+            timeout=4.0,
+        )
+        await asyncio.wait_for(r.content.readuntil(b"\n\n"), timeout=4.0)
+        return r
+
+    try:
+        held.append(await _open_events())
+        held.append(await _open_events())
+        # Both admitted and holding a concurrency slot like /mcp does.
+        assert _po._streaming_proxies_global == 2, (
+            "operator events streams must hold a concurrency slot"
+        )
+        # The third must be rejected cleanly, not admitted nor hang.
+        rejected = await asyncio.wait_for(
+            client.get(
+                "/agent-mcp/api/proj/events",
+                headers={"Accept": "text/event-stream"},
+            ),
+            timeout=4.0,
+        )
+        assert rejected.status == 429
+        rejected.close()
+        assert _po._streaming_proxies_global == 2
+    finally:
+        for r in held:
+            r.close()
+        await runner.cleanup()
+
+
+async def test_operator_events_happy_path_frees_slot(
+    aiohttp_client, router_app, router_module, router_env,
+    systemctl_stub, register_project,
+) -> None:
+    """A single operator events stream works end-to-end AND frees its
+    slot + ``active_conns`` on close, so the idle reaper still fires.
+    Regression guard for the F2 fix (must not break the happy path)."""
+    _po = router_module._po
+    _backend, runner = await _register_active_streaming_backend(
+        "proj", router_module, router_env, systemctl_stub, register_project,
+    )
+    client = await aiohttp_client(router_app)
+    try:
+        resp = await asyncio.wait_for(
+            client.get(
+                "/agent-mcp/api/proj/events",
+                headers={"Accept": "text/event-stream"},
+            ),
+            timeout=4.0,
+        )
+        assert resp.status == 200
+        assert resp.content_type == "text/event-stream"
+        frame = await asyncio.wait_for(
+            resp.content.readuntil(b"\n\n"), timeout=4.0,
+        )
+        assert frame == b"data: frame-1\n\n"
+        assert _po.active_conns["proj"] == 1
+
+        # Client goes away → slot + active_conns return to 0 so the idle
+        # reaper can stop the backend.
+        resp.close()
+        assert await _poll_until(lambda: _po.active_conns["proj"] == 0), (
+            "active_conns did not return to 0 after the operator events "
+            "stream closed — the idle reaper stays pinned"
+        )
+        assert await _poll_until(
+            lambda: _po._streaming_proxies_global == 0
+        ), "streaming slot leaked after the operator events stream closed"
+    finally:
+        await runner.cleanup()
+
+
 # ── R9-F3: teardown on FIN/RST must NOT wait for the next write ──────
 #
 # The aiohttp *TestClient* used above does not surface ``resp.close()``

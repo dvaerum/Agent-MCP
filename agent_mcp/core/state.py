@@ -323,6 +323,19 @@ def register_waiter(agent_id: str) -> asyncio.Queue:
 
     The waiter MUST call :func:`unregister_waiter` on exit (timeout OR
     event drained) to avoid leaking queues.
+
+    Intentionally UNBOUNDED (unlike the delivery/operator SSE fan-out
+    queues, which cap+drop): this queue is a short-lived wake channel for
+    ONE ``wait_for_events`` long-poll cycle, not a durable stream. The
+    waiter parks on ``queue.get()`` and returns on the first item, then
+    unregisters — so the accumulation window is a single poll iteration.
+    The producers (``notify_waiters``/``dispatch_synthetic_event``) push
+    tiny wake-edges gated by real DB mutations, and ``supersede_prior_
+    waiters`` evicts stale concurrent waiters (newest-wins), so the depth
+    is self-limiting. Capping with drop-on-full would be a REGRESSION
+    here: a dropped wake-edge would stall the long-poll until its timeout
+    (a lost notification), the opposite of the SSE case where a dropped
+    hint is reconciled by the client's reconnect refetch (R14 class-sweep).
     """
     queue: asyncio.Queue = asyncio.Queue()
     waiters = agent_event_waiters.get(agent_id)
