@@ -16,6 +16,7 @@ from starlette.middleware.cors import CORSMiddleware
 # MCP Server specific imports
 from mcp.server.lowlevel import Server as MCPLowLevelServer
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.shared.exceptions import McpError
 import mcp.types as mcp_types
 
 # Project-specific imports
@@ -612,6 +613,34 @@ async def mcp_list_prompts_handler() -> List[mcp_types.Prompt]:
     return prompts
 
 
+class _PromptValueError(McpError, ValueError):
+    """A ``prompts/get`` param failure that carries a spec-valid
+    JSON-RPC ``code``.
+
+    FLAG-R17-1: the MCP SDK dispatcher only preserves an error ``code``
+    when the handler raises an :class:`McpError`; a bare ``ValueError``
+    falls into its catch-all and is emitted as ``code: 0`` — not a valid
+    JSON-RPC error code. Subclassing :class:`McpError` routes this
+    through the dispatcher's ``except McpError`` branch. The
+    :class:`ValueError` base keeps the pre-existing
+    ``raise ValueError`` / ``except ValueError`` contract intact.
+    """
+
+    def __init__(self, message: str, *, code: int) -> None:
+        super().__init__(mcp_types.ErrorData(code=code, message=message, data=None))
+
+
+class _PromptPermissionError(McpError, PermissionError):
+    """Same as :class:`_PromptValueError` for authorization failures —
+    stays ``isinstance(..., PermissionError)`` so existing
+    ``except PermissionError`` sites (and tests) keep working, while the
+    SDK emits a proper JSON-RPC ``code`` instead of ``code: 0``.
+    """
+
+    def __init__(self, message: str, *, code: int) -> None:
+        super().__init__(mcp_types.ErrorData(code=code, message=message, data=None))
+
+
 @mcp_app_instance.get_prompt()
 async def mcp_get_prompt_handler(
     name: str, arguments: Optional[dict] = None
@@ -631,10 +660,22 @@ async def mcp_get_prompt_handler(
     role = _principal_role()
     entry = prompt_registry.get(name)
     if entry is None:
-        raise ValueError(f"Unknown prompt: {name}")
-    # `render()` enforces visibility; PermissionError propagates as a
-    # JSON-RPC error via the framework wrapper.
-    rendered = prompt_registry.render(name, arguments or {}, role=role)
+        # Unknown prompt name → -32602 Invalid params (a ValueError-
+        # compatible McpError so the code reaches the wire; see
+        # _PromptValueError).
+        raise _PromptValueError(
+            f"Unknown prompt: {name}", code=mcp_types.INVALID_PARAMS
+        )
+    # `render()` enforces visibility; a PermissionError is re-raised as a
+    # code-carrying McpError (-32603) so the SDK emits a spec-valid
+    # JSON-RPC error code instead of the catch-all `code: 0`, while the
+    # PermissionError base preserves the existing exception contract.
+    try:
+        rendered = prompt_registry.render(name, arguments or {}, role=role)
+    except PermissionError as err:
+        raise _PromptPermissionError(
+            str(err), code=mcp_types.INTERNAL_ERROR
+        ) from err
     return mcp_types.GetPromptResult(
         description=entry.meta.description,
         messages=[

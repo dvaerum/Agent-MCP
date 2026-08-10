@@ -22,8 +22,6 @@ FINDING 2 [LOW-MED] — 413 oracle
 
 from __future__ import annotations
 
-import time
-
 import pytest
 import pytest_asyncio
 from aiohttp import web
@@ -80,46 +78,104 @@ _SMALL = b'{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
 # ── FINDING 1: timing floor ─────────────────────────────────────────
 
 
-async def test_preauth_401_timing_floor_known_vs_unknown(
+async def test_preauth_401_known_and_unknown_both_routed_through_floor(
     aiohttp_client, router_app, router_module, known_401_backend, monkeypatch,
 ) -> None:
-    """A junk-bearer POST to a KNOWN project (backend round-trip) and to
-    an UNKNOWN project (in-process) must both return no earlier than the
-    pre-auth timing floor — otherwise the latency delta enumerates valid
-    project names.
+    """SEC5 timing-oracle closure, asserted by BEHAVIOUR — not by a
+    measured wall-clock threshold.
 
-    Pre-fix: unknown returns in ~ms and known in ~14 ms, both well under
-    the floor, so both floor assertions fail (RED).
+    The invariant: a junk-bearer POST to a KNOWN project (which pays a
+    full backend UDS round-trip before its 401) and to an UNKNOWN
+    project (which 401s in-process) must BOTH funnel their 401 through
+    the single ``_floored_unauthorized`` gate. That shared gate —
+    anchored at handler-entry ``t0`` — is what makes the two paths
+    timing-indistinguishable; if the KNOWN path ever returned the
+    backend's raw 401 without the floor (or the UNKNOWN path skipped
+    it), the latency delta would re-open project-name enumeration.
+
+    R16-1: the previous form asserted ``abs(known - unknown) < 0.15`` on
+    measured wall-clock, which jittered under ``pytest -n auto`` (the
+    delta is scheduling noise, not the round-trip). Spying the shared
+    gate proves the same invariant deterministically, and still goes RED
+    if either path stops flooring.
     """
+    calls: list[float] = []
+    original = router_module._floored_unauthorized
+
+    async def _spy(t0: float):
+        calls.append(t0)
+        return await original(t0)
+
+    # Floor value is irrelevant to a call-based assertion; zero it so the
+    # test does no real sleeping.
     monkeypatch.setattr(
-        router_module, "_PREAUTH_401_FLOOR_SEC", 0.3, raising=False,
+        router_module, "_PREAUTH_401_FLOOR_SEC", 0.0, raising=False,
     )
+    monkeypatch.setattr(router_module, "_floored_unauthorized", _spy)
     client = await aiohttp_client(router_app)
 
-    t = time.monotonic()
     r_known = await client.post(
         "/agent-mcp/mcp/known-proj", data=_SMALL, headers=_JUNK,
         allow_redirects=False,
     )
-    known = time.monotonic() - t
-
-    t = time.monotonic()
+    known_calls = len(calls)
     r_unknown = await client.post(
         "/agent-mcp/mcp/does-not-exist", data=_SMALL, headers=_JUNK,
         allow_redirects=False,
     )
-    unknown = time.monotonic() - t
 
     assert r_known.status == 401, await r_known.text()
     assert r_unknown.status == 401, await r_unknown.text()
-    # Both must clear the floor (allow small scheduling slack).
-    assert known >= 0.25, f"known 401 returned in {known:.3f}s (< floor)"
-    assert unknown >= 0.25, f"unknown 401 returned in {unknown:.3f}s (< floor)"
-    # And the two must be timing-indistinguishable (delta dominated by
-    # the shared floor, not the backend round-trip).
-    assert abs(known - unknown) < 0.15, (
-        f"timing oracle: known={known:.3f}s unknown={unknown:.3f}s "
-        f"delta={abs(known - unknown):.3f}s"
+    # KNOWN path (backend round-trip) floored its 401 …
+    assert known_calls == 1, (
+        "known-project junk bearer did not route its 401 through the "
+        "timing floor — the backend round-trip latency stays observable"
+    )
+    # … and UNKNOWN path (in-process) floored its 401 too.
+    assert len(calls) == 2, (
+        "unknown-project junk bearer did not route its 401 through the "
+        "timing floor"
+    )
+
+
+async def test_floored_unauthorized_absorbs_elapsed_since_t0(
+    router_module, monkeypatch,
+) -> None:
+    """The floor ABSORBS (rather than adds to) time already spent since
+    handler entry: ``_floored_unauthorized`` sleeps only for the
+    REMAINDER of ``_PREAUTH_401_FLOOR_SEC`` measured from ``t0``.
+
+    This is *why* a KNOWN project's backend round-trip is hidden inside
+    the fixed window instead of stacking on top of it — the mechanism
+    that makes known vs unknown timing-indistinguishable. Asserted on
+    the computed sleep argument (deterministic), never on measured
+    wall-clock, so it can't jitter under ``-n auto``; it still goes RED
+    if the floor stops anchoring at ``t0``.
+    """
+    slept: list[float] = []
+
+    async def _fake_sleep(secs: float) -> None:
+        slept.append(secs)
+
+    monkeypatch.setattr(
+        router_module, "_PREAUTH_401_FLOOR_SEC", 10.0, raising=False,
+    )
+    monkeypatch.setattr(router_module.asyncio, "sleep", _fake_sleep)
+
+    now = router_module.time.monotonic()
+    # t0 == "handler entry just now" → sleep ≈ the full floor.
+    await router_module._floored_unauthorized(now)
+    # t0 that already spent ~4 s (e.g. a slow backend round-trip) →
+    # sleep ≈ floor − 4 s. The round-trip is absorbed, not added.
+    await router_module._floored_unauthorized(now - 4.0)
+
+    assert len(slept) == 2, "floor did not compute a remaining sleep"
+    fresh, after_roundtrip = slept[0], slept[1]
+    assert 9.5 <= fresh <= 10.0, fresh
+    assert 5.5 <= after_roundtrip <= 6.0, after_roundtrip
+    assert after_roundtrip < fresh - 3.0, (
+        "floor did not absorb elapsed-since-t0 — a backend round-trip "
+        "would stack on top of the floor and re-open the timing oracle"
     )
 
 
