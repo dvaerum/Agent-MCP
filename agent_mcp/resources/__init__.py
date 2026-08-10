@@ -44,11 +44,36 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
+from mcp.shared.exceptions import McpError
+from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ErrorData
+
 from ..core.auth import get_agent_id
 from ..core.registry import Registry, RegistryEntry
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..core.principal import Principal
+
+
+class ResourceReadError(McpError, ValueError):
+    """A ``resources/read`` failure that carries a spec-valid JSON-RPC
+    ``code``.
+
+    FLAG-R17-1: the MCP SDK dispatcher (``mcp.server.lowlevel.server``)
+    only preserves an error ``code`` when the handler raises an
+    :class:`McpError`; a bare ``ValueError``/``PermissionError`` falls
+    into its catch-all and is emitted as ``code: 0`` — not a valid
+    JSON-RPC error code. Subclassing :class:`McpError` routes this
+    through the dispatcher's ``except McpError`` branch so the intended
+    ``code`` reaches the wire.
+
+    It ALSO subclasses :class:`ValueError` so the pre-existing
+    ``raise ValueError`` / ``except ValueError`` contract of this module
+    (and the in-process callers/tests that depend on it) keeps working
+    unchanged — ``code`` is purely additive.
+    """
+
+    def __init__(self, message: str, *, code: int = INVALID_PARAMS) -> None:
+        super().__init__(ErrorData(code=code, message=message, data=None))
 
 # Two URI prefixes scoped per-agent.
 INBOX_URI_PREFIX = "agent-mcp://inbox/"
@@ -100,13 +125,16 @@ class ResourceRegistry(Registry[ResourceReader]):
         """Resolve agent_id from the URI + bearer, then invoke the
         matching reader.
 
-        Raises ValueError on auth mismatch, unknown URI, or absent
-        bearer — the MCP framework surfaces the message verbatim
-        as a JSON-RPC error.
+        Raises :class:`ResourceReadError` (a ``ValueError`` subclass
+        carrying a JSON-RPC ``code``) on auth mismatch, unknown URI, or
+        absent bearer — the MCP framework surfaces the message verbatim
+        as a JSON-RPC error with that ``code``.
         """
         entry = self.find_by_uri(uri)
         if entry is None:
-            raise ValueError(f"Unknown resource URI: {uri}")
+            raise ResourceReadError(
+                f"Unknown resource URI: {uri}", code=INVALID_PARAMS
+            )
         agent_id = resolve_agent_id_for_uri(
             uri, caller_token, principal=principal
         )
@@ -124,9 +152,10 @@ def resolve_agent_id_for_uri(
 
     The URI carries the agent_id in its path — but the bearer always
     wins. If the URI's agent_id mismatches the bearer's agent_id, we
-    raise ValueError so the caller cannot peek into another agent's
-    inbox or status by guessing the URI. The framework converts the
-    exception into a JSON-RPC error.
+    raise :class:`ResourceReadError` (a ``ValueError`` subclass) so the
+    caller cannot peek into another agent's inbox or status by guessing
+    the URI. The framework converts the exception into a JSON-RPC error
+    carrying its ``code``.
 
     Admin can read any agent's resource (operational visibility);
     workers may only read their own. arch-r3 #1+5 PR-B: "admin" is now
@@ -150,7 +179,10 @@ def resolve_agent_id_for_uri(
     if not bearer_agent_id and caller_token:
         bearer_agent_id = get_agent_id(caller_token)
     if not bearer_agent_id:
-        raise ValueError("Unauthorized: token does not resolve to an agent")
+        raise ResourceReadError(
+            "Unauthorized: token does not resolve to an agent",
+            code=INTERNAL_ERROR,
+        )
 
     # Match the URI against any registered resource's prefix to extract
     # the agent_id segment. Walking the registry keeps the helper open
@@ -162,16 +194,19 @@ def resolve_agent_id_for_uri(
             uri_agent_id = uri[len(prefix):].rstrip("/")
             break
     if uri_agent_id is None:
-        raise ValueError(f"Unknown resource URI: {uri}")
+        raise ResourceReadError(
+            f"Unknown resource URI: {uri}", code=INVALID_PARAMS
+        )
 
     # Admin (per the shared catalog_role) can read any agent's resource
     # (operational visibility). Other callers may only read their own.
     if catalog_role(principal) == "admin":
         return uri_agent_id
     if uri_agent_id != bearer_agent_id:
-        raise ValueError(
+        raise ResourceReadError(
             "Unauthorized: callers may only read their own inbox / "
-            "status resources"
+            "status resources",
+            code=INTERNAL_ERROR,
         )
     return uri_agent_id
 
