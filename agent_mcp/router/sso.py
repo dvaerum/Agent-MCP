@@ -243,6 +243,30 @@ def load_sso_config() -> SSOSettings:
         )
 
     if oidc_issuer:
+        # Refuse a plaintext issuer unless the operator explicitly opts
+        # in (OBS-R17-SSO). Production must run OIDC over https — an
+        # http:// issuer means the discovery doc, token exchange and
+        # JWKS all cross the network in the clear, MITM-able into an
+        # attacker-chosen origin. Local-dev IdPs set
+        # AGENT_MCP_SSO_OIDC_ALLOW_INSECURE=1 to opt back in.
+        issuer_scheme = urlsplit(oidc_issuer).scheme.lower()
+        allow_insecure = _env_truthy(
+            os.environ.get("AGENT_MCP_SSO_OIDC_ALLOW_INSECURE"),
+        )
+        if issuer_scheme == "http":
+            if not allow_insecure:
+                raise SSOConfigError(
+                    "AGENT_MCP_SSO_OIDC_ISSUER uses http://; OIDC "
+                    "requires https. Set "
+                    "AGENT_MCP_SSO_OIDC_ALLOW_INSECURE=1 to opt in for "
+                    "a local-dev IdP."
+                )
+        elif issuer_scheme != "https":
+            raise SSOConfigError(
+                "AGENT_MCP_SSO_OIDC_ISSUER must be an http:// or "
+                f"https:// URL; got scheme {issuer_scheme!r}."
+            )
+
         client_id = os.environ.get("AGENT_MCP_SSO_OIDC_CLIENT_ID", "").strip()
         secret_file = os.environ.get(
             "AGENT_MCP_SSO_OIDC_CLIENT_SECRET_FILE", "",
@@ -933,18 +957,78 @@ def _resolve_redirect_url(
 # ── Authlib seam (monkey-patchable for tests) ──────────────────────
 
 
+# Discovery endpoints whose origin we pin to the configured issuer.
+# A hostile / compromised IdP (or a MITM against an http:// issuer)
+# could otherwise redirect these at internal hosts (SSRF-ish): the
+# token/JWKS fetches and the authorize redirect all trust these URLs
+# verbatim. OBS-R17-SSO.
+_ORIGIN_PINNED_ENDPOINTS = (
+    "authorization_endpoint",
+    "token_endpoint",
+    "jwks_uri",
+)
+
+_DEFAULT_SCHEME_PORTS = {"http": 80, "https": 443}
+
+
+def _origin_tuple(url: str) -> tuple[str, str | None, int | None]:
+    """(scheme, host, effective-port) — the same-origin identity of a URL.
+
+    The port is normalised to its scheme default when absent, so an
+    explicit ``:443`` on an https URL compares equal to a port-less one.
+    """
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    port = (
+        parts.port if parts.port is not None
+        else _DEFAULT_SCHEME_PORTS.get(scheme)
+    )
+    return (scheme, parts.hostname, port)
+
+
+def _assert_discovery_same_origin(
+    issuer: str, metadata: dict[str, Any],
+) -> None:
+    """Reject a discovery doc whose trusted endpoints leave the issuer origin.
+
+    Origin-pin (OBS-R17-SSO): ``authorization_endpoint`` /
+    ``token_endpoint`` / ``jwks_uri`` MUST each share the configured
+    issuer's scheme + host (+ port). A mismatch — or a missing endpoint —
+    raises ``SSOConfigError``, failing the SSO flow rather than trusting
+    an attacker-controlled URL. Does NOT touch the JOSE / iss / aud /
+    nonce checks, which validate the token independently.
+    """
+    issuer_origin = _origin_tuple(issuer)
+    for key in _ORIGIN_PINNED_ENDPOINTS:
+        endpoint = metadata.get(key)
+        if not isinstance(endpoint, str) or not endpoint:
+            raise SSOConfigError(
+                f"OIDC discovery document is missing a usable {key!r}."
+            )
+        if _origin_tuple(endpoint) != issuer_origin:
+            raise SSOConfigError(
+                f"OIDC discovery {key!r} origin does not match the "
+                f"configured issuer origin; refusing (OBS-R17-SSO "
+                f"origin-pin)."
+            )
+
+
 def _fetch_oidc_metadata(issuer: str) -> dict[str, Any]:
-    """Fetch the OIDC discovery document.
+    """Fetch the OIDC discovery document and origin-pin its endpoints.
 
     Sync call (we use requests for parity with Authlib's sync surface);
     the route handler runs this in an executor so the event loop
-    doesn't block on the network.
+    doesn't block on the network. The fetched endpoints are validated
+    against the configured issuer origin before being returned so both
+    route handlers inherit the check at the single trust boundary.
     """
     import requests
     url = issuer.rstrip("/") + "/.well-known/openid-configuration"
     resp = requests.get(url, timeout=10)
     resp.raise_for_status()
-    return resp.json()
+    metadata = resp.json()
+    _assert_discovery_same_origin(issuer, metadata)
+    return metadata
 
 
 def _exchange_code_for_tokens(
