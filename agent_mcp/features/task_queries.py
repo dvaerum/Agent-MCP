@@ -173,14 +173,25 @@ def is_claimable_task(task: Dict[str, Any]) -> bool:
     """The ONE canonical "claimable/unassigned pool" predicate (R16-F2).
 
     A task is claimable iff it is unassigned (``assigned_to`` is NULL or
-    the empty string) AND not in a terminal state. Applied at every read
-    surface (REST ``?unassigned=true``, the query engine's ``unassigned``
-    / worker ``include_unassigned`` pool, and the wake seam) so the
-    read side can never drift from the write-side terminal sink.
+    the empty string) AND its status is in the known ACTIVE set
+    (:data:`_ACTIVE_STATUSES`). Applied at every read surface (REST
+    ``?unassigned=true``, the query engine's ``unassigned`` / worker
+    ``include_unassigned`` pool, and the wake seam) so the read side can
+    never drift from the write-side terminal sink.
+
+    OBS-R17: this is a positive ALLOWLIST, not a denylist. Testing
+    ``status IN active`` rather than ``status NOT IN terminal`` fails
+    CLOSED — an unknown / non-enum status (which a future bulk import,
+    migration, or new write path could store without going through
+    ``update_task``'s enum guard) is treated as NOT claimable, instead of
+    slipping the terminal denylist and re-opening the R16-F2 bypass.
+    ``_ACTIVE_STATUSES`` is the exact complement of
+    :data:`TERMINAL_TASK_STATUSES` over the closed status enum, so the
+    two stay in lockstep — no fresh literal to drift.
     """
     if task.get("assigned_to") not in (None, ""):
         return False
-    return (task.get("status") or "") not in TERMINAL_TASK_STATUSES
+    return (task.get("status") or "") in _ACTIVE_STATUSES
 
 
 def status_filter_matches(want: str, actual: Optional[str]) -> bool:
