@@ -231,6 +231,45 @@ def _config_key_error() -> "Invalid":
     )
 
 
+# FLAG-R17-2: maximum length for a project-context key.
+#
+# ``string_utils.MEMORY_KEY_RE`` bounds the CHARSET of a memory key
+# (``A-Z a-z 0-9 . _ / -``) but places NO bound on its LENGTH — an
+# authenticated caller could store an arbitrarily long ``context_key``
+# (an 80 KB key was accepted, limited only by the request body-size cap).
+# Storage hygiene, not a security hole, but a fat key still bloats the
+# row + primary-key index and every view/health scan.
+#
+# 256 chars is a deliberately generous ceiling: memory keys are namespaced
+# URL path segments (e.g. ``backend-dev/status``, ``ios/improvements-doc``)
+# and a scan of real keys found none anywhere near it, so this renames
+# nothing existing — it is a forward-looking invariant, matching the
+# "positive allowlist found ZERO violations" rationale MEMORY_KEY_RE was
+# introduced under. 256 is also the conventional identifier / path-segment
+# limit, keeping keys comfortably inside DB and URL length assumptions.
+_MAX_CONTEXT_KEY_LEN = 256
+
+
+def _context_key_length_error(context_key: object) -> Optional["Invalid"]:
+    """Return an :class:`Invalid` when ``context_key`` exceeds
+    :data:`_MAX_CONTEXT_KEY_LEN`, else ``None``.
+
+    Additive to the charset validation (``is_valid_memory_key``) — it
+    reuses the same ``field="context_key"`` + :class:`Invalid` shape so
+    both the MCP renderer and the REST adapter (400) surface an
+    over-length key exactly like an over-charset one, never a 500.
+    """
+    if isinstance(context_key, str) and len(context_key) > _MAX_CONTEXT_KEY_LEN:
+        return Invalid(
+            field="context_key",
+            message=(
+                f"context_key exceeds the maximum length of "
+                f"{_MAX_CONTEXT_KEY_LEN} characters."
+            ),
+        )
+    return None
+
+
 def _creator_mismatch_error(context_key: str, creator: str) -> "PermissionDenied":
     return PermissionDenied(
         reason=(
@@ -607,6 +646,16 @@ def _check_write_authorization(
     round trip was a dead no-op that just duplicated the 4-line
     strip-and-rewrap at every call site.
     """
+    # FLAG-R17-2: length bound — checked BEFORE the admin early-return so
+    # it applies to EVERY caller. This is the one seam every write path
+    # (single/bulk update, create, and the REST /api/memories routes that
+    # dispatch through those tools) funnels through before any row is
+    # written, so an over-length key is rejected here with a clean Invalid
+    # (400) — never a fat stored row and never a 500. Additive to the
+    # config_* / charset checks; returns the same Invalid shape.
+    length_err = _context_key_length_error(context_key)
+    if length_err is not None:
+        return length_err
     # ADR-0016: checked BEFORE the admin early-return — config_* is
     # rejected for every caller on the knowledge write path.
     if _CONFIG_KEY_RE.match(context_key):
