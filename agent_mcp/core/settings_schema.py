@@ -3,25 +3,22 @@ per-project ``config_*`` setting (ADR-0018).
 
 Before this module the schema for each setting — its default, its group,
 its human title/description, its tier — was declared in TWO places: the
-frontend (``settings-dashboard.tsx``'s hardcoded ``POLICIES`` /
-``AOE_FIELDS`` arrays) AND, partially, the backend
-(``tools/access._TOGGLE_DEFAULTS`` — only 4 of 6 bool keys — plus
-scattered ``default=`` literals per tool + ``aoe_notify``'s own
-``DEFAULT_*`` constants). Two owners of the same fact drift; the UI's
-"(using default: …)" hint could silently lie.
+frontend (``settings-dashboard.tsx``'s hardcoded policy arrays) AND,
+partially, the backend (``tools/access._TOGGLE_DEFAULTS`` — only 4 of 6
+bool keys — plus scattered ``default=`` literals per tool). Two owners
+of the same fact drift; the UI's "(using default: …)" hint could
+silently lie.
 
 This registry makes the BACKEND the single owner. Every default reader
 resolves through :func:`default_for`; the frontend consumes the schema
-over ``GET /api/settings-schema``; the DEFAULT_* constants
-``features/aoe_notify.py`` used to own now live here and are imported
-back.
+over ``GET /api/settings-schema``.
 
-Tier-enforcement is HYBRID (ADR-0018): the proven ``_CONFIG_AOE_KEY_RE``
-sysadmin gate in ``tools/project_settings_tools.py`` stays the ENFORCER
-(safe-by-default: any future ``config_aoe_*`` key is sysadmin-gated
-automatically). :attr:`SettingSpec.tier` drives the UI + the agreement
-guarantee — a CI invariant test asserts ``schema.tier`` agrees with the
-regex for every key — but it never relocates the live gate.
+Every registered setting is operator-tier: the ``config_*`` namespace
+is writable by any confirmed operator (the ``system.config.write`` cap
+gate in ``tools/project_settings_tools.py`` is the enforcer).
+:attr:`SettingSpec.tier` drives the UI. (The former sysadmin-only
+AoE integration keys were retired with the AoE notify feature — see
+the AoE-removal ADR.)
 """
 
 from __future__ import annotations
@@ -33,7 +30,7 @@ from typing import Literal, Optional
 SettingType = Literal["bool", "int", "string", "secret"]
 SettingTier = Literal["operator", "sysadmin"]
 SettingGroup = Literal[
-    "worker_permissions", "event_loop", "retention", "aoe", "agent_profiles",
+    "worker_permissions", "event_loop", "retention", "agent_profiles",
     "scheduling", "delivery",
 ]
 SettingWidget = Literal[
@@ -46,20 +43,6 @@ SettingWidget = Literal[
     "secret_path",
     "template",
 ]
-
-
-# ---------------------------------------------------------------------------
-# AoE default constants — owned HERE (single source), imported back by
-# ``features/aoe_notify.py``. Moving them out of that module is what makes
-# the registry the single owner of the ``config_aoe_*`` defaults.
-# ---------------------------------------------------------------------------
-
-DEFAULT_BASE_URL = "http://127.0.0.1:8181"
-DEFAULT_TEMPLATE = (
-    "[agent-mcp] New message from {sender}. "
-    "Call get_agent_messages to read."
-)
-DEFAULT_TIMEOUT_MS = 2000
 
 
 @dataclass(frozen=True)
@@ -372,80 +355,11 @@ SETTINGS_SCHEMA: tuple[SettingSpec, ...] = (
         ),
         widget="int_duration",
     ),
-    SettingSpec(
-        key="config_aoe_notify_enabled",
-        type="bool",
-        default=False,
-        tier="sysadmin",
-        group="aoe",
-        title="Notify Agents-of-Empires on new messages",
-        description=(
-            "When on, send_agent_message also POSTs a tmux-pane wake-up "
-            "to a local Agents-of-Empires (AoE) instance so the recipient "
-            "notices the message even between polls. Disabled by default. "
-            "Configure config_aoe_base_url, config_aoe_bearer_token "
-            "(secret), and config_aoe_notify_template in the AoE "
-            "integration card below (sysadmin-only). The message body "
-            "itself is never forwarded — only {sender}, {recipient}, "
-            "{message_id} are interpolated."
-        ),
-        widget="switch",
-    ),
-    SettingSpec(
-        key="config_aoe_base_url",
-        type="string",
-        default=DEFAULT_BASE_URL,
-        tier="sysadmin",
-        group="aoe",
-        title="Base URL",
-        description="",
-        widget="url",
-    ),
-    SettingSpec(
-        key="config_aoe_bearer_token",
-        type="secret",
-        default=None,
-        tier="sysadmin",
-        group="aoe",
-        title="Bearer token",
-        description="",
-        widget="secret",
-    ),
-    SettingSpec(
-        key="config_aoe_bearer_token_file",
-        type="secret",
-        default=None,
-        tier="sysadmin",
-        group="aoe",
-        title="Bearer token file",
-        description="",
-        widget="secret_path",
-    ),
-    SettingSpec(
-        key="config_aoe_notify_template",
-        type="string",
-        default=DEFAULT_TEMPLATE,
-        tier="sysadmin",
-        group="aoe",
-        title="Notify template",
-        description="",
-        widget="template",
-    ),
-    SettingSpec(
-        key="config_aoe_timeout_ms",
-        type="int",
-        default=DEFAULT_TIMEOUT_MS,
-        tier="sysadmin",
-        group="aoe",
-        title="Timeout (ms)",
-        description="",
-        widget="int_ms",
-    ),
     # -- Delivery transport / fallback push (ADR-0021) -----------------
     # The tunable per-project policy for when agent-mcp pushes a skinny
     # notification down a worker's registered delivery transport (the
     # fallback for sessions that don't poll wait_for_events). All
-    # operator-tier (none match the sysadmin _CONFIG_AOE_KEY_RE gate).
+    # operator-tier.
     SettingSpec(
         key="config_delivery_enabled",
         type="bool",
@@ -459,8 +373,7 @@ SETTINGS_SCHEMA: tuple[SettingSpec, ...] = (
             "delivery transport when the agent falls behind (see the "
             "triggers below), so a session that isn't polling still gets "
             "poked. Off by default; a runtime (e.g. the AoE bridge) must "
-            "also register the transport for a worker. Supersedes the "
-            "legacy config_aoe_* notify push."
+            "also register the transport for a worker."
         ),
         widget="switch",
     ),

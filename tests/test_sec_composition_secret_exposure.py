@@ -27,7 +27,12 @@ import secrets
 
 import pytest
 
-from tests.harness import mcp_session, seed_config_setting_as_sysadmin
+from tests.harness import (
+    SYNTHETIC_SECRET_SETTING_KEY,
+    mcp_session,
+    seed_config_setting_as_sysadmin,
+    synthetic_secret_setting_key,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -36,9 +41,9 @@ _SECRET_VALUE = "SENTINEL-CTX-SECRET-7b21"
 
 
 def _seed_ctx(admin, *, key: str, value: str) -> None:
-    # config_aoe_* is sysadmin-only to write (pentest R8-F1) — seed those
-    # keys as a sysadmin would; other keys flow through the REST seam.
-    if key.lower().startswith("config_aoe_"):
+    # config_* keys live in the project_settings store (ADR-0016) — seed
+    # those directly; knowledge keys flow through the REST memories seam.
+    if key.lower().startswith("config_"):
         seed_config_setting_as_sysadmin(key, value)
         return
     r = admin.post(
@@ -83,7 +88,7 @@ def _seed_agent_with_aoe(agent_id: str, aoe_session_id: str) -> None:
 async def test_context_data_requires_operator_session(tmp_path) -> None:
     """No auth at all → 401. The route previously had NO auth dep."""
     async with mcp_session(tmp_path) as admin:
-        _seed_ctx(admin, key="config_aoe_bearer_token", value=_SECRET_VALUE)
+        _seed_ctx(admin, key=SYNTHETIC_SECRET_SETTING_KEY, value=_SECRET_VALUE)
         r = admin.client.get("/api/context-data")
         assert r.status_code == 401, r.text
         assert _SECRET_VALUE not in r.text, "secret leaked in 401 body"
@@ -95,7 +100,7 @@ async def test_context_data_redacts_secret_for_non_confirmed_operator(
     """A forwarding/session operator (tier unverifiable in the backend —
     could be a viewer on a GET) must NOT receive secret values."""
     async with mcp_session(tmp_path) as admin:
-        _seed_ctx(admin, key="config_aoe_bearer_token", value=_SECRET_VALUE)
+        _seed_ctx(admin, key=SYNTHETIC_SECRET_SETTING_KEY, value=_SECRET_VALUE)
         _seed_ctx(admin, key="project_readme", value="public-info")
 
         r = admin.get("/api/context-data")  # signed forwarding header
@@ -110,25 +115,28 @@ async def test_context_data_redacts_secret_for_non_confirmed_operator(
 
 async def test_settings_data_confirmed_operator_sees_secret(tmp_path) -> None:
     """A confirmed operator-tier bearer still receives the secret value —
-    the legitimate admin path must not regress. Wave 11 (ADR-0016): the
-    AoE bearer lives in the ``project_settings`` store, so the read seam
-    is ``/api/settings-data`` (config rows no longer appear in
-    ``/api/context-data`` at all)."""
+    the legitimate admin path must not regress. Wave 11 (ADR-0016): a
+    secret setting lives in the ``project_settings`` store, so the read
+    seam is ``/api/settings-data`` (config rows no longer appear in
+    ``/api/context-data`` at all). The AoE bearer was the historical
+    instance; the redaction machinery is exercised here against a
+    synthetic secret key (see ``synthetic_secret_setting_key``)."""
     async with mcp_session(tmp_path) as admin:
-        _seed_ctx(admin, key="config_aoe_bearer_token", value=_SECRET_VALUE)
+        with synthetic_secret_setting_key() as secret_key:
+            _seed_ctx(admin, key=secret_key, value=_SECRET_VALUE)
 
-        r = admin.client.get("/api/settings-data", headers=_bearer(admin))
-        assert r.status_code == 200, r.text
-        assert _SECRET_VALUE in r.text, (
-            "confirmed operator must still see the secret value"
-        )
+            r = admin.client.get("/api/settings-data", headers=_bearer(admin))
+            assert r.status_code == 200, r.text
+            assert _SECRET_VALUE in r.text, (
+                "confirmed operator must still see the secret value"
+            )
 
-        # And the non-confirmed forwarding path stays masked.
-        r = admin.get("/api/settings-data")
-        assert r.status_code == 200, r.text
-        assert _SECRET_VALUE not in r.text, (
-            "AoE bearer leaked to a non-confirmed operator via settings-data"
-        )
+            # And the non-confirmed forwarding path stays masked.
+            r = admin.get("/api/settings-data")
+            assert r.status_code == 200, r.text
+            assert _SECRET_VALUE not in r.text, (
+                "secret leaked to a non-confirmed operator via settings-data"
+            )
 
 
 # ── /api/create-sample-memories ──────────────────────────────────────

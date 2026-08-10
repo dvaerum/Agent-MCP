@@ -16,17 +16,17 @@ Coverage (the RED set written before the implementation):
      ``project_settings`` AND deletes it from ``project_context``;
      knowledge rows untouched; values byte-identical.
   2. The canonical config-read seams (``_get_config_bool`` /
-     ``_get_config_int`` in ``tools/access.py`` and
-     ``aoe_notify.load_config``) read the NEW table.
+     ``_get_config_int`` in ``tools/access.py``) read the NEW table.
   3. F009 regression at the new seam: ``GET /api/settings-data`` returns
      the REAL toggle value to a cookie/forwarding (non-confirmed)
-     operator; only the two genuinely secret keys
-     (``config_aoe_bearer_token`` / ``config_aoe_bearer_token_file``)
-     redact for non-confirmed tiers.
+     operator; a secret-typed key redacts for non-confirmed tiers. (The
+     AoE bearer was the historical secret instance; with AoE removed the
+     redaction machinery is exercised against a synthetic secret key —
+     see ``synthetic_secret_setting_key``.)
   4. Write gates on the new MCP tool family
      (``update_project_settings`` / ``delete_project_settings``):
-     ``system.config.write`` cap required; ``config_aoe_*`` stays
-     sysadmin-only; non-``config_*`` keys rejected.
+     ``system.config.write`` cap required; non-``config_*`` keys
+     rejected.
   5. The ``project_context`` write path now rejects ``config_*`` for
      EVERYONE (admin included) with the ADR-0016 pointer.
   6. Wake parity (BL-R14-1): settings writes/deletes fire the same
@@ -46,12 +46,16 @@ from unittest.mock import patch
 
 import pytest
 
-from tests.harness import make_principal, mcp_session
+from tests.harness import (
+    make_principal,
+    mcp_session,
+    synthetic_secret_setting_key,
+)
 
 _REDACTED = "[redacted]"
 # The alembic head advances as migrations are added; keep this in lockstep
-# with the newest revision (0020 = agent last_activity_at for idle-stop).
-_MIGRATION_HEAD = "0023_single_root_task_index"
+# with the newest revision (0024 = purge retired AoE settings).
+_MIGRATION_HEAD = "0024_drop_config_aoe_settings"
 
 
 # ---------------------------------------------------------------------------
@@ -204,13 +208,15 @@ def test_migration_0016_moves_config_rows_hard_cutover(tmp_path) -> None:
         db_path, "config_allow_worker_to_worker", "true", "policy seed",
     )
     _seed_context_row(
-        db_path, "config_aoe_bearer_token", '"SENTINEL-BEARER"', "aoe seed",
+        db_path, "config_message_retention_days", "7", "retention seed",
     )
     _seed_context_row(
         db_path, "team_motto", '"ship the v1"', "knowledge seed",
     )
     pre_toggle = _fetch_row(db_path, "project_context", "config_allow_worker_to_worker")
-    pre_bearer = _fetch_row(db_path, "project_context", "config_aoe_bearer_token")
+    pre_retention = _fetch_row(
+        db_path, "project_context", "config_message_retention_days"
+    )
     pre_knowledge = _fetch_row(db_path, "project_context", "team_motto")
 
     command.upgrade(cfg, "head")
@@ -220,15 +226,15 @@ def test_migration_0016_moves_config_rows_hard_cutover(tmp_path) -> None:
         db_path, "project_settings", "config_allow_worker_to_worker"
     ) == pre_toggle
     assert _fetch_row(
-        db_path, "project_settings", "config_aoe_bearer_token"
-    ) == pre_bearer
+        db_path, "project_settings", "config_message_retention_days"
+    ) == pre_retention
 
     # HARD CUTOVER: gone from project_context.
     assert _fetch_row(
         db_path, "project_context", "config_allow_worker_to_worker"
     ) is None
     assert _fetch_row(
-        db_path, "project_context", "config_aoe_bearer_token"
+        db_path, "project_context", "config_message_retention_days"
     ) is None
 
     # Knowledge row untouched.
@@ -338,23 +344,6 @@ async def test_get_config_int_reads_project_settings(tmp_path: Path) -> None:
         assert _get_config_int("config_message_retention_days", 0) == 7
 
 
-@pytest.mark.asyncio
-async def test_aoe_load_config_reads_project_settings(tmp_path: Path) -> None:
-    async with mcp_session(tmp_path):
-        _seed_setting("config_aoe_notify_enabled", True)
-        _seed_setting("config_aoe_base_url", "http://aoe.test")
-        _seed_setting("config_aoe_bearer_token", "SENTINEL-AOE-TOKEN")
-        _seed_setting("config_aoe_timeout_ms", 1234)
-
-        from agent_mcp.features.aoe_notify import load_config
-
-        cfg = load_config()
-        assert cfg.enabled is True
-        assert cfg.base_url == "http://aoe.test"
-        assert cfg.bearer_token == "SENTINEL-AOE-TOKEN"
-        assert cfg.timeout_ms == 1234
-
-
 # ---------------------------------------------------------------------------
 # 3. F009 regression at the new REST seam
 # ---------------------------------------------------------------------------
@@ -379,34 +368,32 @@ async def test_settings_data_real_values_for_non_confirmed_operator(
     tmp_path: Path,
 ) -> None:
     """The F009 scenario against the NEW store: a cookie/forwarding
-    (non-confirmed) operator reads the REAL toggle value — only the two
-    genuinely secret keys redact."""
+    (non-confirmed) operator reads the REAL toggle value — only a
+    secret-typed key redacts."""
     async with mcp_session(tmp_path) as admin:
-        _seed_setting("config_allow_worker_to_worker", True)
-        _seed_setting("config_message_retention_days", 7)
-        _seed_setting("config_aoe_bearer_token", "SENTINEL-AOE-BEARER-9f04")
-        _seed_setting("config_aoe_bearer_token_file", "/run/secret/token")
+        with synthetic_secret_setting_key() as secret_key:
+            _seed_setting("config_allow_worker_to_worker", True)
+            _seed_setting("config_message_retention_days", 7)
+            _seed_setting(secret_key, "SENTINEL-CREDENTIAL-9f04")
 
-        r = admin.get("/api/settings-data")  # signed forwarding header
-        assert r.status_code == 200, r.text
-        rows = _settings_rows(r)
+            r = admin.get("/api/settings-data")  # signed forwarding header
+            assert r.status_code == 200, r.text
+            rows = _settings_rows(r)
 
-        toggle = _row_for(rows, "config_allow_worker_to_worker")
-        assert toggle["value"] != _REDACTED, (
-            "policy toggle redacted to a session operator — F009 regressed "
-            "on the settings store"
-        )
-        assert json.loads(toggle["value"]) is True
+            toggle = _row_for(rows, "config_allow_worker_to_worker")
+            assert toggle["value"] != _REDACTED, (
+                "policy toggle redacted to a session operator — F009 "
+                "regressed on the settings store"
+            )
+            assert json.loads(toggle["value"]) is True
 
-        retention = _row_for(rows, "config_message_retention_days")
-        assert json.loads(retention["value"]) == 7
+            retention = _row_for(rows, "config_message_retention_days")
+            assert json.loads(retention["value"]) == 7
 
-        # The two genuinely secret keys DO redact for non-confirmed tiers.
-        bearer = _row_for(rows, "config_aoe_bearer_token")
-        assert bearer["value"] == _REDACTED
-        token_file = _row_for(rows, "config_aoe_bearer_token_file")
-        assert token_file["value"] == _REDACTED
-        assert "SENTINEL-AOE-BEARER-9f04" not in r.text
+            # The secret-typed key DOES redact for non-confirmed tiers.
+            secret = _row_for(rows, secret_key)
+            assert secret["value"] == _REDACTED
+            assert "SENTINEL-CREDENTIAL-9f04" not in r.text
 
 
 @pytest.mark.asyncio
@@ -416,15 +403,16 @@ async def test_settings_data_real_secret_for_confirmed_operator_bearer(
     """A CONFIRMED operator-tier bearer (per-agent manager/admin token)
     reads the real secret value."""
     async with mcp_session(tmp_path) as admin:
-        _seed_setting("config_aoe_bearer_token", "SENTINEL-AOE-BEARER-9f04")
+        with synthetic_secret_setting_key() as secret_key:
+            _seed_setting(secret_key, "SENTINEL-CREDENTIAL-9f04")
 
-        r = admin.client.get(
-            "/api/settings-data",
-            headers={"Authorization": f"Bearer {admin.admin_token}"},
-        )
-        assert r.status_code == 200, r.text
-        bearer = _row_for(_settings_rows(r), "config_aoe_bearer_token")
-        assert bearer["value"] == json.dumps("SENTINEL-AOE-BEARER-9f04")
+            r = admin.client.get(
+                "/api/settings-data",
+                headers={"Authorization": f"Bearer {admin.admin_token}"},
+            )
+            assert r.status_code == 200, r.text
+            secret = _row_for(_settings_rows(r), secret_key)
+            assert secret["value"] == json.dumps("SENTINEL-CREDENTIAL-9f04")
 
 
 @pytest.mark.asyncio
@@ -498,28 +486,6 @@ async def test_rest_settings_post_and_delete(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_rest_settings_aoe_write_denied_for_non_sysadmin(
-    tmp_path: Path,
-) -> None:
-    """The config_aoe_* sysadmin gate carries over to the settings write
-    path: a forwarding OPERATOR (non-sysadmin) is denied (SSRF /
-    bearer-exfil rationale — see _CONFIG_AOE_KEY_RE)."""
-    async with mcp_session(tmp_path) as admin:
-        r = admin.request(
-            "PUT",
-            "/api/settings/config_aoe_base_url",
-            json={"context_value": "http://169.254.169.254"},
-        )
-        assert r.status_code == 403, r.text
-
-        # The harness roots the app at tmp_path/"project".
-        db_path = str(tmp_path / "project" / ".agent" / "mcp_state.db")
-        assert _fetch_row(
-            db_path, "project_settings", "config_aoe_base_url"
-        ) is None
-
-
-@pytest.mark.asyncio
 async def test_rest_settings_rejects_non_config_key(tmp_path: Path) -> None:
     """The settings store holds config_* keys ONLY — knowledge belongs
     in project_context."""
@@ -588,44 +554,6 @@ async def test_update_project_settings_allows_operator_tier(
 
 
 @pytest.mark.asyncio
-async def test_update_project_settings_aoe_requires_sysadmin(
-    tmp_path: Path,
-) -> None:
-    async with mcp_session(tmp_path) as admin:
-        from agent_mcp.core.tool_result import Ok, PermissionDenied
-        from agent_mcp.tools.registry import dispatch_tool_call
-
-        operator = make_principal(
-            kind="operator_session",
-            user_id="op-nonsysadmin",
-            project_role="operator",
-        )
-        denied = await dispatch_tool_call(
-            "update_project_settings",
-            {
-                "context_key": "config_aoe_base_url",
-                "context_value": "http://aoe.test",
-            },
-            principal=operator,
-        )
-        assert isinstance(denied, PermissionDenied), (
-            f"non-sysadmin operator must be denied config_aoe_*; got {denied!r}"
-        )
-
-        # The harness admin is sysadmin — allowed.
-        sysadmin = admin._principal()
-        ok = await dispatch_tool_call(
-            "update_project_settings",
-            {
-                "context_key": "config_aoe_base_url",
-                "context_value": "http://aoe.test",
-            },
-            principal=sysadmin,
-        )
-        assert isinstance(ok, Ok), f"sysadmin write must pass; got {ok!r}"
-
-
-@pytest.mark.asyncio
 async def test_update_project_settings_rejects_non_config_key(
     tmp_path: Path,
 ) -> None:
@@ -653,7 +581,6 @@ async def test_delete_project_settings_gates(tmp_path: Path) -> None:
         from agent_mcp.tools.registry import dispatch_tool_call
 
         _seed_setting("config_allow_worker_to_worker", True)
-        _seed_setting("config_aoe_base_url", "http://aoe.test")
 
         worker = await admin.create_worker("settings-del-worker")
         denied = await dispatch_tool_call(
@@ -668,13 +595,6 @@ async def test_delete_project_settings_gates(tmp_path: Path) -> None:
             user_id="op-nonsysadmin",
             project_role="operator",
         )
-        aoe_denied = await dispatch_tool_call(
-            "delete_project_settings",
-            {"context_key": "config_aoe_base_url"},
-            principal=operator,
-        )
-        assert isinstance(aoe_denied, PermissionDenied)
-
         ok = await dispatch_tool_call(
             "delete_project_settings",
             {"context_key": "config_allow_worker_to_worker"},
@@ -692,13 +612,16 @@ async def test_view_project_settings_redaction(tmp_path: Path) -> None:
     """view_project_settings masks only _SECRET_SETTING_KEYS, and only
     for non-confirmed tiers."""
     async with mcp_session(tmp_path) as admin:
-        _seed_setting("config_allow_worker_to_worker", True)
-        _seed_setting("config_aoe_bearer_token", "SENTINEL-VIEW-BEARER")
+        with synthetic_secret_setting_key() as secret_key:
+            _seed_setting("config_allow_worker_to_worker", True)
+            _seed_setting(secret_key, "SENTINEL-VIEW-BEARER")
 
-        # Harness admin: agent_bearer manager + sysadmin → CONFIRMED tier.
-        result = await admin.assert_tool_succeeds("view_project_settings", {})
-        text = _text(result)
-        assert "SENTINEL-VIEW-BEARER" in text
+            # Harness admin: agent_bearer manager + sysadmin → CONFIRMED tier.
+            result = await admin.assert_tool_succeeds(
+                "view_project_settings", {}
+            )
+            text = _text(result)
+            assert "SENTINEL-VIEW-BEARER" in text
 
         # A non-confirmed operator-session principal gets the mask.
         from agent_mcp.core.tool_result import Ok

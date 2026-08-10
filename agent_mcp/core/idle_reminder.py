@@ -67,7 +67,7 @@ def _subject_of(row: Dict[str, Any]) -> str:
     Rust bridge, which types the subject verbatim into the recipient's pane
     and from there into the agent's logs). That path is contractually
     body-free (ADR-0021), and message bodies routinely carry secrets — admin
-    tokens appear in message text (see ``aoe_notify`` for the same threat).
+    tokens appear in message text.
     The reminder loses nothing: it already tells the agent to call
     ``get_agent_messages`` to read the body. (R13-F4)
     """

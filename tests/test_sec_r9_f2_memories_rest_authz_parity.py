@@ -7,19 +7,18 @@ Confirmed live (HIGH): the dashboard cookie/forwarding REST handlers
 gate that lives inside the MCP tool impls
 (``agent_mcp/tools/project_context_tools.py``):
 
-  1. ``_deny_non_sysadmin_aoe_config`` — ``config_aoe_*`` keys configure
-     a machine-level outbound integration and are sysadmin-only (R8-F1
-     #481). A non-sysadmin operator ``PUT``-updating ``config_aoe_base_url``
-     re-points the server's outbound AoE client (SSRF + bearer-exfil) —
-     the R8-F1 vuln reopened via the UPDATE/DELETE surfaces even though
-     the POST create surface already 403s it.
-  2. ``_deny_viewer_tier_write`` — a read-only viewer-tier operator must
+  1. ``_deny_viewer_tier_write`` — a read-only viewer-tier operator must
      not mutate project context (SEC1 / #273-#274). The direct-write
      REST path let a signed viewer forwarding header write/delete.
-  3. the critical-key / ``force_delete`` guard in
+  2. the critical-key / ``force_delete`` guard in
      ``delete_project_context_tool_impl`` — deleting a critical system
      key requires ``force_delete=true``; the REST DELETE never enforced
      it.
+
+(The original R9-F2 finding also covered an AoE-specific sysadmin
+write-gate; that gate was retired with the AoE notify feature — the
+whole ``config_*`` namespace is rejected on the memories surface
+outright, and the settings surface no longer sysadmin-gates any key.)
 
 The fix routes both handlers through the gated tools
 (``update_project_context`` / ``delete_project_context``) exactly as the
@@ -38,7 +37,7 @@ import json
 
 import pytest
 
-from tests.harness import mcp_session, seed_config_setting_as_sysadmin
+from tests.harness import mcp_session
 
 pytestmark = pytest.mark.asyncio
 
@@ -109,52 +108,7 @@ def _row_exists(key: str, table: str = "project_context") -> bool:
         conn.close()
 
 
-# ── (1) config_aoe_* — non-sysadmin operator DENIED (R8-F1 reopened) ─
-
-
-async def test_rest_put_config_aoe_denied_for_operator(tmp_path) -> None:
-    """PUT-updating an existing ``config_aoe_base_url`` as a non-sysadmin
-    operator is DENIED (403) — a per-project operator must not re-point
-    the outbound AoE client (SSRF). Wave 11 (ADR-0016): the gate lives on
-    the settings write surface (``PUT /api/settings/...``) now; the
-    memories surface rejects the whole config_* namespace outright."""
-    async with mcp_session(tmp_path) as admin:
-        seed_config_setting_as_sysadmin(
-            "config_aoe_base_url", "http://127.0.0.1:8181"
-        )
-
-        r = admin.request(
-            "PUT",
-            "/api/settings/config_aoe_base_url",
-            json={"context_value": "http://attacker.evil:9999"},
-        )
-
-        assert r.status_code == 403, r.text
-        # The malicious value must NOT have landed.
-        assert _row_value(
-            "config_aoe_base_url", table="project_settings"
-        ) == "http://127.0.0.1:8181"
-
-
-async def test_rest_delete_config_aoe_denied_for_operator(tmp_path) -> None:
-    """DELETE of a ``config_aoe_*`` key as a non-sysadmin operator is
-    DENIED (403) — on the settings surface post-ADR-0016."""
-    async with mcp_session(tmp_path) as admin:
-        seed_config_setting_as_sysadmin(
-            "config_aoe_bearer_token", "s3cr3t-bearer"
-        )
-
-        r = admin.request(
-            "DELETE",
-            "/api/settings/config_aoe_bearer_token",
-            json={},
-        )
-
-        assert r.status_code == 403, r.text
-        assert _row_exists("config_aoe_bearer_token", table="project_settings")
-
-
-# ── (2) viewer-tier operator DENIED on the REST write surfaces ──────
+# ── (1) viewer-tier operator DENIED on the REST write surfaces ──────
 
 
 async def test_rest_put_denied_for_viewer(tmp_path) -> None:

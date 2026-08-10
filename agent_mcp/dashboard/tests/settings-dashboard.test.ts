@@ -10,8 +10,9 @@
  *      resolves to the right control kind, and each kind renders the
  *      right DOM control.
  *   2. group ordering — the five groups render in the fixed order
- *      (worker_permissions → event_loop → agent_profiles → retention →
- *      aoe), empty groups dropped, schema order preserved within a group.
+ *      (worker_permissions → event_loop → scheduling → agent_profiles →
+ *      retention), empty groups dropped, schema order preserved within a
+ *      group.
  *   3. tier-gating — a sysadmin-tier entry renders DISABLED (with the
  *      inline note) when the caller is not a sysadmin, and enabled
  *      when they are (fixes the silent-403 mis-tier).
@@ -188,14 +189,13 @@ describe("int_duration — seconds ⇄ {amount, unit} conversion", () => {
 })
 
 describe("group ordering", () => {
-  it("GROUP_ORDER is the six groups in the specified order", () => {
+  it("GROUP_ORDER is the five groups in the specified order", () => {
     expect(GROUP_ORDER.map((g) => g.group)).toEqual([
       "worker_permissions",
       "event_loop",
       "scheduling",
       "agent_profiles",
       "retention",
-      "aoe",
     ])
     expect(GROUP_ORDER.map((g) => g.title)).toEqual([
       "Worker permissions",
@@ -203,14 +203,13 @@ describe("group ordering", () => {
       "Scheduled directives",
       "Agent profiles",
       "Message retention",
-      "AoE integration",
     ])
   })
 
   it("groupSchema orders groups canonically regardless of schema order", () => {
     // Deliberately shuffled input order.
     const schema: SettingsSchemaEntry[] = [
-      entry({ key: "aoe1", group: "aoe", tier: "sysadmin" }),
+      entry({ key: "ap1", group: "agent_profiles" }),
       entry({ key: "wp1", group: "worker_permissions" }),
       entry({ key: "ret1", group: "retention", widget: "int_days", type: "int" }),
       entry({ key: "el1", group: "event_loop" }),
@@ -219,8 +218,8 @@ describe("group ordering", () => {
     expect(groups.map((g) => g.group)).toEqual([
       "worker_permissions",
       "event_loop",
+      "agent_profiles",
       "retention",
-      "aoe",
     ])
   })
 
@@ -239,9 +238,9 @@ describe("group ordering", () => {
 
 describe("tier-gating (silent-403 fix)", () => {
   const sysadminEntry = entry({
-    key: "config_aoe_notify_enabled",
+    key: "config_synthetic_sysadmin",
     tier: "sysadmin",
-    group: "aoe",
+    group: "worker_permissions",
     widget: "switch",
     type: "bool",
   })
@@ -272,11 +271,11 @@ describe("tier-gating (silent-403 fix)", () => {
     expect(html).not.toMatch(/disabled=""/)
   })
 
-  it("locks a sysadmin secret field (AoE bearer token) for a plain operator", () => {
+  it("locks a sysadmin secret field for a plain operator", () => {
     const secretEntry = entry({
-      key: "config_aoe_bearer_token",
+      key: "config_synthetic_secret",
       tier: "sysadmin",
-      group: "aoe",
+      group: "worker_permissions",
       widget: "secret",
       type: "secret",
     })

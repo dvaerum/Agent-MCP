@@ -1252,11 +1252,10 @@ async def update_project_context_tool_impl(
     requesting_agent_id = _actor_label(principal)
     is_admin = _is_admin_principal(principal)
 
-    # ADR-0016: the config_aoe_* sysadmin gate that used to sit here is
-    # unreachable now — _check_write_authorization rejects the WHOLE
-    # config_* namespace (admin included) before any write; the AoE
-    # tier-gate lives on the settings write path
-    # (tools/project_settings_tools.py).
+    # ADR-0016: _check_write_authorization rejects the WHOLE config_*
+    # namespace (admin included) before any write reaches here — the
+    # config_* keys live in the dedicated project_settings store
+    # (tools/project_settings_tools.py), never in project_context.
 
     # Determine operation mode
     is_bulk_operation = updates_list is not None
@@ -1431,9 +1430,9 @@ async def bulk_update_project_context_tool_impl(
     updates = arguments.get("updates", [])  # List of update operations
     requesting_agent_id = _actor_label(principal)
 
-    # ADR-0016: the batch-level config_aoe_* sysadmin gate is gone —
-    # _check_write_authorization (run per-entry before any write lands)
-    # rejects every config_* key for every caller now.
+    # ADR-0016: _check_write_authorization (run per-entry before any
+    # write lands) rejects every config_* key for every caller now —
+    # config_* belongs in the dedicated project_settings store.
 
     if not updates or not isinstance(updates, list):
         return Invalid(

@@ -10,9 +10,9 @@ Two invariants:
    they were KEPT. This test pins that the vocabulary + bundles stay
    internally consistent regardless of that decision.
 
-2. **Unified config-read seam** (Part B). ``aoe_notify._read_bool`` and
-   ``message_retention._read_retention_days`` used to each re-type the
-   ``SELECT value FROM project_context`` + coercion. They now route
+2. **Unified config-read seam** (Part B).
+   ``message_retention._read_retention_days`` used to re-type the
+   ``SELECT value FROM project_context`` + coercion. It now routes
    through the canonical ``tools.access._get_config_bool`` /
    ``_get_config_int``. These tests assert a value read via the unified
    seam == what the old per-site coercion produced, i.e. behaviour is
@@ -94,7 +94,7 @@ def _seed_ctx(key: str, stored_value: str) -> None:
 
 
 def _old_bool_coerce(raw: str | None, default: bool) -> bool:
-    """Reference impl of the pre-refactor bool coercion (aoe + access)."""
+    """Reference impl of the pre-refactor bool coercion."""
     if raw is None:
         return default
     s = raw.strip().strip('"').lower()
@@ -125,7 +125,6 @@ _BOOL_CASES = [
 
 @pytest.mark.asyncio
 async def test_bool_seam_matches_old_coercion(tmp_path) -> None:
-    from agent_mcp.features.aoe_notify import _read_bool
     from agent_mcp.tools.access import _get_config_bool
 
     async with mcp_session(tmp_path):
@@ -135,19 +134,15 @@ async def test_bool_seam_matches_old_coercion(tmp_path) -> None:
             expected = _old_bool_coerce(stored, default)
             # Canonical seam == the reference (old) coercion.
             assert _get_config_bool(key, default) == expected
-            # aoe_notify now routes through the same seam.
-            assert _read_bool(key, default) == expected
 
 
 @pytest.mark.asyncio
 async def test_bool_seam_absent_key_returns_default(tmp_path) -> None:
-    from agent_mcp.features.aoe_notify import _read_bool
     from agent_mcp.tools.access import _get_config_bool
 
     async with mcp_session(tmp_path):
         assert _get_config_bool("config_absent_bool", True) is True
         assert _get_config_bool("config_absent_bool", False) is False
-        assert _read_bool("config_absent_bool", True) is True
 
 
 @pytest.mark.asyncio

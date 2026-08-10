@@ -175,10 +175,9 @@ def seed_config_setting_as_sysadmin(key: str, value: Any) -> None:
     Wave 11 (ADR-0016): ``config_*`` rows live in the dedicated
     ``project_settings`` store now — this helper (formerly
     ``seed_config_context_as_sysadmin``, which wrote ``project_context``)
-    follows the cutover. ``config_aoe_*`` keys stay sysadmin-only to
-    write (pentest R8-F1: machine-level outbound integration target), so
-    feature / redaction tests that merely need the row PRESENT seed it
-    here instead of through the operator path.
+    follows the cutover. Feature / redaction tests that merely need a
+    ``config_*`` row PRESENT (bypassing the operator write surface) seed
+    it here.
 
     Writes directly on the test DB via the same repository + JSON value
     encoding the tool uses (``json.dumps`` — the settings store keeps
@@ -210,6 +209,37 @@ def seed_config_setting_as_sysadmin(key: str, value: Any) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+# A synthetic secret-typed settings key for exercising the
+# ``_SECRET_SETTING_KEYS`` redaction machinery. The AoE bearer token used
+# to be the ONLY real secret setting; it was removed with the AoE notify
+# feature, leaving the schema with zero ``type == "secret"`` specs. The
+# redaction machinery (``redact_settings_row`` + the ``/api/settings-data``
+# seam) is deliberately retained, so tests inject this key into the
+# derived set to keep that machinery under test.
+SYNTHETIC_SECRET_SETTING_KEY = "config_synthetic_credential"
+
+
+@contextlib.contextmanager
+def synthetic_secret_setting_key(key: str = SYNTHETIC_SECRET_SETTING_KEY):
+    """Temporarily classify ``key`` as a secret settings key so the
+    redaction machinery masks it for non-confirmed tiers.
+
+    Patches the module global the redaction seam reads
+    (``project_settings_tools._SECRET_SETTING_KEYS`` — consulted at call
+    time by ``redact_settings_row``, which both the MCP view tool AND the
+    ``GET /api/settings-data`` REST seam route through in-process), and
+    restores it on exit. Yields the key so a test can seed / assert on it.
+    """
+    import agent_mcp.tools.project_settings_tools as _pst
+
+    original = _pst._SECRET_SETTING_KEYS
+    _pst._SECRET_SETTING_KEYS = frozenset({key})
+    try:
+        yield key
+    finally:
+        _pst._SECRET_SETTING_KEYS = original
 
 
 def seed_agent_rows(*agent_ids: str) -> None:

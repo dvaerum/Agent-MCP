@@ -25,7 +25,6 @@ from ..core.tool_result import (
     PermissionDenied,
     ToolResult,
 )
-from ..features.aoe_notify import notify_aoe as _aoe_notify
 from ..repositories.message_repository import (
     ParentMessageNotFound,
     message_subject_view,
@@ -485,21 +484,6 @@ async def send_agent_message_tool_impl(
         # audit. Everything below is post-commit and only runs on a
         # successful send (an exception inside the scope re-raises out of
         # the ``with`` and skips straight to the handlers below).
-
-        # AoE notification side-channel (best-effort, fire-and-forget).
-        # Disabled by default; admins opt in via
-        # project_context[config_aoe_notify_enabled]. Async, so it stays
-        # OUTSIDE the (synchronous) uow flush — it fires only after a
-        # clean commit and never blocks or raises: the message is already
-        # persisted, and AoE is just a tmux-pane wake-up call.
-        try:
-            asyncio.create_task(
-                _aoe_notify(recipient_id, sender_id, message_id)
-            )
-        except RuntimeError:
-            # No running event loop (e.g. unit tests calling the impl
-            # synchronously). Run inline; still swallows errors.
-            await _aoe_notify(recipient_id, sender_id, message_id)
 
         # Build response. Wave 7 PR 3: stop_command and regular text
         # both land on the "stored" outcome — the recipient's

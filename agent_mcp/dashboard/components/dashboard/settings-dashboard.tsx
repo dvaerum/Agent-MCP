@@ -215,7 +215,6 @@ export const GROUP_ORDER: ReadonlyArray<{
   { group: "scheduling", title: "Scheduled directives" },
   { group: "agent_profiles", title: "Agent profiles" },
   { group: "retention", title: "Message retention" },
-  { group: "aoe", title: "AoE integration" },
 ]
 
 export interface SettingsGroup {
@@ -236,8 +235,8 @@ export function groupSchema(schema: SettingsSchemaEntry[]): SettingsGroup[] {
 
 // Tier-gating: a sysadmin-tier setting is not writable by a plain
 // operator, so the control renders disabled with an inline note
-// instead of letting the save 403 (the backend's `_CONFIG_AOE_KEY_RE`
-// gate is still the enforcer — this only drives the UI).
+// instead of letting the save 403 (the backend gate is still the
+// enforcer — this only drives the UI).
 export function isTierLocked(
   entry: SettingsSchemaEntry,
   caller: { sysadmin: boolean },
@@ -500,9 +499,6 @@ export function SettingsDashboard() {
           </CardContent>
         </Card>
       ))}
-
-      {/* AoE health probe — rendered after the AoE group card. */}
-      <AoeHealthCard />
     </div>
   )
 }
@@ -837,89 +833,5 @@ function DurationControl({
           : `= ${currentSeconds} seconds`}
       </div>
     </div>
-  )
-}
-
-// AoeHealthCard: shows the live status of the configured Agents-of-
-// Empires instance. AoE rotates its bearer token on a schedule (it
-// writes a fresh value to ~/.config/agent-of-empires/serve.token);
-// admins using config_aoe_bearer_token_file get free rotation, but
-// inline tokens go stale silently. This card lets the admin check
-// without sending a real test message.
-function AoeHealthCard() {
-  type Health = Awaited<ReturnType<typeof apiClient.aoeHealth>>
-  const [health, setHealth] = useState<Health | null>(null)
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-
-  const probe = async () => {
-    setBusy(true)
-    setError(null)
-    try {
-      const r = await apiClient.aoeHealth()
-      setHealth(r)
-    } catch (e: any) {
-      setError(e?.message ?? String(e))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  useEffect(() => {
-    probe()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  const statusColor =
-    health?.status === 'ok'
-      ? 'text-emerald-500'
-      : health?.status === 'disabled'
-      ? 'text-muted-foreground'
-      : 'text-destructive'
-
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-base">Agents-of-Empires status</CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        <p className="text-xs text-muted-foreground">
-          Probes the configured AoE instance with the current bearer token
-          (resolved live, including file-sourced rotations). Use this to
-          confirm the token in <span className="font-mono">
-          config_aoe_bearer_token</span> / <span className="font-mono">
-          config_aoe_bearer_token_file</span> still works.
-        </p>
-        <div className="flex items-center justify-between gap-4">
-          <div className="text-sm">
-            {busy && <span className="text-muted-foreground">Probing…</span>}
-            {!busy && error && (
-              <span className="text-destructive">probe error: {error}</span>
-            )}
-            {!busy && !error && health && (
-              <>
-                <span className={`font-medium ${statusColor}`}>
-                  {health.status}
-                </span>
-                {health.status === 'ok' && health.session_count !== undefined && (
-                  <span className="ml-2 text-muted-foreground">
-                    {health.session_count} sessions @ {health.base_url}
-                  </span>
-                )}
-                {health.message && (
-                  <span className="ml-2 text-muted-foreground">
-                    — {health.message}
-                  </span>
-                )}
-              </>
-            )}
-          </div>
-          <Button variant="outline" size="sm" onClick={probe} disabled={busy}>
-            <RefreshCw className={`h-4 w-4 mr-1 ${busy ? 'animate-spin' : ''}`} />
-            Re-check
-          </Button>
-        </div>
-      </CardContent>
-    </Card>
   )
 }

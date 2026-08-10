@@ -103,7 +103,7 @@ async def test_settings_store_secret_never_enters_rag(
     the non-RAG project_settings store, so it never reaches the LLM — not
     because the RAG scans content, but because it isn't in the corpus."""
     async with mcp_session(tmp_path) as admin:
-        _seed(admin, key="config_aoe_bearer_token", value=_SETTINGS_SECRET)
+        _seed(admin, key="config_service_secret", value=_SETTINGS_SECRET)
         _seed(admin, key="project_readme", value=_PUBLIC_VALUE)
         cap = _wire_capture(monkeypatch)
 
@@ -111,7 +111,7 @@ async def test_settings_store_secret_never_enters_rag(
 
         user = _user_content(cap)
         assert _SETTINGS_SECRET not in user
-        assert "config_aoe_bearer_token" not in user
+        assert "config_service_secret" not in user
         # Knowledge content flows through.
         assert _PUBLIC_VALUE in user
         assert "project_readme" in user
