@@ -27,10 +27,10 @@ export interface Agent {
   updated_at: string
   terminated_at?: string | null
   auth_token?: string
-  // 16-char lowercase hex string identifying the matching tmux
-  // session inside Agents-of-Empires for the notification side-
-  // channel. Empty/missing = no AoE binding (notifier will fall back
-  // to title-match resolution).
+  // 16-char lowercase hex string identifying the matching session
+  // used by the ADR-0021 delivery bridge to route messages to this
+  // agent. Empty/missing = no binding (delivery falls back to
+  // title-match resolution).
   aoe_session_id?: string | null
   // Event-coord PR-1: per-agent wake-loop toggle. Default TRUE for
   // every existing row (backfilled via 0010 migration `DEFAULT 1`).
@@ -294,7 +294,7 @@ export interface SettingsSchemaEntry {
   type: 'bool' | 'int' | 'string' | 'secret'
   default: unknown
   tier: 'operator' | 'sysadmin'
-  group: 'worker_permissions' | 'event_loop' | 'retention' | 'aoe' | 'agent_profiles' | 'scheduling'
+  group: 'worker_permissions' | 'event_loop' | 'retention' | 'agent_profiles' | 'scheduling'
   title: string
   description: string
   widget:
@@ -793,8 +793,8 @@ class ApiClient {
   // editAgent updates the editable agent fields (color,
   // working_directory, aoe_session_id). PR D: cookie auth; backed by
   // POST /api/agents/<id>/edit. aoe_session_id is a 16-char lowercase
-  // hex string (or empty to clear) used by the AoE notification side-
-  // channel — see features/aoe_notify.py.
+  // hex string (or empty to clear) used by the ADR-0021 delivery
+  // bridge to route messages to this agent.
   async editAgent(
     agentId: string,
     updates: {
@@ -821,19 +821,6 @@ class ApiClient {
         body: JSON.stringify(updates),
       },
     )
-  }
-
-  // aoeHealth probes the configured Agents-of-Empires instance with
-  // the current bearer token. Settings panel uses it to warn when the
-  // token has gone stale (AoE rotates the file-sourced token on a
-  // schedule). PR D: cookie auth (was ?token=<admin> query param).
-  async aoeHealth(): Promise<{
-    status: 'ok' | 'disabled' | 'unauthorized' | 'unreachable' | 'misconfigured'
-    message?: string
-    session_count?: number
-    base_url?: string
-  }> {
-    return this.request(`/aoe/health`)
   }
 
   async getPurgePreview(agentId: string): Promise<{
@@ -1141,8 +1128,8 @@ class ApiClient {
   // Project settings endpoints (ADR-0016). The Settings tab's store —
   // config_* toggles/knobs live in project_settings, written via the
   // gated update/delete_project_settings tools (system.config.write
-  // cap; config_aoe_* additionally sysadmin-only). Same cookie-session
-  // auth story as the memory endpoints above.
+  // cap; config settings are uniformly operator-tier). Same
+  // cookie-session auth story as the memory endpoints above.
   async getSettingsData(): Promise<{ settings: ProjectSetting[] }> {
     return this.request('/settings-data')
   }

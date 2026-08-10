@@ -12,17 +12,18 @@ Deliberately SMALL and deep — settings has none of the context tools'
 machinery (no creator-ownership matrix, no backups, no bulk paths, no
 RAG coupling). Three tools:
 
-* ``view_project_settings`` — operator read; the two genuinely secret
-  keys (:data:`_SECRET_SETTING_KEYS`) mask for non-confirmed tiers.
+* ``view_project_settings`` — operator read; any genuinely secret keys
+  (:data:`_SECRET_SETTING_KEYS`) mask for non-confirmed tiers.
 * ``update_project_settings`` — upsert; ``system.config.write`` cap
-  required; ``config_aoe_*`` additionally requires sysadmin.
-* ``delete_project_settings`` — same gates as update; fires the same
+  required.
+* ``delete_project_settings`` — same gate as update; fires the same
   post-write wakes (a deleted toggle reverts to its default, so worker
   tool visibility / in-flight waiters may need to re-evaluate).
 
-Secret classification is a LITERAL frozenset owned by this module —
-the settings store knows its own schema, so no prefix heuristic (the
-prefix heuristic on the mixed store is exactly what caused F009).
+Secret classification is derived from the schema registry (every spec
+with ``type == "secret"``) — the settings store knows its own schema,
+so no prefix heuristic (the prefix heuristic on the mixed store is
+exactly what caused F009).
 """
 
 from __future__ import annotations
@@ -54,15 +55,14 @@ from ..repositories import project_settings_repository as settings_repo
 from ..utils.audit_utils import log_audit
 
 
-# The settings store's OWN secret classification: a literal set, not a
-# prefix heuristic — the store knows its schema (ADR-0016). These keys
-# carry the AoE credential (or the path to it); every other ``config_*``
-# row is an operator-readable toggle/knob.
-#
-# ADR-0018: derived from the single-source schema registry
-# (``core/settings_schema.SECRET_SETTING_KEYS`` = every spec with
-# ``type == "secret"``), so the secret classification and the schema's
-# type column can never drift.
+# The settings store's OWN secret classification, derived from the
+# single-source schema registry (``core/settings_schema.SECRET_SETTING_
+# KEYS`` = every spec with ``type == "secret"``) so the secret
+# classification and the schema's type column can never drift. A secret
+# key masks to ``[redacted]`` for non-confirmed tiers; every other
+# ``config_*`` row is an operator-readable toggle/knob. (ADR-0016 chose
+# a schema-derived set over a prefix heuristic — the heuristic on the
+# mixed store is exactly what caused F009.)
 _SECRET_SETTING_KEYS = SECRET_SETTING_KEYS
 
 _REDACTED_VALUE = "[redacted]"
@@ -70,27 +70,6 @@ _REDACTED_VALUE = "[redacted]"
 # The settings store holds the ``config_*`` namespace ONLY — knowledge
 # belongs in project_context.
 _CONFIG_KEY_RE = re.compile(r"^config_", re.IGNORECASE)
-
-# config_aoe_* configures a MACHINE-level outbound integration, not a
-# per-project policy (see features/aoe_notify.py): an operator who
-# could set config_aoe_base_url could aim the shared host's outbound
-# request at an internal/link-local/metadata address (SSRF) and
-# exfiltrate the bearer. So config_aoe_* write/delete requires
-# SYSADMIN, one tier above the operator-writable config_* namespace.
-# Prefix regex (not a literal key set) so future config_aoe_* keys
-# inherit the gate automatically. Carried over unchanged from the
-# project_context write path the cutover retired.
-_CONFIG_AOE_KEY_RE = re.compile(r"^config_aoe_", re.IGNORECASE)
-
-
-def _aoe_config_sysadmin_error() -> PermissionDenied:
-    return PermissionDenied(
-        reason=(
-            "config_aoe_* keys configure a machine-level outbound "
-            "integration target and are sysadmin-only; a per-project "
-            "operator cannot create, modify, or delete them"
-        )
-    )
 
 
 def _actor_label(principal: Optional[Principal]) -> str:
@@ -130,16 +109,6 @@ def _deny_without_config_write_cap(
                 "project settings store"
             )
         )
-    return None
-
-
-def _deny_non_sysadmin_aoe(
-    principal: Optional[Principal], context_key: str,
-) -> Optional[PermissionDenied]:
-    if principal is not None and principal.sysadmin:
-        return None
-    if _CONFIG_AOE_KEY_RE.match(context_key):
-        return _aoe_config_sysadmin_error()
     return None
 
 
@@ -212,9 +181,9 @@ async def update_project_settings_tool_impl(
 
     Gate order: (1) the key must be ``config_*`` (Invalid otherwise —
     knowledge belongs in the project_context tools), (2) the
-    ``system.config.write`` cap, (3) the ``config_aoe_*`` sysadmin
-    tier-gate. Value is JSON-encoded on write exactly like the context
-    tools, keeping the coercion helpers' read contract unchanged.
+    ``system.config.write`` cap. Value is JSON-encoded on write exactly
+    like the context tools, keeping the coercion helpers' read contract
+    unchanged.
     """
     context_key = arguments.get("context_key")
     context_value = arguments.get("context_value")
@@ -235,10 +204,6 @@ async def update_project_settings_tool_impl(
     denied = _deny_without_config_write_cap(principal)
     if denied is not None:
         return denied
-
-    aoe_denied = _deny_non_sysadmin_aoe(principal, context_key)
-    if aoe_denied is not None:
-        return aoe_denied
 
     if context_value is None and "context_value" not in arguments:
         return Invalid(
@@ -312,10 +277,10 @@ async def delete_project_settings_tool_impl(
 ) -> ToolResult:
     """Delete a ``config_*`` row from the settings store.
 
-    Same gates as :func:`update_project_settings_tool_impl` (cap +
-    AoE sysadmin tier). Fires the post-write wakes for the deleted key
-    too: a deleted toggle reverts to its default, so worker tool
-    visibility / in-flight waiters may need to re-evaluate.
+    Same gate as :func:`update_project_settings_tool_impl` (the
+    ``system.config.write`` cap). Fires the post-write wakes for the
+    deleted key too: a deleted toggle reverts to its default, so worker
+    tool visibility / in-flight waiters may need to re-evaluate.
     """
     context_key = arguments.get("context_key")
     if not context_key or not isinstance(context_key, str):
@@ -324,10 +289,6 @@ async def delete_project_settings_tool_impl(
     denied = _deny_without_config_write_cap(principal)
     if denied is not None:
         return denied
-
-    aoe_denied = _deny_non_sysadmin_aoe(principal, context_key)
-    if aoe_denied is not None:
-        return aoe_denied
 
     requesting_actor = _actor_label(principal)
     log_audit(
@@ -403,9 +364,8 @@ def register_project_settings_tools() -> None:
         name="update_project_settings",
         description=(
             "Create or update a project setting (config_* key) in the "
-            "project_settings store. Operator-only; config_aoe_* keys "
-            "require sysadmin. Use the project_context tools for "
-            "knowledge entries."
+            "project_settings store. Operator-only. Use the "
+            "project_context tools for knowledge entries."
         ),
         input_schema={
             "type": "object",
@@ -441,7 +401,7 @@ def register_project_settings_tools() -> None:
         description=(
             "Delete a project setting (config_* key) from the "
             "project_settings store; the toggle reverts to its default. "
-            "Operator-only; config_aoe_* keys require sysadmin."
+            "Operator-only."
         ),
         input_schema={
             "type": "object",

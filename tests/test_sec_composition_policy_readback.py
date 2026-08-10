@@ -15,8 +15,10 @@ checked BEFORE the blanket ``config_*`` rule. These tests pin BOTH sides
 of the class boundary on the SAME response:
 
   * the policy keys read back their real value (not ``[redacted]``), and
-  * ``config_aoe_bearer_token`` (a credential) STAYS ``[redacted]`` —
-    proving the fix does not re-open the pentest-hardened secret.
+  * a secret credential key STAYS ``[redacted]`` — proving the fix does
+    not re-open the pentest-hardened secret. (The AoE bearer was the
+    historical instance; with AoE removed this is exercised against a
+    synthetic secret key — see ``synthetic_secret_setting_key``.)
 
 Wave 11 (ADR-0016): the ROOT-CAUSE fix — ``config_*`` rows moved out of
 ``project_context`` into the dedicated ``project_settings`` store, so
@@ -37,10 +39,15 @@ import json
 
 import pytest
 
-from tests.harness import mcp_session, seed_config_setting_as_sysadmin
+from tests.harness import (
+    SYNTHETIC_SECRET_SETTING_KEY,
+    mcp_session,
+    seed_config_setting_as_sysadmin,
+    synthetic_secret_setting_key,
+)
 
 _REDACTED = "[redacted]"
-_BEARER_SECRET = "SENTINEL-AOE-BEARER-9f04"
+_BEARER_SECRET = "SENTINEL-CREDENTIAL-9f04"
 
 # Every policy toggle the Settings dashboard reads
 # (settings-dashboard.tsx). Seeded true / non-zero so a redaction would be
@@ -51,7 +58,6 @@ _POLICY_SEEDS: dict[str, object] = {
     "config_allow_worker_update_own_status": True,
     "config_allow_worker_create_unassigned": True,
     "config_auto_event_loop_global": True,
-    "config_aoe_notify_enabled": True,
     "config_message_retention_days": 7,
 }
 
@@ -59,8 +65,11 @@ _POLICY_SEEDS: dict[str, object] = {
 def _seed_all() -> None:
     for key, value in _POLICY_SEEDS.items():
         seed_config_setting_as_sysadmin(key, value)
-    # Paired guard: a real credential in the same namespace.
-    seed_config_setting_as_sysadmin("config_aoe_bearer_token", _BEARER_SECRET)
+    # Paired guard: a secret credential in the same namespace. (The AoE
+    # bearer was the historical instance; the redaction machinery is
+    # exercised here against a synthetic secret key — see
+    # ``synthetic_secret_setting_key`` in the tests that read it back.)
+    seed_config_setting_as_sysadmin(SYNTHETIC_SECRET_SETTING_KEY, _BEARER_SECRET)
 
 
 def _row(context: list[dict], key: str) -> dict:
@@ -78,34 +87,37 @@ async def test_settings_data_policy_toggles_readable_to_session_operator(
     operator: policy toggles carry their real value; the AoE bearer stays
     redacted. This is the F009 guarantee at its post-ADR-0016 seam."""
     async with mcp_session(tmp_path) as admin:
-        _seed_all()
+        with synthetic_secret_setting_key():
+            _seed_all()
 
-        r = admin.get("/api/settings-data")  # signed forwarding header
-        assert r.status_code == 200, r.text
-        rows = r.json()["settings"]
+            r = admin.get("/api/settings-data")  # signed forwarding header
+            assert r.status_code == 200, r.text
+            rows = r.json()["settings"]
 
-        for key, value in _POLICY_SEEDS.items():
-            row = _row(rows, key)
-            assert row["value"] != _REDACTED, (
-                f"policy key {key} redacted to a session operator (F009)"
+            for key, value in _POLICY_SEEDS.items():
+                row = _row(rows, key)
+                assert row["value"] != _REDACTED, (
+                    f"policy key {key} redacted to a session operator (F009)"
+                )
+                assert json.loads(row["value"]) == value, (
+                    f"policy key {key} value corrupted: {row['value']!r}"
+                )
+
+            # PAIRED GUARD — the credential MUST stay redacted on this call.
+            bearer = _row(rows, SYNTHETIC_SECRET_SETTING_KEY)
+            assert bearer["value"] == _REDACTED, (
+                "secret credential leaked to a non-confirmed operator"
             )
-            assert json.loads(row["value"]) == value, (
-                f"policy key {key} value corrupted: {row['value']!r}"
+            assert _BEARER_SECRET not in r.text, (
+                "secret credential in settings-data body"
             )
-
-        # PAIRED GUARD — the credential MUST stay redacted on this call.
-        bearer = _row(rows, "config_aoe_bearer_token")
-        assert bearer["value"] == _REDACTED, (
-            "config_aoe_bearer_token leaked to a non-confirmed operator"
-        )
-        assert _BEARER_SECRET not in r.text, "bearer secret in settings-data body"
 
 
 @pytest.mark.asyncio
 async def test_config_rows_absent_from_composition_reads(tmp_path) -> None:
     """Post-cutover: config rows no longer pollute the memory read seams
     at all — ``/api/all-data`` and ``/api/context-data`` carry neither
-    the toggles nor the AoE bearer (in any form)."""
+    the toggles nor the secret credential (in any form)."""
     async with mcp_session(tmp_path) as admin:
         _seed_all()
 
@@ -113,7 +125,7 @@ async def test_config_rows_absent_from_composition_reads(tmp_path) -> None:
         assert r.status_code == 200, r.text
         context_keys = {c.get("context_key") for c in r.json()["context"]}
         assert not (set(_POLICY_SEEDS) & context_keys)
-        assert "config_aoe_bearer_token" not in context_keys
+        assert SYNTHETIC_SECRET_SETTING_KEY not in context_keys
         assert _BEARER_SECRET not in r.text
 
         r = admin.get("/api/context-data")

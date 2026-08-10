@@ -2,9 +2,8 @@
 
 The registry (``agent_mcp/core/settings_schema.py``) is the single
 source of truth for every ``config_*`` setting. These tests PIN that
-contract so a future edit that flips a default, mis-tiers a key, or
-lets the schema drift from the live sysadmin write-gate fails the
-build.
+contract so a future edit that flips a default or mis-tiers a key fails
+the build.
 
 The golden-default table is the no-behaviour-change proof for PR 1:
 every default here is a hardcoded copy of the value the backend
@@ -27,7 +26,6 @@ from agent_mcp.core.settings_schema import (
     default_for,
     spec_for,
 )
-from agent_mcp.tools.project_settings_tools import _CONFIG_AOE_KEY_RE
 from tests.harness import mcp_session
 
 # ---------------------------------------------------------------------------
@@ -62,15 +60,6 @@ GOLDEN_DEFAULTS: dict[str, object] = {
     "config_allow_manager_curate_schedules": True,
     "config_min_schedule_interval_seconds": 60,
     "config_max_schedules_per_agent": 10,
-    "config_aoe_notify_enabled": False,
-    "config_aoe_base_url": "http://127.0.0.1:8181",
-    "config_aoe_bearer_token": None,
-    "config_aoe_bearer_token_file": None,
-    "config_aoe_notify_template": (
-        "[agent-mcp] New message from {sender}. "
-        "Call get_agent_messages to read."
-    ),
-    "config_aoe_timeout_ms": 2000,
     # Delivery transport / fallback push (ADR-0021).
     "config_delivery_enabled": False,
     "config_delivery_on_unread_messages": True,
@@ -101,26 +90,25 @@ def test_golden_table_and_schema_cover_the_same_keys() -> None:
     assert set(GOLDEN_DEFAULTS) == {s.key for s in SETTINGS_SCHEMA}
 
 
-def test_schema_has_thirty_two_ordered_specs() -> None:
-    assert len(SETTINGS_SCHEMA) == 32
+def test_schema_has_twenty_six_ordered_specs() -> None:
+    assert len(SETTINGS_SCHEMA) == 26
     # Keys are unique.
-    assert len({s.key for s in SETTINGS_SCHEMA}) == 32
+    assert len({s.key for s in SETTINGS_SCHEMA}) == 26
 
 
 # ---------------------------------------------------------------------------
-# Hybrid tier-enforcement invariant (ADR-0018): schema.tier MUST agree
-# with the live sysadmin write-gate regex for every key. The regex stays
-# the enforcer; this test guarantees the schema's tier column (which
-# drives the UI) never disagrees with it.
+# Tier invariant: every remaining setting is operator-tier. The AoE
+# feature (the only source of sysadmin-tier keys + the bespoke sysadmin
+# write-gate) was removed; the generic ``system.config.write`` cap gate
+# in ``tools/project_settings_tools.py`` is the enforcer for the whole
+# ``config_*`` namespace now.
 # ---------------------------------------------------------------------------
 
-def test_tier_agrees_with_live_aoe_write_gate() -> None:
+def test_every_spec_is_operator_tier() -> None:
     for spec in SETTINGS_SCHEMA:
-        gated = bool(_CONFIG_AOE_KEY_RE.match(spec.key))
-        assert (spec.tier == "sysadmin") == gated, (
-            f"{spec.key!r}: schema.tier={spec.tier!r} disagrees with the "
-            f"live _CONFIG_AOE_KEY_RE gate (matches={gated}). The regex is "
-            "the enforcer — fix the schema tier to match it."
+        assert spec.tier == "operator", (
+            f"{spec.key!r}: schema.tier={spec.tier!r} — no sysadmin-tier "
+            "setting should remain after the AoE removal"
         )
 
 
@@ -130,15 +118,16 @@ def test_tier_agrees_with_live_aoe_write_gate() -> None:
 
 def test_known_setting_keys_complete() -> None:
     """KNOWN_SETTING_KEYS == the config_* keys the backend actually
-    reads (the 24 in the golden table)."""
+    reads (the 26 in the golden table)."""
     assert KNOWN_SETTING_KEYS == frozenset(GOLDEN_DEFAULTS)
 
 
 def test_secret_keys_derived_from_schema() -> None:
-    assert SECRET_SETTING_KEYS == {
-        "config_aoe_bearer_token",
-        "config_aoe_bearer_token_file",
-    }
+    # The AoE bearer token/file were the only secret-typed settings; with
+    # AoE removed the schema has no ``type == "secret"`` spec, so the
+    # derived set is empty. The redaction machinery is retained (a future
+    # secret setting re-populates this automatically).
+    assert SECRET_SETTING_KEYS == frozenset()
     # Derived, not hand-listed: every secret spec, and only those.
     assert SECRET_SETTING_KEYS == frozenset(
         s.key for s in SETTINGS_SCHEMA if s.type == "secret"
@@ -171,7 +160,7 @@ async def test_settings_schema_endpoint_confirmed_operator(
         assert r.status_code == 200, r.text
         body = r.json()
         rows = _rows(body)
-        assert len(rows) == 32
+        assert len(rows) == 26
         # Row shape carries every schema field the frontend renders.
         first = rows[0]
         assert set(first) == {
@@ -226,4 +215,4 @@ async def test_settings_schema_caller_sysadmin_true_for_sysadmin() -> None:
     body = json.loads(resp.body)
     assert body["caller"]["sysadmin"] is True
     assert body["caller"]["confirmed_operator"] is True
-    assert len(body["schema"]) == 32
+    assert len(body["schema"]) == 26

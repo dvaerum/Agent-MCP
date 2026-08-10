@@ -92,10 +92,10 @@ async def test_skinny_frame_never_leaks_body_for_subjectless_message(
     The frame is a contractually body-free channel (ADR-0021): it flows over
     SSE to the Rust bridge, which types the `subject` verbatim into the
     recipient's pane and from there into the agent's session logs. Message
-    bodies can carry secrets (admin tokens appear in message text — see
-    aoe_notify.py), so NO substring of the body may appear in the rendered
-    frame. Subject is optional and stored NULL by default, so this is the
-    common case, not an edge.
+    bodies can carry secrets (admin tokens appear in message text), so NO
+    substring of the body may appear in the rendered frame. Subject is
+    optional and stored NULL by default, so this is the common case, not
+    an edge.
     """
     secret = "admin token is sk-live-DEADBEEF1234567890 please rotate it"
     async with mcp_session(tmp_path) as admin:

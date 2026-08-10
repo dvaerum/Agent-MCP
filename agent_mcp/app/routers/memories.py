@@ -52,11 +52,10 @@ router = APIRouter(
 
 # R9-F2 (pentest): all three handlers (CREATE / UPDATE / DELETE) now
 # dispatch through the gated MCP project_context tools so the tool-layer
-# authorization gates — the ``config_aoe_*`` sysadmin gate (R8-F1), the
-# viewer-tier write guard (SEC1), the per-key creator-ownership matrix,
-# and the critical-key / ``force_delete`` guard — are enforced on the
-# REST surface too. Before this fix UPDATE + DELETE wrote the table
-# ORM-DIRECT and bypassed every one of them.
+# authorization gates — the viewer-tier write guard (SEC1), the per-key
+# creator-ownership matrix, and the critical-key / ``force_delete``
+# guard — are enforced on the REST surface too. Before this fix UPDATE +
+# DELETE wrote the table ORM-DIRECT and bypassed every one of them.
 #
 # SEC round-9 (type-confusion 400-not-500): ``description`` is a TEXT
 # column — a structured JSON type used to 500. The ``_require_str``
@@ -198,11 +197,9 @@ async def update_memory_api_route(
     R9-F2 (pentest): this handler used to write the ``project_context``
     table ORM-DIRECT after the ``require_operator_session`` gate, which
     BYPASSED every authorization gate that lives inside the MCP tool
-    impl — the ``config_aoe_*`` sysadmin gate (R8-F1), the viewer-tier
-    write guard (SEC1), and the per-key creator-ownership matrix. A
-    non-sysadmin per-project operator could therefore re-point the
-    outbound AoE client via ``config_aoe_base_url`` (SSRF; the R8-F1
-    vuln reopened via UPDATE) even though the POST create surface
+    impl — the viewer-tier write guard (SEC1) and the per-key
+    creator-ownership matrix. A signed viewer forwarding header could
+    therefore mutate project context even though the POST create surface
     already 403s it. The write now dispatches through the gated
     ``update_project_context`` tool exactly as the CREATE handler above
     dispatches ``create_project_context`` — ONE enforcement path. The
@@ -305,10 +302,9 @@ async def delete_memory_api_route(
     R9-F2 (pentest): this route wrote the ``project_context`` table
     ORM-DIRECT (its prior docstring even noted it "never enforced the
     critical-keys guard"), so — like the UPDATE sibling — it BYPASSED
-    every gate inside the MCP tool: the ``config_aoe_*`` sysadmin gate
-    (R8-F1; a non-sysadmin operator could delete ``config_aoe_bearer_token``),
-    the viewer-tier write guard (SEC1), the per-key creator-ownership
-    matrix, AND the critical-key / ``force_delete`` guard. It now
+    every gate inside the MCP tool: the viewer-tier write guard (SEC1),
+    the per-key creator-ownership matrix, AND the critical-key /
+    ``force_delete`` guard. It now
     dispatches through the gated ``delete_project_context`` tool exactly
     as the CREATE handler dispatches ``create_project_context`` — ONE
     enforcement path. The RAG chunk-purge (BL-R5-1) and the post-delete

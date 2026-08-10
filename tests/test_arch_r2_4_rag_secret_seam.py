@@ -76,7 +76,7 @@ def test_fetch_recent_context_returns_secret_keyed_row(
         try:
             c = conn.cursor()
             for key, value in (
-                ("config_aoe_bearer_token", _SECRET_VALUE),
+                ("service_bearer_token", _SECRET_VALUE),
                 ("project_readme", _PUBLIC_VALUE),
             ):
                 c.execute(
@@ -98,7 +98,7 @@ def test_fetch_recent_context_returns_secret_keyed_row(
         keys = [r["context_key"] for r in results]
         values = [r.get("value") for r in results]
 
-        assert "config_aoe_bearer_token" in keys
+        assert "service_bearer_token" in keys
         assert any(_SECRET_VALUE in str(v) for v in values)
         assert "project_readme" in keys
 
@@ -156,11 +156,11 @@ def test_search_similar_returns_secret_context_chunk(
 
         rag_repo.bulk_index_chunks(
             source_type="context",
-            source_ref="config_aoe_bearer_token",
+            source_ref="service_bearer_token",
             chunks=[
                 {
                     "chunk_text": (
-                        "Context Key: config_aoe_bearer_token\n"
+                        "Context Key: service_bearer_token\n"
                         f"Value: {_SECRET_VALUE}"
                     ),
                     "embedding": _emb([1.0, 0.0, 0.0]),
@@ -187,6 +187,6 @@ def test_search_similar_returns_secret_context_chunk(
         source_refs = [r["source_ref"] for r in results]
         texts = " ".join(r.get("chunk_text", "") for r in results)
 
-        assert "config_aoe_bearer_token" in source_refs
+        assert "service_bearer_token" in source_refs
         assert _SECRET_VALUE in texts
         assert "app/util.py" in source_refs
