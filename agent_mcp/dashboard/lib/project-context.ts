@@ -93,9 +93,11 @@ function derive(): {
   }
   const match = pathname.match(APP_PROJECT_PATH_RE)
   if (match) {
-    const apiRoot = apiUrl(match[1])
+    // Group 1 (the project name) is always present when the regex matches.
+    const projectName = match[1] ?? ''
+    const apiRoot = apiUrl(projectName)
     return {
-      projectName: match[1],
+      projectName,
       isOverview: false,
       isRouterServed: true,
       baseUrl: apiRoot,

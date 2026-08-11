@@ -15,7 +15,7 @@
 // 403 envelope and we render an explanatory message rather than the
 // config table.
 
-import React, { useCallback } from "react"
+import { useCallback } from "react"
 import { Loader2, ShieldAlert, ShieldCheck, Server } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"

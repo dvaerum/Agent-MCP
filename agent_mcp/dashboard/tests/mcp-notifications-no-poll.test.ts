@@ -87,7 +87,7 @@ describe("operator events SSE subscription contract", () => {
         `${JSON.stringify(captured.map((c) => c.url))}`,
     ).toBe(1)
 
-    const { url, init } = captured[0]
+    const { url, init } = captured[0]!
     // Targets the operator events channel, not the MCP transport.
     expect(url).toContain("/events")
     expect(url).not.toContain("/mcp")

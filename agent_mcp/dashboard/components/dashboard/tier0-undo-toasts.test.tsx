@@ -171,7 +171,7 @@ describe("group member remove", () => {
     await u.click(within(panel).getByRole("button", { name: "Remove alice" }))
     await screen.findByRole("button", { name: "Undo" })
 
-    requestMock.mockImplementation((url: string, init?: RequestInit) =>
+    requestMock.mockImplementation((_url: string, init?: RequestInit) =>
       init?.method === "POST"
         ? Promise.reject(new Error("membership already exists"))
         : Promise.resolve({ members: [] }),
@@ -189,7 +189,7 @@ describe("group member remove", () => {
       "/groups": { groups: GROUPS },
     })
     const { u, panel } = await expandDevs()
-    requestMock.mockImplementation((url: string, init?: RequestInit) =>
+    requestMock.mockImplementation((_url: string, init?: RequestInit) =>
       init?.method === "DELETE"
         ? Promise.reject(new Error("nope"))
         : Promise.resolve({ members: [] }),
@@ -259,7 +259,7 @@ describe("project membership remove", () => {
   it("keeps the inline error path for a FAILED remove", async () => {
     routeBy({ "/memberships": { memberships: ROWS } })
     const u = await openModal()
-    requestMock.mockImplementation((url: string, init?: RequestInit) =>
+    requestMock.mockImplementation((_url: string, init?: RequestInit) =>
       init?.method === "DELETE"
         ? Promise.reject(new Error("boom"))
         : Promise.resolve({ memberships: ROWS }),

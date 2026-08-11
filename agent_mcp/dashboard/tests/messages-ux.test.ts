@@ -159,8 +159,8 @@ describe("MUX-5: background refresh interval", () => {
       /const interval = setInterval\(\(\) => \{([\s\S]*?)\}, REFRESH_INTERVAL\)/,
     )
     expect(effect, "background-refresh interval must exist").not.toBeNull()
-    expect(/refreshQuery\(\)/.test(effect![1])).toBe(true)
-    expect(/setCurrentOffset/.test(effect![1])).toBe(false)
+    expect(/refreshQuery\(\)/.test(effect![1]!)).toBe(true)
+    expect(/setCurrentOffset/.test(effect![1]!)).toBe(false)
   })
 
   it("pauses while compose is open", () => {

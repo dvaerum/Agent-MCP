@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest"
-import { buildTasksQuery, type TaskFilters } from "@/lib/api"
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
+import { apiClient, ApiError, buildTasksQuery, type TaskFilters } from "@/lib/api"
 
 // Pure-Node assertions on the GET /tasks query-string builder. This is
 // the single serialization point the Tasks page relies on to drive
@@ -84,5 +84,129 @@ describe("buildTasksQuery", () => {
     expect(
       new URLSearchParams(qs.slice(1)).get("created_by"),
     ).toBe("[deleted-foo bar]")
+  })
+})
+
+// Engine-level coverage for ApiClient.request() — the single fetch
+// funnel every endpoint method flows through. request() itself is
+// private, so these tests drive it through public methods
+// (getSystemStatus = GET, createTask = POST) with a `fetch` stub,
+// asserting the four behaviours that are easy to regress:
+//   1. success JSON is parsed and returned as-is,
+//   2. a non-OK response becomes an ApiError with the {status, message,
+//      body} shape and the message-preference cascade,
+//   3. a 401 surfaces as ApiError(401) (the redirect is window-guarded;
+//      the vitest env is `node`, so window is undefined and request()
+//      falls through to the generic ApiError path),
+//   4. the 5xx retry is gated on the HTTP method — GET retries, POST
+//      does not (retrying a mutation double-fires side-effects).
+
+function fakeResponse(status: number, body: unknown, ok?: boolean): Response {
+  const text = typeof body === "string" ? body : JSON.stringify(body)
+  return {
+    ok: ok ?? (status >= 200 && status < 300),
+    status,
+    statusText: `Status ${status}`,
+    text: async () => text,
+    json: async () => (typeof body === "string" ? JSON.parse(body || "null") : body),
+  } as unknown as Response
+}
+
+async function catchApiError(promise: Promise<unknown>): Promise<ApiError> {
+  try {
+    await promise
+  } catch (e) {
+    return e as ApiError
+  }
+  throw new Error("expected the request to reject, but it resolved")
+}
+
+describe("ApiClient.request engine", () => {
+  const realFetch = global.fetch
+
+  beforeEach(() => {
+    apiClient.setBaseUrl("/api")
+  })
+
+  afterEach(() => {
+    global.fetch = realFetch
+    vi.restoreAllMocks()
+  })
+
+  it("parses and returns a successful JSON body", async () => {
+    global.fetch = vi.fn(
+      async () => fakeResponse(200, { server_running: true }),
+    ) as unknown as typeof fetch
+
+    const res = await apiClient.getSystemStatus()
+    expect(res).toEqual({ server_running: true })
+  })
+
+  it("throws an ApiError carrying {status, message, body} on a non-OK response", async () => {
+    const payload = { message: "the thing broke" }
+    global.fetch = vi.fn(
+      async () => fakeResponse(400, payload),
+    ) as unknown as typeof fetch
+
+    const err = await catchApiError(apiClient.getSystemStatus())
+    expect(err).toBeInstanceOf(ApiError)
+    expect(err.status).toBe(400)
+    expect(err.message).toBe("the thing broke")
+    expect(err.body).toBe(JSON.stringify(payload))
+  })
+
+  it("prefers message > detail > error > raw body > status line", async () => {
+    const cases: Array<{ body: unknown; expected: string }> = [
+      { body: { message: "m", detail: "d", error: "e" }, expected: "m" },
+      { body: { detail: "d", error: "e" }, expected: "d" },
+      { body: { error: "e" }, expected: "e" },
+      { body: "plain-text failure", expected: "plain-text failure" },
+    ]
+    for (const { body, expected } of cases) {
+      global.fetch = vi.fn(
+        async () => fakeResponse(422, body),
+      ) as unknown as typeof fetch
+      const err = await catchApiError(apiClient.getSystemStatus())
+      expect(err.message).toBe(expected)
+    }
+
+    // Empty body → nothing to surface, so fall back to the status line.
+    global.fetch = vi.fn(
+      async () => fakeResponse(500, ""),
+    ) as unknown as typeof fetch
+    const err = await catchApiError(apiClient.getSystemStatus())
+    expect(err.message).toContain("500")
+  })
+
+  it("surfaces a 401 as ApiError(401)", async () => {
+    global.fetch = vi.fn(
+      async () => fakeResponse(401, { message: "session expired" }),
+    ) as unknown as typeof fetch
+
+    const err = await catchApiError(apiClient.getSystemStatus())
+    expect(err).toBeInstanceOf(ApiError)
+    expect(err.status).toBe(401)
+  })
+
+  it("retries a read-only (GET) request on a 5xx then returns the recovered body", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(fakeResponse(503, { message: "cold start" }))
+      .mockResolvedValueOnce(fakeResponse(200, { server_running: true }))
+    global.fetch = fetchMock as unknown as typeof fetch
+
+    const res = await apiClient.getSystemStatus()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(res).toEqual({ server_running: true })
+  })
+
+  it("does NOT retry a mutating (POST) request on a 5xx", async () => {
+    const fetchMock = vi.fn(async () => fakeResponse(502, { message: "gateway" }))
+    global.fetch = fetchMock as unknown as typeof fetch
+
+    const err = await catchApiError(apiClient.createTask({ title: "x" }))
+    expect(err).toBeInstanceOf(ApiError)
+    expect(err.status).toBe(502)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 })

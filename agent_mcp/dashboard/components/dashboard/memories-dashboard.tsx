@@ -28,7 +28,7 @@ import { useDataStore } from '@/lib/stores/data-store'
 import { useServerStore } from '@/lib/stores/server-store'
 import { useDialog } from '@/hooks/use-dialog'
 import { useFilters } from '@/hooks/use-filters'
-import { apiClient, type Memory } from '@/lib/api'
+import { apiClient, type Memory, type RawContextEntry } from '@/lib/api'
 import { toastError, toastSuccess } from '@/components/ui/toast'
 import { decodeMemoryValue, memoryValuePreview } from '@/lib/memory-value'
 import { CreateMemoryModal } from './modals/create-memory-modal'
@@ -119,7 +119,7 @@ export function MemoriesDashboard() {
       return []
     }
 
-    return data.context.map(ctx => ({
+    return (data.context as RawContextEntry[]).map(ctx => ({
       context_key: ctx.context_key,
       value: ctx.value,
       description: ctx.description,
@@ -154,6 +154,12 @@ export function MemoriesDashboard() {
   // Deleted-while-open: if the row is purged from the store, the
   // selector returns null. Auto-close so the user isn't stuck on an
   // empty modal.
+  //
+  // exhaustive-deps disabled for this block: useDialog returns a fresh
+  // object each render, so we depend on its stable fields
+  // (.isOpen/.data/.close) rather than the whole object. Listing the
+  // object would re-run every render with no behavioural gain.
+  /* eslint-disable react-hooks/exhaustive-deps */
   useEffect(() => {
     if (viewDialog.isOpen && viewDialog.data === null) viewDialog.close()
   }, [viewDialog.isOpen, viewDialog.data, viewDialog.close])
@@ -163,6 +169,7 @@ export function MemoriesDashboard() {
   useEffect(() => {
     if (deleteDialog.isOpen && deleteDialog.data === null) deleteDialog.close()
   }, [deleteDialog.isOpen, deleteDialog.data, deleteDialog.close])
+  /* eslint-enable react-hooks/exhaustive-deps */
 
   // Fetch data on mount and when server changes
   useEffect(() => {
@@ -173,7 +180,7 @@ export function MemoriesDashboard() {
 
   // Filter and sort memories
   const filteredMemories = React.useMemo(() => {
-    let filtered = memories.filter(memory =>
+    const filtered = memories.filter(memory =>
       memory.context_key.toLowerCase().includes(searchTerm.toLowerCase()) ||
       (memory.description && memory.description.toLowerCase().includes(searchTerm.toLowerCase())) ||
       JSON.stringify(memory.value).toLowerCase().includes(searchTerm.toLowerCase())
@@ -244,7 +251,7 @@ export function MemoriesDashboard() {
 
   const handleCreateMemory = async (data: {
     context_key: string
-    context_value: any
+    context_value: unknown
     description?: string
   }) => {
     try {
@@ -263,7 +270,7 @@ export function MemoriesDashboard() {
 
   const handleUpdateMemory = async (data: {
     context_key: string
-    context_value: any
+    context_value: unknown
     description?: string
   }) => {
     try {

@@ -6,7 +6,6 @@ import {
   CheckCircle2, Users, Zap, Target, Lightbulb, Play
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import {
   Dialog,
@@ -111,7 +110,7 @@ const tutorialSteps: TutorialStep[] = [
             <div>
               <p className="font-medium">Search by Keywords</p>
               <p className="text-sm text-muted-foreground">
-                Use the search bar to find prompts by title, description, or tags like "admin", "worker", "initialization".
+                Use the search bar to find prompts by title, description, or tags like &quot;admin&quot;, &quot;worker&quot;, &quot;initialization&quot;.
               </p>
             </div>
           </div>
@@ -123,7 +122,7 @@ const tutorialSteps: TutorialStep[] = [
             <div>
               <p className="font-medium">Quick Copy or Customize</p>
               <p className="text-sm text-muted-foreground">
-                Either copy the template directly or click "Use Template" to customize variables before copying.
+                Either copy the template directly or click &quot;Use Template&quot; to customize variables before copying.
               </p>
             </div>
           </div>
@@ -135,7 +134,7 @@ const tutorialSteps: TutorialStep[] = [
             <span className="font-medium text-blue-900 dark:text-blue-100 text-sm">Pro Tip</span>
           </div>
           <p className="text-xs text-blue-800 dark:text-blue-200">
-            Start with the "Quick Start" section to see the essential prompts for getting Agent-MCP running.
+            Start with the &quot;Quick Start&quot; section to see the essential prompts for getting Agent-MCP running.
           </p>
         </div>
       </div>
@@ -155,7 +154,7 @@ const tutorialSteps: TutorialStep[] = [
               <span className="text-xs font-bold text-primary">1</span>
             </div>
             <div>
-              <p className="font-medium">Click "Create Prompt"</p>
+              <p className="font-medium">Click &quot;Create Prompt&quot;</p>
               <p className="text-sm text-muted-foreground">
                 Use the green button in the top right to start creating a new prompt template.
               </p>
@@ -181,7 +180,7 @@ const tutorialSteps: TutorialStep[] = [
             <div>
               <p className="font-medium">Auto-Detect Variables</p>
               <p className="text-sm text-muted-foreground">
-                Click "Detect Variables" to automatically find and configure all the variables in your template.
+                Click &quot;Detect Variables&quot; to automatically find and configure all the variables in your template.
               </p>
             </div>
           </div>
@@ -190,7 +189,7 @@ const tutorialSteps: TutorialStep[] = [
         <div className="bg-muted/30 border rounded-lg p-3">
           <p className="font-medium text-sm mb-2">Example Template:</p>
           <code className="text-xs bg-background border rounded px-2 py-1 block">
-            Create a {'{{AGENT_TYPE}}'} agent with ID "{'{{AGENT_ID}}'}" to {'{{TASK_DESCRIPTION}}'}.
+            Create a {'{{AGENT_TYPE}}'} agent with ID &quot;{'{{AGENT_ID}}'}&quot; to {'{{TASK_DESCRIPTION}}'}.
           </code>
           <div className="mt-2 flex flex-wrap gap-1">
             <Badge variant="outline" className="text-xs">AGENT_TYPE</Badge>
@@ -211,7 +210,7 @@ const tutorialSteps: TutorialStep[] = [
         
         <div className="space-y-3">
           <p className="text-sm text-muted-foreground">
-            Agent-MCP works best when you follow a structured workflow. Here's the typical sequence:
+            Agent-MCP works best when you follow a structured workflow. Here&apos;s the typical sequence:
           </p>
           
           {/* Wave 7 PR 2 — coordinator transition. agent-mcp mints
@@ -265,7 +264,7 @@ const tutorialSteps: TutorialStep[] = [
         </div>
         
         <div>
-          <h3 className="text-lg font-semibold">You're Ready to Go!</h3>
+          <h3 className="text-lg font-semibold">You&apos;re Ready to Go!</h3>
           <p className="text-muted-foreground">
             You now know how to use and create prompts in the Prompt Book. Here are some quick actions to get started:
           </p>
@@ -313,13 +312,6 @@ interface PromptBookTutorialProps {
 
 export function PromptBookTutorial({ open, onOpenChange }: PromptBookTutorialProps) {
   const [currentStep, setCurrentStep] = useState(0)
-  const [hasCompletedTutorial, setHasCompletedTutorial] = useState(false)
-
-  useEffect(() => {
-    // Check if user has seen the tutorial before
-    const completed = localStorage.getItem('prompt-book-tutorial-completed')
-    setHasCompletedTutorial(completed === 'true')
-  }, [])
 
   const nextStep = () => {
     if (currentStep < tutorialSteps.length - 1) {
@@ -335,13 +327,17 @@ export function PromptBookTutorial({ open, onOpenChange }: PromptBookTutorialPro
 
   const closeTutorial = () => {
     localStorage.setItem('prompt-book-tutorial-completed', 'true')
-    setHasCompletedTutorial(true)
     onOpenChange(false)
     setCurrentStep(0)
   }
 
   const currentStepData = tutorialSteps[currentStep]
   const isLastStep = currentStep === tutorialSteps.length - 1
+
+  // currentStep is always clamped to a valid index by next/prevStep, so
+  // this never fires in practice — the guard is here to satisfy
+  // noUncheckedIndexedAccess (tutorialSteps[currentStep] is T | undefined).
+  if (!currentStepData) return null
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>

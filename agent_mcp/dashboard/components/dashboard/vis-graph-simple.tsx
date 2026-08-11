@@ -1,6 +1,5 @@
 "use client"
 
-import React from 'react'
 import dynamic from 'next/dynamic'
 
 // Dynamic import for heavy vis-network library
@@ -20,9 +19,9 @@ interface VisGraphProps {
   fullscreen?: boolean
   selectedNodeId?: string | null
   selectedNodeType?: 'agent' | 'task' | 'context' | 'file' | 'admin' | null
-  selectedNodeData?: any
+  selectedNodeData?: unknown
   isPanelOpen?: boolean
-  onNodeSelect?: (nodeId: string, nodeType: 'agent' | 'task' | 'context' | 'file' | 'admin', nodeData: any) => void
+  onNodeSelect?: (nodeId: string, nodeType: 'agent' | 'task' | 'context' | 'file' | 'admin', nodeData: unknown) => void
   onClosePanel?: () => void
 }
 

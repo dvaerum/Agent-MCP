@@ -59,7 +59,7 @@ export function deriveMount(pathname?: string): string {
   // value is always correct per-origin.
   if (p === null || p === undefined) return "/agent-mcp"
   const m = p.match(/^(.*?)\/(?:app|api|assets|mcp|login)(?:\/|$)/)
-  return m ? m[1] : ""
+  return m?.[1] ?? ""
 }
 
 // ── Top-level path segments ─────────────────────────────────────────

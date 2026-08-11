@@ -119,8 +119,8 @@ describe("<MessagesDashboard> (scaffold migration)", () => {
   it("indents reply rows only (rowClassName callback)", () => {
     const { container } = render(<MessagesDashboard />)
     const rows = container.querySelectorAll("tbody tr")
-    expect(rows[0].className).not.toContain("border-l-2")
-    expect(rows[1].className).toContain("border-l-2")
+    expect(rows[0]!.className).not.toContain("border-l-2")
+    expect(rows[1]!.className).toContain("border-l-2")
   })
 
   it("renders both pagination footers with the range label", () => {

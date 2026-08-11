@@ -201,9 +201,22 @@ export interface GraphEdge {
   [key: string]: unknown
 }
 
+// Raw context row as it arrives in the /all-data + /context-data
+// envelopes (pre-Memory-shaping). getMemories() maps these into the
+// richer Memory shape.
+export interface RawContextEntry {
+  context_key: string
+  value: unknown
+  description?: string
+  updated_at: string
+  updated_by: string
+  created_at?: string | null
+  created_by?: string | null
+}
+
 export interface Memory {
   context_key: string
-  value: any
+  value: unknown
   description?: string
   updated_at: string
   updated_by: string
@@ -349,7 +362,7 @@ export interface AgentDetails {
     timestamp: string
     action_type: string
     task_id?: string
-    details?: any
+    details?: unknown
   }>
 }
 
@@ -640,7 +653,7 @@ class ApiClient {
           // Throw a clean error without triggering additional console logs
           const err = new Error(`Network error: Unable to connect to ${this.baseUrl}`)
           // Mark this error as expected to prevent logging
-          ;(err as any).isExpected = true
+          ;(err as Error & { isExpected?: boolean }).isExpected = true
           throw err
         }
       }
@@ -691,7 +704,7 @@ class ApiClient {
       agent: { ...agent, auth_token: agentToken },
       token: agentToken,
       tasks: (nodeDetails.related?.assigned_tasks as Task[]) || [],
-      actions: (nodeDetails.actions as any[]) || []
+      actions: (nodeDetails.actions as AgentDetails['actions']) || []
     }
   }
 
@@ -1039,10 +1052,10 @@ class ApiClient {
   async getAllData(): Promise<{
     agents: Agent[]
     tasks: Task[]
-    context: any[]
-    actions: any[]
-    file_metadata: any[]
-    file_map: Record<string, any>
+    context: RawContextEntry[]
+    actions: unknown[]
+    file_metadata: unknown[]
+    file_map: Record<string, unknown>
     timestamp: string
   }> {
     return this.request('/all-data')
@@ -1060,7 +1073,7 @@ class ApiClient {
   }
 
   // Memory endpoints
-  async getMemories(options?: {
+  async getMemories(_options?: {
     context_key?: string
     search_query?: string
     show_health_analysis?: boolean
@@ -1099,7 +1112,7 @@ class ApiClient {
   // for non-cookie callers (legacy admin scripts).
   async createMemory(data: {
     context_key: string
-    context_value: any
+    context_value: unknown
     description?: string
   }): Promise<{ success: boolean; message: string }> {
     return this.request('/memories', {
@@ -1109,7 +1122,7 @@ class ApiClient {
   }
 
   async updateMemory(context_key: string, data: {
-    context_value: any
+    context_value: unknown
     description?: string
   }): Promise<{ success: boolean; message: string }> {
     return this.request(`/memories/${encodeURIComponent(context_key)}`, {
@@ -1210,7 +1223,7 @@ class ApiClient {
 
   async createSetting(data: {
     context_key: string
-    context_value: any
+    context_value: unknown
     description?: string
   }): Promise<{ success: boolean; message: string }> {
     return this.request('/settings', {
@@ -1220,7 +1233,7 @@ class ApiClient {
   }
 
   async updateSetting(context_key: string, data: {
-    context_value: any
+    context_value: unknown
     description?: string
   }): Promise<{ success: boolean; message: string }> {
     return this.request(`/settings/${encodeURIComponent(context_key)}`, {
@@ -1251,8 +1264,8 @@ class ApiClient {
   // Fetch the project context store (a.k.a. "memories"). Pairs with
   // getAllData() above, which already covers it but may 404 on
   // backends that don't implement the bulk endpoint.
-  async getContextData(): Promise<any[]> {
-    return this.request<any[]>('/context-data').catch(() => [])
+  async getContextData(): Promise<unknown[]> {
+    return this.request<unknown[]>('/context-data').catch(() => [])
   }
 
   // Utility methods

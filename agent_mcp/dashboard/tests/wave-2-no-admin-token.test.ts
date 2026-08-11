@@ -58,7 +58,7 @@ describe("Wave 2: DashboardData type", () => {
       /interface\s+AllData\s*{([\s\S]*?)}/m,
     )
     expect(interfaceBody, "AllData interface must be declared").not.toBeNull()
-    const body = interfaceBody![1]
+    const body = interfaceBody![1]!
     // A property line is `admin_token` followed by optional `?` and a
     // `:`. Match it only as a property declaration (start-of-line or
     // semicolon boundary), so the "Wave 2 ... no longer surfaced"
@@ -169,7 +169,7 @@ describe("Wave 2: MCP notifications client", () => {
     handle.stop()
 
     expect(captured.length).toBeGreaterThan(0)
-    const { init } = captured[0]
+    const { init } = captured[0]!
     expect(init, "fetch was called without init").toBeTruthy()
     expect(init!.credentials, "must opt into cookie auth").toBe(
       "include",

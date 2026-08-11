@@ -7,20 +7,33 @@ import {
   selectActions,
   TERMINAL_TASK_STATUSES,
 } from './selectors'
+import type { ActionRecord } from './selectors'
 
 // Re-export the helpers so callers that want to read from the store's
 // module path (a habit established by the rest of the lib/stores/
 // surface) can do so without learning about the new sibling file.
 export { normalizeAgentId, selectTasks, selectActions, TERMINAL_TASK_STATUSES }
-export type { TaskCriteria, ActionCriteria } from './selectors'
+export type { TaskCriteria, ActionCriteria, ActionRecord } from './selectors'
+
+/**
+ * A raw context row from the `/all-data` REST envelope. Only
+ * `context_key` is looked up today; the value + remaining columns are
+ * untyped JSON.
+ */
+export interface ContextRow {
+  context_key: string
+  value?: unknown
+  description?: string
+  [key: string]: unknown
+}
 
 interface AllData {
   agents: Agent[]
   tasks: Task[]
-  context: any[]
-  actions: any[]
-  file_metadata: any[]
-  file_map: Record<string, any>
+  context: unknown[]
+  actions: unknown[]
+  file_metadata: unknown[]
+  file_map: Record<string, unknown>
   // Wave 2 (cleanup-wave-2): ``admin_token`` is no longer surfaced
   // on this slice. Dashboard mutations authenticate via the operator
   // session cookie (handled inside apiClient.request); the admin
@@ -53,9 +66,9 @@ interface DataStore {
   invalidatePromptsCatalog: () => void
   getAgent: (agentId: string) => Agent | undefined
   getAgentTasks: (agentId: string) => Task[]
-  getAgentActions: (agentId: string) => any[]
+  getAgentActions: (agentId: string) => ActionRecord[]
   getTask: (taskId: string) => Task | undefined
-  getContext: (contextKey: string) => any | undefined
+  getContext: (contextKey: string) => ContextRow | undefined
   // Wave 2 (cleanup-wave-2): ``getAdminToken`` removed. The dashboard
   // authenticates via the operator session cookie now (ADR-0003);
   // no UI surface needs the bare admin token.
@@ -64,7 +77,7 @@ interface DataStore {
     assignedTasks: Task[]
     workedOnTasks: Task[]
     completedTasks: Task[]
-    completionActions: any[]
+    completionActions: ActionRecord[]
     totalTasks: number
     assignedCount: number
     workedOnCount: number
@@ -74,8 +87,8 @@ interface DataStore {
   updateAgent: (agent: Agent) => void
   updateTask: (task: Task) => void
   refreshData: () => Promise<void>
-  shouldDisplayAgent: (agent: any) => boolean
-  getActiveAgents: () => any[]
+  shouldDisplayAgent: (agent: Agent) => boolean
+  getActiveAgents: () => Agent[]
 }
 
 export const useDataStore = create<DataStore>((set, get) => ({
@@ -277,10 +290,10 @@ export const useDataStore = create<DataStore>((set, get) => ({
 
     const assignedTasks = selectTasks(state.data.tasks, { assignedTo: agentId })
 
-    const agentActions = selectActions(state.data.actions, { agentId })
+    const agentActions = selectActions(state.data.actions as ActionRecord[], { agentId })
     const workedOnTaskIds = new Set<string>()
     agentActions.forEach((action) => {
-      if (action.task_id) workedOnTaskIds.add(action.task_id)
+      if (typeof action.task_id === 'string') workedOnTaskIds.add(action.task_id)
     })
 
     const workedOnTasks = selectTasks(state.data.tasks, {
@@ -304,7 +317,7 @@ export const useDataStore = create<DataStore>((set, get) => ({
   getAgentActions: (agentId: string) => {
     const state = get()
     if (!state.data) return []
-    return selectActions(state.data.actions, { agentId })
+    return selectActions(state.data.actions as ActionRecord[], { agentId })
   },
 
   getTask: (taskId: string) => {
@@ -322,7 +335,7 @@ export const useDataStore = create<DataStore>((set, get) => ({
     
     // Strip prefix if present
     const cleanKey = contextKey.startsWith('context_') ? contextKey.substring(8) : contextKey
-    return state.data.context.find(c => c.context_key === cleanKey)
+    return (state.data.context as ContextRow[]).find(c => c.context_key === cleanKey)
   },
 
   // Wave 2 (cleanup-wave-2): ``getAdminToken`` removed. Dashboard
@@ -363,10 +376,10 @@ export const useDataStore = create<DataStore>((set, get) => ({
     // Admin/admin/prefix dance; we then filter for completion-shaped
     // action types. `action.action_type` can be null for legacy
     // rows, so guard the `.includes()` call.
-    const completionActions = selectActions(state.data.actions, { agentId })
+    const completionActions = selectActions(state.data.actions as ActionRecord[], { agentId })
       .filter((a) => {
         const t = a.action_type
-        if (!t) return false
+        if (typeof t !== 'string') return false
         return t === 'task_completed' || t === 'complete_task' || t.includes('complet')
       })
 
@@ -430,7 +443,7 @@ export const useDataStore = create<DataStore>((set, get) => ({
   // That combination silently killed valid worker agents and hid the
   // crime scene. Fix: surface every non-terminated row; rely on the
   // existing status-filter dropdown if users want to hide terminated.
-  shouldDisplayAgent: (agent: any) => agent.status !== 'terminated',
+  shouldDisplayAgent: (agent: Agent) => agent.status !== 'terminated',
 
   getActiveAgents: () => {
     const state = get()

@@ -37,7 +37,7 @@ const statusBadgeClass = (status: Task['status']): string => {
     cancelled: "bg-muted text-muted-foreground ring-1 ring-border",
     failed: "bg-orange-500/15 text-orange-500 dark:text-orange-300 ring-1 ring-orange-500/20",
   }
-  return map[status] || map.pending
+  return map[status] || map.pending || ""
 }
 
 const priorityBadgeClass = (priority: Task['priority']): string => {
@@ -46,7 +46,7 @@ const priorityBadgeClass = (priority: Task['priority']): string => {
     medium: "bg-amber-500/10 text-amber-500 dark:text-amber-300 border-amber-500/20",
     low: "bg-muted text-muted-foreground border-border",
   }
-  return map[priority] || map.medium
+  return map[priority] || map.medium || ""
 }
 
 // Same author tombstone rendering used by the Agents page: a deleted
@@ -252,7 +252,7 @@ const TaskUpdatedCell = React.memo(({ value }: { value: string }) => {
 })
 TaskUpdatedCell.displayName = 'TaskUpdatedCell'
 
-const CreateTaskModal = React.memo(({ onCreateTask }: { onCreateTask: (data: any) => void }) => {
+const CreateTaskModal = React.memo(({ onCreateTask }: { onCreateTask: (data: Parameters<typeof apiClient.createTask>[0]) => void }) => {
   const [open, setOpen] = useState(false)
   const [formData, setFormData] = useState<{
     title: string
@@ -415,7 +415,7 @@ const ViewTaskDialog = React.memo(({ task, onOpenChange, onEdit, onDelete }: Vie
   // Parse JSON-shaped optional fields safely.
   const dependencies = task ? parseJsonField(task.depends_on_tasks) : []
   const childTasks = task ? parseJsonField(task.child_tasks) : []
-  const notes = task ? parseJsonField(task.notes) : []
+  const notes = task ? (parseJsonField(task.notes) as Array<{ author: string; timestamp: string; content: string }>) : []
   const createdBy: string | undefined = task ? (task as unknown as { created_by?: string }).created_by : undefined
 
   return (
@@ -540,7 +540,7 @@ const ViewTaskDialog = React.memo(({ task, onOpenChange, onEdit, onDelete }: Vie
                     <div className="space-y-2">
                       <Label className="text-xs text-muted-foreground uppercase tracking-wider">Depends on</Label>
                       <div className="flex flex-wrap gap-2">
-                        {dependencies.map((id: any, idx) => (
+                        {dependencies.map((id, idx) => (
                           <Badge key={idx} variant="outline" className="text-xs font-mono">{String(id)}</Badge>
                         ))}
                       </div>
@@ -550,7 +550,7 @@ const ViewTaskDialog = React.memo(({ task, onOpenChange, onEdit, onDelete }: Vie
                     <div className="space-y-2">
                       <Label className="text-xs text-muted-foreground uppercase tracking-wider">Subtasks</Label>
                       <div className="flex flex-wrap gap-2">
-                        {childTasks.map((id: any, idx) => (
+                        {childTasks.map((id, idx) => (
                           <Badge key={idx} variant="outline" className="text-xs font-mono">{String(id)}</Badge>
                         ))}
                       </div>
@@ -573,7 +573,7 @@ const ViewTaskDialog = React.memo(({ task, onOpenChange, onEdit, onDelete }: Vie
                 </Label>
                 {notes.length > 0 ? (
                   <div className="space-y-2">
-                    {notes.map((note: any, idx) => (
+                    {notes.map((note, idx) => (
                       <div key={idx} className="bg-muted/50 rounded-lg p-3">
                         <div className="flex items-center justify-between mb-1 text-xs">
                           <span className={cn(
@@ -675,7 +675,7 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
   // Existing notes for the "Existing notes" preview block at the
   // bottom of the Edit dialog. Read-only here — to edit historical
   // notes you'd need per-note IDs which don't exist in the schema.
-  const existingNotes = task ? parseJsonField(task.notes) : []
+  const existingNotes = task ? (parseJsonField(task.notes) as Array<{ author: string; timestamp: string; content: string }>) : []
 
   // Re-seed form whenever the dialog opens for a *different* task.
   // Note: with live-lookup useDialog (Candidate D, 2026-06-02) the
@@ -855,7 +855,7 @@ const EditTaskDialog = React.memo(({ task, onOpenChange, onSaved }: EditTaskDial
                         Existing notes ({existingNotes.length})
                       </summary>
                       <div className="mt-2 space-y-2 max-h-[20vh] overflow-y-auto">
-                        {existingNotes.map((note: any, idx: number) => (
+                        {existingNotes.map((note, idx: number) => (
                           <div key={idx} className="bg-muted/40 rounded p-2">
                             <div className="flex items-center justify-between mb-1">
                               <span className={cn(
@@ -986,6 +986,12 @@ export function TasksDashboard() {
   // dialog deletes the same task), the live selector returns null.
   // Auto-close the dialog so the user isn't stuck staring at an
   // empty modal; the row's gone, no point keeping the modal up.
+  //
+  // exhaustive-deps disabled for this block: useDialog returns a fresh
+  // object each render, so we depend on its stable fields
+  // (.isOpen/.data/.close) rather than the whole object. Listing the
+  // object would re-run every render with no behavioural gain.
+  /* eslint-disable react-hooks/exhaustive-deps */
   useEffect(() => {
     if (viewDialog.isOpen && viewDialog.data === null) viewDialog.close()
   }, [viewDialog.isOpen, viewDialog.data, viewDialog.close])
@@ -995,6 +1001,7 @@ export function TasksDashboard() {
   useEffect(() => {
     if (deleteDialog.isOpen && deleteDialog.data === null) deleteDialog.close()
   }, [deleteDialog.isOpen, deleteDialog.data, deleteDialog.close])
+  /* eslint-enable react-hooks/exhaustive-deps */
 
   // Client-side narrowing only. Status + assignment + creator are
   // already applied server-side (see `serverFilters`), so `tasks` is
@@ -1025,7 +1032,7 @@ export function TasksDashboard() {
     return { total, in_progress, pending, completed, failed, other }
   }, [tasks])
 
-  const handleCreateTask = useCallback(async (data: any) => {
+  const handleCreateTask = useCallback(async (data: Parameters<typeof apiClient.createTask>[0]) => {
     try {
       await apiClient.createTask(data)
       // Refresh tasks after creating a new one

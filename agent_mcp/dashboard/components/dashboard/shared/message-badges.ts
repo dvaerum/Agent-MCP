@@ -16,7 +16,7 @@ export const priorityBadgeClass = (priority: string): string => {
     normal: "bg-muted text-muted-foreground border-border",
     low: "bg-muted text-muted-foreground/70 border-border",
   }
-  return map[priority] || map.normal
+  return map[priority] || map.normal || ""
 }
 
 export const messageTypeBadgeClass = (type: string): string => {
@@ -30,5 +30,5 @@ export const messageTypeBadgeClass = (type: string): string => {
     assistance_request:
       "bg-amber-500/10 text-amber-500 dark:text-amber-300 border-amber-500/20",
   }
-  return map[type] || map.text
+  return map[type] || map.text || ""
 }

@@ -20,7 +20,7 @@ import { useDataStore } from '@/lib/stores/data-store'
 
 interface CreateMemoryData {
   context_key: string
-  context_value: any
+  context_value: unknown
   description?: string
 }
 
@@ -32,7 +32,11 @@ interface CreateMemoryModalProps {
 export function CreateMemoryModal({ onCreateMemory, trigger }: CreateMemoryModalProps) {
   const [open, setOpen] = useState(false)
   const [loading, setLoading] = useState(false)
-  const [formData, setFormData] = useState({
+  const [formData, setFormData] = useState<{
+    context_key: string
+    context_value: unknown
+    description: string
+  }>({
     context_key: '',
     context_value: '',
     description: ''
@@ -45,14 +49,14 @@ export function CreateMemoryModal({ onCreateMemory, trigger }: CreateMemoryModal
   // stays fully supported.
   const context = useDataStore((s) => s.data?.context)
   const existingKeys = React.useMemo(() => {
-    const keys = (context ?? [])
-      .map((c: any) => c?.context_key)
-      .filter((k: unknown): k is string => typeof k === 'string' && k.length > 0)
+    const keys = ((context ?? []) as Array<{ context_key?: string }>)
+      .map((c) => c?.context_key)
+      .filter((k): k is string => typeof k === 'string' && k.length > 0)
     // De-dupe, sort, and cap so a large bank doesn't flood the modal.
     return Array.from(new Set(keys)).sort().slice(0, 12)
   }, [context])
 
-  const handleValueChange = (value: any) => {
+  const handleValueChange = (value: unknown) => {
     setFormData(prev => ({ ...prev, context_value: value }))
   }
 

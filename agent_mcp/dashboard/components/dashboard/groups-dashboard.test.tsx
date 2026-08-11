@@ -172,7 +172,7 @@ describe("<GroupsDashboard> on the shared scaffold", () => {
     })) as HTMLElement
 
     // Dirty the checklist so Save appears, then save.
-    await u.click(panel.querySelectorAll('input[type="checkbox"]')[0])
+    await u.click(panel.querySelectorAll('input[type="checkbox"]')[0]!)
     requestMock.mockImplementationOnce(() =>
       Promise.resolve({ success: true, capabilities: ["task.create"] }),
     )

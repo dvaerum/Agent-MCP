@@ -11,6 +11,23 @@ const compat = new FlatCompat({
 
 const eslintConfig = [
   ...compat.extends("next/core-web-vitals", "next/typescript"),
+  {
+    rules: {
+      // Honour the leading-underscore idiom for intentionally-unused
+      // bindings, matching tsconfig's noUnusedParameters/noUnusedLocals
+      // (tsc already exempts `_`-prefixed names). Without this the two
+      // gates disagree: tsc stays silent on a signature-required
+      // `_signal` while ESLint errors on it.
+      "@typescript-eslint/no-unused-vars": [
+        "error",
+        {
+          argsIgnorePattern: "^_",
+          varsIgnorePattern: "^_",
+          caughtErrorsIgnorePattern: "^_",
+        },
+      ],
+    },
+  },
 ];
 
 export default eslintConfig;

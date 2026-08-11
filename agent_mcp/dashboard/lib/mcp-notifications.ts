@@ -127,8 +127,10 @@ function* parseSseFrames(buffer: string): Generator<string, void, void> {
   // SSE frames are separated by a blank line. Split, keep the last
   // (possibly partial) chunk for the next call.
   const frames = buffer.split(/\r?\n\r?\n/)
-  for (let i = 0; i < frames.length - 1; i++) {
-    yield frames[i]
+  // All but the last (possibly-partial) chunk. slice avoids an indexed
+  // access that noUncheckedIndexedAccess would widen to string|undefined.
+  for (const frame of frames.slice(0, -1)) {
+    yield frame
   }
 }
 

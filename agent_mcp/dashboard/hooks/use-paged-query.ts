@@ -181,11 +181,9 @@ export function usePagedQuery<T extends object>(
 ): UsePagedQueryResult<T> {
   const {
     endpoint,
-    fetchFn,
     filters,
     limit,
     offset,
-    cacheMs = 0,
     deps,
   } = options
 

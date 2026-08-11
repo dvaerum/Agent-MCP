@@ -115,7 +115,7 @@ describe("<RegisterAgentModal>", () => {
     await setupUser().type(input, "worker-1")
     await setupUser().click(screen.getByRole("button", { name: "Register" }))
     await waitFor(() => expect(registerAgent).toHaveBeenCalled())
-    expect(registerAgent.mock.calls[0][0]).toMatchObject({
+    expect(registerAgent.mock.calls[0]![0]).toMatchObject({
       name: "worker-1",
       role: "worker",
     })

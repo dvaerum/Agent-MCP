@@ -90,7 +90,7 @@ describe("UX-09: message-retention validation", () => {
     expect(saveBody, "saveField must be declared").not.toBeNull()
     expect(
       /kind === "int_days" && validateRetention\(draft\) !== null/.test(
-        saveBody![1],
+        saveBody![1]!,
       ),
       "saveField must validate the int_days draft before coercing",
     ).toBe(true)

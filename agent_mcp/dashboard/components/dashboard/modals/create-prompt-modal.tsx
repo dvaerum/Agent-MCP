@@ -1,7 +1,7 @@
 "use client"
 
 import React, { useState } from 'react'
-import { Plus, Sparkles, Tag, Type, Hash, Users } from 'lucide-react'
+import { Plus, Sparkles, Tag, Hash } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
@@ -14,7 +14,6 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
 } from '@/components/ui/dialog'
 import {
   Select,
@@ -23,10 +22,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { type PromptTemplate } from '@/lib/prompt-book'
 import { useDataStore } from '@/lib/stores/data-store'
 
-interface CreatePromptData {
+export interface CreatePromptData {
   title: string
   description: string
   category: string

@@ -59,13 +59,13 @@ describe("buildSnippetBlocks", () => {
 
   it("falls back to a <AGENT_TOKEN> placeholder when the agent has no token", () => {
     const blocks = buildSnippetBlocks("claude-code", "", URL)
-    expect(blocks[0].content).toContain("Bearer <AGENT_TOKEN>")
+    expect(blocks[0]!.content).toContain("Bearer <AGENT_TOKEN>")
   })
 
   it("declares Streamable HTTP transport for the Claude Code tab", () => {
     const [cli, json] = buildSnippetBlocks("claude-code", TOKEN, URL)
-    expect(cli.content).toContain("claude mcp add --transport http agent-mcp")
-    expect(json.content).toContain('"type": "http"')
+    expect(cli!.content).toContain("claude mcp add --transport http agent-mcp")
+    expect(json!.content).toContain('"type": "http"')
   })
 
   it("uses each client's own config schema (not one shape for all)", () => {

@@ -1,9 +1,9 @@
 "use client"
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
-import { 
-  BookOpen, Search, Copy, CheckCircle2, Filter, Tag, ChevronDown, ChevronRight,
-  UserPlus, CheckSquare, Database, Bug, Users, Sparkles, ExternalLink, Plus, HelpCircle, Edit3, X
+import {
+  BookOpen, Search, Copy, CheckCircle2,
+  UserPlus, CheckSquare, Database, Bug, Users, Sparkles, Plus, HelpCircle, X
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -30,7 +30,6 @@ import {
   DialogDescription,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
 } from '@/components/ui/dialog'
 import { Separator } from '@/components/ui/separator'
 import { useDialog } from '@/hooks/use-dialog'
@@ -43,7 +42,7 @@ import {
 } from '@/lib/prompt-book'
 import { useDataStore } from '@/lib/stores/data-store'
 import { AgentSelect } from '@/components/dashboard/shared/agent-select'
-import { CreatePromptModal } from './modals/create-prompt-modal'
+import { CreatePromptModal, type CreatePromptData } from './modals/create-prompt-modal'
 import { PromptBookTutorial, usePromptBookTutorial } from './onboarding/prompt-book-tutorial'
 // CC-3 audit 2026-06-02: imported Skeleton primitive for the
 // initial-mount fade so the empty UI renders briefly while
@@ -178,7 +177,7 @@ const PromptCard = ({ prompt, onSelect, onDelete, isCustom }: {
 }
 
 // Component for the prompt builder/editor
-const PromptBuilder = ({ prompt, onClose }: {
+const PromptBuilder = ({ prompt }: {
   prompt: PromptTemplate;
   onClose: () => void;
 }) => {
@@ -387,9 +386,11 @@ export function PromptBookDashboard() {
   // response lands `promptsCatalog` is null and the skeleton renders.
   const promptsCatalog = useDataStore(s => s.promptsCatalog)
   const promptsCategories = useDataStore(s => s.promptsCategories)
-  const promptsCatalogLoading = useDataStore(s => s.promptsCatalogLoading)
   const fetchPromptsCatalog = useDataStore(s => s.fetchPromptsCatalog)
-  const promptTemplates: PromptTemplate[] = promptsCatalog ?? []
+  // Memoized so the `?? []` fallback doesn't mint a fresh array every
+  // render — that reference churn would re-run promptSelector's
+  // useCallback and the filtered-list useMemo below on every render.
+  const promptTemplates: PromptTemplate[] = useMemo(() => promptsCatalog ?? [], [promptsCatalog])
   const promptCategories: PromptCategory[] = promptsCategories ?? []
 
   // Prompt builder dialog. Live-lookup useDialog (Candidate D,
@@ -408,9 +409,13 @@ export function PromptBookDashboard() {
   const builderDialog = useDialog<PromptTemplate>(promptSelector)
 
   // Auto-close if the prompt is removed from both catalog and
-  // localStorage while the dialog is open.
+  // localStorage while the dialog is open. Depending on the stable
+  // fields (.isOpen/.data/.close) rather than the whole builderDialog
+  // object is deliberate — useDialog returns a fresh object each render,
+  // so listing it would re-run this every render for no behavioural gain.
   useEffect(() => {
     if (builderDialog.isOpen && builderDialog.data === null) builderDialog.close()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [builderDialog.isOpen, builderDialog.data, builderDialog.close])
 
   // Boot the catalogue fetch on first mount.
@@ -464,10 +469,8 @@ export function PromptBookDashboard() {
     const grouped: Record<string, PromptTemplate[]> = {}
     
     filteredPrompts.forEach(prompt => {
-      if (!grouped[prompt.category]) {
-        grouped[prompt.category] = []
-      }
-      grouped[prompt.category].push(prompt)
+      const list = grouped[prompt.category] ?? (grouped[prompt.category] = [])
+      list.push(prompt)
     })
     
     return grouped
@@ -477,7 +480,7 @@ export function PromptBookDashboard() {
     builderDialog.open(prompt.id)
   }
 
-  const handleCreatePrompt = (promptData: any) => {
+  const handleCreatePrompt = (promptData: CreatePromptData) => {
     const newPrompt: PromptTemplate = {
       id: `custom-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
       title: promptData.title,

@@ -231,8 +231,8 @@ describe("group ordering", () => {
     const groups = groupSchema(schema)
     // Only the one non-empty group survives.
     expect(groups).toHaveLength(1)
-    expect(groups[0].group).toBe("worker_permissions")
-    expect(groups[0].entries.map((e) => e.key)).toEqual(["wp_b", "wp_a"])
+    expect(groups[0]!.group).toBe("worker_permissions")
+    expect(groups[0]!.entries.map((e) => e.key)).toEqual(["wp_b", "wp_a"])
   })
 })
 

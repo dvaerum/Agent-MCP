@@ -1,7 +1,7 @@
 "use client"
 
-import React, { useState, useEffect } from 'react'
-import { Plus, Minus, Type, Hash, ToggleLeft, ToggleRight, Calendar, Trash2 } from 'lucide-react'
+import { useState, useEffect } from 'react'
+import { Plus, Type, Hash, ToggleLeft, ToggleRight, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
@@ -19,8 +19,8 @@ import { Badge } from '@/components/ui/badge'
 type ValueType = 'string' | 'number' | 'boolean' | 'array' | 'object' | 'null'
 
 interface SmartValueEditorProps {
-  value: any
-  onChange: (value: any) => void
+  value: unknown
+  onChange: (value: unknown) => void
   className?: string
 }
 
@@ -29,8 +29,8 @@ export function SmartValueEditor({ value, onChange, className }: SmartValueEdito
   const [stringValue, setStringValue] = useState('')
   const [numberValue, setNumberValue] = useState(0)
   const [booleanValue, setBooleanValue] = useState(false)
-  const [arrayValue, setArrayValue] = useState<any[]>([])
-  const [objectValue, setObjectValue] = useState<Record<string, any>>({})
+  const [arrayValue, setArrayValue] = useState<unknown[]>([])
+  const [objectValue, setObjectValue] = useState<Record<string, unknown>>({})
 
   // Detect and initialize value type
   useEffect(() => {
@@ -50,7 +50,7 @@ export function SmartValueEditor({ value, onChange, className }: SmartValueEdito
       setArrayValue(value)
     } else if (typeof value === 'object') {
       setValueType('object')
-      setObjectValue(value)
+      setObjectValue(value as Record<string, unknown>)
     } else {
       setValueType('string')
       setStringValue(String(value))
@@ -58,7 +58,7 @@ export function SmartValueEditor({ value, onChange, className }: SmartValueEdito
   }, [value])
 
   // Update parent when local state changes
-  const updateValue = (newValue: any) => {
+  const updateValue = (newValue: unknown) => {
     onChange(newValue)
   }
 
@@ -83,12 +83,12 @@ export function SmartValueEditor({ value, onChange, className }: SmartValueEdito
         updateValue(boolVal)
         break
       case 'array':
-        const arrVal: any[] = []
+        const arrVal: unknown[] = []
         setArrayValue(arrVal)
         updateValue(arrVal)
         break
       case 'object':
-        const objVal: Record<string, any> = {}
+        const objVal: Record<string, unknown> = {}
         setObjectValue(objVal)
         updateValue(objVal)
         break
@@ -298,7 +298,7 @@ export function SmartValueEditor({ value, onChange, className }: SmartValueEdito
               ))}
               {arrayValue.length === 0 && (
                 <div className="text-center py-6 text-muted-foreground text-sm">
-                  No items in array. Click "Add Item" to get started.
+                  No items in array. Click &quot;Add Item&quot; to get started.
                 </div>
               )}
             </div>
@@ -349,7 +349,7 @@ export function SmartValueEditor({ value, onChange, className }: SmartValueEdito
               ))}
               {Object.keys(objectValue).length === 0 && (
                 <div className="text-center py-6 text-muted-foreground text-sm">
-                  No properties in object. Click "Add Property" to get started.
+                  No properties in object. Click &quot;Add Property&quot; to get started.
                 </div>
               )}
             </div>
