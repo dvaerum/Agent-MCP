@@ -283,12 +283,14 @@ export function SettingsDashboard() {
   const [rows, setRows] = useState<ProjectSetting[]>([])
   // Optimistic switch state, keyed by setting key.
   const [boolState, setBoolState] = useState<Record<string, BoolRow>>({})
-  // Edit drafts for int/string/secret fields (undefined = show stored).
-  const [drafts, setDrafts] = useState<Record<string, string>>({})
-  // Show the int_days validation hint only after the field is blurred.
-  const [touched, setTouched] = useState<Record<string, boolean>>({})
-  // Which non-switch field currently has a save in flight.
-  const [pendingKey, setPendingKey] = useState<string | null>(null)
+  // CD-3 (Wave 5): the per-row EDIT state — the draft string, the
+  // blurred-yet flag and the save-in-flight flag — used to live here as
+  // page-level Records keyed by setting key. Every keystroke called the
+  // page-level `setDrafts`, re-rendering EVERY SettingRow. That state now
+  // lives INSIDE each <SettingRow> (local `useState`), so typing in one
+  // row no longer re-renders its siblings. Only genuinely page-level
+  // state (the schema, the switch optimism, the agents-in-wait count)
+  // stays lifted here.
   // Count of agents currently inside a wait_for_events long-poll —
   // surfaced under the global event-loop toggle. Read from
   // /api/all-data's per-agent `wait_for_events_in_flight` boolean.
@@ -331,8 +333,6 @@ export function SettingsDashboard() {
           : { value: Boolean(e.default), exists: false, pending: false }
       }
       setBoolState(nextBool)
-      setDrafts({})
-      setTouched({})
       setLastFetch(Date.now())
     } catch (e) {
       toastError(e, "Failed to load settings")
@@ -379,43 +379,32 @@ export function SettingsDashboard() {
     }
   }
 
-  // Save an int/string/secret field. int_days runs the retention
-  // validation; int_ms coerces a plain non-negative int; text/secret
-  // save the string verbatim.
-  const saveField = async (entry: SettingsSchemaEntry) => {
-    const kind = widgetKindFor(entry)
-    const draft = drafts[entry.key]
-    if (draft === undefined) return
-    if (kind === "int_days" && validateRetention(draft) !== null) {
-      setTouched((t) => ({ ...t, [entry.key]: true }))
-      return
+  // Persist a saved int/string/secret value. The validation + coercion +
+  // save-in-flight state now live inside <SettingRow> (CD-3); this stays
+  // at the page level only because it needs `refresh()`. `existed`
+  // decides create vs update. Left un-memoised deliberately — SettingRow
+  // isn't memoised and only calls this from a click handler (never a
+  // dependency array), and typing no longer re-renders the parent, so a
+  // fresh identity per parent render costs nothing.
+  const persistSetting = async (
+    entry: SettingsSchemaEntry,
+    value: unknown,
+    existed: boolean,
+  ) => {
+    if (existed) {
+      await apiClient.updateSetting(entry.key, {
+        context_value: value,
+        description: entry.description,
+      })
+    } else {
+      await apiClient.createSetting({
+        context_key: entry.key,
+        context_value: value,
+        description: entry.description,
+      })
     }
-    const existed = rows.some((r) => r.context_key === entry.key)
-    const value: unknown =
-      kind === "int_days" || kind === "int_ms" || kind === "int_duration"
-        ? coerceNonNegInt(draft)
-        : draft
-    setPendingKey(entry.key)
-    try {
-      if (existed) {
-        await apiClient.updateSetting(entry.key, {
-          context_value: value,
-          description: entry.description,
-        })
-      } else {
-        await apiClient.createSetting({
-          context_key: entry.key,
-          context_value: value,
-          description: entry.description,
-        })
-      }
-      toastSuccess(`${entry.title} updated.`)
-      await refresh()
-    } catch (e) {
-      toastError(e, "Failed to save setting")
-    } finally {
-      setPendingKey(null)
-    }
+    toastSuccess(`${entry.title} updated.`)
+    await refresh()
   }
 
   const groups = groupSchema(schema)
@@ -481,18 +470,9 @@ export function SettingsDashboard() {
                 locked={isTierLocked(entry, caller)}
                 row={rows.find((r) => r.context_key === entry.key)}
                 boolRow={boolState[entry.key]}
-                draft={drafts[entry.key]}
-                touched={!!touched[entry.key]}
-                pending={pendingKey === entry.key}
                 agentsInWait={agentsInWait}
                 onToggle={(v) => toggle(entry, v)}
-                onDraft={(v) =>
-                  setDrafts((d) => ({ ...d, [entry.key]: v }))
-                }
-                onBlur={() =>
-                  setTouched((t) => ({ ...t, [entry.key]: true }))
-                }
-                onSave={() => saveField(entry)}
+                onPersist={persistSetting}
               />
             ))}
           </CardContent>
@@ -504,37 +484,74 @@ export function SettingsDashboard() {
 
 // A single setting row: shared left column (title + description + mono
 // key line + hint) plus the control selected by `widgetKindFor`.
+//
+// CD-3 (Wave 5): the draft / touched / save-in-flight state is LOCAL to
+// each row (it used to be page-level Records keyed by setting key). That
+// way a keystroke in one row re-renders only THIS row, never its
+// siblings. `onPersist` is the only thing that reaches back up to the
+// page (it needs `refresh()`); everything else — validation, coercion,
+// the blur-touched flag — is handled here.
 function SettingRow({
   entry,
   locked,
   row,
   boolRow,
-  draft,
-  touched,
-  pending,
   agentsInWait,
   onToggle,
-  onDraft,
-  onBlur,
-  onSave,
+  onPersist,
 }: {
   entry: SettingsSchemaEntry
   locked: boolean
   row?: ProjectSetting
   boolRow?: BoolRow
-  draft?: string
-  touched: boolean
-  pending: boolean
   agentsInWait: number
   onToggle: (v: boolean) => void
-  onDraft: (v: string) => void
-  onBlur: () => void
-  onSave: () => void
+  onPersist: (
+    entry: SettingsSchemaEntry,
+    value: unknown,
+    existed: boolean,
+  ) => Promise<void>
 }) {
   const kind = widgetKindFor(entry)
   const exists =
     kind === "switch" ? boolRow?.exists ?? false : row !== undefined
   const isRedacted = row?.value === REDACTED
+
+  // Per-row edit state (CD-3). `draft === undefined` means "show the
+  // stored value". `touched` is keyed by the entry so the int_days
+  // validation hint only appears after a blur; it is a single-entry
+  // Record purely so the shape matches the shared saveField / control
+  // contract. `pending` is this row's own save-in-flight flag.
+  const [draft, setDraft] = useState<string | undefined>(undefined)
+  const [touched, setTouched] = useState<Record<string, boolean>>({})
+  const [pending, setPending] = useState(false)
+
+  // Save an int/string/secret field. int_days runs the retention
+  // validation; int_ms coerces a plain non-negative int; text/secret
+  // save the string verbatim. Reads THIS row's local `draft`.
+  const saveField = async (entry: SettingsSchemaEntry) => {
+    if (draft === undefined) return
+    if (kind === "int_days" && validateRetention(draft) !== null) {
+      setTouched((t) => ({ ...t, [entry.key]: true }))
+      return
+    }
+    const existed = row !== undefined
+    const value: unknown =
+      kind === "int_days" || kind === "int_ms" || kind === "int_duration"
+        ? coerceNonNegInt(draft)
+        : draft
+    setPending(true)
+    try {
+      await onPersist(entry, value, existed)
+      // Drop back to the freshly-stored value (refresh reloaded `row`).
+      setDraft(undefined)
+      setTouched({})
+    } catch (e) {
+      toastError(e, "Failed to save setting")
+    } finally {
+      setPending(false)
+    }
+  }
 
   return (
     <div
@@ -591,13 +608,13 @@ function SettingRow({
           row={row}
           boolRow={boolRow}
           draft={draft}
-          touched={touched}
+          touched={!!touched[entry.key]}
           pending={pending}
           exists={exists}
           onToggle={onToggle}
-          onDraft={onDraft}
-          onBlur={onBlur}
-          onSave={onSave}
+          onDraft={(v) => setDraft(v)}
+          onBlur={() => setTouched((t) => ({ ...t, [entry.key]: true }))}
+          onSave={() => saveField(entry)}
         />
       </div>
     </div>
