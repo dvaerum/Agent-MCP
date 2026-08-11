@@ -209,7 +209,7 @@ export function DeleteConfirmModal({
             </div>
             {confirmationText.length > 0 && !isConfirmed && (
               <div className="text-xs text-destructive">
-                Please type "{requiredWord}" exactly to confirm deletion
+                Please type &quot;{requiredWord}&quot; exactly to confirm deletion
               </div>
             )}
           </div>

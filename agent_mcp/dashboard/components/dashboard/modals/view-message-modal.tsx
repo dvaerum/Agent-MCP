@@ -234,7 +234,7 @@ export function ViewMessageModal({
   // The root is the first message of the (oldest-first) thread. Its
   // subject titles the conversation. A single-message thread (a root with
   // no replies) drops the conversation chrome and shows the normal detail.
-  const root = thread.length > 0 ? thread[0] : message
+  const root = thread[0] ?? message
   const isConversation = thread.length > 1
 
   // Toggle a message's read flag: tell the parent (persists + refreshes

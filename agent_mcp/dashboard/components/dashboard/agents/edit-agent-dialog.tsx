@@ -96,10 +96,10 @@ export function EditAgentDialog({
   const dataAll = useDataStore((s) => s.data)
   const globalEventLoop = React.useMemo<boolean>(() => {
     const row = dataAll?.context?.find(
-      (c: any) => c.context_key === 'config_auto_event_loop_global'
+      (c) => (c as { context_key?: unknown }).context_key === 'config_auto_event_loop_global'
     )
     if (!row) return true  // unset ⇒ default ON
-    const raw = (row as any).value
+    const raw = (row as { value?: unknown }).value
     if (typeof raw === 'boolean') return raw
     if (typeof raw === 'string') {
       const s = raw.trim().toLowerCase()

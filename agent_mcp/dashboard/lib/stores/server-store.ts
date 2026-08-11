@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { apiClient } from '../api'
-import { config, getAutoDetectServers } from '../config'
+import { getAutoDetectServers } from '../config'
 
 export interface MCPServer {
   id: string
@@ -126,7 +126,6 @@ export const useServerStore = create<ServerStore>()(
           // Temporarily set API client to test this server.
           // Path-prefix entries use the explicit baseUrl rather than
           // the host:port pair.
-          const originalUrl = apiClient.getServerUrl()
           if (server.baseUrl) {
             apiClient.setBaseUrl(server.baseUrl)
           } else {
@@ -148,7 +147,7 @@ export const useServerStore = create<ServerStore>()(
           }
           
           return response.server_running === true
-        } catch (error) {
+        } catch {
           // Use debug logging for health check failures (common during server discovery)
           console.debug(`Health check failed for server ${id}`)
           return false
@@ -239,7 +238,7 @@ export const useServerStore = create<ServerStore>()(
               
               return existingServer || detectedServer
             }
-          } catch (error) {
+          } catch {
             // Continue to next port
             console.debug(`Server not found on ${serverConfig.host}:${serverConfig.port}`)
           }

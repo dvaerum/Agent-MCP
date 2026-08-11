@@ -52,7 +52,7 @@ describe("globals.css must not !important-override Tailwind utilities", () => {
     const offenders = Array.from(
       css.matchAll(/(^|\})\s*(\.[a-z0-9-]+)\s*\{([^}]*!important[^}]*)\}/gi),
     )
-      .filter(([, , , body]) => /\b(width|height|min-width|max-width)\s*:/i.test(body))
+      .filter(([, , , body]) => /\b(width|height|min-width|max-width)\s*:/i.test(body ?? ''))
       .map(([, , sel]) => sel)
     expect(offenders, `!important sizing on ${offenders.join(", ")}`).toEqual([])
   })

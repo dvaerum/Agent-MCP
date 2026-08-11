@@ -115,7 +115,7 @@ export function OverviewDashboard() {
     }
     const agents = data.agents ?? []
     const tasks = data.tasks ?? []
-    const context = data.context ?? []
+    const context = (data.context ?? []) as Array<{ updated_at?: string }>
     const actions = (data.actions ?? []) as ActionRow[]
 
     const agentsActive = agents.filter(
@@ -125,7 +125,7 @@ export function OverviewDashboard() {
     const tasksCompleted = tasks.filter(t => t.status === 'completed').length
 
     const memoriesLastUpdated = context
-      .map((c: { updated_at?: string }) => c.updated_at)
+      .map((c) => c.updated_at)
       .filter((ts): ts is string => typeof ts === 'string' && ts.length > 0)
       .sort()
       .pop()

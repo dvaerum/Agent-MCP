@@ -89,7 +89,7 @@ describe("<ResponsiveDataTable>", () => {
     const mobile = container.querySelector('[data-slot="data-table-mobile"]')!
     const cards = within(mobile as HTMLElement).getAllByTestId("mobile-card")
     expect(cards).toHaveLength(2)
-    expect(cards[0].textContent).toBe("alpha!")
+    expect(cards[0]!.textContent).toBe("alpha!")
   })
 
   // renderExpanded — the accordion seam (Groups: a row expands to its
@@ -109,8 +109,8 @@ describe("<ResponsiveDataTable>", () => {
     const table = container.querySelector("table")!
     const details = within(table).getAllByTestId("detail")
     expect(details).toHaveLength(1)
-    expect(details[0].textContent).toBe("detail-alpha")
-    const cell = details[0].closest("td")!
+    expect(details[0]!.textContent).toBe("detail-alpha")
+    const cell = details[0]!.closest("td")!
     expect(cell.getAttribute("colspan")).toBe(String(columns.length))
   })
 
@@ -166,8 +166,8 @@ describe("<ResponsiveDataTable>", () => {
       />,
     )
     const bodyRows = container.querySelectorAll("tbody tr")
-    expect(bodyRows[0].className).not.toContain("border-l-2")
-    expect(bodyRows[1].className).toContain("border-l-2")
+    expect(bodyRows[0]!.className).not.toContain("border-l-2")
+    expect(bodyRows[1]!.className).toContain("border-l-2")
   })
 
   it("still accepts a static rowClassName string for every row", () => {
@@ -197,8 +197,8 @@ describe("<ResponsiveDataTable>", () => {
       '[data-slot="data-table-mobile"]',
     ) as HTMLElement
     const items = mobile.querySelectorAll("li")
-    expect(items[0].className).not.toContain("border-l-2")
-    expect(items[1].className).toContain("border-l-2")
+    expect(items[0]!.className).not.toContain("border-l-2")
+    expect(items[1]!.className).toContain("border-l-2")
   })
 
   it("does NOT leak rowClassName onto the renderExpanded sibling row", () => {
@@ -243,7 +243,7 @@ describe("<ResponsiveDataTable>", () => {
     // auto-stack renders each row; clicking one fires onRowClick
     const items = mobile.querySelectorAll("li")
     expect(items).toHaveLength(2)
-    await u.click(items[1])
+    await u.click(items[1]!)
     expect(onRowClick).toHaveBeenCalledWith(rows[1])
   })
 })

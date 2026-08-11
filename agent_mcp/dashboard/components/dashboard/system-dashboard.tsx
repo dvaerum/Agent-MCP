@@ -1,6 +1,5 @@
 "use client"
 
-import React from "react"
 import { VisGraph } from "./vis-graph-simple"
 import { Badge } from "@/components/ui/badge"
 import { Activity } from 'lucide-react'

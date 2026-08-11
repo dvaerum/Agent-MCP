@@ -158,6 +158,13 @@ jobs:
       - name: Unit tests (vitest)
         run: npm test
 
+      # ESLint is a real gate now (Wave 2 — dashboard quality gates).
+      # `next build` also lints (next.config.ts no longer sets
+      # eslint.ignoreDuringBuilds), but running it as its own step gives
+      # a clear, fast signal that names lint separately from the build.
+      - name: Lint (dashboard)
+        run: npm run lint
+
       - name: Build static export
         run: npm run build
 

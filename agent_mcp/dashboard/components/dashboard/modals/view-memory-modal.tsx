@@ -35,7 +35,7 @@ export function ViewMemoryModal({ memory, open, onOpenChange, onEdit, onDelete }
   // Human-readable copy string for the footer "Copy Value" / "Copy All"
   // actions: pretty JSON for JSON values, otherwise the decoded logical
   // string. The in-panel MemoryValueView owns its own format-aware Copy.
-  const formatValue = (value: any) => {
+  const formatValue = (value: unknown) => {
     const decoded = decodeMemoryValue(value)
     if (decoded.format === 'json') {
       try {

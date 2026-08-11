@@ -156,12 +156,19 @@ export type ActionCriteria = {
 }
 
 /**
- * Filter actions by `criteria`. Same shape as `selectTasks`. Typed
- * loose (`any[]`) because the dashboard's action records are not
- * statically typed yet -- the all-data REST envelope returns the raw
- * `agent_actions` rows with no TS interface.
+ * A raw agent-action row from the `/all-data` REST envelope. The rows
+ * have no backend TS interface yet; only `agent_id` is matched on
+ * today, so the rest of the record stays open (`unknown`-valued).
  */
-export function selectActions(actions: any[], criteria: ActionCriteria): any[] {
+export type ActionRecord = {
+  agent_id?: string
+  [key: string]: unknown
+}
+
+/**
+ * Filter actions by `criteria`. Same shape as `selectTasks`.
+ */
+export function selectActions(actions: ActionRecord[], criteria: ActionCriteria): ActionRecord[] {
   const { agentId } = criteria
   return actions.filter((a) => {
     if (agentId !== undefined && !matchesAgent(a.agent_id, agentId)) return false

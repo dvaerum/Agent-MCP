@@ -74,7 +74,7 @@ export function AliasChipPanel({
     return () => {
       cancelled = true
     }
-  }, [open, alias.name])
+  }, [open, projectName, alias.name])
 
   // Success toast, deliberately NO Undo.
   //

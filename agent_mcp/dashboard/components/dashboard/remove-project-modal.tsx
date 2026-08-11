@@ -143,9 +143,9 @@ export function RemoveProjectModal({
                   Also delete workspace files (irreversible)
                 </span>
                 <span className="block text-xs text-muted-foreground">
-                  Recursively removes the project's workspace directory.
+                  Recursively removes the project&apos;s workspace directory.
                   Only allowed when the workspace lives under the
-                  router's default workspace parent.
+                  router&apos;s default workspace parent.
                 </span>
               </span>
             </label>

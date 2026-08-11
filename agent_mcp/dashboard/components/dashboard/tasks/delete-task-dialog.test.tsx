@@ -150,7 +150,7 @@ describe("<DeleteTaskDialog> — tier follows the blast radius", () => {
     )
     await setupUser().click(screen.getByRole("button", { name: /^Delete$/ }))
     await waitFor(() => expect(deleteTask).toHaveBeenCalled())
-    expect(deleteTask.mock.calls[0][1]).toEqual({ force: false })
+    expect(deleteTask.mock.calls[0]![1]).toEqual({ force: false })
   })
 
   it("a task blocked only by dependents says 'Delete 1 task', not '1 tasks'", async () => {

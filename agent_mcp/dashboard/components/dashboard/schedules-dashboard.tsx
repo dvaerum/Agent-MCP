@@ -13,7 +13,7 @@
 // desktop/mobile responsive table live there. This file owns the data
 // source, the column spec, and the create/edit/delete/poke modals.
 
-import React, { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 import { CalendarClock, Pencil, Trash2, Send, Plus } from "lucide-react"
 
 import { Button } from "@/components/ui/button"

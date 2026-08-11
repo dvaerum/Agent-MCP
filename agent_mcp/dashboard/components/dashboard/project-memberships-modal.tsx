@@ -12,7 +12,6 @@ import React, { useCallback, useEffect, useState } from "react"
 import {
   Loader2, Plus, Trash2, ShieldAlert, User as UserIcon, Users as UsersIcon,
 } from "lucide-react"
-import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import {

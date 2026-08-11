@@ -51,16 +51,6 @@ interface AdminTokenResult {
   error?: string
 }
 
-const EXTERNAL_URL_SCRIPT_HINT = (
-  // When the dashboard runs at https://host.tailnet.ts.net/agent-mcp/app/
-  // we want the wiring URLs to use the same origin. The router
-  // doesn't surface its configured EXTERNAL_URL via the overview
-  // envelope today (kept out of this PR to avoid expanding the
-  // envelope shape), so we derive a sensible default from
-  // window.location.origin.
-  ""
-)
-
 function originBase(): string {
   if (typeof window === "undefined") return ""
   return `${window.location.protocol}//${window.location.host}`
@@ -284,7 +274,7 @@ function ProjectWiringPanel({
         <p>
           The Admin token surfaces above. Per-agent tokens are minted
           by the admin <code>create_agent</code> tool via MCP; see the
-          dashboard's Agents tab for the current set.
+          dashboard&apos;s Agents tab for the current set.
         </p>
       </div>
     </div>
@@ -305,7 +295,7 @@ export function WiringSnippetsTab(): React.ReactElement {
         <p className="text-sm text-muted-foreground">
           Copy-pastable <code>.mcp.json</code> + installer one-liners
           for each registered project. Use these to point a fresh MCP
-          client (Claude Code, Cline, etc.) at a project's backend.
+          client (Claude Code, Cline, etc.) at a project&apos;s backend.
         </p>
       </div>
 

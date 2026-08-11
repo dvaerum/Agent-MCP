@@ -19,7 +19,7 @@ import type { Memory } from '@/lib/api'
 
 interface EditMemoryData {
   context_key: string
-  context_value: any
+  context_value: unknown
   description?: string
 }
 
@@ -57,7 +57,7 @@ export function EditMemoryModal({ memory, open, onOpenChange, onUpdateMemory }: 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, memoryKey])
 
-  const handleValueChange = (value: any) => {
+  const handleValueChange = (value: unknown) => {
     setFormData(prev => ({ ...prev, context_value: value }))
   }
 
@@ -75,7 +75,7 @@ export function EditMemoryModal({ memory, open, onOpenChange, onUpdateMemory }: 
       // parent surfaces a toast and we keep the dialog open (the throw
       // below lands in the catch).
       onOpenChange(false)
-    } catch (error) {
+    } catch {
       // Parent (handleUpdateMemory) already surfaced the error via
       // toastError; keep the dialog open so the admin can retry.
     } finally {

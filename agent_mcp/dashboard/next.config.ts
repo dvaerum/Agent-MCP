@@ -25,7 +25,7 @@ function resolveVersion(): string {
   try {
     const pyproject = readFileSync(join(__dirname, "..", "..", "pyproject.toml"), "utf8")
     const m = pyproject.match(/^\s*version\s*=\s*"([^"]+)"/m)
-    if (m) return m[1]
+    if (m?.[1]) return m[1]
   } catch {
     // pyproject not reachable (e.g. sandboxed build without the env var) —
     // fall through to the dev sentinel.
@@ -83,10 +83,6 @@ const nextConfig: NextConfig = {
   // footer) read it via process.env at build time. See resolveVersion().
   env: {
     NEXT_PUBLIC_AGENT_MCP_VERSION: AGENT_MCP_VERSION,
-  },
-
-  eslint: {
-    ignoreDuringBuilds: true,
   },
 };
 

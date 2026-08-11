@@ -127,7 +127,7 @@ export function AddProjectModal({
                 placeholder="/home/dennis/.local/share/agent-mcp/projects/<name>"
               />
               <p className="text-xs text-muted-foreground">
-                Editable for the "restore from existing folder" use case.
+                Editable for the &quot;restore from existing folder&quot; use case.
               </p>
             </div>
 

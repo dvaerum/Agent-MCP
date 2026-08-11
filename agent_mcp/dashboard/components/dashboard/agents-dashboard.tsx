@@ -87,6 +87,12 @@ export function AgentsDashboard() {
   // null. Auto-close so the user isn't staring at an empty modal.
   // purge/terminate dialogs are skipped — their "row" is the id itself
   // and is never null while open.
+  //
+  // exhaustive-deps disabled for this block: useDialog returns a fresh
+  // object each render, so we depend on its stable fields
+  // (.isOpen/.data/.close) rather than the whole object. Listing the
+  // object would re-run every render with no behavioural gain.
+  /* eslint-disable react-hooks/exhaustive-deps */
   useEffect(() => {
     if (taskDialog.isOpen && taskDialog.data === null) taskDialog.close()
   }, [taskDialog.isOpen, taskDialog.data, taskDialog.close])
@@ -96,6 +102,7 @@ export function AgentsDashboard() {
   useEffect(() => {
     if (detailDialog.isOpen && detailDialog.data === null) detailDialog.close()
   }, [detailDialog.isOpen, detailDialog.data, detailDialog.close])
+  /* eslint-enable react-hooks/exhaustive-deps */
 
   // Source list: include all agents (terminated rows need to surface so
   // admins can hit Restore/Purge on them). getActiveAgents() is kept

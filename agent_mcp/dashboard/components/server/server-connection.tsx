@@ -1,28 +1,25 @@
 "use client"
 
-import React, { useEffect, useState } from "react"
+import { useState } from "react"
 import { Server, Wifi, WifiOff, Plus, RefreshCw, Trash2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Card, CardContent } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { useServerStore } from "@/lib/stores/server-store"
-import { ProjectPicker } from "./project-picker"
 import { ManualServerInput } from "./manual-server-input"
 import { useServerConfirms } from "./use-server-confirms"
 import { config } from "@/lib/config"
 import { projectContext } from "@/lib/project-context"
 
 export function ServerConnection() {
-  const { 
-    servers, 
-    activeServerId, 
-    setActiveServer, 
-    autoDetectServers, 
+  const {
+    servers,
+    activeServerId,
+    setActiveServer,
+    autoDetectServers,
     clearPersistedData,
     removeServer,
-    isConnecting 
   } = useServerStore()
-  const activeServer = servers.find(s => s.id === activeServerId)
   const [isDetecting, setIsDetecting] = useState(false)
 
   const connectedServers = servers.filter(s => s.status === 'connected')

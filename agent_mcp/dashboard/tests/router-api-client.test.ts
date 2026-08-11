@@ -35,7 +35,7 @@ function headerValue(init: RequestInit | undefined, name: string): string | null
   const key = Object.keys(headers).find(
     (k) => k.toLowerCase() === name.toLowerCase(),
   )
-  return key ? headers[key] : null
+  return key ? headers[key] ?? null : null
 }
 
 describe("routerApi.request", () => {
@@ -63,9 +63,9 @@ describe("routerApi.request", () => {
 
     expect(body).toEqual({ ok: true })
     expect(captured.length).toBe(1)
-    expect(captured[0].url).toBe("/agent-mcp/api/router/users")
-    expect(headerValue(captured[0].init, "Accept")).toBe(ACCEPT)
-    expect(captured[0].init?.credentials).toBe("include")
+    expect(captured[0]!.url).toBe("/agent-mcp/api/router/users")
+    expect(headerValue(captured[0]!.init, "Accept")).toBe(ACCEPT)
+    expect(captured[0]!.init?.credentials).toBe("include")
   })
 
   it("redirects to the login page on a 401 and preserves ?next=", async () => {
@@ -88,7 +88,7 @@ describe("routerApi.request", () => {
     ).rejects.toBeInstanceOf(ApiError)
 
     expect(assign).toHaveBeenCalledTimes(1)
-    const target = assign.mock.calls[0][0] as string
+    const target = assign.mock.calls[0]![0] as string
     expect(target).toContain("/agent-mcp/login")
     expect(target).toContain(
       `next=${encodeURIComponent("/agent-mcp/app/washing-brothers?tab=users")}`,

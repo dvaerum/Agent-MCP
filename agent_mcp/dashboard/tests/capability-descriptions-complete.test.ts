@@ -57,10 +57,10 @@ function parseKnownCapabilities(): Set<string> {
       "could not locate KNOWN_CAPABILITIES literal in " + CAPABILITIES_PY,
     )
   }
-  const body = match[1]
+  const body = match[1]!
   // Each cap is a double-quoted string. Comments may appear; we want
   // only the quoted strings.
-  const caps = [...body.matchAll(/"([^"]+)"/g)].map((m) => m[1])
+  const caps = [...body.matchAll(/"([^"]+)"/g)].map((m) => m[1]!)
   if (caps.length === 0) {
     throw new Error(
       "parsed zero capabilities from KNOWN_CAPABILITIES — regex broke?",

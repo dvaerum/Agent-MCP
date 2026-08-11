@@ -110,7 +110,7 @@ async function callMessages(
   method: "POST" | "PATCH" | "DELETE",
   pathSuffix: string,
   body: Record<string, unknown>
-): Promise<any> {
+): Promise<unknown> {
   const base = apiClient.getServerUrl()
   const res = await fetch(`${base}/messages${pathSuffix}`, {
     method,
@@ -331,7 +331,7 @@ export function MessagesDashboard() {
 
   const loadParticipants = async () => {
     try {
-      const data = await callMessages("POST", "/participants", {})
+      const data = await callMessages("POST", "/participants", {}) as { live?: unknown }
       const live = Array.isArray(data?.live) ? data.live : []
       setLiveParticipants(live)
     } catch {
@@ -455,12 +455,19 @@ export function MessagesDashboard() {
 
   // Deleted-while-open: if the row is removed from the list, the
   // selector returns null. Auto-close so the user isn't stranded.
+  //
+  // exhaustive-deps disabled for this block: useDialog returns a fresh
+  // object each render, so we depend on its stable fields
+  // (.isOpen/.data/.close) rather than the whole object. Listing the
+  // object would re-run every render with no behavioural gain.
+  /* eslint-disable react-hooks/exhaustive-deps */
   useEffect(() => {
     if (detailDialog.isOpen && detailDialog.data === null) detailDialog.close()
   }, [detailDialog.isOpen, detailDialog.data, detailDialog.close])
   useEffect(() => {
     if (deleteDialog.isOpen && deleteDialog.data === null) deleteDialog.close()
   }, [deleteDialog.isOpen, deleteDialog.data, deleteDialog.close])
+  /* eslint-enable react-hooks/exhaustive-deps */
 
   // v5.0.24 polish: human-readable label for a parent message id.
   const labelForParent = useCallback(
@@ -529,7 +536,7 @@ export function MessagesDashboard() {
     try {
       const data = await callMessages("POST", "/suggest-subject", {
         content: composeContent,
-      })
+      }) as { subject?: unknown }
       if (data?.subject) {
         setComposeSubject(String(data.subject))
       } else {

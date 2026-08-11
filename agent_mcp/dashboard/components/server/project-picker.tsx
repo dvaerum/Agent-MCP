@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useState, useEffect } from "react"
+import { useState, useEffect } from "react"
 import { Server, Settings, Wifi, Loader2, ArrowLeft, Lock } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -54,7 +54,7 @@ const CHIP_CLASS = "justify-between max-w-full sm:min-w-[200px]"
 function readActiveProjectName(): string | null {
   if (typeof window === "undefined") return null
   const m = window.location.pathname.match(APP_PROJECT_PATH_RE)
-  return m ? m[1] : null
+  return m?.[1] ?? null
 }
 
 export function ProjectPicker() {
