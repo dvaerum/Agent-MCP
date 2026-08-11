@@ -1,5 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
-import { apiClient, ApiError, buildTasksQuery, type TaskFilters } from "@/lib/api"
+import {
+  apiClient,
+  ApiError,
+  ShapeError,
+  buildTasksQuery,
+  normalizeTask,
+  normalizeTaskListField,
+  type RawTask,
+  type TaskFilters,
+} from "@/lib/api"
 
 // Pure-Node assertions on the GET /tasks query-string builder. This is
 // the single serialization point the Tasks page relies on to drive
@@ -208,5 +217,171 @@ describe("ApiClient.request engine", () => {
     expect(err).toBeInstanceOf(ApiError)
     expect(err.status).toBe(502)
     expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+})
+
+// TY-1: the runtime shape guard at the request<T>() boundary. A 200 OK
+// whose JSON is structurally wrong must throw a ShapeError HERE (at the
+// seam, naming the endpoint + mismatch) rather than be trusted with a
+// bare `as T` cast and blow up deep in a store consumer.
+describe("ApiClient.request shape validation (TY-1)", () => {
+  const realFetch = global.fetch
+
+  beforeEach(() => {
+    apiClient.setBaseUrl("/api")
+  })
+
+  afterEach(() => {
+    global.fetch = realFetch
+    vi.restoreAllMocks()
+  })
+
+  it("rejects a 200 whose /status body is not a SystemStatus", async () => {
+    // Backend returns 200 but the body is an array, not the object with
+    // a boolean server_running the caller was promised.
+    global.fetch = vi.fn(
+      async () => fakeResponse(200, [1, 2, 3]),
+    ) as unknown as typeof fetch
+
+    const err = await catchApiError(apiClient.getSystemStatus())
+    expect(err).toBeInstanceOf(ShapeError)
+    expect(err.message).toContain("/status")
+  })
+
+  it("rejects a 200 whose /agents body is not an array", async () => {
+    global.fetch = vi.fn(
+      async () => fakeResponse(200, { not: "an array" }),
+    ) as unknown as typeof fetch
+
+    const err = await catchApiError(apiClient.getAgents())
+    expect(err).toBeInstanceOf(ShapeError)
+    expect(err.message).toContain("/agents")
+  })
+
+  it("rejects a 200 whose /agents array member lacks agent_id", async () => {
+    global.fetch = vi.fn(
+      async () => fakeResponse(200, [{ status: "running" }]),
+    ) as unknown as typeof fetch
+
+    const err = await catchApiError(apiClient.getAgents())
+    expect(err).toBeInstanceOf(ShapeError)
+  })
+
+  it("rejects a 200 whose /tasks array member lacks task_id", async () => {
+    global.fetch = vi.fn(
+      async () => fakeResponse(200, [{ title: "no id" }]),
+    ) as unknown as typeof fetch
+
+    const err = await catchApiError(apiClient.getTasks())
+    expect(err).toBeInstanceOf(ShapeError)
+  })
+
+  it("accepts and returns a well-shaped body unchanged", async () => {
+    global.fetch = vi.fn(
+      async () => fakeResponse(200, { server_running: true, total_agents: 2 }),
+    ) as unknown as typeof fetch
+
+    const res = await apiClient.getSystemStatus()
+    expect(res.server_running).toBe(true)
+  })
+})
+
+// TY-2: child_tasks / depends_on_tasks are polymorphic on the wire
+// (JSON string | array | null). The lib boundary normalizes both to
+// string[] so every consumer sees exactly one shape.
+describe("normalizeTaskListField (TY-2)", () => {
+  it("parses a JSON-array string", () => {
+    expect(normalizeTaskListField('["a","b"]')).toEqual(["a", "b"])
+  })
+
+  it("passes an array through, keeping only string members", () => {
+    expect(normalizeTaskListField(["a", "b"])).toEqual(["a", "b"])
+    expect(normalizeTaskListField(["a", 1, null, "b"] as unknown)).toEqual([
+      "a",
+      "b",
+    ])
+  })
+
+  it("returns [] for null / undefined / empty / non-JSON / non-array-JSON", () => {
+    expect(normalizeTaskListField(null)).toEqual([])
+    expect(normalizeTaskListField(undefined)).toEqual([])
+    expect(normalizeTaskListField("")).toEqual([])
+    expect(normalizeTaskListField("task_abc")).toEqual([])
+    expect(normalizeTaskListField('{"a":1}')).toEqual([])
+  })
+})
+
+describe("normalizeTask (TY-2)", () => {
+  const base: RawTask = {
+    task_id: "t1",
+    title: "T",
+    status: "pending",
+    priority: "medium",
+    created_at: "2026-01-01",
+    updated_at: "2026-01-01",
+  } as RawTask
+
+  it("collapses JSON-string list fields to arrays", () => {
+    const out = normalizeTask({
+      ...base,
+      child_tasks: '["c1","c2"]',
+      depends_on_tasks: '["d1"]',
+    })
+    expect(out.child_tasks).toEqual(["c1", "c2"])
+    expect(out.depends_on_tasks).toEqual(["d1"])
+  })
+
+  it("is idempotent — arrays pass through", () => {
+    const out = normalizeTask({
+      ...base,
+      child_tasks: ["c1"],
+      depends_on_tasks: ["d1"],
+    })
+    expect(out.child_tasks).toEqual(["c1"])
+    expect(out.depends_on_tasks).toEqual(["d1"])
+  })
+
+  it("defaults missing/null list fields to []", () => {
+    const out = normalizeTask({ ...base, child_tasks: null })
+    expect(out.child_tasks).toEqual([])
+    expect(out.depends_on_tasks).toEqual([])
+  })
+})
+
+// TY-2 end-to-end through the request boundary: getTasks() hands back
+// Tasks whose child_tasks is already an array, even though the wire
+// sent a JSON string.
+describe("getTasks normalization (TY-2, end-to-end)", () => {
+  const realFetch = global.fetch
+
+  beforeEach(() => {
+    apiClient.setBaseUrl("/api")
+  })
+
+  afterEach(() => {
+    global.fetch = realFetch
+    vi.restoreAllMocks()
+  })
+
+  it("normalizes wire JSON-string child_tasks into an array", async () => {
+    global.fetch = vi.fn(
+      async () =>
+        fakeResponse(200, [
+          {
+            task_id: "t1",
+            title: "T",
+            status: "pending",
+            priority: "medium",
+            created_at: "x",
+            updated_at: "x",
+            child_tasks: '["c1","c2"]',
+            depends_on_tasks: null,
+          },
+        ]),
+    ) as unknown as typeof fetch
+
+    const [task] = await apiClient.getTasks()
+    expect(task.child_tasks).toEqual(["c1", "c2"])
+    expect(task.depends_on_tasks).toEqual([])
   })
 })
