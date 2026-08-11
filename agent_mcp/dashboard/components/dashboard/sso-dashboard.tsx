@@ -15,64 +15,29 @@
 // 403 envelope and we render an explanatory message rather than the
 // config table.
 
-import { useCallback } from "react"
 import { Loader2, ShieldAlert, ShieldCheck, Server } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { routerSsoConfigUrl } from "@/lib/urls"
-import { routerApi } from "@/lib/router-api"
-import { useRouterQuery } from "@/hooks/use-router-query"
-
-type SSOMode = "builtin" | "oidc" | "proxy_header"
-
-interface OIDCConfig {
-  issuer: string
-  client_id: string
-  client_secret_present: boolean
-  provider_name: string
-  group_mapping: Record<string, string>
-  redirect_url: string | null
-  scopes: string[]
-}
-
-interface ProxyConfig {
-  trust_header: string
-  trusted_ips: string[]
-  default_is_sysadmin: boolean
-}
-
-interface SSOConfig {
-  mode: SSOMode
-  oidc?: OIDCConfig
-  proxy?: ProxyConfig
-}
-
-interface SSOConfigResponse {
-  success: boolean
-  config?: SSOConfig
-  error?: string
-  message?: string
-}
+import { ApiError } from "@/lib/api"
+import {
+  useSsoConfigQuery,
+  type SSOMode,
+  type OIDCConfig,
+  type ProxyConfig,
+} from "@/lib/queries/sso"
 
 export function SsoDashboard() {
-  const {
-    data: config,
-    loading,
-    error: fetchError,
-    forbidden,
-  } = useRouterQuery<SSOConfig>(
-    useCallback(async (signal) => {
-      const body = await routerApi.request<SSOConfigResponse>(
-        routerSsoConfigUrl(),
-        { signal },
-      )
-      if (!body.success || !body.config) {
-        throw new Error(body.message ?? "SSO config unavailable")
-      }
-      return body.config
-    }, []),
-  )
-  const error = fetchError?.message ?? null
+  const query = useSsoConfigQuery()
+  const config = query.data ?? null
+  // useRouterQuery folded a 403 into a dedicated `forbidden` flag; useQuery
+  // surfaces the same response as a thrown ApiError on `error`. Re-derive
+  // the split so the "Sysadmin only" card still outranks a raw error
+  // string (mirrors groups-dashboard.tsx). `isPending` is the first-load
+  // gate — there is no refetch trigger on this read-only surface.
+  const forbidden =
+    query.error instanceof ApiError && query.error.status === 403
+  const error = forbidden ? null : (query.error?.message ?? null)
+  const loading = query.isPending
 
   if (loading) {
     return (

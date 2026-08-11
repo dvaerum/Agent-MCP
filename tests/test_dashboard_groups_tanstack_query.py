@@ -24,16 +24,22 @@ per-project lists, and this guard pins both:
     ``invalidateGroups()`` from each mutation's success handler rather
     than the debounced SSE choke point the per-project lists use.
 
-``useRouterQuery`` itself is NOT retired: SSO, users, project
-memberships and the per-group capabilities section still use it. So the
-guard repoints the GROUPS PAGE off it while asserting the hook survives
-for its other consumers — the mirror of
-``test_dashboard_use_paged_query_hook.py`` but scoped to groups.
+W6-followup-2 G2 then migrated the LAST four ``useRouterQuery``
+consumers — SSO, users, project memberships and the per-group
+capabilities section — onto their own TanStack Query modules
+(``lib/queries/{sso,users,project-memberships,group-capabilities}.ts``),
+each with a bare-or-parent-scoped key + ``invalidateX()`` in
+``lib/query-client.ts``. With zero consumers left, the hand-rolled hook
+(``hooks/use-router-query.ts``) and its vitest guard were DELETED —
+exactly the fully-retired shape of ``use-paged-query.ts``. So the guard
+below now asserts the hook is GONE and every former consumer imports its
+TanStack replacement instead.
 
 These are text-parse regression guards (same convention as
 ``test_dashboard_use_paged_query_hook.py``); behaviour is verified by the
 vitest suites (``groups-query-invalidation.test.ts`` +
-``groups-dashboard.test.tsx``) plus ``npm run build``.
+``router-admin-queries-invalidation.test.ts`` + ``groups-dashboard.test.tsx``)
+plus ``npm run build``.
 """
 
 from __future__ import annotations
@@ -127,33 +133,80 @@ def test_groups_dashboard_migrated_to_tanstack_query() -> None:
     )
 
 
-# ---------- useRouterQuery survives for its other consumers ----------
+# ---------- useRouterQuery is fully retired (G2) ----------------------
 
 
-def test_use_router_query_hook_is_retained() -> None:
-    """``useRouterQuery`` is scoped-out of the groups PAGE only — it is
-    NOT retired. SSO, users, project memberships and the per-group
-    capabilities section still ride it, so the hook file must remain and
-    stay imported by those consumers. (Contrast the fully-retired
-    ``use-paged-query.ts``.)"""
-    path = DASHBOARD / "hooks" / "use-router-query.ts"
-    assert path.exists(), (
-        "hooks/use-router-query.ts must remain — it still owns the fetch "
-        "state machine for sso-dashboard / users-dashboard / "
-        "project-memberships-modal / group-capabilities-section"
+# Each former ``useRouterQuery`` consumer → the TanStack Query module it
+# now imports (`lib/queries/<name>.ts`). Repointed, NOT weakened: the
+# assertion moved from "still imports the hook" to "imports its migration
+# target and no longer imports the deleted hook".
+_MIGRATED_CONSUMERS = {
+    "components/dashboard/sso-dashboard.tsx": "lib/queries/sso",
+    "components/dashboard/users-dashboard.tsx": "lib/queries/users",
+    "components/dashboard/project-memberships-modal.tsx": (
+        "lib/queries/project-memberships"
+    ),
+    "components/dashboard/groups/group-capabilities-section.tsx": (
+        "lib/queries/group-capabilities"
+    ),
+}
+
+
+def test_use_router_query_hook_is_removed() -> None:
+    """W6-followup-2 G2: with the last four consumers migrated onto
+    TanStack Query, the hand-rolled ``useRouterQuery`` hook + its vitest
+    guard are DELETED — the fully-retired shape of ``use-paged-query.ts``.
+    Nothing may import the hook module any more."""
+    hook = DASHBOARD / "hooks" / "use-router-query.ts"
+    assert not hook.exists(), (
+        "hooks/use-router-query.ts must be DELETED after G2 migrated its "
+        "last consumers (users / SSO / memberships / capabilities) onto "
+        "TanStack Query"
     )
-    consumers = [
-        "components/dashboard/sso-dashboard.tsx",
-        "components/dashboard/users-dashboard.tsx",
-        "components/dashboard/project-memberships-modal.tsx",
-        "components/dashboard/groups/group-capabilities-section.tsx",
-    ]
-    for rel in consumers:
+    guard = DASHBOARD / "tests" / "use-router-query.test.ts"
+    assert not guard.exists(), (
+        "tests/use-router-query.test.ts (the resolveRouterQuery guard) must "
+        "be DELETED alongside the hook it tested"
+    )
+
+
+def test_former_router_query_consumers_migrated_to_tanstack() -> None:
+    """Every former ``useRouterQuery`` consumer imports its TanStack Query
+    module (``lib/queries/<name>``) and no longer imports the deleted
+    hook. Incidental doc-comment mentions of the old hook's name (to
+    explain migration lineage) are fine — only a real ``import`` is
+    forbidden."""
+    for rel, query_module in _MIGRATED_CONSUMERS.items():
         src = _read(rel)
-        assert re.search(
+        assert query_module in src, (
+            f"expected {rel} to import '@/{query_module}' (its TanStack "
+            "Query replacement for useRouterQuery)"
+        )
+        assert not re.search(
             r"""from\s+['"][^'"]*use-router-query['"]""", src
         ), (
-            f"expected {rel} to still import '@/hooks/use-router-query' "
-            "(the groups migration keeps it for the remaining router-admin "
-            "consumers)"
+            f"expected {rel} to NOT import '@/hooks/use-router-query' after "
+            "the G2 migration onto TanStack Query"
+        )
+
+
+def test_query_client_exposes_router_admin_keys_and_invalidators() -> None:
+    """``lib/query-client.ts`` owns the router-level key + invalidator for
+    each migrated resource, matching the groups seam. Users/SSO are single
+    router-level resources (bare keys); memberships/capabilities are keyed
+    by their parent id."""
+    src = _read("lib/query-client.ts")
+    for symbol in (
+        "export const usersQueryKey",
+        "export function invalidateUsers",
+        "export const ssoConfigQueryKey",
+        "export function invalidateSsoConfig",
+        "export const projectMembershipsQueryKey",
+        "export function invalidateProjectMemberships",
+        "export const groupCapabilitiesQueryKey",
+        "export function invalidateGroupCapabilities",
+    ):
+        assert symbol in src, (
+            f"expected lib/query-client.ts to declare `{symbol}` (G2 "
+            "router-admin migration)"
         )

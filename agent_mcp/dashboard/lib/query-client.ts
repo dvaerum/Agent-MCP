@@ -195,3 +195,111 @@ export const groupsQueryKey = () => [GROUPS_KEY] as const
 export function invalidateGroups(): Promise<void> {
   return queryClient.invalidateQueries({ queryKey: groupsQueryKey() })
 }
+
+/**
+ * Router-admin resources migrated off the hand-rolled `useRouterQuery`
+ * hook in W6-followup-2 G2 (2026-08-11) — users, SSO config, per-project
+ * memberships and per-group capabilities. They share the groups list's
+ * shape (see `groupsQueryKey` / `invalidateGroups` above): ROUTER-level
+ * reads that live at the cross-project overview, which has NO
+ * operator-events SSE stream (`subscribeMcpNotifications` early-returns
+ * for `isOverview`). So none of them are wired into the debounced SSE
+ * choke point in `lib/mcp-notifications.ts`; freshness after a mutation
+ * rides an explicit `invalidateX()` from the mutation's success handler —
+ * the faithful analog of the old `useRouterQuery` `refresh()`.
+ *
+ * Users and SSO are single router-level resources → bare keys
+ * (`['users']` / `['sso-config']`). Memberships and capabilities are
+ * per-parent (a project name / a group id) → the id is the second key
+ * segment, mirroring the per-project task/message keys but scoped to the
+ * router-admin parent rather than a project backend.
+ */
+
+/** Query-key root for the router-admin users list (`GET /router/users`). */
+export const USERS_KEY = "users" as const
+
+/**
+ * Stable query key for the router-admin users list. Like `groupsQueryKey`
+ * (and unlike `tasksQueryKey` / `messagesQueryKey`) this is a bare
+ * `['users']` with NO project segment — users are a ROUTER-level resource
+ * shared across every project the operator can see.
+ */
+export const usersQueryKey = () => [USERS_KEY] as const
+
+/**
+ * Invalidate the router-admin users list, forcing a refetch of the mounted
+ * users query. Called from each user mutation's success handler (create /
+ * edit / delete) — the router-admin analog of the SSE-driven invalidation
+ * the per-project lists use (there is no SSE at the overview).
+ */
+export function invalidateUsers(): Promise<void> {
+  return queryClient.invalidateQueries({ queryKey: usersQueryKey() })
+}
+
+/** Query-key root for the router SSO config (`GET /router/sso/config`). */
+export const SSO_CONFIG_KEY = "sso-config" as const
+
+/**
+ * Stable query key for the router SSO config. A bare `['sso-config']` —
+ * one config per router, no project segment. The dashboard's SSO view is
+ * read-only today (writes travel via env vars / the nix module, see
+ * `sso-dashboard.tsx`), so `invalidateSsoConfig()` has no in-app caller
+ * yet; it exists for uniformity + so a future editable SSO surface has the
+ * same freshness seam as its siblings.
+ */
+export const ssoConfigQueryKey = () => [SSO_CONFIG_KEY] as const
+
+/** Invalidate the router SSO config query, forcing a refetch. */
+export function invalidateSsoConfig(): Promise<void> {
+  return queryClient.invalidateQueries({ queryKey: ssoConfigQueryKey() })
+}
+
+/** Query-key root for a project's memberships
+ *  (`GET /router/projects/<name>/memberships`). */
+export const PROJECT_MEMBERSHIPS_KEY = "project-memberships" as const
+
+/**
+ * Stable query key for one project's membership list, keyed by project
+ * NAME (the identifier the router-admin endpoint routes on). Router-level,
+ * so the second segment is the project name rather than a
+ * `projectContext`-derived active project — the memberships modal can be
+ * opened for any project from the overview.
+ */
+export const projectMembershipsQueryKey = (projectName: string) =>
+  [PROJECT_MEMBERSHIPS_KEY, projectName] as const
+
+/**
+ * Invalidate one project's membership list, forcing a refetch of the
+ * mounted memberships query. Called from each membership mutation's
+ * success handler (add / remove / change-role / undo).
+ */
+export function invalidateProjectMemberships(
+  projectName: string,
+): Promise<void> {
+  return queryClient.invalidateQueries({
+    queryKey: projectMembershipsQueryKey(projectName),
+  })
+}
+
+/** Query-key root for a group's capabilities
+ *  (`GET /router/groups/<id>/capabilities`). */
+export const GROUP_CAPABILITIES_KEY = "group-capabilities" as const
+
+/**
+ * Stable query key for one group's capability set, keyed by group id.
+ * Router-level, second segment is the group id.
+ */
+export const groupCapabilitiesQueryKey = (groupId: string) =>
+  [GROUP_CAPABILITIES_KEY, groupId] as const
+
+/**
+ * Invalidate one group's capability set, forcing a refetch of the mounted
+ * capabilities query. Called from the capability-save (PUT) success
+ * handler — the checklist also updates optimistically from the PUT
+ * response, and this reconciles the cache so a remount is fresh.
+ */
+export function invalidateGroupCapabilities(groupId: string): Promise<void> {
+  return queryClient.invalidateQueries({
+    queryKey: groupCapabilitiesQueryKey(groupId),
+  })
+}
