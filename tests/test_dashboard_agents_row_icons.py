@@ -140,7 +140,7 @@ def test_view_dialog_renders_agent_fields() -> None:
 def test_api_client_has_edit_agent() -> None:
     """A new `editAgent` method must exist on the API client, hitting
     the upstream POST /api/agents/<id>/edit route added by this PR."""
-    src = _read("lib/api.ts")
+    src = _read("lib/api/agents.ts")
     assert "editAgent" in src, (
         "api.ts must export editAgent for the dashboard Edit button"
     )

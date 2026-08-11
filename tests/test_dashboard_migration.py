@@ -30,7 +30,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ROUTERS_DIR = REPO_ROOT / "agent_mcp" / "app" / "routers"
 ROUTER_APP_FILE = REPO_ROOT / "agent_mcp" / "router" / "app.py"
-API_TS_FILE = REPO_ROOT / "agent_mcp" / "dashboard" / "lib" / "api.ts"
+# W6-followup F1 split the old lib/api.ts God-module into per-resource
+# modules under lib/api/. The mutation payloads (token-strip guard) and
+# the request core (401 redirect) now live across several of them, so
+# read the whole directory as one blob.
+API_TS_DIR = REPO_ROOT / "agent_mcp" / "dashboard" / "lib" / "api"
 
 
 # ── helpers ────────────────────────────────────────────────────────
@@ -38,6 +42,13 @@ API_TS_FILE = REPO_ROOT / "agent_mcp" / "dashboard" / "lib" / "api.ts"
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def _read_api_client() -> str:
+    """Concatenate every per-resource api module (core + bundles)."""
+    return "\n".join(
+        p.read_text(encoding="utf-8") for p in sorted(API_TS_DIR.glob("*.ts"))
+    )
 
 
 # Patterns that indicate a handler is reading a token field out of an
@@ -131,7 +142,7 @@ def test_dashboard_api_client_strips_token_field_from_payloads() -> None:
     ``deleteTask`` no longer include ``token: tokens.admin_token`` in
     mutation bodies — the cookie carries auth now.
     """
-    text = _read(API_TS_FILE)
+    text = _read_api_client()
     hits = []
     for i, line in enumerate(text.splitlines(), start=1):
         if line.strip().startswith("//"):
@@ -173,7 +184,7 @@ def test_dashboard_api_client_has_401_redirect_handler() -> None:
     the current path in ``?next=`` so post-login the operator lands
     back where they started.
     """
-    text = _read(API_TS_FILE)
+    text = _read_api_client()
     # Loose match: must reference both ``401`` and ``/agent-mcp/login``
     # somewhere in the file plus ``next=`` for the preserved path.
     assert "401" in text, "ApiClient must inspect the 401 status code"

@@ -29,7 +29,7 @@ from pathlib import Path
 from tests.dashboard_sources import tasks_page_source
 
 DASHBOARD = Path("agent_mcp/dashboard/components/dashboard/tasks-dashboard.tsx")
-API = Path("agent_mcp/dashboard/lib/api.ts")
+API = Path("agent_mcp/dashboard/lib/api/tasks.ts")
 # Wave 8 PR 1 moved ``update_task_details_api_route`` (with its
 # EDITABLE_KEYS allowlist + notes-append branch) from
 # ``agent_mcp/app/routes.py`` into the composition router file.
@@ -206,9 +206,11 @@ def test_api_client_update_task_accepts_notes_string() -> None:
     PR #22; this guard pins it so a future refactor doesn't drop it.
     """
     src = _src(API)
-    # Look at the updateTask signature data param.
+    # Look at the updateTask signature data param. W6-followup F1 moved
+    # updateTask into the tasks resource bundle as an object-literal
+    # method (no leading `async`), so match the bare `updateTask(`.
     sig = re.search(
-        r"async updateTask\([^)]*data:\s*\{[^}]*\}",
+        r"updateTask\([^)]*data:\s*\{[^}]*\}",
         src,
         re.DOTALL,
     )

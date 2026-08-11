@@ -44,7 +44,7 @@ import pytest
 from tests.harness import mcp_session
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-API_FILE = REPO_ROOT / "agent_mcp" / "dashboard" / "lib" / "api.ts"
+API_FILE = REPO_ROOT / "agent_mcp" / "dashboard" / "lib" / "api" / "agents.ts"
 
 
 def _row(table: str, where_sql: str, params: tuple) -> dict | None:
@@ -145,16 +145,13 @@ def test_api_client_register_agent_targets_post_agents_register() -> None:
     """
     src = API_FILE.read_text(encoding="utf-8")
 
-    # Locate the registerAgent method by name; slice until the next
-    # method declaration starts (avoids the noisy Promise return-type
-    # spanning multiple lines).
-    start = src.find("async registerAgent")
+    # Locate the registerAgent method by name; slice a generous window
+    # over its body. W6-followup F1 moved it into the agents resource
+    # bundle as an object-literal method (no leading `async`), so match
+    # the bare `registerAgent(`.
+    start = src.find("registerAgent(")
     assert start != -1, "apiClient.registerAgent went missing."
-    next_async = src.find("\n  async ", start + 1)
-    next_method = (
-        next_async if next_async != -1 else start + 2000
-    )
-    body = src[start:next_method]
+    body = src[start:start + 2000]
 
     assert "method: 'POST'" in body or 'method: "POST"' in body, (
         "registerAgent must be a POST."

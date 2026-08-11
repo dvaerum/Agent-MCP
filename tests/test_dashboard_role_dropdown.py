@@ -24,7 +24,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DASHBOARD = REPO_ROOT / "agent_mcp" / "dashboard"
 AGENTS_TSX = DASHBOARD / "components" / "dashboard" / "agents-dashboard.tsx"
-API_TS = DASHBOARD / "lib" / "api.ts"
+API_TS = DASHBOARD / "lib" / "api" / "agents.ts"
 
 
 def _read(p: Path) -> str:

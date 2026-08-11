@@ -29,7 +29,7 @@ def _read(rel: str) -> str:
 
 
 def test_api_client_has_restore_agent() -> None:
-    src = _read("lib/api.ts")
+    src = _read("lib/api/agents.ts")
     assert "restoreAgent" in src, (
         "api.ts must export restoreAgent for the dashboard Restore button"
     )
@@ -39,7 +39,7 @@ def test_api_client_has_restore_agent() -> None:
 
 
 def test_api_client_has_purge_agent_and_preview() -> None:
-    src = _read("lib/api.ts")
+    src = _read("lib/api/agents.ts")
     assert "purgeAgent" in src, "api.ts must export purgeAgent"
     assert "getPurgePreview" in src, (
         "api.ts must export getPurgePreview for the confirmation modal"

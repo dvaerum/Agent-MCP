@@ -28,7 +28,7 @@ def _read(rel: str) -> str:
 
 def test_set_server_appends_api_to_base_url() -> None:
     """setServer must construct baseUrl with `/api` appended."""
-    src = _read("lib/api.ts")
+    src = _read("lib/api/client.ts")
     # find the setServer method body (until next blank-line/method)
     m = re.search(r"setServer\([^)]*\)\s*\{(.*?)\n\s*\}", src, re.DOTALL)
     assert m, "setServer not found in api.ts"
@@ -46,7 +46,7 @@ def test_api_ts_does_not_hardcode_api_segment_after_base_url() -> None:
     `${this.baseUrl}/api${endpoint}` in createEventSource(),
     `${this.baseUrl}/api/health` in testCORS(), etc.
     """
-    src = _read("lib/api.ts")
+    src = _read("lib/api/client.ts")
     # Match either `${baseUrl}/api...` or `${this.baseUrl}/api...`
     bad = re.findall(r"\$\{(?:this\.)?baseUrl\}/api", src)
     assert not bad, (

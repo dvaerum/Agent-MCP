@@ -105,10 +105,10 @@ def test_api_client_exposes_get_prompts_catalog() -> None:
     """`lib/api.ts` exposes a `getPromptsCatalog()` method on the
     apiClient so the store can fetch without each call site
     constructing the URL itself."""
-    src = _read("lib/api.ts")
+    src = _read("lib/api/system.ts")
     assert re.search(r"\bgetPromptsCatalog\b", src), (
-        "lib/api.ts has no getPromptsCatalog method — add it alongside "
-        "getAgents / getTasks etc."
+        "lib/api/system.ts has no getPromptsCatalog method — add it "
+        "alongside getAllData / getTokens etc."
     )
 
 
@@ -118,7 +118,7 @@ def test_notification_listener_invalidates_prompts_catalog() -> None:
     `invalidatePromptsCatalog` so other tabs see admin-created
     prompts within seconds."""
     candidates = [
-        "lib/api.ts",
+        "lib/mcp-notifications.ts",
         "lib/stores/data-store.ts",
     ]
     combined = "\n".join(_read(p) for p in candidates)

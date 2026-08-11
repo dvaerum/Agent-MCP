@@ -241,10 +241,13 @@ def test_api_update_task_accepts_full_field_set() -> None:
     """updateTask used to only take {status, notes}; for the edit
     modal it must also accept title, description, priority,
     assigned_to so the admin can edit those fields."""
-    src = _read("lib/api.ts")
-    # Find the updateTask signature.
-    m = re.search(r"async updateTask\([^)]*\)[^{]*\{.*?\n  \}", src, re.DOTALL)
-    assert m, "updateTask not found in api.ts"
+    src = _read("lib/api/tasks.ts")
+    # Find the updateTask method. W6-followup F1 moved it into the
+    # tasks resource bundle (object-literal method, ~4-space indent, no
+    # `async` keyword since it just returns core.request), so match the
+    # bare `updateTask(` and close on the method's own brace.
+    m = re.search(r"updateTask\([^)]*\)[^{]*\{.*?\n\s{4}\}", src, re.DOTALL)
+    assert m, "updateTask not found in lib/api/tasks.ts"
     body = m.group(0)
     for field in ("title", "description", "priority", "assigned_to"):
         assert field in body, (
