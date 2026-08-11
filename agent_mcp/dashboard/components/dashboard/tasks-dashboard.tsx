@@ -1381,6 +1381,7 @@ export function TasksDashboard() {
             focus-visible:ring-ring/50 styles. */}
         <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
         <Input
+          aria-label="Search tasks"
           placeholder="Search tasks..."
           value={searchTerm}
           onChange={(e) => setFilter("searchTerm", e.target.value)}

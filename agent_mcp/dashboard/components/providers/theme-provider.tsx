@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useEffect, useState } from 'react'
+import React, { useEffect } from 'react'
 import { useTheme } from '@/lib/store'
 
 interface ThemeProviderProps {
@@ -8,13 +8,15 @@ interface ThemeProviderProps {
 }
 
 export function ThemeProvider({ children }: ThemeProviderProps) {
-  const [mounted, setMounted] = useState(false)
   const { theme, setTheme } = useTheme()
 
   useEffect(() => {
-    setMounted(true)
-    
-    // Initialize theme on mount
+    // AX-4: the blocking inline script in app/layout.tsx already applied
+    // the correct `dark` class before first paint, so this provider no
+    // longer withholds its children until mount (that blank-render was
+    // the cause of the flash). This effect only keeps the class in sync
+    // with later theme changes and OS media-query changes — it
+    // re-applies idempotently on mount, a no-op against the script.
     const initializeTheme = () => {
       const isDark = theme === 'dark' || 
         (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)
@@ -39,15 +41,6 @@ export function ThemeProvider({ children }: ThemeProviderProps) {
       return () => mediaQuery.removeEventListener('change', handleChange)
     }
   }, [theme, setTheme])
-
-  // Prevent hydration mismatch by not rendering until mounted
-  if (!mounted) {
-    return (
-      <div className="min-h-screen bg-background" suppressHydrationWarning>
-        {children}
-      </div>
-    )
-  }
 
   return <>{children}</>
 }

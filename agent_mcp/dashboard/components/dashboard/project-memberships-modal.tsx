@@ -362,7 +362,7 @@ function AddMembershipModal({
           </DialogHeader>
           <div className="space-y-4 py-4">
             <div className="space-y-2">
-              <Label>Kind</Label>
+              <Label htmlFor="pm-kind">Kind</Label>
               <Select
                 value={kind}
                 onValueChange={(v) => {
@@ -370,7 +370,7 @@ function AddMembershipModal({
                   setSelectedId("")
                 }}
               >
-                <SelectTrigger>
+                <SelectTrigger id="pm-kind">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -380,12 +380,12 @@ function AddMembershipModal({
               </Select>
             </div>
             <div className="space-y-2">
-              <Label>{kind === "user" ? "User" : "Group"}</Label>
+              <Label htmlFor="pm-entity">{kind === "user" ? "User" : "Group"}</Label>
               {loading ? (
                 <div className="text-sm text-muted-foreground">Loading…</div>
               ) : (
                 <Select value={selectedId} onValueChange={setSelectedId}>
-                  <SelectTrigger>
+                  <SelectTrigger id="pm-entity">
                     <SelectValue placeholder={`Select a ${kind}`} />
                   </SelectTrigger>
                   <SelectContent>
@@ -410,9 +410,9 @@ function AddMembershipModal({
               )}
             </div>
             <div className="space-y-2">
-              <Label>Role</Label>
+              <Label htmlFor="pm-role">Role</Label>
               <Select value={role} onValueChange={(v) => setRole(v as Role)}>
-                <SelectTrigger>
+                <SelectTrigger id="pm-role">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
