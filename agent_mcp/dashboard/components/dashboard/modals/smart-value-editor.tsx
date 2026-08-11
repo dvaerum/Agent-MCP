@@ -40,15 +40,6 @@ export function SmartValueEditor({ value, onChange, className }: SmartValueEdito
   const [arrayIds, setArrayIds] = useState<string[]>([])
   const idCounter = useRef(0)
   const mintId = () => `row-${idCounter.current++}`
-  // Reconcile ids to a new array LENGTH, preserving existing ids by
-  // position (an edit keeps every id; a length change from outside
-  // rebuilds only the delta).
-  const reconcileIds = (len: number) =>
-    setArrayIds((prev) =>
-      prev.length === len
-        ? prev
-        : Array.from({ length: len }, (_, i) => prev[i] ?? mintId()),
-    )
 
   // Detect and initialize value type
   useEffect(() => {
@@ -66,7 +57,16 @@ export function SmartValueEditor({ value, onChange, className }: SmartValueEdito
     } else if (Array.isArray(value)) {
       setValueType('array')
       setArrayValue(value)
-      reconcileIds(value.length)
+      // Reconcile ids to the incoming LENGTH, preserving existing ids by
+      // position: an in-place edit (same length) keeps every id, so rows
+      // keep their DOM identity; a length change from outside rebuilds
+      // only the delta. Add/remove handlers manage ids directly.
+      const len = value.length
+      setArrayIds((prev) =>
+        prev.length === len
+          ? prev
+          : Array.from({ length: len }, (_, i) => prev[i] ?? mintId()),
+      )
     } else if (typeof value === 'object') {
       setValueType('object')
       setObjectValue(value as Record<string, unknown>)
