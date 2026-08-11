@@ -1,10 +1,10 @@
-// Messages resource module — the `Message` row type and the
-// conversation-thread reader.
+// Messages resource module — the `Message` row type, the paginated
+// listing reader, and the conversation-thread reader.
 //
-// NOTE: the per-message CRUD (send / query / mark-read) lives in
+// NOTE: the per-message MUTATIONS (send / mark-read / delete) live in
 // `components/dashboard/messages/messages-api.ts`, not here — this
-// module carries only the shared `Message` shape and the thread reader
-// used by <ViewMessageModal>.
+// module carries the shared `Message` shape plus the two READ paths:
+// `getMessages()` (the paginated list) and `getMessageThread()`.
 
 import { apiClient } from './instance'
 import { apiUrl } from '../urls'
@@ -34,6 +34,49 @@ export interface Message {
   // or a reply (which carries no subject). See backend Phase 1/2.
   subject_is_placeholder?: boolean
   parent_message_id: string | null
+}
+
+// One page of the messages list, as returned by POST /api/messages/query:
+// the `messages` slice for the requested `limit`/`offset` window plus the
+// SERVER-computed `total` (a separate COUNT over the same filter set —
+// NOT `messages.length`, which is only the current page).
+export interface MessagesPage {
+  messages: Message[]
+  total: number
+}
+
+// W6-followup F3: the paginated messages-list read. Previously the
+// listing fetch was hand-built inside the generic `usePagedQuery` hook
+// (POST body assembled from `{limit, offset, ...filters}`); this lifts it
+// into the api layer so the TanStack query hook (`lib/queries/messages.ts`
+// `useMessagesQuery`) can call it the same way `useTasksQuery` calls
+// `getTasks()`.
+//
+// Server-side pagination: `POST /messages/query` slices by `limit`/`offset`
+// (backend default 50, hard cap 500) and returns a separate `total`. The
+// `filters` object is spread into the body verbatim (matching the retired
+// hook's `buildPostBody`); `limit`/`offset` are only sent when supplied so
+// the backend defaults still apply. Routed through `apiClient.request` so
+// it inherits the cookie auth, strict-v1 media type, 30s timeout, and the
+// `NO_SERVER_CONNECTED` throw the query hook swallows into an empty page.
+export async function getMessages(
+  filters: object = {},
+  limit?: number,
+  offset?: number,
+): Promise<MessagesPage> {
+  const body: Record<string, unknown> = {}
+  if (typeof limit === 'number') body.limit = limit
+  if (typeof offset === 'number') body.offset = offset
+  Object.assign(body, filters)
+  const data = await apiClient.request<{ messages?: unknown; total?: unknown }>(
+    '/messages/query',
+    { method: 'POST', body: JSON.stringify(body) },
+  )
+  const messages = Array.isArray(data?.messages)
+    ? (data.messages as Message[])
+    : []
+  const total = typeof data?.total === 'number' ? data.total : messages.length
+  return { messages, total }
 }
 
 // Feature 1 (message-threads-ui): fetch the WHOLE conversation a message

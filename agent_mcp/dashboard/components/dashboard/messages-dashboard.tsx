@@ -24,9 +24,8 @@ import { type Message } from "@/lib/api"
 import { cn } from "@/lib/utils"
 import { useDialog } from "@/hooks/use-dialog"
 import { useFilters } from "@/hooks/use-filters"
-import { usePagedQuery } from "@/hooks/use-paged-query"
+import { useMessagesQuery } from "@/lib/queries/messages"
 import { useServerStore } from "@/lib/stores/server-store"
-import { useSseHealthy } from "@/lib/stores/data-store"
 import { AgentSelect } from "@/components/dashboard/shared/agent-select"
 import { MessageMobileCard } from "@/components/dashboard/messages-mobile-list"
 import { ViewMessageModal } from "@/components/dashboard/messages/view-message-modal"
@@ -63,13 +62,10 @@ interface Filters {
 // no URL state, matches the existing filter behavior.
 const PAGE_SIZE = 100
 
-// Background-refresh interval so new inbound messages appear without a
-// manual Refresh (mirrors tasks-dashboard's REFRESH_INTERVAL). The
-// refresh re-runs the paged query in place — it does NOT reset the
-// cursor (currentOffset) or the filters, so the user's page/scroll is
-// preserved. Paused while the compose form is open so a background
-// refresh can't disrupt an in-progress draft.
-const REFRESH_INTERVAL = 60000 // 1 minute
+// Stable empty page for the no-data path (first load / disconnected /
+// query disabled) — a fresh object each render would defeat reference
+// equality on `messages` and re-run the memoised filtered/stats passes.
+const EMPTY_PAGE = { messages: [] as Message[], total: 0 }
 
 // A filter control with a small visible label stacked above it, so each
 // dropdown is self-describing before it's opened (the From/To agent
@@ -96,13 +92,7 @@ export function MessagesDashboard() {
   const { servers, activeServerId } = useServerStore()
   const activeServer = servers.find((s) => s.id === activeServerId)
 
-  // PF-3: the live SSE stream's health. While healthy, the slow
-  // background poll below is skipped — the mcp:resources-updated refetch
-  // covers new inbound messages; the interval is only a fallback for
-  // when SSE is down.
-  const sseHealthy = useSseHealthy()
-
-  // v5.0.26: pagination cursor. Total comes from the hook. Declared
+  // v5.0.26: pagination cursor. Total comes from the query. Declared
   // before `filters` because the useFilters() `onReset` callback below
   // closes over `setCurrentOffset`.
   const [currentOffset, setCurrentOffset] = useState(0)
@@ -148,70 +138,58 @@ export function MessagesDashboard() {
     return f
   }, [filters])
 
-  // v5.0.31: paginated listing fetch owned by ``usePagedQuery<T>``.
-  const {
-    data: messages,
-    total,
-    loading,
-    error: queryError,
-    refresh: refreshQuery,
-    lastFetch,
-  } = usePagedQuery<Message>({
-    endpoint: "/messages/query",
-    filters: queryFilters,
-    limit: PAGE_SIZE,
-    offset: currentOffset,
-  })
+  // W6-followup F3: the paginated listing fetch now rides the shared
+  // TanStack Query client via ``useMessagesQuery`` (see
+  // ``lib/queries/messages.ts``), mirroring the tasks migration. The
+  // query is keyed ``['messages', project, {filters, limit, offset}]``
+  // and owns the loading/error/lastFetch/refetch state machine plus the
+  // PF-3 SSE-gated background poll. Live updates arrive via the single
+  // ``invalidateMessages()`` SSE choke point in
+  // ``lib/mcp-notifications.ts`` — so the pre-migration 60s
+  // ``setInterval`` and the ``mcp:resources-updated`` window listener are
+  // both retired here. The debounced invalidation refetches the mounted
+  // page IN PLACE at the current offset/filters (``keepPreviousData``
+  // holds the rows on screen), so the operator's page/scroll are
+  // preserved exactly as the old in-place refetch did — and, because a
+  // background invalidation goes through the query (not the ``refresh``
+  // wrapper below), it does NOT wipe the row selection either.
+  const query = useMessagesQuery(queryFilters, PAGE_SIZE, currentOffset)
+  const page = query.data ?? EMPTY_PAGE
+  const messages = page.messages
+  const total = page.total
+  // `loading`: initial load only (no cached page yet) — drives the
+  // skeleton. A background/SSE/page-step refetch keeps the current rows.
+  const loading = query.isLoading
+  // `refreshing`: any fetch in flight — drives the header spinner
+  // (preserves the pre-migration "spins on manual Refresh" feel).
+  const refreshing = query.isFetching
+  // React Query exposes a real `Error`; the toast + scaffold want the
+  // legacy `Error | null` / `string | null` shapes.
+  const queryError: Error | null = query.error
+    ? (query.error as Error)
+    : null
+  // `dataUpdatedAt` is 0 until the first success; the header checks `> 0`.
+  const lastFetch = query.dataUpdatedAt
 
-  // Surface the hook's query error via the shared toast (matches
-  // Agents/Tasks/Memories — no more in-page red banner). `queryError` is
-  // ALSO handed to <DataTablePage>, which now degrades to an inline
-  // stale notice whenever rows are in hand and only takes over the page
-  // on an empty first load — so the toast announces the blip and the
-  // rows the operator is reading stay put.
+  // Surface the query error via the shared toast (matches
+  // Agents/Tasks/Memories — no in-page red banner). `queryError` is ALSO
+  // handed to <DataTablePage>, which degrades to an inline stale notice
+  // whenever rows are in hand and only takes over the page on an empty
+  // first load — so the toast announces the blip and the rows the
+  // operator is reading stay put.
   useEffect(() => {
     if (queryError) toastError(queryError, "Failed to load messages")
   }, [queryError])
 
-  // Wrapper that also clears selection.
+  // Manual-refresh wrapper: `refetch` is referentially stable (React
+  // Query guarantees it), so this keeps a stable identity. It ALSO clears
+  // the row selection so a manual Refresh (or a post-mutation refresh)
+  // doesn't leave stale rows selected.
+  const { refetch } = query
   const refresh = useCallback(() => {
-    refreshQuery()
+    void refetch()
     setSelectedIds(new Set())
-  }, [refreshQuery])
-
-  // Background refresh so new inbound messages surface without a manual
-  // Refresh (mirrors tasks-dashboard). Calls ``refreshQuery()`` directly
-  // — the in-place paged refetch at the current offset/filters — instead
-  // of the ``refresh`` wrapper, so a background tick does NOT wipe the
-  // user's row selection or reset their page/scroll. Paused while the
-  // compose form is open so it can't disrupt an in-progress draft, and
-  // (PF-3) skipped entirely while SSE is healthy — the live refetch
-  // below covers that case.
-  useEffect(() => {
-    if (composeOpen || sseHealthy) return
-    const interval = setInterval(() => {
-      refreshQuery()
-    }, REFRESH_INTERVAL)
-    return () => clearInterval(interval)
-  }, [refreshQuery, composeOpen, sseHealthy])
-
-  // Live refetch on backend mutation. The operator SSE client
-  // (lib/mcp-notifications.ts) dispatches a debounced
-  // ``mcp:resources-updated`` window event on every
-  // ``notifications/resources/updated``. The messages list polls its
-  // OWN endpoint (POST /messages/query), so the data-store's
-  // scheduleDashboardRefresh doesn't cover it — hook the event to the
-  // in-place paged refetch (no local debounce: backend + client already
-  // debounce). Paused while composing, mirroring the background-refresh
-  // pause so a live tick can't disrupt an in-progress draft.
-  useEffect(() => {
-    if (typeof window === "undefined" || composeOpen) return
-    const handler = () => {
-      refreshQuery()
-    }
-    window.addEventListener("mcp:resources-updated", handler)
-    return () => window.removeEventListener("mcp:resources-updated", handler)
-  }, [refreshQuery, composeOpen])
+  }, [refetch])
 
   // Live-lookup selector shared by the detail + delete dialogs — reads
   // the current row from the hook-owned ``messages`` array on every
@@ -575,9 +553,9 @@ export function MessagesDashboard() {
         title: "Messages",
         subtitle: "Inspect and route inter-agent messages",
         serverName: activeServer?.name,
-        lastUpdated: lastFetch ?? undefined,
+        lastUpdated: lastFetch > 0 ? lastFetch : undefined,
         onRefresh: refresh,
-        refreshing: loading,
+        refreshing: refreshing,
         actions: (
           <Button
             size="sm"

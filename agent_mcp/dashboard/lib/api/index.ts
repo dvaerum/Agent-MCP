@@ -57,7 +57,12 @@ export {
   contextEntryToMemory,
 } from './memories'
 
-export { type Message, getMessageThread } from './messages'
+export {
+  type Message,
+  type MessagesPage,
+  getMessages,
+  getMessageThread,
+} from './messages'
 
 export {
   type GraphNode,
