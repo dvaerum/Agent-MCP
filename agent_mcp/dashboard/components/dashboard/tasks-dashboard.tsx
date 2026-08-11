@@ -8,12 +8,11 @@ import {
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { apiClient, Task, type TaskFilters } from "@/lib/api"
+import { Task, type TaskFilters } from "@/lib/api"
 import { useServerStore } from "@/lib/stores/server-store"
-import { useSseHealthy } from "@/lib/stores/data-store"
 import { useDialog } from "@/hooks/use-dialog"
 import { useFilters } from "@/hooks/use-filters"
-import { usePagedQuery } from "@/hooks/use-paged-query"
+import { useTasksQuery } from "@/lib/queries/tasks"
 import { AgentSelect } from "@/components/dashboard/shared/agent-select"
 import { TaskMobileCard } from "@/components/dashboard/tasks-mobile-list"
 import { DataTablePage } from "@/components/dashboard/shared/data-table-page"
@@ -31,132 +30,73 @@ import { useTasksColumns } from "@/components/dashboard/tasks/use-tasks-columns"
 // here as an in-memory window over `filteredTasks`.
 const PAGE_SIZE = 100
 
-// Background-refresh interval for the tasks listing. The 60s interval
-// keeps the "background refresh while tab open" semantic from
-// pre-migration ``useTasksData`` — the hook itself is reactive only,
-// not interval-driven, so we still wire the timer here.
-//
-// No ``cacheMs`` (was 30s pre task-filters): the GET /tasks fetch is
-// now parameterized by the server-side filter snapshot and re-runs via
-// the hook's ``deps`` when a filter changes. A global TTL on the last
-// response would make ``usePagedQuery`` short-circuit that reactive
-// re-fetch (see its cache-hit guard) and silently serve the *previous*
-// filter's rows — so the filtered fetch must not be cached. The 60s
-// background refresh still forces a fetch (``refresh()`` bypasses any
-// cache), and the reactive effect only fires on server / filter
-// changes, so there's nothing left for a TTL to dedupe here.
-const REFRESH_INTERVAL = 60000 // 1 minute for background refresh
+// Stable empty singleton for the no-data path — a fresh `[]` on every
+// render would defeat reference equality and re-run the memoised
+// filtered/stats passes each time. Frozen + shared.
+const EMPTY_TASKS: readonly Task[] = Object.freeze([])
 
-// Tasks-dashboard data hook — delegates the loading/error/lastFetch/
-// refresh state machine to ``usePagedQuery<Task>`` (PR 5 of the
-// 2026-06-09 architecture review). The underlying request still
-// goes through ``apiClient.getTasks()`` (a GET ``/tasks`` that
-// returns ``Task[]`` directly — no envelope, no pagination, no token
-// in body), so we use the hook's ``fetchFn`` escape hatch to wrap
-// it. The escape hatch threads the AbortSignal into the response so
-// a slow stale fetch can't overwrite a fresh fast one.
+// Tasks-dashboard data hook — W6-followup F2: the list fetch now rides
+// the shared TanStack Query client via ``useTasksQuery`` (see
+// ``lib/queries/tasks.ts``), matching the ``/all-data`` envelope
+// pattern. The query is keyed ``['tasks', project, serverFilters]`` and
+// owns the loading/error/lastFetch/refetch state machine plus the PF-3
+// SSE-gated background poll. Live updates arrive via the single
+// ``invalidateTasks()`` SSE choke point in ``lib/mcp-notifications.ts``
+// — so the pre-migration 60s ``setInterval`` and the
+// ``mcp:resources-updated`` window listener are both retired here.
+//
+// ``serverFilters`` (status / assignment / creator) drives the
+// server-side filtered GET /tasks — the single source of truth shared
+// with the backend + the MCP view_tasks tool. It is the query key, so a
+// filter change resolves to a distinct cache entry / fetch.
 const useTasksData = (serverFilters: TaskFilters) => {
   const { activeServerId, servers } = useServerStore()
   const activeServer = servers.find(s => s.id === activeServerId)
   const isConnected = !!activeServerId && activeServer?.status === 'connected'
 
-  // PF-3: the live SSE stream's health. While healthy, the slow
-  // background poll below is skipped — the mcp:resources-updated refetch
-  // covers new task activity; the interval is only a fallback for when
-  // SSE is down.
-  const sseHealthy = useSseHealthy()
+  const query = useTasksQuery(serverFilters)
 
-  // Disconnected: surface an empty result without firing the fetch
-  // (the wrapper short-circuits via fetchFn returning empty). The
-  // hook's state machine still runs — that's fine, it just stays at
-  // {data: [], total: 0, loading: false, error: null}.
-  //
-  // ``serverFilters`` (status / assignment / creator) drives the
-  // server-side filtered GET /tasks — the single source of truth
-  // shared with the backend + the MCP view_tasks tool. Its serialized
-  // form is threaded into ``deps`` below so a filter change re-runs
-  // the fetch.
-  const fetchFn = useCallback(
-    async (_signal: AbortSignal): Promise<{ data: Task[]; total: number }> => {
-      if (!isConnected) {
-        return { data: [], total: 0 }
-      }
-      try {
-        const tasksData = await apiClient.getTasks(serverFilters)
-        return { data: tasksData, total: tasksData.length }
-      } catch (err) {
-        // Pre-migration ``useTasksData`` silenced 'NO_SERVER_CONNECTED'
-        // errors so a transient disconnect didn't paint a red banner
-        // (the DashboardWrapper handles connection state). Preserve
-        // that quirk by returning empty instead of throwing.
-        if (err instanceof Error && err.message === 'NO_SERVER_CONNECTED') {
-          return { data: [], total: 0 }
-        }
-        throw err
-      }
-    },
-    [isConnected, serverFilters],
-  )
+  const tasks = query.data ?? EMPTY_TASKS
 
-  // Stable serialization of the filter snapshot for the reactive
-  // re-fetch dependency — a fresh object identity every render would
-  // thrash the effect; the value change is what must re-fetch.
-  const serverFiltersKey = JSON.stringify(serverFilters)
+  // The consumer below wants ``string | null``; React Query exposes a
+  // real ``Error``. Map it.
+  const error: string | null = query.error
+    ? (query.error as Error).message
+    : null
 
-  const {
-    data: tasks,
-    loading,
-    error: queryError,
-    refresh,
-    lastFetch,
-  } = usePagedQuery<Task>({
-    fetchFn,
-    deps: [activeServerId, serverFiltersKey],
-  })
+  // ``refetch`` is referentially stable across renders (React Query
+  // guarantees it), so destructuring it gives this ``refresh`` a stable
+  // identity — safe to pass to memoized children and the mutation-saved
+  // handlers below, and satisfies exhaustive-deps with a plain
+  // identifier dependency.
+  const { refetch } = query
+  const refresh = useCallback(() => {
+    void refetch()
+  }, [refetch])
 
-  // The pre-migration shape exposed ``error`` as ``string | null``.
-  // The hook returns a real ``Error | null``; map it for backward
-  // compat with the consumer below.
-  const error: string | null = queryError ? queryError.message : null
-
-  // Background refresh — separate from the hook (which is reactive
-  // only). Bypass the cache by calling ``refresh()`` directly; the
-  // hook treats refresh() as a force-fetch. (PF-3) skipped entirely
-  // while SSE is healthy — the live refetch below covers that case.
-  useEffect(() => {
-    if (sseHealthy) return
-    const interval = setInterval(() => {
-      refresh()
-    }, REFRESH_INTERVAL)
-    return () => clearInterval(interval)
-  }, [refresh, sseHealthy])
-
-  // Live refetch on backend mutation. The operator SSE client
-  // (lib/mcp-notifications.ts) dispatches a debounced
-  // ``mcp:resources-updated`` window event on every
-  // ``notifications/resources/updated``. The tasks list fetches its OWN
-  // GET /tasks endpoint (not the data-store all-data envelope), so
-  // scheduleDashboardRefresh doesn't cover it — hook the event to the
-  // force-fetch refresh (backend + client already debounce).
-  useEffect(() => {
-    if (typeof window === "undefined") return
-    const handler = () => {
-      refresh()
-    }
-    window.addEventListener("mcp:resources-updated", handler)
-    return () => window.removeEventListener("mcp:resources-updated", handler)
-  }, [refresh])
-
-  // ``lastFetch`` is ``number | null`` from the hook; the consumer
-  // below assumes ``number`` (it checks ``> 0``). Coalesce.
   return useMemo(() => ({
     tasks,
-    loading,
+    // `loading`: initial load only (no cached rows yet) — drives the
+    // skeleton. A background/SSE refetch keeps the current rows.
+    loading: query.isLoading,
+    // `refreshing`: any fetch in flight — drives the header spinner
+    // (preserves the pre-migration "spins on manual Refresh" feel).
+    refreshing: query.isFetching,
     error,
     refresh,
-    lastFetch: lastFetch ?? 0,
+    // `dataUpdatedAt` is 0 until the first success; the consumer checks
+    // `> 0`, so no coalesce needed.
+    lastFetch: query.dataUpdatedAt,
     isConnected,
-  }), [tasks, loading, error, refresh, lastFetch, isConnected])
+  }), [
+    tasks,
+    query.isLoading,
+    query.isFetching,
+    query.dataUpdatedAt,
+    error,
+    refresh,
+    isConnected,
+  ])
 }
 
 export function TasksDashboard() {
@@ -211,7 +151,7 @@ export function TasksDashboard() {
     return f
   }, [statusFilter, assignment, createdBy])
 
-  const { tasks, loading, error, refresh, lastFetch, isConnected } = useTasksData(serverFilters)
+  const { tasks, loading, refreshing, error, refresh, lastFetch, isConnected } = useTasksData(serverFilters)
 
   // Create modal — parent-controlled open (the header + empty-state
   // "Create Task" buttons drive it), rendered once as a child below.
@@ -481,7 +421,7 @@ export function TasksDashboard() {
         serverName: activeServer?.name,
         lastUpdated: lastFetch > 0 ? lastFetch : undefined,
         onRefresh: refresh,
-        refreshing: loading,
+        refreshing: refreshing,
         actions: (
           <Button
             size="sm"

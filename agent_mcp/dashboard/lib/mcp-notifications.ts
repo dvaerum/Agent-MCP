@@ -78,7 +78,7 @@
  */
 
 import { useDataStore, notifyPromptsListChanged } from "./stores/data-store"
-import { invalidateAllData } from "./query-client"
+import { invalidateAllData, invalidateTasks } from "./query-client"
 import { projectContext } from "./project-context"
 import { eventsUrl } from "./urls"
 
@@ -175,6 +175,16 @@ interface JsonRpcNotification {
 // exactly once (not the old zustand `refreshData()` full-envelope
 // refetch). This is what fixes ST-3 double-sourcing + ST-4 split-brain:
 // there is a single cache and a single invalidation.
+//
+// W6-followup F2: the tasks list is a SEPARATE TanStack Query
+// (`['tasks', project, filters]`, fetched from `GET /tasks` — not part
+// of the `/all-data` envelope), so a task mutation isn't covered by the
+// all-data invalidation above. `invalidateTasks()` is added to the SAME
+// debounced tick: one coalesced refetch per burst, one refetch of the
+// mounted tasks query. Both invalidations share the 300ms debounce, so a
+// tight succession of `resources/updated` notifications still collapses
+// to a single tasks refetch (replacing the page's retired
+// `mcp:resources-updated` listener + 60s `setInterval`).
 const DASHBOARD_REFRESH_DEBOUNCE_MS = 300
 let _dashboardRefreshTimer: ReturnType<typeof setTimeout> | null = null
 function scheduleDashboardRefresh(): void {
@@ -182,6 +192,7 @@ function scheduleDashboardRefresh(): void {
   _dashboardRefreshTimer = setTimeout(() => {
     _dashboardRefreshTimer = null
     void invalidateAllData()
+    void invalidateTasks()
   }, DASHBOARD_REFRESH_DEBOUNCE_MS)
 }
 
