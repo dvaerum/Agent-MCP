@@ -142,12 +142,18 @@ def test_data_store_selectors_call_helpers() -> None:
         # closing of the create() block. A 1500-char window is enough
         # to cover the largest of the three.
         body = impl_src[m.start(): m.start() + 1500]
+        # Accept any of the three helpers extracted to selectors.ts in the
+        # same refactor. getAgentActions composes `selectActions` in its own
+        # body, so it no longer relies on the 1500-char window overlapping a
+        # sibling selector's `selectTasks`/`normalizeAgentId` reference.
         assert (
-            "normalizeAgentId" in body or "selectTasks" in body
+            "normalizeAgentId" in body
+            or "selectTasks" in body
+            or "selectActions" in body
         ), (
-            f"{selector} body does not reference normalizeAgentId or "
-            f"selectTasks — was the selector actually migrated to compose "
-            f"the helpers? Body window:\n{body[:400]}..."
+            f"{selector} body does not reference normalizeAgentId, "
+            f"selectTasks, or selectActions — was the selector actually "
+            f"migrated to compose the helpers? Body window:\n{body[:400]}..."
         )
 
 
