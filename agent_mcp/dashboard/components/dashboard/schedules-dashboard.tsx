@@ -37,7 +37,8 @@ import { SendDirectiveModal } from "@/components/dashboard/shared/send-directive
 import { DataTablePage } from "@/components/dashboard/shared/data-table-page"
 import type { Column } from "@/components/dashboard/shared/responsive-data-table"
 import { toastError, toastSuccess } from "@/components/ui/toast"
-import { apiClient, type Agent, type Schedule } from "@/lib/api"
+import { apiClient, type Schedule } from "@/lib/api"
+import { useActiveAgents } from "@/lib/queries/all-data"
 import {
   agentsInSchedules, filterSchedules, formatAbsolute, formatEndCondition,
   formatInterval, formatNextFire, sortByNextFire, type StatusFilter,
@@ -75,7 +76,13 @@ function toIsoOrNull(local: string): string | null {
 
 export function SchedulesDashboard() {
   const [schedules, setSchedules] = useState<Schedule[]>([])
-  const [agents, setAgents] = useState<Agent[]>([])
+  // W6-followup F1: the agent list for the filter + create/edit pickers
+  // reads the shared `/all-data` query (the single agents source) rather
+  // than the retired lean `apiClient.getAgents()`. `useActiveAgents()`
+  // already excludes terminated rows — scheduling a directive for a
+  // terminated agent is meaningless — and a still-scheduled terminated
+  // agent is re-surfaced below via `agentsInSchedules`.
+  const activeAgents = useActiveAgents()
   const [loading, setLoading] = useState(true)
   const [floor, setFloor] = useState<number>(60)
   const [maxPerAgent, setMaxPerAgent] = useState<number>(10)
@@ -109,12 +116,8 @@ export function SchedulesDashboard() {
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const [rows, agentRows] = await Promise.all([
-        apiClient.getSchedules(),
-        apiClient.getAgents().catch(() => [] as Agent[]),
-      ])
+      const rows = await apiClient.getSchedules()
       setSchedules(rows)
-      setAgents(agentRows)
     } catch (e) {
       toastError(e, "Failed to load schedules")
     } finally {
@@ -141,10 +144,10 @@ export function SchedulesDashboard() {
   }, [])
 
   const agentOptions = useMemo(() => {
-    const fromAgents = agents.map((a) => a.agent_id)
+    const fromAgents = activeAgents.map((a) => a.agent_id)
     const merged = new Set<string>([...fromAgents, ...agentsInSchedules(schedules)])
     return Array.from(merged).filter(Boolean).sort()
-  }, [agents, schedules])
+  }, [activeAgents, schedules])
 
   const visible = useMemo(
     () => sortByNextFire(filterSchedules(schedules, agentFilter, statusFilter)),

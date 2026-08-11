@@ -28,7 +28,7 @@ import { useAllData, useAllDataStatus } from '@/lib/queries/all-data'
 import { useServerStore } from '@/lib/stores/server-store'
 import { useDialog } from '@/hooks/use-dialog'
 import { useFilters } from '@/hooks/use-filters'
-import { apiClient, type Memory, type RawContextEntry } from '@/lib/api'
+import { apiClient, contextEntryToMemory, type Memory, type RawContextEntry } from '@/lib/api'
 import { toastError, toastSuccess } from '@/components/ui/toast'
 import { decodeMemoryValue, memoryValuePreview } from '@/lib/memory-value'
 import { CreateMemoryModal } from './modals/create-memory-modal'
@@ -118,29 +118,17 @@ export function MemoriesDashboard() {
 
   const isConnected = !!activeServerId && activeServer?.status === 'connected'
 
-  // Convert context data to memories format
+  // Convert context data to memories format. The raw-context→Memory
+  // mapping (size / staleness metadata) lives in ONE place —
+  // `contextEntryToMemory` in lib/api/memories.ts — shared with the
+  // `apiClient.getMemories()` read path so the two can't drift (and
+  // undefined-safe: the old inline copy crashed on a row whose value
+  // was `undefined`).
   const memories: Memory[] = React.useMemo(() => {
     if (!data?.context) {
       return []
     }
-
-    return (data.context as RawContextEntry[]).map(ctx => ({
-      context_key: ctx.context_key,
-      value: ctx.value,
-      description: ctx.description,
-      updated_at: ctx.updated_at,
-      updated_by: ctx.updated_by,
-      created_at: ctx.created_at,
-      created_by: ctx.created_by,
-      _metadata: {
-        size_bytes: JSON.stringify(ctx.value).length,
-        size_kb: Math.round(JSON.stringify(ctx.value).length / 1024 * 100) / 100,
-        json_valid: true,
-        days_old: ctx.updated_at ? Math.floor((Date.now() - new Date(ctx.updated_at).getTime()) / (1000 * 60 * 60 * 24)) : undefined,
-        is_stale: ctx.updated_at ? (Date.now() - new Date(ctx.updated_at).getTime()) > (30 * 24 * 60 * 60 * 1000) : false,
-        is_large: JSON.stringify(ctx.value).length > 10240
-      }
-    }))
+    return (data.context as RawContextEntry[]).map(contextEntryToMemory)
   }, [data?.context])
 
   // Live-lookup selector for the View/Edit/Delete dialogs. Re-computes
