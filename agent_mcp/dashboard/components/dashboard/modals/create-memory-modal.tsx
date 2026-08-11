@@ -78,9 +78,13 @@ export function CreateMemoryModal({ onCreateMemory, trigger }: CreateMemoryModal
       // Reset form and close modal
       setFormData({ context_key: '', context_value: '', description: '' })
       setOpen(false)
-    } catch (error) {
-      console.error('Failed to create memory:', error)
-      // Error handling would be done by the parent component
+    } catch {
+      // AX-2: the parent (handleCreateMemory in memories-dashboard)
+      // already surfaces both outcomes through the shared toast —
+      // toastSuccess on create, toastError on failure — and rethrows.
+      // Those toasts are role="status"/"alert" + aria-live, so the
+      // result is announced accessibly. We only need to keep the dialog
+      // open on failure so the admin can retry (matches EditMemoryModal).
     } finally {
       setLoading(false)
     }
