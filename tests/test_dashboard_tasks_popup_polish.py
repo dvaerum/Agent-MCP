@@ -16,8 +16,20 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tests.dashboard_sources import tasks_page_source
+
 DASHBOARD = Path("agent_mcp/dashboard")
 TASKS_TSX = DASHBOARD / "components/dashboard/tasks-dashboard.tsx"
+# Wave 5 (refactor/w5-tasks) satellites the dialog layout guards follow.
+VIEW_TASK_DIALOG_TSX = DASHBOARD / "components/dashboard/tasks/view-task-dialog.tsx"
+EDIT_TASK_DIALOG_TSX = DASHBOARD / "components/dashboard/tasks/edit-task-dialog.tsx"
+# The create/edit dialogs adopted the shared <FormDialog> shell, which
+# now OWNS the DialogContent width + the Cancel/Save footer — so the
+# guarantees about those (mobile-safe width, Cancel-before-primary) are
+# audited at the shell, exactly as the delete guarantees delegate to
+# <ConfirmActionModal>. Not a weakening: every original assertion is
+# still made, just at the component where the markup now lives.
+FORM_DIALOG_TSX = DASHBOARD / "components/dashboard/shared/form-dialog.tsx"
 # The Delete dialog was EXTRACTED out of the page god-file (it needed a
 # test seam once its confirmation tier became conditional on the blast
 # radius). The three delete guarantees below therefore audit the
@@ -35,7 +47,12 @@ CONFIRM_ACTION_MODAL_TSX = (
 
 
 def _read_tasks() -> str:
-    return TASKS_TSX.read_text()
+    # Wave 5 (refactor/w5-tasks): the Tasks page was split into a page
+    # module + a `tasks/` satellite directory (the View / Edit dialogs,
+    # the column spec). These guards assert page-level properties, so
+    # read the page + its satellites as one blob. See
+    # tests/dashboard_sources.py.
+    return tasks_page_source()
 
 
 def _read_delete_dialog() -> str:
@@ -140,12 +157,20 @@ def test_view_dialog_has_explicit_width_override() -> None:
 
 
 def test_edit_dialog_has_max_w_xl() -> None:
-    src = _read_tasks()
-    assert re.search(
-        r"EditTaskDialog.*?DialogContent[^>]*max-w-xl(?!\d)",
-        src,
-        re.DOTALL,
-    ), "Edit dialog DialogContent must use max-w-xl"
+    # Wave 5: the Edit dialog adopted the shared <FormDialog> shell, which
+    # OWNS the DialogContent width. Satisfied by delegation (like the
+    # delete tests delegate to <ConfirmActionModal>): the edit dialog
+    # renders <FormDialog wide>, and the wide width lives on FormDialog.
+    edit_src = EDIT_TASK_DIALOG_TSX.read_text()
+    assert re.search(r"<FormDialog\b", edit_src) and "wide" in edit_src, (
+        "Edit dialog must render the shared <FormDialog wide> shell "
+        "(which owns the desktop-comfortable dialog width)"
+    )
+    form_src = FORM_DIALOG_TSX.read_text()
+    assert "sm:max-w-2xl" in form_src, (
+        "FormDialog's `wide` width (sm:max-w-2xl) must beat the base "
+        "sm:max-w-lg so the Edit dialog isn't squeezed on desktop"
+    )
 
 
 def test_delete_dialog_has_max_w_md() -> None:
@@ -177,18 +202,23 @@ def test_delete_dialog_is_rendered_by_the_page() -> None:
 
 
 def test_view_dialog_body_uses_max_h_overflow() -> None:
-    """Dialog body section scrolls (not the whole modal); use
-    ``max-h-[80vh] overflow-y-auto`` on the body wrapper, not the
-    DialogContent."""
+    """Dialog body section scrolls (not the whole modal): the dialog caps
+    at the viewport and a `flex-1 min-h-0 overflow-y-auto` body is the
+    single scroll region.
+
+    Wave 5: the Edit dialog moved to the shared <FormDialog> (which owns
+    an equivalent viewport cap + scroll body). The View dialog keeps its
+    own layout, so the guarantee is pinned there: `max-h-[90vh]` on the
+    DialogContent + a `flex-1 min-h-0 overflow-y-auto` scroll body.
+    """
     src = _read_tasks()
-    # Either the body section or DialogContent declares max-h-[80vh]
-    # (we accept either; key is overflow-y-auto is present).
-    assert "max-h-[80vh]" in src, (
-        "dialog body must cap height at 80vh so long tasks scroll inside "
+    assert "max-h-[90vh]" in src, (
+        "View dialog must cap height at 90vh so long tasks scroll inside "
         "the modal instead of stretching the page"
     )
-    assert "overflow-y-auto" in src, (
-        "dialog body must use overflow-y-auto for the scrolling area"
+    assert "flex-1 min-h-0 overflow-y-auto" in src, (
+        "the dialog body must be the single `flex-1 min-h-0 "
+        "overflow-y-auto` scroll region"
     )
 
 
@@ -225,15 +255,27 @@ def _footer_block(src: str, dialog_name: str) -> str:
 
 
 def test_edit_dialog_footer_cancel_before_save() -> None:
-    src = _read_tasks()
-    footer = _footer_block(src, "EditTaskDialog")
-    cancel_idx = footer.find("Cancel")
-    save_idx = footer.find("Save")
-    assert cancel_idx != -1, "Edit dialog footer missing Cancel button"
-    assert save_idx != -1, "Edit dialog footer missing Save button"
-    assert cancel_idx < save_idx, (
-        "Edit dialog footer must place Cancel before Save (Cancel-left, "
-        "primary-right)"
+    # Wave 5: the Edit dialog's footer is now owned by the shared
+    # <FormDialog> shell (Cancel + submit), so the Cancel-left /
+    # primary-right guarantee is pinned there — the same delegation the
+    # delete-dialog footer test uses for <ConfirmActionModal>. First
+    # confirm the Edit dialog actually renders the shell.
+    edit_src = EDIT_TASK_DIALOG_TSX.read_text()
+    assert re.search(r"<FormDialog\b", edit_src), (
+        "Edit dialog must render the shared <FormDialog> shell"
+    )
+    src = FORM_DIALOG_TSX.read_text()
+    m = re.search(r"<DialogFooter[\s\S]*?</DialogFooter>", src)
+    assert m, "No DialogFooter found in FormDialog"
+    footer = m.group(0)
+    # Cancel button closes the dialog; submit runs the mutation.
+    cancel_idx = footer.find("onOpenChange(false)")
+    submit_idx = footer.find("void submit()")
+    assert cancel_idx != -1, "FormDialog footer missing Cancel button"
+    assert submit_idx != -1, "FormDialog footer missing submit button"
+    assert cancel_idx < submit_idx, (
+        "FormDialog footer must place Cancel before the primary submit "
+        "(Cancel-left, primary-right)"
     )
 
 
@@ -268,15 +310,11 @@ def test_delete_dialog_confirm_uses_destructive_variant() -> None:
 
 
 def test_edit_dialog_inputs_full_width() -> None:
-    src = _read_tasks()
-    # SelectTrigger inside the EditTaskDialog must declare w-full so
-    # the dropdown fills its column cleanly.
-    edit_block = re.search(
-        r"EditTaskDialog[\s\S]*?\}\)\s*\nEditTaskDialog\.displayName",
-        src,
-    )
-    assert edit_block, "Could not locate EditTaskDialog component body"
-    body = edit_block.group(0)
+    # Wave 5: EditTaskDialog is its own satellite now (adopted
+    # <FormDialog>, so no more `React.memo(...) … displayName` wrapper to
+    # anchor on). Read the satellite directly. SelectTrigger/Input inside
+    # must declare w-full so the controls fill their column.
+    body = EDIT_TASK_DIALOG_TSX.read_text()
     assert "w-full" in body, (
         "Edit dialog SelectTrigger/Input must use w-full so controls "
         "fill their column"
@@ -287,13 +325,8 @@ def test_edit_dialog_inputs_full_width() -> None:
 
 
 def test_view_dialog_task_id_uses_monospace() -> None:
-    src = _read_tasks()
-    view_block = re.search(
-        r"ViewTaskDialog[\s\S]*?\}\)\s*\nViewTaskDialog\.displayName",
-        src,
-    )
-    assert view_block, "Could not locate ViewTaskDialog component body"
-    body = view_block.group(0)
+    # Wave 5: ViewTaskDialog is its own satellite now. Read it directly.
+    body = VIEW_TASK_DIALOG_TSX.read_text()
     # task_id must be rendered with font-mono.
     assert "font-mono" in body, (
         "View dialog must render task_id (and other code-like fields) "

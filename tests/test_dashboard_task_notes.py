@@ -26,6 +26,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tests.dashboard_sources import tasks_page_source
+
 DASHBOARD = Path("agent_mcp/dashboard/components/dashboard/tasks-dashboard.tsx")
 API = Path("agent_mcp/dashboard/lib/api.ts")
 # Wave 8 PR 1 moved ``update_task_details_api_route`` (with its
@@ -47,6 +49,14 @@ TOOLS = Path("agent_mcp/tools/task_tools.py")
 
 
 def _src(p: Path) -> str:
+    # Wave 5 (refactor/w5-tasks): the Tasks page was split into a page
+    # module + a `tasks/` satellite directory (the View / Edit dialogs
+    # that carry the notes UI now live there). Read the page + its
+    # satellites as one blob so these page-level notes guards survive the
+    # split. Other files (lib/api.ts, backend routes/tools) read directly.
+    # See tests/dashboard_sources.py.
+    if p == DASHBOARD:
+        return tasks_page_source()
     return p.read_text()
 
 
@@ -144,8 +154,12 @@ def test_edit_dialog_submits_notes_in_patch() -> None:
     # `apiClient.updateTask`. The append can happen either inside the
     # initial object literal (`notes: ...`) or as a post-construction
     # `patch.notes = ...` (conditional on non-empty input).
+    # Wave 5: EditTaskDialog is now `export function EditTaskDialog` in
+    # the `tasks/` satellite (it adopted the shared <FormDialog> +
+    # useAsyncSubmit shell). Anchor on the component name, not the old
+    # `const … = React.memo(` form.
     edit_dialog_region = re.search(
-        r"const EditTaskDialog\b.*?await apiClient\.updateTask",
+        r"EditTaskDialog\b.*?await apiClient\.updateTask",
         src,
         re.DOTALL,
     )

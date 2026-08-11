@@ -19,13 +19,17 @@ refactor of `DialogContent` can't silently re-introduce any of them.
 
 from __future__ import annotations
 
-from pathlib import Path
-
-DASHBOARD = Path("agent_mcp/dashboard/components/dashboard/tasks-dashboard.tsx")
+from tests.dashboard_sources import tasks_page_source
 
 
 def _src() -> str:
-    return DASHBOARD.read_text()
+    # Wave 5 (refactor/w5-tasks): the Tasks page was split into a page
+    # module + a `tasks/` satellite directory. `ViewTaskDialog` (whose
+    # layout these guards pin) now lives in
+    # `tasks/view-task-dialog.tsx`, so read the page + its satellites as
+    # one blob (mirrors the Messages/Agents split). See
+    # tests/dashboard_sources.py.
+    return tasks_page_source()
 
 
 def test_view_dialog_uses_important_max_width_override() -> None:

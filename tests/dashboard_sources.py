@@ -56,6 +56,26 @@ MESSAGES_SOURCES: tuple[str, ...] = (
 )
 
 
+# The Tasks page + every module it was split into (Wave 5:
+# refactor/w5-tasks). Same rule as AGENTS_SOURCES / MESSAGES_SOURCES —
+# keep this list in sync when a Tasks satellite is added or removed, or
+# the source-grep guards silently narrow their audit surface. Order is
+# deliberate: the page first, then satellites, so the component-scoped
+# slices used by the tasks guards (e.g. the ``ViewTaskDialog`` →
+# ``DialogContent`` window) stay well-defined within one file.
+TASKS_SOURCES: tuple[str, ...] = (
+    "components/dashboard/tasks-dashboard.tsx",
+    "components/dashboard/tasks/tasks-api.ts",
+    "components/dashboard/tasks/use-tasks-columns.tsx",
+    "components/dashboard/tasks/create-task-modal.tsx",
+    "components/dashboard/tasks/view-task-dialog.tsx",
+    "components/dashboard/tasks/edit-task-dialog.tsx",
+    "components/dashboard/tasks/delete-task-dialog.tsx",
+    "components/dashboard/tasks/tasks-pagination.tsx",
+    "components/dashboard/tasks-mobile-list.tsx",
+)
+
+
 def read_dashboard(rel: str) -> str:
     """Read one dashboard-relative source file."""
     return (DASHBOARD / rel).read_text(encoding="utf-8")
@@ -79,3 +99,13 @@ def messages_page_source() -> str:
         f"silently stop auditing them: {missing}"
     )
     return "\n".join(read_dashboard(rel) for rel in MESSAGES_SOURCES)
+
+
+def tasks_page_source() -> str:
+    """The Tasks page and all of its satellites, concatenated."""
+    missing = [rel for rel in TASKS_SOURCES if not (DASHBOARD / rel).is_file()]
+    assert not missing, (
+        "Tasks page satellite(s) missing — the source-grep guards would "
+        f"silently stop auditing them: {missing}"
+    )
+    return "\n".join(read_dashboard(rel) for rel in TASKS_SOURCES)

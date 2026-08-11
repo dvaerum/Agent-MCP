@@ -23,10 +23,20 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tests.dashboard_sources import tasks_page_source
+
 DASHBOARD = Path("agent_mcp/dashboard")
 
 
 def _read(rel: str) -> str:
+    # Wave 5 (refactor/w5-tasks): the Tasks page was split into a page
+    # module + a `tasks/` satellite directory (the row column spec, the
+    # View / Edit dialogs). These guards assert properties of the PAGE,
+    # so read the page + its satellites as one blob. Other paths (the
+    # extracted delete dialog, lib/api.ts) are read directly. See
+    # tests/dashboard_sources.py.
+    if rel == "components/dashboard/tasks-dashboard.tsx":
+        return tasks_page_source()
     return (DASHBOARD / rel).read_text()
 
 
