@@ -9,7 +9,12 @@
 //   2. An operator-events `resources/updated` notification triggers
 //      EXACTLY ONE invalidation of that query, even for a burst of
 //      notifications (the 300ms debounce coalesces them) — one source,
-//      one refetch, no split-brain (fixes ST-4).
+//      one refetch, no split-brain (fixes ST-4). W6-followup F2 added a
+//      sibling `invalidateTasks()` on the SAME debounced tick (the tasks
+//      list is a separate `['tasks', project]` query), so the choke
+//      point now fires one invalidation PER QUERY per burst — this guard
+//      pins the coalescing on the all-data key specifically (still
+//      exactly one, never one-per-notification).
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest"
 import React from "react"
 import { renderHook, waitFor, cleanup } from "@testing-library/react"
@@ -104,10 +109,18 @@ describe("SSE → single invalidation (ST-4)", () => {
     // Nothing yet — the debounce hasn't elapsed.
     expect(invalidateSpy).not.toHaveBeenCalled()
 
-    // After the 300ms debounce, exactly one invalidation fires for the
-    // whole burst (not one per notification).
+    // After the 300ms debounce, the all-data key is invalidated exactly
+    // once for the whole burst (not one per notification). W6-followup
+    // F2 also invalidates the sibling `['tasks', project]` key on the
+    // same tick, so we count all-data invalidations specifically rather
+    // than the total call count.
     vi.advanceTimersByTime(300)
-    expect(invalidateSpy).toHaveBeenCalledTimes(1)
+    const allDataInvalidations = invalidateSpy.mock.calls.filter(
+      ([arg]) =>
+        Array.isArray((arg as { queryKey?: unknown[] })?.queryKey) &&
+        (arg as { queryKey: unknown[] }).queryKey[0] === "all-data",
+    )
+    expect(allDataInvalidations).toHaveLength(1)
 
     vi.useRealTimers()
   })

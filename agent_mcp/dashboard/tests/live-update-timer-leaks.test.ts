@@ -12,11 +12,13 @@
  *
  * 2. The operator-events subscription is the single mutation choke
  *    point: on connect it fires a catch-up `resources/updated`, which
- *    (after the 300ms debounce) calls `invalidateAllData()` — ONE
- *    `queryClient.invalidateQueries` for the shared query. Stopping the
- *    stream inside the debounce window must cancel that pending
- *    invalidation (no stray refetch against a store nobody renders); a
- *    stream left running must let it through.
+ *    (after the 300ms debounce) invalidates the shared queries —
+ *    `invalidateAllData()` for the `/all-data` envelope and (W6-followup
+ *    F2) `invalidateTasks()` for the separate `['tasks', project]` list,
+ *    one refetch of each mounted query per burst. Stopping the stream
+ *    inside the debounce window must cancel that pending invalidation (no
+ *    stray refetch against a store nobody renders); a stream left running
+ *    must let it through.
  *
  * 3. The stream lifecycle drives the PF-3 `sseHealthy` flag — true on a
  *    successful connect, false again on stop.

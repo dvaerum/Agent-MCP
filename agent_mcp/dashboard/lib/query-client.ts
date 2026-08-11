@@ -70,3 +70,45 @@ export function invalidateAllData(): Promise<void> {
     queryKey: allDataQueryKey(projectContext.projectName),
   })
 }
+
+/** Query-key root for the tasks list (`GET /tasks`). */
+export const TASKS_KEY = "tasks" as const
+
+/**
+ * Stable query key for the tasks list, namespaced by project and keyed
+ * on the *server-side* filter snapshot (status / assignment / creator)
+ * — the only inputs that actually parameterize `GET /tasks`.
+ *
+ * Deliberately NOT keyed by page: `GET /tasks` returns the WHOLE task
+ * set with no server-side pagination, so page/search/priority are a
+ * pure in-memory slice over the cached full list (see
+ * `tasks-dashboard.tsx`'s PF-1 clamp). Folding page into the key would
+ * fragment the cache and refetch the identical full list on every page
+ * step — the opposite of the "single source, one invalidation" shape.
+ *
+ * The `filters` object is embedded verbatim; React Query hashes it with
+ * sorted keys, so two renders producing an equal filter snapshot resolve
+ * to the same cache entry. `invalidateTasks()` prefix-matches on
+ * `[TASKS_KEY, project]`, so every filter variant is invalidated at once.
+ */
+export const tasksQueryKey = (
+  projectName: string | null,
+  filters: object = {},
+) => [TASKS_KEY, projectName ?? "standalone", filters] as const
+
+/**
+ * Invalidate the active-project tasks list across every filter variant,
+ * forcing a single refetch of each mounted tasks query. Prefix-matches
+ * `[TASKS_KEY, project]`, so `['tasks', project, {status:'pending'}]` and
+ * `['tasks', project, {}]` are both hit.
+ *
+ * Called from the same SSE choke point as `invalidateAllData()` (see
+ * `lib/mcp-notifications.ts`) so a tasks mutation surfaces on the tasks
+ * page without its own poll. Importable from non-React modules because
+ * `queryClient` is a module singleton.
+ */
+export function invalidateTasks(): Promise<void> {
+  return queryClient.invalidateQueries({
+    queryKey: [TASKS_KEY, projectContext.projectName ?? "standalone"],
+  })
+}

@@ -233,17 +233,37 @@ def test_messages_dashboard_no_longer_declares_messages_use_state() -> None:
     )
 
 
-def test_tasks_dashboard_imports_use_paged_query() -> None:
-    """tasks-dashboard.tsx must import the hook after migration —
-    the in-file ``useTasksData`` delegates to it via the fetchFn
-    escape hatch so the loading/error/lastFetch/refresh state
-    machine comes from a single owner."""
+def test_tasks_dashboard_migrated_to_tanstack_query() -> None:
+    """W6-followup F2 repoint: tasks-dashboard.tsx no longer rides the
+    hand-rolled ``usePagedQuery`` state machine — the list fetch moved
+    onto the shared TanStack Query client via ``useTasksQuery`` (see
+    ``lib/queries/tasks.ts``), matching the ``/all-data`` envelope
+    pattern (one query per ``['tasks', project, filters]``, one SSE
+    invalidation choke point). The in-file ``useTasksData`` wrapper now
+    delegates to that query.
+
+    This guard was previously ``test_tasks_dashboard_imports_use_paged_query``
+    (which asserted the OLD ``usePagedQuery`` import). It is repointed —
+    NOT weakened — to the new location: the page must import the
+    TanStack tasks query and must NOT re-introduce the retired hook.
+    (``messages-dashboard.tsx`` still owns ``usePagedQuery`` — the hook
+    file and its own guards stay put; only the tasks consumer migrated.)
+    """
     src = _read("components/dashboard/tasks-dashboard.tsx")
-    assert "usePagedQuery" in src, (
-        "expected tasks-dashboard.tsx to import usePagedQuery"
+    assert "useTasksQuery" in src, (
+        "expected tasks-dashboard.tsx to import useTasksQuery (the "
+        "TanStack Query tasks-list fetch)"
     )
-    assert "use-paged-query" in src, (
-        "expected tasks-dashboard.tsx to reference '@/hooks/use-paged-query'"
+    assert "lib/queries/tasks" in src, (
+        "expected tasks-dashboard.tsx to reference '@/lib/queries/tasks'"
+    )
+    assert "usePagedQuery" not in src, (
+        "expected tasks-dashboard.tsx to NOT import usePagedQuery after "
+        "the F2 migration onto TanStack Query"
+    )
+    assert "use-paged-query" not in src, (
+        "expected tasks-dashboard.tsx to NOT reference "
+        "'@/hooks/use-paged-query' after the F2 migration"
     )
 
 
