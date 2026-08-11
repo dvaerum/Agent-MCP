@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { Plus, Type, Hash, ToggleLeft, ToggleRight, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -32,6 +32,24 @@ export function SmartValueEditor({ value, onChange, className }: SmartValueEdito
   const [arrayValue, setArrayValue] = useState<unknown[]>([])
   const [objectValue, setObjectValue] = useState<Record<string, unknown>>({})
 
+  // TY-5: array rows are keyed by a STABLE per-row id, not the array
+  // index. Index keys make React re-map surviving rows onto different
+  // DOM nodes on removal/reorder, so focus + selection jump to the
+  // wrong row. `arrayIds[i]` is the identity of row i and travels with
+  // the value as items are added/removed. `idCounter` mints unique ids.
+  const [arrayIds, setArrayIds] = useState<string[]>([])
+  const idCounter = useRef(0)
+  const mintId = () => `row-${idCounter.current++}`
+  // Reconcile ids to a new array LENGTH, preserving existing ids by
+  // position (an edit keeps every id; a length change from outside
+  // rebuilds only the delta).
+  const reconcileIds = (len: number) =>
+    setArrayIds((prev) =>
+      prev.length === len
+        ? prev
+        : Array.from({ length: len }, (_, i) => prev[i] ?? mintId()),
+    )
+
   // Detect and initialize value type
   useEffect(() => {
     if (value === null || value === undefined) {
@@ -48,6 +66,7 @@ export function SmartValueEditor({ value, onChange, className }: SmartValueEdito
     } else if (Array.isArray(value)) {
       setValueType('array')
       setArrayValue(value)
+      reconcileIds(value.length)
     } else if (typeof value === 'object') {
       setValueType('object')
       setObjectValue(value as Record<string, unknown>)
@@ -85,6 +104,7 @@ export function SmartValueEditor({ value, onChange, className }: SmartValueEdito
       case 'array':
         const arrVal: unknown[] = []
         setArrayValue(arrVal)
+        setArrayIds([])
         updateValue(arrVal)
         break
       case 'object':
@@ -102,6 +122,7 @@ export function SmartValueEditor({ value, onChange, className }: SmartValueEdito
   const addArrayItem = () => {
     const newArray = [...arrayValue, '']
     setArrayValue(newArray)
+    setArrayIds((prev) => [...prev, mintId()])
     updateValue(newArray)
   }
 
@@ -117,6 +138,7 @@ export function SmartValueEditor({ value, onChange, className }: SmartValueEdito
   const removeArrayItem = (index: number) => {
     const newArray = arrayValue.filter((_, i) => i !== index)
     setArrayValue(newArray)
+    setArrayIds((prev) => prev.filter((_, i) => i !== index))
     updateValue(newArray)
   }
 
@@ -275,7 +297,7 @@ export function SmartValueEditor({ value, onChange, className }: SmartValueEdito
             </div>
             <div className="space-y-2 max-h-48 overflow-y-auto">
               {arrayValue.map((item, index) => (
-                <div key={index} className="flex items-center gap-2">
+                <div key={arrayIds[index] ?? index} className="flex items-center gap-2">
                   <Badge variant="outline" className="text-xs px-2 py-0.5 min-w-[2rem] justify-center">
                     {index}
                   </Badge>
