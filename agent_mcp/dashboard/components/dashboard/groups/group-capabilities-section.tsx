@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useCallback, useEffect, useState } from "react"
+import React, { useEffect, useState } from "react"
 import { ChevronDown, ChevronRight, Loader2, Shield } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -13,7 +13,8 @@ import {
 } from "@/lib/capability-descriptions"
 import { routerApi } from "@/lib/router-api"
 import { ApiError } from "@/lib/api"
-import { useRouterQuery } from "@/hooks/use-router-query"
+import { useGroupCapabilitiesQuery } from "@/lib/queries/group-capabilities"
+import { invalidateGroupCapabilities } from "@/lib/query-client"
 
 // Capabilities (Wave 9 PR 5) — extracted in Wave 5 into the groups/
 // subfolder alongside the rest of the members/capabilities detail UI.
@@ -33,11 +34,11 @@ export function GroupCapabilitiesSection({
   //   * ``loading`` — transient banner. Errors go to the shared toast.
   //
   // ``loaded`` / ``selected`` / ``forbidden`` stay LOCAL state (not
-  // hook-owned) rather than reading straight off ``useRouterQuery``'s
+  // query-owned) rather than reading straight off ``useGroupCapabilitiesQuery``'s
   // ``data`` — ``save()`` below writes an OPTIMISTIC result into them
   // straight from the PUT response (no extra GET round-trip), and the
   // checklist's dirty-tracking (``selected``) needs to be
-  // independently editable. The hook still owns the GET's own
+  // independently editable. The query still owns the GET's own
   // loading/error/forbidden bookkeeping; a sync effect below folds its
   // outcome into the local state exactly the way the old inline
   // ``load()`` used to.
@@ -46,21 +47,18 @@ export function GroupCapabilitiesSection({
   const [forbidden, setForbidden] = React.useState(false)
   const [saving, setSaving] = React.useState(false)
 
-  const {
-    loading,
-    data: fetchedCaps,
-    error: loadError,
-    forbidden: loadForbidden,
-  } = useRouterQuery<string[]>(
-    useCallback(async (signal) => {
-      const body = await routerApi.request<{ capabilities?: string[] }>(
-        routerGroupCapabilitiesUrl(groupId),
-        { signal },
-      )
-      return body.capabilities ?? []
-    }, [groupId]),
-    { deps: [groupId] },
-  )
+  // useRouterQuery folded a 403 into a `forbidden` flag; useQuery surfaces
+  // it as a thrown ApiError on `error`, so we re-derive `loadForbidden`
+  // (mirrors groups-dashboard.tsx). `isPending` (not `isFetching`) drives
+  // the loading banner: the post-save invalidateGroupCapabilities() below
+  // triggers a background refetch, and using `isFetching` would flash the
+  // whole checklist away behind "Loading capabilities…" on every save.
+  const query = useGroupCapabilitiesQuery(groupId)
+  const loading = query.isPending
+  const fetchedCaps = query.data ?? null
+  const loadForbidden =
+    query.error instanceof ApiError && query.error.status === 403
+  const loadError = loadForbidden ? null : (query.error ?? null)
 
   // Mirrors the old ``load()``'s synchronous reset — as soon as a
   // fetch starts, any stale forbidden from a previous attempt is
@@ -130,6 +128,12 @@ export function GroupCapabilitiesSection({
       const newCaps = body.capabilities ?? []
       setLoaded(newCaps)
       setSelected(new Set(newCaps))
+      // Reconcile the query cache with the PUT result so a remount reads
+      // the fresh set — the router-admin analog of useRouterQuery's
+      // post-mutation refresh() (no SSE at the overview). The optimistic
+      // setLoaded/setSelected above keep the UI instant; this refetch
+      // confirms in the background (isPending stays false, so no flicker).
+      void invalidateGroupCapabilities(groupId)
       // Was the page's REINVENTED toast (a local `setToast` + green
       // <div>); same message, now the shared toast module.
       toastSuccess(

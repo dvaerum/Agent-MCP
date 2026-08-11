@@ -43,19 +43,14 @@ import {
   routerUsersUrl, routerGroupsUrl,
 } from "@/lib/urls"
 import { routerApi } from "@/lib/router-api"
-import { useRouterQuery } from "@/hooks/use-router-query"
+import { ApiError } from "@/lib/api"
+import {
+  useProjectMembershipsQuery,
+  type Role,
+  type MembershipRow,
+} from "@/lib/queries/project-memberships"
+import { invalidateProjectMemberships } from "@/lib/query-client"
 import { toastUndo } from "@/components/ui/toast"
-
-type Role = "operator" | "viewer"
-
-interface MembershipRow {
-  membership_id: string
-  user_id?: string
-  username?: string
-  group_id?: string
-  group_name?: string
-  role: Role
-}
 
 interface UserOption {
   user_id: string
@@ -65,17 +60,6 @@ interface UserOption {
 interface GroupOption {
   group_id: string
   name: string
-}
-
-async function fetchMemberships(
-  name: string,
-  signal: AbortSignal,
-): Promise<MembershipRow[]> {
-  const body = await routerApi.request<{ memberships?: MembershipRow[] }>(
-    projectMembershipsUrl(name),
-    { signal },
-  )
-  return body.memberships || []
 }
 
 
@@ -91,23 +75,27 @@ export function ProjectMembershipsModal({
   open,
   onOpenChange,
 }: ProjectMembershipsModalProps): React.ReactElement {
-  const {
-    data,
-    loading,
-    error: fetchError,
-    forbidden,
-    refresh,
-  } = useRouterQuery<MembershipRow[]>(
-    useCallback(
-      (signal: AbortSignal) => fetchMemberships(projectName, signal),
-      [projectName],
-    ),
-    { deps: [projectName], enabled: open },
-  )
-  const rows = data ?? []
+  const query = useProjectMembershipsQuery(projectName, open)
+  const rows = query.data ?? []
+  // useRouterQuery folded a 403 into a dedicated `forbidden` flag; useQuery
+  // surfaces it as a thrown ApiError on `error`. Re-derive the split (as
+  // groups-dashboard.tsx does) so the "Sysadmin only" card still outranks
+  // a raw fetch-error string. Mutation errors stay in their own state and
+  // render through the same error slot as before.
+  const forbidden =
+    query.error instanceof ApiError && query.error.status === 403
+  const fetchErrorMsg = forbidden ? null : (query.error?.message ?? null)
+  const loading = query.isFetching
   const [mutationError, setMutationError] = useState<string | null>(null)
-  const error = mutationError ?? fetchError?.message ?? null
+  const error = mutationError ?? fetchErrorMsg
   const [addOpen, setAddOpen] = useState(false)
+  // Freshness after a membership mutation rides an explicit
+  // invalidateProjectMemberships() — the direct replacement for
+  // useRouterQuery's `refresh()` (no SSE at the overview).
+  const refresh = useCallback(
+    () => invalidateProjectMemberships(projectName),
+    [projectName],
+  )
 
   // Mirrors the old shared-``error``-state's synchronous reset at the
   // start of every ``refresh()`` — a stale mutation error (e.g. a

@@ -225,10 +225,13 @@ describe("project membership remove", () => {
   async function openModal() {
     const u = setupUser()
     render(
-      <>
+      // W6-followup-2 G2: the memberships modal now fetches its list via
+      // TanStack Query (useProjectMembershipsQuery), so it needs a provider
+      // wired to the shared module-singleton queryClient.
+      <QueryClientProvider client={queryClient}>
         <ProjectMembershipsModal projectName="acme" open onOpenChange={() => {}} />
         <Toaster />
-      </>,
+      </QueryClientProvider>,
     )
     await screen.findByRole("button", { name: "Remove alice" })
     return u

@@ -15,8 +15,8 @@
 // memories-dashboard reference migration): header, loading skeleton,
 // the "Sysadmin only" 403 panel, the list-load error panel, the empty
 // state and the desktop/mobile table all live there now. This file
-// owns only the data source (useRouterQuery), the column spec and the
-// create/edit/delete modals.
+// owns only the data source (useUsersQuery — TanStack Query), the column
+// spec and the create/edit/delete modals.
 
 import React, { useCallback, useMemo, useState } from "react"
 import { Loader2, Plus, Pencil, Trash2, Shield, Users } from "lucide-react"
@@ -34,8 +34,10 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { routerUsersUrl, routerUserUrl } from "@/lib/urls"
 import { routerApi } from "@/lib/router-api"
+import { ApiError } from "@/lib/api"
 import { toastError, toastSuccess } from "@/components/ui/toast"
-import { useRouterQuery } from "@/hooks/use-router-query"
+import { useUsersQuery, type UserRow } from "@/lib/queries/users"
+import { invalidateUsers } from "@/lib/query-client"
 import { DataTablePage } from "@/components/dashboard/shared/data-table-page"
 import type { Column } from "@/components/dashboard/shared/responsive-data-table"
 import { DeleteConfirmModal } from "./modals/delete-confirm-modal"
@@ -48,35 +50,26 @@ import { DeleteConfirmModal } from "./modals/delete-confirm-modal"
 // server return an opaque 400. Update both together if the policy changes.
 const PASSWORD_MIN_LENGTH = 12
 
-interface UserRow {
-  user_id: string
-  username: string
-  email: string | null
-  is_sysadmin: boolean
-  created_at: string
-  last_login_at: string | null
-}
-
-interface ListResponse {
-  success: boolean
-  users: UserRow[]
-}
-
-async function fetchUsers(signal: AbortSignal): Promise<UserRow[]> {
-  const body = await routerApi.request<ListResponse>(routerUsersUrl(), { signal })
-  return body.users || []
-}
-
 export function UsersDashboard(): React.ReactElement {
-  const {
-    data,
-    loading,
-    error: fetchError,
-    forbidden,
-    refresh,
-  } = useRouterQuery<UserRow[]>(fetchUsers)
-  const users = data ?? []
-  const error = fetchError?.message ?? null
+  const query = useUsersQuery()
+  const users = useMemo(() => query.data ?? [], [query.data])
+  // useRouterQuery folded a 403 into a dedicated `forbidden` flag; useQuery
+  // surfaces the same response as a thrown ApiError on `error`. Re-derive
+  // the split here so the UX is unchanged (mirrors groups-dashboard.tsx):
+  // a 403 → the centralized "Sysadmin only" panel (error stays null, it
+  // outranks error in DataTablePage); any other error → the error panel.
+  const forbidden =
+    query.error instanceof ApiError && query.error.status === 403
+  const error = forbidden ? null : (query.error?.message ?? null)
+  // `isFetching` (not `isPending`) mirrors useRouterQuery's `loading`,
+  // which was also true during a manual refresh. DataTablePage only paints
+  // the skeleton when `loading && rows.length === 0`, so an in-place
+  // refresh keeps the rows on screen and just drives the header spinner.
+  const loading = query.isFetching
+  // No SSE stream at the cross-project overview (see lib/queries/users.ts),
+  // so freshness after a user mutation rides an explicit invalidateUsers()
+  // — the direct replacement for useRouterQuery's `refresh()`.
+  const refresh = useCallback(() => invalidateUsers(), [])
   const [addOpen, setAddOpen] = useState(false)
   const [editTarget, setEditTarget] = useState<UserRow | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<UserRow | null>(null)
