@@ -14,13 +14,15 @@
  * the node-only harness.
  */
 import { describe, expect, it } from "vitest"
-import { readFileSync } from "node:fs"
-import { resolve } from "node:path"
+import { tasksPageSource } from "./support/tasks-source"
 
-const src = readFileSync(
-  resolve(__dirname, "..", "components/dashboard/tasks-dashboard.tsx"),
-  "utf8",
-)
+// Wave 5 (refactor/w5-tasks): the Tasks page was split into a page
+// module + a `tasks/` satellite directory. The clamp wiring below is a
+// property of the PAGE, and the "Showing N–M of T" range label now lives
+// in the extracted `tasks/tasks-pagination.tsx`, so read the page and
+// its satellites as one blob (mirrors messages-ux.test.ts's use of
+// messagesPageSource()).
+const src = tasksPageSource()
 
 describe("tasks-dashboard client-side clamp", () => {
   it("defines a PAGE_SIZE ceiling", () => {

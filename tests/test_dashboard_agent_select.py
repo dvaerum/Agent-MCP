@@ -38,6 +38,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tests.dashboard_sources import tasks_page_source
+
 DASHBOARD = Path("agent_mcp/dashboard")
 AGENT_SELECT = DASHBOARD / "components/dashboard/shared/agent-select.tsx"
 TASKS_TSX = DASHBOARD / "components/dashboard/tasks-dashboard.tsx"
@@ -45,6 +47,12 @@ MESSAGES_TSX = DASHBOARD / "components/dashboard/messages-dashboard.tsx"
 
 
 def _read(p: Path) -> str:
+    # Wave 5 (refactor/w5-tasks): the CreateTaskModal + EditTaskDialog
+    # (both AgentSelect adopters) moved into the `tasks/` satellite
+    # directory, so the Tasks page is read as the page + its satellites
+    # blob. See tests/dashboard_sources.py.
+    if p == TASKS_TSX:
+        return tasks_page_source()
     assert p.exists(), f"expected {p} to exist after the agent-select PR"
     return p.read_text()
 
