@@ -128,6 +128,82 @@ export interface Task {
 }
 
 /**
+ * A task row exactly as it arrives from the backend, BEFORE the
+ * lib/api boundary normalizes it.
+ *
+ * TY-2: `child_tasks` / `depends_on_tasks` are polymorphic on the
+ * wire. The `/all-data` + `/tasks` envelopes serialize them as
+ * JSON-encoded strings (see `TaskMirror.child_tasks: string | null`
+ * in api-types.generated.ts), but some code paths / already-normalized
+ * callers hand back a real `string[]`, and legacy/empty rows send
+ * `null`. Rather than leak that `string | string[] | null` union to
+ * every consumer (which forced each component to carry its own
+ * `parseJsonField` defensive parse), `normalizeTask` collapses both
+ * fields to a single shape — `string[]` — at the boundary. Consumers
+ * then get exactly one type (`Task`, whose `child_tasks?: string[]`).
+ */
+export interface RawTask
+  extends Omit<Task, 'child_tasks' | 'depends_on_tasks'> {
+  child_tasks?: string | string[] | null
+  depends_on_tasks?: string | string[] | null
+}
+
+/**
+ * Collapse a polymorphic task list-field (`child_tasks` /
+ * `depends_on_tasks`) to a `string[]`.
+ *
+ * Accepts the three shapes the backend actually emits:
+ *   - `string[]`         → filtered to the string members, returned as-is
+ *   - JSON-array string  → parsed (`'["a","b"]'` → `['a','b']`)
+ *   - anything else       → `[]` (null, undefined, empty string, a
+ *                            non-JSON string, a JSON non-array)
+ *
+ * Mirrors the defensive `parseJsonField` that component code grew
+ * independently; hoisting it to the boundary lets those call-sites drop
+ * their copies (see W4-followup notes).
+ */
+export function normalizeTaskListField(field: unknown): string[] {
+  if (Array.isArray(field)) {
+    return field.filter((x): x is string => typeof x === 'string')
+  }
+  if (typeof field === 'string') {
+    try {
+      const parsed = JSON.parse(field)
+      return Array.isArray(parsed)
+        ? parsed.filter((x): x is string => typeof x === 'string')
+        : []
+    } catch {
+      return []
+    }
+  }
+  return []
+}
+
+/**
+ * Normalize a raw task row into the canonical `Task` shape: both
+ * list-fields become `string[]` regardless of how the backend encoded
+ * them. Idempotent — a `Task` that already carries arrays passes
+ * through unchanged.
+ *
+ * W4-followup(A): now that `child_tasks` / `depends_on_tasks` are
+ * guaranteed `string[]` at this boundary, the components below can drop
+ * their private `parseJsonField` defensive parses and read the arrays
+ * directly (Agent B):
+ *   - components/dashboard/tasks-dashboard.tsx  (parseJsonField, L141)
+ *   - components/dashboard/task-details-dialog.tsx (parseJsonField, L21;
+ *     `parseJsonField(task.child_tasks) as string[]` → task.child_tasks)
+ *   - components/dashboard/tasks-mobile-list.tsx (already reads
+ *     task.child_tasks.length directly — no change needed)
+ */
+export function normalizeTask(raw: RawTask): Task {
+  return {
+    ...raw,
+    child_tasks: normalizeTaskListField(raw.child_tasks),
+    depends_on_tasks: normalizeTaskListField(raw.depends_on_tasks),
+  }
+}
+
+/**
  * Optional server-side filters for `GET /tasks`. All fields are
  * optional and AND-combined by the backend (the single source of
  * truth shared with the MCP `view_tasks` tool). Mirrors the REST
@@ -402,6 +478,102 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Thrown by the `request<T>()` response-shape guards (TY-1) when the
+ * backend returns a body that does not match the shape the caller
+ * expects. Distinct from `ApiError` (which is an HTTP-level failure —
+ * a non-2xx status): a `ShapeError` means the HTTP call succeeded (200
+ * OK) but the JSON payload is structurally wrong, so trusting it with a
+ * bare `as T` cast would push malformed data into the store and blow up
+ * far from the seam. Failing loudly here — at the API boundary, with
+ * the endpoint and the mismatch named — is the whole point.
+ */
+export class ShapeError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ShapeError'
+  }
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v)
+}
+
+/**
+ * Thin runtime shape guards used at the `request<T>()` boundary.
+ *
+ * These are deliberately NOT a full schema library (zod/io-ts): the
+ * dashboard's own CI already pins the row shapes against the ORM via the
+ * generated `*Mirror` types, so the boundary only needs to catch the
+ * gross mismatches a bare `as T` would silently wave through — a 200 OK
+ * whose body is `null`, an object where an array was promised, a row
+ * missing its identity key. Each guard validates just the discriminating
+ * field(s), then narrows; anything deeper is left to TypeScript + the
+ * ORM invariant.
+ */
+export const guards = {
+  systemStatus(data: unknown): SystemStatus {
+    if (!isRecord(data) || typeof data.server_running !== 'boolean') {
+      throw new ShapeError(
+        `GET /status: expected a SystemStatus object with a boolean ` +
+          `server_running, got ${describe(data)}`,
+      )
+    }
+    return data as unknown as SystemStatus
+  },
+
+  agentArray(data: unknown): Agent[] {
+    if (!Array.isArray(data)) {
+      throw new ShapeError(
+        `GET /agents: expected an Agent[] array, got ${describe(data)}`,
+      )
+    }
+    for (const a of data) {
+      if (!isRecord(a) || typeof a.agent_id !== 'string') {
+        throw new ShapeError(
+          `GET /agents: array member is not an Agent (missing string ` +
+            `agent_id): ${describe(a)}`,
+        )
+      }
+    }
+    return data as unknown as Agent[]
+  },
+
+  rawTaskArray(data: unknown): RawTask[] {
+    if (!Array.isArray(data)) {
+      throw new ShapeError(
+        `GET /tasks: expected a Task[] array, got ${describe(data)}`,
+      )
+    }
+    for (const t of data) {
+      if (!isRecord(t) || typeof t.task_id !== 'string') {
+        throw new ShapeError(
+          `GET /tasks: array member is not a Task (missing string ` +
+            `task_id): ${describe(t)}`,
+        )
+      }
+    }
+    return data as unknown as RawTask[]
+  },
+
+  rawTask(data: unknown): RawTask {
+    if (!isRecord(data) || typeof data.task_id !== 'string') {
+      throw new ShapeError(
+        `GET /tasks/<id>: expected a Task object with a string ` +
+          `task_id, got ${describe(data)}`,
+      )
+    }
+    return data as unknown as RawTask
+  },
+}
+
+/** A short, log-safe description of an arbitrary value for error text. */
+function describe(v: unknown): string {
+  if (v === null) return 'null'
+  if (Array.isArray(v)) return `an array of length ${v.length}`
+  return typeof v
+}
+
 class ApiClient {
   private baseUrl: string
   private suppressErrors: boolean = false
@@ -455,7 +627,15 @@ class ApiClient {
 
   private async request<T>(
     endpoint: string,
-    options: RequestInit = {}
+    options: RequestInit = {},
+    // TY-1: optional runtime shape guard applied to the parsed JSON at
+    // the boundary. When supplied, it either returns the value narrowed
+    // to T or throws a ShapeError; when omitted, the body is trusted
+    // with a bare cast (back-compat for the many endpoints whose shape
+    // is asserted elsewhere). Read paths that feed the store pass a
+    // guard so a structurally-wrong 200 fails loudly HERE rather than
+    // deep in a consumer.
+    validate?: (data: unknown) => T,
   ): Promise<T> {
     // Check if a server is connected
     if (!this.baseUrl) {
@@ -630,7 +810,10 @@ class ApiClient {
         throw new ApiError(r.status, surfaced, errorText)
       }
 
-      return await r.json()
+      const parsed: unknown = await r.json()
+      // TY-1: validate the response shape at the seam when the caller
+      // supplied a guard; otherwise fall through to the trusted cast.
+      return validate ? validate(parsed) : (parsed as T)
     } catch (error) {
       clearTimeout(timeoutId)
       
@@ -664,7 +847,7 @@ class ApiClient {
 
   // System endpoints
   async getSystemStatus(): Promise<SystemStatus> {
-    return this.request<SystemStatus>('/status')
+    return this.request<SystemStatus>('/status', {}, guards.systemStatus)
   }
 
   async getGraphData(): Promise<{ nodes: GraphNode[], edges: GraphEdge[] }> {
@@ -677,7 +860,7 @@ class ApiClient {
 
   // Agent endpoints
   async getAgents(): Promise<Agent[]> {
-    return this.request<Agent[]>('/agents')
+    return this.request<Agent[]>('/agents', {}, guards.agentArray)
   }
 
   async getAgent(agentId: string): Promise<Agent> {
@@ -700,11 +883,23 @@ class ApiClient {
     // Get node details which includes actions and related tasks
     const nodeDetails = await this.getNodeDetails(`agent_${agentId}`)
     
+    // TY-4: narrow the untyped node-details record fields instead of a
+    // bare trusted cast. `related.assigned_tasks` arrives as raw task
+    // rows, so run them through the same TY-2 normalizer the list
+    // endpoints use; `actions` is only used array-shaped.
+    const rawAssigned = nodeDetails.related?.assigned_tasks
+    const tasks = Array.isArray(rawAssigned)
+      ? (rawAssigned as RawTask[]).map(normalizeTask)
+      : []
+    const actions = Array.isArray(nodeDetails.actions)
+      ? (nodeDetails.actions as AgentDetails['actions'])
+      : []
+
     return {
       agent: { ...agent, auth_token: agentToken },
       token: agentToken,
-      tasks: (nodeDetails.related?.assigned_tasks as Task[]) || [],
-      actions: (nodeDetails.actions as AgentDetails['actions']) || []
+      tasks,
+      actions,
     }
   }
 
@@ -883,11 +1078,23 @@ class ApiClient {
   // the MCP `view_tasks` tool. Called with no args it stays a plain
   // `GET /tasks` (back-compat). See `buildTasksQuery` / `TaskFilters`.
   async getTasks(filters?: TaskFilters): Promise<Task[]> {
-    return this.request<Task[]>(`/tasks${buildTasksQuery(filters)}`)
+    // TY-1 guard on the raw rows, then TY-2 normalize child_tasks /
+    // depends_on_tasks to arrays so every consumer sees one shape.
+    const raw = await this.request<RawTask[]>(
+      `/tasks${buildTasksQuery(filters)}`,
+      {},
+      guards.rawTaskArray,
+    )
+    return raw.map(normalizeTask)
   }
 
   async getTask(taskId: string): Promise<Task> {
-    return this.request<Task>(`/tasks/${taskId}`)
+    const raw = await this.request<RawTask>(
+      `/tasks/${taskId}`,
+      {},
+      guards.rawTask,
+    )
+    return normalizeTask(raw)
   }
 
   // Update an existing task. Upstream exposes this as
@@ -1058,7 +1265,19 @@ class ApiClient {
     file_map: Record<string, unknown>
     timestamp: string
   }> {
-    return this.request('/all-data')
+    // The bulk envelope carries raw task rows (child_tasks /
+    // depends_on_tasks as JSON strings); TY-2 normalize them to arrays
+    // so getAllData() and getTasks() hand back identically-shaped Tasks.
+    const env = await this.request<{
+      agents: Agent[]
+      tasks: RawTask[]
+      context: RawContextEntry[]
+      actions: unknown[]
+      file_metadata: unknown[]
+      file_map: Record<string, unknown>
+      timestamp: string
+    }>('/all-data')
+    return { ...env, tasks: (env.tasks ?? []).map(normalizeTask) }
   }
 
   // Node details endpoint
