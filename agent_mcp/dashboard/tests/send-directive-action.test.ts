@@ -99,11 +99,14 @@ describe("shared SendDirectiveModal distinguishes delivered vs queued", () => {
     expect(modal).toContain("<AgentSelect")
   })
 
-  it("hydrates the data store on open so the picker isn't empty on the Schedules page", () => {
-    // The picker + listening hint read useDataStore, which only the
-    // Agents/Overview pages hydrate via fetchAllData. Without this the
-    // standalone Schedules-page picker renders zero agents. Regression
-    // guard for the cold-load empty-picker bug.
-    expect(modal).toContain("fetchAllData")
+  it("force-refetches all-data on open so the picker isn't empty on the Schedules page", () => {
+    // Wave 6: the picker + listening hint read the shared `/all-data`
+    // TanStack Query. On the standalone Schedules page the query may be
+    // idle, so the modal calls `refresh()` (the awaitable force-refetch
+    // from useAllDataStatus) on open to hydrate the picker + the live
+    // `wait_for_events_in_flight` flag. Regression guard for the
+    // cold-load empty-picker bug.
+    expect(modal).toContain("useAllDataStatus")
+    expect(modal).toContain("void refresh()")
   })
 })

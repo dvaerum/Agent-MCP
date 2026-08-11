@@ -10,7 +10,7 @@ import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 import { agentPresence, type Agent, type Task } from "@/lib/api"
 import { transportStatusBadge } from "@/lib/status"
-import { useDataStore } from "@/lib/stores/data-store"
+import { useAgentTasks } from "@/lib/queries/all-data"
 import type { Column } from "@/components/dashboard/shared/responsive-data-table"
 import {
   AgentTypeIcon,
@@ -102,8 +102,7 @@ export function AgentTasksCell({
   agent: Agent
   onTaskClick: (task: Task) => void
 }): React.ReactElement {
-  const { getAgentTasks } = useDataStore()
-  const agentTasks = getAgentTasks(agent.agent_id)
+  const agentTasks = useAgentTasks(agent.agent_id)
   const currentTask = agentTasks.find((t) => t.task_id === agent.current_task)
 
   // Use the data store's logic for consistent ID matching.

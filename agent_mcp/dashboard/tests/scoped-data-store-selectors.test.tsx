@@ -1,83 +1,85 @@
 // @vitest-environment jsdom
 //
-// PF-4: the scoped selector hooks give each component a single-slice
-// subscription. These tests pin two properties:
-//   1. each hook returns the correct slice of store state, and
-//   2. the null-data path returns a STABLE empty reference (a fresh []
-//      every render would defeat zustand's reference equality and force
-//      a re-render on every unrelated store write — the exact churn the
-//      scoped selectors exist to prevent).
-//
-// Lives under tests/ (not lib/) because vitest.config.ts includes
-// `lib/**/*.test.ts` but not `.test.tsx`; the jsdom docblock + renderHook
-// need the tsx path, which `tests/**/*.test.tsx` covers.
-import { describe, it, expect, beforeEach } from "vitest"
-import { renderHook } from "@testing-library/react"
-import {
-  useDataStore,
-  useAgents,
-  useTasks,
-  useDataLoading,
-  useIsRefreshing,
-  useDataError,
-  useSseHealthy,
-} from "@/lib/stores/data-store"
+// Scoped selector hooks give each component a single-slice subscription.
+// After Wave 6 (keystone increment 1) the envelope slices come from the
+// shared `/all-data` TanStack Query (`useAgents`/`useTasks` in
+// lib/queries/all-data.ts); `useSseHealthy` stays in the zustand
+// data-store (the PF-3 flag is not part of the envelope). These tests
+// pin two properties:
+//   1. each hook returns the correct slice of the cache, and
+//   2. the no-data path returns a STABLE empty reference (a fresh []
+//      every render would defeat reference equality and force a
+//      re-render on every unrelated write — the churn the scoped
+//      selectors exist to prevent).
+import { describe, it, expect, beforeEach, afterEach } from "vitest"
+import React from "react"
+import { renderHook, cleanup } from "@testing-library/react"
+import { QueryClientProvider } from "@tanstack/react-query"
+import { queryClient, allDataQueryKey } from "@/lib/query-client"
+import { useAgents, useTasks } from "@/lib/queries/all-data"
+import { useDataStore, useSseHealthy } from "@/lib/stores/data-store"
+import { useServerStore } from "@/lib/stores/server-store"
 import type { Agent, Task } from "@/lib/api"
 
 const agents = [{ agent_id: "a1", status: "running" }] as unknown as Agent[]
 const tasks = [{ task_id: "t1", title: "T", status: "pending" }] as unknown as Task[]
 
-function seedEnvelope() {
-  useDataStore.setState({
-    data: {
-      agents,
-      tasks,
-      context: [],
-      actions: [],
-      file_metadata: [],
-      file_map: {},
-      timestamp: new Date().toISOString(),
-    },
+function wrapper({ children }: { children: React.ReactNode }) {
+  return (
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  )
+}
+
+/** Seed the server-store so the query's `enabled` gate opens (only
+ *  needed for the loaded case; the empty case leaves it disabled). */
+function seedConnected() {
+  useServerStore.setState({
+    servers: [
+      { id: "s1", name: "t", host: "h", port: 1, status: "connected" },
+    ] as never,
+    activeServerId: "s1",
   })
 }
 
-describe("scoped data-store selectors (PF-4)", () => {
+function seedEnvelope() {
+  queryClient.setQueryData(allDataQueryKey(null), {
+    agents,
+    tasks,
+    context: [],
+    actions: [],
+    file_metadata: [],
+    file_map: {},
+    timestamp: new Date().toISOString(),
+  })
+}
+
+describe("scoped all-data selectors", () => {
   beforeEach(() => {
-    useDataStore.setState({
-      data: null,
-      loading: false,
-      isRefreshing: false,
-      error: null,
-      sseHealthy: false,
-    })
+    queryClient.clear()
+    useServerStore.setState({ servers: [], activeServerId: null })
+    useDataStore.setState({ sseHealthy: false })
   })
+  afterEach(() => cleanup())
 
-  it("useAgents / useTasks return the loaded slices", () => {
+  it("useAgents / useTasks return the loaded slices from the cache", () => {
+    seedConnected()
     seedEnvelope()
-    expect(renderHook(() => useAgents()).result.current).toBe(agents)
-    expect(renderHook(() => useTasks()).result.current).toBe(tasks)
+    expect(renderHook(() => useAgents(), { wrapper }).result.current).toBe(agents)
+    expect(renderHook(() => useTasks(), { wrapper }).result.current).toBe(tasks)
   })
 
-  it("returns a STABLE empty ref for agents/tasks when data is null", () => {
-    const a1 = renderHook(() => useAgents()).result.current
-    const a2 = renderHook(() => useAgents()).result.current
-    const t1 = renderHook(() => useTasks()).result.current
-    const t2 = renderHook(() => useTasks()).result.current
+  it("returns a STABLE empty ref for agents/tasks when no data is cached", () => {
+    const a1 = renderHook(() => useAgents(), { wrapper }).result.current
+    const a2 = renderHook(() => useAgents(), { wrapper }).result.current
+    const t1 = renderHook(() => useTasks(), { wrapper }).result.current
+    const t2 = renderHook(() => useTasks(), { wrapper }).result.current
     expect(a1).toHaveLength(0)
     expect(a1).toBe(a2) // same frozen singleton, not a fresh []
     expect(t1).toBe(t2)
   })
 
-  it("primitive selectors reflect their slice", () => {
-    useDataStore.setState({
-      loading: true,
-      isRefreshing: true,
-      error: "boom",
-      sseHealthy: true,
-    })
-    expect(renderHook(() => useDataLoading()).result.current).toBe(true)
-    expect(renderHook(() => useIsRefreshing()).result.current).toBe(true)
-    expect(renderHook(() => useDataError()).result.current).toBe("boom")
+  it("useSseHealthy reflects the data-store flag", () => {
+    useDataStore.setState({ sseHealthy: true })
     expect(renderHook(() => useSseHealthy()).result.current).toBe(true)
   })
 })

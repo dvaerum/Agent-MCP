@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import { ThemeProvider } from "@/components/providers/theme-provider";
+import { QueryProvider } from "@/components/providers/query-provider";
 import { ProjectContextProvider } from "@/components/providers/project-context-provider";
 import { McpNotificationsProvider } from "@/components/providers/mcp-notifications-provider";
 import { Toaster } from "@/components/ui/toast";
@@ -64,9 +65,11 @@ export default function RootLayout({
         suppressHydrationWarning
       >
         <ThemeProvider>
-          <ProjectContextProvider>
-            <McpNotificationsProvider>{children}</McpNotificationsProvider>
-          </ProjectContextProvider>
+          <QueryProvider>
+            <ProjectContextProvider>
+              <McpNotificationsProvider>{children}</McpNotificationsProvider>
+            </ProjectContextProvider>
+          </QueryProvider>
           <Toaster />
         </ThemeProvider>
       </body>

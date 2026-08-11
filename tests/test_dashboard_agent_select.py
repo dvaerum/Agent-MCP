@@ -102,22 +102,28 @@ def test_agent_select_props_contract() -> None:
 
 
 def test_agent_select_reads_from_active_agents_store() -> None:
-    """The component must source its agent list from
-    ``getActiveAgents()`` on the Zustand store (the existing helper
-    that already filters ``status='terminated'`` via
-    ``shouldDisplayAgent``). Live-only is the locked design decision —
-    task assignment to a terminated agent is meaningless."""
+    """The component must source its agent list from the live-fleet
+    selector that filters ``status='terminated'`` — live-only is the
+    locked design decision (task assignment to a terminated agent is
+    meaningless).
+
+    Wave 6 keystone increment 1 (2026-08-11): the live agent list moved
+    off the zustand data-store onto the shared `/all-data` TanStack
+    Query. AgentSelect now composes the ``useActiveAgents()`` hook from
+    ``lib/queries/all-data.ts`` (which applies the same
+    terminated-filter) instead of ``useDataStore().getActiveAgents()``.
+    """
     src = _read(AGENT_SELECT)
-    assert "getActiveAgents" in src, (
-        "AgentSelect must call getActiveAgents() from data-store so the "
-        "terminated-agent leak (the EditTaskDialog bug) cannot recur. "
-        "Don't re-implement the filter inline; compose the existing "
-        "helper."
+    assert "useActiveAgents" in src, (
+        "AgentSelect must call useActiveAgents() from the shared "
+        "/all-data query so the terminated-agent leak (the EditTaskDialog "
+        "bug) cannot recur. Don't re-implement the filter inline; compose "
+        "the existing helper."
     )
-    assert "useDataStore" in src, (
-        "AgentSelect must read from the useDataStore Zustand store — "
-        "matches every other dashboard component that needs the live "
-        "agent list"
+    assert "@/lib/queries/all-data" in src, (
+        "AgentSelect must read the live agent list from the shared "
+        "/all-data TanStack Query (lib/queries/all-data) — the single "
+        "source every dashboard consumer now shares"
     )
 
 

@@ -16,7 +16,7 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog'
 import { SmartValueEditor } from './smart-value-editor'
-import { useDataStore } from '@/lib/stores/data-store'
+import { useContextRows } from '@/lib/queries/all-data'
 
 interface CreateMemoryData {
   context_key: string
@@ -47,7 +47,7 @@ export function CreateMemoryModal({ onCreateMemory, trigger }: CreateMemoryModal
   // reuses / edits an actual key, rather than inserting a hardcoded
   // fake example that doesn't exist. Typing a brand-new key free-text
   // stays fully supported.
-  const context = useDataStore((s) => s.data?.context)
+  const context = useContextRows()
   const existingKeys = React.useMemo(() => {
     const keys = ((context ?? []) as Array<{ context_key?: string }>)
       .map((c) => c?.context_key)

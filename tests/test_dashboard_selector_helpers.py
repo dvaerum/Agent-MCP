@@ -30,6 +30,13 @@ from pathlib import Path
 DASHBOARD = Path("agent_mcp/dashboard")
 DATA_STORE = DASHBOARD / "lib/stores/data-store.ts"
 SELECTORS = DASHBOARD / "lib/stores/selectors.ts"
+# Wave 6 keystone increment 1 (2026-08-11): the `/all-data` envelope +
+# its derived agent-tasks selector moved off the zustand data-store onto
+# TanStack Query. The composed selector now lives here as the pure
+# `selectAgentTasks` helper; the redundant `getAgentActions` /
+# `getAgentTaskAnalysis` store selectors (no component consumed them)
+# were dropped in the same move.
+ALL_DATA_QUERY = DASHBOARD / "lib/queries/all-data.ts"
 
 
 def _read(p: Path) -> str:
@@ -118,43 +125,37 @@ def test_data_store_no_longer_duplicates_admin_normalize() -> None:
     )
 
 
-def test_data_store_selectors_call_helpers() -> None:
-    """``getAgentTasks``, ``getAgentActions``, ``getAgentTaskAnalysis``
-    must each reference at least one of the new helpers (proves they
-    were actually refactored, not just left alongside dead helpers).
+def test_agent_tasks_selector_composes_helpers() -> None:
+    """The composed agent-tasks selector must reference the extracted
+    helpers (proves it composes them, not re-inlines the filter logic).
+
+    Wave 6 relocated this selector from the zustand data-store's
+    ``getAgentTasks`` to the pure ``selectAgentTasks`` helper in
+    ``lib/queries/all-data.ts`` (the `/all-data` envelope moved onto
+    TanStack Query). The redundant ``getAgentActions`` /
+    ``getAgentTaskAnalysis`` store selectors — which no component
+    consumed — were dropped in the same move, so they are no longer
+    asserted here.
     """
-    src = _read(DATA_STORE)
-    # Scope the search to the create() body so we don't accidentally
-    # match the TypeScript interface declaration at the top of the
-    # file.
-    impl_start = src.find("create<DataStore>")
-    assert impl_start != -1, "expected create<DataStore>(...) in data-store.ts"
-    impl_src = src[impl_start:]
-    for selector in ("getAgentTasks", "getAgentActions", "getAgentTaskAnalysis"):
-        # Implementation form: `selector: (agentId: string) => {` with
-        # a function body brace (the interface uses `=> ReturnType`
-        # without an opening body brace, or an inline object literal
-        # for the return type -- but that's in the type-only block
-        # above `create<DataStore>`).
-        m = re.search(rf"{selector}\s*:\s*\([^)]*\)\s*=>\s*\{{", impl_src)
-        assert m is not None, f"selector {selector} implementation not found in data-store.ts"
-        # The selector body spans until the next selector definition or
-        # closing of the create() block. A 1500-char window is enough
-        # to cover the largest of the three.
-        body = impl_src[m.start(): m.start() + 1500]
-        # Accept any of the three helpers extracted to selectors.ts in the
-        # same refactor. getAgentActions composes `selectActions` in its own
-        # body, so it no longer relies on the 1500-char window overlapping a
-        # sibling selector's `selectTasks`/`normalizeAgentId` reference.
-        assert (
-            "normalizeAgentId" in body
-            or "selectTasks" in body
-            or "selectActions" in body
-        ), (
-            f"{selector} body does not reference normalizeAgentId, "
-            f"selectTasks, or selectActions — was the selector actually "
-            f"migrated to compose the helpers? Body window:\n{body[:400]}..."
-        )
+    assert ALL_DATA_QUERY.exists(), (
+        "expected lib/queries/all-data.ts to exist after the Wave 6 "
+        "/all-data envelope migration onto TanStack Query"
+    )
+    src = _read(ALL_DATA_QUERY)
+    # Implementation form: `export function selectAgentTasks(` with a
+    # function body.
+    m = re.search(r"export function selectAgentTasks\s*\(", src)
+    assert m is not None, (
+        "selectAgentTasks implementation not found in lib/queries/all-data.ts"
+    )
+    # The body spans until the next top-level export. A 1500-char window
+    # comfortably covers it.
+    body = src[m.start(): m.start() + 1500]
+    assert "selectTasks" in body and "selectActions" in body, (
+        "selectAgentTasks body does not compose selectTasks + selectActions "
+        f"— was it actually migrated to compose the helpers? Body window:\n"
+        f"{body[:400]}..."
+    )
 
 
 # ---------- PR #130 fix is preserved when composed -------------------

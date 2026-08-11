@@ -55,6 +55,12 @@ vi.mock("@/lib/stores/server-store", () => ({
     activeServerId: "s1",
   }),
 }))
+// Wave 6: the compose modal's <AgentSelect> reads the live fleet from
+// the shared `/all-data` TanStack Query via `useActiveAgents`; stub it
+// so this scaffold test doesn't need a QueryClientProvider.
+vi.mock("@/lib/queries/all-data", () => ({
+  useActiveAgents: () => [],
+}))
 // `ApiError` is needed too: the error path runs through `toastError`,
 // which instanceof-checks against it.
 vi.mock("@/lib/api", () => ({

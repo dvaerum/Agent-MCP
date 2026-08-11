@@ -190,10 +190,10 @@ let
     src = "${src}/agent_mcp/dashboard";
     # Re-set whenever the dashboard's package-lock.json changes
     # upstream (rare). On hash mismatch, nix prints the correct
-    # value; paste it here. Updated 2026-08-11 for the Wave-1
-    # subtraction PR — dropped @tanstack/react-query, framer-motion,
-    # recharts, cmdk from the lockfile.
-    npmDepsHash = "sha256-AKcPSOItK+Y7tnK1BpEtt96Hgkyn5eFspaOcqCUJrS8=";
+    # value; paste it here. Updated 2026-08-11 for the Wave-6
+    # keystone increment 1 — re-added @tanstack/react-query for the
+    # /all-data envelope migration onto TanStack Query.
+    npmDepsHash = "sha256-aWMPkHZcXpk9O4d5sKFTKhSF4wnBqtZRGuAz3+fu8IM=";
     NEXT_PUBLIC_AUTO_CONNECT = "false";
     NEXT_PUBLIC_DEFAULT_SERVER_HOST = "";
     NEXT_PUBLIC_DEFAULT_SERVER_PORT = "";

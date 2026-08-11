@@ -41,6 +41,7 @@ import {
   type PromptCategory
 } from '@/lib/prompt-book'
 import { useDataStore } from '@/lib/stores/data-store'
+import { getAgentTokenCached } from '@/lib/queries/all-data'
 import { AgentSelect } from '@/components/dashboard/shared/agent-select'
 import { CreatePromptModal, type CreatePromptData } from './modals/create-prompt-modal'
 import { PromptBookTutorial, usePromptBookTutorial } from './onboarding/prompt-book-tutorial'
@@ -212,7 +213,7 @@ const PromptBuilder = ({ prompt }: {
     setVariables(prev => {
       const next = { ...prev, [name]: agentId }
       if (agentId && agentTokenVarNames.length > 0) {
-        const token = useDataStore.getState().getAgentToken(agentId)
+        const token = getAgentTokenCached(agentId)
         if (token) {
           for (const tokenVar of agentTokenVarNames) next[tokenVar] = token
         }

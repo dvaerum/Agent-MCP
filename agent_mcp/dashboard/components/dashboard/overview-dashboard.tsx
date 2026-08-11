@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useEffect, useMemo } from "react"
+import React, { useMemo } from "react"
 import {
   Activity,
   ArrowRight,
@@ -16,7 +16,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { useServerStore } from "@/lib/stores/server-store"
-import { useDataStore } from "@/lib/stores/data-store"
+import { useAllData, useAllDataStatus } from "@/lib/queries/all-data"
 import { useSectionRoute } from "@/lib/use-section-route"
 
 // Render an ISO timestamp as a coarse relative-time string ("5m ago",
@@ -86,14 +86,13 @@ interface ActionRow {
 export function OverviewDashboard() {
   const { servers, activeServerId } = useServerStore()
   const activeServer = servers.find(s => s.id === activeServerId)
-  const { data, loading, fetchAllData, isRefreshing } = useDataStore()
+  // Wave 6 keystone increment 1: reads the shared `/all-data` TanStack
+  // Query. The query fetches automatically once a connected server is
+  // selected, so no mount effect is needed; `refresh` is the awaitable
+  // force-refetch behind the manual Refresh button.
+  const data = useAllData()
+  const { loading, isRefreshing, refresh } = useAllDataStatus()
   const { setSection } = useSectionRoute()
-
-  useEffect(() => {
-    if (activeServerId && activeServer?.status === 'connected') {
-      fetchAllData()
-    }
-  }, [activeServerId, activeServer?.status, fetchAllData])
 
   const isConnected = !!activeServerId && activeServer?.status === 'connected'
 
@@ -214,7 +213,7 @@ export function OverviewDashboard() {
           <Button
             variant="outline"
             size="sm"
-            onClick={() => fetchAllData(true)}
+            onClick={() => { void refresh() }}
             disabled={loading || isRefreshing}
             className="text-xs"
           >

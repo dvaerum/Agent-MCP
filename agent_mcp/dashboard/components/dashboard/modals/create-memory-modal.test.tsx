@@ -12,9 +12,10 @@ import { describe, it, expect, vi, afterEach } from "vitest"
 import { render, cleanup, screen, waitFor } from "@testing-library/react"
 import { setupUser } from "@/tests/support/user-event"
 
-// The modal reads existing keys from the shared data store; stub it.
-vi.mock("@/lib/stores/data-store", () => ({
-  useDataStore: (sel: (s: unknown) => unknown) => sel({ data: { context: [] } }),
+// Wave 6: the modal reads existing keys from the shared `/all-data`
+// TanStack Query via `useContextRows`; stub it.
+vi.mock("@/lib/queries/all-data", () => ({
+  useContextRows: () => [],
 }))
 
 import { CreateMemoryModal } from "@/components/dashboard/modals/create-memory-modal"
