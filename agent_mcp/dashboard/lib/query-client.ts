@@ -161,3 +161,37 @@ export function invalidateMessages(): Promise<void> {
     queryKey: [MESSAGES_KEY, projectContext.projectName ?? "standalone"],
   })
 }
+
+/** Query-key root for the router-admin groups list (`GET /router/groups`). */
+export const GROUPS_KEY = "groups" as const
+
+/**
+ * Stable query key for the router-admin groups list.
+ *
+ * Deliberately NOT project-namespaced (contrast `tasksQueryKey` /
+ * `messagesQueryKey`, which carry a project segment). Groups are a
+ * ROUTER-level resource — `GET /agent-mcp/api/router/groups` lives under
+ * the router-admin root, not under any single project's backend — so a
+ * bare `['groups']` is the correct scope. There is exactly one groups
+ * list per router, shared across every project the operator can see.
+ */
+export const groupsQueryKey = () => [GROUPS_KEY] as const
+
+/**
+ * Invalidate the router-admin groups list, forcing a refetch of the
+ * mounted groups query.
+ *
+ * Unlike `invalidateTasks()` / `invalidateMessages()`, this is NOT wired
+ * into the debounced SSE choke point in `lib/mcp-notifications.ts`: the
+ * groups page renders at the cross-project overview, which has no
+ * operator-events SSE stream (`subscribeMcpNotifications` early-returns
+ * for `isOverview`). Freshness after a group mutation therefore rides an
+ * explicit call from the mutation success handler (create / edit /
+ * add-member / remove-member / delete) — see `groups-dashboard.tsx`. This
+ * is the faithful router-admin analog of the SSE-driven invalidation the
+ * per-project lists use. Importable from non-React modules because
+ * `queryClient` is a module singleton.
+ */
+export function invalidateGroups(): Promise<void> {
+  return queryClient.invalidateQueries({ queryKey: groupsQueryKey() })
+}
