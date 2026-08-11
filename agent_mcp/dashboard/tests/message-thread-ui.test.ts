@@ -47,7 +47,7 @@ describe("MT-1: api.ts declares getMessageThread", () => {
 // ── MT-2 / MT-3: conversation view in the modal ───────────────────
 
 describe("MT-2: view-message-modal renders a conversation", () => {
-  const src = read("components/dashboard/modals/view-message-modal.tsx")
+  const src = read("components/dashboard/messages/view-message-modal.tsx")
 
   it("imports and calls getMessageThread", () => {
     expect(
@@ -81,7 +81,7 @@ describe("MT-2: view-message-modal renders a conversation", () => {
 })
 
 describe("MT-3: modal highlights the clicked message", () => {
-  const src = read("components/dashboard/modals/view-message-modal.tsx")
+  const src = read("components/dashboard/messages/view-message-modal.tsx")
 
   it("compares each row's id against the opened message_id", () => {
     // The ring/accent is gated on the row being the one the user opened.
@@ -103,7 +103,7 @@ describe("MT-3: modal highlights the clicked message", () => {
 // ── MT-4: per-message read status + toggle (envelope: open=read, closed=unread)
 
 describe("MT-4: per-row read status + toggle", () => {
-  const modal = read("components/dashboard/modals/view-message-modal.tsx")
+  const modal = read("components/dashboard/messages/view-message-modal.tsx")
   const dash = read("components/dashboard/messages-dashboard.tsx")
 
   it("ConversationRow takes a per-message onToggleRead", () => {

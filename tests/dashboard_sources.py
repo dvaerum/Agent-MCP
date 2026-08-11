@@ -38,6 +38,24 @@ AGENTS_SOURCES: tuple[str, ...] = (
 )
 
 
+# The Messages page + every module it was split into (Wave 5:
+# refactor/w5-messages). Same rule as AGENTS_SOURCES — keep this list in
+# sync when a Messages satellite is added or removed, or the source-grep
+# guards silently narrow their audit surface. Order is deliberate: the
+# page first, then satellites, so proximity slices (e.g. the "Recipient
+# agent_id" → `<Select>` window) stay well-defined within one file.
+MESSAGES_SOURCES: tuple[str, ...] = (
+    "components/dashboard/messages-dashboard.tsx",
+    "components/dashboard/messages/messages-api.ts",
+    "components/dashboard/messages/use-messages-columns.tsx",
+    "components/dashboard/messages/compose-message-modal.tsx",
+    "components/dashboard/messages/view-message-modal.tsx",
+    "components/dashboard/messages/message-delete-preview.tsx",
+    "components/dashboard/messages/messages-pagination.tsx",
+    "components/dashboard/messages-mobile-list.tsx",
+)
+
+
 def read_dashboard(rel: str) -> str:
     """Read one dashboard-relative source file."""
     return (DASHBOARD / rel).read_text(encoding="utf-8")
@@ -51,3 +69,13 @@ def agents_page_source() -> str:
         f"silently stop auditing them: {missing}"
     )
     return "\n".join(read_dashboard(rel) for rel in AGENTS_SOURCES)
+
+
+def messages_page_source() -> str:
+    """The Messages page and all of its satellites, concatenated."""
+    missing = [rel for rel in MESSAGES_SOURCES if not (DASHBOARD / rel).is_file()]
+    assert not missing, (
+        "Messages page satellite(s) missing — the source-grep guards would "
+        f"silently stop auditing them: {missing}"
+    )
+    return "\n".join(read_dashboard(rel) for rel in MESSAGES_SOURCES)

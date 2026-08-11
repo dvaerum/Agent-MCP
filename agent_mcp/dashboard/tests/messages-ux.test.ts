@@ -27,6 +27,7 @@ import {
   priorityBadgeClass,
   messageTypeBadgeClass,
 } from "../components/dashboard/shared/message-badges"
+import { messagesPageSource } from "./support/messages-source"
 
 // Keep in sync with the option lists in messages-dashboard.tsx.
 const ALL_TYPES = [
@@ -42,9 +43,13 @@ const DASHBOARD_ROOT = resolve(__dirname, "..")
 const read = (rel: string) =>
   readFileSync(resolve(DASHBOARD_ROOT, rel), "utf8")
 
-const dash = read("components/dashboard/messages-dashboard.tsx")
+// Wave 5 (refactor/w5-messages): the page was split into a page module +
+// a `messages/` satellite directory (column spec, compose modal, …).
+// These guards assert page-level properties, so they read the page and
+// its satellites as one blob — see tests/support/messages-source.ts.
+const dash = messagesPageSource()
 const mobile = read("components/dashboard/messages-mobile-list.tsx")
-const modal = read("components/dashboard/modals/view-message-modal.tsx")
+const modal = read("components/dashboard/messages/view-message-modal.tsx")
 const badges = read("components/dashboard/shared/message-badges.ts")
 
 // ── MUX-1: thread scrolls to the opened message ───────────────────
@@ -164,8 +169,12 @@ describe("MUX-5: background refresh interval", () => {
   })
 
   it("pauses while compose is open", () => {
+    // Wave 5 (PF-3): the guard also short-circuits while SSE is healthy
+    // (`if (composeOpen || sseHealthy) return`) — the live refetch covers
+    // that case — so match composeOpen as part of the guard, not the
+    // whole expression.
     expect(
-      /if \(composeOpen\) return/.test(dash),
+      /if \(composeOpen[^)]*\) return/.test(dash),
       "background refresh must pause while composing",
     ).toBe(true)
   })

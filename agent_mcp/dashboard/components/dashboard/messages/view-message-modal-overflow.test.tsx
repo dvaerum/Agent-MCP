@@ -27,7 +27,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
   }
 })
 
-import { ViewMessageModal } from "@/components/dashboard/modals/view-message-modal"
+import { ViewMessageModal } from "@/components/dashboard/messages/view-message-modal"
 import { getMessageThread, type Message } from "@/lib/api"
 
 const mockThread = vi.mocked(getMessageThread)
