@@ -27,6 +27,89 @@ import { DataTablePage } from "@/components/dashboard/shared/data-table-page"
 import type { StatsCardProps } from "@/components/dashboard/shared/stats-card"
 import type { Column } from "@/components/dashboard/shared/responsive-data-table"
 
+// PF-1 clamp (Wave 3): GET /tasks returns the WHOLE task set with no
+// server-side pagination, so the client bounds the rendered list. Same
+// page size messages-dashboard uses for its server-paged list, applied
+// here as an in-memory window over `filteredTasks`.
+const PAGE_SIZE = 100
+
+/**
+ * Pagination footer — « Newest / Newer / Older / Oldest » plus a
+ * "Showing N–M of T" range label. A client-side twin of
+ * messages-dashboard's <MessagesPagination>: same button spec, same
+ * two-layout (justified row on sm+, stacked 4-col grid below sm), but
+ * driven by an in-memory offset over the already-fetched task list
+ * rather than a server query.
+ */
+function TasksPagination({
+  rangeStart,
+  rangeEnd,
+  total,
+  onFirstPage,
+  onLastPage,
+  onNewest,
+  onNewer,
+  onOlder,
+  onOldest,
+}: {
+  rangeStart: number
+  rangeEnd: number
+  total: number
+  onFirstPage: boolean
+  onLastPage: boolean
+  onNewest: () => void
+  onNewer: () => void
+  onOlder: () => void
+  onOldest: () => void
+}) {
+  const nav = [
+    {
+      key: "newest",
+      label: "« Newest",
+      onClick: onNewest,
+      disabled: onFirstPage,
+      ariaLabel: "jump to first page",
+    },
+    { key: "newer", label: "Newer", onClick: onNewer, disabled: onFirstPage },
+    { key: "older", label: "Older", onClick: onOlder, disabled: onLastPage },
+    {
+      key: "oldest",
+      label: "Oldest »",
+      onClick: onOldest,
+      disabled: onLastPage,
+      ariaLabel: "jump to last page",
+    },
+  ]
+  const button = (b: (typeof nav)[number]) => (
+    <Button
+      key={b.key}
+      variant="outline"
+      size="sm"
+      onClick={b.onClick}
+      disabled={b.disabled}
+      aria-label={b.ariaLabel}
+    >
+      {b.label}
+    </Button>
+  )
+  const range = `Showing ${rangeStart}–${rangeEnd} of ${total}`
+  return (
+    <>
+      <div className="hidden sm:flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2">{nav.slice(0, 2).map(button)}</div>
+        <div className="text-xs text-muted-foreground tabular-nums">{range}</div>
+        <div className="flex items-center gap-2">{nav.slice(2).map(button)}</div>
+      </div>
+      <div className="block sm:hidden">
+        <div className="text-[11px] text-muted-foreground tabular-nums text-center mb-2">
+          {range}
+        </div>
+        <div className="grid grid-cols-4 gap-2">{nav.map(button)}</div>
+      </div>
+    </>
+  )
+}
+
 // Status / priority colour helpers shared by the row + the View / Edit
 // modals. Keep these here so the styles match the rest of the page.
 const statusBadgeClass = (status: Task['status']): string => {
@@ -1017,6 +1100,42 @@ export function TasksDashboard() {
     })
   }, [tasks, searchTerm, priorityFilter])
 
+  // PF-1 clamp — bound the rendered list to one PAGE_SIZE window. The
+  // whole task set is already in memory (`filteredTasks`); this only
+  // caps how many rows reach the DOM at once.
+  const [currentOffset, setCurrentOffset] = useState(0)
+
+  // Reset to the first page whenever the filtered set changes (a new
+  // search/priority narrowing, or a server refetch shrinks the list) so
+  // the offset can't strand the user past the end on an empty page.
+  useEffect(() => {
+    setCurrentOffset(0)
+  }, [searchTerm, priorityFilter, statusFilter, assignment, createdBy])
+
+  const totalFiltered = filteredTasks.length
+  // Clamp the offset defensively in case the list shrank between renders
+  // before the reset effect runs.
+  const safeOffset =
+    currentOffset >= totalFiltered
+      ? Math.max(0, Math.floor(Math.max(0, totalFiltered - 1) / PAGE_SIZE) * PAGE_SIZE)
+      : currentOffset
+  const pagedTasks = useMemo(
+    () => filteredTasks.slice(safeOffset, safeOffset + PAGE_SIZE),
+    [filteredTasks, safeOffset],
+  )
+
+  const onFirstPage = safeOffset === 0
+  const onLastPage = safeOffset + PAGE_SIZE >= totalFiltered
+  const rangeStart = totalFiltered === 0 ? 0 : safeOffset + 1
+  const rangeEnd = Math.min(safeOffset + PAGE_SIZE, totalFiltered)
+  const goNewest = () => setCurrentOffset(0)
+  const goNewer = () => setCurrentOffset(Math.max(0, safeOffset - PAGE_SIZE))
+  const goOlder = () => setCurrentOffset(safeOffset + PAGE_SIZE)
+  const goOldest = () =>
+    setCurrentOffset(
+      Math.floor(Math.max(0, totalFiltered - 1) / PAGE_SIZE) * PAGE_SIZE,
+    )
+
   // Memoize stats calculation
   const stats = useMemo(() => {
     const total = tasks.length
@@ -1354,7 +1473,7 @@ export function TasksDashboard() {
       stats={statsCards}
       filterBar={filterBar}
       columns={columns}
-      rows={filteredTasks}
+      rows={pagedTasks}
       getRowId={(task) => task.task_id}
       onRowClick={(task) => openView(task.task_id)}
       renderMobileCard={(task) => (
@@ -1379,6 +1498,25 @@ export function TasksDashboard() {
             : undefined,
       }}
     >
+      {/* PF-1 clamp footer — only when the list spills past one page.
+          Renders directly beneath the table (DataTablePage drops its
+          children there). */}
+      {totalFiltered > PAGE_SIZE && (
+        <div className="mt-4">
+          <TasksPagination
+            rangeStart={rangeStart}
+            rangeEnd={rangeEnd}
+            total={totalFiltered}
+            onFirstPage={onFirstPage}
+            onLastPage={onLastPage}
+            onNewest={goNewest}
+            onNewer={goNewer}
+            onOlder={goOlder}
+            onOldest={goOldest}
+          />
+        </div>
+      )}
+
       {/* Row-action dialogs (View / Edit / Delete) — Dialog modals,
           NOT the sidebar Sheet. Mirrors the messages-tab popup
           pattern from PR #36. */}

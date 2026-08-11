@@ -9,8 +9,9 @@
 // surface: header, stats, every column header, one desktop row AND one
 // mobile card per message, the reply indent on replies only, both
 // pagination footers, and the selection checkboxes.
-import { describe, it, expect, vi, afterEach } from "vitest"
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest"
 import { render, cleanup, screen, within } from "@testing-library/react"
+import { setMatchMedia } from "@/tests/support/match-media"
 
 const message = {
   message_id: "m1",
@@ -70,6 +71,10 @@ vi.stubGlobal(
 
 import { MessagesDashboard } from "@/components/dashboard/messages-dashboard"
 
+// PF-1 (Wave 3): the shared table now renders only the ACTIVE
+// breakpoint's tree, chosen via matchMedia (jsdom ships none). Default
+// to desktop; the mobile-card test opts into the narrow viewport.
+beforeEach(() => setMatchMedia(false))
 afterEach(() => {
   cleanup()
   query.data = [message, reply]
@@ -107,13 +112,27 @@ describe("<MessagesDashboard> (scaffold migration)", () => {
     expect(screen.getByLabelText("select all visible")).toBeTruthy()
   })
 
-  it("renders a desktop row AND a mobile card per message", () => {
+  it("renders a desktop row per message on a desktop viewport", () => {
+    setMatchMedia(false)
     const { container } = render(<MessagesDashboard />)
     expect(container.querySelectorAll("tbody tr")).toHaveLength(2)
+    // Only the desktop tree exists (PF-1) — no mobile duplicate.
+    expect(
+      container.querySelector('[data-slot="data-table-mobile"]'),
+    ).toBeNull()
+    // Per-row checkbox exists once (desktop only).
+    expect(screen.getAllByLabelText("select message m1")).toHaveLength(1)
+  })
+
+  it("renders a mobile card per message on a mobile viewport", () => {
+    setMatchMedia(true)
+    const { container } = render(<MessagesDashboard />)
     const mobile = container.querySelector('[data-slot="data-table-mobile"]')!
     expect(mobile.querySelectorAll("li")).toHaveLength(2)
-    // Per-row checkbox exists on both halves.
-    expect(screen.getAllByLabelText("select message m1")).toHaveLength(2)
+    // Desktop table is absent on the narrow viewport.
+    expect(container.querySelector("table")).toBeNull()
+    // Per-row checkbox exists once (mobile only).
+    expect(screen.getAllByLabelText("select message m1")).toHaveLength(1)
   })
 
   it("indents reply rows only (rowClassName callback)", () => {
