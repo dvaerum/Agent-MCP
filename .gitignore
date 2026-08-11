@@ -390,6 +390,10 @@ conversations/
 session-*/
 **/session-*/.playwright-mcp/
 
+# Playwright-MCP scratch (snapshots/screenshots) — never commit.
+.playwright-mcp/
+**/.playwright-mcp/
+
 # VM scratch produced by `nix run .#vm-dev` and friends — never commit.
 result
 result-*

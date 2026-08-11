@@ -18,7 +18,6 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { useServerStore } from "@/lib/stores/server-store"
 import { useDataStore } from "@/lib/stores/data-store"
 import { useSectionRoute } from "@/lib/use-section-route"
-import { CORSDiagnostic } from "../debug/cors-diagnostic"
 
 // Render an ISO timestamp as a coarse relative-time string ("5m ago",
 // "2h ago"). The Overview uses this for the recent-activity feed and
@@ -184,9 +183,6 @@ export function OverviewDashboard() {
             {activeServer && activeServer.status === 'error' && (
               <div className="text-sm text-destructive mt-4">
                 Failed to connect to {activeServer.name} ({activeServer.baseUrl ?? `${activeServer.host}:${activeServer.port}`})
-                <div className="mt-4">
-                  <CORSDiagnostic />
-                </div>
               </div>
             )}
           </CardContent>

@@ -1259,36 +1259,6 @@ class ApiClient {
   async healthCheck(): Promise<{ status: string; timestamp: string }> {
     return this.request('/health')
   }
-
-  // CORS diagnostic method
-  async testCORS(): Promise<boolean> {
-    try {
-      console.log(`Testing CORS connection to: ${this.baseUrl}`)
-      
-      // Try a simple OPTIONS request first
-      const optionsResponse = await fetch(`${this.baseUrl}/health`, {
-        method: 'OPTIONS',
-        headers: {
-          'Access-Control-Request-Method': 'GET',
-          'Access-Control-Request-Headers': 'Content-Type'
-        }
-      })
-      
-      console.log('OPTIONS preflight response:', {
-        status: optionsResponse.status,
-        headers: Object.fromEntries(optionsResponse.headers.entries())
-      })
-      
-      // Try the actual health check
-      const healthResponse = await this.healthCheck()
-      console.log('Health check successful:', healthResponse)
-      
-      return true
-    } catch (error) {
-      console.error('CORS test failed:', error)
-      return false
-    }
-  }
 }
 
 // Create singleton instance
@@ -1324,29 +1294,4 @@ export async function getMessageThread(
   }
   const data = await res.json()
   return Array.isArray(data?.thread) ? (data.thread as Message[]) : []
-}
-
-// React Query keys
-export const queryKeys = {
-  systemStatus: ['system', 'status'] as const,
-  graphData: ['graph', 'data'] as const,
-  taskTreeData: ['task-tree', 'data'] as const,
-  agents: ['agents'] as const,
-  agent: (id: string) => ['agents', id] as const,
-  tasks: ['tasks'] as const,
-  task: (id: string) => ['tasks', id] as const,
-  memories: ['memories'] as const,
-  memory: (key: string) => ['memories', key] as const,
-  memoryHealth: ['memories', 'health'] as const,
-  tokens: ['tokens'] as const,
-  nodeDetails: (id: string) => ['node-details', id] as const,
-} as const
-
-// Custom hooks for data fetching
-export function usePolling(intervalMs: number = 10000) {
-  return {
-    refetchInterval: intervalMs,
-    refetchIntervalInBackground: true,
-    staleTime: intervalMs / 2,
-  }
 }

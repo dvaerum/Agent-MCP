@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useState, useEffect, useCallback } from "react"
+import { useState, useEffect, useCallback } from "react"
 import {
   Users, Clock, AlertCircle, CheckCircle2, Network,
   Search, PowerOff, Power,
@@ -31,18 +31,6 @@ import {
 } from "@/components/dashboard/agents/edit-agent-dialog"
 import { TerminateAgentDialog } from "@/components/dashboard/agents/terminate-agent-dialog"
 import { PurgeAgentDialog } from "@/components/dashboard/agents/purge-agent-dialog"
-
-// Performance profiling callback
-const onRender = (id: string, phase: "mount" | "update" | "nested-update", actualDuration: number, baseDuration: number, startTime: number, commitTime: number) => {
-  if (process.env.NODE_ENV === 'development') {
-    console.log(`[Profiler] ${id} ${phase}:`, {
-      actualDuration: `${actualDuration.toFixed(2)}ms`,
-      baseDuration: `${baseDuration.toFixed(2)}ms`,
-      startTime: `${startTime.toFixed(2)}ms`,
-      commitTime: `${commitTime.toFixed(2)}ms`
-    })
-  }
-}
 
 export function AgentsDashboard() {
   const { servers, activeServerId } = useServerStore()
@@ -408,8 +396,7 @@ export function AgentsDashboard() {
   )
 
   return (
-    <React.Profiler id="AgentsDashboard" onRender={onRender}>
-      <DataTablePage<Agent>
+    <DataTablePage<Agent>
         guard={
           !isConnected
             ? {
@@ -560,6 +547,5 @@ export function AgentsDashboard() {
           lockedAgentId={directiveAgentId}
         />
       </DataTablePage>
-    </React.Profiler>
   )
 }
