@@ -18,6 +18,7 @@
 import { describe, expect, it } from "vitest"
 import { readFileSync } from "node:fs"
 import { resolve } from "node:path"
+import { groupsPageSource } from "@/tests/support/groups-source"
 
 const DASHBOARD_ROOT = resolve(__dirname, "..")
 const read = (rel: string) =>
@@ -31,8 +32,14 @@ const read = (rel: string) =>
 // <DeleteConfirmModal> with `requiredWord` + `matchCase`. UX-08 is
 // therefore pinned in two halves: the page must still demand the
 // group's exact NAME, and the shared modal must still gate on it.
+//
+// Wave 5 extraction: the Groups page is now a page + a `groups/`
+// satellite folder, so this reads the whole page blob (page + all
+// satellites) rather than the single orchestrator file — the delete
+// gate stays in the orchestrator today, but reading the blob keeps the
+// assertion honest if it ever moves into a satellite.
 describe("UX-08: group deletion type-to-confirm", () => {
-  const src = read("components/dashboard/groups-dashboard.tsx")
+  const src = groupsPageSource()
   const modal = read("components/dashboard/modals/delete-confirm-modal.tsx")
 
   it("requires the group's own name as the confirmation word", () => {

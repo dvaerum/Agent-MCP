@@ -76,6 +76,24 @@ TASKS_SOURCES: tuple[str, ...] = (
 )
 
 
+# The Groups page + every module it was split into (Wave 5:
+# fix/w5-groups). Same rule as AGENTS_SOURCES / MESSAGES_SOURCES /
+# TASKS_SOURCES — keep this list in sync when a Groups satellite is added
+# or removed, or the source-grep guards silently narrow their audit
+# surface. Order is deliberate: the page first, then satellites, so any
+# component-scoped proximity slice stays well-defined within one file.
+GROUPS_SOURCES: tuple[str, ...] = (
+    "components/dashboard/groups-dashboard.tsx",
+    "components/dashboard/groups/groups-api.ts",
+    "components/dashboard/groups/use-groups-columns.tsx",
+    "components/dashboard/groups/add-group-modal.tsx",
+    "components/dashboard/groups/edit-group-modal.tsx",
+    "components/dashboard/groups/add-member-modal.tsx",
+    "components/dashboard/groups/group-detail-panel.tsx",
+    "components/dashboard/groups/group-capabilities-section.tsx",
+)
+
+
 def read_dashboard(rel: str) -> str:
     """Read one dashboard-relative source file."""
     return (DASHBOARD / rel).read_text(encoding="utf-8")
@@ -109,3 +127,13 @@ def tasks_page_source() -> str:
         f"silently stop auditing them: {missing}"
     )
     return "\n".join(read_dashboard(rel) for rel in TASKS_SOURCES)
+
+
+def groups_page_source() -> str:
+    """The Groups page and all of its satellites, concatenated."""
+    missing = [rel for rel in GROUPS_SOURCES if not (DASHBOARD / rel).is_file()]
+    assert not missing, (
+        "Groups page satellite(s) missing — the source-grep guards would "
+        f"silently stop auditing them: {missing}"
+    )
+    return "\n".join(read_dashboard(rel) for rel in GROUPS_SOURCES)
