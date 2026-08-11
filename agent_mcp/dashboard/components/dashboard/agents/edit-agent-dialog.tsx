@@ -21,7 +21,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { toastError } from "@/components/ui/toast"
-import { useDataStore } from "@/lib/stores/data-store"
+import { useAllData } from "@/lib/queries/all-data"
 import type { Agent } from "@/lib/api"
 
 // AoE session id: 16 lowercase hex chars. Backend re-validates and
@@ -93,7 +93,7 @@ export function EditAgentDialog({
   // Read the global event-loop flag from project_context so we can
   // disable + annotate the per-agent toggle when global is OFF (per
   // the locked-decisions table in the event-coord plan).
-  const dataAll = useDataStore((s) => s.data)
+  const dataAll = useAllData()
   const globalEventLoop = React.useMemo<boolean>(() => {
     const row = dataAll?.context?.find(
       (c) => (c as { context_key?: unknown }).context_key === 'config_auto_event_loop_global'

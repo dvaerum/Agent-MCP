@@ -45,7 +45,7 @@ import {
 import { toastError, toastSuccess } from "@/components/ui/toast"
 import { AgentSelect } from "@/components/dashboard/shared/agent-select"
 import { apiClient } from "@/lib/api"
-import { useDataStore } from "@/lib/stores/data-store"
+import { useAllData, useAllDataStatus } from "@/lib/queries/all-data"
 
 export interface SendDirectiveModalProps {
   open: boolean
@@ -78,23 +78,25 @@ export function SendDirectiveModal({
   // standalone picker would render zero agents. Hydrate on open so the
   // modal is self-sufficient wherever it's mounted; force=true also
   // refreshes the live `wait_for_events_in_flight` flag the hint uses.
-  const fetchAllData = useDataStore((s) => s.fetchAllData)
+  const { refresh } = useAllDataStatus()
 
   // Re-seed on open: a locked target resets the picker so a stale prior
-  // selection can't leak across opens.
+  // selection can't leak across opens. `refresh()` force-refetches the
+  // shared `/all-data` query so the live `wait_for_events_in_flight`
+  // flag the hint uses is current on every open.
   React.useEffect(() => {
     if (open) {
       setPickedAgentId(null)
       setPrompt("")
-      void fetchAllData(true)
+      void refresh()
     }
-  }, [open, lockedAgentId, fetchAllData])
+  }, [open, lockedAgentId, refresh])
 
   // Live listening state for the resolved target — read from the same
   // store field the Agents-table "WAITING" chip is derived from. Cheap
   // and correct: the store polls /api/all-data, which snapshots the
   // in-flight wait_for_events registry server-side.
-  const data = useDataStore((s) => s.data)
+  const data = useAllData()
   const targetAgent = React.useMemo(
     () => (agentId ? data?.agents?.find((a) => a.agent_id === agentId) ?? null : null),
     [data?.agents, agentId],

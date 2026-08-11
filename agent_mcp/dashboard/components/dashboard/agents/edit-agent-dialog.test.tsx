@@ -21,13 +21,11 @@ class ResizeObserverStub {
 ;(globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver =
   ResizeObserverStub
 
-// The dialog reads the global auto-event-loop flag out of the data
-// store; stub it so the form renders without the app's store wiring.
-vi.mock("@/lib/stores/data-store", () => ({
-  useDataStore: (selector?: (s: unknown) => unknown) => {
-    const state = { data: null }
-    return selector ? selector(state) : state
-  },
+// Wave 6: the dialog reads the global auto-event-loop flag out of the
+// shared `/all-data` TanStack Query via `useAllData`; stub it so the
+// form renders without the app's query wiring.
+vi.mock("@/lib/queries/all-data", () => ({
+  useAllData: () => undefined,
 }))
 
 import {

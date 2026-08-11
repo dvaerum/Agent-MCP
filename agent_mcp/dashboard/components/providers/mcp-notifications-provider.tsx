@@ -32,7 +32,6 @@
 
 import { useEffect } from "react"
 import { subscribeMcpNotifications } from "@/lib/mcp-notifications"
-import { startDataStoreAutoRefresh } from "@/lib/stores/data-store"
 
 export function McpNotificationsProvider({
   children,
@@ -41,15 +40,12 @@ export function McpNotificationsProvider({
 }) {
   useEffect(() => {
     const unsubscribe = subscribeMcpNotifications()
-    // The data-store's 60s freshness poll is the safety net BEHIND this
-    // stream, so its lifecycle belongs next to the stream's rather than
-    // firing as an import-time side effect of `lib/stores/data-store`
-    // (where it was unstoppable and re-armed on every module
-    // re-evaluation). See `startDataStoreAutoRefresh`.
-    const stopAutoRefresh = startDataStoreAutoRefresh()
+    // Wave 6 keystone increment 1: the 60s freshness poll that used to
+    // be started here (`startDataStoreAutoRefresh`) is gone — the
+    // `/all-data` TanStack Query owns its own `refetchInterval`, gated
+    // on `sseHealthy` (PF-3) so it only polls while this stream is down.
     return () => {
       unsubscribe()
-      stopAutoRefresh()
     }
   }, [])
 

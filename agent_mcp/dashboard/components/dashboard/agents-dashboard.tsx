@@ -11,7 +11,11 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { apiClient, Agent, Task, agentPresence } from "@/lib/api"
 import { toastError, toastSuccess } from "@/components/ui/toast"
 import { useServerStore } from "@/lib/stores/server-store"
-import { useDataStore } from "@/lib/stores/data-store"
+import {
+  useAllData,
+  useAllDataStatus,
+  useActiveAgents,
+} from "@/lib/queries/all-data"
 import { useDialog } from "@/hooks/use-dialog"
 import { useFilters } from "@/hooks/use-filters"
 import { TaskDetailsDialog } from "./task-details-dialog"
@@ -35,7 +39,13 @@ import { PurgeAgentDialog } from "@/components/dashboard/agents/purge-agent-dial
 export function AgentsDashboard() {
   const { servers, activeServerId } = useServerStore()
   const activeServer = servers.find(s => s.id === activeServerId)
-  const { data, loading, error, fetchAllData, refreshData, getActiveAgents } = useDataStore()
+  // Wave 6 keystone increment 1: the agents list + its satellites read
+  // from the one shared `/all-data` TanStack Query, not the retired
+  // data-store server-cache. `refresh` is the awaitable force-refetch
+  // that replaces the old `refreshData()`.
+  const data = useAllData()
+  const { loading, error, refresh: refreshData } = useAllDataStatus()
+  const activeAgents = useActiveAgents()
   // Filter state — owned by useFilters<AgentFilters> (PR 4 of the
   // 2026-06-09 architecture review). Replaces the two sibling
   // useStates (searchTerm / statusFilter) shared with messages-/
@@ -105,11 +115,11 @@ export function AgentsDashboard() {
   /* eslint-enable react-hooks/exhaustive-deps */
 
   // Source list: include all agents (terminated rows need to surface so
-  // admins can hit Restore/Purge on them). getActiveAgents() is kept
-  // as the fallback for the "no terminated agents in this project"
-  // case but extended with any terminated rows from data.agents.
+  // admins can hit Restore/Purge on them). `activeAgents` (from
+  // useActiveAgents) is kept as the fallback for the "no terminated
+  // agents in this project" case but extended with any terminated rows
+  // from data.agents.
   const allAgents = data?.agents || []
-  const activeAgents = getActiveAgents()
   const terminatedAgents = allAgents.filter(
     (a) => a.status === 'terminated'
   )
@@ -122,12 +132,9 @@ export function AgentsDashboard() {
   })
   const isConnected = !!activeServerId && activeServer?.status === 'connected'
 
-  // Fetch data on mount and when server changes
-  useEffect(() => {
-    if (activeServerId && activeServer?.status === 'connected') {
-      fetchAllData()
-    }
-  }, [activeServerId, activeServer?.status, fetchAllData])
+  // Wave 6: no mount fetch effect — the `/all-data` TanStack Query
+  // fetches automatically once a connected server is selected (its
+  // `enabled` gate reads the same server-store connection state).
 
   // Auto-cleanup loop removed (regression: silently terminated valid
   // worker agents every 2 minutes while the tab was open). Agent

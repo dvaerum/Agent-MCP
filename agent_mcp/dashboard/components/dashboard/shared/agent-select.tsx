@@ -8,7 +8,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { useDataStore } from "@/lib/stores/data-store"
+import { useActiveAgents } from "@/lib/queries/all-data"
 import { cn } from "@/lib/utils"
 
 /**
@@ -135,17 +135,16 @@ export function AgentSelect({
   id,
   ariaLabel,
 }: AgentSelectProps): React.ReactElement {
-  // Read live agents from the store. `getActiveAgents()` is the
-  // single source of truth — it filters `status='terminated'` via
-  // `shouldDisplayAgent`. Subscribing to `data` (rather than calling
-  // `getActiveAgents()` outside of a selector) keeps the dropdown
-  // in sync when agents are created/terminated mid-session.
-  const data = useDataStore((s) => s.data)
-  const liveAgents = React.useMemo(() => {
-    if (!data) return []
-    const all = data.agents.filter((agent) => agent.status !== "terminated")
-    return filterOutAdmin(all)
-  }, [data])
+  // Read live agents from the shared `/all-data` TanStack Query.
+  // `useActiveAgents()` is the single source of truth — it already
+  // filters `status='terminated'` — and re-renders the dropdown in
+  // sync when agents are created/terminated mid-session (SSE
+  // invalidation refetches the one shared query).
+  const activeAgents = useActiveAgents()
+  const liveAgents = React.useMemo(
+    () => filterOutAdmin(activeAgents),
+    [activeAgents],
+  )
 
   // Map between the public `value: string | null` and the Radix
   // Select's required string value. `null` becomes NONE_SENTINEL

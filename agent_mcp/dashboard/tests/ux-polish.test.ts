@@ -141,10 +141,12 @@ describe("UX-10: create-memory suggestion chips", () => {
     ).toEqual([])
   })
 
-  it("sources chips from the data store's existing context keys", () => {
+  it("sources chips from the shared all-data query's existing context keys", () => {
+    // Wave 6: context rows come from the `/all-data` TanStack Query via
+    // `useContextRows()` (was `useDataStore((s) => s.data?.context)`).
     expect(
-      /useDataStore\(\(s\) => s\.data\?\.context\)/.test(src),
-      "chips must read existing keys from the data store",
+      /useContextRows\(\)/.test(src),
+      "chips must read existing keys from the all-data query",
     ).toBe(true)
     expect(
       /c\?\.context_key/.test(src),

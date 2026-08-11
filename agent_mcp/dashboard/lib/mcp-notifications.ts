@@ -78,6 +78,7 @@
  */
 
 import { useDataStore, notifyPromptsListChanged } from "./stores/data-store"
+import { invalidateAllData } from "./query-client"
 import { projectContext } from "./project-context"
 import { eventsUrl } from "./urls"
 
@@ -167,13 +168,20 @@ interface JsonRpcNotification {
 // land before the refetch reads — the backend notification fires
 // pre-commit as a "refetch soon" hint — avoiding a read-before-commit
 // race.
+//
+// Wave 6 keystone increment 1: the single mutation choke point is now
+// `invalidateAllData()` — one `queryClient.invalidateQueries({queryKey:
+// ['all-data', project]})` that refetches the one shared TanStack Query
+// exactly once (not the old zustand `refreshData()` full-envelope
+// refetch). This is what fixes ST-3 double-sourcing + ST-4 split-brain:
+// there is a single cache and a single invalidation.
 const DASHBOARD_REFRESH_DEBOUNCE_MS = 300
 let _dashboardRefreshTimer: ReturnType<typeof setTimeout> | null = null
 function scheduleDashboardRefresh(): void {
   if (_dashboardRefreshTimer !== null) clearTimeout(_dashboardRefreshTimer)
   _dashboardRefreshTimer = setTimeout(() => {
     _dashboardRefreshTimer = null
-    void useDataStore.getState().refreshData()
+    void invalidateAllData()
   }, DASHBOARD_REFRESH_DEBOUNCE_MS)
 }
 

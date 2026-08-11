@@ -15,7 +15,7 @@ import {
 } from "@/components/ui/dialog"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { agentPresence, type Agent, type Task } from "@/lib/api"
-import { useDataStore } from "@/lib/stores/data-store"
+import { useAgentTasks } from "@/lib/queries/all-data"
 import { formatRelative } from "@/lib/utils"
 import { SafeMarkdown } from "@/components/dashboard/memory-value-view"
 import {
@@ -102,7 +102,10 @@ export const AgentDetailDialog = ({
   const [copiedToken, setCopiedToken] = useState(false)
   const [copiedSnippet, setCopiedSnippet] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<ClientTab>('claude-code')
-  const { getAgentTasks } = useDataStore()
+  // Hook must run unconditionally (before the `if (!agent)` early return
+  // below), so pass a safe empty id when there's no agent yet — that
+  // resolves to an empty task list.
+  const agentTasks = useAgentTasks(agent?.agent_id ?? "")
 
   // Hydrate active tab from localStorage on first mount. We
   // deliberately seed lazily (inside useEffect, not in useState) so
@@ -130,7 +133,7 @@ export const AgentDetailDialog = ({
 
   if (!agent) return null
 
-  const currentTask = getAgentTasks(agent.agent_id).find(
+  const currentTask = agentTasks.find(
     (t) => t.task_id === agent.current_task,
   )
 

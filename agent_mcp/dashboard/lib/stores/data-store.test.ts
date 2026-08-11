@@ -1,110 +1,91 @@
-// Direct unit coverage for the data-store's read selectors and the
-// fetch freshness gate — the reconcile/normalisation logic that the
-// React tree relies on but that no component test exercises head-on.
+// Unit coverage for the data-store's remaining responsibilities after
+// Wave 6 keystone increment 1 moved the `/all-data` server-cache onto
+// TanStack Query. What's left in this zustand store:
 //
-//   * getAgent / getTask normalise the caller's id (strip the
-//     `agent_` / `task_` routing prefix, collapse Admin↔admin) before
-//     matching, so both the URL form and the raw store form resolve.
-//   * fetchAllData is throttled: a non-forced call inside the 30s
-//     freshness window must not hit the network.
+//   * the prompt-book catalogue slice (separate endpoint + cadence),
+//     including the load skip-gate and the `tags` normalisation the
+//     2026-06-17 Firefox click-through exposed, and
+//   * the PF-3 `sseHealthy` flag, which the all-data query reads to gate
+//     its fallback poll — flipped only on an actual change.
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest"
 import { useDataStore } from "./data-store"
-import { apiClient, type Agent, type Task } from "../api"
+import { apiClient } from "../api"
 
-const agents = [
-  { agent_id: "Admin", status: "running" },
-  { agent_id: "worker1", status: "running" },
-] as unknown as Agent[]
-
-const tasks = [
-  { task_id: "abc", title: "first", status: "pending" },
-] as unknown as Task[]
-
-function seed(overrides: Record<string, unknown> = {}) {
-  useDataStore.setState({
-    data: {
-      agents,
-      tasks,
-      context: [],
-      actions: [],
-      file_metadata: [],
-      file_map: {},
-      timestamp: new Date().toISOString(),
+const catalogEnvelope = {
+  categories: [{ id: "c1", name: "Cat", description: "", icon: "" }],
+  prompts: [
+    // One prompt deliberately WITHOUT `tags` to pin the boundary
+    // normalisation (the catalogue drift that threw
+    // `TypeError: s.tags is undefined`).
+    {
+      id: "p1",
+      title: "P1",
+      description: "",
+      category: "c1",
+      template: "",
+      variables: [],
+      usage: "",
     },
-    loading: false,
-    isRefreshing: false,
-    error: null,
-    lastFetch: Date.now(),
-    ...overrides,
-  })
-}
+  ],
+} as unknown as Awaited<ReturnType<typeof apiClient.getPromptsCatalog>>
 
-describe("data-store selectors", () => {
+describe("data-store prompts catalogue slice", () => {
   beforeEach(() => {
-    seed()
+    useDataStore.setState({
+      promptsCatalog: null,
+      promptsCategories: null,
+      promptsCatalogLoading: false,
+    })
   })
+  afterEach(() => vi.restoreAllMocks())
 
-  it("getAgent strips the agent_ prefix and resolves Admin↔admin", () => {
-    const { getAgent } = useDataStore.getState()
-    expect(getAgent("worker1")?.agent_id).toBe("worker1")
-    expect(getAgent("agent_worker1")?.agent_id).toBe("worker1")
-    // Both casings + the prefix all land on the capitalised Admin row.
-    expect(getAgent("admin")?.agent_id).toBe("Admin")
-    expect(getAgent("Admin")?.agent_id).toBe("Admin")
-    expect(getAgent("agent_Admin")?.agent_id).toBe("Admin")
-    expect(getAgent("nope")).toBeUndefined()
-  })
-
-  it("getTask strips the task_ prefix", () => {
-    const { getTask } = useDataStore.getState()
-    expect(getTask("abc")?.task_id).toBe("abc")
-    expect(getTask("task_abc")?.task_id).toBe("abc")
-    expect(getTask("missing")).toBeUndefined()
-  })
-})
-
-describe("data-store fetch freshness gate", () => {
-  afterEach(() => {
-    vi.restoreAllMocks()
-  })
-
-  const envelope = {
-    agents,
-    tasks,
-    context: [],
-    actions: [],
-    file_metadata: [],
-    file_map: {},
-    timestamp: new Date().toISOString(),
-  }
-
-  it("skips the network when data is fresh (<30s) and not forced", async () => {
-    seed({ lastFetch: Date.now() })
+  it("fetches the catalogue and backfills missing tags to []", async () => {
     const spy = vi
-      .spyOn(apiClient, "getAllData")
-      .mockResolvedValue(envelope as Awaited<ReturnType<typeof apiClient.getAllData>>)
+      .spyOn(apiClient, "getPromptsCatalog")
+      .mockResolvedValue(catalogEnvelope)
 
-    await useDataStore.getState().fetchAllData()
+    await useDataStore.getState().fetchPromptsCatalog()
+    expect(spy).toHaveBeenCalledTimes(1)
+    const state = useDataStore.getState()
+    expect(state.promptsCatalog?.[0]?.tags).toEqual([])
+    expect(state.promptsCategories?.[0]?.id).toBe("c1")
+  })
+
+  it("skips the network when the catalogue is already loaded and not forced", async () => {
+    useDataStore.setState({ promptsCatalog: [], promptsCategories: [] })
+    const spy = vi
+      .spyOn(apiClient, "getPromptsCatalog")
+      .mockResolvedValue(catalogEnvelope)
+
+    await useDataStore.getState().fetchPromptsCatalog()
     expect(spy).not.toHaveBeenCalled()
   })
 
-  it("fetches when forced even inside the freshness window", async () => {
-    seed({ lastFetch: Date.now() })
+  it("invalidatePromptsCatalog clears + refetches", async () => {
+    useDataStore.setState({ promptsCatalog: [], promptsCategories: [] })
     const spy = vi
-      .spyOn(apiClient, "getAllData")
-      .mockResolvedValue(envelope as Awaited<ReturnType<typeof apiClient.getAllData>>)
+      .spyOn(apiClient, "getPromptsCatalog")
+      .mockResolvedValue(catalogEnvelope)
 
-    await useDataStore.getState().fetchAllData(true)
-    expect(spy).toHaveBeenCalledTimes(1)
+    useDataStore.getState().invalidatePromptsCatalog()
+    // The clear happens synchronously; the refetch is scheduled.
+    await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(1))
   })
+})
 
-  it("fetches when the cached data is stale (>30s old)", async () => {
-    seed({ lastFetch: Date.now() - 40_000 })
-    const spy = vi
-      .spyOn(apiClient, "getAllData")
-      .mockResolvedValue(envelope as Awaited<ReturnType<typeof apiClient.getAllData>>)
+describe("data-store sseHealthy flag (PF-3)", () => {
+  it("writes only on an actual flip", () => {
+    useDataStore.setState({ sseHealthy: false })
+    const seen: boolean[] = []
+    const unsub = useDataStore.subscribe((s) => seen.push(s.sseHealthy))
 
-    await useDataStore.getState().fetchAllData()
-    expect(spy).toHaveBeenCalledTimes(1)
+    const { setSseHealthy } = useDataStore.getState()
+    setSseHealthy(false) // no-op — already false
+    setSseHealthy(true) // flip
+    setSseHealthy(true) // no-op — already true
+    setSseHealthy(false) // flip
+
+    unsub()
+    expect(seen).toEqual([true, false])
   })
 })

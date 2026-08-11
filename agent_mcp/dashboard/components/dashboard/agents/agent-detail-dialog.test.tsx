@@ -15,11 +15,11 @@ class ResizeObserverStub {
 ;(globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver =
   ResizeObserverStub
 
-vi.mock("@/lib/stores/data-store", () => ({
-  useDataStore: (selector?: (s: unknown) => unknown) => {
-    const state = { data: null, getAgentTasks: () => [] }
-    return selector ? selector(state) : state
-  },
+// Wave 6: the dialog reads the agent's tasks from the shared
+// `/all-data` TanStack Query via `useAgentTasks`; stub it so the
+// component renders without the app's query wiring.
+vi.mock("@/lib/queries/all-data", () => ({
+  useAgentTasks: () => [],
 }))
 
 import { AgentDetailDialog } from "@/components/dashboard/agents/agent-detail-dialog"

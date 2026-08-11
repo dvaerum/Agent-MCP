@@ -24,7 +24,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { useDataStore } from '@/lib/stores/data-store'
+import { useAllData, useAllDataStatus } from '@/lib/queries/all-data'
 import { useServerStore } from '@/lib/stores/server-store'
 import { useDialog } from '@/hooks/use-dialog'
 import { useFilters } from '@/hooks/use-filters'
@@ -101,7 +101,12 @@ function MemoryDeletePreview({ memory }: { memory: Memory }) {
 export function MemoriesDashboard() {
   const { servers, activeServerId } = useServerStore()
   const activeServer = servers.find(s => s.id === activeServerId)
-  const { data, loading, error, refreshData } = useDataStore()
+  // Wave 6 keystone increment 1: memories read the `context` slice of
+  // the shared `/all-data` TanStack Query (memory rows are context
+  // rows). `refresh` is the awaitable force-refetch the mutation
+  // handlers await after create/edit/delete.
+  const data = useAllData()
+  const { loading, error, refresh: refreshData } = useAllDataStatus()
   // Filter state — owned by the shared useFilters hook (matches Agents/
   // Tasks). Search is a filter; sort is a separate control (useFilters
   // covers filter fields, not sort order).
@@ -171,12 +176,8 @@ export function MemoriesDashboard() {
   }, [deleteDialog.isOpen, deleteDialog.data, deleteDialog.close])
   /* eslint-enable react-hooks/exhaustive-deps */
 
-  // Fetch data on mount and when server changes
-  useEffect(() => {
-    if (activeServerId && activeServer?.status === 'connected') {
-      refreshData()
-    }
-  }, [activeServerId, activeServer?.status, refreshData])
+  // Wave 6: no mount fetch effect — the `/all-data` TanStack Query
+  // fetches automatically once a connected server is selected.
 
   // Filter and sort memories
   const filteredMemories = React.useMemo(() => {
