@@ -198,9 +198,24 @@ interface JsonRpcNotification {
 // refetch of the mounted messages page per burst, replacing the Messages
 // page's own retired `mcp:resources-updated` listener + 60s
 // `setInterval`.
+//
+// W6-followup-2 G1: this same debounced tick is now ALSO the entry point
+// for the operator's OWN mutations. A create/update/delete handler on an
+// `/all-data`-backed page used to `await refreshData()` (an immediate,
+// un-coalesced `/all-data` refetch) in its success path AND still receive
+// the backend `resources/updated` echo above — two `/all-data` fetches
+// per mutation. Routing the handler's post-write signal through this
+// SAME singleton timer (via the exported `scheduleDashboardRefresh`)
+// coalesces it with the echo into exactly ONE refetch. It is also correct
+// when the SSE stream is down (no echo): the handler's own tick still
+// fires, so the operator's action stays fresh instead of waiting on the
+// 60s poll — a property removing the imperative refresh outright would
+// lose. `invalidateQueries` only refetches MOUNTED queries, so calling
+// this from the Memories page refetches `/all-data` once and no-ops on
+// the unmounted tasks/messages keys.
 const DASHBOARD_REFRESH_DEBOUNCE_MS = 300
 let _dashboardRefreshTimer: ReturnType<typeof setTimeout> | null = null
-function scheduleDashboardRefresh(): void {
+export function scheduleDashboardRefresh(): void {
   if (_dashboardRefreshTimer !== null) clearTimeout(_dashboardRefreshTimer)
   _dashboardRefreshTimer = setTimeout(() => {
     _dashboardRefreshTimer = null
