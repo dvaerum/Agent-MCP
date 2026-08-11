@@ -24,7 +24,9 @@
 //                             it would restore a DIFFERENT alias.
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
 import { render, cleanup, screen, waitFor, within } from "@testing-library/react"
+import { QueryClientProvider } from "@tanstack/react-query"
 import { setupUser } from "@/tests/support/user-event"
+import { queryClient } from "@/lib/query-client"
 
 const requestMock = vi.fn()
 vi.mock("@/lib/router-api", () => ({
@@ -43,10 +45,15 @@ import { Toaster, __resetToastsForTests } from "@/components/ui/toast"
 beforeEach(() => {
   requestMock.mockReset()
   fetchOverview.mockClear()
+  // W6-followup F4: GroupsDashboard's list now rides TanStack Query;
+  // clear the shared module-singleton cache so one test's groups don't
+  // bleed into the next.
+  queryClient.clear()
 })
 afterEach(() => {
   cleanup()
   __resetToastsForTests()
+  queryClient.clear()
 })
 
 /** Route the shared router-api mock by URL substring. */
@@ -81,10 +88,10 @@ describe("group member remove", () => {
   async function expandDevs() {
     const u = setupUser()
     render(
-      <>
+      <QueryClientProvider client={queryClient}>
         <GroupsDashboard />
         <Toaster />
-      </>,
+      </QueryClientProvider>,
     )
     await screen.findByRole("heading", { name: "Groups" })
     const table = document.querySelector("table") as HTMLElement

@@ -38,10 +38,12 @@ import { Button } from "@/components/ui/button"
 import { toastError } from "@/components/ui/toast"
 import { routerGroupUrl } from "@/lib/urls"
 import { routerApi } from "@/lib/router-api"
-import { useRouterQuery } from "@/hooks/use-router-query"
+import { ApiError } from "@/lib/api"
+import { useGroupsQuery } from "@/lib/queries/groups"
+import { invalidateGroups } from "@/lib/query-client"
 import { DeleteConfirmModal } from "./modals/delete-confirm-modal"
 import { DataTablePage } from "@/components/dashboard/shared/data-table-page"
-import { fetchGroups, memberLabel, type GroupRow } from "@/components/dashboard/groups/groups-api"
+import { memberLabel, type GroupRow } from "@/components/dashboard/groups/groups-api"
 import { useGroupsColumns } from "@/components/dashboard/groups/use-groups-columns"
 import { AddGroupModal } from "@/components/dashboard/groups/add-group-modal"
 import { EditGroupModal } from "@/components/dashboard/groups/edit-group-modal"
@@ -73,15 +75,26 @@ function useIsNarrowViewport(): boolean {
 
 
 export function GroupsDashboard(): React.ReactElement {
-  const {
-    data,
-    loading,
-    error: fetchError,
-    forbidden,
-    refresh,
-  } = useRouterQuery<GroupRow[]>(fetchGroups)
-  const groups = useMemo(() => data ?? [], [data])
-  const error = fetchError?.message ?? null
+  const query = useGroupsQuery()
+  const groups = useMemo(() => query.data ?? [], [query.data])
+  // useRouterQuery folded a 403 into a dedicated `forbidden` flag; useQuery
+  // surfaces the same response as a thrown ApiError on `error`. Re-derive
+  // the split here so the UX is unchanged: a 403 → the centralized
+  // "Sysadmin only" panel (error stays null, it outranks error in
+  // DataTablePage); any other error → the connection-error panel.
+  const forbidden =
+    query.error instanceof ApiError && query.error.status === 403
+  const error = forbidden ? null : (query.error?.message ?? null)
+  // `isFetching` (not `isPending`) mirrors useRouterQuery's `loading`,
+  // which was also true during a manual refresh. DataTablePage only paints
+  // the skeleton when `loading && rows.length === 0`, so an in-place
+  // refresh keeps the rows on screen and just drives the header spinner.
+  const loading = query.isFetching
+  // No SSE stream at the cross-project overview (see lib/queries/groups.ts),
+  // so freshness after a group mutation rides an explicit invalidateGroups()
+  // — the direct replacement for useRouterQuery's `refresh()`. Stable
+  // identity so the modals'/detail panel's success handlers stay memo-clean.
+  const refresh = useCallback(() => invalidateGroups(), [])
   const [addOpen, setAddOpen] = useState(false)
   const [editTarget, setEditTarget] = useState<GroupRow | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<GroupRow | null>(null)

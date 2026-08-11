@@ -17,9 +17,11 @@
 // anything here), so every query is scoped to the desktop <table>.
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
 import { render, cleanup, screen, waitFor, within } from "@testing-library/react"
+import { QueryClientProvider } from "@tanstack/react-query"
 import { setupUser } from "@/tests/support/user-event"
 
 import { ApiError } from "@/lib/api"
+import { queryClient } from "@/lib/query-client"
 
 const requestMock = vi.fn()
 vi.mock("@/lib/router-api", () => ({
@@ -60,20 +62,29 @@ function routeBy(handlers: Record<string, unknown>) {
   })
 }
 
+// W6-followup F4: the groups LIST now rides TanStack Query
+// (`useGroupsQuery` → `useQuery`), so the page must render under a
+// QueryClientProvider. Use the app's real module-singleton `queryClient`
+// (cleared between tests) so this exercises the real hook end-to-end —
+// the router-api mock still feeds list + members + capabilities.
 const renderPage = () =>
   render(
-    <>
+    <QueryClientProvider client={queryClient}>
       <GroupsDashboard />
       <Toaster />
-    </>,
+    </QueryClientProvider>,
   )
 
 const desktopTable = () => document.querySelector("table") as HTMLElement
 
 beforeEach(() => {
   requestMock.mockReset()
+  queryClient.clear()
 })
-afterEach(() => cleanup())
+afterEach(() => {
+  cleanup()
+  queryClient.clear()
+})
 
 describe("<GroupsDashboard> on the shared scaffold", () => {
   it("renders the scaffold header + a row per group", async () => {
