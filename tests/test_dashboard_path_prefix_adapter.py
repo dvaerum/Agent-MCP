@@ -41,7 +41,7 @@ DASHBOARD = Path("agent_mcp/dashboard")
 PROJECT_CONTEXT = DASHBOARD / "lib" / "project-context.ts"
 LAYOUT = DASHBOARD / "app" / "layout.tsx"
 PROVIDER = DASHBOARD / "components" / "providers" / "project-context-provider.tsx"
-API = DASHBOARD / "lib" / "api.ts"
+API = DASHBOARD / "lib" / "api" / "client.ts"
 OLD_INIT = DASHBOARD / "components" / "providers" / "api-client-initializer.tsx"
 
 

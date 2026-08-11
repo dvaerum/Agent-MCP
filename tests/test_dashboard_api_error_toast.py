@@ -59,7 +59,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DASHBOARD = REPO_ROOT / "agent_mcp" / "dashboard"
-API_FILE = DASHBOARD / "lib" / "api.ts"
+API_FILE = DASHBOARD / "lib" / "api" / "client.ts"
 AGENTS_TSX = DASHBOARD / "components" / "dashboard" / "agents-dashboard.tsx"
 LAYOUT_TSX = DASHBOARD / "app" / "layout.tsx"
 TOAST_TSX = DASHBOARD / "components" / "ui" / "toast.tsx"

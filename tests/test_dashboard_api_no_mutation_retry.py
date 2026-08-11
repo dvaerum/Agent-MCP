@@ -1,6 +1,8 @@
 """The dashboard API client MUST NOT retry mutating HTTP methods.
 
-The shared `request<T>()` helper in `agent_mcp/dashboard/lib/api.ts`
+The shared `request<T>()` helper in
+`agent_mcp/dashboard/lib/api/client.ts` (the request core the
+W6-followup F1 split extracted from the old `lib/api.ts` God-module)
 implements a transparent retry-on-5xx loop intended to absorb the
 ~10-15s cold-start latency of a lazily-spawned backend (router proxy
 returns 502/503/504 while the UDS comes up). The retry was added in
@@ -28,8 +30,9 @@ The fix: retries are safe ONLY for idempotent reads (GET / HEAD).
 Mutations must surface the 5xx to the caller's catch handler so the
 operator can see what happened and decide whether to retry manually.
 
-This test pins the contract by source-grep on api.ts (same pattern
-as ``test_dashboard_no_auto_cleanup.py`` / ``test_router_no_legacy_redirects.py``).
+This test pins the contract by source-grep on the request core (same
+pattern as ``test_dashboard_no_auto_cleanup.py`` /
+``test_router_no_legacy_redirects.py``).
 """
 
 from __future__ import annotations
@@ -39,12 +42,12 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 API_FILE = (
-    REPO_ROOT / "agent_mcp" / "dashboard" / "lib" / "api.ts"
+    REPO_ROOT / "agent_mcp" / "dashboard" / "lib" / "api" / "client.ts"
 )
 
 
 def test_api_file_exists() -> None:
-    """Sanity: a rename of api.ts invalidates the other assertions."""
+    """Sanity: a rename of client.ts invalidates the other assertions."""
     assert API_FILE.exists(), (
         f"Expected dashboard API client at {API_FILE}; either it was "
         f"moved/renamed (update this test) or the repo layout changed."
@@ -70,10 +73,12 @@ def test_request_retry_loop_gates_on_method() -> None:
     source = API_FILE.read_text(encoding="utf-8")
 
     # Locate the request<T>() method body. Anchor on the
-    # `private async request<T>(` signature; grab until the matching
-    # outer `}` at two-space indent (the class member end).
+    # `async request<T>(` signature (the W6-followup F1 split made it a
+    # public method on the extracted request core, so the leading
+    # `private` is now optional); grab until the matching outer `}` at
+    # two-space indent (the class member end).
     fn_match = re.search(
-        r"private\s+async\s+request<T>\([^)]*\)[^{]*\{(.*?)\n\s{2}\}",
+        r"(?:private\s+)?async\s+request<T>\([^)]*\)[^{]*\{(.*?)\n\s{2}\}",
         source,
         re.DOTALL,
     )

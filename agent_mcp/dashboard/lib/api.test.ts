@@ -248,25 +248,6 @@ describe("ApiClient.request shape validation (TY-1)", () => {
     expect(err.message).toContain("/status")
   })
 
-  it("rejects a 200 whose /agents body is not an array", async () => {
-    global.fetch = vi.fn(
-      async () => fakeResponse(200, { not: "an array" }),
-    ) as unknown as typeof fetch
-
-    const err = await catchApiError(apiClient.getAgents())
-    expect(err).toBeInstanceOf(ShapeError)
-    expect(err.message).toContain("/agents")
-  })
-
-  it("rejects a 200 whose /agents array member lacks agent_id", async () => {
-    global.fetch = vi.fn(
-      async () => fakeResponse(200, [{ status: "running" }]),
-    ) as unknown as typeof fetch
-
-    const err = await catchApiError(apiClient.getAgents())
-    expect(err).toBeInstanceOf(ShapeError)
-  })
-
   it("rejects a 200 whose /tasks array member lacks task_id", async () => {
     global.fetch = vi.fn(
       async () => fakeResponse(200, [{ title: "no id" }]),

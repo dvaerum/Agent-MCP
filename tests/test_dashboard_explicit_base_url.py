@@ -31,7 +31,7 @@ def _read(rel: str) -> str:
 
 
 def test_api_client_has_set_base_url_method() -> None:
-    src = _read("lib/api.ts")
+    src = _read("lib/api/client.ts")
     assert "setBaseUrl" in src, (
         "expected ApiClient to expose a setBaseUrl(url: string) method "
         "so deployments can override baseUrl without going through "

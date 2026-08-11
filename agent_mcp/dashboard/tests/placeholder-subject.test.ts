@@ -25,7 +25,9 @@ const read = (rel: string) => readFileSync(resolve(DASHBOARD_ROOT, rel), "utf8")
 
 describe("Message type exposes subject_is_placeholder", () => {
   it("api.ts Message interface declares the flag", () => {
-    const src = read("lib/api.ts")
+    // W6-followup F1: the Message type moved from the old lib/api.ts
+    // God-module into the per-resource lib/api/messages.ts module.
+    const src = read("lib/api/messages.ts")
     expect(src).toMatch(/subject_is_placeholder\??:\s*boolean/)
   })
 

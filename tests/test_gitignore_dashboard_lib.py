@@ -13,13 +13,13 @@ def test_dashboard_lib_is_not_gitignored() -> None:
     the JS subdir and required ``git add -f``. Three PRs needed the
     workaround before we fixed .gitignore."""
     result = subprocess.run(
-        ["git", "ls-files", "agent_mcp/dashboard/lib/api.ts"],
+        ["git", "ls-files", "agent_mcp/dashboard/lib/api/index.ts"],
         capture_output=True,
         text=True,
         check=True,
     )
-    assert "agent_mcp/dashboard/lib/api.ts" in result.stdout, (
-        "Expected agent_mcp/dashboard/lib/api.ts to be tracked. "
+    assert "agent_mcp/dashboard/lib/api/index.ts" in result.stdout, (
+        "Expected agent_mcp/dashboard/lib/api/index.ts to be tracked. "
         "Check .gitignore for a stray `lib/` that re-shadows the "
         "JS dir."
     )
@@ -42,7 +42,7 @@ def test_dashboard_lib_is_not_gitignored() -> None:
             "check-ignore",
             "-v",
             "--no-index",
-            "agent_mcp/dashboard/lib/api.ts",
+            "agent_mcp/dashboard/lib/api/index.ts",
         ],
         capture_output=True,
         text=True,
@@ -52,7 +52,7 @@ def test_dashboard_lib_is_not_gitignored() -> None:
         # Verbose format: ``<source>:<linenum>:<pattern>\t<pathname>``.
         pattern = check.stdout.split(":", 2)[2].split("\t", 1)[0]
         assert pattern.startswith("!"), (
-            "agent_mcp/dashboard/lib/api.ts is matched by a "
+            "agent_mcp/dashboard/lib/api/index.ts is matched by a "
             f".gitignore rule: {check.stdout.strip()}. The Python "
             "`lib/` convention is shadowing the dashboard's JS lib "
             "directory; add a negation rule (e.g. "

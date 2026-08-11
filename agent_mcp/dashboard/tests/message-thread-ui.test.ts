@@ -23,7 +23,9 @@ const read = (rel: string) =>
 // ── MT-1: api.ts getMessageThread ─────────────────────────────────
 
 describe("MT-1: api.ts declares getMessageThread", () => {
-  const src = read("lib/api.ts")
+  // W6-followup F1: getMessageThread moved from the old lib/api.ts
+  // God-module into the per-resource lib/api/messages.ts module.
+  const src = read("lib/api/messages.ts")
 
   it("exports a getMessageThread function", () => {
     expect(
