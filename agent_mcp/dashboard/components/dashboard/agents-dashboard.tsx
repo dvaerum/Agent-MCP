@@ -16,6 +16,7 @@ import {
   useAllDataStatus,
   useActiveAgents,
 } from "@/lib/queries/all-data"
+import { scheduleDashboardRefresh } from "@/lib/mcp-notifications"
 import { useDialog } from "@/hooks/use-dialog"
 import { useFilters } from "@/hooks/use-filters"
 import { TaskDetailsDialog } from "./task-details-dialog"
@@ -43,6 +44,13 @@ export function AgentsDashboard() {
   // from the one shared `/all-data` TanStack Query, not the retired
   // data-store server-cache. `refresh` is the awaitable force-refetch
   // that replaces the old `refreshData()`.
+  //
+  // W6-followup-2 G1: `refreshData` is now reserved for the manual
+  // Refresh button (an explicit one-off). Mutation success handlers no
+  // longer call it imperatively — they signal through the shared
+  // debounced `scheduleDashboardRefresh()` so the operator's own write
+  // coalesces with the backend `resources/updated` echo into ONE
+  // `/all-data` refetch (was two).
   const data = useAllData()
   const { loading, error, refresh: refreshData } = useAllDataStatus()
   const activeAgents = useActiveAgents()
@@ -188,7 +196,7 @@ export function AgentsDashboard() {
   const handleTerminateAgent = async (agentId: string) => {
     try {
       await apiClient.terminateAgent(agentId)
-      await refreshData()
+      scheduleDashboardRefresh()
     } catch (error) {
       toastError(error, `Failed to terminate ${agentId}`)
     }
@@ -197,11 +205,11 @@ export function AgentsDashboard() {
   const handleRestoreAgent = useCallback(async (agentId: string) => {
     try {
       await apiClient.restoreAgent(agentId)
-      await refreshData()
+      scheduleDashboardRefresh()
     } catch (error) {
       toastError(error, `Failed to restore ${agentId}`)
     }
-  }, [refreshData])
+  }, [])
 
   const handlePurgeAgent = useCallback((agentId: string) => {
     purgeDialog.open(agentId)
@@ -214,43 +222,44 @@ export function AgentsDashboard() {
     async (agentId: string, updates: AgentEditUpdates) => {
       try {
         await apiClient.editAgent(agentId, updates)
-        await refreshData()
+        scheduleDashboardRefresh()
       } catch (error) {
         toastError(error, `Failed to save ${agentId}`)
         throw error
       }
     },
-    [refreshData],
+    [],
   )
 
   // Disconnect / Reconnect — pause or resume monitoring without
-  // terminating. The live-update SSE channel refetches on its own, but we
-  // refreshData() here too so the row flips immediately on click.
+  // terminating. The live-update SSE channel refetches on its own; we
+  // ALSO signal via `scheduleDashboardRefresh()` so the row flips even
+  // when SSE is down, and the two signals coalesce into one refetch.
   const handleDisconnectAgent = useCallback(async (agentId: string) => {
     try {
       const res = await apiClient.disconnectAgent(agentId)
-      await refreshData()
+      scheduleDashboardRefresh()
       toastSuccess(`Agent "${agentId}" disconnected — monitoring paused.`)
       return res
     } catch (error) {
       toastError(error, `Failed to disconnect ${agentId}`)
     }
-  }, [refreshData])
+  }, [])
 
   const handleReconnectAgent = useCallback(async (agentId: string) => {
     try {
       await apiClient.reconnectAgent(agentId)
-      await refreshData()
+      scheduleDashboardRefresh()
       toastSuccess(`Agent "${agentId}" reconnected — monitoring resumed.`)
     } catch (error) {
       toastError(error, `Failed to reconnect ${agentId}`)
     }
-  }, [refreshData])
+  }, [])
 
   const handleDisconnectAll = async () => {
     try {
       await apiClient.disconnectAllAgents()
-      await refreshData()
+      scheduleDashboardRefresh()
       toastSuccess('All agents disconnected — global monitoring paused.')
     } catch (error) {
       toastError(error, 'Failed to disconnect all agents')
@@ -260,7 +269,7 @@ export function AgentsDashboard() {
   const handleReconnectAll = async () => {
     try {
       await apiClient.reconnectAllAgents()
-      await refreshData()
+      scheduleDashboardRefresh()
       toastSuccess('All agents reconnected — global monitoring resumed.')
     } catch (error) {
       toastError(error, 'Failed to reconnect all agents')
@@ -549,7 +558,7 @@ export function AgentsDashboard() {
             if (!open) purgeDialog.close()
           }}
           onConfirmed={() => {
-            void refreshData()
+            scheduleDashboardRefresh()
           }}
         />
 

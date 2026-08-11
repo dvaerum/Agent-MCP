@@ -25,6 +25,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { useAllData, useAllDataStatus } from '@/lib/queries/all-data'
+import { scheduleDashboardRefresh } from '@/lib/mcp-notifications'
 import { useServerStore } from '@/lib/stores/server-store'
 import { useDialog } from '@/hooks/use-dialog'
 import { useFilters } from '@/hooks/use-filters'
@@ -227,10 +228,18 @@ export function MemoriesDashboard() {
   // Tasks). The delete confirmation is the shared tier-1
   // <ConfirmActionModal>; it shows an inline error on failure — we
   // re-throw so it stays open, and also toast for consistency.
+  //
+  // W6-followup-2 G1: after a write we signal the change through the
+  // shared debounced choke point (`scheduleDashboardRefresh`) rather than
+  // an immediate imperative `refreshData` refetch. The backend also emits
+  // a `resources/updated` echo for the same write; both share one
+  // debounce timer, so they coalesce into exactly ONE `/all-data` refetch
+  // instead of two. (The manual Refresh button below still calls
+  // `refreshData` directly — that's an explicit one-off user action.)
   const handleDeleteMemory = async (memory: Memory) => {
     try {
       await apiClient.deleteMemory(memory.context_key)
-      await refreshData()
+      scheduleDashboardRefresh()
       toastSuccess(`Memory "${memory.context_key}" deleted.`)
     } catch (error) {
       toastError(error, 'Failed to delete memory')
@@ -249,7 +258,7 @@ export function MemoriesDashboard() {
         context_value: data.context_value,
         description: data.description,
       })
-      await refreshData()
+      scheduleDashboardRefresh()
       toastSuccess(`Memory "${data.context_key}" created.`)
     } catch (error) {
       toastError(error, 'Failed to create memory')
@@ -267,7 +276,7 @@ export function MemoriesDashboard() {
         context_value: data.context_value,
         description: data.description,
       })
-      await refreshData()
+      scheduleDashboardRefresh()
       toastSuccess(`Memory "${data.context_key}" updated.`)
     } catch (error) {
       toastError(error, 'Failed to update memory')
